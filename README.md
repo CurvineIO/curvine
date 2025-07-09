@@ -18,6 +18,7 @@ For more detailed information, please refer to:
 - [Quick Start](https://curvineio.github.io/docs/Deploy/quick-start)
 - [User Manuals](https://curvineio.github.io/docs/category/user-manuals)
 - [Benchmark](https://curvineio.github.io/docs/category/benchmark)
+- [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
 
 ## Use Case
 ![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.jpg)
