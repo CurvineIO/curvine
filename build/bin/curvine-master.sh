@@ -16,4 +16,4 @@
 # limitations under the License.
 #
 
-sh "$(cd "`dirname "$0"`"; pwd)"/launch-process.sh master $1
+"$(cd "`dirname "$0"`"; pwd)"/launch-process.sh master $1

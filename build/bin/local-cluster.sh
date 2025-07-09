@@ -24,7 +24,7 @@ BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
 CURVINE_HOME="$(cd "$BIN_DIR/.."; pwd)"
 
 # Loading environment variables
-source "$CURVINE_HOME/conf/curvine-env.sh"
+. "$CURVINE_HOME/conf/curvine-env.sh"
 
 # Define the service list
 SERVICES=("master" "worker")

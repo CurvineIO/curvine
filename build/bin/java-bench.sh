@@ -25,7 +25,7 @@
 # client mode reading: bin/java-bench.sh fuse.read /curvine-fuse/fs-bench
 
 
-source "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
+. "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
 export CLASSPATH=$(echo $CURVINE_HOME/lib/curvine-hadoop-*shade.jar | tr ' ' ':')
 
 ACTION=$1

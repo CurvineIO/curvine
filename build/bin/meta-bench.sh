@@ -18,7 +18,7 @@
 
 # Java client side metadata performance test script
 
-source "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
+. "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
 export CLASSPATH=$(echo $CURVINE_HOME/lib/curvine-hadoop-*shade.jar | tr ' ' ':')
 
 # createWrite

@@ -16,7 +16,7 @@
 # limitations under the License.
 #
 
-source "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
+. "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
 
 SERVICE_NAME=$1
 ACTION=$2

@@ -25,7 +25,7 @@
 # client mode reading: bin/curvine-bench.sh fuse.read /curvine-fuse/fs-bench
 
 
-source "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
+. "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
 
 ACTION=$1
 DIR=$2

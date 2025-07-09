@@ -39,7 +39,7 @@ fi
 mkdir -p $MNT_PATH
 
 
-sh "$(cd "`dirname "$0"`"; pwd)"/launch-process.sh fuse $1 \
+"$(cd "`dirname "$0"`"; pwd)"/launch-process.sh fuse $1 \
 --mnt-path $MNT_PATH \
 --mnt-number ${MNT_NUMBER} \
 ${FUSE_OPTS}
