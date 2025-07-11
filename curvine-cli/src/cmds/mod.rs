@@ -17,6 +17,7 @@ mod load;
 mod load_cancel;
 mod load_status;
 mod mount;
+mod node;
 mod report;
 mod umount;
 
@@ -25,5 +26,6 @@ pub use load::LoadCommand;
 pub use load_cancel::CancelLoadCommand;
 pub use load_status::LoadStatusCommand;
 pub use mount::MountCommand;
+pub use node::NodeCommand;
 pub use report::ReportCommand;
 pub use umount::UnMountCommand;

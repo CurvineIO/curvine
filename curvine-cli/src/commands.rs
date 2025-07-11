@@ -43,6 +43,10 @@ pub enum Commands {
     #[command(name = "umount")]
     UnMount(UnMountCommand),
 
+    /// Node command
+    #[command(name = "node")]
+    Node(NodeCommand),
+
     /// show cli version
     #[command(name = "version")]
     Version,

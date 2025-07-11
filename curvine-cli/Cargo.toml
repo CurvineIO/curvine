@@ -16,3 +16,4 @@ num-bigint = { workspace = true }
 bigdecimal = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
+reqwest = { version = "0.11", features = ["json"] }
