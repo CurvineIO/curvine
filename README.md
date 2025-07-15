@@ -137,7 +137,7 @@ You can either:
 
 ```bash
 # Compiled files are in build/dist
-sh build/build.sh
+make all
 ```
 
 After successful compilation, target file will be generated in the build/dist directory. This file is the Curvine installation package that can be used for deployment or building images.
