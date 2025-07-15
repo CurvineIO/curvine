@@ -19,6 +19,7 @@ RUN dnf install -y \
     nodejs \
     npm \
     java-1.8.0-openjdk-devel \
+    openssl-devel \
     && dnf clean all
 
 # 2. Install the Rust toolchain
