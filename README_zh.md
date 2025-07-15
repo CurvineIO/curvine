@@ -5,11 +5,6 @@
 ![curvine-font-dark](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/static/img/curvine_font_dark.svg#gh-light-mode-only)
 ![curvine-font-light](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/static/img/curvine_font_white.svg#gh-dark-mode-only)
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange)](https://www.rust-lang.org)
-
-**Curvine** 是一个用 Rust 编写的高性能、并发分布式缓存系统，专为低延迟和高吞吐量工作负载设计。
-
 <p align="center">
   <a href="https://github.com/CurvineIO/curvine/blob/main/README.md">English</a> ||
   简体中文 |
@@ -21,6 +16,11 @@
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=pt">Português</a> |
   <a href="https://readme-i18n.com/CurvineIO/curvine?lang=ru">Русский</a>
 </p>
+
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange)](https://www.rust-lang.org)
+
+**Curvine** 是一个用 Rust 编写的高性能、并发分布式缓存系统，专为低延迟和高吞吐量工作负载设计。
 
 ## 📚 文档资源
 
