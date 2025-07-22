@@ -18,7 +18,8 @@
 
 export CURVINE_HOME="$(cd "$(dirname "$0")"/..; pwd)"
 
-LOCAL_HOSTNAME=localhost
+# Get the IP address from hostname, taking the last network interface address
+LOCAL_HOSTNAME=$(hostname -I | awk '{print $NF}')
 
 # master bound host name
 export CURVINE_MASTER_HOSTNAME=$LOCAL_HOSTNAME
