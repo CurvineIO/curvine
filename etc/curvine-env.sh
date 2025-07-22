@@ -19,13 +19,14 @@
 export CURVINE_HOME="$(cd "$(dirname "$0")"/..; pwd)"
 
 # Get the IP address from hostname, taking the last network interface address
-LOCAL_HOSTNAME=$(hostname -I | awk '{print $NF}')
+LOCAL_HOSTNAME="localhost"
+LOCAL_IP=$(hostname -I | awk '{print $NF}')
 
 # master bound host name
 export CURVINE_MASTER_HOSTNAME=$LOCAL_HOSTNAME
 
 # worker bound host name
-export CURVINE_WORKER_HOSTNAME=$LOCAL_HOSTNAME
+export CURVINE_WORKER_HOSTNAME=$LOCAL_IP
 
 # The client server hostname is used to determine whether the worker and client are on the same machine.
 export CURVINE_CLIENT_HOSTNAME=$LOCAL_HOSTNAME
