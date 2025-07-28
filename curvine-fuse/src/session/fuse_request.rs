@@ -120,6 +120,22 @@ impl FuseRequest {
                 name: decoder.get_os_str()?,
             }),
 
+            FUSE_SETXATTR => {
+                let arg = decoder.get_struct()?;
+                FuseOperator::SetXAttr(SetXAttr {
+                    header,
+                    arg,
+                    name: decoder.get_os_str()?,
+                    value: decoder.get_bytes(arg.size as usize)?,
+                })
+            }
+
+            FUSE_REMOVEXATTR => FuseOperator::RemoveXAttr(RemoveXAttr {
+                header,
+                arg: decoder.get_struct()?,
+                name: decoder.get_os_str()?,
+            }),
+
             FUSE_SETATTR => FuseOperator::SetAttr(SetAttr {
                 header,
                 arg: decoder.get_struct()?,

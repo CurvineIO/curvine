@@ -86,6 +86,14 @@ impl<'a> FuseDecoder<'a> {
         self.buf = &[];
         Ok(bytes)
     }
+
+    /// Get exactly the specified number of bytes (for FUSE_SETXATTR value)
+    pub fn get_bytes(&mut self, size: usize) -> FuseResult<&'a [u8]> {
+        if size > self.buf.len() {
+            return err_box!("Not enough data for specified size");
+        }
+        self.get_slice(size)
+    }
 }
 
 #[cfg(test)]

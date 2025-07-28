@@ -6,7 +6,7 @@ on:
       push_image:
         description: '是否推送镜像到 GitHub Container Registry'
         required: false
-        default: 'false'
+        default: false
         type: boolean
 
 permissions:

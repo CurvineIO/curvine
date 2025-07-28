@@ -3,7 +3,7 @@ name: Compile and Test
 on:
   push:
     branches:
-      - '**'
+      - 'main'
   pull_request:
     branches:
       - '**'
@@ -13,8 +13,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clean hostedtoolcache to free disk space on host
+        run: |
+          echo "Disk usage before cleanup:"
+          df -h
+          
+          # Remove GitHub Actions pre-installed toolchain cache on host machine
+          sudo rm -rf /opt/hostedtoolcache || true
+          
+          echo "Disk usage after cleanup:"
+          df -h
+
   build:
     runs-on: ubuntu-latest
+    needs: cleanup
     container:
       image: ghcr.io/curvineio/curvine-compile:latest
       credentials:
@@ -37,14 +52,62 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "curvine-build"
+          # 减少缓存大小
+          cache-all-crates: false
+          cache-targets: false
       
-      - name: Build
-        run: cargo build --verbose
-        
       - name: Run fmt
-        run: cargo fmt --check
+        run: |
+          echo "Running fmt check (fastest, no compilation needed)"
+          cargo fmt --check
+          
+          echo "After fmt, disk usage:"
+          df -h
         
       - name: Run clippy
         env:
           CLIPPY_LEVEL: deny 
-        run: cargo clippy --release --all-targets -- --${CLIPPY_LEVEL}=warnings
+        run: |
+          echo "Running clippy (static code analysis)"
+          # Run clippy in debug mode to match build
+          cargo clippy --all-targets --jobs 2 -- --${CLIPPY_LEVEL}=warnings
+          
+          echo "After clippy, disk usage:"
+          df -h
+      
+      - name: Clean after clippy
+        run: |
+          # Clean clippy artifacts to save space
+          find target -name "*.rlib" -delete || true
+          find target -name "*.rmeta" -delete || true
+          rm -rf target/debug/incremental || true
+          
+          echo "After clippy cleanup, disk usage:"
+          df -h
+        
+      - name: Build
+        run: |
+          echo "Starting final build, disk usage:"
+          df -h
+          
+          # Build with limited parallelism to save memory  
+          cargo build --verbose --jobs 2
+          
+          echo "After build, disk usage:"
+          df -h
+      
+      - name: Final cleanup before cache save
+        run: |
+          echo "Final cleanup before cache save"
+          
+          # Clean all temporary files
+          rm -rf target/release/incremental || true
+          rm -rf target/release/.fingerprint || true
+          find target -name "*.d" -delete || true
+          
+          # Clean cargo cache
+          rm -rf ~/.cargo/registry/cache || true
+          rm -rf ~/.cargo/.package-cache || true
+          
+          echo "Final disk usage:"
+          df -h

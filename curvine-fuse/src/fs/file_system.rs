@@ -41,6 +41,16 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{}", msg) }
     }
 
+    async fn set_xattr(&self, op: SetXAttr<'_>) -> FuseResult<()> {
+        let msg = format!("{:?}", op);
+        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    }
+
+    async fn remove_xattr(&self, op: RemoveXAttr<'_>) -> FuseResult<()> {
+        let msg = format!("{:?}", op);
+        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    }
+
     async fn get_attr(&self, op: GetAttr<'_>) -> FuseResult<fuse_attr_out> {
         let msg = format!("{:?}", op);
         async move { err_fuse!(libc::ENOSYS, "{}", msg) }

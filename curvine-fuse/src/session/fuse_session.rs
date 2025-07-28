@@ -249,6 +249,18 @@ impl<T: FileSystem> FuseSession<T> {
 
             FuseOperator::GetXAttr(op) => reply.send_buf(fs.get_xattr(op).await).await,
 
+            FuseOperator::SetXAttr(op) => {
+                fs.set_xattr(op).await?;
+                reply.send_empty().await
+            }
+
+            FuseOperator::RemoveXAttr(op) => {
+                fs.remove_xattr(op).await?;
+                reply.send_empty().await
+            }
+
+            FuseOperator::ListXAttr(op) => reply.send_rep(fs.list_xattr(op).await).await,
+
             FuseOperator::OpenDir(op) => reply.send_rep(fs.open_dir(op).await).await,
 
             FuseOperator::Mkdir(op) => reply.send_rep(fs.mkdir(op).await).await,

@@ -29,6 +29,8 @@ pub enum FuseOperator<'a> {
     GetAttr(GetAttr<'a>),
     SetAttr(SetAttr<'a>),
     GetXAttr(GetXAttr<'a>),
+    SetXAttr(SetXAttr<'a>),
+    RemoveXAttr(RemoveXAttr<'a>),
     OpenDir(OpenDir<'a>),
     Mkdir(MkDir<'a>),
     FAllocate(FAllocate<'a>),
@@ -225,6 +227,28 @@ pub struct Access<'a> {
 pub struct GetXAttr<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_getxattr_in,
+    pub name: &'a OsStr,
+}
+
+/// SetXAttr request structure:
+/// +0                         +40                    +56           +56+len(name)+1
+/// |--------------------------|---------------------|-------------|--------------------------|
+/// |    fuse_in_header        | fuse_setxattr_in    |    name     |    value                 |
+/// |      (40 bytes)          |     (16 bytes)      | (variable)  | (size bytes)             |
+/// |--------------------------|---------------------|-------------|--------------------------|
+
+#[derive(Debug)]
+pub struct SetXAttr<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_setxattr_in,
+    pub name: &'a OsStr,
+    pub value: &'a [u8],
+}
+
+#[derive(Debug)]
+pub struct RemoveXAttr<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_removexattr_in,
     pub name: &'a OsStr,
 }
 

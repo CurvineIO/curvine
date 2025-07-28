@@ -74,7 +74,8 @@ impl UfsFileSystem {
                 let fs = S3FileSystem::new(UfsConf::with_map(conf))?;
                 Ok(UfsFileSystem::S3(fs))
             }
-            Some("gcs") | Some("gs") | Some("azure") | Some("azblob") | Some("abfs") | Some("oss") => {
+            Some("gcs") | Some("gs") | Some("azure") | Some("azblob") | Some("abfs")
+            | Some("oss") => {
                 let fs = OpendalFileSystem::new(path, UfsConf::with_map(conf))?;
                 Ok(UfsFileSystem::OpenDAL(fs))
             }

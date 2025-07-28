@@ -234,6 +234,24 @@ pub struct fuse_getxattr_in {
     pub padding: u32,
 }
 
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_setxattr_in {
+    pub size: u32,
+    pub flags: u32,
+    //maybe different in version
+    pub setxattr_flags: u32,
+    pub padding: u32,
+}
+
+// Note: FUSE_REMOVEXATTR has no input structure
+// The name is passed directly in the payload
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_removexattr_in {
+    pub padding: u32,
+}
+
 #[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Debug)]
