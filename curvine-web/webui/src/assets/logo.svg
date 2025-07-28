@@ -1,45 +1,47 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="_图层_2" data-name="图层 2" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 354.27 383">
   <defs>
-    <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#00d4ff;stop-opacity:1" />
-      <stop offset="100%" style="stop-color:#00ff7f;stop-opacity:1" />
+    <linearGradient id="_未命名的渐变_20" data-name="未命名的渐变 20" x1="12.04" y1="157.81" x2="292.2" y2="10.05" gradientUnits="userSpaceOnUse">
+      <stop offset=".02" stop-color="#33c586"/>
+      <stop offset=".48" stop-color="#33c684"/>
+      <stop offset=".65" stop-color="#33cc7d"/>
+      <stop offset=".77" stop-color="#33d571"/>
+      <stop offset=".86" stop-color="#34e360"/>
+      <stop offset=".94" stop-color="#34f54a"/>
+      <stop offset=".97" stop-color="#35ff40"/>
     </linearGradient>
-    <filter id="glow">
-      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
-      <feMerge> 
-        <feMergeNode in="coloredBlur"/>
-        <feMergeNode in="SourceGraphic"/> 
-      </feMerge>
-    </filter>
+    <linearGradient id="_未命名的渐变_162" data-name="未命名的渐变 162" x1="75.68" y1="358.03" x2="287.55" y2="246.28" gradientUnits="userSpaceOnUse">
+      <stop offset=".02" stop-color="#33c586"/>
+      <stop offset=".46" stop-color="#33c684"/>
+      <stop offset=".61" stop-color="#33cc7d"/>
+      <stop offset=".72" stop-color="#33d571"/>
+      <stop offset=".81" stop-color="#34e360"/>
+      <stop offset=".89" stop-color="#34f54a"/>
+      <stop offset=".92" stop-color="#35ff40"/>
+    </linearGradient>
+    <linearGradient id="_未命名的渐变_233" data-name="未命名的渐变 233" x1="291.66" y1="252.2" x2="336.58" y2="229.23" gradientUnits="userSpaceOnUse">
+      <stop offset=".03" stop-color="#4ee700"/>
+      <stop offset=".95" stop-color="#0f8"/>
+    </linearGradient>
+    <linearGradient id="_未命名的渐变_233-2" data-name="未命名的渐变 233" x1="85.42" y1="242.9" x2="324.63" y2="120.53" xlink:href="#_未命名的渐变_233"/>
+    <linearGradient id="_未命名的渐变_233-3" data-name="未命名的渐变 233" x1="252.84" y1="285.19" x2="316.59" y2="252.58" xlink:href="#_未命名的渐变_233"/>
   </defs>
-  
-  <!-- Background circle -->
-  <circle cx="50" cy="50" r="45" fill="none" stroke="url(#logoGradient)" stroke-width="2" opacity="0.3"/>
-  
-  <!-- Main logo shape - representing distributed cache nodes -->
-  <g filter="url(#glow)">
-    <!-- Central node -->
-    <circle cx="50" cy="50" r="8" fill="url(#logoGradient)"/>
-    
-    <!-- Surrounding nodes -->
-    <circle cx="30" cy="30" r="6" fill="#00d4ff"/>
-    <circle cx="70" cy="30" r="6" fill="#00d4ff"/>
-    <circle cx="30" cy="70" r="6" fill="#00ff7f"/>
-    <circle cx="70" cy="70" r="6" fill="#00ff7f"/>
-    
-    <!-- Connection lines -->
-    <line x1="50" y1="50" x2="30" y2="30" stroke="url(#logoGradient)" stroke-width="2" opacity="0.7"/>
-    <line x1="50" y1="50" x2="70" y2="30" stroke="url(#logoGradient)" stroke-width="2" opacity="0.7"/>
-    <line x1="50" y1="50" x2="30" y2="70" stroke="url(#logoGradient)" stroke-width="2" opacity="0.7"/>
-    <line x1="50" y1="50" x2="70" y2="70" stroke="url(#logoGradient)" stroke-width="2" opacity="0.7"/>
-    
-    <!-- Cross connections -->
-    <line x1="30" y1="30" x2="70" y2="30" stroke="#00d4ff" stroke-width="1" opacity="0.5"/>
-    <line x1="30" y1="70" x2="70" y2="70" stroke="#00ff7f" stroke-width="1" opacity="0.5"/>
-    <line x1="30" y1="30" x2="30" y2="70" stroke="url(#logoGradient)" stroke-width="1" opacity="0.5"/>
-    <line x1="70" y1="30" x2="70" y2="70" stroke="url(#logoGradient)" stroke-width="1" opacity="0.5"/>
+  <g id="_图层_1-2" data-name="图层 1">
+    <g>
+      <g>
+        <path d="m12.73,162.86c6.97-44.62,30.36-85.58,65.91-115.4C114.74,17.18,161.04.5,209,.5c54.38,0,105.07,20.72,142.82,58.36l-38.75,10.78c-29.15-25.89-66.63-40.14-105.57-40.14-73.92,0-137.58,50.27-154.92,122.28l-39.85,11.09Z" style="fill: url(#_未命名的渐变_20);"/>
+        <path d="m209,1c27.5,0,54.12,5.32,79.12,15.82,23.61,9.91,44.71,23.97,62.74,41.79l-37.66,10.48c-29.21-25.86-66.72-40.09-105.7-40.09-74.06,0-137.85,50.29-155.34,122.37l-38.81,10.8c7.1-44.2,30.36-84.75,65.61-114.32C114.98,17.64,161.16,1,209,1m0-1C108.96,0,26.17,71.04,12.12,163.55l40.88-11.38C69.73,82.1,132.55,30,207.5,30c40.47,0,77.39,15.19,105.44,40.2l39.84-11.09C316.55,22.69,265.53,0,209,0h0Z" style="fill: #fff;"/>
+      </g>
+      <g>
+        <path d="m209,382.5c-40.42,0-79.3-11.62-112.46-33.59-32.22-21.36-56.97-51.01-71.59-85.76l36.24-10.09c25.29,58.6,82.67,96.44,146.31,96.44,40.24,0,78.65-15.09,108.19-42.51l37.71,15.56c-18.27,18.64-39.83,33.33-64.08,43.67-25.35,10.81-52.37,16.29-80.32,16.29Z" style="fill: url(#_未命名的渐变_162);"/>
+        <path d="m60.9,253.66c25.46,58.56,82.9,96.34,146.59,96.34,40.26,0,78.7-15.07,108.29-42.43l36.73,15.15c-18.12,18.34-39.44,32.82-63.4,43.03-25.28,10.78-52.24,16.25-80.12,16.25-40.32,0-79.11-11.59-112.18-33.51-31.98-21.2-56.57-50.58-71.19-85.02l35.27-9.82m.57-1.2l-37.21,10.35c29.39,70.44,101.02,120.19,184.73,120.19,57.31,0,108.96-23.33,145.27-60.64l-38.7-15.96c-28.36,26.43-66.33,42.6-108.08,42.6-65.48,0-121.7-39.76-146.02-96.54h0Z" style="fill: #fff;"/>
+      </g>
+    </g>
+    <circle cx="21" cy="209" r="21" style="fill: #1f8b00;"/>
+    <g>
+      <path d="m344.3,241.2l-52.21-21.53c-3.65,4.82-7.72,9.32-12.16,13.45l50.27,31.69c5.42-7.38,10.15-15.28,14.09-23.61Z" style="fill: url(#_未命名的渐变_233);"/>
+      <path d="m235.26,258.05c-9.3,2.57-19.11,3.95-29.26,3.95-59.09,0-107-46.67-107-104.23s47.91-104.23,107-104.23c27.56,0,52.69,10.15,71.66,26.83l30.59-8.51c-26.3-22.92-60.98-36.85-99-36.85-82.15,0-148.75,65.03-148.75,145.25s66.6,145.25,148.75,145.25c18.03,0,35.31-3.13,51.3-8.87l-25.29-58.58Z" style="fill: url(#_未命名的渐变_233-2);"/>
+      <path d="m276.04,236.57c-1.53,1.29-3.09,2.53-4.69,3.73l46.26,38.78-3.21,3.83-47.25-39.61c-1.92,1.3-3.88,2.55-5.88,3.73l40.61,46.32-3.76,3.3-41.32-47.12c-1.79.94-3.62,1.84-5.48,2.68l33.78,52.44-4.2,2.71-34.24-53.15c-2.16.87-4.36,1.67-6.58,2.4l25.15,58.25c5.42-2.15,10.68-4.61,15.76-7.34,1.51-.82,3.01-1.66,4.49-2.52,16.12-9.41,30.26-21.72,41.68-36.19l-51.12-32.23Z" style="fill: url(#_未命名的渐变_233-3);"/>
+    </g>
   </g>
-  
-  <!-- Brand text -->
-  <text x="50" y="90" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="8" font-weight="bold" fill="url(#logoGradient)">CURVINE</text>
 </svg>

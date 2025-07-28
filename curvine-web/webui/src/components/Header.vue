@@ -24,10 +24,7 @@
                             <img src="@/assets/logo.svg" alt="Curvine" class="logo-icon">
                             <div class="logo-glow"></div>
                         </div>
-                        <span class="brand-text">
-                            <span class="brand-main">CURVINE</span>
-                            <span class="brand-sub">Distributed Cache</span>
-                        </span>
+                        <img src="@/assets/curvine_font_white.svg" alt="CURVINE Distributed Cache" class="brand-logo">
                     </a>
                 </div>
                 <div class="tabs">
@@ -215,25 +212,15 @@ export default {
                     }
                 }
                 
-                .brand-text {
-                    display: flex;
-                    flex-direction: column;
+                .brand-logo {
+                    height: 2.2rem;
+                    width: auto;
+                    filter: drop-shadow(0 0 8px rgba(0, 212, 255, 0.3));
+                    transition: all 0.3s ease;
                     
-                    .brand-main {
-                        font-size: 1.5rem;
-                        font-weight: 700;
-                        color: var(--text-primary);
-                        font-family: 'JetBrains Mono', monospace;
-                        letter-spacing: 2px;
-                        text-shadow: 0 0 10px var(--accent-blue);
-                    }
-                    
-                    .brand-sub {
-                        font-size: 0.75rem;
-                        color: var(--text-secondary);
-                        font-weight: 400;
-                        letter-spacing: 1px;
-                        text-transform: uppercase;
+                    &:hover {
+                        filter: drop-shadow(0 0 12px rgba(0, 212, 255, 0.5));
+                        transform: scale(1.02);
                     }
                 }
             }

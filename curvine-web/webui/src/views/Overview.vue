@@ -25,7 +25,7 @@
                         <div class="status-dot" :class="{ 'active': data.master_state === 'Active' }"></div>
                     </div>
                     <div class="status-info">
-                        <h2 class="cluster-name">CURVINE CLUSTER</h2>
+<!--                        <h2 class="cluster-name">CURVINE CLUSTER</h2>-->
                         <p class="cluster-status">{{ data.master_state || 'Unknown' }}</p>
                         <p class="cluster-id">ID: {{ data.cluster_id || 'N/A' }}</p>
                     </div>
