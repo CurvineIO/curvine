@@ -158,7 +158,7 @@ impl FileSystem for S3FileSystem {
             .strip_prefix('/')
             .ok_or_else(|| FsError::invalid_path(uri.full_path(), "Invalid S3 path format"))?;
 
-        println!("Listing objects in bucket: {}, prefix: {}", bucket, key, );
+        println!("Listing objects in bucket: {}, prefix: {}", bucket, key,);
 
         let mut entries = Vec::new();
         let mut continuation_token = None;

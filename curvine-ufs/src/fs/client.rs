@@ -14,14 +14,14 @@
 
 #![allow(unused)]
 
+use super::ufs_context::UFSContext;
 use crate::fs::buffer_transfer::{AsyncChunkReader, AsyncChunkWriter};
 use crate::fs::factory::FileSystemFactory;
 use crate::fs::filesystem::FileSystem;
 use curvine_common::fs::CurvineURI;
+use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
 use std::sync::Arc;
-use curvine_common::state::FileStatus;
-use super::ufs_context::UFSContext;
 
 /// Unified file system client
 ///
