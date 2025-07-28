@@ -17,10 +17,14 @@ use crate::fs::buffer_transfer::{AsyncChunkReader, AsyncChunkWriter};
 use crate::fs::filesystem::FileSystem;
 use crate::fs::s3::{S3AsyncChunkReader, S3AsyncChunkWriter};
 use crate::fs::ufs_context::UFSContext;
+use crate::s3::ObjectStatus;
+use crate::{err_ufs, UfsUtils};
 use async_trait::async_trait;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::Client;
 use curvine_common::error::FsError;
 use curvine_common::fs::CurvineURI;
+use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
@@ -41,10 +45,73 @@ impl S3FileSystem {
 
         Ok(S3FileSystem { client, context })
     }
+
+    async fn get_object_status(&self, bucket: &str, key: &str) -> FsResult<Option<ObjectStatus>> {
+        let res = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        match res {
+            Ok(v) => Ok(Some(ObjectStatus::from_head_object(key, &v))),
+            Err(e) => match e.into_service_error() {
+                HeadObjectError::NotFound(_) => Ok(None),
+                err => err_ufs!(err),
+            },
+        }
+    }
+
+    // Get file and directory information; there are 4 cases:
+    // 1. Root dir is returned directly
+    // 2. First determine whether the file exists, and return if it exists.
+    // 3. If it does not exist, determine whether the directory exists, and return if it exists.
+    // 4. If neither exists, return None
+    async fn get_file_status(&self, path: &CurvineURI) -> FsResult<Option<FileStatus>> {
+        let status = if path.is_root() {
+            Some(ObjectStatus::create_root())
+        } else {
+            let (bucket, key) = UfsUtils::get_bucket_key(path)?;
+            let status = self.get_object_status(bucket, key).await?;
+
+            match status {
+                None => {
+                    self.get_object_status(bucket, &UfsUtils::dir_key(key))
+                        .await?
+                }
+
+                Some(v) => Some(v),
+            }
+        };
+
+        match status {
+            None => Ok(None),
+            Some(v) => {
+                let status = FileStatus {
+                    path: path.full_path().to_owned(),
+                    name: path.name().to_owned(),
+                    is_dir: v.is_dir,
+                    mtime: v.mtime,
+                    is_complete: true,
+                    len: v.len,
+                    replicas: 1,
+                    block_size: 4 * 1024 * 1024,
+                    ..Default::default()
+                };
+                Ok(Some(status))
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl FileSystem for S3FileSystem {
+    async fn open(&self, uri: &CurvineURI) -> FsResult<Box<dyn AsyncChunkReader>> {
+        let reader = S3AsyncChunkReader::new(uri, self.context.s3a_config()).await?;
+        Ok(Box::new(reader))
+    }
+
     async fn is_directory(&self, uri: &CurvineURI) -> FsResult<bool> {
         let bucket = uri
             .authority()
@@ -91,7 +158,7 @@ impl FileSystem for S3FileSystem {
             .strip_prefix('/')
             .ok_or_else(|| FsError::invalid_path(uri.full_path(), "Invalid S3 path format"))?;
 
-        println!("Listing objects in bucket: {}, prefix: {}", bucket, key,);
+        println!("Listing objects in bucket: {}, prefix: {}", bucket, key, );
 
         let mut entries = Vec::new();
         let mut continuation_token = None;
@@ -136,11 +203,6 @@ impl FileSystem for S3FileSystem {
         }
 
         Ok(entries)
-    }
-
-    async fn open(&self, uri: &CurvineURI) -> FsResult<Box<dyn AsyncChunkReader>> {
-        let reader = S3AsyncChunkReader::new(uri, self.context.s3a_config()).await?;
-        Ok(Box::new(reader))
     }
 
     async fn exists(&self, uri: &CurvineURI) -> FsResult<bool> {
@@ -310,5 +372,9 @@ impl FileSystem for S3FileSystem {
 
     async fn mount(&self, _src: &CurvineURI, _dst: &CurvineURI) -> FsResult<()> {
         Err(FsError::common("not implement for s3"))
+    }
+
+    async fn get_file_status(&self, path: &CurvineURI) -> FsResult<Option<FileStatus>> {
+        self.get_file_status(path).await
     }
 }

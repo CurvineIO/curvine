@@ -20,7 +20,7 @@ use crate::fs::filesystem::FileSystem;
 use curvine_common::fs::CurvineURI;
 use curvine_common::FsResult;
 use std::sync::Arc;
-
+use curvine_common::state::FileStatus;
 use super::ufs_context::UFSContext;
 
 /// Unified file system client
@@ -91,5 +91,8 @@ impl UfsClient {
     // Create a write file
     pub async fn create(&self, uri: &CurvineURI) -> FsResult<Box<dyn AsyncChunkWriter>> {
         self.fs.create(uri).await
+    }
+    pub async fn get_file_status(&self, path: &CurvineURI) -> FsResult<Option<FileStatus>> {
+        self.fs.get_file_status(path).await
     }
 }

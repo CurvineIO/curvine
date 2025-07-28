@@ -27,7 +27,7 @@ use curvine_common::proto::{
     CancelLoadRequest, CancelLoadResponse, LoadState, LoadTaskReportRequest, LoadTaskRequest,
     LoadTaskResponse,
 };
-use curvine_common::state::{TtlAction, WorkerAddress};
+use curvine_common::state::{WorkerAddress, TtlAction};
 use dashmap::DashMap;
 use log::{error, info, warn};
 use orpc::client::ClientFactory;
@@ -35,9 +35,11 @@ use orpc::common::DurationUnit;
 use orpc::io::net::InetAddr;
 use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::CommonResult;
+use orpc::{try_err, try_log, try_option, CommonError, CommonResult};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+use curvine_common::FsResult;
+use curvine_ufs::fs::UfsClient;
 
 /// Load the Task Manager
 #[derive(Clone)]
@@ -116,7 +118,7 @@ impl LoadManager {
                         std::io::ErrorKind::InvalidInput,
                         format!("Cannot cancel job in state {}", job.state),
                     )
-                    .into());
+                        .into());
                 }
 
                 // Update status is Cancel
@@ -185,7 +187,6 @@ impl LoadManager {
     /// Handle the task status reported by Worker
     pub async fn handle_task_report(&self, report: LoadTaskReportRequest) -> CommonResult<()> {
         let job_id = report.job_id.clone();
-        // Extract indicator information
         let mut task_id = String::new();
         let mut path = String::new();
         let mut target_path = String::new();
@@ -193,7 +194,7 @@ impl LoadManager {
         let mut loaded_size: u64 = 0;
         let message = report.message.unwrap_or_default();
         let state_name = LoadState::from_i32(report.state).unwrap();
-        // Extract indicator information
+
         if let Some(metrics) = report.metrics {
             task_id = metrics.task_id;
             path = metrics.path;
@@ -240,7 +241,6 @@ impl LoadManager {
         Ok(())
     }
 
-    /// Submit loading task
     pub async fn submit_job(
         &self,
         path: &str,
@@ -252,28 +252,61 @@ impl LoadManager {
             path, recursive
         );
 
+        // Validate and prepare job
+        let (uri, target_path, source_mtime) = self.validate_and_prepare_job(path).await?;
+
+        // Check if reload is needed
+        let should_reload = self.check_file_modification(path, &target_path, source_mtime).await?;
+        if !should_reload {
+            if let Some(existing_job) = self.find_existing_job(path) {
+                return Ok((existing_job.job_id.clone(), existing_job.target_path.clone()));
+            }
+        }
+
+        // Remove duplicate jobs and create new job
+        self.remove_duplicate_jobs_for_path(path).await;
+        let (job, ttl_duration_unit) = self.create_job_with_ttl(path, &target_path, recursive, ttl)?;
+        let job_id = job.job_id.clone();
+        
+        // Add job to storage
+        self.jobs.insert(job_id.clone(), job);
+
+        // Execute job asynchronously
+        self.execute_job_async(job_id.clone(), target_path.clone(), path.to_string(), uri, ttl_duration_unit, recursive).await;
+
+        Ok((job_id, target_path))
+    }
+
+    async fn validate_and_prepare_job(&self, path: &str) -> CommonResult<(CurvineURI, String, i64)> {
         let uri = CurvineURI::new(path)?;
         let mut ufs_manager = UfsManager::new(self.fs_client.clone());
         let target_path = ufs_manager.get_curvine_path(&uri).await?;
         let ufs_client = ufs_manager.get_client(&uri).await?;
+        let file_status = try_err!(ufs_client.get_file_status(&uri).await);
+        let source_mtime = try_option!(file_status, "Source file not found: {}", uri).mtime;
+        
+        Ok((uri, target_path, source_mtime))
+    }
 
-        // Check whether the same path already exists
+    /// Find existing job for the given path
+    fn find_existing_job(&self, path: &str) -> Option<LoadJob> {
         for entry in self.jobs.iter() {
             let job = entry.value();
-            if job.source_path == path
-                && job.state != LoadState::Failed
-                && job.state != LoadState::Canceled
-            {
-                warn!(
-                    "Found existing job for path {}: job_id={}, state={}",
-                    path, job.job_id, job.state
-                );
-                // return Ok((job.job_id.clone(), job.target_path.clone()));
+            if job.source_path == path {
+                return Some(job.clone());
             }
         }
+        None
+    }
 
-        let mut job = LoadJob::new(path.to_string(), target_path.clone(), recursive);
-
+    fn create_job_with_ttl(
+        &self,
+        path: &str,
+        target_path: &str,
+        recursive: bool,
+        ttl: Option<&str>,
+    ) -> CommonResult<(LoadJob, Option<DurationUnit>)> {
+        let mut job = LoadJob::new(path.to_string(), target_path.to_string(), recursive);
         let ttl_duration_unit = if let Some(ttl_str) = ttl {
             match DurationUnit::from_str(ttl_str) {
                 Ok(duration_unit) => {
@@ -290,264 +323,89 @@ impl LoadManager {
         } else {
             None
         };
+        
+        Ok((job, ttl_duration_unit))
+    }
 
-        let job_id = job.job_id.clone();
-
-        // Add tasks to storage
-        self.jobs.insert(job_id.clone(), job);
-
+    /// Execute job asynchronously
+    async fn execute_job_async(
+        &self,
+        job_id: String,
+        target_path: String,
+        source_path: String,
+        uri: CurvineURI,
+        ttl_duration_unit: Option<DurationUnit>,
+        recursive: bool,
+    ) {
         let jobs_clone = self.jobs.clone();
         let fs_clone = self.master_fs.clone();
         let fs_clone_1 = self.master_fs.clone();
         let client_factory_clone = self.client_factory.clone();
-
-        let job_id_clone = job_id.clone();
-        let target_path_clone = target_path.clone();
-        let path = path.to_string();
+        let fs_client_clone = self.fs_client.clone();
 
         tokio::spawn(async move {
-            if let Some(mut job_ref) = jobs_clone.get_mut(&job_id_clone) {
+            if let Some(mut job_ref) = jobs_clone.get_mut(&job_id) {
                 job_ref.update_state(LoadState::Pending, Some("Assigning workers".to_string()));
             }
 
-            // Use UfsClient to determine whether the source path is a directory
+            let mut ufs_manager = UfsManager::new(fs_client_clone);
+            let ufs_client = match ufs_manager.get_client(&uri).await {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("Failed to get UFS client: {}", e);
+                    if let Some(mut job) = jobs_clone.get_mut(&job_id) {
+                        job.update_state(
+                            LoadState::Failed,
+                            Some(format!("Failed to get UFS client: {}", e)),
+                        );
+                    }
+                    return;
+                }
+            };
+
+            // Check if source is directory
             match ufs_client.is_directory(&uri).await {
                 Ok(is_dir) => {
                     if is_dir && !recursive {
-                        // It is a directory but does not recurse, the update status is failed
-                        if let Some(mut job) = jobs_clone.get_mut(&job_id_clone) {
+                        if let Some(mut job) = jobs_clone.get_mut(&job_id) {
                             job.update_state(
                                 LoadState::Failed,
-                                Some(
-                                    "Path is a directory but recursive flag is not set".to_string(),
-                                ),
+                                Some("Path is a directory but recursive flag is not set".to_string()),
                             );
                         }
                         return;
                     }
 
-                    let worker = {
-                        match Self::choose_worker(fs_clone).await {
-                            Ok(w) => w,
-                            Err(e) => {
-                                error!("Failed to choose workers: {}", e);
-                                if let Some(mut job_ref) = jobs_clone.get_mut(&job_id_clone) {
-                                    job_ref.update_state(
-                                        LoadState::Failed,
-                                        Some(format!("Failed to choose workers: {}", e)),
-                                    );
-                                }
-                                return;
-                            }
-                        }
-                    };
-
-                    // Update the Worker allocation of tasks
-                    if let Some(mut job_ref) = jobs_clone.get_mut(&job_id_clone) {
-                        job_ref.assign_worker(worker.clone());
-                        job_ref.update_state(
-                            LoadState::Loading,
-                            Some(format!(
-                                "Assigned to worker {} {}",
-                                &worker.worker_id, &worker.hostname
-                            )),
-                        );
-                    }
-
-                    let worker_addr = InetAddr::new(worker.ip_addr.clone(), worker.rpc_port as u16);
-                    let worker_client = client_factory_clone
-                        .create(&worker_addr, false)
-                        .await
-                        .unwrap();
-
                     if !is_dir {
-                        let (ttl_ms, ttl_action) = if let Some(duration_unit) = ttl_duration_unit {
-                            (
-                                Some(duration_unit.as_millis() as i64),
-                                Some(TtlAction::Delete.into()),
-                            )
-                        } else {
-                            (None, None)
-                        };
-
-                        let request = LoadTaskRequest {
-                            job_id: job_id_clone.clone(),
-                            source_path: path.to_string(),
-                            target_path: target_path.clone(),
-                            ttl_ms,
-                            ttl_action,
-                        };
-                        let msg = Builder::new_rpc(RpcCode::SubmitLoadTask)
-                            .request(RequestStatus::Rpc)
-                            .proto_header(request)
-                            .build();
-
-                        // Send a load task request to Worker
-                        match worker_client.rpc(msg).await {
-                            Ok(response) => {
-                                let task_response: LoadTaskResponse =
-                                    response.parse_header().unwrap();
-
-                                // Record subtask ID
-                                if let Some(mut job) = jobs_clone.get_mut(&job_id_clone) {
-                                    job.add_sub_task(
-                                        task_response.task_id.clone(),
-                                        path.to_string(),
-                                        target_path.clone(),
-                                        worker.worker_id,
-                                    );
-
-                                    info!(
-                                        "Added sub-task {} for job {}",
-                                        task_response.task_id, job_id_clone
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to send load task to worker: {}", e);
-                                if let Some(mut job) = jobs_clone.get_mut(&job_id_clone) {
-                                    job.update_state(
-                                        LoadState::Failed,
-                                        Some(format!("Failed to send load task to worker: {}", e)),
-                                    );
-                                }
-                            }
-                        }
+                        // Process single file
+                        Self::process_single_file(
+                            jobs_clone.clone(),
+                            fs_clone,
+                            client_factory_clone,
+                            job_id,
+                            source_path,
+                            target_path,
+                            ttl_duration_unit,
+                        ).await;
                     } else {
-                        // Use UfsClient to process the directory directly
-                        let files = match ufs_client.list_directory(&uri, recursive).await {
-                            Ok(files) => {
-                                if files.is_empty() {
-                                    if let Some(mut job) = jobs_clone.get_mut(&job_id_clone) {
-                                        job.update_state(
-                                            LoadState::Failed,
-                                            Some(format!(
-                                                "Found {} files to process in directory {}",
-                                                files.len(),
-                                                path
-                                            )),
-                                        );
-                                        return;
-                                    }
-                                }
-
-                                files
-                            }
-                            Err(e) => {
-                                error!("Failed to process directory: {}", e);
-                                if let Some(mut job) = jobs_clone.get_mut(&job_id_clone) {
-                                    job.update_state(
-                                        LoadState::Failed,
-                                        Some(format!("Failed to process directory: {}", e)),
-                                    );
-                                }
-                                return;
-                            }
-                        };
-
-                        info!(
-                            "Found {} files to process in directory {}",
-                            files.len(),
-                            path
-                        );
-
-                        // Send loading tasks for each file
-                        for file_path in files {
-                            // Extract file name from file path
-                            let uri = CurvineURI::new(&file_path).unwrap();
-                            let target_path = ufs_manager.get_curvine_path(&uri).await.unwrap();
-                            let (ttl_ms, ttl_action) =
-                                if let Some(duration_unit) = ttl_duration_unit {
-                                    (
-                                        Some(duration_unit.as_millis() as i64),
-                                        Some(TtlAction::Delete.into()),
-                                    )
-                                } else {
-                                    (None, None)
-                                };
-
-                            let request = LoadTaskRequest {
-                                job_id: job_id_clone.clone(),
-                                source_path: file_path.clone(),
-                                target_path: target_path.clone(),
-                                ttl_ms,
-                                ttl_action,
-                            };
-
-                            let msg = Builder::new_rpc(RpcCode::SubmitLoadTask)
-                                .request(RequestStatus::Rpc)
-                                .proto_header(request)
-                                .build()
-                                .into_arc();
-
-                            let worker = {
-                                match Self::choose_worker(fs_clone_1.clone()).await {
-                                    Ok(w) => w,
-                                    Err(e) => {
-                                        error!("Failed to choose workers: {}", e);
-                                        if let Some(mut job_ref) = jobs_clone.get_mut(&job_id_clone)
-                                        {
-                                            job_ref.update_state(
-                                                LoadState::Failed,
-                                                Some(format!("Failed to choose workers: {}", e)),
-                                            );
-                                        }
-                                        return;
-                                    }
-                                }
-                            };
-
-                            // Update the Worker allocation of tasks
-                            if let Some(mut job_ref) = jobs_clone.get_mut(&job_id_clone) {
-                                job_ref.assign_worker(worker.clone());
-                                job_ref.update_state(
-                                    LoadState::Loading,
-                                    Some(format!(
-                                        "Assigned to worker {} {}",
-                                        &worker.worker_id, &worker.hostname
-                                    )),
-                                );
-                            }
-
-                            let worker_addr =
-                                InetAddr::new(worker.ip_addr.clone(), worker.rpc_port as u16);
-                            let worker_client = client_factory_clone
-                                .create(&worker_addr, false)
-                                .await
-                                .unwrap();
-
-                            // Send a load task request to Worker
-                            match worker_client.rpc(msg).await {
-                                Ok(response) => {
-                                    let task_response: LoadTaskResponse =
-                                        response.parse_header().unwrap();
-                                    // Record subtask ID
-                                    if let Some(mut job) = jobs_clone.get_mut(&job_id_clone) {
-                                        job.add_sub_task(
-                                            task_response.task_id.clone(),
-                                            file_path.clone(),
-                                            uri.to_local_path().unwrap().clone(),
-                                            worker.worker_id,
-                                        );
-
-                                        info!(
-                                            "Added sub-task {} for job {}, sub_path {}",
-                                            task_response.task_id,
-                                            job_id_clone,
-                                            uri.to_local_path().unwrap()
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to send load task to worker: {}", e);
-                                }
-                            }
-                        }
+                        // Process directory
+                        Self::process_directory(
+                            jobs_clone.clone(),
+                            fs_clone_1,
+                            client_factory_clone,
+                            ufs_manager,
+                            ufs_client,
+                            job_id,
+                            source_path,
+                            uri,
+                            ttl_duration_unit,
+                            recursive,
+                        ).await;
                     }
                 }
                 Err(e) => {
                     error!("Failed to check if directory: {}", e);
-                    if let Some(mut job) = jobs_clone.get_mut(&job_id_clone) {
+                    if let Some(mut job) = jobs_clone.get_mut(&job_id) {
                         job.update_state(
                             LoadState::Failed,
                             Some(format!("Failed to check if directory: {}", e)),
@@ -556,8 +414,296 @@ impl LoadManager {
                 }
             }
         });
+    }
 
-        Ok((job_id.clone(), target_path_clone))
+    async fn process_single_file(
+        jobs: Arc<DashMap<String, LoadJob>>,
+        master_fs: Arc<MasterFilesystem>,
+        client_factory: Arc<ClientFactory>,
+        job_id: String,
+        source_path: String,
+        target_path: String,
+        ttl_duration_unit: Option<DurationUnit>,
+    ) {
+        let worker = match Self::choose_worker(master_fs).await {
+            Ok(w) => w,
+            Err(e) => {
+                error!("Failed to choose workers: {}", e);
+                if let Some(mut job_ref) = jobs.get_mut(&job_id) {
+                    job_ref.update_state(
+                        LoadState::Failed,
+                        Some(format!("Failed to choose workers: {}", e)),
+                    );
+                }
+                return;
+            }
+        };
+
+        if let Some(mut job_ref) = jobs.get_mut(&job_id) {
+            job_ref.assign_worker(worker.clone());
+            job_ref.update_state(
+                LoadState::Loading,
+                Some(format!(
+                    "Assigned to worker {} {}",
+                    &worker.worker_id, &worker.hostname
+                )),
+            );
+        }
+
+        let worker_addr = InetAddr::new(worker.ip_addr.clone(), worker.rpc_port as u16);
+        let worker_client = match client_factory.create(&worker_addr, false).await {
+            Ok(client) => client,
+            Err(e) => {
+                error!("Failed to create worker client: {}", e);
+                if let Some(mut job) = jobs.get_mut(&job_id) {
+                    job.update_state(
+                        LoadState::Failed,
+                        Some(format!("Failed to create worker client: {}", e)),
+                    );
+                }
+                return;
+            }
+        };
+
+        let (ttl_ms, ttl_action) = if let Some(duration_unit) = ttl_duration_unit {
+            (Some(duration_unit.as_millis() as i64), Some(TtlAction::Delete.into()))
+        } else {
+            (None, None)
+        };
+
+        let request = LoadTaskRequest {
+            job_id: job_id.clone(),
+            source_path: source_path.clone(),
+            target_path: target_path.clone(),
+            ttl_ms,
+            ttl_action,
+        };
+        
+        let msg = Builder::new_rpc(RpcCode::SubmitLoadTask)
+            .request(RequestStatus::Rpc)
+            .proto_header(request)
+            .build();
+
+        // Send load task request to worker
+        match worker_client.rpc(msg).await {
+            Ok(response) => {
+                let task_response: LoadTaskResponse = response.parse_header().unwrap();
+                if let Some(mut job) = jobs.get_mut(&job_id) {
+                    job.add_sub_task(
+                        task_response.task_id.clone(),
+                        source_path,
+                        target_path,
+                        worker.worker_id,
+                    );
+                    info!("Added sub-task {} for job {}", task_response.task_id, job_id);
+                }
+            }
+            Err(e) => {
+                error!("Failed to send load task to worker: {}", e);
+                if let Some(mut job) = jobs.get_mut(&job_id) {
+                    job.update_state(
+                        LoadState::Failed,
+                        Some(format!("Failed to send load task to worker: {}", e)),
+                    );
+                }
+            }
+        }
+    }
+
+    async fn process_directory(
+        jobs: Arc<DashMap<String, LoadJob>>,
+        master_fs: Arc<MasterFilesystem>,
+        client_factory: Arc<ClientFactory>,
+        mut ufs_manager: UfsManager,
+        ufs_client: Arc<UfsClient>,
+        job_id: String,
+        source_path: String,
+        uri: CurvineURI,
+        ttl_duration_unit: Option<DurationUnit>,
+        recursive: bool,
+    ) {
+        // List directory files
+        let files = match ufs_client.list_directory(&uri, recursive).await {
+            Ok(files) => {
+                if files.is_empty() {
+                    if let Some(mut job) = jobs.get_mut(&job_id) {
+                        job.update_state(
+                            LoadState::Failed,
+                            Some(format!(
+                                "Found {} files to process in directory {}",
+                                files.len(),
+                                source_path
+                            )),
+                        );
+                    }
+                    return;
+                }
+                files
+            }
+            Err(e) => {
+                error!("Failed to process directory: {}", e);
+                if let Some(mut job) = jobs.get_mut(&job_id) {
+                    job.update_state(
+                        LoadState::Failed,
+                        Some(format!("Failed to process directory: {}", e)),
+                    );
+                }
+                return;
+            }
+        };
+
+        info!("Found {} files to process in directory {}", files.len(), source_path);
+
+        // Process each file in directory
+        for file_path in files {
+            let file_uri = match CurvineURI::new(&file_path) {
+                Ok(uri) => uri,
+                Err(e) => {
+                    error!("Failed to create URI for file {}: {}", file_path, e);
+                    continue;
+                }
+            };
+            
+            let file_target_path = match ufs_manager.get_curvine_path(&file_uri).await {
+                Ok(path) => path,
+                Err(e) => {
+                    error!("Failed to get target path for file {}: {}", file_path, e);
+                    continue;
+                }
+            };
+
+            let worker = match Self::choose_worker(master_fs.clone()).await {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to choose workers: {}", e);
+                    if let Some(mut job_ref) = jobs.get_mut(&job_id) {
+                        job_ref.update_state(
+                            LoadState::Failed,
+                            Some(format!("Failed to choose workers: {}", e)),
+                        );
+                    }
+                    return;
+                }
+            };
+
+            // Update worker assignment
+            if let Some(mut job_ref) = jobs.get_mut(&job_id) {
+                job_ref.assign_worker(worker.clone());
+                job_ref.update_state(
+                    LoadState::Loading,
+                    Some(format!(
+                        "Assigned to worker {} {}",
+                        &worker.worker_id, &worker.hostname
+                    )),
+                );
+            }
+
+            let worker_addr = InetAddr::new(worker.ip_addr.clone(), worker.rpc_port as u16);
+            let worker_client = match client_factory.create(&worker_addr, false).await {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("Failed to create worker client: {}", e);
+                    continue;
+                }
+            };
+
+            let (ttl_ms, ttl_action) = if let Some(duration_unit) = ttl_duration_unit {
+                (Some(duration_unit.as_millis() as i64), Some(TtlAction::Delete.into()))
+            } else {
+                (None, None)
+            };
+
+            let request = LoadTaskRequest {
+                job_id: job_id.clone(),
+                source_path: file_path.clone(),
+                target_path: file_target_path.clone(),
+                ttl_ms,
+                ttl_action,
+            };
+
+            let msg = Builder::new_rpc(RpcCode::SubmitLoadTask)
+                .request(RequestStatus::Rpc)
+                .proto_header(request)
+                .build()
+                .into_arc();
+
+            // Send load task request to worker
+            match worker_client.rpc(msg).await {
+                Ok(response) => {
+                    let task_response: LoadTaskResponse = response.parse_header().unwrap();
+                    if let Some(mut job) = jobs.get_mut(&job_id) {
+                        job.add_sub_task(
+                            task_response.task_id.clone(),
+                            file_path.clone(),
+                            file_uri.to_local_path().unwrap_or_default(),
+                            worker.worker_id,
+                        );
+                        info!(
+                            "Added sub-task {} for job {}, sub_path {}",
+                            task_response.task_id,
+                            job_id,
+                            file_uri.to_local_path().unwrap_or_default()
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to send load task to worker: {}", e);
+                }
+            }
+        }
+    }
+
+    async fn check_file_modification(
+        &self,
+        source_path: &str,
+        target_path: &str,
+        source_mtime: i64,
+    ) -> CommonResult<bool> {
+        let target_exists = try_log!(self.master_fs.exists(target_path), false);
+        if !target_exists {
+            return Ok(true);
+        }
+
+        let target_mtime = try_log!(self.master_fs.file_status(target_path), {
+            warn!("Failed to get target file status for {}, proceeding with load", target_path);
+            return Ok(true);
+        }).mtime;
+
+        if source_mtime != target_mtime {
+            for entry in self.jobs.iter() {
+                let job = entry.value();
+                if job.source_path == source_path {
+                    return match job.state {
+                        LoadState::Loading | LoadState::Pending => {
+                            try_log!(self.cancel_job(job.job_id.clone()).await);
+                            Ok(true)
+                        }
+                        LoadState::Completed | LoadState::Failed | LoadState::Canceled => {
+                            Ok(true)
+                        }
+                    };
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn remove_duplicate_jobs_for_path(&self, source_path: &str) {
+        let mut jobs_to_remove = Vec::new();
+
+        for entry in self.jobs.iter() {
+            let job = entry.value();
+            if job.source_path == source_path
+                && (job.state == LoadState::Failed || job.state == LoadState::Canceled) {
+                jobs_to_remove.push(job.job_id.clone());
+            }
+        }
+
+        for job_id in jobs_to_remove {
+            self.jobs.remove(&job_id);
+            info!("Removed duplicate failed/canceled job: {}", job_id);
+        }
     }
 
     async fn choose_worker(master_fs: Arc<MasterFilesystem>) -> CommonResult<WorkerAddress> {
@@ -573,7 +719,6 @@ impl LoadManager {
         }
     }
 
-    /// Get task status
     pub async fn get_load_job_status(&self, job_id: String) -> CommonResult<Option<LoadJob>> {
         match self.jobs.get(&job_id) {
             Some(job_ref) => {
@@ -631,6 +776,7 @@ impl LoadManager {
         }
     }
 }
+
 
 /// Load manager error
 #[derive(Debug, Error)]

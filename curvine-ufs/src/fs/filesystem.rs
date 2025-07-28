@@ -14,6 +14,7 @@
 
 use crate::fs::buffer_transfer::{AsyncChunkReader, AsyncChunkWriter};
 use curvine_common::fs::CurvineURI;
+use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
 
 /// File system abstract interface
@@ -52,4 +53,6 @@ pub trait FileSystem: Send + Sync {
     async fn create(&self, uri: &CurvineURI) -> FsResult<Box<dyn AsyncChunkWriter>>;
 
     async fn mount(&self, src: &CurvineURI, dst: &CurvineURI) -> FsResult<()>;
+
+    async fn get_file_status(&self, path: &CurvineURI) -> FsResult<Option<FileStatus>>;
 }
