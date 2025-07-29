@@ -27,3 +27,4 @@ futures = { workspace = true }
 moka = { workspace = true }
 fxhash = { workspace = true }
 trait-variant = { workspace = true }
+opendal = { workspace = true }

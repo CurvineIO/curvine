@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::fs::filesystem::FileSystem;
-use crate::fs::opendal_filesystem::OpendalFileSystem;
 use crate::fs::s3_filesystem::S3FileSystem;
 use crate::fs::ufs_context::UFSContext;
 use curvine_common::error::FsError;
@@ -46,16 +45,6 @@ impl FileSystemFactory {
                 // Since OSS is compatible with S3 protocol, S3FileSystem can be reused
                 let oss_fs = S3FileSystem::new(context)?;
                 Ok(Arc::new(oss_fs))
-            }
-            Some("gcs") | Some("gs") => {
-                // Google Cloud Storage support via OpenDAL
-                let fs = OpendalFileSystem::new(context)?;
-                Ok(Arc::new(fs))
-            }
-            Some("azure") | Some("azblob") | Some("abfs") => {
-                // Azure Blob Storage support via OpenDAL
-                let fs = OpendalFileSystem::new(context)?;
-                Ok(Arc::new(fs))
             }
             Some(_) => Err(FsError::unsupported("storage scheme")),
             None => Err(FsError::unsupported("Missing storage scheme")),
