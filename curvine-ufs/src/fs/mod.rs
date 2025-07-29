@@ -18,6 +18,7 @@ pub mod channel_transfer;
 pub mod client;
 pub mod factory;
 pub mod filesystem;
+mod opendal_filesystem;
 pub mod s3;
 pub mod s3_conf;
 mod s3_filesystem;
