@@ -130,7 +130,6 @@ impl BlockStore {
                     true
                 }
             };
-
             let info = StorageInfo {
                 dir_id: item.id(),
                 storage_id: item.version().storage_id.to_string(),
@@ -140,6 +139,7 @@ impl BlockStore {
                 non_fs_used: item.non_fs_used(),
                 available: item.available(),
                 storage_type: item.storage_type(),
+                block_num: state.num_blocks() as i64,
             };
             vec.push(info);
         }

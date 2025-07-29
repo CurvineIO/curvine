@@ -115,6 +115,7 @@ message StorageInfoProto {
     required int64 fs_used = 6;
     required int64 non_fs_used = 7;
     required StorageTypeProto storage_type = 8 [default = STORAGE_TYPE_PROTO_DISK];
+    required int64 block_num = 9;
 }
 
 // Represents a customer service address.

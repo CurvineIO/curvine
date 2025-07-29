@@ -32,6 +32,7 @@ impl ProtoUtils {
             non_fs_used: item.non_fs_used,
             available: item.available,
             storage_type: item.storage_type.into(),
+            block_num: item.block_num,
         }
     }
 
@@ -45,6 +46,7 @@ impl ProtoUtils {
             non_fs_used: item.non_fs_used,
             available: item.available,
             storage_type: StorageType::from(item.storage_type),
+            block_num: item.block_num,
         }
     }
 

@@ -28,6 +28,7 @@ pub struct WorkerInfo {
     pub fs_used: i64,
     pub non_fs_used: i64,
     pub last_update: u64,
+    pub block_num: i64,
     pub storage_map: HashMap<String, StorageInfo>,
     pub status: WorkerStatus,
 }
@@ -40,6 +41,7 @@ impl WorkerInfo {
             available: 0,
             fs_used: 0,
             non_fs_used: 0,
+            block_num: 0,
             last_update: LocalTime::mills(),
             storage_map: Default::default(),
             status: WorkerStatus::Live,
@@ -53,6 +55,7 @@ impl WorkerInfo {
             self.available += storage.available;
             self.fs_used += storage.fs_used;
             self.non_fs_used += storage.non_fs_used;
+            self.block_num += storage.block_num;
         }
 
         self.storage_map
@@ -108,6 +111,7 @@ impl Default for WorkerInfo {
             fs_used: 0,
             non_fs_used: 0,
             last_update: 0,
+            block_num: 0,
             storage_map: Default::default(),
             status: WorkerStatus::Live,
         }

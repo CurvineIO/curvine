@@ -72,4 +72,5 @@ pub struct StorageInfo {
     pub non_fs_used: i64,
     pub available: i64,
     pub storage_type: StorageType,
+    pub block_num: i64,
 }

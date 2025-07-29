@@ -474,12 +474,21 @@ impl MasterFilesystem {
         for peer in &wm.conf.journal.journal_addrs {
             info.journal_nodes.push(peer.to_string())
         }
+        let files = match self.list_status("/") {
+            Ok(v) => v.len(),
+            Err(e) => {
+                warn!("Failed to list root directory: {}", e);
+                0
+            }
+        };
+        info.inode_num = files as i64;
 
         for (_, worker) in wm.worker_map.workers() {
             info.capacity += worker.capacity;
             info.available += worker.available;
             info.fs_used += worker.fs_used;
             info.non_fs_used += worker.non_fs_used;
+            info.block_num += worker.block_num;
 
             match worker.status {
                 WorkerStatus::Live => info.live_workers.push(worker.clone()),
