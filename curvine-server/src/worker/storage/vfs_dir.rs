@@ -283,16 +283,14 @@ impl VfsDir {
 
         let mut vec = vec![];
         for file in finalized_files {
-            match BlockMeta::from_file(&file, BlockState::Finalized, self) {
-                Ok(v) => vec.push(v),
-                Err(_) => (), // Illegal documents are currently ignored。
+            if let Ok(v) = BlockMeta::from_file(&file, BlockState::Finalized, self) {
+                vec.push(v);
             }
         }
 
         for file in rbw_files {
-            match BlockMeta::from_file(&file, BlockState::Writing, self) {
-                Ok(v) => vec.push(v),
-                Err(_) => (), // Illegal documents are currently ignored。
+            if let Ok(v) = BlockMeta::from_file(&file, BlockState::Writing, self) {
+                vec.push(v);
             }
         }
 
