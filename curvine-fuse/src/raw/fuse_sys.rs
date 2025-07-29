@@ -59,7 +59,7 @@ pub fn fuse_mount(
     {
         let res = unsafe { fuse_mount_compat25(mnt, args) };
         let fd = err_io!(res)?;
-        return Ok((fd, None));
+        Ok((fd, None))
     }
 
     #[cfg(all(target_os = "linux", feature = "fuse3"))]
@@ -75,7 +75,7 @@ pub fn fuse_mount(
 
         let res = unsafe { fuse_session_fd(session) };
         let fd = err_io!(res)?;
-        return Ok((fd, Some(session)));
+        Ok((fd, Some(session)))
     }
 
     #[cfg(not(target_os = "linux"))]
