@@ -46,6 +46,10 @@ impl FileSystemFactory {
                 let oss_fs = S3FileSystem::new(context)?;
                 Ok(Arc::new(oss_fs))
             }
+            Some("file") => {
+                // The local file system has not yet been implemented, and an error is returned
+                Err(FsError::unsupported("Local filesystem"))
+            }
             Some(_) => Err(FsError::unsupported("storage scheme")),
             None => Err(FsError::unsupported("Missing storage scheme")),
         }
