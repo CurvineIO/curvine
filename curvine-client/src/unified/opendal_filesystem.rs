@@ -196,11 +196,11 @@ impl Writer for OpendalWriter {
             DataSlice::Empty => return Ok(0),
             DataSlice::Bytes(bytes) => bytes,
             DataSlice::Buffer(buf) => buf.freeze(),
-            DataSlice::IOSlice(_) => {
-                return Err(FsError::common("IOSlice not supported for writing"))
-            }
-            DataSlice::MemSlice(_) => {
-                return Err(FsError::common("MemSlice not supported for writing"))
+            DataSlice::IOSlice(_) | DataSlice::MemSlice(_) => {
+                // For IOSlice and MemSlice, we need to copy the data
+                // This is acceptable since OpenDAL will handle the actual I/O efficiently
+                let slice = chunk.as_slice();
+                bytes::Bytes::copy_from_slice(slice)
             }
         };
 
