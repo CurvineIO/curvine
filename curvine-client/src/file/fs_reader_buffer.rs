@@ -105,7 +105,7 @@ impl BufferChannel {
 // Random read and write, chunk_num = 1, use a reader without buffer to read data directly from the remote end.
 enum ReaderAdapter {
     Buffer(BufferChannel),
-    Base(FsReaderParallel),
+    Base(Box<FsReaderParallel>),
 }
 
 impl ReaderAdapter {
@@ -168,7 +168,7 @@ impl FsReaderBuffer {
         let mut readers = Vec::with_capacity(all.len());
         for reader in all {
             let reader = if chunk_num == 1 {
-                ReaderAdapter::Base(reader)
+                ReaderAdapter::Base(Box::new(reader))
             } else {
                 let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
                 let (task_sender, task_receiver) = AsyncChannel::new(2).split();
