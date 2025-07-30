@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::context::MkdirContext;
 use crate::master::meta::feature::{AclFeature, DirFeature};
 use crate::master::meta::inode::inodes_children::InodeChildren;
 use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::{
     ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
 };
-use curvine_common::state::StoragePolicy;
+use curvine_common::state::{MkdirOpts, StoragePolicy};
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
 
@@ -52,17 +51,17 @@ impl InodeDir {
         }
     }
 
-    pub fn with_context(id: i64, name: &str, time: i64, context: MkdirContext) -> Self {
+    pub fn with_opts(id: i64, name: &str, time: i64, opts: MkdirOpts) -> Self {
         Self {
             id,
             parent_id: EMPTY_PARENT_ID,
             name: name.to_string(),
             mtime: time,
             atime: time,
-            storage_policy: context.storage_policy,
+            storage_policy: opts.storage_policy,
             features: DirFeature {
-                acl: AclFeature::with_mode(context.mode),
-                x_attr: context.x_attr,
+                acl: AclFeature::with_mode(opts.mode),
+                x_attr: opts.x_attr,
             },
             children: InodeChildren::new_map(),
         }

@@ -16,8 +16,9 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::fs::CurvineURI;
 use curvine_common::proto::{ConsistencyConfig, MountOptions};
 use curvine_common::raft::{NodeId, RaftPeer};
-use curvine_common::state::{BlockLocation, ClientAddress, CommitBlock, WorkerInfo};
-use curvine_server::master::fs::context::CreateFileContext;
+use curvine_common::state::{
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, WorkerInfo,
+};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{JournalLoader, JournalSystem};
 use curvine_server::master::mount::ConsistencyStrategy;
@@ -175,7 +176,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
 
     // Create a file.
     let status =
-        fs_leader.create_with_ctx(CreateFileContext::with_path("/journal/b/test.log", true))?;
+        fs_leader.create_with_opts("/journal/b/test.log", CreateFileOpts::with_create(true))?;
 
     // Assign block
     let block = fs_leader.add_block(&status.path, address.clone(), None, vec![])?;
@@ -210,7 +211,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
         block_len: 13,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
     };
-    fs_leader.append_file(CreateFileContext::with_append(path))?;
+    fs_leader.append_file(path, CreateFileOpts::with_append())?;
     fs_leader.complete_file(path, 13, Some(commit), "")?;
 
     Ok(())

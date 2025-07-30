@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::context::{CreateFileContext, MkdirContext};
 use crate::master::fs::DeleteResult;
 use crate::master::journal::{JournalEntry, JournalWriter};
 use crate::master::meta::inode::InodeView::{Dir, File};
@@ -24,7 +23,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::proto::{ConsistencyConfig, MountOptions};
 use curvine_common::state::{
-    BlockLocation, CommitBlock, ExtendedBlock, FileStatus, SetAttrOpts, WorkerAddress,
+    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileStatus, MkdirOpts, SetAttrOpts,
+    WorkerAddress,
 };
 use curvine_common::FsResult;
 use log::info;
@@ -80,19 +80,19 @@ impl FsDir {
         Ok(id)
     }
 
-    pub fn mkdir(&mut self, mut inp: InodePath, ctx: MkdirContext) -> FsResult<InodePath> {
+    pub fn mkdir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         // Create parent directory
-        inp = self.create_parent_dir(inp, ctx.parent())?;
+        inp = self.create_parent_dir(inp, opts.parent_opts())?;
 
         // Create the final directory.
-        inp = self.create_single_dir(inp, ctx)?;
+        inp = self.create_single_dir(inp, opts)?;
         Ok(inp)
     }
 
     // Create the first subdirectory that does not exist.
     // 1. If all directories on the path already exist, skip and return successful.
     // 2. If the parent directory does not exist, an error is returned.
-    fn create_single_dir(&mut self, mut inp: InodePath, ctx: MkdirContext) -> FsResult<InodePath> {
+    fn create_single_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         let op_ms = LocalTime::mills();
 
         if inp.is_full() || inp.is_root() {
@@ -102,8 +102,7 @@ impl FsDir {
         let pos = inp.existing_len() - 1;
         let name = inp.get_component(pos + 1)?;
 
-        let dir =
-            InodeDir::with_context(self.next_inode_id()?, name, LocalTime::mills() as i64, ctx);
+        let dir = InodeDir::with_opts(self.next_inode_id()?, name, LocalTime::mills() as i64, opts);
 
         inp = self.add_last_inode(inp, Dir(dir))?;
         self.journal_writer.log_mkdir(op_ms, &inp)?;
@@ -112,11 +111,7 @@ impl FsDir {
     }
 
     // Create all previous directories that may be missing on the path.
-    fn create_parent_dir(
-        &mut self,
-        mut inp: InodePath,
-        context: MkdirContext,
-    ) -> FsResult<InodePath> {
+    fn create_parent_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         let mut index = inp.existing_len();
 
         // The parent directory already exists and does not need to be created.
@@ -125,7 +120,7 @@ impl FsDir {
         }
 
         while index <= inp.len() - 2 {
-            inp = self.create_single_dir(inp, context.clone())?;
+            inp = self.create_single_dir(inp, opts.clone())?;
             index += 1;
         }
 
@@ -249,15 +244,11 @@ impl FsDir {
         Ok(())
     }
 
-    pub fn create_file(
-        &mut self,
-        mut inp: InodePath,
-        context: CreateFileContext,
-    ) -> FsResult<InodePath> {
+    pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
         let op_ms = LocalTime::mills();
         // If overwrite = true, delete the existing file first.
         if inp.get_last_inode().is_some() {
-            if context.overwrite() {
+            if opts.overwrite() {
                 let _ = self.delete(&inp, false)?;
                 inp.delete_last();
             } else {
@@ -266,14 +257,14 @@ impl FsDir {
         }
 
         // Create a directory that does not exist.
-        inp = self.create_parent_dir(inp, context.dir_context())?;
+        inp = self.create_parent_dir(inp, opts.dir_opts())?;
 
         // Create an inode file node.
-        let file = InodeFile::with_context(
+        let file = InodeFile::with_opts(
             self.inode_id.next()?,
             inp.name(),
             LocalTime::mills() as i64,
-            context,
+            opts,
         );
         inp = self.add_last_inode(inp, File(file))?;
         self.journal_writer.log_create_file(op_ms, &inp)?;

@@ -17,8 +17,9 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
 };
-use curvine_common::state::{BlockLocation, ClientAddress, CommitBlock, WorkerInfo};
-use curvine_server::master::fs::context::CreateFileContext;
+use curvine_common::state::{
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, WorkerInfo,
+};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::{LoadManager, Master, MasterHandler, RpcContext};
@@ -166,11 +167,10 @@ fn rename(fs: &MasterFilesystem) -> CommonResult<()> {
 fn create_file(fs: &MasterFilesystem) -> CommonResult<()> {
     fs.mkdir("/a/b", true)?;
 
-    let context = CreateFileContext::with_path("/a/b/1.log", false);
-    fs.create_with_ctx(context)?;
+    let opts = CreateFileOpts::with_create(false);
+    fs.create_with_opts("/a/b/1.log", opts.clone())?;
 
-    let context = CreateFileContext::with_path("/a/b/2.log", false);
-    fs.create_with_ctx(context)?;
+    fs.create_with_opts("/a/b/2.log", opts)?;
 
     fs.print_tree();
 
@@ -178,8 +178,8 @@ fn create_file(fs: &MasterFilesystem) -> CommonResult<()> {
 }
 
 fn get_file_info(fs: &MasterFilesystem) -> CommonResult<()> {
-    let context = CreateFileContext::with_path("/a/b/xx.log", true);
-    fs.create_with_ctx(context)?;
+    let opts = CreateFileOpts::with_create(true);
+    fs.create_with_opts("/a/b/xx.log", opts)?;
     fs.print_tree();
 
     let info = fs.file_status("/a/b/xx.log")?;
@@ -188,8 +188,8 @@ fn get_file_info(fs: &MasterFilesystem) -> CommonResult<()> {
 }
 
 fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
-    let context = CreateFileContext::with_path("/a/1.log", true);
-    fs.create_with_ctx(context)?;
+    let opts = CreateFileOpts::with_create(true);
+    fs.create_with_opts("/a/1.log", opts)?;
 
     fs.mkdir("/a/d1", true)?;
     fs.mkdir("/a/d2", true)?;
@@ -259,8 +259,8 @@ fn create_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
 fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let path = "/add_block_retry.log";
     let addr = ClientAddress::default();
-    let context = CreateFileContext::with_path(path, false);
-    let status = fs.create_with_ctx(context).unwrap();
+    let opts = CreateFileOpts::with_create(false);
+    let status = fs.create_with_opts(path, opts).unwrap();
 
     let b1 = fs.add_block(path, addr.clone(), None, vec![]).unwrap();
     let b2 = fs.add_block(path, addr.clone(), None, vec![]).unwrap();
@@ -298,8 +298,8 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
 fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let path = "/complete_file_retry.log";
     let addr = ClientAddress::default();
-    let context = CreateFileContext::with_path(path, false);
-    fs.create_with_ctx(context)?;
+    let opts = CreateFileOpts::with_create(false);
+    fs.create_with_opts(path, opts)?;
 
     let b1 = fs.add_block(path, addr.clone(), None, vec![])?;
 

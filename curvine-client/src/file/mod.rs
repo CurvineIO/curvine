@@ -18,9 +18,6 @@ pub use self::curvine_filesystem::*;
 mod fs_client;
 pub use self::fs_client::FsClient;
 
-mod options;
-pub use self::options::*;
-
 mod fs_writer_base;
 pub use self::fs_writer_base::FsWriterBase;
 

@@ -12,16 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::{
-    CreateFileOpts, CreateFileOptsBuilder, FsClient, FsContext, FsReader, FsReaderBase, FsWriter,
-    FsWriterBase, MkdirOpts, MkdirOptsBuilder,
-};
+use crate::file::{FsClient, FsContext, FsReader, FsReaderBase, FsWriter, FsWriterBase};
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
-    CacheJobResult, FileBlocks, FileStatus, MasterInfo, MountInfo, SetAttrOpts,
+    CacheJobResult, CreateFileOpts, CreateFileOptsBuilder, FileBlocks, FileStatus, MasterInfo,
+    MkdirOpts, MkdirOptsBuilder, MountInfo, SetAttrOpts,
 };
 use curvine_common::version::GIT_VERSION;
 use curvine_common::FsResult;
@@ -82,7 +80,7 @@ impl CurvineFileSystem {
         let opts = MkdirOptsBuilder::with_conf(&self.fs_context.conf.client)
             .create_parent(create_parent)
             .build();
-        self.fs_client.mkdir(path, opts).await
+        self.mkdir_with_opts(path, opts).await
     }
 
     pub async fn create_with_opts(&self, path: &Path, opts: CreateFileOpts) -> FsResult<FsWriter> {
@@ -91,8 +89,14 @@ impl CurvineFileSystem {
         Ok(writer)
     }
 
+    fn create_opts_builder(&self) -> CreateFileOptsBuilder {
+        CreateFileOptsBuilder::with_conf(&self.fs_context.conf.client)
+            .client_name(self.fs_context.clone_client_name())
+    }
+
     pub async fn create(&self, path: &Path, overwrite: bool) -> FsResult<FsWriter> {
-        let opts = CreateFileOptsBuilder::with_conf(&self.fs_context.conf.client)
+        let opts = self
+            .create_opts_builder()
             .create(true)
             .overwrite(overwrite)
             .append(false)
@@ -102,7 +106,8 @@ impl CurvineFileSystem {
     }
 
     pub async fn append(&self, path: &Path) -> FsResult<FsWriter> {
-        let opts = CreateFileOptsBuilder::with_conf(&self.fs_context.conf.client)
+        let opts = self
+            .create_opts_builder()
             .create(false)
             .overwrite(false)
             .append(true)
@@ -118,7 +123,8 @@ impl CurvineFileSystem {
     // FsWriterBase writes data directly to the network without any optimization,
     // which may be required by model scenarios, such as custom write optimization, etc.
     pub async fn append_direct(&self, path: &Path, create: bool) -> FsResult<FsWriterBase> {
-        let opts = CreateFileOptsBuilder::with_conf(&self.fs_context.conf.client)
+        let opts = self
+            .create_opts_builder()
             .create(create)
             .overwrite(false)
             .append(true)

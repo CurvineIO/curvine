@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::context::CreateFileContext;
 use crate::master::meta::block_meta::BlockState;
 use crate::master::meta::feature::{FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::{BlockMeta, InodeId};
-use curvine_common::state::{CommitBlock, ExtendedBlock, FileType, StoragePolicy};
+use curvine_common::state::{CommitBlock, CreateFileOpts, ExtendedBlock, FileType, StoragePolicy};
 use orpc::{err_box, ternary, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -64,31 +63,31 @@ impl InodeFile {
         }
     }
 
-    pub fn with_context(id: i64, name: &str, time: i64, context: CreateFileContext) -> InodeFile {
+    pub fn with_opts(id: i64, name: &str, time: i64, opts: CreateFileOpts) -> InodeFile {
         let mut file = Self {
             id,
             name: name.to_string(),
-            file_type: context.file_type,
+            file_type: opts.file_type,
             mtime: time,
             atime: time,
 
             len: 0,
-            block_size: context.block_size,
-            replicas: context.replicas,
+            block_size: opts.block_size,
+            replicas: opts.replicas,
 
-            storage_policy: context.storage_policy,
+            storage_policy: opts.storage_policy,
             features: FileFeature::new(),
 
             blocks: vec![],
             parent_id: EMPTY_PARENT_ID,
         };
 
-        file.features.set_writing(context.client_name);
-        if !context.x_attr.is_empty() {
-            file.features.set_attrs(context.x_attr);
+        file.features.set_writing(opts.client_name);
+        if !opts.x_attr.is_empty() {
+            file.features.set_attrs(opts.x_attr);
         }
 
-        file.features.set_mode(context.mode);
+        file.features.set_mode(opts.mode);
 
         file
     }

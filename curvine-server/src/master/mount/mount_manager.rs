@@ -13,13 +13,13 @@
 // limitations under the License.
 
 #![allow(unused)]
-use crate::master::fs::context::MkdirContext;
 use crate::master::fs::MasterFilesystem;
 use crate::master::mount::MountTable;
 use crate::master::{self, SyncFsDir};
 use curvine_common::error::FsError;
 use curvine_common::fs::{self, CurvineURI};
 use curvine_common::proto::{MountOptions, MountPointInfo};
+use curvine_common::state::MkdirOpts;
 use curvine_common::FsResult;
 use log::info;
 use orpc::err_box;
@@ -96,8 +96,11 @@ impl MountManager {
         }
 
         info!("try create mount point {}", mount_path);
-        let dir_ctx = MkdirContext::with_path(mount_path, true);
-        self.master_fs.as_ref().unwrap().mkdir_with_ctx(dir_ctx)?;
+        let opts = MkdirOpts::with_create(true);
+        self.master_fs
+            .as_ref()
+            .unwrap()
+            .mkdir_with_opts(mount_path, opts)?;
         Ok(true)
     }
 

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::context::{CreateFileContext, MkdirContext};
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::load::{LoadManager, MasterLoadService};
 use crate::master::SyncMountManager;
@@ -22,7 +21,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
-use curvine_common::state::{FileStatus, HeartbeatStatus};
+use curvine_common::state::{CreateFileOpts, FileStatus, HeartbeatStatus};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
@@ -90,22 +89,27 @@ impl MasterHandler {
         let header: MkdirRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        let context = MkdirContext::from_opts(header.path, header.opts);
-        let flag = self.fs.mkdir_with_ctx(context)?;
+        let opts = ProtoUtils::mkdir_opts_from_pb(header.opts);
+        let flag = self.fs.mkdir_with_opts(&header.path, opts)?;
         let rep_header = MkdirResponse { flag };
         ctx.response(rep_header)
     }
 
-    fn create_file0(&mut self, req_id: i64, context: CreateFileContext) -> FsResult<FileStatus> {
+    fn create_file0(
+        &mut self,
+        req_id: i64,
+        path: String,
+        opts: CreateFileOpts,
+    ) -> FsResult<FileStatus> {
         if self.check_is_retry(req_id)? {
             // HDFS retries return the results of the last calculation
             // Alluxio Retry will re-query the status.
             // The same solution as alluxio is adopted here. In fact, the hdfs solution is better, but rust requires an additional memory copy to achieve it.
             // Re-querying the file status may cause the request to be unidempotent.
-            return self.fs.file_status(context.path);
+            return self.fs.file_status(&path);
         }
 
-        let res = self.fs.create_with_ctx(context);
+        let res = self.fs.create_with_opts(&path, opts);
         self.set_req_cache(req_id, res)
     }
 
@@ -113,8 +117,8 @@ impl MasterHandler {
         let header: CreateFileRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        let context = CreateFileContext::from_opts(header.path, header.opts);
-        let status = self.create_file0(ctx.msg.req_id(), context)?;
+        let opts = ProtoUtils::create_opts_from_pb(header.opts);
+        let status = self.create_file0(ctx.msg.req_id(), header.path, opts)?;
 
         let rep_header = CreateFileResponse {
             file_status: ProtoUtils::file_status_to_pb(status),
@@ -221,16 +225,16 @@ impl MasterHandler {
 
     pub fn retry_check_append_file(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: AppendFileRequest = ctx.parse_header()?;
-        let context = CreateFileContext::from_opts(req.path, req.opts);
-        ctx.set_audit(Some(context.path.to_string()), None);
+        let opts = ProtoUtils::create_opts_from_pb(req.opts);
+        ctx.set_audit(Some(req.path.to_string()), None);
 
         if self.check_is_retry(ctx.msg.req_id())? {
             // @todo Currently, it is directly reported, and subsequent optimizations are made.
-            return err_box!("append {} repeat request", context.path);
+            return err_box!("append {} repeat request", req.path);
         }
 
         let res = {
-            let (last_block, status) = self.fs.append_file(context)?;
+            let (last_block, status) = self.fs.append_file(&req.path, opts)?;
             let rep_header = AppendFileResponse {
                 file_status: ProtoUtils::file_status_to_pb(status),
                 last_block: last_block.map(ProtoUtils::located_block_to_pb),

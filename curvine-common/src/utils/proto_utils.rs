@@ -430,4 +430,53 @@ impl ProtoUtils {
             remove_x_attr: opts.remove_x_attr,
         }
     }
+
+    pub fn create_opts_to_pb(
+        opts: CreateFileOpts,
+        client_name: impl Into<String>,
+    ) -> CreateFileOptsProto {
+        CreateFileOptsProto {
+            create_flag: opts.create_flag.value(),
+            create_parent: opts.create_parent,
+            file_type: opts.file_type.into(),
+            replicas: opts.replicas as i32,
+            block_size: opts.block_size,
+            x_attr: opts.x_attr,
+            storage_policy: ProtoUtils::storage_policy_to_pb(opts.storage_policy),
+            client_name: client_name.into(),
+            mode: opts.mode,
+        }
+    }
+
+    pub fn create_opts_from_pb(opts: CreateFileOptsProto) -> CreateFileOpts {
+        CreateFileOpts {
+            create_flag: CreateFlag::new(opts.create_flag),
+            create_parent: opts.create_parent,
+            file_type: FileType::from(opts.file_type),
+            replicas: opts.replicas as u16,
+            block_size: opts.block_size,
+            x_attr: opts.x_attr,
+            storage_policy: ProtoUtils::storage_policy_from_pb(opts.storage_policy),
+            mode: opts.mode,
+            client_name: opts.client_name,
+        }
+    }
+
+    pub fn mkdir_opts_to_pb(opts: MkdirOpts) -> MkdirOptsProto {
+        MkdirOptsProto {
+            create_parent: opts.create_parent,
+            x_attr: opts.x_attr,
+            storage_policy: ProtoUtils::storage_policy_to_pb(opts.storage_policy),
+            mode: opts.mode,
+        }
+    }
+
+    pub fn mkdir_opts_from_pb(opts: MkdirOptsProto) -> MkdirOpts {
+        MkdirOpts {
+            create_parent: opts.create_parent,
+            x_attr: opts.x_attr,
+            storage_policy: ProtoUtils::storage_policy_from_pb(opts.storage_policy),
+            mode: opts.mode,
+        }
+    }
 }

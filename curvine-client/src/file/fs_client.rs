@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::{CreateFileOpts, CreateFileOptsBuilder, FsContext, MkdirOpts};
+use crate::file::FsContext;
 use bytes::BytesMut;
 use curvine_common::conf::{UfsConf, UfsConfBuilder};
 use curvine_common::error::FsError;
@@ -45,29 +45,10 @@ impl FsClient {
         self.context.clone()
     }
 
-    fn create_file_opts_to_pb(&self, opts: CreateFileOpts) -> CreateFileOptsProto {
-        CreateFileOptsProto {
-            create_flag: opts.create_flag.value(),
-            create_parent: opts.create_parent,
-            file_type: opts.file_type.into(),
-            replicas: opts.replicas,
-            block_size: opts.block_size,
-            x_attr: opts.x_attr,
-            storage_policy: ProtoUtils::storage_policy_to_pb(opts.storage_policy),
-            client_name: self.context.clone_client_name(),
-            mode: opts.mode,
-        }
-    }
-
     pub async fn mkdir(&self, path: &Path, opts: MkdirOpts) -> FsResult<bool> {
         let header = MkdirRequest {
             path: path.encode(),
-            opts: MkdirOptsProto {
-                create_parent: opts.create_parent,
-                x_attr: opts.x_attr,
-                storage_policy: ProtoUtils::storage_policy_to_pb(opts.storage_policy),
-                mode: opts.mode,
-            },
+            opts: ProtoUtils::mkdir_opts_to_pb(opts),
         };
 
         let rep_header: MkdirResponse = self.rpc(RpcCode::Mkdir, header).await?;
@@ -89,7 +70,7 @@ impl FsClient {
     ) -> FsResult<FileStatus> {
         let header = CreateFileRequest {
             path: path.encode(),
-            opts: self.create_file_opts_to_pb(opts),
+            opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
         };
 
         let rep_header: CreateFileResponse = self.rpc(RpcCode::CreateFile, header).await?;
@@ -100,7 +81,7 @@ impl FsClient {
     pub async fn append(&self, path: &Path, opts: CreateFileOpts) -> FsResult<LastBlockStatus> {
         let header = AppendFileRequest {
             path: path.encode(),
-            opts: self.create_file_opts_to_pb(opts),
+            opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
         };
         let rep_header: AppendFileResponse = self.rpc(RpcCode::AppendFile, header).await?;
         let status = LastBlockStatus {

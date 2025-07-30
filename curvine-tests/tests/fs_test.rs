@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_client::file::{CreateFileOptsBuilder, CurvineFileSystem, MkdirOptsBuilder};
+use curvine_client::file::CurvineFileSystem;
 use curvine_common::fs::Path;
 use curvine_common::fs::Writer;
-use curvine_common::state::{SetAttrOptsBuilder, TtlAction};
+use curvine_common::state::{
+    CreateFileOptsBuilder, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
+};
 use curvine_common::FsResult;
 use curvine_tests::Testing;
 use log::info;
