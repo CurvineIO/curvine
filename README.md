@@ -33,6 +33,7 @@ For more detailed information, please refer to:
 - [User Manuals](https://curvineio.github.io/docs/category/user-manuals)
 - [Benchmark](https://curvineio.github.io/docs/category/benchmark)
 - [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
+- [Commit convention](COMMIT_CONVENTION.md)
 
 ## Use Case
 ![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.jpg)

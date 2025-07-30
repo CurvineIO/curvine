@@ -1,0 +1,13 @@
+{
+  "name": "curvine",
+  "version": "1.0.0",
+  "description": "Curvine - A distributed storage system",
+  "private": true,
+  "devDependencies": {
+    "@commitlint/cli": "^18.4.4",
+    "@commitlint/config-conventional": "^18.4.4"
+  },
+  "scripts": {
+    "commitlint": "commitlint --from=HEAD~1 --to=HEAD --verbose"
+  }
+} 

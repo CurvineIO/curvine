@@ -31,6 +31,7 @@
 - [用户手册](https://curvineio.github.io/docs/category/user-manuals)
 - [性能基准](https://curvineio.github.io/docs/category/benchmark)
 - [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
+- [提交规范](COMMIT_CONVENTION.md)
 
 ## 应用场景
 

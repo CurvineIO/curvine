@@ -3,7 +3,7 @@ name: Compile and Test
 on:
   push:
     branches:
-      - 'main'
+      - '**'
   pull_request:
     branches:
       - '**'
@@ -13,7 +13,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # New commitlint validation job
+  commitlint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Fetch full git history to check all related commits
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4  
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install commitlint dependencies
+        run: npm install
+
+      - name: Validate single commit (for push)
+        if: github.event_name == 'push'
+        run: npx commitlint --from HEAD~1 --to HEAD --verbose
+
+      - name: Validate PR commits (for pull request)
+        if: github.event_name == 'pull_request'
+        run: npx commitlint --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }} --verbose
+
   cleanup:
+    needs: commitlint
     runs-on: ubuntu-latest
     steps:
       - name: Clean hostedtoolcache to free disk space on host
