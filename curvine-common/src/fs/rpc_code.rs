@@ -36,6 +36,7 @@ pub enum RpcCode {
     CompleteFile = 12,
     GetBlockLocations = 13,
     GetMasterInfo = 14,
+    SetAttr = 15,
 
     // manager interface.
     Mount = 30,

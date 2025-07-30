@@ -15,7 +15,7 @@
 use crate::master::meta::inode::{InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
 use curvine_common::proto::MountOptions;
-use curvine_common::state::CommitBlock;
+use curvine_common::state::{CommitBlock, SetAttrOpts};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -90,6 +90,14 @@ pub struct UnMountEntry {
     pub(crate) id: u32,
 }
 
+// set attr
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SetAttrEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) path: String,
+    pub(crate) opts: SetAttrOpts,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -101,6 +109,7 @@ pub enum JournalEntry {
     Delete(DeleteEntry),
     Mount(MountEntry),
     UnMount(UnMountEntry),
+    SetAttr(SetAttrEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

@@ -15,7 +15,7 @@
 use curvine_client::file::{CreateFileOptsBuilder, CurvineFileSystem, MkdirOptsBuilder};
 use curvine_common::fs::Path;
 use curvine_common::fs::Writer;
-use curvine_common::state::TtlAction;
+use curvine_common::state::{SetAttrOptsBuilder, TtlAction};
 use curvine_common::FsResult;
 use curvine_tests::Testing;
 use log::info;
@@ -53,6 +53,10 @@ fn fs_test() -> FsResult<()> {
         add_block(&fs).await?;
 
         rename2(&fs).await?;
+
+        set_attr_non_recursive(&fs).await?;
+
+        set_attr_recursive(&fs).await?;
         Ok(())
     });
 
@@ -223,5 +227,93 @@ async fn add_block(fs: &CurvineFileSystem) -> CommonResult<()> {
 async fn get_master_info(fs: &CurvineFileSystem) -> CommonResult<()> {
     let res = fs.get_master_info().await?;
     info!("master info {:#?}", res);
+    Ok(())
+}
+
+async fn set_attr_non_recursive(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let path = Path::from_str("/fs_test/set_attr1/set_attr2/attr.log")?;
+    let mut writer = fs.create(&path, true).await?;
+    writer.complete().await?;
+
+    let opts = SetAttrOptsBuilder::new()
+        .recursive(false)
+        .owner("root")
+        .group("root")
+        .mode(0o644)
+        .ttl_ms(1000)
+        .ttl_action(TtlAction::Delete)
+        .add_x_attr("attr1", "value1".to_string().into_bytes())
+        .build();
+
+    // Non-recursive settings
+    let path = Path::from_str("/fs_test/set_attr1")?;
+    fs.set_attr(&path, opts.clone()).await?;
+
+    let status = fs.get_status(&path).await?;
+    println!("non-recursive set_attr1 {:?}", status);
+    assert_eq!(
+        status.x_attr.get("attr1"),
+        Some(&"value1".as_bytes().to_vec())
+    );
+    assert_eq!(status.owner, "root");
+    assert_eq!(status.group, "root");
+    assert_eq!(status.mode, 0o644);
+    assert_eq!(status.storage_policy.ttl_ms, 1000);
+    assert_eq!(status.storage_policy.ttl_action, TtlAction::Delete);
+
+    let path = Path::from_str("/fs_test/set_attr1/set_attr2")?;
+    let status = fs.get_status(&path).await?;
+    println!("non-recursive set_attr2 {:?}", status);
+    assert_eq!(status.x_attr.get("attr1"), None);
+    assert_eq!(status.owner, "");
+    assert_eq!(status.group, "");
+    assert_eq!(status.mode, 0o755);
+    assert_eq!(status.storage_policy.ttl_ms, 0);
+    assert_eq!(status.storage_policy.ttl_action, TtlAction::None);
+
+    Ok(())
+}
+
+async fn set_attr_recursive(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let path = Path::from_str("/fs_test/set_attr_a/set_attr_b/attr.log")?;
+    let mut writer = fs.create(&path, true).await?;
+    writer.complete().await?;
+
+    let opts = SetAttrOptsBuilder::new()
+        .recursive(true)
+        .owner("root")
+        .group("root")
+        .mode(0o644)
+        .ttl_ms(1000)
+        .ttl_action(TtlAction::Delete)
+        .add_x_attr("attr1", "value1".to_string().into_bytes())
+        .build();
+
+    // Non-recursive settings
+    let path = Path::from_str("/fs_test/set_attr_a")?;
+    fs.set_attr(&path, opts.clone()).await?;
+
+    let status = fs.get_status(&path).await?;
+    println!("non-recursive set_attr_a {:?}", status);
+    assert_eq!(
+        status.x_attr.get("attr1"),
+        Some(&"value1".as_bytes().to_vec())
+    );
+    assert_eq!(status.owner, "root");
+    assert_eq!(status.group, "root");
+    assert_eq!(status.mode, 0o644);
+    assert_eq!(status.storage_policy.ttl_ms, 1000);
+    assert_eq!(status.storage_policy.ttl_action, TtlAction::Delete);
+
+    let path = Path::from_str("/fs_test/set_attr_a/set_attr_b")?;
+    let status = fs.get_status(&path).await?;
+    println!("non-recursive set_attr_b {:?}", status);
+    assert_eq!(status.x_attr.get("attr1"), None);
+    assert_eq!(status.owner, "root");
+    assert_eq!(status.group, "root");
+    assert_eq!(status.mode, 0o644);
+    assert_eq!(status.storage_policy.ttl_ms, 0);
+    assert_eq!(status.storage_policy.ttl_action, TtlAction::None);
+
     Ok(())
 }

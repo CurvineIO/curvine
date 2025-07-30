@@ -573,6 +573,12 @@ impl MasterFilesystem {
         let fs_dir = self.fs_dir.write();
         fs_dir.delete_locations(worker_id)
     }
+
+    pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        fs_dir.set_attr(inp, opts)
+    }
 }
 
 impl Default for MasterFilesystem {

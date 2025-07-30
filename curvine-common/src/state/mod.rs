@@ -68,3 +68,6 @@ pub use self::mount::*;
 
 mod posix_permission;
 pub use self::posix_permission::*;
+
+mod opts;
+pub use self::opts::*;

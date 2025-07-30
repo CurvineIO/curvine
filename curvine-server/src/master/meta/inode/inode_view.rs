@@ -19,12 +19,12 @@ use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
-use curvine_common::state::{FileStatus, FileType};
+use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy};
 use curvine_common::utils::SerdeUtils;
 use orpc::common::Utils;
 use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
-use std::collections::LinkedList;
+use std::collections::{HashMap, LinkedList};
 use std::fmt::{Debug, Formatter};
 
 #[derive(Serialize, Deserialize)]
@@ -208,8 +208,73 @@ impl InodeView {
         }
     }
 
+    pub fn acl_mut(&mut self) -> &mut AclFeature {
+        match self {
+            File(f) => &mut f.features.acl,
+            Dir(d) => &mut d.features.acl,
+        }
+    }
+
+    pub fn storage_policy(&self) -> &StoragePolicy {
+        match self {
+            File(f) => &f.storage_policy,
+            Dir(d) => &d.storage_policy,
+        }
+    }
+
+    pub fn storage_policy_mut(&mut self) -> &mut StoragePolicy {
+        match self {
+            File(f) => &mut f.storage_policy,
+            Dir(d) => &mut d.storage_policy,
+        }
+    }
+
+    pub fn x_attr(&self) -> &HashMap<String, Vec<u8>> {
+        match self {
+            File(f) => &f.features.x_attr,
+            Dir(d) => &d.features.x_attr,
+        }
+    }
+
+    pub fn x_attr_mut(&mut self) -> &mut HashMap<String, Vec<u8>> {
+        match self {
+            File(f) => &mut f.features.x_attr,
+            Dir(d) => &mut d.features.x_attr,
+        }
+    }
+
     pub fn as_ptr(&mut self) -> InodePtr {
         InodePtr::from_ref(self)
+    }
+
+    pub fn set_attr(&mut self, opts: SetAttrOpts) {
+        if let Some(owner) = opts.owner {
+            self.acl_mut().owner = owner;
+        }
+
+        if let Some(group) = opts.group {
+            self.acl_mut().group = group;
+        }
+
+        if let Some(mode) = opts.mode {
+            self.acl_mut().mode = mode;
+        }
+
+        if let Some(ttl_ms) = opts.ttl_ms {
+            self.storage_policy_mut().ttl_ms = ttl_ms;
+        }
+
+        if let Some(ttl_action) = opts.ttl_action {
+            self.storage_policy_mut().ttl_action = ttl_action;
+        }
+
+        for attr in opts.add_x_attr {
+            self.x_attr_mut().insert(attr.0, attr.1);
+        }
+
+        for key in opts.remove_x_attr {
+            let _ = self.x_attr_mut().remove(&key);
+        }
     }
 
     pub fn to_file_status(&self, path: &str) -> FileStatus {

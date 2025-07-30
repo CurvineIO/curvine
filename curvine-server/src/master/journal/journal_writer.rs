@@ -19,7 +19,7 @@ use crate::master::{Master, MasterMetrics, SyncWorkerManager};
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::MountOptions;
 use curvine_common::raft::RaftClient;
-use curvine_common::state::CommitBlock;
+use curvine_common::state::{CommitBlock, SetAttrOpts};
 use curvine_common::FsResult;
 use log::info;
 use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
@@ -216,6 +216,15 @@ impl JournalWriter {
         let entry = UnMountEntry { op_ms, id };
 
         self.send(JournalEntry::UnMount(entry))
+    }
+
+    pub fn log_set_attr(&self, op_ms: u64, inp: &InodePath, opts: SetAttrOpts) -> FsResult<()> {
+        let entry = SetAttrEntry {
+            op_ms,
+            path: inp.path().to_string(),
+            opts,
+        };
+        self.send(JournalEntry::SetAttr(entry))
     }
 
     // for testing

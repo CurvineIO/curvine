@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::DeleteResult;
-use crate::master::meta::inode::{InodeFile, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{InodeFile, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::FsDir;
 use crate::master::mount::MountPointEntry;
@@ -150,6 +150,14 @@ impl InodeStore {
     pub fn apply_append_file(&self, file: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
+        batch.commit()
+    }
+
+    pub fn apply_set_attr(&self, inodes: Vec<InodePtr>) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+        for inode in inodes {
+            batch.write_inode(inode.as_ref())?;
+        }
         batch.commit()
     }
 

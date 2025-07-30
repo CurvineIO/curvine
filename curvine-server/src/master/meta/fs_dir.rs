@@ -23,12 +23,14 @@ use crate::master::mount::{ConsistencyStrategy, MountPointEntry};
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::proto::{ConsistencyConfig, MountOptions};
-use curvine_common::state::{BlockLocation, CommitBlock, ExtendedBlock, FileStatus, WorkerAddress};
+use curvine_common::state::{
+    BlockLocation, CommitBlock, ExtendedBlock, FileStatus, SetAttrOpts, WorkerAddress,
+};
 use curvine_common::FsResult;
 use log::info;
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::{err_box, err_ext, try_option, CommonResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, LinkedList};
 
 /// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
@@ -681,5 +683,48 @@ impl FsDir {
 
     pub fn get_mount_point(&self, id: u32) -> CommonResult<Option<MountPointEntry>> {
         self.store.get_mount_point(id)
+    }
+
+    pub fn set_attr(&mut self, inp: InodePath, opts: SetAttrOpts) -> FsResult<()> {
+        let op_ms = LocalTime::mills();
+
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        self.unprotected_set_attr(inode, opts.clone())?;
+        self.journal_writer.log_set_attr(op_ms, &inp, opts)?;
+        Ok(())
+    }
+
+    pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {
+        let child_opts = opts.child_opts();
+        let recursive = opts.recursive;
+        let parent_inode_id = inode.id();
+        let mut change_inodes: Vec<InodePtr> = vec![];
+
+        // set current inode
+        inode.as_mut().set_attr(opts);
+        change_inodes.push(inode.clone());
+
+        // recursive set child inode
+        if recursive {
+            let mut stack = LinkedList::new();
+            stack.push_back(inode);
+            while let Some(cur_inode) = stack.pop_front() {
+                if cur_inode.id() != parent_inode_id {
+                    cur_inode.as_mut().set_attr(child_opts.clone());
+                    change_inodes.push(cur_inode.clone());
+                }
+
+                for child in cur_inode.children() {
+                    stack.push_back(InodePtr::from_ref(child));
+                }
+            }
+        }
+
+        self.store.apply_set_attr(change_inodes)?;
+        Ok(())
     }
 }

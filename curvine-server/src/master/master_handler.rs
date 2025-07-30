@@ -347,6 +347,18 @@ impl MasterHandler {
         rep_header.mount_points = mnt_mgr.get_mount_table()?;
         ctx.response(rep_header)
     }
+
+    fn set_attr_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        if self.check_is_retry(ctx.msg.req_id())? {
+            return ctx.response(SetAttrResponse::default());
+        }
+
+        let header: SetAttrRequest = ctx.parse_header()?;
+        let opts = ProtoUtils::set_attr_opts_from_pb(header.opts);
+        self.fs.set_attr(header.path, opts)?;
+
+        ctx.response(SetAttrResponse::default())
+    }
 }
 
 impl MessageHandler for MasterHandler {
@@ -388,6 +400,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::Rename => self.retry_check_rename(ctx),
             RpcCode::ListStatus => self.list_status(ctx),
             RpcCode::GetBlockLocations => self.get_block_locations(ctx),
+            RpcCode::SetAttr => self.set_attr_retry_check(ctx),
 
             RpcCode::Mount => self.mount(ctx),
             RpcCode::UnMount => self.umount(ctx),

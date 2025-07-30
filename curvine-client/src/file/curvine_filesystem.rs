@@ -20,13 +20,15 @@ use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::{CacheJobResult, FileBlocks, FileStatus, MasterInfo, MountInfo};
+use curvine_common::state::{
+    CacheJobResult, FileBlocks, FileStatus, MasterInfo, MountInfo, SetAttrOpts,
+};
 use curvine_common::version::GIT_VERSION;
 use curvine_common::FsResult;
 use log::info;
 use orpc::client::ClientConf;
+use orpc::err_ext;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::{err_box, err_ext};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -138,9 +140,9 @@ impl CurvineFileSystem {
     }
 
     fn check_read_status(path: &Path, file_blocks: &FileBlocks) -> FsResult<()> {
-        if !file_blocks.status.is_complete {
-            return err_box!("Cannot read from {} because it is incomplete.", path);
-        }
+        // if !file_blocks.status.is_complete {
+        //     return err_box!("Cannot read from {} because it is incomplete.", path);
+        // }
 
         if file_blocks.status.is_expired() {
             return err_ext!(FsError::file_expired(path.path()));
@@ -216,6 +218,10 @@ impl CurvineFileSystem {
 
     pub async fn get_all_mounts(&self) -> FsResult<Vec<MountInfo>> {
         self.fs_client.get_all_mounts().await
+    }
+
+    pub async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
+        self.fs_client.set_attr(path, opts).await
     }
 
     pub fn clone_runtime(&self) -> Arc<Runtime> {

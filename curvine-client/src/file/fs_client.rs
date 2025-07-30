@@ -378,6 +378,15 @@ impl FsClient {
         })
     }
 
+    pub async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
+        let req = SetAttrRequest {
+            path: path.encode(),
+            opts: ProtoUtils::set_attr_opts_to_pb(opts),
+        };
+        let _: SetAttrResponse = self.rpc(RpcCode::SetAttr, req).await?;
+        Ok(())
+    }
+
     pub async fn rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
     where
         T: PMessage + Default,

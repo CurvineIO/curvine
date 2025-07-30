@@ -73,6 +73,8 @@ impl JournalLoader {
             JournalEntry::Mount(e) => self.mount(e),
 
             JournalEntry::UnMount(e) => self.unmount(e),
+
+            JournalEntry::SetAttr(e) => self.set_attr(e),
         }
     }
 
@@ -176,6 +178,14 @@ impl JournalLoader {
 
         let mut fs_dir = self.fs_dir.write();
         fs_dir.unmount(entry.id)?;
+        Ok(())
+    }
+
+    pub fn set_attr(&self, entry: SetAttrEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path)?;
+        let last_inode = try_option!(inp.get_last_inode());
+        fs_dir.unprotected_set_attr(last_inode, entry.opts)?;
         Ok(())
     }
 

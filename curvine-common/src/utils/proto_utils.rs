@@ -402,4 +402,32 @@ impl ProtoUtils {
         }
         dst
     }
+
+    pub fn set_attr_opts_to_pb(opts: SetAttrOpts) -> SetAttrOptsProto {
+        SetAttrOptsProto {
+            recursive: opts.recursive,
+            replicas: opts.replicas,
+            owner: opts.owner,
+            group: opts.group,
+            mode: opts.mode,
+            ttl_ms: opts.ttl_ms,
+            ttl_action: opts.ttl_action.map(|v| v as i32),
+            add_x_attr: opts.add_x_attr,
+            remove_x_attr: opts.remove_x_attr,
+        }
+    }
+
+    pub fn set_attr_opts_from_pb(opts: SetAttrOptsProto) -> SetAttrOpts {
+        SetAttrOpts {
+            recursive: opts.recursive,
+            replicas: opts.replicas,
+            owner: opts.owner,
+            group: opts.group,
+            mode: opts.mode,
+            ttl_ms: opts.ttl_ms,
+            ttl_action: opts.ttl_action.map(TtlAction::from),
+            add_x_attr: opts.add_x_attr,
+            remove_x_attr: opts.remove_x_attr,
+        }
+    }
 }

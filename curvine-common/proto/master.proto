@@ -157,3 +157,23 @@ message AppendFileResponse {
     required FileStatusProto file_status = 1;
     optional LocatedBlockProto last_block = 2;
 }
+
+message SetAttrOptsProto {
+    required bool recursive = 1;
+    optional int32 replicas = 2;
+    optional string owner = 3;
+    optional string group = 4;
+    optional uint32 mode = 5;
+    optional int64 ttl_ms = 6;
+    optional TtlActionProto ttl_action = 7;
+    map<string, bytes> add_x_attr = 8;
+    repeated string remove_x_attr = 9;
+}
+
+message SetAttrRequest {
+    required string path = 1;
+    required SetAttrOptsProto opts = 2;
+}
+
+message SetAttrResponse {
+}
