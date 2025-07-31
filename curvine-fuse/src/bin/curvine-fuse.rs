@@ -107,7 +107,11 @@ impl FuseArgs {
 
     pub fn default_mnt_opts() -> Vec<String> {
         if cfg!(feature = "fuse3") {
-            vec!["allow_other".to_string(), "async".to_string()]
+            vec![
+                "allow_other".to_string(),
+                "async".to_string(),
+                "auto_unmount".to_string(),
+            ]
         } else {
             vec![
                 "allow_other".to_string(),
