@@ -259,7 +259,10 @@ impl<T: FileSystem> FuseSession<T> {
                 reply.send_empty().await
             }
 
-            FuseOperator::ListXAttr(op) => reply.send_rep(fs.list_xattr(op).await).await,
+            FuseOperator::ListXAttr(op) => {
+                fs.list_xattr(op).await?;
+                reply.send_empty().await
+            }
 
             FuseOperator::OpenDir(op) => reply.send_rep(fs.open_dir(op).await).await,
 
