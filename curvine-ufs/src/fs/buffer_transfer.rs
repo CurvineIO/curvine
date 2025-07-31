@@ -158,15 +158,6 @@ pub trait AsyncChunkReader: Send + Sync {
     async fn read_chunk(&mut self, buf: &mut BytesMut) -> IoResult<usize>;
     fn content_length(&self) -> u64;
     fn mtime(&self) -> i64;
-    /// Read blocks of data with specified offset and length
-    ///
-    /// # Parameters
-    /// -offset: byte offset relative to the start of the file
-    /// -length: The number of bytes to be read
-    ///
-    /// # Return value
-    /// When successful, return the Bytes object containing data, automatically manage memory release
-    /// Return empty when offset exceeds the end of the file
     async fn read(&mut self, offset: u64, length: u64) -> IoResult<Bytes>;
 }
 

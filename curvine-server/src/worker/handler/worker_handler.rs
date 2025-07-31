@@ -38,22 +38,22 @@ impl MessageHandler for WorkerHandler {
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let code = RpcCode::from(msg.code());
-        let mut rpc_context = RpcContext::new(msg);
-        let ctx = &mut rpc_context;
+        match code {
+            RpcCode::SubmitLoadTask => {
+                let mut rpc_context = RpcContext::new(msg);
+                self.handle_load_task(&mut rpc_context)
+            }
 
-        // Process load task requests
-        if code == RpcCode::SubmitLoadTask {
-            return self.handle_load_task(ctx);
+            RpcCode::CancelLoadJob => {
+                let mut rpc_context = RpcContext::new(msg);
+                self.cancel_load_job(&mut rpc_context)
+            }
+
+            _ => {
+                let h = self.get_handler(msg)?;
+                h.handle(msg)
+            }
         }
-
-        // Handle load task requests
-        if code == RpcCode::CancelLoadJob {
-            return self.cancel_load_job(ctx);
-        }
-
-        // Leave other requests to BlockHandler for processing
-        let h = self.get_handler(msg)?;
-        h.handle(msg)
     }
 }
 

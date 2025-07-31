@@ -27,6 +27,7 @@ use orpc::{err_box, try_option_mut};
 ///
 /// Responsible for reading data blocks from S3 storage, supporting streaming reading and random access
 /// Use AWS SDK to interact with S3 services to achieve efficient data transmission
+#[derive(Debug)]
 pub struct S3Reader {
     client: Client,
     chunk: DataSlice,
@@ -36,6 +37,7 @@ pub struct S3Reader {
     len: i64,
     pos: i64,
     byte_stream: Option<ByteStream>,
+    mtime: i64,
 }
 
 impl S3Reader {
@@ -69,6 +71,11 @@ impl S3Reader {
             None => return err_ufs!("S3 error: Missing content length"),
         };
 
+        let mtime = head_result
+            .last_modified
+            .map(|x| x.to_millis().unwrap_or(0))
+            .unwrap_or(0);
+
         info!(
             "Created S3Reader {}, len = {}",
             path.full_path(),
@@ -84,6 +91,7 @@ impl S3Reader {
             len,
             pos: 0,
             byte_stream: None,
+            mtime,
         })
     }
 
@@ -108,6 +116,10 @@ impl S3Reader {
         }
 
         Ok(try_option_mut!(self.byte_stream))
+    }
+
+    pub fn get_mtime(&self) -> i64 {
+        self.mtime
     }
 }
 

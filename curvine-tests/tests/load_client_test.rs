@@ -44,7 +44,7 @@ fn load_client_test() -> CommonResult<()> {
     // Create a test cluster configuration
     let client_rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let rt_clone = client_rt.clone();
-    let mount_path = "/";
+    let mount_path = "/flink";
     let mut curvine_path = String::new();
 
     client_rt.block_on(async move {
@@ -71,7 +71,7 @@ fn load_client_test() -> CommonResult<()> {
         info!("Submit a load request: {}", TEST_FILE);
 
         let load_response = client
-            .submit_load(TEST_FILE, Some("30s".to_string()), Some(true))
+            .submit_load(TEST_FILE, Some("300s".to_string()), Some(true))
             .await?;
         curvine_path = load_response.target_path.clone();
 

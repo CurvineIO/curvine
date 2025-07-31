@@ -46,7 +46,10 @@ impl MasterLoadService {
     }
 
     /// Submit loading task
-    pub async fn submit_load_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    /// 
+    /// Handles the submission of a new load job by parsing the request,
+    /// validating parameters, and forwarding to the load manager.
+    pub fn submit_load_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: LoadJobRequest = ctx.parse_header()?;
         // Check the request parameters
         let path = req.path.trim();
@@ -64,8 +67,8 @@ impl MasterLoadService {
             path, recursive
         );
 
-        // Submit task
-        let (job_id, target_path) = self.load_manager.submit_job(path, ttl, recursive).await?;
+        // Submit task - use block_on to call async method
+        let (job_id, target_path) = self.rt.block_on(self.load_manager.submit_job(path, ttl, recursive))?;
 
         // Construct the response
         let response = LoadJobResponse {
@@ -78,7 +81,10 @@ impl MasterLoadService {
     }
 
     /// Get the loading task status
-    pub async fn get_load_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    /// 
+    /// Retrieves the current status of a load job by its ID and constructs
+    /// a response with detailed metrics.
+    pub fn get_load_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: GetLoadStatusRequest = ctx.parse_header()?;
 
         // Get the task ID
@@ -87,12 +93,10 @@ impl MasterLoadService {
 
         info!("Received get_load_status request for job: {}", job_id);
 
-        // Get task status
-        let job = match self
-            .load_manager
-            .get_load_job_status(job_id.clone())
-            .await?
-        {
+        // Get task status - use block_on to call async method
+        let job = match self.rt.block_on(
+            self.load_manager.get_load_job_status(job_id.clone())
+        )? {
             Some(status) => status,
             None => {
                 return Err(FsError::Common(ErrorImpl::with_source(
@@ -143,7 +147,10 @@ impl MasterLoadService {
     }
 
     /// Cancel the loading task
-    pub async fn cancel_load_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    /// 
+    /// Handles the cancellation of a load job by its ID and returns
+    /// the result of the cancellation operation.
+    pub fn cancel_load_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: CancelLoadRequest = ctx.parse_header()?;
 
         // Get the task ID
@@ -152,8 +159,8 @@ impl MasterLoadService {
 
         info!("Received cancel_load_job request for job: {}", job_id);
 
-        // Cancel the task
-        let success = self.load_manager.cancel_job(job_id.clone()).await?;
+        // Cancel the task - use block_on to call async method
+        let success = self.rt.block_on(self.load_manager.cancel_job(job_id.clone()))?;
 
         // Construct the response
         let response = CancelLoadResponse {
@@ -170,7 +177,10 @@ impl MasterLoadService {
     }
 
     /// Handle the task status reported by Worker
-    pub async fn handle_task_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    /// 
+    /// Processes status reports from worker nodes about load tasks,
+    /// updating the job status in the load manager.
+    pub fn handle_task_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: LoadTaskReportRequest = ctx.parse_header()?;
 
         let job_id = req.job_id.clone();
@@ -196,8 +206,8 @@ impl MasterLoadService {
             );
         }
 
-        // Process task reports
-        match self.load_manager.handle_task_report(req.clone()).await {
+        // Process task reports - use block_on to call async method
+        match self.rt.block_on(self.load_manager.handle_task_report(req.clone())) {
             Ok(_) => {
                 debug!("Successfully processed task report for job: {}", job_id);
             }
@@ -226,6 +236,10 @@ impl MasterLoadService {
 impl MessageHandler for MasterLoadService {
     type Error = FsError;
 
+    /// Handle incoming RPC messages by dispatching to the appropriate handler method
+    /// 
+    /// Routes messages based on their RPC code to the corresponding handler method
+    /// and records any errors that occur during processing.
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let code = RpcCode::from(msg.code());
 
@@ -234,10 +248,10 @@ impl MessageHandler for MasterLoadService {
         let ctx = &mut rpc_context;
 
         let response = match code {
-            RpcCode::SubmitLoadJob => self.rt.block_on(self.submit_load_job(ctx)),
-            RpcCode::GetLoadStatus => self.rt.block_on(self.get_load_status(ctx)),
-            RpcCode::CancelLoadJob => self.rt.block_on(self.cancel_load_job(ctx)),
-            RpcCode::ReportLoadTask => self.rt.block_on(self.handle_task_report(ctx)),
+            RpcCode::SubmitLoadJob => self.submit_load_job(ctx),
+            RpcCode::GetLoadStatus => self.get_load_status(ctx),
+            RpcCode::CancelLoadJob => self.cancel_load_job(ctx),
+            RpcCode::ReportLoadTask => self.handle_task_report(ctx),
             _ => Err(FsError::Common(ErrorImpl::with_source(
                 format!("Unsupported operation: {:?}", code).into(),
             ))),

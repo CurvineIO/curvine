@@ -26,6 +26,9 @@ use std::collections::HashMap;
 
 pub const S3_SCHEME: &str = "s3";
 
+pub const OSS_SCHEME: &str = "oss";
+
+
 pub mod macros;
 
 mod unified_filesystem;
@@ -81,6 +84,15 @@ impl UfsFileSystem {
             _ => {
                 err_ufs!("Unsupported scheme: {}", path.scheme().unwrap_or("Unknown"))
             }
+        }
+    }
+
+    pub fn with_scheme(scheme: Option<&str>, conf: HashMap<String, String>) -> FsResult<Self> {
+        if scheme == Some(S3_SCHEME) || scheme == Some(OSS_SCHEME) {
+            let fs = S3FileSystem::new(UfsConf::with_map(conf))?;
+            Ok(UfsFileSystem::S3(fs))
+        } else {
+            err_ufs!("Unsupported scheme: {}", scheme.unwrap_or("None"))
         }
     }
 }

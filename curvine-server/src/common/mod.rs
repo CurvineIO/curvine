@@ -13,3 +13,6 @@
 // limitations under the License.
 
 pub mod ufs_manager;
+
+pub mod ufs_client;
+pub use self::ufs_client::UfsClient;

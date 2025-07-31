@@ -18,11 +18,11 @@ use curvine_common::fs::CurvineURI;
 use curvine_common::proto::MountPointInfo;
 use curvine_common::FsResult;
 use curvine_ufs::fs::ufs_context::UFSContext;
-use curvine_ufs::fs::UfsClient;
 use log::info;
 use orpc::err_box;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use crate::common::UfsClient;
 
 /// A class that manages the UFS for master servers.
 /// When loading, directly use the MountTable to return a usable UfsClient to the user
@@ -130,7 +130,7 @@ impl UfsManager {
 
         let ufs_conf = self.get_ufs_conf(&ufs_base_uri).await?;
         let ufs_ctx = Arc::new(UFSContext::new(scheme.unwrap().to_string(), ufs_conf));
-        let ufs_client = Arc::new(UfsClient::new(ufs_ctx).await);
+        let ufs_client = Arc::new(UfsClient::new(ufs_ctx)?);
         Ok(ufs_client.clone())
     }
 
@@ -145,7 +145,7 @@ impl UfsManager {
         }
 
         let ufs_ctx = Arc::new(UFSContext::new(scheme.unwrap().to_string(), ufs_conf));
-        let ufs_client = Arc::new(UfsClient::new(ufs_ctx).await);
+        let ufs_client = Arc::new(UfsClient::new(ufs_ctx)?);
         Ok(ufs_client.clone())
     }
 }

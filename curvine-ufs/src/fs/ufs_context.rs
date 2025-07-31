@@ -18,12 +18,9 @@ use curvine_common::conf::UfsConf;
 use std::collections::HashMap;
 
 pub struct UFSContext {
-    //External data source connection configuration
     conf: UfsConf,
-
-    //Metainfo of the corresponding data source
     scheme: String,
-    mount_id: String, //Current mount point
+    mount_id: String,
 }
 
 impl UFSContext {
