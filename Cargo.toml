@@ -19,8 +19,7 @@ members = [
     "curvine-fuse",
     "curvine-web",
     "curvine-ufs",
-    "curvine-cli",
-    "curvine-shuffle"
+    "curvine-cli"
 ]
 
 [workspace.package]
