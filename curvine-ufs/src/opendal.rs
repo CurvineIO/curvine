@@ -16,12 +16,14 @@ use bytes::BytesMut;
 use curvine_common::conf::UfsConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::FileStatus;
+use curvine_common::state::{FileStatus, SetAttrOpts};
 use curvine_common::FsResult;
 use futures::StreamExt;
 use opendal::services::{Azblob, Gcs, S3};
 use opendal::{layers::LoggingLayer, Operator};
 use orpc::sys::DataSlice;
+
+use crate::err_ufs;
 
 /// OpenDAL Reader implementation
 pub struct OpendalReader {
@@ -523,5 +525,9 @@ impl FileSystem<OpendalWriter, OpendalReader, UfsConf> for OpendalFileSystem {
         }
 
         Ok(statuses)
+    }
+
+    async fn set_attr(&self, _path: &Path, _opts: SetAttrOpts) -> FsResult<()> {
+        err_ufs!("SetAttr operation is not supported by OpenDAL file system")
     }
 }

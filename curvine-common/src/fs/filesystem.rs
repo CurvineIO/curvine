@@ -14,7 +14,7 @@
 
 use crate::fs::Path;
 use crate::proto::{GetFileStatusResponse, ListStatusResponse};
-use crate::state::FileStatus;
+use crate::state::{FileStatus, SetAttrOpts};
 use crate::utils::ProtoUtils;
 use crate::FsResult;
 use prost::bytes::BytesMut;
@@ -63,4 +63,6 @@ pub trait FileSystem<Writer, Reader, Conf> {
             Ok(ProtoUtils::encode(rep)?)
         }
     }
+
+    fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> impl Future<Output = FsResult<()>>;
 }

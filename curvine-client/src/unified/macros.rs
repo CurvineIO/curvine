@@ -204,6 +204,12 @@ macro_rules! impl_filesystem_for_enum {
                     $( $enum_name::$variant(inner) => inner.list_status(path).await, )+
                 }
             }
+
+            async fn set_attr(&self, path: &::curvine_common::fs::Path, opts: ::curvine_common::state::SetAttrOpts) -> ::curvine_common::FsResult<()> {
+                match self {
+                    $( $enum_name::$variant(inner) => inner.set_attr(path, opts).await, )+
+                }
+            }
         }
     };
 }

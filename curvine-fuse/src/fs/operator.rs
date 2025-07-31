@@ -231,11 +231,13 @@ pub struct GetXAttr<'a> {
 }
 
 /// SetXAttr request structure:
+/// ```text
 /// +0                         +40                    +56           +56+len(name)+1
 /// |--------------------------|---------------------|-------------|--------------------------|
 /// |    fuse_in_header        | fuse_setxattr_in    |    name     |    value                 |
 /// |      (40 bytes)          |     (16 bytes)      | (variable)  | (size bytes)             |
 /// |--------------------------|---------------------|-------------|--------------------------|
+/// ```
 
 #[derive(Debug)]
 pub struct SetXAttr<'a> {
@@ -248,7 +250,6 @@ pub struct SetXAttr<'a> {
 #[derive(Debug)]
 pub struct RemoveXAttr<'a> {
     pub header: &'a fuse_in_header,
-    pub arg: &'a fuse_removexattr_in,
     pub name: &'a OsStr,
 }
 

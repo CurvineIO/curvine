@@ -20,7 +20,7 @@ use aws_sdk_s3::types::Object;
 use aws_sdk_s3::Client;
 use curvine_common::conf::UfsConf;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::FileStatus;
+use curvine_common::state::{FileStatus, SetAttrOpts};
 use curvine_common::FsResult;
 use std::sync::Arc;
 
@@ -340,5 +340,9 @@ impl FileSystem<S3Writer, S3Reader, UfsConf> for S3FileSystem {
         }
 
         Ok(entries)
+    }
+
+    async fn set_attr(&self, _path: &Path, _opts: SetAttrOpts) -> FsResult<()> {
+        err_ufs!("SetAttr operation is not supported by S3 file system")
     }
 }

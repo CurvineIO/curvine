@@ -125,7 +125,7 @@ impl NodeState {
             Err(e) => return err_fuse!(libc::ENOMEM, "{}", e),
         };
 
-        let mut attr = CurvineFileSystem::status_to_attr(&self.conf, status);
+        let mut attr = CurvineFileSystem::status_to_attr(&self.conf, status)?;
         attr.ino = node.id;
 
         if self.conf.auto_cache

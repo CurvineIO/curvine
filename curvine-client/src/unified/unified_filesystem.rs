@@ -19,7 +19,7 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::proto::MountOptions;
-use curvine_common::state::{FileStatus, MasterInfo, MountInfo};
+use curvine_common::state::{FileStatus, MasterInfo, MountInfo, SetAttrOpts};
 use curvine_common::FsResult;
 use log::{debug, info, warn};
 use orpc::common::{FastHashMap, LocalTime};
@@ -309,5 +309,9 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
             None => self.cv.list_status_bytes(path).await,
             Some((path, mount)) => mount.ufs.list_status_bytes(&path).await,
         }
+    }
+
+    async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
+        self.cv.set_attr(path, opts).await
     }
 }

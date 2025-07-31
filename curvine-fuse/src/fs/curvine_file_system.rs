@@ -19,16 +19,17 @@ use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
 use crate::session::{FuseBuf, FuseResponse};
 use crate::*;
-use crate::{err_fuse, FuseResult, FuseUtils};
+use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::FileStatus;
-use log::{error, info};
+use curvine_common::state::{FileStatus, SetAttrOpts};
+use log::{debug, error, info};
 use orpc::common::ByteUnit;
 use orpc::runtime::Runtime;
 use orpc::{sys, try_option};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::bytes::BytesMut;
 
@@ -75,12 +76,63 @@ impl CurvineFileSystem {
         &self.conf
     }
 
-    pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> fuse_attr {
+    pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
         let blocks = (status.len as f64 / FUSE_BLOCK_SIZE as f64).ceil() as u64;
         let ctime_sec = (status.mtime / 1000) as u64;
         let ctime_nsec = ((status.mtime % 1000) * 1000) as u32;
 
-        fuse_attr {
+        // Try to get uid from FileStatus owner, fallback to config
+        let uid = if status.owner.is_empty() {
+            conf.uid
+        } else {
+            // First try to parse as numeric uid
+            if let Ok(numeric_uid) = status.owner.parse::<u32>() {
+                numeric_uid
+            } else {
+                // If not numeric, try to lookup by username using system call
+                match orpc::sys::get_uid_by_name(&status.owner) {
+                    Some(uid) => uid,
+                    None => {
+                        return err_fuse!(
+                            libc::EINVAL,
+                            "Cannot resolve username '{}' to UID",
+                            status.owner
+                        );
+                    }
+                }
+            }
+        };
+
+        // Try to get gid from FileStatus group, fallback to config
+        let gid = if status.group.is_empty() {
+            conf.gid
+        } else {
+            // First try to parse as numeric gid
+            if let Ok(numeric_gid) = status.group.parse::<u32>() {
+                numeric_gid
+            } else {
+                // If not numeric, try to lookup by group name using system call
+                match orpc::sys::get_gid_by_name(&status.group) {
+                    Some(gid) => gid,
+                    None => {
+                        return err_fuse!(
+                            libc::EINVAL,
+                            "Cannot resolve group name '{}' to GID",
+                            status.group
+                        );
+                    }
+                }
+            }
+        };
+
+        // Use mode from FileStatus if available, otherwise use default calculation
+        let mode = if status.mode != 0 {
+            FuseUtils::get_mode(status.mode, status.is_dir)
+        } else {
+            FuseUtils::get_mode(FUSE_DEFAULT_MODE & !conf.umask, status.is_dir)
+        };
+
+        Ok(fuse_attr {
             ino: status.id as u64,
             size: status.len as u64,
             blocks,
@@ -90,14 +142,14 @@ impl CurvineFileSystem {
             atimensec: 0,
             mtimensec: ctime_nsec,
             ctimensec: ctime_nsec,
-            mode: FuseUtils::get_mode(FUSE_DEFAULT_MODE & !conf.umask, status.is_dir),
+            mode,
             nlink: 1,
-            uid: conf.uid,
-            gid: conf.gid,
+            uid,
+            gid,
             rdev: 0,
             blksize: FUSE_BLOCK_SIZE as u32,
             padding: 0,
-        }
+        })
     }
 
     pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr) -> fuse_entry_out {
@@ -181,7 +233,7 @@ impl CurvineFileSystem {
         let mut res = FuseDirentList::new(arg);
         for (index, status) in list.iter().enumerate().skip(start_index) {
             if plus {
-                let attr = Self::status_to_attr(&self.conf, status);
+                let attr = Self::status_to_attr(&self.conf, status)?;
                 let entry = Self::create_entry_out(&self.conf, attr);
                 if !res.add_plus((index + 1) as u64, status, entry) {
                     break;
@@ -191,6 +243,54 @@ impl CurvineFileSystem {
             }
         }
         Ok(res)
+    }
+
+    fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
+        let owner = {
+            // Try to get username from uid, fail if not found
+            match orpc::sys::get_username_by_uid(setattr.uid) {
+                Some(username) => Some(username),
+                None => {
+                    return err_fuse!(
+                        libc::EINVAL,
+                        "Cannot resolve UID {} to username",
+                        setattr.uid
+                    );
+                }
+            }
+        };
+
+        let group = {
+            // Try to get group name from gid, fail if not found
+            match orpc::sys::get_groupname_by_gid(setattr.gid) {
+                Some(groupname) => Some(groupname),
+                None => {
+                    return err_fuse!(
+                        libc::EINVAL,
+                        "Cannot resolve GID {} to group name",
+                        setattr.gid
+                    );
+                }
+            }
+        };
+
+        let mode = if setattr.mode != 0 {
+            Some(setattr.mode)
+        } else {
+            None
+        };
+
+        Ok(SetAttrOpts {
+            recursive: false,
+            replicas: None,
+            owner,
+            group,
+            mode,
+            ttl_ms: None,
+            ttl_action: None,
+            add_x_attr: HashMap::new(),
+            remove_x_attr: Vec::new(),
+        })
     }
 }
 
@@ -282,33 +382,63 @@ impl fs::FileSystem for CurvineFileSystem {
     // id="1057"
     async fn get_xattr(&self, op: GetXAttr<'_>) -> FuseResult<BytesMut> {
         let name = try_option!(op.name.to_str());
+        let path = self.state.get_path(op.header.nodeid)?;
+
+        debug!("Getting xattr: path='{}' name='{}'", path, name);
+
+        let status = match self.fs.get_status(&path).await {
+            Ok(status) => status,
+            Err(e) => {
+                error!("Failed to get status for {}: {}", path, e);
+                return err_fuse!(libc::ENOENT, "File not found: {}", path);
+            }
+        };
 
         let mut buf = FuseBuf::default();
         match name {
             "id" => {
-                let path = self.state.get_path(op.header.nodeid)?;
-                let status = self.fs.get_status(&path).await?;
                 let value = status.id.to_string();
-
                 if op.arg.size == 0 {
                     buf.add_xattr_out(value.len())
                 } else {
                     buf.add_slice(value.as_bytes());
                 }
             }
+            "security.capability" => {
+                debug!("Querying file capabilities for: {}", path);
+                // Return ENODATA silently to avoid ERROR logs
+                let err = FuseError::new(libc::ENODATA, "No capabilities set".into());
+                return Err(err);
+            }
+            "security.selinux" => {
+                debug!("Querying SELinux context for: {}", path);
+                // Return ENODATA silently to avoid ERROR logs
+                let err = FuseError::new(libc::ENODATA, "No SELinux context set".into());
+                return Err(err);
+            }
+            "system.posix_acl_access" | "system.posix_acl_default" => {
+                debug!("Querying POSIX ACL for: {}", path);
+                // Return ENODATA silently to avoid ERROR logs
+                let err = FuseError::new(libc::ENODATA, "POSIX ACLs not supported".into());
+                return Err(err);
+            }
             _ => {
                 // For other xattr names, try to get from file's xattr
-                let path = self.state.get_path(op.header.nodeid)?;
-                let status = self.fs.get_status(&path).await?;
-
                 if let Some(value) = status.x_attr.get(name) {
                     if op.arg.size == 0 {
                         buf.add_xattr_out(value.len())
+                    } else if op.arg.size < value.len() as u32 {
+                        return err_fuse!(
+                            libc::ERANGE,
+                            "Buffer too small for xattr value: {} < {}",
+                            op.arg.size,
+                            value.len()
+                        );
                     } else {
                         buf.add_slice(value);
                     }
                 } else {
-                    buf.add_xattr_out(0)
+                    return err_fuse!(libc::ENODATA, "No such attribute: {}", name);
                 }
             }
         }
@@ -318,74 +448,115 @@ impl fs::FileSystem for CurvineFileSystem {
 
     // setfattr -n system.posix_acl_access -v "user::rw-,group::r--,other::r--" /curvine-fuse/file
     // Set POSIX ACL attributes for files and directories
-    // TODO: implement this in curvine metadata layer
     async fn set_xattr(&self, op: SetXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        let _path = self.state.get_path(op.header.nodeid)?;
+        let path = self.state.get_path(op.header.nodeid)?;
 
-        // Get the xattr value from the request - now properly extracted from the parsed request
+        // Get the xattr value from the request
         let value_slice: &[u8] = op.value;
 
-        // Handle different xattr names
-        match name {
-            "system.posix_acl_access" | "system.posix_acl_default" => {
-                // Store POSIX ACL in the file's xattr
-                // TODO: Parse ACL value and update file's metadata with proper ACL structure
-                info!(
-                    "Setting POSIX ACL: name='{}' value='{}'",
-                    name,
-                    String::from_utf8_lossy(value_slice)
-                );
+        info!(
+            "Setting xattr: path='{}' name='{}' value='{}'",
+            path,
+            name,
+            String::from_utf8_lossy(value_slice)
+        );
 
-                Ok(())
-            }
-            _ => {
-                // For other xattr names, store them in the file's xattr map
-                // TODO: Update the file's metadata in the backend storage
-                info!(
-                    "Setting xattr: name='{}' value='{}'",
-                    name,
-                    String::from_utf8_lossy(value_slice)
-                );
-                Ok(())
+        // Create SetAttrOpts with the xattr to add
+        let mut add_x_attr = HashMap::new();
+        add_x_attr.insert(name.to_string(), value_slice.to_vec());
+
+        let opts = SetAttrOpts {
+            recursive: false,
+            replicas: None,
+            owner: None,
+            group: None,
+            mode: None,
+            ttl_ms: None,
+            ttl_action: None,
+            add_x_attr,
+            remove_x_attr: Vec::new(),
+        };
+
+        // Call backend filesystem to set the xattr
+        match self.fs.set_attr(&path, opts).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                error!("Failed to set xattr: {}", e);
+                err_fuse!(libc::EIO, "Failed to set xattr: {}", e)
             }
         }
     }
 
     // setfattr -x system.posix_acl_access /curvine-fuse/file
     // Remove POSIX ACL attributes from files and directories
-    // TODO: implement this in curvine metadata layer
     async fn remove_xattr(&self, op: RemoveXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        let _path = self.state.get_path(op.header.nodeid)?;
+        let path = self.state.get_path(op.header.nodeid)?;
 
-        // Handle different xattr names
+        info!("Removing xattr: path='{}' name='{}'", path, name);
+
+        // Handle system extended attributes silently to avoid ERROR logs
         match name {
+            "security.capability" => {
+                debug!("Removing file capabilities for: {}", path);
+                // Return success silently to avoid ERROR logs
+                return Ok(());
+            }
+            "security.selinux" => {
+                debug!("Removing SELinux context for: {}", path);
+                // Return success silently to avoid ERROR logs
+                return Ok(());
+            }
             "system.posix_acl_access" | "system.posix_acl_default" => {
-                // Remove POSIX ACL from the file's xattr
-                // This would typically involve updating the file's metadata
-                Ok(())
+                debug!("Removing POSIX ACL for: {}", path);
+                // Return success silently to avoid ERROR logs
+                return Ok(());
             }
             _ => {
-                // For other xattr names, remove them from the file's xattr map
-                // This would involve updating the file's metadata in the backend
-                Ok(())
+                // Handle user-defined attributes and other attributes
+            }
+        }
+
+        // Create SetAttrOpts with the xattr to remove
+        let opts = SetAttrOpts {
+            recursive: false,
+            replicas: None,
+            owner: None,
+            group: None,
+            mode: None,
+            ttl_ms: None,
+            ttl_action: None,
+            add_x_attr: HashMap::new(),
+            remove_x_attr: vec![name.to_string()],
+        };
+
+        // Call backend filesystem to remove the xattr
+        match self.fs.set_attr(&path, opts).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                error!("Failed to remove xattr: {}", e);
+                err_fuse!(libc::EIO, "Failed to remove xattr: {}", e)
             }
         }
     }
 
     // listxattr /curvine-fuse/file
     // List all extended attributes for a file or directory
-    async fn list_xattr(&self, op: ListXAttr<'_>) -> FuseResult<fuse_getxattr_out> {
+    async fn list_xattr(&self, op: ListXAttr<'_>) -> FuseResult<BytesMut> {
         let path = self.state.get_path(op.header.nodeid)?;
-        let status = self.fs.get_status(&path).await?;
+        debug!("Listing xattrs: path='{}' size={}", path, op.arg.size);
+
+        let status = match self.fs.get_status(&path).await {
+            Ok(status) => status,
+            Err(e) => {
+                error!("Failed to get status for {}: {}", path, e);
+                return err_fuse!(libc::ENOENT, "File not found: {}", path);
+            }
+        };
 
         // Build the list of xattr names
         let mut xattr_names = Vec::new();
-
-        // Add standard POSIX ACL attributes
-        xattr_names.extend_from_slice(b"system.posix_acl_access\0");
-        xattr_names.extend_from_slice(b"system.posix_acl_default\0");
 
         // Add custom xattr names from the file
         for name in status.x_attr.keys() {
@@ -396,12 +567,26 @@ impl fs::FileSystem for CurvineFileSystem {
         // Add the special "id" attribute
         xattr_names.extend_from_slice(b"id\0");
 
-        let out = fuse_getxattr_out {
-            size: xattr_names.len() as u32,
-            padding: 0,
-        };
+        let mut buf = FuseBuf::default();
 
-        Ok(out)
+        // If size is 0, just return the total size needed
+        if op.arg.size == 0 {
+            buf.add_xattr_out(xattr_names.len());
+        } else {
+            // Check if the provided buffer is large enough
+            if op.arg.size < xattr_names.len() as u32 {
+                return err_fuse!(
+                    libc::ERANGE,
+                    "Buffer too small: {} < {}",
+                    op.arg.size,
+                    xattr_names.len()
+                );
+            }
+            // Return the actual xattr names data
+            buf.add_slice(&xattr_names);
+        }
+
+        Ok(buf.take())
     }
 
     // Get the attribute of the specified inode.
@@ -424,9 +609,16 @@ impl fs::FileSystem for CurvineFileSystem {
     //The chown, chmod, and truncate commands will access the interface.
     // @todo is not implemented at this time, and this interface will not cause inode to be familiar with.
     async fn set_attr(&self, op: SetAttr<'_>) -> FuseResult<fuse_attr_out> {
+        info!(
+            "Setting attr: path='{}', opts={:?}",
+            op.header.nodeid, op.arg
+        );
         let path = self.state.get_path(op.header.nodeid)?;
         let status = self.fs_get_status(&path).await?;
         let attr = self.lookup_status::<String>(op.header.nodeid, None, &status)?;
+
+        let opts = Self::fuse_setattr_to_opts(op.arg)?;
+        self.fs.set_attr(&path, opts).await?;
 
         let attr = fuse_attr_out {
             attr_valid: self.conf.attr_ttl.as_secs(),
