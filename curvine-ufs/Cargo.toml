@@ -24,3 +24,4 @@ futures = { workspace = true }
 num_cpus = { workspace = true }
 rand = { workspace = true}
 trait-variant = { workspace = true }
+opendal = { workspace = true }

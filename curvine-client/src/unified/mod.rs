@@ -19,6 +19,7 @@ use curvine_common::conf::UfsConf;
 use curvine_common::fs::Path;
 use curvine_common::FsResult;
 use curvine_ufs::err_ufs;
+use curvine_ufs::opendal::{OpendalFileSystem, OpendalReader, OpendalWriter};
 use curvine_ufs::s3::S3FileSystem;
 use curvine_ufs::s3::{S3Reader, S3Writer};
 use std::collections::HashMap;
@@ -26,8 +27,6 @@ use std::collections::HashMap;
 pub const S3_SCHEME: &str = "s3";
 
 pub mod macros;
-mod opendal_filesystem;
-use self::opendal_filesystem::{OpendalFileSystem, OpendalReader, OpendalWriter};
 
 mod unified_filesystem;
 pub use self::unified_filesystem::UnifiedFileSystem;

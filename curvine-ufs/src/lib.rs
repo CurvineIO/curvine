@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 pub mod fs;
+pub mod opendal;
 pub mod s3;
 
 mod ufs_utils;
