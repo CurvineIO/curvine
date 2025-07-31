@@ -16,6 +16,7 @@ use crate::common::ufs_manager::UfsManager;
 use axum::async_trait;
 use bytes::{Bytes, BytesMut};
 use curvine_client::file::{FsClient, FsWriter};
+use curvine_client::unified::UnifiedReader;
 use curvine_common::fs::{CurvineURI, Path, Reader, Writer};
 use curvine_common::state::{CreateFileOptsBuilder, TtlAction};
 use curvine_common::FsResult;
@@ -25,7 +26,6 @@ use orpc::CommonResult;
 use std::io::Error;
 use std::io::Result as IoResult;
 use std::sync::Arc;
-use curvine_client::unified::UnifiedReader;
 
 pub struct UfsConnector {
     source_path: String,
@@ -72,7 +72,7 @@ impl UfsConnector {
             ttl_ms,
             ttl_action,
         )
-            .await;
+        .await;
         Ok(Box::new(writer))
     }
 }

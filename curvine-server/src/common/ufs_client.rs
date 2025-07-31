@@ -14,13 +14,13 @@
 
 #![allow(unused)]
 
+use curvine_client::unified::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use curvine_common::error::FsError;
 use curvine_common::fs::{CurvineURI, FileSystem, Path};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
-use std::sync::Arc;
-use curvine_client::unified::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use curvine_ufs::fs::ufs_context::UFSContext;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct UfsClient {
@@ -31,44 +31,43 @@ pub struct UfsClient {
 impl UfsClient {
     pub fn new(context: Arc<UFSContext>) -> FsResult<Self> {
         let fs = Self::create_filesystem(context.clone())?;
-        Ok(UfsClient { fs, context: context.clone() })
+        Ok(UfsClient {
+            fs,
+            context: context.clone(),
+        })
     }
-    
+
     fn create_filesystem(context: Arc<UFSContext>) -> FsResult<Arc<UfsFileSystem>> {
         match context.get_scheme() {
             Some("s3") => {
-                let s3_fs = UfsFileSystem::with_scheme(context.get_scheme(), context.conf().get_config().clone())?;
+                let s3_fs = UfsFileSystem::with_scheme(
+                    context.get_scheme(),
+                    context.conf().get_config().clone(),
+                )?;
                 Ok(Arc::new(s3_fs))
             }
             Some("oss") => {
-                let oss_fs = UfsFileSystem::with_scheme(context.get_scheme(), context.conf().get_config().clone())?;
+                let oss_fs = UfsFileSystem::with_scheme(
+                    context.get_scheme(),
+                    context.conf().get_config().clone(),
+                )?;
                 Ok(Arc::new(oss_fs))
             }
-            Some("file") => {
-                Err(FsError::unsupported("Local filesystem"))
-            }
+            Some("file") => Err(FsError::unsupported("Local filesystem")),
             Some(_) => Err(FsError::unsupported("storage scheme")),
             None => Err(FsError::unsupported("Missing storage scheme")),
         }
     }
-    
+
     pub async fn is_dir(&self, path: &CurvineURI) -> FsResult<bool> {
         self.fs.get_status(path).await.map(|status| status.is_dir)
     }
 
-    pub async fn list_dir(
-        &self,
-        path: &CurvineURI,
-        recursive: bool,
-    ) -> FsResult<Vec<String>> {
+    pub async fn list_dir(&self, path: &CurvineURI, recursive: bool) -> FsResult<Vec<String>> {
         self.list_dir_impl(path, recursive).await
     }
 
-    async fn list_dir_impl(
-        &self,
-        path: &CurvineURI,
-        recursive: bool,
-    ) -> FsResult<Vec<String>> {
+    async fn list_dir_impl(&self, path: &CurvineURI, recursive: bool) -> FsResult<Vec<String>> {
         let status = self.fs.list_status(path).await?;
         let mut result = vec![];
 

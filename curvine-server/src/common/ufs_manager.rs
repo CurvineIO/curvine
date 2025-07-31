@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::UfsClient;
 use curvine_client::file::FsClient;
 use curvine_common::conf::{UfsConf, UfsConfBuilder};
 use curvine_common::fs::CurvineURI;
@@ -22,7 +23,6 @@ use log::info;
 use orpc::err_box;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use crate::common::UfsClient;
 
 /// A class that manages the UFS for master servers.
 /// When loading, directly use the MountTable to return a usable UfsClient to the user

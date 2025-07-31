@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 use crate::common::ufs_manager::UfsManager;
+use crate::common::UfsClient;
 use crate::master::fs::MasterFilesystem;
 use crate::master::{LoadJob, LoadManagerConfig};
 use chrono::Utc;
@@ -38,7 +39,6 @@ use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{try_err, try_log, CommonResult};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use crate::common::UfsClient;
 
 /// Directory processing context
 #[derive(Clone)]
@@ -576,10 +576,7 @@ impl LoadManager {
         context: DirectoryProcessContext,
     ) {
         // List directory files
-        let files = match ufs_client
-            .list_dir(&context.uri, context.recursive)
-            .await
-        {
+        let files = match ufs_client.list_dir(&context.uri, context.recursive).await {
             Ok(files) => {
                 if files.is_empty() {
                     if let Some(mut job) = jobs.get_mut(&context.job_id) {

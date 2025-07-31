@@ -21,5 +21,3 @@ pub mod channel_transfer;
 
 pub mod ufs_context;
 pub use self::ufs_context::UFSContext;
-
-

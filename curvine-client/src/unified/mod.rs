@@ -28,7 +28,6 @@ pub const S3_SCHEME: &str = "s3";
 
 pub const OSS_SCHEME: &str = "oss";
 
-
 pub mod macros;
 
 mod unified_filesystem;
