@@ -24,12 +24,12 @@ RUN dnf install -y \
 
 # 2. Install the Rust toolchain
 # uncomment the following two lines if you met network problem
-#ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
-#ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
+ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
     source $HOME/.cargo/env && \
-    rustup default 1.86.0
+    rustup default stable
 
 # 3. Install protoc
 RUN mkdir -p /app/protoc && cd /app/protoc && \
@@ -41,9 +41,9 @@ ENV PATH="/app/protoc/bin:${PATH}"
 
 # 4. Install Maven
 RUN cd /app && \
-    curl -LO https://downloads.apache.org/maven/maven-3/3.9.10/binaries/apache-maven-3.9.10-bin.tar.gz && \
-    tar -xzf apache-maven-3.9.10-bin.tar.gz && \
-    mv apache-maven-3.9.10 maven && \
+    curl -LO https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz && \
+    tar -xzf apache-maven-3.9.11-bin.tar.gz && \
+    mv apache-maven-3.9.11 maven && \
     rm -f *.tar.gz
 ENV PATH="/app/maven/bin:${PATH}"
 

@@ -3,7 +3,8 @@ name: Compile and Test
 on:
   push:
     branches:
-      - '**'
+      - 'main'
+      - 'release/**'
   pull_request:
     branches:
       - '**'
@@ -72,7 +73,7 @@ jobs:
           export PATH="/root/.cargo/bin:$PATH"
           unset RUSTUP_UPDATE_ROOT
           unset RUSTUP_DIST_SERVER
-          rustup default 1.86.0
+          rustup default stable
           rustc --version
           cargo --version
       
@@ -98,7 +99,7 @@ jobs:
         run: |
           echo "Running clippy (static code analysis)"
           # Run clippy in debug mode to match build
-          cargo clippy --all-targets --jobs 2 -- --${CLIPPY_LEVEL}=warnings
+          cargo clippy --all-targets --jobs 2 -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
           
           echo "After clippy, disk usage:"
           df -h
