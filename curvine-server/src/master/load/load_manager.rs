@@ -28,7 +28,6 @@ use curvine_common::proto::{
     LoadTaskResponse,
 };
 use curvine_common::state::{TtlAction, WorkerAddress};
-use curvine_ufs::fs::UfsClient;
 use dashmap::DashMap;
 use log::{error, info, warn};
 use orpc::client::ClientFactory;
@@ -36,9 +35,10 @@ use orpc::common::DurationUnit;
 use orpc::io::net::InetAddr;
 use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::{try_err, try_log, try_option, CommonResult};
+use orpc::{try_err, try_log, CommonResult};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+use crate::common::UfsClient;
 
 /// Directory processing context
 #[derive(Clone)]
@@ -327,7 +327,7 @@ impl LoadManager {
         let target_path = ufs_manager.get_curvine_path(&uri).await?;
         let ufs_client = ufs_manager.get_client(&uri).await?;
         let file_status = try_err!(ufs_client.get_file_status(&uri).await);
-        let source_mtime = try_option!(file_status, "Source file not found: {}", uri).mtime;
+        let source_mtime = file_status.mtime;
 
         Ok((uri, target_path, source_mtime))
     }
@@ -408,7 +408,7 @@ impl LoadManager {
             };
 
             // Check if source is directory
-            match ufs_client.is_directory(&uri).await {
+            match ufs_client.is_dir(&uri).await {
                 Ok(is_dir) => {
                     if is_dir && !recursive {
                         if let Some(mut job) = jobs_clone.get_mut(&job_id) {
@@ -577,7 +577,7 @@ impl LoadManager {
     ) {
         // List directory files
         let files = match ufs_client
-            .list_directory(&context.uri, context.recursive)
+            .list_dir(&context.uri, context.recursive)
             .await
         {
             Ok(files) => {

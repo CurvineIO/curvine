@@ -32,6 +32,7 @@ use tokio::sync::Mutex;
 ///
 /// Responsible for writing data blocks to S3 storage, supporting streaming writing and segmented upload
 /// Use AWS SDK to interact with S3 services to achieve efficient data transmission
+#[derive(Debug)]
 pub struct S3Writer {
     client: Client,
     path: Path,

@@ -19,7 +19,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     LoadMetrics, LoadState, LoadTaskReportRequest, LoadTaskReportResponse,
 };
-use curvine_ufs::fs::buffer_transfer::BufferFileTransfer;
+use curvine_ufs::fs::BufferFileTransfer;
 use curvine_ufs::fs::{AsyncChunkReader, AsyncChunkWriter};
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
@@ -253,8 +253,9 @@ async fn execute_load_task(
     };
 
     // Create writer to Curvine filesystem
+    let mtime = reader.mtime();
     let writer = match external_client
-        .create_curvine_writer(reader.mtime(), task.ttl_ms, task.ttl_action)
+        .create_curvine_writer(mtime, task.ttl_ms, task.ttl_action)
         .await
     {
         Ok(writer) => writer,
