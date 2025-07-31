@@ -51,7 +51,7 @@ impl RocksLogStorage {
     pub fn lib_error(error: RaftError) -> raft::Error {
         match error {
             RaftError::Raft(e) => e.source,
-            e => raft::Error::Io(io::Error::new(io::ErrorKind::Other, e)),
+            e => raft::Error::Io(io::Error::other(e)),
         }
     }
 

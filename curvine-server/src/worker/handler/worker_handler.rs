@@ -24,7 +24,6 @@ use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use orpc::runtime::{RpcRuntime, Runtime};
-use std::mem;
 use std::sync::Arc;
 
 pub struct WorkerHandler {
@@ -63,7 +62,7 @@ impl WorkerHandler {
         if self.handler.is_none() {
             let handler = BlockHandler::new(RpcCode::from(msg.code()), self.store.clone())?;
 
-            let _ = mem::replace(&mut self.handler, Some(handler));
+            let _ = self.handler.replace(handler);
         }
 
         match self.handler.as_mut() {

@@ -126,7 +126,7 @@ impl ReadHandler {
         };
 
         let _ = mem::replace(&mut self.file, file);
-        let _ = mem::replace(&mut self.context, Some(context));
+        let _ = self.context.replace(context);
 
         self.metrics.read_blocks.with_label_values(&[label]).inc();
         info!("{}", log_msg);

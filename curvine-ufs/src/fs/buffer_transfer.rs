@@ -353,8 +353,7 @@ where
                     }
                     Err(e) => {
                         // The task itself fails (such as panic)
-                        return Err(Error::new(
-                            ErrorKind::Other,
+                        return Err(Error::other(
                             format!("The write task failed to execute: {}", e),
                         ));
                     }

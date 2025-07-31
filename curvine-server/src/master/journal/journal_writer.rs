@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::result_large_err)]
+
 use crate::master::fs::DeleteResult;
 use crate::master::journal::*;
 use crate::master::meta::inode::{InodeFile, InodePath};

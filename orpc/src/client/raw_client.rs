@@ -20,7 +20,6 @@ use crate::io::{IOError, IOResult};
 use crate::message::Message;
 use log::warn;
 use socket2::SockRef;
-use std::mem;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time;
@@ -74,7 +73,7 @@ impl RawClient {
                             policy.count(),
                             e
                         );
-                        let _ = mem::replace(&mut last_error, Some(e.into()));
+                        let _ = last_error.replace(e.into());
                     }
                 },
 
@@ -85,7 +84,7 @@ impl RawClient {
                         policy.count(),
                         e
                     );
-                    let _ = mem::replace(&mut last_error, Some(e.into()));
+                    let _ = last_error.replace(e.into());
                 }
             }
         }

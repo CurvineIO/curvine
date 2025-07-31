@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::error::Error;
-use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -42,7 +41,7 @@ impl<E: Error> ErrorMonitor<E> {
         }
         let mut e = self.error.lock().unwrap();
         self.has_error.store(true, Ordering::SeqCst);
-        let _ = mem::replace(&mut *e, Some(error));
+        let _ = (*e).replace(error);
     }
 
     pub fn take_error(&self) -> Option<E> {

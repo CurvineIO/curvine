@@ -15,7 +15,6 @@
 use crate::master::meta::feature::{AclFeature, WriteFeature};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::mem;
 
 // File extension function.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,7 +47,7 @@ impl FileFeature {
     }
 
     pub fn set_writing(&mut self, client_name: String) {
-        let _ = mem::replace(&mut self.file_write, Some(WriteFeature::new(client_name)));
+        let _ = self.file_write.replace(WriteFeature::new(client_name));
     }
 
     pub fn set_finalized(&mut self) {

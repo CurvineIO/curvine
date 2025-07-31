@@ -17,7 +17,6 @@ use crate::sys::pipe::{AsyncFd, PipeFd, PipePool, PipeReader, PipeWriter};
 use crate::sys::RawIO;
 use crate::{err_box, sys};
 use std::io::IoSlice;
-use std::mem;
 use std::sync::Arc;
 
 pub struct Pipe2 {
@@ -44,7 +43,7 @@ impl Pipe2 {
     }
 
     pub fn set_pool(&mut self, pool: Arc<PipePool>) {
-        let _ = mem::replace(&mut self.pool, Some(pool));
+        let _ = self.pool.replace(pool);
     }
 
     pub fn write_raw_fd(&self) -> RawIO {

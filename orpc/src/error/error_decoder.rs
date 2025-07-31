@@ -60,7 +60,7 @@ impl ErrorDecoder {
     }
 
     pub fn into_io(self) -> ErrorImpl<std::io::Error> {
-        let error = std::io::Error::new(std::io::ErrorKind::Other, self.source);
+        let error = std::io::Error::other(self.source);
         ErrorImpl::with_source(error)
     }
 

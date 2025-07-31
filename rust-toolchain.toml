@@ -16,5 +16,5 @@
 # under the License.
 
 [toolchain]
-channel = "1.86.0"
+#channel = "stable"
 components = ["rustfmt", "clippy", "rust-analyzer"]
