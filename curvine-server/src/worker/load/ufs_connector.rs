@@ -22,8 +22,8 @@ use curvine_common::state::{CreateFileOptsBuilder, TtlAction};
 use curvine_common::FsResult;
 use curvine_ufs::fs::buffer_transfer::{AsyncChunkReader, AsyncChunkWriter};
 use orpc::CommonResult;
+use std::io::Error;
 use std::io::Result as IoResult;
-use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 
 /// External storage client
@@ -132,7 +132,7 @@ impl AsyncChunkWriter for CurvineFsWriter {
         self.writer
             .write(data.as_ref())
             .await
-            .map_err(|e| Error::new(ErrorKind::Other, format!("Curvine write error: {}", e)))
+            .map_err(|e| Error::other(format!("Curvine write error: {}", e)))
     }
 
     /// Refresh the buffer
@@ -140,6 +140,6 @@ impl AsyncChunkWriter for CurvineFsWriter {
         self.writer
             .complete()
             .await
-            .map_err(|e| Error::new(ErrorKind::Other, format!("Curvine complete error: {}", e)))
+            .map_err(|e| Error::other(format!("Curvine complete error: {}", e)))
     }
 }

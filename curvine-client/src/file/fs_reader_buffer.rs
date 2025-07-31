@@ -103,6 +103,7 @@ impl BufferChannel {
 
 // Sequential read and write, chunk_num > 1, use a buffered reader to read data in advance, and reduce network latency.
 // Random read and write, chunk_num = 1, use a reader without buffer to read data directly from the remote end.
+#[allow(clippy::large_enum_variant)]
 enum ReaderAdapter {
     Buffer(BufferChannel),
     Base(FsReaderParallel),

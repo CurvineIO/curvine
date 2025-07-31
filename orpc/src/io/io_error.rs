@@ -69,14 +69,14 @@ impl IOError {
     where
         E: Into<Box<dyn Error + Send + Sync>>,
     {
-        Self::new(io::Error::new(ErrorKind::Other, error))
+        Self::new(io::Error::other(error))
     }
 
     pub fn create_ctx<E>(error: E, ctx: impl Into<String>) -> Self
     where
         E: Into<Box<dyn Error + Send + Sync>>,
     {
-        let error = io::Error::new(ErrorKind::Other, error);
+        let error = io::Error::other(error);
         Self::with_ctx(error, ctx)
     }
 

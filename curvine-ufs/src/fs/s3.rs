@@ -74,12 +74,8 @@ impl S3AsyncChunkReader {
         );
 
         // Create an S3 client with aws_utils
-        let client = aws_utils::create_s3_client(config).map_err(|e| {
-            Error::new(
-                ErrorKind::Other,
-                format!("Failed to create S3 client: {}", e),
-            )
-        })?;
+        let client = aws_utils::create_s3_client(config)
+            .map_err(|e| Error::other(format!("Failed to create S3 client: {}", e)))?;
         use aws_sdk_s3::error::ProvideErrorMetadata;
         // Get object metadata
         let head_result = client
@@ -94,7 +90,7 @@ impl S3AsyncChunkReader {
                     e.code().unwrap_or("Unknown"),
                     e
                 );
-                Error::new(ErrorKind::Other, error_msg)
+                Error::other(error_msg)
             })?;
 
         let content_length = head_result
@@ -134,9 +130,7 @@ impl S3AsyncChunkReader {
                 .key(&self.key)
                 .send()
                 .await
-                .map_err(|e| {
-                    Error::new(ErrorKind::Other, format!("Failed to get object: {}", e))
-                })?;
+                .map_err(|e| Error::other(format!("Failed to get object: {}", e)))?;
 
             self.byte_stream = Some(resp.body);
         }
@@ -170,9 +164,10 @@ impl S3AsyncChunkReader {
                 req = req.continuation_token(token);
             }
 
-            let resp = req.send().await.map_err(|e| {
-                Error::new(ErrorKind::Other, format!("Failed to list objects: {}", e))
-            })?;
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| Error::other(format!("Failed to list objects: {}", e)))?;
 
             // Handle ordinary objects
             if let Some(ref objects) = resp.contents {
@@ -225,10 +220,7 @@ impl AsyncChunkReader for S3AsyncChunkReader {
                         self.current_offset += bytes_read as u64;
                         Ok(bytes_read)
                     }
-                    Err(e) => Err(Error::new(
-                        ErrorKind::Other,
-                        format!("Failed to read chunk: {}", e),
-                    )),
+                    Err(e) => Err(Error::other(format!("Failed to read chunk: {}", e))),
                 }
             } else {
                 // The stream has ended
@@ -236,7 +228,7 @@ impl AsyncChunkReader for S3AsyncChunkReader {
                 Ok(0)
             }
         } else {
-            Err(Error::new(ErrorKind::Other, "Stream not initialized"))
+            Err(Error::other("Stream not initialized"))
         }
     }
 
@@ -271,12 +263,7 @@ impl AsyncChunkReader for S3AsyncChunkReader {
                 .range(format!("bytes={}-", offset))
                 .send()
                 .await
-                .map_err(|e| {
-                    Error::new(
-                        ErrorKind::Other,
-                        format!("Failed to get object range: {}", e),
-                    )
-                })?;
+                .map_err(|e| Error::other(format!("Failed to get object range: {}", e)))?;
 
             self.byte_stream = Some(resp.body);
         }
@@ -384,12 +371,8 @@ impl S3AsyncChunkWriter {
             });
 
         // Create an S3 client with aws_utils
-        let client = aws_utils::create_s3_client(config).map_err(|e| {
-            Error::new(
-                ErrorKind::Other,
-                format!("Failed to create S3 client: {}", e),
-            )
-        })?;
+        let client = aws_utils::create_s3_client(config)
+            .map_err(|e| Error::other(format!("Failed to create S3 client: {}", e)))?;
 
         debug!(
             "Created S3 writer for s3://{}/{}, buffer size: {} bytes",
@@ -427,10 +410,7 @@ impl S3AsyncChunkWriter {
                 .await
                 .map_err(|e| {
                     error!("Failed to initialize multipart upload: {}", e);
-                    Error::new(
-                        ErrorKind::Other,
-                        format!("Failed to initialize multipart upload: {}", e),
-                    )
+                    Error::other(format!("Failed to initialize multipart upload: {}", e))
                 })?;
 
             self.upload_id = resp.upload_id.clone();
@@ -447,7 +427,7 @@ impl S3AsyncChunkWriter {
         let upload_id = self
             .upload_id
             .as_ref()
-            .ok_or_else(|| Error::new(ErrorKind::Other, "Upload ID not initialized"))?;
+            .ok_or_else(|| Error::other("Upload ID not initialized"))?;
 
         // Get and add segment numbers
         let mut part_number = self.part_number.lock().await;
@@ -476,12 +456,12 @@ impl S3AsyncChunkWriter {
             .await
             .map_err(|e| {
                 error!("Failed to upload part {}: {}", current_part_number, e);
-                Error::new(ErrorKind::Other, format!("Failed to upload part: {}", e))
+                Error::other(format!("Failed to upload part: {}", e))
             })?;
 
         let e_tag = resp
             .e_tag
-            .ok_or_else(|| Error::new(ErrorKind::Other, "ETag not returned from upload part"))?;
+            .ok_or_else(|| Error::other("ETag not returned from upload part"))?;
 
         Ok(CompletedPart::builder()
             .part_number(current_part_number)
@@ -493,13 +473,13 @@ impl S3AsyncChunkWriter {
         let upload_id = self
             .upload_id
             .as_ref()
-            .ok_or_else(|| Error::new(ErrorKind::Other, "Upload ID not initialized"))?;
+            .ok_or_else(|| Error::other("Upload ID not initialized"))?;
 
         // Get and check the segmented list
         let parts = {
             let parts_guard = self.parts.lock().await;
             if parts_guard.is_empty() {
-                return Err(Error::new(ErrorKind::Other, "No parts uploaded"));
+                return Err(Error::other("No parts uploaded"));
             }
             // Clone and sort by segment number
             let mut sorted_parts = parts_guard.clone();
@@ -526,10 +506,7 @@ impl S3AsyncChunkWriter {
             .await
             .map_err(|e| {
                 error!("Failed to complete multipart upload: {}", e);
-                Error::new(
-                    ErrorKind::Other,
-                    format!("Failed to complete multipart upload: {}", e),
-                )
+                Error::other(format!("Failed to complete multipart upload: {}", e))
             })?;
 
         info!(
@@ -555,10 +532,7 @@ impl S3AsyncChunkWriter {
                 .await
                 .map_err(|e| {
                     error!("Failed to abort multipart upload: {}", e);
-                    Error::new(
-                        ErrorKind::Other,
-                        format!("Failed to abort multipart upload: {}", e),
-                    )
+                    Error::other(format!("Failed to abort multipart upload: {}", e))
                 })?;
 
             info!(
@@ -590,7 +564,7 @@ impl S3AsyncChunkWriter {
             .await
             .map_err(|e| {
                 error!("Failed to upload object: {}", e);
-                Error::new(ErrorKind::Other, format!("Failed to upload object: {}", e))
+                Error::other(format!("Failed to upload object: {}", e))
             })?;
 
         info!("Object uploaded to s3://{}/{}", self.bucket, self.key);

@@ -163,7 +163,7 @@ impl From<String> for RaftError {
 
 impl From<rocksdb::Error> for RaftError {
     fn from(value: Error) -> Self {
-        let io = io::Error::new(io::ErrorKind::Other, value);
+        let io = io::Error::other(value);
         IO(ErrorImpl::with_source(io))
     }
 }
@@ -176,7 +176,7 @@ impl From<io::Error> for RaftError {
 
 impl From<JoinError> for RaftError {
     fn from(value: JoinError) -> Self {
-        let io = io::Error::new(io::ErrorKind::Other, value);
+        let io = io::Error::other(value);
         IO(ErrorImpl::with_source(io))
     }
 }

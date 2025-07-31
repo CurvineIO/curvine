@@ -242,7 +242,7 @@ impl RocksStorageCore {
         batch.append_index_range(self.first_index(), self.last_index())?;
 
         batch.commit()?;
-        let _ = mem::replace(&mut self.first_index, Some(compact_index));
+        let _ = self.first_index.replace(compact_index);
         Ok(())
     }
 

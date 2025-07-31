@@ -26,7 +26,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::CurvineURI;
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
-use std::io::{Error, ErrorKind};
+use std::io::Error;
 use std::sync::Arc;
 
 /// S3 file system implementation
@@ -143,7 +143,7 @@ impl FileSystem for S3FileSystem {
             .map_err(|e| {
                 // Convert an AWS SDK error to a file system error
                 let error_msg = format!("The S3 list operation failed: {}", e);
-                Error::new(ErrorKind::Other, error_msg)
+                Error::other(error_msg)
             })?;
 
         Ok(!resp.contents().is_empty() || !resp.common_prefixes().is_empty())
@@ -175,10 +175,7 @@ impl FileSystem for S3FileSystem {
                 req = req.continuation_token(token);
             }
 
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+            let resp = req.send().await.map_err(|e| Error::other(e.to_string()))?;
 
             if let Some(ref objects) = resp.contents {
                 for obj in objects {
@@ -242,7 +239,7 @@ impl FileSystem for S3FileSystem {
             .body(bytes::Bytes::new().into())
             .send()
             .await
-            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| Error::other(e.to_string()))?;
 
         Ok(())
     }
@@ -271,10 +268,7 @@ impl FileSystem for S3FileSystem {
                     req = req.continuation_token(token);
                 }
 
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+                let resp = req.send().await.map_err(|e| Error::other(e.to_string()))?;
 
                 if let Some(ref objects) = resp.contents {
                     for obj in objects {
@@ -285,7 +279,7 @@ impl FileSystem for S3FileSystem {
                                 .key(key)
                                 .send()
                                 .await
-                                .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+                                .map_err(|e| Error::other(e.to_string()))?;
                         }
                     }
                 }
@@ -302,7 +296,7 @@ impl FileSystem for S3FileSystem {
                 .key(key)
                 .send()
                 .await
-                .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| Error::other(e.to_string()))?;
         }
 
         Ok(())
@@ -352,7 +346,7 @@ impl FileSystem for S3FileSystem {
             .key(dst_key)
             .send()
             .await
-            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| Error::other(e.to_string()))?;
 
         self.client
             .delete_object()
@@ -360,7 +354,7 @@ impl FileSystem for S3FileSystem {
             .key(src_key)
             .send()
             .await
-            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| Error::other(e.to_string()))?;
 
         Ok(())
     }

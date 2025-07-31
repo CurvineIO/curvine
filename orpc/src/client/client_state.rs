@@ -16,7 +16,6 @@ use crate::io::io_error::IOError;
 use crate::io::net::InetAddr;
 use crate::sync::StateCtl;
 use num_enum::{FromPrimitive, IntoPrimitive};
-use std::mem;
 use std::sync::Mutex;
 
 // Connection status
@@ -76,7 +75,7 @@ impl ClientState {
 
         let mut e = self.error.lock().unwrap();
         self.state.set_state(InnerState::Error);
-        let _ = mem::replace(&mut *e, Some(error));
+        let _ = (*e).replace(error);
     }
 
     pub fn take_error(&self) -> Option<IOError> {

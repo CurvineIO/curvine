@@ -15,8 +15,8 @@
 use crate::fs::{AsyncChunkReader, AsyncChunkWriter, ProgressCallback};
 use bytes::{Bytes, BytesMut};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
+use std::io::Error;
 use std::io::Result as IoResult;
-use std::io::{Error, ErrorKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::Instant;
@@ -204,18 +204,12 @@ where
 
         // Wait for reader task to complete
         let read_result = reader_handle.await.unwrap_or_else(|e| {
-            Err(Error::new(
-                ErrorKind::Other,
-                format!("Reader task execution failed: {}", e),
-            ))
+            Err(Error::other(format!("Reader task execution failed: {}", e)))
         })?;
 
         // Wait for writer task to complete
         writer_handle.await.unwrap_or_else(|e| {
-            Err(Error::new(
-                ErrorKind::Other,
-                format!("Writer task execution failed: {}", e),
-            ))
+            Err(Error::other(format!("Writer task execution failed: {}", e)))
         })?;
 
         // Final progress report (if different from last report)

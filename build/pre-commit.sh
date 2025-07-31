@@ -16,11 +16,11 @@
 # limitations under the License.
 #
 
-cargo clippy --release --fix --all-targets --allow-dirty --allow-staged --allow-no-vcs -- --deny warnings
+cargo clippy --release --fix --all-targets --allow-dirty --allow-staged --allow-no-vcs -- --deny warnings --allow clippy::uninlined-format-args
 
 cargo fmt
 
-if ! cargo clippy --release --all-targets -- --deny warnings; then
+if ! cargo clippy --release --all-targets -- --deny warnings --allow clippy::uninlined-format-args; then
   echo "Clippy check failed"
   exit 1
 fi

@@ -274,12 +274,7 @@ impl FileLoadService {
         self.task_tx
             .send(TaskOperation::GetStatus(job_id, resp_tx))
             .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to send status request: {}", e),
-                )
-            })?;
+            .map_err(|e| std::io::Error::other(format!("Failed to send status request: {}", e)))?;
 
         Ok(resp_rx.recv().await.unwrap_or(None))
     }
@@ -291,12 +286,7 @@ impl FileLoadService {
         self.task_tx
             .send(TaskOperation::GetAll(resp_tx))
             .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to send get all request: {}", e),
-                )
-            })?;
+            .map_err(|e| std::io::Error::other(format!("Failed to send get all request: {}", e)))?;
 
         Ok(resp_rx.recv().await.unwrap_or_else(Vec::new))
     }
