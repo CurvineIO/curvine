@@ -36,12 +36,12 @@ For more detailed information, please refer to:
 - [Commit convention](COMMIT_CONVENTION.md)
 
 ## Use Case
-![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.jpg)
+![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
 
-- **Case1**: Shuffle acceleration
-- **Case2**: Hot table data acceleration
-- **Case3**: Training acceleration
-- **Case4**: Model distribution
+- **Case1**: Training acceleration
+- **Case2**: Model distribution
+- **Case3**: Hot table data acceleration
+- **Case4**: Shuffle acceleration
 - **Case5**: Multi-cloud data caching
 
 

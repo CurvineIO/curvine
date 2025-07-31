@@ -35,12 +35,12 @@
 
 ## 应用场景
 
-![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.jpg)
+![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
 
-- **场景1**: 数据洗牌加速
-- **场景2**: 热表数据加速
-- **场景3**: 训练加速
-- **场景4**: 模型分发
+- **场景1**: 训练加速
+- **场景2**: 模型分发
+- **场景3**: 热表数据加速
+- **场景4**: 大数据Shuffle加速
 - **场景5**: 多云数据缓存
 
 ## 🚀 核心特性
