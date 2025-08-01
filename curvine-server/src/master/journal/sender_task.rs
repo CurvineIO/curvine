@@ -18,7 +18,6 @@ use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
 use curvine_common::utils::SerdeUtils;
 use curvine_common::FsResult;
-use log::error;
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::err_box;
 use std::sync::mpsc;
