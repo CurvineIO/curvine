@@ -15,6 +15,7 @@
 use clap::Parser;
 
 #[derive(Debug, Parser, Clone, Default)]
+#[command(arg_required_else_help = true)]
 pub struct BenchArgs {
     #[arg(short, long, default_value = "")]
     pub action: String,
