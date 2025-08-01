@@ -198,7 +198,7 @@ impl FsError {
     }
 
     pub fn unsupported<T: Into<String>>(feature: T) -> Self {
-        let msg = format!("{} is not implemenet", feature.into());
+        let msg = format!("{} is not implemented", feature.into());
         Self::Unsupported(ErrorImpl::with_source(msg.into()))
     }
 
