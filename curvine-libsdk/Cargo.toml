@@ -28,6 +28,7 @@ serde = { workspace = true }
 prost = { workspace = true }
 prost-build = { workspace = true }
 jni = "0.21.1"
+pyo3 = { version = "0.25.1", features = ["extension-module","abi3-py38","num-complex"] }
 
 [build-dependencies]
 cc = "1.1.7"
