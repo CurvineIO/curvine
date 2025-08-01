@@ -56,7 +56,7 @@ impl SenderTask {
         let task = self;
         thread::Builder::new().name(name.clone()).spawn(move || {
             if let Err(e) = Self::loop0(receiver, poll, task) {
-                error!("thread {} stop: {:?}", name, e)
+                panic!("thread {} stop: {:?}", name, e);
             }
         })?;
         Ok(())
