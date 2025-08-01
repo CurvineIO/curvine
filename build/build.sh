@@ -25,7 +25,7 @@ get_arch_name() {
         i386 | i686)
             echo "x86_32"
             ;;
-        aarch64)
+        aarch64 | arm64)
              echo "aarch_64"
             ;;
         armv7l | armv6l)
@@ -38,9 +38,15 @@ get_arch_name() {
 }
 
 get_os_version() {
-  id=$(grep -E '^ID=' /etc/os-release | cut -d= -f2- | tr -d '"')
-  ver=$(grep ^VERSION_ID= /etc/os-release | cut -d '"' -f 2| cut -d '.' -f 1)
-  echo $id$ver
+  if [ -f "/etc/os-release" ]; then
+    id=$(grep -E '^ID=' /etc/os-release | cut -d= -f2- | tr -d '"')
+    ver=$(grep ^VERSION_ID= /etc/os-release | cut -d '"' -f 2| cut -d '.' -f 1)
+    echo $id$ver
+  elif [[ "$OSTYPE" == "darwin"* ]]; then
+    echo "mac"
+  else
+    echo "unknown"
+  fi
 }
 
 get_fuse_version() {
