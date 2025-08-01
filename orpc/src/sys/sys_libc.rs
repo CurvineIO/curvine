@@ -19,6 +19,7 @@ use crate::handler::RpcFrame;
 use crate::io::IOResult;
 use crate::sys::*;
 use crate::{err_io, err_msg, try_err, try_option};
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::IoSlice;
 use std::path::Path;
@@ -516,5 +517,97 @@ pub fn get_device_id(path: &Path) -> u64 {
         }
     } else {
         0
+    }
+}
+
+/// Get UID by username using getpwnam system call
+pub fn get_uid_by_name(username: &str) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let c_username = match CString::new(username) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+
+        unsafe {
+            let passwd = libc::getpwnam(c_username.as_ptr());
+            if passwd.is_null() {
+                None
+            } else {
+                Some((*passwd).pw_uid)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Get username by UID using getpwuid system call  
+pub fn get_username_by_uid(uid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            let passwd = libc::getpwuid(uid);
+            if passwd.is_null() {
+                None
+            } else {
+                let c_str = CStr::from_ptr((*passwd).pw_name);
+                c_str.to_string_lossy().into_owned().into()
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Get GID by group name using getgrnam system call
+pub fn get_gid_by_name(groupname: &str) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let c_groupname = match CString::new(groupname) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+
+        unsafe {
+            let group = libc::getgrnam(c_groupname.as_ptr());
+            if group.is_null() {
+                None
+            } else {
+                Some((*group).gr_gid)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Get group name by GID using getgrgid system call
+pub fn get_groupname_by_gid(gid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            let group = libc::getgrgid(gid);
+            if group.is_null() {
+                None
+            } else {
+                let c_str = CStr::from_ptr((*group).gr_name);
+                c_str.to_string_lossy().into_owned().into()
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }

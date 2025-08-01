@@ -132,7 +132,6 @@ impl FuseRequest {
 
             FUSE_REMOVEXATTR => FuseOperator::RemoveXAttr(RemoveXAttr {
                 header,
-                arg: decoder.get_struct()?,
                 name: decoder.get_os_str()?,
             }),
 
