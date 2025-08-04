@@ -70,7 +70,7 @@ Curvine adopts a modular design and is mainly composed of the following core com
 
 ## 📦 System Requirements
 
-- Rust 1.80+
+- Rust 1.86+
 - Linux or macOS (Limited support on Windows)
 - FUSE library (for file system functionality)
 
