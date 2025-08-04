@@ -186,6 +186,12 @@ impl UnifiedFileSystem {
     pub fn clone_runtime(&self) -> Arc<Runtime> {
         self.cv.clone_runtime()
     }
+
+    // If the path lies outside the mount point, the operation behaves as a full delete.
+    // If it’s within the mount point, only the associated cache files will be removed. (ufs will be ignored)
+    pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<()> {
+        self.cv.delete(path, recursive).await
+    }
 }
 
 impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem {
@@ -279,7 +285,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
         match self.get_mount(path).await? {
             None => self.cv.delete(path, recursive).await,
-            Some((path, mount)) => mount.ufs.delete(&path, recursive).await,
+            Some((path, mount)) => {
+                if let Some(_) = self.get_cache_status(&path).await? {
+                    self.cv.delete(&path, recursive).await?;
+                }
+                mount.ufs.delete(&path, recursive).await
+            }
         }
     }
 
