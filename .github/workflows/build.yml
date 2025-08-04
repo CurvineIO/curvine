@@ -62,7 +62,7 @@ jobs:
     container:
       image: ghcr.io/curvineio/curvine-compile:latest
       credentials:
-        username: ${{ github.actor }}
+        username: ${{ secrets.GHCR_USERNAME }}
         password: ${{ secrets.PAT_GITHUB_TOKEN }}
     
     steps:
