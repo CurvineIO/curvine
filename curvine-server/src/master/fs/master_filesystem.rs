@@ -114,7 +114,10 @@ impl MasterFilesystem {
             return err_box!("F ailed to remove {} because it does not exist", inp.path());
         }
 
-        let _ = fs_dir.delete(&inp, recursive)?;
+        let delete_result = fs_dir.delete(&inp, recursive)?;
+
+        let mut worker_manager = self.worker_manager.write();
+        worker_manager.remove_blocks(&delete_result);
 
         Ok(true)
     }

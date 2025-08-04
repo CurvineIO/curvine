@@ -46,18 +46,12 @@ pub struct JournalWriter {
     enable: bool,
     debug: bool,
     sender: SenderAdapter,
-    worker_manager: SyncWorkerManager,
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<Receiver<JournalEntry>>>,
 }
 
 impl JournalWriter {
-    pub fn new(
-        testing: bool,
-        client: RaftClient,
-        worker_manager: SyncWorkerManager,
-        conf: &JournalConf,
-    ) -> Self {
+    pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> Self {
         let (sender, receiver) = if conf.writer_channel_size == 0 {
             let (sender, receiver) = mpsc::channel();
             (SenderAdapter::UnBounded(sender), receiver)
@@ -79,7 +73,6 @@ impl JournalWriter {
             enable: conf.enable,
             debug: conf.writer_debug,
             sender,
-            worker_manager,
             metrics: Master::get_metrics(),
             receiver,
         }
@@ -187,11 +180,6 @@ impl JournalWriter {
             path: path.as_ref().to_string(),
             mtime,
         };
-
-        let mut wm = self.worker_manager.write();
-        wm.remove_blocks(del_res);
-        drop(wm);
-
         self.send(JournalEntry::Delete(entry))
     }
 

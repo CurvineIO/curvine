@@ -69,8 +69,7 @@ impl JournalSystem {
         let worker_manager = SyncWorkerManager::new(WorkerManager::new(conf));
 
         let client = RaftClient::from_conf(rt.clone(), &conf.journal);
-        let journal_writer =
-            JournalWriter::new(conf.testing, client, worker_manager.clone(), &conf.journal);
+        let journal_writer = JournalWriter::new(conf.testing, client, &conf.journal);
 
         // If a snapshot exists in the current system, fs_dir will be restored based on the snapshot.
         // Here we will first delete the rocksdb data directory, which is to prevent the creation of the memory directory tree twice.
