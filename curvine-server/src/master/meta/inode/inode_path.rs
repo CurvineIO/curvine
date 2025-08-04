@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::InodeView::{self, Dir, File};
+use crate::master::meta::inode::InodeView::{self, Dir};
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePtr, PATH_SEPARATOR};
+use curvine_common::fs::Path;
 use orpc::{err_box, try_option, CommonResult};
 
 #[derive(Debug, Clone)]
@@ -25,16 +26,32 @@ pub struct InodePath {
 }
 
 impl InodePath {
+    pub const MAX_LINK_DEPTH: u8 = 10;
+
     pub fn resolve<T: AsRef<str>>(root: InodePtr, path: T) -> CommonResult<Self> {
-        let components = InodeView::path_components(path.as_ref())?;
+        Self::resolve0(root, path, 0, false)
+    }
+
+    pub fn resolve_for_read<T: AsRef<str>>(root: InodePtr, path: T) -> CommonResult<Self> {
+        Self::resolve0(root, path, 0, true)
+    }
+
+    fn resolve0<T: AsRef<str>>(
+        root: InodePtr,
+        path: T,
+        link_recursion: u8,
+        for_read: bool,
+    ) -> CommonResult<Self> {
+        let path = path.as_ref();
+        let components = InodeView::path_components(path)?;
 
         let name = try_option!(components.last());
         if name.is_empty() {
-            return err_box!("Path {} is invalid", path.as_ref());
+            return err_box!("Path {} is invalid", path);
         }
 
         let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
-        let mut cur_inode = root;
+        let mut cur_inode = root.clone();
         let mut index = 0;
 
         while index < components.len() {
@@ -50,26 +67,60 @@ impl InodePath {
                 Dir(d) => {
                     if let Some(child) = d.get_child_ptr(child_name) {
                         cur_inode = child;
+                        if for_read && cur_inode.is_link() {
+                            return Self::resolve_link(
+                                root.clone(),
+                                path,
+                                cur_inode.as_mut(),
+                                link_recursion,
+                                for_read,
+                            );
+                        }
                     } else {
                         // The directory has not been created, so there is no need to search again.
                         break;
                     }
                 }
 
-                File(_) => {
-                    // The current path is a file, there is no need to search again.
-                    break;
+                v if v.is_link() => {
+                    return Self::resolve_link(root.clone(), path, v, link_recursion, for_read)
                 }
+
+                _ => break,
             }
         }
 
         let inode_path = Self {
-            path: path.as_ref().to_string(),
+            path: path.to_string(),
             name: name.to_string(),
             components,
             inodes,
         };
         Ok(inode_path)
+    }
+
+    fn resolve_link(
+        root: InodePtr,
+        path: &str,
+        inode: &mut InodeView,
+        link_recursion: u8,
+        for_read: bool,
+    ) -> CommonResult<Self> {
+        let file = inode.as_file_ref()?;
+        if let Some(target) = &file.target {
+            if link_recursion > Self::MAX_LINK_DEPTH {
+                return err_box!(
+                    "link file {} parsing exceeds maximum depth {}",
+                    path,
+                    Self::MAX_LINK_DEPTH
+                );
+            }
+
+            let target_path = Path::from_str(target)?;
+            Self::resolve0(root, target_path.path(), link_recursion + 1, for_read)
+        } else {
+            err_box!("Link file {} is valid, no target file", path)
+        }
     }
 
     pub fn is_root(&self) -> bool {

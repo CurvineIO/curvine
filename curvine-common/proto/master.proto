@@ -177,3 +177,13 @@ message SetAttrRequest {
 
 message SetAttrResponse {
 }
+
+message SymlinkRequest {
+    required string target = 1;
+    required string link = 2;
+    required bool force = 3;
+    required uint32 mode = 4;
+}
+
+message SymlinkResponse {
+}

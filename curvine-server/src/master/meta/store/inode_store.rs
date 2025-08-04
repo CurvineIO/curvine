@@ -161,6 +161,16 @@ impl InodeStore {
         batch.commit()
     }
 
+    pub fn apply_symlink(&self, parent: &InodeView, new_inode: &InodeView) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+
+        batch.write_inode(parent)?;
+        batch.write_inode(new_inode)?;
+        batch.add_child(parent.id(), new_inode.name(), new_inode.id())?;
+
+        batch.commit()
+    }
+
     // Restore to a directory tree from rocksdb
     pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
         let mut root = FsDir::create_root();

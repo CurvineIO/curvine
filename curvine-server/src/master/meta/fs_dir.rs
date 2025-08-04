@@ -31,6 +31,7 @@ use log::info;
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
+use std::mem;
 
 /// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
@@ -717,5 +718,71 @@ impl FsDir {
 
         self.store.apply_set_attr(change_inodes)?;
         Ok(())
+    }
+
+    pub fn symlink(
+        &mut self,
+        target: InodePath,
+        link: InodePath,
+        force: bool,
+        mode: u32,
+    ) -> FsResult<()> {
+        let op_ms = LocalTime::mills();
+
+        if target.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(target.path()));
+        }
+
+        let new_inode = InodeFile::with_link(
+            self.inode_id.next()?,
+            link.name(),
+            op_ms as i64,
+            target.path(),
+            mode,
+        );
+
+        let link = self.unprotected_symlink(link, new_inode, force)?;
+        self.journal_writer.log_symlink(op_ms, &link, force)?;
+        Ok(())
+    }
+
+    pub fn unprotected_symlink(
+        &mut self,
+        mut link: InodePath,
+        new_inode: InodeFile,
+        force: bool,
+    ) -> FsResult<InodePath> {
+        // check parent
+        let mut parent = match link.get_inode(-2) {
+            Some(v) => v,
+            None => return err_box!("Directory does not exist"),
+        };
+
+        let old_inode = if let Some(v) = link.get_last_inode() {
+            if !v.is_link() || (v.is_link() && !force) {
+                return err_ext!(FsError::file_exists(link.path()));
+            } else {
+                Some(v)
+            }
+        } else {
+            None
+        };
+
+        parent.update_mtime(new_inode.mtime);
+        let new_inode_ptr = match old_inode {
+            Some(v) => {
+                let _ = mem::replace(v.as_mut(), File(new_inode));
+                v
+            }
+            None => {
+                let added = parent.add_child(File(new_inode))?;
+                link.append(added.clone())?;
+                added
+            }
+        };
+
+        self.store
+            .apply_symlink(parent.as_ref(), new_inode_ptr.as_ref())?;
+        Ok(link)
     }
 }

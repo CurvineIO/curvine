@@ -46,6 +46,10 @@ impl InodeView {
         !self.is_dir()
     }
 
+    pub fn is_link(&self) -> bool {
+        matches!(self, File(v) if v.file_type == FileType::Link)
+    }
+
     pub fn id(&self) -> i64 {
         match self {
             File(f) => f.id(),
@@ -297,6 +301,7 @@ impl InodeView {
             owner: acl.owner.to_owned(),
             group: acl.group.to_owned(),
             mode: acl.mode,
+            target: None,
         };
 
         match self {
@@ -308,6 +313,7 @@ impl InodeView {
                 status.file_type = f.file_type;
                 status.x_attr = f.features.x_attr.clone();
                 status.storage_policy = f.storage_policy.clone();
+                status.target = f.target.clone();
             }
 
             Dir(d) => {

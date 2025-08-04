@@ -217,6 +217,7 @@ impl ProtoUtils {
             owner: status.owner,
             group: status.group,
             mode: status.mode,
+            target: status.target,
         }
     }
 
@@ -239,6 +240,7 @@ impl ProtoUtils {
             owner: status.owner,
             group: status.group,
             mode: status.mode,
+            target: status.target,
         }
     }
 

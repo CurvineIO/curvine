@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::block_meta::BlockState;
-use crate::master::meta::feature::{FileFeature, WriteFeature};
+use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::state::{CommitBlock, CreateFileOpts, ExtendedBlock, FileType, StoragePolicy};
@@ -39,6 +39,8 @@ pub struct InodeFile {
     pub(crate) features: FileFeature,
 
     pub(crate) blocks: Vec<BlockMeta>,
+
+    pub(crate) target: Option<String>,
 }
 
 impl InodeFile {
@@ -58,7 +60,7 @@ impl InodeFile {
             features: FileFeature::new(),
 
             blocks: vec![],
-
+            target: None,
             parent_id: EMPTY_PARENT_ID,
         }
     }
@@ -79,6 +81,7 @@ impl InodeFile {
             features: FileFeature::new(),
 
             blocks: vec![],
+            target: None,
             parent_id: EMPTY_PARENT_ID,
         };
 
@@ -90,6 +93,31 @@ impl InodeFile {
         file.features.set_mode(opts.mode);
 
         file
+    }
+
+    pub fn with_link(id: i64, name: &str, time: i64, target: impl Into<String>, mode: u32) -> Self {
+        Self {
+            id,
+            name: name.to_string(),
+            file_type: FileType::Link,
+            mtime: time,
+            atime: time,
+
+            len: 0,
+            block_size: 0,
+            replicas: 0,
+
+            storage_policy: Default::default(),
+            features: FileFeature {
+                x_attr: Default::default(),
+                file_write: None,
+                acl: AclFeature::with_mode(mode),
+            },
+
+            blocks: vec![],
+            target: Some(target.into()),
+            parent_id: EMPTY_PARENT_ID,
+        }
     }
 
     pub fn block_ids(&self) -> Vec<i64> {

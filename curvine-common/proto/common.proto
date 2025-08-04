@@ -59,6 +59,7 @@ message FileStatusProto {
     required string owner = 15;
     required string group = 16;
     required uint32 mode = 17;
+    optional string target = 18;
 }
 
 // Describe the worker address information.

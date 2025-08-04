@@ -14,7 +14,7 @@
 
 use crate::file::FsContext;
 use bytes::BytesMut;
-use curvine_common::conf::{UfsConf, UfsConfBuilder};
+use curvine_common::conf::{ClientConf, UfsConf, UfsConfBuilder};
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, RpcCode};
 use curvine_common::proto::*;
@@ -365,6 +365,17 @@ impl FsClient {
             opts: ProtoUtils::set_attr_opts_to_pb(opts),
         };
         let _: SetAttrResponse = self.rpc(RpcCode::SetAttr, req).await?;
+        Ok(())
+    }
+
+    pub async fn symlink(&self, target: &Path, link: &Path, force: bool) -> FsResult<()> {
+        let req = SymlinkRequest {
+            target: target.encode(),
+            link: link.encode(),
+            force,
+            mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
+        };
+        let _: SymlinkResponse = self.rpc(RpcCode::Symlink, req).await?;
         Ok(())
     }
 

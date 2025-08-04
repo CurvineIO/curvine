@@ -16,7 +16,7 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_common::fs::Path;
 use curvine_common::fs::Writer;
 use curvine_common::state::{
-    CreateFileOptsBuilder, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
+    CreateFileOptsBuilder, FileType, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
 };
 use curvine_common::FsResult;
 use curvine_tests::Testing;
@@ -59,6 +59,8 @@ fn fs_test() -> FsResult<()> {
         set_attr_non_recursive(&fs).await?;
 
         set_attr_recursive(&fs).await?;
+
+        symlink(&fs).await?;
         Ok(())
     });
 
@@ -316,6 +318,36 @@ async fn set_attr_recursive(fs: &CurvineFileSystem) -> CommonResult<()> {
     assert_eq!(status.mode, 0o644);
     assert_eq!(status.storage_policy.ttl_ms, 0);
     assert_eq!(status.storage_policy.ttl_action, TtlAction::None);
+
+    Ok(())
+}
+
+async fn symlink(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let path = Path::from_str("/fs_test/symlink/data/test.log")?;
+    let mut writer = fs.create(&path, true).await?;
+    writer.write("symlink".as_bytes()).await?;
+    writer.complete().await?;
+
+    // create symlink
+    let link = Path::from_str("/fs_test/symlink/link")?;
+    fs.symlink(&path, &link, true).await?;
+
+    let list = fs.list_status(&Path::from_str("/fs_test/symlink")?).await?;
+    for item in &list {
+        info!("list file: {:?}", item);
+    }
+    assert_eq!(list.len(), 2);
+
+    let status = fs.get_status(&link).await?;
+    println!("link status{:?}", status);
+    assert_eq!(
+        status.target,
+        Some("/fs_test/symlink/data/test.log".to_string())
+    );
+    assert_eq!(status.file_type, FileType::Link);
+
+    let context = fs.read_string(&link).await?;
+    assert_eq!(context, "symlink");
 
     Ok(())
 }

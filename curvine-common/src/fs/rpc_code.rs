@@ -37,6 +37,7 @@ pub enum RpcCode {
     GetBlockLocations = 13,
     GetMasterInfo = 14,
     SetAttr = 15,
+    Symlink = 16,
 
     // manager interface.
     Mount = 30,

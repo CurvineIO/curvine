@@ -214,7 +214,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
 
         let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let inp = Self::resolve_path_for_read(&fs_dir, path)?;
 
         if inp.get_last_inode().is_none() {
             if opts.create() {
@@ -261,6 +261,10 @@ impl MasterFilesystem {
 
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
         InodePath::resolve(fs_dir.root_ptr(), path)
+    }
+
+    fn resolve_path_for_read(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
+        InodePath::resolve_for_read(fs_dir.root_ptr(), path)
     }
 
     pub fn check_path_length(&self, path: &str) -> CommonResult<()> {
@@ -420,7 +424,7 @@ impl MasterFilesystem {
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
         let fs_dir = self.fs_dir.read();
         let path = path.as_ref();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let inp = Self::resolve_path_for_read(&fs_dir, path)?;
 
         let inode = try_option!(inp.get_last_inode(), "File {} not exits", path);
         let file = inode.as_file_ref()?;
@@ -595,6 +599,19 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         fs_dir.set_attr(inp, opts)
+    }
+
+    pub fn symlink<T: AsRef<str>>(
+        &self,
+        target: T,
+        link: T,
+        force: bool,
+        mode: u32,
+    ) -> FsResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let target = Self::resolve_path(&fs_dir, target.as_ref())?;
+        let link = Self::resolve_path(&fs_dir, link.as_ref())?;
+        fs_dir.symlink(target, link, force, mode)
     }
 }
 

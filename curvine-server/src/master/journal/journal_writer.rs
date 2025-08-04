@@ -229,6 +229,16 @@ impl JournalWriter {
         self.send(JournalEntry::SetAttr(entry))
     }
 
+    pub fn log_symlink(&self, op_ms: u64, link: &InodePath, force: bool) -> FsResult<()> {
+        let entry = SymlinkEntry {
+            op_ms,
+            link: link.path().to_string(),
+            new_inode: link.clone_last_file()?,
+            force,
+        };
+        self.send(JournalEntry::Symlink(entry))
+    }
+
     // for testing
     pub fn take_entries(&self) -> Vec<JournalEntry> {
         let mut entries = vec![];

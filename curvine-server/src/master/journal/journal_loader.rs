@@ -75,6 +75,8 @@ impl JournalLoader {
             JournalEntry::UnMount(e) => self.unmount(e),
 
             JournalEntry::SetAttr(e) => self.set_attr(e),
+
+            JournalEntry::Symlink(e) => self.symlink(e),
         }
     }
 
@@ -186,6 +188,13 @@ impl JournalLoader {
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path)?;
         let last_inode = try_option!(inp.get_last_inode());
         fs_dir.unprotected_set_attr(last_inode, entry.opts)?;
+        Ok(())
+    }
+
+    pub fn symlink(&self, entry: SymlinkEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.link)?;
+        fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force)?;
         Ok(())
     }
 

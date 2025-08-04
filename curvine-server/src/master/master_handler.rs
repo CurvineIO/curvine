@@ -363,6 +363,23 @@ impl MasterHandler {
 
         ctx.response(SetAttrResponse::default())
     }
+
+    fn symlink_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: SymlinkRequest = ctx.parse_header()?;
+        ctx.set_audit(
+            Some(header.target.to_string()),
+            Some(header.link.to_string()),
+        );
+
+        if self.check_is_retry(ctx.msg.req_id())? {
+            return ctx.response(SymlinkResponse::default());
+        }
+
+        self.fs
+            .symlink(&header.target, &header.link, header.force, header.mode)?;
+
+        ctx.response(SymlinkResponse::default())
+    }
 }
 
 impl MessageHandler for MasterHandler {
@@ -405,6 +422,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::ListStatus => self.list_status(ctx),
             RpcCode::GetBlockLocations => self.get_block_locations(ctx),
             RpcCode::SetAttr => self.set_attr_retry_check(ctx),
+            RpcCode::Symlink => self.symlink_retry_check(ctx),
 
             RpcCode::Mount => self.mount(ctx),
             RpcCode::UnMount => self.umount(ctx),

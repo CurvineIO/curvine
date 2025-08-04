@@ -39,6 +39,8 @@ pub struct FileStatus {
     pub mode: u32,
     pub owner: String,
     pub group: String,
+
+    pub target: Option<String>,
 }
 
 impl FileStatus {

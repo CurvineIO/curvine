@@ -98,6 +98,15 @@ pub struct SetAttrEntry {
     pub(crate) opts: SetAttrOpts,
 }
 
+// set attr
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SymlinkEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) link: String,
+    pub(crate) new_inode: InodeFile,
+    pub(crate) force: bool,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -110,6 +119,7 @@ pub enum JournalEntry {
     Mount(MountEntry),
     UnMount(UnMountEntry),
     SetAttr(SetAttrEntry),
+    Symlink(SymlinkEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
