@@ -139,7 +139,7 @@ impl FsDir {
         }
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
         self.journal_writer
-            .log_delete(op_ms, inp.path(), &del_res, op_ms as i64)?;
+            .log_delete(op_ms, inp.path(), op_ms as i64)?;
 
         Ok(del_res)
     }

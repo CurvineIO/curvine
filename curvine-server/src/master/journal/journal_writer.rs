@@ -14,10 +14,9 @@
 
 #![allow(clippy::result_large_err)]
 
-use crate::master::fs::DeleteResult;
 use crate::master::journal::*;
 use crate::master::meta::inode::{InodeFile, InodePath};
-use crate::master::{Master, MasterMetrics, SyncWorkerManager};
+use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::MountOptions;
 use curvine_common::raft::RaftClient;
@@ -168,13 +167,7 @@ impl JournalWriter {
         self.send(JournalEntry::Rename(entry))
     }
 
-    pub fn log_delete<P: AsRef<str>>(
-        &self,
-        op_ms: u64,
-        path: P,
-        del_res: &DeleteResult,
-        mtime: i64,
-    ) -> FsResult<()> {
+    pub fn log_delete<P: AsRef<str>>(&self, op_ms: u64, path: P, mtime: i64) -> FsResult<()> {
         let entry = DeleteEntry {
             op_ms,
             path: path.as_ref().to_string(),

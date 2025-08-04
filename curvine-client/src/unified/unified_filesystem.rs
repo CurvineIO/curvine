@@ -286,7 +286,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
         match self.get_mount(path).await? {
             None => self.cv.delete(path, recursive).await,
             Some((path, mount)) => {
-                if let Some(_) = self.get_cache_status(&path).await? {
+                if (self.get_cache_status(&path).await?).is_some() {
                     self.cv.delete(&path, recursive).await?;
                 }
                 mount.ufs.delete(&path, recursive).await
