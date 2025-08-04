@@ -41,10 +41,16 @@ public class CurvineNative {
     public static final String LINUX_ID_PREFIX = "ID=";
     public static final String LINUX_VERSION_PREFIX = "VERSION_ID=";
 
+    // Split java.version on non-digit chars:
+    private static final int majorVersion =
+            Integer.parseInt(System.getProperty("java.version").split("\\D+")[0]);
+
     static {
         try {
             Class<?> cls = Class.forName("java.nio.DirectByteBuffer");
-            Constructor<?> constructor = cls.getDeclaredConstructor(Long.TYPE, Integer.TYPE);
+            Constructor<?> constructor = (majorVersion < 21) ?
+                    cls.getDeclaredConstructor(Long.TYPE, Integer.TYPE) :
+                    cls.getDeclaredConstructor(Long.TYPE, Long.TYPE);
             constructor.setAccessible(true);
             Field cleanerField = cls.getDeclaredField("cleaner");
             cleanerField.setAccessible(true);
