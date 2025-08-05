@@ -16,5 +16,18 @@
 # limitations under the License.
 #
 
+# curvine command line tool.
+
 source "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
-${CURVINE_HOME}/lib/curvine-cli "$@"
+export CLASSPATH=$(echo $CURVINE_HOME/lib/curvine-hadoop-*shade.jar | tr ' ' ':')
+
+# Choose whether to use a Java client or a Rust client according to the command
+if [ "$1" = "fs" ] || [ "$1" = "report" ]; then
+    # Use Java client to process file system commands
+    java -Xms256m -Xmx256m \
+    -Dcurvine.conf.dir=${CURVINE_HOME}/conf \
+    io.curvine.CurvineShell "$@"
+else
+    # Use the Rust client to process load-related commands
+    ${CURVINE_HOME}/lib/curvine-cli "$@"
+fi
