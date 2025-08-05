@@ -53,7 +53,7 @@ help:
 
 # 1. Format the project
 format:
-	$(SHELL_CMD) build/pre-commit.sh
+	$(SHELL_CMD) build/pre-commit.sh $(MODE)
 
 # 2. Build and package the project (depends on format)
 build: format

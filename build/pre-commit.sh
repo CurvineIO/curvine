@@ -15,6 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+# Process command parameters
+PROFILE=$1
+if [ -z "$PROFILE" ] || [ "$PROFILE" = "-r" ]; then
+    PROFILE="release"
+fi
 
 cargo clippy --release --fix --all-targets --allow-dirty --allow-staged --allow-no-vcs -- --deny warnings --allow clippy::uninlined-format-args
 
