@@ -1,7 +1,7 @@
 .PHONY: help format build cargo docker-build docker-build-img docker-build-cached fuse server cli ufs all
 
 # Build mode configuration (debug or release)
-MODE ?= debug
+MODE ?= release
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -22,7 +22,7 @@ help:
 	@echo "Curvine Build System - Available Commands:"
 	@echo ""
 	@echo "Building:"
-	@echo "  make build [MODE=debug|release]  - Format and build the entire project (default: debug)"
+	@echo "  make build [MODE=debug|release]  - Format and build the entire project (default: release)"
 	@echo "  make all                         - Same as 'make build'"
 	@echo "  make format                      - Format code using pre-commit hooks"
 	@echo ""
