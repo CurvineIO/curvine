@@ -34,6 +34,7 @@ For more detailed information, please refer to:
 - [Benchmark](https://curvineio.github.io/docs/category/benchmark)
 - [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
 - [Commit convention](COMMIT_CONVENTION.md)
+- [Contribute guidelines](CONTRIBUTING.md)
 
 ## Use Case
 ![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
@@ -206,6 +207,9 @@ Curvine performs excellently in high-concurrency scenarios and supports:
 - High-throughput data read and write
 - Low-latency operations
 - Large-scale concurrent connections
+
+## Contributing
+Please read Curvine [Contribute guidelines](CONTRIBUTING.md)
 
 ## 📜 License
 Curvine is licensed under the ​**​[Apache License 2.0](LICENSE)​**.
