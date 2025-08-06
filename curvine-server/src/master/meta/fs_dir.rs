@@ -14,6 +14,7 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::journal::{JournalEntry, JournalWriter};
+use crate::master::meta::inode::ttl_manager::InodeTtlManager;
 use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
@@ -27,42 +28,44 @@ use curvine_common::state::{
     WorkerAddress,
 };
 use curvine_common::FsResult;
-use log::info;
+use log::{info, warn};
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::mem;
+use std::sync::Arc;
 
-/// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
-    pub(crate) root_dir: InodeView,
-    pub(crate) inode_id: InodeId,
-    pub(crate) store: InodeStore,
-    pub(crate) journal_writer: JournalWriter,
+    pub root_dir: InodeView,
+    pub inode_id: InodeId,
+    pub store: InodeStore,
+    pub journal_writer: JournalWriter,
+    pub ttl_manager: Option<Arc<InodeTtlManager>>,
 }
 
 impl FsDir {
     pub fn new(conf: &ClusterConf, journal_writer: JournalWriter) -> FsResult<Self> {
         let db_conf = conf.meta_rocks_conf();
-
         let store = RocksInodeStore::new(db_conf, conf.format_master)?;
         let state = InodeStore::new(store);
-        let (last_inode_id, root_dir) = state.create_tree()?;
 
         let fs_dir = Self {
-            root_dir,
+            root_dir: Dir(InodeDir::new(ROOT_INODE_ID, ROOT_INODE_NAME, 0)),
             inode_id: InodeId::new(),
             store: state,
             journal_writer,
+            ttl_manager: None,
         };
-        fs_dir.update_last_inode_id(last_inode_id)?;
 
         Ok(fs_dir)
     }
-
     pub fn inode_store(&self) -> InodeStore {
         self.store.clone()
     }
+    pub fn set_root_dir(&mut self, root_dir: InodeView) {
+        self.root_dir = root_dir
+    }
+
     // Create root directory
     pub fn create_root() -> InodeView {
         Dir(InodeDir::new(ROOT_INODE_ID, ROOT_INODE_NAME, 0))
@@ -167,6 +170,14 @@ impl FsDir {
 
         // After deletion occurs, the target address cannot be used.
         let _ = parent.delete_child(child.id(), child.name())?;
+        if let Some(ttl_manager) = &self.ttl_manager {
+            if let Err(e) = ttl_manager.remove_ttl_tracking(child.id() as u64) {
+                warn!(
+                    "File TTL registration failed, but file creation continues: {}",
+                    e
+                );
+            }
+        }
         Ok(del_res)
     }
 
@@ -302,7 +313,16 @@ impl FsDir {
         // Update inode data.
         let added = parent.add_child(child)?;
         self.store.apply_add(parent.as_ref(), added.as_ref())?;
-        inp.append(added)?;
+        inp.append(added.clone())?;
+
+        if let Some(ttl_manager) = &self.ttl_manager {
+            if let Err(e) = ttl_manager.register_file_ttl(&added) {
+                warn!(
+                    "File TTL registration failed, but file creation continues: {}",
+                    e
+                );
+            }
+        }
 
         Ok(inp)
     }
@@ -564,7 +584,9 @@ impl FsDir {
 
     // Read data from rocksdb to build a directory tree
     pub fn create_tree(&self) -> CommonResult<InodeView> {
-        self.store.create_tree().map(|x| x.1)
+        self.store
+            .create_tree(self.ttl_manager.clone())
+            .map(|x| x.1)
     }
 
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
@@ -584,7 +606,7 @@ impl FsDir {
         spend.reset();
 
         // Update the directory tree
-        let (last_inode_id, root_dir) = self.store.create_tree()?;
+        let (last_inode_id, root_dir) = self.store.create_tree(self.ttl_manager.clone())?;
         self.root_dir = root_dir;
         self.update_last_inode_id(last_inode_id)?;
         let time2 = spend.used_ms();
@@ -784,5 +806,16 @@ impl FsDir {
         self.store
             .apply_symlink(parent.as_ref(), new_inode_ptr.as_ref())?;
         Ok(link)
+    }
+
+    pub fn init_ttl_manager(&mut self, ttl_manager: Arc<InodeTtlManager>) -> FsResult<()> {
+        self.ttl_manager = Some(ttl_manager);
+
+        let (last_inode_id, root_dir) = self.inode_store().create_tree(self.ttl_manager.clone())?;
+
+        self.set_root_dir(root_dir);
+        self.update_last_inode_id(last_inode_id)?;
+
+        Ok(())
     }
 }

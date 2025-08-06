@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::DeleteResult;
+use crate::master::meta::inode::ttl_manager::InodeTtlManager;
 use crate::master::meta::inode::{InodeFile, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::FsDir;
@@ -36,7 +37,6 @@ impl InodeStore {
             store: Arc::new(store),
         }
     }
-
     pub fn apply_add(&self, parent: &InodeView, child: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
@@ -172,7 +172,10 @@ impl InodeStore {
     }
 
     // Restore to a directory tree from rocksdb
-    pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
+    pub fn create_tree(
+        &self,
+        ttl_manager: Option<Arc<InodeTtlManager>>,
+    ) -> CommonResult<(i64, InodeView)> {
         let mut root = FsDir::create_root();
         let mut stack = LinkedList::new();
         stack.push_back((root.as_ptr(), ROOT_INODE_ID));
@@ -196,6 +199,10 @@ impl InodeStore {
                     let child_id = RocksUtils::i64_from_bytes(&value)?;
                     stack.push_back((next_parent.clone(), child_id))
                 }
+            }
+
+            if let Some(ref ttl_manager) = ttl_manager {
+                ttl_manager.register_file_ttl(&next_parent)?;
             }
         }
 

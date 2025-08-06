@@ -12,18 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::{HeartbeatChecker, MasterFilesystem};
+use crate::master::fs::heartbeat_checker::HeartbeatChecker;
+use crate::master::fs::master_filesystem::MasterFilesystem;
+use crate::master::meta::inode::ttl::ttl_manager::InodeTtlManager;
+use crate::master::meta::inode::ttl::ttl_scheduler::TtlHeartbeatChecker;
+use crate::master::meta::inode::ttl_scheduler::TtlHeartbeatConfig;
 use crate::master::MasterMonitor;
 use curvine_common::executor::ScheduledExecutor;
-use log::info;
+use log::{error, info};
 use orpc::runtime::GroupExecutor;
 use orpc::CommonResult;
 use std::sync::Arc;
 
 pub struct MasterActor {
-    fs: MasterFilesystem,
-    master_monitor: MasterMonitor,
-    executor: Arc<GroupExecutor>,
+    pub fs: MasterFilesystem,
+    pub master_monitor: MasterMonitor,
+    pub executor: Arc<GroupExecutor>,
 }
 
 impl MasterActor {
@@ -39,7 +43,7 @@ impl MasterActor {
         }
     }
 
-    pub fn start(&self) {
+    pub fn start(&mut self) {
         info!("start master actor");
         Self::start_heartbeat_checker(
             self.fs.clone(),
@@ -47,6 +51,47 @@ impl MasterActor {
             self.executor.clone(),
         )
         .unwrap();
+
+        if let Err(e) = self.start_ttl_scheduler() {
+            error!("Failed to start TTL scheduler: {}", e);
+        }
+    }
+    pub fn start_ttl_scheduler(&mut self) -> CommonResult<()> {
+        info!("Starting TTL scheduler with new architecture");
+        let ttl_manager = InodeTtlManager::create(self.fs.clone(), self.fs.conf.clone())
+            .map_err(|e| format!("Failed to create TTL system: {}", e))?;
+        let ttl_manager_arc = Arc::new(ttl_manager);
+
+        {
+            let fs_dir_lock = self.fs.fs_dir();
+            let mut fs_dir = fs_dir_lock.write();
+            let _ = fs_dir.init_ttl_manager(ttl_manager_arc.clone());
+        }
+
+        ttl_manager_arc.initialize()?;
+        self.start_ttl_heartbeat_checker(ttl_manager_arc)?;
+
+        info!("Inode ttl scheduler started successfully.");
+        Ok(())
+    }
+
+    fn start_ttl_heartbeat_checker(
+        &mut self,
+        ttl_manager: Arc<InodeTtlManager>,
+    ) -> CommonResult<()> {
+        info!("Starting inode ttl checker");
+        let ttl_config = TtlHeartbeatConfig {
+            task_name: "inode-ttl-checker".to_string(),
+            timeout_ms: self.fs.conf.ttl_checker_interval_ms() * 2,
+        };
+        let heartbeat_checker = TtlHeartbeatChecker::new(ttl_manager, ttl_config);
+        let scheduler = ScheduledExecutor::new(
+            "inode-ttl-checker".to_string(),
+            self.fs.conf.ttl_checker_interval_ms(),
+        );
+        scheduler.start(heartbeat_checker)?;
+        info!("Inode ttl checker started");
+        Ok(())
     }
 
     fn start_heartbeat_checker(

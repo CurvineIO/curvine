@@ -15,6 +15,7 @@
 #![allow(clippy::large_enum_variant)]
 
 use crate::master::meta::feature::AclFeature;
+use crate::master::meta::inode::ttl_types::TtlConfig;
 use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
@@ -56,7 +57,12 @@ impl InodeView {
             Dir(d) => d.id(),
         }
     }
-
+    pub fn ttl_config(&self) -> Option<TtlConfig> {
+        match self {
+            File(f) => TtlConfig::from_storage_policy(&f.storage_policy),
+            Dir(d) => TtlConfig::from_storage_policy(&d.storage_policy),
+        }
+    }
     pub fn name(&self) -> &str {
         match self {
             File(f) => f.name(),
