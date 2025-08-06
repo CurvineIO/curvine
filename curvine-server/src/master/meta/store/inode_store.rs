@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use crate::master::fs::DeleteResult;
+use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
+use crate::master::meta::inode::ttl_types::TtlInodeMetadata;
 use crate::master::meta::inode::{InodeFile, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::FsDir;
@@ -28,13 +30,19 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct InodeStore {
     pub(crate) store: Arc<RocksInodeStore>,
+    ttl_bucket_list: Arc<TtlBucketList>,
 }
 
 impl InodeStore {
-    pub fn new(store: RocksInodeStore) -> Self {
+    pub fn new(store: RocksInodeStore, ttl_bucket_list: Arc<TtlBucketList>) -> Self {
         InodeStore {
             store: Arc::new(store),
+            ttl_bucket_list,
         }
+    }
+
+    pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
+        self.ttl_bucket_list.clone()
     }
 
     pub fn apply_add(&self, parent: &InodeView, child: &InodeView) -> CommonResult<()> {
@@ -44,7 +52,20 @@ impl InodeStore {
         batch.write_inode(parent)?;
         batch.add_child(parent.id(), child.name(), child.id())?;
 
-        batch.commit()
+        batch.commit()?;
+
+        if let Some(ttl_config) = child.ttl_config() {
+            let metadata = TtlInodeMetadata::new(child.id() as u64, ttl_config.clone());
+            if let Err(e) = self.ttl_bucket_list.add_inode(&metadata) {
+                log::warn!(
+                    "Direct ttl registration failed for inode {}: {}",
+                    child.id(),
+                    e
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub fn apply_delete(&self, parent: &InodeView, del: &InodeView) -> CommonResult<DeleteResult> {
@@ -60,6 +81,10 @@ impl InodeStore {
             batch.delete_inode(inode.id())?;
             batch.delete_child(parent_id, inode.name())?;
             del_res.inodes += 1;
+
+            if let Err(e) = self.ttl_bucket_list.remove_inode(inode.id() as u64) {
+                log::warn!("Direct ttl removal failed for inode {}: {}", inode.id(), e);
+            }
 
             match inode {
                 InodeView::File(file) => {
@@ -110,7 +135,9 @@ impl InodeStore {
         batch.write_inode(src_parent)?;
         batch.write_inode(dst_parent)?;
 
-        batch.commit()
+        batch.commit()?;
+
+        Ok(())
     }
 
     pub fn apply_new_block(
@@ -155,10 +182,27 @@ impl InodeStore {
 
     pub fn apply_set_attr(&self, inodes: Vec<InodePtr>) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
-        for inode in inodes {
+        for inode in &inodes {
             batch.write_inode(inode.as_ref())?;
         }
-        batch.commit()
+        batch.commit()?;
+
+        for inode in &inodes {
+            let inode_id = inode.id() as u64;
+            let _ = self.ttl_bucket_list.remove_inode(inode_id);
+            if let Some(ttl_config) = inode.ttl_config() {
+                let metadata = TtlInodeMetadata::new(inode_id, ttl_config.clone());
+                if let Err(e) = self.ttl_bucket_list.add_inode(&metadata) {
+                    log::warn!(
+                        "Direct ttl re-registration failed for inode {}: {}",
+                        inode_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn apply_symlink(&self, parent: &InodeView, new_inode: &InodeView) -> CommonResult<()> {
@@ -168,7 +212,9 @@ impl InodeStore {
         batch.write_inode(new_inode)?;
         batch.add_child(parent.id(), new_inode.name(), new_inode.id())?;
 
-        batch.commit()
+        batch.commit()?;
+
+        Ok(())
     }
 
     // Restore to a directory tree from rocksdb
@@ -195,6 +241,17 @@ impl InodeStore {
                     let (_, value) = try_err!(item);
                     let child_id = RocksUtils::i64_from_bytes(&value)?;
                     stack.push_back((next_parent.clone(), child_id))
+                }
+            }
+
+            if let Some(ttl_config) = next_parent.ttl_config() {
+                let metadata = TtlInodeMetadata::new(next_parent.id() as u64, ttl_config.clone());
+                if let Err(e) = self.ttl_bucket_list.add_inode(&metadata) {
+                    log::warn!(
+                        "Direct ttl registration failed during tree creation for inode {}: {}",
+                        next_parent.id(),
+                        e
+                    );
                 }
             }
         }

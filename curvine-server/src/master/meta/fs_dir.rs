@@ -14,6 +14,7 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::journal::{JournalEntry, JournalWriter};
+use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
@@ -31,6 +32,7 @@ use orpc::common::{LocalTime, TimeSpent};
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::mem;
+use std::sync::Arc;
 
 /// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
@@ -41,11 +43,15 @@ pub struct FsDir {
 }
 
 impl FsDir {
-    pub fn new(conf: &ClusterConf, journal_writer: JournalWriter) -> FsResult<Self> {
+    pub fn new(
+        conf: &ClusterConf,
+        journal_writer: JournalWriter,
+        ttl_bucket_list: Arc<TtlBucketList>,
+    ) -> FsResult<Self> {
         let db_conf = conf.meta_rocks_conf();
 
         let store = RocksInodeStore::new(db_conf, conf.format_master)?;
-        let state = InodeStore::new(store);
+        let state = InodeStore::new(store, ttl_bucket_list);
         let (last_inode_id, root_dir) = state.create_tree()?;
 
         let fs_dir = Self {
@@ -78,6 +84,10 @@ impl FsDir {
     fn next_inode_id(&self) -> FsResult<i64> {
         let id = self.inode_id.next()?;
         Ok(id)
+    }
+
+    pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
+        self.store.get_ttl_bucket_list()
     }
 
     pub fn mkdir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {

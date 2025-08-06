@@ -16,7 +16,9 @@ use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 
 #[repr(i32)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, IntoPrimitive, FromPrimitive)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, IntoPrimitive, FromPrimitive, Eq,
+)]
 pub enum TtlAction {
     /// No action is performed.
     #[num_enum(default)]

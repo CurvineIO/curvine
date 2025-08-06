@@ -11,6 +11,14 @@ format_worker = false
 meta_dir = "testing/meta"
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 
+# TTL (Time-To-Live) configuration
+ttl_checker_interval = "1h"        # TTL checker execution interval
+ttl_checker_retry_attempts = 3     # Maximum retry attempts for failed TTL operations
+ttl_bucket_interval = "1h"         # TTL bucket time interval
+ttl_max_retry_duration = "30m"     # Maximum duration for retrying failed operations
+ttl_retry_interval = "5s"          # Interval between retry attempts
+ttl_cleanup_timeout = "30s"        # Timeout for individual cleanup operations
+
 # master loading function configuration
 [master.load]
 job_ttl_seconds = 1209600

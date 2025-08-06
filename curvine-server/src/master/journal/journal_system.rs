@@ -14,6 +14,7 @@
 
 use crate::master::fs::{MasterFilesystem, WorkerManager};
 use crate::master::journal::{JournalLoader, JournalWriter};
+use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::FsDir;
 use crate::master::{MasterMonitor, MetaRaftJournal, MountManager, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::ClusterConf;
@@ -84,7 +85,10 @@ impl JournalSystem {
         let role_monitor = RoleMonitor::new();
         let master_monitor = MasterMonitor::new(role_monitor.read_ctl(), StateCtl::new(0));
 
-        let fs_dir = SyncFsDir::new(FsDir::new(conf, journal_writer)?);
+        // Create TTL bucket list early with configuration
+        let ttl_bucket_list = Arc::new(TtlBucketList::new(conf.master.ttl_bucket_interval_ms()));
+
+        let fs_dir = SyncFsDir::new(FsDir::new(conf, journal_writer, ttl_bucket_list)?);
         let fs = MasterFilesystem::new(
             conf,
             fs_dir.clone(),

@@ -179,7 +179,7 @@ impl Master {
         Self::new(conf)
     }
 
-    pub async fn start(self) -> ServerStateListener {
+    pub async fn start(mut self) -> ServerStateListener {
         // step 1: Start journal_system, raft server and raft node will be started internally
         let mut listener = self.journal_system.start().await.unwrap();
         listener.wait_role().await.unwrap();
