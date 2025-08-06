@@ -245,6 +245,140 @@ impl CurvineFileSystem {
         Ok(res)
     }
 
+    /// Check if the current user has the requested access permissions
+    fn check_access_permissions(
+        &self,
+        status: &FileStatus,
+        current_uid: u32,
+        current_gid: u32,
+        mask: u32,
+    ) -> bool {
+        let file_uid = self.resolve_file_uid(&status.owner);
+        let file_gid = self.resolve_file_gid(&status.group);
+        let permission_bits = self.get_effective_permission_bits(
+            status.mode,
+            current_uid,
+            current_gid,
+            file_uid,
+            file_gid,
+        );
+
+        debug!(
+            "Access check: file_uid={}, file_gid={}, current_uid={}, current_gid={}, mode={:o}, permission_bits={:o}, mask={:o}",
+            file_uid, file_gid, current_uid, current_gid, status.mode, permission_bits, mask
+        );
+
+        let has_permission = self.check_permission_mask(permission_bits, mask);
+        debug!("Final access result: {}", has_permission);
+        has_permission
+    }
+
+    /// Resolve file owner UID from string (supports both numeric and username)
+    fn resolve_file_uid(&self, owner: &str) -> u32 {
+        if owner.is_empty() {
+            return self.conf.uid;
+        }
+
+        // Try to parse as numeric uid first
+        if let Ok(numeric_uid) = owner.parse::<u32>() {
+            return numeric_uid;
+        }
+
+        // If not numeric, try to lookup by username
+        match orpc::sys::get_uid_by_name(owner) {
+            Some(uid) => uid,
+            None => {
+                debug!(
+                    "Failed to resolve username '{}', using fallback UID {}",
+                    owner, self.conf.uid
+                );
+                self.conf.uid // Fallback to config uid
+            }
+        }
+    }
+
+    /// Resolve file group GID from string (supports both numeric and group name)
+    fn resolve_file_gid(&self, group: &str) -> u32 {
+        if group.is_empty() {
+            return self.conf.gid;
+        }
+
+        // Try to parse as numeric gid first
+        if let Ok(numeric_gid) = group.parse::<u32>() {
+            return numeric_gid;
+        }
+
+        // If not numeric, try to lookup by group name
+        match orpc::sys::get_gid_by_name(group) {
+            Some(gid) => gid,
+            None => {
+                debug!(
+                    "Failed to resolve group '{}', using fallback GID {}",
+                    group, self.conf.gid
+                );
+                self.conf.gid // Fallback to config gid
+            }
+        }
+    }
+
+    /// Determine which permission bits to check based on user relationship to file
+    fn get_effective_permission_bits(
+        &self,
+        mode: u32,
+        current_uid: u32,
+        current_gid: u32,
+        file_uid: u32,
+        file_gid: u32,
+    ) -> u32 {
+        if current_uid == file_uid {
+            // Owner permissions (bits 8-10)
+            (mode >> 6) & 0o7
+        } else if current_gid == file_gid {
+            // Group permissions (bits 5-7)
+            (mode >> 3) & 0o7
+        } else {
+            // Other permissions (bits 2-4)
+            mode & 0o7
+        }
+    }
+
+    /// Check if the permission bits satisfy the requested access mask
+    fn check_permission_mask(&self, permission_bits: u32, mask: u32) -> bool {
+        let mut has_permission = true;
+
+        // Check read permission (R_OK = 4)
+        if (mask & libc::R_OK as u32) != 0 {
+            let has_read = (permission_bits & 0o4) != 0;
+            has_permission = has_permission && has_read;
+            debug!(
+                "Read permission check: requested=true, granted={}",
+                has_read
+            );
+        }
+
+        // Check write permission (W_OK = 2)
+        if (mask & libc::W_OK as u32) != 0 {
+            let has_write = (permission_bits & 0o2) != 0;
+            has_permission = has_permission && has_write;
+            debug!(
+                "Write permission check: requested=true, granted={}",
+                has_write
+            );
+        }
+
+        // Check execute permission (X_OK = 1)
+        if (mask & libc::X_OK as u32) != 0 {
+            let has_execute = (permission_bits & 0o1) != 0;
+            has_permission = has_permission && has_execute;
+            debug!(
+                "Execute permission check: requested=true, granted={}",
+                has_execute
+            );
+        }
+
+        has_permission
+    }
+
     fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
         let owner = {
             // Try to get username from uid, fail if not found
@@ -631,7 +765,29 @@ impl fs::FileSystem for CurvineFileSystem {
 
     // This interface is not supported at present
     async fn access(&self, op: Access<'_>) -> FuseResult<()> {
-        let _ = self.state.get_path(op.header.nodeid)?;
+        let path = self.state.get_path(op.header.nodeid)?;
+
+        // Get file status to check permissions
+        let status = match self.fs.get_status(&path).await {
+            Ok(status) => status,
+            Err(e) => {
+                error!("Failed to get status for {}: {}", path, e);
+                return err_fuse!(libc::ENOENT, "File not found: {}", path);
+            }
+        };
+
+        // Get current user's UID and GID from the request header
+        let current_uid = op.header.uid;
+        let current_gid = op.header.gid;
+
+        // Get requested access mask
+        let mask = op.arg.mask;
+
+        // Check if user has the requested permissions
+        if !self.check_access_permissions(&status, current_uid, current_gid, mask) {
+            return err_fuse!(libc::EACCES, "Permission denied for {}", path);
+        }
+
         Ok(())
     }
 
