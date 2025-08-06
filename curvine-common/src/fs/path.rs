@@ -23,6 +23,8 @@ use std::path::MAIN_SEPARATOR;
 
 static SLASHES: Lazy<Regex> = Lazy::new(|| Regex::new(r"/+").unwrap());
 
+static MNT_SPLIT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?<!:)/").unwrap());
+
 #[derive(Debug, Clone)]
 pub struct Path {
     uri: Uri,
@@ -67,6 +69,10 @@ impl Path {
 
     pub fn is_root(&self) -> bool {
         self.path() == Self::SEPARATOR
+    }
+
+    pub fn is_cv(&self) -> bool {
+        matches!(self.scheme(), None | Some("cv"))
     }
 
     pub fn authority(&self) -> Option<&str> {
@@ -140,7 +146,12 @@ impl Path {
     }
 
     pub fn get_possible_mounts(&self) -> Vec<String> {
-        let splits: Vec<&str> = self.path().split(Self::SEPARATOR).collect();
+        let splits: Vec<&str> = if self.is_cv() {
+            self.path().split(Self::SEPARATOR).collect()
+        } else {
+            MNT_SPLIT_REGEX.split(self.full_path()).collect()
+        };
+
         let mut res = vec![];
         if splits.len() <= 1 {
             return res;

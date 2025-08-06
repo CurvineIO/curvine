@@ -62,8 +62,7 @@ message GetMountTableResponse {
 }
 
 message GetMountPointInfoRequest {
-    optional string ufs_path = 1;
-    optional string curvine_path = 2;
+    required string path = 1;
 }
 
 message GetMountPointInfoResponse {

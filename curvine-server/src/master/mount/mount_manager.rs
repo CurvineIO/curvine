@@ -17,12 +17,12 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::mount::MountTable;
 use crate::master::{self, SyncFsDir};
 use curvine_common::error::FsError;
-use curvine_common::fs::{self, CurvineURI};
+use curvine_common::fs::{self, CurvineURI, Path};
 use curvine_common::proto::{MountOptions, MountPointInfo};
 use curvine_common::state::MkdirOpts;
 use curvine_common::FsResult;
 use log::info;
-use orpc::err_box;
+use orpc::{err_box, try_option};
 use std::collections::HashMap;
 
 pub struct MountManager {
@@ -124,7 +124,7 @@ impl MountManager {
         );
 
         let mount_path = mount_uri.path().to_string();
-        let ufs_path = ufs_uri.normalize_uri().unwrap(); //already validate
+        let ufs_path = try_option!(ufs_uri.normalize_uri()); //already validate
         info!("normalize ufs uri : {}", ufs_path);
 
         //step2
@@ -238,16 +238,11 @@ impl MountManager {
     /**
      * use ufs_uri to find mount entry
      */
-    pub fn get_mount_point(&self, ufs_uri: &CurvineURI) -> FsResult<MountPointInfo> {
-        let ufs_path = match ufs_uri.normalize_uri() {
-            Some(ufs_path) => ufs_path,
-            None => return err_box!("invalid ufs_uri {}", ufs_uri),
-        };
-
-        let mount_entry = self.mount_table.get_mount_entry(&ufs_path)?;
+    pub fn get_mount_point(&self, path: &Path) -> FsResult<Option<MountPointInfo>> {
+        let mount_entry = self.mount_table.get_mount_entry(path)?;
 
         //trans to mountPointInfo
-        Ok(mount_entry.into())
+        Ok(mount_entry.map(|entry| entry.into()))
     }
 
     pub fn get_mount_table(&self) -> FsResult<Vec<MountPointInfo>> {

@@ -75,7 +75,7 @@ impl UfsManager {
         }
 
         let resp = self.curvine_client.get_mount_point(ufs_base_uri).await?;
-        match resp.mount_point {
+        match resp {
             Some(mount_point_info) => {
                 let mut table = self.mount_table.write().unwrap();
                 let ret = mount_point_info.clone();
