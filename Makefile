@@ -1,4 +1,4 @@
-.PHONY: help format build cargo docker-build docker-build-img docker-build-cached fuse server cli ufs all
+.PHONY: help check-env format build cargo docker-build docker-build-img docker-build-cached fuse server cli ufs all
 
 # Build mode configuration (debug or release)
 MODE ?= release
@@ -21,8 +21,11 @@ endif
 help:
 	@echo "Curvine Build System - Available Commands:"
 	@echo ""
+	@echo "Environment:"
+	@echo "  make check-env                   - Check build environment dependencies"
+	@echo ""
 	@echo "Building:"
-	@echo "  make build [MODE=debug|release]  - Format and build the entire project (default: release)"
+	@echo "  make build [MODE=debug|release]  - Check environment, format and build the entire project (default: release)"
 	@echo "  make all                         - Same as 'make build'"
 	@echo "  make format                      - Format code using pre-commit hooks"
 	@echo ""
@@ -51,26 +54,30 @@ help:
 	@echo "  make server MODE=release         - Build only server component in release mode"
 	@echo "  make cargo ARGS='test --verbose' - Run cargo test with verbose output"
 
-# 1. Format the project
+# 1. Check build environment dependencies
+check-env:
+	$(SHELL_CMD) build/check-env.sh
+
+# 2. Format the project
 format:
 	$(SHELL_CMD) build/pre-commit.sh
 
-# 2. Build and package the project (depends on format)
-build: format
+# 3. Build and package the project (depends on environment check and format)
+build: check-env format
 	$(SHELL_CMD) build/build.sh $(MODE)
 
-# 3. Other modules through cargo command
+# 4. Other modules through cargo command
 cargo:
 	cargo $(ARGS)
 
-# 4. Build through docker compilation image
+# 5. Build through docker compilation image
 docker-build:
 	docker run --rm -v $(PWD):/workspace -w /workspace curvine/curvine-compile:latest make all
 
 docker-build-cached:
 	docker run --rm -v $(PWD):/workspace -w /workspace curvine/curvine-compile:build-cached make all
 
-# 5. Build compilation image under curvine-docker
+# 6. Build compilation image under curvine-docker
 docker-build-img:
 	@echo "Please select the system type to build:"
 	@echo "1) Rocky Linux 9"
@@ -108,5 +115,5 @@ cli:
 ufs:
 	cargo build -p curvine-ufs $(CARGO_FLAGS)
 
-# 6. All in one
+# 7. All in one
 all: build

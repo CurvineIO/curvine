@@ -122,6 +122,7 @@ This project requires the following dependencies. Please ensure they are install
 
 ### 📋 Prerequisites
 
+- ​**GCC**: version 10 or later ([Installation Guide](https://gcc.gnu.org/install/))
 - ​**Rust**: version 1.86 or later ([Installation Guide](https://www.rust-lang.org/tools/install))
 - ​**Protobuf**: version 3.x
 - ​**Maven**: version 3.8 or later ([Install Guide](https://maven.apache.org/install.html))
@@ -129,6 +130,7 @@ This project requires the following dependencies. Please ensure they are install
 - ​**FUSE**: libfuse2 or libfuse3 development packages
 - ​**JDK**: version 1.8 or later (OpenJDK or Oracle JDK)
 - ​**npm**: version 9 or later ([Node.js Installation](https://nodejs.org/))
+- ​**Python**: version 3.7 or later ([Installation Guide](https://www.python.org/downloads/))
 
 You can either:
 1. Use the pre-configured `curvine-docker/compile/Dockerfile_rocky9` to build a compilation image

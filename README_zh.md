@@ -125,13 +125,15 @@ FSDataInputStream in = fs.open(new Path("/user/test/file.txt"));
 
 ### 📋 先决条件
 
-- ​**Rust**: 1.80 或更高版本 ([安装指南](https://www.rust-lang.org/tools/install))
-- ​**Protobuf**: 2.x 版本
+- ​**GCC**: 10 或更高版本 ([安装指南](https://gcc.gnu.org/install/))
+- ​**Rust**: 1.86 或更高版本 ([安装指南](https://www.rust-lang.org/tools/install))
+- ​**Protobuf**: 3.x 版本
 - ​**Maven**: 3.8 或更高版本 ([安装指南](https://maven.apache.org/install.html))
 - ​**LLVM**: 12 或更高版本 ([安装指南](https://llvm.org/docs/GettingStarted.html))
 - ​**FUSE**: libfuse2 或 libfuse3 开发包
 - ​**JDK**: 1.8 或更高版本 (OpenJDK 或 Oracle JDK)
 - ​**npm**: 9 或更高版本 ([Node.js 安装](https://nodejs.org/))
+- ​**Python**: 3.7 或更高版本 ([安装指南](https://www.python.org/downloads/))
 
 您可以选择：
 
