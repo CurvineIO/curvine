@@ -16,11 +16,12 @@ use crate::master::mount::MountPointEntry;
 use crate::master::SyncFsDir;
 use curvine_common::conf::{UfsConf, UfsConfBuilder};
 use curvine_common::error::FsError;
+use curvine_common::fs::Path;
 use curvine_common::proto::ConsistencyConfig;
 use curvine_common::proto::MountOptions;
 use curvine_common::FsResult;
 use log::info;
-use orpc::err_box;
+use orpc::{err_box, try_option};
 use rand::Rng;
 use std::collections::HashMap;
 use std::convert::Into;
@@ -263,17 +264,24 @@ impl MountTable {
         Ok(ufs_conf)
     }
 
-    pub fn get_mount_entry(&self, ufs_path: &String) -> FsResult<MountPointEntry> {
+    pub fn get_mount_entry(&self, path: &Path) -> FsResult<Option<MountPointEntry>> {
+        let list = path.get_possible_mounts();
+        let is_cv = path.is_cv();
         let inner = self.inner.read().unwrap();
 
-        for (existing_path, &id) in &inner.ufs2mountid {
-            if ufs_path.starts_with(existing_path) {
-                return self.get_mount_entry_by_id(id);
+        for mnt in list {
+            let option_id = if is_cv {
+                inner.mountpath2id.get(&mnt)
+            } else {
+                inner.ufs2mountid.get(&mnt)
+            };
+            if let Some(id) = option_id {
+                let entry = try_option!(inner.mountid2entry.get(id));
+                return Ok(Some(entry.clone()));
             }
         }
 
-        // If no match is found, an error is returned.
-        err_box!("failed found {}", ufs_path)
+        Ok(None)
     }
 
     pub fn get_mount_entry_by_id(&self, mount_id: u32) -> FsResult<MountPointEntry> {

@@ -42,7 +42,7 @@ impl LoadCommand {
         println!("Source path: {}", self.path);
 
         let rep = handle_rpc_result(client.get_mount_point(self.path.as_str())).await;
-        if rep.mount_point.is_none() {
+        if rep.is_none() {
             println!(
                 "Can not found mount point for path : {}, please mount first.",
                 self.path

@@ -18,8 +18,8 @@ use crate::master::SyncMountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
-use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
+use curvine_common::fs::{CurvineURI, Path};
 use curvine_common::proto::*;
 use curvine_common::state::{CreateFileOpts, FileStatus, HeartbeatStatus};
 use curvine_common::utils::ProtoUtils;
@@ -329,17 +329,12 @@ impl MasterHandler {
 
     fn get_mount_point(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: GetMountPointInfoRequest = ctx.parse_header()?;
-        let mut rep_header = GetMountPointInfoResponse::default();
-        if request.curvine_path.is_none() && request.ufs_path.is_none() {
-            return err_box!("either ufs_path or mnt_path need provided");
-        }
+        ctx.set_audit(Some(request.path.to_string()), None);
 
-        let uri = CurvineURI::new(request.ufs_path.unwrap());
-        if let Ok(ufs_path) = uri {
-            let mnt_mgr = self.mount_manager.read();
-            let ret = mnt_mgr.get_mount_point(&ufs_path)?;
-            rep_header.mount_point = Some(ret);
-        }
+        let mnt_mgr = self.mount_manager.read();
+        let path = Path::from_str(request.path)?;
+        let ret = mnt_mgr.get_mount_point(&path)?;
+        let rep_header = GetMountPointInfoResponse { mount_point: ret };
         ctx.response(rep_header)
     }
 
