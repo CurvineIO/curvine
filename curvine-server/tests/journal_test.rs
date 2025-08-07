@@ -22,12 +22,13 @@ use curvine_common::state::{
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{JournalLoader, JournalSystem};
 use curvine_server::master::mount::ConsistencyStrategy;
-use curvine_server::master::{Master, SyncMountManager};
+use curvine_server::master::{Master, MountManager};
 use log::info;
 use orpc::common::{Logger, TimeSpent};
 use orpc::io::net::NetUtils;
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -44,9 +45,8 @@ fn check_journal_state() -> CommonResult<()> {
 
     conf.change_test_meta_dir("meta-js1");
     let journal_system = JournalSystem::from_conf(&conf)?;
-    let fs_leader = MasterFilesystem::new(&conf, &journal_system)?;
+    let fs_leader = MasterFilesystem::with_js(&conf, &journal_system);
     let mnt_mgr1 = journal_system.mount_manager();
-    mnt_mgr1.write().set_master_fs(fs_leader.clone());
     fs_leader.add_test_worker(worker.clone());
 
     run(&fs_leader, &worker)?;
@@ -55,12 +55,11 @@ fn check_journal_state() -> CommonResult<()> {
     /************* Replay log from node **************/
     conf.change_test_meta_dir("meta-js2");
     let follower_journal_system = JournalSystem::from_conf(&conf)?;
-    let fs_follower = MasterFilesystem::new(&conf, &follower_journal_system)?;
+    let fs_follower = MasterFilesystem::with_js(&conf, &follower_journal_system);
     let mnt_mgr2 = follower_journal_system.mount_manager();
-    mnt_mgr2.write().set_master_fs(fs_follower.clone());
     let journal_loader = JournalLoader::new(fs_follower.fs_dir(), mnt_mgr2.clone(), &conf.journal);
 
-    let entries = journal_system.fs_dir().read().take_entries();
+    let entries = journal_system.fs().fs_dir.read().take_entries();
     info!("entries size {}", entries.len());
     for entry in entries {
         journal_loader.apply_entry(entry).unwrap();
@@ -71,8 +70,8 @@ fn check_journal_state() -> CommonResult<()> {
     assert_eq!(fs_leader.last_inode_id(), fs_follower.last_inode_id());
     assert_eq!(fs_leader.sum_hash(), fs_follower.sum_hash());
 
-    let leader_mnt = mnt_mgr1.read().get_mount_table().unwrap();
-    let follower_mnt = mnt_mgr2.read().get_mount_table().unwrap();
+    let leader_mnt = mnt_mgr1.get_mount_table().unwrap();
+    let follower_mnt = mnt_mgr2.get_mount_table().unwrap();
     assert_eq!(leader_mnt.len(), 1);
     assert_eq!(leader_mnt.len(), follower_mnt.len());
     assert_eq!(leader_mnt[0], follower_mnt[0]);
@@ -101,18 +100,16 @@ fn check_raft_state() -> CommonResult<()> {
     conf.change_test_meta_dir("raft-1");
     conf.journal.rpc_port = port1;
     let js1 = JournalSystem::from_conf(&conf).unwrap();
-    let fs1 = MasterFilesystem::new(&conf, &js1).unwrap();
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
     let mnt_mgr1 = js1.mount_manager();
-    mnt_mgr1.write().set_master_fs(fs1.clone());
     fs1.add_test_worker(worker.clone());
     let fs_monitor1 = js1.master_monitor();
 
     conf.change_test_meta_dir("raft-2");
     conf.journal.rpc_port = port2;
     let js2 = JournalSystem::from_conf(&conf).unwrap();
-    let fs2 = MasterFilesystem::new(&conf, &js2).unwrap();
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
     let mnt_mgr2 = js2.mount_manager();
-    mnt_mgr2.write().set_master_fs(fs2.clone());
     fs2.add_test_worker(worker.clone());
     let fs_monitor2 = js2.master_monitor();
 
@@ -154,8 +151,8 @@ fn check_raft_state() -> CommonResult<()> {
     assert_eq!(active.last_inode_id(), standby.last_inode_id());
     assert_eq!(active.sum_hash(), standby.sum_hash());
 
-    let leader_mnt = mnt_mgr1.read().get_mount_table().unwrap();
-    let follower_mnt = mnt_mgr2.read().get_mount_table().unwrap();
+    let leader_mnt = mnt_mgr1.get_mount_table().unwrap();
+    let follower_mnt = mnt_mgr2.get_mount_table().unwrap();
     assert_eq!(leader_mnt.len(), 1);
     assert_eq!(leader_mnt.len(), follower_mnt.len());
     assert_eq!(leader_mnt[0], follower_mnt[0]);
@@ -217,10 +214,10 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     Ok(())
 }
 
-fn run_mnt(mnt_mgr: SyncMountManager) -> CommonResult<()> {
+fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
     /************* Master node execution log **************/
     //mount oss://cluster1/ -> /x/y/z
-    let mgr = mnt_mgr.read();
+    let mgr = mnt_mgr;
     let mount_uri = CurvineURI::new("/x/y/z")?;
     let ufs_uri = CurvineURI::new("oss://cluster1/")?;
     let mut config = HashMap::new();
@@ -268,9 +265,8 @@ fn test_restart() -> CommonResult<()> {
 
     conf.change_test_meta_dir("meta-test-restart");
     let js = JournalSystem::from_conf(&conf)?;
-    let fs = MasterFilesystem::new(&conf, &js)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
     let mnt_mgr = js.mount_manager();
-    mnt_mgr.write().set_master_fs(fs.clone());
     fs.add_test_worker(worker.clone());
 
     fs.mkdir("/a", false)?;
@@ -278,7 +274,7 @@ fn test_restart() -> CommonResult<()> {
 
     assert!(fs.exists("/a")?);
 
-    let leader_mnt = mnt_mgr.read().get_mount_table().unwrap();
+    let leader_mnt = mnt_mgr.get_mount_table().unwrap();
     assert_eq!(leader_mnt.len(), 1);
 
     // Create a snapshot manually.
@@ -291,12 +287,11 @@ fn test_restart() -> CommonResult<()> {
     conf.format_master = false;
     let js = JournalSystem::from_conf(&conf)?;
     js.apply_snapshot()?;
-    let fs = MasterFilesystem::new(&conf, &js)?;
+    let fs = MasterFilesystem::with_js(&conf, &js);
     let mnt_mgr = js.mount_manager();
-    mnt_mgr.write().set_master_fs(fs.clone());
     fs.add_test_worker(worker.clone());
     assert!(fs.exists("/a")?);
-    let leader_mnt = mnt_mgr.read().get_mount_table().unwrap();
+    let leader_mnt = mnt_mgr.get_mount_table().unwrap();
     assert_eq!(leader_mnt.len(), 1);
 
     Ok(())

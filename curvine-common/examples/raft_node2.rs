@@ -14,7 +14,7 @@
 
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::storage::{RocksAppStorage, RocksLogStorage};
-use curvine_common::raft::{RaftJournal, RaftPeer};
+use curvine_common::raft::{RaftJournal, RaftPeer, RoleMonitor};
 use log::info;
 use orpc::common::{Logger, Utils};
 use orpc::runtime::RpcRuntime;
@@ -39,7 +39,13 @@ fn main() -> CommonResult<()> {
 
     let log_store = RocksLogStorage::from_conf(&conf, true);
     let app_store: RocksAppStorage<String, String> = RocksAppStorage::new("../target/data/raft-2");
-    let raft = RaftJournal::new(rt.clone(), log_store, app_store.clone(), conf.clone());
+    let raft = RaftJournal::new(
+        rt.clone(),
+        log_store,
+        app_store.clone(),
+        RoleMonitor::new(),
+        conf.clone(),
+    );
 
     rt.spawn(async move {
         raft.run_candidate().await.unwrap();
