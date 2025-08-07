@@ -19,7 +19,7 @@ use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::{
     AppStorage, HashAppStorage, LogStorage, MemLogStorage, RocksLogStorage,
 };
-use curvine_common::raft::{RaftClient, RaftJournal};
+use curvine_common::raft::{RaftClient, RaftJournal, RoleMonitor};
 use curvine_common::utils::SerdeUtils;
 use orpc::common::{Logger, Utils};
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -104,7 +104,13 @@ where
     T: LogStorage + Send + Sync + 'static,
 {
     let app_store: HashAppStorage<String, String> = HashAppStorage::new();
-    let raft = RaftJournal::new(rt.clone(), log_store, app_store.clone(), conf.clone());
+    let raft = RaftJournal::new(
+        rt.clone(),
+        log_store,
+        app_store.clone(),
+        conf.clone(),
+        RoleMonitor::new(),
+    );
 
     rt.spawn(async move {
         raft.run().await.unwrap();

@@ -148,15 +148,17 @@ public class CurvineNative {
             return;
         } catch (UnsatisfiedLinkError e) {
             // pass
+            LOGGER.warn("xxx {} {}", libraryName, e);
         }
 
-try {
+        try {
             // Load from the jar package.
             String libraryPath = loadLibraryFromJar(libraryName);
             System.load(libraryPath);
             LOGGER.info("Loaded lib by jar from path {}", libraryPath);
             return;
         } catch (Throwable e) {
+            LOGGER.warn("xxx {} {}", libraryName, e);
             lastException = e;
         }
 
@@ -170,6 +172,7 @@ try {
             LOGGER.info("Loaded {} by System.loadLibrary", filename);
             System.load(filename);
         } catch (Throwable e) {
+            LOGGER.warn("xxx {} {}", libraryName, e);
             throw new RuntimeException(e);
         }
     }
@@ -196,7 +199,7 @@ try {
             temp.deleteOnExit();
         }
 
-        try (final InputStream is = CurvineNative.class.getClassLoader().getResourceAsStream(libraryName)) {
+        try (final InputStream is = CurvineNative.class.getClassLoader().getResourceAsStream("/" + libraryName)) {
             if (is == null) {
                 throw new RuntimeException(libraryName + " was not found inside JAR.");
             } else {

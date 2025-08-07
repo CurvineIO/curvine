@@ -36,7 +36,13 @@ where
     A: LogStorage,
     B: AppStorage,
 {
-    pub fn new(rt: Arc<Runtime>, log_store: A, app_store: B, conf: JournalConf) -> Self {
+    pub fn new(
+        rt: Arc<Runtime>,
+        log_store: A,
+        app_store: B,
+        conf: JournalConf,
+        role_monitor: RoleMonitor,
+    ) -> Self {
         // Create a raft client manager.
         let logger = Self::create_slog(&conf);
 
@@ -44,7 +50,7 @@ where
             rt,
             log_store,
             app_store,
-            role_monitor: RoleMonitor::new(),
+            role_monitor,
             conf,
             logger,
         }

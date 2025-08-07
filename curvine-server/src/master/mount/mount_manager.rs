@@ -26,28 +26,17 @@ use orpc::{err_box, try_option};
 use std::collections::HashMap;
 
 pub struct MountManager {
-    master_fs: Option<MasterFilesystem>,
+    master_fs: MasterFilesystem,
     mount_table: MountTable,
 }
 
 impl MountManager {
     pub fn new(master_fs: MasterFilesystem) -> Self {
-        let fs_dir = master_fs.fs_dir();
+        let fs_dir = master_fs.fs_dir.clone();
         MountManager {
-            master_fs: Some(master_fs),
+            master_fs,
             mount_table: MountTable::new(fs_dir),
         }
-    }
-
-    pub fn new_partial(fs_dir: SyncFsDir) -> Self {
-        MountManager {
-            master_fs: None,
-            mount_table: MountTable::new(fs_dir),
-        }
-    }
-
-    pub fn set_master_fs(&mut self, master_fs: MasterFilesystem) {
-        self.master_fs = Some(master_fs);
     }
 
     /// recovery mount points from store
@@ -89,7 +78,7 @@ impl MountManager {
     }
 
     fn create_mount_point(&self, mount_path: &String) -> FsResult<bool> {
-        let exist = self.master_fs.as_ref().unwrap().exists(mount_path)?;
+        let exist = self.master_fs.exists(mount_path)?;
         if exist {
             info!("mount point {} already exists", mount_path);
             return Ok(true);
@@ -97,10 +86,7 @@ impl MountManager {
 
         info!("try create mount point {}", mount_path);
         let opts = MkdirOpts::with_create(true);
-        self.master_fs
-            .as_ref()
-            .unwrap()
-            .mkdir_with_opts(mount_path, opts)?;
+        self.master_fs.mkdir_with_opts(mount_path, opts)?;
         Ok(true)
     }
 

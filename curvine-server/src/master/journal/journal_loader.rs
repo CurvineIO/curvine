@@ -18,7 +18,7 @@ use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
 use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::mount::MountPointEntry;
-use crate::master::{SyncFsDir, SyncMountManager};
+use crate::master::{MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::fs::CurvineURI;
 use curvine_common::proto::raft::SnapshotData;
@@ -37,14 +37,14 @@ use std::{fs, mem};
 #[derive(Clone)]
 pub struct JournalLoader {
     fs_dir: SyncFsDir,
-    mnt_mgr: SyncMountManager,
+    mnt_mgr: Arc<MountManager>,
     seq_id: Arc<AtomicCounter>,
     retain_checkpoint_num: usize,
     ignore_replay_error: bool,
 }
 
 impl JournalLoader {
-    pub fn new(fs_dir: SyncFsDir, mnt_mgr: SyncMountManager, conf: &JournalConf) -> Self {
+    pub fn new(fs_dir: SyncFsDir, mnt_mgr: Arc<MountManager>, conf: &JournalConf) -> Self {
         Self {
             fs_dir,
             mnt_mgr,
@@ -156,12 +156,12 @@ impl JournalLoader {
     }
 
     pub fn mount(&self, entry: MountEntry) -> CommonResult<()> {
-        let mnt_mgr = self.mnt_mgr.read();
         let mnt_opt = entry.mnt_opt;
 
         let curvine_uri = CurvineURI::new(entry.mnt_path.clone()).unwrap();
         let ufs_uri = CurvineURI::new(entry.ufs_path.clone()).unwrap();
-        mnt_mgr.mount(Some(entry.id), &curvine_uri, &ufs_uri, &mnt_opt)?;
+        self.mnt_mgr
+            .mount(Some(entry.id), &curvine_uri, &ufs_uri, &mnt_opt)?;
 
         let moint_point = MountPointEntry::new(
             entry.id,
@@ -175,8 +175,7 @@ impl JournalLoader {
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
-        let mnt_mgr = self.mnt_mgr.read();
-        mnt_mgr.unmount_by_id(entry.id)?;
+        self.mnt_mgr.unmount_by_id(entry.id)?;
 
         let mut fs_dir = self.fs_dir.write();
         fs_dir.unmount(entry.id)?;
@@ -294,8 +293,7 @@ impl AppStorage for JournalLoader {
             fs_dir.restore(&data.dir)?;
         }
         {
-            let mnt_mgr = self.mnt_mgr.write();
-            mnt_mgr.restore();
+            self.mnt_mgr.restore();
         }
         Ok(())
     }
