@@ -23,8 +23,6 @@ use std::path::MAIN_SEPARATOR;
 
 static SLASHES: Lazy<Regex> = Lazy::new(|| Regex::new(r"/+").unwrap());
 
-static MNT_SPLIT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?<!:)/").unwrap());
-
 #[derive(Debug, Clone)]
 pub struct Path {
     uri: Uri,
@@ -146,28 +144,27 @@ impl Path {
     }
 
     pub fn get_possible_mounts(&self) -> Vec<String> {
-        let splits: Vec<&str> = if self.is_cv() {
-            self.path().split(Self::SEPARATOR).collect()
-        } else {
-            MNT_SPLIT_REGEX.split(self.full_path()).collect()
+        let parts: Vec<&str> = self.path().split(Self::SEPARATOR).collect();
+        let mut result = Vec::new();
+
+        if parts.is_empty() {
+            return result;
+        }
+
+        let mut current_path = match self.scheme() {
+            Some(v) => format!("{}://{}", v, self.authority().unwrap_or("")),
+            None => String::from("/"),
         };
 
-        let mut res = vec![];
-        if splits.len() <= 1 {
-            return res;
-        }
-
-        let mut p = Self::SEPARATOR.to_owned();
-        for item in &splits[1..] {
-            p = if p == Self::SEPARATOR {
-                format!("{}{}", Self::SEPARATOR, item)
-            } else {
-                format!("{}{}{}", p, Self::SEPARATOR, item)
+        for part in parts {
+            if !current_path.ends_with('/') {
+                current_path.push('/');
             };
-            res.push(p.to_owned());
+            current_path.push_str(part);
+            result.push(current_path.clone());
         }
 
-        res
+        result
     }
 }
 
@@ -254,8 +251,15 @@ mod tests {
         let p1 = Path::from_str("/a/b/c")?;
         let mnts = p1.get_possible_mounts();
         println!("{:?}", mnts);
-        assert_eq!(mnts, Vec::from(["/a", "/a/b", "/a/b/c"]));
+        assert_eq!(mnts, Vec::from(["/", "/a", "/a/b", "/a/b/c"]));
 
+        let p1 = Path::from_str("s3://bucket/a/b")?;
+        let mnts = p1.get_possible_mounts();
+        println!("{:?}", mnts);
+        assert_eq!(
+            mnts,
+            Vec::from(["s3://bucket/", "s3://bucket/a", "s3://bucket/a/b"])
+        );
         Ok(())
     }
 

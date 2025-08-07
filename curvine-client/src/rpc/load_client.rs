@@ -15,9 +15,10 @@
 use crate::file::FsClient;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    CancelLoadRequest, CancelLoadResponse, GetLoadStatusRequest, GetLoadStatusResponse, LoadJobRequest, LoadJobResponse, MountPointInfo,
+    CancelLoadRequest, CancelLoadResponse, GetLoadStatusRequest, GetLoadStatusResponse,
+    LoadJobRequest, LoadJobResponse, MountPointInfo,
 };
-use orpc::{try_option, CommonResult};
+use orpc::CommonResult;
 use std::sync::Arc;
 
 /// Master RPC client
@@ -75,8 +76,8 @@ impl LoadClient {
 
         Ok(rep)
     }
-    pub async fn get_mount_point(&self, path: &str) -> CommonResult<MountPointInfo> {
+    pub async fn get_mount_point(&self, path: &str) -> CommonResult<Option<MountPointInfo>> {
         let rep = self.rpc_client.get_mount_point(path).await?;
-        Ok(try_option!(rep))
+        Ok(rep)
     }
 }

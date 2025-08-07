@@ -70,12 +70,15 @@ public class FilesystemConf {
     public String read_ahead_len = "0";
     public String drop_cache_len = "1MB";
 
-    public boolean enable_local_cache = false;
-    public String local_cache_type = "mem";
-    public String local_cache_size = "1GB";
-    public String local_cache_ttl = "30m";
-
     public String failed_worker_ttl = "10m";
+
+    public boolean enable_unified_fs  = true;
+
+    public boolean enable_read_ufs  = false;
+
+    public int umask = 022;
+
+    public String mount_update_ttl = "5m";
 
     // Log configuration, default to standard output.
     public String log_level = "info";
@@ -188,14 +191,14 @@ public class FilesystemConf {
                 ", io_threads=" + io_threads +
                 ", worker_threads=" + worker_threads +
                 ", replicas=" + replicas +
-                ", block_size=" + block_size +
+                ", block_size='" + block_size + '\'' +
                 ", short_circuit=" + short_circuit +
-                ", write_chunk_size=" + write_chunk_size +
+                ", write_chunk_size='" + write_chunk_size + '\'' +
                 ", write_chunk_num=" + write_chunk_num +
-                ", read_chunk_size=" + read_chunk_size +
+                ", read_chunk_size='" + read_chunk_size + '\'' +
                 ", read_chunk_num=" + read_chunk_num +
                 ", read_parallel=" + read_parallel +
-                ", read_slice_size=" + read_slice_size +
+                ", read_slice_size='" + read_slice_size + '\'' +
                 ", close_reader_limit=" + close_reader_limit +
                 ", storage_type='" + storage_type + '\'' +
                 ", ttl_ms=" + ttl_ms +
@@ -212,13 +215,13 @@ public class FilesystemConf {
                 ", data_timeout_ms=" + data_timeout_ms +
                 ", master_conn_pool_size=" + master_conn_pool_size +
                 ", enable_read_ahead=" + enable_read_ahead +
-                ", read_ahead_len=" + read_ahead_len +
-                ", drop_cache_len=" + drop_cache_len +
-                ", enable_local_cache=" + enable_local_cache +
-                ", local_cache_type='" + local_cache_type + '\'' +
-                ", local_cache_size='" + local_cache_size + '\'' +
-                ", local_cache_ttl='" + local_cache_ttl + '\'' +
+                ", read_ahead_len='" + read_ahead_len + '\'' +
+                ", drop_cache_len='" + drop_cache_len + '\'' +
                 ", failed_worker_ttl='" + failed_worker_ttl + '\'' +
+                ", enable_unified_fs=" + enable_unified_fs +
+                ", enable_read_ufs=" + enable_read_ufs +
+                ", umask=" + umask +
+                ", mount_update_ttl='" + mount_update_ttl + '\'' +
                 ", log_level='" + log_level + '\'' +
                 ", log_dir='" + log_dir + '\'' +
                 ", log_file_name='" + log_file_name + '\'' +

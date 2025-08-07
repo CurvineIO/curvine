@@ -266,4 +266,5 @@ try {
 
     public static native byte[] getMasterInfo(long nativeHandle) throws IOException;
 
+    public static native byte[] getMountPoint(long nativeHandle, String path) throws IOException;
 }

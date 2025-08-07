@@ -131,4 +131,10 @@ public class CurvineFsMount {
         checkError(bytes);
         return bytes;
     }
+
+    public byte[] getMountPoint(String path) throws IOException {
+        byte[] bytes = CurvineNative.getMountPoint(nativeHandle, path);
+        checkError(bytes);
+        return bytes;
+    }
 }

@@ -122,18 +122,6 @@ pub struct ClientConf {
     #[serde(alias = "drop_cache_len")]
     pub drop_cache_len_str: String,
 
-    // Local cache settings.
-    pub enable_local_cache: bool,
-    pub local_cache_type: String,
-    #[serde(skip)]
-    pub local_cache_size: u64,
-    #[serde(alias = "local_cache_size")]
-    pub local_cache_size_str: String,
-    #[serde(skip)]
-    pub local_cache_ttl: Duration,
-    #[serde(alias = "local_cache_ttl")]
-    pub local_cache_ttl_str: String,
-
     // Worker blacklist survival time
     #[serde(skip)]
     pub failed_worker_ttl: Duration,
@@ -142,6 +130,9 @@ pub struct ClientConf {
 
     // Whether to enable the unified file system
     pub enable_unified_fs: bool,
+    // If the cache hits, read data from Curvine.
+    // If the cache misses, determine whether to allow Curvine to directly read data from the unified file system (UFS).
+    pub enable_read_ufs: bool,
 
     // Mount information update interval
     #[serde(skip)]
@@ -184,10 +175,6 @@ impl ClientConf {
         if self.read_chunk_num <= 1 || self.read_ahead_len < Self::LONG_READ_THRESHOLD_LEN {
             self.enable_read_ahead = false
         }
-
-        // Handle local cache.
-        self.local_cache_size = ByteUnit::from_str(&self.local_cache_size_str)?.as_byte();
-        self.local_cache_ttl = DurationUnit::from_str(&self.local_cache_ttl_str)?.as_duration();
 
         self.failed_worker_ttl = DurationUnit::from_str(&self.failed_worker_ttl_str)?.as_duration();
         self.mount_update_ttl = DurationUnit::from_str(&self.mount_update_ttl_str)?.as_duration();
@@ -285,17 +272,11 @@ impl Default for ClientConf {
             drop_cache_len: 0,
             drop_cache_len_str: "1MB".to_string(),
 
-            enable_local_cache: false,
-            local_cache_type: "MEM".to_string(),
-            local_cache_size: 0,
-            local_cache_size_str: "1GB".to_owned(),
-            local_cache_ttl: Duration::default(),
-            local_cache_ttl_str: "30m".to_owned(),
-
             failed_worker_ttl: Duration::default(),
             failed_worker_ttl_str: "10m".to_owned(),
 
             enable_unified_fs: true,
+            enable_read_ufs: true,
 
             mount_update_ttl: Default::default(),
             mount_update_ttl_str: "10m".to_string(),

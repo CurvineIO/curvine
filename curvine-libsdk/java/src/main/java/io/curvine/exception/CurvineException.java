@@ -14,30 +14,24 @@
 
 package io.curvine.exception;
 
-import java.io.FileNotFoundException;
 import java.io.IOException;
 
 public class CurvineException extends IOException {
-    public final static int FILE_NOT_FOUND = 8;
+    public final static int FILE_EXPIRED = 21;
+
+    private final int errno;
 
     public CurvineException(String message) {
         super(message);
+        errno = 10000;
     }
 
     public CurvineException(int errno, String message) {
         super(String.format("[errno %s] %s", errno, message));
+        this.errno = errno;
     }
 
-    public CurvineException(Throwable e) {
-       super(e);
-    }
-
-    public static IOException create(int errno, String message) {
-        switch (errno) {
-            case FILE_NOT_FOUND:
-                return new FileNotFoundException(message);
-            default:
-                return new CurvineException(errno, message);
-        }
+    public boolean isExpired() {
+        return errno == FILE_EXPIRED;
     }
 }
