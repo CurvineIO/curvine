@@ -69,7 +69,7 @@ pub fn validate_path_and_configs(
 }
 
 pub fn validate_s3_path(path: &str) -> Result<(), String> {
-    let (bucket, key) = extract_s3_bucket_and_key(path)
+    let (bucket, _) = extract_s3_bucket_and_key(path)
         .ok_or_else(|| format!("Invalid S3 path format: {}", path))?;
 
     if bucket.is_empty() {
@@ -84,10 +84,6 @@ pub fn validate_s3_path(path: &str) -> Result<(), String> {
             "S3 bucket name contains invalid characters: {}",
             bucket
         ));
-    }
-
-    if key.is_empty() {
-        return Err("S3 object key cannot be empty".to_string());
     }
 
     Ok(())
