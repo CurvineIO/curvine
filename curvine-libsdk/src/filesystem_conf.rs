@@ -80,11 +80,6 @@ pub struct FilesystemConf {
 
     pub drop_cache_len: String,
 
-    pub enable_local_cache: bool,
-    pub local_cache_type: String,
-    pub local_cache_ttl: String,
-    pub local_cache_size: String,
-
     // Log configuration
     pub log_level: String,
     pub log_dir: String,
@@ -94,6 +89,11 @@ pub struct FilesystemConf {
     pub display_position: bool,
 
     pub failed_worker_ttl: String,
+
+    pub enable_unified_fs: bool,
+    pub enable_read_ufs: bool,
+
+    pub mount_update_ttl: String,
 }
 
 impl FilesystemConf {
@@ -157,13 +157,6 @@ impl FilesystemConf {
             drop_cache_len: 0,
             drop_cache_len_str: self.drop_cache_len,
 
-            enable_local_cache: self.enable_local_cache,
-            local_cache_type: self.local_cache_type,
-            local_cache_size: 0,
-            local_cache_size_str: self.local_cache_size,
-            local_cache_ttl: Duration::default(),
-            local_cache_ttl_str: self.local_cache_ttl,
-
             storage_type: self.storage_type,
             ttl_ms: self.ttl_ms,
             ttl_action: self.ttl_action,
@@ -174,6 +167,11 @@ impl FilesystemConf {
 
             failed_worker_ttl: Duration::default(),
             failed_worker_ttl_str: self.failed_worker_ttl,
+
+            enable_unified_fs: self.enable_read_ufs,
+            enable_read_ufs: self.enable_read_ufs,
+            mount_update_ttl_str: self.mount_update_ttl,
+
             ..Default::default()
         };
 

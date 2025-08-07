@@ -169,7 +169,7 @@ fn mount_test() -> CommonResult<()> {
         // get mountpoint
         let mountpoint_resp = client.get_mount_point(s3_path).await?;
         info!("MountPoint: {:?}", mountpoint_resp);
-        let mountpoint = mountpoint_resp.mount_point.unwrap();
+        let mountpoint = mountpoint_resp.unwrap();
         assert_eq!(
             mountpoint.curvine_path, s3_mnt_path,
             "mnt path should be {}, actural {}",
@@ -179,7 +179,7 @@ fn mount_test() -> CommonResult<()> {
         let s3_path = "s3://flink/savepoints/ab";
         let mountpoint_resp = client.get_mount_point(s3_path).await?;
         info!("MountPoint: {:?}", mountpoint_resp);
-        let mountpoint = mountpoint_resp.mount_point.unwrap();
+        let mountpoint = mountpoint_resp.unwrap();
         assert_eq!(
             mountpoint.curvine_path, s3_mnt_path,
             "mnt path should be {}, actural {}",

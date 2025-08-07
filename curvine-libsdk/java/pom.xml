@@ -357,6 +357,8 @@
                         <include>common.proto</include>
                         <include>master.proto</include>
                         <include>worker.proto</include>
+                        <include>mount.proto</include>
+                        <include>load.proto</include>
                     </includes>
                     <skip>false</skip>
                 </configuration>

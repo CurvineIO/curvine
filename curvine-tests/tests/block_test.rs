@@ -87,8 +87,6 @@ fn remote_parallel_4_cache() -> CommonResult<()> {
     conf.client.read_chunk_num = 4;
     conf.client.read_parallel = 4;
     conf.client.read_chunk_size = 65536;
-    conf.client.enable_local_cache = true;
-    conf.client.local_cache_size = 100 * 1024 * 1024;
 
     let path = Path::from_str("/file_remote_parallel_4_cache.data")?;
     run(conf, path)

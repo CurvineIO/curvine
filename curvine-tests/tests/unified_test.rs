@@ -33,6 +33,7 @@ fn run() -> CommonResult<()> {
 
     rt.block_on(async {
         mount(&fs).await.unwrap();
+        get_mount(&fs).await.unwrap();
 
         let data = "test unified_fs";
         write(&fs, &path, data).await.unwrap();
@@ -46,6 +47,12 @@ fn run() -> CommonResult<()> {
     Ok(())
 }
 
+async fn get_mount(fs: &UnifiedFileSystem) -> FsResult<()> {
+    let path = Path::from_str("s3://flink/xuen-test")?;
+    let res = fs.cv().get_mount_point(&path).await?;
+    println!("res {:?}", res);
+    Ok(())
+}
 async fn mount(fs: &UnifiedFileSystem) -> FsResult<()> {
     let s3_conf = Testing::get_s3_conf().unwrap();
     let opts = MountOptions {
@@ -55,8 +62,8 @@ async fn mount(fs: &UnifiedFileSystem) -> FsResult<()> {
         cache_ttl_secs: Some(3600),
         consistency_config: None,
     };
-    let ufs_path = "s3://flink/".into();
-    let cv_path = "/s3".into();
+    let ufs_path = "s3://flink/xuen-test".into();
+    let cv_path = "/xuen-test".into();
     fs.mount(&ufs_path, &cv_path, opts).await?;
     Ok(())
 }

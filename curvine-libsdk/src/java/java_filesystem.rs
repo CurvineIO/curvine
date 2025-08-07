@@ -96,4 +96,11 @@ impl JavaFilesystem {
         let byte_arr = JavaUtils::new_jarray(env, &status)?;
         Ok(byte_arr)
     }
+
+    pub fn get_mount_point(&self, env: &mut JNIEnv, path: JString) -> FsResult<jarray> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        let bytes = self.inner.get_mount_point(path)?;
+        let byte_arr = JavaUtils::new_jarray(env, &bytes)?;
+        Ok(byte_arr)
+    }
 }

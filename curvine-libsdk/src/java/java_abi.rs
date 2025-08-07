@@ -247,3 +247,14 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getMasterInfo(
     let fs = &*fs_ptr;
     java_err2!(env, fs.get_master_info(&mut env))
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getMountPoint(
+    mut env: JNIEnv,
+    _this: JObject,
+    fs_ptr: *mut JavaFilesystem,
+    path: JString,
+) -> jarray {
+    let fs = &*fs_ptr;
+    java_err2!(env, fs.get_mount_point(&mut env, path))
+}
