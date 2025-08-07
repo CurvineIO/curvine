@@ -14,10 +14,8 @@
 
 package io.curvine;
 
-import io.curvine.proto.FileStatusProto;
-import io.curvine.proto.GetFileStatusResponse;
-import io.curvine.proto.GetMasterInfoResponse;
-import io.curvine.proto.ListStatusResponse;
+import io.curvine.exception.CurvineException;
+import io.curvine.proto.*;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -26,6 +24,8 @@ import org.apache.hadoop.conf.StorageSize;
 import org.apache.hadoop.fs.*;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.util.Progressable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URI;
@@ -36,6 +36,8 @@ import java.net.URI;
 @InterfaceAudience.Public
 @InterfaceStability.Unstable
 public class CurvineFileSystem extends FileSystem {
+    public static final Logger LOGGER = LoggerFactory.getLogger(CurvineFileSystem.class);
+
     private CurvineFsMount libFs;
     private FilesystemConf filesystemConf;
     private Path workingDir;
@@ -91,8 +93,18 @@ public class CurvineFileSystem extends FileSystem {
     @Override
     public FSDataInputStream open(Path path, int bufferSize) throws IOException {
         long[] tmp = new long[] {0, 0};
-        long nativeHandle = libFs.open(formatPath(path), tmp);
-        return new FSDataInputStream(new CurvineInputStream(libFs, nativeHandle, tmp[0]));
+        try {
+            long nativeHandle = libFs.open(formatPath(path), tmp);
+            return new FSDataInputStream(new CurvineInputStream(libFs, nativeHandle, tmp[0]));
+        } catch (CurvineException e) {
+            if (e.isExpired()) {
+                LOGGER.info("The {} data is either cached or has expired, " +
+                        "data will be read from the ufs.", path);
+                return FileSystem.get(path.toUri(), getConf()).open(path, bufferSize);
+            } else {
+                throw e;
+            }
+        }
     }
 
     @Override
@@ -198,5 +210,16 @@ public class CurvineFileSystem extends FileSystem {
         byte[] bytes = libFs.getMasterInfo();
         GetMasterInfoResponse info = GetMasterInfoResponse.parseFrom(bytes);
         return new CurvineFsStat(info);
+    }
+
+    public MountPointInfo getMountPoint(Path path) throws IOException {
+        System.out.println(path.toString());
+        byte[] bytes = libFs.getMountPoint(path.toString());
+        GetMountPointInfoResponse response = GetMountPointInfoResponse.parseFrom(bytes);
+        if (response.hasMountPoint()) {
+            return response.getMountPoint();
+        }  else {
+            return null;
+        }
     }
 }

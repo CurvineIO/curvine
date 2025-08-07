@@ -15,6 +15,7 @@
 package io.curvine;
 
 import io.curvine.bench.Utils;
+import io.curvine.proto.MountPointInfo;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.fs.*;
 import org.apache.hadoop.conf.Configuration;
@@ -34,7 +35,7 @@ public class CurvineFileSystemTest {
         System.setProperty("java.library.path", useDir + "/../../target/debug");
         System.setProperty("curvine.conf.dir", useDir + "/../../etc");
         Configuration conf = Utils.getCurvineConf();
-        conf.set("fs.curvine.master_addrs", "localhost:50724");
+        conf.set("fs.cv.master_addrs", "localhost:52389");
 
         fs = FileSystem.get(conf);
     }
@@ -47,10 +48,10 @@ public class CurvineFileSystemTest {
     }
 
     @Test
-    public void newFs() throws Exception {
-        Configuration conf = Utils.getCurvineConf();
-        FileSystem fs1 = FileSystem.newInstance(conf);
-        FileSystem fs2 = FileSystem.newInstance(conf);
+    public void getMountInfo() throws Exception {
+        Path path = new Path("s3://flink/xuen-test");
+        MountPointInfo mountPoint = ((CurvineFileSystem) fs).getMountPoint(path);
+        System.out.println("mount point: " + mountPoint);
     }
 
     @Test

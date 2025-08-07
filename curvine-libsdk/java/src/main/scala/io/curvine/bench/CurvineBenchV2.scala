@@ -15,11 +15,11 @@
  */
 
 package io.curvine.bench
-import io.curvine.bench.ReadBench.LOGGER
+import io.curvine.bench.CurvineBenchV2.LOGGER
 import io.curvine.executor.FixedAllocationExecutor
 import org.apache.commons.lang3.RandomStringUtils
 import org.apache.hadoop.fs.{FileSystem, Path}
-import org.slf4j.Logger
+import org.slf4j.{Logger, LoggerFactory}
 
 import java.io._
 import java.util.concurrent.atomic.LongAdder
@@ -186,7 +186,7 @@ class CurvineBenchV2(params: BenchParams) {
 }
 
 object CurvineBenchV2 {
-  val LOGGER: Logger = CurvineBench.LOGGER
+  val LOGGER: Logger = LoggerFactory.getLogger(CurvineBenchV2.getClass)
 
   def main(args: Array[String]): Unit = {
     val params = BenchParams.buildFromArgs(args)

@@ -14,7 +14,6 @@
 
 package io.curvine;
 
-import io.curvine.bench.CurvineBench;
 import io.curvine.bench.CurvineBenchV2;
 import io.curvine.bench.NNBenchWithoutMR;
 import io.curvine.bench.Utils;
@@ -45,13 +44,6 @@ public class BenchTest {
     }
 
     @Test
-    public void write() {
-        // System.setProperty("fs.curvine.block_size", "6291456");
-        String[] args = { "-action", "write"};
-        CurvineBench.main(args);
-    }
-
-    @Test
     public void benchV2() {
         String userNIO = "true";
         String[] writerArgs = {
@@ -71,12 +63,6 @@ public class BenchTest {
                 "-fileSize", "10MB",
         };
         CurvineBenchV2.main(readArgs);
-    }
-
-    @Test
-    public void read() {
-        String[] args = { "-action", "read" };
-        CurvineBench.main(args);
     }
 
     @Test

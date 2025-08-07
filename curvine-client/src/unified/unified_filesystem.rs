@@ -25,7 +25,7 @@ use log::{debug, info, warn};
 use orpc::common::{FastHashMap, LocalTime};
 use orpc::runtime::Runtime;
 use orpc::sync::AtomicCounter;
-use orpc::CommonResult;
+use orpc::{err_ext, CommonResult};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -98,6 +98,7 @@ pub struct UnifiedFileSystem {
     cv: CurvineFileSystem,
     mount_state: MountState,
     enable_unified: bool,
+    enable_read_ufs: bool,
 }
 
 impl UnifiedFileSystem {
@@ -110,9 +111,14 @@ impl UnifiedFileSystem {
             cv,
             mount_state: MountState::new(update_interval),
             enable_unified,
+            enable_read_ufs: true,
         };
 
         Ok(fs)
+    }
+
+    pub fn cv(&self) -> &CurvineFileSystem {
+        &self.cv
     }
 
     // Check if the path is a mount point, if so, return the mount point information
@@ -268,8 +274,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
         }
 
         // Reading from ufs
-        info!("Read from ufs, ufs path {}, cv path: {}", ufs_path, path);
-        mount.ufs.open(&ufs_path).await
+        if self.enable_read_ufs {
+            info!("Read from ufs, ufs path {}, cv path: {}", ufs_path, path);
+            mount.ufs.open(&ufs_path).await
+        } else {
+            err_ext!(FsError::file_expired(path.path()))
+        }
     }
 
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
