@@ -93,6 +93,19 @@ impl MountState {
     }
 }
 
+#[derive(Clone, PartialOrd, PartialEq, Debug)]
+enum CacheValidity {
+    Valid,
+    Invalid,
+    NotExists,
+}
+
+impl CacheValidity {
+    fn is_valid(&self) -> bool {
+        self == &CacheValidity::Valid
+    }
+}
+
 #[derive(Clone)]
 pub struct UnifiedFileSystem {
     cv: CurvineFileSystem,
@@ -198,6 +211,29 @@ impl UnifiedFileSystem {
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<()> {
         self.cv.delete(path, recursive).await
     }
+
+    async fn get_cache_validity(
+        &self,
+        cv_path: &Path,
+        ufs_path: &Path,
+        mount: &MountItem,
+    ) -> FsResult<CacheValidity> {
+        let validity = match self.get_cache_status(cv_path).await? {
+            Some(cv_status) => {
+                let ufs_status = mount.ufs.get_status(&ufs_path).await?;
+                if cv_status.len == ufs_status.len
+                    && cv_status.storage_policy.ufs_mtime != 0
+                    && cv_status.storage_policy.ufs_mtime == ufs_status.mtime
+                {
+                    CacheValidity::Valid
+                } else {
+                    CacheValidity::Invalid
+                }
+            }
+            None => CacheValidity::NotExists,
+        };
+        Ok(validity)
+    }
 }
 
 impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem {
@@ -239,19 +275,10 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
             Some(v) => v,
         };
 
-        let read_cache = match self.get_cache_status(path).await? {
-            Some(cv_status) => {
-                let ufs_status = mount.ufs.get_status(&ufs_path).await?;
-                cv_status.len == ufs_status.len
-                    && cv_status.storage_policy.ufs_mtime != 0
-                    && cv_status.storage_policy.ufs_mtime == ufs_status.mtime
-            }
-
-            None => false,
-        };
+        let read_cache = self.get_cache_validity(path, &ufs_path, &mount).await?;
 
         // Read data from the curvine cache
-        if read_cache {
+        if read_cache.is_valid() {
             info!(
                 "Read from Curvine(cache), ufs path {}, cv path: {}",
                 ufs_path, path
@@ -287,7 +314,25 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
             None => self.cv.rename(src, dst).await,
             Some((src_path, mount)) => {
                 let dst_path = mount.ufs_path(dst)?;
-                mount.ufs.rename(&src_path, &dst_path).await
+                let rename_result = mount.ufs.rename(&src_path, &dst_path).await?;
+                if rename_result {
+                    // to find out the cache status and then rename or delete it
+                    let valid = self.get_cache_validity(src, &dst_path, &mount).await?;
+                    match valid {
+                        CacheValidity::Valid => {
+                            self.cv.rename(src, dst).await?;
+                        }
+                        CacheValidity::Invalid => {
+                            self.cv.delete(src, true).await?;
+                        }
+                        _ => {
+                            // ignore
+                        }
+                    };
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }
         }
     }
