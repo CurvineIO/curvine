@@ -22,6 +22,7 @@ use curvine_common::conf::UfsConf;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{FileStatus, SetAttrOpts};
 use curvine_common::FsResult;
+use orpc::common::LocalTime;
 use std::sync::Arc;
 
 /// S3 file system implementation
@@ -161,7 +162,7 @@ impl S3FileSystem {
             name: path.name().to_owned(),
             is_dir,
             mtime,
-            atime: mtime,
+            atime: LocalTime::mills() as i64,
             is_complete: true,
             len,
             replicas: 1,
@@ -174,9 +175,13 @@ impl S3FileSystem {
 
     pub fn prefix_to_status(bucket: &str, prefix: &str) -> FsResult<FileStatus> {
         let path = Path::from_str(format!("{}{}{}{}", SCHEME, bucket, FOLDER_SUFFIX, prefix))?;
+        // dir mtime should be defined by the sub items latest mtime
+        // but s3 does not support this, so we use the current time
         let status = FileStatus {
             path: path.full_path().to_owned(),
             name: path.name().to_owned(),
+            atime: LocalTime::mills() as i64,
+            mtime: LocalTime::mills() as i64,
             is_dir: true,
             is_complete: true,
             ..Default::default()
