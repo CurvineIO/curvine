@@ -180,3 +180,36 @@ impl FsReaderParallel {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_slices() {
+        // total_size = 1000, slice_size = 300, read_parallel = 3
+        let slices = FsReaderParallel::split(1000, 300, 3);
+        let mut flattened: Vec<_> = slices.into_iter().flatten().collect();
+
+        // Ensure slices are ordered and cover all bytes without overlap
+        flattened.sort_by_key(|s| s.start);
+        let mut current = 0;
+        for slice in &flattened {
+            assert_eq!(slice.start, current);
+            assert!(slice.end > slice.start);
+            current = slice.end;
+        }
+        assert_eq!(current, 1000);
+
+        // test with parallelism = 1
+        let single = FsReaderParallel::split(1000, 300, 1);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].len(), 1);
+        assert_eq!(single[0][0].start, 0);
+        assert_eq!(single[0][0].end, 1000);
+
+        // test with total_size = 0
+        let empty = FsReaderParallel::split(0, 300, 3);
+        assert!(empty.is_empty());
+    }
+}
