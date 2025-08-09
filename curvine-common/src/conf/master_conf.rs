@@ -85,9 +85,12 @@ pub struct MasterConf {
     pub audit_log: LogConf,
 
     pub log: LogConf,
-
     // Master loading function configuration
     pub load: MasterLoadConf,
+
+    pub ttl_checker_interval_ms: u64,
+    pub ttl_checker_retry_attempts: u32,
+    pub ttl_bucket_interval_ms: u64,
 }
 
 impl MasterConf {
@@ -196,6 +199,10 @@ impl Default for MasterConf {
 
             log: Default::default(),
             load: Default::default(),
+
+            ttl_checker_interval_ms: 3600000,
+            ttl_checker_retry_attempts: 3,
+            ttl_bucket_interval_ms: 3600000,
         };
 
         conf.init().unwrap();
