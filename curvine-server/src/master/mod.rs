@@ -51,5 +51,4 @@ pub mod mount;
 pub type MetaRaftJournal = RaftJournal<RocksLogStorage, JournalLoader>;
 pub type SyncFsDir = ArcRwLock<FsDir>;
 pub type SyncWorkerManager = ArcRwLock<WorkerManager>;
-pub type SyncMountManager = ArcRwLock<MountManager>;
 pub use mount::MountManager;

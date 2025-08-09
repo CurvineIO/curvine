@@ -36,14 +36,27 @@ pub struct MasterFilesystem {
 }
 
 impl MasterFilesystem {
-    pub fn new(conf: &ClusterConf, journal_system: &JournalSystem) -> FsResult<Self> {
-        let fs = Self {
-            fs_dir: journal_system.fs_dir(),
-            worker_manager: journal_system.worker_manager().clone(),
-            master_monitor: journal_system.master_monitor(),
+    pub fn new(
+        conf: &ClusterConf,
+        fs_dir: SyncFsDir,
+        worker_manager: SyncWorkerManager,
+        master_monitor: MasterMonitor,
+    ) -> Self {
+        Self {
+            fs_dir,
+            worker_manager,
+            master_monitor,
             conf: Arc::new(conf.master.clone()),
-        };
-        Ok(fs)
+        }
+    }
+
+    pub fn with_js(conf: &ClusterConf, js: &JournalSystem) -> Self {
+        Self {
+            fs_dir: js.fs().fs_dir.clone(),
+            worker_manager: js.worker_manager(),
+            master_monitor: js.master_monitor(),
+            conf: Arc::new(conf.master.clone()),
+        }
     }
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {
@@ -622,6 +635,6 @@ impl Default for MasterFilesystem {
     fn default() -> Self {
         let conf = ClusterConf::format();
         let journal_system = JournalSystem::from_conf(&conf).unwrap();
-        Self::new(&conf, &journal_system).unwrap()
+        journal_system.fs()
     }
 }

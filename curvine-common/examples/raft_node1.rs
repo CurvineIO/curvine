@@ -14,7 +14,7 @@
 
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::storage::{LogStorage, RocksAppStorage, RocksLogStorage};
-use curvine_common::raft::{RaftClient, RaftJournal, RaftPeer};
+use curvine_common::raft::{RaftClient, RaftJournal, RaftPeer, RoleMonitor};
 use curvine_common::utils::SerdeUtils;
 use log::info;
 use orpc::common::{Logger, Utils};
@@ -80,7 +80,13 @@ where
     T: LogStorage + Send + Sync + 'static,
 {
     let app_store: RocksAppStorage<String, String> = RocksAppStorage::new("../target/data/raft-1");
-    let raft = RaftJournal::new(rt.clone(), log_store, app_store.clone(), conf.clone());
+    let raft = RaftJournal::new(
+        rt.clone(),
+        log_store,
+        app_store.clone(),
+        RoleMonitor::new(),
+        conf.clone(),
+    );
 
     rt.spawn(async move {
         raft.run().await.unwrap();

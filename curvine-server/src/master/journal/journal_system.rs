@@ -12,16 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::WorkerManager;
+use crate::master::fs::{MasterFilesystem, WorkerManager};
 use crate::master::journal::{JournalLoader, JournalWriter};
 use crate::master::meta::FsDir;
-use crate::master::{
-    MasterMonitor, MetaRaftJournal, MountManager, SyncFsDir, SyncMountManager, SyncWorkerManager,
-};
+use crate::master::{MasterMonitor, MetaRaftJournal, MountManager, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
-use curvine_common::raft::{RaftClient, RaftResult, RoleStateListener};
+use curvine_common::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
 use curvine_common::FsResult;
 use log::info;
 use orpc::common::FileUtils;
@@ -35,25 +33,25 @@ use std::sync::Arc;
 // Send and replay metadata operation logs based on raft.
 pub struct JournalSystem {
     rt: Arc<Runtime>,
-    fs_dir: SyncFsDir,
+    fs: MasterFilesystem,
     worker_manager: SyncWorkerManager,
     raft_journal: MetaRaftJournal,
     master_monitor: MasterMonitor,
-    mount_manager: SyncMountManager,
+    mount_manager: Arc<MountManager>,
 }
 
 impl JournalSystem {
     fn new(
         rt: Arc<Runtime>,
-        fs_dir: SyncFsDir,
+        fs: MasterFilesystem,
         worker_manager: SyncWorkerManager,
         raft_journal: MetaRaftJournal,
         master_monitor: MasterMonitor,
-        mount_manager: SyncMountManager,
+        mount_manager: Arc<MountManager>,
     ) -> Self {
         Self {
             rt,
-            fs_dir,
+            fs,
             worker_manager,
             raft_journal,
             master_monitor,
@@ -83,22 +81,30 @@ impl JournalSystem {
             FileUtils::delete_path(&db_conf.data_dir, true)?;
         }
 
-        let fs_dir = SyncFsDir::new(FsDir::new(conf, journal_writer)?);
+        let role_monitor = RoleMonitor::new();
+        let master_monitor = MasterMonitor::new(role_monitor.read_ctl(), StateCtl::new(0));
 
-        let mount_manager = SyncMountManager::new(MountManager::new_partial(fs_dir.clone()));
+        let fs_dir = SyncFsDir::new(FsDir::new(conf, journal_writer)?);
+        let fs = MasterFilesystem::new(
+            conf,
+            fs_dir.clone(),
+            worker_manager.clone(),
+            master_monitor.clone(),
+        );
+
+        let mount_manager = Arc::new(MountManager::new(fs.clone()));
 
         let raft_journal = MetaRaftJournal::new(
             rt.clone(),
             log_store,
             JournalLoader::new(fs_dir.clone(), mount_manager.clone(), &conf.journal),
+            role_monitor,
             conf.journal.clone(),
         );
 
-        let master_monitor = MasterMonitor::new(raft_journal.new_state_ctl(), StateCtl::new(0));
-
         let js = Self::new(
             rt,
-            fs_dir,
+            fs,
             worker_manager,
             raft_journal,
             master_monitor,
@@ -119,16 +125,12 @@ impl JournalSystem {
         rt.block_on(async move { js.start().await })
     }
 
-    pub fn fs_dir(&self) -> SyncFsDir {
-        self.fs_dir.clone()
+    pub fn fs(&self) -> MasterFilesystem {
+        self.fs.clone()
     }
 
     pub fn worker_manager(&self) -> SyncWorkerManager {
         self.worker_manager.clone()
-    }
-
-    pub fn mount_manager(&self) -> SyncMountManager {
-        self.mount_manager.clone()
     }
 
     pub fn state_listener(&self) -> RoleStateListener {
@@ -137,6 +139,10 @@ impl JournalSystem {
 
     pub fn master_monitor(&self) -> MasterMonitor {
         self.master_monitor.clone()
+    }
+
+    pub fn mount_manager(&self) -> Arc<MountManager> {
+        self.mount_manager.clone()
     }
 
     // Create a snapshot manually, dedicated for testing.

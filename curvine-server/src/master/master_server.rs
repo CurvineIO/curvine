@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::router_handler::MasterRouterHandler;
-use crate::master::SyncMountManager;
+use crate::master::MountManager;
 use crate::master::{LoadManager, MasterHandler};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
 use curvine_common::conf::ClusterConf;
@@ -37,7 +37,7 @@ pub struct MasterService {
     conf: ClusterConf,
     fs: MasterFilesystem,
     retry_cache: Option<FsRetryCache>,
-    mount_manager: SyncMountManager,
+    mount_manager: Arc<MountManager>,
     load_manager: Arc<LoadManager>,
     rt: Arc<Runtime>,
 }
@@ -47,7 +47,7 @@ impl MasterService {
         conf: ClusterConf,
         fs: MasterFilesystem,
         retry_cache: Option<FsRetryCache>,
-        mount_manager: SyncMountManager,
+        mount_manager: Arc<MountManager>,
         load_manager: Arc<LoadManager>,
         rt: Arc<Runtime>,
     ) -> Self {
@@ -112,7 +112,7 @@ pub struct Master {
     web_server: WebServer<MasterService>,
     journal_system: JournalSystem,
     actor: MasterActor,
-    mount_manager: SyncMountManager,
+    mount_manager: Arc<MountManager>,
     load_manager: Arc<LoadManager>,
 }
 
@@ -129,9 +129,8 @@ impl Master {
 
         // step1: Create a journal system, the journal system determines how to create a fs dir.
         let journal_system = JournalSystem::from_conf(&conf)?;
-
-        // step2: Create filesystem.
-        let fs = MasterFilesystem::new(&conf, &journal_system)?;
+        let fs = journal_system.fs();
+        let mount_manager = journal_system.mount_manager();
 
         let actor = MasterActor::new(
             fs.clone(),
@@ -140,9 +139,6 @@ impl Master {
         );
 
         let rt = Arc::new(conf.master_server_conf().create_runtime());
-
-        let mount_manager = journal_system.mount_manager();
-        mount_manager.write().set_master_fs(fs.clone());
 
         let load_manager = Arc::new(LoadManager::from_cluster_conf(
             Arc::new(fs.clone()),
@@ -199,7 +195,7 @@ impl Master {
         self.actor.start();
 
         // reload mount info
-        self.mount_manager.read().restore();
+        self.mount_manager.restore();
 
         // step5: Start load manager
         self.load_manager.start();
