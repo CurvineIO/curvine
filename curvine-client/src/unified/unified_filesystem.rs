@@ -220,7 +220,7 @@ impl UnifiedFileSystem {
     ) -> FsResult<CacheValidity> {
         let validity = match self.get_cache_status(cv_path).await? {
             Some(cv_status) => {
-                let ufs_status = mount.ufs.get_status(&ufs_path).await?;
+                let ufs_status = mount.ufs.get_status(ufs_path).await?;
                 if cv_status.len == ufs_status.len
                     && cv_status.storage_policy.ufs_mtime != 0
                     && cv_status.storage_policy.ufs_mtime == ufs_status.mtime

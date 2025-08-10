@@ -25,8 +25,6 @@ module.exports = {
     'subject-empty': [2, 'never'],
     // Subject cannot end with period
     'subject-full-stop': [2, 'never', '.'],
-    // Subject must start with lowercase
-    'subject-case': [2, 'always', 'lower-case'],
     // Header max length
     'header-max-length': [2, 'always', 120],
     // Body line max length
