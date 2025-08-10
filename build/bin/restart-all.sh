@@ -1,3 +1,4 @@
+#!/bin/bash
 
 #
 # Copyright 2025 OPPO.
@@ -16,6 +17,8 @@
 #
 
 # Close all services and restart.
+
+curr_dir="$(pwd)"
 
 # Function to wait for a process to start
 wait_for_process() {
@@ -43,12 +46,12 @@ pkill -9 -f "curvine"
 sleep 3
 
 # Start master and worker services
-bin/curvine-master.sh start
-bin/curvine-worker.sh start
+"${curr_dir}/curvine-master.sh" start
+"${curr_dir}/curvine-worker.sh" start
 
 # Wait for master and worker to start
 wait_for_process "master"
 wait_for_process "worker"
 
 # Start fuse service
-bin/curvine-fuse.sh start
+"${curr_dir}/curvine-fuse.sh" start
