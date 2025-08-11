@@ -1,4 +1,4 @@
-
+#!/bin/bash
 #
 # Copyright 2025 OPPO.
 #
@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
+# Get the absolute path to the directory where the script is located
+BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
 
 # Close all services and restart.
 
@@ -43,12 +46,12 @@ pkill -9 -f "curvine"
 sleep 3
 
 # Start master and worker services
-bin/curvine-master.sh start
-bin/curvine-worker.sh start
+${BIN_DIR}/curvine-master.sh start
+${BIN_DIR}/curvine-worker.sh start
 
 # Wait for master and worker to start
 wait_for_process "master"
 wait_for_process "worker"
 
 # Start fuse service
-bin/curvine-fuse.sh start
+${BIN_DIR}/curvine-fuse.sh start
