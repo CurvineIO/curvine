@@ -190,7 +190,8 @@
                 <directory>${project.basedir}/src/main/resources</directory>
             </resource>
             <resource>
-            <!--native is not included in the code. After compiling curvine on the corresponding platform, put the libsdk package in the native directory and recompile java -->                <directory>${project.basedir}/native</directory>
+            <!--native is not included in the code. After compiling curvine on the corresponding platform, put the libsdk package in the native directory and recompile java -->
+                <directory>${project.basedir}/native</directory>
             </resource>
         </resources>
         <testResources>

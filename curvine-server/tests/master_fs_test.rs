@@ -49,7 +49,7 @@ fn new_fs(format: bool, name: &str) -> MasterFilesystem {
     };
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
-    let fs = MasterFilesystem::new(&conf, &journal_system).unwrap();
+    let fs = MasterFilesystem::with_js(&conf, &journal_system);
     fs.add_test_worker(WorkerInfo::default());
 
     fs
@@ -65,7 +65,7 @@ fn new_handler() -> MasterHandler {
     conf.journal.journal_dir = Utils::test_sub_dir("master-fs-test/journal-retry");
 
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
-    let fs = MasterFilesystem::new(&conf, &journal_system).unwrap();
+    let fs = MasterFilesystem::with_js(&conf, &journal_system);
     fs.add_test_worker(WorkerInfo::default());
     let retry_cache = FsRetryCache::with_conf(&conf.master);
 

@@ -309,7 +309,7 @@ impl CurvineFileSystem {
         }
 
         // If not numeric, try to lookup by group name
-        match orpc::sys::get_gid_by_name(group) {
+        match sys::get_gid_by_name(group) {
             Some(gid) => gid,
             None => {
                 debug!(
@@ -343,40 +343,49 @@ impl CurvineFileSystem {
     }
 
     /// Check if the permission bits satisfy the requested access mask
+    #[allow(unused)]
     fn check_permission_mask(&self, permission_bits: u32, mask: u32) -> bool {
-        let mut has_permission = true;
-
-        // Check read permission (R_OK = 4)
-        if (mask & libc::R_OK as u32) != 0 {
-            let has_read = (permission_bits & 0o4) != 0;
-            has_permission = has_permission && has_read;
-            debug!(
-                "Read permission check: requested=true, granted={}",
-                has_read
-            );
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
         }
 
-        // Check write permission (W_OK = 2)
-        if (mask & libc::W_OK as u32) != 0 {
-            let has_write = (permission_bits & 0o2) != 0;
-            has_permission = has_permission && has_write;
-            debug!(
-                "Write permission check: requested=true, granted={}",
-                has_write
-            );
-        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut has_permission = true;
 
-        // Check execute permission (X_OK = 1)
-        if (mask & libc::X_OK as u32) != 0 {
-            let has_execute = (permission_bits & 0o1) != 0;
-            has_permission = has_permission && has_execute;
-            debug!(
-                "Execute permission check: requested=true, granted={}",
-                has_execute
-            );
-        }
+            // Check read permission (R_OK = 4)
+            if (mask & libc::R_OK as u32) != 0 {
+                let has_read = (permission_bits & 0o4) != 0;
+                has_permission = has_permission && has_read;
+                debug!(
+                    "Read permission check: requested=true, granted={}",
+                    has_read
+                );
+            }
 
-        has_permission
+            // Check write permission (W_OK = 2)
+            if (mask & libc::W_OK as u32) != 0 {
+                let has_write = (permission_bits & 0o2) != 0;
+                has_permission = has_permission && has_write;
+                debug!(
+                    "Write permission check: requested=true, granted={}",
+                    has_write
+                );
+            }
+
+            // Check execute permission (X_OK = 1)
+            if (mask & libc::X_OK as u32) != 0 {
+                let has_execute = (permission_bits & 0o1) != 0;
+                has_permission = has_permission && has_execute;
+                debug!(
+                    "Execute permission check: requested=true, granted={}",
+                    has_execute
+                );
+            }
+
+            has_permission
+        }
     }
 
     fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {

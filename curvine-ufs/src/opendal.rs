@@ -21,7 +21,6 @@ use curvine_common::FsResult;
 use futures::StreamExt;
 use opendal::services::{Azblob, Gcs, S3};
 use opendal::{layers::LoggingLayer, Operator};
-use orpc::common::LocalTime;
 use orpc::sys::DataSlice;
 
 use crate::err_ufs;
@@ -517,7 +516,6 @@ impl FileSystem<OpendalWriter, OpendalReader, UfsConf> for OpendalFileSystem {
                     .last_modified()
                     .map(|t| t.timestamp_millis())
                     .unwrap_or(0),
-                atime: LocalTime::mills() as i64,
                 is_complete: true,
                 len: metadata.content_length() as i64,
                 replicas: 1,

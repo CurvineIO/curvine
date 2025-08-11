@@ -14,7 +14,7 @@
 
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::load::{LoadManager, MasterLoadService};
-use crate::master::SyncMountManager;
+use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
@@ -38,7 +38,7 @@ pub struct MasterHandler {
     pub(crate) audit_logging_enabled: bool,
     pub(crate) conn_state: Option<ConnState>,
     pub(crate) load_service: Option<MasterLoadService>,
-    pub(crate) mount_manager: SyncMountManager,
+    pub(crate) mount_manager: Arc<MountManager>,
 }
 
 impl MasterHandler {
@@ -47,7 +47,7 @@ impl MasterHandler {
         fs: MasterFilesystem,
         retry_cache: Option<FsRetryCache>,
         conn_state: Option<ConnState>,
-        mount_manager: SyncMountManager,
+        mount_manager: Arc<MountManager>,
         load_manager: Arc<LoadManager>,
         rt: Arc<Runtime>,
     ) -> Self {
@@ -58,7 +58,7 @@ impl MasterHandler {
             audit_logging_enabled: conf.master.audit_logging_enabled,
             conn_state,
             load_service: Some(MasterLoadService::new(load_manager, rt.clone())),
-            mount_manager: mount_manager.clone(),
+            mount_manager,
         }
     }
 
@@ -307,8 +307,8 @@ impl MasterHandler {
         let ufs_uri = CurvineURI::new(request.ufs_path)?;
         let mnt_opt = request.mount_options.unwrap_or_default();
 
-        let mnt_mgr = self.mount_manager.read();
-        mnt_mgr.mount(None, &curvine_uri, &ufs_uri, &mnt_opt)?;
+        self.mount_manager
+            .mount(None, &curvine_uri, &ufs_uri, &mnt_opt)?;
         let rep_header = MountResponse::default();
         ctx.response(rep_header)
     }
@@ -321,8 +321,7 @@ impl MasterHandler {
     fn umount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: UnMountRequest = ctx.parse_header()?;
         let mnt_path = CurvineURI::new(request.curvine_path)?;
-        let mnt_mgr = self.mount_manager.read();
-        mnt_mgr.umount(&mnt_path)?;
+        self.mount_manager.umount(&mnt_path)?;
         let rep_header = UnMountResponse::default();
         ctx.response(rep_header)
     }
@@ -331,19 +330,17 @@ impl MasterHandler {
         let request: GetMountPointInfoRequest = ctx.parse_header()?;
         ctx.set_audit(Some(request.path.to_string()), None);
 
-        let mnt_mgr = self.mount_manager.read();
         let path = Path::from_str(request.path)?;
-        let ret = mnt_mgr.get_mount_point(&path)?;
+        let ret = self.mount_manager.get_mount_point(&path)?;
         let rep_header = GetMountPointInfoResponse { mount_point: ret };
         ctx.response(rep_header)
     }
 
     fn get_mount_table(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let _: GetMountTableRequest = ctx.parse_header()?;
-        let mut rep_header = GetMountTableResponse::default();
-
-        let mnt_mgr = self.mount_manager.read();
-        rep_header.mount_points = mnt_mgr.get_mount_table()?;
+        let rep_header = GetMountTableResponse {
+            mount_points: self.mount_manager.get_mount_table()?,
+        };
         ctx.response(rep_header)
     }
 
