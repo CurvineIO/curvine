@@ -86,6 +86,9 @@ fn mount_test() -> CommonResult<()> {
             auto_cache: false,
             cache_ttl_secs: None,
             consistency_config: None,
+            storage_type: None,
+            block_size: None,
+            replicas: None,
         };
         let mount_resp = client.mount(s3_path, s3_mnt_path, mnt_opt.clone()).await;
         info!("S3 MountResp: {:?}", mount_resp);
@@ -102,6 +105,9 @@ fn mount_test() -> CommonResult<()> {
             auto_cache: false,
             cache_ttl_secs: None,
             consistency_config: None,
+            storage_type: None,
+            block_size: None,
+            replicas: None,
         };
         let mount_resp = client
             .mount(hdfs_path, hdfs_mnt_path, mnt_opt.clone())

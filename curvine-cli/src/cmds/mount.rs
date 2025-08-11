@@ -15,6 +15,8 @@
 use crate::util::*;
 use clap::Parser;
 use curvine_client::file::FsClient;
+use curvine_common::state::StorageType;
+use orpc::common::ByteUnit;
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,6 +40,15 @@ pub struct MountCommand {
     /// Update the mount point config if it already exists
     #[arg(long, default_value_t = false)]
     update: bool,
+
+    #[arg(short, long)]
+    replicas: Option<usize>,
+
+    #[arg(short, long)]
+    block_size: Option<String>,
+
+    #[arg(short, long)]
+    storage_type: Option<StorageType>,
 }
 
 impl MountCommand {
@@ -97,6 +108,14 @@ impl MountCommand {
             auto_cache: false,
             cache_ttl_secs: None,
             consistency_config: None,
+            storage_type: self.storage_type.map(|stype| stype.into()),
+            block_size: self
+                .block_size
+                .as_ref()
+                .map(|s| ByteUnit::from_str(s))
+                .transpose()?
+                .map(|u| u.as_byte()),
+            replicas: self.replicas.map(|r| r as u32),
         };
 
         let rep =

@@ -18,10 +18,9 @@ use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
-use crate::master::mount::{ConsistencyStrategy, MountPointEntry};
+use crate::master::mount::MountPointEntry;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
-use curvine_common::proto::{ConsistencyConfig, MountOptions};
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileStatus, MkdirOpts, SetAttrOpts,
     WorkerAddress,
@@ -635,28 +634,12 @@ impl FsDir {
         let op_ms = LocalTime::mills();
         self.store.store.add_mountpoint(entry.id, &entry)?;
 
-        let mut consistency_config = ConsistencyConfig {
-            strategy: entry.consistency_strategy.into(),
-            period_seconds: None,
-        };
-        if let ConsistencyStrategy::Period(sec) = entry.consistency_strategy {
-            consistency_config.period_seconds = Some(sec);
-        }
-
-        let mnt_opt = MountOptions {
-            update: false,
-            properties: entry.properties,
-            auto_cache: entry.auto_cache,
-            cache_ttl_secs: entry.cache_ttl_secs,
-            consistency_config: Some(consistency_config),
-        };
-
         self.journal_writer.log_mount(
             op_ms,
             entry.id,
             &entry.curvine_uri,
             &entry.ufs_uri,
-            mnt_opt,
+            entry.to_mount_options(),
         )?;
         Ok(())
     }

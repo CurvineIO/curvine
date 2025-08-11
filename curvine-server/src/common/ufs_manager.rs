@@ -60,7 +60,18 @@ impl UfsManager {
         Ok(ufs_conf)
     }
 
-    async fn get_mount_point(&mut self, ufs_base_uri: &String) -> FsResult<MountPointInfo> {
+    pub async fn get_mount_point_with_uri(
+        &mut self,
+        ufs_uri: &CurvineURI,
+    ) -> FsResult<MountPointInfo> {
+        let ufs_norm_uri = match ufs_uri.normalize_uri() {
+            Some(ufs_base_uri) => ufs_base_uri,
+            None => return err_box!("invalid ufs_uri, can't find baseuri"),
+        };
+        self.get_mount_point(&ufs_norm_uri).await
+    }
+
+    pub async fn get_mount_point(&mut self, ufs_base_uri: &str) -> FsResult<MountPointInfo> {
         // looking cache
         {
             let table = self.mount_table.read().unwrap();
@@ -79,7 +90,7 @@ impl UfsManager {
             Some(mount_point_info) => {
                 let mut table = self.mount_table.write().unwrap();
                 let ret = mount_point_info.clone();
-                table.insert(ufs_base_uri.clone(), mount_point_info);
+                table.insert(ufs_base_uri.into(), mount_point_info);
                 Ok(ret)
             }
             None => err_box!("failed trans ufs_uri to curvine path, maybe mount first"),

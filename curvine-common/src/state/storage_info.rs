@@ -14,12 +14,23 @@
 
 #![allow(clippy::derivable_impls)]
 
+use clap::ValueEnum;
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
 
 #[repr(i32)]
 #[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, IntoPrimitive, FromPrimitive,
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    Hash,
+    IntoPrimitive,
+    FromPrimitive,
+    ValueEnum,
 )]
 pub enum StorageType {
     Mem = 0,

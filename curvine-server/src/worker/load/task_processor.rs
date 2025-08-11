@@ -223,7 +223,7 @@ async fn execute_load_task(
     }
 
     // Create external storage connector
-    let mut external_client = UfsConnector::new(task.path.clone(), fs_client.clone());
+    let mut external_client = UfsConnector::new(task.path.clone(), fs_client.clone()).await?;
 
     // Get file size from external storage
     let file_size = match external_client.get_file_size().await {

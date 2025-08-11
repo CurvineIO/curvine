@@ -58,6 +58,9 @@ fn load_client_test() -> CommonResult<()> {
             auto_cache: false,
             cache_ttl_secs: None,
             consistency_config: None,
+            storage_type: None,
+            block_size: None,
+            replicas: None,
         };
         let ret = client.umount(mount_path).await;
         let mount_resp = client.mount(UFS_PATH, mount_path, mnt_opt.clone()).await;

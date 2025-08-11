@@ -18,6 +18,7 @@ use bytes::{Bytes, BytesMut};
 use curvine_client::file::{FsClient, FsWriter};
 use curvine_client::unified::UnifiedReader;
 use curvine_common::fs::{CurvineURI, Path, Reader, Writer};
+use curvine_common::proto::MountPointInfo;
 use curvine_common::state::{CreateFileOptsBuilder, TtlAction};
 use curvine_common::FsResult;
 use curvine_ufs::fs::{AsyncChunkReader, AsyncChunkWriter};
@@ -34,13 +35,16 @@ pub struct UfsConnector {
 }
 
 impl UfsConnector {
-    pub fn new(source_path: String, fs_client: Arc<FsClient>) -> Self {
-        let ufs_manager = UfsManager::new(fs_client.clone());
-        Self {
+    pub async fn new(source_path: String, fs_client: Arc<FsClient>) -> CommonResult<Self> {
+        let mut ufs_manager = UfsManager::new(fs_client.clone());
+        // ufs connector will be created by the worker side,
+        // and all the mount table should be retrieved from master.
+        ufs_manager.sync_mount_table().await?;
+        Ok(Self {
             source_path,
             fs_client: fs_client.clone(),
             ufs_manager,
-        }
+        })
     }
 
     pub(crate) async fn get_file_size(&mut self) -> CommonResult<u64> {
@@ -63,6 +67,7 @@ impl UfsConnector {
         ttl_action: Option<i32>,
     ) -> FsResult<Box<dyn AsyncChunkWriter + Send + 'static>> {
         let uri = CurvineURI::new(&self.source_path)?;
+        let mount_point_info = self.ufs_manager.get_mount_point_with_uri(&uri).await?;
         let target_path = self.ufs_manager.get_curvine_path(&uri).await?.into();
         let writer = CurvineFsWriter::new(
             self.fs_client.clone(),
@@ -71,6 +76,7 @@ impl UfsConnector {
             ufs_mtime,
             ttl_ms,
             ttl_action,
+            mount_point_info,
         )
         .await;
         Ok(Box::new(writer))
@@ -193,6 +199,7 @@ impl CurvineFsWriter {
         ufs_mtime: i64,
         ttl_ms: Option<i64>,
         ttl_action: Option<i32>,
+        mount_point_info: MountPointInfo,
     ) -> Self {
         let fs_context = fs_client.context();
         let client_conf = fs_context.cluster_conf().client;
@@ -210,6 +217,11 @@ impl CurvineFsWriter {
             let action = TtlAction::from(ttl_action_value);
             opts_builder = opts_builder.ttl_action(action);
         }
+
+        opts_builder = opts_builder
+            .block_size(mount_point_info.block_size as i64)
+            .storage_type(mount_point_info.storage_type.into())
+            .replicas(mount_point_info.replicas as i32);
 
         let opts = opts_builder.build();
         let status = fs_client.create_with_opts(&path, opts).await.unwrap();

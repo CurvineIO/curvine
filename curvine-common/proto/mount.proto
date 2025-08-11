@@ -5,6 +5,8 @@ option java_package = "io.curvine.proto";
 option java_multiple_files = true;
 option java_outer_classname = "MountProto";
 
+import "common.proto";
+
 message MountPointInfo {
     required string curvine_path = 1;
     required string ufs_path = 2;
@@ -13,6 +15,9 @@ message MountPointInfo {
     required bool auto_cache = 5;
     optional uint64 cache_ttl_secs = 6;
     required ConsistencyConfig consistency_config = 7;
+    required StorageTypeProto storage_type = 8;
+    required uint64 block_size = 9;
+    required uint32 replicas = 10;
 }
 
 message MountOptions {
@@ -21,6 +26,9 @@ message MountOptions {
     required bool auto_cache = 3 [default = false];
     optional uint64 cache_ttl_secs = 4;
     optional ConsistencyConfig consistency_config = 5;
+    optional StorageTypeProto storage_type = 6 [default = STORAGE_TYPE_PROTO_DISK];
+    optional uint64 block_size = 7 [default = 134217728];
+    optional uint32 replicas = 8 [default = 1];
 }
 
 enum ConsistencyStrategy {

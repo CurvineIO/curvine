@@ -61,6 +61,9 @@ async fn mount(fs: &UnifiedFileSystem) -> FsResult<()> {
         auto_cache: true,
         cache_ttl_secs: Some(3600),
         consistency_config: None,
+        storage_type: None,
+        block_size: None,
+        replicas: None,
     };
     let ufs_path = "s3://flink/xuen-test".into();
     let cv_path = "/xuen-test".into();

@@ -17,7 +17,6 @@ use crate::master::SyncFsDir;
 use curvine_common::conf::{UfsConf, UfsConfBuilder};
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
-use curvine_common::proto::ConsistencyConfig;
 use curvine_common::proto::MountOptions;
 use curvine_common::FsResult;
 use log::info;
@@ -55,14 +54,7 @@ impl MountTable {
         if let Ok(mounts) = self.fs_dir.read().get_mount_table() {
             for mnt in mounts {
                 // Creating a MountOptions Object
-                let mount_options = MountOptions {
-                    properties: mnt.properties.clone(),
-                    auto_cache: mnt.auto_cache,
-                    cache_ttl_secs: mnt.cache_ttl_secs,
-                    consistency_config: Some(ConsistencyConfig::from(mnt.consistency_strategy)),
-                    ..Default::default()
-                };
-
+                let mount_options = mnt.to_mount_options();
                 let _ =
                     self.insert_mount_table(mnt.id, &mnt.curvine_uri, &mnt.ufs_uri, &mount_options);
                 info!("recovering {} mount to {}", mnt.ufs_uri, mnt.curvine_uri);

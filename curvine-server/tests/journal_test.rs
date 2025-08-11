@@ -228,6 +228,9 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
         auto_cache: false,
         cache_ttl_secs: None,
         consistency_config: None,
+        storage_type: None,
+        block_size: None,
+        replicas: None,
     };
     mgr.mount(None, &mount_uri, &ufs_uri, &mnt_opt)?;
 
@@ -245,6 +248,9 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
             strategy: ConsistencyStrategy::Always.into(),
             period_seconds: Some(10),
         }),
+        storage_type: None,
+        block_size: None,
+        replicas: None,
     };
     mgr.mount(None, &mount_uri, &ufs_uri, &mnt_opt)?;
 
