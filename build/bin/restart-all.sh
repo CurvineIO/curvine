@@ -18,9 +18,7 @@
 
 # Close all services and restart.
 
-# Resolve base directories robustly relative to this script
-BUILD_DIR="$(cd "$(dirname "$0")"/.. && pwd)"
-BIN_DIR="${BUILD_DIR}/bin"
+curr_dir="$(pwd)"
 
 # Function to wait for a process to start
 wait_for_process() {
@@ -48,12 +46,12 @@ pkill -9 -f "curvine"
 sleep 3
 
 # Start master and worker services
-"${BIN_DIR}/curvine-master.sh" start
-"${BIN_DIR}/curvine-worker.sh" start
+"${curr_dir}/curvine-master.sh" start
+"${curr_dir}/curvine-worker.sh" start
 
 # Wait for master and worker to start
 wait_for_process "master"
 wait_for_process "worker"
 
 # Start fuse service
-"${BIN_DIR}/curvine-fuse.sh" start
+"${curr_dir}/curvine-fuse.sh" start
