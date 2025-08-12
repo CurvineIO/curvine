@@ -268,18 +268,43 @@ pub fn pipe2(size: usize) -> IOResult<[RawIO; 2]> {
             );
             err_io!(res)?;
 
+            // Try to set pipe size, but don't fail if we can't set the exact size
+            // This handles the case where non-root users hit the pipe-max-size limit
+            let mut actual_size = size;
+
+            // Try to set the write pipe size
             let set_buf_res = libc::fcntl(fds[1], libc::F_SETPIPE_SZ, size);
-            err_io!(set_buf_res)?;
+            if set_buf_res < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EPERM) {
+                    // Permission denied, likely hit pipe-max-size limit
+                    // Try to get current size and use it
+                    let current_size = libc::fcntl(fds[1], libc::F_GETPIPE_SZ);
+                    if current_size > 0 {
+                        actual_size = current_size as usize;
+                        log::warn!(
+                            "Cannot set pipe size to {}, using default size {}",
+                            size,
+                            actual_size
+                        );
+                    } else {
+                        err_io!(set_buf_res)?;
+                    }
+                } else {
+                    err_io!(set_buf_res)?;
+                }
+            } else {
+                actual_size = set_buf_res as usize;
+            }
 
-            let set_buf_res = libc::fcntl(fds[0], libc::F_SETPIPE_SZ, size);
-            err_io!(set_buf_res)?;
-
-            if (set_buf_res as usize) < size {
-                return err_box!(
-                    "Failed to set pipe size, expected: {}, actual: {}",
-                    size,
-                    set_buf_res
-                );
+            // Try to set the read pipe size to match
+            let set_buf_res = libc::fcntl(fds[0], libc::F_SETPIPE_SZ, actual_size);
+            if set_buf_res < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EPERM) {
+                    err_io!(set_buf_res)?;
+                }
+                // If EPERM, just continue with default size
             }
 
             Ok(fds)
