@@ -50,7 +50,7 @@ impl UfsManager {
         Ok(())
     }
 
-    async fn get_ufs_conf(&mut self, ufs_base_uri: &String) -> FsResult<UfsConf> {
+    async fn get_ufs_conf(&mut self, ufs_base_uri: &str) -> FsResult<UfsConf> {
         let mount_point_info = self.get_mount_point(ufs_base_uri).await?;
         let mut ufs_conf_builder = UfsConfBuilder::default();
         for (k, v) in &mount_point_info.properties {
