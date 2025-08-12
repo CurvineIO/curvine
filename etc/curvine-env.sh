@@ -18,9 +18,19 @@
 
 export CURVINE_HOME="$(cd "$(dirname "$0")"/..; pwd)"
 
-# Get the IP address from ifconfig, taking the last network interface address
+OS_NAME=$(uname)
+# Get the IP address from hostname, taking the last network interface address
 LOCAL_HOSTNAME="localhost"
-LOCAL_IP=$(ifconfig | grep "inet " | awk '{print $2}' | grep -v 127.0.0.1 | tail -n 1)
+
+if [ "$OS_NAME" == "Linux" ]; then
+    LOCAL_IP=$(hostname -I | awk '{print $NF}')
+elif [ "$OS_NAME" == "Darwin" ]; then
+    LOCAL_IP=$(ifconfig | grep "inet " | awk '{print $2}' | grep -v 127.0.0.1 | tail -n 1)
+else
+    echo "Unsupported OS: $OS_NAME"
+    exit 1
+fi
+
 
 # master bound host name
 export CURVINE_MASTER_HOSTNAME=$LOCAL_HOSTNAME
