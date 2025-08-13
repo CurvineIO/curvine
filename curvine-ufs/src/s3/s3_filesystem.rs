@@ -22,6 +22,7 @@ use curvine_common::conf::UfsConf;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{FileStatus, SetAttrOpts};
 use curvine_common::FsResult;
+use orpc::common::LocalTime;
 use std::sync::Arc;
 
 /// S3 file system implementation
@@ -61,6 +62,42 @@ impl S3FileSystem {
         }
     }
 
+    async fn list_object_status(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> FsResult<Option<ObjectStatus>> {
+        let res = self
+            .client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .delimiter(FOLDER_SUFFIX)
+            .max_keys(1)
+            .send()
+            .await;
+        match res {
+            Ok(v) => {
+                if let Some(prefixs) = &v.common_prefixes {
+                    for prefix_val in prefixs {
+                        if let Some(prefix_str) = &prefix_val.prefix {
+                            if prefix_str.starts_with(prefix) {
+                                return Ok(Some(ObjectStatus::new(
+                                    prefix,
+                                    0,
+                                    LocalTime::mills() as i64,
+                                    true,
+                                )));
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Err(e) => err_ufs!(e),
+        }
+    }
+
     // Get file and directory information; there are 4 cases:
     // 1. Root dir is returned directly
     // 2. First determine whether the file exists, and return if it exists.
@@ -75,8 +112,13 @@ impl S3FileSystem {
 
             match status {
                 None => {
-                    self.get_object_status(bucket, &UfsUtils::dir_key(key))
-                        .await?
+                    let status1 = self
+                        .get_object_status(bucket, &UfsUtils::dir_key(key))
+                        .await?;
+                    match status1 {
+                        None => self.list_object_status(bucket, key).await?,
+                        Some(v) => Some(v),
+                    }
                 }
 
                 Some(v) => Some(v),
