@@ -104,10 +104,14 @@ impl FilesystemConf {
 
     pub fn into_cluster_conf(self) -> FsResult<ClusterConf> {
         let mut master_addrs = vec![];
+        if self.master_addrs.is_empty() {
+            return err_box!("fs.cv.master_addrs can not be empty");
+        }
+
         for node in self.master_addrs.split(",") {
             let vec: Vec<&str> = node.split(":").collect();
             if vec.len() != 2 {
-                return err_box!("wrong format: {}", node);
+                return err_box!("wrong format fs.cv.master_addrs {}", self.master_addrs);
             }
             let hostname = vec[0].to_string();
             let port: u16 = vec[1].parse()?;
