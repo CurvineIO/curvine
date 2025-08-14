@@ -1,0 +1,16 @@
+apiVersion: v2
+name: curvine-csi
+description: A Helm chart for Curvine CSI Driver
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - storage
+  - csi
+  - curvine
+home: https://github.com/CurvineIO/curvine
+sources:
+  - https://github.com/CurvineIO/curvine
+maintainers:
+  - name: Curvine Team
+    email: support@curvine.io

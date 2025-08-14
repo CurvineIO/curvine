@@ -1,0 +1,34 @@
+1. Curvine CSI Driver has been successfully installed!
+
+2. Check the status of Curvine CSI Driver:
+   kubectl get pods -n {{ .Values.global.namespace }} -l app.kubernetes.io/name={{ include "curvine-csi.name" . }}
+
+3. Check CSI Driver registration:
+   kubectl get csidriver {{ .Values.csiDriver.name }}
+
+4. Create a StorageClass to use Curvine CSI:
+   kubectl apply -f - <<EOF
+   apiVersion: storage.k8s.io/v1
+   kind: StorageClass
+   metadata:
+     name: curvine-csi
+   provisioner: {{ .Values.csiDriver.name }}
+   parameters:
+     # Add your Curvine-specific parameters here
+   volumeBindingMode: WaitForFirstConsumer
+   EOF
+
+5. Test with a PVC:
+   kubectl apply -f - <<EOF
+   apiVersion: v1
+   kind: PersistentVolumeClaim
+   metadata:
+     name: test-pvc
+   spec:
+     accessModes:
+       - ReadWriteOnce
+     resources:
+       requests:
+         storage: 1Gi
+     storageClassName: curvine-csi
+   EOF
