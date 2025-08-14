@@ -15,9 +15,9 @@ message MountPointInfo {
     required bool auto_cache = 5;
     optional uint64 cache_ttl_secs = 6;
     required ConsistencyConfig consistency_config = 7;
-    required StorageTypeProto storage_type = 8;
-    required uint64 block_size = 9;
-    required uint32 replicas = 10;
+    optional StorageTypeProto storage_type = 8;
+    optional uint64 block_size = 9;
+    optional uint32 replicas = 10;
 }
 
 message MountOptions {
@@ -26,9 +26,9 @@ message MountOptions {
     required bool auto_cache = 3 [default = false];
     optional uint64 cache_ttl_secs = 4;
     optional ConsistencyConfig consistency_config = 5;
-    optional StorageTypeProto storage_type = 6 [default = STORAGE_TYPE_PROTO_DISK];
-    optional uint64 block_size = 7 [default = 134217728];
-    optional uint32 replicas = 8 [default = 1];
+    optional StorageTypeProto storage_type = 6;
+    optional uint64 block_size = 7;
+    optional uint32 replicas = 8;
 }
 
 enum ConsistencyStrategy {

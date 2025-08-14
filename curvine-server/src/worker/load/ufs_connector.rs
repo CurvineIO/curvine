@@ -218,10 +218,17 @@ impl CurvineFsWriter {
             opts_builder = opts_builder.ttl_action(action);
         }
 
-        opts_builder = opts_builder
-            .block_size(mount_point_info.block_size as i64)
-            .storage_type(mount_point_info.storage_type.into())
-            .replicas(mount_point_info.replicas as i32);
+        if let Some(block_size) = mount_point_info.block_size {
+            opts_builder = opts_builder.block_size(block_size as i64);
+        }
+
+        if let Some(replicas) = mount_point_info.replicas {
+            opts_builder = opts_builder.replicas(replicas as i32);
+        }
+
+        if let Some(storage_type) = mount_point_info.storage_type {
+            opts_builder = opts_builder.storage_type(storage_type.into());
+        }
 
         let opts = opts_builder.build();
         let status = fs_client.create_with_opts(&path, opts).await.unwrap();

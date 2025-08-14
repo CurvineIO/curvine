@@ -29,18 +29,18 @@ pub struct MountPointEntry {
     pub(crate) auto_cache: bool,
     pub(crate) cache_ttl_secs: Option<u64>,
     pub(crate) consistency_strategy: ConsistencyStrategy,
-    pub(crate) block_size: u64,
-    pub(crate) replicas: u32,
-    pub(crate) storage_type: StorageType,
+    pub(crate) block_size: Option<u64>,
+    pub(crate) replicas: Option<u32>,
+    pub(crate) storage_type: Option<StorageType>,
 }
 
 impl MountPointEntry {
     pub fn new(id: u32, curvine_uri: String, ufs_uri: String, mnt_opt: MountOptions) -> Self {
         let consistency_conf = mnt_opt.consistency_config.unwrap_or_default();
         let strategy = ConsistencyStrategy::from(consistency_conf);
-        let block_size = mnt_opt.block_size.unwrap_or_default();
-        let replicas = mnt_opt.replicas.unwrap_or_default();
-        let storage_type = mnt_opt.storage_type.unwrap_or_default().into();
+        let block_size = mnt_opt.block_size;
+        let replicas = mnt_opt.replicas;
+        let storage_type = mnt_opt.storage_type.map(|x| StorageType::from(x));
 
         MountPointEntry {
             id,
@@ -63,9 +63,9 @@ impl MountPointEntry {
             auto_cache: self.auto_cache,
             cache_ttl_secs: self.cache_ttl_secs,
             consistency_config: Some(self.consistency_strategy.into()),
-            storage_type: Some(self.storage_type.into()),
-            block_size: Some(self.block_size),
-            replicas: Some(self.replicas),
+            storage_type: self.storage_type.map(|x| x.into()),
+            block_size: self.block_size,
+            replicas: self.replicas,
         }
     }
 }
@@ -74,7 +74,7 @@ impl fmt::Display for MountPointEntry {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(
             fmt,
-            "id: {}, curvine_uri: {}, ufs_uri: {}, properties: {:?}, auto_cache: {}, cache_ttl_secs: {:?}, consistency_strategy: {:?}, block_size: {}, replicas: {}, storage_type: {:?}",
+            "id: {}, curvine_uri: {}, ufs_uri: {}, properties: {:?}, auto_cache: {}, cache_ttl_secs: {:?}, consistency_strategy: {:?}, block_size: {:?}, replicas: {:?}, storage_type: {:?}",
             self.id, self.curvine_uri, self.ufs_uri, self.properties, self.auto_cache, self.cache_ttl_secs, self.consistency_strategy, self.block_size, self.replicas, self.storage_type,
         )
     }
@@ -90,7 +90,7 @@ impl From<MountPointEntry> for MountPointInfo {
             auto_cache: val.auto_cache,
             cache_ttl_secs: val.cache_ttl_secs,
             consistency_config: ConsistencyStrategy::into(val.consistency_strategy),
-            storage_type: val.storage_type.into(),
+            storage_type: val.storage_type.map(|x| x.into()),
             block_size: val.block_size,
             replicas: val.replicas,
         }
