@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    {{- include "curvine-csi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+  name: {{ .Values.controller.name }}
+  namespace: {{ .Values.global.namespace }}
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      app: curvine-csi-controller
+  template:
+    metadata:
+      labels:
+        app: curvine-csi-controller
+        {{- include "curvine-csi.selectorLabels" . | nindent 8 }}
+    spec:
+      priorityClassName: {{ .Values.controller.priorityClassName }}
+      serviceAccountName: {{ .Values.serviceAccount.controller.name }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Values.controller.container.name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: {{ .Values.controller.container.command | toJson }}
+          args:
+            {{- range .Values.controller.container.args }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: CSI_ENDPOINT
+              value: {{ .Values.controller.container.env.CSI_ENDPOINT }}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          livenessProbe:
+            failureThreshold: {{ .Values.controller.container.livenessProbe.failureThreshold }}
+            httpGet:
+              path: {{ .Values.controller.container.livenessProbe.httpGet.path }}
+              port: {{ .Values.controller.container.livenessProbe.httpGet.port }}
+            initialDelaySeconds: {{ .Values.controller.container.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.controller.container.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.controller.container.livenessProbe.timeoutSeconds }}
+          ports:
+            - containerPort: {{ .Values.controller.container.ports.healthz }}
+              name: healthz
+              protocol: TCP
+          securityContext:
+            {{- toYaml .Values.controller.container.securityContext | nindent 12 }}
+          volumeMounts:
+            - mountPath: /csi
+              name: socket-dir
+            - mountPath: /opt/curvine/conf
+              name: curvine-config
+              readOnly: true
+        - name: csi-provisioner
+          image: {{ .Values.controller.sidecars.provisioner.image }}
+          args:
+            {{- range .Values.controller.sidecars.provisioner.args }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - mountPath: /csi
+              name: socket-dir
+        - name: csi-attacher
+          image: {{ .Values.controller.sidecars.attacher.image }}
+          args:
+            {{- range .Values.controller.sidecars.attacher.args }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - mountPath: /csi
+              name: socket-dir
+        - name: liveness-probe
+          image: {{ .Values.controller.sidecars.livenessProbe.image }}
+          args:
+            {{- range .Values.controller.sidecars.livenessProbe.args }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: HEALTH_PORT
+              value: {{ .Values.controller.sidecars.livenessProbe.env.HEALTH_PORT | quote }}
+          volumeMounts:
+            - mountPath: /csi
+              name: socket-dir
+      volumes:
+        - emptyDir: {}
+          name: socket-dir
+        - name: curvine-config
+          configMap:
+            name: {{ .Values.configMap.name }}
+            defaultMode: {{ .Values.configMap.defaultMode }}
