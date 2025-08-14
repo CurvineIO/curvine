@@ -48,7 +48,6 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 3
-          name: csi-plugin
           ports:
             - containerPort: 9909
               name: healthz
