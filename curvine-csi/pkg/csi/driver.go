@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package csi
 
 import (
@@ -30,7 +29,6 @@ import (
 	"google.golang.org/grpc"
 	"k8s.io/klog"
 )
-
 
 const (
 	// DriverName to be registered

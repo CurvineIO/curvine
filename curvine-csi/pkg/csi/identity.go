@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package csi
 
 import (
@@ -21,7 +20,6 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"k8s.io/klog"
 )
-
 
 // GetPluginInfo returns the name and version of the plugin
 func (d *Driver) GetPluginInfo(ctx context.Context, request *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {

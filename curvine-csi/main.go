@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package main
 
 import (
@@ -24,7 +23,6 @@ import (
 
 	"github.com/curvineio/curvine-csi/pkg/csi"
 )
-
 
 var (
 	endpoint   = flag.String("endpoint", "unix://tmp/csi.sock", "CSI Endpoint")

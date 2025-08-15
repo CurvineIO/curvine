@@ -40,6 +40,16 @@ help:
 	@echo "  make docker-build-cached         - Build using cached Docker compilation image"
 	@echo "  make docker-build-img            - Build compilation Docker image (interactive)"
 	@echo ""
+	@echo "CSI (Container Storage Interface):"
+	@echo "  make csi-build                   - Build curvine-csi Go binary"
+	@echo "  make csi-run                     - Run curvine-csi from source"
+	@echo "  make csi-docker-build            - Build curvine-csi Docker image"
+	@echo "  make csi-docker-push             - Push curvine-csi Docker image"
+	@echo "  make csi-docker                  - Build and push curvine-csi Docker image"
+	@echo "  make csi-docker-fast             - Build curvine-csi Docker image quickly (no push)"
+	@echo "  make csi-fmt                     - Format curvine-csi Go code"
+	@echo "  make csi-vet                     - Run go vet on curvine-csi code"
+	@echo ""
 	@echo "Other:"
 	@echo "  make cargo ARGS='<args>'         - Run arbitrary cargo commands"
 	@echo "  make help                        - Show this help message"
@@ -53,6 +63,7 @@ help:
 	@echo "  make build MODE=release          - Build entire project in release mode"
 	@echo "  make server MODE=release         - Build only server component in release mode"
 	@echo "  make cargo ARGS='test --verbose' - Run cargo test with verbose output"
+	@echo "  make csi-docker-fast             - Build curvine-csi Docker image quickly"
 
 # 1. Check build environment dependencies
 check-env:
@@ -93,6 +104,50 @@ docker-build-img:
 		*) \
 			echo "Invalid option!" ;; \
 	esac
+
+# 8. CSI (Container Storage Interface) targets - delegate to curvine-csi/Makefile
+.PHONY: csi-build csi-run csi-fmt csi-vet csi-docker-build csi-docker-push csi-docker csi-docker-fast
+
+# Build curvine-csi Go binary
+csi-build:
+	@echo "Building curvine-csi..."
+	cd curvine-csi && go fmt ./... && go vet ./... && go build -o bin/csi main.go
+
+# Run curvine-csi from source
+csi-run:
+	@echo "Running curvine-csi..."
+	cd curvine-csi && go fmt ./... && go vet ./... && go run ./main.go
+
+# Format curvine-csi Go code
+csi-fmt:
+	@echo "Formatting curvine-csi Go code..."
+	cd curvine-csi && go fmt ./...
+
+# Run go vet on curvine-csi code
+csi-vet:
+	@echo "Running go vet on curvine-csi code..."
+	cd curvine-csi && go vet ./...
+
+# Build curvine-csi Docker image (from root context)
+csi-docker-build:
+	@echo "Building curvine-csi Docker image..."
+	docker build --build-arg GOPROXY=https://goproxy.cn,direct -t curvine-csi:latest -f curvine-csi/Dockerfile .
+
+# Push curvine-csi Docker image
+csi-docker-push:
+	@echo "Pushing curvine-csi Docker image..."
+	docker push curvine-csi:latest
+
+# Build and push curvine-csi Docker image
+csi-docker:
+	@echo "Building and pushing curvine-csi Docker image..."
+	docker build --build-arg GOPROXY=https://goproxy.cn,direct -t curvine-csi:latest -f curvine-csi/Dockerfile .
+	docker push curvine-csi:latest
+
+# Build curvine-csi Docker image quickly (no push)
+csi-docker-fast:
+	@echo "Building curvine-csi Docker image (fast)..."
+	docker build --build-arg GOPROXY=https://goproxy.cn,direct -t curvine-csi:latest -f curvine-csi/Dockerfile .
 
 CARGO_FLAGS :=
 ifeq ($(MODE),release)

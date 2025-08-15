@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package csi
 
 import (
@@ -27,7 +26,6 @@ import (
 
 	"k8s.io/klog"
 )
-
 
 // ExecuteWithRetry executes command with retry and timeout control
 func ExecuteWithRetry(cmd *exec.Cmd, maxRetries int, retryInterval, timeout time.Duration) ([]byte, error) {
@@ -101,11 +99,11 @@ func waitForMount(mountPath string, timeout time.Duration) error {
 		case <-ctx.Done():
 			// Get mount status information
 			mountInfo := getMountInfo(mountPath)
-			return fmt.Errorf("timeout waiting for mount point %s to appear after %d attempts. Mount info: %s", 
+			return fmt.Errorf("timeout waiting for mount point %s to appear after %d attempts. Mount info: %s",
 				mountPath, attempts, mountInfo)
 		case <-ticker.C:
 			attempts++
-			
+
 			// Check if path exists
 			if _, err := os.Stat(mountPath); err != nil {
 				if os.IsNotExist(err) {
@@ -121,11 +119,11 @@ func waitForMount(mountPath string, timeout time.Duration) error {
 				// Mount point exists
 				return nil
 			}
-			
+
 			// If tried half the attempts but still not successful, record detailed info
 			if attempts == maxAttempts/2 {
 				mountInfo := getMountInfo(mountPath)
-				klog.Warningf("Still waiting for mount point %s after %d attempts. Mount info: %s", 
+				klog.Warningf("Still waiting for mount point %s after %d attempts. Mount info: %s",
 					mountPath, attempts, mountInfo)
 			}
 		}
@@ -138,7 +136,7 @@ func getMountInfo(mountPath string) string {
 	if _, err := os.Stat(mountPath); err != nil {
 		return fmt.Sprintf("Directory status: %v", err)
 	}
-	
+
 	// Check mount point status
 	mountpointCmd := exec.Command("mountpoint", "-v", mountPath)
 	mountpointOutput, err := mountpointCmd.CombinedOutput()
@@ -146,17 +144,17 @@ func getMountInfo(mountPath string) string {
 	if err != nil {
 		mountpointInfo += fmt.Sprintf(" (error: %v)", err)
 	}
-	
+
 	// Get system mount info
 	findmntCmd := exec.Command("sh", "-c", fmt.Sprintf("findmnt %s 2>&1 || echo 'Not found in findmnt'", mountPath))
 	findmntOutput, _ := findmntCmd.CombinedOutput()
-	
+
 	// Get process info
-	fuseProcessCmd := exec.Command("sh", "-c", fmt.Sprintf("ps aux | grep -E 'fuse|%s' | grep -v grep || echo 'No related processes found'", 
+	fuseProcessCmd := exec.Command("sh", "-c", fmt.Sprintf("ps aux | grep -E 'fuse|%s' | grep -v grep || echo 'No related processes found'",
 		strings.ReplaceAll(mountPath, "/", "\\/")))
 	fuseProcessOutput, _ := fuseProcessCmd.CombinedOutput()
-	
-	return fmt.Sprintf("Mountpoint check: %s\nFindmnt output: %s\nRelated processes: %s", 
+
+	return fmt.Sprintf("Mountpoint check: %s\nFindmnt output: %s\nRelated processes: %s",
 		mountpointInfo, string(findmntOutput), string(fuseProcessOutput))
 }
 

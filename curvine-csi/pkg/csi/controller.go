@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package csi
 
 import (
@@ -25,7 +24,6 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/klog"
 )
-
 
 var (
 	controllerCaps = []csi.ControllerServiceCapability_RPC_Type{
