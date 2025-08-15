@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub use curvine_common::state::TtlAction;
+use orpc::common::LocalTime;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,10 +39,7 @@ pub struct TtlConfig {
 
 impl TtlConfig {
     pub fn new(ttl_ms: u64, action: TtlAction) -> Self {
-        let creation_time_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let creation_time_ms = LocalTime::mills();
 
         Self {
             ttl_ms,
@@ -57,10 +55,7 @@ impl TtlConfig {
             Some(Self {
                 ttl_ms: storage_policy.ttl_ms as u64,
                 action: storage_policy.ttl_action,
-                creation_time_ms: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
+                creation_time_ms: LocalTime::mills(),
             })
         } else {
             None
@@ -96,54 +91,6 @@ impl TtlConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TtlInodeMetadata {
-    pub inode_id: u64,
-    pub ttl_config: TtlConfig,
-    pub retry_count: u32,
-    pub last_retry_time_ms: Option<u64>,
-}
-
-impl TtlInodeMetadata {
-    pub fn new(inode_id: u64, ttl_config: TtlConfig) -> Self {
-        Self {
-            inode_id,
-            ttl_config,
-            retry_count: 0,
-            last_retry_time_ms: None,
-        }
-    }
-    pub fn has_ttl(&self) -> bool {
-        self.ttl_config.action != TtlAction::None
-    }
-
-    pub fn is_expired(&self) -> bool {
-        self.ttl_config.is_expired()
-    }
-
-    pub fn is_expired_at(&self, time_ms: u64) -> bool {
-        self.ttl_config.is_expired_at(time_ms)
-    }
-
-    pub fn increment_retry(&mut self) {
-        self.retry_count += 1;
-        self.last_retry_time_ms = Some(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        );
-    }
-
-    pub fn exceeds_max_retries(&self, max_retries: u32) -> bool {
-        self.retry_count >= max_retries
-    }
-
-    pub fn expiry_time_ms(&self) -> u64 {
-        self.ttl_config.expiry_time_ms()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct TtlCleanupConfig {
     pub check_interval_ms: u64,
@@ -151,7 +98,6 @@ pub struct TtlCleanupConfig {
     pub max_retry_duration_ms: u64,
     pub retry_interval_ms: u64,
     pub bucket_interval_ms: u64,
-    pub cleanup_timeout_ms: u64,
 }
 
 impl Default for TtlCleanupConfig {
@@ -162,7 +108,6 @@ impl Default for TtlCleanupConfig {
             max_retry_duration_ms: 1800000, // 30 minutes
             retry_interval_ms: 5000,        // 5 seconds
             bucket_interval_ms: 3600000,    // 1 hour
-            cleanup_timeout_ms: 30000,      // 30 seconds
         }
     }
 }
@@ -216,12 +161,6 @@ impl TtlCleanupConfig {
         if self.bucket_interval_ms == 0 {
             return Err(TtlError::ConfigError(
                 "bucket_interval_ms must be greater than 0".to_string(),
-            ));
-        }
-
-        if self.cleanup_timeout_ms == 0 {
-            return Err(TtlError::ConfigError(
-                "cleanup_timeout_ms must be greater than 0".to_string(),
             ));
         }
 

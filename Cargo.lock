@@ -1289,6 +1289,7 @@ dependencies = [
  "num_enum",
  "once_cell",
  "orpc",
+ "parking_lot",
  "prost",
  "prost-build",
  "raft",
