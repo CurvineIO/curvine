@@ -21,6 +21,9 @@ pub use self::heartbeat_checker::HeartbeatChecker;
 mod master_actor;
 pub use self::master_actor::MasterActor;
 
+mod replica_checker;
+pub use self::replica_checker::ReplicaChecker;
+
 mod fs_retry_cache;
 pub use self::fs_retry_cache::*;
 

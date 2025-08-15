@@ -14,6 +14,7 @@
 
 use crate::master::fs::heartbeat_checker::HeartbeatChecker;
 use crate::master::fs::master_filesystem::MasterFilesystem;
+use crate::master::fs::replica_checker::ReplicaChecker;
 use crate::master::meta::inode::ttl::ttl_manager::InodeTtlManager;
 use crate::master::meta::inode::ttl::ttl_scheduler::TtlHeartbeatChecker;
 use crate::master::meta::inode::ttl_scheduler::TtlHeartbeatConfig;
@@ -51,6 +52,10 @@ impl MasterActor {
             self.executor.clone(),
         )
         .unwrap();
+
+        if let Err(e) = self.start_replica_checker() {
+            error!("Failed to start replica checker: {}", e);
+        }
 
         if let Err(e) = self.start_ttl_scheduler() {
             error!("Failed to start inode ttl scheduler: {}", e);
@@ -106,6 +111,16 @@ impl MasterActor {
         let task = HeartbeatChecker::new(fs, master_monitor, executor);
 
         scheduler.start(task)?;
+        Ok(())
+    }
+
+    fn start_replica_checker(&mut self) -> CommonResult<()> {
+        info!("Starting replica checker");
+        let check_interval = self.fs.conf.worker_check_interval_ms() * 2;
+        let scheduler = ScheduledExecutor::new("replica-checker".to_string(), check_interval);
+        let task = ReplicaChecker::new(self.fs.clone(), self.master_monitor.clone());
+        scheduler.start(task)?;
+        info!("Replica checker started");
         Ok(())
     }
 }
