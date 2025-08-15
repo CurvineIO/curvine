@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::ttl::ttl_bucket::{TtlBucket, TtlBucketList};
+use crate::master::meta::inode::ttl::ttl_bucket::TtlBucket;
+use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::inode::ttl::ttl_executor::InodeTtlExecutor;
 use crate::master::meta::inode::ttl::ttl_types::{
-    TtlAction, TtlCleanupConfig, TtlCleanupResult, TtlInodeMetadata, TtlResult,
+    TtlAction, TtlCleanupConfig, TtlCleanupResult, TtlResult,
 };
 use crate::master::meta::inode::InodeView;
 use log::{debug, error, info, warn};
@@ -29,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 //
 // Key Features:
 // - Bucket-based expiration processing for efficient batch operations
-// - Configurable retry logic with timeout and attempt limits
+// - Configurable retry logic with attempt limits
 // - Support for different TTL actions (Delete, Move, Free)
 // - Integration with inode storage and execution systems
 // - Comprehensive cleanup result tracking and statistics
@@ -98,20 +99,16 @@ impl InodeTtlChecker {
     ) -> TtlResult<TtlCleanupResult> {
         let mut result = TtlCleanupResult::new();
 
-        let expired_inodes = bucket.get_all_inodes();
-
-        for metadata in expired_inodes {
-            let inode_id = metadata.inode_id;
-            if self.should_stop_retry(&metadata, current_time_ms) {
-                warn!(
-                    "Stopping retry for inode {} due to timeout or max attempts",
-                    inode_id
-                );
+        // Iterate entries without long-held locks using for_each_inode snapshot
+        bucket.for_each_inode(|inode_id, retry_count| {
+            if self.should_stop_retry(retry_count) {
+                warn!("Stopping retry for inode {} due to max attempts", inode_id);
+                // Count as processed even if we stop retrying
                 result.failed_inodes.push(inode_id);
                 result.failed_cleanups += 1;
                 result.total_processed += 1;
-                bucket.remove_inode(inode_id);
-                continue;
+                let _ = bucket.remove_inode(inode_id);
+                return;
             }
 
             let action_result = self.execute_ttl_action(inode_id);
@@ -120,84 +117,51 @@ impl InodeTtlChecker {
             if result.successful_deletes.contains(&inode_id)
                 || result.successful_frees.contains(&inode_id)
             {
-                bucket.remove_inode(inode_id);
+                let _ = bucket.remove_inode(inode_id);
             } else if result.failed_inodes.contains(&inode_id) {
-                let updated_metadata =
-                    self.increment_retry_with_timeout_check(metadata, current_time_ms)?;
+                // Exponential backoff with jitter and reschedule into a future bucket
+                let updated_retry = retry_count.saturating_add(1);
 
-                if self.should_stop_retry(&updated_metadata, current_time_ms) {
+                if self.should_stop_retry(updated_retry) {
                     warn!("Max retries reached for inode {}, giving up", inode_id);
-                    bucket.remove_inode(inode_id);
+                    let _ = bucket.remove_inode(inode_id);
                 } else {
-                    bucket.add_inode(inode_id, updated_metadata.retry_count);
+                    let next_ts =
+                        self.compute_next_retry_ms(current_time_ms, inode_id, updated_retry);
+                    let _ = self
+                        .bucket_list
+                        .reschedule_inode(inode_id, updated_retry, next_ts);
                     result.retry_inodes.push(inode_id);
                     info!(
-                        "Scheduled retry for inode {} (attempt {}/{})",
-                        inode_id, updated_metadata.retry_count, self.config.max_retry_count
+                        "Scheduled retry for inode {} (attempt {}/{}) at {}",
+                        inode_id, updated_retry, self.config.max_retry_count, next_ts
                     );
                 }
             }
-        }
+        });
 
         // After processing all inodes, check if bucket is now empty and remove it
-        let remaining_inodes = bucket.get_all_inodes();
-        if remaining_inodes.is_empty() {
-            debug!(
-                "Bucket processing completed, removing empty bucket with interval_start_ms={}",
-                bucket.interval_start_ms
-            );
+        if bucket.is_empty() {
             let _ = self.bucket_list.remove_empty_bucket(bucket);
         } else {
             debug!(
                 "Bucket processing completed, {} inodes remaining for retry",
-                remaining_inodes.len()
+                bucket.len()
             );
         }
 
         Ok(result)
     }
 
-    fn should_stop_retry(&self, metadata: &TtlInodeMetadata, current_time_ms: u64) -> bool {
-        if metadata.retry_count >= self.config.max_retry_count {
+    fn should_stop_retry(&self, retry_count: u32) -> bool {
+        if retry_count >= self.config.max_retry_count {
             debug!(
                 "Retry count limit reached: {}/{}",
-                metadata.retry_count, self.config.max_retry_count
+                retry_count, self.config.max_retry_count
             );
             return true;
         }
-
-        if let Some(first_retry_time) = metadata.last_retry_time_ms {
-            let retry_duration = current_time_ms.saturating_sub(first_retry_time);
-
-            if retry_duration > self.config.max_retry_duration_ms {
-                warn!(
-                    "Global retry timeout reached for inode {}: duration={}ms, limit={}ms",
-                    metadata.inode_id, retry_duration, self.config.max_retry_duration_ms
-                );
-                return true;
-            }
-        }
-
         false
-    }
-
-    fn increment_retry_with_timeout_check(
-        &self,
-        mut metadata: TtlInodeMetadata,
-        current_time_ms: u64,
-    ) -> TtlResult<TtlInodeMetadata> {
-        metadata.retry_count += 1;
-
-        if metadata.last_retry_time_ms.is_none() {
-            metadata.last_retry_time_ms = Some(current_time_ms);
-        }
-
-        debug!(
-            "Incremented retry count for inode {}: {}/{}",
-            metadata.inode_id, metadata.retry_count, self.config.max_retry_count
-        );
-
-        Ok(metadata)
     }
 
     fn execute_ttl_action(&self, inode_id: u64) -> TtlCleanupResult {
@@ -235,7 +199,7 @@ impl InodeTtlChecker {
         match action {
             TtlAction::Delete => match self.action_executor.delete_inode(inode_id) {
                 Ok(()) => {
-                    info!("Successfully executed DELETE action for inode {}", inode_id);
+                    debug!("Successfully executed DELETE action for inode {}", inode_id);
                     result.successful_deletes.push(inode_id);
                     result.successful_cleanups = 1;
                 }
@@ -267,5 +231,20 @@ impl InodeTtlChecker {
         }
 
         result
+    }
+
+    /// Compute next retry timestamp with exponential backoff and ±10% jitter.
+    fn compute_next_retry_ms(&self, current_time_ms: u64, inode_id: u64, retry_count: u32) -> u64 {
+        let base = self.config.retry_interval_ms.max(1);
+        let pow = retry_count.min(16); // cap to avoid overflow
+        let mut backoff = base.saturating_mul(1u64 << pow);
+        backoff = backoff.min(self.config.max_retry_duration_ms);
+
+        // deterministic jitter based on ids to avoid extra deps
+        let basis = inode_id.rotate_left(pow) ^ current_time_ms;
+        let jitter_pct: i64 = (basis % 21) as i64 - 10; // [-10, +10]
+        let jitter_ms = ((backoff as i128 * jitter_pct as i128) / 100) as i64;
+        let adjusted = (backoff as i64 + jitter_ms).max(0) as u64;
+        current_time_ms.saturating_add(adjusted)
     }
 }

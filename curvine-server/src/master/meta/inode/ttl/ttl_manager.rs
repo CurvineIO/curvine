@@ -47,7 +47,6 @@ impl InodeTtlManager {
             max_retry_count: filesystem.conf.ttl_checker_retry_attempts,
             max_retry_duration_ms: filesystem.conf.ttl_max_retry_duration_ms(),
             retry_interval_ms: filesystem.conf.ttl_retry_interval_ms(),
-            cleanup_timeout_ms: filesystem.conf.ttl_cleanup_timeout_ms(),
         };
 
         let checker = Arc::new(InodeTtlChecker::new(

@@ -105,10 +105,6 @@ pub struct MasterConf {
     pub ttl_retry_interval: String,
     #[serde(skip)]
     pub ttl_retry_interval_unit: DurationUnit,
-
-    pub ttl_cleanup_timeout: String,
-    #[serde(skip)]
-    pub ttl_cleanup_timeout_unit: DurationUnit,
 }
 
 impl MasterConf {
@@ -127,7 +123,6 @@ impl MasterConf {
         self.ttl_bucket_interval_unit = DurationUnit::from_str(&self.ttl_bucket_interval)?;
         self.ttl_max_retry_duration_unit = DurationUnit::from_str(&self.ttl_max_retry_duration)?;
         self.ttl_retry_interval_unit = DurationUnit::from_str(&self.ttl_retry_interval)?;
-        self.ttl_cleanup_timeout_unit = DurationUnit::from_str(&self.ttl_cleanup_timeout)?;
 
         if self.heartbeat_interval_unit > self.worker_blacklist_interval_unit {
             return err_box!("Worker_blacklist_interval must be greater than heartbeat_interval");
@@ -170,10 +165,6 @@ impl MasterConf {
 
     pub fn ttl_retry_interval_ms(&self) -> u64 {
         self.ttl_retry_interval_unit.as_millis()
-    }
-
-    pub fn ttl_cleanup_timeout_ms(&self) -> u64 {
-        self.ttl_cleanup_timeout_unit.as_millis()
     }
 
     pub fn io_timeout_ms(&self) -> u64 {
@@ -258,9 +249,6 @@ impl Default for MasterConf {
 
             ttl_retry_interval: "1s".to_string(),
             ttl_retry_interval_unit: Default::default(),
-
-            ttl_cleanup_timeout: "10s".to_string(),
-            ttl_cleanup_timeout_unit: Default::default(),
         };
 
         conf.init().unwrap();
