@@ -14,14 +14,12 @@
 
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::CurvineURI;
-use curvine_common::proto::{ConsistencyConfig, MountOptions};
 use curvine_common::raft::{NodeId, RaftPeer};
 use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, WorkerInfo,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, WorkerInfo,
 };
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{JournalLoader, JournalSystem};
-use curvine_server::master::mount::ConsistencyStrategy;
 use curvine_server::master::{Master, MountManager};
 use log::info;
 use orpc::common::{Logger, TimeSpent};
@@ -222,41 +220,22 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
     let ufs_uri = CurvineURI::new("oss://cluster1/")?;
     let mut config = HashMap::new();
     config.insert("k1".to_string(), "v1".to_string());
-    let mnt_opt = MountOptions {
-        update: false,
-        properties: config,
-        auto_cache: false,
-        cache_ttl_secs: None,
-        consistency_config: None,
-        storage_type: None,
-        block_size: None,
-        replicas: None,
-    };
-    mgr.mount(None, &mount_uri, &ufs_uri, &mnt_opt)?;
+    let mnt_opt = MountOptions::builder()
+        .set_properties(config)
+        .build();
+    mgr.mount(None, mount_uri.path(), ufs_uri.path(), &mnt_opt)?;
 
     //mount hdfs://cluster1/ -> /x/z/y
     let mount_uri = CurvineURI::new("/x/z/y")?;
     let ufs_uri = CurvineURI::new("hdfs://cluster1/")?;
     let mut config = HashMap::new();
     config.insert("k2".to_string(), "v1".to_string());
-    let mnt_opt = MountOptions {
-        update: false,
-        properties: config,
-        auto_cache: true,
-        cache_ttl_secs: Some(10),
-        consistency_config: Some(ConsistencyConfig {
-            strategy: ConsistencyStrategy::Always.into(),
-            period_seconds: Some(10),
-        }),
-        storage_type: None,
-        block_size: None,
-        replicas: None,
-    };
-    mgr.mount(None, &mount_uri, &ufs_uri, &mnt_opt)?;
+    let mnt_opt = MountOptions::builder().build();
+    mgr.mount(None, mount_uri.path(), ufs_uri.path(), &mnt_opt)?;
 
     // umount
     let mount_uri = CurvineURI::new("/x/z/y")?;
-    mgr.umount(&mount_uri)?;
+    mgr.umount(mount_uri.path())?;
 
     Ok(())
 }

@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::mount::MountPointEntry;
 use crate::master::SyncFsDir;
 use curvine_common::conf::{UfsConf, UfsConfBuilder};
-use curvine_common::error::FsError;
 use curvine_common::fs::Path;
-use curvine_common::proto::MountOptions;
+use curvine_common::state::{MountInfo, MountOptions};
 use curvine_common::FsResult;
-use log::info;
 use orpc::{err_box, try_option};
 use rand::Rng;
 use std::collections::HashMap;
@@ -28,7 +25,7 @@ use std::sync::RwLock;
 
 pub struct MountTableInner {
     ufs2mountid: HashMap<String, u32>,
-    mountid2entry: HashMap<u32, MountPointEntry>,
+    mountid2entry: HashMap<u32, MountInfo>,
     mountpath2id: HashMap<String, u32>,
 }
 
@@ -53,30 +50,24 @@ impl MountTable {
     pub fn restore(&self) {
         if let Ok(mounts) = self.fs_dir.read().get_mount_table() {
             for mnt in mounts {
-                // Creating a MountOptions Object
-                let mount_options = mnt.to_mount_options();
-                let _ =
-                    self.insert_mount_table(mnt.id, &mnt.curvine_uri, &mnt.ufs_uri, &mount_options);
-                info!("recovering {} mount to {}", mnt.ufs_uri, mnt.curvine_uri);
+                self.unprotected_add_mount(mnt).unwrap();
             }
-        } else {
-            info!("mount table restore nothing.")
         }
     }
 
     // ufs maybe mounted already or has prefix overlap with existing mounts
-    pub fn exists(&self, ufs_uri: &String) -> bool {
+    pub fn exists(&self, ufs_path: &str) -> bool {
         let inner = self.inner.read().unwrap();
 
         // full match check
-        if inner.ufs2mountid.contains_key(ufs_uri) {
+        if inner.ufs2mountid.contains_key(ufs_path) {
             return true;
         }
 
         false
     }
 
-    pub fn ufs_path_conflict(&self, ufs_uri: &String) -> Option<String> {
+    pub fn ufs_path_conflict(&self, ufs_uri: &str) -> Option<String> {
         // prefix check
         let inner = self.inner.read().unwrap();
         for existing_uri in inner.ufs2mountid.keys() {
@@ -84,7 +75,7 @@ impl MountTable {
             //avoid 's3://abcde' s3://abc conflict, this is two different path
             //after add '/', 's3://abcde/' s3://abc/ won't conflict
             let ufs_uri = if ufs_uri.ends_with("/") {
-                ufs_uri.clone()
+                ufs_uri.to_string()
             } else {
                 format!("{}/", ufs_uri)
             };
@@ -107,7 +98,7 @@ impl MountTable {
         None
     }
 
-    pub fn mnt_path_conflict(&self, mnt_uri: &String) -> Option<String> {
+    pub fn mnt_path_conflict(&self, mnt_uri: &str) -> Option<String> {
         // prefix check
         let inner = self.inner.read().unwrap();
         for existing_uri in inner.mountpath2id.keys() {
@@ -120,7 +111,7 @@ impl MountTable {
             //avoid '/abcde' and '/abc' conflict, this is two different path
             //after add '/', '/abcde/' and '/abc/' won't conflict
             let mnt_uri = if mnt_uri.ends_with("/") {
-                mnt_uri.clone()
+                mnt_uri.to_string()
             } else {
                 format!("{}/", mnt_uri)
             };
@@ -150,53 +141,44 @@ impl MountTable {
     }
 
     // mount_path maybe mounted by other ufs
-    fn mount_point_inuse(&self, mount_path: &String) -> bool {
+    fn mount_point_inuse(&self, cv_path: &str) -> bool {
         let inner = self.inner.read().unwrap();
-        inner.mountpath2id.contains_key(mount_path)
+        inner.mountpath2id.contains_key(cv_path)
     }
 
-    pub fn insert_mount_table(
-        &self,
-        mount_id: u32,
-        mnt_path: &String,
-        ufs_path: &String,
-        mnt_opt: &MountOptions,
-    ) -> FsResult<MountPointEntry> {
-        if self.exists(ufs_path) {
-            return err_box!("{} already exists in mount table", ufs_path);
-        }
-
-        if self.mount_point_inuse(mnt_path) {
-            return err_box!("{} already exists in mount table", ufs_path);
-        }
-
+    pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
         let mut inner = self.inner.write().unwrap();
-        inner.ufs2mountid.insert(ufs_path.clone(), mount_id);
-        inner.mountpath2id.insert(mnt_path.clone(), mount_id);
+        inner
+            .ufs2mountid
+            .insert(info.ufs_path.to_string(), info.mount_id);
+        inner
+            .mountpath2id
+            .insert(info.cv_path.to_string(), info.mount_id);
+        inner.mountid2entry.insert(info.mount_id, info);
 
-        let mount_entry = MountPointEntry::new(
-            mount_id,
-            mnt_path.clone(),
-            ufs_path.clone(),
-            mnt_opt.clone(),
-        );
-        info!("mount entry is {:?}", mount_entry);
-        inner.mountid2entry.insert(mount_id, mount_entry.clone());
-
-        Ok(mount_entry)
+        Ok(())
     }
 
     pub fn add_mount(
         &self,
         mount_id: u32,
-        mnt_path: &String,
-        ufs_path: &String,
+        cv_path: &str,
+        ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
-        let mount_entry = self.insert_mount_table(mount_id, mnt_path, ufs_path, mnt_opt)?;
+        if self.exists(ufs_path) {
+            return err_box!("{} already exists in mount table", ufs_path);
+        }
+
+        if self.mount_point_inuse(cv_path) {
+            return err_box!("{} already exists in mount table", ufs_path);
+        }
+
+        let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
+        self.unprotected_add_mount(info.clone())?;
 
         let mut fs_dir = self.fs_dir.write();
-        fs_dir.mount(mount_entry)?;
+        fs_dir.store_mount(info, true)?;
         Ok(())
     }
 
@@ -208,10 +190,11 @@ impl MountTable {
                 return Ok(new_id);
             }
         }
-        Err(FsError::common("failed assign mount id"))
+
+        err_box!("failed assign mount id")
     }
 
-    pub fn umount(&self, mount_path: &String) -> FsResult<()> {
+    pub fn umount(&self, mount_path: &str) -> FsResult<()> {
         let mut inner = self.inner.write().unwrap();
 
         let mount_id = match inner.mountpath2id.get(mount_path) {
@@ -220,7 +203,7 @@ impl MountTable {
         };
 
         let ufs_path = match inner.mountid2entry.get(&mount_id) {
-            Some(entry) => entry.ufs_uri.clone(),
+            Some(entry) => entry.ufs_path.clone(),
             None => return err_box!("failed found {} matched mountentry to umount", mount_id),
         };
 
@@ -256,7 +239,7 @@ impl MountTable {
         Ok(ufs_conf)
     }
 
-    pub fn get_mount_entry(&self, path: &Path) -> FsResult<Option<MountPointEntry>> {
+    pub fn get_mount_entry(&self, path: &Path) -> FsResult<Option<MountInfo>> {
         let list = path.get_possible_mounts();
         let is_cv = path.is_cv();
         let inner = self.inner.read().unwrap();
@@ -276,7 +259,7 @@ impl MountTable {
         Ok(None)
     }
 
-    pub fn get_mount_entry_by_id(&self, mount_id: u32) -> FsResult<MountPointEntry> {
+    pub fn get_mount_info_by_id(&self, mount_id: u32) -> FsResult<MountInfo> {
         let inner = self.inner.read().unwrap();
         let entry = match inner.mountid2entry.get(&mount_id) {
             Some(entry) => entry.clone(),
@@ -285,7 +268,7 @@ impl MountTable {
         Ok(entry)
     }
 
-    pub fn get_mount_table(&self) -> FsResult<Vec<MountPointEntry>> {
+    pub fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
         let inner = self.inner.read().unwrap();
         let table = inner.mountid2entry.values().cloned().collect();
         Ok(table)

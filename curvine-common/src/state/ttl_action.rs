@@ -13,15 +13,26 @@
 // limitations under the License.
 
 use num_enum::{FromPrimitive, IntoPrimitive};
+use orpc::{err_box, CommonError};
 use serde::{Deserialize, Serialize};
 
 #[repr(i32)]
 #[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, IntoPrimitive, FromPrimitive, Eq,
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    IntoPrimitive,
+    FromPrimitive,
+    Eq,
+    Default,
+    Hash,
 )]
 pub enum TtlAction {
     /// No action is performed.
-    #[num_enum(default)]
+    #[default]
     None = 0,
 
     /// Try moving to slow storage such as disk
@@ -32,4 +43,21 @@ pub enum TtlAction {
 
     /// Delete after expiration
     Delete = 3,
+}
+
+impl TryFrom<&str> for TtlAction {
+    type Error = CommonError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let action = match value.to_uppercase().as_str() {
+            "NONE" => TtlAction::None,
+            "MOVE" => TtlAction::Move,
+            "UFS" => TtlAction::Ufs,
+            "DELETE" => TtlAction::Delete,
+
+            _ => return err_box!("invalid ttl action: {}", value),
+        };
+
+        Ok(action)
+    }
 }

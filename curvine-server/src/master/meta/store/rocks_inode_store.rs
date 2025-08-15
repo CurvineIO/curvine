@@ -14,9 +14,8 @@
 
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::BlockMeta;
-use crate::master::mount::MountPointEntry;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
-use curvine_common::state::BlockLocation;
+use curvine_common::state::{BlockLocation, MountInfo};
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use rocksdb::{DBIteratorWithThreadMode, WriteBatchWithTransaction, DB};
@@ -113,8 +112,7 @@ impl RocksInodeStore {
         self.db.prefix_delete(Self::CF_LOCATION, prefix)
     }
 
-    /// mountId -> MountPointEntry
-    pub fn add_mountpoint(&self, id: u32, entry: &MountPointEntry) -> CommonResult<()> {
+    pub fn add_mountpoint(&self, id: u32, entry: &MountInfo) -> CommonResult<()> {
         let key = RocksUtils::u32_to_bytes(id);
         let value = Serde::serialize(entry).unwrap();
         self.db.put_cf(RocksInodeStore::CF_MOUNTPOINT, key, value)
@@ -125,26 +123,27 @@ impl RocksInodeStore {
         self.db.delete_cf(RocksInodeStore::CF_MOUNTPOINT, key)
     }
 
-    pub fn get_mountpoint_entry(&self, id: u32) -> CommonResult<Option<MountPointEntry>> {
+    pub fn get_mount_info(&self, id: u32) -> CommonResult<Option<MountInfo>> {
         let bytes = self
             .db
             .get_cf(Self::CF_MOUNTPOINT, RocksUtils::u32_to_bytes(id))?;
+
         match bytes {
             None => Ok(None),
 
             Some(v) => {
-                let entry: MountPointEntry = Serde::deserialize(&v)?;
-                Ok(Some(entry))
+                let info: MountInfo = Serde::deserialize(&v)?;
+                Ok(Some(info))
             }
         }
     }
 
-    pub fn get_mount_table(&self) -> CommonResult<Vec<MountPointEntry>> {
+    pub fn get_mount_table(&self) -> CommonResult<Vec<MountInfo>> {
         let iter = self.db.scan(Self::CF_MOUNTPOINT)?;
         let mut vec = Vec::with_capacity(8);
         for item in iter {
             let bytes = item?;
-            let mnt = Serde::deserialize::<MountPointEntry>(&bytes.1)?;
+            let mnt = Serde::deserialize::<MountInfo>(&bytes.1)?;
             vec.push(mnt);
         }
 

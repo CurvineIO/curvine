@@ -14,8 +14,7 @@
 
 use crate::master::meta::inode::{InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
-use curvine_common::proto::MountOptions;
-use curvine_common::state::{CommitBlock, SetAttrOpts};
+use curvine_common::state::{CommitBlock, MountInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -77,10 +76,7 @@ pub struct DeleteEntry {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct MountEntry {
     pub(crate) op_ms: u64,
-    pub(crate) id: u32,
-    pub(crate) mnt_path: String,
-    pub(crate) ufs_path: String,
-    pub(crate) mnt_opt: MountOptions,
+    pub(crate) info: MountInfo,
 }
 
 // umount

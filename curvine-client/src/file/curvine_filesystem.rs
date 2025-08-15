@@ -17,11 +17,11 @@ use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::proto::MountPointInfo;
 use curvine_common::state::{
     CacheJobResult, CreateFileOpts, CreateFileOptsBuilder, FileBlocks, FileStatus, MasterInfo,
     MkdirOpts, MkdirOptsBuilder, MountInfo, SetAttrOpts,
 };
+use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
 use curvine_common::FsResult;
 use log::info;
@@ -223,8 +223,15 @@ impl CurvineFileSystem {
         self.fs_client.async_cache(path, ttl, recursive).await
     }
 
-    pub async fn get_all_mounts(&self) -> FsResult<Vec<MountInfo>> {
-        self.fs_client.get_all_mounts().await
+    pub async fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
+        let res = self.fs_client.get_mount_table().await?;
+        let table = res
+            .mount_table
+            .into_iter()
+            .map(ProtoUtils::mount_info_from_pb)
+            .collect();
+
+        Ok(table)
     }
 
     pub async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
@@ -235,12 +242,12 @@ impl CurvineFileSystem {
         self.fs_client.symlink(target, link, force).await
     }
 
-    pub async fn get_mount_point(&self, path: &Path) -> FsResult<Option<MountPointInfo>> {
-        self.fs_client.get_mount_point(path.full_path()).await
+    pub async fn get_mount_info(&self, path: &Path) -> FsResult<Option<MountInfo>> {
+        self.fs_client.get_mount_info(path).await
     }
 
-    pub async fn get_mount_point_bytes(&self, path: &Path) -> FsResult<BytesMut> {
-        self.fs_client.get_mount_point_bytes(path.full_path()).await
+    pub async fn get_mount_info_bytes(&self, path: &Path) -> FsResult<BytesMut> {
+        self.fs_client.get_mount_info_bytes(path).await
     }
 
     pub fn clone_runtime(&self) -> Arc<Runtime> {

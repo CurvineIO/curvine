@@ -18,9 +18,8 @@ use crate::master::journal::*;
 use crate::master::meta::inode::{InodeFile, InodePath};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
-use curvine_common::proto::MountOptions;
 use curvine_common::raft::RaftClient;
-use curvine_common::state::{CommitBlock, SetAttrOpts};
+use curvine_common::state::{CommitBlock, MountInfo, SetAttrOpts};
 use curvine_common::FsResult;
 use log::info;
 use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
@@ -176,21 +175,8 @@ impl JournalWriter {
         self.send(JournalEntry::Delete(entry))
     }
 
-    pub fn log_mount<P: AsRef<str>>(
-        &self,
-        op_ms: u64,
-        id: u32,
-        mnt_path: P,
-        ufs_path: P,
-        mnt_opt: MountOptions,
-    ) -> FsResult<()> {
-        let entry = MountEntry {
-            op_ms,
-            id,
-            mnt_path: mnt_path.as_ref().to_string(),
-            ufs_path: ufs_path.as_ref().to_string(),
-            mnt_opt,
-        };
+    pub fn log_mount(&self, op_ms: u64, info: MountInfo) -> FsResult<()> {
+        let entry = MountEntry { op_ms, info };
 
         self.send(JournalEntry::Mount(entry))
     }

@@ -15,8 +15,9 @@
 use crate::util::*;
 use clap::Parser;
 use curvine_client::file::FsClient;
-use curvine_common::state::StorageType;
-use orpc::common::ByteUnit;
+use curvine_common::fs::Path;
+use curvine_common::state::{ConsistencyStrategy, MountOptions, MountType, StorageType, TtlAction};
+use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ pub struct MountCommand {
 
     /// Curvine path to mount to
     #[arg(default_value = "")]
-    curvine_path: String,
+    cv_path: String,
 
     #[arg(short, long)]
     config: Vec<String>,
@@ -41,26 +42,38 @@ pub struct MountCommand {
     #[arg(long, default_value_t = false)]
     update: bool,
 
-    #[arg(short, long)]
-    replicas: Option<usize>,
+    #[arg(long, default_value = "cst")]
+    mnt_type: String,
 
-    #[arg(short, long)]
+    #[arg(long, default_value = "always")]
+    consistency_strategy: String,
+
+    #[arg(long, default_value = "0")]
+    ttl_ms: String,
+
+    #[arg(long, default_value = "none")]
+    ttl_action: String,
+
+    #[arg(long)]
+    replicas: Option<i32>,
+
+    #[arg(long)]
     block_size: Option<String>,
 
     #[arg(short, long)]
-    storage_type: Option<StorageType>,
+    storage_type: Option<String>,
 }
 
 impl MountCommand {
     pub async fn execute(&self, client: Arc<FsClient>) -> CommonResult<()> {
         // If no path argument is given, all mount points are listed.
-        if self.ufs_path.trim().is_empty() && self.curvine_path.trim().is_empty() {
+        if self.ufs_path.trim().is_empty() && self.cv_path.trim().is_empty() {
             let rep = handle_rpc_result(client.get_mount_table()).await;
             println!("{}", rep);
             return Ok(());
         }
 
-        if self.curvine_path.trim().is_empty() {
+        if self.cv_path.trim().is_empty() {
             eprintln!("Error: Curvine Path cannot be empty");
             std::process::exit(1);
         }
@@ -71,7 +84,7 @@ impl MountCommand {
         }
 
         println!("Ufs path: {}", self.ufs_path);
-        println!("Curvine path: {}", self.curvine_path);
+        println!("Curvine path: {}", self.cv_path);
 
         let mut configs = match self.get_config_map() {
             Ok(configs) => configs,
@@ -101,26 +114,12 @@ impl MountCommand {
             println!("\n");
         }
 
-        // Creating a MountOptions Object
-        let mount_options = curvine_common::proto::MountOptions {
-            update: self.update,
-            properties: configs,
-            auto_cache: false,
-            cache_ttl_secs: None,
-            consistency_config: None,
-            storage_type: self.storage_type.map(|stype| stype.into()),
-            block_size: self
-                .block_size
-                .as_ref()
-                .map(|s| ByteUnit::from_str(s))
-                .transpose()?
-                .map(|u| u.as_byte()),
-            replicas: self.replicas.map(|r| r as u32),
-        };
+        let ufs_path = Path::from_str(&self.ufs_path)?;
+        let cv_path = Path::from_str(&self.cv_path)?;
 
-        let rep =
-            handle_rpc_result(client.mount(&self.ufs_path, &self.curvine_path, mount_options))
-                .await;
+        // Creating a MountOptions Object
+        let mnt_opts = self.to_mnt_opts()?;
+        let rep = handle_rpc_result(client.mount(&ufs_path, &cv_path, mnt_opts)).await;
         println!("{}", rep);
         Ok(())
     }
@@ -137,5 +136,32 @@ impl MountCommand {
         }
 
         Ok(configs)
+    }
+
+    pub fn to_mnt_opts(&self) -> CommonResult<MountOptions> {
+        let mnt_type = MountType::try_from(self.mnt_type.as_str())?;
+        let consistency_strategy =
+            ConsistencyStrategy::try_from(self.consistency_strategy.as_str())?;
+        let ttl_ms = DurationUnit::from_str(self.ttl_ms.as_str())?.as_millis() as i64;
+        let ttl_action = TtlAction::try_from(self.ttl_action.as_str())?;
+
+        let mut opts = MountOptions::builder()
+            .update(self.update)
+            .mount_type(mnt_type)
+            .consistency_strategy(consistency_strategy)
+            .ttl_ms(ttl_ms)
+            .ttl_action(ttl_action);
+
+        if let Some(replicas) = self.replicas {
+            opts = opts.replicas(replicas);
+        }
+        if let Some(block_size) = self.block_size.as_ref() {
+            opts = opts.block_size(ByteUnit::from_str(block_size.as_str())?.as_byte() as i64);
+        }
+        if let Some(storage_type) = self.storage_type.as_ref() {
+            opts = opts.storage_type(StorageType::try_from(storage_type.as_str())?);
+        }
+
+        Ok(opts.build())
     }
 }

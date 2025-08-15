@@ -12,12 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod cache_strategy;
-mod mount_entry;
 mod mount_manager;
 mod mount_table;
 
-pub use cache_strategy::ConsistencyStrategy;
-pub use mount_entry::MountPointEntry;
 pub use mount_manager::MountManager;
 pub use mount_table::MountTable;
