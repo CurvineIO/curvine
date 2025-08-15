@@ -18,8 +18,7 @@ use bytes::{Bytes, BytesMut};
 use curvine_client::file::{FsClient, FsWriter};
 use curvine_client::unified::UnifiedReader;
 use curvine_common::fs::{CurvineURI, Path, Reader, Writer};
-use curvine_common::proto::MountPointInfo;
-use curvine_common::state::{CreateFileOptsBuilder, TtlAction};
+use curvine_common::state::{CreateFileOptsBuilder, MountInfo, TtlAction};
 use curvine_common::FsResult;
 use curvine_ufs::fs::{AsyncChunkReader, AsyncChunkWriter};
 use orpc::sys::DataSlice;
@@ -199,7 +198,7 @@ impl CurvineFsWriter {
         ufs_mtime: i64,
         ttl_ms: Option<i64>,
         ttl_action: Option<i32>,
-        mount_point_info: MountPointInfo,
+        mount_point_info: MountInfo,
     ) -> Self {
         let fs_context = fs_client.context();
         let client_conf = fs_context.cluster_conf().client;
@@ -219,15 +218,15 @@ impl CurvineFsWriter {
         }
 
         if let Some(block_size) = mount_point_info.block_size {
-            opts_builder = opts_builder.block_size(block_size as i64);
+            opts_builder = opts_builder.block_size(block_size);
         }
 
         if let Some(replicas) = mount_point_info.replicas {
-            opts_builder = opts_builder.replicas(replicas as i32);
+            opts_builder = opts_builder.replicas(replicas);
         }
 
         if let Some(storage_type) = mount_point_info.storage_type {
-            opts_builder = opts_builder.storage_type(storage_type.into());
+            opts_builder = opts_builder.storage_type(storage_type);
         }
 
         let opts = opts_builder.build();

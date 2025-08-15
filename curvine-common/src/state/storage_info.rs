@@ -16,6 +16,7 @@
 
 use clap::ValueEnum;
 use num_enum::{FromPrimitive, IntoPrimitive};
+use orpc::{err_box, CommonError};
 use serde::{Deserialize, Serialize};
 
 #[repr(i32)]
@@ -57,13 +58,25 @@ impl StorageType {
     }
 
     pub fn from_str_name(value: &str) -> Self {
-        match value.to_uppercase().as_str() {
+        Self::try_from(value).unwrap_or(StorageType::Disk)
+    }
+}
+
+impl TryFrom<&str> for StorageType {
+    type Error = CommonError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let typ = match value.to_uppercase().as_str() {
             "MEM" => Self::Mem,
             "SSD" => Self::Ssd,
             "HDD" => Self::Hdd,
             "UFS" => Self::Ufs,
-            _ => Self::Disk,
-        }
+            "DISK" => Self::Disk,
+
+            _ => return err_box!("invalid storage type: {}", value),
+        };
+
+        Ok(typ)
     }
 }
 

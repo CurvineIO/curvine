@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::conf::ClusterConf;
+use crate::state::{StorageType, TtlAction};
 use orpc::client::ClientConf as RpcConf;
 use orpc::common::{ByteUnit, DurationUnit, Utils};
 use orpc::io::net::InetAddr;
@@ -70,9 +71,20 @@ pub struct ClientConf {
 
     pub short_circuit: bool,
 
-    pub storage_type: String,
+    #[serde(skip)]
+    pub storage_type: StorageType,
+    #[serde(alias = "storage_type")]
+    pub storage_type_str: String,
+
+    #[serde(skip)]
     pub ttl_ms: i64,
-    pub ttl_action: String,
+    #[serde(alias = "ttl_ms")]
+    pub ttl_ms_str: String,
+
+    #[serde(skip)]
+    pub ttl_action: TtlAction,
+    #[serde(alias = "ttl_action")]
+    pub ttl_action_str: String,
 
     /// Whether to enable automatic caching function
     /// When enabled, when the client reads files from external file systems (such as S3, OSS, etc.),
@@ -179,6 +191,10 @@ impl ClientConf {
         self.failed_worker_ttl = DurationUnit::from_str(&self.failed_worker_ttl_str)?.as_duration();
         self.mount_update_ttl = DurationUnit::from_str(&self.mount_update_ttl_str)?.as_duration();
 
+        self.ttl_ms = DurationUnit::from_str(&self.ttl_ms_str)?.as_millis() as i64;
+        self.ttl_action = TtlAction::try_from(self.ttl_action_str.as_str())?;
+        self.storage_type = StorageType::try_from(self.storage_type_str.as_str())?;
+
         Ok(())
     }
 
@@ -244,9 +260,12 @@ impl Default for ClientConf {
 
             short_circuit: true,
 
-            storage_type: "disk".to_string(),
+            storage_type: StorageType::Disk,
+            storage_type_str: "disk".to_string(),
             ttl_ms: 0,
-            ttl_action: "none".to_string(),
+            ttl_ms_str: "0".to_string(),
+            ttl_action: TtlAction::None,
+            ttl_action_str: "none".to_string(),
 
             auto_cache_enabled: false,
             auto_cache_ttl: "7d".to_string(),

@@ -99,6 +99,6 @@ impl LibFilesystem {
     pub fn get_mount_point(&self, path: impl AsRef<str>) -> FsResult<BytesMut> {
         let path = Path::from_str(path)?;
         self.rt
-            .block_on(async { self.inner.cv().get_mount_point_bytes(&path).await })
+            .block_on(async { self.inner.cv().get_mount_info_bytes(&path).await })
     }
 }

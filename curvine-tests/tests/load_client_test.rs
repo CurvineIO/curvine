@@ -19,7 +19,7 @@ use curvine_client::file::{CurvineFileSystem, FsClient, FsContext};
 use curvine_client::LoadClient;
 use curvine_common::fs::{Path, Reader};
 use curvine_common::proto::LoadState;
-use curvine_common::proto::MountOptions;
+use curvine_common::state::MountOptions;
 use curvine_tests::Testing;
 use log::info;
 use orpc::common::Logger;
@@ -52,18 +52,14 @@ fn load_client_test() -> CommonResult<()> {
         let fs_context = Arc::new(FsContext::with_rt(conf.clone(), rt_clone.clone())?);
         let client = FsClient::new(fs_context);
         let configs = get_s3_test_config().await;
-        let mnt_opt = MountOptions {
-            update: false,
-            properties: configs,
-            auto_cache: false,
-            cache_ttl_secs: None,
-            consistency_config: None,
-            storage_type: None,
-            block_size: None,
-            replicas: None,
-        };
-        let ret = client.umount(mount_path).await;
-        let mount_resp = client.mount(UFS_PATH, mount_path, mnt_opt.clone()).await;
+        let mnt_opt = MountOptions::builder()
+            .set_properties(configs)
+            .build();
+
+        let mount_path = Path::from_str(mount_path)?;
+        let ufs_pat = Path::from_str(UFS_PATH)?;
+        let ret = client.umount(&mount_path).await;
+        let mount_resp = client.mount(&ufs_pat, &mount_path, mnt_opt.clone()).await;
         info!("S3 MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "mount should success");
 

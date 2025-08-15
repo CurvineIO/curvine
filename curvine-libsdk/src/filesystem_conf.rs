@@ -43,7 +43,7 @@ pub struct FilesystemConf {
     pub close_reader_limit: u32,
 
     pub storage_type: String,
-    pub ttl_ms: i64,
+    pub ttl_ms: String,
     pub ttl_action: String,
 
     pub auto_cache_enabled: bool,
@@ -161,9 +161,9 @@ impl FilesystemConf {
             drop_cache_len: 0,
             drop_cache_len_str: self.drop_cache_len,
 
-            storage_type: self.storage_type,
-            ttl_ms: self.ttl_ms,
-            ttl_action: self.ttl_action,
+            storage_type_str: self.storage_type,
+            ttl_ms_str: self.ttl_ms,
+            ttl_action_str: self.ttl_action,
 
             auto_cache_enabled: self.auto_cache_enabled,
             auto_cache_ttl: self.auto_cache_ttl,
@@ -172,7 +172,7 @@ impl FilesystemConf {
             failed_worker_ttl: Duration::default(),
             failed_worker_ttl_str: self.failed_worker_ttl,
 
-            enable_unified_fs: self.enable_read_ufs,
+            enable_unified_fs: self.enable_unified_fs,
             enable_read_ufs: self.enable_read_ufs,
             mount_update_ttl_str: self.mount_update_ttl,
 

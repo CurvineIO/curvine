@@ -15,8 +15,9 @@
 use crate::common::UfsClient;
 use curvine_client::file::FsClient;
 use curvine_common::conf::{UfsConf, UfsConfBuilder};
-use curvine_common::fs::CurvineURI;
-use curvine_common::proto::MountPointInfo;
+use curvine_common::fs::{CurvineURI, Path};
+use curvine_common::state::MountInfo;
+use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use curvine_ufs::fs::ufs_context::UFSContext;
 use log::info;
@@ -28,7 +29,7 @@ use std::sync::{Arc, RwLock};
 /// When loading, directly use the MountTable to return a usable UfsClient to the user
 pub struct UfsManager {
     curvine_client: Arc<FsClient>,
-    mount_table: RwLock<HashMap<String, MountPointInfo>>, //ufs_path -> mountPointInfo
+    mount_table: RwLock<HashMap<String, MountInfo>>, //ufs_path -> mountPointInfo
 }
 
 /// manager all ufs associate with mount table
@@ -43,9 +44,9 @@ impl UfsManager {
     pub async fn sync_mount_table(&mut self) -> FsResult<()> {
         let resp = self.curvine_client.get_mount_table().await?;
         let mut table = self.mount_table.write().unwrap();
-        resp.mount_points.into_iter().for_each(|mnt| {
+        resp.mount_table.into_iter().for_each(|mnt| {
             let ufs_path = mnt.ufs_path.clone();
-            table.insert(ufs_path, mnt);
+            table.insert(ufs_path, ProtoUtils::mount_info_from_pb(mnt));
         });
         Ok(())
     }
@@ -60,10 +61,7 @@ impl UfsManager {
         Ok(ufs_conf)
     }
 
-    pub async fn get_mount_point_with_uri(
-        &mut self,
-        ufs_uri: &CurvineURI,
-    ) -> FsResult<MountPointInfo> {
+    pub async fn get_mount_point_with_uri(&mut self, ufs_uri: &CurvineURI) -> FsResult<MountInfo> {
         let ufs_norm_uri = match ufs_uri.normalize_uri() {
             Some(ufs_base_uri) => ufs_base_uri,
             None => return err_box!("invalid ufs_uri, can't find baseuri"),
@@ -71,7 +69,7 @@ impl UfsManager {
         self.get_mount_point(&ufs_norm_uri).await
     }
 
-    pub async fn get_mount_point(&mut self, ufs_base_uri: &str) -> FsResult<MountPointInfo> {
+    pub async fn get_mount_point(&mut self, ufs_base_uri: &str) -> FsResult<MountInfo> {
         // looking cache
         {
             let table = self.mount_table.read().unwrap();
@@ -85,7 +83,8 @@ impl UfsManager {
             };
         }
 
-        let resp = self.curvine_client.get_mount_point(ufs_base_uri).await?;
+        let path = Path::from_str(ufs_base_uri)?;
+        let resp = self.curvine_client.get_mount_info(&path).await?;
         match resp {
             Some(mount_point_info) => {
                 let mut table = self.mount_table.write().unwrap();
@@ -107,7 +106,7 @@ impl UfsManager {
         let ufs_norm_path = ufs_uri.full_path().trim_end_matches('/');
         let mount_point_info = self.get_mount_point(&ufs_norm_uri).await?;
 
-        let curvine_path = mount_point_info.curvine_path.clone();
+        let curvine_path = mount_point_info.cv_path.clone();
         let curvine_path = curvine_path.trim_end_matches('/');
 
         // Extract the relative path by removing the mount point prefix

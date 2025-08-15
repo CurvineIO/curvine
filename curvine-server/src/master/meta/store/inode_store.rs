@@ -18,9 +18,8 @@ use crate::master::meta::inode::ttl_types::TtlInodeMetadata;
 use crate::master::meta::inode::{InodeFile, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir};
-use crate::master::mount::MountPointEntry;
 use curvine_common::rocksdb::{DBConf, RocksUtils};
-use curvine_common::state::{BlockLocation, CommitBlock};
+use curvine_common::state::{BlockLocation, CommitBlock, MountInfo};
 use orpc::common::{FileUtils, Utils};
 use orpc::{try_err, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
@@ -363,19 +362,19 @@ impl InodeStore {
         self.store.new_batch()
     }
 
-    pub fn apply_mount(&self, id: u32, entry: &MountPointEntry) -> CommonResult<()> {
-        self.store.add_mountpoint(id, entry)
+    pub fn apply_mount(&self, id: u32, info: &MountInfo) -> CommonResult<()> {
+        self.store.add_mountpoint(id, info)
     }
 
     pub fn apply_umount(&self, id: u32) -> CommonResult<()> {
         self.store.remove_mountpoint(id)
     }
 
-    pub fn get_mount_point(&self, id: u32) -> CommonResult<Option<MountPointEntry>> {
-        self.store.get_mountpoint_entry(id)
+    pub fn get_mount_point(&self, id: u32) -> CommonResult<Option<MountInfo>> {
+        self.store.get_mount_info(id)
     }
 
-    pub fn get_mount_table(&self) -> CommonResult<Vec<MountPointEntry>> {
+    pub fn get_mount_table(&self) -> CommonResult<Vec<MountInfo>> {
         self.store.get_mount_table()
     }
 

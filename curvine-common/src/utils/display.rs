@@ -214,7 +214,7 @@ impl Display for UnMountResponse {
 
 impl Display for GetMountTableResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.mount_points.is_empty() {
+        if self.mount_table.is_empty() {
             return writeln!(f, "Mount Table: (empty)");
         }
 
@@ -222,9 +222,9 @@ impl Display for GetMountTableResponse {
         let mut id_width = 2; //length of "ID"
         let mut curvine_width = 12; //length of "Curvine Path"
         let mut ufs_width = 8; //length of "UFS Path"
-        for mnt in &self.mount_points {
+        for mnt in &self.mount_table {
             id_width = id_width.max(mnt.mount_id.to_string().len());
-            curvine_width = curvine_width.max(mnt.curvine_path.len());
+            curvine_width = curvine_width.max(mnt.cv_path.len());
             ufs_width = ufs_width.max(mnt.ufs_path.len());
         }
 
@@ -255,15 +255,10 @@ impl Display for GetMountTableResponse {
         writeln!(f, "{:-^width$}+", "", width = ufs_width)?;
 
         // Data line
-        for mnt in &self.mount_points {
+        for mnt in &self.mount_table {
             write!(f, "|")?;
             write!(f, " {:<width$}|", mnt.mount_id, width = id_width - 1)?;
-            write!(
-                f,
-                " {:<width$}|",
-                mnt.curvine_path,
-                width = curvine_width - 1
-            )?;
+            write!(f, " {:<width$}|", mnt.cv_path, width = curvine_width - 1)?;
             writeln!(f, " {:<width$}|", mnt.ufs_path, width = ufs_width - 1)?;
         }
 
@@ -274,7 +269,7 @@ impl Display for GetMountTableResponse {
         writeln!(f, "{:-^width$}+", "", width = ufs_width)?;
 
         // Summary of information
-        writeln!(f, "Total mount points: {}", self.mount_points.len())?;
+        writeln!(f, "Total mount points: {}", self.mount_table.len())?;
 
         Ok(())
     }

@@ -14,7 +14,7 @@
 
 use curvine_client::file::{FsClient, FsContext};
 use curvine_common::fs::CurvineURI;
-use curvine_common::proto::MountOptions;
+use curvine_common::state::MountOptions;
 use curvine_server::common::ufs_manager::UfsManager;
 use curvine_tests::Testing;
 use log::info;
@@ -40,32 +40,32 @@ fn mount_test() -> CommonResult<()> {
         let uri = CurvineURI::new("s3://flink").unwrap();
         info!("norm path is {}", uri.normalize_uri().unwrap());
 
-        let s3_mnt_path = "/a/b";
-        let s3_path = "s3://flink/savepoints/ab/";
+        let s3_mnt_path = "/a/b".into();
+        let s3_path = "s3://flink/savepoints/ab/".into();
 
-        let s3_path2 = "s3://flink/savepoints";
-        let s3_mnt_path2 = "/c/d";
+        let s3_path2 = "s3://flink/savepoints".into();
+        let s3_mnt_path2 = "/c/d".into();
 
-        let s3_path3 = "s3://flink/savepoints/ab/cde";
-        let s3_mnt_path3 = "/c/d/e";
+        let s3_path3 = "s3://flink/savepoints/ab/cde".into();
+        let s3_mnt_path3 = "/c/d/e".into();
 
-        let s3_path4 = "s3://flink/savepoints/ab/cde";
-        let s3_mnt_path4 = "/a";
+        let s3_path4 = "s3://flink/savepoints/ab/cde".into();
+        let s3_mnt_path4 = "/a".into();
 
-        let s3_path5 = "s3://flink/savepoints/ab/cde";
-        let s3_mnt_path5 = "/a/b/c";
+        let s3_path5 = "s3://flink/savepoints/ab/cde".into();
+        let s3_mnt_path5 = "/a/b/c".into();
 
-        let s3_path6 = "s3://flink/savepoi";
-        let s3_mnt_path6 = "/c/d/e";
+        let s3_path6 = "s3://flink/savepoi".into();
+        let s3_mnt_path6 = "/c/d/e".into();
 
-        let s3_path7 = "s3://flink2";
-        let s3_mnt_path7 = "/s3";
+        let s3_path7 = "s3://flink2".into();
+        let s3_mnt_path7 = "/s3".into();
 
-        let hdfs_mnt_path = "/xyz";
-        let hdfs_path = "hdfs://test-cluster:1234/x/y//z//";
+        let hdfs_mnt_path = "/xyz".into();
+        let hdfs_path = "hdfs://test-cluster:1234/x/y//z//".into();
 
-        let hdfs_mnt_path2 = "/";
-        let hdfs_path2 = "hdfs://test-cluster:1234/x/y//z//";
+        let hdfs_mnt_path2 = "/".into();
+        let hdfs_path2 = "hdfs://test-cluster:1234/x/y//z//".into();
         // Create a MasterClient for submitting a load request
         let fs_context = Arc::new(FsContext::with_rt(cluster_conf.clone(), rt.clone())?);
         let client = FsClient::new(fs_context);
@@ -73,51 +73,36 @@ fn mount_test() -> CommonResult<()> {
 
         //umount all exits mount points
         let exists_mnts = client.get_mount_table().await?;
-        for mnt in exists_mnts.mount_points {
+        for mnt in exists_mnts.mount_table {
             info!("Unmounting existing mount point: {}", mnt.mount_id);
-            let umount_resp = client.umount(mnt.curvine_path.as_str()).await;
+            let path = mnt.cv_path.into();
+            let umount_resp = client.umount(&path).await;
             assert!(umount_resp.is_ok(), "{}", umount_resp.unwrap_err());
         }
 
         let configs = get_s3_test_config().await;
-        let mnt_opt = MountOptions {
-            update: false,
-            properties: configs,
-            auto_cache: false,
-            cache_ttl_secs: None,
-            consistency_config: None,
-            storage_type: None,
-            block_size: None,
-            replicas: None,
-        };
-        let mount_resp = client.mount(s3_path, s3_mnt_path, mnt_opt.clone()).await;
+        let mnt_opt = MountOptions::builder().set_properties(configs).build();
+        let mount_resp = client.mount(&s3_path, &s3_mnt_path, mnt_opt.clone()).await;
         info!("S3 MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "mount should success");
 
-        let mount_resp = client.mount(s3_path7, s3_mnt_path7, mnt_opt.clone()).await;
+        let mount_resp = client
+            .mount(&s3_path7, &s3_mnt_path7, mnt_opt.clone())
+            .await;
         info!("S3 MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "mount should success",);
 
         let configs = get_hdfs_test_config().await;
-        let mnt_opt = MountOptions {
-            update: false,
-            properties: configs,
-            auto_cache: false,
-            cache_ttl_secs: None,
-            consistency_config: None,
-            storage_type: None,
-            block_size: None,
-            replicas: None,
-        };
+        let mnt_opt = MountOptions::builder().set_properties(configs).build();
         let mount_resp = client
-            .mount(hdfs_path, hdfs_mnt_path, mnt_opt.clone())
+            .mount(&hdfs_path, &hdfs_mnt_path, mnt_opt.clone())
             .await;
         info!("Hdfs MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "mount should success");
 
         // forbidden mount to root
         let mount_resp = client
-            .mount(hdfs_path2, hdfs_mnt_path2, mnt_opt.clone())
+            .mount(&hdfs_path2, &hdfs_mnt_path2, mnt_opt.clone())
             .await;
         info!("Hdfs MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "mount should failed");
@@ -147,67 +132,81 @@ fn mount_test() -> CommonResult<()> {
         info!("target_path: {:?}", target_path);
 
         // monut s3 again
-        let mount_resp = client.mount(s3_path, s3_mnt_path, mnt_opt.clone()).await;
+        let mount_resp = client.mount(&s3_path, &s3_mnt_path, mnt_opt.clone()).await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
-        let mount_resp = client.mount(s3_path2, s3_mnt_path2, mnt_opt.clone()).await;
+        let mount_resp = client
+            .mount(&s3_path2, &s3_mnt_path2, mnt_opt.clone())
+            .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
-        let mount_resp = client.mount(s3_path3, s3_mnt_path3, mnt_opt.clone()).await;
+        let mount_resp = client
+            .mount(&s3_path3, &s3_mnt_path3, mnt_opt.clone())
+            .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
-        let mount_resp = client.mount(s3_path4, s3_mnt_path4, mnt_opt.clone()).await;
+        let mount_resp = client
+            .mount(&s3_path4, &s3_mnt_path4, mnt_opt.clone())
+            .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
-        let mount_resp = client.mount(s3_path5, s3_mnt_path5, mnt_opt.clone()).await;
+        let mount_resp = client
+            .mount(&s3_path5, &s3_mnt_path5, mnt_opt.clone())
+            .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_err(), "{}", mount_resp.unwrap_err());
 
-        let mount_resp = client.mount(s3_path6, s3_mnt_path6, mnt_opt.clone()).await;
+        let mount_resp = client
+            .mount(&s3_path6, &s3_mnt_path6, mnt_opt.clone())
+            .await;
         info!("MountResp: {:?}", mount_resp);
         assert!(mount_resp.is_ok(), "{}", "mount should success");
-        client.umount(s3_mnt_path6).await?;
+        client.umount(&s3_mnt_path6).await?;
 
         // get mountpoint
-        let mountpoint_resp = client.get_mount_point(s3_path).await?;
+        let mountpoint_resp = client.get_mount_info(&s3_path).await?;
         info!("MountPoint: {:?}", mountpoint_resp);
         let mountpoint = mountpoint_resp.unwrap();
         assert_eq!(
-            mountpoint.curvine_path, s3_mnt_path,
+            mountpoint.cv_path,
+            s3_mnt_path.path(),
             "mnt path should be {}, actural {}",
-            s3_mnt_path, mountpoint.curvine_path
+            s3_mnt_path.path(),
+            mountpoint.cv_path
         );
 
-        let s3_path = "s3://flink/savepoints/ab";
-        let mountpoint_resp = client.get_mount_point(s3_path).await?;
+        let s3_path = "s3://flink/savepoints/ab".into();
+        let mountpoint_resp = client.get_mount_info(&s3_path).await?;
         info!("MountPoint: {:?}", mountpoint_resp);
         let mountpoint = mountpoint_resp.unwrap();
         assert_eq!(
-            mountpoint.curvine_path, s3_mnt_path,
+            mountpoint.cv_path,
+            s3_mnt_path.path(),
             "mnt path should be {}, actural {}",
-            s3_mnt_path, mountpoint.curvine_path
+            s3_mnt_path.path(),
+            mountpoint.cv_path
         );
 
         let resp = client.get_mount_table().await?;
         info!("MountTable: {:?}", resp);
-        let mount_table = resp.mount_points;
+        let mount_table = resp.mount_table;
         assert_eq!(mount_table.len(), 3);
 
-        let umount_resp = client.umount(s3_mnt_path).await;
+        let umount_resp = client.umount(&s3_mnt_path).await;
         info!("UmountResp: {:?}", umount_resp);
         assert!(umount_resp.is_ok(), "umount should be success");
 
         //umount again
-        let umount_resp = client.umount(s3_mnt_path).await;
+        let umount_resp = client.umount(&s3_mnt_path).await;
         info!("UmountResp: {:?}", umount_resp);
         assert!(umount_resp.is_err(), "{}", umount_resp.unwrap_err());
 
-        let invalid_mnt_path = "b/c";
-        let umount_resp = client.umount(invalid_mnt_path).await;
+        let invalid_mnt_path = "b/c".into();
+        let umount_resp = client.umount(&invalid_mnt_path).await;
         info!("UmountResp: {:?}", umount_resp);
         assert!(umount_resp.is_err(), "{}", umount_resp.unwrap_err());
 

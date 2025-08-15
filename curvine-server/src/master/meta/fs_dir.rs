@@ -19,12 +19,11 @@ use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
-use crate::master::mount::MountPointEntry;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
-    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileStatus, MkdirOpts, SetAttrOpts,
-    WorkerAddress,
+    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileStatus, MkdirOpts, MountInfo,
+    SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
 use log::info;
@@ -645,18 +644,15 @@ impl FsDir {
         self.journal_writer.take_entries()
     }
 
-    pub fn mount(&mut self, entry: MountPointEntry) -> FsResult<()> {
+    pub fn store_mount(&mut self, info: MountInfo, send_log: bool) -> FsResult<()> {
         // Create parent directory
         let op_ms = LocalTime::mills();
-        self.store.store.add_mountpoint(entry.id, &entry)?;
+        self.store.store.add_mountpoint(info.mount_id, &info)?;
 
-        self.journal_writer.log_mount(
-            op_ms,
-            entry.id,
-            &entry.curvine_uri,
-            &entry.ufs_uri,
-            entry.to_mount_options(),
-        )?;
+        if send_log {
+            self.journal_writer.log_mount(op_ms, info)?;
+        }
+
         Ok(())
     }
 
@@ -668,11 +664,11 @@ impl FsDir {
         Ok(())
     }
 
-    pub fn get_mount_table(&self) -> CommonResult<Vec<MountPointEntry>> {
+    pub fn get_mount_table(&self) -> CommonResult<Vec<MountInfo>> {
         self.store.get_mount_table()
     }
 
-    pub fn get_mount_point(&self, id: u32) -> CommonResult<Option<MountPointEntry>> {
+    pub fn get_mount_point(&self, id: u32) -> CommonResult<Option<MountInfo>> {
         self.store.get_mount_point(id)
     }
 

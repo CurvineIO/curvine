@@ -260,52 +260,56 @@ impl FsClient {
 
     pub async fn mount(
         &self,
-        ufs_path: &str,
-        curvine_path: &str,
-        mount_opt: MountOptions,
+        ufs_path: &Path,
+        cv_path: &Path,
+        mount_options: MountOptions,
     ) -> FsResult<MountResponse> {
-        // Create a request
+        if mount_options.mount_type == MountType::Cst && ufs_path.path() != cv_path.path() {
+            return err_box!(
+                "for cst mount type, the ufs path and the mount path must be exactly the same, \
+            for example: bin/cv mount s3://bucket/dir /bucket/dir"
+            );
+        }
+
         let req = MountRequest {
-            ufs_path: ufs_path.to_string(),
-            curvine_path: curvine_path.to_string(),
-            mount_options: Some(mount_opt),
+            ufs_path: ufs_path.encode_uri(),
+            cv_path: cv_path.encode(),
+            mount_options: ProtoUtils::mount_options_to_pb(mount_options),
         };
 
         let rep: MountResponse = self.rpc(RpcCode::Mount, req).await?;
         Ok(rep)
     }
 
-    pub async fn umount(&self, mnt_path: &str) -> FsResult<UnMountResponse> {
-        //TODO umount options
+    pub async fn umount(&self, cv_path: &Path) -> FsResult<UnMountResponse> {
         let req = UnMountRequest {
-            curvine_path: mnt_path.to_string(),
-            unmount_options: None,
+            cv_path: cv_path.encode(),
         };
 
         let rep: UnMountResponse = self.rpc(RpcCode::UnMount, req).await?;
         Ok(rep)
     }
 
-    pub async fn get_mount_point(&self, path: &str) -> FsResult<Option<MountPointInfo>> {
-        let req = GetMountPointInfoRequest {
-            path: path.to_string(),
+    pub async fn get_mount_info(&self, path: &Path) -> FsResult<Option<MountInfo>> {
+        let req = GetMountInfoRequest {
+            path: path.encode_uri(),
         };
 
-        let rep: GetMountPointInfoResponse = self.rpc(RpcCode::GetMountInfo, req).await?;
-        Ok(rep.mount_point)
+        let rep: GetMountInfoResponse = self.rpc(RpcCode::GetMountInfo, req).await?;
+        Ok(rep.mount_info.map(ProtoUtils::mount_info_from_pb))
     }
 
-    pub async fn get_mount_point_bytes(&self, path: &str) -> FsResult<BytesMut> {
-        let req = GetMountPointInfoRequest {
-            path: path.to_string(),
+    pub async fn get_mount_info_bytes(&self, path: &Path) -> FsResult<BytesMut> {
+        let req = GetMountInfoRequest {
+            path: path.encode_uri(),
         };
 
         let bytes = self.rpc_bytes(RpcCode::GetMountInfo, req).await?;
         Ok(bytes)
     }
 
-    pub async fn get_ufs_conf(&self, ufs_path: &str) -> FsResult<UfsConf> {
-        let resp = self.get_mount_point(ufs_path).await?;
+    pub async fn get_ufs_conf(&self, ufs_path: &Path) -> FsResult<UfsConf> {
+        let resp = self.get_mount_info(ufs_path).await?;
         let conf = match resp {
             Some(mount_point) => {
                 let mut ufs_conf_builder = UfsConfBuilder::default();
@@ -323,27 +327,6 @@ impl FsClient {
         let req = GetMountTableRequest {};
         let rep: GetMountTableResponse = self.rpc(RpcCode::GetMountTable, req).await?;
         Ok(rep)
-    }
-
-    pub async fn get_all_mounts(&self) -> FsResult<Vec<MountInfo>> {
-        let req = GetMountTableRequest {};
-        let rep: GetMountTableResponse = self.rpc(RpcCode::GetMountTable, req).await?;
-
-        let mut res = Vec::with_capacity(rep.mount_points.len());
-        for item in rep.mount_points {
-            let mount_info = MountInfo {
-                mount_id: item.mount_id,
-                curvine_path: item.curvine_path,
-                ufs_path: item.ufs_path,
-                properties: item.properties,
-                auto_cache: item.auto_cache,
-                cache_ttl_secs: item.cache_ttl_secs,
-                consistency_strategy: curvine_common::state::ConsistencyStrategy::Always,
-            };
-            res.push(mount_info);
-        }
-
-        Ok(res)
     }
 
     // async cache loading task

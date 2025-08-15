@@ -7,45 +7,47 @@ option java_outer_classname = "MountProto";
 
 import "common.proto";
 
-message MountPointInfo {
-    required string curvine_path = 1;
+enum MountTypeProto {
+    MOUNT_TYPE_PROTO_CST = 0;
+    MOUNT_TYPE_PROTO_ORCH = 1;
+}
+
+message MountInfoProto {
+    required string cv_path = 1;
     required string ufs_path = 2;
     required uint32 mount_id = 3;
     map<string, string> properties = 4;
-    required bool auto_cache = 5;
-    optional uint64 cache_ttl_secs = 6;
-    required ConsistencyConfig consistency_config = 7;
+    required int64 ttl_ms = 5;
+    required TtlActionProto ttl_action = 6;
+    required ConsistencyStrategyProto consistency_strategy = 7;
     optional StorageTypeProto storage_type = 8;
-    optional uint64 block_size = 9;
-    optional uint32 replicas = 10;
+    optional int64 block_size = 9;
+    optional int32 replicas = 10;
+    required MountTypeProto mount_type = 11;
 }
 
-message MountOptions {
+message MountOptionsProto {
     required bool update = 1 [default = false];
-    map<string, string> properties = 2;
-    required bool auto_cache = 3 [default = false];
-    optional uint64 cache_ttl_secs = 4;
-    optional ConsistencyConfig consistency_config = 5;
+    map<string, string> add_properties = 2;
+    optional int64 ttl_ms = 3;
+    optional TtlActionProto ttl_action = 4;
+    optional ConsistencyStrategyProto consistency_strategy = 5;
     optional StorageTypeProto storage_type = 6;
-    optional uint64 block_size = 7;
-    optional uint32 replicas = 8;
+    optional int64 block_size = 7;
+    optional int32 replicas = 8;
+    required MountTypeProto mount_type = 9;
+    repeated string remove_properties = 10;
 }
 
-enum ConsistencyStrategy {
-    None = 0;
-    Always = 1;
-    Period = 2;
-}
-
-message ConsistencyConfig {
-    required ConsistencyStrategy strategy = 1 [default = None];
-    optional uint64 period_seconds = 2; // Only used when strategy is Periodically
+enum ConsistencyStrategyProto {
+    CONSISTENCY_STRATEGY_PROTO_NONE = 0;
+    CONSISTENCY_STRATEGY_PROTO_ALWAYS = 1;
 }
 
 message MountRequest {
-    required string curvine_path = 1;
+    required string cv_path = 1;
     required string ufs_path = 2;
-    optional MountOptions mount_options = 3;
+    required MountOptionsProto mount_options = 3;
 }
 
 message MountResponse {
@@ -56,8 +58,7 @@ message UnMountOptions {
 }
 
 message UnMountRequest {
-    required string curvine_path = 1;
-    optional UnMountOptions unmount_options = 2;
+    required string cv_path = 1;
 }
 
 message UnMountResponse {
@@ -66,13 +67,13 @@ message UnMountResponse {
 message GetMountTableRequest {}
 
 message GetMountTableResponse {
-    repeated MountPointInfo mount_points = 1;
+    repeated MountInfoProto mount_table = 1;
 }
 
-message GetMountPointInfoRequest {
+message GetMountInfoRequest {
     required string path = 1;
 }
 
-message GetMountPointInfoResponse {
-    optional MountPointInfo mount_point = 1;
+message GetMountInfoResponse {
+    optional MountInfoProto mount_info = 1;
 }
