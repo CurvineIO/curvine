@@ -220,9 +220,7 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
     let ufs_uri = CurvineURI::new("oss://cluster1/")?;
     let mut config = HashMap::new();
     config.insert("k1".to_string(), "v1".to_string());
-    let mnt_opt = MountOptions::builder()
-        .set_properties(config)
-        .build();
+    let mnt_opt = MountOptions::builder().set_properties(config).build();
     mgr.mount(None, mount_uri.path(), ufs_uri.path(), &mnt_opt)?;
 
     //mount hdfs://cluster1/ -> /x/z/y
