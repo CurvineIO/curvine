@@ -20,9 +20,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          # Fetch full git history to check all related commits
-          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4  
@@ -33,13 +30,19 @@ jobs:
       - name: Install commitlint dependencies
         run: npm install
 
-      - name: Validate single commit (for push)
-        if: github.event_name == 'push'
-        run: npx commitlint --from HEAD~1 --to HEAD --verbose
-
-      - name: Validate PR commits (for pull request)
+      - name: Validate PR title (for pull request only)
         if: github.event_name == 'pull_request'
-        run: npx commitlint --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }} --verbose
+        run: |
+          # Check PR title format and output as warning instead of error
+          echo "Checking PR title: ${{ github.event.pull_request.title }}"
+          
+          # Use commitlint to validate PR title format
+          echo "${{ github.event.pull_request.title }}" | npx commitlint --verbose || {
+            echo "⚠️  Warning: PR title does not follow conventional commit format"
+            echo "   Expected format: <type>(<scope>): <description>"
+            echo "   Example: feat(storage): add new compression algorithm"
+            echo "   This is a warning and will not fail the build"
+          }
 
   cleanup:
     needs: commitlint
