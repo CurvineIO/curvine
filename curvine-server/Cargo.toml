@@ -39,3 +39,4 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 url = { workspace = true }
+parking_lot = { workspace = true }

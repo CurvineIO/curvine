@@ -26,6 +26,9 @@ fn main() -> CommonResult<()> {
     conf.format_worker = true;
     conf.journal.snapshot_interval = "10s".to_owned();
     conf.master.min_block_size = 1024 * 1024;
+    conf.master.ttl_bucket_interval = "1m".to_string();
+    conf.master.ttl_checker_interval = "1m".to_string();
+    conf.master.init()?;
 
     let testing = Testing {
         worker_num: 3,

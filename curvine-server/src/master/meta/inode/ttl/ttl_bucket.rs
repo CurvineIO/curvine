@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::ttl::ttl_types::{
-    TtlAction, TtlConfig, TtlError, TtlInodeMetadata, TtlResult,
-};
+use crate::master::meta::inode::ttl::ttl_types::TtlResult;
 use dashmap::DashMap;
 use log::{debug, info, warn};
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 // TTL Bucket Management Module
 //
@@ -39,15 +38,15 @@ pub struct TtlBucket {
     pub interval_start_ms: u64,
     /// Interval duration in milliseconds
     pub interval_duration_ms: u64,
-    /// Map of inode ID to retry count for thread-safe access
-    pub inode_retries: Arc<DashMap<u64, u32>>,
+    /// Map of inode ID to retry count (memory efficient)
+    pub inode_retries: RwLock<HashMap<u64, u32>>,
 }
 impl TtlBucket {
     pub fn new(interval_start_ms: u64, interval_duration_ms: u64) -> Self {
         Self {
             interval_start_ms,
             interval_duration_ms,
-            inode_retries: Arc::new(DashMap::new()),
+            inode_retries: RwLock::new(HashMap::new()),
         }
     }
 
@@ -56,29 +55,37 @@ impl TtlBucket {
     }
 
     pub fn add_inode(&self, inode_id: u64, retry_count: u32) {
-        self.inode_retries.insert(inode_id, retry_count);
+        self.inode_retries.write().insert(inode_id, retry_count);
     }
 
     pub fn remove_inode(&self, inode_id: u64) -> Option<u32> {
-        self.inode_retries
-            .remove(&inode_id)
-            .map(|(_, retry_count)| retry_count)
+        self.inode_retries.write().remove(&inode_id)
     }
 
     pub fn is_expired_at(&self, current_time_ms: u64) -> bool {
         self.get_interval_end_ms() <= current_time_ms
     }
 
-    pub fn get_all_inodes(&self) -> Vec<TtlInodeMetadata> {
-        self.inode_retries
+    pub fn len(&self) -> usize {
+        self.inode_retries.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn for_each_inode<F: FnMut(u64, u32)>(&self, mut f: F) {
+        // Take a lightweight snapshot of (inode_id, retry_count) pairs, then release the lock
+        let snapshot: Vec<(u64, u32)> = self
+            .inode_retries
+            .read()
             .iter()
-            .map(|entry| TtlInodeMetadata {
-                inode_id: *entry.key(),
-                retry_count: *entry.value(),
-                ttl_config: TtlConfig::new(0, TtlAction::Delete),
-                last_retry_time_ms: None,
-            })
-            .collect()
+            .map(|(inode_id, retry_count)| (*inode_id, *retry_count))
+            .collect();
+        // Process without holding the read lock to avoid lock upgrade issues
+        for (inode_id, retry_count) in snapshot {
+            f(inode_id, retry_count);
+        }
     }
 }
 impl PartialEq for TtlBucket {
@@ -125,6 +132,14 @@ impl TtlBucketList {
         }
     }
 
+    pub fn total_inodes(&self) -> u64 {
+        self.total_inodes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn buckets_len(&self) -> usize {
+        self.buckets.read().len()
+    }
+
     fn get_bucket_interval_start(&self, timestamp_ms: u64) -> u64 {
         (timestamp_ms / self.interval_duration_ms) * self.interval_duration_ms
     }
@@ -132,20 +147,11 @@ impl TtlBucketList {
     fn get_or_create_bucket(&self, timestamp_ms: u64) -> TtlResult<Arc<TtlBucket>> {
         let interval_start = self.get_bucket_interval_start(timestamp_ms);
 
-        {
-            let buckets = self
-                .buckets
-                .read()
-                .map_err(|_| TtlError::ServiceError("Failed to acquire read lock".to_string()))?;
-            if let Some(bucket) = buckets.get(&interval_start) {
-                return Ok(bucket.clone());
-            }
+        if let Some(bucket) = self.buckets.read().get(&interval_start) {
+            return Ok(bucket.clone());
         }
 
-        let mut buckets = self
-            .buckets
-            .write()
-            .map_err(|_| TtlError::ServiceError("Failed to acquire write lock".to_string()))?;
+        let mut buckets = self.buckets.write();
         if let Some(bucket) = buckets.get(&interval_start) {
             return Ok(bucket.clone());
         }
@@ -160,20 +166,18 @@ impl TtlBucketList {
         Ok(new_bucket)
     }
 
-    pub fn add_inode(&self, metadata: &TtlInodeMetadata) -> TtlResult<()> {
-        let expiration_ms = metadata.ttl_config.expiration_time_ms();
+    pub fn add_inode(&self, inode_id: u64, expiration_ms: u64) -> TtlResult<()> {
         let interval_start = self.get_bucket_interval_start(expiration_ms);
         let bucket = self.get_or_create_bucket(expiration_ms)?;
 
-        bucket.add_inode(metadata.inode_id, metadata.retry_count);
-        self.inode_to_bucket_index
-            .insert(metadata.inode_id, interval_start);
+        bucket.add_inode(inode_id, 0);
+        self.inode_to_bucket_index.insert(inode_id, interval_start);
         self.total_inodes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         debug!(
             "Added inode {} to sorted TTL bucket list, expires at {}ms",
-            metadata.inode_id, expiration_ms
+            inode_id, expiration_ms
         );
         Ok(())
     }
@@ -184,12 +188,7 @@ impl TtlBucketList {
             None => return Ok(None), // Inode not found
         };
 
-        let buckets = self
-            .buckets
-            .read()
-            .map_err(|_| TtlError::ServiceError("Failed to acquire read lock".to_string()))?;
-
-        if let Some(bucket) = buckets.get(&interval_start) {
+        if let Some(bucket) = self.buckets.read().get(&interval_start) {
             let result = bucket.remove_inode(inode_id);
             if result.is_some() {
                 // Remove from index
@@ -207,53 +206,56 @@ impl TtlBucketList {
         }
     }
 
-    pub fn get_expired_buckets_at(&self, current_time_ms: u64) -> Vec<Arc<TtlBucket>> {
-        let buckets = match self.buckets.read() {
-            Ok(buckets) => buckets,
-            Err(_) => {
-                warn!("Failed to acquire read lock for expired buckets lookup");
-                return Vec::new();
+    /// Reschedule an inode into a future bucket at the provided timestamp (ms).
+    /// This keeps total_inodes unchanged.
+    pub fn reschedule_inode(
+        &self,
+        inode_id: u64,
+        retry_count: u32,
+        next_timestamp_ms: u64,
+    ) -> TtlResult<()> {
+        // Find current bucket via index (if any) and remove it
+        if let Some(cur) = self.inode_to_bucket_index.get(&inode_id) {
+            let cur_start = *cur.value();
+            if let Some(bucket) = self.buckets.read().get(&cur_start) {
+                let _ = bucket.remove_inode(inode_id);
             }
-        };
-
-        let max_expired_start = current_time_ms.saturating_sub(self.interval_duration_ms);
-
-        let expired_buckets: Vec<Arc<TtlBucket>> = buckets
-            .range(..=max_expired_start) // Only check potentially expired buckets
-            .filter(|(_, bucket)| bucket.is_expired_at(current_time_ms))
-            .map(|(_, bucket)| bucket.clone())
-            .collect();
-
-        if !expired_buckets.is_empty() {
-            debug!(
-                "Found {} expired TTL buckets at time {}ms",
-                expired_buckets.len(),
-                current_time_ms
-            );
         }
 
-        expired_buckets
+        // Insert into new bucket and update index; total_inodes unchanged
+        let new_bucket = self.get_or_create_bucket(next_timestamp_ms)?;
+        let new_start = self.get_bucket_interval_start(next_timestamp_ms);
+        new_bucket.add_inode(inode_id, retry_count);
+        self.inode_to_bucket_index.insert(inode_id, new_start);
+        Ok(())
+    }
+
+    pub fn get_expired_buckets_at(&self, current_time_ms: u64) -> Vec<Arc<TtlBucket>> {
+        // Any bucket with start <= current - interval_duration has end <= current ⇒ expired
+        let max_expired_start = current_time_ms.saturating_sub(self.interval_duration_ms);
+
+        self.buckets
+            .read()
+            .range(..=max_expired_start)
+            .map(|(_, bucket)| bucket.clone())
+            .collect()
     }
 
     /// Remove an empty bucket from the bucket list
     pub fn remove_empty_bucket(&self, bucket: &TtlBucket) -> TtlResult<bool> {
         // Double-check that the bucket is actually empty before attempting removal
-        if !bucket.inode_retries.is_empty() {
+        if !bucket.is_empty() {
             warn!(
                 "Attempted to remove non-empty bucket with interval_start_ms={}, {} inodes remaining",
                 bucket.interval_start_ms,
-                bucket.inode_retries.len()
+                bucket.len()
             );
             return Ok(false);
         }
 
-        let mut buckets = self
-            .buckets
-            .write()
-            .map_err(|_| TtlError::ServiceError("Failed to acquire write lock".to_string()))?;
-
         // Remove the bucket directly using its interval_start_ms
-        if buckets.remove(&bucket.interval_start_ms).is_some() {
+        let removed = self.buckets.write().remove(&bucket.interval_start_ms);
+        if removed.is_some() {
             debug!(
                 "Removed empty TTL bucket with interval_start_ms={}",
                 bucket.interval_start_ms

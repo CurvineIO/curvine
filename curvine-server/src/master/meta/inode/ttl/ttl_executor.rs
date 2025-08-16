@@ -183,7 +183,7 @@ impl InodeTtlExecutor {
         let path = self.get_inode_path(inode_id)?;
         match self.filesystem.delete(&path, true) {
             Ok(_) => {
-                info!("Successfully deleted file: {}", path);
+                info!("Successfully deleted file(dir): {}", path);
 
                 if let Ok(mut cache) = self.path_cache.write() {
                     cache.remove(&inode_id);

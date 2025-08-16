@@ -14,7 +14,6 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
-use crate::master::meta::inode::ttl_types::TtlInodeMetadata;
 use crate::master::meta::inode::{InodeFile, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir};
@@ -57,8 +56,9 @@ impl InodeStore {
         batch.commit()?;
 
         if let Some(ttl_config) = child.ttl_config() {
-            let metadata = TtlInodeMetadata::new(child.id() as u64, ttl_config.clone());
-            if let Err(e) = self.ttl_bucket_list.add_inode(&metadata) {
+            let expiration_ms = ttl_config.expiry_time_ms();
+            let inode_id = child.id() as u64;
+            if let Err(e) = self.ttl_bucket_list.add_inode(inode_id, expiration_ms) {
                 log::warn!(
                     "Direct ttl registration failed for inode {}: {}",
                     child.id(),
@@ -218,8 +218,8 @@ impl InodeStore {
             let inode_id = inode.id() as u64;
             let _ = self.ttl_bucket_list.remove_inode(inode_id);
             if let Some(ttl_config) = inode.ttl_config() {
-                let metadata = TtlInodeMetadata::new(inode_id, ttl_config.clone());
-                if let Err(e) = self.ttl_bucket_list.add_inode(&metadata) {
+                let expiration_ms = ttl_config.expiry_time_ms();
+                if let Err(e) = self.ttl_bucket_list.add_inode(inode_id, expiration_ms) {
                     log::warn!(
                         "Direct ttl re-registration failed for inode {}: {}",
                         inode_id,
@@ -286,8 +286,9 @@ impl InodeStore {
             }
 
             if let Some(ttl_config) = next_parent.ttl_config() {
-                let metadata = TtlInodeMetadata::new(next_parent.id() as u64, ttl_config.clone());
-                if let Err(e) = self.ttl_bucket_list.add_inode(&metadata) {
+                let inode_id = next_parent.id() as u64;
+                let expiration_ms = ttl_config.expiry_time_ms();
+                if let Err(e) = self.ttl_bucket_list.add_inode(inode_id, expiration_ms) {
                     log::warn!(
                         "Direct ttl registration failed during tree creation for inode {}: {}",
                         next_parent.id(),

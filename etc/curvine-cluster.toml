@@ -17,7 +17,6 @@ ttl_checker_retry_attempts = 3     # Maximum retry attempts for failed TTL opera
 ttl_bucket_interval = "1h"         # TTL bucket time interval
 ttl_max_retry_duration = "30m"     # Maximum duration for retrying failed operations
 ttl_retry_interval = "5s"          # Interval between retry attempts
-ttl_cleanup_timeout = "30s"        # Timeout for individual cleanup operations
 
 # master loading function configuration
 [master.load]
