@@ -760,11 +760,12 @@ impl fs::FileSystem for CurvineFileSystem {
             op.header.nodeid, op.arg
         );
         let path = self.state.get_path(op.header.nodeid)?;
-        let status = self.fs_get_status(&path).await?;
-        let attr = self.lookup_status::<String>(op.header.nodeid, None, &status)?;
 
         let opts = Self::fuse_setattr_to_opts(op.arg)?;
         self.fs.set_attr(&path, opts).await?;
+
+        let status = self.fs_get_status(&path).await?;
+        let attr = self.lookup_status::<String>(op.header.nodeid, None, &status)?;
 
         let attr = fuse_attr_out {
             attr_valid: self.conf.attr_ttl.as_secs(),
