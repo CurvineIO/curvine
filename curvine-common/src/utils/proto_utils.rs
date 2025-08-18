@@ -489,4 +489,66 @@ impl ProtoUtils {
             mode: opts.mode,
         }
     }
+
+    pub fn mount_info_to_pb(info: MountInfo) -> MountInfoProto {
+        MountInfoProto {
+            cv_path: info.cv_path,
+            ufs_path: info.ufs_path,
+            mount_id: info.mount_id,
+            properties: info.properties,
+            ttl_ms: info.ttl_ms,
+            ttl_action: info.ttl_action.into(),
+            consistency_strategy: info.consistency_strategy.into(),
+            storage_type: info.storage_type.map(|v| v.into()),
+            block_size: info.block_size,
+            replicas: info.replicas,
+            mount_type: info.mount_type.into(),
+        }
+    }
+
+    pub fn mount_info_from_pb(info: MountInfoProto) -> MountInfo {
+        MountInfo {
+            cv_path: info.cv_path,
+            ufs_path: info.ufs_path,
+            mount_id: info.mount_id,
+            properties: info.properties,
+            ttl_ms: info.ttl_ms,
+            ttl_action: info.ttl_action.into(),
+            consistency_strategy: info.consistency_strategy.into(),
+            storage_type: info.storage_type.map(|x| x.into()),
+            block_size: info.block_size,
+            replicas: info.replicas,
+            mount_type: info.mount_type.into(),
+        }
+    }
+
+    pub fn mount_options_to_pb(opts: MountOptions) -> MountOptionsProto {
+        MountOptionsProto {
+            update: opts.update,
+            add_properties: opts.add_properties,
+            ttl_ms: opts.ttl_ms,
+            ttl_action: opts.ttl_action.map(|v| v.into()),
+            consistency_strategy: opts.consistency_strategy.map(|v| v.into()),
+            storage_type: opts.storage_type.map(|v| v.into()),
+            block_size: opts.block_size,
+            replicas: opts.replicas,
+            mount_type: opts.mount_type.into(),
+            remove_properties: opts.remove_properties,
+        }
+    }
+
+    pub fn mount_options_from_pb(opts: MountOptionsProto) -> MountOptions {
+        MountOptions {
+            update: opts.update,
+            add_properties: opts.add_properties,
+            ttl_ms: opts.ttl_ms,
+            ttl_action: opts.ttl_action.map(TtlAction::from),
+            consistency_strategy: opts.consistency_strategy.map(ConsistencyStrategy::from),
+            storage_type: opts.storage_type.map(StorageType::from),
+            block_size: opts.block_size,
+            replicas: opts.replicas,
+            mount_type: MountType::from(opts.mount_type),
+            remove_properties: opts.remove_properties,
+        }
+    }
 }

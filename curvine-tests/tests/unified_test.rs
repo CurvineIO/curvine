@@ -15,7 +15,7 @@
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::proto::MountOptions;
+use curvine_common::state::MountOptions;
 use curvine_common::FsResult;
 use curvine_tests::Testing;
 use orpc::common::Logger;
@@ -49,22 +49,13 @@ fn run() -> CommonResult<()> {
 
 async fn get_mount(fs: &UnifiedFileSystem) -> FsResult<()> {
     let path = Path::from_str("s3://flink/xuen-test")?;
-    let res = fs.cv().get_mount_point(&path).await?;
+    let res = fs.cv().get_mount_info(&path).await?;
     println!("res {:?}", res);
     Ok(())
 }
 async fn mount(fs: &UnifiedFileSystem) -> FsResult<()> {
     let s3_conf = Testing::get_s3_conf().unwrap();
-    let opts = MountOptions {
-        update: false,
-        properties: s3_conf,
-        auto_cache: true,
-        cache_ttl_secs: Some(3600),
-        consistency_config: None,
-        storage_type: None,
-        block_size: None,
-        replicas: None,
-    };
+    let opts = MountOptions::builder().set_properties(s3_conf).build();
     let ufs_path = "s3://flink/xuen-test".into();
     let cv_path = "/xuen-test".into();
     fs.mount(&ufs_path, &cv_path, opts).await?;

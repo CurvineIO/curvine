@@ -18,8 +18,7 @@ use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::proto::MountOptions;
-use curvine_common::state::{FileStatus, MasterInfo, MountInfo, SetAttrOpts};
+use curvine_common::state::{FileStatus, MasterInfo, MountInfo, MountOptions, SetAttrOpts};
 use curvine_common::FsResult;
 use log::{debug, info, warn};
 use orpc::common::{FastHashMap, LocalTime};
@@ -47,7 +46,7 @@ impl MountItem {
         // parse real path
         // mnt: /xuen-test s3://flink/xuen-test
         // Path /xuen-test/a -> s3://flink/xuen-test/a
-        let sub_path = path.path().replacen(&self.info.curvine_path, "", 1);
+        let sub_path = path.path().replacen(&self.info.cv_path, "", 1);
         Path::from_str(format!("{}/{}", self.info.ufs_path, sub_path))
     }
 }
@@ -67,7 +66,7 @@ impl MountState {
 
     async fn check_update(&self, fs: &CurvineFileSystem, force: bool) -> FsResult<()> {
         if self.need_update() || force {
-            let mounts = fs.get_all_mounts().await?;
+            let mounts = fs.get_mount_table().await?;
             let mut state = self.mounts.lock().unwrap();
             state.clear();
 
@@ -76,7 +75,7 @@ impl MountState {
                 let ufs = UfsFileSystem::new(&path, item.properties.clone())?;
 
                 state.insert(
-                    item.curvine_path.to_owned(),
+                    item.cv_path.to_owned(),
                     MountItem {
                         info: Arc::new(item),
                         ufs,
@@ -188,16 +187,13 @@ impl UnifiedFileSystem {
     }
 
     pub async fn mount(&self, ufs_path: &Path, cv_path: &Path, opts: MountOptions) -> FsResult<()> {
-        self.cv
-            .fs_client
-            .mount(ufs_path.full_path(), cv_path.full_path(), opts)
-            .await?;
+        self.cv.fs_client.mount(ufs_path, cv_path, opts).await?;
         self.mount_state.check_update(&self.cv, true).await?;
         Ok(())
     }
 
     pub async fn umount(&self, cv_path: &Path) -> FsResult<()> {
-        self.cv.fs_client.umount(cv_path.path()).await?;
+        self.cv.fs_client.umount(cv_path).await?;
         self.mount_state.check_update(&self.cv, true).await?;
         Ok(())
     }
@@ -290,7 +286,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
             return Ok(UnifiedReader::Cv(self.cv.open(path).await?));
         }
 
-        if mount.info.auto_cache {
+        if mount.info.auto_cache() {
             match self
                 .cv
                 .async_cache(&ufs_path, mount.info.get_ttl(), false)

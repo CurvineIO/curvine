@@ -100,6 +100,10 @@ impl Path {
         self.path().to_string()
     }
 
+    pub fn encode_uri(&self) -> String {
+        self.full_path().to_string()
+    }
+
     pub fn uri(&self) -> &Uri {
         &self.uri
     }

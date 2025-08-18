@@ -117,7 +117,9 @@ impl CreateFileOptsBuilder {
             file_type: FileType::File,
             x_attr: Default::default(),
             storage_policy: StoragePolicy {
-                storage_type: StorageType::from_str_name(&conf.storage_type),
+                storage_type: conf.storage_type,
+                ttl_ms: conf.ttl_ms,
+                ttl_action: conf.ttl_action,
                 ..Default::default()
             },
             mode: conf.get_mode(),
@@ -283,7 +285,9 @@ impl MkdirOptsBuilder {
             create_parent: false,
             x_attr: HashMap::new(),
             storage_policy: StoragePolicy {
-                storage_type: StorageType::from_str_name(&conf.storage_type),
+                storage_type: conf.storage_type,
+                ttl_ms: conf.ttl_ms,
+                ttl_action: conf.ttl_action,
                 ..Default::default()
             },
             mode: conf.get_mode(),

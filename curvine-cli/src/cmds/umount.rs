@@ -15,6 +15,7 @@
 use crate::util::*;
 use clap::Parser;
 use curvine_client::file::FsClient;
+use curvine_common::fs::Path;
 use orpc::CommonResult;
 use std::sync::Arc;
 
@@ -25,7 +26,8 @@ pub struct UnMountCommand {
 
 impl UnMountCommand {
     pub async fn execute(&self, client: Arc<FsClient>) -> CommonResult<()> {
-        let rep = handle_rpc_result(client.umount(&self.curvine_path)).await;
+        let path = Path::from_str(&self.curvine_path)?;
+        let rep = handle_rpc_result(client.umount(&path)).await;
         println!("{}", rep);
         Ok(())
     }

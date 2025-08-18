@@ -18,8 +18,8 @@ use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
+use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
-use curvine_common::fs::{CurvineURI, Path};
 use curvine_common::proto::*;
 use curvine_common::state::{CreateFileOpts, FileStatus, HeartbeatStatus};
 use curvine_common::utils::ProtoUtils;
@@ -303,44 +303,49 @@ impl MasterHandler {
 
     fn mount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: MountRequest = ctx.parse_header()?;
-        let curvine_uri = CurvineURI::new(request.curvine_path)?;
-        let ufs_uri = CurvineURI::new(request.ufs_path)?;
-        let mnt_opt = request.mount_options.unwrap_or_default();
+        let cv_path = Path::from_str(request.cv_path)?;
+        let ufs_path = Path::from_str(request.ufs_path)?;
+        let mnt_opt = ProtoUtils::mount_options_from_pb(request.mount_options);
+
+        ctx.set_audit(Some(cv_path.to_string()), Some(ufs_path.to_string()));
 
         self.mount_manager
-            .mount(None, &curvine_uri, &ufs_uri, &mnt_opt)?;
-        let rep_header = MountResponse::default();
-        ctx.response(rep_header)
-    }
-
-    fn update_mount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+            .mount(None, cv_path.path(), ufs_path.path(), &mnt_opt)?;
         let rep_header = MountResponse::default();
         ctx.response(rep_header)
     }
 
     fn umount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: UnMountRequest = ctx.parse_header()?;
-        let mnt_path = CurvineURI::new(request.curvine_path)?;
-        self.mount_manager.umount(&mnt_path)?;
+        let cv_path = Path::from_str(request.cv_path)?;
+        ctx.set_audit(Some(cv_path.path().to_string()), None);
+
+        self.mount_manager.umount(cv_path.path())?;
         let rep_header = UnMountResponse::default();
         ctx.response(rep_header)
     }
 
-    fn get_mount_point(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let request: GetMountPointInfoRequest = ctx.parse_header()?;
+    fn get_mount_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let request: GetMountInfoRequest = ctx.parse_header()?;
         ctx.set_audit(Some(request.path.to_string()), None);
 
         let path = Path::from_str(request.path)?;
-        let ret = self.mount_manager.get_mount_point(&path)?;
-        let rep_header = GetMountPointInfoResponse { mount_point: ret };
+        let ret = self.mount_manager.get_mount_info(&path)?;
+        let rep_header = GetMountInfoResponse {
+            mount_info: ret.map(ProtoUtils::mount_info_to_pb),
+        };
         ctx.response(rep_header)
     }
 
     fn get_mount_table(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let _: GetMountTableRequest = ctx.parse_header()?;
-        let rep_header = GetMountTableResponse {
-            mount_points: self.mount_manager.get_mount_table()?,
-        };
+        let table = self.mount_manager.get_mount_table()?;
+
+        let mount_table: Vec<MountInfoProto> = table
+            .into_iter()
+            .map(ProtoUtils::mount_info_to_pb)
+            .collect();
+        let rep_header = GetMountTableResponse { mount_table };
         ctx.response(rep_header)
     }
 
@@ -389,18 +394,6 @@ impl MessageHandler for MasterHandler {
 
         // Unified processing of all RPC requests
         let response = match code {
-            // Load task related requests
-            RpcCode::SubmitLoadJob
-            | RpcCode::GetLoadStatus
-            | RpcCode::CancelLoadJob
-            | RpcCode::ReportLoadTask => {
-                if let Some(ref mut load_service) = self.load_service {
-                    return load_service.handle(msg);
-                } else {
-                    return Err(FsError::common("Load service not initialized"));
-                }
-            }
-
             // File system operation request
             RpcCode::Mkdir => self.mkdir(ctx),
             RpcCode::CreateFile => self.retry_check_create_file(ctx),
@@ -418,14 +411,25 @@ impl MessageHandler for MasterHandler {
 
             RpcCode::Mount => self.mount(ctx),
             RpcCode::UnMount => self.umount(ctx),
-            RpcCode::UpdateMount => self.update_mount(ctx),
             RpcCode::GetMountTable => self.get_mount_table(ctx),
-            RpcCode::GetMountInfo => self.get_mount_point(ctx),
+            RpcCode::GetMountInfo => self.get_mount_info(ctx),
 
             // Worker related requests
             RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),
             RpcCode::WorkerBlockReport => self.block_report(ctx),
             RpcCode::GetMasterInfo => self.get_master_info(ctx),
+
+            // Load task related requests
+            RpcCode::SubmitLoadJob
+            | RpcCode::GetLoadStatus
+            | RpcCode::CancelLoadJob
+            | RpcCode::ReportLoadTask => {
+                if let Some(ref mut load_service) = self.load_service {
+                    return load_service.handle(msg);
+                } else {
+                    return Err(FsError::common("Load service not initialized"));
+                }
+            }
 
             // Unsupported request
             _ => err_box!("Unsupported operation"),

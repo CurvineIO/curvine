@@ -41,7 +41,7 @@ public class FilesystemConf {
     public int close_reader_limit = 20;
 
     public String storage_type = "disk";
-    public long ttl_ms = 0;
+    public String ttl_ms = "0";
     public String ttl_action = "none";
 
     // Set up the customer service retry policy

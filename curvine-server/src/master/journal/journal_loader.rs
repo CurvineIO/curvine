@@ -17,10 +17,8 @@
 use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
 use crate::master::meta::inode::InodeView::{Dir, File};
-use crate::master::mount::MountPointEntry;
 use crate::master::{MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
-use curvine_common::fs::CurvineURI;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
 use curvine_common::raft::{RaftResult, RaftUtils};
@@ -156,21 +154,10 @@ impl JournalLoader {
     }
 
     pub fn mount(&self, entry: MountEntry) -> CommonResult<()> {
-        let mnt_opt = entry.mnt_opt;
+        self.mnt_mgr.unprotected_add_mount(entry.info.clone())?;
 
-        let curvine_uri = CurvineURI::new(entry.mnt_path.clone()).unwrap();
-        let ufs_uri = CurvineURI::new(entry.ufs_path.clone()).unwrap();
-        self.mnt_mgr
-            .mount(Some(entry.id), &curvine_uri, &ufs_uri, &mnt_opt)?;
-
-        let moint_point = MountPointEntry::new(
-            entry.id,
-            entry.mnt_path.clone(),
-            entry.ufs_path.clone(),
-            mnt_opt,
-        );
         let mut fs_dir = self.fs_dir.write();
-        fs_dir.mount(moint_point)?;
+        fs_dir.store_mount(entry.info, false)?;
         Ok(())
     }
 
