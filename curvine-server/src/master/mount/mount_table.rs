@@ -17,6 +17,7 @@ use curvine_common::conf::{UfsConf, UfsConfBuilder};
 use curvine_common::fs::Path;
 use curvine_common::state::{MountInfo, MountOptions};
 use curvine_common::FsResult;
+use log::info;
 use orpc::{err_box, try_option};
 use rand::Rng;
 use std::collections::HashMap;
@@ -67,71 +68,27 @@ impl MountTable {
         false
     }
 
-    pub fn ufs_path_conflict(&self, ufs_uri: &str) -> Option<String> {
-        // prefix check
+    pub fn check_conflict(&self, cv_path: &str, ufs_path: &str) -> FsResult<()> {
         let inner = self.inner.read().unwrap();
-        for existing_uri in inner.ufs2mountid.keys() {
-            //add '/' suffix for mnt_uri and existing_uri
-            //avoid 's3://abcde' s3://abc conflict, this is two different path
-            //after add '/', 's3://abcde/' s3://abc/ won't conflict
-            let ufs_uri = if ufs_uri.ends_with("/") {
-                ufs_uri.to_string()
-            } else {
-                format!("{}/", ufs_uri)
-            };
-
-            let existing_uri = if existing_uri.ends_with("/") {
-                existing_uri.clone()
-            } else {
-                format!("{}/", existing_uri)
-            };
-
-            if ufs_uri.starts_with(&existing_uri) {
-                return Some(existing_uri.clone());
+        for info in inner.mountid2entry.values() {
+            if Path::has_prefix(cv_path, &info.cv_path) {
+                return err_box!("mount point {} is a prefix of {}", info.cv_path, cv_path);
             }
 
-            if existing_uri.starts_with(&ufs_uri) {
-                return Some(existing_uri.clone());
+            if Path::has_prefix(&info.cv_path, cv_path) {
+                return err_box!("mount point {} is a prefix of {}", cv_path, info.cv_path);
+            }
+
+            if Path::has_prefix(ufs_path, &info.ufs_path) {
+                return err_box!("mount point {} is a prefix of {}", info.ufs_path, ufs_path);
+            }
+
+            if Path::has_prefix(&info.ufs_path, ufs_path) {
+                return err_box!("mount point {} is a prefix of {}", ufs_path, info.ufs_path);
             }
         }
 
-        None
-    }
-
-    pub fn mnt_path_conflict(&self, mnt_uri: &str) -> Option<String> {
-        // prefix check
-        let inner = self.inner.read().unwrap();
-        for existing_uri in inner.mountpath2id.keys() {
-            //mnt path is root, skip this prefix
-            if existing_uri.eq("/") {
-                continue;
-            }
-
-            //add '/' suffix for mnt_uri and existing_uri
-            //avoid '/abcde' and '/abc' conflict, this is two different path
-            //after add '/', '/abcde/' and '/abc/' won't conflict
-            let mnt_uri = if mnt_uri.ends_with("/") {
-                mnt_uri.to_string()
-            } else {
-                format!("{}/", mnt_uri)
-            };
-
-            let existing_uri = if existing_uri.ends_with("/") {
-                existing_uri.clone()
-            } else {
-                format!("{}/", existing_uri)
-            };
-
-            if mnt_uri.starts_with(&existing_uri) {
-                return Some(existing_uri.clone());
-            }
-
-            if existing_uri.starts_with(&mnt_uri) {
-                return Some(existing_uri.clone());
-            }
-        }
-
-        None
+        Ok(())
     }
 
     // mountid maybe occupied
@@ -147,6 +104,8 @@ impl MountTable {
     }
 
     pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
+        info!("add mount: {:?}", info);
+
         let mut inner = self.inner.write().unwrap();
         inner
             .ufs2mountid
@@ -173,6 +132,8 @@ impl MountTable {
         if self.mount_point_inuse(cv_path) {
             return err_box!("{} already exists in mount table", ufs_path);
         }
+
+        self.check_conflict(cv_path, ufs_path)?;
 
         let info = mnt_opt.clone().to_info(mount_id, cv_path, ufs_path);
         self.unprotected_add_mount(info.clone())?;
@@ -239,7 +200,7 @@ impl MountTable {
         Ok(ufs_conf)
     }
 
-    pub fn get_mount_entry(&self, path: &Path) -> FsResult<Option<MountInfo>> {
+    pub fn get_mount_info(&self, path: &Path) -> FsResult<Option<MountInfo>> {
         let list = path.get_possible_mounts();
         let is_cv = path.is_cv();
         let inner = self.inner.read().unwrap();

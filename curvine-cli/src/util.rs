@@ -130,10 +130,6 @@ pub fn extract_scheme(path: &str) -> Option<String> {
 }
 
 pub fn validate_s3_configs(configs: &HashMap<String, String>) -> Result<(), String> {
-    if !configs.contains_key("s3.region_name") {
-        return Err("Missing required S3 parameter: s3.region_name".to_string());
-    }
-
     if let Some(endpoint) = configs.get("s3.endpoint_url") {
         if endpoint.is_empty() {
             return Err("s3.endpoint_url cannot be empty".to_string());

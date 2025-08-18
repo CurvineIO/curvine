@@ -29,6 +29,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.URI;
+import java.util.Optional;
 
 /****************************************************************
  * Implement the Hadoop FileSystem API for Curvine
@@ -56,6 +57,20 @@ public class CurvineFileSystem extends FileSystem {
     @Override
     public URI getUri() {
         return this.uri;
+    }
+
+    @Override
+    public void setWorkingDirectory(Path newDir) {
+        workingDir = newDir;
+    }
+
+    @Override
+    public Path getWorkingDirectory() {
+        return workingDir;
+    }
+
+    public FilesystemConf getFilesystemConf() {
+        return filesystemConf;
     }
 
     @Override
@@ -93,14 +108,21 @@ public class CurvineFileSystem extends FileSystem {
     @Override
     public FSDataInputStream open(Path path, int bufferSize) throws IOException {
         long[] tmp = new long[] {0, 0};
+        String formatPath = formatPath(path);
         try {
-            long nativeHandle = libFs.open(formatPath(path), tmp);
+            long nativeHandle = libFs.open(formatPath, tmp);
             return new FSDataInputStream(new CurvineInputStream(libFs, nativeHandle, tmp[0]));
         } catch (CurvineException e) {
-            if (e.isExpired()) {
-                LOGGER.info("The {} data is either cached or has expired, " +
-                        "data will be read from the ufs.", path);
-                return FileSystem.get(path.toUri(), getConf()).open(path, bufferSize);
+            if (filesystemConf.enable_unified_fs && !filesystemConf.enable_read_ufs) {
+                Optional<String> optUfsPath = libFs.getUfsPath(formatPath);
+                if (!optUfsPath.isPresent()) {
+                    throw new CurvineException(formatPath + "{} not find ufs path");
+                }
+
+                Path ufsPath = new Path(optUfsPath.get());
+                LOGGER.warn("Not support reading using the Rust API, " +
+                        "it will be read using the Java API. path: {} -> {}", formatPath, ufsPath);
+                return FileSystem.get(ufsPath.toUri(), getConf()).open(ufsPath, bufferSize);
             } else {
                 throw e;
             }
@@ -140,16 +162,6 @@ public class CurvineFileSystem extends FileSystem {
     public boolean delete(Path f, boolean recursive) throws IOException {
         libFs.delete(formatPath(f), recursive);
         return true;
-    }
-
-    @Override
-    public void setWorkingDirectory(Path newDir) {
-        workingDir = newDir;
-    }
-
-    @Override
-    public Path getWorkingDirectory() {
-        return workingDir;
     }
 
     @Override
@@ -212,13 +224,13 @@ public class CurvineFileSystem extends FileSystem {
         return new CurvineFsStat(info);
     }
 
-    public MountPointInfo getMountPoint(Path path) throws IOException {
-        byte[] bytes = libFs.getMountPoint(path.toString());
-        GetMountPointInfoResponse response = GetMountPointInfoResponse.parseFrom(bytes);
-        if (response.hasMountPoint()) {
-            return response.getMountPoint();
+    public Optional<MountInfoProto> getMountInfo(Path path) throws IOException {
+        byte[] bytes = libFs.getMountInfo(path.toString());
+        GetMountInfoResponse response = GetMountInfoResponse.parseFrom(bytes);
+        if (response.hasMountInfo()) {
+            return Optional.of(response.getMountInfo());
         }  else {
-            return null;
+            return Optional.empty();
         }
     }
 }

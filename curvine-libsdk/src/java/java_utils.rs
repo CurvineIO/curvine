@@ -14,7 +14,7 @@
 
 use curvine_common::error::FsError;
 use jni::objects::{JObject, JString, JThrowable, JValue};
-use jni::sys::{jarray, jboolean, JNI_TRUE};
+use jni::sys::{jarray, jboolean, jstring, JNI_TRUE};
 use jni::JNIEnv;
 use orpc::CommonResult;
 
@@ -108,5 +108,14 @@ impl JavaUtils {
     pub fn new_jarray(env: &mut JNIEnv, slice: &[u8]) -> CommonResult<jarray> {
         let array = env.byte_array_from_slice(slice)?;
         Ok(array.into_raw())
+    }
+
+    pub fn new_jstring(env: &mut JNIEnv, r_string: Option<String>) -> CommonResult<jstring> {
+        if let Some(v) = r_string {
+            let string = env.new_string(v)?;
+            Ok(string.into_raw())
+        } else {
+            Ok(JObject::null().into_raw())
+        }
     }
 }

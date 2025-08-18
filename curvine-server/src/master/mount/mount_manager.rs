@@ -43,34 +43,6 @@ impl MountManager {
         self.mount_table.restore();
     }
 
-    fn validate(&self, mount_path: &str, ufs_path: &str) -> FsResult<()> {
-        if mount_path == "/" {
-            return err_box!("mount point can not be root");
-        }
-
-        //mount table check
-        if self.mount_table.exists(ufs_path) {
-            return err_box!("mount point {} already exists in mount table", ufs_path);
-        }
-
-        let exists_path = self.mount_table.ufs_path_conflict(ufs_path);
-        if let Some(exists_path) = exists_path {
-            return err_box!(
-                "ufs path conflict, {} already exists in mount table",
-                exists_path
-            );
-        }
-
-        let exists_path = self.mount_table.mnt_path_conflict(ufs_path);
-        if let Some(exists_path) = exists_path {
-            return err_box!(
-                "mount path conflict, {} already exists in mount table",
-                exists_path
-            );
-        }
-        Ok(())
-    }
-
     fn create_mount_point(&self, mount_path: &str) -> FsResult<bool> {
         let exist = self.master_fs.exists(mount_path)?;
         if exist {
@@ -93,10 +65,6 @@ impl MountManager {
         ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
-        //step1
-        self.validate(mount_path, ufs_path)?;
-
-        //step2
         let _ = self.create_mount_point(mount_path)?;
 
         let assign_id = match mnt_id {
@@ -104,7 +72,6 @@ impl MountManager {
             None => self.mount_table.assign_mount_id()?,
         };
 
-        //step3
         self.mount_table
             .add_mount(assign_id, mount_path, ufs_path, mnt_opt)
     }
@@ -148,7 +115,7 @@ impl MountManager {
             return self.update_mount(mnt_id, cv_path, ufs_path, mnt_opt);
         }
 
-        self.add_mount(mnt_id, cv_path, cv_path, mnt_opt)
+        self.add_mount(mnt_id, cv_path, ufs_path, mnt_opt)
     }
 
     pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
@@ -168,7 +135,7 @@ impl MountManager {
      * use ufs_uri to find mount entry
      */
     pub fn get_mount_info(&self, path: &Path) -> FsResult<Option<MountInfo>> {
-        self.mount_table.get_mount_entry(path)
+        self.mount_table.get_mount_info(path)
     }
 
     pub fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {

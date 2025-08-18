@@ -303,24 +303,24 @@ impl MasterHandler {
 
     fn mount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: MountRequest = ctx.parse_header()?;
-        let cv_path = Path::from_str(request.cv_path)?;
-        let ufs_path = Path::from_str(request.ufs_path)?;
         let mnt_opt = ProtoUtils::mount_options_from_pb(request.mount_options);
 
-        ctx.set_audit(Some(cv_path.to_string()), Some(ufs_path.to_string()));
+        ctx.set_audit(
+            Some(request.cv_path.to_string()),
+            Some(request.ufs_path.to_string()),
+        );
 
         self.mount_manager
-            .mount(None, cv_path.path(), ufs_path.path(), &mnt_opt)?;
+            .mount(None, &request.cv_path, &request.ufs_path, &mnt_opt)?;
         let rep_header = MountResponse::default();
         ctx.response(rep_header)
     }
 
     fn umount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: UnMountRequest = ctx.parse_header()?;
-        let cv_path = Path::from_str(request.cv_path)?;
-        ctx.set_audit(Some(cv_path.path().to_string()), None);
+        ctx.set_audit(Some(request.cv_path.to_string()), None);
 
-        self.mount_manager.umount(cv_path.path())?;
+        self.mount_manager.umount(&request.cv_path)?;
         let rep_header = UnMountResponse::default();
         ctx.response(rep_header)
     }

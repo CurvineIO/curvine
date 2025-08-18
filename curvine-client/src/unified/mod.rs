@@ -33,6 +33,9 @@ pub mod macros;
 mod unified_filesystem;
 pub use self::unified_filesystem::UnifiedFileSystem;
 
+mod mount_cache;
+pub use self::mount_cache::*;
+
 pub enum UnifiedWriter {
     Cv(FsWriter),
     S3(S3Writer),

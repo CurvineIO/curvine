@@ -19,15 +19,15 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
     CacheJobResult, CreateFileOpts, CreateFileOptsBuilder, FileBlocks, FileStatus, MasterInfo,
-    MkdirOpts, MkdirOptsBuilder, MountInfo, SetAttrOpts,
+    MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, SetAttrOpts,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
 use curvine_common::FsResult;
 use log::info;
 use orpc::client::ClientConf;
-use orpc::err_ext;
 use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::{err_box, err_ext};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -232,6 +232,35 @@ impl CurvineFileSystem {
             .collect();
 
         Ok(table)
+    }
+
+    pub async fn mount(&self, ufs_path: &Path, cv_path: &Path, opts: MountOptions) -> FsResult<()> {
+        if !opts.update && ufs_path.scheme().is_none() {
+            return err_box!("ufs path {} invalid must be start with schema://", ufs_path);
+        }
+        if cv_path.is_root() {
+            return err_box!("mount path can not be root");
+        }
+
+        if !opts.update
+            && opts.mount_type == MountType::Cst
+            && ufs_path.authority_path() != cv_path.path()
+        {
+            return err_box!(
+                "for Cst mount type, the ufs path and the cv path must be identical. \
+                     current ufs path: {},  current cv path: {}",
+                ufs_path.authority_path(),
+                cv_path.path()
+            );
+        }
+
+        self.fs_client.mount(ufs_path, cv_path, opts).await?;
+        Ok(())
+    }
+
+    pub async fn umount(&self, cv_path: &Path) -> FsResult<()> {
+        self.fs_client.umount(cv_path).await?;
+        Ok(())
     }
 
     pub async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {

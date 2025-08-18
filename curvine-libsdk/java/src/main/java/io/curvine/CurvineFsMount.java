@@ -19,6 +19,7 @@ import sun.nio.ch.DirectBuffer;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Optional;
 
 public class CurvineFsMount {
     private final long nativeHandle;
@@ -132,9 +133,14 @@ public class CurvineFsMount {
         return bytes;
     }
 
-    public byte[] getMountPoint(String path) throws IOException {
-        byte[] bytes = CurvineNative.getMountPoint(nativeHandle, path);
+    public byte[] getMountInfo(String path) throws IOException {
+        byte[] bytes = CurvineNative.getMountInfo(nativeHandle, path);
         checkError(bytes);
         return bytes;
+    }
+
+    public Optional<String> getUfsPath(String path) throws IOException {
+        String ufsPath = CurvineNative.getUfsPath(nativeHandle, path);
+        return Optional.ofNullable(ufsPath);
     }
 }

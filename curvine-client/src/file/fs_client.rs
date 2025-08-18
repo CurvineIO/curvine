@@ -262,19 +262,12 @@ impl FsClient {
         &self,
         ufs_path: &Path,
         cv_path: &Path,
-        mount_options: MountOptions,
+        opts: MountOptions,
     ) -> FsResult<MountResponse> {
-        if mount_options.mount_type == MountType::Cst && ufs_path.path() != cv_path.path() {
-            return err_box!(
-                "for cst mount type, the ufs path and the mount path must be exactly the same, \
-            for example: bin/cv mount s3://bucket/dir /bucket/dir"
-            );
-        }
-
         let req = MountRequest {
             ufs_path: ufs_path.encode_uri(),
             cv_path: cv_path.encode(),
-            mount_options: ProtoUtils::mount_options_to_pb(mount_options),
+            mount_options: ProtoUtils::mount_options_to_pb(opts),
         };
 
         let rep: MountResponse = self.rpc(RpcCode::Mount, req).await?;

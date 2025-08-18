@@ -15,7 +15,7 @@
 package io.curvine;
 
 import io.curvine.bench.Utils;
-import io.curvine.proto.MountPointInfo;
+import io.curvine.proto.MountInfoProto;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.fs.*;
 import org.apache.hadoop.conf.Configuration;
@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Optional;
 
 public class CurvineFileSystemTest {
     static FileSystem fs;
@@ -50,7 +51,7 @@ public class CurvineFileSystemTest {
     @Test
     public void getMountInfo() throws Exception {
         Path path = new Path("s3://flink/xuen-test");
-        MountPointInfo mountPoint = ((CurvineFileSystem) fs).getMountPoint(path);
+        Optional<MountInfoProto> mountPoint = ((CurvineFileSystem) fs).getMountInfo(path);
         System.out.println("mount point: " + mountPoint);
     }
 

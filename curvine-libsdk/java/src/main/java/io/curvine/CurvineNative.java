@@ -267,5 +267,7 @@ public class CurvineNative {
 
     public static native byte[] getMasterInfo(long nativeHandle) throws IOException;
 
-    public static native byte[] getMountPoint(long nativeHandle, String path) throws IOException;
+    public static native byte[] getMountInfo(long nativeHandle, String path) throws IOException;
+
+    public static native String getUfsPath(long nativeHandle, String path) throws IOException;
 }

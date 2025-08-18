@@ -78,7 +78,7 @@ public class FilesystemConf {
 
     public int umask = 022;
 
-    public String mount_update_ttl = "5m";
+    public String mount_update_ttl = "10m";
 
     // Log configuration, default to standard output.
     public String log_level = "info";

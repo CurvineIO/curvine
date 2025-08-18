@@ -58,6 +58,20 @@ impl Path {
         self.uri.path()
     }
 
+    pub fn full_path(&self) -> &str {
+        &self.full_path
+    }
+
+    pub fn authority_path(&self) -> &str {
+        let full_path = self.full_path();
+
+        if let Some(scheme_end) = full_path.find("://") {
+            let start_index = scheme_end + 2;
+            return &full_path[start_index..];
+        }
+        full_path
+    }
+
     pub fn name(&self) -> &str {
         match self.path().rfind(Self::SEPARATOR) {
             None => "",
@@ -122,10 +136,6 @@ impl Path {
         Some(path.to_string())
     }
 
-    pub fn full_path(&self) -> &str {
-        &self.full_path
-    }
-
     fn normalize_path(path: &str) -> String {
         let p = SLASHES.replace_all(path, Self::SEPARATOR);
         let min_len = if MAIN_SEPARATOR == '\\' { 4 } else { 1 };
@@ -169,6 +179,32 @@ impl Path {
         }
 
         result
+    }
+
+    pub fn get_components<T: AsRef<str>>(path: T) -> Vec<String> {
+        let path = Self::normalize_path(path.as_ref());
+        if path.as_str() == "/" {
+            vec![]
+        } else {
+            path.split(Self::SEPARATOR).map(|x| x.to_string()).collect()
+        }
+    }
+
+    pub fn has_prefix<T: AsRef<str>>(path: T, prefix: &str) -> bool {
+        let path_components = Self::get_components(path);
+        let prefix_components = Self::get_components(prefix);
+
+        if path_components.len() < prefix_components.len() {
+            return false;
+        }
+
+        for (i, component) in prefix_components.iter().enumerate() {
+            if component != &path_components[i] {
+                return false;
+            }
+        }
+
+        true
     }
 }
 

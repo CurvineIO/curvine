@@ -96,9 +96,15 @@ impl LibFilesystem {
             .block_on(async { self.inner.get_master_info_bytes().await })
     }
 
-    pub fn get_mount_point(&self, path: impl AsRef<str>) -> FsResult<BytesMut> {
+    pub fn get_mount_info(&self, path: impl AsRef<str>) -> FsResult<BytesMut> {
         let path = Path::from_str(path)?;
         self.rt
-            .block_on(async { self.inner.cv().get_mount_info_bytes(&path).await })
+            .block_on(async { self.inner.get_mount_info_bytes(&path).await })
+    }
+
+    pub fn get_ufs_path(&self, path: impl AsRef<str>) -> FsResult<Option<String>> {
+        let path = Path::from_str(path)?;
+        self.rt
+            .block_on(async { self.inner.get_ufs_path(&path).await })
     }
 }

@@ -15,6 +15,7 @@
 use crate::util::*;
 use clap::Parser;
 use curvine_client::file::FsClient;
+use curvine_client::unified::UfsFileSystem;
 use curvine_common::fs::Path;
 use curvine_common::state::{ConsistencyStrategy, MountOptions, MountType, StorageType, TtlAction};
 use orpc::common::{ByteUnit, DurationUnit};
@@ -119,6 +120,14 @@ impl MountCommand {
 
         // Creating a MountOptions Object
         let mnt_opts = self.to_mnt_opts()?;
+
+        // try create ufsFileSystem
+        if !mnt_opts.update {
+            if let Err(e) = UfsFileSystem::new(&ufs_path, mnt_opts.add_properties.clone()) {
+                eprintln!("Error create UfsFileSystem: {}", e);
+            }
+        }
+
         let rep = handle_rpc_result(client.mount(&ufs_path, &cv_path, mnt_opts)).await;
         println!("{}", rep);
         Ok(())
@@ -144,9 +153,11 @@ impl MountCommand {
             ConsistencyStrategy::try_from(self.consistency_strategy.as_str())?;
         let ttl_ms = DurationUnit::from_str(self.ttl_ms.as_str())?.as_millis() as i64;
         let ttl_action = TtlAction::try_from(self.ttl_action.as_str())?;
+        let conf_map = self.get_config_map()?;
 
         let mut opts = MountOptions::builder()
             .update(self.update)
+            .set_properties(conf_map)
             .mount_type(mnt_type)
             .consistency_strategy(consistency_strategy)
             .ttl_ms(ttl_ms)
