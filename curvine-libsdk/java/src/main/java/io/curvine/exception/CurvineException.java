@@ -22,6 +22,7 @@ public class CurvineException extends IOException {
     public final static int FILE_ALREADY_EXISTS = 7;
     public final static int FILE_NOT_FOUND = 8;
     public final static int FILE_EXPIRED = 21;
+    public final static int UNSUPPORTED_UFS_READ = 22;
 
     private final int errno;
 
@@ -35,6 +36,10 @@ public class CurvineException extends IOException {
         this.errno = errno;
     }
 
+    public int getErrno() {
+        return errno;
+    }
+
     public static IOException create(int errno, String message) {
         switch (errno) {
             case FILE_NOT_FOUND:
@@ -44,9 +49,5 @@ public class CurvineException extends IOException {
             default:
                 return new CurvineException(errno, message);
         }
-    }
-
-    public boolean isExpired() {
-        return errno == FILE_EXPIRED;
     }
 }

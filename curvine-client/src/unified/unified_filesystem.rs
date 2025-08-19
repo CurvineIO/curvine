@@ -13,90 +13,24 @@
 // limitations under the License.
 
 use crate::file::CurvineFileSystem;
-use crate::unified::{UfsFileSystem, UnifiedReader, UnifiedWriter};
+use crate::unified::{MountCache, MountValue, UnifiedReader, UnifiedWriter};
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{FileStatus, MasterInfo, MountInfo, MountOptions, SetAttrOpts};
+use curvine_common::state::{
+    ConsistencyStrategy, FileStatus, MasterInfo, MountInfo, MountOptions, SetAttrOpts,
+};
 use curvine_common::FsResult;
-use log::{debug, info, warn};
-use orpc::common::{FastHashMap, LocalTime};
+use log::{info, warn};
 use orpc::runtime::Runtime;
-use orpc::sync::AtomicCounter;
-use orpc::{err_ext, CommonResult};
-use std::sync::{Arc, Mutex};
+use orpc::{err_box, err_ext};
+use std::sync::Arc;
 
-#[derive(Clone)]
-struct MountItem {
-    info: Arc<MountInfo>,
-    ufs: UfsFileSystem,
-}
-
-#[derive(Clone)]
-struct MountState {
-    mounts: Arc<Mutex<FastHashMap<String, MountItem>>>,
-    last_update: Arc<AtomicCounter>,
-    update_interval: u64,
-}
-
-impl MountItem {
-    // Get the ufs path of the curvine path
-    fn ufs_path(&self, path: &Path) -> CommonResult<Path> {
-        // parse real path
-        // mnt: /xuen-test s3://flink/xuen-test
-        // Path /xuen-test/a -> s3://flink/xuen-test/a
-        let sub_path = path.path().replacen(&self.info.cv_path, "", 1);
-        Path::from_str(format!("{}/{}", self.info.ufs_path, sub_path))
-    }
-}
-
-impl MountState {
-    fn new(update_interval: u64) -> Self {
-        Self {
-            mounts: Arc::new(Mutex::new(FastHashMap::default())),
-            last_update: Arc::new(AtomicCounter::new(0)),
-            update_interval,
-        }
-    }
-
-    fn need_update(&self) -> bool {
-        LocalTime::mills() > self.update_interval + self.last_update.get()
-    }
-
-    async fn check_update(&self, fs: &CurvineFileSystem, force: bool) -> FsResult<()> {
-        if self.need_update() || force {
-            let mounts = fs.get_mount_table().await?;
-            let mut state = self.mounts.lock().unwrap();
-            state.clear();
-
-            for item in mounts {
-                let path = Path::from_str(&item.ufs_path)?;
-                let ufs = UfsFileSystem::new(&path, item.properties.clone())?;
-
-                state.insert(
-                    item.cv_path.to_owned(),
-                    MountItem {
-                        info: Arc::new(item),
-                        ufs,
-                    },
-                );
-            }
-
-            debug!("update mounts, size {}", state.len());
-            self.last_update.set(LocalTime::mills());
-            Ok(())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[derive(Clone, PartialOrd, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialOrd, PartialEq, Debug)]
 enum CacheValidity {
     Valid,
     Invalid,
-    NotExists,
 }
 
 impl CacheValidity {
@@ -108,22 +42,23 @@ impl CacheValidity {
 #[derive(Clone)]
 pub struct UnifiedFileSystem {
     cv: CurvineFileSystem,
-    mount_state: MountState,
+    mount_cache: Arc<MountCache>,
     enable_unified: bool,
     enable_read_ufs: bool,
 }
 
 impl UnifiedFileSystem {
     pub fn with_rt(conf: ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
-        let update_interval = conf.client.mount_update_ttl.as_millis() as u64;
+        let update_interval = conf.client.mount_update_ttl;
         let enable_unified = conf.client.enable_unified_fs;
+        let enable_read_ufs = conf.client.enable_read_ufs;
 
         let cv = CurvineFileSystem::with_rt(conf, rt.clone())?;
         let fs = UnifiedFileSystem {
             cv,
-            mount_state: MountState::new(update_interval),
+            mount_cache: Arc::new(MountCache::new(update_interval)),
             enable_unified,
-            enable_read_ufs: true,
+            enable_read_ufs,
         };
 
         Ok(fs)
@@ -134,29 +69,22 @@ impl UnifiedFileSystem {
     }
 
     // Check if the path is a mount point, if so, return the mount point information
-    async fn get_mount(&self, path: &Path) -> FsResult<Option<(Path, MountItem)>> {
-        // If unified file system is not enabled, return None
+    async fn get_mount(&self, path: &Path) -> FsResult<Option<(Path, MountValue)>> {
+        if !path.is_cv() {
+            return err_box!("path is not curvine path");
+        }
+
         if !self.enable_unified {
             return Ok(None);
         }
 
-        // Check if the mount point information needs to be updated
-        self.mount_state.check_update(&self.cv, false).await?;
-
-        let state = self.mount_state.mounts.lock().unwrap();
-        if state.is_empty() {
-            return Ok(None);
+        let state = self.mount_cache.get_mount(self, path).await?;
+        if let Some(mnt) = state {
+            let ufs_path = mnt.get_ufs_path(path)?;
+            Ok(Some((ufs_path, mnt)))
+        } else {
+            Ok(None)
         }
-
-        // Find the mount point information for the path
-        for mount_path in path.get_possible_mounts() {
-            if let Some(item) = state.get(&mount_path).cloned() {
-                let ufs_path = item.ufs_path(path)?;
-                return Ok(Some((ufs_path, item)));
-            }
-        }
-
-        Ok(None)
     }
 
     pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
@@ -187,15 +115,31 @@ impl UnifiedFileSystem {
     }
 
     pub async fn mount(&self, ufs_path: &Path, cv_path: &Path, opts: MountOptions) -> FsResult<()> {
-        self.cv.fs_client.mount(ufs_path, cv_path, opts).await?;
-        self.mount_state.check_update(&self.cv, true).await?;
+        self.cv.mount(ufs_path, cv_path, opts).await?;
+        let _ = self.get_mount(cv_path).await?;
         Ok(())
     }
 
     pub async fn umount(&self, cv_path: &Path) -> FsResult<()> {
-        self.cv.fs_client.umount(cv_path).await?;
-        self.mount_state.check_update(&self.cv, true).await?;
+        self.cv.umount(cv_path).await?;
+        self.mount_cache.remove(cv_path);
         Ok(())
+    }
+
+    // According to cv_path, find the mount point and get the corresponding ufs_path path.
+    pub async fn get_ufs_path(&self, path: &Path) -> FsResult<Option<String>> {
+        match self.get_mount(path).await? {
+            Some((ufs_path, _)) => Ok(Some(ufs_path.to_string())),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_mount_info(&self, path: &Path) -> FsResult<Option<MountInfo>> {
+        self.cv.get_mount_info(path).await
+    }
+
+    pub async fn get_mount_info_bytes(&self, path: &Path) -> FsResult<BytesMut> {
+        self.cv.get_mount_info_bytes(path).await
     }
 
     pub fn clone_runtime(&self) -> Arc<Runtime> {
@@ -216,23 +160,26 @@ impl UnifiedFileSystem {
         &self,
         cv_path: &Path,
         ufs_path: &Path,
-        mount: &MountItem,
+        mount: &MountValue,
     ) -> FsResult<CacheValidity> {
-        let validity = match self.get_cache_status(cv_path).await? {
-            Some(cv_status) => {
-                let ufs_status = mount.ufs.get_status(ufs_path).await?;
-                if cv_status.len == ufs_status.len
-                    && cv_status.storage_policy.ufs_mtime != 0
-                    && cv_status.storage_policy.ufs_mtime == ufs_status.mtime
-                {
-                    CacheValidity::Valid
-                } else {
-                    CacheValidity::Invalid
-                }
-            }
-            None => CacheValidity::NotExists,
+        let cv_status = match self.get_cache_status(cv_path).await? {
+            Some(v) => v,
+            None => return Ok(CacheValidity::Invalid),
         };
-        Ok(validity)
+
+        if mount.info.consistency_strategy == ConsistencyStrategy::None {
+            Ok(CacheValidity::Valid)
+        } else {
+            let ufs_status = mount.ufs.get_status(ufs_path).await?;
+            if cv_status.len == ufs_status.len
+                && cv_status.storage_policy.ufs_mtime != 0
+                && cv_status.storage_policy.ufs_mtime == ufs_status.mtime
+            {
+                Ok(CacheValidity::Valid)
+            } else {
+                Ok(CacheValidity::Invalid)
+            }
+        }
     }
 }
 
@@ -244,28 +191,28 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
     async fn mkdir(&self, path: &Path, create_parent: bool) -> FsResult<bool> {
         match self.get_mount(path).await? {
             None => self.cv.mkdir(path, create_parent).await,
-            Some((path, mount)) => mount.ufs.mkdir(&path, create_parent).await,
+            Some((ufs_path, mount)) => mount.ufs.mkdir(&ufs_path, create_parent).await,
         }
     }
 
     async fn create(&self, path: &Path, overwrite: bool) -> FsResult<UnifiedWriter> {
         match self.get_mount(path).await? {
             None => Ok(UnifiedWriter::Cv(self.cv.create(path, overwrite).await?)),
-            Some((path, mount)) => mount.ufs.create(&path, overwrite).await,
+            Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, overwrite).await,
         }
     }
 
     async fn append(&self, path: &Path) -> FsResult<UnifiedWriter> {
         match self.get_mount(path).await? {
             None => Ok(UnifiedWriter::Cv(self.cv.append(path).await?)),
-            Some((path, mount)) => mount.ufs.append(&path).await,
+            Some((ufs_path, mount)) => mount.ufs.append(&ufs_path).await,
         }
     }
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
         match self.get_mount(path).await? {
             None => self.cv.exists(path).await,
-            Some((path, mount)) => mount.ufs.exists(&path).await,
+            Some((ufs_path, mount)) => mount.ufs.exists(&ufs_path).await,
         }
     }
 
@@ -305,34 +252,22 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
             info!("Read from ufs, ufs path {}, cv path: {}", ufs_path, path);
             mount.ufs.open(&ufs_path).await
         } else {
-            err_ext!(FsError::file_expired(path.path()))
+            err_ext!(FsError::unsupported_ufs_read(path.path()))
         }
     }
 
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
         match self.get_mount(src).await? {
             None => self.cv.rename(src, dst).await,
-            Some((src_path, mount)) => {
-                let dst_path = mount.ufs_path(dst)?;
-                let rename_result = mount.ufs.rename(&src_path, &dst_path).await?;
-                if rename_result {
-                    // to find out the cache status and then rename or delete it
-                    let valid = self.get_cache_validity(src, &dst_path, &mount).await?;
-                    match valid {
-                        CacheValidity::Valid => {
-                            self.cv.rename(src, dst).await?;
-                        }
-                        CacheValidity::Invalid => {
-                            self.cv.delete(src, true).await?;
-                        }
-                        _ => {
-                            // ignore
-                        }
-                    };
-                    Ok(true)
-                } else {
-                    Ok(false)
+            Some((src_ufs, mount)) => {
+                let dst_ufs = mount.get_ufs_path(dst)?;
+                let _ = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
+
+                if self.cv.exists(src).await? {
+                    self.cv.delete(src, true).await?;
                 }
+
+                Ok(true)
             }
         }
     }
@@ -340,11 +275,14 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
         match self.get_mount(path).await? {
             None => self.cv.delete(path, recursive).await,
-            Some((path, mount)) => {
-                if (self.get_cache_status(&path).await?).is_some() {
-                    self.cv.delete(&path, recursive).await?;
+            Some((ufs_path, mount)) => {
+                // delete cache
+                if self.cv.exists(path).await? {
+                    self.cv.delete(path, recursive).await?;
                 }
-                mount.ufs.delete(&path, recursive).await
+
+                // delete ufs
+                mount.ufs.delete(&ufs_path, recursive).await
             }
         }
     }
@@ -352,28 +290,28 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
         match self.get_mount(path).await? {
             None => self.cv.get_status(path).await,
-            Some((path, mount)) => mount.ufs.get_status(&path).await,
+            Some((ufs_path, mount)) => mount.ufs.get_status(&ufs_path).await,
         }
     }
 
     async fn get_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         match self.get_mount(path).await? {
             None => self.cv.get_status_bytes(path).await,
-            Some((path, mount)) => mount.ufs.get_status_bytes(&path).await,
+            Some((ufs_path, mount)) => mount.ufs.get_status_bytes(&ufs_path).await,
         }
     }
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
         match self.get_mount(path).await? {
             None => self.cv.list_status(path).await,
-            Some((path, mount)) => mount.ufs.list_status(&path).await,
+            Some((ufs_path, mount)) => mount.ufs.list_status(&ufs_path).await,
         }
     }
 
     async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         match self.get_mount(path).await? {
             None => self.cv.list_status_bytes(path).await,
-            Some((path, mount)) => mount.ufs.list_status_bytes(&path).await,
+            Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
         }
     }
 

@@ -15,10 +15,10 @@
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::MountOptions;
+use curvine_common::state::{MountOptions, MountType, TtlAction};
 use curvine_common::FsResult;
 use curvine_tests::Testing;
-use orpc::common::Logger;
+use orpc::common::{DurationUnit, Logger};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
 use std::sync::Arc;
@@ -53,11 +53,20 @@ async fn get_mount(fs: &UnifiedFileSystem) -> FsResult<()> {
     println!("res {:?}", res);
     Ok(())
 }
+
 async fn mount(fs: &UnifiedFileSystem) -> FsResult<()> {
+    let ttl_ms = DurationUnit::from_str("1h")?.as_millis() as i64;
+
     let s3_conf = Testing::get_s3_conf().unwrap();
-    let opts = MountOptions::builder().set_properties(s3_conf).build();
+    let opts = MountOptions::builder()
+        .set_properties(s3_conf)
+        .ttl_ms(ttl_ms)
+        .ttl_action(TtlAction::Delete)
+        .mount_type(MountType::Orch)
+        .build();
+
     let ufs_path = "s3://flink/xuen-test".into();
-    let cv_path = "/xuen-test".into();
+    let cv_path = "/s3/xuen-test".into();
     fs.mount(&ufs_path, &cv_path, opts).await?;
     Ok(())
 }

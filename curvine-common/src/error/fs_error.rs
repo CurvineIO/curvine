@@ -56,6 +56,7 @@ pub enum ErrorKind {
     Unsupported = 19,
     Ufs = 20,
     Expired = 21,
+    UnsupportedUfsRead = 22,
 
     #[num_enum(default)]
     Common = 10000,
@@ -145,6 +146,10 @@ pub enum FsError {
     #[error("{0}")]
     Expired(ErrorImpl<StringError>),
 
+    // Data expiration
+    #[error("{0}")]
+    UnsupportedUfsRead(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -181,6 +186,11 @@ impl FsError {
     pub fn file_expired(path: impl AsRef<str>) -> Self {
         let msg = format!("File {} expired", path.as_ref());
         Self::Expired(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn unsupported_ufs_read(path: impl AsRef<str>) -> Self {
+        let msg = format!("File {} unsupported ufs read", path.as_ref());
+        Self::UnsupportedUfsRead(ErrorImpl::with_source(msg.into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -238,6 +248,7 @@ impl FsError {
             FsError::Unsupported(_) => ErrorKind::Unsupported,
             FsError::Ufs(_) => ErrorKind::Ufs,
             FsError::Expired(_) => ErrorKind::Expired,
+            FsError::UnsupportedUfsRead(_) => ErrorKind::UnsupportedUfsRead,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -266,7 +277,7 @@ impl From<RaftError> for FsError {
 }
 
 impl From<std::io::Error> for FsError {
-    fn from(value: std::io::Error) -> Self {
+    fn from(value: io::Error) -> Self {
         Self::IO(ErrorImpl::with_source(value))
     }
 }
@@ -344,6 +355,7 @@ impl ErrorExt for FsError {
             FsError::Unsupported(e) => FsError::Unsupported(e.ctx(ctx)),
             FsError::Ufs(e) => FsError::Ufs(e.ctx(ctx)),
             FsError::Expired(e) => FsError::Expired(e.ctx(ctx)),
+            FsError::UnsupportedUfsRead(e) => FsError::UnsupportedUfsRead(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -371,6 +383,7 @@ impl ErrorExt for FsError {
             FsError::Unsupported(e) => e.encode(ErrorKind::Unsupported),
             FsError::Ufs(e) => e.encode(ErrorKind::Ufs),
             FsError::Expired(e) => e.encode(ErrorKind::Expired),
+            FsError::UnsupportedUfsRead(e) => e.encode(ErrorKind::UnsupportedUfsRead),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -401,6 +414,7 @@ impl ErrorExt for FsError {
             ErrorKind::Unsupported => FsError::Unsupported(de.into_string()),
             ErrorKind::Ufs => FsError::Ufs(de.into_string()),
             ErrorKind::Expired => FsError::Expired(de.into_string()),
+            ErrorKind::UnsupportedUfsRead => FsError::UnsupportedUfsRead(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }

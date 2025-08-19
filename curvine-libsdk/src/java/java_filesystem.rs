@@ -16,7 +16,7 @@ use crate::java::JavaUtils;
 use crate::{FilesystemConf, LibFilesystem, LibFsReader, LibFsWriter};
 use curvine_common::FsResult;
 use jni::objects::JString;
-use jni::sys::{jarray, jboolean};
+use jni::sys::{jarray, jboolean, jstring};
 use jni::JNIEnv;
 
 pub struct JavaFilesystem {
@@ -97,10 +97,17 @@ impl JavaFilesystem {
         Ok(byte_arr)
     }
 
-    pub fn get_mount_point(&self, env: &mut JNIEnv, path: JString) -> FsResult<jarray> {
+    pub fn get_mount_info(&self, env: &mut JNIEnv, path: JString) -> FsResult<jarray> {
         let path = JavaUtils::jstring_to_string(env, &path)?;
-        let bytes = self.inner.get_mount_point(path)?;
+        let bytes = self.inner.get_mount_info(path)?;
         let byte_arr = JavaUtils::new_jarray(env, &bytes)?;
         Ok(byte_arr)
+    }
+
+    pub fn get_ufs_path(&self, env: &mut JNIEnv, path: JString) -> FsResult<jstring> {
+        let path = JavaUtils::jstring_to_string(env, &path)?;
+        let ufs_path = self.inner.get_ufs_path(path)?;
+        let string = JavaUtils::new_jstring(env, ufs_path)?;
+        Ok(string)
     }
 }
