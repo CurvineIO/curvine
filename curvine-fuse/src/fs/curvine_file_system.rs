@@ -34,6 +34,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::bytes::BytesMut;
 
+// FUSE setattr valid bit flags (aligned with linux/fs/fuse definitions)
+const FATTR_MODE: u32 = 1 << 0;
+const FATTR_UID: u32 = 1 << 1;
+const FATTR_GID: u32 = 1 << 2;
+
+#[derive(Copy, Clone, Debug)]
+enum DirectoryAction {
+    Read,
+    Search,
+    Open,
+}
+
+impl DirectoryAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            DirectoryAction::Read => "read",
+            DirectoryAction::Search => "search",
+            DirectoryAction::Open => "open",
+        }
+    }
+}
+
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
     state: NodeState,
@@ -229,6 +251,15 @@ impl CurvineFileSystem {
         plus: bool,
     ) -> FuseResult<FuseDirentList> {
         let path = self.state.get_path(header.nodeid)?;
+        // Enforce directory search permission before listing
+        let dir_status = self.fs_get_status(&path).await?;
+        self.enforce_directory_search_permission(
+            &dir_status,
+            &path,
+            header.uid,
+            header.gid,
+            DirectoryAction::Read,
+        )?;
         let list = self.fs_list_status(header.nodeid, &path).await?;
 
         let start_index = arg.offset as usize;
@@ -355,6 +386,12 @@ impl CurvineFileSystem {
 
         #[cfg(target_os = "linux")]
         {
+            // F_OK (0) - only check if file exists, no permission check needed
+            if mask == 0 {
+                debug!("F_OK only check - always allowed");
+                return true;
+            }
+
             let mut has_permission = true;
 
             // Check read permission (R_OK = 4)
@@ -387,13 +424,47 @@ impl CurvineFileSystem {
                 );
             }
 
+            debug!(
+                "Permission mask check: mask={:o}, permission_bits={:o}, result={}",
+                mask, permission_bits, has_permission
+            );
+
             has_permission
         }
     }
 
+    /// Enforce directory search (execute) permission for traversal or operations
+    fn enforce_directory_search_permission(
+        &self,
+        dir_status: &FileStatus,
+        dir_path: &Path,
+        caller_uid: u32,
+        caller_gid: u32,
+        action: DirectoryAction,
+    ) -> FuseResult<()> {
+        if dir_status.is_dir {
+            let perm_bits = self.get_effective_permission_bits(
+                dir_status.mode,
+                caller_uid,
+                caller_gid,
+                self.resolve_file_uid(&dir_status.owner),
+                self.resolve_file_gid(&dir_status.group),
+            );
+            if (perm_bits & 0o1) == 0 {
+                return err_fuse!(
+                    libc::EACCES,
+                    "Permission denied to {} directory: {}",
+                    action.as_str(),
+                    dir_path
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
-        let owner = {
-            // Try to get username from uid, fail if not found
+        // Only set fields when the corresponding valid flag is present
+        let owner = if (setattr.valid & FATTR_UID) != 0 {
             match orpc::sys::get_username_by_uid(setattr.uid) {
                 Some(username) => Some(username),
                 None => {
@@ -404,10 +475,11 @@ impl CurvineFileSystem {
                     );
                 }
             }
+        } else {
+            None
         };
 
-        let group = {
-            // Try to get group name from gid, fail if not found
+        let group = if (setattr.valid & FATTR_GID) != 0 {
             match orpc::sys::get_groupname_by_gid(setattr.gid) {
                 Some(groupname) => Some(groupname),
                 None => {
@@ -418,10 +490,13 @@ impl CurvineFileSystem {
                     );
                 }
             }
+        } else {
+            None
         };
 
-        let mode = if setattr.mode != 0 {
-            Some(setattr.mode)
+        // Strip file type bits; keep only permission and special bits
+        let mode = if (setattr.valid & FATTR_MODE) != 0 {
+            Some(setattr.mode & 0o7777)
         } else {
             None
         };
@@ -499,6 +574,19 @@ impl fs::FileSystem for CurvineFileSystem {
         } else {
             (id, Some(name))
         };
+
+        // Enforce directory search (execute) permission on parent before lookup
+        {
+            let parent_path = self.state.get_path(parent)?;
+            let parent_status = self.fs_get_status(&parent_path).await?;
+            self.enforce_directory_search_permission(
+                &parent_status,
+                &parent_path,
+                op.header.uid,
+                op.header.gid,
+                DirectoryAction::Search,
+            )?;
+        }
 
         // Get the path.
         let path = self.state.get_path_common(parent, name)?;
@@ -789,6 +877,19 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         };
 
+        // Enforce parent directory search (execute) permission for path traversal
+        if let Ok(parent_id) = self.state.get_parent_id(op.header.nodeid) {
+            let parent_path = self.state.get_path(parent_id)?;
+            let parent_status = self.fs_get_status(&parent_path).await?;
+            self.enforce_directory_search_permission(
+                &parent_status,
+                &parent_path,
+                op.header.uid,
+                op.header.gid,
+                DirectoryAction::Search,
+            )?;
+        }
+
         // Get current user's UID and GID from the request header
         let current_uid = op.header.uid;
         let current_gid = op.header.gid;
@@ -796,7 +897,7 @@ impl fs::FileSystem for CurvineFileSystem {
         // Get requested access mask
         let mask = op.arg.mask;
 
-        // Check if user has the requested permissions
+        // Check if user has the requested permissions on the node itself
         if !self.check_access_permissions(&status, current_uid, current_gid, mask) {
             return err_fuse!(libc::EACCES, "Permission denied for {}", path);
         }
@@ -808,6 +909,19 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn open_dir(&self, op: OpenDir<'_>) -> FuseResult<fuse_open_out> {
         let _ = OpenAction::try_from(op.arg.flags)?;
         let _ = self.state.get_node(op.header.nodeid)?;
+
+        // Enforce directory search (execute) permission on the directory being opened
+        {
+            let dir_path = self.state.get_path(op.header.nodeid)?;
+            let dir_status = self.fs_get_status(&dir_path).await?;
+            self.enforce_directory_search_permission(
+                &dir_status,
+                &dir_path,
+                op.header.uid,
+                op.header.gid,
+                DirectoryAction::Open,
+            )?;
+        }
 
         let fh = self.state.next_handle();
         let open_flags = Self::fill_open_flags(&self.conf, op.arg.flags);
@@ -850,6 +964,23 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_name(op.header.nodeid, name)?;
 
         let _ = self.fs.mkdir(&path, false).await?;
+        // Apply requested mode to directory if provided (mask out file type bits)
+        if op.arg.mode != 0 {
+            let add_x_attr = HashMap::new();
+            let opts = SetAttrOpts {
+                recursive: false,
+                replicas: None,
+                owner: None,
+                group: None,
+                mode: Some(op.arg.mode & 0o7777),
+                ttl_ms: None,
+                ttl_action: None,
+                add_x_attr,
+                remove_x_attr: Vec::new(),
+            };
+            // Ignore error intentionally if backend rejects, continue
+            let _ = self.fs.set_attr(&path, opts).await;
+        }
         let entry = self
             .lookup_path(op.header.nodeid, Some(name), &path)
             .await?;
@@ -915,6 +1046,23 @@ impl fs::FileSystem for CurvineFileSystem {
         let file = FuseFile::for_write(self.fs.clone(), path, op.arg.flags).await?;
         let status = file.status()?;
         let attr = self.lookup_status(id, Some(name), status)?;
+
+        // Apply requested mode to the new file if provided (mask out file type bits)
+        if op.arg.mode != 0 {
+            let path2 = self.state.get_path_common(id, Some(name))?;
+            let opts = SetAttrOpts {
+                recursive: false,
+                replicas: None,
+                owner: None,
+                group: None,
+                mode: Some(op.arg.mode & 0o7777),
+                ttl_ms: None,
+                ttl_action: None,
+                add_x_attr: HashMap::new(),
+                remove_x_attr: Vec::new(),
+            };
+            let _ = self.fs.set_attr(&path2, opts).await;
+        }
 
         // step2: cache file handle.
         let fh = self.state.add_file(file)?;
