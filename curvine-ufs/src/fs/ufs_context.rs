@@ -15,24 +15,24 @@
 #![allow(unused)]
 
 use curvine_common::conf::UfsConf;
+use curvine_common::fs::Path;
 use std::collections::HashMap;
 
 pub struct UFSContext {
     conf: UfsConf,
-    scheme: String,
+    path: Path,
     mount_id: String,
 }
 
 impl UFSContext {
-    pub fn new(scheme: String, conf: UfsConf) -> Self {
+    pub fn new(path: &Path, conf: UfsConf) -> Self {
         UFSContext {
-            scheme,
+            path: path.clone(),
             conf,
             mount_id: "".to_string(),
         }
     }
 
-    //TODO Then change to fixed configuration items
     pub fn s3a_config(&self) -> &HashMap<String, String> {
         self.conf.get_config()
     }
@@ -41,7 +41,7 @@ impl UFSContext {
         &self.conf
     }
 
-    pub fn get_scheme(&self) -> Option<&str> {
-        Some(self.scheme.as_str())
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }

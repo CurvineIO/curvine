@@ -14,19 +14,22 @@
 
 use crate::file::{FsReader, FsWriter};
 use crate::impl_filesystem_for_enum;
+use crate::*;
 use crate::{impl_reader_for_enum, impl_writer_for_enum};
 use curvine_common::conf::UfsConf;
 use curvine_common::fs::Path;
 use curvine_common::FsResult;
 use curvine_ufs::err_ufs;
-use curvine_ufs::opendal::{OpendalFileSystem, OpendalReader, OpendalWriter};
-use curvine_ufs::s3::S3FileSystem;
-use curvine_ufs::s3::{S3Reader, S3Writer};
 use std::collections::HashMap;
 
-pub const S3_SCHEME: &str = "s3";
+#[cfg(feature = "s3")]
+use curvine_ufs::s3::*;
 
-pub const OSS_SCHEME: &str = "oss";
+#[cfg(feature = "opendal")]
+use curvine_ufs::opendal::*;
+
+// Storage schemes
+pub const S3_SCHEME: &str = "s3";
 
 pub mod macros;
 
@@ -38,70 +41,58 @@ pub use self::mount_cache::*;
 
 pub enum UnifiedWriter {
     Cv(FsWriter),
+
+    #[cfg(feature = "s3")]
     S3(S3Writer),
+
+    #[cfg(feature = "opendal")]
     OpenDAL(OpendalWriter),
 }
 
-impl_writer_for_enum!(
-    UnifiedWriter {
-        Cv(FsWriter),
-        S3(S3Writer),
-        OpenDAL(OpendalWriter)
-    }
-);
+impl_writer_for_enum!(UnifiedWriter);
 
 pub enum UnifiedReader {
     Cv(FsReader),
+
+    #[cfg(feature = "s3")]
     S3(S3Reader),
+
+    #[cfg(feature = "opendal")]
     OpenDAL(OpendalReader),
 }
 
-impl_reader_for_enum!(
-    UnifiedReader {
-        Cv(FsReader),
-        S3(S3Reader),
-        OpenDAL(OpendalReader)
-    }
-);
+impl_reader_for_enum!(UnifiedReader);
 
-// @todo Too much repeated code, subsequent optimization
 #[derive(Clone)]
 pub enum UfsFileSystem {
+    #[cfg(feature = "s3")]
     S3(S3FileSystem),
+
+    #[cfg(feature = "opendal")]
     OpenDAL(OpendalFileSystem),
 }
 
 impl UfsFileSystem {
     pub fn new(path: &Path, conf: HashMap<String, String>) -> FsResult<Self> {
         match path.scheme() {
+            #[cfg(feature = "s3")]
             Some(S3_SCHEME) => {
                 let fs = S3FileSystem::new(UfsConf::with_map(conf))?;
                 Ok(UfsFileSystem::S3(fs))
             }
-            Some("gcs") | Some("gs") | Some("azure") | Some("azblob") | Some("abfs")
-            | Some("oss") => {
+
+            #[cfg(feature = "opendal")]
+            Some(scheme)
+                if ["s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs"].contains(&scheme) =>
+            {
                 let fs = OpendalFileSystem::new(path, UfsConf::with_map(conf))?;
                 Ok(UfsFileSystem::OpenDAL(fs))
             }
-            _ => {
-                err_ufs!("Unsupported scheme: {}", path.scheme().unwrap_or("Unknown"))
-            }
-        }
-    }
 
-    pub fn with_scheme(scheme: Option<&str>, conf: HashMap<String, String>) -> FsResult<Self> {
-        if scheme == Some(S3_SCHEME) || scheme == Some(OSS_SCHEME) {
-            let fs = S3FileSystem::new(UfsConf::with_map(conf))?;
-            Ok(UfsFileSystem::S3(fs))
-        } else {
-            err_ufs!("Unsupported scheme: {}", scheme.unwrap_or("None"))
+            Some(scheme) => err_ufs!("Unsupported scheme: {}", scheme),
+
+            None => err_ufs!("Missing scheme"),
         }
     }
 }
-
-impl_filesystem_for_enum!(
-    UfsFileSystem {
-        S3(S3FileSystem),
-        OpenDAL(OpendalFileSystem)
-    }
-);
+impl_filesystem_for_enum!(UfsFileSystem);

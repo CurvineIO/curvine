@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::err_ufs;
-use crate::s3::FOLDER_SUFFIX;
+use crate::FOLDER_SUFFIX;
 use curvine_common::fs::Path;
 use curvine_common::FsResult;
 

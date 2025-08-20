@@ -38,19 +38,15 @@ impl UfsClient {
     }
 
     fn create_filesystem(context: Arc<UFSContext>) -> FsResult<Arc<UfsFileSystem>> {
-        match context.get_scheme() {
+        match context.path().scheme() {
             Some("s3") => {
-                let s3_fs = UfsFileSystem::with_scheme(
-                    context.get_scheme(),
-                    context.conf().get_config().clone(),
-                )?;
+                let s3_fs =
+                    UfsFileSystem::new(context.path(), context.conf().get_config().clone())?;
                 Ok(Arc::new(s3_fs))
             }
             Some("oss") => {
-                let oss_fs = UfsFileSystem::with_scheme(
-                    context.get_scheme(),
-                    context.conf().get_config().clone(),
-                )?;
+                let oss_fs =
+                    UfsFileSystem::new(context.path(), context.conf().get_config().clone())?;
                 Ok(Arc::new(oss_fs))
             }
             Some("file") => Err(FsError::unsupported("Local filesystem")),

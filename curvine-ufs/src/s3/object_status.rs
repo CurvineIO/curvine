@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::s3::FOLDER_SUFFIX;
+use crate::FOLDER_SUFFIX;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use orpc::common::LocalTime;
 
