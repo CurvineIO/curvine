@@ -218,16 +218,13 @@ impl NodeMap {
     ) -> FuseResult<()> {
         let (old_name, new_name) = (old_name.as_ref(), new_name.as_ref());
 
-        match self.lookup_node(new_id, Some(new_name)) {
-            None => (),
-            Some(_) => {
-                return err_fuse!(
-                    libc::EEXIST,
-                    "dst parent: {}, name: {} already  exists",
-                    new_id,
-                    new_name
-                );
-            }
+        // If destination node exists, remove it first to support replace semantics
+        let existing_node = self.lookup_node(new_id, Some(new_name)).cloned();
+        if existing_node.is_some() {
+            info!(
+                "Removing existing destination node for rename: parent={}, name={}",
+                new_id, new_name
+            );
         }
 
         let old_node = match self.lookup_node(old_id, Some(old_name)) {
@@ -243,8 +240,24 @@ impl NodeMap {
             Some(v) => v.clone(),
         };
 
-        self.delete_node(&old_node);
-        self.add_node(new_id, Some(new_name));
+        // Remove existing destination node if it exists
+        if let Some(node) = existing_node {
+            self.delete_node(&node);
+        }
+
+        // Remove the old node from names mapping but keep the inode
+        let old_name_key = Self::name_key(old_node.parent, &old_node.name);
+        self.names.remove(&old_name_key);
+
+        // Update the old node with new parent and name, then re-add it
+        let mut updated_node = old_node;
+        updated_node.parent = new_id;
+        updated_node.name = new_name.to_string();
+
+        // Add the updated node back with new path mapping
+        let new_name_key = Self::name_key(updated_node.parent, &updated_node.name);
+        self.names.insert(new_name_key, updated_node.id);
+        self.nodes.insert(updated_node.id, updated_node);
 
         Ok(())
     }

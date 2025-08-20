@@ -336,6 +336,10 @@ pub struct SetAttrOpts {
     pub owner: Option<String>,
     pub group: Option<String>,
     pub mode: Option<u32>,
+    #[serde(default)]
+    pub atime: Option<i64>, // Access time in milliseconds
+    #[serde(default)]
+    pub mtime: Option<i64>, // Modification time in milliseconds
     pub ttl_ms: Option<i64>,
     pub ttl_action: Option<TtlAction>,
     pub add_x_attr: HashMap<String, Vec<u8>>,
@@ -351,6 +355,8 @@ impl SetAttrOpts {
             owner: self.owner.clone(),
             group: self.group.clone(),
             mode: self.mode,
+            atime: None,
+            mtime: None,
             ttl_ms: None,
             ttl_action: None,
             add_x_attr: HashMap::default(),
@@ -365,6 +371,8 @@ pub struct SetAttrOptsBuilder {
     owner: Option<String>,
     group: Option<String>,
     mode: Option<u32>,
+    atime: Option<i64>,
+    mtime: Option<i64>,
     ttl_ms: Option<i64>,
     ttl_action: Option<TtlAction>,
     add_x_attr: HashMap<String, Vec<u8>>,
@@ -385,6 +393,8 @@ impl SetAttrOptsBuilder {
             owner: None,
             group: None,
             mode: None,
+            atime: None,
+            mtime: None,
             ttl_ms: None,
             ttl_action: None,
             add_x_attr: HashMap::new(),
@@ -417,6 +427,16 @@ impl SetAttrOptsBuilder {
         self
     }
 
+    pub fn atime(mut self, atime: i64) -> Self {
+        let _ = self.atime.insert(atime);
+        self
+    }
+
+    pub fn mtime(mut self, mtime: i64) -> Self {
+        let _ = self.mtime.insert(mtime);
+        self
+    }
+
     pub fn ttl_ms(mut self, ms: i64) -> Self {
         let _ = self.ttl_ms.insert(ms);
         self
@@ -444,6 +464,8 @@ impl SetAttrOptsBuilder {
             owner: self.owner,
             group: self.group,
             mode: self.mode,
+            atime: self.atime,
+            mtime: self.mtime,
             ttl_ms: self.ttl_ms,
             ttl_action: self.ttl_action,
             add_x_attr: self.add_x_attr,

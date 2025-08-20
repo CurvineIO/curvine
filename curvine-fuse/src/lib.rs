@@ -118,6 +118,21 @@ pub const FUSE_FOPEN_NOFLUSH: u32 = 1 << 5;
 
 pub const FUSE_FOPEN_PARALLEL_DIRECT_WRITES: i32 = 1 << 6;
 
+// FUSE setattr valid bit flags (aligned with linux/fs/fuse definitions)
+pub const FATTR_MODE: u32 = 1 << 0;
+
+pub const FATTR_UID: u32 = 1 << 1;
+
+pub const FATTR_GID: u32 = 1 << 2;
+
+pub const FATTR_ATIME: u32 = 1 << 4;
+
+pub const FATTR_MTIME: u32 = 1 << 5;
+
+pub const FATTR_ATIME_NOW: u32 = 1 << 7;
+
+pub const FATTR_MTIME_NOW: u32 = 1 << 8;
+
 // The minimum version of the clone fd feature can be used.
 pub const FUSE_CLONE_FD_MIN_VERSION: f32 = 4.2f32;
 

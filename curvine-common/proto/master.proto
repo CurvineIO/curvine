@@ -165,10 +165,12 @@ message SetAttrOptsProto {
     optional string owner = 3;
     optional string group = 4;
     optional uint32 mode = 5;
-    optional int64 ttl_ms = 6;
-    optional TtlActionProto ttl_action = 7;
-    map<string, bytes> add_x_attr = 8;
-    repeated string remove_x_attr = 9;
+    optional int64 atime = 6;  // Access time in milliseconds
+    optional int64 mtime = 7;  // Modification time in milliseconds
+    optional int64 ttl_ms = 8;
+    optional TtlActionProto ttl_action = 9;
+    map<string, bytes> add_x_attr = 10;
+    repeated string remove_x_attr = 11;
 }
 
 message SetAttrRequest {
