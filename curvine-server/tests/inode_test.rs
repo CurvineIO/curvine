@@ -126,3 +126,41 @@ fn block_store() -> CommonResult<()> {
 
     Ok(())
 }
+
+#[test]
+fn blocks_locations_delete_worker_test() -> CommonResult<()> {
+    let conf = DBConf::default();
+    let db = RocksInodeStore::new(conf, true)?;
+
+    // Setup: Add locations for multiple blocks and workers
+    let mut batch = db.new_batch();
+    for block_id in 401..405 {
+        for worker_id in 1..4 {
+            batch.add_location(block_id, &BlockLocation::with_id(worker_id))?;
+        }
+    }
+    batch.commit()?;
+
+    // Test delete_locations for worker 2
+    db.delete_locations(2)?;
+
+    // Verify worker 2's locations are removed from CF_LOCATION
+    let block_ids_worker2 = db.get_block_ids(2)?;
+    assert_eq!(block_ids_worker2.len(), 0);
+
+    // Verify worker 2's locations are removed from CF_BLOCK
+    for block_id in 401..405 {
+        let locations = db.get_locations(block_id)?;
+        assert_eq!(locations.len(), 2); // Only workers 1 and 3 remain
+        let worker_ids: Vec<u32> = locations.iter().map(|loc| loc.worker_id).collect();
+        assert_eq!(worker_ids, vec![1, 3]);
+    }
+
+    // Verify other workers are unaffected
+    for worker_id in [1, 3] {
+        let block_ids = db.get_block_ids(worker_id)?;
+        assert_eq!(block_ids.len(), 4);
+    }
+
+    Ok(())
+}
