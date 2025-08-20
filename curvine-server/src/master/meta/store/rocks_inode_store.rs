@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::master::meta::inode::InodeView;
-use crate::master::meta::BlockMeta;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
 use curvine_common::state::{BlockLocation, MountInfo};
 use curvine_common::utils::SerdeUtils as Serde;
@@ -59,9 +58,9 @@ impl RocksInodeStore {
     }
 
     // Get all location information for all block ids.
-    pub fn get_locations(&self, id: i64) -> CommonResult<Vec<BlockLocation>> {
-        let prefix = RocksUtils::i64_to_bytes(id);
-        let iter = self.db.prefix_scan(Self::CF_LOCATION, prefix)?;
+    pub fn get_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
+        let prefix = RocksUtils::i64_to_bytes(block_id);
+        let iter = self.db.prefix_scan(Self::CF_BLOCK, prefix)?;
 
         let mut vec = Vec::with_capacity(8);
         for item in iter {
@@ -108,8 +107,33 @@ impl RocksInodeStore {
     }
 
     pub fn delete_locations(&self, worker_id: u32) -> CommonResult<()> {
+        let block_ids = self.get_block_ids(worker_id)?;
+
+        // delete all worker_id -> block_ids
         let prefix = RocksUtils::u32_to_bytes(worker_id);
-        self.db.prefix_delete(Self::CF_LOCATION, prefix)
+        self.db.prefix_delete(Self::CF_LOCATION, prefix)?;
+
+        // delete all block_id -> worker_ids
+        for block_id in block_ids {
+            let key = RocksUtils::i64_u32_to_bytes(block_id, worker_id);
+            self.db.delete_cf(Self::CF_BLOCK, key)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn get_block_ids(&self, worker_id: u32) -> CommonResult<Vec<i64>> {
+        let prefix = RocksUtils::u32_to_bytes(worker_id);
+        let iter = self.db.prefix_scan(Self::CF_LOCATION, prefix)?;
+
+        let mut vec = Vec::with_capacity(8);
+        for item in iter {
+            let bytes = item?;
+            let location = Serde::deserialize::<i64>(&bytes.1)?;
+            vec.push(location);
+        }
+
+        Ok(vec)
     }
 
     pub fn add_mountpoint(&self, id: u32, entry: &MountInfo) -> CommonResult<()> {
@@ -207,8 +231,14 @@ impl<'a> InodeWriteBatch<'a> {
     }
 
     pub fn add_location(&mut self, id: i64, loc: &BlockLocation) -> CommonResult<()> {
+        // store with the key of  (block_id, worker_id)
         let key = RocksUtils::i64_u32_to_bytes(id, loc.worker_id);
-        let value = Serde::serialize(loc).unwrap();
+        let value = Serde::serialize(loc)?;
+        self.put_cf(RocksInodeStore::CF_BLOCK, key, value)?;
+
+        // store with the key of (worker_id, block_id)
+        let key = RocksUtils::u32_i64_to_bytes(loc.worker_id, id);
+        let value = Serde::serialize(&id)?;
         self.put_cf(RocksInodeStore::CF_LOCATION, key, value)
     }
 
@@ -217,17 +247,6 @@ impl<'a> InodeWriteBatch<'a> {
         let key = RocksUtils::i64_to_bytes(inode.id());
         let value = Serde::serialize(inode)?;
         self.put_cf(RocksInodeStore::CF_INODES, key, value)
-    }
-
-    pub fn write_block(&mut self, meta: &BlockMeta) -> CommonResult<()> {
-        let key = RocksUtils::i64_to_bytes(meta.id);
-        let value = Serde::serialize(meta)?;
-        self.put_cf(RocksInodeStore::CF_BLOCK, key, value)
-    }
-
-    pub fn delete_block(&mut self, meta: &BlockMeta) -> CommonResult<()> {
-        let key = RocksUtils::i64_to_bytes(meta.id);
-        self.delete_cf(RocksInodeStore::CF_BLOCK, key)
     }
 
     // Add an edge to identify the subordinate relationship between inodes
@@ -256,6 +275,9 @@ impl<'a> InodeWriteBatch<'a> {
     // Delete 1 block to store information
     pub fn delete_location(&mut self, id: i64, worker_id: u32) -> CommonResult<()> {
         let key = RocksUtils::i64_u32_to_bytes(id, worker_id);
+        self.delete_cf(RocksInodeStore::CF_BLOCK, key)?;
+
+        let key = RocksUtils::u32_i64_to_bytes(worker_id, id);
         self.delete_cf(RocksInodeStore::CF_LOCATION, key)
     }
 
