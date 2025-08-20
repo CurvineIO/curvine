@@ -79,54 +79,52 @@ impl CurvineFileSystem {
 
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
         let blocks = (status.len as f64 / FUSE_BLOCK_SIZE as f64).ceil() as u64;
-        let ctime_sec = (status.mtime / 1000) as u64;
-        let ctime_nsec = ((status.mtime % 1000) * 1000) as u32;
 
-        // Try to get uid from FileStatus owner, fallback to config
+        let ctime_sec = if status.atime > 0 {
+            (status.atime / 1000) as u64
+        } else {
+            (status.mtime / 1000) as u64
+        };
+        let ctime_nsec = if status.atime > 0 {
+            ((status.atime % 1000) * 1000) as u32
+        } else {
+            ((status.mtime % 1000) * 1000) as u32
+        };
+
         let uid = if status.owner.is_empty() {
             conf.uid
+        } else if let Ok(numeric_uid) = status.owner.parse::<u32>() {
+            numeric_uid
         } else {
-            // First try to parse as numeric uid
-            if let Ok(numeric_uid) = status.owner.parse::<u32>() {
-                numeric_uid
-            } else {
-                // If not numeric, try to lookup by username using system call
-                match orpc::sys::get_uid_by_name(&status.owner) {
-                    Some(uid) => uid,
-                    None => {
-                        return err_fuse!(
-                            libc::EINVAL,
-                            "Cannot resolve username '{}' to UID",
-                            status.owner
-                        );
-                    }
+            match orpc::sys::get_uid_by_name(&status.owner) {
+                Some(uid) => uid,
+                None => {
+                    return err_fuse!(
+                        libc::EINVAL,
+                        "Cannot resolve username '{}' to UID",
+                        status.owner
+                    );
                 }
             }
         };
 
-        // Try to get gid from FileStatus group, fallback to config
         let gid = if status.group.is_empty() {
             conf.gid
+        } else if let Ok(numeric_gid) = status.group.parse::<u32>() {
+            numeric_gid
         } else {
-            // First try to parse as numeric gid
-            if let Ok(numeric_gid) = status.group.parse::<u32>() {
-                numeric_gid
-            } else {
-                // If not numeric, try to lookup by group name using system call
-                match orpc::sys::get_gid_by_name(&status.group) {
-                    Some(gid) => gid,
-                    None => {
-                        return err_fuse!(
-                            libc::EINVAL,
-                            "Cannot resolve group name '{}' to GID",
-                            status.group
-                        );
-                    }
+            match orpc::sys::get_gid_by_name(&status.group) {
+                Some(gid) => gid,
+                None => {
+                    return err_fuse!(
+                        libc::EINVAL,
+                        "Cannot resolve username '{}' to GID",
+                        status.group
+                    );
                 }
             }
         };
 
-        // Use mode from FileStatus if available, otherwise use default calculation
         let mode = if status.mode != 0 {
             FuseUtils::get_mode(status.mode, status.file_type)
         } else {
@@ -138,10 +136,10 @@ impl CurvineFileSystem {
             ino: status.id as u64,
             size,
             blocks,
-            atime: 0,
+            atime: ctime_sec,
             mtime: ctime_sec,
             ctime: ctime_sec,
-            atimensec: 0,
+            atimensec: ctime_nsec,
             mtimensec: ctime_nsec,
             ctimensec: ctime_nsec,
             mode,
@@ -210,7 +208,9 @@ impl CurvineFileSystem {
         path: &Path,
     ) -> FuseResult<fuse_attr> {
         let status = self.fs_get_status(path).await?;
-        self.state.do_lookup(parent, name, &status)
+        let attr = self.state.do_lookup(parent, name, &status)?;
+        // Apply time overrides if present
+        Ok(attr)
     }
 
     fn lookup_status<T: AsRef<str>>(
@@ -219,7 +219,8 @@ impl CurvineFileSystem {
         name: Option<T>,
         status: &FileStatus,
     ) -> FuseResult<fuse_attr> {
-        self.state.do_lookup(parent, name, status)
+        let attr = self.state.do_lookup(parent, name, status)?;
+        Ok(attr)
     }
 
     async fn read_dir_common(
@@ -229,6 +230,16 @@ impl CurvineFileSystem {
         plus: bool,
     ) -> FuseResult<FuseDirentList> {
         let path = self.state.get_path(header.nodeid)?;
+        let dir_status = self.fs_get_status(&path).await?;
+
+        self.enforce_directory_search_permission(
+            &dir_status,
+            &path,
+            header.uid,
+            header.gid,
+            DirectoryAction::Read,
+        )?;
+
         let list = self.fs_list_status(header.nodeid, &path).await?;
 
         let start_index = arg.offset as usize;
@@ -256,6 +267,10 @@ impl CurvineFileSystem {
         current_gid: u32,
         mask: u32,
     ) -> bool {
+        // Root (uid=0) bypasses permission checks
+        if current_uid == 0 {
+            return true;
+        }
         let file_uid = self.resolve_file_uid(&status.owner);
         let file_gid = self.resolve_file_gid(&status.group);
         let permission_bits = self.get_effective_permission_bits(
@@ -355,6 +370,12 @@ impl CurvineFileSystem {
 
         #[cfg(target_os = "linux")]
         {
+            // F_OK (0) - only check if file exists, no permission check needed
+            if mask == 0 {
+                debug!("F_OK only check - always allowed");
+                return true;
+            }
+
             let mut has_permission = true;
 
             // Check read permission (R_OK = 4)
@@ -387,13 +408,51 @@ impl CurvineFileSystem {
                 );
             }
 
+            debug!(
+                "Permission mask check: mask={:o}, permission_bits={:o}, result={}",
+                mask, permission_bits, has_permission
+            );
+
             has_permission
         }
     }
 
+    /// Enforce directory search (execute) permission for traversal or operations
+    fn enforce_directory_search_permission(
+        &self,
+        dir_status: &FileStatus,
+        dir_path: &Path,
+        caller_uid: u32,
+        caller_gid: u32,
+        action: DirectoryAction,
+    ) -> FuseResult<()> {
+        // Root (uid=0) bypasses directory search checks
+        if caller_uid == 0 {
+            return Ok(());
+        }
+        if dir_status.is_dir {
+            let perm_bits = self.get_effective_permission_bits(
+                dir_status.mode,
+                caller_uid,
+                caller_gid,
+                self.resolve_file_uid(&dir_status.owner),
+                self.resolve_file_gid(&dir_status.group),
+            );
+            if (perm_bits & 0o1) == 0 {
+                return err_fuse!(
+                    libc::EACCES,
+                    "Permission denied to {} directory: {}",
+                    action.as_str(),
+                    dir_path
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
-        let owner = {
-            // Try to get username from uid, fail if not found
+        // Only set fields when the corresponding valid flag is present
+        let owner = if (setattr.valid & FATTR_UID) != 0 {
             match orpc::sys::get_username_by_uid(setattr.uid) {
                 Some(username) => Some(username),
                 None => {
@@ -404,10 +463,11 @@ impl CurvineFileSystem {
                     );
                 }
             }
+        } else {
+            None
         };
 
-        let group = {
-            // Try to get group name from gid, fail if not found
+        let group = if (setattr.valid & FATTR_GID) != 0 {
             match orpc::sys::get_groupname_by_gid(setattr.gid) {
                 Some(groupname) => Some(groupname),
                 None => {
@@ -418,13 +478,32 @@ impl CurvineFileSystem {
                     );
                 }
             }
-        };
-
-        let mode = if setattr.mode != 0 {
-            Some(setattr.mode)
         } else {
             None
         };
+
+        // Strip file type bits; keep only permission and special bits
+        let mode = if (setattr.valid & FATTR_MODE) != 0 {
+            Some(setattr.mode & 0o7777)
+        } else {
+            None
+        };
+
+        // Handle time modifications
+        let mut atime = None;
+        let mut mtime = None;
+
+        if (setattr.valid & FATTR_ATIME) != 0 {
+            atime = Some((setattr.atime * 1000) as i64);
+        } else if (setattr.valid & FATTR_ATIME_NOW) != 0 {
+            atime = Some(orpc::common::LocalTime::mills() as i64);
+        }
+
+        if (setattr.valid & FATTR_MTIME) != 0 {
+            mtime = Some((setattr.mtime * 1000) as i64);
+        } else if (setattr.valid & FATTR_MTIME_NOW) != 0 {
+            mtime = Some(orpc::common::LocalTime::mills() as i64);
+        }
 
         Ok(SetAttrOpts {
             recursive: false,
@@ -432,6 +511,8 @@ impl CurvineFileSystem {
             owner,
             group,
             mode,
+            atime,
+            mtime,
             ttl_ms: None,
             ttl_action: None,
             add_x_attr: HashMap::new(),
@@ -499,6 +580,19 @@ impl fs::FileSystem for CurvineFileSystem {
         } else {
             (id, Some(name))
         };
+
+        // Enforce directory search (execute) permission on parent before lookup
+        {
+            let parent_path = self.state.get_path(parent)?;
+            let parent_status = self.fs_get_status(&parent_path).await?;
+            self.enforce_directory_search_permission(
+                &parent_status,
+                &parent_path,
+                op.header.uid,
+                op.header.gid,
+                DirectoryAction::Search,
+            )?;
+        }
 
         // Get the path.
         let path = self.state.get_path_common(parent, name)?;
@@ -618,6 +712,8 @@ impl fs::FileSystem for CurvineFileSystem {
             owner: None,
             group: None,
             mode: None,
+            atime: None,
+            mtime: None,
             ttl_ms: None,
             ttl_action: None,
             add_x_attr,
@@ -671,6 +767,8 @@ impl fs::FileSystem for CurvineFileSystem {
             owner: None,
             group: None,
             mode: None,
+            atime: None,
+            mtime: None,
             ttl_ms: None,
             ttl_action: None,
             add_x_attr: HashMap::new(),
@@ -761,8 +859,26 @@ impl fs::FileSystem for CurvineFileSystem {
         );
         let path = self.state.get_path(op.header.nodeid)?;
 
-        let opts = Self::fuse_setattr_to_opts(op.arg)?;
-        self.fs.set_attr(&path, opts).await?;
+        let opts = match Self::fuse_setattr_to_opts(op.arg) {
+            Ok(opts) => {
+                info!("Converted setattr opts: {:?}", opts);
+                opts
+            }
+            Err(e) => {
+                error!("Failed to convert setattr opts: {}", e);
+                return Err(e);
+            }
+        };
+
+        match self.fs.set_attr(&path, opts).await {
+            Ok(_) => {
+                info!("Backend set_attr succeeded for path: {}", path);
+            }
+            Err(e) => {
+                error!("Backend set_attr failed for path {}: {}", path, e);
+                return err_fuse!(libc::EPERM, "Operation not permitted: {}", e);
+            }
+        }
 
         let status = self.fs_get_status(&path).await?;
         let attr = self.lookup_status::<String>(op.header.nodeid, None, &status)?;
@@ -789,6 +905,22 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         };
 
+        // Enforce parent directory search (execute) permission for path traversal
+        if let Ok(parent_id) = self.state.get_parent_id(op.header.nodeid) {
+            // Skip when parent_id is invalid (e.g., root has no parent). Inode 0 is invalid.
+            if parent_id != 0 {
+                let parent_path = self.state.get_path(parent_id)?;
+                let parent_status = self.fs_get_status(&parent_path).await?;
+                self.enforce_directory_search_permission(
+                    &parent_status,
+                    &parent_path,
+                    op.header.uid,
+                    op.header.gid,
+                    DirectoryAction::Search,
+                )?;
+            }
+        }
+
         // Get current user's UID and GID from the request header
         let current_uid = op.header.uid;
         let current_gid = op.header.gid;
@@ -796,7 +928,7 @@ impl fs::FileSystem for CurvineFileSystem {
         // Get requested access mask
         let mask = op.arg.mask;
 
-        // Check if user has the requested permissions
+        // Check if user has the requested permissions on the node itself
         if !self.check_access_permissions(&status, current_uid, current_gid, mask) {
             return err_fuse!(libc::EACCES, "Permission denied for {}", path);
         }
@@ -808,6 +940,19 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn open_dir(&self, op: OpenDir<'_>) -> FuseResult<fuse_open_out> {
         let _ = OpenAction::try_from(op.arg.flags)?;
         let _ = self.state.get_node(op.header.nodeid)?;
+
+        // Enforce directory search (execute) permission on the directory being opened
+        {
+            let dir_path = self.state.get_path(op.header.nodeid)?;
+            let dir_status = self.fs_get_status(&dir_path).await?;
+            self.enforce_directory_search_permission(
+                &dir_status,
+                &dir_path,
+                op.header.uid,
+                op.header.gid,
+                DirectoryAction::Open,
+            )?;
+        }
 
         let fh = self.state.next_handle();
         let open_flags = Self::fill_open_flags(&self.conf, op.arg.flags);
@@ -850,6 +995,25 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_name(op.header.nodeid, name)?;
 
         let _ = self.fs.mkdir(&path, false).await?;
+        // Apply requested mode to directory if provided (mask out file type bits)
+        if op.arg.mode != 0 {
+            let add_x_attr = HashMap::new();
+            let opts = SetAttrOpts {
+                recursive: false,
+                replicas: None,
+                owner: None,
+                group: None,
+                mode: Some(op.arg.mode & 0o7777),
+                atime: None,
+                mtime: None,
+                ttl_ms: None,
+                ttl_action: None,
+                add_x_attr,
+                remove_x_attr: Vec::new(),
+            };
+            // Ignore error intentionally if backend rejects, continue
+            let _ = self.fs.set_attr(&path, opts).await;
+        }
         let entry = self
             .lookup_path(op.header.nodeid, Some(name), &path)
             .await?;
@@ -886,6 +1050,35 @@ impl fs::FileSystem for CurvineFileSystem {
         let id = op.header.nodeid;
         let path = self.state.get_path(id)?;
 
+        // Check file access permissions before opening
+        let status = self.fs_get_status(&path).await?;
+        let action = OpenAction::try_from(op.arg.flags)?;
+
+        // Determine what permissions we need to check
+        let required_mask = match action {
+            OpenAction::ReadOnly => libc::R_OK as u32,
+            OpenAction::WriteOnly => libc::W_OK as u32,
+            OpenAction::ReadWrite => (libc::R_OK | libc::W_OK) as u32,
+        };
+
+        // Check if the current user has the required permissions
+        if !self.check_access_permissions(&status, op.header.uid, op.header.gid, required_mask) {
+            return err_fuse!(libc::EACCES, "Permission denied to open file: {}", path);
+        }
+
+        // Enforce parent directory search permission
+        if let Ok(parent_id) = self.state.get_parent_id(id) {
+            let parent_path = self.state.get_path(parent_id)?;
+            let parent_status = self.fs_get_status(&parent_path).await?;
+            self.enforce_directory_search_permission(
+                &parent_status,
+                &parent_path,
+                op.header.uid,
+                op.header.gid,
+                DirectoryAction::Search,
+            )?;
+        }
+
         let file = FuseFile::create(self.fs.clone(), path, op.arg.flags).await?;
         let fh = self.state.add_file(file)?;
 
@@ -915,6 +1108,25 @@ impl fs::FileSystem for CurvineFileSystem {
         let file = FuseFile::for_write(self.fs.clone(), path, op.arg.flags).await?;
         let status = file.status()?;
         let attr = self.lookup_status(id, Some(name), status)?;
+
+        // Apply requested mode to the new file if provided (mask out file type bits)
+        if op.arg.mode != 0 {
+            let path2 = self.state.get_path_common(id, Some(name))?;
+            let opts = SetAttrOpts {
+                recursive: false,
+                replicas: None,
+                owner: None,
+                group: None,
+                mode: Some(op.arg.mode & 0o7777),
+                atime: None,
+                mtime: None,
+                ttl_ms: None,
+                ttl_action: None,
+                add_x_attr: HashMap::new(),
+                remove_x_attr: Vec::new(),
+            };
+            let _ = self.fs.set_attr(&path2, opts).await;
+        }
 
         // step2: cache file handle.
         let fh = self.state.add_file(file)?;
@@ -994,10 +1206,30 @@ impl fs::FileSystem for CurvineFileSystem {
         let (old_path, new_path) =
             self.state
                 .get_path2(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
+
+        // If destination exists, remove it to emulate POSIX rename() replace semantics for files/symlinks
+        if (self.fs.get_status(&new_path).await).is_ok() {
+            // Try to delete the destination file, but don't fail if it doesn't exist
+            match self.fs.delete(&new_path, false).await {
+                Ok(_) => info!(
+                    "Successfully removed existing destination file: {}",
+                    new_path
+                ),
+                Err(e) => {
+                    // Log the error but continue - the file might have been deleted by another process
+                    info!("Destination file deletion result (non-critical): {}", e);
+                }
+            }
+        }
+
+        // Perform the rename operation
         self.fs.rename(&old_path, &new_path).await?;
+
+        // Update FUSE state after successful backend rename
         self.state
             .rename_node(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
 
+        info!("Successfully renamed {} to {}", old_path, new_path);
         Ok(())
     }
 
@@ -1069,5 +1301,34 @@ impl fs::FileSystem for CurvineFileSystem {
         result.extend_from_slice(&[0]);
 
         Ok(result.split_to(result.len() - 1))
+    }
+
+    async fn fsync(&self, op: FSync<'_>) -> FuseResult<()> {
+        // Best-effort data durability for tools like mkfs on loop-backed files
+        // 1) Try to flush the writer bound to this fh
+        if let Some(file) = self.state.get_file(op.arg.fh) {
+            file.as_mut().flush().await?; // Flush pending chunks to backend
+            return Ok(());
+        }
+        // 2) If fh is unknown (some callers may fsync without cached fh), fall back to path-level no-op
+        //    We intentionally return success to comply with common FUSE behavior where fsync may be a no-op.
+        Ok(())
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum DirectoryAction {
+    Read,
+    Search,
+    Open,
+}
+
+impl DirectoryAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            DirectoryAction::Read => "read",
+            DirectoryAction::Search => "search",
+            DirectoryAction::Open => "open",
+        }
     }
 }

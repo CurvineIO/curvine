@@ -270,6 +270,21 @@ impl InodeView {
             self.acl_mut().mode = mode;
         }
 
+        // Handle time modifications
+        if let Some(atime) = opts.atime {
+            match self {
+                File(f) => f.atime = atime,
+                Dir(d) => d.atime = atime,
+            }
+        }
+
+        if let Some(mtime) = opts.mtime {
+            match self {
+                File(f) => f.mtime = mtime,
+                Dir(d) => d.mtime = mtime,
+            }
+        }
+
         if let Some(ttl_ms) = opts.ttl_ms {
             self.storage_policy_mut().ttl_ms = ttl_ms;
         }
