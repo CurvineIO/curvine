@@ -143,11 +143,42 @@ FSDataInputStream in = fs.open(new Path("/user/test/file.txt"));
 
 ### 🚀 构建步骤 (Linux - Ubuntu/Debian 示例)
 
+使用 make 编译:
+
 ```bash
-# Compiled files are in build/dist
-sh build/build.sh
+# 编译所有模块
+make all
+
+# 只编译核心模块: server client cli
+make build ARGS="-p core"
+
+# 编译fuse和核心模块
+make build ARGS="-p core -p fuse"
+```
+
+
+使用build.sh编译：
+
+```bash
+# 编译所有模块
+sh build/build.sh 
+
+# 输出命令帮助 
+sh build/build.sh -h
+
+# 只编译核心模块: server client cli
+sh build/build.sh -p core
+
+# 编译fuse和核心模块
+sh build/build.sh -p core -p fuse
+```
+
+构建镜像：
+
+```bash
 # or use curvine-compile:latest docker images to build
 make docker-build
+
 # or use curvine-compile:build-cached docker images to build, this image already cached most dependency crates
 make docker-build-cached
 ```
@@ -176,14 +207,13 @@ bin/curvine-fuse.sh start
 查看集群概览：
 
 ```bash
-bin/curvine report
+bin/cv report
 ```
 
-使用兼容的 HDFS 命令访问文件系统：
-
+执行文件系统命令：
 ```bash
-bin/curvine fs -mkdir /a
-bin/curvine fs -ls /
+bin/dfs fs mkdir /a
+bin/dfs fs ls /
 ```
 
 访问 Web 界面：

@@ -1,7 +1,4 @@
-.PHONY: help check-env format build cargo docker-build docker-build-img docker-build-cached fuse server cli ufs all
-
-# Build mode configuration (debug or release)
-MODE ?= release
+.PHONY: help check-env format build cargo docker-build docker-build-img docker-build-cached all
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -25,15 +22,9 @@ help:
 	@echo "  make check-env                   - Check build environment dependencies"
 	@echo ""
 	@echo "Building:"
-	@echo "  make build [MODE=debug|release]  - Check environment, format and build the entire project (default: release)"
+	@echo "  make build ARGS='<args>'         - Build with specific arguments passed to build.sh"
 	@echo "  make all                         - Same as 'make build'"
 	@echo "  make format                      - Format code using pre-commit hooks"
-	@echo ""
-	@echo "Individual Components:"
-	@echo "  make fuse [MODE=debug|release]   - Build curvine-fuse component only"
-	@echo "  make server [MODE=debug|release] - Build curvine-server component only"
-	@echo "  make cli [MODE=debug|release]    - Build curvine-cli component only"
-	@echo "  make ufs [MODE=debug|release]    - Build curvine-ufs component only"
 	@echo ""
 	@echo "Docker:"
 	@echo "  make docker-build                - Build using Docker compilation image"
@@ -55,15 +46,15 @@ help:
 	@echo "  make help                        - Show this help message"
 	@echo ""
 	@echo "Parameters:"
-	@echo "  MODE=debug     - Build in debug mode (default, faster compilation)"
-	@echo "  MODE=release   - Build in release mode (optimized, slower compilation)"
+	@echo "  ARGS='<args>'  - Additional arguments to pass to build.sh"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make build                       - Build entire project in debug mode"
-	@echo "  make build MODE=release          - Build entire project in release mode"
-	@echo "  make server MODE=release         - Build only server component in release mode"
-	@echo "  make cargo ARGS='test --verbose' - Run cargo test with verbose output"
-	@echo "  make csi-docker-fast             - Build curvine-csi Docker image quickly"
+	@echo "  make build                                  - Build entire project in release mode"
+	@echo "  make build ARGS='-d'                       - Build entire project in debug mode"
+	@echo "  make build ARGS='-p server -p client'       - Build only server and client components"
+	@echo "  make build ARGS='--package core --ufs s3'   - Build core packages with S3 native SDK"
+	@echo "  make cargo ARGS='test --verbose'            - Run cargo test with verbose output"
+	@echo "  make csi-docker-fast                        - Build curvine-csi Docker image quickly"
 
 # 1. Check build environment dependencies
 check-env:
@@ -74,8 +65,8 @@ format:
 	$(SHELL_CMD) build/pre-commit.sh
 
 # 3. Build and package the project (depends on environment check and format)
-build: check-env format
-	$(SHELL_CMD) build/build.sh $(MODE)
+build: check-env
+	$(SHELL_CMD) build/build.sh $(ARGS)
 
 # 4. Other modules through cargo command
 cargo:
@@ -149,32 +140,5 @@ csi-docker-fast:
 	@echo "Building curvine-csi Docker image (fast)..."
 	docker build --build-arg GOPROXY=https://goproxy.cn,direct -t curvine-csi:latest -f curvine-csi/Dockerfile .
 
-CARGO_FLAGS :=
-ifeq ($(MODE),release)
-  CARGO_FLAGS := --release
-endif
-
-# Build curvine-fuse
-fuse: check-env
-	@if [ -n "$$CURVINE_FUSE_FEATURE" ]; then \
-		echo "Building curvine-fuse with feature: $$CURVINE_FUSE_FEATURE"; \
-		cargo build -p curvine-fuse --features "$$CURVINE_FUSE_FEATURE" $(CARGO_FLAGS); \
-	else \
-		echo "FUSE not available, skipping curvine-fuse build"; \
-		exit 1; \
-	fi
-
-# Build curvine-server
-server:
-	cargo build -p curvine-server $(CARGO_FLAGS)
-
-# Build curvine-cli
-cli:
-	cargo build -p curvine-cli $(CARGO_FLAGS)
-
-# Build curvine-ufs
-ufs:
-	cargo build -p curvine-ufs $(CARGO_FLAGS)
-
-# 7. All in one
+# 8. All in one
 all: build
