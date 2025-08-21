@@ -102,6 +102,13 @@ impl RocksUtils {
         }
     }
 
+    pub fn u32_i64_to_bytes(prefix: u32, key: i64) -> [u8; 12] {
+        let mut v = [0; 12];
+        BigEndian::write_u32(&mut v[..4], prefix);
+        BigEndian::write_i64(&mut v[4..12], key);
+        v
+    }
+
     pub fn i64_u32_to_bytes(prefix: i64, key: u32) -> [u8; 12] {
         let mut v = [0; 12];
         BigEndian::write_i64(&mut v[..8], prefix);
