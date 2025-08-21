@@ -487,6 +487,11 @@ impl FsDir {
         Ok(locs)
     }
 
+    pub fn add_block_location(&self, block_id: i64, location: BlockLocation) -> FsResult<()> {
+        self.store.add_block_location(block_id, location)?;
+        Ok(())
+    }
+
     pub fn get_block_locations(&self, block_id: i64) -> FsResult<Vec<BlockLocation>> {
         Ok(self.store.get_block_locations(block_id)?)
     }

@@ -16,7 +16,7 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::SyncWorkerManager;
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::ReportBlockReplicationRequest;
-use curvine_common::state::WorkerAddress;
+use curvine_common::state::{BlockLocation, StorageType, WorkerAddress};
 use log::{error, warn};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::sync::FastDashMap;
@@ -153,7 +153,13 @@ impl BlockReplicationManager {
                 warn!("Should not happen that Block {} not found", block_id);
             }
             Some(entry) => {
-                if !success {
+                if success {
+                    // todo: add location for the block id
+                    let dir = self.fs.fs_dir.write();
+                    let location =
+                        BlockLocation::new(entry.1.target_worker.worker_id, StorageType::Disk);
+                    dir.add_block_location(block_id, location)?;
+                } else {
                     error!(
                         "Errors on block replication for block_id: {} to worker: {}. error: {:?}",
                         block_id, &entry.1.target_worker, message
