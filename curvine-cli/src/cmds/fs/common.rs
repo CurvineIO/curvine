@@ -1,11 +1,11 @@
 use super::content_summary::ContentSummary;
-use curvine_client::file::CurvineFileSystem;
-use curvine_common::fs::CurvineURI;
+use curvine_client::unified::UnifiedFileSystem;
+use curvine_common::fs::{CurvineURI, FileSystem};
 use orpc::CommonResult;
 
 /// Calculates content summary (directory size, file count, directory count) on the client side
 pub async fn calculate_content_summary(
-    client: &CurvineFileSystem,
+    client: &UnifiedFileSystem,
     path: &CurvineURI,
 ) -> CommonResult<ContentSummary> {
     calculate_content_summary_impl(client, path).await
@@ -13,7 +13,7 @@ pub async fn calculate_content_summary(
 
 /// Implementation of calculate_content_summary that handles recursion properly
 async fn calculate_content_summary_impl(
-    client: &CurvineFileSystem,
+    client: &UnifiedFileSystem,
     path: &CurvineURI,
 ) -> CommonResult<ContentSummary> {
     // First check if the path exists and get its status

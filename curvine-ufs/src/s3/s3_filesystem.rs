@@ -26,6 +26,7 @@ use curvine_common::state::{FileStatus, SetAttrOpts};
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
 use std::sync::Arc;
+use orpc::CommonResult;
 
 /// S3 file system implementation
 #[derive(Clone)]
@@ -189,9 +190,15 @@ impl S3FileSystem {
         }
     }
 
+    pub fn create_path<T: AsRef<str>>(bucket: T, key: T) -> CommonResult<Path> {
+        let str= format!("{}://{}{}{}", SCHEME, bucket.as_ref(), FOLDER_SUFFIX, key.as_ref());
+        let path = Path::from_str(str)?;
+        Ok(path)
+    }
+
     pub fn obj_to_status(bucket: &str, obj: &Object) -> FsResult<FileStatus> {
         let sub_key = obj.key().unwrap_or("");
-        let path = Path::from_str(format!("{}{}{}{}", SCHEME, bucket, FOLDER_SUFFIX, sub_key))?;
+        let path = Self::create_path(bucket, sub_key)?;
         let is_dir = sub_key.ends_with(FOLDER_SUFFIX);
 
         let mtime = obj
@@ -205,7 +212,6 @@ impl S3FileSystem {
             name: path.name().to_owned(),
             is_dir,
             mtime,
-            atime: mtime,
             is_complete: true,
             len,
             replicas: 1,
@@ -217,7 +223,7 @@ impl S3FileSystem {
     }
 
     pub fn prefix_to_status(bucket: &str, prefix: &str) -> FsResult<FileStatus> {
-        let path = Path::from_str(format!("{}{}{}{}", SCHEME, bucket, FOLDER_SUFFIX, prefix))?;
+        let path = Self::create_path(bucket, prefix)?;
         let status = FileStatus {
             path: path.full_path().to_owned(),
             name: path.name().to_owned(),

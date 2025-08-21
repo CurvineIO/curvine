@@ -1,7 +1,7 @@
 use bytes::BytesMut;
 use clap::Subcommand;
-use curvine_client::file::CurvineFileSystem;
-use curvine_common::fs::{CurvineURI, Reader};
+use curvine_client::unified::UnifiedFileSystem;
+use curvine_common::fs::{CurvineURI, FileSystem, Reader};
 use orpc::CommonResult;
 
 #[derive(Subcommand, Debug)]
@@ -14,7 +14,7 @@ pub enum CatCommand {
 }
 
 impl CatCommand {
-    pub async fn execute(&self, client: CurvineFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             CatCommand::Cat { path } => {
                 let path = CurvineURI::new(path)?;
