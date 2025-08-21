@@ -17,8 +17,7 @@ use crate::master::RpcContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    ReportBlockReplicationRequest, ReportBlockReplicationResponse, SubmitBlockReplicationResponse,
-    SumbitBlockReplicationRequest,
+    ReportBlockReplicationRequest, ReportBlockReplicationResponse,
 };
 use curvine_common::FsResult;
 use log::warn;
@@ -26,7 +25,6 @@ use orpc::error::ErrorImpl;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use orpc::runtime::AsyncRuntime;
-use orpc::CommonResult;
 use std::sync::Arc;
 
 #[derive(Clone)]

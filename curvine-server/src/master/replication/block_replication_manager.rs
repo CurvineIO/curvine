@@ -12,17 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::{MasterFilesystem, WorkerManager};
+use crate::master::fs::MasterFilesystem;
 use crate::master::SyncWorkerManager;
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::ReportBlockReplicationRequest;
-use curvine_common::state::{WorkerAddress, WorkerInfo};
+use curvine_common::state::WorkerAddress;
 use log::{error, warn};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::sync::FastDashMap;
 use orpc::CommonResult;
-use parking_lot::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -110,7 +108,7 @@ impl BlockReplicationManager {
 
         // step1: find out the available worker to replicate blocks
         // todo: use pluggable policy to find out the best worker to do replication
-        let worker_id = locations.get(0).unwrap().worker_id;
+        let worker_id = locations.first().unwrap().worker_id;
         let worker_manager = self.worker_manager.read();
         let Some(worker) = worker_manager.get_worker(worker_id) else {
             warn!("Invalid worker id: {}", worker_id);
