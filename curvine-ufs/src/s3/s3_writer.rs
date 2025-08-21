@@ -221,35 +221,6 @@ impl S3Writer {
         Ok(())
     }
 
-    async fn abort_upload(&self) -> FsResult<()> {
-        if let Some(upload_id) = &self.upload_id {
-            debug!(
-                "Aborting multipart upload for s3://{}/{}",
-                self.bucket, self.key
-            );
-
-            let resp = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .upload_id(upload_id)
-                .send()
-                .await;
-
-            if let Err(e) = resp {
-                return err_ufs!("Failed to abort multipart upload: {}", e);
-            }
-
-            info!(
-                "Multipart upload aborted for s3://{}/{}",
-                self.bucket, self.key
-            );
-        }
-
-        Ok(())
-    }
-
     async fn put_object(&self, data: Bytes) -> FsResult<PutObjectOutput> {
         debug!(
             "Uploading object s3://{}/{}, size: {} bytes",
@@ -277,31 +248,6 @@ impl S3Writer {
         info!("Object uploaded to s3://{}/{}", self.bucket, self.key);
 
         Ok(resp)
-    }
-
-    /// Close the writer
-    async fn close(&mut self) -> FsResult<()> {
-        if !self.cancelled {
-            self.flush().await?;
-        } else if self.upload_id.is_some() {
-            // If there is a cancellation and there is an unfinished upload, abort the upload
-            self.abort_upload().await?;
-        }
-
-        Ok(())
-    }
-
-    /// Cancel write
-    fn cancel(&mut self) {
-        self.cancelled = true;
-
-        // Note: The actual cancel operation is completed in the close method
-        debug!("S3 write cancelled for s3://{}/{}", self.bucket, self.key);
-    }
-
-    /// Get the number of bytes written
-    fn written_bytes(&self) -> i64 {
-        self.pos
     }
 }
 

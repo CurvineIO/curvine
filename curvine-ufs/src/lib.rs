@@ -12,14 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 pub mod fs;
-pub mod opendal;
+
+// Native S3 implementation
+#[cfg(feature = "s3")]
 pub mod s3;
+
+// OpenDAL implementations
+#[cfg(feature = "opendal")]
+pub mod opendal;
 
 mod ufs_utils;
 pub use self::ufs_utils::UfsUtils;
+
+pub const FOLDER_SUFFIX: &str = "/";
 
 #[macro_export]
 macro_rules! err_ufs {

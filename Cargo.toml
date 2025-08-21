@@ -106,36 +106,14 @@ linked-hash-map = "0.5.6"
 fxhash = "0.2.1"
 serde_with = "3.12.0"
 parking_lot = "0.12.3"
-
-# aws
-aws-config = { version = "1", default-features = false, features = [
-    "behavior-version-latest",
-    "rt-tokio",
-    "rustls",
-] }
-aws-credential-types = { version = "1", default-features = false, features = [
-    "hardcoded-credentials",
-] }
-aws-sdk-s3 = { version = "1", default-features = false, features = [
-    "behavior-version-latest",
-    "rt-tokio",
-    "rustls",
-] }
-aws-smithy-runtime-api = "1"
-aws-smithy-runtime = "1"
-aws-smithy-types = { version = "1", default-features = false, features = [
-    "hyper-0-14-x",
-] }
-aws-types = "1"
 anyhow = "1.0.97"
-
 url = "2.2.2"
 async-trait = "0.1.76"
 fastrand = "1.9.0"
-opendal = { version = "0.54", features = ["services-s3", "services-gcs", "services-azblob"] }
 num_cpus = "1.16.0"
 slog = "2.7.0"
 slog-stdlog = "4.1.0"
 num-bigint = "0.4.6"
 bigdecimal = "0.4.8"
 bitvec = "1.0.1"
+config = "0.13.4"

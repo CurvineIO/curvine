@@ -128,8 +128,7 @@ impl UfsManager {
 
     /// get client with cache
     pub async fn get_client(&mut self, ufs_uri: &CurvineURI) -> FsResult<Arc<UfsClient>> {
-        let scheme = ufs_uri.scheme();
-        if scheme.is_none() {
+        if ufs_uri.scheme().is_none() {
             return err_box!("none scheme provided!");
         }
 
@@ -139,7 +138,7 @@ impl UfsManager {
         };
 
         let ufs_conf = self.get_ufs_conf(&ufs_base_uri).await?;
-        let ufs_ctx = Arc::new(UFSContext::new(scheme.unwrap().to_string(), ufs_conf));
+        let ufs_ctx = Arc::new(UFSContext::new(ufs_uri, ufs_conf));
         let ufs_client = Arc::new(UfsClient::new(ufs_ctx)?);
         Ok(ufs_client.clone())
     }
@@ -154,7 +153,7 @@ impl UfsManager {
             return err_box!("none scheme provided!");
         }
 
-        let ufs_ctx = Arc::new(UFSContext::new(scheme.unwrap().to_string(), ufs_conf));
+        let ufs_ctx = Arc::new(UFSContext::new(ufs_uri, ufs_conf));
         let ufs_client = Arc::new(UfsClient::new(ufs_ctx)?);
         Ok(ufs_client.clone())
     }

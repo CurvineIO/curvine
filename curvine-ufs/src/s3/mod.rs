@@ -24,5 +24,4 @@ pub use self::s3_reader::S3Reader;
 mod object_status;
 pub use self::object_status::ObjectStatus;
 
-pub const FOLDER_SUFFIX: &str = "/";
-pub const SCHEME: &str = "s3://";
+pub const SCHEME: &str = "s3";

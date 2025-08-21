@@ -19,7 +19,7 @@ use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{FileStatus, SetAttrOpts};
 use curvine_common::FsResult;
 use futures::StreamExt;
-use opendal::services::{Azblob, Gcs, S3};
+use opendal::services::*;
 use opendal::{layers::LoggingLayer, Operator};
 use orpc::sys::DataSlice;
 
@@ -264,20 +264,21 @@ impl OpendalFileSystem {
             .to_string();
 
         let operator = match scheme {
-            "s3" => {
+            #[cfg(feature = "opendal-s3")]
+            "s3" | "s3a" => {
                 let mut builder = S3::default();
                 builder = builder.bucket(&bucket_or_container);
 
-                if let Some(endpoint) = conf.get("fs.s3a.endpoint") {
+                if let Some(endpoint) = conf.get("s3.endpoint_url") {
                     builder = builder.endpoint(endpoint);
                 }
-                if let Some(region) = conf.get("fs.s3a.region") {
+                if let Some(region) = conf.get("s3.region_name") {
                     builder = builder.region(region);
                 }
-                if let Some(access_key) = conf.get("fs.s3a.access.key") {
+                if let Some(access_key) = conf.get("s3.credentials.access") {
                     builder = builder.access_key_id(access_key);
                 }
-                if let Some(secret_key) = conf.get("fs.s3a.secret.key") {
+                if let Some(secret_key) = conf.get("s3.credentials.secret") {
                     builder = builder.secret_access_key(secret_key);
                 }
 
@@ -286,14 +287,37 @@ impl OpendalFileSystem {
                     .layer(LoggingLayer::default())
                     .finish()
             }
+
+            #[cfg(feature = "opendal-oss")]
+            "oss" => {
+                let mut builder = Oss::default();
+                builder = builder.bucket(&bucket_or_container);
+
+                if let Some(endpoint) = conf.get("oss.endpoint_url") {
+                    builder = builder.endpoint(endpoint);
+                }
+                if let Some(access_key) = conf.get("oss.credentials.access") {
+                    builder = builder.access_key_id(access_key);
+                }
+                if let Some(secret_key) = conf.get("oss.credentials.secret") {
+                    builder = builder.secret_access_key(secret_key);
+                }
+
+                Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create OSS operator: {}", e)))?
+                    .layer(LoggingLayer::default())
+                    .finish()
+            }
+
+            #[cfg(feature = "opendal-gcs")]
             "gcs" | "gs" => {
                 let mut builder = Gcs::default();
                 builder = builder.bucket(&bucket_or_container);
 
-                if let Some(service_account) = conf.get("fs.gcs.service_account") {
+                if let Some(service_account) = conf.get("gcs.service_account") {
                     builder = builder.credential(service_account);
                 }
-                if let Some(endpoint) = conf.get("fs.gcs.endpoint") {
+                if let Some(endpoint) = conf.get("gcs.endpoint_url") {
                     builder = builder.endpoint(endpoint);
                 }
 
@@ -302,17 +326,19 @@ impl OpendalFileSystem {
                     .layer(LoggingLayer::default())
                     .finish()
             }
+
+            #[cfg(feature = "opendal-azblob")]
             "azblob" => {
                 let mut builder = Azblob::default();
                 builder = builder.container(&bucket_or_container);
 
-                if let Some(account_name) = conf.get("fs.azure.account_name") {
+                if let Some(account_name) = conf.get("azure.account_name") {
                     builder = builder.account_name(account_name);
                 }
-                if let Some(account_key) = conf.get("fs.azure.account_key") {
+                if let Some(account_key) = conf.get("azure.account_key") {
                     builder = builder.account_key(account_key);
                 }
-                if let Some(endpoint) = conf.get("fs.azure.endpoint") {
+                if let Some(endpoint) = conf.get("azure.endpoint_url") {
                     builder = builder.endpoint(endpoint);
                 }
 
@@ -323,6 +349,7 @@ impl OpendalFileSystem {
                     .layer(LoggingLayer::default())
                     .finish()
             }
+
             _ => {
                 return Err(FsError::unsupported(format!(
                     "Unsupported scheme: {}",

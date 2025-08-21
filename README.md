@@ -139,13 +139,42 @@ You can either:
 3. We also supply `curvine/curvine-compile` image on dockerhub
 
 ### 🚀 Build Steps (Linux - Ubuntu/Debian example)
+Using make to build:
 
 ```bash
-# Compiled files are in build/dist
+# Build all modules
 make all
 
+# Build core modules only: server client cli
+make build ARGS="-p core"
+
+# Build fuse and core modules
+make build ARGS="-p core -p fuse"
+```
+
+
+Using build.sh directly:
+
+```bash
+# Build all modules
+sh build/build.sh 
+
+# Display command help 
+sh build/build.sh -h
+
+# Build core modules only: server client cli
+sh build/build.sh -p core
+
+# Build fuse and core modules
+sh build/build.sh -p core -p fuse
+```
+
+Building Docker images:
+
+```bash
 # or use curvine-compile:latest docker images to build
 make docker-build
+
 # or use curvine-compile:build-cached docker images to build, this image already cached most dependency crates
 make docker-build-cached
 ```
@@ -171,13 +200,13 @@ bin/curvine-fuse.sh start
 
 View the cluster overview:
 ```bash
-bin/curvine report
+bin/cv report
 ```
 
 Access the file system using compatible HDFS commands:
 ```bash
-bin/curvine fs -mkdir /a
-bin/curvine fs -ls /
+bin/cv fs mkdir /a
+bin/cv fs ls /
 ```
 
 Access Web UI：

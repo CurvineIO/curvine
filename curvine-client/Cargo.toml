@@ -9,7 +9,7 @@ license.workspace = true
 [dependencies]
 orpc = { workspace = true }
 curvine-common = { workspace = true }
-curvine-ufs = { workspace = true }
+curvine-ufs = { workspace = true, optional = true }
 once_cell = { workspace = true }
 hyper = { workspace = true }
 prost = { workspace = true }
@@ -26,4 +26,14 @@ dashmap = { workspace = true }
 futures = { workspace = true }
 moka = { workspace = true }
 fxhash = { workspace = true }
-trait-variant = { workspace = true }
+
+[features]
+default = ["s3"]
+
+s3 = ["dep:curvine-ufs", "curvine-ufs/s3"]
+
+opendal = ["dep:curvine-ufs", "curvine-ufs/opendal"]
+opendal-s3 = ["opendal", "curvine-ufs/opendal-s3"]
+opendal-oss = ["opendal", "curvine-ufs/opendal-oss"]
+opendal-gcs = ["opendal", "curvine-ufs/opendal-gcs"]
+opendal-azblob = ["opendal", "curvine-ufs/opendal-azblob"]

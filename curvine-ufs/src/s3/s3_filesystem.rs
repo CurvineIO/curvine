@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::fs::aws_utils;
-use crate::s3::{ObjectStatus, S3Reader, S3Writer, FOLDER_SUFFIX, SCHEME};
+use crate::s3::SCHEME;
+use crate::s3::{ObjectStatus, S3Reader, S3Writer};
+use crate::FOLDER_SUFFIX;
 use crate::{err_ufs, UfsUtils};
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::types::Object;

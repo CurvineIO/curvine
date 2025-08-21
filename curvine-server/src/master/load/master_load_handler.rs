@@ -22,6 +22,7 @@ use curvine_common::proto::{
 };
 use curvine_common::FsResult;
 use log::{debug, error, info, warn};
+use orpc::err_box;
 use orpc::error::ErrorImpl;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
@@ -52,25 +53,17 @@ impl MasterLoadService {
     pub fn submit_load_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: LoadJobRequest = ctx.parse_header()?;
         // Check the request parameters
-        let path = req.path.trim();
-        if path.is_empty() {
-            return Err(FsError::Common(ErrorImpl::with_source(
-                "Path cannot be empty".into(),
-            )));
+        if req.path.is_empty() {
+            return err_box!("Path cannot be empty");
         }
 
         let ttl = req.ttl.as_deref();
         let recursive = req.recursive.unwrap_or(false);
 
-        info!(
-            "Received submit_load_job request: path={}, recursive={}",
-            path, recursive
-        );
-
         // Submit task - use block_on to call async method
         let (job_id, target_path) = self
             .rt
-            .block_on(self.load_manager.submit_job(path, ttl, recursive))?;
+            .block_on(self.load_manager.submit_job(&req.path, ttl, recursive))?;
 
         // Construct the response
         let response = LoadJobResponse {
