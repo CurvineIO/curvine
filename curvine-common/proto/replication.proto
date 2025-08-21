@@ -1,0 +1,25 @@
+syntax = "proto2";
+package proto;
+
+import "common.proto";
+
+message SumbitBlockReplicationRequest {
+    required int64 block_id = 1;
+    required WorkerAddressProto target_worker_info = 2;
+}
+
+message SubmitBlockReplicationResponse {
+    required bool success = 1;
+    optional string message = 2;
+}
+
+message ReportBlockReplicationRequest {
+    required int64 block_id = 1;
+    required bool success =  2;
+    optional string message = 3;
+}
+
+message ReportBlockReplicationResponse {
+    required bool success = 1;
+    optional string message = 2;
+}

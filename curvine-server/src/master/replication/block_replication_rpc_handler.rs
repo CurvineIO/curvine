@@ -13,13 +13,23 @@
 // limitations under the License.
 
 use crate::master::replication::block_replication_manager::BlockReplicationManager;
+use crate::master::RpcContext;
 use curvine_common::error::FsError;
+use curvine_common::fs::RpcCode;
+use curvine_common::proto::{
+    ReportBlockReplicationRequest, ReportBlockReplicationResponse, SubmitBlockReplicationResponse,
+    SumbitBlockReplicationRequest,
+};
+use curvine_common::FsResult;
+use log::warn;
+use orpc::error::ErrorImpl;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use orpc::runtime::AsyncRuntime;
 use orpc::CommonResult;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct BlockReplicationRpcHandler {
     manager: BlockReplicationManager,
     runtime: Arc<AsyncRuntime>,
@@ -30,19 +40,40 @@ impl BlockReplicationRpcHandler {
         todo!()
     }
 
-    pub fn submit_replication_job() -> CommonResult<bool> {
-        todo!()
-    }
-
-    pub fn accept_replication_result() -> CommonResult<()> {
-        todo!()
+    pub fn report_replication_result(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let req: ReportBlockReplicationRequest = ctx.parse_header()?;
+        // todo: error handling
+        let _ = self.manager.report_replicated_block(req);
+        let response = ReportBlockReplicationResponse {
+            success: true,
+            message: None,
+        };
+        ctx.response(response)
     }
 }
 
 impl MessageHandler for BlockReplicationRpcHandler {
     type Error = FsError;
 
-    fn handle(&mut self, msg: &Message) -> Result<Message, Self::Error> {
-        todo!()
+    fn handle(&mut self, msg: &Message) -> FsResult<Message> {
+        let code = RpcCode::from(msg.code());
+
+        // Create RpcContext
+        let mut rpc_context = RpcContext::new(msg);
+        let ctx = &mut rpc_context;
+
+        let response = match code {
+            RpcCode::ReportBlockReplicationResult => self.report_replication_result(ctx),
+            _ => Err(FsError::Common(ErrorImpl::with_source(
+                format!("Unsupported operation: {:?}", code).into(),
+            ))),
+        };
+
+        // Record the request processing status
+        if let Err(ref e) = response {
+            warn!("Request {:?} failed: {}", code, e);
+        }
+
+        response
     }
 }

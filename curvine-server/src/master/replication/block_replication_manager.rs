@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::MasterFilesystem;
+use crate::master::fs::{MasterFilesystem, WorkerManager};
+use crate::master::SyncWorkerManager;
 use curvine_common::conf::ClusterConf;
+use curvine_common::proto::ReportBlockReplicationRequest;
+use curvine_common::state::{WorkerAddress, WorkerInfo};
 use log::{error, warn};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::sync::FastDashMap;
@@ -30,6 +33,8 @@ type WorkerId = u32;
 #[derive(Clone)]
 pub struct BlockReplicationManager {
     fs: MasterFilesystem,
+    worker_manager: SyncWorkerManager,
+
     replication_semaphore: Arc<Semaphore>,
     runtime: Arc<AsyncRuntime>,
 
@@ -41,16 +46,23 @@ pub struct BlockReplicationManager {
 struct InflightReplicationJob {
     block_id: BlockId,
     permit: OwnedSemaphorePermit,
+    target_worker: WorkerAddress,
 }
 
 impl BlockReplicationManager {
-    pub fn new(fs: MasterFilesystem, conf: ClusterConf, rt: Arc<AsyncRuntime>) -> Arc<Self> {
+    pub fn new(
+        fs: MasterFilesystem,
+        conf: ClusterConf,
+        rt: Arc<AsyncRuntime>,
+        worker_manager: &SyncWorkerManager,
+    ) -> Arc<Self> {
         let async_runtime = rt.clone();
         let semaphore = Semaphore::new(10);
         let (send, recv) = tokio::sync::mpsc::channel(10000);
 
         let manager = Self {
             fs,
+            worker_manager: worker_manager.clone(),
             replication_semaphore: Arc::new(semaphore),
             staging_queue_sender: Arc::new(send),
             runtime: rt.clone(),
@@ -99,13 +111,23 @@ impl BlockReplicationManager {
         // step1: find out the available worker to replicate blocks
         // todo: use pluggable policy to find out the best worker to do replication
         let worker_id = locations.get(0).unwrap().worker_id;
+        let worker_manager = self.worker_manager.read();
+        let Some(worker) = worker_manager.get_worker(worker_id) else {
+            warn!("Invalid worker id: {}", worker_id);
+            return Ok(());
+        };
 
         // step2: call the corresponding worker to do replication
-        // todo: introduce the rpc to do this replication communication
 
         // step3: add into the replicating queue
-        self.inflight_blocks
-            .insert(block_id, InflightReplicationJob { block_id, permit });
+        self.inflight_blocks.insert(
+            block_id,
+            InflightReplicationJob {
+                block_id,
+                permit,
+                target_worker: worker.address.clone(),
+            },
+        );
 
         Ok(())
     }
@@ -122,13 +144,23 @@ impl BlockReplicationManager {
         Ok(())
     }
 
-    // This is invoked by the master handler that is invoked by the client side of finish replication
-    pub async fn report_replicated_block(&self, block_id: BlockId) -> CommonResult<()> {
+    pub fn report_replicated_block(&self, req: ReportBlockReplicationRequest) -> CommonResult<()> {
+        // todo: retry on failure of block replication
+
+        let block_id = req.block_id;
+        let success = req.success;
+        let message = req.message;
         match self.inflight_blocks.remove(&block_id) {
             None => {
                 warn!("Should not happen that Block {} not found", block_id);
             }
             Some(entry) => {
+                if !success {
+                    error!(
+                        "Errors on block replication for block_id: {} to worker: {}. error: {:?}",
+                        block_id, &entry.1.target_worker, message
+                    );
+                }
                 drop(entry.1.permit);
             }
         }
