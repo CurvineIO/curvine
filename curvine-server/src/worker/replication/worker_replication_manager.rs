@@ -47,8 +47,7 @@ impl WorkerReplicationManager {
         // step1: check the block_id existence (todo)
         // step2: push into the queue
 
-        self
-            .runtime
+        self.runtime
             .block_on(async move { self.jobs_queue_sender.send(job).await })?;
         Ok(())
     }

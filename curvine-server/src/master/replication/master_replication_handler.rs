@@ -26,14 +26,13 @@ use orpc::runtime::AsyncRuntime;
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct MasterReplicationRpcHandler {
+pub struct MasterReplicationHandler {
     manager: MasterReplicationManager,
-    runtime: Arc<AsyncRuntime>,
 }
 
-impl MasterReplicationRpcHandler {
-    pub fn new(manager: MasterReplicationManager, runtime: Arc<AsyncRuntime>) -> Self {
-        todo!()
+impl MasterReplicationHandler {
+    pub fn new(manager: MasterReplicationManager) -> Self {
+        Self { manager }
     }
 
     pub fn report_replication_result(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -48,7 +47,7 @@ impl MasterReplicationRpcHandler {
     }
 }
 
-impl MessageHandler for MasterReplicationRpcHandler {
+impl MessageHandler for MasterReplicationHandler {
     type Error = FsError;
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {

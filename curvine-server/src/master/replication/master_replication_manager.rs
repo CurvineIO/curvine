@@ -17,8 +17,7 @@ use crate::master::SyncWorkerManager;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    ReportBlockReplicationRequest,
-    SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
+    ReportBlockReplicationRequest, SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
 };
 use curvine_common::state::{BlockLocation, StorageType, WorkerAddress};
 use log::{error, warn};

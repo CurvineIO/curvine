@@ -10,11 +10,11 @@ use orpc::handler::MessageHandler;
 use orpc::message::Message;
 
 #[derive(Clone)]
-struct WorkerReplicationRpcHandler {
+struct WorkerReplicationHandler {
     manager: WorkerReplicationManager,
 }
 
-impl WorkerReplicationRpcHandler {
+impl WorkerReplicationHandler {
     pub fn new(manager: &WorkerReplicationManager) -> Self {
         Self {
             manager: manager.clone(),
@@ -28,7 +28,7 @@ impl WorkerReplicationRpcHandler {
     }
 }
 
-impl MessageHandler for WorkerReplicationRpcHandler {
+impl MessageHandler for WorkerReplicationHandler {
     type Error = FsError;
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
