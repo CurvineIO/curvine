@@ -19,6 +19,8 @@ pub struct WorkerReplicationManager {
 
     runtime: Arc<AsyncRuntime>,
     fs_client_context: Arc<FsContext>,
+
+    replicate_chunk_size: usize,
 }
 
 impl WorkerReplicationManager {
@@ -35,6 +37,7 @@ impl WorkerReplicationManager {
             jobs_queue_sender: Arc::new(send),
             runtime: async_runtime.clone(),
             fs_client_context: fs_client_context.clone(),
+            replicate_chunk_size: 1024 * 1024,
         };
         let handler = Arc::new(handler);
         Self::handle(&handler, async_runtime, recv);
@@ -80,11 +83,17 @@ impl WorkerReplicationManager {
             job.target_worker_addr.clone(),
         )
         .await?;
-        let reader = block_meta.create_reader(0)?;
-        // reader.read_region()
-        // writer.write(job).await;
-        // writer.flush().await;
-        todo!()
+        let mut reader = block_meta.create_reader(0)?;
+        let mut remaining = block_meta.len;
+        while remaining > 0 {
+            let size = remaining.min(self.replicate_chunk_size as i64);
+            let slice = reader.read_region(true, size as i32)?;
+            writer.write(slice).await?;
+            remaining -= size;
+        }
+        writer.flush().await?;
+        writer.complete().await?;
+        Ok(())
     }
 
     pub fn accept_job(&self, job: ReplicationJob) -> CommonResult<()> {
