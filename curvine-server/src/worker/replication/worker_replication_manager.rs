@@ -1,8 +1,12 @@
-use crate::worker::block::BlockStore;
+use crate::worker::block::{BlockState, BlockStore};
 use crate::worker::replication::replication_job::ReplicationJob;
+use curvine_client::block::BlockWriterRemote;
+use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
+use curvine_common::state::{ExtendedBlock, FileType};
+use log::error;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
+use orpc::{err_box, CommonResult};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Semaphore;
@@ -14,6 +18,7 @@ pub struct WorkerReplicationManager {
     jobs_queue_sender: Arc<Sender<ReplicationJob>>,
 
     runtime: Arc<AsyncRuntime>,
+    fs_client_context: Arc<FsContext>,
 }
 
 impl WorkerReplicationManager {
@@ -21,6 +26,7 @@ impl WorkerReplicationManager {
         block_store: BlockStore,
         async_runtime: Arc<AsyncRuntime>,
         conf: &ClusterConf,
+        fs_client_context: &Arc<FsContext>,
     ) -> Arc<Self> {
         let (send, recv) = tokio::sync::mpsc::channel(10000);
         let handler = Self {
@@ -28,6 +34,7 @@ impl WorkerReplicationManager {
             replication_semaphore: Arc::new(Semaphore::new(10)),
             jobs_queue_sender: Arc::new(send),
             runtime: async_runtime.clone(),
+            fs_client_context: fs_client_context.clone(),
         };
         let handler = Arc::new(handler);
         Self::handle(&handler, async_runtime, recv);
@@ -39,8 +46,45 @@ impl WorkerReplicationManager {
         async_runtime: Arc<AsyncRuntime>,
         mut recv: Receiver<ReplicationJob>,
     ) {
-        let handler = me.clone();
-        async_runtime.spawn(async move { while let Some(block_id) = recv.recv().await {} });
+        let manager = me.clone();
+        async_runtime.spawn(async move {
+            let semaphore = manager.replication_semaphore.clone();
+            while let Some(job) = recv.recv().await {
+                if let Err(e) = manager.replicate_block(&job).await {
+                    error!("Error writing block: {}. err: {}", job.block_id, e);
+                }
+            }
+        });
+    }
+
+    async fn replicate_block(&self, job: &ReplicationJob) -> CommonResult<()> {
+        let permit = self
+            .replication_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let block_meta = self.block_store.get_block(job.block_id)?;
+        if block_meta.state != BlockState::Finalized {
+            return err_box!("");
+        }
+        let extend_block = ExtendedBlock::new(
+            block_meta.id,
+            block_meta.len,
+            block_meta.storage_type(),
+            FileType::File,
+        );
+        let mut writer = BlockWriterRemote::new(
+            &self.fs_client_context,
+            extend_block,
+            job.target_worker_addr.clone(),
+        )
+        .await?;
+        let reader = block_meta.create_reader(0)?;
+        // reader.read_region()
+        // writer.write(job).await;
+        // writer.flush().await;
+        todo!()
     }
 
     pub fn accept_job(&self, job: ReplicationJob) -> CommonResult<()> {

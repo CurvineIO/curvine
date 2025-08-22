@@ -99,7 +99,7 @@ impl MasterReplicationManager {
         });
     }
 
-    fn get_worker_addr(&self, worker_id: WorkerId) -> CommonResult<WorkerAddress> {
+    fn get_next_worker(&self, worker_id: WorkerId) -> CommonResult<WorkerAddress> {
         let worker_manager = self.worker_manager.read();
         match worker_manager.get_worker(worker_id) {
             None => {
@@ -135,7 +135,7 @@ impl MasterReplicationManager {
         // todo: use pluggable policy to find out the best worker to do replication
         let source_worker_id =
             try_option!(locations.first(), "missing block: {}", block_id).worker_id;
-        let source_worker_addr = self.get_worker_addr(source_worker_id)?;
+        let source_worker_addr = self.get_next_worker(source_worker_id)?;
 
         // step2: choose the target worker
         let target_worker_addr = self.assign(locations.iter().map(|x| x.worker_id).collect())?;
