@@ -272,8 +272,7 @@ declare -a FEATURES=()
 # Check FUSE availability if needed
 if [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]] || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
   if [ -z "$FUSE_VERSION" ]; then
-    echo "Error: FUSE package requested but FUSE is not available on this system" >&2
-    exit 1
+    echo "Warn: FUSE package requested but FUSE is not available on this system" >&2
   fi
 fi
 

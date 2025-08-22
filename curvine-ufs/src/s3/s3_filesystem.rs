@@ -25,8 +25,8 @@ use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{FileStatus, SetAttrOpts};
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
-use std::sync::Arc;
 use orpc::CommonResult;
+use std::sync::Arc;
 
 /// S3 file system implementation
 #[derive(Clone)]
@@ -191,7 +191,13 @@ impl S3FileSystem {
     }
 
     pub fn create_path<T: AsRef<str>>(bucket: T, key: T) -> CommonResult<Path> {
-        let str= format!("{}://{}{}{}", SCHEME, bucket.as_ref(), FOLDER_SUFFIX, key.as_ref());
+        let str = format!(
+            "{}://{}{}{}",
+            SCHEME,
+            bucket.as_ref(),
+            FOLDER_SUFFIX,
+            key.as_ref()
+        );
         let path = Path::from_str(str)?;
         Ok(path)
     }
