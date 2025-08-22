@@ -21,6 +21,7 @@ pub struct WorkerReplicationManager {
     fs_client_context: Arc<FsContext>,
 
     replicate_chunk_size: usize,
+    // todo: add more metrics to track
 }
 
 impl WorkerReplicationManager {
@@ -51,11 +52,11 @@ impl WorkerReplicationManager {
     ) {
         let manager = me.clone();
         async_runtime.spawn(async move {
-            let semaphore = manager.replication_semaphore.clone();
             while let Some(job) = recv.recv().await {
                 if let Err(e) = manager.replicate_block(&job).await {
                     error!("Error writing block: {}. err: {}", job.block_id, e);
                 }
+                todo!("report replication result")
             }
         });
     }
