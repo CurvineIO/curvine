@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use curvine_client::file::CurvineFileSystem;
+use curvine_client::unified::UnifiedFileSystem;
 use orpc::CommonResult;
 use std::path::PathBuf;
 
@@ -72,6 +72,9 @@ pub enum FsSubCommand {
             help = "Use time of last access instead of modification for display and sorting"
         )]
         atime: bool,
+
+        #[clap(short = 'l', long, help = "Use a long listing format")]
+        long_format: bool,
     },
 
     /// Create a directory
@@ -156,7 +159,7 @@ pub enum FsSubCommand {
 }
 
 impl FsCommand {
-    pub async fn execute(&self, client: CurvineFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match &self.action {
             FsSubCommand::Ls {
                 path,
@@ -169,6 +172,7 @@ impl FsCommand {
                 mtime,
                 size,
                 atime,
+                long_format,
             } => {
                 let ls_cmd = LsCommand::Ls {
                     path: path.clone(),
@@ -181,6 +185,7 @@ impl FsCommand {
                     mtime: *mtime,
                     size: *size,
                     atime: *atime,
+                    long_format: *long_format,
                 };
                 ls_cmd.execute(client).await
             }

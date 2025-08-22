@@ -14,7 +14,7 @@
 
 use crate::util::*;
 use clap::{Parser, Subcommand};
-use curvine_client::file::CurvineFileSystem;
+use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::state::MasterInfo;
 use num_bigint::ToBigInt;
 use orpc::CommonResult;
@@ -38,7 +38,7 @@ pub enum ReportSubCommand {
 }
 
 impl ReportCommand {
-    pub async fn execute(&self, fs: CurvineFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, fs: UnifiedFileSystem) -> CommonResult<()> {
         let rep = handle_rpc_result(fs.get_master_info()).await;
         let report = CurvineReport { info: rep };
         match &self.action {

@@ -1,7 +1,8 @@
 use clap::Subcommand;
-use curvine_client::file::CurvineFileSystem;
-use curvine_common::fs::CurvineURI;
+use curvine_client::unified::UnifiedFileSystem;
+use curvine_common::fs::{CurvineURI, FileSystem};
 use curvine_common::state::FileStatus;
+use orpc::common::{ByteUnit, DurationUnit};
 use orpc::CommonResult;
 
 /// Configuration for printing file entries
@@ -10,6 +11,7 @@ struct PrintConfig {
     human_readable: bool,
     hide_non_printable: bool,
     atime: bool,
+    long_format: bool,
 
     display_path: String,
 }
@@ -71,11 +73,14 @@ pub enum LsCommand {
             help = "Use time of last access instead of modification for display and sorting"
         )]
         atime: bool,
+
+        #[clap(short = 'l', long, help = "Use a long listing format")]
+        long_format: bool,
     },
 }
 
 impl LsCommand {
-    pub async fn execute(&self, client: CurvineFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             LsCommand::Ls {
                 path,
@@ -88,6 +93,7 @@ impl LsCommand {
                 mtime,
                 size,
                 atime,
+                long_format,
             } => {
                 let path = CurvineURI::new(path)?;
 
@@ -114,7 +120,8 @@ impl LsCommand {
                             human_readable: *human_readable,
                             hide_non_printable: *hide_non_printable,
                             atime: *atime,
-                            display_path: status.name.clone(),
+                            long_format: *long_format,
+                            display_path: status.path.clone(),
                         };
                         print_file_entry(&status, &path, &client, &config).await?;
                     }
@@ -157,6 +164,7 @@ impl LsCommand {
                             human_readable: *human_readable,
                             hide_non_printable: *hide_non_printable,
                             atime: *atime,
+                            long_format: *long_format,
                             display_path: file.path.clone(),
                         };
                         print_file_entry(file, &CurvineURI::new(&file.path)?, &client, &config)
@@ -172,7 +180,8 @@ impl LsCommand {
                             human_readable: *human_readable,
                             hide_non_printable: *hide_non_printable,
                             atime: *atime,
-                            display_path: file.name.clone(),
+                            long_format: *long_format,
+                            display_path: file.path.clone(),
                         };
                         print_file_entry(file, &CurvineURI::new(&file.path)?, &client, &config)
                             .await?;
@@ -187,7 +196,7 @@ impl LsCommand {
 
 // Recursively list all files and directories using depth-first search
 async fn list_files_recursive(
-    client: &CurvineFileSystem,
+    client: &UnifiedFileSystem,
     path: &CurvineURI,
 ) -> CommonResult<Vec<FileStatus>> {
     let mut all_files = Vec::new();
@@ -238,7 +247,7 @@ async fn list_files_recursive(
 }
 
 /// Recursively list all paths only using depth-first search
-async fn list_paths_recursive(client: &CurvineFileSystem, path: &CurvineURI) -> CommonResult<()> {
+async fn list_paths_recursive(client: &UnifiedFileSystem, path: &CurvineURI) -> CommonResult<()> {
     let mut to_process = vec![path.clone()];
 
     while let Some(current_path) = to_process.pop() {
@@ -296,7 +305,7 @@ fn sort_files(files: &mut [FileStatus], mtime: bool, size: bool, reverse: bool, 
 /// Calculate column widths for formatting
 async fn calculate_column_widths(
     _files: &[FileStatus],
-    _client: &CurvineFileSystem,
+    _client: &UnifiedFileSystem,
 ) -> CommonResult<()> {
     // For now, we'll use fixed widths since we don't have dynamic content
     // In a full implementation, you would calculate max widths for each column
@@ -307,7 +316,7 @@ async fn calculate_column_widths(
 async fn print_file_entry(
     file: &FileStatus,
     _path: &CurvineURI,
-    _client: &CurvineFileSystem,
+    _client: &UnifiedFileSystem,
     config: &PrintConfig,
 ) -> CommonResult<()> {
     let file_type = if file.is_dir { "d" } else { "-" };
@@ -317,8 +326,8 @@ async fn print_file_entry(
     } else {
         &file.replicas.to_string()
     };
-    let owner = "curvine"; // Default owner
-    let group = "curvine"; // Default group
+    let owner = file.owner.to_string(); // Default owner
+    let group = file.group.to_string(); // Default group
 
     // Format file size
     let size = if file.is_dir {
@@ -353,10 +362,27 @@ async fn print_file_entry(
     };
 
     // Print in HDFS-like format
-    println!(
-        "{}{} {} {} {} {:>12} {} {}",
-        file_type, permissions, replicas, owner, group, size, formatted_time, filename
-    );
+    if config.long_format {
+        println!(
+            "{}{} {} {} {} {:>12} {:>8} {:>8} {:<8} {} {}",
+            file_type,
+            permissions,
+            replicas,
+            owner,
+            group,
+            size,
+            ByteUnit::byte_to_string(file.block_size as u64),
+            DurationUnit::new(file.storage_policy.ttl_ms as u64),
+            format!("{:?}", file.storage_policy.ttl_action),
+            formatted_time,
+            filename
+        );
+    } else {
+        println!(
+            "{}{} {} {} {} {:>12} {} {}",
+            file_type, permissions, replicas, owner, group, size, formatted_time, filename
+        );
+    }
 
     Ok(())
 }

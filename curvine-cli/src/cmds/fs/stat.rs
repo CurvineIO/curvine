@@ -1,6 +1,7 @@
 use clap::Subcommand;
-use curvine_client::file::CurvineFileSystem;
-use curvine_common::fs::CurvineURI;
+use curvine_client::unified::UnifiedFileSystem;
+use curvine_common::fs::{CurvineURI, FileSystem};
+use orpc::common::{ByteUnit, DurationUnit};
 use orpc::CommonResult;
 
 #[derive(Subcommand, Debug)]
@@ -13,7 +14,7 @@ pub enum StatCommand {
 }
 
 impl StatCommand {
-    pub async fn execute(&self, client: CurvineFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             StatCommand::Stat { path } => {
                 let path = CurvineURI::new(path)?;
@@ -21,8 +22,21 @@ impl StatCommand {
                 match client.get_status(&path).await {
                     Ok(status) => {
                         // Format similar to HDFS stat output
-                        println!("File: {}", path.full_path());
-                        println!("Size: {}", status.len);
+                        println!("Path: {}", path.full_path());
+                        println!("File size: {}", ByteUnit::byte_to_string(status.len as u64));
+                        println!(
+                            "Block size: {}",
+                            ByteUnit::byte_to_string(status.block_size as u64)
+                        );
+                        if !status.is_dir {
+                            println!("Replication: {}", status.replicas);
+                        }
+
+                        println!(
+                            "Ttl: {}",
+                            DurationUnit::new(status.storage_policy.ttl_ms as u64)
+                        );
+                        println!("Ttl action: {:?}", status.storage_policy.ttl_action);
 
                         // Format modification time
                         let mtime = chrono::DateTime::from_timestamp(status.mtime / 1000, 0)
@@ -35,12 +49,8 @@ impl StatCommand {
                             "Permission: {}rwxr-xr-x",
                             if status.is_dir { "d" } else { "-" }
                         );
-                        println!("Owner: curvine");
-                        println!("Group: curvine");
-
-                        if !status.is_dir {
-                            println!("Replication: {}", status.replicas);
-                        }
+                        println!("Owner: {}", status.owner);
+                        println!("Group: {}", status.group);
 
                         Ok(())
                     }

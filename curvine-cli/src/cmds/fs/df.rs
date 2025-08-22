@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use curvine_client::file::CurvineFileSystem;
+use curvine_client::unified::UnifiedFileSystem;
 use orpc::CommonResult;
 
 #[derive(Subcommand, Debug)]
@@ -12,7 +12,7 @@ pub enum DfCommand {
 }
 
 impl DfCommand {
-    pub async fn execute(&self, client: CurvineFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             DfCommand::Df { human_readable } => {
                 // Get master info from the filesystem

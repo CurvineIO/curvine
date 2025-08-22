@@ -1,5 +1,5 @@
 use clap::Subcommand;
-use curvine_client::file::CurvineFileSystem;
+use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::CurvineURI;
 use orpc::CommonResult;
 
@@ -13,7 +13,7 @@ pub enum CountCommand {
 }
 
 impl CountCommand {
-    pub async fn execute(&self, client: CurvineFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             CountCommand::Count { path } => {
                 let path = CurvineURI::new(path)?;
