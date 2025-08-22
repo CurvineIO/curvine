@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::replication::block_replication_manager::BlockReplicationManager;
+use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::RpcContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
@@ -26,20 +26,20 @@ use orpc::runtime::AsyncRuntime;
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct BlockReplicationRpcHandler {
-    manager: BlockReplicationManager,
+pub struct MasterReplicationRpcHandler {
+    manager: MasterReplicationManager,
     runtime: Arc<AsyncRuntime>,
 }
 
-impl BlockReplicationRpcHandler {
-    pub fn new(manager: BlockReplicationManager, runtime: Arc<AsyncRuntime>) -> Self {
+impl MasterReplicationRpcHandler {
+    pub fn new(manager: MasterReplicationManager, runtime: Arc<AsyncRuntime>) -> Self {
         todo!()
     }
 
     pub fn report_replication_result(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: ReportBlockReplicationRequest = ctx.parse_header()?;
         // todo: error handling
-        let _ = self.manager.report_replicated_block(req);
+        let _ = self.manager.finish_replicated_block(req);
         let response = ReportBlockReplicationResponse {
             success: true,
             message: None,
@@ -48,7 +48,7 @@ impl BlockReplicationRpcHandler {
     }
 }
 
-impl MessageHandler for BlockReplicationRpcHandler {
+impl MessageHandler for MasterReplicationRpcHandler {
     type Error = FsError;
 
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {

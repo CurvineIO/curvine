@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::proto::WorkerAddressProto;
-use crate::state::WorkerInfo;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
@@ -52,14 +51,26 @@ impl Display for WorkerAddress {
     }
 }
 
-impl Into<WorkerAddressProto> for WorkerAddress {
-    fn into(self) -> WorkerAddressProto {
+impl From<WorkerAddress> for WorkerAddressProto {
+    fn from(val: WorkerAddress) -> Self {
         WorkerAddressProto {
-            worker_id: self.worker_id,
-            hostname: self.hostname,
-            ip_addr: self.ip_addr,
-            rpc_port: self.rpc_port,
-            web_port: self.web_port,
+            worker_id: val.worker_id,
+            hostname: val.hostname,
+            ip_addr: val.ip_addr,
+            rpc_port: val.rpc_port,
+            web_port: val.web_port,
+        }
+    }
+}
+
+impl From<WorkerAddressProto> for WorkerAddress {
+    fn from(proto: WorkerAddressProto) -> Self {
+        Self {
+            worker_id: proto.worker_id,
+            hostname: proto.hostname,
+            ip_addr: proto.ip_addr,
+            rpc_port: proto.rpc_port,
+            web_port: proto.web_port,
         }
     }
 }

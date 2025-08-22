@@ -13,23 +13,21 @@
 // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::meta::FsDir;
 use crate::master::SyncWorkerManager;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    CancelLoadRequest, CancelLoadResponse, ReportBlockReplicationRequest,
+    ReportBlockReplicationRequest,
     SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
 };
-use curvine_common::state::{BlockLocation, StorageType, WorkerAddress, WorkerInfo};
+use curvine_common::state::{BlockLocation, StorageType, WorkerAddress};
 use log::{error, warn};
 use orpc::client::ClientFactory;
 use orpc::io::net::InetAddr;
-use orpc::io::IOResult;
 use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::sync::{ArcRwLock, FastDashMap};
-use orpc::{err_box, try_err_opt, try_option, CommonResult};
+use orpc::sync::FastDashMap;
+use orpc::{err_box, try_option, CommonResult};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -38,7 +36,7 @@ type BlockId = i64;
 type WorkerId = u32;
 
 #[derive(Clone)]
-pub struct BlockReplicationManager {
+pub struct MasterReplicationManager {
     fs: MasterFilesystem,
     worker_manager: SyncWorkerManager,
 
@@ -58,7 +56,7 @@ struct InflightReplicationJob {
     target_worker: WorkerAddress,
 }
 
-impl BlockReplicationManager {
+impl MasterReplicationManager {
     pub fn new(
         fs: MasterFilesystem,
         conf: ClusterConf,
@@ -206,7 +204,7 @@ impl BlockReplicationManager {
         Ok(())
     }
 
-    pub fn report_replicated_block(&self, req: ReportBlockReplicationRequest) -> CommonResult<()> {
+    pub fn finish_replicated_block(&self, req: ReportBlockReplicationRequest) -> CommonResult<()> {
         // todo: retry on failure of block replication
 
         let block_id = req.block_id;
