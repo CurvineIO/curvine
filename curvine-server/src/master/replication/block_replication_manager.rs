@@ -13,14 +13,23 @@
 // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
+use crate::master::meta::FsDir;
 use crate::master::SyncWorkerManager;
 use curvine_common::conf::ClusterConf;
-use curvine_common::proto::ReportBlockReplicationRequest;
-use curvine_common::state::{BlockLocation, StorageType, WorkerAddress};
+use curvine_common::fs::RpcCode;
+use curvine_common::proto::{
+    CancelLoadRequest, CancelLoadResponse, ReportBlockReplicationRequest,
+    SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
+};
+use curvine_common::state::{BlockLocation, StorageType, WorkerAddress, WorkerInfo};
 use log::{error, warn};
+use orpc::client::ClientFactory;
+use orpc::io::net::InetAddr;
+use orpc::io::IOResult;
+use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::sync::FastDashMap;
-use orpc::CommonResult;
+use orpc::sync::{ArcRwLock, FastDashMap};
+use orpc::{err_box, try_err_opt, try_option, CommonResult};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -38,6 +47,8 @@ pub struct BlockReplicationManager {
 
     staging_queue_sender: Arc<Sender<BlockId>>,
     inflight_blocks: Arc<FastDashMap<BlockId, InflightReplicationJob>>,
+
+    worker_client_factory: Arc<ClientFactory>,
     // todo: add some metrics here.
 }
 
@@ -65,6 +76,7 @@ impl BlockReplicationManager {
             staging_queue_sender: Arc::new(send),
             runtime: rt.clone(),
             inflight_blocks: Default::default(),
+            worker_client_factory: Arc::new(Default::default()),
         };
         let manager = Arc::new(manager);
         Self::handle(async_runtime, manager.clone(), recv);
@@ -90,6 +102,26 @@ impl BlockReplicationManager {
         });
     }
 
+    fn get_worker_addr(&self, worker_id: WorkerId) -> CommonResult<WorkerAddress> {
+        let worker_manager = self.worker_manager.read();
+        match worker_manager.get_worker(worker_id) {
+            None => {
+                err_box!("Worker not found: {}", worker_id)
+            }
+            Some(worker) => Ok(worker.address.clone()),
+        }
+    }
+
+    fn assign(&self, exclusive_worker_ids: Vec<WorkerId>) -> CommonResult<WorkerAddress> {
+        let worker_manager = self.worker_manager.read();
+        let mut assignment = worker_manager.choose_workers(1, exclusive_worker_ids)?;
+        let worker_id = try_option!(assignment.pop()).worker_id;
+        let worker_addr = try_option!(worker_manager.get_worker(worker_id))
+            .address
+            .clone();
+        Ok(worker_addr)
+    }
+
     async fn replicate_block(
         &self,
         block_id: BlockId,
@@ -97,45 +129,77 @@ impl BlockReplicationManager {
     ) -> CommonResult<()> {
         // todo: check whether the block_id replicas legal
 
-        let fs = self.fs.fs_dir.write();
-        let locations = fs.get_block_locations(block_id)?;
-        drop(fs);
-
-        if locations.is_empty() {
-            warn!("Found missing block: {}", block_id);
-            return Ok(());
-        }
+        let locations = {
+            let fs_dir = self.fs.fs_dir.read();
+            fs_dir.get_block_locations(block_id)?
+        };
 
         // step1: find out the available worker to replicate blocks
         // todo: use pluggable policy to find out the best worker to do replication
-        let worker_id = locations.first().unwrap().worker_id;
-        let worker_manager = self.worker_manager.read();
-        let Some(worker) = worker_manager.get_worker(worker_id) else {
-            warn!("Invalid worker id: {}", worker_id);
-            return Ok(());
+        let source_worker_id =
+            try_option!(locations.first(), "missing block: {}", block_id).worker_id;
+        let source_worker_addr = self.get_worker_addr(source_worker_id)?;
+
+        // step2: choose the target worker
+        let target_worker_addr = self.assign(locations.iter().map(|x| x.worker_id).collect())?;
+
+        // step3: call the corresponding worker to do replication
+        let source_worker_addr = InetAddr::new(
+            &source_worker_addr.ip_addr,
+            source_worker_addr.rpc_port as u16,
+        );
+        let source_worker_client = self
+            .worker_client_factory
+            .create_raw(&source_worker_addr)
+            .await?;
+
+        let request = SumbitBlockReplicationRequest {
+            block_id,
+            target_worker_info: target_worker_addr.clone().into(),
         };
+        let msg = Builder::new_rpc(RpcCode::SubmitBlockReplicationJob)
+            .request(RequestStatus::Rpc)
+            .proto_header(request)
+            .build();
+        match source_worker_client.rpc(msg).await {
+            Ok(response) => {
+                let response: SubmitBlockReplicationResponse = response.parse_header()?;
+                if !response.success {
+                    return err_box!(
+                        "Errors on submit replication job to {}. err: {:?}",
+                        &source_worker_addr,
+                        response.message
+                    );
+                }
+            }
+            Err(e) => {
+                return err_box!(
+                    "Errors on sending replication job to {}, err: {:?}",
+                    &source_worker_addr,
+                    e
+                );
+            }
+        }
 
-        // step2: call the corresponding worker to do replication
-
-        // step3: add into the replicating queue
+        // step4: add into the replicating queue
         self.inflight_blocks.insert(
             block_id,
             InflightReplicationJob {
                 block_id,
                 permit,
-                target_worker: worker.address.clone(),
+                target_worker: target_worker_addr,
             },
         );
 
         Ok(())
     }
 
-    // This is invoked by heartbeat task or worker manager to report under_replicated blocks due to the missing workers
     pub async fn report_under_replicated_blocks(
         &self,
         worker_id: WorkerId,
         block_ids: Vec<BlockId>,
     ) -> CommonResult<()> {
+        // todo: check whether this block is under replicated
         for block_id in block_ids {
             self.staging_queue_sender.send(block_id).await?;
         }
@@ -154,8 +218,8 @@ impl BlockReplicationManager {
             }
             Some(entry) => {
                 if success {
-                    // todo: add location for the block id
                     let dir = self.fs.fs_dir.write();
+                    // todo: change its storage type
                     let location =
                         BlockLocation::new(entry.1.target_worker.worker_id, StorageType::Disk);
                     dir.add_block_location(block_id, location)?;
