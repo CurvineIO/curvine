@@ -639,9 +639,9 @@ impl FsDir {
         &self.store.store
     }
 
-    pub fn delete_locations(&self, worker_id: u32) -> FsResult<()> {
-        self.store.store.delete_locations(worker_id)?;
-        Ok(())
+    pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
+        let block_ids = self.store.store.delete_locations(worker_id)?;
+        Ok(block_ids)
     }
 
     // for testing

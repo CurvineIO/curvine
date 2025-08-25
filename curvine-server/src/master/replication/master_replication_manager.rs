@@ -26,12 +26,12 @@ use orpc::io::net::InetAddr;
 use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::sync::FastDashMap;
-use orpc::{err_box, try_option, CommonResult};
+use orpc::{err_box, try_log, try_option, CommonResult};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-type BlockId = i64;
+pub type BlockId = i64;
 type WorkerId = u32;
 
 #[derive(Clone)]
@@ -57,9 +57,9 @@ struct InflightReplicationJob {
 
 impl MasterReplicationManager {
     pub fn new(
-        fs: MasterFilesystem,
-        conf: ClusterConf,
-        rt: Arc<AsyncRuntime>,
+        fs: &MasterFilesystem,
+        conf: &ClusterConf,
+        rt: &Arc<AsyncRuntime>,
         worker_manager: &SyncWorkerManager,
     ) -> Arc<Self> {
         let async_runtime = rt.clone();
@@ -67,7 +67,7 @@ impl MasterReplicationManager {
         let (send, recv) = tokio::sync::mpsc::channel(10000);
 
         let manager = Self {
-            fs,
+            fs: fs.clone(),
             worker_manager: worker_manager.clone(),
             replication_semaphore: Arc::new(semaphore),
             staging_queue_sender: Arc::new(send),
@@ -191,15 +191,16 @@ impl MasterReplicationManager {
         Ok(())
     }
 
-    pub async fn report_under_replicated_blocks(
+    pub fn report_under_replicated_blocks(
         &self,
         worker_id: WorkerId,
-        block_ids: Vec<BlockId>,
+        block_ids: Vec<i64>,
     ) -> CommonResult<()> {
-        // todo: check whether this block is under replicated
-        for block_id in block_ids {
-            self.staging_queue_sender.send(block_id).await?;
-        }
+        self.runtime.block_on(async move {
+            for block_id in &block_ids {
+                let _ = try_log!(self.staging_queue_sender.send(*block_id).await);
+            }
+        });
         Ok(())
     }
 

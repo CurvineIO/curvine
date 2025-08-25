@@ -12,23 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use once_cell::sync::OnceCell;
-use std::sync::Arc;
-
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
+use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::router_handler::MasterRouterHandler;
 use crate::master::MountManager;
 use crate::master::{LoadManager, MasterHandler};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
 use curvine_common::conf::ClusterConf;
 use curvine_web::server::{WebHandlerService, WebServer};
+use once_cell::sync::OnceCell;
 use orpc::common::{LocalTime, Logger, Metrics};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
+use raft::ProgressState::Replicate;
+use std::sync::Arc;
 
 static MASTER_METRICS: OnceCell<MasterMetrics> = OnceCell::new();
 
@@ -114,6 +115,7 @@ pub struct Master {
     actor: MasterActor,
     mount_manager: Arc<MountManager>,
     load_manager: Arc<LoadManager>,
+    replication_manager: Arc<MasterReplicationManager>,
 }
 
 impl Master {
@@ -130,15 +132,19 @@ impl Master {
         // step1: Create a journal system, the journal system determines how to create a fs dir.
         let journal_system = JournalSystem::from_conf(&conf)?;
         let fs = journal_system.fs();
+        let worker_manager = journal_system.worker_manager();
         let mount_manager = journal_system.mount_manager();
+
+        let rt = Arc::new(conf.master_server_conf().create_runtime());
+
+        let replication_manager = MasterReplicationManager::new(&fs, &conf, &rt, &worker_manager);
 
         let actor = MasterActor::new(
             fs.clone(),
             journal_system.master_monitor(),
             conf.master.new_executor(),
+            &replication_manager,
         );
-
-        let rt = Arc::new(conf.master_server_conf().create_runtime());
 
         let load_manager = Arc::new(LoadManager::from_cluster_conf(
             Arc::new(fs.clone()),
@@ -172,6 +178,7 @@ impl Master {
             actor,
             mount_manager,
             load_manager,
+            replication_manager,
         })
     }
 
