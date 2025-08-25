@@ -15,8 +15,9 @@ message SubmitBlockReplicationResponse {
 
 message ReportBlockReplicationRequest {
     required int64 block_id = 1;
-    required bool success =  2;
-    optional string message = 3;
+    required StorageTypeProto storage_type = 2;
+    required bool success =  3;
+    optional string message = 4;
 }
 
 message ReportBlockReplicationResponse {

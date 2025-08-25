@@ -209,6 +209,7 @@ impl MasterReplicationManager {
         let block_id = req.block_id;
         let success = req.success;
         let message = req.message;
+        let storage_type = req.storage_type;
         match self.inflight_blocks.remove(&block_id) {
             None => {
                 warn!("Should not happen that Block {} not found", block_id);
@@ -216,9 +217,8 @@ impl MasterReplicationManager {
             Some(entry) => {
                 if success {
                     let dir = self.fs.fs_dir.write();
-                    // todo: change its storage type
                     let location =
-                        BlockLocation::new(entry.1.target_worker.worker_id, StorageType::Disk);
+                        BlockLocation::new(entry.1.target_worker.worker_id, storage_type.into());
                     dir.add_block_location(block_id, location)?;
                 } else {
                     error!(
