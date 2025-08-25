@@ -608,7 +608,7 @@ impl MasterFilesystem {
         fs_dir.block_report(batch)
     }
 
-    pub fn delete_locations(&self, worker_id: u32) -> FsResult<()> {
+    pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
         let fs_dir = self.fs_dir.write();
         fs_dir.delete_locations(worker_id)
     }

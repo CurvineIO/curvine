@@ -487,6 +487,11 @@ impl FsDir {
         Ok(locs)
     }
 
+    pub fn add_block_location(&self, block_id: i64, location: BlockLocation) -> FsResult<()> {
+        self.store.add_block_location(block_id, location)?;
+        Ok(())
+    }
+
     pub fn get_block_locations(&self, block_id: i64) -> FsResult<Vec<BlockLocation>> {
         Ok(self.store.get_block_locations(block_id)?)
     }
@@ -634,9 +639,9 @@ impl FsDir {
         &self.store.store
     }
 
-    pub fn delete_locations(&self, worker_id: u32) -> FsResult<()> {
-        self.store.store.delete_locations(worker_id)?;
-        Ok(())
+    pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
+        let block_ids = self.store.store.delete_locations(worker_id)?;
+        Ok(block_ids)
     }
 
     // for testing

@@ -22,6 +22,7 @@ fn main() {
         "worker.proto",
         "load.proto",
         "mount.proto",
+        "replication.proto",
     ];
 
     let base = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());

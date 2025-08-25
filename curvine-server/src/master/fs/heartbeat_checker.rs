@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
+use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
 use curvine_common::error::FsError;
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{error, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::runtime::{GroupExecutor, LoopTask};
 use orpc::try_log;
@@ -28,10 +29,16 @@ pub struct HeartbeatChecker {
     executor: Arc<GroupExecutor>,
     worker_blacklist_ms: u64,
     worker_lost_ms: u64,
+    replication_manager: Arc<MasterReplicationManager>,
 }
 
 impl HeartbeatChecker {
-    pub fn new(fs: MasterFilesystem, monitor: MasterMonitor, executor: Arc<GroupExecutor>) -> Self {
+    pub fn new(
+        fs: MasterFilesystem,
+        monitor: MasterMonitor,
+        executor: Arc<GroupExecutor>,
+        replication_manager: Arc<MasterReplicationManager>,
+    ) -> Self {
         let worker_blacklist_ms = fs.conf.worker_blacklist_interval_ms();
         let worker_lost_ms = fs.conf.worker_lost_interval_ms();
         Self {
@@ -40,6 +47,7 @@ impl HeartbeatChecker {
             executor,
             worker_blacklist_ms,
             worker_lost_ms,
+            replication_manager,
         }
     }
 }
@@ -75,9 +83,17 @@ impl LoopTask for HeartbeatChecker {
                 );
                 // Asynchronously delete all block location data.
                 let fs = self.fs.clone();
+                let rm = self.replication_manager.clone();
                 let res = self.executor.spawn(move || {
                     let spend = TimeSpent::new();
-                    let _ = try_log!(fs.delete_locations(id));
+                    let block_ids = try_log!(fs.delete_locations(id), vec![]);
+                    let block_num = block_ids.len();
+                    if let Err(e) = rm.report_under_replicated_blocks(id, block_ids) {
+                        error!(
+                            "Errors on reporting under-replicated {} blocks. err: {:?}",
+                            block_num, e
+                        );
+                    }
                     info!(
                         "Delete worker {} all locations used {} ms",
                         id,
