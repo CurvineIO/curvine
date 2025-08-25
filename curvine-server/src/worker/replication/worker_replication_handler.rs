@@ -16,12 +16,15 @@ use crate::master::RpcContext;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
-use curvine_common::proto::SumbitBlockReplicationRequest;
+use curvine_common::proto::{
+    ReportBlockReplicationResponse, SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
+};
 use curvine_common::FsResult;
 use log::warn;
 use orpc::error::ErrorImpl;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
+use orpc::CommonResult;
 
 #[derive(Clone)]
 pub struct WorkerReplicationHandler {
@@ -37,8 +40,17 @@ impl WorkerReplicationHandler {
 
     pub fn accept_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: SumbitBlockReplicationRequest = ctx.parse_header()?;
-        self.manager.accept_job(req.into())?;
-        todo!()
+        let response = match self.manager.accept_job(req.into()) {
+            Ok(_) => SubmitBlockReplicationResponse {
+                success: true,
+                message: None,
+            },
+            Err(e) => SubmitBlockReplicationResponse {
+                success: false,
+                message: e.to_string().into(),
+            },
+        };
+        ctx.response(response)
     }
 }
 

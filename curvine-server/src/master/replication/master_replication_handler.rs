@@ -23,6 +23,7 @@ use orpc::error::ErrorImpl;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use orpc::runtime::AsyncRuntime;
+use orpc::CommonResult;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -38,10 +39,15 @@ impl MasterReplicationHandler {
     pub fn report_replication_result(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: ReportBlockReplicationRequest = ctx.parse_header()?;
         // todo: error handling
-        let _ = self.manager.finish_replicated_block(req);
-        let response = ReportBlockReplicationResponse {
-            success: true,
-            message: None,
+        let response = match self.manager.finish_replicated_block(req) {
+            Ok(_) => ReportBlockReplicationResponse {
+                success: true,
+                message: None,
+            },
+            Err(e) => ReportBlockReplicationResponse {
+                success: false,
+                message: e.to_string().into(),
+            },
         };
         ctx.response(response)
     }
