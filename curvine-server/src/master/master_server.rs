@@ -41,6 +41,7 @@ pub struct MasterService {
     mount_manager: Arc<MountManager>,
     load_manager: Arc<LoadManager>,
     rt: Arc<Runtime>,
+    replication_manager: Arc<MasterReplicationManager>,
 }
 
 impl MasterService {
@@ -51,6 +52,7 @@ impl MasterService {
         mount_manager: Arc<MountManager>,
         load_manager: Arc<LoadManager>,
         rt: Arc<Runtime>,
+        replication_manager: Arc<MasterReplicationManager>,
     ) -> Self {
         Self {
             conf,
@@ -59,6 +61,7 @@ impl MasterService {
             mount_manager,
             load_manager,
             rt,
+            replication_manager,
         }
     }
 
@@ -95,6 +98,7 @@ impl HandlerService for MasterService {
             self.mount_manager.clone(),
             Arc::clone(&self.load_manager),
             self.rt.clone(),
+            self.replication_manager.clone(),
         )
     }
 }
@@ -161,6 +165,7 @@ impl Master {
             mount_manager.clone(),
             Arc::clone(&load_manager),
             rt.clone(),
+            replication_manager.clone(),
         );
 
         let rpc_conf = conf.master_server_conf();

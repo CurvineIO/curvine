@@ -24,7 +24,7 @@ pub mod meta;
 mod load;
 pub use self::load::*;
 
-mod replication;
+pub mod replication;
 
 mod master_server;
 pub use self::master_server::*;

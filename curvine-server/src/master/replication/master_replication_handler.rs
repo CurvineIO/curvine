@@ -27,11 +27,11 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct MasterReplicationHandler {
-    manager: MasterReplicationManager,
+    manager: Arc<MasterReplicationManager>,
 }
 
 impl MasterReplicationHandler {
-    pub fn new(manager: MasterReplicationManager) -> Self {
+    pub fn new(manager: Arc<MasterReplicationManager>) -> Self {
         Self { manager }
     }
 
