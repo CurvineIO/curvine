@@ -14,7 +14,6 @@
 
 use crate::worker::block::{BlockState, BlockStore, MasterClient};
 use crate::worker::replication::replication_job::ReplicationJob;
-use chrono::try_opt;
 use curvine_client::block::BlockWriterRemote;
 use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
@@ -25,6 +24,7 @@ use curvine_common::proto::{
 use curvine_common::state::{ExtendedBlock, FileType};
 use futures::future::ok;
 use log::error;
+use once_cell::sync::OnceCell;
 use orpc::client::ClientFactory;
 use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -42,7 +42,7 @@ pub struct WorkerReplicationManager {
     runtime: Arc<AsyncRuntime>,
     fs_client_context: Arc<FsContext>,
 
-    master_client: MasterClient,
+    master_client: OnceCell<MasterClient>,
 
     replicate_chunk_size: usize,
     // todo: add more metrics to track
@@ -54,7 +54,6 @@ impl WorkerReplicationManager {
         async_runtime: &Arc<AsyncRuntime>,
         conf: &ClusterConf,
         fs_client_context: &Arc<FsContext>,
-        master_client: &MasterClient,
     ) -> Arc<Self> {
         let (send, recv) = tokio::sync::mpsc::channel(10000);
         let handler = Self {
@@ -63,7 +62,7 @@ impl WorkerReplicationManager {
             jobs_queue_sender: Arc::new(send),
             runtime: async_runtime.clone(),
             fs_client_context: fs_client_context.clone(),
-            master_client: master_client.clone(),
+            master_client: Default::default(),
             replicate_chunk_size: 1024 * 1024,
         };
         let handler = Arc::new(handler);
@@ -101,8 +100,7 @@ impl WorkerReplicationManager {
             success: false,
             message: None,
         };
-        let response: ReportBlockReplicationResponse = self
-            .master_client
+        let response: ReportBlockReplicationResponse = try_option!(self.master_client.get())
             .fs_client
             .rpc(RpcCode::ReportBlockReplicationResult, request)
             .await?;
@@ -153,5 +151,9 @@ impl WorkerReplicationManager {
         self.runtime
             .block_on(async move { self.jobs_queue_sender.send(job).await })?;
         Ok(())
+    }
+
+    pub fn with_master_client(&self, master_client: MasterClient) {
+        let _ = self.master_client.set(master_client);
     }
 }

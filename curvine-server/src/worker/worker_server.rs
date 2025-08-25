@@ -15,6 +15,7 @@
 use crate::worker::block::{BlockActor, BlockStore};
 use crate::worker::handler::{WorkerHandler, WorkerRouterHandler};
 use crate::worker::load::FileLoadService;
+use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::WorkerMetrics;
 use curvine_client::file::FsContext;
@@ -25,7 +26,7 @@ use log::{error, info};
 use once_cell::sync::OnceCell;
 use orpc::common::{LocalTime, Logger, Metrics};
 use orpc::handler::HandlerService;
-use orpc::io::net::ConnState;
+use orpc::io::net::{ConnState, InetAddr};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
@@ -42,6 +43,7 @@ pub struct WorkerService {
     conf: ClusterConf,
     file_loader: Arc<FileLoadService>,
     rt: Arc<Runtime>,
+    replication_manager: Arc<WorkerReplicationManager>,
 }
 
 impl WorkerService {
@@ -56,11 +58,15 @@ impl WorkerService {
             return Err(e);
         }
 
+        let replication_manager =
+            WorkerReplicationManager::new(&store, &rt, &conf, &file_loader.get_fs_context());
+
         let ws = Self {
             store,
             conf: conf.clone(),
             file_loader: Arc::from(file_loader),
             rt,
+            replication_manager,
         };
         Ok(ws)
     }
@@ -83,6 +89,7 @@ impl HandlerService for WorkerService {
             handler: None,
             file_loader: self.file_loader.clone(),
             rt: self.rt.clone(),
+            replication_handler: WorkerReplicationHandler::new(&self.replication_manager),
         }
     }
 }
@@ -112,7 +119,6 @@ impl Worker {
 
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
         let service: WorkerService = WorkerService::with_conf(&conf, rt.clone())?;
-        let fs_context = service.file_loader.get_fs_context();
         let worker_id = service.store.worker_id();
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
@@ -121,7 +127,7 @@ impl Worker {
         let block_store = service.store.clone();
         let rpc_server = RpcServer::with_rt(rt.clone(), conf.worker_server_conf(), service.clone());
 
-        let web_server = WebServer::with_rt(rt.clone(), conf.worker_web_conf(), service);
+        let web_server = WebServer::with_rt(rt.clone(), conf.worker_web_conf(), service.clone());
 
         let net_addr = rpc_server.bind_addr();
         let addr = WorkerAddress {
@@ -140,8 +146,9 @@ impl Worker {
         );
 
         let master_client = block_actor.client.clone();
-        let replication_manager =
-            WorkerReplicationManager::new(&block_store, &rt, &conf, &fs_context, &master_client);
+        service
+            .replication_manager
+            .with_master_client(master_client.clone());
 
         rpc_server.add_shutdown_hook(move || {
             if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {

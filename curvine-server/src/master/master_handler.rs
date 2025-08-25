@@ -435,7 +435,7 @@ impl MessageHandler for MasterHandler {
                     return Err(FsError::common("Load service not initialized"));
                 }
             }
-            | RpcCode::ReportBlockReplicationResult => {
+            RpcCode::ReportBlockReplicationResult => {
                 if let Some(ref mut replication_service) = self.replication_handler {
                     return replication_service.handle(msg);
                 } else {

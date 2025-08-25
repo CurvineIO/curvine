@@ -24,7 +24,7 @@ use orpc::handler::MessageHandler;
 use orpc::message::Message;
 
 #[derive(Clone)]
-struct WorkerReplicationHandler {
+pub struct WorkerReplicationHandler {
     manager: WorkerReplicationManager,
 }
 
