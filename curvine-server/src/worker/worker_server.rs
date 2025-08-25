@@ -15,6 +15,7 @@
 use crate::worker::block::{BlockActor, BlockStore};
 use crate::worker::handler::{WorkerHandler, WorkerRouterHandler};
 use crate::worker::load::FileLoadService;
+use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::WorkerMetrics;
 use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
@@ -111,6 +112,7 @@ impl Worker {
 
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
         let service: WorkerService = WorkerService::with_conf(&conf, rt.clone())?;
+        let fs_context = service.file_loader.get_fs_context();
         let worker_id = service.store.worker_id();
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
@@ -133,11 +135,14 @@ impl Worker {
             rt.clone(),
             &conf,
             addr.clone(),
-            block_store,
+            block_store.clone(),
             rpc_server.new_state_ctl(),
         );
 
         let master_client = block_actor.client.clone();
+        let replication_manager =
+            WorkerReplicationManager::new(&block_store, &rt, &conf, &fs_context, &master_client);
+
         rpc_server.add_shutdown_hook(move || {
             if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
                 info!("error unregister {}", e)

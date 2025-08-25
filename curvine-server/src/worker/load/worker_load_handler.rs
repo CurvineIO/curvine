@@ -113,6 +113,10 @@ impl FileLoadService {
         Ok(())
     }
 
+    pub fn get_fs_context(&self) -> Arc<FsContext> {
+        self.fs_client.context()
+    }
+
     /// Handle load task requests from Master
     pub async fn handle_load_task(
         &self,

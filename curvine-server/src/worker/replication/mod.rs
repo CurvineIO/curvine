@@ -12,6 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod replication_job;
-mod worker_replication_handler;
-mod worker_replication_manager;
+pub mod replication_job;
+pub mod worker_replication_handler;
+pub mod worker_replication_manager;

@@ -50,15 +50,15 @@ pub struct WorkerReplicationManager {
 
 impl WorkerReplicationManager {
     pub fn new(
-        block_store: BlockStore,
-        async_runtime: Arc<AsyncRuntime>,
+        block_store: &BlockStore,
+        async_runtime: &Arc<AsyncRuntime>,
         conf: &ClusterConf,
         fs_client_context: &Arc<FsContext>,
         master_client: &MasterClient,
     ) -> Arc<Self> {
         let (send, recv) = tokio::sync::mpsc::channel(10000);
         let handler = Self {
-            block_store,
+            block_store: block_store.clone(),
             replication_semaphore: Arc::new(Semaphore::new(10)),
             jobs_queue_sender: Arc::new(send),
             runtime: async_runtime.clone(),
@@ -67,7 +67,7 @@ impl WorkerReplicationManager {
             replicate_chunk_size: 1024 * 1024,
         };
         let handler = Arc::new(handler);
-        Self::handle(&handler, async_runtime, recv);
+        Self::handle(&handler, async_runtime.clone(), recv);
         handler
     }
 
