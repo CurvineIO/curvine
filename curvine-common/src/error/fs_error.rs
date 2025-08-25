@@ -146,7 +146,7 @@ pub enum FsError {
     #[error("{0}")]
     Expired(ErrorImpl<StringError>),
 
-    // Data expiration
+    // Unsupported UFS read operation
     #[error("{0}")]
     UnsupportedUfsRead(ErrorImpl<StringError>),
 
