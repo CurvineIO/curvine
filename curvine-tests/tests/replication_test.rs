@@ -122,17 +122,15 @@ fn test_block_replication_e2e() -> CommonResult<()> {
     }
 
     // Step 6: Verify data integrity
-    // info!("Verifying data integrity after replication");
-    // let read_data = rt.block_on(async {
-    //     read_test_file(&fs, &path).await
-    // })?;
-    // info!("Expected: {}. Real: {}", test_data.len(), read_data.len());
-    //
-    // if read_data == test_data {
-    //     info!("✓ Data integrity verified - all data matches original");
-    // } else {
-    //     return Err(CommonError::from("Data integrity check failed"));
-    // }
+    info!("Verifying data integrity after replication");
+    let read_data = rt.block_on(async { read_test_file(&fs, &path).await })?;
+    info!("Expected: {}. Real: {}", test_data.len(), read_data.len());
+
+    if read_data == test_data {
+        info!("✓ Data integrity verified - all data matches original");
+    } else {
+        return Err(CommonError::from("Data integrity check failed"));
+    }
 
     // Step 7: Verify increased replication
     let target_block_locations = final_locations.get(&block_id);
@@ -165,7 +163,6 @@ fn test_block_replication_e2e() -> CommonResult<()> {
 
 /// Test replication with worker failure simulation  
 #[test]
-#[ignore]
 fn test_replication_with_simulated_worker_failure() -> CommonResult<()> {
     let mut conf = create_test_config();
     conf.client.block_size = 32 * 1024; // 32KB blocks
@@ -269,14 +266,16 @@ async fn write_test_file(
 async fn read_test_file(fs: &CurvineFileSystem, path: &Path) -> CommonResult<Vec<u8>> {
     let file_status = fs.get_status(path).await?;
     let mut reader = fs.open(path).await?;
-    let mut buffer = BytesMut::with_capacity(file_status.len as usize);
-    loop {
-        let n = reader.read_full(&mut buffer).await?;
-        if n == 0 {
-            break;
-        }
-    }
+
+    // Create buffer with the exact file size, filled with zeros
+    let mut buffer = BytesMut::zeroed(file_status.len as usize);
+
+    // Read the entire file in one call
+    let bytes_read = reader.read_full(&mut buffer).await?;
     reader.complete().await?;
+
+    // Truncate buffer to actual bytes read
+    buffer.truncate(bytes_read);
     Ok(buffer.to_vec())
 }
 
