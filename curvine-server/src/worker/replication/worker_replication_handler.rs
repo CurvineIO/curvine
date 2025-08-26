@@ -17,14 +17,13 @@ use crate::worker::replication::worker_replication_manager::WorkerReplicationMan
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    ReportBlockReplicationResponse, SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
+    SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
 };
 use curvine_common::FsResult;
 use log::warn;
 use orpc::error::ErrorImpl;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
-use orpc::CommonResult;
 
 #[derive(Clone)]
 pub struct WorkerReplicationHandler {

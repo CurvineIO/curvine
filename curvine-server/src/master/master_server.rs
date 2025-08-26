@@ -28,7 +28,6 @@ use orpc::io::net::ConnState;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
-use raft::ProgressState::Replicate;
 use std::sync::Arc;
 
 static MASTER_METRICS: OnceCell<MasterMetrics> = OnceCell::new();

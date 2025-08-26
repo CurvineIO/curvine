@@ -19,8 +19,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     ReportBlockReplicationRequest, SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
 };
-use curvine_common::state::{BlockLocation, StorageType, WorkerAddress};
-use dashmap::DashSet;
+use curvine_common::state::{BlockLocation, WorkerAddress};
 use log::{error, info, warn};
 use orpc::client::ClientFactory;
 use orpc::io::net::InetAddr;

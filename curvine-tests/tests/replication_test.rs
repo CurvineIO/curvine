@@ -17,16 +17,14 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
-    BlockLocation, CreateFileOptsBuilder, FileBlocks, WorkerAddress, WorkerInfo,
+    CreateFileOptsBuilder, FileBlocks, WorkerAddress,
 };
 use curvine_server::test::MiniCluster;
 use log::info;
-use orpc::common::{LocalTime, Utils};
+use orpc::common::Utils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{CommonError, CommonResult};
-use std::str::from_boxed_utf8_unchecked;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Create a test configuration for replication testing
 /// 2 masters, 3 workers, no S3 mounting

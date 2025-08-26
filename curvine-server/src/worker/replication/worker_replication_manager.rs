@@ -19,14 +19,11 @@ use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    ReportBlockReplicationRequest, ReportBlockReplicationResponse, SumbitBlockReplicationRequest,
+    ReportBlockReplicationRequest, ReportBlockReplicationResponse,
 };
 use curvine_common::state::{ExtendedBlock, FileType};
-use futures::future::ok;
 use log::{error, info};
 use once_cell::sync::OnceCell;
-use orpc::client::ClientFactory;
-use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{err_box, try_option, CommonResult};
 use std::sync::Arc;

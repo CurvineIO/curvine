@@ -26,7 +26,7 @@ use log::{error, info};
 use once_cell::sync::OnceCell;
 use orpc::common::{LocalTime, Logger, Metrics};
 use orpc::handler::HandlerService;
-use orpc::io::net::{ConnState, InetAddr};
+use orpc::io::net::ConnState;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
@@ -59,7 +59,7 @@ impl WorkerService {
         }
 
         let replication_manager =
-            WorkerReplicationManager::new(&store, &rt, &conf, &file_loader.get_fs_context());
+            WorkerReplicationManager::new(&store, &rt, conf, &file_loader.get_fs_context());
 
         let ws = Self {
             store,
