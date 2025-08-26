@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
+use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::Master;
 use crate::worker::Worker;
 use curvine_client::file::CurvineFileSystem;
@@ -30,6 +31,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+struct MasterEntry(MasterFilesystem, Arc<MasterReplicationManager>);
+
 // A cluster of unit tests.
 pub struct MiniCluster {
     // Cluster default configuration file
@@ -37,7 +40,7 @@ pub struct MiniCluster {
     pub master_conf: Vec<ClusterConf>,
     pub worker_conf: Vec<ClusterConf>,
 
-    pub master_fs: DashMap<usize, MasterFilesystem>,
+    pub master_entries: DashMap<usize, MasterEntry>,
     pub client_rt: Arc<Runtime>,
 }
 
@@ -48,7 +51,7 @@ impl MiniCluster {
             cluster_conf: master_conf[0].clone(),
             master_conf,
             worker_conf,
-            master_fs: DashMap::new(),
+            master_entries: Default::default(),
             client_rt,
         }
     }
@@ -62,7 +65,10 @@ impl MiniCluster {
     pub fn start_master(&self) {
         for (index, conf) in self.master_conf.iter().enumerate() {
             let master = Master::with_conf(conf.clone()).unwrap();
-            self.master_fs.insert(index, master.get_fs());
+            self.master_entries.insert(
+                index,
+                MasterEntry(master.get_fs(), master.get_replication_manager()),
+            );
             thread::spawn(move || master.block_on_start());
         }
     }
@@ -101,7 +107,7 @@ impl MiniCluster {
 
             // First check if any master is active by checking the master_fs
             let mut raft_leader_ready = false;
-            for master_fs in self.master_fs.iter() {
+            for master_fs in self.master_entries.iter().map(|x| x.0.clone()) {
                 if master_fs.master_monitor.is_active() {
                     raft_leader_ready = true;
                     break;
@@ -204,10 +210,18 @@ impl MiniCluster {
     }
 
     pub fn get_active_master_fs(&self) -> MasterFilesystem {
-        self.master_fs
+        self.master_entries
             .iter()
-            .find(|x| x.master_monitor.is_active())
-            .map(|x| x.clone())
+            .find(|x| x.0.master_monitor.is_active())
+            .map(|x| x.0.clone())
+            .unwrap()
+    }
+
+    pub fn get_active_master_replication_manager(&self) -> Arc<MasterReplicationManager> {
+        self.master_entries
+            .iter()
+            .find(|x| x.0.master_monitor.is_active())
+            .map(|x| x.1.clone())
             .unwrap()
     }
 

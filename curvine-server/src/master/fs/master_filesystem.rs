@@ -185,7 +185,8 @@ impl MasterFilesystem {
 
         if opts.replicas < self.conf.min_replication || opts.replicas >= self.conf.max_replication {
             return err_box!(
-                "The number of replicas needs to be between {} and {}",
+                "The replica number {} needs to be between {} and {}",
+                opts.replicas,
                 self.conf.min_replication,
                 self.conf.max_replication
             );

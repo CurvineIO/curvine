@@ -23,7 +23,7 @@ use curvine_common::proto::{
 };
 use curvine_common::state::{ExtendedBlock, FileType};
 use futures::future::ok;
-use log::error;
+use log::{error, info};
 use once_cell::sync::OnceCell;
 use orpc::client::ClientFactory;
 use orpc::message::{Builder, RequestStatus};
@@ -67,6 +67,8 @@ impl WorkerReplicationManager {
         };
         let handler = Arc::new(handler);
         Self::handle(&handler, async_runtime.clone(), recv);
+
+        info!("Worker replication manager is initialized");
         handler
     }
 
@@ -78,12 +80,15 @@ impl WorkerReplicationManager {
         let manager = me.clone();
         async_runtime.spawn(async move {
             while let Some(mut job) = recv.recv().await {
-                if let Err(e) = manager.replicate_block(&mut job).await {
-                    error!("Errors on replicating block: {}. err: {}", job.block_id, e);
-                } else {
-                    if let Err(e) = manager.report_job(&job).await {
-                        error!("Errors on reporting block: {}. err: {}", job.block_id, e);
+                let msg = match manager.replicate_block(&mut job).await {
+                    Ok(_) => None,
+                    Err(e) => {
+                        error!("Errors on replicating block: {}. err: {}", job.block_id, e);
+                        Some(e.to_string())
                     }
+                };
+                if let Err(e) = manager.report_job(&job, msg).await {
+                    error!("Errors on reporting block: {}. err: {}", job.block_id, e);
                 }
             }
         });
@@ -92,13 +97,14 @@ impl WorkerReplicationManager {
     async fn report_job(
         &self,
         job: &ReplicationJob,
+        err_msg: Option<String>,
     ) -> CommonResult<ReportBlockReplicationResponse> {
         let storage_type = try_option!(job.storage_type);
         let request = ReportBlockReplicationRequest {
             block_id: job.block_id,
             storage_type: storage_type.into(),
-            success: false,
-            message: None,
+            success: err_msg.is_none(),
+            message: err_msg,
         };
         let response: ReportBlockReplicationResponse = try_option!(self.master_client.get())
             .fs_client
@@ -116,15 +122,17 @@ impl WorkerReplicationManager {
             .unwrap();
         let block_meta = self.block_store.get_block(job.block_id)?;
         if block_meta.state != BlockState::Finalized {
-            return err_box!("");
+            return err_box!("Block: {} is not finalized", job.block_id);
         }
         // update the storage type for the replication job.
         job.with_storage_type(block_meta.storage_type());
-        let extend_block = ExtendedBlock::new(
-            block_meta.id,
-            block_meta.len,
-            block_meta.storage_type(),
-            FileType::File,
+        let extend_block =
+            ExtendedBlock::new(block_meta.id, 0, block_meta.storage_type(), FileType::File);
+        info!(
+            "Replicating block_id: {} from {} to {}",
+            job.block_id,
+            self.block_store.worker_id(),
+            job.target_worker_addr.worker_id
         );
         let mut writer = BlockWriterRemote::new(
             &self.fs_client_context,

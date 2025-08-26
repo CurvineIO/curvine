@@ -239,6 +239,11 @@ impl Master {
         self.rpc_server.service().fs.clone()
     }
 
+    // for test
+    pub fn get_replication_manager(&self) -> Arc<MasterReplicationManager> {
+        self.replication_manager.clone()
+    }
+
     pub fn service(&self) -> &MasterService {
         self.rpc_server.service()
     }

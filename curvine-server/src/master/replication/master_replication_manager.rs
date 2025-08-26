@@ -20,7 +20,8 @@ use curvine_common::proto::{
     ReportBlockReplicationRequest, SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
 };
 use curvine_common::state::{BlockLocation, StorageType, WorkerAddress};
-use log::{error, warn};
+use dashmap::DashSet;
+use log::{error, info, warn};
 use orpc::client::ClientFactory;
 use orpc::io::net::InetAddr;
 use orpc::message::{Builder, RequestStatus};
@@ -63,7 +64,7 @@ impl MasterReplicationManager {
         worker_manager: &SyncWorkerManager,
     ) -> Arc<Self> {
         let async_runtime = rt.clone();
-        let semaphore = Semaphore::new(10);
+        let semaphore = Semaphore::new(100);
         let (send, recv) = tokio::sync::mpsc::channel(10000);
 
         let manager = Self {
@@ -77,6 +78,8 @@ impl MasterReplicationManager {
         };
         let manager = Arc::new(manager);
         Self::handle(async_runtime, manager.clone(), recv);
+
+        info!("Master replication manager is initialized");
         manager
     }
 
@@ -139,6 +142,10 @@ impl MasterReplicationManager {
 
         // step2: choose the target worker
         let target_worker_addr = self.assign(locations.iter().map(|x| x.worker_id).collect())?;
+        info!(
+            "block_id: {}. locations: {:?}, target: {}",
+            block_id, &locations, &target_worker_addr
+        );
 
         // step3: call the corresponding worker to do replication
         let source_worker_addr = InetAddr::new(
@@ -198,6 +205,7 @@ impl MasterReplicationManager {
     ) -> CommonResult<()> {
         self.runtime.block_on(async move {
             for block_id in &block_ids {
+                info!("Accepting block {} replication job", block_id);
                 let _ = try_log!(self.staging_queue_sender.send(*block_id).await);
             }
         });
@@ -217,6 +225,7 @@ impl MasterReplicationManager {
             }
             Some(entry) => {
                 if success {
+                    info!("Successfully replicated {}", block_id);
                     let dir = self.fs.fs_dir.write();
                     let location =
                         BlockLocation::new(entry.1.target_worker.worker_id, storage_type.into());

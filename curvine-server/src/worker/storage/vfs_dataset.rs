@@ -158,9 +158,10 @@ impl Dataset for VfsDataset {
     fn create_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         if let Some(v) = self.block_map.get(&block.id) {
             return err_box!(
-                "Block {} already exists in state {:?} and thus cannot be created",
+                "Block {} already exists in state {:?} and thus cannot be created in worker_id: {}",
                 block.id,
-                v.state()
+                v.state(),
+                self.worker_id
             );
         }
 
