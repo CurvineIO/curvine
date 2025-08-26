@@ -99,11 +99,6 @@ fn test_block_replication_e2e() -> CommonResult<()> {
     // In a real scenario, this would happen when a worker fails
     let master_replication_manager = cluster.get_active_master_replication_manager();
 
-    for block_loc in &file_blocks.block_locs {
-        let block = &block_loc.block;
-        println!("id: {}. len: {}", block.id, block.len);
-    }
-
     // Pick the first block and simulate it becoming under-replicated
     let first_block = file_blocks.block_locs.first().unwrap();
     let block_id = first_block.block.id;
@@ -131,6 +126,7 @@ fn test_block_replication_e2e() -> CommonResult<()> {
     // let read_data = rt.block_on(async {
     //     read_test_file(&fs, &path).await
     // })?;
+    // info!("Expected: {}. Real: {}", test_data.len(), read_data.len());
     //
     // if read_data == test_data {
     //     info!("✓ Data integrity verified - all data matches original");
@@ -274,7 +270,13 @@ async fn read_test_file(fs: &CurvineFileSystem, path: &Path) -> CommonResult<Vec
     let file_status = fs.get_status(path).await?;
     let mut reader = fs.open(path).await?;
     let mut buffer = BytesMut::with_capacity(file_status.len as usize);
-    reader.read_full(&mut buffer).await?;
+    loop {
+        let n = reader.read_full(&mut buffer).await?;
+        if n == 0 {
+            break;
+        }
+    }
+    reader.complete().await?;
     Ok(buffer.to_vec())
 }
 
