@@ -14,6 +14,7 @@
 
 use curvine_common::proto::SumbitBlockReplicationRequest;
 use curvine_common::state::{StorageType, WorkerAddress};
+use curvine_common::utils::ProtoUtils;
 
 pub struct ReplicationJob {
     pub block_id: i64,
@@ -25,7 +26,7 @@ impl From<SumbitBlockReplicationRequest> for ReplicationJob {
     fn from(val: SumbitBlockReplicationRequest) -> Self {
         ReplicationJob {
             block_id: val.block_id,
-            target_worker_addr: val.target_worker_info.into(),
+            target_worker_addr: ProtoUtils::worker_address_from_pb(&val.target_worker_info),
             storage_type: None,
         }
     }

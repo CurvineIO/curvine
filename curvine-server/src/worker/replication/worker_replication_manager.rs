@@ -18,9 +18,7 @@ use curvine_client::block::BlockWriterRemote;
 use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
-use curvine_common::proto::{
-    ReportBlockReplicationRequest, ReportBlockReplicationResponse,
-};
+use curvine_common::proto::{ReportBlockReplicationRequest, ReportBlockReplicationResponse};
 use curvine_common::state::{ExtendedBlock, FileType};
 use log::{error, info};
 use once_cell::sync::OnceCell;

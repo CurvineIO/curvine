@@ -20,6 +20,7 @@ use curvine_common::proto::{
     ReportBlockReplicationRequest, SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
 };
 use curvine_common::state::{BlockLocation, WorkerAddress};
+use curvine_common::utils::ProtoUtils;
 use log::{error, info, warn};
 use orpc::client::ClientFactory;
 use orpc::io::net::InetAddr;
@@ -158,7 +159,7 @@ impl MasterReplicationManager {
 
         let request = SumbitBlockReplicationRequest {
             block_id,
-            target_worker_info: target_worker_addr.clone().into(),
+            target_worker_info: ProtoUtils::worker_address_to_pb(&target_worker_addr),
         };
         let msg = Builder::new_rpc(RpcCode::SubmitBlockReplicationJob)
             .request(RequestStatus::Rpc)
