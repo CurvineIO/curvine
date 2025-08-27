@@ -84,6 +84,9 @@ pub struct MasterConf {
     pub audit_logging_enabled: bool,
     pub audit_log: LogConf,
 
+    // Block replication
+    pub block_replication_enabled: bool,
+
     pub log: LogConf,
     // Master loading function configuration
     pub load: MasterLoadConf,
@@ -233,6 +236,7 @@ impl Default for MasterConf {
             audit_logging_enabled: true,
             audit_log: Default::default(),
 
+            block_replication_enabled: false,
             log: Default::default(),
             load: Default::default(),
 

@@ -47,6 +47,8 @@ pub struct MasterReplicationManager {
     inflight_blocks: Arc<FastDashMap<BlockId, InflightReplicationJob>>,
 
     worker_client_factory: Arc<ClientFactory>,
+
+    replication_enabled: bool,
     // todo: add some metrics here.
 }
 
@@ -59,7 +61,7 @@ struct InflightReplicationJob {
 impl MasterReplicationManager {
     pub fn new(
         fs: &MasterFilesystem,
-        _conf: &ClusterConf,
+        conf: &ClusterConf,
         rt: &Arc<AsyncRuntime>,
         worker_manager: &SyncWorkerManager,
     ) -> Arc<Self> {
@@ -75,6 +77,7 @@ impl MasterReplicationManager {
             runtime: rt.clone(),
             inflight_blocks: Default::default(),
             worker_client_factory: Arc::new(Default::default()),
+            replication_enabled: conf.master.block_replication_enabled,
         };
         let manager = Arc::new(manager);
         Self::handle(async_runtime, manager.clone(), recv);
@@ -203,6 +206,9 @@ impl MasterReplicationManager {
         _worker_id: WorkerId,
         block_ids: Vec<i64>,
     ) -> CommonResult<()> {
+        if !self.replication_enabled {
+            return Ok(());
+        }
         self.runtime.block_on(async move {
             for block_id in &block_ids {
                 info!("Accepting block {} replication job", block_id);
