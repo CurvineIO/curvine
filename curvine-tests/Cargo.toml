@@ -19,3 +19,4 @@ bytes = { workspace = true }
 once_cell = { workspace = true }
 clap = { workspace = true }
 awaitility = "0.4"
+tempfile = { workspace = true }
