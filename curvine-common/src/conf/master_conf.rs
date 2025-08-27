@@ -86,6 +86,7 @@ pub struct MasterConf {
 
     // Block replication
     pub block_replication_enabled: bool,
+    pub block_replication_concurrency_limit: usize,
 
     pub log: LogConf,
     // Master loading function configuration
@@ -237,6 +238,7 @@ impl Default for MasterConf {
             audit_log: Default::default(),
 
             block_replication_enabled: false,
+            block_replication_concurrency_limit: 1000,
             log: Default::default(),
             load: Default::default(),
 
