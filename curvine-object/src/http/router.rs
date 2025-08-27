@@ -537,7 +537,6 @@ impl S3Router {
         req: Request,
         listobj_obj: Option<Arc<dyn ListObjectHandler + Send + Sync>>,
     ) -> axum::response::Response {
-        log::info!("is list objects");
         match listobj_obj {
             Some(listobj_obj) => {
                 let mut resp = Response::default();

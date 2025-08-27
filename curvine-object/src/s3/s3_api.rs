@@ -552,7 +552,7 @@ pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
 
             match quick_xml::se::to_string(&result) {
                 Ok(data) => {
-                    log::info!("ListObjectsV2 XML => {}", data);
+                    log::debug!("ListObjectsV2 XML => {}", data);
                     resp.set_header("content-type", "application/xml");
                     resp.set_header("content-length", data.len().to_string().as_str());
                     resp.set_status(200);

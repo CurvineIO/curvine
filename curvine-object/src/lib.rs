@@ -285,7 +285,7 @@ pub async fn start_gateway(
         .try_init();
 
     tracing::info!(
-        "Starting Curvine S3 Gateway on {} with region {}",
+        "Try to start Curvine S3 Gateway on {} with region {}",
         listen,
         region
     );
@@ -335,7 +335,7 @@ pub async fn start_gateway(
 
     // Parse the listen address and bind the server
     let addr: SocketAddr = listen.parse().expect("invalid listen address");
-    tracing::info!("Binding to address: {}", addr);
+    tracing::debug!("Binding to address: {}", addr);
 
     // Create TCP listener for incoming connections
     let listener = tokio::net::TcpListener::bind(addr).await?;

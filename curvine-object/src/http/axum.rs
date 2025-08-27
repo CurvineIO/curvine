@@ -254,7 +254,7 @@ impl sig_v4::VHeader for Response {
     }
 
     fn set_header(&mut self, key: &str, val: &str) {
-        log::info!("set header {key} {val}");
+        log::debug!("set header {key} {val}");
         self.headers.insert(
             key.to_string().parse::<axum::http::HeaderName>().unwrap(),
             val.parse().unwrap(),
