@@ -18,6 +18,7 @@ use crate::master::fs::replica_checker::ReplicaChecker;
 use crate::master::meta::inode::ttl::ttl_manager::InodeTtlManager;
 use crate::master::meta::inode::ttl::ttl_scheduler::TtlHeartbeatChecker;
 use crate::master::meta::inode::ttl_scheduler::TtlHeartbeatConfig;
+use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
 use curvine_common::executor::ScheduledExecutor;
 use log::{error, info};
@@ -29,6 +30,7 @@ pub struct MasterActor {
     pub fs: MasterFilesystem,
     pub master_monitor: MasterMonitor,
     pub executor: Arc<GroupExecutor>,
+    pub replication_manager: Arc<MasterReplicationManager>,
 }
 
 impl MasterActor {
@@ -36,11 +38,13 @@ impl MasterActor {
         fs: MasterFilesystem,
         master_monitor: MasterMonitor,
         executor: Arc<GroupExecutor>,
+        replication_manager: &Arc<MasterReplicationManager>,
     ) -> Self {
         Self {
             fs,
             master_monitor,
             executor,
+            replication_manager: replication_manager.clone(),
         }
     }
 
@@ -50,6 +54,7 @@ impl MasterActor {
             self.fs.clone(),
             self.master_monitor.clone(),
             self.executor.clone(),
+            self.replication_manager.clone(),
         )
         .unwrap();
 
@@ -104,11 +109,12 @@ impl MasterActor {
         fs: MasterFilesystem,
         master_monitor: MasterMonitor,
         executor: Arc<GroupExecutor>,
+        replication_manager: Arc<MasterReplicationManager>,
     ) -> CommonResult<()> {
         let check_ms = fs.conf.worker_check_interval_ms();
         let scheduler = ScheduledExecutor::new("worker-heartbeat", check_ms);
 
-        let task = HeartbeatChecker::new(fs, master_monitor, executor);
+        let task = HeartbeatChecker::new(fs, master_monitor, executor, replication_manager);
 
         scheduler.start(task)?;
         Ok(())

@@ -54,6 +54,9 @@ pub enum RpcCode {
     WorkerHeartbeat = 40,
     WorkerBlockReport = 41,
 
+    SubmitBlockReplicationJob = 42,
+    ReportBlockReplicationResult = 43,
+
     // block interface.
     WriteBlock = 80,
     ReadBlock = 81,

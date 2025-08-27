@@ -14,6 +14,8 @@
 
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::load::{LoadManager, MasterLoadService};
+use crate::master::replication::master_replication_handler::MasterReplicationHandler;
+use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_common::conf::ClusterConf;
@@ -39,9 +41,11 @@ pub struct MasterHandler {
     pub(crate) conn_state: Option<ConnState>,
     pub(crate) load_service: Option<MasterLoadService>,
     pub(crate) mount_manager: Arc<MountManager>,
+    pub(crate) replication_handler: Option<MasterReplicationHandler>,
 }
 
 impl MasterHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         conf: &ClusterConf,
         fs: MasterFilesystem,
@@ -50,6 +54,7 @@ impl MasterHandler {
         mount_manager: Arc<MountManager>,
         load_manager: Arc<LoadManager>,
         rt: Arc<Runtime>,
+        replication_manager: Arc<MasterReplicationManager>,
     ) -> Self {
         Self {
             fs,
@@ -59,6 +64,7 @@ impl MasterHandler {
             conn_state,
             load_service: Some(MasterLoadService::new(load_manager, rt.clone())),
             mount_manager,
+            replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
         }
     }
 
@@ -428,6 +434,13 @@ impl MessageHandler for MasterHandler {
                     return load_service.handle(msg);
                 } else {
                     return Err(FsError::common("Load service not initialized"));
+                }
+            }
+            RpcCode::ReportBlockReplicationResult => {
+                if let Some(ref mut replication_service) = self.replication_handler {
+                    return replication_service.handle(msg);
+                } else {
+                    return Err(FsError::common("Replication service not initialized"));
                 }
             }
 

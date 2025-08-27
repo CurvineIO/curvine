@@ -16,6 +16,7 @@ use crate::master::RpcContext;
 use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler;
 use crate::worker::load::FileLoadService;
+use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
@@ -31,6 +32,7 @@ pub struct WorkerHandler {
     pub handler: Option<BlockHandler>,
     pub file_loader: Arc<FileLoadService>,
     pub rt: Arc<Runtime>,
+    pub replication_handler: WorkerReplicationHandler,
 }
 
 impl MessageHandler for WorkerHandler {
@@ -48,6 +50,8 @@ impl MessageHandler for WorkerHandler {
                 let mut rpc_context = RpcContext::new(msg);
                 self.cancel_load_job(&mut rpc_context)
             }
+
+            RpcCode::SubmitBlockReplicationJob => self.replication_handler.handle(msg),
 
             _ => {
                 let h = self.get_handler(msg)?;

@@ -15,6 +15,8 @@
 use crate::worker::block::{BlockActor, BlockStore};
 use crate::worker::handler::{WorkerHandler, WorkerRouterHandler};
 use crate::worker::load::FileLoadService;
+use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
+use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::WorkerMetrics;
 use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
@@ -41,6 +43,7 @@ pub struct WorkerService {
     conf: ClusterConf,
     file_loader: Arc<FileLoadService>,
     rt: Arc<Runtime>,
+    replication_manager: Arc<WorkerReplicationManager>,
 }
 
 impl WorkerService {
@@ -55,11 +58,15 @@ impl WorkerService {
             return Err(e);
         }
 
+        let replication_manager =
+            WorkerReplicationManager::new(&store, &rt, conf, &file_loader.get_fs_context());
+
         let ws = Self {
             store,
             conf: conf.clone(),
             file_loader: Arc::from(file_loader),
             rt,
+            replication_manager,
         };
         Ok(ws)
     }
@@ -82,6 +89,7 @@ impl HandlerService for WorkerService {
             handler: None,
             file_loader: self.file_loader.clone(),
             rt: self.rt.clone(),
+            replication_handler: WorkerReplicationHandler::new(&self.replication_manager),
         }
     }
 }
@@ -119,7 +127,7 @@ impl Worker {
         let block_store = service.store.clone();
         let rpc_server = RpcServer::with_rt(rt.clone(), conf.worker_server_conf(), service.clone());
 
-        let web_server = WebServer::with_rt(rt.clone(), conf.worker_web_conf(), service);
+        let web_server = WebServer::with_rt(rt.clone(), conf.worker_web_conf(), service.clone());
 
         let net_addr = rpc_server.bind_addr();
         let addr = WorkerAddress {
@@ -133,11 +141,15 @@ impl Worker {
             rt.clone(),
             &conf,
             addr.clone(),
-            block_store,
+            block_store.clone(),
             rpc_server.new_state_ctl(),
         );
 
         let master_client = block_actor.client.clone();
+        service
+            .replication_manager
+            .with_master_client(master_client.clone());
+
         rpc_server.add_shutdown_hook(move || {
             if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
                 info!("error unregister {}", e)

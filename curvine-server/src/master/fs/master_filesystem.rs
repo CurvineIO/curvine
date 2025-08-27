@@ -185,7 +185,8 @@ impl MasterFilesystem {
 
         if opts.replicas < self.conf.min_replication || opts.replicas >= self.conf.max_replication {
             return err_box!(
-                "The number of replicas needs to be between {} and {}",
+                "The replica number {} needs to be between {} and {}",
+                opts.replicas,
                 self.conf.min_replication,
                 self.conf.max_replication
             );
@@ -608,7 +609,7 @@ impl MasterFilesystem {
         fs_dir.block_report(batch)
     }
 
-    pub fn delete_locations(&self, worker_id: u32) -> FsResult<()> {
+    pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
         let fs_dir = self.fs_dir.write();
         fs_dir.delete_locations(worker_id)
     }

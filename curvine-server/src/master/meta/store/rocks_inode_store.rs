@@ -106,7 +106,7 @@ impl RocksInodeStore {
         self.db.iter_cf_opt(cf)
     }
 
-    pub fn delete_locations(&self, worker_id: u32) -> CommonResult<()> {
+    pub fn delete_locations(&self, worker_id: u32) -> CommonResult<Vec<i64>> {
         let block_ids = self.get_block_ids(worker_id)?;
 
         // delete all worker_id -> block_ids
@@ -114,12 +114,12 @@ impl RocksInodeStore {
         self.db.prefix_delete(Self::CF_LOCATION, prefix)?;
 
         // delete all block_id -> worker_ids
-        for block_id in block_ids {
-            let key = RocksUtils::i64_u32_to_bytes(block_id, worker_id);
+        for block_id in &block_ids {
+            let key = RocksUtils::i64_u32_to_bytes(*block_id, worker_id);
             self.db.delete_cf(Self::CF_BLOCK, key)?;
         }
 
-        Ok(())
+        Ok(block_ids)
     }
 
     pub fn get_block_ids(&self, worker_id: u32) -> CommonResult<Vec<i64>> {
