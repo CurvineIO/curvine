@@ -1,6 +1,6 @@
 use clap::Subcommand;
-use curvine_client::file::CurvineFileSystem;
-use curvine_common::fs::{CurvineURI, Writer};
+use curvine_client::unified::UnifiedFileSystem;
+use curvine_common::fs::{CurvineURI, FileSystem, Writer};
 use orpc::CommonResult;
 use std::path::PathBuf;
 use tokio::fs;
@@ -19,7 +19,7 @@ pub enum PutCommand {
 }
 
 impl PutCommand {
-    pub async fn execute(&self, client: CurvineFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             PutCommand::Put {
                 local_path,

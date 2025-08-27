@@ -18,7 +18,7 @@ mod util;
 
 use clap::Parser;
 use commands::Commands;
-use curvine_client::file::CurvineFileSystem;
+use curvine_client::unified::UnifiedFileSystem;
 use curvine_client::LoadClient;
 use curvine_common::conf::ClusterConf;
 use curvine_common::version;
@@ -47,7 +47,7 @@ fn main() -> CommonResult<()> {
     let conf = ClusterConf::from(&actual_conf)
         .map_err(|e| format!("Failed to load configuration from {}: {}", actual_conf, e))?;
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-    let curvine_fs = CurvineFileSystem::with_rt(conf.clone(), rt.clone())?;
+    let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let fs_client = curvine_fs.fs_client();
     let load_client = LoadClient::new(fs_client.clone())?;
 

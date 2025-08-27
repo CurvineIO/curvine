@@ -1,6 +1,6 @@
 use clap::Subcommand;
-use curvine_client::file::CurvineFileSystem;
-use curvine_common::fs::{CurvineURI, Writer};
+use curvine_client::unified::UnifiedFileSystem;
+use curvine_common::fs::{CurvineURI, FileSystem, Writer};
 use orpc::CommonResult;
 
 #[derive(Subcommand, Debug)]
@@ -13,7 +13,7 @@ pub enum TouchCommand {
 }
 
 impl TouchCommand {
-    pub async fn execute(&self, client: CurvineFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             TouchCommand::Touch { path } => {
                 let path = CurvineURI::new(path)?;

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::CurvineFileSystem;
+use crate::file::{CurvineFileSystem, FsClient};
 use crate::unified::{MountCache, MountValue, UnifiedReader, UnifiedWriter};
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
@@ -64,8 +64,12 @@ impl UnifiedFileSystem {
         Ok(fs)
     }
 
-    pub fn cv(&self) -> &CurvineFileSystem {
-        &self.cv
+    pub fn cv(&self) -> CurvineFileSystem {
+        self.cv.clone()
+    }
+
+    pub fn fs_client(&self) -> Arc<FsClient> {
+        self.cv.fs_client()
     }
 
     // Check if the path is a mount point, if so, return the mount point information
