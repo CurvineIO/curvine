@@ -1,3 +1,17 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::collections::HashMap;
 
 use axum::response::IntoResponse;
@@ -196,6 +210,7 @@ pub struct Response {
     headers: axum::http::HeaderMap,
     body: Vec<u8>,
 }
+
 impl Default for Response {
     fn default() -> Self {
         Self {
@@ -205,6 +220,7 @@ impl Default for Response {
         }
     }
 }
+
 impl From<Response> for axum::response::Response {
     fn from(val: Response) -> Self {
         let mut respbuilder = axum::response::Response::builder().status(if val.status == 0 {
@@ -218,10 +234,11 @@ impl From<Response> for axum::response::Response {
             }
         }
         let raw = val.body;
-        log::info!("Response body length: {}", raw.len());
+        // log::info!("Response body length: {}", raw.len());
         respbuilder.body(raw.into()).unwrap()
     }
 }
+
 impl sig_v4::VHeader for Response {
     fn get_header(&self, key: &str) -> Option<String> {
         self.headers

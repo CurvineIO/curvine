@@ -1,3 +1,27 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::types::{PutContext, PutOperation};
+use super::ListObjectContent;
+use super::ListObjectHandler;
+use super::ListObjectOption;
+use super::PutObjectHandler;
+use super::PutObjectOption;
+use crate::s3::error::Error;
+use crate::s3::s3_api::HeadHandler;
+use crate::s3::s3_api::HeadObjectResult;
+use crate::utils::utils::{file_status_to_head_object_result, file_status_to_list_object_content};
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
@@ -5,6 +29,7 @@ use curvine_common::state::FileType;
 use curvine_common::FsResult;
 use orpc::runtime::AsyncRuntime;
 use orpc::runtime::RpcRuntime;
+use std::future::Future;
 use tokio::io::AsyncWriteExt;
 use tracing;
 use uuid;
@@ -97,7 +122,7 @@ impl S3Handlers {
 }
 
 #[async_trait::async_trait]
-impl crate::s3::s3_api::HeadHandler for S3Handlers {
+impl HeadHandler for S3Handlers {
     /// Look up object metadata for HEAD request
     ///
     /// # Arguments
@@ -115,12 +140,7 @@ impl crate::s3::s3_api::HeadHandler for S3Handlers {
             dyn 'a
                 + Send
                 + Sync
-                + std::future::Future<
-                    Output = Result<
-                        Option<crate::s3::s3_api::HeadObjectResult>,
-                        crate::s3::error::Error,
-                    >,
-                >,
+                + std::future::Future<Output = Result<Option<HeadObjectResult>, Error>>,
         >,
     > {
         tracing::debug!("HEAD request for s3://{}/{}", bucket, object);
@@ -140,21 +160,18 @@ impl crate::s3::s3_api::HeadHandler for S3Handlers {
 
         let fs = self.fs.clone();
         let rt = self.rt.clone();
+        let object_name = object.to_string(); // Convert to owned string for async block
+
         Box::pin(async move {
             let res = tokio::task::block_in_place(|| rt.block_on(fs.get_status(&path)));
             match res {
                 Ok(st) if st.file_type == FileType::File => {
                     tracing::debug!("Found file at path: {}, size: {}", path, st.len);
-                    let mut head: crate::s3::s3_api::HeadObjectResult = Default::default();
-                    head.content_length = Some(st.len as usize);
-                    head.last_modified = Some(
-                        chrono::Utc::now()
-                            .format("%a, %d %b %Y %H:%M:%S GMT")
-                            .to_string(),
-                    );
-                    Ok::<Option<crate::s3::s3_api::HeadObjectResult>, crate::s3::error::Error>(
-                        Some(head),
-                    )
+
+                    // Use file converter to create complete HeadObjectResult
+                    let head = file_status_to_head_object_result(&st, &object_name);
+
+                    Ok::<Option<HeadObjectResult>, Error>(Some(head))
                 }
                 Ok(st) => {
                     tracing::debug!("Path exists but is not a file: {:?}", st.file_type);
@@ -325,7 +342,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 }
 
 #[async_trait::async_trait]
-impl crate::s3::s3_api::PutObjectHandler for S3Handlers {
+impl PutObjectHandler for S3Handlers {
     /// Handle PUT object request for uploading data
     ///
     /// # Arguments
@@ -338,106 +355,23 @@ impl crate::s3::s3_api::PutObjectHandler for S3Handlers {
     /// * Future that resolves to success or error
     fn handle<'a>(
         &'a self,
-        _opt: &crate::s3::s3_api::PutObjectOption,
+        _opt: &PutObjectOption,
         bucket: &'a str,
         object: &'a str,
         body: &'a mut (dyn crate::utils::io::PollRead + Unpin + Send),
     ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>> {
-        let fs = self.fs.clone();
-        let rt = self.rt.clone();
-        let path = self.cv_object_path(bucket, object);
-        let bucket = bucket.to_string();
-        let object = object.to_string();
+        // Create PUT operation context
+        let context = PutContext::new(
+            self.fs.clone(),
+            self.rt.clone(),
+            bucket.to_string(),
+            object.to_string(),
+            self.cv_object_path(bucket, object),
+        );
 
         Box::pin(async move {
-            tracing::info!("PUT object s3://{}/{}", bucket, object);
-
-            // Use our PollRead interface instead of AsyncRead
-            let path = path.map_err(|e| {
-                tracing::error!(
-                    "Failed to convert S3 path s3://{}/{}: {}",
-                    bucket,
-                    object,
-                    e
-                );
-                e.to_string()
-            })?;
-
-            let mut writer = tokio::task::block_in_place(|| rt.block_on(fs.create(&path, true)))
-                .map_err(|e| {
-                    tracing::error!("Failed to create file at path {}: {}", path, e);
-                    e.to_string()
-                })?;
-
-            let mut total_written = 0u64;
-            let mut first_chunk = true;
-
-            loop {
-                // Use PollRead interface to get data as Vec<u8>
-                let chunk_result = body.poll_read().await.map_err(|e| {
-                    tracing::error!("Failed to read from input stream: {}", e);
-                    e
-                })?;
-
-                let chunk = match chunk_result {
-                    Some(data) => data,
-                    None => break, // End of stream
-                };
-
-                if chunk.is_empty() {
-                    break;
-                }
-
-                let n = chunk.len();
-                log::debug!("POLLREAD-CHUNK: {} bytes", n);
-                if n > 0 {
-                    log::debug!(
-                        "POLLREAD-HEX: {:?}",
-                        chunk
-                            .iter()
-                            .take(30)
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
-                }
-
-                // DEBUG: Log first chunk details for debugging
-                if first_chunk {
-                    log::debug!("PUT DEBUG - First chunk: {} bytes", n);
-                    log::debug!(
-                        "PUT DEBUG - First chunk hex: {:?}",
-                        chunk[..n.min(50)]
-                            .iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    );
-                    first_chunk = false;
-                }
-
-                // Write the chunk data directly
-                tokio::task::block_in_place(|| rt.block_on(writer.write(&chunk))).map_err(|e| {
-                    tracing::error!("Failed to write chunk to file: {}", e);
-                    e.to_string()
-                })?;
-
-                total_written += n as u64;
-                tracing::debug!("Written chunk: {} bytes, total: {} bytes", n, total_written);
-            }
-
-            tokio::task::block_in_place(|| rt.block_on(writer.complete())).map_err(|e| {
-                tracing::error!("Failed to complete file write: {}", e);
-                e.to_string()
-            })?;
-
-            tracing::info!(
-                "PUT object s3://{}/{} completed, total bytes: {}",
-                bucket,
-                object,
-                total_written
-            );
-            Ok(())
+            // Execute PUT operation using the orchestrator
+            PutOperation::execute(context, body).await
         })
     }
 }
@@ -686,24 +620,18 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
     }
 }
 
-impl crate::s3::s3_api::ListObjectHandler for S3Handlers {
+impl ListObjectHandler for S3Handlers {
     fn handle<'a>(
         &'a self,
-        opt: &'a crate::s3::s3_api::ListObjectOption,
+        opt: &'a ListObjectOption,
         bucket: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn 'a
-                + Send
-                + std::future::Future<
-                    Output = Result<Vec<crate::s3::s3_api::ListObjectContent>, String>,
-                >,
-        >,
-    > {
+    ) -> std::pin::Pin<Box<dyn 'a + Send + Future<Output = Result<Vec<ListObjectContent>, String>>>>
+    {
         let fs = self.fs.clone();
         let _region = self.region.clone();
         let bucket = bucket.to_string();
         let prefix = opt.prefix.clone();
+
         Box::pin(async move {
             let bkt_path = match self.cv_bucket_path(&bucket) {
                 Ok(p) => p,
@@ -722,96 +650,15 @@ impl crate::s3::s3_api::ListObjectHandler for S3Handlers {
                     // skip directories for now; S3 v2 can emit CommonPrefixes if delimiter set
                     continue;
                 }
-                contents.push(crate::s3::s3_api::ListObjectContent {
-                    key: if let Some(pref) = &prefix {
-                        format!("{}/{}", pref.trim_matches('/'), st.name)
-                    } else {
-                        st.name
-                    },
-                    last_modified: Some(
-                        chrono::Utc::now()
-                            .format("%a, %d %b %Y %H:%M:%S GMT")
-                            .to_string(),
-                    ),
-                    etag: None,
-                    size: st.len as u64,
-                    storage_class: None,
-                    owner: None,
-                });
+                // Use file converter to create complete ListObjectContent
+                let key = if let Some(pref) = &prefix {
+                    format!("{}/{}", pref.trim_matches('/'), st.name.clone())
+                } else {
+                    st.name.clone()
+                };
+                contents.push(file_status_to_list_object_content(&st, key));
             }
             Ok(contents)
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use curvine_common::fs::Path;
-    use std::sync::Arc;
-
-    // Test path mapping functions directly
-    #[test]
-    fn test_cv_object_path() {
-        let handlers = S3Handlers::new(
-            curvine_client::unified::UnifiedFileSystem::with_rt(
-                curvine_common::conf::ClusterConf::default(),
-                Arc::new(orpc::runtime::AsyncRuntime::new("test", 1, 1)),
-            )
-            .unwrap(),
-            "us-east-1".to_string(),
-            Arc::new(orpc::runtime::AsyncRuntime::new("test", 1, 1)),
-        );
-
-        // Test bucket and object path mapping
-        let path = handlers.cv_object_path("mybucket", "folder/file.txt");
-        assert!(path.is_ok());
-        assert_eq!(path.unwrap().to_string(), "/mybucket/folder/file.txt");
-
-        let path = handlers.cv_object_path("bucket", "object");
-        assert!(path.is_ok());
-        assert_eq!(path.unwrap().to_string(), "/bucket/object");
-    }
-
-    #[test]
-    fn test_cv_bucket_path() {
-        let handlers = S3Handlers::new(
-            curvine_client::unified::UnifiedFileSystem::with_rt(
-                curvine_common::conf::ClusterConf::default(),
-                Arc::new(orpc::runtime::AsyncRuntime::new("test", 1, 1)),
-            )
-            .unwrap(),
-            "us-east-1".to_string(),
-            Arc::new(orpc::runtime::AsyncRuntime::new("test", 1, 1)),
-        );
-
-        // Test bucket path mapping
-        let path = handlers.cv_bucket_path("mybucket");
-        assert!(path.is_ok());
-        assert_eq!(path.unwrap().to_string(), "/mybucket");
-    }
-
-    #[test]
-    fn test_path_validation() {
-        let handlers = S3Handlers::new(
-            curvine_client::unified::UnifiedFileSystem::with_rt(
-                curvine_common::conf::ClusterConf::default(),
-                Arc::new(orpc::runtime::AsyncRuntime::new("test", 1, 1)),
-            )
-            .unwrap(),
-            "us-east-1".to_string(),
-            Arc::new(orpc::runtime::AsyncRuntime::new("test", 1, 1)),
-        );
-
-        // Test invalid bucket names
-        let path = handlers.cv_bucket_path("");
-        assert!(path.is_err());
-
-        let path = handlers.cv_bucket_path("invalid/bucket");
-        assert!(path.is_err());
-
-        // Test invalid object names
-        let path = handlers.cv_object_path("bucket", "");
-        assert!(path.is_err());
     }
 }

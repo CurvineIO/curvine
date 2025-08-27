@@ -1,3 +1,17 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 pub use crate::s3::error::Error;
 use std::{
     collections::HashMap,
@@ -160,6 +174,7 @@ pub trait GetObjectHandler: HeadHandler {
         >,
     ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>;
 }
+
 extern crate serde;
 use serde::Serialize;
 use sha1::Digest;
@@ -293,6 +308,7 @@ pub trait ListObjectHandler {
         Box<dyn 'a + Send + std::future::Future<Output = Result<Vec<ListObjectContent>, String>>>,
     >;
 }
+
 pub fn handle_head_object<T: VRequest, F: VResponse, E: HeadHandler>(
     _req: &T,
     _resp: &mut F,
@@ -300,6 +316,7 @@ pub fn handle_head_object<T: VRequest, F: VResponse, E: HeadHandler>(
 ) {
     todo!()
 }
+
 pub async fn handle_get_object<T: VRequest, F: VResponse>(
     req: T,
     resp: &mut F,
@@ -310,6 +327,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         resp.send_header();
         return;
     }
+
     let rpath = req.url_path();
     let raw = rpath.trim_matches('/');
     let r = raw.find('/');
@@ -318,6 +336,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         resp.send_header();
         return;
     }
+
     // build option from query first
     let mut opt = GetObjectOption {
         range_start: req
@@ -327,6 +346,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
             .get_query("range-end")
             .and_then(|v| v.parse::<u64>().ok()),
     };
+
     // Try parse HTTP Range header: bytes=start-end
     if let Some(rh) = req.get_header("range") {
         if let Some(bytes) = rh.strip_prefix("bytes=") {
@@ -345,6 +365,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
             }
         }
     }
+
     let next = r.unwrap();
     let bucket = &raw[..next];
     let object = &raw[next + 1..];
@@ -729,6 +750,7 @@ pub trait PutObjectHandler {
         body: &'a mut (dyn crate::utils::io::PollRead + Unpin + Send),
     ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>;
 }
+
 pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
     mut v4head: crate::auth::sig_v4::V4Head,
     req: T,
