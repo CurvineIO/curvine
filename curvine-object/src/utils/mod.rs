@@ -70,7 +70,7 @@ struct ChunkHead {
 pub async fn chunk_parse<R: io::PollRead + Send, W: tokio::io::AsyncWrite + Send + Unpin>(
     mut src: R,
     dst: &mut W,
-    circle_hasher: &mut crate::auth::v4::HmacSha256CircleHasher,
+    circle_hasher: &mut crate::auth::sig_v4::HmacSha256CircleHasher,
 ) -> Result<usize, ChunkParseError> {
     let mut total_buff = BytesMut::with_capacity(10 << 20);
     let mut head = None;
@@ -100,7 +100,7 @@ async fn parse_buff<W: tokio::io::AsyncWrite + Send + Unpin>(
     mut state: ParseProcessState,
     head: &mut Option<ChunkHead>,
     total_size: &mut usize,
-    circle_hasher: &mut crate::auth::v4::HmacSha256CircleHasher,
+    circle_hasher: &mut crate::auth::sig_v4::HmacSha256CircleHasher,
 ) -> Result<ParseProcessState, ChunkParseError> {
     use tokio::io::AsyncWriteExt;
     while !content.is_empty() {

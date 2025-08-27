@@ -12,7 +12,7 @@ pub type DateTime = chrono::DateTime<chrono::Utc>;
 // Re-export Error from error module
 pub use super::error::Error;
 
-pub trait VRequest: crate::auth::v4::VHeader {
+pub trait VRequest: crate::auth::sig_v4::VHeader {
     fn method(&self) -> String;
     fn url_path(&self) -> String;
     fn get_query(&self, k: &str) -> Option<String>;
@@ -37,7 +37,7 @@ pub trait BodyReader {
     >;
 }
 pub trait HeaderTaker {
-    type Head: crate::auth::v4::VHeader;
+    type Head: crate::auth::sig_v4::VHeader;
     fn take_header(&self) -> Self::Head;
 }
 pub trait VRequestPlus: VRequest {
@@ -47,7 +47,7 @@ pub trait VRequestPlus: VRequest {
         Box<dyn 'a + Send + std::future::Future<Output = Result<Vec<u8>, std::io::Error>>>,
     >;
 }
-pub trait VResponse: crate::auth::v4::VHeader + BodyWriter {
+pub trait VResponse: crate::auth::sig_v4::VHeader + BodyWriter {
     fn set_status(&mut self, status: u16);
     fn send_header(&mut self);
 }
@@ -661,7 +661,7 @@ pub trait PutObjectHandler {
     ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>;
 }
 pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
-    mut v4head: crate::auth::v4::V4Head,
+    mut v4head: crate::auth::sig_v4::V4Head,
     req: T,
     resp: &mut F,
     handler: &std::sync::Arc<dyn PutObjectHandler + Send + Sync>,
@@ -1582,7 +1582,7 @@ enum StreamType {
     File(tokio::fs::File),
     Buff(tokio::io::BufReader<std::io::Cursor<Vec<u8>>>),
 }
-async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::v4::VHeader>(
+async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::sig_v4::VHeader>(
     src: T,
     header: &H,
 ) -> Result<
@@ -2052,4 +2052,3 @@ async fn parse_streaming_body<
 //     #[test]
 //     fn put_and_delete_object() {}
 // }
- 

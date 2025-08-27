@@ -6,8 +6,8 @@
 //! - S3 operation implementations
 
 pub mod error;
+pub mod handlers;
 pub mod s3_api;
-pub mod s3_handlers;
 pub mod types;
 
 // Export APIs to avoid conflicts with duplicated names in types

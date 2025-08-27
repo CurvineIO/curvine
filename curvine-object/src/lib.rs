@@ -15,7 +15,7 @@ use curvine_common::conf::ClusterConf;
 /// Helper function to register all S3 handlers with the router
 fn register_s3_handlers(
     router: axum::Router,
-    handlers: Arc<s3::s3_handlers::S3Handlers>,
+    handlers: Arc<s3::handlers::S3Handlers>,
 ) -> axum::Router {
     router
         .layer(axum::Extension(
@@ -117,7 +117,7 @@ pub async fn start_gateway(
     std::mem::forget(_leaked_rt);
 
     let ufs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
-    let handlers = Arc::new(s3::s3_handlers::S3Handlers::new(
+    let handlers = Arc::new(s3::handlers::S3Handlers::new(
         ufs,
         "us-east-1".to_string(),
         rt.clone(),

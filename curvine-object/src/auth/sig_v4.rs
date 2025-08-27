@@ -4,30 +4,6 @@ extern crate sha1;
 use self::hmac::{Hmac, Mac};
 use self::sha1::Digest;
 
-/// Simple URI encoding function based on AWS S3 requirements
-fn uri_encode(input: &str, encode_slash: bool) -> String {
-    let mut output = String::with_capacity(input.len() * 3);
-
-    for byte in input.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'~' | b'.' => {
-                output.push(byte as char);
-            }
-            b'/' => {
-                if encode_slash {
-                    output.push_str("%2F");
-                } else {
-                    output.push('/');
-                }
-            }
-            _ => {
-                output.push_str(&format!("%{:02X}", byte));
-            }
-        }
-    }
-
-    output
-}
 pub trait VHeader {
     fn get_header(&self, key: &str) -> Option<String>;
     fn set_header(&mut self, key: &str, val: &str);
@@ -50,21 +26,7 @@ pub struct BaseArgs {
 
 pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, ()> {
     let authorization = r.get_header("authorization");
-
     let authorization = authorization.ok_or_else(|| ())?;
-
-    let xamz_content_sha256 = r.get_header("x-amz-content-sha256");
-    // Content SHA256 header validation removed for production
-
-    let xamz_date = r.get_header("x-amz-date");
-
-    // Log all headers for debugging
-    r.rng_header(|k, v| {
-        if k.starts_with("x-amz-") || k == "authorization" || k == "content-length" {
-            // Header logging removed for production
-        }
-        true
-    });
 
     let authorization = authorization.trim();
     let heads = authorization.splitn(2, ' ').collect::<Vec<&str>>();

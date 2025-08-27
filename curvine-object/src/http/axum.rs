@@ -1,14 +1,16 @@
+use std::collections::HashMap;
+
 use axum::response::IntoResponse;
 use futures::StreamExt;
 
-use crate::auth::v4;
+use crate::auth::sig_v4;
 use crate::s3::s3_api::VRequest;
 use axum::body;
 // use std::sync::Arc; // Used via std::sync::Arc in code
 
 pub struct Request {
     request: axum::http::Request<axum::body::Body>,
-    query: Option<std::collections::HashMap<String, String>>,
+    query: Option<HashMap<String, String>>,
 }
 impl From<Request> for axum::extract::Request {
     fn from(val: Request) -> Self {
@@ -34,7 +36,7 @@ impl From<axum::extract::Request> for Request {
         }
     }
 }
-impl v4::VHeader for Request {
+impl sig_v4::VHeader for Request {
     fn get_header(&self, key: &str) -> Option<String> {
         self.request
             .headers()
@@ -155,7 +157,7 @@ impl crate::s3::s3_api::BodyReader for Request {
     }
 }
 pub struct HeaderWarp(axum::http::HeaderMap);
-impl v4::VHeader for HeaderWarp {
+impl sig_v4::VHeader for HeaderWarp {
     fn get_header(&self, key: &str) -> Option<String> {
         self.0
             .get(key)
@@ -220,7 +222,7 @@ impl From<Response> for axum::response::Response {
         respbuilder.body(raw.into()).unwrap()
     }
 }
-impl v4::VHeader for Response {
+impl sig_v4::VHeader for Response {
     fn get_header(&self, key: &str) -> Option<String> {
         self.headers
             .get(key)
@@ -304,7 +306,10 @@ pub async fn handle_fn(
                 .extensions()
                 .get::<std::sync::Arc<dyn crate::s3::s3_api::CreateBucketHandler + Sync + Send>>()
                 .cloned();
-            let v4head = req.extensions().get::<crate::auth::v4::V4Head>().cloned();
+            let v4head = req
+                .extensions()
+                .get::<crate::auth::sig_v4::V4Head>()
+                .cloned();
             let path = req.uri().path();
             let rpath = path
                 .trim_start_matches('/')
@@ -618,7 +623,7 @@ pub async fn handle_fn(
                 match head_obj.lookup(args[0], args[1]).await {
                     Ok(metadata) => match metadata {
                         Some(head) => {
-                            use crate::auth::v4::VHeader;
+                            use crate::auth::sig_v4::VHeader;
                             let mut resp = Response::default();
                             if let Some(v) = head.content_length {
                                 resp.set_header("content-length", v.to_string().as_str())
@@ -691,41 +696,26 @@ pub async fn handle_authorization_middleware(
     req: axum::extract::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> impl axum::response::IntoResponse {
-    // Check if this is a multipart upload request for debugging
-    let is_multipart = (req.method() == axum::http::Method::POST
-        && req.uri().query().map_or(false, |q| q.contains("uploads=")))
-        || (req.method() == axum::http::Method::POST
-            && req.uri().query().map_or(false, |q| q.contains("uploadId=")))
-        || (req.method() == axum::http::Method::PUT
-            && req
-                .uri()
-                .query()
-                .map_or(false, |q| q.contains("x-id=UploadPart")));
-
-    if is_multipart {
-        // Log all headers for multipart requests
-        for (name, value) in req.headers().iter() {
-            if let Ok(v) = value.to_str() {}
-        }
-    }
-
     let ret = req
         .extensions()
         .get::<std::sync::Arc<dyn crate::auth::AccesskeyStore + Send + Sync>>()
         .cloned();
+
     let ak_store = match ret {
         Some(ret) => ret,
         None => {
             return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, b"").into_response();
         }
     };
+
     let req = Request::from(req);
-    let base_arg = match crate::auth::v4::extract_args(&req) {
+    let base_arg = match crate::auth::sig_v4::extract_args(&req) {
         Ok(arg) => arg,
         Err(_) => {
             return (axum::http::StatusCode::BAD_REQUEST, b"").into_response();
         }
     };
+
     // Get raw query string for signature calculation
     let mut query = Vec::new();
     if let Some(query_str) = req.request.uri().query() {
@@ -760,7 +750,7 @@ pub async fn handle_authorization_middleware(
         }
     };
 
-    let ret = crate::auth::v4::get_v4_signature(
+    let ret = crate::auth::sig_v4::get_v4_signature(
         &req,
         req.method().as_str(),
         &base_arg.region,
@@ -779,12 +769,12 @@ pub async fn handle_authorization_middleware(
             }
             circle_hasher
         }
-        Err(err) => {
+        Err(_) => {
             return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
         }
     };
 
-    let v4head = v4::V4Head::new(
+    let v4head = sig_v4::V4Head::new(
         base_arg.signature,
         base_arg.region,
         base_arg.access_key,
@@ -812,227 +802,6 @@ mod bucket {
                 region: region.into(),
                 _xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
             }
-        }
-    }
-}
-#[cfg(test)]
-mod itest {
-    use std::sync::Arc;
-
-    use tokio::io::AsyncReadExt;
-
-    #[derive(Default)]
-    struct Target {}
-    use crate::s3::s3_api::*;
-    impl CreateBucketHandler for Target {
-        fn handle<'a>(
-            &'a self,
-            _opt: &'a CreateBucketOption,
-            _bucket: &'a str,
-        ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>
-        {
-            Box::pin(async move {
-                log::info!("create bucket {_bucket}");
-                Ok(())
-            })
-        }
-    }
-    impl ListBucketHandler for Target {
-        fn handle<'a>(
-            &'a self,
-            _opt: &'a ListBucketsOption,
-        ) -> std::pin::Pin<
-            Box<dyn 'a + Send + std::future::Future<Output = Result<Vec<Bucket>, String>>>,
-        > {
-            Box::pin(async move {
-                let datetime = chrono::Utc::now().to_rfc3339();
-                Ok(vec![Bucket {
-                    name: "test1".to_string(),
-                    creation_date: datetime,
-                    bucket_region: "us-east-1".to_string(),
-                }])
-            })
-        }
-    }
-    impl HeadHandler for Target {
-        fn lookup<'a>(
-            &self,
-            _bucket: &str,
-            _object: &str,
-        ) -> std::pin::Pin<
-            Box<
-                dyn 'a
-                    + Send
-                    + Sync
-                    + std::future::Future<Output = Result<Option<HeadObjectResult>, Error>>,
-            >,
-        > {
-            Box::pin(async move {
-                let mut ret: HeadObjectResult = Default::default();
-                ret.checksum_sha256 = Some(
-                    "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
-                );
-                ret.content_length = Some(5);
-                ret.etag = Some("5d41402abc4b2a76b9719d911017c592".to_string());
-                ret.last_modified = Some(
-                    chrono::Utc::now()
-                        .format("%a, %d %b %Y %H:%M:%S GMT")
-                        .to_string(),
-                );
-                Ok(Some(ret))
-            })
-        }
-    }
-
-    impl PutObjectHandler for Target {
-        fn handle<'a>(
-            &'a self,
-            opt: &PutObjectOption,
-            bucket: &'a str,
-            object: &'a str,
-            body: &'a mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>
-        {
-            Box::pin(async move {
-                log::info!("put bucket {bucket} object {object}");
-                let mut buff = vec![];
-                match body.read_to_end(&mut buff).await {
-                    Ok(size) => {
-                        log::info!("get {}", unsafe {
-                            std::str::from_utf8_unchecked(&buff[..size])
-                        });
-                    }
-                    Err(err) => {
-                        log::error!("read error {err}");
-                    }
-                }
-                Ok(())
-            })
-        }
-    }
-
-    impl DeleteBucketHandler for Target {
-        fn handle<'a>(
-            &'a self,
-            _opt: &'a DeleteBucketOption,
-            _bucket: &'a str,
-        ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>
-        {
-            Box::pin(async move {
-                log::info!("delete bucket {_bucket}");
-                Ok(())
-            })
-        }
-    }
-
-    impl DeleteObjectHandler for Target {
-        fn handle<'a>(
-            &'a self,
-            _opt: &'a DeleteObjectOption,
-            _object: &'a str,
-        ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>
-        {
-            Box::pin(async move {
-                log::info!("delete object {_object}");
-                Ok(())
-            })
-        }
-    }
-
-    impl crate::auth::AccesskeyStore for Target {
-        fn get<'a>(
-            &'a self,
-            _accesskey: &'a str,
-        ) -> std::pin::Pin<
-            Box<
-                dyn 'a + Send + Sync + std::future::Future<Output = Result<Option<String>, String>>,
-            >,
-        > {
-            Box::pin(async move { Ok(Some(format!("{_accesskey}12345"))) })
-        }
-    }
-    // DISABLED: This test implementation was interfering with production GetObjectHandler
-    /*
-    impl crate::s3::s3_api::GetObjectHandler for Target {
-        fn handle<'a>(
-            &'a self,
-            bucket: &str,
-            object: &str,
-            opt: crate::s3::s3_api::GetObjectOption,
-            mut out: tokio::sync::Mutex<
-                std::pin::Pin<
-                    std::boxed::Box<(dyn crate::utils::io::PollWrite + Send + Unpin + 'a)>,
-                >,
-            >,
-        ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>
-        {
-            Box::pin(async move {
-                let mut l = out.lock().await;
-                let _ = l.poll_write(b"hello").await.map_err(|err| {
-                    log::error!("write error {err}");
-                });
-                Ok(())
-            })
-        }
-    }
-    */
-
-    impl crate::s3::s3_api::GetBucketLocationHandler for Target {}
-
-    impl MultiUploadObjectHandler for Target {
-        fn handle_create_session<'a>(
-            &'a self,
-            bucket: &'a str,
-            key: &'a str,
-        ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>>
-        {
-            Box::pin(async move { Ok("ffffff".to_string()) })
-        }
-
-        fn handle_upload_part<'a>(
-            &'a self,
-            bucket: &'a str,
-            key: &'a str,
-            upload_id: &'a str,
-            part_number: u32,
-            body: &'a mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>>
-        {
-            Box::pin(async move {
-                let mut buff = Vec::new();
-                let size = body
-                    .read_to_end(&mut buff)
-                    .await
-                    .map_err(|err| log::error!("read body error {err}"))?;
-                println!(
-                    "upload part upload_id={upload_id} part_number={part_number} bucket={bucket} key={key}\n{}",
-                    unsafe { std::str::from_boxed_utf8_unchecked((&buff[..size]).into()) }
-                );
-                Ok("5d41402abc4b2a76b9719d911017c592".to_string())
-            })
-        }
-
-        fn handle_complete<'a>(
-            &'a self,
-            bucket: &'a str,
-            key: &'a str,
-            upload_id: &'a str,
-            //(etag,part number)
-            data: &'a [(&'a str, u32)],
-            opts: MultiUploadObjectCompleteOption,
-        ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>>
-        {
-            Box::pin(async move { Ok("69a329523ce1ec88bf63061863d9cb14".to_string()) })
-        }
-
-        fn handle_abort<'a>(
-            &'a self,
-            bucket: &'a str,
-            key: &'a str,
-            upload_id: &'a str,
-        ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), ()>>>>
-        {
-            todo!()
         }
     }
 }

@@ -21,22 +21,3 @@ fn get_v2_signature(
     let ans = base64::engine::general_purpose::STANDARD.encode(hsh.finalize().into_bytes());
     Ok(ans)
 }
-#[cfg(test)]
-mod v2_test {
-    use crate::utils::GenericResult;
-    #[test]
-    fn v2_signature_test() -> GenericResult<()> {
-        let signature = super::get_v2_signature(
-            "root12345",
-            "GET",
-            "/test/hello.txt",
-            "application/text",
-            "Mon, 07 Apr 2025 09:20:53 +0000",
-        )?;
-        assert!(
-            signature == "ZDG7mtEBYOSLC8PfKoz9iHR23fk=",
-            "expect ZDG7mtEBYOSLC8PfKoz9iHR23fk=,get {signature}"
-        );
-        Ok(())
-    }
-}

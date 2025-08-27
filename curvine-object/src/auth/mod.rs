@@ -2,8 +2,8 @@
 //!
 //! This module provides S3-compatible authentication mechanisms
 
-pub mod v2;
-pub mod v4;
+pub mod sig_v2;
+pub mod sig_v4;
 
 pub trait AccesskeyStore: Send + Sync {
     fn get<'a>(
@@ -75,4 +75,4 @@ impl AccesskeyStore for StaticAccessKeyStore {
 }
 
 // pub use v2::*; // Currently unused
-pub use v4::*;
+pub use sig_v4::*;
