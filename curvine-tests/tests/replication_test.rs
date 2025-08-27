@@ -34,6 +34,7 @@ fn create_test_config() -> ClusterConf {
     conf.master.min_block_size = 64 * 1024;
     conf.master.min_replication = 1;
     conf.master.max_replication = 3;
+    conf.master.block_replication_enabled = true;
 
     // Test directories (will be overridden by MiniCluster)
     conf.master.meta_dir = "/tmp/curvine-test/meta".to_string();
