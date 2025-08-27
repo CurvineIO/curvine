@@ -45,6 +45,7 @@ pub struct MasterHandler {
 }
 
 impl MasterHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         conf: &ClusterConf,
         fs: MasterFilesystem,

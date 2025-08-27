@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-struct MasterEntry(MasterFilesystem, Arc<MasterReplicationManager>);
+pub struct MasterEntry(MasterFilesystem, Arc<MasterReplicationManager>);
 
 // A cluster of unit tests.
 pub struct MiniCluster {

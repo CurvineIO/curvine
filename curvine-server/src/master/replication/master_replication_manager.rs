@@ -51,7 +51,7 @@ pub struct MasterReplicationManager {
 }
 
 struct InflightReplicationJob {
-    block_id: BlockId,
+    _block_id: BlockId,
     permit: OwnedSemaphorePermit,
     target_worker: WorkerAddress,
 }
@@ -59,7 +59,7 @@ struct InflightReplicationJob {
 impl MasterReplicationManager {
     pub fn new(
         fs: &MasterFilesystem,
-        conf: &ClusterConf,
+        _conf: &ClusterConf,
         rt: &Arc<AsyncRuntime>,
         worker_manager: &SyncWorkerManager,
     ) -> Arc<Self> {
@@ -189,7 +189,7 @@ impl MasterReplicationManager {
         self.inflight_blocks.insert(
             block_id,
             InflightReplicationJob {
-                block_id,
+                _block_id: block_id,
                 permit,
                 target_worker: target_worker_addr,
             },
@@ -200,7 +200,7 @@ impl MasterReplicationManager {
 
     pub fn report_under_replicated_blocks(
         &self,
-        worker_id: WorkerId,
+        _worker_id: WorkerId,
         block_ids: Vec<i64>,
     ) -> CommonResult<()> {
         self.runtime.block_on(async move {

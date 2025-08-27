@@ -47,7 +47,7 @@ impl WorkerReplicationManager {
     pub fn new(
         block_store: &BlockStore,
         async_runtime: &Arc<AsyncRuntime>,
-        conf: &ClusterConf,
+        _conf: &ClusterConf,
         fs_client_context: &Arc<FsContext>,
     ) -> Arc<Self> {
         let (send, recv) = tokio::sync::mpsc::channel(10000);
@@ -109,7 +109,7 @@ impl WorkerReplicationManager {
     }
 
     async fn replicate_block(&self, job: &mut ReplicationJob) -> CommonResult<()> {
-        let permit = self
+        let _permit = self
             .replication_semaphore
             .clone()
             .acquire_owned()
