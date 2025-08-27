@@ -12,6 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! # S3 API Trait Definitions and Data Structures
+//!
+//! This module defines the core S3 API traits and data structures that provide
+//! complete AWS S3 compatibility for the Curvine Object Gateway. It serves as
+//! the contract between HTTP handlers and storage backend implementations.
+//!
+//! ## API Coverage
+//!
+//! The module implements all major S3 operations:
+//! - **Object Operations**: PUT, GET, HEAD, DELETE with range support
+//! - **Bucket Operations**: CREATE, DELETE, LIST with location support  
+//! - **Multipart Upload**: Complete lifecycle from initiation to completion
+//! - **Listing Operations**: LIST objects and buckets with filtering
+//!
+//! ## Design Principles
+//!
+//! - **Full S3 Compatibility**: All structures match AWS S3 API specifications
+//! - **Async First**: All operations return futures for high-concurrency handling
+//! - **Type Safety**: Strong typing prevents common integration errors
+//! - **Extensibility**: Trait-based design allows pluggable implementations
+//!
+//! ## Response Format Compatibility
+//!
+//! All response structures are designed for direct XML serialization,
+//! maintaining full compatibility with S3 clients including:
+//! - AWS CLI and SDKs
+//! - MinIO client libraries
+//! - Third-party S3 tools
+//! - Custom S3 applications
+
 pub use crate::s3::error::Error;
 use std::{
     collections::HashMap,
@@ -1526,6 +1556,7 @@ pub enum LocationType {
     AvailabilityZone,
     LocalZone,
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BucketLocationConstraint {
     AfSouth1,
@@ -1563,6 +1594,7 @@ pub enum BucketLocationConstraint {
     UsWest2,
     Unknown(String),
 }
+
 impl From<&str> for BucketLocationConstraint {
     fn from(s: &str) -> Self {
         match s {
@@ -1877,376 +1909,6 @@ async fn parse_body<
     }
 }
 
-#[allow(dead_code)]
-async fn parse_streaming_body<
-    T: crate::utils::io::PollRead + Send,
-    E: tokio::io::AsyncWrite + Send + Unpin,
->(
-    _src: T,
-    _dst: &mut E,
-    _content_sha256: &str,
-) -> Result<(), ParseBodyError> {
-    todo!()
-}
-// #[cfg(test)]
-// mod req_test {
-//     use std::{collections::HashMap, sync::RwLock};
-//     static FAKE_ETAG: &str = "ffffffffffffffff";
-//     struct HttpRequest {
-//         url_path: String,
-//         query: Vec<(String, String)>,
-//         method: String,
-//         headers: HashMap<String, String>,
-//     }
-//     impl crate::authorization::v4::VHeader for HttpRequest {
-//         fn get_header(&self, key: &str) -> Option<String> {
-//             self.headers
-//                 .get(key)
-//                 .map_or_else(|| None, |v| Some(v.clone()))
-//         }
-
-//         fn set_header(&mut self, key: &str, val: &str) {
-//             self.headers.insert(key.to_string(), val.to_string());
-//         }
-
-//         fn delete_header(&mut self, key: &str) {
-//             self.headers.remove(key);
-//         }
-
-//         fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
-//             self.headers.iter().all(|(k, v)| cb(k, v));
-//         }
-//     }
-//     impl super::VRequest for HttpRequest {
-//         fn method(&self) -> String {
-//             self.method.clone()
-//         }
-
-//         fn url_path(&self) -> String {
-//             self.url_path.clone()
-//         }
-
-//         fn get_query(&self, target: &str) -> Option<String> {
-//             let ans: Vec<_> = self.query.iter().filter(|(k, v)| k == target).collect();
-//             if !ans.is_empty() {
-//                 Some(ans.first().unwrap().1.clone())
-//             } else {
-//                 None
-//             }
-//         }
-
-//         fn all_query(&self, mut cb: impl FnMut(&str, &str) -> bool) {
-//             self.query.iter().all(|(k, v)| cb(k, v));
-//         }
-//     }
-//     #[derive(Default)]
-//     struct HttpResponse {
-//         status: u16,
-//         headers: HashMap<String, String>,
-//         body: Vec<u8>,
-//     }
-//     impl crate::authorization::v4::VHeader for HttpResponse {
-//         fn get_header(&self, key: &str) -> Option<String> {
-//             self.headers
-//                 .get(key)
-//                 .map_or_else(|| None, |v| Some(v.clone()))
-//         }
-
-//         fn set_header(&mut self, key: &str, val: &str) {
-//             self.headers.insert(key.to_string(), val.to_string());
-//         }
-
-//         fn delete_header(&mut self, key: &str) {
-//             self.headers.remove(key);
-//         }
-
-//         fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
-//             self.headers.iter().all(|(k, v)| cb(k, v));
-//         }
-//     }
-//     struct VecWriter<'a>(&'a mut Vec<u8>);
-//     impl<'a> std::io::Write for VecWriter<'_> {
-//         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-//             self.0.extend_from_slice(buf);
-//             Ok(buf.len())
-//         }
-
-//         fn flush(&mut self) -> std::io::Result<()> {
-//             Ok(())
-//         }
-//     }
-//     impl super::BodyWriter for HttpResponse {
-//         type BodyWriter<'a> = VecWriter<'a>;
-
-//         fn get_body_writer(&mut self) -> Result<Self::BodyWriter<'_>, String> {
-//             Ok(VecWriter(&mut self.body))
-//         }
-//     }
-//     impl super::VResponse for HttpResponse {
-//         fn set_status(&mut self, status: u16) {
-//             if self.status != 0 {
-//                 return;
-//             }
-//             self.status = status;
-//         }
-
-//         fn send_header(&mut self) {}
-//     }
-
-//     pub struct ListBucket(Vec<String>);
-//     impl super::ListObjectHandler for ListBucket {
-//         fn handle(
-//             &self,
-//             _: &super::ListObjectOption,
-//             bucket: &str,
-//         ) -> Result<Vec<super::ListObjectContent>, String> {
-//             let last_modified = chrono::Utc::now().to_rfc2822();
-//             Ok(self
-//                 .0
-//                 .iter()
-//                 .filter_map(|v| {
-//                     if v.starts_with(bucket) {
-//                         return Some(super::ListObjectContent {
-//                             key: v.trim_start_matches(bucket).to_string(),
-//                             last_modified: Some(last_modified.clone()),
-//                             etag: Some("801cbd6952577c28310fd5002670132a".to_string()),
-//                             size: 20,
-//                             owner: Some(super::Owner {
-//                                 id: "123456789".to_string(),
-//                                 display_name: "root".to_string(),
-//                             }),
-//                             storage_class: Some("standard".to_string()),
-//                         });
-//                     }
-//                     None
-//                 })
-//                 .collect())
-//         }
-//     }
-
-//     impl super::ListBucketHandler for ListBucket {
-//         fn handle(
-//             &self,
-//             opt: &super::ListBucketsOption,
-//         ) -> Result<Vec<super::Bucket>, String> {
-//             let date = chrono::Utc::now().to_rfc2822();
-//             Ok(self
-//                 .0
-//                 .iter()
-//                 .map(|v| super::Bucket {
-//                     name: v.find('/').map_or(v.clone(), |next| v[..next].to_string()),
-//                     creation_date: date.clone(),
-//                     bucket_region: "us-east-1".to_string(),
-//                 })
-//                 .collect())
-//         }
-//     }
-
-//     #[test]
-//     fn list_object() {
-//         let lb = ListBucket(vec![
-//             "test/hello.txt".to_string(),
-//             "test/test.dat".to_string(),
-//             "one/jack.json".to_string(),
-//             "one/jim.json".to_string(),
-//         ]);
-//         let hm = HashMap::default();
-//         let req = HttpRequest {
-//             url_path: "/test".to_string(),
-//             query: vec![],
-//             method: "GET".to_string(),
-//             headers: hm,
-//         };
-//         let mut resp = HttpResponse {
-//             status: 0,
-//             headers: HashMap::default(),
-//             body: vec![],
-//         };
-//         super::handle_get_list_object(&req, &mut resp, &lb);
-//         String::from_utf8(resp.body)
-//             .map_or_else(|e| eprintln!("not ascii {e}"), |v| println!("{v}"));
-//     }
-//     #[test]
-//     fn list_buckets() {
-//         let hm = HashMap::default();
-//         let req = HttpRequest {
-//             url_path: "/".to_string(),
-//             query: vec![],
-//             method: "GET".to_string(),
-//             headers: hm,
-//         };
-//         let mut resp = HttpResponse {
-//             status: 0,
-//             headers: HashMap::default(),
-//             body: vec![],
-//         };
-//         let lb = ListBucket(vec![
-//             "test/hello.txt".to_string(),
-//             "test/test.dat".to_string(),
-//             "one/jack.json".to_string(),
-//             "one/jim.json".to_string(),
-//         ]);
-//         super::handle_get_list_buckets(&req, &mut resp, &lb);
-//         String::from_utf8(resp.body)
-//             .map_or_else(|e| eprintln!("not ascii {e}"), |v| println!("{v}"));
-//     }
-
-//     impl super::CreateBucketHandler for RwLock<ListBucket> {
-//         fn handle(
-//             &self,
-//             opt: &super::CreateBucketOption,
-//             bucket: &str,
-//         ) -> Result<(), String> {
-//             self.write().map_or(
-//                 Err(Box::new(super::Error("write lock failed".to_string()))),
-//                 |mut raw| {
-//                     for v in raw.0.iter() {
-//                         if v == bucket {
-//                             return Ok(());
-//                         }
-//                     }
-//                     raw.0.push(bucket.to_string());
-//                     Ok(())
-//                 },
-//             )
-//         }
-//     }
-//     impl super::DeleteBucketHandler for RwLock<ListBucket> {
-//         fn handle(
-//             &self,
-//             opt: &super::DeleteBucketOption,
-//             bucket: &str,
-//         ) -> Result<(), String> {
-//             self.write().map_or(
-//                 Err(Box::new(super::Error("write lock failed".to_string()))),
-//                 |mut v| {
-//                     let mut index = 0;
-//                     let mut remove_index = -1;
-//                     for vv in v.0.iter() {
-//                         if vv == bucket {
-//                             remove_index = index;
-//                             break;
-//                         }
-//                         index += 1;
-//                     }
-//                     if remove_index >= 0 {
-//                         v.0.remove(remove_index as usize);
-//                     }
-//                     Ok(())
-//                 },
-//             )
-//         }
-//     }
-//     #[test]
-//     fn create_bucket() {
-//         let hm = HashMap::default();
-//         let mut req = HttpRequest {
-//             url_path: "/t10".to_string(),
-//             query: vec![],
-//             method: "PUT".to_string(),
-//             headers: hm,
-//         };
-//         let mut resp = HttpResponse {
-//             status: 0,
-//             headers: HashMap::default(),
-//             body: vec![],
-//         };
-//         let lb = ListBucket(vec![]);
-//         let lb = RwLock::new(lb);
-//         super::handle_create_bucket(&req, &mut resp, &lb);
-//         assert!(
-//             lb.read().expect("read lock error").0.len() == 1,
-//             "create bucket failed {}",
-//             resp.status
-//         );
-//         req.method = "DELETE".to_string();
-//         resp = HttpResponse {
-//             status: 0,
-//             headers: HashMap::default(),
-//             body: vec![],
-//         };
-//         super::handle_delete_bucket(&req, &mut resp, &lb);
-//         assert!(
-//             lb.read().unwrap().0.is_empty(),
-//             "delete failed {}",
-//             resp.status
-//         );
-//     }
-//     impl super::LookupHandler for HashMap<String, String> {
-//         fn lookup(
-//             &self,
-//             bucket: &str,
-//             object: &str,
-//         ) -> Result<Option<super::HeadObjectResult>, super::Error> {
-//             let ret = self.get(object);
-//             if let None = ret {
-//                 return Ok(None);
-//             }
-//             let info = ret.unwrap();
-//             Ok(Some(super::HeadObjectResult {
-//                 content_length: Some(info.len()),
-//                 content_type: Some("text/plain".to_string()),
-//                 etag: Some(FAKE_ETAG.to_string()),
-//                 last_modified: Some(chrono::Utc::now().to_rfc2822().to_string()),
-//                 ..Default::default()
-//             }))
-//         }
-//     }
-//     impl super::GetObjectHandler for HashMap<String, String> {
-//         fn handle(
-//             &self,
-//             bucket: &str,
-//             object: &str,
-//             mut out: impl FnMut(&[u8]) -> Result<(), String>,
-//         ) -> Result<(), String> {
-//             let ret = self.get(object);
-//             if let None = ret {
-//                 return Err(Box::new(super::Error("content not found".to_string())));
-//             }
-//             let info = ret.unwrap();
-//             out(info.as_bytes())
-//         }
-//     }
-
-//     #[test]
-//     fn get_object() {
-//         let hm = HashMap::default();
-//         let req = HttpRequest {
-//             url_path: "/test/test.txt".to_string(),
-//             query: vec![],
-//             method: "GET".to_string(),
-//             headers: hm,
-//         };
-//         let mut resp = HttpResponse::default();
-//         let mut objstore = HashMap::default();
-//         objstore.insert("test.txt".to_string(), "im test!".to_string());
-//         super::handle_get_object(&req, &mut resp, &objstore);
-//         assert!(
-//             resp.status == 200,
-//             "response status is not 200 {}",
-//             resp.status
-//         );
-//         let val = String::from_utf8(resp.body).map_or("NoAscii".to_string(), |v| v);
-//         assert!(
-//             val == "im test!",
-//             "response content is not 'im test!' got {}",
-//             val
-//         );
-
-//         let mut resp = HttpResponse::default();
-//         let mut objstore = HashMap::default();
-//         objstore.insert("hello.txt".to_string(), "im test!".to_string());
-//         super::handle_get_object(&req, &mut resp, &objstore);
-//         assert!(
-//             resp.status == 404,
-//             "response status is not 404 {}",
-//             resp.status
-//         );
-//     }
-//     #[test]
-//     fn put_and_delete_object() {}
-// }
-
 impl crate::utils::io::PollRead for tokio::io::BufReader<std::io::Cursor<Vec<u8>>> {
     fn poll_read<'a>(
         &'a mut self,
@@ -2288,10 +1950,6 @@ impl crate::utils::io::PollRead for tokio::fs::File {
         })
     }
 }
-
-// Removed unused AsyncReadPollAdapter
-
-// In-memory PollRead over a Vec<u8>
 struct InMemoryPollReader {
     data: Vec<u8>,
     offset: usize,

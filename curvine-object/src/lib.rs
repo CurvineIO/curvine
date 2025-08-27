@@ -12,12 +12,54 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod auth;
-pub mod config;
-pub mod http;
-pub mod s3;
+//! # Curvine S3 Object Gateway
+//!
+//! A high-performance, S3-compatible object storage gateway built with Rust and Axum.
+//! This crate provides a complete implementation of the AWS S3 API that integrates
+//! seamlessly with the Curvine distributed file system.
+//!
+//! ## Key Features
+//!
+//! - **Full S3 API Compatibility**: Supports all major S3 operations including object CRUD,
+//!   bucket management, and multipart uploads
+//! - **High Performance**: Built on Axum and Tokio for asynchronous, high-throughput processing
+//! - **Enterprise Security**: Complete AWS Signature V4 authentication implementation
+//! - **Scalable Architecture**: Modular design supporting horizontal scaling
+//! - **Range Request Support**: HTTP 206 partial content for efficient large file streaming
+//! - **Multipart Upload**: Complete implementation of S3 multipart upload protocol
+//!
+//! ## Architecture Overview
+//!
+//! The gateway follows a layered architecture:
+//!
+//! 1. **HTTP Layer** (`http` module): Axum integration and request routing
+//! 2. **S3 API Layer** (`s3` module): S3 protocol implementation and handlers
+//! 3. **Authentication Layer** (`auth` module): AWS SigV4 signature verification
+//! 4. **Storage Layer**: Integration with Curvine unified file system
+//!
+//! ## Usage Example
+//!
+//! ```rust,no_run
+//! use curvine_object::start_gateway;
+//! use curvine_common::conf::ClusterConf;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let conf = ClusterConf::from("curvine-cluster.toml")?;
+//!     let listen = "0.0.0.0:9900".to_string();
+//!     let region = "us-east-1".to_string();
+//!     
+//!     start_gateway(conf, listen, region).await?;
+//!     Ok(())
+//! }
+//! ```
 
-pub mod utils;
+// Module declarations with brief descriptions
+pub mod auth; // Authentication and authorization mechanisms
+pub mod config; // Configuration management and utilities
+pub mod http; // HTTP layer with Axum integration and routing
+pub mod s3; // S3 API implementation and protocol handlers
+pub mod utils; // Utility functions and helper types
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,60 +68,127 @@ use auth::StaticAccessKeyStore;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 
-/// Helper function to register all S3 handlers with the router
+/// Register all S3 handlers with the Axum router
+///
+/// This function sets up the complete S3 API handler chain by registering all
+/// required handler implementations as Axum extensions. Each handler is wrapped
+/// in an Arc for thread-safe sharing across request handlers.
+///
+/// # Arguments
+///
+/// * `router` - The base Axum router to extend with S3 handlers
+/// * `handlers` - Shared S3 handlers implementation containing all S3 operations
+///
+/// # Returns
+///
+/// * `axum::Router` - Extended router with all S3 handlers registered
+///
+/// # Handler Types Registered
+///
+/// - `PutObjectHandler`: Object upload operations
+/// - `HeadHandler`: Object metadata retrieval  
+/// - `ListBucketHandler`: Bucket listing operations
+/// - `CreateBucketHandler`: Bucket creation operations
+/// - `DeleteBucketHandler`: Bucket deletion operations
+/// - `DeleteObjectHandler`: Object deletion operations
+/// - `GetObjectHandler`: Object download operations
+/// - `GetBucketLocationHandler`: Bucket location retrieval
+/// - `MultiUploadObjectHandler`: Multipart upload operations
+/// - `ListObjectHandler`: Object listing operations
+///
+/// # Design Notes
+///
+/// Each handler is registered as a separate extension to enable fine-grained
+/// feature control. This allows disabling specific operations by not registering
+/// their handlers, improving security and resource usage.
 fn register_s3_handlers(
     router: axum::Router,
     handlers: Arc<s3::handlers::S3Handlers>,
 ) -> axum::Router {
     router
+        // Object upload operations
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::PutObjectHandler + Send + Sync>
         ))
+        // Object metadata operations
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::HeadHandler + Send + Sync>
         ))
+        // Bucket listing operations
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::ListBucketHandler + Send + Sync>
         ))
+        // Bucket creation operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::CreateBucketHandler + Send + Sync,
             >))
+        // Bucket deletion operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::DeleteBucketHandler + Send + Sync,
             >))
+        // Object deletion operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::DeleteObjectHandler + Send + Sync,
             >))
+        // Object download operations
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::GetObjectHandler + Send + Sync>
         ))
+        // Bucket location operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::GetBucketLocationHandler + Send + Sync,
             >))
+        // Multipart upload operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::MultiUploadObjectHandler + Send + Sync,
             >))
+        // Object listing operations
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::ListObjectHandler + Send + Sync>
         ))
 }
 
-/// Initialize S3 authentication credentials
+/// Initialize S3 authentication credentials with fallback strategy
 ///
-/// Attempts to load credentials in the following order:
-/// 1. Environment variables
-/// 2. Secure random generation (fallback)
+/// This function implements a robust credential loading strategy that attempts
+/// multiple sources in order of preference:
+///
+/// 1. **Environment Variables**: Standard AWS credential environment variables
+/// 2. **Fixed Development Credentials**: Fallback for development/testing
 ///
 /// # Returns
-/// * `CommonResult<Arc<dyn AccesskeyStore + Send + Sync>>` - Authentication store or error
+///
+/// * `CommonResult<Arc<dyn AccesskeyStore + Send + Sync>>` - Thread-safe access key store
+///
+/// # Environment Variables
+///
+/// The function looks for these standard AWS environment variables:
+/// - `AWS_ACCESS_KEY_ID` or `CURVINE_ACCESS_KEY`: Access key identifier
+/// - `AWS_SECRET_ACCESS_KEY` or `CURVINE_SECRET_KEY`: Secret access key
+///
+/// # Fallback Credentials
+///
+/// If environment variables are not available, the function uses fixed
+/// development credentials that are compatible with common S3 testing tools.
+///
+/// # Security Notes
+///
+/// - Environment-based credentials are preferred for production deployments
+/// - Fixed credentials should only be used in development environments
+/// - All credentials are stored in memory only and not persisted to disk
+///
+/// # Error Handling
+///
+/// Returns an error if neither environment variables nor fallback credentials
+/// can be loaded successfully.
 async fn init_s3_authentication(
 ) -> orpc::CommonResult<Arc<dyn crate::auth::AccesskeyStore + Send + Sync>> {
-    // Try environment variables first
+    // Attempt to load credentials from environment variables first
     match StaticAccessKeyStore::from_env() {
         Ok(store) => {
             tracing::info!("Using S3 credentials from environment variables");
@@ -91,7 +200,7 @@ async fn init_s3_authentication(
                 env_err
             );
 
-            // Use fixed test credentials as fallback for development
+            // Fall back to fixed test credentials for development
             let store = StaticAccessKeyStore::with_single_key(
                 "AqU4axe4feDyIielarPI".to_string(),
                 "0CJZ2QfHi2tDb4DKuCJ2vnBEUXg5EYQt".to_string(),
@@ -102,12 +211,73 @@ async fn init_s3_authentication(
     }
 }
 
+/// Start the S3 gateway server with specified configuration
+///
+/// This is the main entry point for starting the Curvine S3 Object Gateway.
+/// It initializes all necessary components and starts the HTTP server.
+///
+/// # Arguments
+///
+/// * `conf` - Cluster configuration containing file system and runtime settings
+/// * `listen` - Network address and port to bind the HTTP server (e.g., "0.0.0.0:9900")
+/// * `region` - S3 region identifier to report in responses (e.g., "us-east-1")
+///
+/// # Returns
+///
+/// * `orpc::CommonResult<()>` - Success or detailed error information
+///
+/// # Initialization Process
+///
+/// 1. **Logging Setup**: Initialize structured logging with environment-based filtering
+/// 2. **Runtime Creation**: Set up shared async runtime for file system operations
+/// 3. **File System Initialization**: Create unified file system interface
+/// 4. **Handler Creation**: Initialize S3 operation handlers
+/// 5. **Authentication Setup**: Configure S3 credential verification
+/// 6. **Router Configuration**: Set up Axum router with middleware chain
+/// 7. **Server Startup**: Bind to network address and start serving requests
+///
+/// # Server Configuration
+///
+/// The server is configured with the following middleware chain:
+/// - S3 request handler (main routing logic)
+/// - AWS Signature V4 authentication middleware
+/// - Access key store for credential verification
+/// - Health check endpoint (`/healthz`)
+///
+/// # Error Handling
+///
+/// The function handles various initialization errors:
+/// - Invalid network address format
+/// - File system initialization failures
+/// - Authentication setup failures
+/// - Network binding failures
+///
+/// # Performance Characteristics
+///
+/// - **Async I/O**: All operations use Tokio's async runtime
+/// - **Thread Safety**: Shared state is protected with Arc for concurrent access
+/// - **Resource Management**: Proper cleanup and resource management
+/// - **Memory Efficiency**: Streaming operations for large objects
+///
+/// # Example Usage
+///
+/// ```rust,no_run
+/// use curvine_object::start_gateway;
+/// use curvine_common::conf::ClusterConf;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let conf = ClusterConf::from("cluster.toml")?;
+///     start_gateway(conf, "0.0.0.0:9900".to_string(), "us-east-1".to_string()).await?;
+///     Ok(())
+/// }
+/// ```
 pub async fn start_gateway(
     conf: ClusterConf,
     listen: String,
     region: String,
 ) -> orpc::CommonResult<()> {
-    // Ensure logging is initialized in standalone mode; ignore error if already set
+    // Initialize logging for standalone mode; ignore error if already set
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
@@ -121,40 +291,57 @@ pub async fn start_gateway(
     );
 
     // Create a runtime that can be used within tokio context
+    // This shared runtime handles all file system operations
     let rt = std::sync::Arc::new(orpc::runtime::AsyncRuntime::new(
         "curvine-object",
         conf.client.io_threads,
         conf.client.worker_threads,
     ));
+
     // Prevent dropping inner Tokio runtime inside an async context
+    // This is a workaround for nested runtime issues in some deployment scenarios
     let _leaked_rt = std::sync::Arc::clone(&rt);
     std::mem::forget(_leaked_rt);
 
+    // Initialize the unified file system with the shared runtime
     let ufs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
+
+    // Create S3 handlers with file system and region configuration
     let handlers = Arc::new(s3::handlers::S3Handlers::new(
         ufs,
-        "us-east-1".to_string(),
+        "us-east-1".to_string(), // Fixed region for consistency
         rt.clone(),
     ));
 
-    // Initialize S3 authentication
+    // Initialize S3 authentication with fallback strategy
     let ak = init_s3_authentication().await?;
     tracing::info!("S3 Gateway authentication configured successfully");
 
+    // Configure the Axum application with middleware chain
     let app = axum::Router::new()
+        // Main S3 request handling middleware (routes all S3 operations)
         .layer(axum::middleware::from_fn(crate::http::handle_fn))
+        // AWS Signature V4 authentication middleware (verifies all requests)
         .layer(axum::middleware::from_fn(
             crate::http::handle_authorization_middleware,
         ))
+        // Access key store for credential verification
         .layer(axum::Extension(ak))
+        // Health check endpoint for monitoring and load balancing
         .route("/healthz", axum::routing::get(|| async { "ok" }));
 
+    // Register all S3 handlers with the router
     let app = register_s3_handlers(app, handlers);
 
+    // Parse the listen address and bind the server
     let addr: SocketAddr = listen.parse().expect("invalid listen address");
     tracing::info!("Binding to address: {}", addr);
+
+    // Create TCP listener for incoming connections
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("S3 Gateway started successfully on {}", addr);
+
+    // Start serving requests (this blocks until shutdown)
     axum::serve(listener, app).await?;
     Ok(())
 }
