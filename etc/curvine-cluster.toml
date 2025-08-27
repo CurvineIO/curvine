@@ -52,3 +52,13 @@ master_addrs = [
 level = "info"
 log_dir = "stdout"
 file_name = "curvine.log"
+
+
+# S3 Object Gateway configuration
+[object]
+# Listen address for S3 gateway (host:port)
+listen = "0.0.0.0:9900"
+# Region to report via GetBucketLocation
+region = "us-east-1"
+# Temporary directory for multipart uploads
+multipart_temp = "/tmp/curvine-multipart" 

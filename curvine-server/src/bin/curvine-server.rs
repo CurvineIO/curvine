@@ -36,6 +36,26 @@ fn main() -> CommonResult<()> {
 
     match service {
         ServiceType::Master => {
+            if args.enable_object_gateway {
+                let listen = if args.object_listen.is_empty() {
+                    "0.0.0.0:9900".to_string()
+                } else {
+                    args.object_listen.clone()
+                };
+                let region = if args.object_region.is_empty() {
+                    "us-east-1".to_string()
+                } else {
+                    args.object_region.clone()
+                };
+                let conf_clone = conf.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build tokio runtime");
+                    let _ = rt.block_on(curvine_object::start_gateway(conf_clone, listen, region));
+                });
+            }
             let master = Master::with_conf(conf)?;
             master.block_on_start();
         }
@@ -58,6 +78,18 @@ pub struct ServerArgs {
     // Configuration file path
     #[arg(long, default_value = "")]
     conf: String,
+
+    // Enable S3 object gateway alongside master
+    #[arg(long, default_value_t = false)]
+    enable_object_gateway: bool,
+
+    // Gateway listen address
+    #[arg(long, default_value = "0.0.0.0:9900")]
+    object_listen: String,
+
+    // Gateway region
+    #[arg(long, default_value = "us-east-1")]
+    object_region: String,
 }
 
 impl ServerArgs {

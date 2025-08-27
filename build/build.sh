@@ -87,6 +87,7 @@ print_help() {
   echo "                          - java: Java SDK"
   echo "                          - python: Python SDK"
   echo "                          - tests: test suite and benchmarks"
+  echo "                          - object: S3 object gateway"
   echo "                          - all: all packages"
   echo
   echo "  -u, --ufs TYPE        UFS storage type (can be specified multiple times, default: opendal-s3)"
@@ -256,6 +257,12 @@ fi
 if should_build_package "tests"; then
   RUST_BUILD_ARGS+=("-p" "curvine-tests")
   COPY_TARGETS+=("curvine-bench")
+fi
+
+# Add S3 object gateway package
+if should_build_package "object" || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
+  RUST_BUILD_ARGS+=("-p" "curvine-object")
+  COPY_TARGETS+=("curvine-object")
 fi
 
 # Base command
