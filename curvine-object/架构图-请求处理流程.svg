@@ -1,0 +1,174 @@
+<svg viewBox="0 0 1200 900" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="requestGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#4285f4;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1a73e8;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="authGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#34a853;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0f9d58;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="routeGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#fbbc04;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#ea4335;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="processGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#ff9800;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#f57c00;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="responseGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#9c27b0;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#673ab7;stop-opacity:1" />
+    </linearGradient>
+    <!-- 箭头标记定义 -->
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#666" />
+    </marker>
+  </defs>
+  
+  <!-- 标题 -->
+  <text x="600" y="30" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 24px; font-weight: bold; fill: #333;">
+    🔄 Curvine S3 API 请求处理流程
+  </text>
+  <text x="600" y="55" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 16px; fill: #666;">
+    从 HTTP 请求到响应的完整处理路径 | 5步高效处理链
+  </text>
+  
+  <!-- 第1步: HTTP 请求接收 -->
+  <rect x="50" y="100" width="1100" height="120" rx="10" fill="url(#requestGrad)" opacity="0.1" stroke="#4285f4" stroke-width="2"/>
+  <text x="70" y="125" style="font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; fill: #1a73e8;">
+    📨 第1步: HTTP 请求接收
+  </text>
+  
+  <rect x="80" y="140" width="200" height="70" rx="5" fill="#4285f4" opacity="0.8"/>
+  <text x="180" y="165" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">客户端请求</text>
+  <text x="180" y="180" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">HTTP/HTTPS</text>
+  
+  <rect x="320" y="140" width="200" height="70" rx="5" fill="#4285f4" opacity="0.8"/>
+  <text x="420" y="165" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">Axum 解析</text>
+  <text x="420" y="180" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">请求头/体</text>
+  
+  <rect x="560" y="140" width="200" height="70" rx="5" fill="#4285f4" opacity="0.8"/>
+  <text x="660" y="165" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">中间件链</text>
+  <text x="660" y="180" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">预处理</text>
+  
+  <rect x="800" y="140" width="280" height="70" rx="5" fill="#4285f4" opacity="0.8"/>
+  <text x="940" y="165" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">Request 对象创建</text>
+  <text x="940" y="180" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">封装查询参数</text>
+  
+  <!-- 第2步: 身份认证 -->
+  <rect x="50" y="250" width="1100" height="120" rx="10" fill="url(#authGrad)" opacity="0.1" stroke="#34a853" stroke-width="2"/>
+  <text x="70" y="275" style="font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; fill: #0f9d58;">
+    🔐 第2步: 身份认证与授权
+  </text>
+  
+  <rect x="80" y="290" width="250" height="70" rx="5" fill="#34a853" opacity="0.8"/>
+  <text x="205" y="315" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">提取认证信息</text>
+  <text x="205" y="330" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">Authorization 头</text>
+  
+  <rect x="360" y="290" width="250" height="70" rx="5" fill="#34a853" opacity="0.8"/>
+  <text x="485" y="315" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">AWS SigV4 验证</text>
+  <text x="485" y="330" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">签名计算对比</text>
+  
+  <rect x="640" y="290" width="200" height="70" rx="5" fill="#34a853" opacity="0.8"/>
+  <text x="740" y="315" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">密钥查找</text>
+  <text x="740" y="330" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">AccessKey 验证</text>
+  
+  <rect x="870" y="290" width="210" height="70" rx="5" fill="#34a853" opacity="0.8"/>
+  <text x="975" y="315" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">权限验证</text>
+  <text x="975" y="330" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">通过/拒绝</text>
+  
+  <!-- 第3步: 请求路由 -->
+  <rect x="50" y="400" width="1100" height="120" rx="10" fill="url(#routeGrad)" opacity="0.1" stroke="#fbbc04" stroke-width="2"/>
+  <text x="70" y="425" style="font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; fill: #ea4335;">
+    🎯 第3步: 智能请求路由
+  </text>
+  
+  <rect x="80" y="440" width="200" height="70" rx="5" fill="#fbbc04" opacity="0.8"/>
+  <text x="180" y="465" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">HTTP 方法识别</text>
+  <text x="180" y="480" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">GET/PUT/HEAD/DELETE</text>
+  
+  <rect x="310" y="440" width="200" height="70" rx="5" fill="#fbbc04" opacity="0.8"/>
+  <text x="410" y="465" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">路径解析</text>
+  <text x="410" y="480" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">bucket/object 分离</text>
+  
+  <rect x="540" y="440" width="200" height="70" rx="5" fill="#ea4335" opacity="0.8"/>
+  <text x="640" y="465" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">查询参数分析</text>
+  <text x="640" y="480" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">uploads/range 等</text>
+  
+  <rect x="770" y="440" width="280" height="70" rx="5" fill="#ea4335" opacity="0.8"/>
+  <text x="910" y="465" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">处理器选择</text>
+  <text x="910" y="480" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">23个专门方法</text>
+  
+  <!-- 第4步: 业务处理 -->
+  <rect x="50" y="550" width="1100" height="120" rx="10" fill="url(#processGrad)" opacity="0.1" stroke="#ff9800" stroke-width="2"/>
+  <text x="70" y="575" style="font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; fill: #f57c00;">
+    ⚙️ 第4步: 核心业务处理
+  </text>
+  
+  <rect x="80" y="590" width="200" height="70" rx="5" fill="#ff9800" opacity="0.8"/>
+  <text x="180" y="615" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">路径映射</text>
+  <text x="180" y="630" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">S3 → 文件系统</text>
+  
+  <rect x="310" y="590" width="200" height="70" rx="5" fill="#ff9800" opacity="0.8"/>
+  <text x="410" y="615" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">文件系统操作</text>
+  <text x="410" y="630" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">读写/列表/删除</text>
+  
+  <rect x="540" y="590" width="200" height="70" rx="5" fill="#f57c00" opacity="0.8"/>
+  <text x="640" y="615" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">元数据转换</text>
+  <text x="640" y="630" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">FileStatus → S3</text>
+  
+  <rect x="770" y="590" width="280" height="70" rx="5" fill="#f57c00" opacity="0.8"/>
+  <text x="910" y="615" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">流式数据处理</text>
+  <text x="910" y="630" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">上传/下载流</text>
+  
+  <!-- 第5步: 响应构建 -->
+  <rect x="50" y="700" width="1100" height="120" rx="10" fill="url(#responseGrad)" opacity="0.1" stroke="#9c27b0" stroke-width="2"/>
+  <text x="70" y="725" style="font-family: Arial, sans-serif; font-size: 18px; font-weight: bold; fill: #673ab7;">
+    📤 第5步: 响应构建与返回
+  </text>
+  
+  <rect x="80" y="740" width="200" height="70" rx="5" fill="#9c27b0" opacity="0.8"/>
+  <text x="180" y="765" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">状态码设置</text>
+  <text x="180" y="780" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">200/206/404/500</text>
+  
+  <rect x="310" y="740" width="200" height="70" rx="5" fill="#9c27b0" opacity="0.8"/>
+  <text x="410" y="765" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">响应头构建</text>
+  <text x="410" y="780" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">ETag/Content-Type</text>
+  
+  <rect x="540" y="740" width="200" height="70" rx="5" fill="#673ab7" opacity="0.8"/>
+  <text x="640" y="765" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">数据序列化</text>
+  <text x="640" y="780" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">XML/Binary</text>
+  
+  <rect x="770" y="740" width="280" height="70" rx="5" fill="#673ab7" opacity="0.8"/>
+  <text x="910" y="765" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: white;">客户端响应</text>
+  <text x="910" y="780" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 12px; fill: white;">HTTP 响应发送</text>
+  
+  <!-- 连接箭头 -->
+  <!-- 第1步到第2步 -->
+  <line x1="600" y1="220" x2="600" y2="250" stroke="#666" stroke-width="3" marker-end="url(#arrowhead)"/>
+  
+  <!-- 第2步到第3步 -->
+  <line x1="600" y1="370" x2="600" y2="400" stroke="#666" stroke-width="3" marker-end="url(#arrowhead)"/>
+  
+  <!-- 第3步到第4步 -->
+  <line x1="600" y1="520" x2="600" y2="550" stroke="#666" stroke-width="3" marker-end="url(#arrowhead)"/>
+  
+  <!-- 第4步到第5步 -->
+  <line x1="600" y1="670" x2="600" y2="700" stroke="#666" stroke-width="3" marker-end="url(#arrowhead)"/>
+  
+  <!-- 性能特性标签 -->
+  <rect x="50" y="840" width="300" height="50" rx="5" fill="#f8f9fa" stroke="#dee2e6" stroke-width="1"/>
+  <text x="200" y="860" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #333;">🚀 性能特性</text>
+  <text x="200" y="875" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 11px; fill: #666;">异步处理 | 零拷贝 | 流式传输</text>
+  
+  <!-- 错误处理标签 -->
+  <rect x="380" y="840" width="300" height="50" rx="5" fill="#f8f9fa" stroke="#dee2e6" stroke-width="1"/>
+  <text x="530" y="860" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #333;">⚠️ 错误处理</text>
+  <text x="530" y="875" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 11px; fill: #666;">认证失败 | 路径错误 | 系统异常</text>
+  
+  <!-- 兼容性标签 -->
+  <rect x="710" y="840" width="300" height="50" rx="5" fill="#f8f9fa" stroke="#dee2e6" stroke-width="1"/>
+  <text x="860" y="860" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 14px; font-weight: bold; fill: #333;">✅ S3 兼容</text>
+  <text x="860" y="875" text-anchor="middle" style="font-family: Arial, sans-serif; font-size: 11px; fill: #666;">完整 API | Range 支持 | 分片上传</text>
+</svg> 
