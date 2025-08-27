@@ -16,17 +16,19 @@ use bytes::BytesMut;
 use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::{CreateFileOptsBuilder, FileBlocks, WorkerAddress};
+use curvine_common::state::{BlockLocation, CreateFileOptsBuilder, FileBlocks, WorkerAddress};
 use curvine_server::test::MiniCluster;
 use log::info;
 use orpc::common::Utils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{CommonError, CommonResult};
 use std::sync::Arc;
+use tempfile::{tempdir, TempDir};
 
 /// Create a test configuration for replication testing
 /// 2 masters, 3 workers, no S3 mounting
-fn create_test_config() -> ClusterConf {
+fn create_test_config(tmp_dir: &TempDir) -> ClusterConf {
+    let root = tmp_dir.path().to_str().unwrap();
     let mut conf = ClusterConf::default();
 
     // Block configuration
@@ -37,9 +39,9 @@ fn create_test_config() -> ClusterConf {
     conf.master.block_replication_enabled = true;
 
     // Test directories (will be overridden by MiniCluster)
-    conf.master.meta_dir = "/tmp/curvine-test/meta".to_string();
-    conf.journal.journal_dir = "/tmp/curvine-test/journal".to_string();
-    conf.worker.data_dir = vec!["/tmp/curvine-test/data".to_string()];
+    conf.master.meta_dir = format!("{}/meta", root);
+    conf.journal.journal_dir = format!("{}/journal", root);
+    conf.worker.data_dir = vec![format!("{}/data", root)];
 
     // Network configuration (will be overridden by MiniCluster)
     conf.master.hostname = "127.0.0.1".to_string();
@@ -58,7 +60,8 @@ fn create_test_config() -> ClusterConf {
 /// the replication manager automatically replicates them to ensure data availability
 #[test]
 fn test_block_replication_e2e() -> CommonResult<()> {
-    let conf = create_test_config();
+    let tmpdir = tempdir().unwrap();
+    let conf = create_test_config(&tmpdir);
 
     // Use 2 masters and 3 workers as requested
     let cluster = MiniCluster::with_num(&conf, 2, 3);
@@ -95,10 +98,12 @@ fn test_block_replication_e2e() -> CommonResult<()> {
     // Step 3: Simulate under-replication by reporting blocks as missing
     // In a real scenario, this would happen when a worker fails
     let master_replication_manager = cluster.get_active_master_replication_manager();
+    let master_filesystem = cluster.get_active_master_fs();
 
     // Pick the first block and simulate it becoming under-replicated
     let first_block = file_blocks.block_locs.first().unwrap();
     let block_id = first_block.block.id;
+    let locations = &first_block.locs;
 
     info!("Simulating under-replication for block {}", block_id);
 
@@ -118,20 +123,9 @@ fn test_block_replication_e2e() -> CommonResult<()> {
         info!("Block {} has {} replicas", block_id, locations.len());
     }
 
-    // Step 6: Verify data integrity
-    info!("Verifying data integrity after replication");
-    let read_data = rt.block_on(async { read_test_file(&fs, &path).await })?;
-    info!("Expected: {}. Real: {}", test_data.len(), read_data.len());
-
-    if read_data == test_data {
-        info!("✓ Data integrity verified - all data matches original");
-    } else {
-        return Err(CommonError::from("Data integrity check failed"));
-    }
-
-    // Step 7: Verify increased replication
     let target_block_locations = final_locations.get(&block_id);
     if let Some(locations) = target_block_locations {
+        info!("Target block locations: {}", locations.len());
         if locations.len()
             > initial_locations
                 .get(&block_id)
@@ -154,6 +148,38 @@ fn test_block_replication_e2e() -> CommonResult<()> {
         ));
     }
 
+    // step 6: to remove other block locations to check the replicated block effectiveness
+    let fs_dir = master_filesystem.fs_dir();
+    {
+        let mut fs_dir = fs_dir.write();
+        let mut reports = vec![];
+        for addr in locations {
+            reports.push((
+                false,
+                block_id,
+                BlockLocation {
+                    worker_id: addr.worker_id,
+                    storage_type: Default::default(),
+                },
+            ));
+        }
+        fs_dir.block_report(reports)?;
+    }
+    let latest_locations = rt.block_on(async { get_block_locations(&fs, &path).await })?;
+    let first_block_locations = latest_locations.get(&block_id).unwrap();
+    assert_eq!(1, first_block_locations.len());
+
+    // Step 7: Verify data integrity
+    info!("Verifying data integrity after replication");
+    let read_data = rt.block_on(async { read_test_file(&fs, &path).await })?;
+    info!("Expected: {}. Real: {}", test_data.len(), read_data.len());
+
+    if read_data == test_data {
+        info!("✓ Data integrity verified - all data matches original");
+    } else {
+        return Err(CommonError::from("Data integrity check failed"));
+    }
+
     info!("✅ End-to-end replication test completed successfully");
     Ok(())
 }
@@ -161,7 +187,8 @@ fn test_block_replication_e2e() -> CommonResult<()> {
 /// Test replication with worker failure simulation  
 #[test]
 fn test_replication_with_simulated_worker_failure() -> CommonResult<()> {
-    let mut conf = create_test_config();
+    let tmpdir = tempdir().unwrap();
+    let mut conf = create_test_config(&tmpdir);
     conf.client.block_size = 32 * 1024; // 32KB blocks
     conf.master.min_block_size = 32 * 1024;
 
