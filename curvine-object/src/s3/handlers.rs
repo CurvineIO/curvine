@@ -748,6 +748,18 @@ impl crate::s3::s3_api::CreateBucketHandler for S3Handlers {
         let path = self.cv_bucket_path(&bucket);
 
         let path = path.map_err(|e| e.to_string())?;
+
+        // Check if bucket already exists
+        match fs.get_status(&path).await {
+            Ok(_) => {
+                // Bucket already exists, return 409 Conflict error
+                return Err("BucketAlreadyExists".to_string());
+            }
+            Err(_) => {
+                // Bucket doesn't exist, proceed to create
+            }
+        }
+
         fs.mkdir(&path, true).await.map_err(|e| e.to_string())?;
         Ok(())
     }

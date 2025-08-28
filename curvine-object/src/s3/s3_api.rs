@@ -1741,8 +1741,12 @@ pub async fn handle_create_bucket<T: VRequest, F: VResponse>(
     };
     let url_path = req.url_path();
     if let Err(e) = handler.handle(&opt, url_path.trim_matches('/')).await {
-        resp.set_status(500);
-        log::info!("delete object handler error: {e}")
+        if e.contains("BucketAlreadyExists") {
+            resp.set_status(409); // Conflict
+        } else {
+            resp.set_status(500); // Internal Server Error
+        }
+        log::info!("create bucket handler error: {e}")
     }
 }
 
