@@ -1308,34 +1308,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "curvine-libsdk"
-version = "0.2.1-beta"
-dependencies = [
- "bytes",
- "cc",
- "curvine-client",
- "curvine-common",
- "curvine-tracing-appender",
- "dashmap",
- "futures",
- "jni",
- "log",
- "once_cell",
- "orpc",
- "pin-project-lite",
- "prost",
- "prost-build",
- "pyo3",
- "serde",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "curvine-object"
+name = "curvine-gateway"
 version = "0.2.1-beta"
 dependencies = [
  "async-trait",
@@ -1369,6 +1342,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-libsdk"
+version = "0.2.1-beta"
+dependencies = [
+ "bytes",
+ "cc",
+ "curvine-client",
+ "curvine-common",
+ "curvine-tracing-appender",
+ "dashmap",
+ "futures",
+ "jni",
+ "log",
+ "once_cell",
+ "orpc",
+ "pin-project-lite",
+ "prost",
+ "prost-build",
+ "pyo3",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "curvine-server"
 version = "0.2.1-beta"
 dependencies = [
@@ -1379,7 +1379,6 @@ dependencies = [
  "clap",
  "curvine-client",
  "curvine-common",
- "curvine-object",
  "curvine-ufs",
  "curvine-web",
  "dashmap",

@@ -40,7 +40,7 @@
 //! ## Usage Example
 //!
 //! ```rust,no_run
-//! use curvine_object::start_gateway;
+//! use curvine_gateway::start_gateway;
 //! use curvine_common::conf::ClusterConf;
 //!
 //! #[tokio::main]
@@ -262,7 +262,7 @@ async fn init_s3_authentication(
 /// # Example Usage
 ///
 /// ```rust,no_run
-/// use curvine_object::start_gateway;
+/// use curvine_gateway::start_gateway;
 /// use curvine_common::conf::ClusterConf;
 ///
 /// #[tokio::main]

@@ -261,8 +261,8 @@ fi
 
 # Add S3 object gateway package
 if should_build_package "object" || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
-  RUST_BUILD_ARGS+=("-p" "curvine-object")
-  COPY_TARGETS+=("curvine-object")
+  RUST_BUILD_ARGS+=("-p" "curvine-gateway")
+  COPY_TARGETS+=("curvine-gateway")
 fi
 
 # Base command

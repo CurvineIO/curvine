@@ -1,5 +1,5 @@
 [package]
-name = "curvine-object"
+name = "curvine-gateway"
 version = "0.2.1-beta"
 edition = "2021"
 license = "Apache-2.0"

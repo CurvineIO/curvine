@@ -19,19 +19,19 @@ Curvine S3 Object Gateway is an S3-compatible object storage gateway that provid
 
 ```bash
 # Start with default configuration file (etc/curvine-cluster.toml)
-./build/bin/curvine-object.sh
+./build/bin/curvine-gateway.sh
 
 # Start with custom configuration file
-./build/bin/curvine-object.sh --conf /path/to/curvine.conf
+./build/bin/curvine-gateway.sh --conf /path/to/curvine.conf
 
 # Override listen address and region from configuration
-./build/bin/curvine-object.sh \
+./build/bin/curvine-gateway.sh \
     --conf /path/to/curvine.conf \
     --listen 0.0.0.0:9000 \
     --region us-west-2
 
 # Override only listen address, use region from config file
-./build/bin/curvine-object.sh \
+./build/bin/curvine-gateway.sh \
     --conf /path/to/curvine.conf \
     --listen 0.0.0.0:9000
 ```
@@ -52,10 +52,10 @@ cargo run --bin curvine-server -- \
 
 ```bash
 # Build the project
-cargo build --release --bin curvine-object
+cargo build --release --bin curvine-gateway
 
 # Run tests
-cargo test -p curvine-object
+cargo test -p curvine-gateway
 
 # Generate documentation
 cargo doc --open
@@ -301,10 +301,10 @@ curl http://localhost:9900/healthz
 
 ```bash
 # Enable debug logging
-export RUST_LOG=curvine_object=debug
+export RUST_LOG=curvine_gateway=debug
 
 # Enable info level logging for specific modules
-export RUST_LOG=curvine_object::s3::handlers=info
+export RUST_LOG=curvine_gateway::s3::handlers=info
 
 # Enable trace logging (very verbose)
 export RUST_LOG=trace
@@ -326,7 +326,7 @@ The gateway provides detailed logging for monitoring:
 1. **Port Already in Use**
    ```bash
    # Change listen port
-   ./curvine-object --listen 0.0.0.0:9901
+   ./curvine-gateway --listen 0.0.0.0:9901
    ```
 
 2. **Authentication Failures**
@@ -336,16 +336,16 @@ The gateway provides detailed logging for monitoring:
    echo $AWS_SECRET_ACCESS_KEY
    
    # Verify credentials in application logs
-   export RUST_LOG=curvine_object::auth=debug
+   export RUST_LOG=curvine_gateway::auth=debug
    ```
 
 3. **Configuration File Errors**
    ```bash
    # Validate configuration file
-   ./curvine-object --conf /path/to/config.toml
+   ./curvine-gateway --conf /path/to/config.toml
    
    # Use default configuration
-   ./curvine-object --conf ""
+   ./curvine-gateway --conf ""
    ```
 
 4. **File System Errors**
@@ -371,11 +371,11 @@ The gateway provides detailed logging for monitoring:
 ```bash
 # Enable verbose debugging
 export RUST_LOG=debug
-./curvine-object --conf /path/to/curvine.conf
+./curvine-gateway --conf /path/to/curvine.conf
 
 # Enable trace level for all modules
 export RUST_LOG=trace
-./curvine-object --conf /path/to/curvine.conf
+./curvine-gateway --conf /path/to/curvine.conf
 ```
 
 ### Performance Tuning
@@ -402,26 +402,26 @@ git clone https://github.com/your-org/curvine.git
 cd curvine
 
 # Build the gateway
-cargo build --release --bin curvine-object
+cargo build --release --bin curvine-gateway
 
 # Run tests
-cargo test -p curvine-object
+cargo test -p curvine-gateway
 
 # Run with development logging
-RUST_LOG=debug cargo run --bin curvine-object
+RUST_LOG=debug cargo run --bin curvine-gateway
 ```
 
 ### Running Tests
 
 ```bash
 # Unit tests
-cargo test -p curvine-object --lib
+cargo test -p curvine-gateway --lib
 
 # Integration tests
-cargo test -p curvine-object --test integration
+cargo test -p curvine-gateway --test integration
 
 # Complete test suite
-./curvine-object/src/example/test_s3_complete.sh
+./curvine-gateway/src/example/test_s3_complete.sh
 ```
 
 ### Documentation

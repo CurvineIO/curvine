@@ -15,7 +15,7 @@
 #!/bin/bash
 
 # S3 Complete Test Script
-# Tests all S3 operations against curvine-object gateway
+# Tests all S3 operations against curvine-gateway S3 gateway
 
 set -e  # Exit on any error
 
@@ -345,7 +345,7 @@ if [ $TESTS_FAILED -eq 0 ]; then
     echo "Special Characters: Working"
     echo "Empty Files: Working"
     echo
-    echo "curvine-object S3 gateway is fully functional and robust!" 
+    echo "Curvine S3 gateway is fully functional and robust!" 
 else
     echo "PARTIAL SUCCESS: Some tests failed"
     echo
@@ -365,5 +365,5 @@ else
     echo "Failed Tests:"
     echo -e "$FAILED_TESTS"
     echo
-    echo "curvine-object S3 gateway is mostly functional with some issues to fix."
+    echo "Curvine S3 gateway is mostly functional with some issues to fix."
 fi 

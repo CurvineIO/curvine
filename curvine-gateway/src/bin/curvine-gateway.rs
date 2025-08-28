@@ -83,13 +83,13 @@ fn main() -> CommonResult<()> {
 
     // Create unified AsyncRuntime for all operations
     let rt = std::sync::Arc::new(orpc::runtime::AsyncRuntime::new(
-        "curvine-object",
+        "curvine-gateway",
         conf.client.io_threads,
         conf.client.worker_threads,
     ));
 
     // Run start_gateway with the unified runtime
-    rt.block_on(curvine_object::start_gateway(
+    rt.block_on(curvine_gateway::start_gateway(
         conf,
         listen,
         region,
