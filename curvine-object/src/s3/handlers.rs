@@ -1201,20 +1201,15 @@ impl ListObjectHandler for S3Handlers {
         let bucket = bucket.to_string();
         let prefix = opt.prefix.clone();
 
-        Box::pin(async move {
-            // Convert bucket name to file system path
-            let bkt_path = match self.cv_bucket_path(&bucket) {
-                Ok(p) => p,
-                Err(e) => return Err(e.to_string()),
-            };
+        // Convert bucket name to file system path before async block
+        let bkt_path = match self.cv_bucket_path(&bucket) {
+            Ok(p) => p,
+            Err(e) => return Box::pin(async move { Err(e.to_string()) }),
+        };
 
-            // Determine root path based on prefix
-            let root = if let Some(pref) = &prefix {
-                Path::from_str(format!("{}/{}", bkt_path.full_path(), pref))
-                    .map_err(|e| e.to_string())?
-            } else {
-                bkt_path
-            };
+        Box::pin(async move {
+            // Always list from bucket root
+            let root = bkt_path;
 
             // List directory contents
             let list = fs.list_status(&root).await.map_err(|e| e.to_string())?;
@@ -1227,12 +1222,15 @@ impl ListObjectHandler for S3Handlers {
                     continue;
                 }
 
-                // Construct object key based on prefix
-                let key = if let Some(pref) = &prefix {
-                    format!("{}/{}", pref.trim_matches('/'), st.name.clone())
-                } else {
-                    st.name.clone()
-                };
+                // Object key is just the file name (no prefix manipulation)
+                let key = st.name.clone();
+
+                // Apply prefix filtering if specified
+                if let Some(pref) = &prefix {
+                    if !key.starts_with(pref) {
+                        continue; // Skip objects that don't match prefix
+                    }
+                }
 
                 // Use file converter to create complete ListObjectContent
                 contents.push(file_status_to_list_object_content(&st, key));
