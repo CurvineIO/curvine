@@ -305,18 +305,7 @@ impl HeadHandler for S3Handlers {
     /// - Uses `block_in_place` to avoid blocking the async executor
     /// - Single file system call for efficiency
     /// - Metadata conversion is performed in memory
-    fn lookup<'a>(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn 'a
-                + Send
-                + Sync
-                + std::future::Future<Output = Result<Option<HeadObjectResult>, Error>>,
-        >,
-    > {
+    async fn lookup(&self, bucket: &str, object: &str) -> Result<Option<HeadObjectResult>, Error> {
         tracing::debug!("HEAD request for s3://{}/{}", bucket, object);
 
         // Convert S3 path to file system path with error handling
@@ -329,7 +318,7 @@ impl HeadHandler for S3Handlers {
                     object,
                     e
                 );
-                return Box::pin(async { Ok(None) });
+                return Ok(None);
             }
         };
 
@@ -338,29 +327,27 @@ impl HeadHandler for S3Handlers {
         let rt = self.rt.clone();
         let object_name = object.to_string(); // Convert to owned string for async block
 
-        Box::pin(async move {
-            // Execute file system operation in blocking context
-            let res = tokio::task::block_in_place(|| rt.block_on(fs.get_status(&path)));
+        // Execute file system operation in blocking context
+        let res = tokio::task::block_in_place(|| rt.block_on(fs.get_status(&path)));
 
-            match res {
-                Ok(st) if st.file_type == FileType::File => {
-                    tracing::debug!("Found file at path: {}, size: {}", path, st.len);
+        match res {
+            Ok(st) if st.file_type == FileType::File => {
+                tracing::debug!("Found file at path: {}, size: {}", path, st.len);
 
-                    // Use file converter to create complete HeadObjectResult
-                    let head = file_status_to_head_object_result(&st, &object_name);
+                // Use file converter to create complete HeadObjectResult
+                let head = file_status_to_head_object_result(&st, &object_name);
 
-                    Ok::<Option<HeadObjectResult>, Error>(Some(head))
-                }
-                Ok(st) => {
-                    tracing::debug!("Path exists but is not a file: {:?}", st.file_type);
-                    Ok(None)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get status for path {}: {}", path, e);
-                    Ok(None)
-                }
+                Ok(Some(head))
             }
-        })
+            Ok(st) => {
+                tracing::debug!("Path exists but is not a file: {:?}", st.file_type);
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get status for path {}: {}", path, e);
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -609,13 +596,13 @@ impl PutObjectHandler for S3Handlers {
     /// - File system errors → Write operation failures
     /// - Network errors → Stream reading failures
     /// - Resource exhaustion → Out of disk space errors
-    fn handle<'a>(
-        &'a self,
+    async fn handle(
+        &self,
         _opt: &PutObjectOption,
-        bucket: &'a str,
-        object: &'a str,
-        body: &'a mut (dyn crate::utils::io::PollRead + Unpin + Send),
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>> {
+        bucket: &str,
+        object: &str,
+        body: &mut (dyn crate::utils::io::PollRead + Unpin + Send),
+    ) -> Result<(), String> {
         // Create PUT operation context with all necessary configuration
         let context = PutContext::new(
             self.fs.clone(),
@@ -625,10 +612,8 @@ impl PutObjectHandler for S3Handlers {
             self.cv_object_path(bucket, object),
         );
 
-        Box::pin(async move {
-            // Execute PUT operation using the modular orchestrator
-            PutOperation::execute(context, body).await
-        })
+        // Execute PUT operation using the modular orchestrator
+        PutOperation::execute(context, body).await
     }
 }
 

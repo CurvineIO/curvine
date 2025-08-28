@@ -173,19 +173,9 @@ pub struct HeadObjectResult {
     pub website_redirect_location: Option<String>,
 }
 
+#[async_trait::async_trait]
 pub trait HeadHandler {
-    fn lookup<'a>(
-        &self,
-        bucket: &str,
-        object: &str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn 'a
-                + Send
-                + Sync
-                + std::future::Future<Output = Result<Option<HeadObjectResult>, Error>>,
-        >,
-    >;
+    async fn lookup(&self, bucket: &str, object: &str) -> Result<Option<HeadObjectResult>, Error>;
 }
 #[derive(Default)]
 pub struct GetObjectOption {
@@ -771,14 +761,15 @@ impl std::str::FromStr for ObjectLockLegalHoldStatus {
     }
 }
 
+#[async_trait::async_trait]
 pub trait PutObjectHandler {
-    fn handle<'a>(
-        &'a self,
+    async fn handle(
+        &self,
         opt: &PutObjectOption,
-        bucket: &'a str,
-        object: &'a str,
-        body: &'a mut (dyn crate::utils::io::PollRead + Unpin + Send),
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>;
+        bucket: &str,
+        object: &str,
+        body: &mut (dyn crate::utils::io::PollRead + Unpin + Send),
+    ) -> Result<(), String>;
 }
 
 pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
