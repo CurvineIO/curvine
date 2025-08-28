@@ -294,8 +294,9 @@ echo
 
 # Test 16: Verify Empty Bucket - NEW
 echo "Test 16: Verify Empty Bucket"
-if aws --endpoint-url=$ENDPOINT s3api list-objects-v2 --bucket $TEST_BUCKET --query 'Contents' --output text | grep -q .; then
-    echo "WARNING: Bucket should be empty"
+BUCKET_CONTENTS=$(aws --endpoint-url=$ENDPOINT s3api list-objects-v2 --bucket $TEST_BUCKET --query 'Contents' --output text)
+if [ "$BUCKET_CONTENTS" != "None" ] && [ -n "$BUCKET_CONTENTS" ]; then
+    echo "WARNING: Bucket should be empty, but contains: $BUCKET_CONTENTS"
     TESTS_FAILED=$((TESTS_FAILED + 1))
     FAILED_TESTS="$FAILED_TESTS\n- Test 16: Bucket cleanup verification"
 else
