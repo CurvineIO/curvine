@@ -14,6 +14,7 @@
 
 use clap::Parser;
 use curvine_common::conf::ClusterConf;
+use orpc::runtime::RpcRuntime;
 use orpc::CommonResult;
 
 /// Curvine S3-compatible Object Gateway
@@ -80,10 +81,18 @@ fn main() -> CommonResult<()> {
         region
     );
 
-    // Run start_gateway on a dedicated Tokio runtime to avoid nested runtime issues
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-    rt.block_on(curvine_object::start_gateway(conf, listen, region))
+    // Create unified AsyncRuntime for all operations
+    let rt = std::sync::Arc::new(orpc::runtime::AsyncRuntime::new(
+        "curvine-object",
+        conf.client.io_threads,
+        conf.client.worker_threads,
+    ));
+
+    // Run start_gateway with the unified runtime
+    rt.block_on(curvine_object::start_gateway(
+        conf,
+        listen,
+        region,
+        rt.clone(),
+    ))
 }

@@ -276,6 +276,7 @@ pub async fn start_gateway(
     conf: ClusterConf,
     listen: String,
     region: String,
+    rt: std::sync::Arc<orpc::runtime::AsyncRuntime>,
 ) -> orpc::CommonResult<()> {
     // Initialize logging for standalone mode; ignore error if already set
     let _ = tracing_subscriber::fmt()
@@ -290,18 +291,8 @@ pub async fn start_gateway(
         region
     );
 
-    // Create a runtime that can be used within tokio context
-    // This shared runtime handles all file system operations
-    let rt = std::sync::Arc::new(orpc::runtime::AsyncRuntime::new(
-        "curvine-object",
-        conf.client.io_threads,
-        conf.client.worker_threads,
-    ));
-
-    // Prevent dropping inner Tokio runtime inside an async context
-    // This is a workaround for nested runtime issues in some deployment scenarios
-    let _leaked_rt = std::sync::Arc::clone(&rt);
-    std::mem::forget(_leaked_rt);
+    // Use the provided unified runtime (no need to create a new one)
+    // This shared runtime is managed at the application level
 
     // Initialize the unified file system with the shared runtime
     let ufs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;

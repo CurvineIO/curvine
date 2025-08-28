@@ -36,26 +36,6 @@ fn main() -> CommonResult<()> {
 
     match service {
         ServiceType::Master => {
-            if args.enable_object_gateway {
-                let listen = if args.object_listen.is_empty() {
-                    "0.0.0.0:9900".to_string()
-                } else {
-                    args.object_listen.clone()
-                };
-                let region = if args.object_region.is_empty() {
-                    "us-east-1".to_string()
-                } else {
-                    args.object_region.clone()
-                };
-                let conf_clone = conf.clone();
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .build()
-                        .expect("build tokio runtime");
-                    let _ = rt.block_on(curvine_object::start_gateway(conf_clone, listen, region));
-                });
-            }
             let master = Master::with_conf(conf)?;
             master.block_on_start();
         }

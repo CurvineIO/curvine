@@ -324,11 +324,10 @@ impl HeadHandler for S3Handlers {
 
         // Clone necessary data for the async block
         let fs = self.fs.clone();
-        let rt = self.rt.clone();
-        let object_name = object.to_string(); // Convert to owned string for async block
+        let object_name = object.to_string();
 
-        // Execute file system operation in blocking context
-        let res = tokio::task::block_in_place(|| rt.block_on(fs.get_status(&path)));
+        // Execute file system operation directly in async context
+        let res = fs.get_status(&path).await;
 
         match res {
             Ok(st) if st.file_type == FileType::File => {
