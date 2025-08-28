@@ -457,22 +457,52 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                 e.to_string()
             })?;
 
-            // Apply range seek if specified
-            if let Some(start) = _opt.range_start {
-                tracing::debug!("Seeking to position {} for range request", start);
-                reader.seek(start as i64).await.map_err(|e| {
-                    tracing::error!("Failed to seek to position {}: {}", start, e);
+            // Handle range requests (including suffix-byte-range-spec)
+            let (seek_pos, bytes_to_read) = if let Some(range_end) = _opt.range_end {
+                if range_end > u64::MAX - 1000000 {
+                    // This is a suffix-byte-range-spec (bytes=-N)
+                    let suffix_len = u64::MAX - range_end;
+                    let file_size = reader.remaining().max(0) as u64;
+                    if suffix_len > file_size {
+                        // If suffix length is larger than file, read entire file
+                        (None, None)
+                    } else {
+                        // Seek to (file_size - suffix_len) and read suffix_len bytes
+                        let start_pos = file_size - suffix_len;
+                        tracing::debug!(
+                            "Suffix range request: seeking to {} for last {} bytes",
+                            start_pos,
+                            suffix_len
+                        );
+                        (Some(start_pos), Some(suffix_len))
+                    }
+                } else {
+                    // Normal range processing
+                    let start = _opt.range_start.unwrap_or(0);
+                    let bytes = range_end - start + 1;
+                    tracing::debug!(
+                        "Normal range request: seeking to {} for {} bytes",
+                        start,
+                        bytes
+                    );
+                    (Some(start), Some(bytes))
+                }
+            } else if let Some(start) = _opt.range_start {
+                // range_start only (bytes=N-)
+                tracing::debug!("Open-ended range request: seeking to {}", start);
+                (Some(start), None)
+            } else {
+                // No range request
+                (None, None)
+            };
+
+            // Apply seek if needed
+            if let Some(pos) = seek_pos {
+                reader.seek(pos as i64).await.map_err(|e| {
+                    tracing::error!("Failed to seek to position {}: {}", pos, e);
                     e.to_string()
                 })?;
             }
-
-            // Calculate bytes to read for range requests
-            let bytes_to_read = if let (Some(start), Some(end)) = (_opt.range_start, _opt.range_end)
-            {
-                Some(end - start + 1)
-            } else {
-                None
-            };
 
             // Determine target read amount
             let remaining_bytes = bytes_to_read;

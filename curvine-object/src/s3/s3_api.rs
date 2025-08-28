@@ -367,20 +367,31 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
             .and_then(|v| v.parse::<u64>().ok()),
     };
 
-    // Try parse HTTP Range header: bytes=start-end
+    // Try parse HTTP Range header: bytes=start-end, bytes=start-, bytes=-suffix
     if let Some(rh) = req.get_header("range") {
         if let Some(bytes) = rh.strip_prefix("bytes=") {
-            let mut it = bytes.splitn(2, '-');
-            let s = it.next().unwrap_or("");
-            let e = it.next().unwrap_or("");
-            if !s.is_empty() {
-                if let Ok(v) = s.parse::<u64>() {
-                    opt.range_start = Some(v);
+            if bytes.starts_with('-') {
+                // Handle suffix-byte-range-spec: bytes=-N (last N bytes)
+                if let Ok(suffix_len) = bytes[1..].parse::<u64>() {
+                    // We'll need to calculate the actual range after we know the file size
+                    // For now, we mark this as a special case
+                    opt.range_start = None;
+                    opt.range_end = Some(u64::MAX - suffix_len); // Use special encoding
                 }
-            }
-            if !e.is_empty() {
-                if let Ok(v) = e.parse::<u64>() {
-                    opt.range_end = Some(v);
+            } else {
+                // Handle normal range: bytes=start-end or bytes=start-
+                let mut it = bytes.splitn(2, '-');
+                let s = it.next().unwrap_or("");
+                let e = it.next().unwrap_or("");
+                if !s.is_empty() {
+                    if let Ok(v) = s.parse::<u64>() {
+                        opt.range_start = Some(v);
+                    }
+                }
+                if !e.is_empty() {
+                    if let Ok(v) = e.parse::<u64>() {
+                        opt.range_end = Some(v);
+                    }
                 }
             }
         }
@@ -417,21 +428,46 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
 
     // If range requested, validate and compute
     if opt.range_start.is_some() || opt.range_end.is_some() {
-        let start = opt.range_start.unwrap_or(0);
-        if start >= total_len {
-            resp.set_status(416);
-            resp.set_header("content-range", &format!("bytes */{}", total_len));
-            resp.send_header();
-            return;
-        }
-        let end = opt.range_end.unwrap_or_else(|| total_len.saturating_sub(1));
-        let end = end.min(total_len.saturating_sub(1));
-        if end < start {
-            resp.set_status(416);
-            resp.set_header("content-range", &format!("bytes */{}", total_len));
-            resp.send_header();
-            return;
-        }
+        let (start, end) = if let Some(range_end) = opt.range_end {
+            if range_end > u64::MAX - 1000000 {
+                // This is a suffix-byte-range-spec (bytes=-N)
+                let suffix_len = u64::MAX - range_end;
+                if suffix_len > total_len {
+                    // If suffix length is larger than file, return entire file
+                    (0, total_len.saturating_sub(1))
+                } else {
+                    // Return last N bytes
+                    (total_len - suffix_len, total_len.saturating_sub(1))
+                }
+            } else {
+                // Normal range processing
+                let start = opt.range_start.unwrap_or(0);
+                if start >= total_len {
+                    resp.set_status(416);
+                    resp.set_header("content-range", &format!("bytes */{}", total_len));
+                    resp.send_header();
+                    return;
+                }
+                let end = range_end.min(total_len.saturating_sub(1));
+                if end < start {
+                    resp.set_status(416);
+                    resp.set_header("content-range", &format!("bytes */{}", total_len));
+                    resp.send_header();
+                    return;
+                }
+                (start, end)
+            }
+        } else {
+            // range_start only (bytes=N-)
+            let start = opt.range_start.unwrap_or(0);
+            if start >= total_len {
+                resp.set_status(416);
+                resp.set_header("content-range", &format!("bytes */{}", total_len));
+                resp.send_header();
+                return;
+            }
+            (start, total_len.saturating_sub(1))
+        };
         resp_len = end - start + 1;
         status = 206;
         resp.set_header(
