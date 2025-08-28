@@ -47,18 +47,20 @@ impl WorkerReplicationManager {
     pub fn new(
         block_store: &BlockStore,
         async_runtime: &Arc<AsyncRuntime>,
-        _conf: &ClusterConf,
+        conf: &ClusterConf,
         fs_client_context: &Arc<FsContext>,
     ) -> Arc<Self> {
-        let (send, recv) = tokio::sync::mpsc::channel(10000);
+        let (send, recv) = tokio::sync::mpsc::channel(Semaphore::MAX_PERMITS);
         let handler = Self {
             block_store: block_store.clone(),
-            replication_semaphore: Arc::new(Semaphore::new(10)),
+            replication_semaphore: Arc::new(Semaphore::new(
+                conf.worker.block_replication_concurrency_limit,
+            )),
             jobs_queue_sender: Arc::new(send),
             runtime: async_runtime.clone(),
             fs_client_context: fs_client_context.clone(),
             master_client: Default::default(),
-            replicate_chunk_size: 1024 * 1024,
+            replicate_chunk_size: conf.worker.block_replication_chunk_size,
         };
         let handler = Arc::new(handler);
         Self::handle(&handler, async_runtime.clone(), recv);

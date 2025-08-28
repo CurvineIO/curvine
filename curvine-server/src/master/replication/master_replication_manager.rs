@@ -66,8 +66,8 @@ impl MasterReplicationManager {
         worker_manager: &SyncWorkerManager,
     ) -> Arc<Self> {
         let async_runtime = rt.clone();
-        let semaphore = Semaphore::new(100);
-        let (send, recv) = tokio::sync::mpsc::channel(10000);
+        let semaphore = Semaphore::new(conf.master.block_replication_concurrency_limit);
+        let (send, recv) = tokio::sync::mpsc::channel(Semaphore::MAX_PERMITS);
 
         let manager = Self {
             fs: fs.clone(),
