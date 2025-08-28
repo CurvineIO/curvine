@@ -1117,12 +1117,10 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
     }
 }
 pub struct DeleteObjectOption {}
+
+#[async_trait::async_trait]
 pub trait DeleteObjectHandler {
-    fn handle<'a>(
-        &'a self,
-        opt: &'a DeleteObjectOption,
-        object: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>;
+    async fn handle(&self, opt: &DeleteObjectOption, object: &str) -> Result<(), String>;
 }
 
 pub async fn handle_delete_object<T: VRequest, F: VResponse>(
@@ -1668,13 +1666,11 @@ impl Display for BucketLocationConstraint {
     }
 }
 
+#[async_trait::async_trait]
 pub trait CreateBucketHandler {
-    fn handle<'a>(
-        &'a self,
-        opt: &'a CreateBucketOption,
-        bucket: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>;
+    async fn handle(&self, opt: &CreateBucketOption, bucket: &str) -> Result<(), String>;
 }
+
 pub async fn handle_create_bucket<T: VRequest, F: VResponse>(
     req: T,
     resp: &mut F,
@@ -1717,12 +1713,10 @@ pub async fn handle_create_bucket<T: VRequest, F: VResponse>(
 pub struct DeleteBucketOption {
     pub expected_owner: Option<String>,
 }
+
+#[async_trait::async_trait]
 pub trait DeleteBucketHandler {
-    fn handle<'a>(
-        &'a self,
-        opt: &'a DeleteBucketOption,
-        bucket: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>;
+    async fn handle(&self, opt: &DeleteBucketOption, bucket: &str) -> Result<(), String>;
 }
 
 pub async fn handle_delete_bucket<T: VRequest, F: VResponse>(

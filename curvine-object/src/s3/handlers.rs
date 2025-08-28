@@ -649,34 +649,32 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
     ///
     /// Currently takes full object path rather than separate bucket/object
     /// parameters. This may be updated in future versions for consistency.
-    fn handle<'a>(
-        &'a self,
-        _opt: &'a crate::s3::s3_api::DeleteObjectOption,
-        object: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>> {
+    async fn handle(
+        &self,
+        _opt: &crate::s3::s3_api::DeleteObjectOption,
+        object: &str,
+    ) -> Result<(), String> {
         // Clone necessary data for async block
         let fs = self.fs.clone();
         let object = object.to_string();
         let path = Path::from_str(format!("/{}", object));
 
-        Box::pin(async move {
-            let path = path.map_err(|e| e.to_string())?;
-            match fs.delete(&path, false).await {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    let msg = e.to_string();
-                    // Treat not-found as success to be S3 compatible (idempotent)
-                    if msg.contains("No such file")
-                        || msg.contains("not exists")
-                        || msg.contains("not found")
-                    {
-                        Ok(())
-                    } else {
-                        Err(msg)
-                    }
+        let path = path.map_err(|e| e.to_string())?;
+        match fs.delete(&path, false).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                // Treat not-found as success to be S3 compatible (idempotent)
+                if msg.contains("No such file")
+                    || msg.contains("not exists")
+                    || msg.contains("not found")
+                {
+                    Ok(())
+                } else {
+                    Err(msg)
                 }
             }
-        })
+        }
     }
 }
 
@@ -709,21 +707,19 @@ impl crate::s3::s3_api::CreateBucketHandler for S3Handlers {
     /// # File System Mapping
     ///
     /// Creates directory `/bucket-name` in the file system root
-    fn handle<'a>(
-        &'a self,
-        _opt: &'a crate::s3::s3_api::CreateBucketOption,
-        bucket: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>> {
+    async fn handle(
+        &self,
+        _opt: &crate::s3::s3_api::CreateBucketOption,
+        bucket: &str,
+    ) -> Result<(), String> {
         // Clone necessary data for async block
         let fs = self.fs.clone();
         let bucket = bucket.to_string();
         let path = self.cv_bucket_path(&bucket);
 
-        Box::pin(async move {
-            let path = path.map_err(|e| e.to_string())?;
-            fs.mkdir(&path, true).await.map_err(|e| e.to_string())?;
-            Ok(())
-        })
+        let path = path.map_err(|e| e.to_string())?;
+        fs.mkdir(&path, true).await.map_err(|e| e.to_string())?;
+        Ok(())
     }
 }
 
@@ -752,20 +748,18 @@ impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
     /// - Fails if bucket is not empty (standard S3 behavior)
     /// - Returns appropriate error codes
     /// - Idempotent operation
-    fn handle<'a>(
-        &'a self,
-        _opt: &'a crate::s3::s3_api::DeleteBucketOption,
-        bucket: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>> {
+    async fn handle(
+        &self,
+        _opt: &crate::s3::s3_api::DeleteBucketOption,
+        bucket: &str,
+    ) -> Result<(), String> {
         // Clone necessary data for async block
         let fs = self.fs.clone();
         let bucket = bucket.to_string();
         let path = self.cv_bucket_path(&bucket);
 
-        Box::pin(async move {
-            let path = path.map_err(|e| e.to_string())?;
-            fs.delete(&path, false).await.map_err(|e| e.to_string())
-        })
+        let path = path.map_err(|e| e.to_string())?;
+        fs.delete(&path, false).await.map_err(|e| e.to_string())
     }
 }
 
