@@ -56,13 +56,14 @@ use crate::s3::error::Error;
 use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
 use crate::utils::utils::{file_status_to_head_object_result, file_status_to_list_object_content};
+use bytes::BytesMut;
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::FileType;
 use curvine_common::FsResult;
 use orpc::runtime::AsyncRuntime;
-use orpc::runtime::RpcRuntime;
+
 use std::future::Future;
 use tokio::io::AsyncWriteExt;
 use tracing;
@@ -306,7 +307,7 @@ impl HeadHandler for S3Handlers {
     /// - Single file system call for efficiency
     /// - Metadata conversion is performed in memory
     async fn lookup(&self, bucket: &str, object: &str) -> Result<Option<HeadObjectResult>, Error> {
-        tracing::debug!("HEAD request for s3://{}/{}", bucket, object);
+        tracing::info!("HEAD request for s3://{}/{}", bucket, object);
 
         // Convert S3 path to file system path with error handling
         let path = match self.cv_object_path(bucket, object) {
@@ -411,7 +412,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
     ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>> {
         // Clone necessary data for async block
         let fs = self.fs.clone();
-        let rt = self.rt.clone();
+        // let rt = self.rt.clone();
         let path = self.cv_object_path(bucket, object);
         let bucket = bucket.to_string();
         let object = object.to_string();
@@ -451,21 +452,18 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
             })?;
 
             // Open file for reading with error handling
-            let mut reader =
-                tokio::task::block_in_place(|| rt.block_on(fs.open(&path))).map_err(|e| {
-                    tracing::error!("Failed to open file at path {}: {}", path, e);
-                    e.to_string()
-                })?;
+            let mut reader = fs.open(&path).await.map_err(|e| {
+                tracing::error!("Failed to open file at path {}: {}", path, e);
+                e.to_string()
+            })?;
 
             // Apply range seek if specified
             if let Some(start) = _opt.range_start {
                 tracing::debug!("Seeking to position {} for range request", start);
-                tokio::task::block_in_place(|| rt.block_on(reader.seek(start as i64))).map_err(
-                    |e| {
-                        tracing::error!("Failed to seek to position {}: {}", start, e);
-                        e.to_string()
-                    },
-                )?;
+                reader.seek(start as i64).await.map_err(|e| {
+                    tracing::error!("Failed to seek to position {}: {}", start, e);
+                    e.to_string()
+                })?;
             }
 
             // Calculate bytes to read for range requests
@@ -500,19 +498,24 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 
             // Read all data at once using read_full
             if to_read > 0 {
-                let mut buffer = vec![0u8; to_read];
-                let n = tokio::task::block_in_place(|| rt.block_on(reader.read_full(&mut buffer)))
+                let mut buffer = BytesMut::zeroed(to_read);
+                let n = reader
+                    .read_full(&mut buffer)
+                    .await
                     .map_err(|e| e.to_string())?;
-                data = buffer[..n].to_vec();
+                buffer.truncate(n);
+                data = buffer.to_vec();
             } else {
                 // Read all available data
                 let remaining = reader.remaining().max(0) as usize;
                 if remaining > 0 {
-                    let mut buffer = vec![0u8; remaining];
-                    let n =
-                        tokio::task::block_in_place(|| rt.block_on(reader.read_full(&mut buffer)))
-                            .map_err(|e| e.to_string())?;
-                    data = buffer[..n].to_vec();
+                    let mut buffer = BytesMut::zeroed(remaining);
+                    let n = reader
+                        .read_full(&mut buffer)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    buffer.truncate(n);
+                    data = buffer.to_vec();
                 }
             }
 
@@ -528,7 +531,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
             let total_read = data.len() as u64;
 
             // Clean up reader to stop background tasks
-            if let Err(e) = tokio::task::block_in_place(|| rt.block_on(reader.complete())) {
+            if let Err(e) = reader.complete().await {
                 tracing::warn!("Failed to complete reader cleanup: {}", e);
                 // Don't fail the request for cleanup errors
             }
