@@ -487,6 +487,21 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
     if let Some(v) = header_last_modified.take() {
         resp.set_header("last-modified", &v)
     }
+
+    // Set custom metadata as x-amz-meta-* headers
+    if let Some(metadata) = head.metadata {
+        for (key, value) in metadata {
+            // If key already starts with x-amz-meta-, use as-is
+            // Otherwise, add the x-amz-meta- prefix
+            let header_name = if key.starts_with("x-amz-meta-") {
+                key
+            } else {
+                format!("x-amz-meta-{}", key)
+            };
+            resp.set_header(&header_name, &value);
+        }
+    }
+
     // Fix for leading zeros: force connection close for GET responses
     resp.set_header("Connection", "close");
     //
