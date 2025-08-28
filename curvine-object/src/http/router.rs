@@ -797,6 +797,20 @@ impl S3Router {
                         resp.set_header("last-modified", &v);
                     }
 
+                    // Set custom metadata as x-amz-meta-* headers
+                    if let Some(metadata) = head.metadata {
+                        for (key, value) in metadata {
+                            // If key already starts with x-amz-meta-, use as-is
+                            // Otherwise, add the x-amz-meta- prefix
+                            let header_name = if key.starts_with("x-amz-meta-") {
+                                key
+                            } else {
+                                format!("x-amz-meta-{}", key)
+                            };
+                            resp.set_header(&header_name, &value);
+                        }
+                    }
+
                     // Fix for leading zeros: prevent HEAD response mixing with GET response
                     resp.set_header("Connection", "close");
                     // Keep original content-length for S3 compatibility
