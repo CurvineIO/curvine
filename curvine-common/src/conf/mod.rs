@@ -36,12 +36,12 @@ pub use self::size_string::SizeString;
 mod duration_string;
 pub use self::duration_string::DurationString;
 
-mod load_conf;
-pub use self::load_conf::{MasterLoadConf, WorkerLoadConf};
-
 mod ufs_conf;
 pub use self::ufs_conf::UfsConf;
 pub use self::ufs_conf::UfsConfBuilder;
+
+mod job_conf;
+pub use self::job_conf::JobConf;
 
 #[cfg(test)]
 mod tests {

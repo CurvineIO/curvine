@@ -12,10 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod load_job;
-mod load_manager;
-mod master_load_handler;
+//! Worker side data loading module
+//! Responsible for loading data from external storage systems (such as S3) to local storage
 
-pub use crate::master::load::load_manager::LoadManager;
-pub use load_job::*;
-pub use master_load_handler::MasterLoadService;
+mod load_task_runner;
+pub use self::load_task_runner::LoadTaskRunner;
+
+mod task_manager;
+pub use self::task_manager::TaskManager;
+
+mod task_store;
+pub use self::task_store::TaskStore;
+
+mod task_context;
+pub use self::task_context::TaskContext;

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_client::LoadClient;
+use curvine_client::rpc::JobMasterClient;
 use orpc::CommonResult;
 
 use crate::util::*;
@@ -27,7 +27,7 @@ pub struct CancelLoadCommand {
 }
 
 impl CancelLoadCommand {
-    pub async fn execute(&self, client: LoadClient) -> CommonResult<()> {
+    pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
         // Verify the task ID
         if self.job_id.trim().is_empty() {
             eprintln!("Error: Job ID cannot be empty");
@@ -38,14 +38,8 @@ impl CancelLoadCommand {
         println!("┌─────────────────────────────────");
         println!("│ Job ID: {}", self.job_id);
 
-        let resp = handle_rpc_result(client.cancel_load(&self.job_id)).await;
-
-        if resp.success {
-            println!("│ ✅ Job cancelled successfully");
-        } else {
-            println!("│ ⚠️  Job cannot be cancelled");
-            println!("│ The job may have already completed or been cancelled.");
-        }
+        handle_rpc_result(client.cancel_job(&self.job_id)).await;
+        println!("│ ✅ Job cancelled successfully");
         println!("└─────────────────────────────────");
         Ok(())
     }

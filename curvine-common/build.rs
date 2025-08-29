@@ -20,7 +20,7 @@ fn main() {
         "common.proto",
         "master.proto",
         "worker.proto",
-        "load.proto",
+        "job.proto",
         "mount.proto",
     ];
 

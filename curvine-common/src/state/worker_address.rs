@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkerAddress {
@@ -37,6 +38,14 @@ impl WorkerAddress {
 impl PartialEq for WorkerAddress {
     fn eq(&self, other: &Self) -> bool {
         self.worker_id == other.worker_id
+    }
+}
+
+impl Eq for WorkerAddress {}
+
+impl Hash for WorkerAddress {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.worker_id.hash(state);
     }
 }
 

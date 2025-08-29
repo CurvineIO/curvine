@@ -16,10 +16,9 @@
 
 use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsClient, FsContext};
-use curvine_client::LoadClient;
+use curvine_client::rpc::JobMasterClient;
 use curvine_common::fs::{Path, Reader};
-use curvine_common::proto::LoadState;
-use curvine_common::state::MountOptions;
+use curvine_common::state::{MountOptions, WorkState};
 use curvine_tests::Testing;
 use log::info;
 use orpc::common::Logger;
@@ -64,13 +63,13 @@ fn load_client_test() -> CommonResult<()> {
         assert!(mount_resp.is_ok(), "mount should success");
 
         // Create MasterClient for submitting load request
-        let client = LoadClient::new(Arc::new(client))?;
         let fs = CurvineFileSystem::with_rt(conf, rt_clone.clone())?;
+        let client = JobMasterClient::new(fs.fs_client());
         // Submit a load request
         info!("Submit a load request: {}", TEST_FILE);
 
         let load_response = client
-            .submit_load(TEST_FILE, Some("300s".to_string()), Some(true))
+            .submit_load(TEST_FILE)
             .await?;
         curvine_path = load_response.target_path.clone();
 
@@ -86,22 +85,22 @@ fn load_client_test() -> CommonResult<()> {
         let max_retries = 100;
 
         while !loaded && retry_count < max_retries {
-            let status = client.get_load_status(&job_id).await?;
+            let status = client.get_job_status(&job_id).await?;
             info!("Loading status: {}", status);
-            if status.state == LoadState::Completed as i32 {
+            if status.state == WorkState::Completed {
                 loaded = true;
                 info!("The file load is complete");
 
                 let read_len = read(&fs, curvine_path.as_str()).await?;
-                let expected_size = status.metrics.unwrap().total_size.unwrap_or_default();
+                let expected_size = status.progress.total_size;
                 assert_eq!(
                     read_len, expected_size,
                     "Read length {} is not equal to the expected size {}",
                     read_len, expected_size
                 );
                 break;
-            } else if status.state == LoadState::Failed as i32 {
-                return Err(format!("The loading task failed: {}", status.message.unwrap_or_default()).into());
+            } else if status.state == WorkState::Failed {
+                return Err(format!("The loading task failed: {}", status.progress.message).into());
             } else {
                 // Wait for a while before trying again
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -141,13 +140,12 @@ async fn read(fs: &CurvineFileSystem, path_str: &str) -> CommonResult<i64> {
 
     Ok(len as i64)
 }
-async fn test_cancel_load(client: &LoadClient, file_path: &str) -> CommonResult<()> {
+
+async fn test_cancel_load(client: &JobMasterClient, file_path: &str) -> CommonResult<()> {
     info!("Start testing the unload task: {}", file_path);
 
     // Submit a loading task
-    let load_response = client
-        .submit_load(file_path, Some("30s".to_string()), Some(true))
-        .await?;
+    let load_response = client.submit_load(file_path).await?;
 
     info!(
         "The upload task is submitted successfully, and you are ready to cancel it: {}",
@@ -157,7 +155,7 @@ async fn test_cancel_load(client: &LoadClient, file_path: &str) -> CommonResult<
 
     // Cancel the task immediately
     let job_id = load_response.job_id;
-    client.cancel_load(&job_id).await?;
+    client.cancel_job(&job_id).await?;
     info!("A cancellation request has been sent, waiting for the task status to be updated");
 
     // Verify that the task status changes to Canceled
@@ -166,20 +164,16 @@ async fn test_cancel_load(client: &LoadClient, file_path: &str) -> CommonResult<
     let max_retries = 20;
 
     while !canceled && retry_count < max_retries {
-        let status = client.get_load_status(&job_id).await?;
+        let status = client.get_job_status(&job_id).await?;
         info!("The status of the load after the cancellation: {}", status);
 
-        if status.state == LoadState::Canceled as i32 {
+        if status.state == WorkState::Canceled {
             canceled = true;
             info!("The task was successfully canceled");
             break;
-        } else if status.state == LoadState::Failed as i32 {
-            return Err(format!(
-                "The loading task failed: {}",
-                status.message.unwrap_or_default()
-            )
-            .into());
-        } else if status.state == LoadState::Completed as i32 {
+        } else if status.state == WorkState::Failed {
+            return Err(format!("The loading task failed: {}", status.progress.message).into());
+        } else if status.state == WorkState::Completed {
             info!("The task was completed before it was canceled");
             break;
         } else {

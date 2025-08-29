@@ -22,7 +22,7 @@ use curvine_common::state::{
 };
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::JournalSystem;
-use curvine_server::master::{LoadManager, Master, MasterHandler, RpcContext};
+use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use orpc::common::Utils;
 use orpc::message::Builder;
 use orpc::runtime::AsyncRuntime;
@@ -71,12 +71,14 @@ fn new_handler() -> MasterHandler {
 
     let mount_manager = journal_system.mount_manager();
     let rt = Arc::new(AsyncRuntime::single());
-    let load = Arc::new(LoadManager::from_cluster_conf(
-        Arc::new(fs.clone()),
+    let job_manager = Arc::new(JobManager::from_cluster_conf(
+        fs.clone(),
+        mount_manager.clone(),
         rt.clone(),
         &conf,
     ));
-    MasterHandler::new(&conf, fs, retry_cache, None, mount_manager, load, rt)
+    let job_handler = JobHandler::new(job_manager);
+    MasterHandler::new(&conf, fs, retry_cache, None, mount_manager, job_handler)
 }
 
 #[test]

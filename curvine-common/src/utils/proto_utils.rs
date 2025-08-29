@@ -555,4 +555,24 @@ impl ProtoUtils {
             remove_properties: opts.remove_properties,
         }
     }
+
+    pub fn work_progress_to_pb(report: WorkProgress) -> WorkProgressProto {
+        WorkProgressProto {
+            loaded_size: report.loaded_size,
+            total_size: report.total_size,
+            update_time: report.update_time,
+            state: report.state as i8 as i32,
+            message: report.message,
+        }
+    }
+
+    pub fn work_progress_from_pb(report: WorkProgressProto) -> WorkProgress {
+        WorkProgress {
+            loaded_size: report.loaded_size,
+            total_size: report.total_size,
+            update_time: report.update_time,
+            state: WorkState::from(report.state as i8),
+            message: report.message,
+        }
+    }
 }

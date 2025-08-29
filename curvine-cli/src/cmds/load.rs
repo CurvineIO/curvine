@@ -14,25 +14,20 @@
 
 use crate::util::*;
 use clap::Parser;
-use curvine_client::LoadClient;
+use curvine_client::rpc::JobMasterClient;
+use curvine_common::state::LoadJobCommand;
 use orpc::CommonResult;
 
 #[derive(Parser, Debug)]
 pub struct LoadCommand {
     path: String,
 
-    #[arg(long, short = 't', default_value = "3d")]
-    ttl: Option<String>,
-
-    #[arg(long, short = 'r', default_value = "true")]
-    recursive: Option<bool>,
-
     #[arg(long, default_value = "${CURVINE_CONF_FILE}")]
     conf: String,
 }
 
 impl LoadCommand {
-    pub async fn execute(&self, client: LoadClient) -> CommonResult<()> {
+    pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
         if self.path.trim().is_empty() {
             eprintln!("Error: Path cannot be empty");
             std::process::exit(1);
@@ -41,18 +36,8 @@ impl LoadCommand {
         println!("\n Loading file to Curvine");
         println!("Source path: {}", self.path);
 
-        let rep = handle_rpc_result(client.get_mount_point(self.path.as_str())).await;
-        if rep.is_none() {
-            println!(
-                "Can not found mount point for path : {}, please mount first.",
-                self.path
-            );
-            std::process::exit(1);
-        }
-
-        let rep =
-            handle_rpc_result(client.submit_load(&self.path, self.ttl.clone(), self.recursive))
-                .await;
+        let command = LoadJobCommand::builder(&self.path).build();
+        let rep = handle_rpc_result(client.submit_load_job(command)).await;
         println!("{}", rep);
         Ok(())
     }

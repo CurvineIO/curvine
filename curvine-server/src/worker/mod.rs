@@ -23,4 +23,4 @@ mod worker_metrics;
 pub use self::worker_metrics::WorkerMetrics;
 
 pub mod handler;
-pub mod load;
+pub mod task;

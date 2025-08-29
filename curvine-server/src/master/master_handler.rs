@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
-use crate::master::load::{LoadManager, MasterLoadService};
+use crate::master::job::JobHandler;
 use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_common::conf::ClusterConf;
@@ -28,7 +28,6 @@ use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::net::ConnState;
 use orpc::message::Message;
-use orpc::runtime::Runtime;
 use std::sync::Arc;
 
 pub struct MasterHandler {
@@ -37,7 +36,7 @@ pub struct MasterHandler {
     pub(crate) metrics: &'static MasterMetrics,
     pub(crate) audit_logging_enabled: bool,
     pub(crate) conn_state: Option<ConnState>,
-    pub(crate) load_service: Option<MasterLoadService>,
+    pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
 }
 
@@ -48,8 +47,7 @@ impl MasterHandler {
         retry_cache: Option<FsRetryCache>,
         conn_state: Option<ConnState>,
         mount_manager: Arc<MountManager>,
-        load_manager: Arc<LoadManager>,
-        rt: Arc<Runtime>,
+        job_handler: JobHandler,
     ) -> Self {
         Self {
             fs,
@@ -57,7 +55,7 @@ impl MasterHandler {
             metrics: Master::get_metrics(),
             audit_logging_enabled: conf.master.audit_logging_enabled,
             conn_state,
-            load_service: Some(MasterLoadService::new(load_manager, rt.clone())),
+            job_handler,
             mount_manager,
         }
     }
@@ -420,16 +418,10 @@ impl MessageHandler for MasterHandler {
             RpcCode::GetMasterInfo => self.get_master_info(ctx),
 
             // Load task related requests
-            RpcCode::SubmitLoadJob
-            | RpcCode::GetLoadStatus
-            | RpcCode::CancelLoadJob
-            | RpcCode::ReportLoadTask => {
-                if let Some(ref mut load_service) = self.load_service {
-                    return load_service.handle(msg);
-                } else {
-                    return Err(FsError::common("Load service not initialized"));
-                }
-            }
+            RpcCode::SubmitJob
+            | RpcCode::GetJobStatus
+            | RpcCode::CancelJob
+            | RpcCode::ReportTask => self.job_handler.handle(ctx),
 
             // Unsupported request
             _ => err_box!("Unsupported operation"),

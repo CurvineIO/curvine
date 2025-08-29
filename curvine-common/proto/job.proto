@@ -1,0 +1,83 @@
+syntax = "proto2";
+package proto;
+
+option java_package = "io.curvine.proto";
+option java_multiple_files = true;
+option java_outer_classname = "LoadProto";
+
+import "common.proto";
+
+// job and task status enumeration
+enum WorkStateProto {
+  WORK_STATE_PROTO_PENDING = 0;
+  WORK_STATE_PROTO_LOADING = 1;
+  WORK_STATE_PROTO_COMPLETED = 2;
+  WORK_STATE_PROTO_FAILED = 3;
+  WORK_STATE_PROTO_CANCELED = 4;
+}
+
+enum WorkTypeProto {
+  WORK_TYPE_PROTO_LOAD = 0;
+}
+
+message WorkProgressProto {
+  required int64 loaded_size = 1;
+  required int64 total_size = 2;
+  required int64 update_time = 3;
+  required int32 state = 4;
+  required string message = 5;
+}
+
+
+// Submit a load job request
+message SubmitJobRequest {
+  required WorkTypeProto job_type = 1;
+  required bytes job_command = 2;
+}
+
+// Submit the load job response
+message SubmitJobResponse {
+  required string job_id = 1;
+  required string target_path = 2;
+}
+
+// Cancel the job request
+message CancelJobRequest {
+  required string job_id = 1;
+}
+
+// Cancel the job response
+message CancelJobResponse {
+}
+
+message GetJobStatusRequest {
+  required string job_id = 1;
+  required bool verbose = 2 [default = false];
+}
+
+message GetJobStatusResponse {
+  required string job_id = 1;
+  required WorkStateProto state = 2;
+  required string source_path = 3;
+  required string target_path = 4;
+  required WorkProgressProto progress = 5;
+
+}
+
+message SubmitTaskRequest {
+  required WorkTypeProto task_type = 1;
+  required bytes task_command = 2;
+}
+
+message SubmitTaskResponse {
+  required string task_id = 1;
+}
+
+message TaskReportRequest {
+  required string job_id = 1;
+  required string task_id = 2;
+  required WorkProgressProto report = 3;
+}
+
+message TaskReportResponse {
+}

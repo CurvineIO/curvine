@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::{load_conf::MasterLoadConf, ClusterConf};
+use crate::conf::{ClusterConf, JobConf};
 use orpc::common::{DurationUnit, LogConf, Utils};
 use orpc::runtime::GroupExecutor;
 use orpc::{err_box, CommonResult};
@@ -86,7 +86,7 @@ pub struct MasterConf {
 
     pub log: LogConf,
     // Master loading function configuration
-    pub load: MasterLoadConf,
+    pub load: JobConf,
 
     pub ttl_checker_retry_attempts: u32,
 

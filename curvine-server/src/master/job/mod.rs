@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Worker side data loading module
-//! Responsible for loading data from external storage systems (such as S3) to local storage
+mod job_manager;
+pub use crate::master::job::job_manager::JobManager;
 
-pub mod load_task;
-mod task_processor;
-mod ufs_connector;
-mod worker_load_handler;
+mod job_handler;
+pub use job_handler::JobHandler;
 
-pub use load_task::LoadTask;
-pub use ufs_connector::{CurvineFsWriter, UfsConnector};
-pub use worker_load_handler::FileLoadService;
+mod job_worker_client;
+pub use self::job_worker_client::JobWorkerClient;
+
+mod job_store;
+pub use job_store::JobStore;
+
+mod job_context;
+pub use self::job_context::*;

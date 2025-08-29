@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_client::LoadClient;
-use curvine_common::proto::LoadState;
+use curvine_client::rpc::JobMasterClient;
+use curvine_common::state::WorkState;
 use orpc::CommonResult;
 
 use crate::util::*;
@@ -34,13 +34,13 @@ pub struct LoadStatusCommand {
 }
 
 impl LoadStatusCommand {
-    pub async fn execute(&self, client: LoadClient) -> CommonResult<()> {
+    pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
         println!("\n Checking status for {}", self.job_id);
 
         if let Some(watch_interval) = &self.watch {
             self.watch_status(client, watch_interval).await
         } else {
-            let status = handle_rpc_result(client.get_load_status(&self.job_id)).await;
+            let status = handle_rpc_result(client.get_job_status(&self.job_id)).await;
             println!("{}", status);
             Ok(())
         }
@@ -51,7 +51,7 @@ impl LoadStatusCommand {
     /// # Arguments
     /// * `client` - LoadClient Instance
     /// * `interval_str` - Example：5s, 1m
-    async fn watch_status(&self, client: LoadClient, interval_str: &str) -> CommonResult<()> {
+    async fn watch_status(&self, client: JobMasterClient, interval_str: &str) -> CommonResult<()> {
         // Resolution refresh interval
         let duration = parse_duration(interval_str).unwrap_or_else(|_| {
             eprintln!("❌ Error: Invalid watch interval format: {}", interval_str);
@@ -81,12 +81,12 @@ impl LoadStatusCommand {
             );
             println!("Press Ctrl+C to stop watching.");
 
-            let status = handle_rpc_result(client.get_load_status(&self.job_id)).await;
+            let status = handle_rpc_result(client.get_job_status(&self.job_id)).await;
             println!("{}", status);
 
-            if status.state == LoadState::Completed as i32
-                || status.state == LoadState::Failed as i32
-                || status.state == LoadState::Canceled as i32
+            if status.state == WorkState::Completed
+                || status.state == WorkState::Failed
+                || status.state == WorkState::Canceled
             {
                 break;
             }

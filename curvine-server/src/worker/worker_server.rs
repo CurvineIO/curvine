@@ -14,19 +14,19 @@
 
 use crate::worker::block::{BlockActor, BlockStore};
 use crate::worker::handler::{WorkerHandler, WorkerRouterHandler};
-use crate::worker::load::FileLoadService;
+use crate::worker::task::TaskManager;
 use crate::worker::WorkerMetrics;
-use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{HeartbeatStatus, WorkerAddress};
 use curvine_web::server::{WebHandlerService, WebServer};
-use log::{error, info};
+use log::info;
 use once_cell::sync::OnceCell;
 use orpc::common::{LocalTime, Logger, Metrics};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
+use orpc::sync::channel::AsyncChannel;
 use orpc::CommonResult;
 use std::sync::Arc;
 use std::thread;
@@ -39,26 +39,22 @@ static WORKER_METRICS: OnceCell<WorkerMetrics> = OnceCell::new();
 pub struct WorkerService {
     store: BlockStore,
     conf: ClusterConf,
-    file_loader: Arc<FileLoadService>,
+    task_manager: Arc<TaskManager>,
     rt: Arc<Runtime>,
 }
 
 impl WorkerService {
     pub fn with_conf(conf: &ClusterConf, rt: Arc<Runtime>) -> CommonResult<Self> {
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
-        let fs_context = FsContext::with_rt(conf.clone(), rt.clone())?;
-        let mut file_loader =
-            FileLoadService::from_cluster_conf(Arc::from(fs_context), rt.clone(), conf);
 
-        if let Err(e) = file_loader.start() {
-            error!("Failed to start FileLoadService: {}", e);
-            return Err(e);
-        }
+        let (sender, receiver) = AsyncChannel::new(0).split();
+        let task_manager = TaskManager::with_rt(rt.clone(), conf, sender)?;
+        task_manager.start(receiver);
 
         let ws = Self {
             store,
             conf: conf.clone(),
-            file_loader: Arc::from(file_loader),
+            task_manager: Arc::new(task_manager),
             rt,
         };
         Ok(ws)
@@ -80,7 +76,7 @@ impl HandlerService for WorkerService {
         WorkerHandler {
             store: self.store.clone(),
             handler: None,
-            file_loader: self.file_loader.clone(),
+            task_manager: self.task_manager.clone(),
             rt: self.rt.clone(),
         }
     }

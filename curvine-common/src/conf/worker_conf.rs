@@ -14,7 +14,7 @@
 
 #![allow(clippy::should_implement_trait)]
 
-use crate::conf::{load_conf::WorkerLoadConf, ClusterConf};
+use crate::conf::ClusterConf;
 use crate::state::StorageType;
 use orpc::common::{ByteUnit, DurationUnit, FileUtils, LogConf, Utils};
 use orpc::{err_box, CommonResult};
@@ -117,9 +117,6 @@ pub struct WorkerConf {
     pub rpc_port: u16,
     pub web_port: u16,
 
-    // Worker loading function configuration
-    pub load: WorkerLoadConf,
-
     pub dir_reserved: String,
 
     pub data_dir: Vec<String>,
@@ -189,8 +186,6 @@ impl Default for WorkerConf {
 
             executor_threads: 10,
             executor_channel_size: 1000,
-
-            load: Default::default(),
 
             enable_splice: false,
             enable_send_file: true,

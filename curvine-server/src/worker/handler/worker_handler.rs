@@ -12,24 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::RpcContext;
 use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler;
-use crate::worker::load::FileLoadService;
+use crate::worker::task::TaskManager;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
+use curvine_common::state::LoadTaskInfo;
+use curvine_common::utils::SerdeUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
-use orpc::message::Message;
-use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::message::{Builder, Message};
+use orpc::runtime::Runtime;
 use std::sync::Arc;
 
 pub struct WorkerHandler {
     pub store: BlockStore,
     pub handler: Option<BlockHandler>,
-    pub file_loader: Arc<FileLoadService>,
+    pub task_manager: Arc<TaskManager>,
     pub rt: Arc<Runtime>,
 }
 
@@ -39,16 +40,8 @@ impl MessageHandler for WorkerHandler {
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let code = RpcCode::from(msg.code());
         match code {
-            RpcCode::SubmitLoadTask => {
-                let mut rpc_context = RpcContext::new(msg);
-                self.handle_load_task(&mut rpc_context)
-            }
-
-            RpcCode::CancelLoadJob => {
-                let mut rpc_context = RpcContext::new(msg);
-                self.cancel_load_job(&mut rpc_context)
-            }
-
+            RpcCode::SubmitTask => self.task_submit(msg),
+            RpcCode::CancelJob => self.cancel_job(msg),
             _ => {
                 let h = self.get_handler(msg)?;
                 h.handle(msg)
@@ -71,16 +64,20 @@ impl WorkerHandler {
         }
     }
 
-    /// Process load task requests (received directly from RPC)
-    fn handle_load_task(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let req: LoadTaskRequest = ctx.parse_header()?;
-        let response = self.rt.block_on(self.file_loader.handle_load_task(req))?;
-        ctx.response(response)
+    pub fn task_submit(&self, msg: &Message) -> FsResult<Message> {
+        let req: SubmitTaskRequest = msg.parse_header()?;
+        let task: LoadTaskInfo = SerdeUtils::deserialize(&req.task_command)?;
+        let task_id = task.task_id.clone();
+
+        self.task_manager.submit_task(task)?;
+        let response = SubmitTaskResponse { task_id };
+
+        Ok(Builder::success(msg).proto_header(response).build())
     }
 
-    fn cancel_load_job(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let req: CancelLoadRequest = ctx.parse_header()?;
-        let response = self.rt.block_on(self.file_loader.cancel_load_task(req))?;
-        ctx.response(response)
+    pub fn cancel_job(&self, msg: &Message) -> FsResult<Message> {
+        let req: CancelJobRequest = msg.parse_header()?;
+        self.task_manager.cancel_job(req.job_id)?;
+        Ok(msg.success())
     }
 }

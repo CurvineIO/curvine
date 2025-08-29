@@ -12,4 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod load_client;
+mod job_master_client;
+pub use self::job_master_client::JobMasterClient;
