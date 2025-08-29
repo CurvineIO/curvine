@@ -37,7 +37,7 @@ curvine-ufs = { path = "curvine-ufs" }
 curvine-tests = { path = "curvine-tests" }
 curvine-fuse = { path = "curvine-fuse" }
 curvine-web = { path = "curvine-web" }
-curvine-shuffle = { path = "curvine-shuffle" }
+
 
 # The most important library start
 

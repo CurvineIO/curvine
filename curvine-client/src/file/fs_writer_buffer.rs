@@ -91,6 +91,10 @@ impl FsWriterBuffer {
         self.pos
     }
 
+    pub fn pos_mut(&mut self) -> &mut i64 {
+        &mut self.pos
+    }
+
     pub fn check_error(&self, e: FsError) -> FsError {
         match self.err_monitor.take_error() {
             Some(e) => e,

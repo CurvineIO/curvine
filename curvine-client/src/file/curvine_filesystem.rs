@@ -18,8 +18,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
-    CacheJobResult, CreateFileOpts, CreateFileOptsBuilder, FileBlocks, FileStatus, MasterInfo,
-    MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, SetAttrOpts,
+    CreateFileOpts, CreateFileOptsBuilder, FileBlocks, FileStatus, MasterInfo, MkdirOpts,
+    MkdirOptsBuilder, MountInfo, MountOptions, MountType, SetAttrOpts,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
@@ -212,15 +212,6 @@ impl CurvineFileSystem {
 
     pub async fn get_master_info_bytes(&self) -> FsResult<BytesMut> {
         self.fs_client.get_master_info_bytes().await
-    }
-
-    pub async fn async_cache(
-        &self,
-        path: &Path,
-        ttl: Option<String>,
-        recursive: bool,
-    ) -> FsResult<CacheJobResult> {
-        self.fs_client.async_cache(path, ttl, recursive).await
     }
 
     pub async fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {

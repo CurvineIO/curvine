@@ -22,9 +22,9 @@ use curvine_common::state::*;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::client::ClusterConnector;
+use orpc::err_box;
 use orpc::message::MessageBuilder;
 use orpc::runtime::RpcRuntime;
-use orpc::{err_box, ternary};
 use prost::Message as PMessage;
 use std::collections::LinkedList;
 use std::sync::Arc;
@@ -320,26 +320,6 @@ impl FsClient {
         let req = GetMountTableRequest {};
         let rep: GetMountTableResponse = self.rpc(RpcCode::GetMountTable, req).await?;
         Ok(rep)
-    }
-
-    // async cache loading task
-    pub async fn async_cache(
-        &self,
-        path: &Path,
-        ttl: Option<String>,
-        recursive: bool,
-    ) -> FsResult<CacheJobResult> {
-        let req = LoadJobRequest {
-            path: path.full_path().to_owned(),
-            ttl,
-            recursive: ternary!(recursive, Some(recursive), None),
-        };
-
-        let rep: LoadJobResponse = self.rpc(RpcCode::SubmitLoadJob, req).await?;
-        Ok(CacheJobResult {
-            job_id: rep.job_id,
-            target_path: rep.target_path,
-        })
     }
 
     pub async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
