@@ -914,7 +914,24 @@ impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
     /// Returns a fixed region "us-east-1" for all buckets. Future versions
     /// may support region-specific bucket placement.
     async fn handle(&self, _loc: Option<&str>) -> Result<Option<&'static str>, ()> {
-        Ok(Some("us-east-1"))
+        // Return configured region, with common regions as static strings
+        match self.region.as_str() {
+            "us-east-1" => Ok(Some("us-east-1")),
+            "us-west-1" => Ok(Some("us-west-1")),
+            "us-west-2" => Ok(Some("us-west-2")),
+            "eu-west-1" => Ok(Some("eu-west-1")),
+            "eu-central-1" => Ok(Some("eu-central-1")),
+            "ap-southeast-1" => Ok(Some("ap-southeast-1")),
+            "ap-northeast-1" => Ok(Some("ap-northeast-1")),
+            _ => {
+                // For non-standard regions, use the default
+                tracing::warn!(
+                    "Unsupported region '{}', defaulting to us-east-1",
+                    self.region
+                );
+                Ok(Some("us-east-1"))
+            }
+        }
     }
 }
 
