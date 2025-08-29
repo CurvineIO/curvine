@@ -12,16 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod worker_server;
-pub use self::worker_server::*;
-
-pub mod storage;
-
-pub mod block;
-
-mod worker_metrics;
-pub use self::worker_metrics::WorkerMetrics;
-
-pub mod handler;
-mod replication;
-pub mod task;
+pub mod replication_job;
+pub mod worker_replication_handler;
+pub mod worker_replication_manager;

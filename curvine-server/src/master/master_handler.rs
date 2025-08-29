@@ -14,6 +14,8 @@
 
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
+use crate::master::replication::master_replication_handler::MasterReplicationHandler;
+use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MountManager;
 use crate::master::{Master, MasterMetrics, RpcContext};
 use curvine_common::conf::ClusterConf;
@@ -38,9 +40,11 @@ pub struct MasterHandler {
     pub(crate) conn_state: Option<ConnState>,
     pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
+    pub(crate) replication_handler: Option<MasterReplicationHandler>,
 }
 
 impl MasterHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         conf: &ClusterConf,
         fs: MasterFilesystem,
@@ -48,6 +52,7 @@ impl MasterHandler {
         conn_state: Option<ConnState>,
         mount_manager: Arc<MountManager>,
         job_handler: JobHandler,
+        replication_manager: Arc<MasterReplicationManager>,
     ) -> Self {
         Self {
             fs,
@@ -55,8 +60,9 @@ impl MasterHandler {
             metrics: Master::get_metrics(),
             audit_logging_enabled: conf.master.audit_logging_enabled,
             conn_state,
-            job_handler,
             mount_manager,
+            job_handler,
+            replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
         }
     }
 
@@ -422,6 +428,14 @@ impl MessageHandler for MasterHandler {
             | RpcCode::GetJobStatus
             | RpcCode::CancelJob
             | RpcCode::ReportTask => self.job_handler.handle(ctx),
+
+            RpcCode::ReportBlockReplicationResult => {
+                if let Some(ref mut replication_service) = self.replication_handler {
+                    return replication_service.handle(msg);
+                } else {
+                    return Err(FsError::common("Replication service not initialized"));
+                }
+            }
 
             // Unsupported request
             _ => err_box!("Unsupported operation"),

@@ -24,6 +24,8 @@ pub mod meta;
 mod job;
 pub use self::job::*;
 
+pub mod replication;
+
 mod master_server;
 pub use self::master_server::*;
 

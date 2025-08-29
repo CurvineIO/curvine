@@ -153,6 +153,9 @@ pub struct WorkerConf {
     pub pipe_pool_max_cap: usize,
     // In the pipeline resource pool, the pipeline idle recycling time.
     pub pipe_pool_idle_time: usize,
+
+    pub block_replication_concurrency_limit: usize,
+    pub block_replication_chunk_size: usize,
 }
 
 impl WorkerConf {
@@ -194,6 +197,8 @@ impl Default for WorkerConf {
             pipe_pool_init_cap: 0,
             pipe_pool_max_cap: 2000, // 100 mb
             pipe_pool_idle_time: 0,
+            block_replication_concurrency_limit: 100,
+            block_replication_chunk_size: 1024 * 1024,
         }
     }
 }

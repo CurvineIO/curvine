@@ -14,6 +14,7 @@
 
 use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler;
+use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::task::TaskManager;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
@@ -32,6 +33,7 @@ pub struct WorkerHandler {
     pub handler: Option<BlockHandler>,
     pub task_manager: Arc<TaskManager>,
     pub rt: Arc<Runtime>,
+    pub replication_handler: WorkerReplicationHandler,
 }
 
 impl MessageHandler for WorkerHandler {
@@ -41,7 +43,11 @@ impl MessageHandler for WorkerHandler {
         let code = RpcCode::from(msg.code());
         match code {
             RpcCode::SubmitTask => self.task_submit(msg),
+
             RpcCode::CancelJob => self.cancel_job(msg),
+
+            RpcCode::SubmitBlockReplicationJob => self.replication_handler.handle(msg),
+
             _ => {
                 let h = self.get_handler(msg)?;
                 h.handle(msg)

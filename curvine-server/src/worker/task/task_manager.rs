@@ -1,6 +1,6 @@
 use crate::worker::task::load_task_runner::LoadTaskRunner;
 use crate::worker::task::{TaskContext, TaskStore};
-use curvine_client::file::CurvineFileSystem;
+use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::LoadTaskInfo;
 use curvine_common::FsResult;
@@ -90,5 +90,9 @@ impl TaskManager {
             job_id
         );
         Ok(())
+    }
+
+    pub fn get_fs_context(&self) -> Arc<FsContext> {
+        self.fs.fs_context()
     }
 }

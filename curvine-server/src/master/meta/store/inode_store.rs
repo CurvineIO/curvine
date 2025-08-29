@@ -320,6 +320,13 @@ impl InodeStore {
         self.store.get_locations(block_id)
     }
 
+    pub fn add_block_location(&self, block_id: i64, location: BlockLocation) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+        batch.add_location(block_id, &location)?;
+        batch.commit()?;
+        Ok(())
+    }
+
     pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
         self.store.get_inode(id)
     }
