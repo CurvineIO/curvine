@@ -848,38 +848,45 @@ impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
     /// - Only directories are considered as buckets
     /// - Creation date is set to current time (file system limitation)
     /// - Region is set from handler configuration
-    fn handle<'a>(
-        &'a self,
-        _opt: &'a crate::s3::s3_api::ListBucketsOption,
-    ) -> std::pin::Pin<
-        Box<
-            dyn 'a
-                + Send
-                + std::future::Future<Output = Result<Vec<crate::s3::s3_api::Bucket>, String>>,
-        >,
-    > {
-        // Clone necessary data for async block
-        let fs = self.fs.clone();
-        let region = self.region.clone();
+    async fn handle(
+        &self,
+        _opt: &crate::s3::s3_api::ListBucketsOption,
+    ) -> Result<Vec<crate::s3::s3_api::Bucket>, String> {
+        let mut buckets = vec![];
+        let root = Path::from_str("/").map_err(|e| e.to_string())?;
+        let list = self
+            .fs
+            .list_status(&root)
+            .await
+            .map_err(|e| e.to_string())?;
 
-        Box::pin(async move {
-            let mut buckets = vec![];
-            let root = Path::from_str("/").map_err(|e| e.to_string())?;
-            let list = fs.list_status(&root).await.map_err(|e| e.to_string())?;
-            let now = chrono::Utc::now().to_rfc3339();
+        // Convert directories to bucket entries
+        for st in list {
+            if st.is_dir {
+                // Convert mtime (timestamp in milliseconds) to ISO 8601 format
+                let creation_date = if st.mtime > 0 {
+                    chrono::DateTime::from_timestamp(st.mtime / 1000, 0)
+                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                        .unwrap_or_else(|| {
+                            chrono::Utc::now()
+                                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                                .to_string()
+                        })
+                } else {
+                    // Fallback to current time if mtime is not available
+                    chrono::Utc::now()
+                        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                        .to_string()
+                };
 
-            // Convert directories to bucket entries
-            for st in list {
-                if st.is_dir {
-                    buckets.push(crate::s3::s3_api::Bucket {
-                        name: st.name,
-                        creation_date: now.clone(),
-                        bucket_region: region.clone(),
-                    });
-                }
+                buckets.push(crate::s3::s3_api::Bucket {
+                    name: st.name,
+                    creation_date,
+                    bucket_region: self.region.clone(),
+                });
             }
-            Ok(buckets)
-        })
+        }
+        Ok(buckets)
     }
 }
 
@@ -887,6 +894,7 @@ impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
 ///
 /// Provides S3 GetBucketLocation functionality by returning the configured
 /// region for all buckets.
+#[async_trait::async_trait]
 impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
     /// Handle GET bucket location request
     ///
@@ -905,13 +913,8 @@ impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
     ///
     /// Returns a fixed region "us-east-1" for all buckets. Future versions
     /// may support region-specific bucket placement.
-    fn handle<'a>(
-        &'a self,
-        _loc: Option<&'a str>,
-    ) -> std::pin::Pin<
-        Box<dyn 'a + Send + std::future::Future<Output = Result<Option<&'static str>, ()>>>,
-    > {
-        Box::pin(async move { Ok(Some("us-east-1")) })
+    async fn handle(&self, _loc: Option<&str>) -> Result<Option<&'static str>, ()> {
+        Ok(Some("us-east-1"))
     }
 }
 

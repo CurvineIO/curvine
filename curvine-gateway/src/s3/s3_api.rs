@@ -633,20 +633,14 @@ pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
     }
 }
 
+#[async_trait::async_trait]
 pub trait ListBucketHandler {
-    fn handle<'a>(
-        &'a self,
-        opt: &'a ListBucketsOption,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<Vec<Bucket>, String>>>>;
+    async fn handle(&self, opt: &ListBucketsOption) -> Result<Vec<Bucket>, String>;
 }
+#[async_trait::async_trait]
 pub trait GetBucketLocationHandler {
-    fn handle<'a>(
-        &'a self,
-        _loc: Option<&'a str>,
-    ) -> std::pin::Pin<
-        Box<dyn 'a + Send + std::future::Future<Output = Result<Option<&'static str>, ()>>>,
-    > {
-        Box::pin(async { Ok(Some("us-west-1")) })
+    async fn handle(&self, _loc: Option<&str>) -> Result<Option<&'static str>, ()> {
+        Ok(Some("us-west-1"))
     }
 }
 #[derive(Debug)]
