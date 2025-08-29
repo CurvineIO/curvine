@@ -459,7 +459,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 
             // Handle range requests (including suffix-byte-range-spec)
             let (seek_pos, bytes_to_read) = if let Some(range_end) = _opt.range_end {
-                if range_end > u64::MAX - 1000000 {
+                if range_end > u64::MAX / 2 {
                     // This is a suffix-byte-range-spec (bytes=-N)
                     let suffix_len = u64::MAX - range_end;
                     let file_size = reader.remaining().max(0) as u64;
@@ -522,43 +522,56 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 
             log::debug!("GetObject: will read {} bytes directly", target_read);
 
-            // Simple, single-threaded read and write, no complex async pipelines
-            let to_read = target_read as usize;
-            let mut data = Vec::new();
+            // Stream processing with fixed 4KB buffer for memory efficiency
+            const CHUNK_SIZE: usize = 4096; // 4KB chunks for memory efficiency
+            let mut total_read = 0u64;
+            let mut remaining_to_read = target_read;
 
-            // Read all data at once using read_full
-            if to_read > 0 {
-                let mut buffer = BytesMut::zeroed(to_read);
-                let n = reader
+            // Get output writer outside the loop
+            let mut guard = out.lock().await;
+
+            while remaining_to_read > 0 {
+                // Calculate chunk size for this iteration
+                let chunk_size = std::cmp::min(CHUNK_SIZE, remaining_to_read as usize);
+
+                // Read chunk from file
+                let mut buffer = BytesMut::zeroed(chunk_size);
+                let bytes_read = reader
                     .read_full(&mut buffer)
                     .await
                     .map_err(|e| e.to_string())?;
-                buffer.truncate(n);
-                data = buffer.to_vec();
-            } else {
-                // Read all available data
-                let remaining = reader.remaining().max(0) as usize;
-                if remaining > 0 {
-                    let mut buffer = BytesMut::zeroed(remaining);
-                    let n = reader
-                        .read_full(&mut buffer)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    buffer.truncate(n);
-                    data = buffer.to_vec();
+
+                if bytes_read == 0 {
+                    // End of file reached
+                    break;
                 }
+
+                // Truncate buffer to actual bytes read
+                buffer.truncate(bytes_read);
+
+                // Write chunk to output stream immediately
+                guard.poll_write(&buffer).await.map_err(|e| {
+                    tracing::error!("Failed to write chunk to output: {}", e);
+                    e.to_string()
+                })?;
+
+                total_read += bytes_read as u64;
+                remaining_to_read -= bytes_read as u64;
+
+                log::trace!(
+                    "GetObject: streamed chunk {} bytes (total: {})",
+                    bytes_read,
+                    total_read
+                );
             }
 
-            log::debug!("GetObject: read completed {} bytes", data.len());
+            // Release the guard
+            drop(guard);
 
-            // Single write operation - no concurrent access
-            let mut guard = out.lock().await;
-            guard.poll_write(&data).await.map_err(|e| {
-                tracing::error!("Failed to write data to output: {}", e);
-                e.to_string()
-            })?;
-
-            let total_read = data.len() as u64;
+            log::debug!(
+                "GetObject: streaming completed, total bytes: {}",
+                total_read
+            );
 
             // Clean up reader to stop background tasks
             if let Err(e) = reader.complete().await {

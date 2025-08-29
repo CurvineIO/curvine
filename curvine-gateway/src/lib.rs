@@ -35,24 +35,7 @@
 //! 1. **HTTP Layer** (`http` module): Axum integration and request routing
 //! 2. **S3 API Layer** (`s3` module): S3 protocol implementation and handlers
 //! 3. **Authentication Layer** (`auth` module): AWS SigV4 signature verification
-//! 4. **Storage Layer**: Integration with Curvine unified file system
-//!
-//! ## Usage Example
-//!
-//! ```rust,no_run
-//! use curvine_gateway::start_gateway;
-//! use curvine_common::conf::ClusterConf;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let conf = ClusterConf::from("curvine-cluster.toml")?;
-//!     let listen = "0.0.0.0:9900".to_string();
-//!     let region = "us-east-1".to_string();
-//!     
-//!     start_gateway(conf, listen, region).await?;
-//!     Ok(())
-//! }
-//! ```
+//! 4. **Storage Layer**: Integration with Curvine unified file system`
 
 // Module declarations with brief descriptions
 pub mod auth; // Authentication and authorization mechanisms
@@ -259,19 +242,6 @@ async fn init_s3_authentication(
 /// - **Resource Management**: Proper cleanup and resource management
 /// - **Memory Efficiency**: Streaming operations for large objects
 ///
-/// # Example Usage
-///
-/// ```rust,no_run
-/// use curvine_gateway::start_gateway;
-/// use curvine_common::conf::ClusterConf;
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let conf = ClusterConf::from("cluster.toml")?;
-///     start_gateway(conf, "0.0.0.0:9900".to_string(), "us-east-1".to_string()).await?;
-///     Ok(())
-/// }
-/// ```
 pub async fn start_gateway(
     conf: ClusterConf,
     listen: String,
@@ -300,12 +270,12 @@ pub async fn start_gateway(
     // Create S3 handlers with file system and region configuration
     let handlers = Arc::new(s3::handlers::S3Handlers::new(
         ufs,
-        "us-east-1".to_string(), // Fixed region for consistency
+        region.clone(),
         rt.clone(),
     ));
 
     // Initialize S3 authentication with fallback strategy
-    let ak = init_s3_authentication().await?;
+    let ak_store = init_s3_authentication().await?;
     tracing::info!("S3 Gateway authentication configured successfully");
 
     // Configure the Axum application with middleware chain
@@ -317,7 +287,7 @@ pub async fn start_gateway(
             crate::http::handle_authorization_middleware,
         ))
         // Access key store for credential verification
-        .layer(axum::Extension(ak))
+        .layer(axum::Extension(ak_store))
         // Health check endpoint for monitoring and load balancing
         .route("/healthz", axum::routing::get(|| async { "ok" }));
 

@@ -429,9 +429,19 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
     // If range requested, validate and compute
     if opt.range_start.is_some() || opt.range_end.is_some() {
         let (start, end) = if let Some(range_end) = opt.range_end {
-            if range_end > u64::MAX - 1000000 {
+            if range_end > u64::MAX / 2 {
                 // This is a suffix-byte-range-spec (bytes=-N)
                 let suffix_len = u64::MAX - range_end;
+
+                // Add reasonable limit: maximum 1GB suffix range
+                const MAX_SUFFIX_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
+                if suffix_len > MAX_SUFFIX_SIZE {
+                    resp.set_status(416); // Range Not Satisfiable
+                    resp.set_header("content-range", &format!("bytes */{}", total_len));
+                    resp.send_header();
+                    return;
+                }
+
                 if suffix_len > total_len {
                     // If suffix length is larger than file, return entire file
                     (0, total_len.saturating_sub(1))
