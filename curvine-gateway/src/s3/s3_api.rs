@@ -319,14 +319,13 @@ pub struct ListObjectOption {
     pub start_after: Option<String>,
 }
 
+#[async_trait::async_trait]
 pub trait ListObjectHandler {
-    fn handle<'a>(
-        &'a self,
-        opt: &'a ListObjectOption,
-        bucket: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn 'a + Send + std::future::Future<Output = Result<Vec<ListObjectContent>, String>>>,
-    >;
+    async fn handle(
+        &self,
+        opt: &ListObjectOption,
+        bucket: &str,
+    ) -> Result<Vec<ListObjectContent>, String>;
 }
 
 pub fn handle_head_object<T: VRequest, F: VResponse, E: HeadHandler>(

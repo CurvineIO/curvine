@@ -64,7 +64,6 @@ use curvine_common::state::FileType;
 use curvine_common::FsResult;
 use orpc::runtime::AsyncRuntime;
 
-use std::future::Future;
 use tokio::io::AsyncWriteExt;
 use tracing;
 use uuid;
@@ -1184,6 +1183,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
 ///
 /// Provides S3 ListObjectsV2 functionality with prefix filtering and
 /// proper S3-compatible response format.
+#[async_trait::async_trait]
 impl ListObjectHandler for S3Handlers {
     /// Handle LIST objects request
     ///
@@ -1214,54 +1214,46 @@ impl ListObjectHandler for S3Handlers {
     /// - Size: Object size in bytes
     /// - StorageClass: Storage tier information
     /// - Owner: Object owner information
-    fn handle<'a>(
-        &'a self,
-        opt: &'a ListObjectOption,
-        bucket: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + Future<Output = Result<Vec<ListObjectContent>, String>>>>
-    {
-        // Clone necessary data for async block
-        let fs = self.fs.clone();
-        let _region = self.region.clone();
-        let bucket = bucket.to_string();
-        let prefix = opt.prefix.clone();
+    async fn handle(
+        &self,
+        opt: &ListObjectOption,
+        bucket: &str,
+    ) -> Result<Vec<ListObjectContent>, String> {
+        // Convert bucket name to file system path
+        let bkt_path = self.cv_bucket_path(bucket).map_err(|e| e.to_string())?;
 
-        // Convert bucket name to file system path before async block
-        let bkt_path = match self.cv_bucket_path(&bucket) {
-            Ok(p) => p,
-            Err(e) => return Box::pin(async move { Err(e.to_string()) }),
-        };
+        // Always list from bucket root
+        let root = bkt_path;
 
-        Box::pin(async move {
-            // Always list from bucket root
-            let root = bkt_path;
+        // List directory contents
+        let list = self
+            .fs
+            .list_status(&root)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut contents = Vec::new();
 
-            // List directory contents
-            let list = fs.list_status(&root).await.map_err(|e| e.to_string())?;
-            let mut contents = Vec::new();
-
-            // Process each file system entry
-            for st in list {
-                if st.is_dir {
-                    // Skip directories for now; S3 v2 can emit CommonPrefixes if delimiter set
-                    continue;
-                }
-
-                // Object key is just the file name (no prefix manipulation)
-                let key = st.name.clone();
-
-                // Apply prefix filtering if specified
-                if let Some(pref) = &prefix {
-                    if !key.starts_with(pref) {
-                        continue; // Skip objects that don't match prefix
-                    }
-                }
-
-                // Use file converter to create complete ListObjectContent
-                contents.push(file_status_to_list_object_content(&st, key));
+        // Process each file system entry
+        for st in list {
+            if st.is_dir {
+                // Skip directories for now; S3 v2 can emit CommonPrefixes if delimiter set
+                continue;
             }
 
-            Ok(contents)
-        })
+            // Object key is just the file name (no prefix manipulation)
+            let key = st.name.clone();
+
+            // Apply prefix filtering if specified
+            if let Some(pref) = &opt.prefix {
+                if !key.starts_with(pref) {
+                    continue; // Skip objects that don't match prefix
+                }
+            }
+
+            // Use file converter to create complete ListObjectContent
+            contents.push(file_status_to_list_object_content(&st, key));
+        }
+
+        Ok(contents)
     }
 }
