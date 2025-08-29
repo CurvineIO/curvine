@@ -1,5 +1,5 @@
 use crate::master::JobContext;
-use curvine_common::state::WorkProgress;
+use curvine_common::state::JobTaskProgress;
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::sync::FastDashMap;
@@ -28,7 +28,7 @@ impl JobStore {
         &self,
         job_id: impl AsRef<str>,
         task_id: impl AsRef<str>,
-        progress: WorkProgress,
+        progress: JobTaskProgress,
     ) -> FsResult<()> {
         let job_id = job_id.as_ref();
         let task_id = task_id.as_ref();

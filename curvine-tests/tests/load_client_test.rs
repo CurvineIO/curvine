@@ -18,7 +18,7 @@ use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsClient, FsContext};
 use curvine_client::rpc::JobMasterClient;
 use curvine_common::fs::{Path, Reader};
-use curvine_common::state::{MountOptions, WorkState};
+use curvine_common::state::{JobTaskState, MountOptions};
 use curvine_tests::Testing;
 use log::info;
 use orpc::common::Logger;
@@ -87,7 +87,7 @@ fn load_client_test() -> CommonResult<()> {
         while !loaded && retry_count < max_retries {
             let status = client.get_job_status(&job_id).await?;
             info!("Loading status: {}", status);
-            if status.state == WorkState::Completed {
+            if status.state == JobTaskState::Completed {
                 loaded = true;
                 info!("The file load is complete");
 
@@ -99,7 +99,7 @@ fn load_client_test() -> CommonResult<()> {
                     read_len, expected_size
                 );
                 break;
-            } else if status.state == WorkState::Failed {
+            } else if status.state == JobTaskState::Failed {
                 return Err(format!("The loading task failed: {}", status.progress.message).into());
             } else {
                 // Wait for a while before trying again
@@ -167,13 +167,13 @@ async fn test_cancel_load(client: &JobMasterClient, file_path: &str) -> CommonRe
         let status = client.get_job_status(&job_id).await?;
         info!("The status of the load after the cancellation: {}", status);
 
-        if status.state == WorkState::Canceled {
+        if status.state == JobTaskState::Canceled {
             canceled = true;
             info!("The task was successfully canceled");
             break;
-        } else if status.state == WorkState::Failed {
+        } else if status.state == JobTaskState::Failed {
             return Err(format!("The loading task failed: {}", status.progress.message).into());
-        } else if status.state == WorkState::Completed {
+        } else if status.state == JobTaskState::Completed {
             info!("The task was completed before it was canceled");
             break;
         } else {

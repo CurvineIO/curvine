@@ -556,8 +556,8 @@ impl ProtoUtils {
         }
     }
 
-    pub fn work_progress_to_pb(report: WorkProgress) -> WorkProgressProto {
-        WorkProgressProto {
+    pub fn work_progress_to_pb(report: JobTaskProgress) -> JobTaskProgressProto {
+        JobTaskProgressProto {
             loaded_size: report.loaded_size,
             total_size: report.total_size,
             update_time: report.update_time,
@@ -566,12 +566,12 @@ impl ProtoUtils {
         }
     }
 
-    pub fn work_progress_from_pb(report: WorkProgressProto) -> WorkProgress {
-        WorkProgress {
+    pub fn work_progress_from_pb(report: JobTaskProgressProto) -> JobTaskProgress {
+        JobTaskProgress {
             loaded_size: report.loaded_size,
             total_size: report.total_size,
             update_time: report.update_time,
-            state: WorkState::from(report.state as i8),
+            state: JobTaskState::from(report.state as i8),
             message: report.message,
         }
     }

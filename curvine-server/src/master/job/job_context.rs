@@ -1,6 +1,7 @@
 use curvine_common::conf::ClientConf;
 use curvine_common::state::{
-    LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo, WorkProgress, WorkState, WorkerAddress,
+    JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
+    WorkerAddress,
 };
 use curvine_common::FsResult;
 use orpc::common::{FastHashMap, FastHashSet, LocalTime};
@@ -9,14 +10,14 @@ use orpc::sync::StateCtl;
 
 pub struct TaskDetail {
     pub task: LoadTaskInfo,
-    pub progress: WorkProgress,
+    pub progress: JobTaskProgress,
 }
 
 impl TaskDetail {
     pub fn new(task: LoadTaskInfo) -> Self {
         Self {
             task,
-            progress: WorkProgress::default(),
+            progress: JobTaskProgress::default(),
         }
     }
 }
@@ -24,7 +25,7 @@ impl TaskDetail {
 pub struct JobContext {
     pub info: LoadJobInfo,
     pub state: StateCtl,
-    pub progress: WorkProgress,
+    pub progress: JobTaskProgress,
     pub assigned_workers: FastHashSet<WorkerAddress>,
     pub tasks: FastHashMap<String, TaskDetail>,
 }
@@ -69,7 +70,7 @@ impl JobContext {
 
         JobContext {
             info: job,
-            state: StateCtl::new(WorkState::Pending.into()),
+            state: StateCtl::new(JobTaskState::Pending.into()),
             progress: Default::default(),
             assigned_workers: Default::default(),
             tasks: Default::default(),
@@ -78,7 +79,7 @@ impl JobContext {
 
     pub fn add_task(&mut self, task: LoadTaskInfo) {
         self.update_state(
-            WorkState::Loading,
+            JobTaskState::Loading,
             format!("Assigned to worker {}", task.worker),
         );
         self.assigned_workers.insert(task.worker.clone());
@@ -86,7 +87,7 @@ impl JobContext {
             .insert(task.task_id.clone(), TaskDetail::new(task));
     }
 
-    pub fn update_state(&mut self, state: WorkState, message: impl Into<String>) {
+    pub fn update_state(&mut self, state: JobTaskState, message: impl Into<String>) {
         self.state.set_state(state);
         self.progress.update_time = LocalTime::mills() as i64;
         self.progress.message = message.into();
@@ -95,7 +96,7 @@ impl JobContext {
     pub fn update_progress(
         &mut self,
         task_id: impl AsRef<str>,
-        progress: WorkProgress,
+        progress: JobTaskProgress,
     ) -> FsResult<()> {
         let task_id = task_id.as_ref();
         let detail = if let Some(v) = self.tasks.get_mut(task_id) {
@@ -110,16 +111,16 @@ impl JobContext {
         let mut total_size: i64 = 0;
         let mut loaded_size: i64 = 0;
         let mut complete: usize = 0;
-        let mut job_state: WorkState = self.state.state();
+        let mut job_state: JobTaskState = self.state.state();
         let mut message = "".to_string();
 
         for detail in self.tasks.values() {
             total_size += detail.progress.total_size;
             loaded_size += detail.progress.loaded_size;
             match detail.progress.state {
-                WorkState::Completed => complete += 1,
-                WorkState::Failed => {
-                    job_state = WorkState::Failed;
+                JobTaskState::Completed => complete += 1,
+                JobTaskState::Failed => {
+                    job_state = JobTaskState::Failed;
                     message = format!(
                         "task {} failed: {}",
                         detail.task.task_id, detail.progress.message
@@ -130,7 +131,7 @@ impl JobContext {
         }
 
         if complete == self.tasks.len() {
-            job_state = WorkState::Completed;
+            job_state = JobTaskState::Completed;
             message = "All subtasks completed".into();
         }
 

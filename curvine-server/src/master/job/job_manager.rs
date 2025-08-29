@@ -20,8 +20,8 @@ use curvine_client::unified::UfsFileSystem;
 use curvine_common::conf::{ClientConf, ClusterConf};
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    FileStatus, JobStatus, LoadJobCommand, LoadJobResult, LoadTaskInfo, MountInfo, WorkProgress,
-    WorkState, WorkerAddress,
+    FileStatus, JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult,
+    LoadTaskInfo, MountInfo, WorkerAddress,
 };
 use curvine_common::FsResult;
 use log::{error, info};
@@ -89,7 +89,7 @@ impl JobManager {
         format!("job_{}", Utils::murmur3(source.as_ref().as_bytes()))
     }
 
-    fn update_state(&self, job_id: &str, state: WorkState, message: impl Into<String>) {
+    fn update_state(&self, job_id: &str, state: JobTaskState, message: impl Into<String>) {
         if let Some(mut job) = self.jobs.get_mut(job_id) {
             job.update_state(state, message);
         }
@@ -124,8 +124,8 @@ impl JobManager {
         if source_status.is_dir {
             // For directories, if a task already exists and is in loading state, duplicate submission is not allowed.
             if let Some(job) = self.jobs.get(job_id) {
-                let state: WorkState = job.state.state();
-                state == WorkState::Pending || state == WorkState::Loading
+                let state: JobTaskState = job.state.state();
+                state == JobTaskState::Pending || state == JobTaskState::Loading
             } else {
                 false
             }
@@ -163,11 +163,11 @@ impl JobManager {
         let job_id = job_id.as_ref();
         let assigned_workers = {
             if let Some(job) = self.jobs.get(job_id) {
-                let state: WorkState = job.state.state();
+                let state: JobTaskState = job.state.state();
                 // Check whether it can be canceled
-                if state == WorkState::Completed
-                    || state == WorkState::Failed
-                    || state == WorkState::Canceled
+                if state == JobTaskState::Completed
+                    || state == JobTaskState::Failed
+                    || state == JobTaskState::Canceled
                 {
                     return err_box!("Cannot cancel job in state {:?}", state);
                 }
@@ -178,7 +178,7 @@ impl JobManager {
             }
         };
 
-        self.update_state(job_id, WorkState::Canceled, "Canceling job by user");
+        self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user");
 
         // Send a cancel request to all assigned Workers
         for worker in assigned_workers {
@@ -195,7 +195,7 @@ impl JobManager {
                 );
                 self.update_state(
                     job_id,
-                    WorkState::Canceled,
+                    JobTaskState::Canceled,
                     format!(
                         "Failed to send cancel load request to worker {}: {}",
                         worker, e
@@ -211,7 +211,7 @@ impl JobManager {
         &self,
         job_id: impl AsRef<str>,
         task_id: impl AsRef<str>,
-        progress: WorkProgress,
+        progress: JobTaskProgress,
     ) -> FsResult<()> {
         self.jobs.update_progress(job_id, task_id, progress)
     }
@@ -277,7 +277,7 @@ impl JobManager {
         ufs: &UfsFileSystem,
         mnt: &MountInfo,
     ) -> FsResult<()> {
-        job.update_state(WorkState::Pending, "Assigning workers");
+        job.update_state(JobTaskState::Pending, "Assigning workers");
         let block_size = job.info.block_size;
 
         let mut stack = LinkedList::new();

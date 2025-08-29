@@ -17,7 +17,7 @@ use curvine_client::file::{CurvineFileSystem, FsWriter};
 use curvine_client::rpc::JobMasterClient;
 use curvine_client::unified::{UfsFileSystem, UnifiedReader};
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{CreateFileOptsBuilder, WorkState};
+use curvine_common::state::{CreateFileOptsBuilder, JobTaskState};
 use curvine_common::FsResult;
 use log::{error, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
@@ -70,7 +70,8 @@ impl LoadTaskRunner {
     }
 
     async fn run0(&self) -> FsResult<()> {
-        self.task.update_state(WorkState::Loading, "Task started");
+        self.task
+            .update_state(JobTaskState::Loading, "Task started");
 
         let (mut reader, mut writer) = self.create_stream().await?;
         let mut last_progress_time = LocalTime::mills();

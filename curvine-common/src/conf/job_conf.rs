@@ -53,6 +53,13 @@ pub struct JobConf {
 }
 
 impl JobConf {
+    pub const DEFAULT_JOB_LIFE_TTL: &'static str = "6h";
+    pub const DEFAULT_JOB_CLEANUP_TTL_STR: &'static str = "10m";
+    pub const DEFAULT_JOB_MAX_FILES: usize = 100000;
+    pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
+    pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "5s";
+    pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 1000;
+
     pub fn init(&mut self) -> FsResult<()> {
         self.job_life_ttl = DurationUnit::from_str(&self.job_life_ttl_str)?.as_duration();
         self.job_cleanup_ttl = DurationUnit::from_str(&self.job_cleanup_ttl_str)?.as_duration();
@@ -67,20 +74,20 @@ impl Default for JobConf {
     fn default() -> Self {
         Self {
             job_life_ttl: Default::default(),
-            job_life_ttl_str: "6h".to_string(),
+            job_life_ttl_str: Self::DEFAULT_JOB_LIFE_TTL.to_string(),
 
             job_cleanup_ttl: Default::default(),
-            job_cleanup_ttl_str: "10m".to_string(),
+            job_cleanup_ttl_str: Self::DEFAULT_JOB_CLEANUP_TTL_STR.to_string(),
 
-            job_max_files: 100000,
+            job_max_files: Self::DEFAULT_JOB_MAX_FILES,
 
             task_timeout: Default::default(),
-            task_timeout_str: "1h".to_string(),
+            task_timeout_str: Self::DEFAULT_TASK_TIMEOUT.to_string(),
 
             task_report_interval: Default::default(),
-            task_report_interval_str: "5s".to_string(),
+            task_report_interval_str: Self::DEFAULT_TASK_REPORT_INTERVAL.to_string(),
 
-            worker_max_concurrent_tasks: 1000,
+            worker_max_concurrent_tasks: Self::DEFAULT_WORKER_MAX_CONCURRENT_TASKS,
         }
     }
 }

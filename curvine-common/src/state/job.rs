@@ -32,13 +32,14 @@ use std::collections::HashMap;
     Deserialize,
 )]
 #[repr(i8)]
-pub enum WorkState {
+pub enum JobTaskState {
     #[num_enum(default)]
-    Pending = 0,
-    Loading = 1,
-    Completed = 2,
-    Failed = 3,
-    Canceled = 4,
+    UNKNOWN = 0,
+    Pending = 1,
+    Loading = 2,
+    Completed = 3,
+    Failed = 4,
+    Canceled = 5,
 }
 
 pub struct LoadJobResult {
@@ -61,17 +62,17 @@ pub struct LoadJobResult {
     Deserialize,
 )]
 #[repr(i32)]
-pub enum WorkType {
+pub enum JobTaskType {
     #[num_enum(default)]
-    Load = 0,
+    Load = 1,
 }
 
 pub struct JobStatus {
     pub job_id: String,
-    pub state: WorkState,
+    pub state: JobTaskState,
     pub source_path: String,
     pub target_path: String,
-    pub progress: WorkProgress,
+    pub progress: JobTaskProgress,
 }
 
 #[derive(Default, Debug, Deserialize, Serialize)]
@@ -170,18 +171,18 @@ pub struct LoadTaskInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkProgress {
-    pub state: WorkState,
+pub struct JobTaskProgress {
+    pub state: JobTaskState,
     pub loaded_size: i64,
     pub total_size: i64,
     pub update_time: i64,
     pub message: String,
 }
 
-impl Default for WorkProgress {
+impl Default for JobTaskProgress {
     fn default() -> Self {
         Self {
-            state: WorkState::Pending,
+            state: JobTaskState::Pending,
             total_size: 0,
             loaded_size: 0,
             update_time: 0,

@@ -20,7 +20,7 @@ use curvine_common::proto::{
     SubmitJobRequest, SubmitJobResponse, TaskReportRequest, TaskReportResponse,
 };
 use curvine_common::state::{
-    JobStatus, LoadJobCommand, LoadJobResult, WorkProgress, WorkState, WorkType,
+    JobStatus, JobTaskProgress, JobTaskState, JobTaskType, LoadJobCommand, LoadJobResult,
 };
 use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
@@ -46,7 +46,7 @@ impl JobMasterClient {
     // Submit loading task
     pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
         let req = SubmitJobRequest {
-            job_type: WorkType::Load.into(),
+            job_type: JobTaskType::Load.into(),
             job_command: SerdeUtils::serialize(&command)?,
         };
 
@@ -68,7 +68,7 @@ impl JobMasterClient {
 
         Ok(JobStatus {
             job_id: status.job_id,
-            state: WorkState::from(status.state as i8),
+            state: JobTaskState::from(status.state as i8),
             source_path: status.source_path,
             target_path: status.target_path,
             progress: ProtoUtils::work_progress_from_pb(status.progress),
@@ -88,7 +88,7 @@ impl JobMasterClient {
         &self,
         job_id: impl AsRef<str>,
         task_id: impl AsRef<str>,
-        report: WorkProgress,
+        report: JobTaskProgress,
     ) -> FsResult<()> {
         let req = TaskReportRequest {
             job_id: job_id.as_ref().to_string(),

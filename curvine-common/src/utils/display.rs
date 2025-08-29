@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::proto::{GetMountTableResponse, MountResponse, UnMountResponse};
-use crate::state::{JobStatus, LoadJobResult, WorkState};
+use crate::state::{JobStatus, JobTaskState, LoadJobResult};
 use chrono::DateTime;
 use std::fmt;
 use std::fmt::Display;
@@ -130,7 +130,7 @@ impl Display for LoadJobResult {
         Ok(())
     }
 }
-impl Display for WorkState {
+impl Display for JobTaskState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{:?}", self)
     }
@@ -140,11 +140,12 @@ impl Display for JobStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Get the color identification corresponding to the status
         let state_color = match self.state {
-            WorkState::Pending => "⚪",
-            WorkState::Loading => "🔵",
-            WorkState::Completed => "🟢",
-            WorkState::Failed => "🔴",
-            WorkState::Canceled => "⚫",
+            JobTaskState::Pending => "⚪",
+            JobTaskState::Loading => "🔵",
+            JobTaskState::Completed => "🟢",
+            JobTaskState::Failed => "🔴",
+            JobTaskState::Canceled => "⚫",
+            JobTaskState::UNKNOWN => "Unknown",
         };
 
         // Format time

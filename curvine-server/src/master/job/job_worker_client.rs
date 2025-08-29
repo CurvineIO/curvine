@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
-use curvine_common::state::{LoadTaskInfo, WorkType};
+use curvine_common::state::{JobTaskType, LoadTaskInfo};
 use curvine_common::utils::{RpcUtils, SerdeUtils};
 use curvine_common::FsResult;
 use orpc::client::RpcClient;
@@ -29,7 +29,7 @@ impl JobWorkerClient {
 
     pub async fn submit_load_task(&self, task: LoadTaskInfo) -> FsResult<()> {
         let request = SubmitTaskRequest {
-            task_type: WorkType::Load.into(),
+            task_type: JobTaskType::Load.into(),
             task_command: SerdeUtils::serialize(&task)?,
         };
 

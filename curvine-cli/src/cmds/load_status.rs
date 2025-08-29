@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use curvine_client::rpc::JobMasterClient;
-use curvine_common::state::WorkState;
+use curvine_common::state::JobTaskState;
 use orpc::CommonResult;
 
 use crate::util::*;
@@ -84,9 +84,9 @@ impl LoadStatusCommand {
             let status = handle_rpc_result(client.get_job_status(&self.job_id)).await;
             println!("{}", status);
 
-            if status.state == WorkState::Completed
-                || status.state == WorkState::Failed
-                || status.state == WorkState::Canceled
+            if status.state == JobTaskState::Completed
+                || status.state == JobTaskState::Failed
+                || status.state == JobTaskState::Canceled
             {
                 break;
             }

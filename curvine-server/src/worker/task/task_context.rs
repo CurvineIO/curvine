@@ -1,35 +1,35 @@
 use std::sync::Mutex;
 
-use curvine_common::state::{LoadTaskInfo, WorkProgress, WorkState};
+use curvine_common::state::{JobTaskProgress, JobTaskState, LoadTaskInfo};
 use orpc::common::LocalTime;
 use orpc::sync::StateCtl;
 
 pub struct TaskContext {
     pub info: LoadTaskInfo,
     state: StateCtl,
-    progress: Mutex<WorkProgress>,
+    progress: Mutex<JobTaskProgress>,
 }
 
 impl TaskContext {
     pub fn new(info: LoadTaskInfo) -> Self {
         Self {
             info,
-            state: StateCtl::new(WorkState::Pending.into()),
-            progress: Mutex::new(WorkProgress::default()),
+            state: StateCtl::new(JobTaskState::Pending.into()),
+            progress: Mutex::new(JobTaskProgress::default()),
         }
     }
 
-    pub fn get_state(&self) -> WorkState {
+    pub fn get_state(&self) -> JobTaskState {
         self.state.state()
     }
 
-    pub fn set_failed(&self, message: impl Into<String>) -> WorkProgress {
+    pub fn set_failed(&self, message: impl Into<String>) -> JobTaskProgress {
         let mut lock = self.progress.lock().unwrap();
-        self.state.set_state(WorkState::Failed);
+        self.state.set_state(JobTaskState::Failed);
         lock.message = message.into();
         lock.update_time = LocalTime::mills() as i64;
 
-        WorkProgress {
+        JobTaskProgress {
             state: self.get_state(),
             total_size: lock.total_size,
             loaded_size: lock.loaded_size,
@@ -39,21 +39,21 @@ impl TaskContext {
     }
 
     pub fn is_submit(&self) -> bool {
-        self.get_state() <= WorkState::Loading
+        self.get_state() <= JobTaskState::Loading
     }
 
     pub fn is_cancel(&self) -> bool {
-        self.get_state() == WorkState::Canceled
+        self.get_state() == JobTaskState::Canceled
     }
 
-    pub fn update_state(&self, state: WorkState, message: impl Into<String>) {
+    pub fn update_state(&self, state: JobTaskState, message: impl Into<String>) {
         let mut lock = self.progress.lock().unwrap();
         self.state.set_state(state);
         lock.message = message.into();
         lock.update_time = LocalTime::mills() as i64;
     }
 
-    pub fn update_progress(&self, loaded_size: i64, total_size: i64) -> WorkProgress {
+    pub fn update_progress(&self, loaded_size: i64, total_size: i64) -> JobTaskProgress {
         let mut lock = self.progress.lock().unwrap();
 
         lock.loaded_size = loaded_size;
@@ -62,10 +62,10 @@ impl TaskContext {
 
         if loaded_size >= total_size {
             lock.message = "task completed successfully".into();
-            self.state.set_state(WorkState::Completed);
+            self.state.set_state(JobTaskState::Completed);
         }
 
-        WorkProgress {
+        JobTaskProgress {
             state: self.get_state(),
             total_size: lock.total_size,
             loaded_size: lock.loaded_size,

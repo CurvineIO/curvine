@@ -19,12 +19,34 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
+    /// Creates a new TaskManager with an existing runtime.
+    ///
+    /// This method initializes a task manager that handles load tasks execution
+    /// with an external async runtime, providing better resource control and
+    /// allowing runtime sharing across components.
+    ///
+    /// # Arguments
+    ///
+    /// * `rt` - An existing Arc-wrapped Runtime for async task execution
+    /// * `conf` - The cluster configuration containing job and client settings
+    /// * `sender` - Async channel sender for dispatching task contexts to workers
+    ///
+    /// # Returns
+    ///
+    /// Returns `FsResult<Self>` containing the initialized TaskManager or an error
+    /// if filesystem initialization fails or configuration is invalid.
+    ///
+    /// # Behavior
+    ///
+    /// - Modifies client hostname to "localhost" to prevent local write priority
+    /// - This ensures data distribution across all workers instead of local bias
+    /// - Initializes filesystem client with the modified configuration
+    /// - Sets up task store and timing configurations from job settings
     pub fn with_rt(
         rt: Arc<Runtime>,
         conf: &ClusterConf,
         sender: AsyncSender<Arc<TaskContext>>,
     ) -> FsResult<Self> {
-        // Set hostname to localhost to prevent local priority in data writing that would cause data to be written only to the current worker node
         let mut new_conf = conf.clone();
         new_conf.client.hostname = "localhost".to_string();
 
