@@ -13,13 +13,15 @@
 // limitations under the License.
 
 use crate::file::{CurvineFileSystem, FsClient};
+use crate::rpc::JobMasterClient;
 use crate::unified::{MountCache, MountValue, UnifiedReader, UnifiedWriter};
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    ConsistencyStrategy, FileStatus, MasterInfo, MountInfo, MountOptions, SetAttrOpts,
+    ConsistencyStrategy, FileStatus, LoadJobCommand, LoadJobResult, MasterInfo, MountInfo,
+    MountOptions, SetAttrOpts,
 };
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -185,6 +187,12 @@ impl UnifiedFileSystem {
             }
         }
     }
+
+    pub async fn async_cache(&self, source_path: &Path) -> FsResult<LoadJobResult> {
+        let client = JobMasterClient::new(self.fs_client());
+        let command = LoadJobCommand::builder(source_path.clone_uri()).build();
+        client.submit_load_job(command).await
+    }
 }
 
 impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem {
@@ -238,15 +246,11 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
         }
 
         if mount.info.auto_cache() {
-            match self
-                .cv
-                .async_cache(&ufs_path, mount.info.get_ttl(), false)
-                .await
-            {
+            match self.async_cache(&ufs_path).await {
                 Err(e) => warn!("Submit async cache error for {}: {}", ufs_path, e),
                 Ok(res) => info!(
-                    "Submit async cache successfully for {}, job res {}",
-                    ufs_path, res
+                    "Submit async cache successfully for {}, job id {}, target_path {}",
+                    ufs_path, res.job_id, res.target_path
                 ),
             }
         }

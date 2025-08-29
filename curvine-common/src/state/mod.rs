@@ -60,9 +60,6 @@ pub use self::worker_status::WorkerStatus;
 mod create_flag;
 pub use self::create_flag::*;
 
-mod async_cache;
-pub use self::async_cache::*;
-
 mod mount;
 pub use self::mount::*;
 
@@ -71,3 +68,6 @@ pub use self::posix_permission::*;
 
 mod opts;
 pub use self::opts::*;
+
+mod job;
+pub use self::job::*;

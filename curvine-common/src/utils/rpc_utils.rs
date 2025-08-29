@@ -12,24 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::RpcCode;
 use orpc::client::RpcClient;
-use orpc::message::Builder;
-use orpc::CommonResult;
+use orpc::error::ErrorExt;
+use orpc::io::IOError;
+use orpc::message::MessageBuilder;
+use orpc::CommonError;
 use prost::Message as PMessage;
+use std::time::Duration;
 
 pub struct RpcUtils;
 
 impl RpcUtils {
-    pub async fn rpc<T, R>(client: &mut RpcClient, code: RpcCode, header: T) -> CommonResult<R>
+    pub async fn proto_rpc<T, R, E>(
+        client: &RpcClient,
+        timeout: Duration,
+        code: impl Into<i8>,
+        header: T,
+    ) -> Result<R, E>
     where
         T: PMessage + Default,
         R: PMessage + Default,
+        E: ErrorExt + From<IOError> + From<CommonError>,
     {
-        let msg = Builder::new_rpc(code).proto_header(header).build();
+        let msg = MessageBuilder::new_rpc(code.into())
+            .proto_header(header)
+            .build();
 
-        let rep_msg = client.rpc(msg).await?;
-        let rep_header: R = rep_msg.parse_header()?;
-        Ok(rep_header)
+        match client.timeout_rpc(timeout, msg).await {
+            Ok(v) => {
+                v.check_error_ext::<E>()?;
+                Ok(v.parse_header()?)
+            }
+
+            Err(e) => {
+                client.set_closed();
+                Err(e.into())
+            }
+        }
     }
 }

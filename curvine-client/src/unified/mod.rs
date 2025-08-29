@@ -18,6 +18,7 @@ use crate::*;
 use crate::{impl_reader_for_enum, impl_writer_for_enum};
 use curvine_common::conf::UfsConf;
 use curvine_common::fs::Path;
+use curvine_common::state::MountInfo;
 use curvine_common::FsResult;
 use curvine_ufs::err_ufs;
 use std::collections::HashMap;
@@ -93,6 +94,11 @@ impl UfsFileSystem {
 
             None => err_ufs!("Missing scheme"),
         }
+    }
+
+    pub fn with_mount(mnt: &MountInfo) -> FsResult<Self> {
+        let path = Path::from_str(&mnt.ufs_path)?;
+        Self::new(&path, mnt.properties.clone())
     }
 }
 impl_filesystem_for_enum!(UfsFileSystem);

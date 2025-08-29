@@ -62,6 +62,14 @@ impl Path {
         &self.full_path
     }
 
+    pub fn clone_path(&self) -> String {
+        self.path().to_string()
+    }
+
+    pub fn clone_uri(&self) -> String {
+        self.full_path.clone()
+    }
+
     pub fn authority_path(&self) -> &str {
         let full_path = self.full_path();
 
