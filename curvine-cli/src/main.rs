@@ -18,8 +18,8 @@ mod util;
 
 use clap::Parser;
 use commands::Commands;
+use curvine_client::rpc::JobMasterClient;
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_client::LoadClient;
 use curvine_common::conf::ClusterConf;
 use curvine_common::version;
 use orpc::common::Utils;
@@ -49,7 +49,7 @@ fn main() -> CommonResult<()> {
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let fs_client = curvine_fs.fs_client();
-    let load_client = LoadClient::new(fs_client.clone())?;
+    let load_client = JobMasterClient::new(fs_client.clone());
 
     rt.block_on(async move {
         let result = match args.command {

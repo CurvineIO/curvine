@@ -25,12 +25,8 @@ impl MountValue {
     }
 
     // Get the ufs path of the cv path
-    pub fn get_ufs_path(&self, path: &Path) -> CommonResult<Path> {
-        // parse real path
-        // mnt: /xuen-test s3://flink/xuen-test
-        // Path /xuen-test/a -> s3://flink/xuen-test/a
-        let sub_path = path.path().replacen(&self.info.cv_path, "", 1);
-        Path::from_str(format!("{}/{}", self.info.ufs_path, sub_path))
+    pub fn get_ufs_path(&self, cv_path: &Path) -> CommonResult<Path> {
+        self.info.get_ufs_path(cv_path)
     }
 }
 

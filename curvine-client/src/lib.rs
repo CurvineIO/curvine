@@ -20,8 +20,6 @@ pub mod file;
 pub mod rpc;
 pub mod unified;
 
-pub use rpc::load_client::LoadClient;
-
 mod client_metrics;
 pub use self::client_metrics::ClientMetrics;
 

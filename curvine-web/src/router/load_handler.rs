@@ -19,19 +19,19 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use curvine_client::LoadClient;
-use curvine_common::proto::LoadState;
+use curvine_client::rpc::JobMasterClient;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use curvine_common::fs::Path;
 
 use crate::router::RouterHandler;
 
 ///Loading the processor, responsible for handling REST API requests related to loading external data
 pub struct LoadHandler {
     ///Master client instance
-    client: Arc<LoadClient>,
+    client: Arc<JobMasterClient>,
 }
 
 ///Submit a load task request
@@ -158,7 +158,7 @@ struct ErrorResponse {
 
 impl LoadHandler {
     ///Create a new load processor
-    pub fn new(master_client: Arc<LoadClient>) -> Self {
+    pub fn new(master_client: Arc<JobMasterClient>) -> Self {
         Self {
             client: master_client,
         }
@@ -174,10 +174,11 @@ impl LoadHandler {
             payload.path, payload.recursive
         );
 
+        let path = Path::from_str(&payload.path).unwrap();
         //Submit loading tasks
         let response = self
             .client
-            .submit_load(&payload.path, payload.ttl, Some(payload.recursive))
+            .submit_load(&path, LoadJobOptions::default())
             .await
             .map_err(|e| AppError::internal(format!("Failed to submit load task: {}", e)))?;
 

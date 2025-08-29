@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::{ClientConf, FuseConf, JournalConf, MasterConf, WorkerConf};
+use crate::conf::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf};
 use crate::rocksdb::DBConf;
 use crate::version;
 use log::info;
@@ -53,6 +53,8 @@ pub struct ClusterConf {
     pub client: ClientConf,
 
     pub fuse: FuseConf,
+
+    pub job: JobConf,
 }
 
 impl ClusterConf {
@@ -87,6 +89,7 @@ impl ClusterConf {
         conf.master.init()?;
         conf.client.init()?;
         conf.fuse.init()?;
+        conf.job.init()?;
 
         Ok(conf)
     }
@@ -237,6 +240,7 @@ impl Default for ClusterConf {
             log: Default::default(),
             client: Default::default(),
             fuse: FuseConf::default(),
+            job: JobConf::default(),
         }
     }
 }
@@ -244,83 +248,5 @@ impl Default for ClusterConf {
 impl Display for ClusterConf {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_load_conf_parsing() {
-        // Construct a TOML string containing load configuration
-        let toml_str = r#"
-            [master.load]
-            job_ttl_seconds = 1209600  # 14 day
-            job_cleanup_interval_seconds = 7200
-
-            [worker.load]
-            task_status_report_interval_ms = 2000
-            task_read_chunk_size_bytes = 2097152  # 2MB
-            task_transfer_buffer_count = 32
-            task_timeout_seconds = 7200  # 2 hour
-        "#;
-
-        // parse TOML string to ClusterConf structure
-        let conf: ClusterConf = toml::from_str(toml_str).unwrap();
-
-        // Verify that the master.load configuration is parsed correctly
-        assert_eq!(conf.master.load.job_ttl_seconds, 1209600);
-        assert_eq!(conf.master.load.job_cleanup_interval_seconds, 7200);
-
-        // Verify that the worker.load configuration is parsed correctly
-        assert_eq!(conf.worker.load.task_status_report_interval_ms, 2000);
-        assert_eq!(conf.worker.load.task_read_chunk_size_bytes, 2097152);
-        assert_eq!(conf.worker.load.task_transfer_buffer_count, 32);
-        assert_eq!(conf.worker.load.task_timeout_seconds, 7200);
-    }
-
-    #[test]
-    fn test_load_conf_default_values() {
-        // Construct an empty TOML string and test the default value
-        let toml_str = r#"
-            [master]
-            [worker]
-        "#;
-
-        // parse TOML string to ClusterConf structure
-        let conf: ClusterConf = toml::from_str(toml_str).unwrap();
-
-        // Verify the default configuration of master.load
-        assert_eq!(conf.master.load.job_ttl_seconds, 7 * 24 * 3600); // 7 day
-        assert_eq!(conf.master.load.job_cleanup_interval_seconds, 3600);
-
-        // Verify the default configuration of worker.load
-        assert_eq!(conf.worker.load.task_status_report_interval_ms, 5000);
-        assert_eq!(conf.worker.load.task_read_chunk_size_bytes, 1024 * 1024); // 1MB
-        assert_eq!(conf.worker.load.task_transfer_buffer_count, 16);
-        assert_eq!(conf.worker.load.task_timeout_seconds, 3600); // 1 hour
-    }
-
-    #[test]
-    fn test_load_conf_partial_override() {
-        // Construct the TOML string that partially overwrites the default value
-        let toml_str = r#"
-            [master.load]
-            worker_threads = 6
-
-            [worker.load]
-            default_buffer_size = 24
-            max_concurrent_tasks = 8
-        "#;
-
-        // parse TOML string to ClusterConf structure
-        let conf: ClusterConf = toml::from_str(toml_str).unwrap();
-
-        // Verify the master.load configuration, partially override
-        assert_eq!(conf.master.load.job_ttl_seconds, 7 * 24 * 3600);
-
-        assert_eq!(conf.worker.load.task_status_report_interval_ms, 5000);
-        assert_eq!(conf.worker.load.task_transfer_buffer_count, 16);
     }
 }

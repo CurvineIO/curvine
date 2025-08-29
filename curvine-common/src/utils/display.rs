@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::{
-    GetLoadStatusResponse, GetMountTableResponse, LoadJobResponse, LoadState, MountResponse,
-    UnMountResponse,
-};
+use crate::proto::{GetMountTableResponse, MountResponse, UnMountResponse};
+use crate::state::{JobStatus, JobTaskState, LoadJobResult};
 use chrono::DateTime;
 use std::fmt;
 use std::fmt::Display;
@@ -111,13 +109,13 @@ impl ProgressDisplay for BasicProgress {
     }
 }
 
-impl fmt::Display for BasicProgress {
+impl Display for BasicProgress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{}", self.format_progress())
     }
 }
 
-impl Display for LoadJobResponse {
+impl Display for LoadJobResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "\n✅ Load job submitted successfully")?;
         writeln!(f, "┌─────────────────────────────────────")?;
@@ -132,23 +130,22 @@ impl Display for LoadJobResponse {
         Ok(())
     }
 }
-impl Display for LoadState {
+impl Display for JobTaskState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}", self.as_str_name())
+        writeln!(f, "{:?}", self)
     }
 }
 
-impl Display for GetLoadStatusResponse {
+impl Display for JobStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Get the color identification corresponding to the status
-        let state = LoadState::from_i32(self.state);
-        let state_color = match state {
-            Some(LoadState::Pending) => "⚪",
-            Some(LoadState::Loading) => "🔵",
-            Some(LoadState::Completed) => "🟢",
-            Some(LoadState::Failed) => "🔴",
-            Some(LoadState::Canceled) => "⚫",
-            None => "❓",
+        let state_color = match self.state {
+            JobTaskState::Pending => "⚪",
+            JobTaskState::Loading => "🔵",
+            JobTaskState::Completed => "🟢",
+            JobTaskState::Failed => "🔴",
+            JobTaskState::Canceled => "⚫",
+            JobTaskState::UNKNOWN => "Unknown",
         };
 
         // Format time
@@ -164,34 +161,24 @@ impl Display for GetLoadStatusResponse {
         writeln!(f, "\n📋 Load Job Status")?;
         writeln!(f, "┌──────────────────────────────────────────")?;
         writeln!(f, "│ 🔑 Job ID: {}", self.job_id)?;
-        writeln!(f, "│ 📁 Source: {}", self.path)?;
+        writeln!(f, "│ 📁 Source: {}", self.source_path)?;
         writeln!(f, "│ 📂 Target: {}", self.target_path)?;
-        writeln!(
-            f,
-            "│ 🚦 Status: {} {}",
-            state_color,
-            state.unwrap().as_str_name()
-        )?;
+        writeln!(f, "│ 🚦 Status: {} {:?}", state_color, self.state)?;
 
-        if let Some(message) = &self.message {
-            writeln!(f, "│ 📝 Message: {}", message)?;
-        }
+        writeln!(f, "│ 📝 Message: {}", self.progress.message)?;
 
         // Show progress information
-        if let Some(metrics) = &self.metrics {
-            if let Some(total) = metrics.total_size {
-                let loaded = metrics.loaded_size.unwrap_or(0);
-                let progress = BasicProgress::new(loaded as u64, total as u64);
-                write!(f, "{}", progress.format_progress())?;
-            }
+        let loaded = self.progress.loaded_size;
+        let total = self.progress.total_size;
+        let progress = BasicProgress::new(loaded as u64, total as u64);
+        write!(f, "{}", progress.format_progress())?;
 
-            writeln!(f, "│")?;
-            writeln!(f, "│ ⏰ Created: {}", format_time(metrics.create_time))?;
-            writeln!(f, "│ 🔄 Updated: {}", format_time(metrics.update_time))?;
-            if let Some(expire) = metrics.expire_time {
-                writeln!(f, "│ ⌛ Expires: {}", format_time(Some(expire)))?;
-            }
-        }
+        writeln!(f, "│")?;
+        writeln!(
+            f,
+            "│ 🔄 Updated: {}",
+            format_time(Some(self.progress.update_time))
+        )?;
         writeln!(f, "└──────────────────────────────────────────")?;
 
         Ok(())

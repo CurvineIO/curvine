@@ -18,10 +18,6 @@ ttl_bucket_interval = "1h"         # TTL bucket time interval
 ttl_max_retry_duration = "30m"     # Maximum duration for retrying failed operations
 ttl_retry_interval = "5s"          # Interval between retry attempts
 
-# master loading function configuration
-[master.load]
-job_ttl_seconds = 1209600
-job_cleanup_interval_seconds = 7200
 
 
 # masta ha raft configuration.
@@ -39,13 +35,6 @@ data_dir = [
     "[DISK]testing/data",
 ]
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
-
-# Worker loading function configuration
-[worker.load]
-task_status_report_interval_ms = 2000
-task_read_chunk_size_bytes = 2097152
-task_transfer_buffer_count = 32
-task_timeout_seconds = 7200
 
 
 # Customer service configuration.

@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use crate::conf::ClientConf;
+use crate::fs::Path;
 use crate::state::{StorageType, TtlAction};
 use num_enum::{FromPrimitive, IntoPrimitive};
-use orpc::{err_box, CommonError};
+use orpc::{err_box, CommonError, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -114,6 +115,30 @@ impl MountInfo {
         } else {
             Some(format!("{}s", self.ttl_ms / 1000))
         }
+    }
+
+    pub fn get_ufs_path(&self, path: &Path) -> CommonResult<Path> {
+        if !path.is_cv() {
+            return err_box!("path {} is not cv path", path);
+        }
+
+        // parse real path
+        // mnt: /xuen-test s3://flink/xuen-test
+        // Path /xuen-test/a -> s3://flink/xuen-test/a
+        let sub_path = path.path().replacen(&self.cv_path, "", 1);
+        Path::from_str(format!("{}/{}", self.ufs_path, sub_path))
+    }
+
+    pub fn get_cv_path(&self, path: &Path) -> CommonResult<Path> {
+        if path.is_cv() {
+            return err_box!("path {} is not ufs path", path);
+        }
+
+        // parse real path
+        // mnt: /xuen-test s3://flink/xuen-test
+        // Path s3://flink/xuen-test/a -> /xuen-test/a
+        let sub_path = path.path().replacen(&self.ufs_path, "", 1);
+        Path::from_str(format!("{}/{}", self.cv_path, sub_path))
     }
 }
 

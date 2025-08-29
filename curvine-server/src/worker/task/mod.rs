@@ -12,19 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::{Display, Formatter};
+//! Worker side data loading module
+//! Responsible for loading data from external storage systems (such as S3) to local storage
 
-pub struct CacheJobResult {
-    pub job_id: String,
-    pub target_path: String,
-}
+mod load_task_runner;
+pub use self::load_task_runner::LoadTaskRunner;
 
-impl Display for CacheJobResult {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "CacheJobResult {{ job_id: {}, target_path: {} }}",
-            self.job_id, self.target_path
-        )
-    }
-}
+mod task_manager;
+pub use self::task_manager::TaskManager;
+
+mod task_store;
+pub use self::task_store::TaskStore;
+
+mod task_context;
+pub use self::task_context::TaskContext;

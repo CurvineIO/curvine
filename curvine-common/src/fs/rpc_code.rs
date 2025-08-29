@@ -46,11 +46,11 @@ pub enum RpcCode {
     GetMountTable = 33,
     GetMountInfo = 34,
 
-    SubmitLoadJob = 35,
-    GetLoadStatus = 36,
-    CancelLoadJob = 37,
-    ReportLoadTask = 38,
-    SubmitLoadTask = 39,
+    SubmitJob = 35,
+    GetJobStatus = 36,
+    CancelJob = 37,
+    ReportTask = 38,
+    SubmitTask = 39,
     WorkerHeartbeat = 40,
     WorkerBlockReport = 41,
 

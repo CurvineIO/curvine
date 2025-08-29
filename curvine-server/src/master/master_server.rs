@@ -16,8 +16,8 @@ use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::router_handler::MasterRouterHandler;
-use crate::master::MountManager;
-use crate::master::{LoadManager, MasterHandler};
+use crate::master::{JobHandler, MountManager};
+use crate::master::{JobManager, MasterHandler};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
 use curvine_common::conf::ClusterConf;
 use curvine_web::server::{WebHandlerService, WebServer};
@@ -38,7 +38,7 @@ pub struct MasterService {
     fs: MasterFilesystem,
     retry_cache: Option<FsRetryCache>,
     mount_manager: Arc<MountManager>,
-    load_manager: Arc<LoadManager>,
+    job_manager: Arc<JobManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<MasterReplicationManager>,
 }
@@ -49,7 +49,7 @@ impl MasterService {
         fs: MasterFilesystem,
         retry_cache: Option<FsRetryCache>,
         mount_manager: Arc<MountManager>,
-        load_manager: Arc<LoadManager>,
+        job_manager: Arc<JobManager>,
         rt: Arc<Runtime>,
         replication_manager: Arc<MasterReplicationManager>,
     ) -> Self {
@@ -58,7 +58,7 @@ impl MasterService {
             fs,
             retry_cache,
             mount_manager,
-            load_manager,
+            job_manager,
             rt,
             replication_manager,
         }
@@ -95,8 +95,7 @@ impl HandlerService for MasterService {
             self.retry_cache.clone(),
             client_state,
             self.mount_manager.clone(),
-            Arc::clone(&self.load_manager),
-            self.rt.clone(),
+            JobHandler::new(self.job_manager.clone()),
             self.replication_manager.clone(),
         )
     }
@@ -117,7 +116,7 @@ pub struct Master {
     journal_system: JournalSystem,
     actor: MasterActor,
     mount_manager: Arc<MountManager>,
-    load_manager: Arc<LoadManager>,
+    job_manager: Arc<JobManager>,
     replication_manager: Arc<MasterReplicationManager>,
 }
 
@@ -149,8 +148,9 @@ impl Master {
             &replication_manager,
         );
 
-        let load_manager = Arc::new(LoadManager::from_cluster_conf(
-            Arc::new(fs.clone()),
+        let job_manager = Arc::new(JobManager::from_cluster_conf(
+            fs.clone(),
+            mount_manager.clone(),
             rt.clone(),
             &conf,
         ));
@@ -162,7 +162,7 @@ impl Master {
             fs,
             retry_cache,
             mount_manager.clone(),
-            Arc::clone(&load_manager),
+            job_manager.clone(),
             rt.clone(),
             replication_manager.clone(),
         );
@@ -181,7 +181,7 @@ impl Master {
             journal_system,
             actor,
             mount_manager,
-            load_manager,
+            job_manager,
             replication_manager,
         })
     }
@@ -208,8 +208,8 @@ impl Master {
         // reload mount info
         self.mount_manager.restore();
 
-        // step5: Start load manager
-        self.load_manager.start();
+        // step5: Start job manager
+        self.job_manager.start();
 
         rpc_status
     }

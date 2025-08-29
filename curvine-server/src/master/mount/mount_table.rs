@@ -68,7 +68,7 @@ impl MountTable {
         false
     }
 
-    pub fn check_conflict(&self, cv_path: &str, ufs_path: &str) -> FsResult<()> {
+    pub fn check_conflict(&self, cv_path: &str, _ufs_path: &str) -> FsResult<()> {
         let inner = self.inner.read().unwrap();
         for info in inner.mountid2entry.values() {
             if Path::has_prefix(cv_path, &info.cv_path) {
@@ -79,13 +79,12 @@ impl MountTable {
                 return err_box!("mount point {} is a prefix of {}", cv_path, info.cv_path);
             }
 
-            if Path::has_prefix(ufs_path, &info.ufs_path) {
-                return err_box!("mount point {} is a prefix of {}", info.ufs_path, ufs_path);
-            }
-
-            if Path::has_prefix(&info.ufs_path, ufs_path) {
-                return err_box!("mount point {} is a prefix of {}", ufs_path, info.ufs_path);
-            }
+            // if Path::has_prefix(ufs_path, &info.ufs_path) {
+            //     return err_box!("mount point {} is a prefix of {}", info.ufs_path, ufs_path);
+            // }
+            // if Path::has_prefix(&info.ufs_path, ufs_path) {
+            //     return err_box!("mount point {} is a prefix of {}", ufs_path, info.ufs_path);
+            // }
         }
 
         Ok(())

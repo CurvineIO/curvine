@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod load_handler;
+// pub mod load_handler;
 mod router_handler;
 
 pub use self::router_handler::{RouterHandler, TestHandler};
