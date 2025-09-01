@@ -26,7 +26,6 @@ use serde::{Deserialize, Serialize};
 pub struct InodeDir {
     pub(crate) id: i64,
     pub(crate) parent_id: i64,
-    pub(crate) name: String,
     pub(crate) mtime: i64,
     pub(crate) atime: i64,
     pub(crate) storage_policy: StoragePolicy,
@@ -38,11 +37,10 @@ pub struct InodeDir {
 }
 
 impl InodeDir {
-    pub fn new(id: i64, name: &str, time: i64) -> Self {
+    pub fn new(id: i64, time: i64) -> Self {
         Self {
             id,
             parent_id: EMPTY_PARENT_ID,
-            name: name.to_string(),
             mtime: time,
             atime: time,
             storage_policy: Default::default(),
@@ -51,11 +49,10 @@ impl InodeDir {
         }
     }
 
-    pub fn with_opts(id: i64, name: &str, time: i64, opts: MkdirOpts) -> Self {
+    pub fn with_opts(id: i64, time: i64, opts: MkdirOpts) -> Self {
         Self {
             id,
             parent_id: EMPTY_PARENT_ID,
-            name: name.to_string(),
             mtime: time,
             atime: time,
             storage_policy: opts.storage_policy,
@@ -96,7 +93,7 @@ impl InodeDir {
         for child in self.children.iter() {
             let t = if child.is_dir() { "dir" } else { "file" };
 
-            println!("{} {}, {}", t, child.id(), child.name());
+            println!("{} {}", t, child.id());
         }
     }
 
@@ -112,22 +109,18 @@ impl InodeDir {
         self.children.len()
     }
 
-    pub fn add_file_child(&mut self, file: InodeFile) -> CommonResult<InodePtr> {
-        self.add_child(File(file))
+    pub fn add_file_child(&mut self, name: &str, file: InodeFile) -> CommonResult<InodePtr> {
+        self.add_child(File(name.to_string(), file))
     }
 
-    pub fn add_dir_child(&mut self, dir: InodeDir) -> CommonResult<InodePtr> {
-        self.add_child(Dir(dir))
+    pub fn add_dir_child(&mut self, name: &str, dir: InodeDir) -> CommonResult<InodePtr> {
+        self.add_child(Dir(name.to_string(), dir))
     }
 }
 
 impl Inode for InodeDir {
     fn id(&self) -> i64 {
         self.id
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 
     fn parent_id(&self) -> i64 {

@@ -47,7 +47,7 @@ impl InodePath {
             index += 1;
             let child_name: &str = components[index].as_str();
             match cur_inode.as_mut() {
-                Dir(d) => {
+                Dir(_, d) => {
                     if let Some(child) = d.get_child_ptr(child_name) {
                         cur_inode = child;
                     } else {
@@ -56,7 +56,7 @@ impl InodePath {
                     }
                 }
 
-                File(_) => {
+                File(_, _) => {
                     // The current path is a file, there is no need to search again.
                     break;
                 }

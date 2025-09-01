@@ -82,7 +82,8 @@ impl JournalLoader {
         let mut fs_dir = self.fs_dir.write();
         fs_dir.update_last_inode_id(entry.dir.id)?;
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path)?;
-        let _ = fs_dir.add_last_inode(inp, Dir(entry.dir))?;
+        let name = inp.name().to_string();
+        let _ = fs_dir.add_last_inode(inp, Dir(name, entry.dir))?;
         Ok(())
     }
 
@@ -90,7 +91,8 @@ impl JournalLoader {
         let mut fs_dir = self.fs_dir.write();
         fs_dir.update_last_inode_id(entry.file.id)?;
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path)?;
-        let _ = fs_dir.add_last_inode(inp, File(entry.file))?;
+        let name = inp.name().to_string();
+        let _ = fs_dir.add_last_inode(inp, File(name, entry.file))?;
         Ok(())
     }
 

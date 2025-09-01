@@ -86,21 +86,21 @@ impl InodeTtlExecutor {
 
         if let Ok(Some(inode_view)) = self.inode_store.get_inode(inode_id) {
             match &inode_view {
-                InodeView::File(file) => {
+                InodeView::File(name, file) => {
                     let parent_path = self.build_path_recursive(file.parent_id())?;
                     let file_path = if parent_path == "/" {
-                        format!("/{}", file.name())
+                        format!("/{}", name)
                     } else {
-                        format!("{}/{}", parent_path, file.name())
+                        format!("{}/{}", parent_path, name)
                     };
                     return Ok(file_path);
                 }
-                InodeView::Dir(dir) => {
+                InodeView::Dir(name, dir) => {
                     let parent_path = self.build_path_recursive(dir.parent_id())?;
                     let dir_path = if parent_path == "/" {
-                        format!("/{}", dir.name())
+                        format!("/{}", name)
                     } else {
-                        format!("{}/{}", parent_path, dir.name())
+                        format!("{}/{}", parent_path, name)
                     };
                     return Ok(dir_path);
                 }
@@ -208,7 +208,7 @@ impl InodeTtlExecutor {
 
         if let Some(inode) = self.get_inode_from_store(inode_id)? {
             match &inode {
-                InodeView::File(file) => {
+                InodeView::File(_, file) => {
                     info!(
                         "Executing Inode ttl free operation for file: inode={}, path={}",
                         inode_id, path
@@ -219,7 +219,7 @@ impl InodeTtlExecutor {
                     info!("Inode ttl free completed: {}", path);
                     Ok(())
                 }
-                InodeView::Dir(_) => {
+                InodeView::Dir(_, _) => {
                     warn!("Cannot free directory: {}", path);
                     Err(TtlError::ActionExecutionError(format!(
                         "Cannot free directory: {}",

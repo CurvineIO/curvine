@@ -69,7 +69,7 @@ impl FsDir {
     }
     // Create root directory
     pub fn create_root() -> InodeView {
-        Dir(InodeDir::new(ROOT_INODE_ID, ROOT_INODE_NAME, 0))
+        Dir(ROOT_INODE_NAME.to_string(), InodeDir::new(ROOT_INODE_ID, 0))
     }
 
     pub fn root_ptr(&self) -> InodePtr {
@@ -109,11 +109,11 @@ impl FsDir {
         }
 
         let pos = inp.existing_len() - 1;
-        let name = inp.get_component(pos + 1)?;
+        let name = inp.get_component(pos + 1)?.to_string();
 
-        let dir = InodeDir::with_opts(self.next_inode_id()?, name, LocalTime::mills() as i64, opts);
+        let dir = InodeDir::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
 
-        inp = self.add_last_inode(inp, Dir(dir))?;
+        inp = self.add_last_inode(inp, Dir(name, dir))?;
         self.journal_writer.log_mkdir(op_ms, &inp)?;
 
         Ok(inp)
@@ -168,13 +168,14 @@ impl FsDir {
             None => return err_box!("Abnormal data status"),
         };
         let child = target.as_ref();
+        let child_name = inp.name();
 
         // Delete the data in rocksdb.
         parent.update_mtime(mtime);
         let del_res = self.store.apply_delete(parent.as_ref(), child)?;
 
         // After deletion occurs, the target address cannot be used.
-        let _ = parent.delete_child(child.id(), child.name())?;
+        let _ = parent.delete_child(child.id(), child_name)?;
         Ok(del_res)
     }
 
@@ -206,13 +207,11 @@ impl FsDir {
         // Get the target parent node that needs to be added
         // 1. If dst last is a directory, then a new node is created under that directory.
         // 2. If dst last does not exist, create a node in the parent directory.
-        let mut new_name = dst_inp.name();
         let mut dst_parent = match dst_inp.get_last_inode() {
             Some(v) => {
                 // /1.log -> /b is equivalent to /1.log /b/1.log
                 // b is an existing directory, indicating that you can move to this directory.
                 if v.is_dir() {
-                    new_name = src_inp.name();
                     v
                 } else {
                     return err_box!("Rename failed, because dst {} is exists", dst_inp.path());
@@ -229,7 +228,6 @@ impl FsDir {
 
         // Modify the time and name of the rename node.
         let mut new_inode = src_inode.as_ref().clone();
-        new_inode.change_name(new_name);
         new_inode.update_mtime(mtime);
 
         // Update the parent directory for the last modification time.
@@ -267,15 +265,11 @@ impl FsDir {
 
         // Create a directory that does not exist.
         inp = self.create_parent_dir(inp, opts.dir_opts())?;
+        let name = inp.name().to_string();
 
         // Create an inode file node.
-        let file = InodeFile::with_opts(
-            self.inode_id.next()?,
-            inp.name(),
-            LocalTime::mills() as i64,
-            opts,
-        );
-        inp = self.add_last_inode(inp, File(file))?;
+        let file = InodeFile::with_opts(self.inode_id.next()?, LocalTime::mills() as i64, opts);
+        inp = self.add_last_inode(inp, File(name, file))?;
         self.journal_writer.log_create_file(op_ms, &inp)?;
 
         Ok(inp)
@@ -333,9 +327,9 @@ impl FsDir {
 
         let mut res = Vec::with_capacity(1.max(inode.child_len()));
         match inode.as_ref() {
-            File(_) => res.push(inode.to_file_status(inp.path())),
+            File(_, _) => res.push(inode.to_file_status(inp.path())),
 
-            Dir(d) => {
+            Dir(_, d) => {
                 for item in d.children_iter() {
                     let child_path = inp.child_path(item.name());
                     res.push(item.to_file_status(&child_path));
@@ -346,7 +340,11 @@ impl FsDir {
         Ok(res)
     }
 
-    fn commit_block(file: &mut InodeFile, commit: Option<&CommitBlock>) -> FsResult<()> {
+    fn commit_block(
+        name: &str,
+        file: &mut InodeFile,
+        commit: Option<&CommitBlock>,
+    ) -> FsResult<()> {
         let commit = match commit {
             None => return Ok(()),
             Some(v) => v,
@@ -357,21 +355,21 @@ impl FsDir {
                 return err_box!(
                     "Inode file {}({}) block status is abnormal, no blocks",
                     file.id,
-                    file.name
+                    name
                 )
             }
             Some(v) => v,
         };
         if last_block.id != commit.block_id {
             return err_box!("Inode file {}({}) block status is abnormal, expected last block id {}, actual submitted block id {}",
-                 file.id, file.name, last_block.id, commit.block_id);
+                 file.id, name, last_block.id, commit.block_id);
         }
 
         if !last_block.is_writing() {
             return err_box!(
                 "Inode file {}({}), block {} not writing status",
                 file.id,
-                file.name,
+                name,
                 commit.block_id
             );
         }
@@ -410,6 +408,7 @@ impl FsDir {
     ) -> FsResult<ExtendedBlock> {
         let op_ms = LocalTime::mills();
         let mut inode = try_option!(inp.get_last_inode());
+        let name = inp.name();
         let file = inode.as_file_mut()?;
 
         // Check whether it is a retry request.
@@ -426,7 +425,7 @@ impl FsDir {
         let new_block_id = file.next_block_id()?;
 
         // commit block
-        Self::commit_block(file, commit_block.as_ref())?;
+        Self::commit_block(name, file, commit_block.as_ref())?;
 
         // create block.
         file.add_block(BlockMeta::with_pre(new_block_id, choose_workers));
@@ -454,6 +453,7 @@ impl FsDir {
     ) -> FsResult<bool> {
         let op_ms = LocalTime::mills();
         let mut inode = try_option!(inp.get_last_inode());
+        let name = inp.name();
         let file = inode.as_file_mut()?;
         if file.is_complete() {
             // The file has been completed, it is a duplicate request from the client service.
@@ -461,7 +461,7 @@ impl FsDir {
         }
 
         // commit block
-        Self::commit_block(file, commit_block.as_ref())?;
+        Self::commit_block(name, file, commit_block.as_ref())?;
 
         // Update file status.
         file.mtime = LocalTime::mills() as i64;
@@ -729,13 +729,7 @@ impl FsDir {
     ) -> FsResult<()> {
         let op_ms = LocalTime::mills();
 
-        let new_inode = InodeFile::with_link(
-            self.inode_id.next()?,
-            link.name(),
-            op_ms as i64,
-            target,
-            mode,
-        );
+        let new_inode = InodeFile::with_link(self.inode_id.next()?, op_ms as i64, target, mode);
 
         let link = self.unprotected_symlink(link, new_inode, force)?;
         self.journal_writer.log_symlink(op_ms, &link, force)?;
@@ -764,14 +758,15 @@ impl FsDir {
             None
         };
 
+        let name = link.name().to_string();
         parent.update_mtime(new_inode.mtime);
         let new_inode_ptr = match old_inode {
             Some(v) => {
-                let _ = mem::replace(v.as_mut(), File(new_inode));
+                let _ = mem::replace(v.as_mut(), File(name, new_inode));
                 v
             }
             None => {
-                let added = parent.add_child(File(new_inode))?;
+                let added = parent.add_child(File(name, new_inode))?;
                 link.append(added.clone())?;
                 added
             }
