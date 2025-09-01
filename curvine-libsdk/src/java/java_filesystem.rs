@@ -110,4 +110,8 @@ impl JavaFilesystem {
         let string = JavaUtils::new_jstring(env, ufs_path)?;
         Ok(string)
     }
+
+    pub fn cleanup(&self) {
+        self.inner.cleanup()
+    }
 }

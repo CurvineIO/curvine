@@ -11,22 +11,29 @@ use std::time::Duration;
 pub struct MountValue {
     pub info: Arc<MountInfo>,
     pub ufs: UfsFileSystem,
+    pub mount_id: String,
 }
 
 impl MountValue {
     pub fn new(info: MountInfo) -> FsResult<Self> {
         let ufs_path = Path::from_str(&info.ufs_path)?;
         let ufs = UfsFileSystem::new(&ufs_path, info.properties.clone())?;
+        let mount_id = format!("{}", info.mount_id);
 
         Ok(Self {
             info: Arc::new(info),
             ufs,
+            mount_id,
         })
     }
 
     // Get the ufs path of the cv path
     pub fn get_ufs_path(&self, cv_path: &Path) -> CommonResult<Path> {
         self.info.get_ufs_path(cv_path)
+    }
+
+    pub fn mount_id(&self) -> &str {
+        &self.mount_id
     }
 }
 

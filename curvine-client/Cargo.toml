@@ -26,6 +26,7 @@ dashmap = { workspace = true }
 futures = { workspace = true }
 moka = { workspace = true }
 fxhash = { workspace = true }
+prometheus = { workspace = true }
 
 [features]
 default = ["s3"]

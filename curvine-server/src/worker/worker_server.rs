@@ -23,7 +23,7 @@ use curvine_common::state::{HeartbeatStatus, WorkerAddress};
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
-use orpc::common::{LocalTime, Logger, Metrics};
+use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -111,7 +111,6 @@ pub struct Worker {
 impl Worker {
     pub fn with_conf(conf: ClusterConf) -> CommonResult<Self> {
         Logger::init(conf.worker.log.clone());
-        Metrics::init();
 
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
         let service: WorkerService = WorkerService::with_conf(&conf, rt.clone())?;

@@ -107,4 +107,8 @@ impl LibFilesystem {
         self.rt
             .block_on(async { self.inner.get_ufs_path(&path).await })
     }
+
+    pub fn cleanup(&self) {
+        self.rt.block_on(self.inner.cleanup())
+    }
 }

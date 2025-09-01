@@ -342,6 +342,20 @@ impl FsClient {
         Ok(())
     }
 
+    pub async fn metrics_report(&self, metrics: Vec<MetricValue>) -> FsResult<()> {
+        if metrics.is_empty() {
+            return Ok(());
+        }
+
+        let req = MetricsReportRequest {
+            instance: self.context.client_addr.ip_addr.clone(),
+            source: "".to_string(),
+            metrics: ProtoUtils::metrics_report_to_pb(metrics),
+        };
+        let _: MetricsReportResponse = self.rpc(RpcCode::MetricsReport, req).await?;
+        Ok(())
+    }
+
     pub async fn rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
     where
         T: PMessage + Default,

@@ -57,6 +57,8 @@ pub enum RpcCode {
     SubmitBlockReplicationJob = 42,
     ReportBlockReplicationResult = 43,
 
+    MetricsReport = 60,
+
     // block interface.
     WriteBlock = 80,
     ReadBlock = 81,

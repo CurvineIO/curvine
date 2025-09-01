@@ -575,4 +575,28 @@ impl ProtoUtils {
             message: report.message,
         }
     }
+
+    pub fn metrics_report_from_pb(report: Vec<MetricValueProto>) -> Vec<MetricValue> {
+        report
+            .into_iter()
+            .map(|metric| MetricValue {
+                metric_type: metric.metric_type.into(),
+                name: metric.name,
+                value: metric.value,
+                tags: metric.tags,
+            })
+            .collect()
+    }
+
+    pub fn metrics_report_to_pb(report: Vec<MetricValue>) -> Vec<MetricValueProto> {
+        report
+            .into_iter()
+            .map(|metric| MetricValueProto {
+                metric_type: metric.metric_type.into(),
+                name: metric.name,
+                value: metric.value,
+                tags: metric.tags,
+            })
+            .collect()
+    }
 }

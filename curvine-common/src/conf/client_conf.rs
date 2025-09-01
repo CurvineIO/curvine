@@ -153,6 +153,13 @@ pub struct ClientConf {
     pub mount_update_ttl_str: String,
 
     pub umask: u32,
+
+    pub metric_report_enable: bool,
+
+    #[serde(skip)]
+    pub metric_report_interval: Duration,
+    #[serde(alias = "metric_report_interval")]
+    pub metric_report_interval_str: String,
 }
 
 impl ClientConf {
@@ -161,6 +168,8 @@ impl ClientConf {
     pub const DEFAULT_FILE_SYSTEM_UMASK: u32 = 0o22;
 
     pub const DEFAULT_FILE_SYSTEM_MODE: u32 = 0o777;
+
+    pub const DEFAULT_METRIC_REPORT_INTERVAL_STR: &'static str = "10s";
 
     pub fn init(&mut self) -> CommonResult<()> {
         self.block_size = ByteUnit::from_str(&self.block_size_str)?.as_byte() as i64;
@@ -194,6 +203,9 @@ impl ClientConf {
         self.ttl_ms = DurationUnit::from_str(&self.ttl_ms_str)?.as_millis() as i64;
         self.ttl_action = TtlAction::try_from(self.ttl_action_str.as_str())?;
         self.storage_type = StorageType::try_from(self.storage_type_str.as_str())?;
+
+        self.metric_report_interval =
+            DurationUnit::from_str(&self.metric_report_interval_str)?.as_duration();
 
         Ok(())
     }
@@ -301,6 +313,10 @@ impl Default for ClientConf {
             mount_update_ttl_str: "10m".to_string(),
 
             umask: Self::DEFAULT_FILE_SYSTEM_UMASK,
+
+            metric_report_enable: true,
+            metric_report_interval: Default::default(),
+            metric_report_interval_str: Self::DEFAULT_METRIC_REPORT_INTERVAL_STR.to_string(),
         };
 
         conf.init().unwrap();

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::file::{FsClient, FsContext, FsReader, FsReaderBase, FsWriter, FsWriterBase};
+use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
@@ -24,11 +25,13 @@ use curvine_common::state::{
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
 use curvine_common::FsResult;
-use log::info;
+use log::{info, warn};
 use orpc::client::ClientConf;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
 
 #[derive(Clone)]
 pub struct CurvineFileSystem {
@@ -37,6 +40,8 @@ pub struct CurvineFileSystem {
 }
 
 impl CurvineFileSystem {
+    pub const CLOSE_TIMEOUT_SECS: u64 = 5;
+
     pub fn with_rt(conf: ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
         let fs_context = Arc::new(FsContext::with_rt(conf, rt.clone())?);
         let fs_client = FsClient::new(fs_context.clone());
@@ -44,6 +49,8 @@ impl CurvineFileSystem {
             fs_context,
             fs_client: Arc::new(fs_client),
         };
+
+        FsContext::start_metrics_report_task(fs.clone());
 
         let c = &fs.conf().client;
         info!(
@@ -293,6 +300,11 @@ impl CurvineFileSystem {
         Ok(String::from_utf8_lossy(&buf).to_string())
     }
 
+    pub async fn metrics_report(&self) -> FsResult<()> {
+        let metrics = ClientMetrics::encode()?;
+        self.fs_client.metrics_report(metrics).await
+    }
+
     pub async fn write_string(&self, path: &Path, str: impl AsRef<str>) -> FsResult<()> {
         let mut writer = self.create(path, true).await?;
         writer.write(str.as_ref().as_bytes()).await?;
@@ -305,5 +317,17 @@ impl CurvineFileSystem {
         writer.write(str.as_ref().as_bytes()).await?;
         writer.complete().await?;
         Ok(())
+    }
+
+    // close fs, report metrics
+    pub async fn cleanup(&self) {
+        let res = timeout(
+            Duration::from_secs(Self::CLOSE_TIMEOUT_SECS),
+            self.metrics_report(),
+        )
+        .await;
+        if let Err(e) = res {
+            warn!("close {}", e);
+        }
     }
 }

@@ -190,3 +190,27 @@ message SymlinkRequest {
 
 message SymlinkResponse {
 }
+
+
+
+enum MetricTypeProto {
+    GAUGE = 1;
+    COUNTER = 2;
+}
+
+message MetricValueProto {
+    required MetricTypeProto metric_type = 1;
+    required string name = 2;
+    required double value = 3;
+    map<string, string> tags = 4;
+}
+
+message MetricsReportRequest {
+    required string instance = 1;
+    required string source = 2;
+    repeated MetricValueProto metrics = 3;
+}
+
+message MetricsReportResponse {
+
+}

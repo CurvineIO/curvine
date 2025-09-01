@@ -381,6 +381,15 @@ impl MasterHandler {
 
         ctx.response(SymlinkResponse::default())
     }
+
+    fn metrics_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: MetricsReportRequest = ctx.parse_header()?;
+
+        let metrics = ProtoUtils::metrics_report_from_pb(header.metrics);
+        Master::get_metrics().metrics_report(metrics)?;
+
+        ctx.response(MetricsReportResponse {})
+    }
 }
 
 impl MessageHandler for MasterHandler {
@@ -417,6 +426,8 @@ impl MessageHandler for MasterHandler {
             RpcCode::UnMount => self.umount(ctx),
             RpcCode::GetMountTable => self.get_mount_table(ctx),
             RpcCode::GetMountInfo => self.get_mount_info(ctx),
+
+            RpcCode::MetricsReport => self.metrics_report(ctx),
 
             // Worker related requests
             RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),
