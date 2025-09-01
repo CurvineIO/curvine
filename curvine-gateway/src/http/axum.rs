@@ -278,18 +278,15 @@ impl<'b> crate::utils::io::PollWrite for BodyWriter<'b> {
     }
 }
 
+#[async_trait::async_trait]
 impl crate::s3::s3_api::BodyWriter for Response {
     type BodyWriter<'a>
         = BodyWriter<'a>
     where
         Self: 'a;
 
-    fn get_body_writer<'b>(
-        &'b mut self,
-    ) -> std::pin::Pin<
-        Box<dyn 'b + Send + std::future::Future<Output = Result<Self::BodyWriter<'b>, String>>>,
-    > {
-        Box::pin(async move { Ok(BodyWriter(&mut self.body)) })
+    async fn get_body_writer(&mut self) -> Result<Self::BodyWriter<'_>, String> {
+        Ok(BodyWriter(&mut self.body))
     }
 }
 
