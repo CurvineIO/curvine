@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_client::file::CurvineFileSystem;
+use curvine_client::file::{CurvineFileSystem, FsContext};
+use curvine_client::ClientMetrics;
 use curvine_common::fs::Path;
 use curvine_common::fs::Writer;
 use curvine_common::state::{
@@ -31,7 +32,9 @@ const PATH: &str = "/fs_test/a.log";
 fn fs_test() -> FsResult<()> {
     let rt = Arc::new(AsyncRuntime::single());
 
-    let fs = Testing::get_fs_with_rt(rt.clone())?;
+    let mut conf = Testing::get_cluster_conf()?;
+    conf.client.metric_report_enable = true;
+    let fs = Testing::get_fs_with_conf(conf)?;
     let res: FsResult<()> = rt.block_on(async move {
         let path = Path::from_str("/fs_test")?;
         let _ = fs.delete(&path, true).await;
@@ -61,6 +64,8 @@ fn fs_test() -> FsResult<()> {
         set_attr_recursive(&fs).await?;
 
         test_fs_used(&fs).await?;
+
+        test_metrics(&fs).await?;
 
         // symlink(&fs).await?;
         Ok(())
@@ -477,3 +482,18 @@ async fn test_fs_used(fs: &CurvineFileSystem) -> CommonResult<()> {
 
     Ok(())
 }*/
+
+async fn test_metrics(fs: &CurvineFileSystem) -> FsResult<()> {
+    FsContext::get_metrics()
+        .mount_cache_hits
+        .with_label_values(&["id1"])
+        .inc_by(100);
+    FsContext::get_metrics()
+        .mount_cache_misses
+        .with_label_values(&["id1"])
+        .inc_by(200);
+
+    fs.fs_client()
+        .metrics_report(ClientMetrics::encode().unwrap())
+        .await
+}

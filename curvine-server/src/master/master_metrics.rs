@@ -15,7 +15,11 @@
 #![allow(unused)]
 
 use crate::master::fs::MasterFilesystem;
+use crate::master::Master;
+use curvine_common::state::MetricValue;
+use log::{debug, info, warn};
 use orpc::common::{Counter, CounterVec, Gauge, GaugeVec, Metrics as m, Metrics};
+use orpc::sync::FastDashMap;
 use orpc::sys::SysUtils;
 use orpc::CommonResult;
 use std::fmt::{Debug, Formatter};
@@ -97,6 +101,35 @@ impl MasterMetrics {
             .set(master_info.lost_workers.len() as i64);
 
         Metrics::text_output()
+    }
+
+    pub fn get_or_register(&self, value: &MetricValue) -> CommonResult<CounterVec> {
+        if let Some(v) = Metrics::get(&value.name) {
+            return v.try_into_counter_vec();
+        }
+
+        let label_values: Vec<&str> = value.tags.keys().map(|v| v.as_str()).collect();
+        let metric = m::new_counter_vec(&value.name, &value.name, &label_values)?;
+        Ok(metric)
+    }
+
+    pub fn metrics_report(&self, metrics: Vec<MetricValue>) -> CommonResult<()> {
+        for value in metrics {
+            let counter = match self.get_or_register(&value) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Not fond metrics {}: {}", value.name, e);
+                    continue;
+                }
+            };
+
+            let label_values: Vec<&str> = value.tags.values().map(|v| v.as_str()).collect();
+            counter
+                .with_label_values(&label_values)
+                .inc_by(value.value as i64)
+        }
+
+        Ok(())
     }
 }
 

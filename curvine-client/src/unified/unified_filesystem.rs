@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::{CurvineFileSystem, FsClient};
+use crate::file::{CurvineFileSystem, FsClient, FsContext};
 use crate::rpc::JobMasterClient;
 use crate::unified::{MountCache, MountValue, UnifiedReader, UnifiedWriter};
+use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
@@ -47,6 +48,7 @@ pub struct UnifiedFileSystem {
     mount_cache: Arc<MountCache>,
     enable_unified: bool,
     enable_read_ufs: bool,
+    metrics: &'static ClientMetrics,
 }
 
 impl UnifiedFileSystem {
@@ -61,6 +63,7 @@ impl UnifiedFileSystem {
             mount_cache: Arc::new(MountCache::new(update_interval)),
             enable_unified,
             enable_read_ufs,
+            metrics: FsContext::get_metrics(),
         };
 
         Ok(fs)
@@ -193,6 +196,10 @@ impl UnifiedFileSystem {
         let command = LoadJobCommand::builder(source_path.clone_uri()).build();
         client.submit_load_job(command).await
     }
+
+    pub async fn cleanup(&self) {
+        self.cv.cleanup().await
+    }
 }
 
 impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem {
@@ -242,7 +249,15 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
                 "Read from Curvine(cache), ufs path {}, cv path: {}",
                 ufs_path, path
             );
+            self.metrics
+                .mount_cache_hits
+                .with_label_values(&[mount.mount_id()]);
+
             return Ok(UnifiedReader::Cv(self.cv.open(path).await?));
+        } else {
+            self.metrics
+                .mount_cache_misses
+                .with_label_values(&[mount.mount_id()]);
         }
 
         if mount.info.auto_cache() {

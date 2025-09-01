@@ -1234,6 +1234,7 @@ dependencies = [
  "once_cell",
  "orpc",
  "pin-project-lite",
+ "prometheus",
  "prost",
  "prost-build",
  "serde_json",

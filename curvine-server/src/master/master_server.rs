@@ -12,6 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
+use once_cell::sync::OnceCell;
+
+use curvine_common::conf::ClusterConf;
+use curvine_web::server::{WebHandlerService, WebServer};
+use orpc::common::{LocalTime, Logger};
+use orpc::handler::HandlerService;
+use orpc::io::net::ConnState;
+use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::server::{RpcServer, ServerStateListener};
+use orpc::CommonResult;
+
 use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
@@ -19,16 +32,6 @@ use crate::master::router_handler::MasterRouterHandler;
 use crate::master::{JobHandler, MountManager};
 use crate::master::{JobManager, MasterHandler};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
-use curvine_common::conf::ClusterConf;
-use curvine_web::server::{WebHandlerService, WebServer};
-use once_cell::sync::OnceCell;
-use orpc::common::{LocalTime, Logger, Metrics};
-use orpc::handler::HandlerService;
-use orpc::io::net::ConnState;
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::server::{RpcServer, ServerStateListener};
-use orpc::CommonResult;
-use std::sync::Arc;
 
 static MASTER_METRICS: OnceCell<MasterMetrics> = OnceCell::new();
 
@@ -128,7 +131,6 @@ impl Master {
         }
 
         Logger::init(log);
-        Metrics::init();
         MASTER_METRICS.get_or_init(|| MasterMetrics::new().unwrap());
 
         // step1: Create a journal system, the journal system determines how to create a fs dir.
@@ -228,7 +230,6 @@ impl Master {
 
     // Instantiate metrics during testing
     pub fn init_test_metrics() {
-        Metrics::init();
         let metrics = MasterMetrics::new().unwrap();
         MASTER_METRICS.get_or_init(|| metrics);
     }

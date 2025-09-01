@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use log::warn;
-use once_cell::sync::OnceCell;
+use once_cell::sync::Lazy;
 use prometheus::core::{
     AtomicI64, Collector, GenericCounter, GenericCounterVec, GenericGauge, GenericGaugeVec,
 };
-use prometheus::{Encoder, Opts, Registry, TextEncoder};
+use prometheus::{default_registry, Encoder, Opts, Registry, TextEncoder};
 
+use crate::sync::FastDashMap;
 use crate::{err_box, CommonResult};
 
 pub type Counter = GenericCounter<AtomicI64>;
@@ -26,32 +26,48 @@ pub type CounterVec = GenericCounterVec<AtomicI64>;
 pub type Gauge = GenericGauge<AtomicI64>;
 pub type GaugeVec = GenericGaugeVec<AtomicI64>;
 
-static REGISTRY: OnceCell<Registry> = OnceCell::new();
+static METRICS_MAP: Lazy<FastDashMap<String, Metrics>> = Lazy::new(FastDashMap::default);
 
-pub struct Metrics;
+#[derive(Clone)]
+pub enum Metrics {
+    Counter(Counter),
+    CounterVec(CounterVec),
+    Gauge(Gauge),
+    GaugeVec(GaugeVec),
+}
 
 impl Metrics {
-    pub fn init() {
-        REGISTRY.get_or_init(Registry::new);
+    pub fn boxed(&self) -> Box<dyn Collector> {
+        match self {
+            Metrics::Counter(v) => Box::new(v.clone()),
+            Metrics::CounterVec(v) => Box::new(v.clone()),
+            Metrics::Gauge(v) => Box::new(v.clone()),
+            Metrics::GaugeVec(v) => Box::new(v.clone()),
+        }
     }
 
-    fn register(c: Box<dyn Collector>) -> CommonResult<()> {
-        match REGISTRY.get() {
-            Some(v) => {
-                match v.register(c) {
-                    Ok(_) => (),
-                    Err(e) => warn!("register {}", e),
-                }
-                Ok(())
-            }
-
-            None => err_box!("Prometheus registry not init"),
+    pub fn name(&self) -> &str {
+        match self {
+            Metrics::Counter(v) => &v.desc()[0].fq_name,
+            Metrics::CounterVec(v) => &v.desc()[0].fq_name,
+            Metrics::Gauge(v) => &v.desc()[0].fq_name,
+            Metrics::GaugeVec(v) => &v.desc()[0].fq_name,
         }
+    }
+
+    fn register(m: Metrics) -> CommonResult<()> {
+        if METRICS_MAP.contains_key(m.name()) {
+            return Ok(());
+        }
+
+        let res = METRICS_MAP.entry(m.name().to_string()).or_insert(m);
+        default_registry().register(res.boxed())?;
+        Ok(())
     }
 
     pub fn new_counter<T: Into<String>>(name: T, help: T) -> CommonResult<Counter> {
         let c = Counter::new(name, help)?;
-        Self::register(Box::new(c.clone()))?;
+        Self::register(Self::Counter(c.clone()))?;
         Ok(c)
     }
 
@@ -61,13 +77,13 @@ impl Metrics {
         label_names: &[&str],
     ) -> CommonResult<CounterVec> {
         let c = CounterVec::new(Opts::new(name, help), label_names)?;
-        Self::register(Box::new(c.clone()))?;
+        Self::register(Self::CounterVec(c.clone()))?;
         Ok(c)
     }
 
     pub fn new_gauge<T: Into<String>>(name: T, help: T) -> CommonResult<Gauge> {
         let g = Gauge::new(name, help)?;
-        Self::register(Box::new(g.clone()))?;
+        Self::register(Self::Gauge(g.clone()))?;
         Ok(g)
     }
 
@@ -77,21 +93,32 @@ impl Metrics {
         label_names: &[&str],
     ) -> CommonResult<GaugeVec> {
         let g = GaugeVec::new(Opts::new(name, help), label_names)?;
-        Self::register(Box::new(g.clone()))?;
+        Self::register(Self::GaugeVec(g.clone()))?;
         Ok(g)
     }
 
     pub fn text_output() -> CommonResult<String> {
-        if let Some(r) = REGISTRY.get() {
-            let mut buffer = Vec::new();
-            let encoder = TextEncoder::new();
-            let metric_families = r.gather();
-            encoder.encode(&metric_families, &mut buffer)?;
+        let mut buffer = Vec::new();
+        let encoder = TextEncoder::new();
+        let metric_families = default_registry().gather();
+        encoder.encode(&metric_families, &mut buffer)?;
 
-            let output = String::from_utf8(buffer.clone())?;
-            Ok(output)
-        } else {
-            err_box!("Registry not init")
+        let output = String::from_utf8(buffer.clone())?;
+        Ok(output)
+    }
+
+    pub fn registry() -> &'static Registry {
+        default_registry()
+    }
+
+    pub fn get(name: impl AsRef<str>) -> Option<Metrics> {
+        METRICS_MAP.get(name.as_ref()).map(|x| x.clone())
+    }
+
+    pub fn try_into_counter_vec(self) -> CommonResult<CounterVec> {
+        match self {
+            Metrics::CounterVec(v) => Ok(v),
+            _ => err_box!("Not CounterVec"),
         }
     }
 }
@@ -102,8 +129,6 @@ mod test {
 
     #[test]
     fn sample() {
-        Metrics::init();
-
         let counter = Metrics::new_counter("m1", "m1").unwrap();
         let counter_vec = Metrics::new_counter_vec("m2", "m2", &["l1"]).unwrap();
         let gauge = Metrics::new_gauge("g1", "g1").unwrap();

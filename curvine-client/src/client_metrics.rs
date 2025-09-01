@@ -12,27 +12,93 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::common::Metrics as m;
-use orpc::common::{Counter, Metrics};
+use curvine_common::state::{MetricType, MetricValue};
+use orpc::common::Metrics;
+use orpc::common::{CounterVec, Metrics as m};
 use orpc::CommonResult;
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 
 pub struct ClientMetrics {
-    pub local_cache_hits: Counter,
-    pub local_cache_misses: Counter,
+    pub mount_cache_hits: CounterVec,
+    pub mount_cache_misses: CounterVec,
 }
 
 impl ClientMetrics {
+    pub const PREFIX: &'static str = "client";
+
     pub fn new() -> CommonResult<Self> {
         let cm = Self {
-            local_cache_hits: m::new_counter("local_cache_hits", "Cache hit count")?,
-            local_cache_misses: m::new_counter("local_cache_misses", "Cache miss count")?,
+            mount_cache_hits: m::new_counter_vec(
+                "client_mount_cache_hits",
+                "mount cache miss count",
+                &["id"],
+            )?,
+            mount_cache_misses: m::new_counter_vec(
+                "client_mount_cache_misses",
+                "mount cache miss count",
+                &["id"],
+            )?,
         };
+
         Ok(cm)
     }
 
     pub fn text_output(&self) -> CommonResult<String> {
         Metrics::text_output()
+    }
+
+    pub fn encode() -> CommonResult<Vec<MetricValue>> {
+        let mut metric_values = Vec::new();
+        let metric_families = Metrics::registry().gather();
+        for mf in metric_families {
+            let name = mf.get_name().to_string();
+            if !name.starts_with(Self::PREFIX) {
+                break;
+            }
+
+            let metric_type = match mf.get_field_type() {
+                prometheus::proto::MetricType::COUNTER => MetricType::Counter,
+                prometheus::proto::MetricType::GAUGE => MetricType::Gauge,
+                _ => MetricType::Gauge,
+            };
+
+            for metric in mf.get_metric() {
+                let mut tags = HashMap::new();
+                for label_pair in metric.get_label() {
+                    tags.insert(
+                        label_pair.get_name().to_string(),
+                        label_pair.get_value().to_string(),
+                    );
+                }
+
+                let value = match metric_type {
+                    MetricType::Counter => {
+                        if metric.has_counter() {
+                            metric.get_counter().get_value()
+                        } else {
+                            0.0
+                        }
+                    }
+                    MetricType::Gauge => {
+                        if metric.has_gauge() {
+                            metric.get_gauge().get_value()
+                        } else {
+                            0.0
+                        }
+                    }
+                };
+
+                metric_values.push(MetricValue {
+                    metric_type,
+                    name: name.clone(),
+                    value,
+                    tags,
+                });
+            }
+        }
+
+        Ok(metric_values)
     }
 }
 

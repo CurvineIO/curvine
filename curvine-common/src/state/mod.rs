@@ -71,3 +71,6 @@ pub use self::opts::*;
 
 mod job;
 pub use self::job::*;
+
+mod metrics;
+pub use self::metrics::*;

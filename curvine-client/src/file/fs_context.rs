@@ -13,19 +13,21 @@
 // limitations under the License.
 
 use crate::block::BlockClient;
+use crate::file::CurvineFileSystem;
 use crate::ClientMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{ClientAddress, WorkerAddress};
 use curvine_common::FsResult;
 use fxhash::FxHasher;
+use log::warn;
 use moka::policy::EvictionPolicy;
 use moka::sync::{Cache, CacheBuilder};
 use once_cell::sync::OnceCell;
 use orpc::client::{ClientConf, ClusterConnector};
-use orpc::common::{Metrics, Utils};
+use orpc::common::Utils;
 use orpc::io::net::{InetAddr, NetUtils};
 use orpc::io::IOResult;
-use orpc::runtime::Runtime;
+use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::CacheManager;
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
@@ -60,8 +62,6 @@ impl FsContext {
             port: 0,
         };
 
-        // Initialize metrics
-        Metrics::init();
         CLIENT_METRICS.get_or_init(|| ClientMetrics::new().unwrap());
 
         let connector = ClusterConnector::with_rt(conf.client_rpc_conf(), rt.clone());
@@ -172,5 +172,22 @@ impl FsContext {
         }
 
         res
+    }
+
+    pub fn start_metrics_report_task(fs: CurvineFileSystem) {
+        if !fs.conf().client.metric_report_enable {
+            return;
+        }
+
+        let interval = fs.conf().client.metric_report_interval;
+        fs.clone_runtime().spawn(async move {
+            let mut interval = tokio::time::interval(interval);
+            loop {
+                interval.tick().await;
+                if let Err(e) = fs.metrics_report().await {
+                    warn!("metrics report: {}", e)
+                }
+            }
+        });
     }
 }

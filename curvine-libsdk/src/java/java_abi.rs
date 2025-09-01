@@ -171,6 +171,9 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_closeFilesystem(
     _this: JObject,
     fs_ptr: *mut JavaFilesystem,
 ) -> jlong {
+    let fs = &*fs_ptr;
+    fs.cleanup();
+
     FFIUtils::free_raw_ptr(fs_ptr);
     SUCCESS
 }
