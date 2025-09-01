@@ -32,13 +32,9 @@ pub mod io {
     pub trait PollRead {
         async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String>;
     }
+    #[async_trait::async_trait]
     pub trait PollWrite {
-        fn poll_write<'a>(
-            &'a mut self,
-            buff: &'a [u8],
-        ) -> std::pin::Pin<
-            Box<dyn 'a + Send + std::future::Future<Output = Result<usize, std::io::Error>>>,
-        >;
+        async fn poll_write(&mut self, buff: &[u8]) -> Result<usize, std::io::Error>;
     }
 
     pub struct BuffIo<const N: usize> {

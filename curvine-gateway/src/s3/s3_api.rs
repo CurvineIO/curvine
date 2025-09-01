@@ -94,15 +94,12 @@ pub trait VRequest: crate::auth::sig_v4::VHeader {
     fn get_query(&self, k: &str) -> Option<String>;
     fn all_query(&self, cb: impl FnMut(&str, &str) -> bool);
 }
+#[async_trait::async_trait]
 pub trait BodyWriter {
     type BodyWriter<'a>: crate::utils::io::PollWrite + Send + Unpin
     where
         Self: 'a;
-    fn get_body_writer<'b>(
-        &'b mut self,
-    ) -> std::pin::Pin<
-        Box<dyn 'b + Send + std::future::Future<Output = Result<Self::BodyWriter<'b>, String>>>,
-    >;
+    async fn get_body_writer(&mut self) -> Result<Self::BodyWriter<'_>, String>;
 }
 pub trait BodyReader {
     type BodyReader: crate::utils::io::PollRead + Send;

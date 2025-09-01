@@ -42,6 +42,8 @@
 pub mod sig_v2; // AWS Signature Version 2 implementation (legacy)
 pub mod sig_v4; // AWS Signature Version 4 implementation (primary)
 
+use async_trait::async_trait;
+
 /// Core trait for access key and secret key storage and retrieval
 ///
 /// This trait defines the interface for credential storage backends,
@@ -74,6 +76,7 @@ pub mod sig_v4; // AWS Signature Version 4 implementation (primary)
 /// // Custom database store (future implementation)
 /// let store = DatabaseAccessKeyStore::new(connection_pool);
 /// ```
+#[async_trait]
 pub trait AccesskeyStore: Send + Sync {
     /// Retrieve the secret key for a given access key
     ///
@@ -106,12 +109,7 @@ pub trait AccesskeyStore: Send + Sync {
     /// - Implementations should cache frequently accessed credentials
     /// - Use connection pooling for database-backed stores
     /// - Consider implementing async batching for multiple lookups
-    fn get<'a>(
-        &'a self,
-        accesskey: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn 'a + Send + Sync + std::future::Future<Output = Result<Option<String>, String>>>,
-    >;
+    async fn get(&self, accesskey: &str) -> Result<Option<String>, String>;
 }
 
 /// Static access key store for S3 authentication
@@ -333,6 +331,7 @@ impl StaticAccessKeyStore {
 /// Provides async credential lookup functionality with proper error handling
 /// and security considerations. The implementation is optimized for performance
 /// while maintaining security best practices.
+#[async_trait]
 impl AccesskeyStore for StaticAccessKeyStore {
     /// Asynchronous access key lookup implementation
     ///
@@ -359,16 +358,11 @@ impl AccesskeyStore for StaticAccessKeyStore {
     /// - **Memory Usage**: O(n) where n is number of stored credentials
     /// - **Async Overhead**: Minimal - resolves immediately
     /// - **Thread Contention**: None - uses immutable references
-    fn get<'a>(
-        &'a self,
-        access_key: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn 'a + Send + Sync + std::future::Future<Output = Result<Option<String>, String>>>,
-    > {
-        // Perform immediate lookup and wrap in async future
-        // This pattern allows for future enhancement with async operations
-        // while maintaining compatibility with the async trait interface
-        Box::pin(async move { Ok(self.credentials.get(access_key).cloned()) })
+    async fn get(&self, accesskey: &str) -> Result<Option<String>, String> {
+        // Perform immediate lookup - now with clean async interface
+        // This implementation is optimized for performance while maintaining
+        // compatibility for future async enhancements
+        Ok(self.credentials.get(accesskey).cloned())
     }
 }
 

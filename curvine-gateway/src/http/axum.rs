@@ -269,18 +269,12 @@ impl sig_v4::VHeader for Response {
     }
 }
 pub struct BodyWriter<'a>(&'a mut Vec<u8>);
+#[async_trait::async_trait]
 impl<'b> crate::utils::io::PollWrite for BodyWriter<'b> {
-    fn poll_write<'a>(
-        &'a mut self,
-        buff: &'a [u8],
-    ) -> std::pin::Pin<
-        Box<dyn 'a + Send + std::future::Future<Output = Result<usize, std::io::Error>>>,
-    > {
-        Box::pin(async move {
-            // append to body buffer
-            self.0.extend_from_slice(buff);
-            Ok(buff.len())
-        })
+    async fn poll_write(&mut self, buff: &[u8]) -> Result<usize, std::io::Error> {
+        // append to body buffer
+        self.0.extend_from_slice(buff);
+        Ok(buff.len())
     }
 }
 
