@@ -20,12 +20,12 @@ use orpc::CommonResult;
 
 #[test]
 fn inode_dir() {
-    let mut root = InodeDir::new(0, "123", 0);
+    let mut root = InodeDir::new(0, 0);
     println!("{:?}", root);
-    root.add_file_child(InodeFile::new(1, "aa1", 0)).unwrap();
-    root.add_file_child(InodeFile::new(2, "aa3", 0)).unwrap();
-    root.add_file_child(InodeFile::new(3, "aa2", 0)).unwrap();
-    root.add_file_child(InodeFile::new(5, "b", 0)).unwrap();
+    root.add_file_child("aa1", InodeFile::new(1, 0)).unwrap();
+    root.add_file_child("aa3", InodeFile::new(2, 0)).unwrap();
+    root.add_file_child("aa2", InodeFile::new(3, 0)).unwrap();
+    root.add_file_child("b", InodeFile::new(5, 0)).unwrap();
 
     root.print_child();
 

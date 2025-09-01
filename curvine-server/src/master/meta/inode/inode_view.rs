@@ -31,15 +31,15 @@ use std::fmt::{Debug, Formatter};
 #[derive(Serialize, Deserialize)]
 #[repr(i8)]
 pub enum InodeView {
-    File(InodeFile) = 1,
-    Dir(InodeDir) = 2,
+    File(String, InodeFile) = 1,
+    Dir(String, InodeDir) = 2,
 }
 
 impl InodeView {
     pub fn is_dir(&self) -> bool {
         match self {
-            File(_) => false,
-            Dir(_) => true,
+            File(_, _) => false,
+            Dir(_, _) => true,
         }
     }
 
@@ -48,32 +48,25 @@ impl InodeView {
     }
 
     pub fn is_link(&self) -> bool {
-        matches!(self, File(v) if v.file_type == FileType::Link)
+        matches!(self, File(_, v) if v.file_type == FileType::Link)
     }
 
     pub fn id(&self) -> i64 {
         match self {
-            File(f) => f.id(),
-            Dir(d) => d.id(),
+            File(_, f) => f.id(),
+            Dir(_, d) => d.id(),
         }
     }
     pub fn ttl_config(&self) -> Option<TtlConfig> {
         match self {
-            File(f) => TtlConfig::from_storage_policy(&f.storage_policy),
-            Dir(d) => TtlConfig::from_storage_policy(&d.storage_policy),
+            File(_, f) => TtlConfig::from_storage_policy(&f.storage_policy),
+            Dir(_, d) => TtlConfig::from_storage_policy(&d.storage_policy),
         }
     }
     pub fn name(&self) -> &str {
         match self {
-            File(f) => f.name(),
-            Dir(d) => d.name(),
-        }
-    }
-
-    pub fn change_name(&mut self, name: &str) {
-        match self {
-            File(f) => f.name = name.to_string(),
-            Dir(d) => d.name = name.to_string(),
+            File(name, _) => name,
+            Dir(name, _) => name,
         }
     }
 
@@ -101,22 +94,22 @@ impl InodeView {
 
     pub fn get_child(&self, name: &str) -> Option<&InodeView> {
         match self {
-            File(_) => None,
-            Dir(d) => d.get_child(name),
+            File(_, _) => None,
+            Dir(_, d) => d.get_child(name),
         }
     }
 
     pub fn get_child_ptr(&mut self, name: &str) -> Option<InodePtr> {
         match self {
-            File(_) => None,
-            Dir(d) => d.get_child_ptr(name),
+            File(_, _) => None,
+            Dir(_, d) => d.get_child_ptr(name),
         }
     }
 
     // Test and print for use. Memory copying occurs.
     pub fn children(&self) -> Vec<&InodeView> {
         let mut vec = Vec::with_capacity(8);
-        if let Dir(d) = self {
+        if let Dir(_, d) = self {
             for item in d.children_iter() {
                 vec.push(item)
             }
@@ -127,41 +120,41 @@ impl InodeView {
 
     pub fn child_len(&self) -> usize {
         match self {
-            File(_) => 0,
-            Dir(d) => d.children_iter().len(),
+            File(_, _) => 0,
+            Dir(_, d) => d.children_iter().len(),
         }
     }
 
     // Add child nodes.
     pub fn add_child(&mut self, child: InodeView) -> CommonResult<InodePtr> {
         match self {
-            File(f) => err_box!("Path not a dir: {}", f.name()),
-            Dir(d) => d.add_child(child),
+            File(name, _) => err_box!("Path not a dir: {}", name),
+            Dir(_, d) => d.add_child(child),
         }
     }
 
     pub fn delete_child(&mut self, id: i64, name: &str) -> CommonResult<InodeView> {
         match self {
-            File(f) => err_box!("Path not a dir: {}", f.name()),
-            Dir(ref mut d) => d.delete_child(id, name),
+            File(name, _) => err_box!("Path not a dir: {}", name),
+            Dir(_, d) => d.delete_child(id, name),
         }
     }
 
     pub fn mtime(&self) -> i64 {
         match self {
-            File(f) => f.mtime(),
-            Dir(d) => d.mtime(),
+            File(_, f) => f.mtime(),
+            Dir(_, d) => d.mtime(),
         }
     }
 
     pub fn update_mtime(&mut self, time: i64) {
         match self {
-            File(ref mut f) => {
+            File(_, ref mut f) => {
                 if time > f.mtime {
                     f.mtime = time
                 }
             }
-            Dir(ref mut d) => {
+            Dir(_, ref mut d) => {
                 if time > d.mtime {
                     d.mtime = time
                 }
@@ -171,85 +164,85 @@ impl InodeView {
 
     pub fn set_parent_id(&mut self, parent_id: i64) {
         match self {
-            File(f) => f.parent_id = parent_id,
-            Dir(d) => d.parent_id = parent_id,
+            File(_, f) => f.parent_id = parent_id,
+            Dir(_, d) => d.parent_id = parent_id,
         }
     }
 
     pub fn atime(&self) -> i64 {
         match self {
-            File(f) => f.atime(),
-            Dir(d) => d.atime(),
+            File(_, f) => f.atime(),
+            Dir(_, d) => d.atime(),
         }
     }
 
     pub fn as_dir_mut(&mut self) -> CommonResult<&mut InodeDir> {
         match self {
-            File(_) => err_box!("Not a dir"),
-            Dir(ref mut d) => Ok(d),
+            File(_, _) => err_box!("Not a dir"),
+            Dir(_, ref mut d) => Ok(d),
         }
     }
 
     pub fn as_dir_ref(&self) -> CommonResult<&InodeDir> {
         match self {
-            File(_) => err_box!("Not a dir"),
-            Dir(ref d) => Ok(d),
+            File(_, _) => err_box!("Not a dir"),
+            Dir(_, ref d) => Ok(d),
         }
     }
 
     pub fn as_file_ref(&self) -> CommonResult<&InodeFile> {
         match self {
-            File(f) => Ok(f),
-            Dir(_) => err_box!("Not a file"),
+            File(_, f) => Ok(f),
+            Dir(_, _) => err_box!("Not a file"),
         }
     }
 
     pub fn as_file_mut(&mut self) -> CommonResult<&mut InodeFile> {
         match self {
-            File(ref mut f) => Ok(f),
-            Dir(_) => err_box!("Not a file"),
+            File(_, ref mut f) => Ok(f),
+            Dir(_, _) => err_box!("Not a file"),
         }
     }
 
     pub fn acl(&self) -> &AclFeature {
         match self {
-            File(f) => &f.features.acl,
-            Dir(d) => &d.features.acl,
+            File(_, f) => &f.features.acl,
+            Dir(_, d) => &d.features.acl,
         }
     }
 
     pub fn acl_mut(&mut self) -> &mut AclFeature {
         match self {
-            File(f) => &mut f.features.acl,
-            Dir(d) => &mut d.features.acl,
+            File(_, f) => &mut f.features.acl,
+            Dir(_, d) => &mut d.features.acl,
         }
     }
 
     pub fn storage_policy(&self) -> &StoragePolicy {
         match self {
-            File(f) => &f.storage_policy,
-            Dir(d) => &d.storage_policy,
+            File(_, f) => &f.storage_policy,
+            Dir(_, d) => &d.storage_policy,
         }
     }
 
     pub fn storage_policy_mut(&mut self) -> &mut StoragePolicy {
         match self {
-            File(f) => &mut f.storage_policy,
-            Dir(d) => &mut d.storage_policy,
+            File(_, f) => &mut f.storage_policy,
+            Dir(_, d) => &mut d.storage_policy,
         }
     }
 
     pub fn x_attr(&self) -> &HashMap<String, Vec<u8>> {
         match self {
-            File(f) => &f.features.x_attr,
-            Dir(d) => &d.features.x_attr,
+            File(_, f) => &f.features.x_attr,
+            Dir(_, d) => &d.features.x_attr,
         }
     }
 
     pub fn x_attr_mut(&mut self) -> &mut HashMap<String, Vec<u8>> {
         match self {
-            File(f) => &mut f.features.x_attr,
-            Dir(d) => &mut d.features.x_attr,
+            File(_, f) => &mut f.features.x_attr,
+            Dir(_, d) => &mut d.features.x_attr,
         }
     }
 
@@ -273,15 +266,15 @@ impl InodeView {
         // Handle time modifications
         if let Some(atime) = opts.atime {
             match self {
-                File(f) => f.atime = atime,
-                Dir(d) => d.atime = atime,
+                File(_, f) => f.atime = atime,
+                Dir(_, d) => d.atime = atime,
             }
         }
 
         if let Some(mtime) = opts.mtime {
             match self {
-                File(f) => f.mtime = mtime,
-                Dir(d) => d.mtime = mtime,
+                File(_, f) => f.mtime = mtime,
+                Dir(_, d) => d.mtime = mtime,
             }
         }
 
@@ -307,7 +300,7 @@ impl InodeView {
         let mut status = FileStatus {
             id: self.id(),
             path: path.to_owned(),
-            name: self.name().to_string(),
+            name: self.name().to_owned(),
             is_dir: self.is_dir(),
             mtime: self.mtime(),
             atime: self.atime(),
@@ -326,7 +319,7 @@ impl InodeView {
         };
 
         match self {
-            File(f) => {
+            File(_, f) => {
                 status.is_complete = f.is_complete();
                 status.len = f.len;
                 status.replicas = f.replicas as i32;
@@ -337,7 +330,7 @@ impl InodeView {
                 status.target = f.target.clone();
             }
 
-            Dir(d) => {
+            Dir(_, d) => {
                 status.file_type = FileType::Dir;
                 status.len = d.children_len() as i64;
                 status.x_attr = d.features.x_attr.clone();
@@ -413,8 +406,8 @@ impl InodeView {
 impl Clone for InodeView {
     fn clone(&self) -> Self {
         match self {
-            File(f) => File(f.clone()),
-            Dir(d) => Dir(d.clone()),
+            File(name, f) => File(name.clone(), f.clone()),
+            Dir(name, d) => Dir(name.clone(), d.clone()),
         }
     }
 }
@@ -422,8 +415,8 @@ impl Clone for InodeView {
 impl Debug for InodeView {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            File(x) => x.fmt(f),
-            Dir(x) => x.fmt(f),
+            File(name, x) => write!(f, "File(name={}, x={:?})", name, x),
+            Dir(name, x) => write!(f, "Dir(name={}, x={:?})", name, x),
         }
     }
 }

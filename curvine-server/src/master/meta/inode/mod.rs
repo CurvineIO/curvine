@@ -46,9 +46,6 @@ pub trait Inode {
     // inode id
     fn id(&self) -> i64;
 
-    // inode name
-    fn name(&self) -> &str;
-
     // Previous level id.
     fn parent_id(&self) -> i64;
 

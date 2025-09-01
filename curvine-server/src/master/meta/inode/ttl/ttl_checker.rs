@@ -185,8 +185,8 @@ impl InodeTtlChecker {
         };
 
         let storage_policy = match &inode_view {
-            InodeView::File(file) => &file.storage_policy,
-            InodeView::Dir(dir) => &dir.storage_policy,
+            InodeView::File(_, file) => &file.storage_policy,
+            InodeView::Dir(_, dir) => &dir.storage_policy,
         };
 
         let action = &storage_policy.ttl_action;

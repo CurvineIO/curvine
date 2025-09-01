@@ -67,8 +67,8 @@ impl InodeStore {
         }
 
         match child {
-            InodeView::File(_) => self.fs_stats.increment_file_count(),
-            InodeView::Dir(dir) => {
+            InodeView::File(_, _) => self.fs_stats.increment_file_count(),
+            InodeView::Dir(_, dir) => {
                 // Don't count root directory
                 if dir.id != ROOT_INODE_ID {
                     self.fs_stats.increment_dir_count();
@@ -100,7 +100,7 @@ impl InodeStore {
             }
 
             match inode {
-                InodeView::File(file) => {
+                InodeView::File(_, file) => {
                     deleted_files += 1;
                     for meta in &file.blocks {
                         if meta.is_writing() {
@@ -117,7 +117,7 @@ impl InodeStore {
                     }
                 }
 
-                InodeView::Dir(dir) => {
+                InodeView::Dir(_, dir) => {
                     // Don't count root directory
                     if dir.id != ROOT_INODE_ID {
                         deleted_dirs += 1;
@@ -260,8 +260,8 @@ impl InodeStore {
 
                 // Count files and directories during tree reconstruction
                 match &inode {
-                    InodeView::File(_) => file_count += 1,
-                    InodeView::Dir(dir) => {
+                    InodeView::File(_, _) => file_count += 1,
+                    InodeView::Dir(_, dir) => {
                         // Don't count root directory
                         if dir.id != ROOT_INODE_ID {
                             dir_count += 1;

@@ -25,7 +25,6 @@ use std::fmt::Debug;
 pub struct InodeFile {
     pub(crate) id: i64,
     pub(crate) parent_id: i64,
-    pub(crate) name: String,
     pub(crate) file_type: FileType,
     pub(crate) mtime: i64,
     pub(crate) atime: i64,
@@ -44,14 +43,12 @@ pub struct InodeFile {
 }
 
 impl InodeFile {
-    pub fn new(id: i64, name: &str, time: i64) -> Self {
+    pub fn new(id: i64, time: i64) -> Self {
         Self {
             id,
-            name: name.to_string(),
             file_type: FileType::File,
             mtime: time,
             atime: time,
-
             len: 0,
             block_size: 0,
             replicas: 0,
@@ -65,14 +62,12 @@ impl InodeFile {
         }
     }
 
-    pub fn with_opts(id: i64, name: &str, time: i64, opts: CreateFileOpts) -> InodeFile {
+    pub fn with_opts(id: i64, time: i64, opts: CreateFileOpts) -> InodeFile {
         let mut file = Self {
             id,
-            name: name.to_string(),
             file_type: opts.file_type,
             mtime: time,
             atime: time,
-
             len: 0,
             block_size: opts.block_size,
             replicas: opts.replicas,
@@ -95,14 +90,12 @@ impl InodeFile {
         file
     }
 
-    pub fn with_link(id: i64, name: &str, time: i64, target: impl Into<String>, mode: u32) -> Self {
+    pub fn with_link(id: i64, time: i64, target: impl Into<String>, mode: u32) -> Self {
         Self {
             id,
-            name: name.to_string(),
             file_type: FileType::Link,
             mtime: time,
             atime: time,
-
             len: 0,
             block_size: 0,
             replicas: 0,
@@ -215,10 +208,9 @@ impl InodeFile {
 
     pub fn simple_string(&self) -> String {
         format!(
-            "id={}, pid={}, name={}, len={}, blocks={:?}",
+            "id={}, pid={}, len={}, blocks={:?}",
             self.id,
             self.parent_id,
-            self.name,
             self.len,
             self.block_ids()
         )
@@ -228,10 +220,6 @@ impl InodeFile {
 impl Inode for InodeFile {
     fn id(&self) -> i64 {
         self.id
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 
     fn parent_id(&self) -> i64 {
