@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::InodeView::{self, Dir, File};
+use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePtr, PATH_SEPARATOR};
+use crate::master::meta::store::InodeStore;
 use orpc::{err_box, try_option, CommonResult};
+use std::fmt;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InodePath {
     path: String,
     name: String,
@@ -25,7 +27,11 @@ pub struct InodePath {
 }
 
 impl InodePath {
-    pub fn resolve<T: AsRef<str>>(root: InodePtr, path: T) -> CommonResult<Self> {
+    pub fn resolve<T: AsRef<str>>(
+        root: InodePtr,
+        path: T,
+        store: &InodeStore,
+    ) -> CommonResult<Self> {
         let components = InodeView::path_components(path.as_ref())?;
 
         let name = try_option!(components.last());
@@ -38,7 +44,20 @@ impl InodePath {
         let mut index = 0;
 
         while index < components.len() {
-            inodes.push(cur_inode.clone());
+            //make sure resolved_inode is not a FileEntry
+            //if it is a FileEntry, load the complete file data from store
+            let resolved_inode = match cur_inode.as_ref() {
+                FileEntry(_name, id) => {
+                    // If it is a FileEntry, load the complete object from store
+                    match store.get_inode(*id)? {
+                        Some(full_inode) => InodePtr::from_owned(full_inode),
+                        None => return err_box!("Failed to load inode {} from store", id),
+                    }
+                }
+                _ => cur_inode.clone(),
+            };
+
+            inodes.push(resolved_inode);
 
             if index == components.len() - 1 {
                 break;
@@ -56,8 +75,8 @@ impl InodePath {
                     }
                 }
 
-                File(_, _) => {
-                    // The current path is a file, there is no need to search again.
+                File(_, _) | FileEntry(_, _) => {
+                    // File or FileEntry nodes cannot have children, stop path resolution
                     break;
                 }
             }
@@ -69,6 +88,7 @@ impl InodePath {
             components,
             inodes,
         };
+
         Ok(inode_path)
     }
 
@@ -144,6 +164,8 @@ impl InodePath {
     // Convert the last node to InodeDir
     pub fn clone_last_file(&self) -> CommonResult<InodeFile> {
         if let Some(v) = self.get_last_inode() {
+            // Assert that lastnode should not be FileEntry
+            assert!(!v.is_file_entry());
             Ok(v.as_file_ref()?.clone())
         } else {
             err_box!("status error")
@@ -207,5 +229,17 @@ impl InodePath {
     // Delete the last 1 inodes.
     pub fn delete_last(&mut self) {
         self.inodes.pop();
+    }
+}
+
+impl fmt::Debug for InodePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InodePath")
+            .field("path", &self.path)
+            .field("name", &self.name)
+            .field("components", &self.components)
+            .field("inodes", &self.inodes)
+            .field("store", &"<InodeStore>")
+            .finish()
     }
 }

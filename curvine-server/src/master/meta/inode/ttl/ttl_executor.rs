@@ -104,6 +104,10 @@ impl InodeTtlExecutor {
                     };
                     return Ok(dir_path);
                 }
+                InodeView::FileEntry(name, _) => {
+                    // For empty files, we can't determine parent_id, so return a basic path
+                    return Ok(format!("/{}", name));
+                }
             }
         }
 
@@ -223,6 +227,13 @@ impl InodeTtlExecutor {
                     warn!("Cannot free directory: {}", path);
                     Err(TtlError::ActionExecutionError(format!(
                         "Cannot free directory: {}",
+                        path
+                    )))
+                }
+                InodeView::FileEntry(..) => {
+                    warn!("Cannot free empty file: {}", path);
+                    Err(TtlError::ActionExecutionError(format!(
+                        "Cannot free empty file: {}",
                         path
                     )))
                 }

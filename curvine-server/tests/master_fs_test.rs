@@ -147,6 +147,13 @@ fn mkdir(fs: &MasterFilesystem) -> CommonResult<()> {
     let res2 = fs.mkdir("/a3/b/c", true)?;
     assert!(res2);
 
+    // Verify directories exist after creation
+    assert!(fs.exists("/a1")?);
+    assert!(fs.exists("/a2")?);
+    assert!(fs.exists("/a3")?);
+    assert!(fs.exists("/a3/b")?);
+    assert!(fs.exists("/a3/b/c")?);
+
     let list = fs.list_status("/")?;
     assert_eq!(list.len(), 3);
 
@@ -161,28 +168,121 @@ fn delete(fs: &MasterFilesystem) -> CommonResult<()> {
 
     fs.mkdir("/a/b/c/d", true)?;
 
+    // Verify directory structure exists before deletion
+    assert!(fs.exists("/a")?);
+    assert!(fs.exists("/a/b")?);
+    assert!(fs.exists("/a/b/c")?);
+    assert!(fs.exists("/a/b/c/d")?);
+
     fs.delete("/a/b/c", true)?;
+
+    // Verify deletion results
+    assert!(!fs.exists("/a/b/c")?);
+    assert!(!fs.exists("/a/b/c/d")?);
+    // Parent directories should still exist
+    assert!(fs.exists("/a")?);
+    assert!(fs.exists("/a/b")?);
 
     fs.print_tree();
     Ok(())
 }
 
 fn rename(fs: &MasterFilesystem) -> CommonResult<()> {
+    // Test directory rename
     fs.mkdir("/a/b/c", true)?;
+    println!("=== Before directory rename ===");
     fs.print_tree();
 
+    // Verify original paths exist
+    assert!(fs.exists("/a/b/c")?);
+    assert!(fs.exists("/a/b")?);
+    assert!(fs.exists("/a")?);
+
+    // Execute rename operation
     fs.rename("/a/b/c", "/a/x")?;
+
+    println!("=== After directory rename ===");
     fs.print_tree();
+
+    // Verify rename results
+    // Original path should not exist
+    assert!(!fs.exists("/a/b/c")?);
+    // New path should exist
+    assert!(fs.exists("/a/x")?);
+    // Parent directory should still exist
+    assert!(fs.exists("/a")?);
+    // Intermediate directory b should still exist (since rename only moved c)
+    assert!(fs.exists("/a/b")?);
+
+    // Test file rename
+    let opts = CreateFileOpts::with_create(false);
+    fs.create_with_opts("/a.txt", opts.clone())?;
+
+    println!("=== Before file rename ===");
+    fs.print_tree();
+
+    // Verify original file exists
+    assert!(fs.exists("/a.txt")?);
+
+    // Execute file rename operation
+    fs.rename("/a.txt", "/aaa.txt")?;
+
+    println!("=== After file rename ===");
+    fs.print_tree();
+
+    // Verify file rename results
+    // Original file should not exist
+    assert!(!fs.exists("/a.txt")?);
+    // New file should exist
+    assert!(fs.exists("/aaa.txt")?);
+
+    // Test file rename to existing directory scenario
+    // Create directory /a/b
+    fs.mkdir("/a/b", true)?;
+    // Create file /a/1.log
+    let opts = CreateFileOpts::with_create(false);
+    fs.create_with_opts("/a/1.log", opts.clone())?;
+
+    println!("=== Before file rename to directory ===");
+    fs.print_tree();
+
+    // Verify original file exists
+    assert!(fs.exists("/a/1.log")?);
+    assert!(fs.exists("/a/b")?);
+
+    // Execute file rename to directory operation
+    // Expected result: /a/1.log -> /a/b/1.log
+    fs.rename("/a/1.log", "/a/b")?;
+
+    println!("=== After file rename to directory ===");
+    fs.print_tree();
+
+    // Verify rename results
+    // Original file should not exist
+    assert!(!fs.exists("/a/1.log")?);
+    // New file should exist under directory b
+    assert!(fs.exists("/a/b/1.log")?);
+    // Directory b should still exist
+    assert!(fs.exists("/a/b")?);
+
     Ok(())
 }
 
 fn create_file(fs: &MasterFilesystem) -> CommonResult<()> {
-    fs.mkdir("/a/b", true)?;
+    fs.mkdir("/test_dir/subdir", true)?;
+
+    // Verify directory exists before file creation
+    assert!(fs.exists("/test_dir/subdir")?);
 
     let opts = CreateFileOpts::with_create(false);
-    fs.create_with_opts("/a/b/1.log", opts.clone())?;
+    fs.create_with_opts("/test_dir/subdir/file1.log", opts.clone())?;
+    fs.create_with_opts("/test_dir/subdir/file2.log", opts)?;
 
-    fs.create_with_opts("/a/b/2.log", opts)?;
+    // Verify files exist after creation
+    assert!(fs.exists("/test_dir/subdir/file1.log")?);
+    assert!(fs.exists("/test_dir/subdir/file2.log")?);
+    // Verify directory still exists
+    assert!(fs.exists("/test_dir/subdir")?);
 
     fs.print_tree();
 

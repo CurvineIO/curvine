@@ -86,6 +86,8 @@ impl InodeChildren {
 
     pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
         let inode = Box::new(inode);
+        // Assert that it should not be FileEntry
+        assert!(!inode.is_file_entry());
         match self {
             InodeChildren::List(list) => {
                 let index = Self::search_by_name(list, inode.name());
@@ -104,8 +106,19 @@ impl InodeChildren {
 
             InodeChildren::Map(map) => match map.entry(inode.name().to_owned()) {
                 Entry::Vacant(v) => {
-                    let cur_node = v.insert(inode);
-                    Ok(InodePtr::from_ref(cur_node.as_ref()))
+                    if inode.is_file() {
+                        // Store lightweight FileEntry in map
+                        v.insert(Box::new(InodeView::FileEntry(
+                            inode.name().to_string(),
+                            inode.id(),
+                        )));
+                        // But return owned pointer to complete object
+                        Ok(InodePtr::from_owned(*inode))
+                    } else {
+                        // Directory directly stores complete object and returns its reference
+                        let inserted = v.insert(inode.clone());
+                        Ok(InodePtr::from_ref(inserted.as_ref()))
+                    }
                 }
 
                 Entry::Occupied(_) => {

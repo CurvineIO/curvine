@@ -277,7 +277,7 @@ impl MasterFilesystem {
     }
 
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
-        InodePath::resolve(fs_dir.root_ptr(), path)
+        InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
     }
 
     pub fn check_path_length(&self, path: &str) -> CommonResult<()> {
@@ -394,7 +394,7 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
-        let mut inode = match inp.get_last_inode() {
+        let inode = match inp.get_last_inode() {
             None => return err_box!("File does not exist: {}", inp.path()),
             Some(v) => v,
         };
@@ -402,6 +402,15 @@ impl MasterFilesystem {
         if !inode.is_file() {
             return err_box!("INode is not a regular file: {}", inp.path());
         }
+
+        //from store
+        let mut inode = fs_dir.store.get_inode(inode.id())?;
+        let inode = match inode.as_mut() {
+            Some(inode_view) => inode_view,
+            None => {
+                return err_box!("File does not exist: {}", inp.path());
+            }
+        };
 
         let file = inode.as_file_mut()?;
         if file.is_complete() {
