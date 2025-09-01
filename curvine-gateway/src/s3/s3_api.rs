@@ -2251,45 +2251,35 @@ async fn parse_body<
     }
 }
 
+#[async_trait::async_trait]
 impl crate::utils::io::PollRead for tokio::io::BufReader<std::io::Cursor<Vec<u8>>> {
-    fn poll_read<'a>(
-        &'a mut self,
-    ) -> std::pin::Pin<
-        Box<dyn 'a + Send + std::future::Future<Output = Result<Option<Vec<u8>>, String>>>,
-    > {
-        Box::pin(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 64 * 1024];
-            match self.read(&mut buf).await {
-                Ok(0) => Ok(None),
-                Ok(n) => {
-                    buf.truncate(n);
-                    Ok(Some(buf))
-                }
-                Err(e) => Err(e.to_string()),
+    async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        match self.read(&mut buf).await {
+            Ok(0) => Ok(None),
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some(buf))
             }
-        })
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 
+#[async_trait::async_trait]
 impl crate::utils::io::PollRead for tokio::fs::File {
-    fn poll_read<'a>(
-        &'a mut self,
-    ) -> std::pin::Pin<
-        Box<dyn 'a + Send + std::future::Future<Output = Result<Option<Vec<u8>>, String>>>,
-    > {
-        Box::pin(async move {
-            use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; 64 * 1024];
-            match self.read(&mut buf).await {
-                Ok(0) => Ok(None),
-                Ok(n) => {
-                    buf.truncate(n);
-                    Ok(Some(buf))
-                }
-                Err(e) => Err(e.to_string()),
+    async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        match self.read(&mut buf).await {
+            Ok(0) => Ok(None),
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some(buf))
             }
-        })
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 struct InMemoryPollReader {
@@ -2297,23 +2287,18 @@ struct InMemoryPollReader {
     offset: usize,
 }
 
+#[async_trait::async_trait]
 impl crate::utils::io::PollRead for InMemoryPollReader {
-    fn poll_read<'a>(
-        &'a mut self,
-    ) -> std::pin::Pin<
-        Box<dyn 'a + Send + std::future::Future<Output = Result<Option<Vec<u8>>, String>>>,
-    > {
-        Box::pin(async move {
-            if self.offset >= self.data.len() {
-                return Ok(None);
-            }
-            let remaining = self.data.len() - self.offset;
-            // read up to 64KB per poll
-            let to_read = remaining.min(64 * 1024);
-            let chunk = self.data[self.offset..self.offset + to_read].to_vec();
-            self.offset += to_read;
-            Ok(Some(chunk))
-        })
+    async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if self.offset >= self.data.len() {
+            return Ok(None);
+        }
+        let remaining = self.data.len() - self.offset;
+        // read up to 64KB per poll
+        let to_read = remaining.min(64 * 1024);
+        let chunk = self.data[self.offset..self.offset + to_read].to_vec();
+        self.offset += to_read;
+        Ok(Some(chunk))
     }
 }
 

@@ -124,41 +124,36 @@ impl VRequestPlus for Request {
 }
 pub struct BodyReader(body::BodyDataStream);
 
+#[async_trait::async_trait]
 impl crate::utils::io::PollRead for BodyReader {
-    fn poll_read<'a>(
-        &'a mut self,
-    ) -> std::pin::Pin<
-        Box<dyn 'a + Send + std::future::Future<Output = Result<Option<Vec<u8>>, String>>>,
-    > {
-        Box::pin(async move {
-            let data = self.0.next().await;
-            match data {
-                Some(ret) => match ret {
-                    Ok(ret) => {
-                        let vec_data = ret.to_vec();
-                        // DEBUG: Log body data for debugging
-                        log::debug!("HTTP-BODY-CHUNK: {} bytes", vec_data.len());
-                        if vec_data.len() > 0 {
-                            log::debug!(
-                                "HTTP-BODY-HEX: {:?}",
-                                vec_data
-                                    .iter()
-                                    .take(30)
-                                    .map(|b| format!("{:02x}", b))
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            );
-                        }
-                        Ok(Some(vec_data))
+    async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        let data = self.0.next().await;
+        match data {
+            Some(ret) => match ret {
+                Ok(ret) => {
+                    let vec_data = ret.to_vec();
+                    // DEBUG: Log body data for debugging
+                    log::debug!("HTTP-BODY-CHUNK: {} bytes", vec_data.len());
+                    if vec_data.len() > 0 {
+                        log::debug!(
+                            "HTTP-BODY-HEX: {:?}",
+                            vec_data
+                                .iter()
+                                .take(30)
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        );
                     }
-                    Err(err) => Err(err.to_string()),
-                },
-                None => {
-                    log::debug!("HTTP-BODY-CHUNK: END OF STREAM");
-                    Ok(None)
+                    Ok(Some(vec_data))
                 }
+                Err(err) => Err(err.to_string()),
+            },
+            None => {
+                log::debug!("HTTP-BODY-CHUNK: END OF STREAM");
+                Ok(None)
             }
-        })
+        }
     }
 }
 

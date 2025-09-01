@@ -28,12 +28,9 @@ pub struct BaseKv<K: PartialOrd, V> {
 pub mod io {
     use std::ops::{Deref, DerefMut};
 
+    #[async_trait::async_trait]
     pub trait PollRead {
-        fn poll_read<'a>(
-            &'a mut self,
-        ) -> std::pin::Pin<
-            Box<dyn 'a + Send + std::future::Future<Output = Result<Option<Vec<u8>>, String>>>,
-        >;
+        async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String>;
     }
     pub trait PollWrite {
         fn poll_write<'a>(
@@ -43,6 +40,7 @@ pub mod io {
             Box<dyn 'a + Send + std::future::Future<Output = Result<usize, std::io::Error>>>,
         >;
     }
+
     pub struct BuffIo<const N: usize> {
         buff: Vec<u8>,
     }
