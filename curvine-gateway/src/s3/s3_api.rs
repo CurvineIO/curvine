@@ -997,18 +997,6 @@ fn parse_put_object_path(url_path: &str) -> Result<(&str, &str), ()> {
     Ok((bucket, object))
 }
 
-/// Validate content SHA256 header for S3 authentication
-///
-/// ## Parameters
-/// - `req`: HTTP request containing x-amz-content-sha256 header
-///
-/// ## Returns
-/// - `Some(content_sha256)`: Valid SHA256 header value
-/// - `None`: Missing or invalid SHA256 header
-fn validate_content_sha256<T: VRequest>(req: &T) -> Option<String> {
-    req.get_header("x-amz-content-sha256")
-}
-
 /// Handle S3 PUT Object requests with streaming upload and metadata support
 ///
 /// This function processes S3 PUT Object requests, providing full AWS S3 compatibility
