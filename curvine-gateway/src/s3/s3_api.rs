@@ -173,8 +173,34 @@ pub struct HeadObjectResult {
     pub website_redirect_location: Option<String>,
 }
 
+/// Core trait for object metadata retrieval operations
+///
+/// This trait provides the fundamental capability to retrieve object metadata
+/// without transferring the object content itself. It serves as the foundation
+/// for both HEAD requests and as a prerequisite for GET operations.
+///
+/// ## Purpose
+/// - **Metadata Lookup**: Retrieve object size, modification time, ETag, and custom metadata
+/// - **Existence Check**: Determine if an object exists without downloading it
+/// - **Performance**: Efficient metadata access for large objects
+/// - **Foundation**: Required by GetObjectHandler for content operations
+///
+/// ## Implementation Notes
+/// - Should return `None` if object doesn't exist (not an error)
+/// - Must populate all available metadata fields accurately
+/// - Should be optimized for fast metadata access
 #[async_trait::async_trait]
 pub trait HeadHandler {
+    /// Retrieve object metadata without content transfer
+    ///
+    /// ## Parameters
+    /// - `bucket`: S3 bucket name containing the object
+    /// - `object`: Object key/path within the bucket
+    ///
+    /// ## Returns
+    /// - `Ok(Some(HeadObjectResult))`: Object exists with metadata
+    /// - `Ok(None)`: Object does not exist
+    /// - `Err(Error)`: Backend error during lookup
     async fn lookup(&self, bucket: &str, object: &str) -> Result<Option<HeadObjectResult>, Error>;
 }
 #[derive(Default)]
@@ -336,6 +362,29 @@ pub fn handle_head_object<T: VRequest, F: VResponse, E: HeadHandler>(
     todo!()
 }
 
+/// Handle S3 GET Object requests with streaming support and range capabilities
+///
+/// This function processes S3 GET Object requests, providing full AWS S3 compatibility
+/// including HTTP range requests, metadata headers, and streaming download.
+///
+/// ## Features
+/// - **Streaming Download**: Efficient memory usage for large files
+/// - **Range Requests**: Support for partial content (bytes=start-end, bytes=start-, bytes=-suffix)
+/// - **Metadata Headers**: Returns all custom metadata as x-amz-meta-* headers
+/// - **Content Headers**: Proper Content-Type, Content-Length, ETag handling
+/// - **Error Handling**: Standard S3 error responses (404, 416, etc.)
+///
+/// ## Parameters
+/// - `req`: HTTP request containing bucket/object path and range headers
+/// - `resp`: HTTP response writer for streaming object data
+/// - `handler`: Backend implementation for object retrieval
+///
+/// ## HTTP Response Codes
+/// - `200 OK`: Full object retrieved successfully
+/// - `206 Partial Content`: Range request fulfilled
+/// - `404 Not Found`: Object does not exist
+/// - `405 Method Not Allowed`: Non-GET request
+/// - `416 Range Not Satisfiable`: Invalid range specification
 pub async fn handle_get_object<T: VRequest, F: VResponse>(
     req: T,
     resp: &mut F,
@@ -407,6 +456,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         resp.send_header();
         return;
     }
+
     let head = head.unwrap();
     if head.is_none() {
         log::info!("not found {bucket} {object}");
@@ -414,6 +464,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         resp.send_header();
         return;
     }
+
     //send header info to client
     let head = head.unwrap();
     let total_len = head.content_length.unwrap_or(0) as u64;
@@ -490,9 +541,11 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
     if let Some(v) = header_etag.take() {
         resp.set_header("etag", &v)
     }
+
     if let Some(v) = header_ct.take() {
         resp.set_header("content-type", &v)
     }
+
     if let Some(v) = header_last_modified.take() {
         resp.set_header("last-modified", &v)
     }
@@ -516,6 +569,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
     //
     resp.set_status(status);
     resp.send_header();
+
     let ret = {
         match resp.get_body_writer().await {
             Ok(body) => {
@@ -537,7 +591,30 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
     }
 }
 
-//query list-type=2, return ListObjectResult
+/// Handle S3 LIST Objects V2 requests with prefix filtering and pagination
+///
+/// This function processes S3 ListObjectsV2 requests, providing AWS S3 compatible
+/// object listing with advanced filtering, pagination, and metadata support.
+///
+/// ## Features
+/// - **Prefix Filtering**: Filter objects by key prefix for directory-like browsing
+/// - **Pagination Support**: Handle large object lists with continuation tokens
+/// - **Metadata Inclusion**: Return object size, modification time, ETag, and storage class
+/// - **Delimiter Support**: Enable hierarchical listing with common prefixes
+/// - **Performance Optimized**: Efficient backend queries with result limiting
+///
+/// ## Query Parameters
+/// - `list-type=2`: Specifies ListObjectsV2 API version
+/// - `prefix`: Filter objects by key prefix
+/// - `max-keys`: Limit number of objects returned (default: 1000)
+/// - `continuation-token`: Token for paginated results
+/// - `delimiter`: Character for hierarchical grouping
+///
+/// ## HTTP Response Codes
+/// - `200 OK`: Object list retrieved successfully
+/// - `404 Not Found`: Bucket does not exist
+/// - `405 Method Not Allowed`: Non-GET request
+/// - `500 Internal Server Error`: Backend listing error
 pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
     req: T,
     resp: &mut F,
@@ -551,6 +628,7 @@ pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
 
     let rpath = req.url_path();
     let trimmed = rpath.trim_matches('/');
+
     let bucket = if !trimmed.is_empty() {
         trimmed.to_string()
     } else if let Some(b) = req.get_query("bucket") {
@@ -650,6 +728,35 @@ pub struct ListBucketsOption {
     pub max_buckets: Option<i32>,
     pub prefix: Option<String>,
 }
+
+/// Handle S3 LIST Buckets requests with metadata and ownership information
+///
+/// This function processes S3 ListBuckets (GET /) requests, providing complete
+/// bucket listing with creation dates, regions, and owner information.
+///
+/// ## Features
+/// - **Complete Bucket Listing**: Returns all accessible buckets for the user
+/// - **Real Metadata**: Shows actual creation dates from filesystem timestamps
+/// - **Region Information**: Includes bucket region configuration
+/// - **Owner Details**: Provides bucket ownership information
+/// - **Performance Optimized**: Efficient directory scanning and metadata retrieval
+///
+/// ## Parameters
+/// - `req`: HTTP request for bucket listing
+/// - `resp`: HTTP response writer for bucket list XML
+/// - `handler`: Backend implementation for bucket enumeration
+///
+/// ## Response Format
+/// Returns XML with bucket information including:
+/// - Bucket name and creation date
+/// - Region/location constraint
+/// - Owner display name and ID
+///
+/// ## HTTP Response Codes
+/// - `200 OK`: Bucket list retrieved successfully
+/// - `403 Forbidden`: Access denied to bucket listing
+/// - `405 Method Not Allowed`: Non-GET request
+/// - `500 Internal Server Error`: Backend listing error
 pub async fn handle_get_list_buckets<T: VRequest, F: VResponse>(
     req: T,
     resp: &mut F,
@@ -660,6 +767,7 @@ pub async fn handle_get_list_buckets<T: VRequest, F: VResponse>(
         resp.send_header();
         return;
     }
+
     let opt = ListBucketsOption {
         bucket_region: req.get_query("bucket-region"),
         continuation_token: req.get_query("continuation-token"),
@@ -668,6 +776,7 @@ pub async fn handle_get_list_buckets<T: VRequest, F: VResponse>(
             .and_then(|v| v.parse::<i32>().ok()),
         prefix: req.get_query("prefix"),
     };
+
     match handler.handle(&opt).await {
         Ok(v) => {
             let res = ListAllMyBucketsResult {
@@ -678,6 +787,7 @@ pub async fn handle_get_list_buckets<T: VRequest, F: VResponse>(
                 },
                 buckets: Buckets { bucket: v },
             };
+
             match quick_xml::se::to_string(&res) {
                 Ok(v) => match resp.get_body_writer().await {
                     Ok(mut w) => {
@@ -694,6 +804,7 @@ pub async fn handle_get_list_buckets<T: VRequest, F: VResponse>(
                 }
             }
         }
+
         Err(e) => {
             log::info!("listbucket handle error: {e}");
             resp.set_status(500);
@@ -733,6 +844,7 @@ pub struct PutObjectOption {
     // pub website_redirect_location: Option<String>,
     pub write_offset_bytes: Option<i64>,
 }
+
 impl PutObjectOption {
     pub fn invalid(&self) -> bool {
         if self.content_length.is_none() {
@@ -772,6 +884,7 @@ impl std::str::FromStr for ChecksumAlgorithm {
 pub enum RequestPayer {
     Requester,
 }
+
 impl std::str::FromStr for RequestPayer {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -796,11 +909,13 @@ impl std::str::FromStr for ObjectLockMode {
         }
     }
 }
+
 #[derive(Debug)]
 pub enum ObjectLockLegalHoldStatus {
     On,
     Off,
 }
+
 impl std::str::FromStr for ObjectLockLegalHoldStatus {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -826,6 +941,30 @@ pub trait PutObjectHandler {
     ) -> Result<(), String>;
 }
 
+/// Handle S3 PUT Object requests with streaming upload and metadata support
+///
+/// This function processes S3 PUT Object requests, providing full AWS S3 compatibility
+/// including streaming upload, custom metadata, content validation, and authentication.
+///
+/// ## Features
+/// - **Streaming Upload**: Memory-efficient handling of large files
+/// - **Metadata Support**: Processes x-amz-meta-* headers for custom metadata
+/// - **Content Validation**: MD5 checksum verification and content-type detection
+/// - **Authentication**: AWS Signature V4 validation for secure uploads
+/// - **Atomic Operations**: Ensures data integrity during upload process
+///
+/// ## Parameters
+/// - `v4head`: AWS Signature V4 authentication headers
+/// - `req`: HTTP request containing object data and metadata
+/// - `resp`: HTTP response writer for upload confirmation
+/// - `handler`: Backend implementation for object storage
+///
+/// ## HTTP Response Codes
+/// - `200 OK`: Object uploaded successfully
+/// - `400 Bad Request`: Invalid request format or metadata
+/// - `403 Forbidden`: Authentication failure
+/// - `405 Method Not Allowed`: Non-PUT request
+/// - `500 Internal Server Error`: Storage backend error
 pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
     mut v4head: crate::auth::sig_v4::V4Head,
     req: T,
@@ -837,6 +976,7 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         resp.send_header();
         return;
     }
+
     let url_path = req.url_path();
     let url_path = url_path.trim_matches('/');
     let ret = url_path.find('/');
@@ -845,9 +985,11 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         resp.send_header();
         return;
     }
+
     let next = ret.unwrap();
     let bucket = &url_path[..next];
     let object = &url_path[next + 1..];
+
     let opt = PutObjectOption {
         cache_control: req.get_header("cache-control"),
         checksum_algorithm: req
@@ -909,6 +1051,7 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         Streaming,
         Unsigned,
     }
+
     let content_sha256 = req.get_header("x-amz-content-sha256").map_or_else(
         || None,
         |content_sha256| {
@@ -921,10 +1064,12 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
             }
         },
     );
+
     if content_sha256.is_none() {
         resp.set_status(403);
         return;
     }
+
     let content_sha256 = content_sha256.unwrap();
     let ret = req.get_body_reader().await;
     if let Err(err) = ret {
@@ -933,6 +1078,7 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         log::error!("get body reader error: {err}");
         return;
     }
+
     let r = ret.unwrap();
     let ret: Result<(), String> = match content_sha256 {
         ContentSha256::Hash(cs) => {
@@ -1131,12 +1277,14 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
                     return;
                 }
             };
+
             if let Err(_err) = ret {
                 let _ = tokio::fs::remove_file(file_name.as_str()).await;
                 resp.set_status(500);
                 resp.send_header();
                 return;
             }
+
             match tokio::fs::OpenOptions::new()
                 .read(true)
                 .open(file_name.as_str())
@@ -1177,6 +1325,31 @@ pub trait DeleteObjectHandler {
     async fn handle(&self, opt: &DeleteObjectOption, object: &str) -> Result<(), String>;
 }
 
+/// Handle S3 DELETE Object requests with version and metadata support
+///
+/// This function processes S3 DeleteObject (DELETE /{bucket}/{key}) requests,
+/// providing safe object deletion with proper validation and AWS S3 compatibility.
+///
+/// ## Features
+/// - **Object Existence Check**: Verifies object exists before deletion
+/// - **Atomic Deletion**: Ensures object deletion is atomic and consistent
+/// - **Metadata Cleanup**: Removes associated metadata and references
+/// - **Version Support**: Handles object versioning if enabled
+/// - **Error Handling**: Proper S3 error responses for various scenarios
+///
+/// ## Parameters
+/// - `req`: HTTP request containing bucket and object key to delete
+/// - `resp`: HTTP response writer for deletion confirmation
+/// - `handler`: Backend implementation for object deletion
+///
+/// ## HTTP Response Codes
+/// - `204 No Content`: Object deleted successfully
+/// - `404 Not Found`: Object does not exist (S3 returns 204 anyway)
+/// - `405 Method Not Allowed`: Non-DELETE request
+/// - `500 Internal Server Error`: Backend deletion error
+///
+/// ## S3 Behavior Note
+/// S3 returns 204 even if the object doesn't exist, for security reasons
 pub async fn handle_delete_object<T: VRequest, F: VResponse>(
     req: T,
     resp: &mut F,
@@ -1201,6 +1374,7 @@ pub trait MultiUploadObjectHandler {
         bucket: &'a str,
         key: &'a str,
     ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>>;
+
     ///return etag
     fn handle_upload_part<'a>(
         &'a self,
@@ -1210,6 +1384,7 @@ pub trait MultiUploadObjectHandler {
         part_number: u32,
         body: &'a mut (dyn tokio::io::AsyncRead + Unpin + Send),
     ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>>;
+
     fn handle_complete<'a>(
         &'a self,
         bucket: &'a str,
@@ -1219,6 +1394,7 @@ pub trait MultiUploadObjectHandler {
         data: &'a [(&'a str, u32)],
         opts: MultiUploadObjectCompleteOption,
     ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>>;
+
     fn handle_abort<'a>(
         &'a self,
         bucket: &'a str,
@@ -1242,6 +1418,7 @@ pub async fn handle_multipart_create_session<T: VRequest, F: VResponse>(
         resp.send_header();
         return;
     }
+
     let bucket = raw[0];
     let key = raw[1];
     match handler.handle_create_session(bucket, key).await {
@@ -1256,11 +1433,13 @@ pub async fn handle_multipart_create_session<T: VRequest, F: VResponse>(
                 #[serde(rename = "UploadId")]
                 pub upload_id: &'a str,
             }
+
             let r = MultipartInitResponse {
                 bucket,
                 key,
                 upload_id: &upload_id,
             };
+
             let is_err = match quick_xml::se::to_string(&r) {
                 Ok(content) => match resp.get_body_writer().await {
                     Ok(mut w) => {
@@ -1277,6 +1456,7 @@ pub async fn handle_multipart_create_session<T: VRequest, F: VResponse>(
                     Some(())
                 }
             };
+
             if is_err.is_some() {
                 resp.set_status(500);
                 resp.send_header();
@@ -1308,6 +1488,7 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
         }
         let part_number = ret.unwrap();
         let raw_path = req.url_path();
+
         let raw = raw_path
             .trim_start_matches('/')
             .splitn(2, '/')
@@ -1316,6 +1497,7 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
             resp.set_status(400);
             return;
         }
+
         let header = req.take_header();
         let body_reader = match req.get_body_reader().await {
             Ok(body_reader) => body_reader,
@@ -1326,6 +1508,7 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
                 return;
             }
         };
+
         let (body, release) = match get_body_stream(body_reader, &header).await {
             Ok(data) => data,
             Err(err) => {
@@ -1335,6 +1518,7 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
                 return;
             }
         };
+
         let ret = match body {
             StreamType::File(mut file) => {
                 handler
@@ -1347,6 +1531,7 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
                     )
                     .await
             }
+
             StreamType::Buff(mut buf_reader) => {
                 handler
                     .handle_upload_part(
@@ -1359,9 +1544,11 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
                     .await
             }
         };
+
         if let Some(release) = release {
             release.await;
         }
+
         if let Ok(etag) = ret {
             resp.set_header("etag", &etag);
         } else {
@@ -1370,6 +1557,7 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
         }
     }
 }
+
 pub async fn handle_multipart_complete_session<T: VRequestPlus, F: VResponse>(
     req: T,
     resp: &mut F,
@@ -1385,9 +1573,11 @@ pub async fn handle_multipart_complete_session<T: VRequestPlus, F: VResponse>(
         resp.send_header();
         return;
     }
+
     let bucket = raw[0];
     let key = raw[1];
     let upload_id = req.get_query("uploadId");
+
     if let Some(upload_id) = upload_id {
         #[derive(Debug, serde::Deserialize)]
         #[serde(rename_all = "PascalCase")]
@@ -1403,6 +1593,7 @@ pub async fn handle_multipart_complete_session<T: VRequestPlus, F: VResponse>(
             #[serde(rename = "PartNumber")]
             pub part_number: u32,
         }
+
         match req.body().await {
             Ok(body) => {
                 match quick_xml::de::from_str::<CompleteMultiPartUploadRequest>(unsafe {
@@ -1441,12 +1632,14 @@ pub async fn handle_multipart_complete_session<T: VRequestPlus, F: VResponse>(
                                     #[serde(rename = "ETag")]
                                     pub etag: &'a str,
                                 }
+
                                 let r = CompleteMultipartUploadResponse {
                                     location: "",
                                     bucket,
                                     key,
                                     etag: &etag,
                                 };
+
                                 match quick_xml::se::to_string(&r) {
                                     Ok(content) => {
                                         let err = match resp.get_body_writer().await {
@@ -1456,6 +1649,7 @@ pub async fn handle_multipart_complete_session<T: VRequestPlus, F: VResponse>(
                                             }
                                             Err(err) => Some(err),
                                         };
+
                                         if let Some(err) = err {
                                             log::error!("get body writer error {err}");
                                             resp.set_status(500);
@@ -1493,6 +1687,7 @@ pub async fn handle_multipart_complete_session<T: VRequestPlus, F: VResponse>(
         resp.send_header();
     }
 }
+
 pub async fn handle_multipart_abort_session<T: VRequest, F: VResponse>(
     _req: T,
     _resp: &mut F,
@@ -1514,6 +1709,7 @@ pub enum ObjectOwnership {
     ObjectWriter,
     BucketOwnerEnforced,
 }
+
 impl FromStr for ObjectOwnership {
     type Err = Error;
 
@@ -1535,6 +1731,7 @@ pub struct BucketInfo {
     pub data_redundancy: DataRedundancy,
     pub bucket_type: BucketType,
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataRedundancy {
     SingleAvailabilityZone,
@@ -1551,6 +1748,7 @@ impl From<&str> for DataRedundancy {
         }
     }
 }
+
 impl Display for DataRedundancy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(
@@ -1563,6 +1761,7 @@ impl Display for DataRedundancy {
         )
     }
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BucketType {
     Directory,
@@ -1725,6 +1924,29 @@ pub trait CreateBucketHandler {
     async fn handle(&self, opt: &CreateBucketOption, bucket: &str) -> Result<(), String>;
 }
 
+/// Handle S3 CREATE Bucket requests with region and configuration support
+///
+/// This function processes S3 CreateBucket (PUT /{bucket}) requests, providing full
+/// AWS S3 compatibility for bucket creation with proper validation and error handling.
+///
+/// ## Features
+/// - **Bucket Validation**: Ensures bucket names follow S3 naming conventions
+/// - **Duplicate Detection**: Returns 409 Conflict for existing buckets
+/// - **Region Support**: Handles bucket location constraints and region configuration
+/// - **Atomic Creation**: Ensures bucket creation is atomic and consistent
+/// - **Error Handling**: Proper S3 error responses for various failure scenarios
+///
+/// ## Parameters
+/// - `req`: HTTP request containing bucket name and optional configuration
+/// - `resp`: HTTP response writer for creation confirmation
+/// - `handler`: Backend implementation for bucket creation
+///
+/// ## HTTP Response Codes
+/// - `200 OK`: Bucket created successfully
+/// - `400 Bad Request`: Invalid bucket name or configuration
+/// - `409 Conflict`: Bucket already exists
+/// - `405 Method Not Allowed`: Non-PUT request
+/// - `500 Internal Server Error`: Backend creation error
 pub async fn handle_create_bucket<T: VRequest, F: VResponse>(
     req: T,
     resp: &mut F,
@@ -1777,6 +1999,29 @@ pub trait DeleteBucketHandler {
     async fn handle(&self, opt: &DeleteBucketOption, bucket: &str) -> Result<(), String>;
 }
 
+/// Handle S3 DELETE Bucket requests with safety validation
+///
+/// This function processes S3 DeleteBucket (DELETE /{bucket}) requests, providing
+/// safe bucket deletion with proper validation and AWS S3 compatibility.
+///
+/// ## Features
+/// - **Empty Bucket Validation**: Ensures bucket is empty before deletion
+/// - **Existence Check**: Verifies bucket exists before attempting deletion
+/// - **Atomic Deletion**: Ensures bucket deletion is atomic and consistent
+/// - **Safety Measures**: Prevents accidental deletion of non-empty buckets
+/// - **Error Handling**: Proper S3 error responses for various failure scenarios
+///
+/// ## Parameters
+/// - `req`: HTTP request containing bucket name to delete
+/// - `resp`: HTTP response writer for deletion confirmation
+/// - `handler`: Backend implementation for bucket deletion
+///
+/// ## HTTP Response Codes
+/// - `204 No Content`: Bucket deleted successfully
+/// - `404 Not Found`: Bucket does not exist
+/// - `409 Conflict`: Bucket is not empty
+/// - `405 Method Not Allowed`: Non-DELETE request
+/// - `500 Internal Server Error`: Backend deletion error
 pub async fn handle_delete_bucket<T: VRequest, F: VResponse>(
     req: T,
     resp: &mut F,
