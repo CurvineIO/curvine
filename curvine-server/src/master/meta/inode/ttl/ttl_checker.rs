@@ -19,6 +19,7 @@ use crate::master::meta::inode::ttl::ttl_types::{
     TtlAction, TtlCleanupConfig, TtlCleanupResult, TtlResult,
 };
 use crate::master::meta::inode::InodeView;
+use curvine_common::state::StoragePolicy;
 use log::{debug, error, info, warn};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -187,6 +188,7 @@ impl InodeTtlChecker {
         let storage_policy = match &inode_view {
             InodeView::File(_, file) => &file.storage_policy,
             InodeView::Dir(_, dir) => &dir.storage_policy,
+            InodeView::FileEntry(..) => &StoragePolicy::default(),
         };
 
         let action = &storage_policy.ttl_action;

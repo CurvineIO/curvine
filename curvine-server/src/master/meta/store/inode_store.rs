@@ -74,6 +74,7 @@ impl InodeStore {
                     self.fs_stats.increment_dir_count();
                 }
             }
+            InodeView::FileEntry(..) => self.fs_stats.increment_file_count(),
         }
 
         Ok(())
@@ -125,6 +126,10 @@ impl InodeStore {
                     for item in dir.children_iter() {
                         stack.push_back((inode.id(), item))
                     }
+                }
+
+                InodeView::FileEntry(..) => {
+                    deleted_files += 1;
                 }
             }
         }
@@ -267,6 +272,7 @@ impl InodeStore {
                             dir_count += 1;
                         }
                     }
+                    InodeView::FileEntry(..) => file_count += 1,
                 }
 
                 parent.add_child(inode)?

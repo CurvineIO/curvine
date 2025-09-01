@@ -106,11 +106,16 @@ impl JournalWriter {
         self.send(JournalEntry::CreateFile(entry))
     }
 
-    pub fn log_append_file(&self, op_ms: u64, inp: &InodePath) -> FsResult<()> {
+    pub fn log_append_file<P: AsRef<str>>(
+        &self,
+        op_ms: u64,
+        path: P,
+        file: &InodeFile,
+    ) -> FsResult<()> {
         let entry = AppendFileEntry {
             op_ms,
-            path: inp.path().to_string(),
-            file: inp.clone_last_file()?,
+            path: path.as_ref().to_string(),
+            file: file.clone(),
         };
         self.send(JournalEntry::AppendFile(entry))
     }
@@ -196,11 +201,17 @@ impl JournalWriter {
         self.send(JournalEntry::SetAttr(entry))
     }
 
-    pub fn log_symlink(&self, op_ms: u64, link: &InodePath, force: bool) -> FsResult<()> {
+    pub fn log_symlink<P: AsRef<str>>(
+        &self,
+        op_ms: u64,
+        link: P,
+        new_inode: InodeFile,
+        force: bool,
+    ) -> FsResult<()> {
         let entry = SymlinkEntry {
             op_ms,
-            link: link.path().to_string(),
-            new_inode: link.clone_last_file()?,
+            link: link.as_ref().to_string(),
+            new_inode,
             force,
         };
         self.send(JournalEntry::Symlink(entry))

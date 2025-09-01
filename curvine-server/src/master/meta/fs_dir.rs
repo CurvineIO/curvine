@@ -15,7 +15,7 @@
 use crate::master::fs::DeleteResult;
 use crate::master::journal::{JournalEntry, JournalWriter};
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
-use crate::master::meta::inode::InodeView::{Dir, File};
+use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
@@ -196,7 +196,16 @@ impl FsDir {
         // Delete src_inp
         let src_inode = match src_inp.get_last_inode() {
             None => return err_box!("File not exits: {}", src_inp.path()),
-            Some(v) => v,
+            Some(v) => {
+                // If src_inode is FileEntry, load the complete object from store
+                match v.as_ref() {
+                    FileEntry(_, id) => match self.store.get_inode(*id)? {
+                        Some(full_inode) => InodePtr::from_owned(full_inode),
+                        None => return err_box!("Failed to load inode {} from store", id),
+                    },
+                    _ => v,
+                }
+            }
         };
 
         let mut src_parent = match src_inp.get_inode(-2) {
@@ -207,11 +216,13 @@ impl FsDir {
         // Get the target parent node that needs to be added
         // 1. If dst last is a directory, then a new node is created under that directory.
         // 2. If dst last does not exist, create a node in the parent directory.
+        let mut new_name = dst_inp.name().to_string();
         let mut dst_parent = match dst_inp.get_last_inode() {
             Some(v) => {
                 // /1.log -> /b is equivalent to /1.log /b/1.log
                 // b is an existing directory, indicating that you can move to this directory.
                 if v.is_dir() {
+                    new_name = src_inp.name().to_string();
                     v
                 } else {
                     return err_box!("Rename failed, because dst {} is exists", dst_inp.path());
@@ -229,6 +240,7 @@ impl FsDir {
         // Modify the time and name of the rename node.
         let mut new_inode = src_inode.as_ref().clone();
         new_inode.update_mtime(mtime);
+        new_inode.change_name(new_name);
 
         // Update the parent directory for the last modification time.
         src_parent.update_mtime(mtime);
@@ -303,8 +315,10 @@ impl FsDir {
         parent.update_mtime(child.mtime());
 
         // Update inode data.
+        let child_for_store = child.clone();
         let added = parent.add_child(child)?;
-        self.store.apply_add(parent.as_ref(), added.as_ref())?;
+        // Persist full inode, not FileEntry placeholder
+        self.store.apply_add(parent.as_ref(), &child_for_store)?;
         inp.append(added)?;
 
         Ok(inp)
@@ -316,7 +330,18 @@ impl FsDir {
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
-        Ok(inode.to_file_status(inp.path()))
+        let status = match inode.as_ref() {
+            File(..) | Dir(..) => inode.to_file_status(inp.path()),
+            FileEntry(_name, id) => {
+                let inode_opt = self.store.get_inode(*id)?;
+                match inode_opt {
+                    Some(inode_view) => inode_view.to_file_status(inp.path()),
+                    None => return err_ext!(FsError::file_not_found(inp.path())),
+                }
+            }
+        };
+
+        Ok(status)
     }
 
     pub fn list_status(&self, inp: &InodePath) -> FsResult<Vec<FileStatus>> {
@@ -332,7 +357,23 @@ impl FsDir {
             Dir(_, d) => {
                 for item in d.children_iter() {
                     let child_path = inp.child_path(item.name());
-                    res.push(item.to_file_status(&child_path));
+                    match item {
+                        File(..) | Dir(..) => res.push(item.to_file_status(&child_path)),
+                        FileEntry(_name, id) => {
+                            let inode_opt = self.store.get_inode(*id)?;
+                            if let Some(inode_view) = inode_opt {
+                                res.push(inode_view.to_file_status(&child_path));
+                            }
+                        }
+                    }
+                }
+            }
+
+            FileEntry(_name, id) => {
+                let inode_opt = self.store.get_inode(*id)?;
+                match inode_opt {
+                    Some(inode_view) => res.push(inode_view.to_file_status(inp.path())),
+                    None => return err_box!("File {} not exists", inp.path()),
                 }
             }
         }
@@ -465,7 +506,7 @@ impl FsDir {
 
         // Update file status.
         file.mtime = LocalTime::mills() as i64;
-        file.features.file_write = None;
+        file.features.complete_write();
         file.len = len;
 
         self.store
@@ -502,30 +543,39 @@ impl FsDir {
         client_name: impl AsRef<str>,
     ) -> FsResult<(Option<ExtendedBlock>, FileStatus)> {
         let op_ms = LocalTime::mills();
-        let mut inode = match inp.get_last_inode() {
+        let inode_ptr = match inp.get_last_inode() {
             None => return err_ext!(FsError::file_not_found(inp.path())),
+            Some(v) => v,
+        };
 
-            Some(v) => {
-                if v.is_dir() {
-                    let err_msg =
-                        format!("Cannot append to already exists {} directory", inp.path());
-                    return err_ext!(FsError::file_exists(err_msg));
-                } else {
-                    v
+        let mut inode = match inode_ptr.as_ref() {
+            File(..) => inode_ptr.as_ref().clone(),
+            Dir(..) => {
+                let err_msg = format!("Cannot append to already exists {} directory", inp.path());
+                return err_ext!(FsError::file_exists(err_msg));
+            }
+            FileEntry(_name, id) => {
+                let inode = self.store.get_inode(*id)?;
+                match inode {
+                    Some(inode_view) => inode_view,
+                    None => return err_ext!(FsError::file_not_found(inp.path())),
                 }
             }
         };
 
-        let file = inode.as_file_mut()?;
-        if !file.is_complete() {
-            return err_box!("Cannot append not complete file {}", inp.path());
+        let last_block;
+        {
+            let file = inode.as_file_mut()?;
+            if !file.is_complete() {
+                return err_box!("Cannot append not complete file {}", inp.path());
+            }
+            last_block = file.append(client_name);
         }
-
-        let last_block = file.append(client_name);
         let status = inode.to_file_status(inp.path());
 
-        self.store.apply_append_file(inode.as_ref())?;
-        self.journal_writer.log_append_file(op_ms, inp)?;
+        self.store.apply_append_file(&inode)?;
+        self.journal_writer
+            .log_append_file(op_ms, inp.path(), inode.as_file_ref()?)?;
 
         Ok((last_block, status))
     }
@@ -731,8 +781,9 @@ impl FsDir {
 
         let new_inode = InodeFile::with_link(self.inode_id.next()?, op_ms as i64, target, mode);
 
-        let link = self.unprotected_symlink(link, new_inode, force)?;
-        self.journal_writer.log_symlink(op_ms, &link, force)?;
+        let link = self.unprotected_symlink(link, new_inode.clone(), force)?;
+        self.journal_writer
+            .log_symlink(op_ms, link.path(), new_inode, force)?;
         Ok(())
     }
 

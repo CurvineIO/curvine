@@ -46,6 +46,10 @@ impl FileFeature {
         self.x_attr = map
     }
 
+    pub fn complete_write(&mut self) {
+        self.file_write = None;
+    }
+
     pub fn set_writing(&mut self, client_name: String) {
         let _ = self.file_write.replace(WriteFeature::new(client_name));
     }

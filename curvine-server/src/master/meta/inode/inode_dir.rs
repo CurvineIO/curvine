@@ -93,7 +93,7 @@ impl InodeDir {
         for child in self.children.iter() {
             let t = if child.is_dir() { "dir" } else { "file" };
 
-            println!("{} {}", t, child.id());
+            println!("{} {} {}", t, child.id(), child.name());
         }
     }
 
