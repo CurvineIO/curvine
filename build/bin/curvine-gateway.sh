@@ -144,6 +144,69 @@ wait_for_stop() {
 # Start the service
 start_service() {
     echo "Starting ${SERVICE_NAME} S3 Gateway..."
+
+    # Check if already running
+    if check_running; then
+        local PID=$(cat ${PID_FILE})
+        echo "Error: ${SERVICE_NAME} is already running with PID ${PID}"
+        echo "Please stop the service first or use 'restart'"
+        exit 1
+    fi
+
+    # Validate configuration
+    if [ -n "$CONF" ] && [ ! -f "$CONF" ]; then
+        echo "Error: Configuration file '$CONF' not found"
+        exit 1
+    fi
+
+    # Set configuration values
+    local CONFIG_FILE=${CONF:-${DEFAULT_CONF}}
+    local LISTEN_ADDR=${LISTEN:-${DEFAULT_LISTEN}}
+    local REGION_VALUE=${REGION:-${DEFAULT_REGION}}
+
+    # Try to read from config file if not specified
+    if [ -f "$CONFIG_FILE" ]; then
+        if [ -z "$LISTEN" ]; then
+            local LISTEN_FROM_CONFIG=$(grep -E '^\s*listen\s*=' "$CONFIG_FILE" | head -1 | sed 's/.*=\s*"\([^"]*\)".*/\1/' 2>/dev/null || echo "")
+            if [ -n "$LISTEN_FROM_CONFIG" ]; then
+                LISTEN_ADDR="$LISTEN_FROM_CONFIG"
+                echo "Using listen address from config: $LISTEN_ADDR"
+            fi
+        fi
+
+        if [ -z "$REGION" ]; then
+            local REGION_FROM_CONFIG=$(grep -E '^\s*region\s*=' "$CONFIG_FILE" | head -1 | sed 's/.*=\s*"\([^"]*\)".*/\1/' 2>/dev/null || echo "")
+            if [ -n "$REGION_FROM_CONFIG" ]; then
+                REGION_VALUE="$REGION_FROM_CONFIG"
+                echo "Using region from config: $REGION_FROM_CONFIG"
+            fi
+        fi
+    else
+        echo "Warning: Configuration file '$CONFIG_FILE' not found, using defaults"
+    fi
+
+    local PORT=""
+    if [[ "$LISTEN_ADDR" =~ :([0-9]+)$ ]]; then
+        PORT="${BASH_REMATCH[1]}"
+    fi
+    if [ -n "$PORT" ]; then
+        local OCCUPIED_PIDS=$(lsof -t -i :"$PORT" 2>/dev/null)
+        if [ -n "$OCCUPIED_PIDS" ]; then
+            echo "Warning: Port $PORT is already in use by process(es): $OCCUPIED_PIDS"
+            echo "Killing process(es) occupying port $PORT..."
+            kill -9 $OCCUPIED_PIDS
+            sleep 1
+        fi
+    fi
+
+    # Check if binary exists
+    local BINARY_PATH="${CURVINE_HOME}/lib/${SERVICE_NAME}"
+    if [ ! -f "$BINARY_PATH" ]; then
+        echo "Error: ${SERVICE_NAME} binary not found at $BINARY_PATH"
+        echo "Please ensure the project has been built with 'make all'"
+        exit 1
+    fi
+    echo "Starting ${SERVICE_NAME} S3 Gateway..."
     
     # Check if already running
     if check_running; then

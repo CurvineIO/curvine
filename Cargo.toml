@@ -95,6 +95,7 @@ memchr = "2.6.4"
 smallvec = "1.11.2"
 
 axum = "0.7.4"
+# Note: curvine-gateway uses axum 0.8.4 independently for S3 compatibility
 tower = "0.4.13"
 tower-http = "0.5.2"
 

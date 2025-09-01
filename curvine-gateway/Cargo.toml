@@ -5,7 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-clap = { version = "4.3.10", features = ["derive"] }
+clap = { workspace = true }
 axum = { version = "0.8.4", features = ["macros"] }
 tokio = { workspace = true }
 bytes = { workspace = true }
@@ -17,19 +17,19 @@ async-trait = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 uuid = { workspace = true }
 md5 = "0.7"
-thiserror = "1.0"
-rand = "0.8"
-toml = "0.8"
+thiserror = { workspace = true }
+rand = { workspace = true }
+toml = { workspace = true }
 scopeguard = "1.2"
 hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
 base64 = "0.21"
 hex = "0.4"
-log = "0.4"
+log = { workspace = true }
 quick-xml = { version = "0.31", features = ["serialize"] }
 serde-xml-rs = "0.6"
-futures = "0.3"
+futures = { workspace = true }
 
 curvine-common = { path = "../curvine-common" }
 curvine-client = { path = "../curvine-client" }
