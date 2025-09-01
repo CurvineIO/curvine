@@ -50,6 +50,41 @@ use std::{
     str::FromStr,
 };
 
+/// S3 Archive Status enumeration for object lifecycle management
+///
+/// Represents the current archive status of an S3 object in various storage tiers.
+/// This follows AWS S3 Glacier and Intelligent Tiering specifications.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum ArchiveStatus {
+    /// Object is being restored from archive storage
+    #[serde(rename = "ARCHIVE_ACCESS")]
+    ArchiveAccess,
+    /// Object is in deep archive storage (Glacier Deep Archive)
+    #[serde(rename = "DEEP_ARCHIVE_ACCESS")]
+    DeepArchiveAccess,
+}
+
+impl std::str::FromStr for ArchiveStatus {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ARCHIVE_ACCESS" => Ok(ArchiveStatus::ArchiveAccess),
+            "DEEP_ARCHIVE_ACCESS" => Ok(ArchiveStatus::DeepArchiveAccess),
+            _ => Err(Error::Other(format!("Invalid ArchiveStatus value: {}", s))),
+        }
+    }
+}
+
+impl std::fmt::Display for ArchiveStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArchiveStatus::ArchiveAccess => write!(f, "ARCHIVE_ACCESS"),
+            ArchiveStatus::DeepArchiveAccess => write!(f, "DEEP_ARCHIVE_ACCESS"),
+        }
+    }
+}
+
 static OWNER_ID: &str = "ffffffffffffffff";
 pub type DateTime = chrono::DateTime<chrono::Utc>;
 
@@ -98,7 +133,7 @@ pub struct HeadObjectResult {
     #[serde(rename = "AcceptRanges")]
     pub accept_ranges: Option<String>,
     #[serde(rename = "ArchiveStatus")]
-    pub archive_status: Option<String>, // 可用枚举替代
+    pub archive_status: Option<ArchiveStatus>,
     #[serde(rename = "BucketKeyEnabled")]
     pub bucket_key_enabled: Option<bool>,
     #[serde(rename = "CacheControl")]
@@ -941,6 +976,39 @@ pub trait PutObjectHandler {
     ) -> Result<(), String>;
 }
 
+/// Parse bucket and object names from URL path for PUT operations
+///
+/// ## Parameters
+/// - `url_path`: The URL path from the request
+///
+/// ## Returns
+/// - `Ok((bucket, object))`: Successfully parsed bucket and object names
+/// - `Err(())`: Invalid path format
+fn parse_put_object_path(url_path: &str) -> Result<(&str, &str), ()> {
+    let url_path = url_path.trim_matches('/');
+    let ret = url_path.find('/');
+    if ret.is_none() {
+        return Err(());
+    }
+
+    let next = ret.unwrap();
+    let bucket = &url_path[..next];
+    let object = &url_path[next + 1..];
+    Ok((bucket, object))
+}
+
+/// Validate content SHA256 header for S3 authentication
+///
+/// ## Parameters
+/// - `req`: HTTP request containing x-amz-content-sha256 header
+///
+/// ## Returns
+/// - `Some(content_sha256)`: Valid SHA256 header value
+/// - `None`: Missing or invalid SHA256 header
+fn validate_content_sha256<T: VRequest>(req: &T) -> Option<String> {
+    req.get_header("x-amz-content-sha256")
+}
+
 /// Handle S3 PUT Object requests with streaming upload and metadata support
 ///
 /// This function processes S3 PUT Object requests, providing full AWS S3 compatibility
@@ -977,18 +1045,16 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         return;
     }
 
+    // Parse bucket and object from URL path
     let url_path = req.url_path();
-    let url_path = url_path.trim_matches('/');
-    let ret = url_path.find('/');
-    if ret.is_none() {
-        resp.set_status(400);
-        resp.send_header();
-        return;
-    }
-
-    let next = ret.unwrap();
-    let bucket = &url_path[..next];
-    let object = &url_path[next + 1..];
+    let (bucket, object) = match parse_put_object_path(&url_path) {
+        Ok((bucket, object)) => (bucket, object),
+        Err(()) => {
+            resp.set_status(400);
+            resp.send_header();
+            return;
+        }
+    };
 
     let opt = PutObjectOption {
         cache_control: req.get_header("cache-control"),
@@ -2272,6 +2338,7 @@ async fn read_body_to_vec<T: crate::utils::io::PollRead + Send>(
     use bytes::BytesMut;
     let mut hasher = sha2::Sha256::new();
     let mut out = BytesMut::with_capacity(content_length);
+
     while let Some(buff) = src.poll_read().await.map_err(ParseBodyError::Io)? {
         let buff_len = buff.len();
         if content_length < buff_len {
@@ -2281,6 +2348,7 @@ async fn read_body_to_vec<T: crate::utils::io::PollRead + Send>(
         let _ = std::io::Write::write_all(&mut hasher, &buff);
         out.extend_from_slice(&buff);
     }
+
     let real_sha256 = hex::encode(hasher.finalize());
     if real_sha256.as_str() != expected_sha256 {
         Err(ParseBodyError::HashNoMatch)
