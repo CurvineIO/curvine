@@ -18,7 +18,7 @@ use bytes::BytesMut;
 use sha1::Digest;
 
 pub type GenericResult<T> = Result<T, String>;
-pub mod utils;
+pub mod s3_utils;
 #[derive(Debug)]
 pub struct BaseKv<K: PartialOrd, V> {
     pub key: K,

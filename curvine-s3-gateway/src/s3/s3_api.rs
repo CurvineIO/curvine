@@ -450,9 +450,9 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
     // Try parse HTTP Range header: bytes=start-end, bytes=start-, bytes=-suffix
     if let Some(rh) = req.get_header("range") {
         if let Some(bytes) = rh.strip_prefix("bytes=") {
-            if bytes.starts_with('-') {
+            if let Some(suffix_str) = bytes.strip_prefix('-') {
                 // Handle suffix-byte-range-spec: bytes=-N (last N bytes)
-                if let Ok(suffix_len) = bytes[1..].parse::<u64>() {
+                if let Ok(suffix_len) = suffix_str.parse::<u64>() {
                     // We'll need to calculate the actual range after we know the file size
                     // For now, we mark this as a special case
                     opt.range_start = None;

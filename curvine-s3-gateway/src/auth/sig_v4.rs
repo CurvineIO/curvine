@@ -40,7 +40,7 @@ pub struct BaseArgs {
 
 pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, ()> {
     let authorization = r.get_header("authorization");
-    let authorization = authorization.ok_or_else(|| ())?;
+    let authorization = authorization.ok_or(())?;
 
     let authorization = authorization.trim();
     let heads = authorization.splitn(2, ' ').collect::<Vec<&str>>();
@@ -90,7 +90,7 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, ()> {
             let singed_headers = singed_headers.unwrap();
             let credential = credential.unwrap();
 
-            let content_hash = r.get_header("x-amz-content-sha256").ok_or_else(|| ())?;
+            let content_hash = r.get_header("x-amz-content-sha256").ok_or(())?;
 
             // Special handling for common S3 content hash values
             let normalized_content_hash = match content_hash.as_str() {
@@ -268,9 +268,9 @@ pub struct HmacSha256CircleHasher {
 impl HmacSha256CircleHasher {
     pub fn new(ksigning: [u8; 32], lasthash: String, xamz_date: String, region: String) -> Self {
         Self {
-            ksigning: ksigning,
+            ksigning,
             last_hash: lasthash,
-            region: region,
+            region,
             xamz_date: xamz_date.clone(),
             date: xamz_date[..8].to_string(),
         }

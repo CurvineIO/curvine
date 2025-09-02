@@ -55,7 +55,9 @@ use super::PutObjectOption;
 use crate::s3::error::Error;
 use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
-use crate::utils::utils::{file_status_to_head_object_result, file_status_to_list_object_content};
+use crate::utils::s3_utils::{
+    file_status_to_head_object_result, file_status_to_list_object_content,
+};
 use bytes::BytesMut;
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
@@ -1063,7 +1065,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             }
 
             // Write all accumulated data at once to avoid corruption
-            if let Err(_) = file.write_all(&total_data).await {
+            if file.write_all(&total_data).await.is_err() {
                 return Err(());
             }
 
@@ -1161,9 +1163,9 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                     }
 
                     // Write chunk to final object
-                    if let Err(_) = writer.write(&buf[..n]).await {
+                    if writer.write(&buf[..n]).await.is_err() {
                         return Err(());
-                    };
+                    }
                 }
             }
 

@@ -59,10 +59,7 @@ pub fn infer_content_type(object_name: &str) -> String {
 
 /// Generate ETag from file status
 pub fn generate_etag(file_status: &FileStatus) -> String {
-    format!(
-        "\"{}\"",
-        format!("{:x}-{:x}", file_status.id, file_status.mtime)
-    )
+    format!("\"{:x}-{:x}\"", file_status.id, file_status.mtime)
 }
 
 /// Create owner information from file status
@@ -152,15 +149,15 @@ pub fn file_status_to_head_object_result(
     file_status: &FileStatus,
     object_name: &str,
 ) -> HeadObjectResult {
-    let mut head = HeadObjectResult::default();
-
-    // Basic file information
-    head.content_length = Some(file_status.len as usize);
-    head.last_modified = format_s3_timestamp(file_status.mtime);
-    head.accept_ranges = Some("bytes".to_string());
-    head.etag = Some(generate_etag(file_status));
-    head.storage_class = Some(map_storage_class(&file_status.storage_policy.storage_type));
-    head.content_type = Some(infer_content_type(object_name));
+    let mut head = HeadObjectResult {
+        content_length: Some(file_status.len as usize),
+        last_modified: format_s3_timestamp(file_status.mtime),
+        accept_ranges: Some("bytes".to_string()),
+        etag: Some(generate_etag(file_status)),
+        storage_class: Some(map_storage_class(&file_status.storage_policy.storage_type)),
+        content_type: Some(infer_content_type(object_name)),
+        ..Default::default()
+    };
 
     // TTL/Expiration information
     fill_ttl_info(&mut head, file_status);
