@@ -1,0 +1,87 @@
+# docker build -t curvine-compile-amzn2 -f Dockerfile_amzn2 .
+FROM amazonlinux:2
+
+# Add metadata labels
+ARG REPO_URL=https://github.com/curvineio/curvine
+LABEL org.opencontainers.image.source="${REPO_URL}"
+
+# 1. Install the basic toolchain and dependencies
+RUN yum install -y \
+    fuse3 \
+    fuse3-devel \
+    clang \
+    llvm \
+    llvm-devel \
+    git \
+    wget \
+    zip \
+    unzip \
+    nodejs \
+    npm \
+    java-1.8.0-openjdk-devel \
+    openssl-devel \
+    pkg-config \
+    tar \
+    && yum clean all
+
+# 2. Install the Rust toolchain
+# uncomment the following two lines if you met network problem
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
+ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
+    source $HOME/.cargo/env && \
+    rustup default stable
+
+# 3. Install protoc (auto-detect architecture)
+RUN mkdir -p /app/protoc && cd /app/protoc && \
+    ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        "x86_64") PROTOC_ARCH="x86_64" ;; \
+        "aarch64"|"arm64") PROTOC_ARCH="aarch_64" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-${PROTOC_ARCH}.zip" && \
+    unzip "protoc-27.2-linux-${PROTOC_ARCH}.zip" && \
+    chmod +x bin/protoc && \
+    rm -f *.zip
+ENV PATH="/app/protoc/bin:${PATH}"
+
+# 4. Install Maven
+RUN cd /app && \
+    curl -LO https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz && \
+    tar -xzf apache-maven-3.9.11-bin.tar.gz && \
+    mv apache-maven-3.9.11 maven && \
+    rm -f *.tar.gz
+ENV PATH="/app/maven/bin:${PATH}"
+
+# 5. Replace the configuration
+RUN mkdir -p /app/maven/conf
+COPY settings.xml /app/maven/conf/settings.xml
+
+RUN mkdir -p /root/.cargo
+COPY config /root/.cargo/config.toml
+
+# Add useful aliases and settings to .bashrc for interactive sessions
+RUN echo 'export PS1="\[\033[01;32m\]curvine\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' >> /root/.bashrc && \
+    echo 'alias ll="ls -la"' >> /root/.bashrc && \
+    echo 'alias cb="cargo build"' >> /root/.bashrc && \
+    echo 'alias ct="cargo test"' >> /root/.bashrc && \
+    echo 'alias cr="cargo run"' >> /root/.bashrc
+
+# Add after all installation commands
+RUN rm -rf \
+    /var/cache/yum/* \
+    /tmp/* \
+    /var/tmp/*
+
+
+WORKDIR /workspace
+
+# Verify installation and show architecture
+RUN echo "Architecture: $(uname -m)" && \
+    rustc --version && cargo --version && protoc --version && mvn --version
+
+# Use ENTRYPOINT to ensure environment is loaded
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["bash"]
