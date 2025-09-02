@@ -1,0 +1,39 @@
+[package]
+name = "curvine-s3-gateway"
+version = "0.2.1-beta"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+clap = { workspace = true }
+axum = { version = "0.8.4", features = ["macros"] }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+async-trait = { workspace = true }
+chrono = { workspace = true, default-features = false, features = ["clock"] }
+uuid = { workspace = true }
+md5 = "0.7"
+thiserror = { workspace = true }
+rand = { workspace = true }
+toml = { workspace = true }
+scopeguard = "1.2"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+base64 = "0.21"
+hex = "0.4"
+log = { workspace = true }
+quick-xml = { version = "0.31", features = ["serialize"] }
+serde-xml-rs = "0.6"
+futures = { workspace = true }
+
+curvine-common = { path = "../curvine-common" }
+curvine-client = { path = "../curvine-client" }
+orpc = { path = "../orpc" }
+
+# bws-rs removed: migrated source in-tree
+# bws-rs = { path = "/home/oppo/Documents/bws-rs" } 

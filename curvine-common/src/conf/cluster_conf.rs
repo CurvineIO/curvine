@@ -54,6 +54,8 @@ pub struct ClusterConf {
 
     pub fuse: FuseConf,
 
+    pub s3_gateway: S3GatewayConf,
+
     pub job: JobConf,
 }
 
@@ -240,7 +242,8 @@ impl Default for ClusterConf {
             log: Default::default(),
             client: Default::default(),
             fuse: FuseConf::default(),
-            job: JobConf::default(),
+            s3_gateway: Default::default(),
+            job: Default::default(),
         }
     }
 }
@@ -248,5 +251,28 @@ impl Default for ClusterConf {
 impl Display for ClusterConf {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "")
+    }
+}
+
+/// S3 Object Gateway configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct S3GatewayConf {
+    pub listen: String,
+    pub region: String,
+    pub multipart_temp: String,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+}
+
+impl Default for S3GatewayConf {
+    fn default() -> Self {
+        Self {
+            listen: "0.0.0.0:9900".to_string(),
+            region: "us-east-1".to_string(),
+            multipart_temp: "/tmp/curvine-multipart".to_string(),
+            access_key: None,
+            secret_key: None,
+        }
     }
 }

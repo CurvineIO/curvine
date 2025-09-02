@@ -52,6 +52,7 @@ help:
 	@echo "  make build                                  - Build entire project in release mode"
 	@echo "  make build ARGS='-d'                       - Build entire project in debug mode"
 	@echo "  make build ARGS='-p server -p client'       - Build only server and client components"
+	@echo "  make build ARGS='-p object'                  - Build S3 object gateway"
 	@echo "  make build ARGS='--package core --ufs s3'   - Build core packages with S3 native SDK"
 	@echo "  make cargo ARGS='test --verbose'            - Run cargo test with verbose output"
 	@echo "  make csi-docker-fast                        - Build curvine-csi Docker image quickly"
