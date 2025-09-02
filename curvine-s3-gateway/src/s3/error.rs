@@ -23,8 +23,8 @@ pub enum Error {
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Illegal => write!(f, "Illegal"),
-            Self::UnSupport => write!(f, "UnSupport"),
+            Self::Illegal => write!(f, "{}", "Illegal"),
+            Self::UnSupport => write!(f, "{}", "UnSupport"),
             Self::Other(arg0) => f.debug_tuple("Other").field(arg0).finish(),
         }
     }
@@ -33,8 +33,8 @@ impl Display for Error {
 impl Debug for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Illegal => write!(f, "Illegal"),
-            Self::UnSupport => write!(f, "UnSupport"),
+            Self::Illegal => write!(f, "{}", "Illegal"),
+            Self::UnSupport => write!(f, "{}", "UnSupport"),
             Self::Other(arg0) => f.debug_tuple("Other").field(arg0).finish(),
         }
     }
