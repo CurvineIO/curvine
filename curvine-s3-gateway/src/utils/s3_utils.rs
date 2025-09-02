@@ -19,7 +19,6 @@ use crate::s3::s3_api::{HeadObjectResult, ListObjectContent, Owner};
 use curvine_common::state::{FileStatus, StorageType, TtlAction};
 use std::collections::HashMap;
 
-/// Format timestamp in milliseconds to S3-compatible date string
 pub fn format_s3_timestamp(timestamp_ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(timestamp_ms / 1000, 0)
         .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())

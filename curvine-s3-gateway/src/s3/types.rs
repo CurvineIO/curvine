@@ -22,7 +22,6 @@ use orpc::runtime::AsyncRuntime;
 use std::sync::Arc;
 use tracing;
 
-/// Upload statistics for tracking upload progress
 #[derive(Debug, Default, Clone)]
 pub struct UploadStats {
     pub total_written: u64,
@@ -31,23 +30,19 @@ pub struct UploadStats {
 }
 
 impl UploadStats {
-    /// Create new upload statistics
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Add written bytes to statistics
     pub fn add_written(&mut self, bytes: u64) {
         self.total_written += bytes;
         self.chunks_processed += 1;
     }
 
-    /// Mark first chunk as logged
     pub fn mark_first_chunk_logged(&mut self) {
         self.first_chunk_logged = true;
     }
 
-    /// Check if first chunk needs logging
     pub fn should_log_first_chunk(&self) -> bool {
         !self.first_chunk_logged
     }
@@ -247,56 +242,31 @@ impl PutOperation {
 /// Supports standard HTTP range requests as defined in RFC 9110
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Range {
-    /// Int range in bytes: bytes=start-end or bytes=start-
-    /// This range is **inclusive**.
-    Int {
-        /// first position (0-based)
-        first: u64,
-        /// last position (0-based, inclusive), None means "to end"
-        last: Option<u64>,
-    },
-    /// Suffix range in bytes: bytes=-N
-    /// Represents the last N bytes of the resource
-    Suffix {
-        /// number of bytes from the end
-        length: u64,
-    },
+    Int { first: u64, last: Option<u64> },
+    Suffix { length: u64 },
 }
 
 impl Range {
-    /// Parse HTTP Range header value
-    ///
-    /// Supports:
-    /// - `bytes=0-499` (first 500 bytes)
-    /// - `bytes=500-999` (bytes 500-999)  
-    /// - `bytes=500-` (from byte 500 to end)
-    /// - `bytes=-500` (last 500 bytes)
-    ///
-    /// # Errors
-    /// Returns `Err` if the header format is invalid
     pub fn parse(header: &str) -> Result<Self, String> {
         let header = header.trim();
 
-        // Must start with "bytes="
         let range_spec = header
             .strip_prefix("bytes=")
             .ok_or("Range header must start with 'bytes='")?;
 
         if let Some(suffix_str) = range_spec.strip_prefix('-') {
-            // Suffix range: bytes=-N
             let length = suffix_str
                 .parse::<u64>()
                 .map_err(|_| format!("Invalid suffix length: {suffix_str}"))?;
             if length == 0 {
-                return Err("Suffix length cannot be zero".to_string());
+                return orpc::err_box!("Suffix length cannot be zero");
             }
             return Ok(Range::Suffix { length });
         }
 
-        // Int range: bytes=start-end or bytes=start-
         let parts: Vec<&str> = range_spec.splitn(2, '-').collect();
         if parts.len() != 2 {
-            return Err(format!("Invalid range format: {range_spec}"));
+            return orpc::err_box!("Invalid range format: {}", range_spec);
         }
 
         let first = parts[0]
@@ -304,10 +274,8 @@ impl Range {
             .map_err(|_| format!("Invalid start position: {}", parts[0]))?;
 
         if parts[1].is_empty() {
-            // bytes=start-
             Ok(Range::Int { first, last: None })
         } else {
-            // bytes=start-end
             let last = parts[1]
                 .parse::<u64>()
                 .map_err(|_| format!("Invalid end position: {}", parts[1]))?;
@@ -323,14 +291,11 @@ impl Range {
         }
     }
 
-    /// Convert range to actual byte range for a file of given size
-    ///
-    /// Returns (start_pos, bytes_to_read) or None if range is not satisfiable
     pub fn to_byte_range(&self, file_size: u64) -> Option<(u64, u64)> {
         match *self {
             Range::Int { first, last } => {
                 if first >= file_size {
-                    return None; // Range not satisfiable
+                    return None;
                 }
 
                 let end_pos = match last {
@@ -339,7 +304,7 @@ impl Range {
                 };
 
                 if first > end_pos {
-                    return None; // Range not satisfiable
+                    return None;
                 }
 
                 let bytes_to_read = end_pos - first + 1;
@@ -357,7 +322,6 @@ impl Range {
         }
     }
 
-    /// Format range as Content-Range header value
     pub fn to_content_range(&self, file_size: u64) -> Option<String> {
         if let Some((start, length)) = self.to_byte_range(file_size) {
             let end = start + length - 1;

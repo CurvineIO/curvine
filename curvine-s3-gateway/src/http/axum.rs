@@ -17,13 +17,10 @@ use std::collections::HashMap;
 use axum::response::IntoResponse;
 use futures::StreamExt;
 
-use crate::auth::sig_v4;
+use crate::auth::{sig_v4, AccesskeyStore};
 use crate::s3::s3_api::VRequest;
 use crate::s3::VRequestPlus;
 use axum::body;
-
-// use std::sync::Arc; // Used via std::sync::Arc in code
-
 pub struct Request {
     request: axum::http::Request<axum::body::Body>,
     query: Option<HashMap<String, String>>,
@@ -303,7 +300,7 @@ pub async fn handle_authorization_middleware(
 ) -> impl axum::response::IntoResponse {
     let ret = req
         .extensions()
-        .get::<std::sync::Arc<dyn crate::auth::AccesskeyStore + Send + Sync>>()
+        .get::<crate::auth::AccessKeyStoreEnum>()
         .cloned();
 
     let ak_store = match ret {

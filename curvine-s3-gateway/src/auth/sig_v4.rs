@@ -39,25 +39,27 @@ pub struct BaseArgs {
     pub date: String,
 }
 
-#[derive(Debug)]
-pub struct AuthError(pub String);
+pub use crate::error::AuthError;
 
 pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, AuthError> {
     let authorization = r.get_header("authorization");
-    let authorization =
-        authorization.ok_or(AuthError("Missing authorization header".to_string()))?;
+    let authorization = authorization.ok_or(AuthError::MissingAuthHeader)?;
 
     let authorization = authorization.trim();
     let heads = authorization.splitn(2, ' ').collect::<Vec<&str>>();
     if heads.len() != 2 {
-        return Err(AuthError("Invalid authorization header format".to_string()));
+        return Err(AuthError::InvalidFormat(
+            "Invalid authorization header format".to_string(),
+        ));
     }
 
     match heads[0] {
         "AWS4-HMAC-SHA256" => {
             let heads = heads[1].split(',').collect::<Vec<&str>>();
             if heads.len() != 3 {
-                return Err(AuthError("Invalid authorization header format".to_string()));
+                return Err(AuthError::InvalidFormat(
+                    "Invalid authorization header format".to_string(),
+                ));
             }
             let mut credential = None;
             let mut singed_headers = None;
@@ -65,13 +67,15 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, AuthError> {
             for head in heads {
                 let heads = head.trim().splitn(2, '=').collect::<Vec<&str>>();
                 if heads.len() != 2 {
-                    return Err(AuthError("Invalid authorization header format".to_string()));
+                    return Err(AuthError::InvalidFormat(
+                        "Invalid authorization header format".to_string(),
+                    ));
                 }
                 match heads[0] {
                     "Credential" => {
                         let heads = heads[1].split('/').collect::<Vec<&str>>();
                         if heads.len() != 5 {
-                            return Err(AuthError(
+                            return Err(AuthError::InvalidFormat(
                                 "Invalid authorization header format".to_string(),
                             ));
                         }
@@ -84,22 +88,28 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, AuthError> {
                         signature = Some(heads[1]);
                     }
                     _ => {
-                        return Err(AuthError("Invalid authorization header format".to_string()));
+                        return Err(AuthError::InvalidFormat(
+                            "Invalid authorization header format".to_string(),
+                        ));
                     }
                 }
             }
 
             if signature.is_none() || singed_headers.is_none() || credential.is_none() {
-                return Err(AuthError("Invalid authorization header format".to_string()));
+                return Err(AuthError::InvalidFormat(
+                    "Invalid authorization header format".to_string(),
+                ));
             }
 
             let signature = signature.unwrap();
             let singed_headers = singed_headers.unwrap();
             let credential = credential.unwrap();
 
-            let content_hash = r
-                .get_header("x-amz-content-sha256")
-                .ok_or(AuthError("Missing content hash header".to_string()))?;
+            let content_hash =
+                r.get_header("x-amz-content-sha256")
+                    .ok_or(AuthError::InvalidFormat(
+                        "Missing content hash header".to_string(),
+                    ))?;
 
             // Special handling for common S3 content hash values
             let normalized_content_hash = match content_hash.as_str() {
@@ -120,7 +130,9 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, AuthError> {
 
             Ok(result)
         }
-        _ => Err(AuthError("Invalid authorization header format".to_string())),
+        _ => Err(AuthError::InvalidFormat(
+            "Invalid authorization header format".to_string(),
+        )),
     }
 }
 

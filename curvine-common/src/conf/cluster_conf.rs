@@ -263,6 +263,9 @@ pub struct S3GatewayConf {
     pub multipart_temp: String,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
+    pub enable_distributed_auth: bool,
+    pub credentials_path: Option<String>,
+    pub cache_refresh_interval_secs: u64,
 }
 
 impl Default for S3GatewayConf {
@@ -273,6 +276,9 @@ impl Default for S3GatewayConf {
             multipart_temp: "/tmp/curvine-multipart".to_string(),
             access_key: None,
             secret_key: None,
+            enable_distributed_auth: false,
+            credentials_path: None,
+            cache_refresh_interval_secs: 30,
         }
     }
 }

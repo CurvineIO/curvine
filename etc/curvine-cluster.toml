@@ -55,7 +55,7 @@ file_name = "curvine.log"
 
 
 # S3 Object Gateway configuration
-[object]
+[s3_gateway]
 # Listen address for S3 gateway (host:port)
 listen = "0.0.0.0:9900"
 # Region to report via GetBucketLocation
