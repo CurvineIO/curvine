@@ -132,6 +132,7 @@ impl LoadTaskRunner {
         let source_path = Path::from_str(&info.source_path)?;
         let ufs = UfsFileSystem::new(&source_path, info.job.ufs_conf.clone())?;
         let reader = ufs.open(&source_path).await?;
+        let source_status = ufs.get_status(&source_path).await?;
 
         // create cv writer
         let target_path = Path::from_str(&info.target_path)?;
@@ -143,6 +144,7 @@ impl LoadTaskRunner {
             .storage_type(info.job.storage_type)
             .ttl_ms(info.job.ttl_ms)
             .ttl_action(info.job.ttl_action)
+            .ufs_mtime(source_status.mtime)
             .build();
         let writer = self.fs.create_with_opts(&target_path, opts).await?;
 

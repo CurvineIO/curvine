@@ -241,7 +241,11 @@ impl JobManager {
 
         // check job status
         if self.check_job_exists(&job_id, &source_status, &target_path) {
-            info!("job {} already exists", job_id);
+            info!(
+                "job {}, source_path {} already exists",
+                job_id,
+                source_path.full_path()
+            );
             return Ok(result);
         }
 

@@ -43,8 +43,16 @@ impl StatCommand {
                             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
                         let formatted_mtime = mtime.format("%Y-%m-%d %H:%M:%S").to_string();
 
+                        let ufs_mtime = chrono::DateTime::from_timestamp(
+                            status.storage_policy.ufs_mtime / 1000,
+                            0,
+                        )
+                        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
+                        let formatted_ufs_mtime = ufs_mtime.format("%Y-%m-%d %H:%M:%S").to_string();
+
                         println!("Type: {}", if status.is_dir { "directory" } else { "file" });
                         println!("Modification time: {}", formatted_mtime);
+                        println!("Ufs Modification time: {}", formatted_ufs_mtime);
                         println!(
                             "Permission: {}rwxr-xr-x",
                             if status.is_dir { "d" } else { "-" }

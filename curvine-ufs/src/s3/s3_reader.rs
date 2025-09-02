@@ -37,7 +37,6 @@ pub struct S3Reader {
     len: i64,
     pos: i64,
     byte_stream: Option<ByteStream>,
-    mtime: i64,
 }
 
 impl S3Reader {
@@ -71,11 +70,6 @@ impl S3Reader {
             None => return err_ufs!("S3 error: Missing content length"),
         };
 
-        let mtime = head_result
-            .last_modified
-            .map(|x| x.to_millis().unwrap_or(0))
-            .unwrap_or(0);
-
         info!(
             "Created S3Reader {}, len = {}",
             path.full_path(),
@@ -91,7 +85,6 @@ impl S3Reader {
             len,
             pos: 0,
             byte_stream: None,
-            mtime,
         })
     }
 
@@ -116,10 +109,6 @@ impl S3Reader {
         }
 
         Ok(try_option_mut!(self.byte_stream))
-    }
-
-    pub fn get_mtime(&self) -> i64 {
-        self.mtime
     }
 }
 
