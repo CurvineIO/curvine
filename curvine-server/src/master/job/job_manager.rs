@@ -24,9 +24,9 @@ use curvine_common::state::{
     LoadTaskInfo, MountInfo, WorkerAddress,
 };
 use curvine_common::FsResult;
-use log::{error, info};
+use log::{error, info, warn};
 use orpc::client::ClientFactory;
-use orpc::common::{LocalTime, Utils};
+use orpc::common::{ByteUnit, LocalTime, Utils};
 use orpc::err_box;
 use orpc::io::net::InetAddr;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -258,15 +258,24 @@ impl JobManager {
         let res =
             self.rt
                 .block_on(self.create_all_tasks(&mut job_context, source_status, &ufs, &mnt));
-        self.jobs.insert(job_id, job_context);
 
         match res {
             Err(e) => {
+                warn!("Submit load job {} failed: {}", job_id, e);
                 // @todo Whether to cancel some tasks that may have been dispatched.
                 Err(e)
             }
 
-            Ok(()) => Ok(result),
+            Ok(size) => {
+                info!(
+                    "Submit load job {} success, tasks {}, total_size {}",
+                    job_id,
+                    job_context.tasks.len(),
+                    ByteUnit::byte_to_string(size as u64)
+                );
+                self.jobs.insert(job_id, job_context);
+                Ok(result)
+            }
         }
     }
 
@@ -276,10 +285,11 @@ impl JobManager {
         source_status: FileStatus,
         ufs: &UfsFileSystem,
         mnt: &MountInfo,
-    ) -> FsResult<()> {
+    ) -> FsResult<i64> {
         job.update_state(JobTaskState::Pending, "Assigning workers");
         let block_size = job.info.block_size;
 
+        let mut total_size = 0;
         let mut stack = LinkedList::new();
         let mut task_index = 0;
         stack.push_back(source_status);
@@ -298,6 +308,7 @@ impl JobManager {
 
                 let task_id = format!("{}_task_{}", job.info.job_id, task_index);
                 task_index += 1;
+                total_size += status.len;
 
                 let task = LoadTaskInfo {
                     job: job.info.clone(),
@@ -323,7 +334,7 @@ impl JobManager {
             }
         }
 
-        Ok(())
+        Ok(total_size)
     }
 
     fn cleanup_expired_jobs(jobs: JobStore, ttl_ms: i64) {
