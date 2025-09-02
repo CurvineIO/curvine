@@ -134,13 +134,13 @@ impl crate::utils::io::PollRead for BodyReader {
                     let vec_data = ret.to_vec();
                     // DEBUG: Log body data for debugging
                     log::debug!("HTTP-BODY-CHUNK: {} bytes", vec_data.len());
-                    if vec_data.len() > 0 {
+                    if !vec_data.is_empty() {
                         log::debug!(
                             "HTTP-BODY-HEX: {:?}",
                             vec_data
                                 .iter()
-                                .take(30)
-                                .map(|b| format!("{:02x}", b))
+                                .take(64)
+                                .map(|b| format!("{b:02x}"))
                                 .collect::<Vec<_>>()
                                 .join(" ")
                         );
@@ -207,20 +207,11 @@ impl crate::s3::s3_api::HeaderTaker for Request {
         HeaderWarp(self.request.headers().clone())
     }
 }
+#[derive(Default)]
 pub struct Response {
     status: u16,
     headers: axum::http::HeaderMap,
     body: Vec<u8>,
-}
-
-impl Default for Response {
-    fn default() -> Self {
-        Self {
-            status: Default::default(),
-            headers: Default::default(),
-            body: Default::default(),
-        }
-    }
 }
 
 impl From<Response> for axum::response::Response {

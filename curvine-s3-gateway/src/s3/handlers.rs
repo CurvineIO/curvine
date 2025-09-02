@@ -204,7 +204,7 @@ impl S3Handlers {
         }
 
         // Construct the file system path
-        let path = format!("/{}/{}", bucket, key);
+        let path = format!("/{bucket}/{key}");
         tracing::debug!("Mapped S3 path to Curvine path: {}", path);
         Ok(Path::from_str(&path)?)
     }
@@ -264,7 +264,7 @@ impl S3Handlers {
         }
 
         // Construct bucket directory path
-        let path = format!("/{}", bucket);
+        let path = format!("/{bucket}");
         tracing::debug!("Mapped S3 bucket to Curvine path: {}", path);
         Ok(Path::from_str(&path)?)
     }
@@ -534,7 +534,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                 reader.remaining().max(0) as u64
             };
 
-            log::debug!("GetObject: will read {} bytes directly", target_read);
+            log::debug!("GetObject: will read {target_read} bytes directly");
 
             // Stream processing with fixed 4KB buffer for memory efficiency
             const CHUNK_SIZE: usize = 4096; // 4KB chunks for memory efficiency
@@ -714,7 +714,7 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
         // Clone necessary data for async block
         let fs = self.fs.clone();
         let object = object.to_string();
-        let path = Path::from_str(format!("/{}", object));
+        let path = Path::from_str(format!("/{object}"));
 
         let path = path.map_err(|e| e.to_string())?;
         match fs.delete(&path, false).await {
@@ -1031,7 +1031,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             let _ = tokio::fs::create_dir_all(&dir).await;
 
             // Create file for this specific part
-            let path = format!("{}/{}", dir, part_number);
+            let path = format!("{dir}/{part_number}");
             let mut file = match tokio::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -1071,7 +1071,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
 
             // Generate ETag from MD5 hash
             let digest = hasher.compute();
-            Ok(format!("\"{:x}\"", digest))
+            Ok(format!("\"{digest:x}\""))
         })
     }
 
@@ -1137,7 +1137,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
 
             // Prepare temporary directory path using configured multipart temp directory
             let multipart_temp = self.multipart_temp.clone();
-            let dir = format!("{}/{}", multipart_temp, upload_id);
+            let dir = format!("{multipart_temp}/{upload_id}");
 
             // Sort parts by part number to ensure correct order
             let mut part_list = data.to_vec();
@@ -1145,7 +1145,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
 
             // Concatenate all parts in order
             for (_, num) in part_list {
-                let path = format!("{}/{}", dir, num);
+                let path = format!("{dir}/{num}");
                 let mut file = match tokio::fs::OpenOptions::new().read(true).open(&path).await {
                     Ok(f) => f,
                     Err(_) => return Err(()),
@@ -1170,7 +1170,7 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             }
 
             // Complete the final object write
-            if let Err(_) = writer.complete().await {
+            if writer.complete().await.is_err() {
                 return Err(());
             }
 

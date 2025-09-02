@@ -204,10 +204,8 @@ async fn init_s3_authentication(
             );
 
             Err(format!(
-                "No S3 credentials configured. Gateway cannot start without authentication. {}",
-                env_err
-            )
-            .into())
+                "No S3 credentials configured. Gateway cannot start without authentication. {env_err}"
+            ).into())
         }
     }
 }

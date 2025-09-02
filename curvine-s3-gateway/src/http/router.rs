@@ -354,8 +354,7 @@ impl S3Router {
                 // Analyze query string to determine multipart operation
                 let query_string = req.uri().query();
                 let is_create_session = if let Some(query) = query_string {
-                    let has_uploads = query.contains("uploads=") || query.contains("uploads");
-                    has_uploads
+                    query.contains("uploads=") || query.contains("uploads")
                 } else {
                     false
                 };
@@ -581,7 +580,7 @@ impl S3Router {
                         // Simple XML response without complex struct
                         let xml_content = match location {
                             Some(loc) => {
-                                format!("<LocationConstraint>{}</LocationConstraint>", loc)
+                                format!("<LocationConstraint>{loc}</LocationConstraint>")
                             }
                             None => "<LocationConstraint></LocationConstraint>".to_string(),
                         };

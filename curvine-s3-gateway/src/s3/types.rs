@@ -129,16 +129,16 @@ impl ChunkProcessor {
         }
 
         let n = chunk.len();
-        log::debug!("POLLREAD-CHUNK: {} bytes", n);
+        log::debug!("POLLREAD-CHUNK: {n} bytes");
 
         // Log hex dump for debugging
         if n > 0 {
             log::debug!(
-                "POLLREAD-HEX: {:?}",
+                "POLLREAD-HEX: {}",
                 chunk
                     .iter()
                     .take(30)
-                    .map(|b| format!("{:02x}", b))
+                    .map(|b| format!("{b:02x}"))
                     .collect::<Vec<_>>()
                     .join(" ")
             );
@@ -146,12 +146,12 @@ impl ChunkProcessor {
 
         // Log first chunk details for debugging
         if stats.should_log_first_chunk() {
-            log::debug!("PUT DEBUG - First chunk: {} bytes", n);
+            log::debug!("PUT DEBUG - First chunk: {n} bytes");
             log::debug!(
-                "PUT DEBUG - First chunk hex: {:?}",
-                chunk[..n.min(50)]
+                "PUT DEBUG - First chunk hex: {}",
+                chunk[..n.min(64)]
                     .iter()
-                    .map(|b| format!("{:02x}", b))
+                    .map(|b| format!("{b:02x}"))
                     .collect::<Vec<_>>()
                     .join(" ")
             );
@@ -280,14 +280,13 @@ impl Range {
         // Must start with "bytes="
         let range_spec = header
             .strip_prefix("bytes=")
-            .ok_or_else(|| "Range header must start with 'bytes='")?;
+            .ok_or("Range header must start with 'bytes='")?;
 
-        if range_spec.starts_with('-') {
+        if let Some(suffix_str) = range_spec.strip_prefix('-') {
             // Suffix range: bytes=-N
-            let suffix_str = &range_spec[1..];
             let length = suffix_str
                 .parse::<u64>()
-                .map_err(|_| format!("Invalid suffix length: {}", suffix_str))?;
+                .map_err(|_| format!("Invalid suffix length: {suffix_str}"))?;
             if length == 0 {
                 return Err("Suffix length cannot be zero".to_string());
             }
@@ -297,7 +296,7 @@ impl Range {
         // Int range: bytes=start-end or bytes=start-
         let parts: Vec<&str> = range_spec.splitn(2, '-').collect();
         if parts.len() != 2 {
-            return Err(format!("Invalid range format: {}", range_spec));
+            return Err(format!("Invalid range format: {range_spec}"));
         }
 
         let first = parts[0]
@@ -314,8 +313,7 @@ impl Range {
                 .map_err(|_| format!("Invalid end position: {}", parts[1]))?;
             if first > last {
                 return Err(format!(
-                    "Start position {} cannot be greater than end position {}",
-                    first, last
+                    "Start position {first} cannot be greater than end position {last}"
                 ));
             }
             Ok(Range::Int {
@@ -363,7 +361,7 @@ impl Range {
     pub fn to_content_range(&self, file_size: u64) -> Option<String> {
         if let Some((start, length)) = self.to_byte_range(file_size) {
             let end = start + length - 1;
-            Some(format!("bytes {}-{}/{}", start, end, file_size))
+            Some(format!("bytes {start}-{end}/{file_size}"))
         } else {
             None
         }

@@ -71,7 +71,7 @@ impl std::str::FromStr for ArchiveStatus {
         match s {
             "ARCHIVE_ACCESS" => Ok(ArchiveStatus::ArchiveAccess),
             "DEEP_ARCHIVE_ACCESS" => Ok(ArchiveStatus::DeepArchiveAccess),
-            _ => Err(Error::Other(format!("Invalid ArchiveStatus value: {}", s))),
+            _ => Err(Error::Other(format!("Invalid ArchiveStatus value: {s}"))),
         }
     }
 }
@@ -518,8 +518,13 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
                 // Add reasonable limit: maximum 1GB suffix range
                 const MAX_SUFFIX_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
                 if suffix_len > MAX_SUFFIX_SIZE {
+                    tracing::warn!(
+                        "Suffix range size {} exceeds maximum allowed {}",
+                        suffix_len,
+                        MAX_SUFFIX_SIZE
+                    );
+                    resp.set_header("content-range", &format!("bytes */{total_len}"));
                     resp.set_status(416); // Range Not Satisfiable
-                    resp.set_header("content-range", &format!("bytes */{}", total_len));
                     resp.send_header();
                     return;
                 }
@@ -562,10 +567,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         };
         resp_len = end - start + 1;
         status = 206;
-        resp.set_header(
-            "content-range",
-            &format!("bytes {}-{}/{}", start, end, total_len),
-        );
+        resp.set_header("content-range", &format!("bytes {start}-{end}/{total_len}"));
     }
 
     // Apply headers
@@ -588,9 +590,9 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
             // If key already starts with x-amz-meta-, use as-is
             // Otherwise, add the x-amz-meta- prefix
             let header_name = if key.starts_with("x-amz-meta-") {
-                key
+                key.to_string()
             } else {
-                format!("x-amz-meta-{}", key)
+                format!("x-amz-meta-{key}")
             };
             resp.set_header(&header_name, &value);
         }
@@ -712,7 +714,7 @@ pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
 
             match quick_xml::se::to_string(&result) {
                 Ok(data) => {
-                    log::debug!("ListObjectsV2 XML => {}", data);
+                    log::debug!("ListObjectsV2 XML => {data}");
                     resp.set_header("content-type", "application/xml");
                     resp.set_header("content-length", data.len().to_string().as_str());
                     resp.set_status(200);
@@ -730,7 +732,6 @@ pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
                         log::error!("write body error {err}");
                         resp.set_status(500);
                         resp.send_header();
-                        return;
                     }
                 }
 
@@ -879,9 +880,7 @@ pub struct PutObjectOption {
 
 impl PutObjectOption {
     pub fn invalid(&self) -> bool {
-        if self.content_length.is_none() {
-            return false;
-        } else if self.content_md5.is_none() {
+        if self.content_length.is_none() || self.content_md5.is_none() {
             return false;
         }
         true
@@ -1532,7 +1531,7 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
     if upload_id.is_none() || part_number.is_none() {
         resp.set_status(400);
     } else {
-        let ret = u32::from_str_radix(part_number.unwrap().as_str(), 10);
+        let ret = part_number.unwrap().as_str().parse::<u32>();
         if ret.is_err() {
             resp.set_status(400);
             return;
@@ -2175,10 +2174,7 @@ async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::s
                     None,
                 ));
             } else {
-                let file_name = format!(
-                    ".sys_bws/{}",
-                    uuid::Uuid::new_v4().to_string()[..8].to_string()
-                );
+                let file_name = format!(".sys_bws/{}", &uuid::Uuid::new_v4().to_string()[..8]);
                 let mut fd = tokio::fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)

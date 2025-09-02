@@ -38,21 +38,25 @@ pub struct BaseArgs {
     pub date: String,
 }
 
-pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, ()> {
+#[derive(Debug)]
+pub struct AuthError(pub String);
+
+pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, AuthError> {
     let authorization = r.get_header("authorization");
-    let authorization = authorization.ok_or(())?;
+    let authorization =
+        authorization.ok_or(AuthError("Missing authorization header".to_string()))?;
 
     let authorization = authorization.trim();
     let heads = authorization.splitn(2, ' ').collect::<Vec<&str>>();
     if heads.len() != 2 {
-        return Err(());
+        return Err(AuthError("Invalid authorization header format".to_string()));
     }
 
     match heads[0] {
         "AWS4-HMAC-SHA256" => {
             let heads = heads[1].split(',').collect::<Vec<&str>>();
             if heads.len() != 3 {
-                return Err(());
+                return Err(AuthError("Invalid authorization header format".to_string()));
             }
             let mut credential = None;
             let mut singed_headers = None;
@@ -60,13 +64,15 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, ()> {
             for head in heads {
                 let heads = head.trim().splitn(2, '=').collect::<Vec<&str>>();
                 if heads.len() != 2 {
-                    return Err(());
+                    return Err(AuthError("Invalid authorization header format".to_string()));
                 }
                 match heads[0] {
                     "Credential" => {
                         let heads = heads[1].split('/').collect::<Vec<&str>>();
                         if heads.len() != 5 {
-                            return Err(());
+                            return Err(AuthError(
+                                "Invalid authorization header format".to_string(),
+                            ));
                         }
                         credential = Some((heads[0], heads[1], heads[2], heads[3], heads[4]));
                     }
@@ -77,20 +83,22 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, ()> {
                         signature = Some(heads[1]);
                     }
                     _ => {
-                        return Err(());
+                        return Err(AuthError("Invalid authorization header format".to_string()));
                     }
                 }
             }
 
             if signature.is_none() || singed_headers.is_none() || credential.is_none() {
-                return Err(());
+                return Err(AuthError("Invalid authorization header format".to_string()));
             }
 
             let signature = signature.unwrap();
             let singed_headers = singed_headers.unwrap();
             let credential = credential.unwrap();
 
-            let content_hash = r.get_header("x-amz-content-sha256").ok_or(())?;
+            let content_hash = r
+                .get_header("x-amz-content-sha256")
+                .ok_or(AuthError("Missing content hash header".to_string()))?;
 
             // Special handling for common S3 content hash values
             let normalized_content_hash = match content_hash.as_str() {
@@ -111,11 +119,12 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, ()> {
 
             Ok(result)
         }
-        _ => Err(()),
+        _ => Err(AuthError("Invalid authorization header format".to_string())),
     }
 }
 
-pub fn get_v4_signature<'a, T: VHeader, S: ToString>(
+#[allow(clippy::too_many_arguments)]
+pub fn get_v4_signature<T: VHeader, S: ToString>(
     req: &T,
     method: &str,
     region: &str,
@@ -144,7 +153,7 @@ pub fn get_v4_signature<'a, T: VHeader, S: ToString>(
                     canonical_header
                 }
                 None => {
-                    let canonical_header = format!("{}:", header_name);
+                    let canonical_header = format!("{header_name}:");
                     canonical_header
                 }
             }
@@ -175,13 +184,7 @@ pub fn get_v4_signature<'a, T: VHeader, S: ToString>(
 
     // Build canonical request
     let canonical_request = format!(
-        "{}\n{}\n{}\n{}\n\n{}\n{}",
-        method,
-        url_path,
-        canonical_query_string,
-        canonical_headers,
-        signed_headers_string,
-        content_hash
+        "{method}\n{url_path}\n{canonical_query_string}\n{canonical_headers}\n\n{signed_headers_string}\n{content_hash}"
     );
 
     let ksign = get_v4_ksigning(secretkey, region, &xamz_date)?;
@@ -222,7 +225,7 @@ fn get_v4_ksigning(secretkey: &str, region: &str, xamz_date: &str) -> GenericRes
     circle_hmac_sha256(
         format!("AWS4{secretkey}").as_str(),
         vec![
-            xamz_date[..8].as_bytes(),
+            &xamz_date.as_bytes()[..8],
             region.as_bytes(),
             "s3".as_bytes(),
             "aws4_request".as_bytes(),
@@ -241,10 +244,10 @@ fn circle_hmac_sha256(initkey: &str, values: &[&[u8]], target: &mut [u8]) -> Gen
     let mut hsh = ret.unwrap();
     hsh.update(values[0]);
     let mut next = hsh.finalize().into_bytes();
-    for i in 1..values.len() {
+    for value in values.iter().skip(1) {
         match Hmac::<sha2::Sha256>::new_from_slice(&next) {
             Ok(mut hsh) => {
-                hsh.update(values[i]);
+                hsh.update(value);
                 next = hsh.finalize().into_bytes();
             }
             Err(err) => {
