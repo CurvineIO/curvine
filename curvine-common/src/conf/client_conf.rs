@@ -160,6 +160,8 @@ pub struct ClientConf {
     pub metric_report_interval: Duration,
     #[serde(alias = "metric_report_interval")]
     pub metric_report_interval_str: String,
+
+    pub close_timeout_secs: u64,
 }
 
 impl ClientConf {
@@ -170,6 +172,8 @@ impl ClientConf {
     pub const DEFAULT_FILE_SYSTEM_MODE: u32 = 0o777;
 
     pub const DEFAULT_METRIC_REPORT_INTERVAL_STR: &'static str = "10s";
+
+    pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
     pub fn init(&mut self) -> CommonResult<()> {
         self.block_size = ByteUnit::from_str(&self.block_size_str)?.as_byte() as i64;
@@ -317,6 +321,7 @@ impl Default for ClientConf {
             metric_report_enable: true,
             metric_report_interval: Default::default(),
             metric_report_interval_str: Self::DEFAULT_METRIC_REPORT_INTERVAL_STR.to_string(),
+            close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
         };
 
         conf.init().unwrap();

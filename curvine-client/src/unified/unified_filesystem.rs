@@ -251,13 +251,15 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
             );
             self.metrics
                 .mount_cache_hits
-                .with_label_values(&[mount.mount_id()]);
+                .with_label_values(&[mount.mount_id()])
+                .inc();
 
             return Ok(UnifiedReader::Cv(self.cv.open(path).await?));
         } else {
             self.metrics
                 .mount_cache_misses
-                .with_label_values(&[mount.mount_id()]);
+                .with_label_values(&[mount.mount_id()])
+                .inc();
         }
 
         if mount.info.auto_cache() {

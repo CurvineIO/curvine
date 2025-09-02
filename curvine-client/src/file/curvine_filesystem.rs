@@ -40,8 +40,6 @@ pub struct CurvineFileSystem {
 }
 
 impl CurvineFileSystem {
-    pub const CLOSE_TIMEOUT_SECS: u64 = 5;
-
     pub fn with_rt(conf: ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
         let fs_context = Arc::new(FsContext::with_rt(conf, rt.clone())?);
         let fs_client = FsClient::new(fs_context.clone());
@@ -322,7 +320,7 @@ impl CurvineFileSystem {
     // close fs, report metrics
     pub async fn cleanup(&self) {
         let res = timeout(
-            Duration::from_secs(Self::CLOSE_TIMEOUT_SECS),
+            Duration::from_secs(self.conf().client.close_timeout_secs),
             self.metrics_report(),
         )
         .await;

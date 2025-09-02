@@ -89,7 +89,7 @@ impl TryFrom<&str> for ConsistencyStrategy {
 }
 
 /// Mount information structure
-#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq, Default)]
 pub struct MountInfo {
     pub cv_path: String,
     pub ufs_path: String,
@@ -122,9 +122,6 @@ impl MountInfo {
             return err_box!("path {} is not cv path", path);
         }
 
-        // parse real path
-        // mnt: /xuen-test s3://flink/xuen-test
-        // Path /xuen-test/a -> s3://flink/xuen-test/a
         let sub_path = path.path().replacen(&self.cv_path, "", 1);
         Path::from_str(format!("{}/{}", self.ufs_path, sub_path))
     }
@@ -134,10 +131,7 @@ impl MountInfo {
             return err_box!("path {} is not ufs path", path);
         }
 
-        // parse real path
-        // mnt: /xuen-test s3://flink/xuen-test
-        // Path s3://flink/xuen-test/a -> /xuen-test/a
-        let sub_path = path.path().replacen(&self.ufs_path, "", 1);
+        let sub_path = path.full_path().replacen(&self.ufs_path, "", 1);
         Path::from_str(format!("{}/{}", self.cv_path, sub_path))
     }
 }
@@ -277,5 +271,72 @@ impl MountOptionsBuilder {
             mount_type: self.mount_type,
             remove_properties: self.remove_properties,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::fs::Path;
+    use crate::state::MountInfo;
+
+    #[test]
+    fn test_path_cst() {
+        let info = MountInfo {
+            ufs_path: "s3://spark/test1".to_string(),
+            cv_path: "/spark/test1".to_string(),
+            ..Default::default()
+        };
+        let path = Path::from_str("s3://spark/test1/1.csv").unwrap();
+        assert_eq!(
+            info.get_cv_path(&path).unwrap().full_path(),
+            "/spark/test1/1.csv"
+        );
+
+        let path = Path::from_str("s3://spark/test1/test/dt=2025/1.csv").unwrap();
+        assert_eq!(
+            info.get_cv_path(&path).unwrap().full_path(),
+            "/spark/test1/test/dt=2025/1.csv"
+        );
+
+        let path = Path::from_str("/spark/test1/1.csv").unwrap();
+        assert_eq!(
+            info.get_ufs_path(&path).unwrap().full_path(),
+            "s3://spark/test1/1.csv"
+        );
+
+        let path = Path::from_str("/spark/test1/test/dt=2025/1.csv").unwrap();
+        assert_eq!(
+            info.get_ufs_path(&path).unwrap().full_path(),
+            "s3://spark/test1/test/dt=2025/1.csv"
+        );
+    }
+
+    #[test]
+    fn test_path_arch() {
+        let info = MountInfo {
+            ufs_path: "s3://spark/a/b".to_string(),
+            cv_path: "/my".to_string(),
+            ..Default::default()
+        };
+        let path = Path::from_str("s3://spark/a/b/1.csv").unwrap();
+        assert_eq!(info.get_cv_path(&path).unwrap().full_path(), "/my/1.csv");
+
+        let path = Path::from_str("s3://spark/a/b/c/dt=2025/1.csv").unwrap();
+        assert_eq!(
+            info.get_cv_path(&path).unwrap().full_path(),
+            "/my/c/dt=2025/1.csv"
+        );
+
+        let path = Path::from_str("/my/1.csv").unwrap();
+        assert_eq!(
+            info.get_ufs_path(&path).unwrap().full_path(),
+            "s3://spark/a/b/1.csv"
+        );
+
+        let path = Path::from_str("/my/c/dt=2025/1.csv").unwrap();
+        assert_eq!(
+            info.get_ufs_path(&path).unwrap().full_path(),
+            "s3://spark/a/b/c/dt=2025/1.csv"
+        );
     }
 }

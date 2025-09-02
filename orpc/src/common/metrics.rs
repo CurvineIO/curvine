@@ -46,7 +46,7 @@ impl Metrics {
         }
     }
 
-    pub fn name(&self) -> &str {
+    pub fn get_name(&self) -> &str {
         match self {
             Metrics::Counter(v) => &v.desc()[0].fq_name,
             Metrics::CounterVec(v) => &v.desc()[0].fq_name,
@@ -56,11 +56,11 @@ impl Metrics {
     }
 
     fn register(m: Metrics) -> CommonResult<()> {
-        if METRICS_MAP.contains_key(m.name()) {
+        if METRICS_MAP.contains_key(m.get_name()) {
             return Ok(());
         }
 
-        let res = METRICS_MAP.entry(m.name().to_string()).or_insert(m);
+        let res = METRICS_MAP.entry(m.get_name().to_string()).or_insert(m);
         default_registry().register(res.boxed())?;
         Ok(())
     }

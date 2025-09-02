@@ -18,7 +18,7 @@ use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsClient, FsContext};
 use curvine_client::rpc::JobMasterClient;
 use curvine_common::fs::{Path, Reader};
-use curvine_common::state::{JobTaskState, MountOptions};
+use curvine_common::state::{JobTaskState, MountOptions, TtlAction};
 use curvine_tests::Testing;
 use log::info;
 use orpc::common::Logger;
@@ -53,6 +53,9 @@ fn load_client_test() -> CommonResult<()> {
         let configs = get_s3_test_config().await;
         let mnt_opt = MountOptions::builder()
             .set_properties(configs)
+            .ttl_ms(36000)
+            .ttl_action(TtlAction::Delete)
+            .replicas(3)
             .build();
 
         let mount_path = Path::from_str(mount_path)?;
