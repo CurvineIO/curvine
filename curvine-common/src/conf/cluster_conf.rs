@@ -258,12 +258,11 @@ impl Display for ClusterConf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct S3GatewayConf {
-    /// Listen address for S3 gateway (host:port)
     pub listen: String,
-    /// Region to report via GetBucketLocation
     pub region: String,
-    /// Temporary directory for multipart uploads
     pub multipart_temp: String,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
 }
 
 impl Default for S3GatewayConf {
@@ -272,6 +271,8 @@ impl Default for S3GatewayConf {
             listen: "0.0.0.0:9900".to_string(),
             region: "us-east-1".to_string(),
             multipart_temp: "/tmp/curvine-multipart".to_string(),
+            access_key: None,
+            secret_key: None,
         }
     }
 }

@@ -61,7 +61,7 @@ pub struct ServerArgs {
 
     // Enable S3 object gateway alongside master
     #[arg(long, default_value_t = false)]
-    enable_object_gateway: bool,
+    enable_s3_gateway: bool,
 
     // Gateway listen address
     #[arg(long, default_value = "0.0.0.0:9900")]

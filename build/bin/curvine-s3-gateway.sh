@@ -20,7 +20,7 @@
 . "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
 
 # Service configuration
-SERVICE_NAME="curvine-gateway"
+SERVICE_NAME="curvine-s3-gateway"
 PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 LOG_DIR=${CURVINE_HOME}/logs
 OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
@@ -73,10 +73,10 @@ show_usage() {
 Usage: $0 [ACTION] [OPTIONS]
 
 ACTIONS:
-    start       Start the curvine-gateway S3 gateway service
-stop        Stop the curvine-gateway S3 gateway service
-status      Show the status of the curvine-gateway service
-restart     Restart the curvine-gateway S3 gateway service
+    start       Start the curvine-s3-gateway S3 gateway service
+stop        Stop the curvine-s3-gateway S3 gateway service
+status      Show the status of the curvine-s3-gateway service
+restart     Restart the curvine-s3-gateway S3 gateway service
 
 OPTIONS:
     --conf <config>     Path to curvine cluster configuration file

@@ -68,20 +68,14 @@ use tokio::io::AsyncWriteExt;
 use tracing;
 use uuid;
 
-/// Core S3 handlers implementation
+/// S3 Handlers Implementation
 ///
-/// This struct serves as the main implementation of all S3 API operations.
-/// It integrates with the Curvine file system and provides S3-compatible
-/// responses for all supported operations.
+/// This struct provides concrete implementations of all S3 API operations,
+/// serving as the bridge between HTTP requests and the Curvine file system.
+/// It maintains the necessary context and configuration for handling S3 operations
+/// efficiently and correctly.
 ///
-/// ## Design Principles
-///
-/// - **Stateless Operations**: Each handler method is stateless and thread-safe
-/// - **Async First**: All operations are designed for high-concurrency async execution
-/// - **Error Resilience**: Comprehensive error handling with proper S3 error responses
-/// - **Performance Focused**: Streaming operations for large objects without memory buffering
-///
-/// ## Thread Safety
+/// # Thread Safety
 ///
 /// The struct implements `Clone` and all fields are thread-safe, allowing
 /// multiple concurrent operations across different async tasks.
@@ -94,6 +88,10 @@ pub struct S3Handlers {
     /// S3 region identifier returned in various responses
     /// Used for GetBucketLocation and other region-aware operations
     pub region: String,
+
+    /// Temporary directory for multipart uploads
+    /// Configurable path where multipart upload parts are stored temporarily
+    pub multipart_temp: String,
 
     /// Shared async runtime for executing blocking file system operations
     /// Prevents blocking the main async executor with CPU-intensive tasks
@@ -110,6 +108,7 @@ impl S3Handlers {
     ///
     /// * `fs` - The unified filesystem instance for storage operations
     /// * `region` - The S3 region identifier to report in responses
+    /// * `multipart_temp` - Temporary directory path for multipart uploads
     /// * `rt` - Shared runtime for scheduling internal blocking tasks
     ///
     /// # Returns
@@ -120,9 +119,23 @@ impl S3Handlers {
     ///
     /// The handlers are designed to be cloneable and thread-safe, allowing
     /// the same instance to handle multiple concurrent requests efficiently.
-    pub fn new(fs: UnifiedFileSystem, region: String, rt: std::sync::Arc<AsyncRuntime>) -> Self {
-        tracing::debug!("Creating new S3Handlers with region: {}", region);
-        Self { fs, region, rt }
+    pub fn new(
+        fs: UnifiedFileSystem,
+        region: String,
+        multipart_temp: String,
+        rt: std::sync::Arc<AsyncRuntime>,
+    ) -> Self {
+        tracing::debug!(
+            "Creating new S3Handlers with region: {}, multipart_temp: {}",
+            region,
+            multipart_temp
+        );
+        Self {
+            fs,
+            region,
+            multipart_temp,
+            rt,
+        }
     }
 
     /// Convert S3 bucket and object key to Curvine filesystem path
@@ -1011,8 +1024,8 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             use bytes::BytesMut;
             use tokio::io::AsyncReadExt;
 
-            // Create temporary directory for this upload session
-            let dir = format!("/tmp/curvine-multipart/{}", upload_id);
+            // Create temporary directory for this upload session using configured path
+            let dir = format!("{}/{}", self.multipart_temp, upload_id);
             let _ = tokio::fs::create_dir_all(&dir).await;
 
             // Create file for this specific part
@@ -1120,8 +1133,9 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                 Err(_) => return Err(()),
             };
 
-            // Prepare temporary directory path
-            let dir = format!("/tmp/curvine-multipart/{}", upload_id);
+            // Prepare temporary directory path using configured multipart temp directory
+            let multipart_temp = self.multipart_temp.clone();
+            let dir = format!("{}/{}", multipart_temp, upload_id);
 
             // Sort parts by part number to ensure correct order
             let mut part_list = data.to_vec();

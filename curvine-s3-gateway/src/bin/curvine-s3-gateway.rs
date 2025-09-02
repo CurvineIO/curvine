@@ -14,9 +14,9 @@
 
 use clap::Parser;
 use curvine_common::conf::ClusterConf;
-use orpc::runtime::RpcRuntime;
+use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
-
+use std::sync::Arc;
 /// Curvine S3-compatible Object Gateway
 #[derive(Debug, Parser, Clone)]
 pub struct ObjectArgs {
@@ -64,7 +64,7 @@ fn main() -> CommonResult<()> {
         args.listen.clone()
     } else {
         // Use config value or default
-        conf.object.listen.clone()
+        conf.s3_gateway.listen.clone()
     };
 
     let region = if args.region != "us-east-1" {
@@ -72,7 +72,7 @@ fn main() -> CommonResult<()> {
         args.region.clone()
     } else {
         // Use config value or default
-        conf.object.region.clone()
+        conf.s3_gateway.region.clone()
     };
 
     tracing::info!(
@@ -82,14 +82,14 @@ fn main() -> CommonResult<()> {
     );
 
     // Create unified AsyncRuntime for all operations
-    let rt = std::sync::Arc::new(orpc::runtime::AsyncRuntime::new(
-        "curvine-gateway",
+    let rt = Arc::new(AsyncRuntime::new(
+        "curvine-s3-gateway",
         conf.client.io_threads,
         conf.client.worker_threads,
     ));
 
     // Run start_gateway with the unified runtime
-    rt.block_on(curvine_gateway::start_gateway(
+    rt.block_on(curvine_s3_gateway::start_gateway(
         conf,
         listen,
         region,

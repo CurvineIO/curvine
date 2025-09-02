@@ -39,7 +39,6 @@
 
 // Module declarations with brief descriptions
 pub mod auth; // Authentication and authorization mechanisms
-pub mod config; // Configuration management and utilities
 pub mod http; // HTTP layer with Axum integration and routing
 pub mod s3; // S3 API implementation and protocol handlers
 pub mod utils; // Utility functions and helper types
@@ -136,13 +135,18 @@ fn register_s3_handlers(
         ))
 }
 
-/// Initialize S3 authentication credentials with fallback strategy
+/// Initialize S3 authentication credentials with comprehensive fallback strategy
 ///
 /// This function implements a robust credential loading strategy that attempts
 /// multiple sources in order of preference:
 ///
-/// 1. **Environment Variables**: Standard AWS credential environment variables
-/// 2. **Fixed Development Credentials**: Fallback for development/testing
+/// 1. **Configuration File**: S3 gateway configuration (access_key, secret_key)
+/// 2. **Environment Variables**: Standard AWS credential environment variables
+/// 3. **Error**: No fallback credentials, gateway fails to start
+///
+/// # Arguments
+///
+/// * `s3_conf` - S3 gateway configuration containing optional credentials
 ///
 /// # Returns
 ///
@@ -154,42 +158,56 @@ fn register_s3_handlers(
 /// - `AWS_ACCESS_KEY_ID` or `CURVINE_ACCESS_KEY`: Access key identifier
 /// - `AWS_SECRET_ACCESS_KEY` or `CURVINE_SECRET_KEY`: Secret access key
 ///
-/// # Fallback Credentials
+/// # Error Handling
 ///
-/// If environment variables are not available, the function uses fixed
-/// development credentials that are compatible with common S3 testing tools.
+/// Returns an error if no credentials can be loaded from any source.
+/// This ensures the gateway doesn't start with insecure default credentials.
 ///
 /// # Security Notes
 ///
-/// - Environment-based credentials are preferred for production deployments
-/// - Fixed credentials should only be used in development environments
-/// - All credentials are stored in memory only and not persisted to disk
-///
-/// # Error Handling
-///
-/// Returns an error if neither environment variables nor fallback credentials
-/// can be loaded successfully.
+/// - Configuration-based credentials are preferred for production deployments
+/// - Environment-based credentials provide compatibility with AWS tooling
+/// - No default credentials are provided to prevent security issues
 async fn init_s3_authentication(
+    s3_conf: &curvine_common::conf::S3GatewayConf,
 ) -> orpc::CommonResult<Arc<dyn crate::auth::AccesskeyStore + Send + Sync>> {
-    // Attempt to load credentials from environment variables first
+    // First priority: Check configuration file credentials
+    if let (Some(access_key), Some(secret_key)) = (&s3_conf.access_key, &s3_conf.secret_key) {
+        if !access_key.trim().is_empty() && !secret_key.trim().is_empty() {
+            tracing::info!("Using S3 credentials from configuration file");
+            let store =
+                StaticAccessKeyStore::with_single_key(access_key.clone(), secret_key.clone());
+            return Ok(Arc::new(store));
+        }
+    }
+
+    // Second priority: Attempt to load credentials from environment variables
     match StaticAccessKeyStore::from_env() {
         Ok(store) => {
             tracing::info!("Using S3 credentials from environment variables");
             Ok(Arc::new(store))
         }
         Err(env_err) => {
-            tracing::warn!(
-                "Failed to load S3 credentials from environment: {}",
+            tracing::error!(
+                "Failed to load S3 credentials from both configuration and environment: {}",
                 env_err
             );
-
-            // Fall back to fixed test credentials for development
-            let store = StaticAccessKeyStore::with_single_key(
-                "AqU4axe4feDyIielarPI".to_string(),
-                "0CJZ2QfHi2tDb4DKuCJ2vnBEUXg5EYQt".to_string(),
+            tracing::error!("Please configure S3 credentials in one of the following ways:");
+            tracing::error!(
+                "1. Set access_key and secret_key in [s3_gateway] section of config file"
             );
-            tracing::warn!("Using fixed test S3 credentials for development");
-            Ok(Arc::new(store))
+            tracing::error!(
+                "2. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"
+            );
+            tracing::error!(
+                "3. Set CURVINE_ACCESS_KEY and CURVINE_SECRET_KEY environment variables"
+            );
+
+            Err(format!(
+                "No S3 credentials configured. Gateway cannot start without authentication. {}",
+                env_err
+            )
+            .into())
         }
     }
 }
@@ -267,15 +285,16 @@ pub async fn start_gateway(
     // Initialize the unified file system with the shared runtime
     let ufs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
 
-    // Create S3 handlers with file system and region configuration
+    // Create S3 handlers with file system, region, and multipart temp configuration
     let handlers = Arc::new(s3::handlers::S3Handlers::new(
         ufs,
         region.clone(),
+        conf.s3_gateway.multipart_temp.clone(),
         rt.clone(),
     ));
 
     // Initialize S3 authentication with fallback strategy
-    let ak_store = init_s3_authentication().await?;
+    let ak_store = init_s3_authentication(&conf.s3_gateway).await?;
     tracing::info!("S3 Gateway authentication configured successfully");
 
     // Configure the Axum application with middleware chain
