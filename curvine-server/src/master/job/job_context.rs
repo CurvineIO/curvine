@@ -18,7 +18,8 @@ use curvine_common::state::{
     WorkerAddress,
 };
 use curvine_common::FsResult;
-use orpc::common::{FastHashMap, FastHashSet, LocalTime};
+use log::{info, warn};
+use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use orpc::err_box;
 use orpc::sync::StateCtl;
 
@@ -147,6 +148,22 @@ impl JobContext {
         if complete == self.tasks.len() {
             job_state = JobTaskState::Completed;
             message = "All subtasks completed".into();
+            info!(
+                "job {} all subtasks completed, tasks {}, len = {}, cost {} ms",
+                self.info.job_id,
+                self.tasks.len(),
+                ByteUnit::byte_to_string(self.progress.loaded_size as u64),
+                LocalTime::mills() as i64 - self.info.create_time
+            )
+        } else if job_state == JobTaskState::Failed {
+            warn!(
+                "job {} execute failed, tasks {}, len = {}, cost {} ms, error {}",
+                self.info.job_id,
+                self.tasks.len(),
+                ByteUnit::byte_to_string(self.progress.loaded_size as u64),
+                LocalTime::mills() as i64 - self.info.create_time,
+                message
+            )
         }
 
         self.update_state(job_state, message);

@@ -113,8 +113,10 @@ impl LoadTaskRunner {
         self.update_progress(writer.pos(), reader.len()).await;
 
         info!(
-            "task {} completed, copy bytes {}, read cost {} ms, task cost {} ms",
+            "task {} completed, source_path {}, target_path {}, copy bytes {}, read cost {} ms, task cost {} ms",
             self.task.info.task_id,
+            self.task.info.source_path,
+            self.task.info.target_path,
             writer.pos(),
             read_cost_ms,
             total_cost_ms,
