@@ -30,6 +30,9 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
 
     private ByteBuffer[] buffer;
 
+    private final int chunkSize;
+    private final int chunkNum;
+
     private long pos = 0;
 
     private int bufIndex = 0;
@@ -44,12 +47,9 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
         this.libFs = libFs;
         this.nativeHandle = nativeHandle;
         this.oneByte = new byte[1];
-
-        this.buffer = new ByteBuffer[chunk_num];
-        for (int i = 0; i < chunk_num; i++) {
-            this.buffer[i] = CurvineNative.createBuffer(chunk_size);
-        }
         this.pos = pos;
+        this.chunkSize = chunk_size;
+        this.chunkNum = chunk_num;
     }
 
     private void checkClosed() throws IOException {
@@ -72,6 +72,10 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
     }
 
     protected ByteBuffer getBuffer() throws IOException {
+        if (buffer == null) {
+            buffer = createBufferArray(chunkSize, chunkNum);
+        }
+
         if (!buffer[bufIndex].hasRemaining()) {
             flushBuffer();
 
@@ -149,5 +153,28 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
     @Override
     public void hsync() throws IOException {
         // pass
+    }
+
+    private static ByteBuffer[] createBufferArray(int chunkSize, int chunkNum) {
+        if (chunkSize <= 0 || chunkNum <= 0) {
+            throw new IllegalArgumentException("chunkSize and chunkNum must be positive");
+        }
+
+        ByteBuffer sourceBuffer = CurvineNative.createBuffer(chunkSize * chunkNum);
+        ByteBuffer[] chunks = new ByteBuffer[chunkNum];
+
+        sourceBuffer.position(0);
+        sourceBuffer.limit(sourceBuffer.capacity());
+        for (int i = 0; i < chunkNum; i++) {
+            int startPos = i * chunkSize;
+            int endPos = startPos + chunkSize;
+
+            sourceBuffer.position(startPos);
+            sourceBuffer.limit(endPos);
+
+            chunks[i] = sourceBuffer.slice();
+        }
+
+        return chunks;
     }
 }
