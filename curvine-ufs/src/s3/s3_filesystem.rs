@@ -17,6 +17,7 @@ use crate::s3::SCHEME;
 use crate::s3::{ObjectStatus, S3Reader, S3Writer};
 use crate::FOLDER_SUFFIX;
 use crate::{err_ufs, UfsUtils};
+use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::Client;
@@ -49,19 +50,21 @@ impl S3FileSystem {
     }
 
     async fn get_object_status(&self, bucket: &str, key: &str) -> FsResult<Option<ObjectStatus>> {
-        let res = self
+        match self
             .client
             .head_object()
             .bucket(bucket)
             .key(key)
             .send()
-            .await;
-        match res {
-            Ok(v) => Ok(Some(ObjectStatus::from_head_object(key, &v))),
-            Err(e) => match e.into_service_error() {
-                HeadObjectError::NotFound(_) => Ok(None),
-                err => err_ufs!(err),
-            },
+            .await
+        {
+            Ok(output) => Ok(Some(ObjectStatus::from_head_object(key, &output))),
+            Err(SdkError::ServiceError(service_err))
+                if matches!(service_err.err(), HeadObjectError::NotFound(_)) =>
+            {
+                Ok(None)
+            }
+            Err(e) => err_ufs!(e),
         }
     }
 
