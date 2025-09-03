@@ -2,14 +2,14 @@ use crate::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::fs::Path;
 use curvine_common::state::MountInfo;
 use curvine_common::FsResult;
-use orpc::sync::FastSyncCache;
+use log::debug;
+use orpc::common::{FastHashMap, LocalTime};
+use orpc::sync::AtomicCounter;
 use orpc::CommonResult;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
 
-#[derive(Clone)]
 pub struct MountValue {
-    pub info: Arc<MountInfo>,
+    pub info: MountInfo,
     pub ufs: UfsFileSystem,
     pub mount_id: String,
 }
@@ -21,7 +21,7 @@ impl MountValue {
         let mount_id = format!("{}", info.mount_id);
 
         Ok(Self {
-            info: Arc::new(info),
+            info,
             ufs,
             mount_id,
         })
@@ -38,41 +38,66 @@ impl MountValue {
 }
 
 pub struct MountCache {
-    cache: FastSyncCache<String, Option<MountValue>>,
+    mounts: RwLock<FastHashMap<String, Arc<MountValue>>>,
+    update_interval: u64,
+    last_update: AtomicCounter,
 }
 
 impl MountCache {
-    pub fn new(ttl: Duration) -> Self {
+    pub fn new(update_interval: u64) -> Self {
         Self {
-            cache: FastSyncCache::new(100000, ttl),
+            mounts: RwLock::new(FastHashMap::new()),
+            update_interval,
+            last_update: AtomicCounter::new(0),
         }
+    }
+
+    fn need_update(&self) -> bool {
+        LocalTime::mills() > self.update_interval + self.last_update.get()
+    }
+
+    pub async fn check_update(&self, fs: &UnifiedFileSystem, force: bool) -> FsResult<()> {
+        if self.need_update() || force {
+            let mounts = fs.get_mount_table().await?;
+
+            let mut state = self.mounts.write().unwrap();
+            state.clear();
+
+            for item in mounts {
+                let value = MountValue::new(item)?;
+                state.insert(value.info.cv_path.clone(), Arc::new(value));
+            }
+
+            debug!("update mounts {:?}", state.len());
+            self.last_update.set(LocalTime::mills());
+        }
+
+        Ok(())
     }
 
     pub async fn get_mount(
         &self,
-        cv: &UnifiedFileSystem,
+        fs: &UnifiedFileSystem,
         path: &Path,
-    ) -> FsResult<Option<MountValue>> {
-        let key = path.path();
-        if let Some(v) = self.cache.get(key) {
-            return Ok(v.clone());
+    ) -> FsResult<Option<Arc<MountValue>>> {
+        self.check_update(fs, false).await?;
+
+        let state = self.mounts.read().unwrap();
+        if state.is_empty() {
+            return Ok(None);
         }
 
-        let mnt_info = cv.get_mount_info(path).await?;
-        let mnt_value = match mnt_info {
-            None => None,
-            Some(v) => Some(MountValue::new(v)?),
-        };
-
-        for item in path.get_possible_mounts() {
-            self.cache.insert(item, None);
+        for mount_path in path.get_possible_mounts() {
+            if let Some(mount) = state.get(&mount_path).cloned() {
+                return Ok(Some(mount));
+            }
         }
-        self.cache.insert(key.to_string(), mnt_value.clone());
 
-        Ok(mnt_value)
+        Ok(None)
     }
 
     pub fn remove(&self, path: &Path) {
-        self.cache.remove(path.path());
+        let mut state = self.mounts.write().unwrap();
+        state.remove(path.path());
     }
 }
