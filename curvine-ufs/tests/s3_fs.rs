@@ -15,7 +15,7 @@
 #[cfg(feature = "s3")]
 mod s3_tests {
     use bytes::BytesMut;
-    use curvine_common::conf::UfsConf;
+
     use curvine_common::fs::{FileSystem, Path, Reader, Writer};
     use curvine_common::state::FileStatus;
     use curvine_ufs::s3::S3FileSystem;
@@ -41,7 +41,7 @@ mod s3_tests {
 
     fn get_fs() -> Option<S3FileSystem> {
         let conf = get_s3_conf()?;
-        let fs = S3FileSystem::new(UfsConf::with_map(conf)).unwrap();
+        let fs = S3FileSystem::new(conf).unwrap();
         Some(fs)
     }
 

@@ -12,41 +12,61 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::aws_utils;
 use crate::s3::SCHEME;
 use crate::s3::{ObjectStatus, S3Reader, S3Writer};
+use crate::S3Conf;
 use crate::FOLDER_SUFFIX;
 use crate::{err_ufs, UfsUtils};
+use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_credential_types::Credentials;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::Client;
-use curvine_common::conf::UfsConf;
+use aws_smithy_types::error::display::DisplayErrorContext;
+use aws_types::region::Region;
+use aws_types::SdkConfig;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{FileStatus, SetAttrOpts};
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
 use orpc::CommonResult;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// S3 file system implementation
 #[derive(Clone)]
 pub struct S3FileSystem {
     client: Client,
-    conf: Arc<UfsConf>,
+    conf: Arc<S3Conf>,
 }
 
 impl S3FileSystem {
-    pub fn new(conf: UfsConf) -> FsResult<Self> {
-        let client = match aws_utils::create_s3_client(conf.get_config()) {
-            Ok(v) => v,
-            Err(e) => return err_ufs!("Failed to create S3 client: {}", e),
-        };
-        let client = (*client).clone();
+    pub fn new(conf: HashMap<String, String>) -> FsResult<Self> {
+        let conf = S3Conf::with_map(conf)?;
+        let client = Self::create_client(&conf);
         Ok(S3FileSystem {
             client,
             conf: Arc::new(conf),
         })
+    }
+
+    fn create_client(conf: &S3Conf) -> Client {
+        let credentials_provider =
+            Credentials::new(&conf.access_key, &conf.secret_key, None, None, "Static");
+        let shared_credentials_provider = SharedCredentialsProvider::new(credentials_provider);
+
+        let sdk_conf = SdkConfig::builder()
+            .endpoint_url(&conf.endpoint_url)
+            .region(Region::new(conf.region_name.clone()))
+            .credentials_provider(shared_credentials_provider)
+            .build();
+
+        let obj_conf = aws_sdk_s3::config::Builder::from(&sdk_conf)
+            .force_path_style(conf.force_path_style)
+            .build();
+
+        Client::from_conf(obj_conf)
     }
 
     async fn get_object_status(&self, bucket: &str, key: &str) -> FsResult<Option<ObjectStatus>> {
@@ -64,7 +84,10 @@ impl S3FileSystem {
             {
                 Ok(None)
             }
-            Err(e) => err_ufs!(e),
+
+            Err(e) => {
+                err_ufs!("{}", DisplayErrorContext(&e))
+            }
         }
     }
 
@@ -260,11 +283,7 @@ impl S3FileSystem {
     }
 }
 
-impl FileSystem<S3Writer, S3Reader, UfsConf> for S3FileSystem {
-    fn conf(&self) -> &UfsConf {
-        &self.conf
-    }
-
+impl FileSystem<S3Writer, S3Reader> for S3FileSystem {
     async fn mkdir(&self, path: &Path, create_parent: bool) -> FsResult<bool> {
         let (bucket, key) = UfsUtils::get_bucket_key(path)?;
 
@@ -300,7 +319,7 @@ impl FileSystem<S3Writer, S3Reader, UfsConf> for S3FileSystem {
         if let Some(parent) = path.parent()? {
             self.mkdir(&parent, true).await?;
         }
-        let writer = S3Writer::new(self.client.clone(), path, self.conf())?;
+        let writer = S3Writer::new(self.client.clone(), path, &self.conf)?;
         Ok(writer)
     }
 

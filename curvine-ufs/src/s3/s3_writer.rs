@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{err_ufs, UfsUtils};
+use crate::{err_ufs, S3Conf, UfsUtils};
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
 use aws_smithy_types::byte_stream::ByteStream;
 use bytes::{Bytes, BytesMut};
-use curvine_common::conf::UfsConf;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
@@ -57,7 +56,7 @@ impl S3Writer {
     ///
     /// # return
     /// Return IoResult<Self>, containing the initialized writer or error
-    pub fn new(client: Client, path: &Path, config: &UfsConf) -> FsResult<Self> {
+    pub fn new(client: Client, path: &Path, config: &S3Conf) -> FsResult<Self> {
         let (bucket, key) = UfsUtils::get_bucket_key(path)?;
 
         // Get the buffer size from the configuration, default is 5MB

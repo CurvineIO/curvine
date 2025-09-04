@@ -194,13 +194,8 @@ macro_rules! impl_filesystem_for_enum {
             ::curvine_common::fs::FileSystem<
                 $crate::unified::UnifiedWriter,
                 $crate::unified::UnifiedReader,
-                ::curvine_common::conf::UfsConf,
             > for $enum_name
         {
-            fn conf(&self) -> &::curvine_common::conf::UfsConf {
-                match_fs_variants!(self, conf)
-            }
-
             async fn mkdir(
                 &self,
                 path: &::curvine_common::fs::Path,

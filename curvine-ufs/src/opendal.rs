@@ -22,6 +22,7 @@ use futures::StreamExt;
 use opendal::services::*;
 use opendal::{layers::LoggingLayer, Operator};
 use orpc::sys::DataSlice;
+use std::collections::HashMap;
 
 use crate::err_ufs;
 
@@ -69,7 +70,6 @@ impl Reader for OpendalReader {
                 .operator
                 .reader_with(&self.object_path)
                 .chunk(self.chunk_size)
-                .concurrent(4)
                 .await
                 .map_err(|e| FsError::common(format!("Failed to create reader: {}", e)))?;
 
@@ -110,7 +110,6 @@ impl Reader for OpendalReader {
                 .operator
                 .reader_with(&self.object_path)
                 .chunk(self.chunk_size)
-                .concurrent(4)
                 .await
                 .map_err(|e| FsError::common(format!("Failed to create reader: {}", e)))?;
 
@@ -251,7 +250,7 @@ pub struct OpendalFileSystem {
 }
 
 impl OpendalFileSystem {
-    pub fn new(path: &Path, conf: UfsConf) -> FsResult<Self> {
+    pub fn new(path: &Path, conf: HashMap<String, String>) -> FsResult<Self> {
         let scheme = path
             .scheme()
             .ok_or_else(|| FsError::invalid_path(path.full_path(), "Missing scheme"))?;
@@ -376,14 +375,7 @@ impl OpendalFileSystem {
     }
 }
 
-impl FileSystem<OpendalWriter, OpendalReader, UfsConf> for OpendalFileSystem {
-    fn conf(&self) -> &UfsConf {
-        // OpenDAL doesn't store conf as all configuration is already applied to the operator
-        // This is a limitation of the current design, but it's acceptable for OpenDAL
-        static EMPTY_CONF: std::sync::OnceLock<UfsConf> = std::sync::OnceLock::new();
-        EMPTY_CONF.get_or_init(UfsConf::new)
-    }
-
+impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     async fn mkdir(&self, path: &Path, _create_parent: bool) -> FsResult<bool> {
         let object_path = self.get_object_path(path)?;
 
