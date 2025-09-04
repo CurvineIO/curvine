@@ -319,14 +319,24 @@ impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
         match self.get_mount(path).await? {
             None => self.cv.get_status(path).await,
-            Some((ufs_path, mount)) => mount.ufs.get_status(&ufs_path).await,
+            Some((ufs_path, mount)) => {
+                if mount.info.cv_path == path.path() {
+                    return self.cv.get_status(path).await;
+                }
+                mount.ufs.get_status(&ufs_path).await
+            }
         }
     }
 
     async fn get_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         match self.get_mount(path).await? {
             None => self.cv.get_status_bytes(path).await,
-            Some((ufs_path, mount)) => mount.ufs.get_status_bytes(&ufs_path).await,
+            Some((ufs_path, mount)) => {
+                if mount.info.cv_path == path.path() {
+                    return self.cv.get_status_bytes(path).await;
+                }
+                mount.ufs.get_status_bytes(&ufs_path).await
+            }
         }
     }
 
