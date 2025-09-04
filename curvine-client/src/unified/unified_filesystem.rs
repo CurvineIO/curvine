@@ -60,7 +60,7 @@ impl UnifiedFileSystem {
         let cv = CurvineFileSystem::with_rt(conf, rt.clone())?;
         let fs = UnifiedFileSystem {
             cv,
-            mount_cache: Arc::new(MountCache::new(update_interval)),
+            mount_cache: Arc::new(MountCache::new(update_interval.as_millis() as u64)),
             enable_unified,
             enable_read_ufs,
             metrics: FsContext::get_metrics(),
@@ -78,7 +78,7 @@ impl UnifiedFileSystem {
     }
 
     // Check if the path is a mount point, if so, return the mount point information
-    async fn get_mount(&self, path: &Path) -> FsResult<Option<(Path, MountValue)>> {
+    async fn get_mount(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
         if !path.is_cv() {
             return err_box!("path is not curvine path");
         }
@@ -125,7 +125,7 @@ impl UnifiedFileSystem {
 
     pub async fn mount(&self, ufs_path: &Path, cv_path: &Path, opts: MountOptions) -> FsResult<()> {
         self.cv.mount(ufs_path, cv_path, opts).await?;
-        let _ = self.get_mount(cv_path).await?;
+        self.mount_cache.check_update(self, true).await?;
         Ok(())
     }
 
@@ -149,6 +149,10 @@ impl UnifiedFileSystem {
 
     pub async fn get_mount_info_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         self.cv.get_mount_info_bytes(path).await
+    }
+
+    pub async fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
+        self.cv.get_mount_table().await
     }
 
     pub fn clone_runtime(&self) -> Arc<Runtime> {

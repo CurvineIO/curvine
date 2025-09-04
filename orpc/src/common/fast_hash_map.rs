@@ -14,6 +14,8 @@
 
 use fxhash::FxHasher;
 use std::collections::HashMap;
+use std::fmt;
+use std::fmt::Debug;
 use std::hash::{BuildHasherDefault, Hash};
 use std::ops::{Deref, DerefMut};
 
@@ -49,5 +51,15 @@ impl<K: Eq + Hash, V> Deref for FastHashMap<K, V> {
 impl<K: Eq + Hash, V> DerefMut for FastHashMap<K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl<K, V> Debug for FastHashMap<K, V>
+where
+    K: Debug,
+    V: Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.0.iter()).finish()
     }
 }
