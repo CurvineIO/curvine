@@ -16,6 +16,7 @@ use crate::{err_ufs, UfsUtils};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::Client;
 use aws_smithy_types::byte_stream::ByteStream;
+use aws_smithy_types::error::display::DisplayErrorContext;
 use curvine_common::fs::{Path, Reader};
 use curvine_common::FsResult;
 use log::info;
@@ -57,9 +58,11 @@ impl S3Reader {
         let head_result = match head_result {
             Err(e) => {
                 return err_ufs!(
-                    "S3 error: {}, details: {}",
+                    "S3 head_object failed for bucket={}, key={}, error_code={}, details: {:?}",
+                    bucket,
+                    key,
                     e.code().unwrap_or("Unknown"),
-                    e
+                    DisplayErrorContext(&e)
                 )
             }
             Ok(v) => v,
@@ -102,7 +105,16 @@ impl S3Reader {
                 .await;
             let resp = match resp {
                 Ok(v) => v,
-                Err(e) => return err_ufs!("Failed to get object: {}", e),
+                Err(e) => {
+                    return err_ufs!(
+                        "S3 get_object failed for bucket={}, key={}, range=bytes={}- , error_code={}, details: {:?}",
+                        &self.bucket,
+                        &self.key,
+                        self.pos,
+                        e.code().unwrap_or("Unknown"),
+                        DisplayErrorContext(&e)
+                    );
+                }
             };
 
             let _ = self.byte_stream.insert(resp.body);
@@ -138,11 +150,24 @@ impl Reader for S3Reader {
     }
 
     async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
+        // S3 report an error when reading a 0-byte object
+        if self.is_empty() {
+            return Ok(DataSlice::Empty);
+        }
+
         let stream = self.get_stream().await?;
         if let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(chunk) => Ok(DataSlice::Bytes(chunk)),
-                Err(e) => err_ufs!("Failed to read chunk: {}", e),
+                Err(e) => {
+                    err_ufs!(
+                        "S3 chunk read failed for bucket={}, key={}, pos={}, details: {:?}",
+                        &self.bucket,
+                        &self.key,
+                        self.pos,
+                        DisplayErrorContext(&e)
+                    )
+                }
             }
         } else {
             Ok(DataSlice::Empty)
