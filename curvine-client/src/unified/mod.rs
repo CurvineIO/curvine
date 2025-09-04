@@ -16,7 +16,6 @@ use crate::file::{FsReader, FsWriter};
 use crate::impl_filesystem_for_enum;
 use crate::*;
 use crate::{impl_reader_for_enum, impl_writer_for_enum};
-use curvine_common::conf::UfsConf;
 use curvine_common::fs::Path;
 use curvine_common::state::MountInfo;
 use curvine_common::FsResult;
@@ -78,7 +77,7 @@ impl UfsFileSystem {
         match path.scheme() {
             #[cfg(feature = "s3")]
             Some(S3_SCHEME) => {
-                let fs = S3FileSystem::new(UfsConf::with_map(conf))?;
+                let fs = S3FileSystem::new(conf)?;
                 Ok(UfsFileSystem::S3(fs))
             }
 
@@ -86,7 +85,7 @@ impl UfsFileSystem {
             Some(scheme)
                 if ["s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs"].contains(&scheme) =>
             {
-                let fs = OpendalFileSystem::new(path, UfsConf::with_map(conf))?;
+                let fs = OpendalFileSystem::new(path, conf)?;
                 Ok(UfsFileSystem::OpenDAL(fs))
             }
 

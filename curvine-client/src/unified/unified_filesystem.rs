@@ -69,6 +69,10 @@ impl UnifiedFileSystem {
         Ok(fs)
     }
 
+    pub fn conf(&self) -> &ClusterConf {
+        self.cv.conf()
+    }
+
     pub fn cv(&self) -> CurvineFileSystem {
         self.cv.clone()
     }
@@ -206,11 +210,7 @@ impl UnifiedFileSystem {
     }
 }
 
-impl FileSystem<UnifiedWriter, UnifiedReader, ClusterConf> for UnifiedFileSystem {
-    fn conf(&self) -> &ClusterConf {
-        self.cv.conf()
-    }
-
+impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     async fn mkdir(&self, path: &Path, create_parent: bool) -> FsResult<bool> {
         match self.get_mount(path).await? {
             None => self.cv.mkdir(path, create_parent).await,
