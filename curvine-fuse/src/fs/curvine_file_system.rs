@@ -132,6 +132,10 @@ impl CurvineFileSystem {
         };
         let size = FuseUtils::fuse_st_size(status);
 
+        // For hardlinks, nlink should be greater than 1
+        // Now we use the actual nlink from FileStatus
+        let nlink = status.nlink;
+
         Ok(fuse_attr {
             ino: status.id as u64,
             size,
@@ -143,7 +147,7 @@ impl CurvineFileSystem {
             mtimensec: ctime_nsec,
             ctimensec: ctime_nsec,
             mode,
-            nlink: 1,
+            nlink,
             uid,
             gid,
             rdev: 0,
@@ -1189,8 +1193,48 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn unlink(&self, op: Unlink<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+        
+        // Get the file status to check nlink
+        let _status = self.fs_get_status(&path).await?;
+        
+        // For hardlinks, we need to check if this is the last reference
+        // This is a simplified implementation - in a real filesystem, you would
+        // need to implement proper hardlink support in the backend
         self.fs.delete(&path, false).await?;
+        
         Ok(())
+    }
+
+    async fn link(&self, op: Link<'_>) -> FuseResult<fuse_entry_out> {
+        let name = try_option!(op.name.to_str());
+        let oldnodeid = op.arg.oldnodeid;
+        
+        // Get the path for the new hardlink
+        let new_path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+        
+        // Get the path for the original file
+        let old_path = self.state.get_path(oldnodeid)?;
+        
+        // Check if the original file exists
+        let old_status = self.fs_get_status(&old_path).await?;
+        
+        // Check if the new hardlink name already exists
+        if self.fs.exists(&new_path).await? {
+            return err_fuse!(libc::EEXIST, "File already exists: {}", new_path);
+        }
+        
+        // For directories, hardlink is not allowed
+        if old_status.is_dir {
+            return err_fuse!(libc::EPERM, "Cannot create hardlink to directory: {}", old_path);
+        }
+        
+        // Create hardlink using the backend hardlink functionality
+        self.fs.hardlink(&old_path, &new_path).await?;
+        
+        // Get the created hardlink's attributes
+        let entry = self.lookup_path(op.header.nodeid, Some(name), &new_path).await?;
+        
+        Ok(Self::create_entry_out(&self.conf, entry))
     }
 
     async fn rm_dir(&self, op: RmDir<'_>) -> FuseResult<()> {

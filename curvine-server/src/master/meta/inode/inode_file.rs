@@ -39,6 +39,9 @@ pub struct InodeFile {
 
     pub(crate) blocks: Vec<BlockMeta>,
 
+    // Number of hard links to this file
+    pub(crate) nlink: u32,
+
     pub(crate) target: Option<String>,
 }
 
@@ -57,6 +60,7 @@ impl InodeFile {
             features: FileFeature::new(),
 
             blocks: vec![],
+            nlink: 1,
             target: None,
             parent_id: EMPTY_PARENT_ID,
         }
@@ -76,6 +80,7 @@ impl InodeFile {
             features: FileFeature::new(),
 
             blocks: vec![],
+            nlink: 1,
             target: None,
             parent_id: EMPTY_PARENT_ID,
         };
@@ -108,6 +113,7 @@ impl InodeFile {
             },
 
             blocks: vec![],
+            nlink: 1,
             target: Some(target.into()),
             parent_id: EMPTY_PARENT_ID,
         }
@@ -208,12 +214,36 @@ impl InodeFile {
 
     pub fn simple_string(&self) -> String {
         format!(
-            "id={}, pid={}, len={}, blocks={:?}",
+            "id={}, pid={}, len={}, nlink={}, blocks={:?}",
             self.id,
             self.parent_id,
             self.len,
+            self.nlink,
             self.block_ids()
         )
+    }
+
+    // Increment hardlink count
+    pub fn increment_nlink(&mut self) {
+        self.nlink += 1;
+    }
+
+    // Decrement hardlink count
+    pub fn decrement_nlink(&mut self) -> u32 {
+        if self.nlink > 0 {
+            self.nlink -= 1;
+        }
+        self.nlink
+    }
+
+    // Get current hardlink count
+    pub fn nlink(&self) -> u32 {
+        self.nlink
+    }
+
+    // Check if this is the last hardlink
+    pub fn is_last_link(&self) -> bool {
+        self.nlink <= 1
     }
 }
 

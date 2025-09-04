@@ -217,6 +217,20 @@ impl JournalWriter {
         self.send(JournalEntry::Symlink(entry))
     }
 
+    pub fn log_hardlink<P: AsRef<str>>(
+        &self,
+        op_ms: u64,
+        old_path: P,
+        new_path: P,
+    ) -> FsResult<()> {
+        let entry = HardlinkEntry {
+            op_ms,
+            old_path: old_path.as_ref().to_string(),
+            new_path: new_path.as_ref().to_string(),
+        };
+        self.send(JournalEntry::Hardlink(entry))
+    }
+
     // for testing
     pub fn take_entries(&self) -> Vec<JournalEntry> {
         let mut entries = vec![];

@@ -20,7 +20,7 @@ use crate::master::meta::{FileSystemStats, FsDir};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
 use curvine_common::state::{BlockLocation, CommitBlock, MountInfo};
 use orpc::common::{FileUtils, Utils};
-use orpc::{try_err, try_option, CommonResult};
+use orpc::{err_box, try_err, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
 
@@ -155,7 +155,7 @@ impl InodeStore {
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
-        // Delete the old node.
+        // Delete the old node using the original name (important for FileEntry)
         batch.delete_child(src_parent.id(), src_inode.name())?;
 
         // Add new node.
@@ -248,6 +248,126 @@ impl InodeStore {
         Ok(())
     }
 
+    pub fn apply_hardlink(
+        &self, 
+        parent: &InodeView, 
+        new_entry: &InodeView, 
+        original_inode_id: i64
+    ) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+
+        // Write the updated parent directory
+        batch.write_inode(parent)?;
+        
+        // For FileEntry, we don't write it as a separate inode - it's just an edge
+        // The FileEntry points to the original inode, so we just add the child relationship
+        batch.add_child(parent.id(), new_entry.name(), original_inode_id)?;
+        
+        // Increment nlink count of the original inode
+        // Note: We should load the original inode, increment its nlink, and write it back
+        // This is a simplified implementation
+        self.increment_inode_nlink(original_inode_id)?;
+        
+        batch.commit()?;
+
+        // Don't increment file count since we're not creating a new inode, just a new link
+        
+        Ok(())
+    }
+
+    // Helper method to increment nlink count of an inode
+    fn increment_inode_nlink(&self, inode_id: i64) -> CommonResult<()> {
+        // Load the inode from storage
+        if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
+            match &mut inode_view {
+                InodeView::File(_, file) => {
+                    file.increment_nlink();
+                    // Write the updated inode back to storage
+                    let mut batch = self.store.new_batch();
+                    batch.write_inode(&inode_view)?;
+                    batch.commit()?;
+                }
+                _ => {
+                    return err_box!("Cannot increment nlink for non-file inode {}", inode_id);
+                }
+            }
+        } else {
+            return err_box!("Inode {} not found when incrementing nlink", inode_id);
+        }
+        Ok(())
+    }
+
+    pub fn apply_unlink(&self, parent: &InodeView, child: &InodeView) -> CommonResult<DeleteResult> {
+        let mut batch = self.store.new_batch();
+
+        // Write the updated parent directory (child will be removed by the caller)
+        batch.write_inode(parent)?;
+        
+        // Remove the child from the parent's children list
+        batch.delete_child(parent.id(), child.name())?;
+        
+        // Decrement nlink count of the file being unlinked
+        if let InodeView::File(_, _) = child {
+            self.decrement_inode_nlink(child.id())?;
+        }
+        
+        batch.commit()?;
+
+        // Create a delete result indicating only the directory entry was removed
+        // For unlink operations, we don't delete blocks since the inode still exists
+        Ok(DeleteResult {
+            inodes: 0, // No inodes actually deleted
+            blocks: Default::default(), // No blocks deleted for unlink
+        })
+    }
+
+    pub fn apply_unlink_file_entry(&self, parent: &InodeView, child: &InodeView, inode_id: i64) -> CommonResult<DeleteResult> {
+        let mut batch = self.store.new_batch();
+
+        // Write the updated parent directory
+        batch.write_inode(parent)?;
+        
+        // Remove the FileEntry from the parent's children list
+        batch.delete_child(parent.id(), child.name())?;
+        
+        // Decrement nlink count of the original inode
+        self.decrement_inode_nlink(inode_id)?;
+        
+        batch.commit()?;
+
+        // Create a delete result indicating only the directory entry was removed
+        Ok(DeleteResult {
+            inodes: 0, // No inodes actually deleted
+            blocks: Default::default(), // No blocks deleted for unlink
+        })
+    }
+
+    // Helper method to decrement nlink count of an inode
+    fn decrement_inode_nlink(&self, inode_id: i64) -> CommonResult<()> {
+        // Load the inode from storage
+        if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
+            match &mut inode_view {
+                InodeView::File(_, file) => {
+                    let remaining_links = file.decrement_nlink();
+                    if remaining_links == 0 {
+                        // TODO: When nlink reaches 0, we should delete the inode and its blocks
+                        // For now, we just write back the updated inode
+                    }
+                    // Write the updated inode back to storage
+                    let mut batch = self.store.new_batch();
+                    batch.write_inode(&inode_view)?;
+                    batch.commit()?;
+                }
+                _ => {
+                    return err_box!("Cannot decrement nlink for non-file inode {}", inode_id);
+                }
+            }
+        } else {
+            return err_box!("Inode {} not found when decrementing nlink", inode_id);
+        }
+        Ok(())
+    }
+
     // Restore to a directory tree from rocksdb
     pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
         let mut root = FsDir::create_root();
@@ -333,8 +453,16 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
-        self.store.get_inode(id)
+    //get_inode should return the inode with the name of the FileEntry
+    //TODO refactor: remove seq name from store_inode
+    pub fn get_inode(&self, id: i64, name: Option<&str>) -> CommonResult<Option<InodeView>> {
+        let mut inode_view = self.store.get_inode(id)?;
+        if let Some(name) = name {
+            if let Some(ref mut inode) = inode_view {
+                inode.change_name(name.to_string());
+            }
+        }
+        Ok(inode_view)
     }
 
     pub fn cf_hash(&self, cf: &str) -> u128 {

@@ -35,7 +35,7 @@ impl CreateFileOpts {
     pub fn with_create(create_parent: bool) -> Self {
         Self {
             create_flag: Default::default(),
-            file_type: FileType::Dir,
+            file_type: FileType::File,
             replicas: 1,
             block_size: ByteUnit::MB as i64 * 64,
             x_attr: Default::default(),

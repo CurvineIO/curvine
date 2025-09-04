@@ -356,6 +356,15 @@ impl FsClient {
         Ok(())
     }
 
+    pub async fn hardlink(&self, old_path: &Path, new_path: &Path) -> FsResult<()> {
+        let req = HardlinkRequest {
+            old_path: old_path.encode(),
+            new_path: new_path.encode(),
+        };
+        let _: HardlinkResponse = self.rpc(RpcCode::Hardlink, req).await?;
+        Ok(())
+    }
+
     pub async fn rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
     where
         T: PMessage + Default,

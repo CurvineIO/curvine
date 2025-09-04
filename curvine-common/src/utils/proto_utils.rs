@@ -242,6 +242,7 @@ impl ProtoUtils {
             owner: status.owner,
             group: status.group,
             mode: status.mode,
+            nlink: 1, // Default to 1 for now, will be updated by hardlink implementation
             target: status.target,
         }
     }

@@ -103,6 +103,14 @@ pub struct SymlinkEntry {
     pub(crate) force: bool,
 }
 
+// hardlink
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct HardlinkEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) old_path: String,
+    pub(crate) new_path: String,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
@@ -116,6 +124,7 @@ pub enum JournalEntry {
     UnMount(UnMountEntry),
     SetAttr(SetAttrEntry),
     Symlink(SymlinkEntry),
+    Hardlink(HardlinkEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

@@ -298,6 +298,8 @@ impl<T: FileSystem> FuseSession<T> {
 
             FuseOperator::RmDir(op) => reply.send_rep(fs.rm_dir(op).await).await,
 
+            FuseOperator::Link(op) => reply.send_rep(fs.link(op).await).await,
+
             FuseOperator::BatchForget(op) => {
                 fs.batch_forget(op).await?;
                 Ok(0)

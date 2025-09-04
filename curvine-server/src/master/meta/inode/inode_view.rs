@@ -294,6 +294,16 @@ impl InodeView {
         }
     }
 
+    pub fn nlink(&self) -> u32 {
+        match self {
+            File(_, f) => f.nlink(),
+            Dir(_, _) => 1,
+            FileEntry(_, _) => {
+                panic!("FileEntry does not support nlink")
+            }
+        }
+    }
+
     pub fn as_ptr(&mut self) -> InodePtr {
         InodePtr::from_ref(self)
     }
@@ -365,6 +375,7 @@ impl InodeView {
             owner: acl.owner.to_owned(),
             group: acl.group.to_owned(),
             mode: acl.mode,
+            nlink: self.nlink(),
             target: None,
         };
 
@@ -387,7 +398,17 @@ impl InodeView {
                 status.storage_policy = d.storage_policy.clone();
             }
 
-            FileEntry(..) => {}
+            FileEntry(_, _inode_id) => {
+                // For FileEntry, we need to look up the actual inode to get file status
+                // This is a placeholder - in a real implementation, we would:
+                // 1. Look up the inode by ID from storage
+                // 2. Return the file status of the actual inode
+                // 3. Set the correct nlink count
+                
+                // For now, we return basic file information
+                status.file_type = FileType::File;
+                status.nlink = 1; // This should be the actual nlink from the inode
+            }
         }
 
         status

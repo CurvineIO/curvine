@@ -47,6 +47,7 @@ pub enum FuseOperator<'a> {
     Release(Release<'a>),
     Unlink(Unlink<'a>),
     RmDir(RmDir<'a>),
+    Link(Link<'a>),
     BatchForget(BatchForget<'a>),
     Rename(Rename<'a>),
     Interrupt(Interrupt<'a>),
@@ -283,6 +284,13 @@ pub struct Release<'a> {
 #[derive(Debug)]
 pub struct Unlink<'a> {
     pub header: &'a fuse_in_header,
+    pub name: &'a OsStr,
+}
+
+#[derive(Debug)]
+pub struct Link<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_link_in,
     pub name: &'a OsStr,
 }
 

@@ -75,6 +75,7 @@ impl JournalLoader {
             JournalEntry::SetAttr(e) => self.set_attr(e),
 
             JournalEntry::Symlink(e) => self.symlink(e),
+            JournalEntry::Hardlink(e) => self.hardlink(e),
         }
     }
 
@@ -183,6 +184,21 @@ impl JournalLoader {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.link, &fs_dir.store)?;
         fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force)?;
+        Ok(())
+    }
+
+    pub fn hardlink(&self, entry: HardlinkEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let old_path = InodePath::resolve(fs_dir.root_ptr(), entry.old_path, &fs_dir.store)?;
+        let new_path = InodePath::resolve(fs_dir.root_ptr(), entry.new_path, &fs_dir.store)?;
+        
+        // Get the original inode ID
+        let original_inode_id = match old_path.get_last_inode() {
+            Some(inode) => inode.id(),
+            None => return err_box!("Original file not found during hardlink recovery"),
+        };
+        
+        fs_dir.unprotected_hardlink(new_path, original_inode_id, entry.op_ms)?;
         Ok(())
     }
 
