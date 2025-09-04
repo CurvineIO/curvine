@@ -160,7 +160,7 @@ impl JobContext {
                 "job {} execute failed, tasks {}, len = {}, cost {} ms, error {}",
                 self.info.job_id,
                 self.tasks.len(),
-                ByteUnit::byte_to_string(self.progress.loaded_size as u64),
+                ByteUnit::byte_to_string(loaded_size as u64),
                 LocalTime::mills() as i64 - self.info.create_time,
                 message
             )

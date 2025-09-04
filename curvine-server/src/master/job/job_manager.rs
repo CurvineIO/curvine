@@ -86,7 +86,7 @@ impl JobManager {
     }
 
     fn create_job_id(source: impl AsRef<str>) -> String {
-        format!("job_{}", Utils::murmur3(source.as_ref().as_bytes()))
+        format!("job_{}", Utils::md5(source))
     }
 
     fn update_state(&self, job_id: &str, state: JobTaskState, message: impl Into<String>) {
