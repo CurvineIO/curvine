@@ -22,7 +22,7 @@ use aws_sdk_s3::types::Object;
 use aws_sdk_s3::Client;
 use curvine_common::conf::UfsConf;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{FileStatus, SetAttrOpts};
+use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
 use orpc::CommonResult;
@@ -140,6 +140,11 @@ impl S3FileSystem {
                     len: v.len,
                     replicas: 1,
                     block_size: 4 * 1024 * 1024,
+                    file_type: if v.is_dir {
+                        FileType::Dir
+                    } else {
+                        FileType::File
+                    },
                     ..Default::default()
                 };
                 Ok(Some(status))
@@ -222,6 +227,11 @@ impl S3FileSystem {
             len,
             replicas: 1,
             block_size: 4 * 1024 * 1024,
+            file_type: if is_dir {
+                FileType::Dir
+            } else {
+                FileType::File
+            },
             ..Default::default()
         };
 
@@ -235,6 +245,7 @@ impl S3FileSystem {
             name: path.name().to_owned(),
             is_dir: true,
             is_complete: true,
+            file_type: FileType::Dir,
             ..Default::default()
         };
 

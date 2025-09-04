@@ -407,6 +407,7 @@ impl FileSystem<OpendalWriter, OpendalReader, UfsConf> for OpendalFileSystem {
             len: 0,
             replicas: 1,
             block_size: 4 * 1024 * 1024,
+            file_type: FileType::File,
             ..Default::default()
         };
 
@@ -512,6 +513,11 @@ impl FileSystem<OpendalWriter, OpendalReader, UfsConf> for OpendalFileSystem {
             len: metadata.content_length() as i64,
             replicas: 1,
             block_size: 4 * 1024 * 1024,
+            file_type: if metadata.is_dir() {
+                FileType::Dir
+            } else {
+                FileType::File
+            },
             ..Default::default()
         })
     }
@@ -547,6 +553,11 @@ impl FileSystem<OpendalWriter, OpendalReader, UfsConf> for OpendalFileSystem {
                 len: metadata.content_length() as i64,
                 replicas: 1,
                 block_size: 4 * 1024 * 1024,
+                file_type: if metadata.is_dir() {
+                    FileType::Dir
+                } else {
+                    FileType::File
+                },
                 ..Default::default()
             });
         }
