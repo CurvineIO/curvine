@@ -84,7 +84,7 @@ impl InodeTtlExecutor {
             return Ok("/".to_string());
         }
 
-        if let Ok(Some(inode_view)) = self.inode_store.get_inode(inode_id) {
+        if let Ok(Some(inode_view)) = self.inode_store.get_inode(inode_id, None) {
             match &inode_view {
                 InodeView::File(name, file) => {
                     let parent_path = self.build_path_recursive(file.parent_id())?;
@@ -119,7 +119,7 @@ impl InodeTtlExecutor {
 
     pub fn get_inode_from_store(&self, inode_id: u64) -> TtlResult<Option<InodeView>> {
         self.inode_store
-            .get_inode(inode_id as i64)
+            .get_inode(inode_id as i64, None)
             .map_err(|e| TtlError::ServiceError(format!("Failed to get inode from store: {}", e)))
     }
 

@@ -173,6 +173,10 @@ impl UnifiedFileSystem {
         self.cv.symlink(target, link, force).await
     }
 
+    pub async fn hardlink(&self, old_path: &Path, new_path: &Path) -> FsResult<()> {
+        self.cv.hardlink(old_path, new_path).await
+    }
+
     async fn get_cache_validity(
         &self,
         cv_path: &Path,

@@ -69,7 +69,7 @@ impl InodeChildren {
         };
 
         match removed {
-            None => err_box!("Child {} not exists", child_name),
+            None => err_box!("Child {} not exists, all child {:?}", child_name, self),
             Some(r) => {
                 if r.id() != child_id {
                     err_box!(
@@ -87,7 +87,6 @@ impl InodeChildren {
     pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
         let inode = Box::new(inode);
         // Assert that it should not be FileEntry
-        assert!(!inode.is_file_entry());
         match self {
             InodeChildren::List(list) => {
                 let index = Self::search_by_name(list, inode.name());

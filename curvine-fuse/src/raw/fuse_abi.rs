@@ -319,6 +319,12 @@ pub struct fuse_rename_in {
 
 #[repr(C)]
 #[derive(Debug, Default)]
+pub struct fuse_link_in {
+    pub oldnodeid: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
 pub struct fuse_interrupt_in {
     pub unique: u64,
 }

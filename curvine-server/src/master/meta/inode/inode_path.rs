@@ -47,9 +47,9 @@ impl InodePath {
             //make sure resolved_inode is not a FileEntry
             //if it is a FileEntry, load the complete file data from store
             let resolved_inode = match cur_inode.as_ref() {
-                FileEntry(_name, id) => {
+                FileEntry(name, id) => {
                     // If it is a FileEntry, load the complete object from store
-                    match store.get_inode(*id)? {
+                    match store.get_inode(*id, Some(name))? {
                         Some(full_inode) => InodePtr::from_owned(full_inode),
                         None => return err_box!("Failed to load inode {} from store", id),
                     }

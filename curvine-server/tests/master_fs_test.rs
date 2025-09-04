@@ -25,11 +25,12 @@ use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use orpc::common::Utils;
+use orpc::common::LocalTime;
 use orpc::message::Builder;
 use orpc::runtime::AsyncRuntime;
 use orpc::CommonResult;
 use std::sync::Arc;
-
+use curvine_common::state::SetAttrOptsBuilder;
 // Test the master filesystem function separately.
 // This test does not require a cluster startup
 fn new_fs(format: bool, name: &str) -> MasterFilesystem {
@@ -310,6 +311,68 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
     println!("list = {:#?}", list);
 
     fs.print_tree();
+
+    Ok(())
+}
+
+#[test]
+fn hardlink() -> CommonResult<()> {
+    let fs = new_fs(true, "fs_test");
+    fs.mkdir("/a/b", true)?;
+    fs.create("/a/b/file.log", true)?;
+    fs.print_tree();
+    fs.hardlink("/a/b/file.log", "/a/b/file2.log")?;
+    assert!(fs.exists("/a/b/file2.log")?);
+    fs.print_tree();
+
+    fs.hardlink("/a/b/file.log", "/a/d/file.log")?;
+    assert!(fs.exists("/a/d/file.log")?);
+    fs.print_tree();
+
+    let inode1 = fs.file_status("/a/b/file.log")?.id;
+    let inode2 = fs.file_status("/a/b/file2.log")?.id;
+    let inode3 = fs.file_status("/a/d/file.log")?.id;
+    assert_eq!(inode1, inode2);
+    assert_eq!(inode1, inode3);
+
+    //update to check all linked file attr is same
+    let time = LocalTime::mills() as i64;
+    let opts = SetAttrOptsBuilder::new()
+        .mtime(time)
+        .build();
+    fs.set_attr("/a/b/file2.log", opts)?;
+    fs.print_tree();
+    let mtime_t = fs.file_status("/a/b/file2.log")?.mtime;
+    assert_eq!(mtime_t, fs.file_status("/a/b/file.log")?.mtime);
+    assert_eq!(mtime_t, fs.file_status("/a/d/file.log")?.mtime);
+
+    let nlink_t = fs.file_status("/a/b/file.log")?.nlink;
+    assert_eq!(nlink_t, 3);
+    let nlink_t = fs.file_status("/a/b/file2.log")?.nlink;
+    assert_eq!(nlink_t, 3);
+    let nlink_t = fs.file_status("/a/d/file.log")?.nlink;
+    assert_eq!(nlink_t, 3);
+
+    fs.delete("/a/b/file.log", true)?;
+    assert!(!fs.exists("/a/b/file.log")?);
+    assert!(fs.exists("/a/b/file2.log")?);
+    assert!(fs.exists("/a/d/file.log")?);
+    fs.print_tree();
+
+    let nlink_t = fs.file_status("/a/b/file2.log")?.nlink;
+    assert_eq!(nlink_t, 2);
+    let nlink_t = fs.file_status("/a/d/file.log")?.nlink;
+    assert_eq!(nlink_t, 2);
+
+
+    //rename file2.log
+    fs.rename("/a/b/file2.log", "/a/b/file3.log")?;
+    assert!(!fs.exists("/a/b/file2.log")?);
+    assert!(fs.exists("/a/b/file3.log")?);
+    fs.print_tree();
+
+    //let nlink_t = fs.file_status("/a/b/file3.log")?.nlink;
+    //assert_eq!(nlink_t, 2);
 
     Ok(())
 }

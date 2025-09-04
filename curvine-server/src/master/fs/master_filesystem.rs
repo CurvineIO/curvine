@@ -404,7 +404,7 @@ impl MasterFilesystem {
         }
 
         //from store
-        let mut inode = fs_dir.store.get_inode(inode.id())?;
+        let mut inode = fs_dir.store.get_inode(inode.id(), None)?;
         let inode = match inode.as_mut() {
             Some(inode_view) => inode_view,
             None => {
@@ -640,6 +640,17 @@ impl MasterFilesystem {
         let target = target.as_ref().to_string();
         let link = Self::resolve_path(&fs_dir, link.as_ref())?;
         fs_dir.symlink(target, link, force, mode)
+    }
+
+    pub fn hardlink<T: AsRef<str>>(
+        &self,
+        old_path: T,
+        new_path: T,
+    ) -> FsResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let old_path = Self::resolve_path(&fs_dir, old_path.as_ref())?;
+        let new_path = Self::resolve_path(&fs_dir, new_path.as_ref())?;
+        fs_dir.hardlink(old_path, new_path)
     }
 }
 

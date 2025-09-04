@@ -151,6 +151,11 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{}", msg) }
     }
 
+    async fn link(&self, op: Link<'_>) -> FuseResult<fuse_entry_out> {
+        let msg = format!("{:?}", op);
+        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    }
+
     async fn rm_dir(&self, op: RmDir<'_>) -> FuseResult<()> {
         let msg = format!("{:?}", op);
         async move { err_fuse!(libc::ENOSYS, "{}", msg) }

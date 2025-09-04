@@ -170,9 +170,33 @@ impl FsDir {
         let child = target.as_ref();
         let child_name = inp.name();
 
-        // Delete the data in rocksdb.
+        // Handle different types of nodes
         parent.update_mtime(mtime);
-        let del_res = self.store.apply_delete(parent.as_ref(), child)?;
+        let del_res = match child {
+            File(_, file) => {
+                if file.nlink() > 1 {
+                    // This is a hardlink, decrement nlink count but don't delete the inode
+                    // Update nlink in memory first
+                    let target_inode = target.clone();
+                    if let File(_, ref mut target_file) = target_inode.as_mut() {
+                        target_file.decrement_nlink();
+                    }
+                    self.store.apply_unlink(parent.as_ref(), child)?
+                } else {
+                    // This is the last link, delete the inode
+                    self.store.apply_delete(parent.as_ref(), child)?
+                }
+            },
+            FileEntry(_, inode_id) => {
+                // This is a hardlink entry, just remove the directory entry
+                // The actual inode's nlink count should be decremented
+                self.store.apply_unlink_file_entry(parent.as_ref(), child, *inode_id)?
+            },
+            Dir(_, _) => {
+                // Directories are always deleted
+                self.store.apply_delete(parent.as_ref(), child)?
+            }
+        };
 
         // After deletion occurs, the target address cannot be used.
         let _ = parent.delete_child(child.id(), child_name)?;
@@ -197,16 +221,10 @@ impl FsDir {
         let src_inode = match src_inp.get_last_inode() {
             None => return err_box!("File not exits: {}", src_inp.path()),
             Some(v) => {
-                // If src_inode is FileEntry, load the complete object from store
-                match v.as_ref() {
-                    FileEntry(_, id) => match self.store.get_inode(*id)? {
-                        Some(full_inode) => InodePtr::from_owned(full_inode),
-                        None => return err_box!("Failed to load inode {} from store", id),
-                    },
-                    _ => v,
-                }
+                v
             }
         };
+        assert!(!src_inode.as_ref().is_file_entry());
 
         let mut src_parent = match src_inp.get_inode(-2) {
             None => return err_box!("Parent not exits: {}", src_inp.path()),
@@ -329,15 +347,12 @@ impl FsDir {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
+        assert!(!inode.is_file_entry());
 
         let status = match inode.as_ref() {
             File(..) | Dir(..) => inode.to_file_status(inp.path()),
-            FileEntry(_name, id) => {
-                let inode_opt = self.store.get_inode(*id)?;
-                match inode_opt {
-                    Some(inode_view) => inode_view.to_file_status(inp.path()),
-                    None => return err_ext!(FsError::file_not_found(inp.path())),
-                }
+            FileEntry(..) => {
+                return err_box!("FileEntry is not supported");
             }
         };
 
@@ -349,6 +364,7 @@ impl FsDir {
             Some(v) => v,
             None => return err_box!("File {} not exists", inp.path()),
         };
+        assert!(!inode.is_file_entry());
 
         let mut res = Vec::with_capacity(1.max(inode.child_len()));
         match inode.as_ref() {
@@ -359,8 +375,8 @@ impl FsDir {
                     let child_path = inp.child_path(item.name());
                     match item {
                         File(..) | Dir(..) => res.push(item.to_file_status(&child_path)),
-                        FileEntry(_name, id) => {
-                            let inode_opt = self.store.get_inode(*id)?;
+                        FileEntry(name, id) => {
+                            let inode_opt = self.store.get_inode(*id, Some(name))?;
                             if let Some(inode_view) = inode_opt {
                                 res.push(inode_view.to_file_status(&child_path));
                             }
@@ -369,13 +385,13 @@ impl FsDir {
                 }
             }
 
-            FileEntry(_name, id) => {
-                let inode_opt = self.store.get_inode(*id)?;
+            FileEntry(name, id) => {
+                let inode_opt = self.store.get_inode(*id, Some(name))?;
                 match inode_opt {
                     Some(inode_view) => res.push(inode_view.to_file_status(inp.path())),
                     None => return err_box!("File {} not exists", inp.path()),
                 }
-            }
+            } 
         }
 
         Ok(res)
@@ -547,6 +563,7 @@ impl FsDir {
             None => return err_ext!(FsError::file_not_found(inp.path())),
             Some(v) => v,
         };
+        assert!(!inode_ptr.is_file_entry());
 
         let mut inode = match inode_ptr.as_ref() {
             File(..) => inode_ptr.as_ref().clone(),
@@ -554,12 +571,8 @@ impl FsDir {
                 let err_msg = format!("Cannot append to already exists {} directory", inp.path());
                 return err_ext!(FsError::file_exists(err_msg));
             }
-            FileEntry(_name, id) => {
-                let inode = self.store.get_inode(*id)?;
-                match inode {
-                    Some(inode_view) => inode_view,
-                    None => return err_ext!(FsError::file_not_found(inp.path())),
-                }
+            FileEntry(..) => {
+                return err_box!("FileEntry is not supported");
             }
         };
 
@@ -584,7 +597,7 @@ impl FsDir {
     //Judge whether the block's inode exists. Block will only be deleted if the inode is deleted. All this judgment is not problematic.
     pub fn block_exists(&self, block_id: i64) -> FsResult<bool> {
         let file_id = InodeId::get_id(block_id);
-        let inode = self.store.get_inode(file_id)?;
+        let inode = self.store.get_inode(file_id, None)?;
         match inode {
             None => Ok(false),
             Some(v) => {
@@ -826,5 +839,90 @@ impl FsDir {
         self.store
             .apply_symlink(parent.as_ref(), new_inode_ptr.as_ref())?;
         Ok(link)
+    }
+
+    // Create a hardlink to an existing file
+    pub fn hardlink(
+        &mut self,
+        old_path: InodePath,
+        new_path: InodePath,
+    ) -> FsResult<()> {
+        let op_ms = LocalTime::mills();
+
+        // Get the original inode ID and update nlink in memory if it's a direct File
+        let (original_inode_id, mut original_inode_ptr) = match old_path.get_last_inode() {
+            Some(inode) => match inode.as_ref() {
+                File(_, file) => {
+                    // Check if it's a regular file (not a directory or symlink)
+                    if file.file_type != curvine_common::state::FileType::File {
+                        return err_ext!(FsError::common(
+                            "Cannot create hardlink to non-regular file"
+                        ));
+                    }
+                    (file.id, Some(inode.clone()))
+                },
+                FileEntry(_, inode_id) => (*inode_id, None), // FileEntry already points to an inode
+                Dir(_, _) => return err_ext!(FsError::common(
+                    "Cannot create hardlink to directory"
+                )),
+            },
+            None => return err_ext!(FsError::file_not_found(old_path.path())),
+        };
+
+        // If we have the original inode in memory, increment its nlink count
+        if let Some(ref mut inode_ptr) = original_inode_ptr {
+            if let File(_, ref mut file) = inode_ptr.as_mut() {
+                file.increment_nlink();
+            }
+        }
+
+        // Create the hardlink
+        let new_path_str = new_path.path().to_string();
+        self.unprotected_hardlink(new_path, original_inode_id, op_ms)?;
+        
+        // Log the operation
+        self.journal_writer
+            .log_hardlink(op_ms, old_path.path(), &new_path_str)?;
+
+        Ok(())
+    }
+
+    pub fn unprotected_hardlink(
+        &mut self,
+        mut new_path: InodePath,
+        original_inode_id: i64,
+        op_ms: u64,
+    ) -> FsResult<InodePath> {
+        // Check if the new path already exists
+        if new_path.get_last_inode().is_some() {
+            return err_ext!(FsError::file_exists(new_path.path()));
+        }
+
+        // Create parent directory if needed
+        new_path = self.create_parent_dir(new_path, MkdirOpts::with_create(true))?;
+
+        // Get the parent directory
+        let mut parent = match new_path.get_inode(-2) {
+            Some(v) => v,
+            None => return err_box!("Parent directory does not exist"),
+        };
+
+        // Create a FileEntry that points to the original inode
+        let name = new_path.name().to_string();
+        let file_entry = FileEntry(name.clone(), original_inode_id);
+        
+        // Update parent directory
+        parent.update_mtime(op_ms as i64);
+        let added = parent.add_child(file_entry)?;
+        new_path.append(added.clone())?;
+
+        // Apply changes to storage - this creates an edge pointing to the original inode
+        self.store.apply_hardlink(
+            parent.as_ref(), 
+            added.as_ref(), 
+            original_inode_id
+        )?;
+
+        Ok(new_path)
     }
 }

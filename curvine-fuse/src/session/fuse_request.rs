@@ -232,6 +232,12 @@ impl FuseRequest {
                 name: decoder.get_os_str()?,
             }),
 
+            FUSE_LINK => FuseOperator::Link(Link {
+                header,
+                arg: decoder.get_struct()?,
+                name: decoder.get_os_str()?,
+            }),
+
             FUSE_RMDIR => FuseOperator::RmDir(RmDir {
                 header,
                 name: decoder.get_os_str()?,

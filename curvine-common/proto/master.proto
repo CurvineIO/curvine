@@ -191,7 +191,13 @@ message SymlinkRequest {
 message SymlinkResponse {
 }
 
+message HardlinkRequest {
+    required string old_path = 1;
+    required string new_path = 2;
+}
 
+message HardlinkResponse {
+}
 
 enum MetricTypeProto {
     GAUGE = 1;

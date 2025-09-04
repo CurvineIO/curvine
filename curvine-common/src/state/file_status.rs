@@ -40,6 +40,9 @@ pub struct FileStatus {
     pub owner: String,
     pub group: String,
 
+    // Number of hard links to this file
+    pub nlink: u32,
+
     pub target: Option<String>,
 }
 
