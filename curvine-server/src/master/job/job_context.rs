@@ -23,6 +23,7 @@ use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use orpc::err_box;
 use orpc::sync::StateCtl;
 
+#[derive(Debug, Clone)]
 pub struct TaskDetail {
     pub task: LoadTaskInfo,
     pub progress: JobTaskProgress,
@@ -152,7 +153,7 @@ impl JobContext {
                 "job {} all subtasks completed, tasks {}, len = {}, cost {} ms",
                 self.info.job_id,
                 self.tasks.len(),
-                ByteUnit::byte_to_string(self.progress.loaded_size as u64),
+                ByteUnit::byte_to_string(loaded_size as u64),
                 LocalTime::mills() as i64 - self.info.create_time
             )
         } else if job_state == JobTaskState::Failed {
@@ -160,7 +161,7 @@ impl JobContext {
                 "job {} execute failed, tasks {}, len = {}, cost {} ms, error {}",
                 self.info.job_id,
                 self.tasks.len(),
-                ByteUnit::byte_to_string(self.progress.loaded_size as u64),
+                ByteUnit::byte_to_string(loaded_size as u64),
                 LocalTime::mills() as i64 - self.info.create_time,
                 message
             )

@@ -84,7 +84,7 @@ impl LoadTaskRunner {
             }
 
             let spend = TimeSpent::new();
-            let chunk = reader.read_chunk0().await?;
+            let chunk = reader.async_read(None).await?;
             read_cost_ms += spend.used_ms();
 
             if chunk.is_empty() {

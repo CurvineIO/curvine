@@ -2973,6 +2973,7 @@ dependencies = [
  "fxhash",
  "libc",
  "log",
+ "md-5",
  "mini-moka",
  "moka",
  "murmur3",

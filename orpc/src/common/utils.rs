@@ -15,6 +15,7 @@
 use crate::common::LocalTime;
 use crate::runtime::Runtime;
 use crate::CommonResult;
+use md5::{Digest, Md5};
 use rand::prelude::ThreadRng;
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -179,6 +180,13 @@ impl Utils {
         let conf = toml::from_str::<T>(&content)?;
         Ok(conf)
     }
+
+    pub fn md5(source: impl AsRef<str>) -> String {
+        let mut hasher = Md5::new();
+        hasher.update(source.as_ref().as_bytes());
+        let hash = hasher.finalize();
+        format!("{:x}", hash)
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +196,35 @@ mod tests {
     #[test]
     pub fn uuid() {
         println!("uuid = {}", Utils::uuid())
+    }
+
+    #[test]
+    pub fn test_md5() {
+        assert_eq!(
+            Utils::md5("hello world"),
+            "5eb63bbbe01eeed093cb22bb8f5acdc3"
+        );
+        assert_eq!(Utils::md5(""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(
+            Utils::md5("The quick brown fox jumps over the lazy dog"),
+            "9e107d9d372bb6826bd81d3542a419d6"
+        );
+        assert_eq!(Utils::md5("hello"), "5d41402abc4b2a76b9719d911017c592");
+
+        let input = "test string";
+        let hash1 = Utils::md5(input);
+        let hash2 = Utils::md5(input);
+        assert_eq!(hash1, hash2);
+
+        assert_eq!(Utils::md5("any string").len(), 32);
+
+        assert_ne!(Utils::md5("hello"), Utils::md5("world"));
+
+        println!("MD5 tests passed!");
+        println!("Examples:");
+        println!("  MD5('hello world') = {}", Utils::md5("hello world"));
+        println!("  MD5('hello') = {}", Utils::md5("hello"));
+        println!("  MD5('') = {}", Utils::md5(""));
     }
 
     #[test]

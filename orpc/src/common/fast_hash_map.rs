@@ -32,6 +32,10 @@ impl<K: Eq + Hash, V> FastHashMap<K, V> {
             HashMap::with_capacity_and_hasher(capacity, BuildHasherDefault::<FxHasher>::default());
         Self(inner)
     }
+
+    pub fn take(self) -> HashMap<K, V, BuildHasherDefault<FxHasher>> {
+        self.0
+    }
 }
 
 impl<K: Eq + Hash, V> Default for FastHashMap<K, V> {
@@ -61,5 +65,16 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.0.iter()).finish()
+    }
+}
+
+impl<K, V> Clone for FastHashMap<K, V>
+where
+    K: Clone,
+    V: Clone,
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }

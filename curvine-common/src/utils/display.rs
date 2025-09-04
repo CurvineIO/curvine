@@ -151,7 +151,7 @@ impl Display for JobStatus {
         // Format time
         let format_time = |time: Option<i64>| -> String {
             time.map(|t| {
-                let dt = DateTime::from_timestamp(t, 0).unwrap();
+                let dt = DateTime::from_timestamp_millis(t).unwrap();
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
             })
             .unwrap_or_else(|| "N/A".to_string())
