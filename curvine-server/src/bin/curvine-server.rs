@@ -31,7 +31,8 @@ fn main() -> CommonResult<()> {
 
     let service = args.get_service()?;
     let conf = args.get_conf()?;
-
+    conf.print();
+    
     Utils::set_panic_exit_hook();
 
     match service {
