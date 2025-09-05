@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::{ClusterConf, JobConf};
+use crate::conf::ClusterConf;
 use orpc::common::{DurationUnit, LogConf, Utils};
 use orpc::runtime::GroupExecutor;
 use orpc::{err_box, CommonResult};
@@ -89,8 +89,6 @@ pub struct MasterConf {
     pub block_replication_concurrency_limit: usize,
 
     pub log: LogConf,
-    // Master loading function configuration
-    pub load: JobConf,
 
     pub ttl_checker_retry_attempts: u32,
 
@@ -240,7 +238,6 @@ impl Default for MasterConf {
             block_replication_enabled: false,
             block_replication_concurrency_limit: 1000,
             log: Default::default(),
-            load: Default::default(),
 
             ttl_checker_retry_attempts: 3,
 
