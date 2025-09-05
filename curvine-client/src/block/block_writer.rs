@@ -17,6 +17,7 @@ use crate::block::{BlockWriterLocal, BlockWriterRemote};
 use crate::file::FsContext;
 use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
+use futures::future::try_join_all;
 use orpc::err_box;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
@@ -125,51 +126,93 @@ impl BlockWriter {
 
     pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
         let chunk = chunk.freeze();
-        for writer in &mut self.inners {
-            if let Err(e) = writer.write(chunk.clone()).await {
-                self.fs_context.add_failed_worker(writer.worker_address());
-                return Err(e);
-            }
+        let mut futures = Vec::with_capacity(self.inners.len());
+        for writer in self.inners.iter_mut() {
+            let chunk_clone = chunk.clone();
+            let task = async move {
+                writer
+                    .write(chunk_clone)
+                    .await
+                    .map_err(|e| (writer.worker_address().clone(), e))
+            };
+            futures.push(task);
+        }
+
+        if let Err((worker_addr, e)) = try_join_all(futures).await {
+            self.fs_context.add_failed_worker(&worker_addr);
+            return Err(e);
         }
         Ok(())
     }
 
-    pub fn blocking_write(&mut self, rt: &Runtime, buf: DataSlice) -> FsResult<()> {
-        for writer in &mut self.inners {
-            if let Err(e) = writer.blocking_write(rt, buf.clone()) {
-                self.fs_context.add_failed_worker(writer.worker_address());
-                return Err(e);
+    pub fn blocking_write(&mut self, rt: &Runtime, chunk: DataSlice) -> FsResult<()> {
+        if self.inners.len() == 1 {
+            if let Err(e) = self.inners[0].blocking_write(rt, chunk) {
+                self.fs_context
+                    .add_failed_worker(self.inners[0].worker_address());
+                Err(e)
+            } else {
+                Ok(())
             }
+        } else {
+            rt.block_on(self.write(chunk))?;
+            Ok(())
         }
-        Ok(())
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        for writer in &mut self.inners {
-            if let Err(e) = writer.flush().await {
-                self.fs_context.add_failed_worker(writer.worker_address());
-                return Err(e);
-            }
+        let mut futures = Vec::with_capacity(self.inners.len());
+        for writer in self.inners.iter_mut() {
+            let task = async move {
+                writer
+                    .flush()
+                    .await
+                    .map_err(|e| (writer.worker_address().clone(), e))
+            };
+            futures.push(task);
+        }
+
+        if let Err((worker_addr, e)) = try_join_all(futures).await {
+            self.fs_context.add_failed_worker(&worker_addr);
+            return Err(e);
         }
         Ok(())
     }
 
     pub async fn complete(&mut self) -> FsResult<CommitBlock> {
-        for writer in &mut self.inners {
-            if let Err(e) = writer.complete().await {
-                self.fs_context.add_failed_worker(writer.worker_address());
-                return Err(e);
-            }
+        let mut futures = Vec::with_capacity(self.inners.len());
+        for writer in self.inners.iter_mut() {
+            let task = async move {
+                writer
+                    .complete()
+                    .await
+                    .map_err(|e| (writer.worker_address().clone(), e))
+            };
+            futures.push(task);
+        }
+
+        if let Err((worker_addr, e)) = try_join_all(futures).await {
+            self.fs_context.add_failed_worker(&worker_addr);
+            return Err(e);
         }
         Ok(self.to_commit_block())
     }
 
     pub async fn cancel(&mut self) -> FsResult<()> {
-        for writer in &mut self.inners {
-            if let Err(e) = writer.cancel().await {
-                self.fs_context.add_failed_worker(writer.worker_address());
-                return Err(e);
-            }
+        let mut futures = Vec::with_capacity(self.inners.len());
+        for writer in self.inners.iter_mut() {
+            let task = async move {
+                writer
+                    .cancel()
+                    .await
+                    .map_err(|e| (writer.worker_address().clone(), e))
+            };
+            futures.push(task);
+        }
+
+        if let Err((worker_addr, e)) = try_join_all(futures).await {
+            self.fs_context.add_failed_worker(&worker_addr);
+            return Err(e);
         }
         Ok(())
     }
