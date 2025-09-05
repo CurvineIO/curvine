@@ -28,7 +28,11 @@ fn main() -> CommonResult<()> {
     conf.master.min_block_size = 1024 * 1024;
     conf.master.ttl_bucket_interval = "1m".to_string();
     conf.master.ttl_checker_interval = "1m".to_string();
+    conf.job.job_life_ttl_str = "1m".to_string();
+    conf.job.job_cleanup_ttl_str = "1m".to_string();
     conf.master.init()?;
+    conf.job.init()?;
+    conf.print();
 
     let testing = Testing {
         worker_num: 3,

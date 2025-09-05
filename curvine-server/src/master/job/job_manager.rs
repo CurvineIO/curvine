@@ -19,6 +19,7 @@ use core::time::Duration;
 use curvine_client::unified::UfsFileSystem;
 use curvine_common::conf::{ClientConf, ClusterConf};
 use curvine_common::error::FsError;
+use curvine_common::executor::ScheduledExecutor;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
     FileStatus, JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult,
@@ -31,7 +32,7 @@ use orpc::client::ClientFactory;
 use orpc::common::{ByteUnit, FastHashMap, LocalTime, Utils};
 use orpc::err_box;
 use orpc::io::net::InetAddr;
-use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::runtime::{LoopTask, RpcRuntime, Runtime};
 use std::collections::linked_list::LinkedList;
 use std::sync::Arc;
 
@@ -73,17 +74,17 @@ impl JobManager {
 
     /// Start the job manager
     pub fn start(&self) {
-        let cleanup_interval = self.job_cleanup_ttl;
+        let cleanup_interval = self.job_cleanup_ttl.as_millis() as u64;
         let ttl_ms = self.job_life_ttl.as_millis() as i64;
 
-        let jobs = self.jobs.clone();
-        self.rt.spawn(async move {
-            let mut interval = tokio::time::interval(cleanup_interval);
-            loop {
-                interval.tick().await;
-                Self::cleanup_expired_jobs(jobs.clone(), ttl_ms);
-            }
-        });
+        let executor = ScheduledExecutor::new("job_cleanup", cleanup_interval);
+        executor
+            .start(JobCleanupTask {
+                jobs: self.jobs.clone(),
+                ttl_ms,
+            })
+            .unwrap();
+
         info!("JobManager started");
     }
 
@@ -123,16 +124,20 @@ impl JobManager {
         source_status: &FileStatus,
         target_path: &Path,
     ) -> bool {
-        if source_status.is_dir {
-            // For directories, if a task already exists and is in loading state, duplicate submission is not allowed.
-            if let Some(job) = self.jobs.get(job_id) {
-                let state: JobTaskState = job.state.state();
-                state == JobTaskState::Pending || state == JobTaskState::Loading
-            } else {
-                false
-            }
+        let job = if let Some(job) = self.jobs.get(job_id) {
+            job
         } else {
-            // Files are generally auto-loaded and executed in parallel. Validate ufs_mtime to prevent distributing a large number of duplicate tasks.
+            return false;
+        };
+
+        let state: JobTaskState = job.state.state();
+        if state == JobTaskState::Pending || state == JobTaskState::Loading {
+            return true;
+        }
+
+        if !source_status.is_dir {
+            // Files are generally auto-loaded and executed in parallel.
+            // Validate ufs_mtime to prevent distributing a large number of duplicate tasks.
             if let Ok(cv_status) = self.master_fs.file_status(target_path.path()) {
                 if cv_status.storage_policy.ufs_mtime == 0 {
                     false
@@ -142,6 +147,8 @@ impl JobManager {
             } else {
                 false
             }
+        } else {
+            true
         }
     }
 
@@ -359,23 +366,37 @@ impl JobManager {
 
         Ok(total_size)
     }
+}
 
-    fn cleanup_expired_jobs(jobs: JobStore, ttl_ms: i64) {
+struct JobCleanupTask {
+    jobs: JobStore,
+    ttl_ms: i64,
+}
+
+impl LoopTask for JobCleanupTask {
+    type Error = FsError;
+
+    fn run(&self) -> Result<(), Self::Error> {
         // Collect tasks that need to be removed first
         let mut jobs_to_remove = vec![];
         let now = LocalTime::mills() as i64;
-
-        for entry in jobs.iter() {
+        for entry in self.jobs.iter() {
             let job = entry.value();
-            if ttl_ms + job.info.create_time > now {
+            if now > self.ttl_ms + job.info.create_time {
                 jobs_to_remove.push(job.info.job_id.clone());
             }
         }
 
         for job_id in jobs_to_remove {
-            if jobs.remove(&job_id).is_some() {
-                info!("Removing expired job: {}", job_id);
+            if let Some(v) = self.jobs.remove(&job_id) {
+                info!("Removing expired job: {:?}", v.1.info);
             }
         }
+
+        Ok(())
+    }
+
+    fn terminate(&self) -> bool {
+        false
     }
 }
