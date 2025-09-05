@@ -14,19 +14,21 @@
 
 use crate::master::fs::policy::ChooseContext;
 use crate::master::fs::MasterFilesystem;
-use crate::master::{JobContext, JobStore, JobWorkerClient, MountManager};
+use crate::master::{JobContext, JobStore, JobWorkerClient, MountManager, TaskDetail};
 use core::time::Duration;
 use curvine_client::unified::UfsFileSystem;
 use curvine_common::conf::{ClientConf, ClusterConf};
+use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
     FileStatus, JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult,
     LoadTaskInfo, MountInfo, WorkerAddress,
 };
 use curvine_common::FsResult;
+use futures::future;
 use log::{error, info, warn};
 use orpc::client::ClientFactory;
-use orpc::common::{ByteUnit, LocalTime, Utils};
+use orpc::common::{ByteUnit, FastHashMap, LocalTime, Utils};
 use orpc::err_box;
 use orpc::io::net::InetAddr;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -86,7 +88,7 @@ impl JobManager {
     }
 
     fn create_job_id(source: impl AsRef<str>) -> String {
-        format!("job_{}", Utils::murmur3(source.as_ref().as_bytes()))
+        format!("job_{}", Utils::md5(source))
     }
 
     fn update_state(&self, job_id: &str, state: JobTaskState, message: impl Into<String>) {
@@ -265,8 +267,7 @@ impl JobManager {
 
         match res {
             Err(e) => {
-                warn!("Submit load job {} failed: {}", job_id, e);
-                // @todo Whether to cancel some tasks that may have been dispatched.
+                warn!("Create load job {} failed: {}", job_id, e);
                 Err(e)
             }
 
@@ -277,10 +278,31 @@ impl JobManager {
                     job_context.tasks.len(),
                     ByteUnit::byte_to_string(size as u64)
                 );
+
+                let tasks = job_context.tasks.clone();
                 self.jobs.insert(job_id, job_context);
+                // @todo Whether to cancel some tasks that may have been dispatched.
+                self.rt.block_on(self.submit_all_task(tasks))?;
+
                 Ok(result)
             }
         }
+    }
+
+    async fn submit_all_task(&self, tasks: FastHashMap<String, TaskDetail>) -> FsResult<()> {
+        let submit_futures: Vec<_> = tasks
+            .take()
+            .into_iter()
+            .map(|(id, task)| async move {
+                let client = self.get_worker_client(&task.task.worker).await?;
+                client.submit_load_task(task.task).await?;
+                info!("Submit sub-task {}", id);
+                Ok::<(), FsError>(())
+            })
+            .collect();
+
+        future::try_join_all(submit_futures).await?;
+        Ok(())
     }
 
     async fn create_all_tasks(
@@ -331,9 +353,6 @@ impl JobManager {
                         self.job_max_files
                     );
                 }
-
-                let client = self.get_worker_client(&worker).await?;
-                client.submit_load_task(task).await?;
                 info!("Added sub-task {}", task_id);
             }
         }

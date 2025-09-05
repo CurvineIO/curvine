@@ -25,6 +25,9 @@ pub mod opendal;
 mod ufs_utils;
 pub use self::ufs_utils::UfsUtils;
 
+mod conf;
+pub use self::conf::*;
+
 pub const FOLDER_SUFFIX: &str = "/";
 
 #[macro_export]

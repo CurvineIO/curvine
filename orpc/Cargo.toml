@@ -42,3 +42,4 @@ dashmap = { workspace = true }
 tracing-log = { workspace = true }
 fxhash = { workspace = true }
 moka = { workspace = true }
+md-5 = { workspace = true }

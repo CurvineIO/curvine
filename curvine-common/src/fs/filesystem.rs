@@ -20,9 +20,7 @@ use crate::FsResult;
 use prost::bytes::BytesMut;
 use std::future::Future;
 
-pub trait FileSystem<Writer, Reader, Conf> {
-    fn conf(&self) -> &Conf;
-
+pub trait FileSystem<Writer, Reader> {
     fn mkdir(&self, path: &Path, create_parent: bool) -> impl Future<Output = FsResult<bool>>;
 
     fn create(&self, path: &Path, overwrite: bool) -> impl Future<Output = FsResult<Writer>>;

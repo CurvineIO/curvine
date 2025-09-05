@@ -89,6 +89,14 @@ pub trait Reader {
         Ok(chunk)
     }
 
+    fn async_read(&mut self, len: Option<usize>) -> impl Future<Output = FsResult<DataSlice>> {
+        async move {
+            let chunk = self.read_chunk(len).await?;
+            *self.pos_mut() += chunk.len() as i64;
+            Ok(chunk)
+        }
+    }
+
     // Read data directly from the chunk, fuse will call the modified method.
     // The fuse call tries to return the same number of bytes as expected, otherwise the delay may be increased.
     // This is more important in fio testing.

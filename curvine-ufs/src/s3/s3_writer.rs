@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{err_ufs, UfsUtils};
+use crate::{err_ufs, S3Conf, UfsUtils};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
 use aws_smithy_types::byte_stream::ByteStream;
+use aws_smithy_types::error::display::DisplayErrorContext;
 use bytes::{Bytes, BytesMut};
-use curvine_common::conf::UfsConf;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
@@ -57,7 +58,7 @@ impl S3Writer {
     ///
     /// # return
     /// Return IoResult<Self>, containing the initialized writer or error
-    pub fn new(client: Client, path: &Path, config: &UfsConf) -> FsResult<Self> {
+    pub fn new(client: Client, path: &Path, config: &S3Conf) -> FsResult<Self> {
         let (bucket, key) = UfsUtils::get_bucket_key(path)?;
 
         // Get the buffer size from the configuration, default is 5MB
@@ -111,7 +112,15 @@ impl S3Writer {
 
             let resp = match resp {
                 Ok(v) => v,
-                Err(e) => return err_ufs!("Failed to initialize multipart upload: {}", e),
+                Err(e) => {
+                    return err_ufs!(
+                        "S3 create_multipart_upload failed for bucket={}, key={}, error_code={}, details: {:?}",
+                        &self.bucket,
+                        &self.key,
+                        e.code().unwrap_or("Unknown"),
+                        DisplayErrorContext(&e)
+                    );
+                }
             };
 
             self.upload_id = resp.upload_id.clone();
@@ -160,12 +169,28 @@ impl S3Writer {
 
         let resp = match resp {
             Ok(v) => v,
-            Err(e) => return err_ufs!("Failed to upload part {}: {}", current_part_number, e),
+            Err(e) => {
+                return err_ufs!(
+                    "S3 upload_part failed for bucket={}, key={}, part={}, error_code={}, details: {:?}",
+                    &self.bucket,
+                    &self.key,
+                    current_part_number,
+                    e.code().unwrap_or("Unknown"),
+                    DisplayErrorContext(&e)
+                );
+            }
         };
 
         let e_tag = match resp.e_tag {
             Some(v) => v,
-            None => return err_ufs!("ETag not returned from upload part"),
+            None => {
+                return err_ufs!(
+                    "S3 upload_part missing ETag for bucket={}, key={}, part={}",
+                    &self.bucket,
+                    &self.key,
+                    current_part_number
+                );
+            }
         };
 
         Ok(CompletedPart::builder()
@@ -177,7 +202,13 @@ impl S3Writer {
     async fn complete_upload(&mut self) -> FsResult<()> {
         let upload_id = match self.upload_id.as_ref() {
             Some(v) => v,
-            None => return err_ufs!("Upload ID not initialized"),
+            None => {
+                return err_ufs!(
+                    "S3 upload_part failed: Upload ID not initialized for bucket={}, key={}",
+                    &self.bucket,
+                    &self.key
+                );
+            }
         };
 
         // Get and check the segmented list
@@ -211,7 +242,14 @@ impl S3Writer {
             .await;
 
         if let Err(e) = resp {
-            return err_ufs!("Failed to complete multipart upload: {}", e);
+            return err_ufs!(
+                "S3 complete_multipart_upload failed for bucket={}, key={}, upload_id={}, error_code={}, details: {:?}",
+                &self.bucket,
+                &self.key,
+                upload_id,
+                e.code().unwrap_or("Unknown"),
+                DisplayErrorContext(&e)
+            );
         }
 
         info!(
@@ -242,7 +280,15 @@ impl S3Writer {
 
         let resp = match resp {
             Ok(v) => v,
-            Err(e) => return err_ufs!("Failed to upload object: {}", e),
+            Err(e) => {
+                return err_ufs!(
+                    "S3 put_object failed for bucket={}, key={}, error_code={}, details: {:?}",
+                    &self.bucket,
+                    &self.key,
+                    e.code().unwrap_or("Unknown"),
+                    DisplayErrorContext(&e)
+                );
+            }
         };
 
         info!("Object uploaded to s3://{}/{}", self.bucket, self.key);
@@ -278,7 +324,12 @@ impl Writer for S3Writer {
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
         if self.cancelled {
-            return err_ufs!("Write cancelled");
+            return err_ufs!(
+                "S3 write_chunk cancelled for bucket={}, key={}, pos={}",
+                &self.bucket,
+                &self.key,
+                self.pos
+            );
         }
 
         let data_len = chunk.len();
@@ -305,7 +356,13 @@ impl Writer for S3Writer {
     /// Refresh buffered data
     async fn flush(&mut self) -> FsResult<()> {
         if self.cancelled {
-            return err_ufs!("Flush cancelled");
+            return err_ufs!(
+                "S3 flush cancelled for bucket={}, key={}, pos={}, buffer_len={}",
+                &self.bucket,
+                &self.key,
+                self.pos,
+                self.buffer.len()
+            );
         }
 
         // Get and clear the buffer
@@ -358,7 +415,14 @@ impl Writer for S3Writer {
                     .await;
 
                 if let Err(e) = res {
-                    return err_ufs!("Failed to abort multipart upload in drop handler: {}", e);
+                    return err_ufs!(
+                        "S3 abort_multipart_upload failed for bucket={}, key={}, upload_id={}, error_code={}, details: {:?}",
+                        &bucket,
+                        &key,
+                        &upload_id,
+                        e.code().unwrap_or("Unknown"),
+                        DisplayErrorContext(&e)
+                    );
                 }
             }
         }

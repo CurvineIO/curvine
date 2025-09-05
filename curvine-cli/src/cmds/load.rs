@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cmds::LoadStatusCommand;
 use crate::util::*;
 use clap::Parser;
 use curvine_client::rpc::JobMasterClient;
@@ -24,6 +25,10 @@ pub struct LoadCommand {
 
     #[arg(long, default_value = "${CURVINE_CONF_FILE}")]
     conf: String,
+
+    /// Watch load job status after submission
+    #[arg(long, short = 'w')]
+    watch: bool,
 }
 
 impl LoadCommand {
@@ -39,6 +44,18 @@ impl LoadCommand {
         let command = LoadJobCommand::builder(&self.path).build();
         let rep = handle_rpc_result(client.submit_load_job(command)).await;
         println!("{}", rep);
+
+        if self.watch {
+            let status_command = LoadStatusCommand::new(
+                rep.job_id.clone(),
+                false,
+                "1s".to_string(),
+                self.conf.clone(),
+            );
+
+            status_command.execute(client).await?;
+        }
+
         Ok(())
     }
 }
