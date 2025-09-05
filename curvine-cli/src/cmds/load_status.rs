@@ -34,6 +34,14 @@ pub struct LoadStatusCommand {
 }
 
 impl LoadStatusCommand {
+    pub fn new(job_id: String, verbose: bool, watch: String, conf: String) -> Self {
+        Self {
+            job_id,
+            verbose,
+            watch: Some(watch),
+            conf,
+        }
+    }
     pub async fn execute(&self, client: JobMasterClient) -> CommonResult<()> {
         println!("\n Checking status for {}", self.job_id);
 
