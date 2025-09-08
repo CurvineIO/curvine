@@ -17,6 +17,8 @@ use crate::s3::{ObjectStatus, S3Reader, S3Writer};
 use crate::S3Conf;
 use crate::FOLDER_SUFFIX;
 use crate::{err_ufs, UfsUtils};
+use aws_config::retry::RetryConfig;
+use aws_config::timeout::TimeoutConfig;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::error::SdkError;
@@ -29,6 +31,7 @@ use aws_types::SdkConfig;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
 use curvine_common::FsResult;
+use log::warn;
 use orpc::common::LocalTime;
 use orpc::CommonResult;
 use std::collections::HashMap;
@@ -56,10 +59,19 @@ impl S3FileSystem {
             Credentials::new(&conf.access_key, &conf.secret_key, None, None, "Static");
         let shared_credentials_provider = SharedCredentialsProvider::new(credentials_provider);
 
+        let retry_config = RetryConfig::adaptive().with_max_attempts(conf.retry_times);
+
+        let timeout_config = TimeoutConfig::builder()
+            .connect_timeout(conf.connect_timeout)
+            .read_timeout(conf.read_timeout)
+            .build();
+
         let sdk_conf = SdkConfig::builder()
             .endpoint_url(&conf.endpoint_url)
             .region(Region::new(conf.region_name.clone()))
             .credentials_provider(shared_credentials_provider)
+            .retry_config(retry_config)
+            .timeout_config(timeout_config)
             .build();
 
         let obj_conf = aws_sdk_s3::config::Builder::from(&sdk_conf)
@@ -86,7 +98,18 @@ impl S3FileSystem {
             }
 
             Err(e) => {
-                err_ufs!("{}", DisplayErrorContext(&e))
+                warn!(
+                    "S3 head_object failed: bucket={}, key={}, error={}",
+                    bucket,
+                    key,
+                    DisplayErrorContext(&e)
+                );
+                err_ufs!(
+                    "S3 head_object failed for bucket={}, key={}: {}",
+                    bucket,
+                    key,
+                    DisplayErrorContext(&e)
+                )
             }
         }
     }

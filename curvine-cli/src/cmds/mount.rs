@@ -16,7 +16,7 @@ use crate::util::*;
 use clap::Parser;
 use curvine_client::file::FsClient;
 use curvine_client::unified::UfsFileSystem;
-use curvine_common::fs::Path;
+use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{ConsistencyStrategy, MountOptions, MountType, StorageType, TtlAction};
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
@@ -87,19 +87,13 @@ impl MountCommand {
         println!("Ufs path: {}", self.ufs_path);
         println!("Curvine path: {}", self.cv_path);
 
-        let mut configs = match self.get_config_map() {
+        let configs = match self.get_config_map() {
             Ok(configs) => configs,
             Err(e) => {
                 eprintln!("Error: Invalid config format: {}", e);
                 std::process::exit(1);
             }
         };
-
-        if let Some(scheme) = extract_scheme(&self.ufs_path) {
-            if scheme == "s3" {
-                enrich_s3_configs(&self.ufs_path, &mut configs);
-            }
-        }
 
         let validation_result = validate_path_and_configs(&self.ufs_path, &configs);
         if let Err(error_msg) = validation_result {
@@ -121,10 +115,12 @@ impl MountCommand {
         // Creating a MountOptions Object
         let mnt_opts = self.to_mnt_opts()?;
 
-        // try create ufsFileSystem
+        // try to create ufsFileSystem
         if !mnt_opts.update {
-            if let Err(e) = UfsFileSystem::new(&ufs_path, mnt_opts.add_properties.clone()) {
-                eprintln!("Error create UfsFileSystem: {}", e);
+            let ufs = UfsFileSystem::new(&ufs_path, mnt_opts.add_properties.clone())?;
+            if let Err(e) = ufs.list_status(&ufs_path).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
             }
         }
 
