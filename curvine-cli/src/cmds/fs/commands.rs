@@ -4,9 +4,9 @@ use orpc::CommonResult;
 use std::path::PathBuf;
 
 use crate::cmds::fs::{
-    cat::CatCommand, count::CountCommand, df::DfCommand, du::DuCommand, get::GetCommand,
-    ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand, rm::RmCommand,
-    stat::StatCommand, touch::TouchCommand,
+    blocks::BlocksCommand, cat::CatCommand, count::CountCommand, df::DfCommand, du::DuCommand,
+    get::GetCommand, ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand,
+    rm::RmCommand, stat::StatCommand, touch::TouchCommand,
 };
 
 #[derive(Parser, Debug)]
@@ -164,6 +164,16 @@ pub enum FsSubCommand {
         #[clap(help = "Destination path")]
         dst_path: String,
     },
+
+    /// Get block location information for a file
+    Blocks {
+        #[clap(help = "Path to get block location information")]
+        path: String,
+
+        /// Output format: table, json
+        #[clap(long, default_value = "table")]
+        format: String,
+    },
 }
 
 impl FsCommand {
@@ -279,6 +289,14 @@ impl FsCommand {
                     destination: dst_path.clone(),
                 };
                 mv_cmd.execute(client).await
+            }
+
+            FsSubCommand::Blocks { path, format } => {
+                let blocks_cmd = BlocksCommand::Blocks {
+                    path: path.clone(),
+                    format: format.clone(),
+                };
+                blocks_cmd.execute(client).await
             }
         }
     }
