@@ -85,7 +85,7 @@ impl std::fmt::Display for ArchiveStatus {
     }
 }
 
-static OWNER_ID: &str = "ffffffffffffffff";
+static OWNER_ID: &str = DEFAULT_OWNER_ID;
 pub type DateTime = chrono::DateTime<chrono::Utc>;
 
 pub trait VRequest: crate::auth::sig_v4::VHeader {
@@ -258,6 +258,7 @@ use serde::Serialize;
 use sha1::Digest;
 use tokio::io::AsyncSeekExt;
 
+use crate::utils::consts::*;
 use crate::utils::io::{PollRead, PollWrite};
 
 #[derive(Debug, Serialize)]
@@ -1174,7 +1175,7 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
                     .write(true)
                     .read(true)
                     .mode(0o644)
-                    .open(format!(".sys_bws/{}", cs))
+                    .open(format!("{}{}", ".sys_bws/", cs))
                     .await
                 {
                     Ok(mut fd) => match parse_body(r, &mut fd, &cs, content_length).await {
@@ -1219,7 +1220,7 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         }
         ContentSha256::Streaming => {
             let file_name = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let file_name = format!(".sys_bws/{}", file_name);
+            let file_name = format!("{}{}", ".sys_bws/", file_name);
             let ret = match tokio::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -1287,7 +1288,7 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         ContentSha256::Unsigned => {
             // No hash verification; stream body into a temp file, then pass to handler
             let file_name = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let file_name = format!(".sys_bws/{}", file_name);
+            let file_name = format!("{}{}", ".sys_bws/", file_name);
             let ret = match tokio::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -2174,7 +2175,8 @@ async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::s
                     None,
                 ));
             } else {
-                let file_name = format!(".sys_bws/{}", &uuid::Uuid::new_v4().to_string()[..8]);
+                let file_name =
+                    format!("{}{}", ".sys_bws/", &uuid::Uuid::new_v4().to_string()[..8]);
                 let mut fd = tokio::fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)

@@ -117,7 +117,10 @@ pub fn create_metadata_map(file_status: &FileStatus) -> HashMap<String, String> 
     // Add custom attributes from x_attr
     for (key, value) in &file_status.x_attr {
         if let Ok(value_str) = String::from_utf8(value.clone()) {
-            metadata.insert(format!("x-amz-meta-{}", key.to_lowercase()), value_str);
+            metadata.insert(
+                format!("{}{}", "x-amz-meta-", key.to_lowercase()),
+                value_str,
+            );
         }
     }
 

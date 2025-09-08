@@ -17,7 +17,10 @@ use std::io::Write;
 use bytes::BytesMut;
 use sha1::Digest;
 
+use crate::utils::consts::*;
+
 pub type GenericResult<T> = Result<T, String>;
+pub mod consts;
 pub mod s3_utils;
 #[derive(Debug)]
 pub struct BaseKv<K: PartialOrd, V> {
@@ -123,15 +126,13 @@ async fn parse_buff<W: tokio::io::AsyncWrite + Send + Unpin>(
                     })?);
                     if let Some(hdr) = head {
                         if hdr.content_size == 0 {
-                            let next=circle_hasher.next(
-                                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-                                ).unwrap();
+                            let next = circle_hasher.next(EMPTY_PAYLOAD_HASH).unwrap();
                             if hdr.signature.as_str() == next.as_str() {
                                 log::info!("all signature verify pass");
                                 state = ParseProcessState::End;
                                 return Ok(state);
                             } else {
-                                log::info!("hash no match expect {next} got {}", hdr.signature);
+                                log::info!("hash no match expect {} got {}", next, hdr.signature);
                                 return Err(ChunkParseError::HashNoMatch);
                             }
                         }
