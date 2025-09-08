@@ -82,7 +82,7 @@ public class FilesystemConf {
 
     // Log configuration, default to standard output.
     public String log_level = "info";
-    public String log_dir = "stdout";
+    public String log_dir = "stderr";
     public String log_file_name = "";
     public int max_log_files = 3;
     public boolean display_thread = false;
