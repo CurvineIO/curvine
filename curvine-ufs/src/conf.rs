@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use orpc::common::DurationUnit;
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::ops::Deref;
+use std::time::Duration;
 
 pub struct ConfMap(HashMap<String, String>);
 
@@ -39,6 +41,22 @@ impl ConfMap {
             _ => err_box!("Invalid boolean string"),
         }
     }
+
+    pub fn get_u32(&self, key: &str) -> CommonResult<u32> {
+        let value = self.get_string(key)?;
+        value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("Invalid u32 value for key '{}': {}", key, value).into())
+    }
+
+    pub fn get_u64(&self, key: &str) -> CommonResult<u64> {
+        let value = self.get_string(key)?;
+        value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("Invalid u64 value for key '{}': {}", key, value).into())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +67,10 @@ pub struct S3Conf {
     pub region_name: String,
     pub force_path_style: bool,
 
+    pub retry_times: u32,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+
     pub properties: HashMap<String, String>,
 }
 
@@ -58,6 +80,13 @@ impl S3Conf {
     pub const SECRET_KEY: &'static str = "s3.credentials.secret";
     pub const REGION_NAME: &'static str = "s3.region_name";
     pub const FORCE_PATH_STYLE: &'static str = "s3.force.path.style";
+    pub const RETRY_TIMES: &'static str = "s3.retry_times";
+    pub const CONNECT_TIMEOUT: &'static str = "s3.connect_timeout";
+    pub const READ_TIMEOUT: &'static str = "s3.read_timeout";
+
+    pub const DEFAULT_RETRY_TIMES: u32 = 3;
+    pub const DEFAULT_CONNECT_TIMEOUT: &'static str = "30s";
+    pub const DEFAULT_READ_TIMEOUT: &'static str = "120s";
 
     pub fn with_map(properties: HashMap<String, String>) -> CommonResult<Self> {
         let map = ConfMap::new(properties);
@@ -79,12 +108,29 @@ impl S3Conf {
 
         let force_path_style = map.get_bool(Self::FORCE_PATH_STYLE).unwrap_or(false);
 
+        let retry_times = map
+            .get_u32(Self::RETRY_TIMES)
+            .unwrap_or(Self::DEFAULT_RETRY_TIMES);
+
+        let connect_timeout = map
+            .get_string(Self::CONNECT_TIMEOUT)
+            .unwrap_or(Self::DEFAULT_CONNECT_TIMEOUT.to_string());
+        let connect_timeout = DurationUnit::from_str(&connect_timeout)?.as_duration();
+
+        let read_timeout = map
+            .get_string(Self::READ_TIMEOUT)
+            .unwrap_or(Self::DEFAULT_READ_TIMEOUT.to_string());
+        let read_timeout = DurationUnit::from_str(&read_timeout)?.as_duration();
+
         Ok(Self {
             endpoint_url,
             access_key,
             secret_key,
             region_name,
             force_path_style,
+            retry_times,
+            connect_timeout,
+            read_timeout,
             properties: map.0,
         })
     }
