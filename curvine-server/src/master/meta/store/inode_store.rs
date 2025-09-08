@@ -155,7 +155,7 @@ impl InodeStore {
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
-        // Delete the old node using the original name (important for FileEntry)
+        // Delete the old node using the original name
         batch.delete_child(src_parent.id(), src_inode.name())?;
 
         // Add new node.
@@ -205,6 +205,12 @@ impl InodeStore {
         batch.commit()
     }
 
+    pub fn apply_overwrite_file(&self, file: &InodeView) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+        batch.write_inode(file)?;
+        batch.commit()
+    }
+
     pub fn apply_append_file(&self, file: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
@@ -248,41 +254,32 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_hardlink(
-        &self, 
-        parent: &InodeView, 
-        new_entry: &InodeView, 
-        original_inode_id: i64
+    pub fn apply_link(
+        &self,
+        parent: &InodeView,
+        new_entry: &InodeView,
+        original_inode_id: i64,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
-        // Write the updated parent directory
         batch.write_inode(parent)?;
-        
-        // For FileEntry, we don't write it as a separate inode - it's just an edge
-        // The FileEntry points to the original inode, so we just add the child relationship
+
+        //link is a edge, link to same inode
         batch.add_child(parent.id(), new_entry.name(), original_inode_id)?;
-        
+
         // Increment nlink count of the original inode
-        // Note: We should load the original inode, increment its nlink, and write it back
-        // This is a simplified implementation
         self.increment_inode_nlink(original_inode_id)?;
-        
+
         batch.commit()?;
 
-        // Don't increment file count since we're not creating a new inode, just a new link
-        
         Ok(())
     }
 
-    // Helper method to increment nlink count of an inode
     fn increment_inode_nlink(&self, inode_id: i64) -> CommonResult<()> {
-        // Load the inode from storage
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {
                 InodeView::File(_, file) => {
                     file.increment_nlink();
-                    // Write the updated inode back to storage
                     let mut batch = self.store.new_batch();
                     batch.write_inode(&inode_view)?;
                     batch.commit()?;
@@ -297,47 +294,56 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_unlink(&self, parent: &InodeView, child: &InodeView) -> CommonResult<DeleteResult> {
+    pub fn apply_unlink(
+        &self,
+        parent: &InodeView,
+        child: &InodeView,
+    ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
 
         // Write the updated parent directory (child will be removed by the caller)
         batch.write_inode(parent)?;
-        
+
         // Remove the child from the parent's children list
         batch.delete_child(parent.id(), child.name())?;
-        
+
         // Decrement nlink count of the file being unlinked
         if let InodeView::File(_, _) = child {
             self.decrement_inode_nlink(child.id())?;
         }
-        
+
         batch.commit()?;
 
         // Create a delete result indicating only the directory entry was removed
         // For unlink operations, we don't delete blocks since the inode still exists
         Ok(DeleteResult {
-            inodes: 0, // No inodes actually deleted
+            inodes: 0,                  // No inodes actually deleted
             blocks: Default::default(), // No blocks deleted for unlink
         })
     }
 
-    pub fn apply_unlink_file_entry(&self, parent: &InodeView, child: &InodeView, inode_id: i64) -> CommonResult<DeleteResult> {
+    pub fn apply_unlink_file_entry(
+        &self,
+        parent: &InodeView,
+        child: &InodeView,
+        inode_id: i64,
+    ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
 
         // Write the updated parent directory
         batch.write_inode(parent)?;
-        
+
         // Remove the FileEntry from the parent's children list
         batch.delete_child(parent.id(), child.name())?;
-        
+
         // Decrement nlink count of the original inode
         self.decrement_inode_nlink(inode_id)?;
-        
+
         batch.commit()?;
 
         // Create a delete result indicating only the directory entry was removed
         Ok(DeleteResult {
-            inodes: 0, // No inodes actually deleted
+            inodes: 0,                  // No inodes actually deleted
             blocks: Default::default(), // No blocks deleted for unlink
         })
     }

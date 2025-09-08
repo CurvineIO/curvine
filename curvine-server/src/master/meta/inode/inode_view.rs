@@ -20,6 +20,7 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
+use core::panic;
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy};
 use curvine_common::utils::SerdeUtils;
 use orpc::common::Utils;
@@ -399,15 +400,7 @@ impl InodeView {
             }
 
             FileEntry(_, _inode_id) => {
-                // For FileEntry, we need to look up the actual inode to get file status
-                // This is a placeholder - in a real implementation, we would:
-                // 1. Look up the inode by ID from storage
-                // 2. Return the file status of the actual inode
-                // 3. Set the correct nlink count
-                
-                // For now, we return basic file information
-                status.file_type = FileType::File;
-                status.nlink = 1; // This should be the actual nlink from the inode
+                panic!("FileEntry does not support to_file_status");
             }
         }
 

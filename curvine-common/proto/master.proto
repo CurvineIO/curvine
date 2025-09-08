@@ -191,12 +191,12 @@ message SymlinkRequest {
 message SymlinkResponse {
 }
 
-message HardlinkRequest {
-    required string old_path = 1;
-    required string new_path = 2;
+message LinkRequest {
+    required string src_path = 1;
+    required string dst_path = 2;
 }
 
-message HardlinkResponse {
+message LinkResponse {
 }
 
 enum MetricTypeProto {

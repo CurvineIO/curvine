@@ -69,7 +69,7 @@ impl InodeChildren {
         };
 
         match removed {
-            None => err_box!("Child {} not exists, all child {:?}", child_name, self),
+            None => err_box!("Child {} not exists", child_name),
             Some(r) => {
                 if r.id() != child_id {
                     err_box!(

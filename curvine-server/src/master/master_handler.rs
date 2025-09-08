@@ -391,21 +391,20 @@ impl MasterHandler {
         ctx.response(MetricsReportResponse {})
     }
 
-    fn hardlink_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: HardlinkRequest = ctx.parse_header()?;
+    fn link_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: LinkRequest = ctx.parse_header()?;
         ctx.set_audit(
-            Some(header.old_path.to_string()),
-            Some(header.new_path.to_string()),
+            Some(header.src_path.to_string()),
+            Some(header.dst_path.to_string()),
         );
 
         if self.check_is_retry(ctx.msg.req_id())? {
-            return ctx.response(HardlinkResponse::default());
+            return ctx.response(LinkResponse::default());
         }
 
-        self.fs
-            .hardlink(&header.old_path, &header.new_path)?;
+        self.fs.link(&header.src_path, &header.dst_path)?;
 
-        ctx.response(HardlinkResponse::default())
+        ctx.response(LinkResponse::default())
     }
 }
 
@@ -438,7 +437,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::GetBlockLocations => self.get_block_locations(ctx),
             RpcCode::SetAttr => self.set_attr_retry_check(ctx),
             RpcCode::Symlink => self.symlink_retry_check(ctx),
-            RpcCode::Hardlink => self.hardlink_retry_check(ctx),
+            RpcCode::Link => self.link_retry_check(ctx),
 
             RpcCode::Mount => self.mount(ctx),
             RpcCode::UnMount => self.umount(ctx),

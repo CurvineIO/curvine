@@ -356,12 +356,12 @@ impl FsClient {
         Ok(())
     }
 
-    pub async fn hardlink(&self, old_path: &Path, new_path: &Path) -> FsResult<()> {
-        let req = HardlinkRequest {
-            old_path: old_path.encode(),
-            new_path: new_path.encode(),
+    pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
+        let req = LinkRequest {
+            src_path: src_path.encode(),
+            dst_path: dst_path.encode(),
         };
-        let _: HardlinkResponse = self.rpc(RpcCode::Hardlink, req).await?;
+        let _: LinkResponse = self.rpc(RpcCode::Link, req).await?;
         Ok(())
     }
 

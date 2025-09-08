@@ -26,7 +26,7 @@ use curvine_common::state::{
     SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
-use log::info;
+use log::{info, warn};
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
@@ -175,8 +175,6 @@ impl FsDir {
         let del_res = match child {
             File(_, file) => {
                 if file.nlink() > 1 {
-                    // This is a hardlink, decrement nlink count but don't delete the inode
-                    // Update nlink in memory first
                     let target_inode = target.clone();
                     if let File(_, ref mut target_file) = target_inode.as_mut() {
                         target_file.decrement_nlink();
@@ -186,12 +184,13 @@ impl FsDir {
                     // This is the last link, delete the inode
                     self.store.apply_delete(parent.as_ref(), child)?
                 }
-            },
+            }
             FileEntry(_, inode_id) => {
-                // This is a hardlink entry, just remove the directory entry
+                // This is a link entry, just remove the directory entry
                 // The actual inode's nlink count should be decremented
-                self.store.apply_unlink_file_entry(parent.as_ref(), child, *inode_id)?
-            },
+                self.store
+                    .apply_unlink_file_entry(parent.as_ref(), child, *inode_id)?
+            }
             Dir(_, _) => {
                 // Directories are always deleted
                 self.store.apply_delete(parent.as_ref(), child)?
@@ -220,9 +219,7 @@ impl FsDir {
         // Delete src_inp
         let src_inode = match src_inp.get_last_inode() {
             None => return err_box!("File not exits: {}", src_inp.path()),
-            Some(v) => {
-                v
-            }
+            Some(v) => v,
         };
         assert!(!src_inode.as_ref().is_file_entry());
 
@@ -283,14 +280,8 @@ impl FsDir {
 
     pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
         let op_ms = LocalTime::mills();
-        // If overwrite = true, delete the existing file first.
         if inp.get_last_inode().is_some() {
-            if opts.overwrite() {
-                let _ = self.delete(&inp, false)?;
-                inp.delete_last();
-            } else {
-                return err_ext!(FsError::file_exists(inp.path()));
-            }
+            return err_ext!(FsError::file_exists(inp.path()));
         }
 
         // Create a directory that does not exist.
@@ -391,7 +382,7 @@ impl FsDir {
                     Some(inode_view) => res.push(inode_view.to_file_status(inp.path())),
                     None => return err_box!("File {} not exists", inp.path()),
                 }
-            } 
+            }
         }
 
         Ok(res)
@@ -614,6 +605,44 @@ impl FsDir {
         }
     }
 
+    /// Overwrite a file by cleaning all blocks and updating metadata.
+    /// If file doesn't exist, create a new one.
+    /// Returns DeleteResult containing blocks that need to be removed from workers.
+    pub fn overwrite_file(
+        &mut self,
+        inp: &InodePath,
+        opts: CreateFileOpts,
+    ) -> FsResult<DeleteResult> {
+        let op_ms = LocalTime::mills();
+        let mut delete_result = DeleteResult::new();
+
+        match inp.get_last_inode() {
+            Some(inode) => {
+                if !inode.is_file() {
+                    return err_box!("Path is not a file: {}", inp.path());
+                }
+
+                let file = inode.as_mut().as_file_mut()?;
+                for block_meta in &file.blocks {
+                    if let Ok(locations) = self.get_block_locations(block_meta.id) {
+                        delete_result.blocks.insert(block_meta.id, locations);
+                    }
+                }
+                file.overwrite(opts, op_ms as i64);
+
+                self.store.apply_overwrite_file(inode.as_ref())?;
+            }
+            None => {
+                return err_ext!(FsError::file_not_found(inp.path()));
+            }
+        }
+
+        // Log the operation
+        self.journal_writer.log_overwrite_file(op_ms, inp)?;
+
+        Ok(delete_result)
+    }
+
     pub fn print_tree(&self) {
         self.root_dir.print_tree()
     }
@@ -773,8 +802,22 @@ impl FsDir {
                     change_inodes.push(cur_inode.clone());
                 }
 
+                //children may be FileEntry, so we need to load complete data from store
                 for child in cur_inode.children() {
-                    stack.push_back(InodePtr::from_ref(child));
+                    let resolved_child = match child {
+                        FileEntry(name, id) => match self.store.get_inode(*id, Some(name))? {
+                            Some(full_inode) => InodePtr::from_owned(full_inode),
+                            None => {
+                                warn!(
+                                    "Failed to load child inode {} from store during set_attr",
+                                    id
+                                );
+                                continue;
+                            }
+                        },
+                        _ => InodePtr::from_ref(child),
+                    };
+                    stack.push_back(resolved_child);
                 }
             }
         }
@@ -841,32 +884,24 @@ impl FsDir {
         Ok(link)
     }
 
-    // Create a hardlink to an existing file
-    pub fn hardlink(
-        &mut self,
-        old_path: InodePath,
-        new_path: InodePath,
-    ) -> FsResult<()> {
+    // Create a link to an existing file
+    pub fn link(&mut self, src_path: InodePath, dst_path: InodePath) -> FsResult<()> {
         let op_ms = LocalTime::mills();
 
         // Get the original inode ID and update nlink in memory if it's a direct File
-        let (original_inode_id, mut original_inode_ptr) = match old_path.get_last_inode() {
+        let (original_inode_id, mut original_inode_ptr) = match src_path.get_last_inode() {
             Some(inode) => match inode.as_ref() {
                 File(_, file) => {
                     // Check if it's a regular file (not a directory or symlink)
                     if file.file_type != curvine_common::state::FileType::File {
-                        return err_ext!(FsError::common(
-                            "Cannot create hardlink to non-regular file"
-                        ));
+                        return err_ext!(FsError::common("Cannot create link to non-regular file"));
                     }
                     (file.id, Some(inode.clone()))
-                },
+                }
                 FileEntry(_, inode_id) => (*inode_id, None), // FileEntry already points to an inode
-                Dir(_, _) => return err_ext!(FsError::common(
-                    "Cannot create hardlink to directory"
-                )),
+                Dir(_, _) => return err_ext!(FsError::common("Cannot create link to directory")),
             },
-            None => return err_ext!(FsError::file_not_found(old_path.path())),
+            None => return err_ext!(FsError::file_not_found(src_path.path())),
         };
 
         // If we have the original inode in memory, increment its nlink count
@@ -876,18 +911,18 @@ impl FsDir {
             }
         }
 
-        // Create the hardlink
-        let new_path_str = new_path.path().to_string();
-        self.unprotected_hardlink(new_path, original_inode_id, op_ms)?;
-        
+        // Create the link
+        let dst_path_str = dst_path.path().to_string();
+        self.unprotected_link(dst_path, original_inode_id, op_ms)?;
+
         // Log the operation
         self.journal_writer
-            .log_hardlink(op_ms, old_path.path(), &new_path_str)?;
+            .log_link(op_ms, src_path.path(), &dst_path_str)?;
 
         Ok(())
     }
 
-    pub fn unprotected_hardlink(
+    pub fn unprotected_link(
         &mut self,
         mut new_path: InodePath,
         original_inode_id: i64,
@@ -910,18 +945,15 @@ impl FsDir {
         // Create a FileEntry that points to the original inode
         let name = new_path.name().to_string();
         let file_entry = FileEntry(name.clone(), original_inode_id);
-        
+
         // Update parent directory
         parent.update_mtime(op_ms as i64);
         let added = parent.add_child(file_entry)?;
         new_path.append(added.clone())?;
 
         // Apply changes to storage - this creates an edge pointing to the original inode
-        self.store.apply_hardlink(
-            parent.as_ref(), 
-            added.as_ref(), 
-            original_inode_id
-        )?;
+        self.store
+            .apply_link(parent.as_ref(), added.as_ref(), original_inode_id)?;
 
         Ok(new_path)
     }

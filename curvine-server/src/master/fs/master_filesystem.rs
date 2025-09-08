@@ -16,7 +16,7 @@ use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodePath, InodeView, PATH_SEPARATOR};
-use crate::master::meta::{FsDir, InodeId};
+use crate::master::meta::FsDir;
 use crate::master::{MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
@@ -204,7 +204,8 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
-        if let Some(inode) = inp.get_last_inode() {
+        let last_inode = inp.get_last_inode();
+        if let Some(inode) = &last_inode {
             if inode.is_dir() {
                 return err_box!("{}  already exists as a dir", inp.path());
             }
@@ -214,7 +215,19 @@ impl MasterFilesystem {
             Self::check_parent(&inp)?;
         }
 
-        let inp = fs_dir.create_file(inp, opts)?;
+        // If the file already exists and overwrite is enabled, overwrite the file
+        let inp = if last_inode.is_some() && opts.overwrite() {
+            let clean_result = fs_dir.overwrite_file(&inp, opts)?;
+            if !clean_result.blocks.is_empty() {
+                let mut worker_manager = self.worker_manager.write();
+                worker_manager.remove_blocks(&clean_result);
+            }
+            inp
+        } else {
+            // If the file does not exist, create a new file
+            fs_dir.create_file(inp, opts)?
+        };
+
         let status = fs_dir.file_status(&inp)?;
 
         Ok(status)
@@ -456,14 +469,6 @@ impl MasterFilesystem {
         let mut block_locs = Vec::with_capacity(file_locs.len());
 
         for (index, meta) in file.blocks.iter().enumerate() {
-            if index as i64 + 1 != InodeId::get_seq(meta.id) {
-                return err_box!(
-                    "block status abnormal, block_id {}, expected sequence number: {}",
-                    meta.id,
-                    index
-                );
-            }
-
             if index + 1 < file.blocks.len() && meta.len != file.block_size {
                 return err_box!(
                     "block status abnormal, block id {}, block len {}, expected block size {}",
@@ -642,15 +647,11 @@ impl MasterFilesystem {
         fs_dir.symlink(target, link, force, mode)
     }
 
-    pub fn hardlink<T: AsRef<str>>(
-        &self,
-        old_path: T,
-        new_path: T,
-    ) -> FsResult<()> {
+    pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let old_path = Self::resolve_path(&fs_dir, old_path.as_ref())?;
-        let new_path = Self::resolve_path(&fs_dir, new_path.as_ref())?;
-        fs_dir.hardlink(old_path, new_path)
+        let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
+        let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
+        fs_dir.link(src_path, dst_path)
     }
 }
 

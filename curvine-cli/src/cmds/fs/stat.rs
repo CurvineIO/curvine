@@ -23,6 +23,20 @@ impl StatCommand {
                     Ok(status) => {
                         // Format similar to HDFS stat output
                         println!("Path: {}", path.full_path());
+                        println!("Name: {}", status.name);
+                        println!("Id: {}", status.id);
+                        println!("Is dir: {}", status.is_dir);
+                        println!("Mtime: {}", status.mtime);
+                        println!("Atime: {}", status.atime);
+                        println!("Children num: {}", status.children_num);
+                        println!("Is complete: {}", status.is_complete);
+                        println!("Len: {}", status.len);
+                        println!("Replics: {}", status.replicas);
+                        println!("Block size: {}", status.block_size);
+                        println!("File type: {:?}", status.file_type);
+                        println!("Xattr: {:?}", status.x_attr);
+                        println!("Storage policy: {:?}", status.storage_policy);
+                        println!("Owner: {}", status.owner);
                         println!("File size: {}", ByteUnit::byte_to_string(status.len as u64));
                         println!(
                             "Block size: {}",
@@ -59,6 +73,7 @@ impl StatCommand {
                         );
                         println!("Owner: {}", status.owner);
                         println!("Group: {}", status.group);
+                        println!("Nlink: {}", status.nlink);
 
                         Ok(())
                     }

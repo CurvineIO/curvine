@@ -38,6 +38,13 @@ pub struct AppendFileEntry {
     pub(crate) file: InodeFile,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct OverWriteFileEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) path: String,
+    pub(crate) file: InodeFile,
+}
+
 // Apply for a new block
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct AddBlockEntry {
@@ -103,12 +110,11 @@ pub struct SymlinkEntry {
     pub(crate) force: bool,
 }
 
-// hardlink
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct HardlinkEntry {
+pub struct LinkEntry {
     pub(crate) op_ms: u64,
-    pub(crate) old_path: String,
-    pub(crate) new_path: String,
+    pub(crate) src_path: String,
+    pub(crate) dst_path: String,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -116,6 +122,7 @@ pub enum JournalEntry {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
     AppendFile(AppendFileEntry),
+    OverWriteFile(OverWriteFileEntry),
     AddBlock(AddBlockEntry),
     CompleteFile(CompleteFileEntry),
     Rename(RenameEntry),
@@ -124,7 +131,7 @@ pub enum JournalEntry {
     UnMount(UnMountEntry),
     SetAttr(SetAttrEntry),
     Symlink(SymlinkEntry),
-    Hardlink(HardlinkEntry),
+    Link(LinkEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
