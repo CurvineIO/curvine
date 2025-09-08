@@ -31,16 +31,15 @@ else
     exit 1
 fi
 
-
 # master bound host name
-export CURVINE_MASTER_HOSTNAME=$LOCAL_HOSTNAME
+export CURVINE_MASTER_HOSTNAME=${CURVINE_MASTER_HOSTNAME:-$LOCAL_HOSTNAME}
 
 # worker bound host name
-export CURVINE_WORKER_HOSTNAME=$LOCAL_IP
+export CURVINE_WORKER_HOSTNAME=${CURVINE_WORKER_HOSTNAME:-$LOCAL_IP}
 
 # The client server hostname is used to determine whether the worker and client are on the same machine.
-export CURVINE_CLIENT_HOSTNAME=$LOCAL_HOSTNAME
+export CURVINE_CLIENT_HOSTNAME=${CURVINE_CLIENT_HOSTNAME:-$LOCAL_HOSTNAME}
 
-export ORPC_BIND_HOSTNAME=0.0.0.0
+export ORPC_BIND_HOSTNAME=${ORPC_BIND_HOSTNAME:-0.0.0.0}
 
-export CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
+export CURVINE_CONF_FILE=${CURVINE_CONF_FILE:-$CURVINE_HOME/conf/curvine-cluster.toml}
