@@ -42,6 +42,9 @@ pub struct InodeFile {
     // Number of hard links to this file
     pub(crate) nlink: u32,
 
+    // Next sequence number for block ID generation (auto-increment)
+    pub(crate) next_seq: u32,
+
     pub(crate) target: Option<String>,
 }
 
@@ -61,6 +64,7 @@ impl InodeFile {
 
             blocks: vec![],
             nlink: 1,
+            next_seq: 0,
             target: None,
             parent_id: EMPTY_PARENT_ID,
         }
@@ -81,6 +85,7 @@ impl InodeFile {
 
             blocks: vec![],
             nlink: 1,
+            next_seq: 0,
             target: None,
             parent_id: EMPTY_PARENT_ID,
         };
@@ -114,6 +119,7 @@ impl InodeFile {
 
             blocks: vec![],
             nlink: 1,
+            next_seq: 0,
             target: Some(target.into()),
             parent_id: EMPTY_PARENT_ID,
         }
@@ -204,11 +210,12 @@ impl InodeFile {
         }
     }
 
-    // Create a new block id
-    // It is composed of the inode id + block number of the file, starting from 1.
-    // inode id + serial number 0, is the file id.
-    pub fn next_block_id(&self) -> CommonResult<i64> {
-        let seq = self.blocks.len() as i64 + 1;
+    /// Create a new block id
+    /// It is composed of the inode id + block number of the file, starting from 1.
+    /// inode id + serial number 0, is the file id.
+    pub fn next_block_id(&mut self) -> CommonResult<i64> {
+        let seq = self.next_seq as i64;
+        self.next_seq += 1;
         InodeId::create_block_id(self.id, seq)
     }
 
@@ -223,12 +230,12 @@ impl InodeFile {
         )
     }
 
-    // Increment hardlink count
+    // Increment link count
     pub fn increment_nlink(&mut self) {
         self.nlink += 1;
     }
 
-    // Decrement hardlink count
+    // Decrement link count
     pub fn decrement_nlink(&mut self) -> u32 {
         if self.nlink > 0 {
             self.nlink -= 1;
@@ -236,14 +243,30 @@ impl InodeFile {
         self.nlink
     }
 
-    // Get current hardlink count
+    // Get current link count
     pub fn nlink(&self) -> u32 {
         self.nlink
     }
 
-    // Check if this is the last hardlink
+    // Check if this is the last link
     pub fn is_last_link(&self) -> bool {
         self.nlink <= 1
+    }
+
+    /// Update file metadata for overwrite operation
+    pub fn overwrite(&mut self, opts: CreateFileOpts, mtime: i64) {
+        // Clear all blocks and reset file size
+        self.blocks.clear();
+        self.len = 0;
+
+        // Update file metadata with new options
+        self.replicas = opts.replicas;
+        self.block_size = opts.block_size;
+        self.storage_policy = opts.storage_policy;
+        self.mtime = mtime;
+
+        // Reset file writing state for new write operation
+        self.features.set_writing(opts.client_name);
     }
 }
 

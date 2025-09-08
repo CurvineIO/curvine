@@ -154,6 +154,15 @@ impl JournalWriter {
         self.send(JournalEntry::CompleteFile(entry))
     }
 
+    pub fn log_overwrite_file(&self, op_ms: u64, inp: &InodePath) -> FsResult<()> {
+        let entry = OverWriteFileEntry {
+            op_ms,
+            path: inp.path().to_string(),
+            file: inp.clone_last_file()?,
+        };
+        self.send(JournalEntry::OverWriteFile(entry))
+    }
+
     pub fn log_rename<P: AsRef<str>>(
         &self,
         op_ms: u64,
@@ -217,18 +226,13 @@ impl JournalWriter {
         self.send(JournalEntry::Symlink(entry))
     }
 
-    pub fn log_hardlink<P: AsRef<str>>(
-        &self,
-        op_ms: u64,
-        old_path: P,
-        new_path: P,
-    ) -> FsResult<()> {
-        let entry = HardlinkEntry {
+    pub fn log_link<P: AsRef<str>>(&self, op_ms: u64, src_path: P, dst_path: P) -> FsResult<()> {
+        let entry = LinkEntry {
             op_ms,
-            old_path: old_path.as_ref().to_string(),
-            new_path: new_path.as_ref().to_string(),
+            src_path: src_path.as_ref().to_string(),
+            dst_path: dst_path.as_ref().to_string(),
         };
-        self.send(JournalEntry::Hardlink(entry))
+        self.send(JournalEntry::Link(entry))
     }
 
     // for testing

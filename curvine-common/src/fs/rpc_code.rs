@@ -38,7 +38,7 @@ pub enum RpcCode {
     GetMasterInfo = 14,
     SetAttr = 15,
     Symlink = 16,
-    Hardlink = 17,
+    Link = 17,
 
     // manager interface.
     Mount = 30,

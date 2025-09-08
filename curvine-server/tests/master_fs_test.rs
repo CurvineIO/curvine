@@ -17,20 +17,20 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
 };
+use curvine_common::state::SetAttrOptsBuilder;
 use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, WorkerInfo,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, CreateFlag, WorkerInfo,
 };
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
-use orpc::common::Utils;
 use orpc::common::LocalTime;
+use orpc::common::Utils;
 use orpc::message::Builder;
 use orpc::runtime::AsyncRuntime;
 use orpc::CommonResult;
 use std::sync::Arc;
-use curvine_common::state::SetAttrOptsBuilder;
 // Test the master filesystem function separately.
 // This test does not require a cluster startup
 fn new_fs(format: bool, name: &str) -> MasterFilesystem {
@@ -287,6 +287,14 @@ fn create_file(fs: &MasterFilesystem) -> CommonResult<()> {
 
     fs.print_tree();
 
+    // overwrite file
+    let oldid = fs.file_status("/test_dir/subdir/file1.log")?.id;
+    let mut opts = CreateFileOpts::with_create(false);
+    opts.create_flag = CreateFlag::new(CreateFlag::CRATE | CreateFlag::OVERWRITE);
+    fs.create_with_opts("/test_dir/subdir/file1.log", opts.clone())?;
+    assert_eq!(oldid, fs.file_status("/test_dir/subdir/file1.log")?.id);
+
+    fs.print_tree();
     Ok(())
 }
 
@@ -316,16 +324,16 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
 }
 
 #[test]
-fn hardlink() -> CommonResult<()> {
+fn link() -> CommonResult<()> {
     let fs = new_fs(true, "fs_test");
     fs.mkdir("/a/b", true)?;
     fs.create("/a/b/file.log", true)?;
     fs.print_tree();
-    fs.hardlink("/a/b/file.log", "/a/b/file2.log")?;
+    fs.link("/a/b/file.log", "/a/b/file2.log")?;
     assert!(fs.exists("/a/b/file2.log")?);
     fs.print_tree();
 
-    fs.hardlink("/a/b/file.log", "/a/d/file.log")?;
+    fs.link("/a/b/file.log", "/a/d/file.log")?;
     assert!(fs.exists("/a/d/file.log")?);
     fs.print_tree();
 
@@ -337,9 +345,7 @@ fn hardlink() -> CommonResult<()> {
 
     //update to check all linked file attr is same
     let time = LocalTime::mills() as i64;
-    let opts = SetAttrOptsBuilder::new()
-        .mtime(time)
-        .build();
+    let opts = SetAttrOptsBuilder::new().mtime(time).build();
     fs.set_attr("/a/b/file2.log", opts)?;
     fs.print_tree();
     let mtime_t = fs.file_status("/a/b/file2.log")?.mtime;
@@ -363,7 +369,6 @@ fn hardlink() -> CommonResult<()> {
     assert_eq!(nlink_t, 2);
     let nlink_t = fs.file_status("/a/d/file.log")?.nlink;
     assert_eq!(nlink_t, 2);
-
 
     //rename file2.log
     fs.rename("/a/b/file2.log", "/a/b/file3.log")?;

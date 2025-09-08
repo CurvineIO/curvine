@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_client::ClientMetrics;
-use curvine_common::fs::Path;
-use curvine_common::fs::Writer;
+use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
     CreateFileOptsBuilder, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
 };
@@ -34,38 +34,55 @@ fn fs_test() -> FsResult<()> {
 
     let mut conf = Testing::get_cluster_conf()?;
     conf.client.metric_report_enable = true;
-    let fs = Testing::get_fs_with_conf(conf)?;
+    let fs = Testing::get_fs(Some(rt.clone()), Some(conf))?;
     let res: FsResult<()> = rt.block_on(async move {
         let path = Path::from_str("/fs_test")?;
         let _ = fs.delete(&path, true).await;
 
         mkdir(&fs).await?;
+        println!("mkdir done");
 
         create_file(&fs).await?;
+        println!("create_file done");
+
+        test_overwrite(&fs).await?;
+        println!("test_overwrite done");
 
         file_status(&fs).await?;
+        println!("file_status done");
 
         delete(&fs).await?;
+        println!("delete done");
 
         rename(&fs).await?;
+        println!("rename done");
 
         list_status(&fs).await?;
+        println!("list_status done");
 
         list_files(&fs).await?;
+        println!("list_files done");
 
         get_master_info(&fs).await?;
+        println!("get_master_info done");
 
         add_block(&fs).await?;
+        println!("add_block done");
 
         rename2(&fs).await?;
+        println!("rename2 done");
 
         set_attr_non_recursive(&fs).await?;
+        println!("set_attr_non_recursive done");
 
         set_attr_recursive(&fs).await?;
+        println!("set_attr_recursive done");
 
         test_fs_used(&fs).await?;
+        println!("test_fs_used done");
 
         test_metrics(&fs).await?;
+        println!("test_metrics done");
 
         // symlink(&fs).await?;
         Ok(())
@@ -125,6 +142,118 @@ async fn create_file(fs: &CurvineFileSystem) -> CommonResult<()> {
     assert_eq!(status.storage_policy.ttl_ms, 10000);
     assert_eq!(status.storage_policy.ttl_action, TtlAction::Delete);
     assert_eq!(status.x_attr.get("123"), Some(&"xxx".as_bytes().to_vec()));
+    Ok(())
+}
+
+async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
+    let path = Path::from_str("/fs_test/overwrite_test.log")?;
+
+    // Helper function to read file content
+    async fn read_file_content(fs: &CurvineFileSystem, path: &Path) -> CommonResult<String> {
+        let status = fs.get_status(path).await?;
+        let mut reader = fs.open(path).await?;
+        let mut buffer = BytesMut::zeroed(status.len as usize);
+        let bytes_read = reader.read_full(&mut buffer).await?;
+        reader.complete().await?;
+        buffer.truncate(bytes_read);
+        Ok(String::from_utf8(buffer.to_vec())?)
+    }
+
+    // 1. Create initial file and write content "initial"
+    let create_opts = CreateFileOptsBuilder::with_conf(&fs.conf().client)
+        .create_parent(true)
+        .overwrite(false) // First creation, no need to overwrite
+        .build();
+
+    let mut writer = fs.create_with_opts(&path, create_opts).await?;
+    writer.write("initial".as_bytes()).await?;
+    writer.complete().await?;
+
+    let initial_status = fs.get_status(&path).await?;
+    let initial_inode_id = initial_status.id;
+    let initial_content = read_file_content(fs, &path).await?;
+    assert_eq!(initial_content, "initial");
+    assert_eq!(initial_status.len, 7); // Length of "initial"
+    println!(
+        "Initial file created, inode_id: {}, content: {}",
+        initial_inode_id, initial_content
+    );
+
+    // 2. Use overwrite mode to rewrite file content to "overwritten_content"
+    let overwrite_opts = CreateFileOptsBuilder::with_conf(&fs.conf().client)
+        .create_parent(true)
+        .overwrite(true) // Enable overwrite
+        .build();
+
+    println!("xx overwrite_inode_id");
+    let mut writer = fs.create_with_opts(&path, overwrite_opts.clone()).await?;
+    writer.write("overwritten_content".as_bytes()).await?;
+    println!("yy overwrite_inode_id");
+    writer.complete().await?;
+    println!("xxyy overwrite_inode_id");
+
+    let overwrite_status = fs.get_status(&path).await?;
+    let overwrite_inode_id = overwrite_status.id;
+    println!("x overwrite_inode_id: {}", overwrite_inode_id);
+    let overwrite_content = read_file_content(fs, &path).await?;
+    println!("y overwrite_content: {}", overwrite_content);
+
+    // 3. Verify state after overwrite
+    assert_eq!(overwrite_content, "overwritten_content");
+    assert_eq!(overwrite_status.len, 19); // Length of "overwritten_content"
+    assert_eq!(
+        initial_inode_id, overwrite_inode_id,
+        "Overwrite should preserve inode ID"
+    );
+    println!(
+        "File overwritten successfully, inode_id: {} (preserved), content: {}",
+        overwrite_inode_id, overwrite_content
+    );
+
+    // 4. Overwrite again, write shorter content "short"
+    let mut writer = fs.create_with_opts(&path, overwrite_opts.clone()).await?;
+    writer.write("short".as_bytes()).await?;
+    writer.complete().await?;
+
+    let final_status = fs.get_status(&path).await?;
+    let final_inode_id = final_status.id;
+    let final_content = read_file_content(fs, &path).await?;
+
+    // 5. Verify final state
+    assert_eq!(final_content, "short");
+    assert_eq!(final_status.len, 5); // Length of "short"
+    assert_eq!(
+        initial_inode_id, final_inode_id,
+        "Multiple overwrites should preserve inode ID"
+    );
+    println!(
+        "File overwritten again, inode_id: {} (preserved), content: {}",
+        final_inode_id, final_content
+    );
+
+    // 6. Test overwrite to empty file
+    let mut writer = fs.create_with_opts(&path, overwrite_opts).await?;
+    writer.complete().await?; // Don't write any content
+
+    let empty_status = fs.get_status(&path).await?;
+    let empty_inode_id = empty_status.id;
+    let empty_content = if empty_status.len > 0 {
+        read_file_content(fs, &path).await?
+    } else {
+        String::new()
+    };
+
+    // 7. Verify empty file state
+    assert_eq!(empty_content, "");
+    assert_eq!(empty_status.len, 0);
+    assert_eq!(
+        initial_inode_id, empty_inode_id,
+        "Overwrite to empty should preserve inode ID"
+    );
+    println!(
+        "File overwritten to empty, inode_id: {} (preserved), content length: {}",
+        empty_inode_id, empty_status.len
+    );
 
     Ok(())
 }

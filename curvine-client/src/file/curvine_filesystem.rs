@@ -267,8 +267,8 @@ impl CurvineFileSystem {
         self.fs_client.symlink(target, link, force).await
     }
 
-    pub async fn hardlink(&self, old_path: &Path, new_path: &Path) -> FsResult<()> {
-        self.fs_client.hardlink(old_path, new_path).await
+    pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
+        self.fs_client.link(src_path, dst_path).await
     }
 
     pub async fn get_mount_info(&self, path: &Path) -> FsResult<Option<MountInfo>> {

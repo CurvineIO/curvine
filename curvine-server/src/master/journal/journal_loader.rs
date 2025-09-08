@@ -58,6 +58,8 @@ impl JournalLoader {
 
             JournalEntry::CreateFile(e) => self.create_file(e),
 
+            JournalEntry::OverWriteFile(e) => self.overwrite_file(e),
+
             JournalEntry::AddBlock(e) => self.add_block(e),
 
             JournalEntry::CompleteFile(e) => self.complete_file(e),
@@ -75,7 +77,7 @@ impl JournalLoader {
             JournalEntry::SetAttr(e) => self.set_attr(e),
 
             JournalEntry::Symlink(e) => self.symlink(e),
-            JournalEntry::Hardlink(e) => self.hardlink(e),
+            JournalEntry::Link(e) => self.link(e),
         }
     }
 
@@ -110,6 +112,20 @@ impl JournalLoader {
         Ok(())
     }
 
+    fn overwrite_file(&self, entry: OverWriteFileEntry) -> CommonResult<()> {
+        let fs_dir = self.fs_dir.write();
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+
+        // For journal replay, we directly update the file with the entry's file data
+        let mut inode = try_option!(inp.get_last_inode());
+        let file = inode.as_file_mut()?;
+        let _ = mem::replace(file, entry.file);
+
+        fs_dir.store.apply_overwrite_file(inode.as_ref())?;
+
+        Ok(())
+    }
+
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
@@ -135,7 +151,7 @@ impl JournalLoader {
         // Update block location
         fs_dir
             .store
-            .apply_new_block(inode.as_ref(), entry.commit_block.as_ref())?;
+            .apply_complete_file(inode.as_ref(), entry.commit_block.as_ref())?;
 
         Ok(())
     }
@@ -187,18 +203,18 @@ impl JournalLoader {
         Ok(())
     }
 
-    pub fn hardlink(&self, entry: HardlinkEntry) -> CommonResult<()> {
+    pub fn link(&self, entry: LinkEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let old_path = InodePath::resolve(fs_dir.root_ptr(), entry.old_path, &fs_dir.store)?;
-        let new_path = InodePath::resolve(fs_dir.root_ptr(), entry.new_path, &fs_dir.store)?;
-        
+        let old_path = InodePath::resolve(fs_dir.root_ptr(), entry.src_path, &fs_dir.store)?;
+        let new_path = InodePath::resolve(fs_dir.root_ptr(), entry.dst_path, &fs_dir.store)?;
+
         // Get the original inode ID
         let original_inode_id = match old_path.get_last_inode() {
             Some(inode) => inode.id(),
-            None => return err_box!("Original file not found during hardlink recovery"),
+            None => return err_box!("Original file not found during link recovery"),
         };
-        
-        fs_dir.unprotected_hardlink(new_path, original_inode_id, entry.op_ms)?;
+
+        fs_dir.unprotected_link(new_path, original_inode_id, entry.op_ms)?;
         Ok(())
     }
 

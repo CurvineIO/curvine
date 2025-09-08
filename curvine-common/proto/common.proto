@@ -60,6 +60,7 @@ message FileStatusProto {
     required string group = 16;
     required uint32 mode = 17;
     optional string target = 18;
+    required uint32 nlink = 19;
 }
 
 // Describe the worker address information.
