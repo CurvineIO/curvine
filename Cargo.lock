@@ -1208,6 +1208,7 @@ dependencies = [
  "clap",
  "curvine-client",
  "curvine-common",
+ "curvine-ufs",
  "num-bigint",
  "orpc",
  "reqwest 0.11.27",

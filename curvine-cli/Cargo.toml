@@ -8,6 +8,7 @@ license.workspace = true
 orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-client = { workspace = true }
+curvine-ufs = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

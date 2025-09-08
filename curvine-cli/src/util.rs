@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use bigdecimal::BigDecimal;
+use curvine_ufs::S3Conf;
 use num_bigint::BigInt;
-use orpc::CommonResult;
+use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
-use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -54,17 +54,17 @@ pub async fn handle_rpc_result<T, E: Display>(operation: impl Future<Output = Re
 pub fn validate_path_and_configs(
     path: &str,
     configs: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> CommonResult<()> {
     let scheme = extract_scheme(path);
 
     match scheme.as_deref() {
         Some("s3") => {
             validate_s3_path(path)?;
-            validate_s3_configs(configs)
+            S3Conf::with_map(configs.clone())?;
+            Ok(())
         }
-        Some("minio") => validate_minio_configs(path),
         Some(_) => Ok(()), // No special validation for other schemes
-        None => Err(format!("Unrecognized path format: {}", path)),
+        None => err_box!("Unrecognized path format: {}", path),
     }
 }
 
@@ -104,82 +104,8 @@ pub fn extract_s3_bucket_and_key(path: &str) -> Option<(String, String)> {
     }
 }
 
-pub fn enrich_s3_configs(path: &str, configs: &mut HashMap<String, String>) {
-    if !configs.contains_key("s3.bucket_name") {
-        if let Some((bucket, _)) = extract_s3_bucket_and_key(path) {
-            configs.insert("s3.bucket_name".to_string(), bucket.clone());
-            println!("bucket name: {}", bucket);
-        }
-    }
-
-    if !configs.contains_key("conn_timeout") {
-        configs.insert("conn_timeout".to_string(), "3".to_string());
-    }
-
-    if !configs.contains_key("retry_times") {
-        configs.insert("retry_times".to_string(), "3".to_string());
-    }
-
-    if !configs.contains_key("read_timeout") {
-        configs.insert("read_timeout".to_string(), "5".to_string());
-    }
-}
-
 pub fn extract_scheme(path: &str) -> Option<String> {
     path.find("://").map(|pos| path[..pos].to_lowercase())
-}
-
-pub fn validate_s3_configs(configs: &HashMap<String, String>) -> Result<(), String> {
-    if let Some(endpoint) = configs.get("s3.endpoint_url") {
-        if endpoint.is_empty() {
-            return Err("s3.endpoint_url cannot be empty".to_string());
-        }
-
-        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
-            return Err("s3.endpoint_url must start with http:// or https://".to_string());
-        }
-    }
-
-    let has_access = configs.contains_key("s3.credentials.access");
-    let has_secret = configs.contains_key("s3.credentials.secret");
-
-    if has_access != has_secret {
-        let missing = if has_access {
-            "s3.credentials.secret"
-        } else {
-            "s3.credentials.access"
-        };
-
-        return Err(format!(
-            "S3 authentication information incomplete: access provided but missing {}",
-            missing
-        ));
-    }
-
-    if has_access && has_secret {
-        let access = configs.get("s3.credentials.access").unwrap();
-        let secret = configs.get("s3.credentials.secret").unwrap();
-
-        if access.is_empty() {
-            return Err("s3.credentials.access cannot be empty".to_string());
-        }
-
-        if secret.is_empty() {
-            return Err("s3.credentials.secret cannot be empty".to_string());
-        }
-    }
-
-    Ok(())
-}
-
-pub fn validate_minio_configs(path: &str) -> Result<(), String> {
-    let file_path = path.strip_prefix("file://").unwrap_or(path);
-
-    if !Path::new(file_path).exists() {
-        return Err(format!("Local file does not exist: {}", file_path));
-    }
-
-    Ok(())
 }
 
 pub fn parse_duration(interval_str: &str) -> Result<Duration, String> {
