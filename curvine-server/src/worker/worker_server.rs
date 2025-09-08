@@ -118,6 +118,7 @@ impl Worker {
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
         WORKER_METRICS.get_or_init(|| WorkerMetrics::new(service.store.clone()).unwrap());
+        conf.print();
 
         let block_store = service.store.clone();
         let rpc_server = RpcServer::with_rt(rt.clone(), conf.worker_server_conf(), service.clone());

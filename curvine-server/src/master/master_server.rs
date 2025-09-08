@@ -132,6 +132,7 @@ impl Master {
 
         Logger::init(log);
         MASTER_METRICS.get_or_init(|| MasterMetrics::new().unwrap());
+        conf.print();
 
         // step1: Create a journal system, the journal system determines how to create a fs dir.
         let journal_system = JournalSystem::from_conf(&conf)?;

@@ -1,3 +1,4 @@
+mod blocks;
 mod cat;
 mod commands;
 mod common;
