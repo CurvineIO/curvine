@@ -29,7 +29,7 @@ public class BenchTest {
         System.setProperty("java.library.path", useDir + "/../../target/debug");
         System.setProperty("curvine.conf.dir", useDir + "/../../etc");
 
-        System.setProperty("fs.cv.master_addrs", "localhost:60705");
+        System.setProperty("fs.cv.default.master_addrs", "localhost:51753");
         System.setProperty("fs.cv.log_level", "debug");
         // System.setProperty("fs.cv.client_hostname", "localhost");
     }
