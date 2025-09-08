@@ -121,6 +121,6 @@ impl Writer for FsWriter {
 
 impl Drop for FsWriter {
     fn drop(&mut self) {
-        info!("Close writer, path = {}", self.path())
+        info!("Close writer, path={}", self.path())
     }
 }

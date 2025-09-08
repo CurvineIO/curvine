@@ -139,10 +139,12 @@ impl JobManager {
             // Files are generally auto-loaded and executed in parallel.
             // Validate ufs_mtime to prevent distributing a large number of duplicate tasks.
             if let Ok(cv_status) = self.master_fs.file_status(target_path.path()) {
-                if cv_status.storage_policy.ufs_mtime == 0 {
+                if cv_status.is_expired() || !cv_status.is_complete {
                     false
                 } else {
-                    cv_status.storage_policy.ufs_mtime == source_status.mtime
+                    source_status.len == cv_status.len
+                        && cv_status.storage_policy.ufs_mtime != 0
+                        && cv_status.storage_policy.ufs_mtime == source_status.mtime
                 }
             } else {
                 false
