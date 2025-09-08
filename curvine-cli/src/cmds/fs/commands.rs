@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use crate::cmds::fs::{
     cat::CatCommand, count::CountCommand, df::DfCommand, du::DuCommand, get::GetCommand,
-    ls::LsCommand, mkdir::MkdirCommand, put::PutCommand, rm::RmCommand, stat::StatCommand,
-    touch::TouchCommand,
+    ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand, rm::RmCommand,
+    stat::StatCommand, touch::TouchCommand,
 };
 
 #[derive(Parser, Debug)]
@@ -156,6 +156,14 @@ pub enum FsSubCommand {
         #[clap(help = "Path of the directory to count")]
         path: String,
     },
+
+    /// Move file or directory
+    Mv {
+        #[clap(help = "Source path to move")]
+        src_path: String,
+        #[clap(help = "Destination path")]
+        dst_path: String,
+    },
 }
 
 impl FsCommand {
@@ -263,6 +271,14 @@ impl FsCommand {
             FsSubCommand::Count { path } => {
                 let count_cmd = CountCommand::Count { path: path.clone() };
                 count_cmd.execute(client).await
+            }
+
+            FsSubCommand::Mv { src_path, dst_path } => {
+                let mv_cmd = MvCommand::Mv {
+                    source: src_path.clone(),
+                    destination: dst_path.clone(),
+                };
+                mv_cmd.execute(client).await
             }
         }
     }
