@@ -16,6 +16,7 @@ package io.curvine;
 
 import org.apache.hadoop.fs.FSExceptionMessages;
 import org.apache.hadoop.fs.FSInputStream;
+import org.apache.hadoop.fs.FileSystem;
 
 import javax.annotation.Nonnull;
 import java.io.EOFException;
@@ -33,10 +34,13 @@ public class CurvineInputStream extends FSInputStream {
     private final long[] tmp = new long[] {0, 0};
     private ByteBuffer buffer;
 
-    public CurvineInputStream(CurvineFsMount libFs, long nativeHandle, long fileSize) {
+    private FileSystem.Statistics statistics;
+
+    public CurvineInputStream(CurvineFsMount libFs, long nativeHandle, long fileSize, FileSystem.Statistics statistics) {
         this.libFs = libFs;
         this.nativeHandle = nativeHandle;
         this.fileSize = fileSize;
+        this.statistics = statistics;
     }
 
     private void checkClosed() throws IOException {
@@ -93,6 +97,11 @@ public class CurvineInputStream extends FSInputStream {
         int size = Math.min(buffer.remaining(), length);
         buffer.get(buf, offset, size);
         pos += size;
+
+        if (statistics != null) {
+            statistics.incrementBytesRead(size);
+        }
+
         return size;
     }
 

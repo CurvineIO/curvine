@@ -114,11 +114,15 @@ public class CurvineFileSystem extends FileSystem {
 
     @Override
     public FSDataInputStream open(Path path, int bufferSize) throws IOException {
+        if (statistics != null) {
+            statistics.incrementReadOps(1);
+        }
+
         long[] tmp = new long[] {0, 0};
         String formatPath = formatPath(path);
         try {
             long nativeHandle = libFs.open(formatPath, tmp);
-            return new FSDataInputStream(new CurvineInputStream(libFs, nativeHandle, tmp[0]));
+            return new FSDataInputStream(new CurvineInputStream(libFs, nativeHandle, tmp[0], statistics));
         } catch (CurvineException e) {
             if (filesystemConf.enable_unified_fs && !filesystemConf.enable_read_ufs) {
                 Optional<String> optUfsPath = libFs.getUfsPath(formatPath);
@@ -146,6 +150,9 @@ public class CurvineFileSystem extends FileSystem {
             long blockSize,
             Progressable progress
     ) throws IOException {
+        if (statistics != null) {
+            statistics.incrementWriteOps(1);
+        }
         long nativeHandle = this.libFs.create(formatPath(path), overwrite);
         CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, 0, writeChunkSize, writeChunkNum);
         return new FSDataOutputStream(output, statistics);
@@ -153,6 +160,10 @@ public class CurvineFileSystem extends FileSystem {
 
     @Override
     public FSDataOutputStream append(Path path, int bufferSize, Progressable progress) throws IOException {
+        if (statistics != null) {
+            statistics.incrementWriteOps(1);
+        }
+
         long[] tmp = new long[] {0};
         long nativeHandle = this.libFs.append(formatPath(path), tmp);
         CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, tmp[0], writeChunkSize, writeChunkNum);
@@ -161,18 +172,30 @@ public class CurvineFileSystem extends FileSystem {
 
     @Override
     public boolean rename(Path src, Path dst) throws IOException {
+        if (statistics != null) {
+            statistics.incrementWriteOps(1);
+        }
+
         libFs.rename(formatPath(src), formatPath(dst));
         return true;
     }
 
     @Override
     public boolean delete(Path f, boolean recursive) throws IOException {
+        if (statistics != null) {
+            statistics.incrementWriteOps(1);
+        }
+
         libFs.delete(formatPath(f), recursive);
         return true;
     }
 
     @Override
     public boolean mkdirs(Path f, FsPermission permission) throws IOException {
+        if (statistics != null) {
+            statistics.incrementWriteOps(1);
+        }
+
         libFs.mkdir(formatPath(f), true);
         return true;
     }
@@ -187,6 +210,10 @@ public class CurvineFileSystem extends FileSystem {
 
     @Override
     public FileStatus getFileStatus(Path f) throws IOException {
+        if (statistics != null) {
+            statistics.incrementReadOps(1);
+        }
+
         byte[] bytes = libFs.getFileStatus(formatPath(f));
         GetFileStatusResponse proto = GetFileStatusResponse.parseFrom(bytes);
         return toHadoop(proto.getStatus(), f);
@@ -194,6 +221,10 @@ public class CurvineFileSystem extends FileSystem {
 
     @Override
     public FileStatus[] listStatus(Path f) throws IOException {
+        if (statistics != null) {
+            statistics.incrementReadOps(1);
+        }
+
         byte[] bytes = libFs.listStatus(formatPath(f));
         ListStatusResponse proto = ListStatusResponse.parseFrom(bytes);
         FileStatus[] statuses = new FileStatus[proto.getStatusesList().size()];
@@ -226,12 +257,20 @@ public class CurvineFileSystem extends FileSystem {
     }
 
     public CurvineFsStat getFsStat() throws IOException {
+        if (statistics != null) {
+            statistics.incrementReadOps(1);
+        }
+
         byte[] bytes = libFs.getMasterInfo();
         GetMasterInfoResponse info = GetMasterInfoResponse.parseFrom(bytes);
         return new CurvineFsStat(info);
     }
 
     public Optional<MountInfoProto> getMountInfo(Path path) throws IOException {
+        if (statistics != null) {
+            statistics.incrementReadOps(1);
+        }
+
         byte[] bytes = libFs.getMountInfo(path.toString());
         GetMountInfoResponse response = GetMountInfoResponse.parseFrom(bytes);
         if (response.hasMountInfo()) {
