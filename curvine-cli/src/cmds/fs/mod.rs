@@ -8,6 +8,7 @@ mod du;
 mod get;
 mod ls;
 mod mkdir;
+mod mv;
 mod put;
 mod rm;
 mod stat;

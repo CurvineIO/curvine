@@ -292,6 +292,29 @@ impl S3FileSystem {
             Ok(_) => Ok(()),
         }
     }
+
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> FsResult<()> {
+        let source_object = format!("{}/{}", src_bucket, src_key);
+
+        let res = self
+            .client
+            .copy_object()
+            .bucket(dst_bucket)
+            .key(dst_key)
+            .copy_source(source_object)
+            .send()
+            .await;
+        match res {
+            Err(e) => err_ufs!(e),
+            Ok(_) => Ok(()),
+        }
+    }
 }
 
 impl FileSystem<S3Writer, S3Reader> for S3FileSystem {
@@ -347,8 +370,28 @@ impl FileSystem<S3Writer, S3Reader> for S3FileSystem {
         Ok(reader)
     }
 
-    async fn rename(&self, _src: &Path, _dst: &Path) -> FsResult<bool> {
-        err_ufs!("Not supported")
+    async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
+        if src.is_root() || dst.is_root() {
+            return err_ufs!("Cannot rename root directory");
+        }
+
+        let (src_bucket, src_key) = UfsUtils::get_bucket_key(src)?;
+        let (dst_bucket, dst_key) = UfsUtils::get_bucket_key(dst)?;
+        let status = self.get_object_status(src_bucket, src_key).await?;
+        match status {
+            None => err_ufs!("Path not exists: {}", src),
+            Some(v) if v.is_file() => {
+                self.copy_object(src_bucket, src_key, dst_bucket, dst_key)
+                    .await?;
+                self.delete_object(src_bucket, src_key).await?;
+                Ok(true)
+            }
+            Some(_) => {
+                // Rename directory
+                // @todo Implement directory renaming
+                err_ufs!("Renaming directories is not supported")
+            }
+        }
     }
 
     async fn delete(&self, path: &Path, _recursive: bool) -> FsResult<()> {
