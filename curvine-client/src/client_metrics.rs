@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::file::FsContext;
 use curvine_common::state::{MetricType, MetricValue};
 use orpc::common::Metrics;
 use orpc::common::{CounterVec, Metrics as m};
+use orpc::sync::FastDashMap;
 use orpc::CommonResult;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -22,6 +24,7 @@ use std::fmt::{Debug, Formatter};
 pub struct ClientMetrics {
     pub mount_cache_hits: CounterVec,
     pub mount_cache_misses: CounterVec,
+    pub last_value_map: FastDashMap<String, f64>,
 }
 
 impl ClientMetrics {
@@ -39,6 +42,8 @@ impl ClientMetrics {
                 "mount cache miss count",
                 &["id"],
             )?,
+
+            last_value_map: FastDashMap::default(),
         };
 
         Ok(cm)
@@ -49,6 +54,8 @@ impl ClientMetrics {
     }
 
     pub fn encode() -> CommonResult<Vec<MetricValue>> {
+        let cm = FsContext::get_metrics();
+
         let mut metric_values = Vec::new();
         let metric_families = Metrics::registry().gather();
         for mf in metric_families {
@@ -89,12 +96,21 @@ impl ClientMetrics {
                     }
                 };
 
-                metric_values.push(MetricValue {
-                    metric_type,
-                    name: name.clone(),
-                    value,
-                    tags,
-                });
+                let incr_value = {
+                    let mut last_value = cm.last_value_map.entry(name.clone()).or_insert(0.0);
+                    let incr_value = value - *last_value;
+                    *last_value = value;
+                    incr_value
+                };
+
+                if incr_value > 0f64 {
+                    metric_values.push(MetricValue {
+                        metric_type,
+                        name: name.clone(),
+                        value: incr_value,
+                        tags,
+                    });
+                }
             }
         }
 
