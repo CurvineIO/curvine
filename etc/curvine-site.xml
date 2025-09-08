@@ -21,7 +21,7 @@
 <configuration>
     <property>
         <name>fs.defaultFS</name>
-        <value>cv:///</value>
+        <value>cv://default</value>
     </property>
 
     <property>
@@ -30,7 +30,7 @@
     </property>
 
     <property>
-        <name>fs.cv.master_addrs</name>
+        <name>fs.cv.default.master_addrs</name>
         <value>localhost:8995</value>
     </property>
 
@@ -56,7 +56,7 @@
 
     <property>
         <name>fs.cv.log_dir</name>
-        <value>stdout</value>
+        <value>stderr</value>
     </property>
 
     <property>

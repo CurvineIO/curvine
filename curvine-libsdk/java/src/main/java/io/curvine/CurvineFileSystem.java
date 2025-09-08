@@ -73,17 +73,24 @@ public class CurvineFileSystem extends FileSystem {
         return filesystemConf;
     }
 
+    private String getMasterAddrs(String name) throws IOException {
+        String key = String.format("%s.%s.master_addrs", FilesystemConf.PREFIX, name);
+        String addrs = getConf().get(key);
+        if (StringUtils.isEmpty(addrs)) {
+            throw new IOException(key + " not set");
+        } else {
+            return addrs;
+        }
+    }
     @Override
     public void initialize(URI name, Configuration conf) throws IOException {
         super.initialize(name, conf);
         setConf(conf);
-        String authority;
+        String authority = name.getAuthority();
         try {
             filesystemConf = new FilesystemConf(conf);
-            // cv://host:name format, host:name is the curvine cluster address.
-            if (StringUtils.isNotEmpty(name.getAuthority())) {
-                filesystemConf.master_addrs = name.getAuthority();
-                authority = name.getAuthority();
+            if (StringUtils.isNotEmpty(authority)) {
+                filesystemConf.master_addrs = getMasterAddrs(authority);
             } else {
                 authority = "/";
             }
