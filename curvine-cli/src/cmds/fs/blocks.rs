@@ -64,39 +64,51 @@ impl BlocksCommand {
         }
 
         println!("\n📦 Block Locations:");
-        println!("{:-<85}", "");
+        let separator = format!("{:-<80}", "");
+        println!("{}", separator);
         println!(
-            "{:<6} {:<15} {:<12} {:<12} {:<40}",
-            "Block", "Block ID", "Size", "Storage", "Workers"
+            "{:<6} {:<15} {:<12} {:<12} {:<6} {}",
+            "Block", "Block ID", "Size", "Storage", "Count", "Workers"
         );
-        println!("{:-<85}", "");
+        println!("{}", separator);
 
         for (idx, block) in file_blocks.block_locs.iter().enumerate() {
             let size_str = ByteUnit::byte_to_string(block.block.len as u64);
             let storage_type = format!("{:?}", block.block.storage_type);
+            let worker_count = block.locs.len();
 
             let workers: Vec<String> = block
                 .locs
                 .iter()
                 .map(|addr| format!("{}:{}", addr.hostname, addr.rpc_port))
                 .collect();
-            let worker_str = workers.join(", ");
 
+            let first_worker = workers.first().map(|w| w.as_str()).unwrap_or("");
             println!(
-                "{:<6} {:<15} {:<12} {:<12} {:<40}",
+                "{:<6} {:<15} {:<12} {:<12} {:<6} {}",
                 idx + 1,
                 block.block.id,
                 size_str,
                 storage_type,
-                if worker_str.len() > 40 {
-                    &worker_str[..37]
-                } else {
-                    &worker_str
-                }
+                worker_count,
+                first_worker
             );
+
+            if workers.len() > 1 {
+                for worker in &workers[1..] {
+                    println!(
+                        "{:<6} {:<15} {:<12} {:<12} {:<6} {}",
+                        "", "", "", "", "", worker
+                    );
+                }
+            }
+
+            if idx < file_blocks.block_locs.len() - 1 && workers.len() > 1 {
+                println!();
+            }
         }
 
-        println!("{:-<85}", "");
+        println!("{}", separator);
     }
 
     fn print_json(file_blocks: &FileBlocks) {
