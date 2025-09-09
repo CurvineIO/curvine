@@ -38,6 +38,11 @@ aws-types = { version = "1.3.8", optional = true}
 
 opendal = { version = "0.54", default-features = false, optional = true }
 
+# JNI support for HDFS (moved from curvine-common)
+jni = { version = "0.21.1", features = ["invocation"], optional = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
 
 [features]
 # Storage backend implementations
@@ -57,3 +62,7 @@ opendal-oss = ["opendal", "opendal/services-oss"]      # Alibaba Cloud OSS
 opendal-cos = ["opendal", "opendal/services-cos"]      # Tencent Cloud COS
 opendal-azblob = ["opendal", "opendal/services-azblob"] # Azure Blob Storage
 opendal-gcs = ["opendal", "opendal/services-gcs"]      # Google Cloud Storage
+opendal-hdfs = ["opendal", "opendal/services-hdfs", "jni"]  
+opendal-webhdfs = ["opendal", "opendal/services-webhdfs"]         
+         
+jni = ["dep:jni"]  # JNI support (now local to curvine-ufs)

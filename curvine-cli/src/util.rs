@@ -104,6 +104,59 @@ pub fn extract_s3_bucket_and_key(path: &str) -> Option<(String, String)> {
     }
 }
 
+pub fn enrich_s3_configs(path: &str, configs: &mut HashMap<String, String>) {
+    if !configs.contains_key("s3.bucket_name") {
+        if let Some((bucket, _)) = extract_s3_bucket_and_key(path) {
+            configs.insert("s3.bucket_name".to_string(), bucket.clone());
+            println!("bucket name: {}", bucket);
+        }
+    }
+}
+
+pub fn enrich_hdfs_configs(path: &str, configs: &mut HashMap<String, String>) {
+    if let Some((namenode, hdfs_path)) = extract_hdfs_namenode_and_path(path) {
+        // Auto-set hdfs.namenode if not provided
+        if !configs.contains_key("hdfs.namenode") {
+            configs.insert("hdfs.namenode".to_string(), namenode.clone());
+            println!("Auto-detected HDFS namenode: {}", namenode);
+        }
+
+        // Auto-set hdfs.root if not provided
+        if !configs.contains_key("hdfs.root") && !hdfs_path.is_empty() {
+            configs.insert("hdfs.root".to_string(), hdfs_path);
+            println!(
+                "Auto-detected HDFS root path: {}",
+                configs.get("hdfs.root").unwrap()
+            );
+        }
+    }
+}
+
+pub fn extract_hdfs_namenode_and_path(path: &str) -> Option<(String, String)> {
+    if !path.starts_with("hdfs://") {
+        return None;
+    }
+
+    let path = path.strip_prefix("hdfs://")?;
+
+    // Find the first slash after the authority
+    let slash_pos = path.find('/');
+
+    match slash_pos {
+        Some(pos) => {
+            let authority = path[..pos].to_string();
+            let hdfs_path = path[pos..].to_string(); // Include the leading slash
+            let namenode = format!("hdfs://{}", authority);
+            Some((namenode, hdfs_path))
+        }
+        None => {
+            // No path component, just authority
+            let namenode = format!("hdfs://{}", path);
+            Some((namenode, "/".to_string()))
+        }
+    }
+}
+
 pub fn extract_scheme(path: &str) -> Option<String> {
     path.find("://").map(|pos| path[..pos].to_lowercase())
 }

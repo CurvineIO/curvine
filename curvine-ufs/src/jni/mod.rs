@@ -12,35 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod fs;
+mod jni_macros;
+mod jvm;
 
-// JNI support for HDFS operations (moved from curvine-common)
-#[cfg(feature = "jni")]
-pub mod jni;
-
-// Native S3 implementation
-#[cfg(feature = "s3")]
-pub mod s3;
-
-// OpenDAL implementations
-#[cfg(feature = "opendal")]
-pub mod opendal;
-
-mod ufs_utils;
-pub use self::ufs_utils::UfsUtils;
-
-mod conf;
-pub use self::conf::*;
-
-pub const FOLDER_SUFFIX: &str = "/";
-
-#[macro_export]
-macro_rules! err_ufs {
-    ($e:expr) => ({
-        Err(orpc::err_msg!($e).into())
-    });
-
-    ($f:tt, $($arg:expr),+) => ({
-        orpc::err_box!(format!($f, $($arg),+))
-    });
-}
+pub use jvm::*;

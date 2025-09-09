@@ -99,6 +99,7 @@ print_help() {
   echo "                          - opendal-gcs: OpenDAL GCS"
   echo
   echo "  -d, --debug           Build in debug mode (default: release mode)"
+  echo "  -f, --features LIST   Comma-separated list of extra features to enable"
   echo "  -z, --zip             Create zip archive"
   echo "  -h, --help            Show this help message"
   echo
@@ -107,6 +108,8 @@ print_help() {
   echo "  $0 --package core --ufs s3             # Build core packages with server, client and cli"
   echo "  $0 -p web --package fuse --debug       # Build web and fuse in debug mode"
   echo "  $0 --package all --ufs opendal-s3 -z   # Build all packages with OpenDAL S3 and create zip"
+  echo "  $0 --features opendal-hdfs,opendal-webhdfs  # Build with HDFS support"
+  echo "  $0 --features jni --package client     # Build client with JNI support"
 }
 
 # Create a version file.
@@ -129,10 +132,11 @@ DIST_ZIP=curvine-${CURVINE_VERSION}-${ARCH_NAME}-${OS_VERSION}.zip
 PROFILE="--release"
 declare -a PACKAGES=("all")  # Default to build all packages
 declare -a UFS_TYPES=("s3")  # Default UFS type
+declare -a EXTRA_FEATURES=()  # Extra features to add
 CRATE_ZIP=""
 
 # Parse command line arguments
-TEMP=$(getopt -o p:u:dzhv --long package:,ufs:,debug,zip,help -n "$0" -- "$@")
+TEMP=$(getopt -o p:u:f:dzhv --long package:,ufs:,features:,debug,zip,help -n "$0" -- "$@")
 if [ $? != 0 ] ; then print_help ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -149,6 +153,14 @@ while true ; do
       ;;
     -u|--ufs)
       UFS_TYPES+=("$2")
+      shift 2
+      ;;
+    -f|--features)
+      # Parse comma-separated features
+      IFS=',' read -ra FEATURE_ARRAY <<< "$2"
+      for feature in "${FEATURE_ARRAY[@]}"; do
+        EXTRA_FEATURES+=("$feature")
+      done
       shift 2
       ;;
     -d|--debug)
@@ -315,6 +327,33 @@ else
         ;;
       *)
         FEATURES+=("curvine-client/$ufs")
+        ;;
+    esac
+  done
+fi
+
+# Add extra features if specified
+if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
+  for feature in "${EXTRA_FEATURES[@]}"; do
+    case $feature in
+      opendal-hdfs)
+        # HDFS features need to be added to the correct packages
+        FEATURES+=("curvine-ufs/opendal-hdfs")
+        FEATURES+=("curvine-client/opendal-hdfs")
+        ;;
+      opendal-webhdfs)
+        # WebHDFS features need to be added to the correct packages
+        FEATURES+=("curvine-ufs/opendal-webhdfs")
+        FEATURES+=("curvine-client/opendal-webhdfs")
+        ;;
+      jni)
+        # JNI features need to be added to curvine-ufs and curvine-server
+        FEATURES+=("curvine-ufs/jni")
+        FEATURES+=("curvine-server/jni")
+        ;;
+      *)
+        # For other features, add as-is (might be package-specific)
+        FEATURES+=("$feature")
         ;;
     esac
   done

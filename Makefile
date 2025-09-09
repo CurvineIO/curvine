@@ -57,6 +57,8 @@ help:
 	@echo "  make build ARGS='-p server -p client'       - Build only server and client components"
 	@echo "  make build ARGS='-p object'                  - Build S3 object gateway"
 	@echo "  make build ARGS='--package core --ufs s3'   - Build core packages with S3 native SDK"
+	@echo "  make build-hdfs                             - Build with HDFS support (native + WebHDFS)"
+	@echo "  make build-webhdfs                          - Build with WebHDFS support only"
 	@echo "  make dist                                   - Build and create distribution package"
 	@echo "  RELEASE_VERSION=v1.0.0 make dist           - Build and package with specific version"
 	@echo "  make cargo ARGS='test --verbose'            - Run cargo test with verbose output"
@@ -145,6 +147,14 @@ csi-docker:
 csi-docker-fast:
 	@echo "Building curvine-csi Docker image (fast)..."
 	docker build --build-arg GOPROXY=https://goproxy.cn,direct -t curvine-csi:latest -f curvine-csi/Dockerfile .
+
+# 7. HDFS-specific builds
+.PHONY: build-hdfs build-webhdfs setup-hdfs
+
+# Build with HDFS support (native HDFS + WebHDFS)
+build-hdfs: check-env
+	@echo "Building Curvine with HDFS support..."
+	$(SHELL_CMD) build/build.sh --features opendal-hdfs,opendal-webhdfs,jni $(ARGS)
 
 # 8. All in one
 all: build

@@ -6,6 +6,10 @@ license.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+jni = ["curvine-ufs/jni"]
+
 [dependencies]
 orpc = { workspace = true }
 curvine-common = { workspace = true }

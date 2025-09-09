@@ -74,6 +74,17 @@ pub struct S3Conf {
     pub properties: HashMap<String, String>,
 }
 
+/// Unified OpenDAL configuration for timeout and retry settings
+/// Uses the same default values as S3Conf for consistency
+#[derive(Debug, Clone)]
+pub struct OpendalConf {
+    pub retry_times: u32,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+    pub retry_interval_ms: u64,
+    pub retry_max_delay_ms: u64,
+}
+
 impl S3Conf {
     pub const ENDPOINT: &'static str = "s3.endpoint_url";
     pub const ACCESS_KEY: &'static str = "s3.credentials.access";
@@ -133,6 +144,61 @@ impl S3Conf {
             read_timeout,
             properties: map.0,
         })
+    }
+}
+
+impl OpendalConf {
+    // Configuration keys
+    pub const RETRY_TIMES: &'static str = "opendal.retry_times";
+    pub const CONNECT_TIMEOUT: &'static str = "opendal.connect_timeout";
+    pub const READ_TIMEOUT: &'static str = "opendal.read_timeout";
+    pub const RETRY_INTERVAL_MS: &'static str = "opendal.retry_interval_ms";
+    pub const RETRY_MAX_DELAY_MS: &'static str = "opendal.retry_max_delay_ms";
+
+    // Default values - using S3Conf defaults for consistency
+    pub const DEFAULT_RETRY_TIMES: u32 = S3Conf::DEFAULT_RETRY_TIMES; // 3
+    pub const DEFAULT_CONNECT_TIMEOUT: &'static str = S3Conf::DEFAULT_CONNECT_TIMEOUT; // "30s"
+    pub const DEFAULT_READ_TIMEOUT: &'static str = S3Conf::DEFAULT_READ_TIMEOUT; // "120s"
+    pub const DEFAULT_RETRY_INTERVAL_MS: u64 = 1000; // 1 second
+    pub const DEFAULT_RETRY_MAX_DELAY_MS: u64 = 10000; // 10 seconds
+
+    /// Create OpendalConf from configuration map
+    pub fn from_map(properties: &HashMap<String, String>) -> CommonResult<Self> {
+        let map = ConfMap::new(properties.clone());
+
+        let retry_times = map
+            .get_u32(Self::RETRY_TIMES)
+            .unwrap_or(Self::DEFAULT_RETRY_TIMES);
+
+        let connect_timeout_str = map
+            .get_string(Self::CONNECT_TIMEOUT)
+            .unwrap_or(Self::DEFAULT_CONNECT_TIMEOUT.to_string());
+        let connect_timeout = DurationUnit::from_str(&connect_timeout_str)?.as_duration();
+
+        let read_timeout_str = map
+            .get_string(Self::READ_TIMEOUT)
+            .unwrap_or(Self::DEFAULT_READ_TIMEOUT.to_string());
+        let read_timeout = DurationUnit::from_str(&read_timeout_str)?.as_duration();
+
+        let retry_interval_ms = map
+            .get_u64(Self::RETRY_INTERVAL_MS)
+            .unwrap_or(Self::DEFAULT_RETRY_INTERVAL_MS);
+
+        let retry_max_delay_ms = map
+            .get_u64(Self::RETRY_MAX_DELAY_MS)
+            .unwrap_or(Self::DEFAULT_RETRY_MAX_DELAY_MS);
+
+        Ok(Self {
+            retry_times,
+            connect_timeout,
+            read_timeout,
+            retry_interval_ms,
+            retry_max_delay_ms,
+        })
+    }
+
+    pub fn total_timeout_ms(&self) -> u64 {
+        self.connect_timeout.as_millis() as u64 + self.read_timeout.as_millis() as u64
     }
 }
 

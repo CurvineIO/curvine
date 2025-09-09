@@ -12,19 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::err_ufs;
+use crate::OpendalConf;
 use bytes::BytesMut;
-use curvine_common::conf::UfsConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{FileStatus, SetAttrOpts};
+use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
 use curvine_common::FsResult;
 use futures::StreamExt;
 use opendal::services::*;
-use opendal::{layers::LoggingLayer, Operator};
+use opendal::{
+    layers::{LoggingLayer, RetryLayer, TimeoutLayer},
+    Operator,
+};
 use orpc::sys::DataSlice;
 use std::collections::HashMap;
-
-use crate::err_ufs;
+use std::time::Duration;
 
 /// OpenDAL Reader implementation
 pub struct OpendalReader {
@@ -250,6 +253,30 @@ pub struct OpendalFileSystem {
 }
 
 impl OpendalFileSystem {
+    fn add_stability_layers(
+        base_op: Operator,
+        conf: &HashMap<String, String>,
+    ) -> FsResult<Operator> {
+        let opendal_conf = OpendalConf::from_map(conf)
+            .map_err(|e| FsError::common(format!("Failed to parse OpenDAL config: {}", e)))?;
+
+        let total_timeout_ms = opendal_conf.total_timeout_ms();
+
+        let op = base_op
+            .layer(LoggingLayer::default())
+            .layer(TimeoutLayer::new().with_io_timeout(Duration::from_millis(total_timeout_ms)))
+            .layer(
+                RetryLayer::new()
+                    .with_min_delay(Duration::from_millis(opendal_conf.retry_interval_ms))
+                    .with_max_delay(Duration::from_millis(opendal_conf.retry_max_delay_ms))
+                    .with_max_times(opendal_conf.retry_times as usize)
+                    .with_factor(2.0)
+                    .with_jitter(),
+            );
+
+        Ok(op)
+    }
+
     pub fn new(path: &Path, conf: HashMap<String, String>) -> FsResult<Self> {
         let scheme = path
             .scheme()
@@ -263,6 +290,82 @@ impl OpendalFileSystem {
             .to_string();
 
         let operator = match scheme {
+            #[cfg(feature = "opendal-hdfs")]
+            "hdfs" | "oss" => {
+                use crate::jni::{register_jvm, JVM};
+
+                register_jvm();
+
+                let _ = JVM.get_or_init().map_err(|e| {
+                    FsError::common(format!("Failed to initialize JVM for HDFS: {}", e))
+                })?;
+
+                let mut builder = Hdfs::default();
+
+                let namenode = if let Some(namenode_config) = conf.get("hdfs.namenode") {
+                    namenode_config.clone()
+                } else {
+                    format!("hdfs://{}", bucket_or_container)
+                };
+
+                builder = builder.name_node(&namenode);
+
+                let root_path = conf.get("hdfs.root").map(|s| s.as_str()).unwrap_or("/");
+                builder = builder.root(root_path);
+
+                let hdfs_user = conf
+                    .get("hdfs.user")
+                    .cloned()
+                    .or_else(|| std::env::var("HADOOP_USER_NAME").ok())
+                    .or_else(|| std::env::var("USER").ok());
+
+                if let Some(user) = hdfs_user {
+                    builder = builder.user(&user);
+                }
+
+                if conf
+                    .get("hdfs.atomic_write_dir")
+                    .map(|s| s == "true")
+                    .unwrap_or(false)
+                {
+                    let atomic_dir = format!("{}/atomic_write_dir", root_path);
+                    builder = builder.atomic_write_dir(&atomic_dir);
+                }
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create HDFS operator: {}", e)))?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
+            #[cfg(feature = "opendal-webhdfs")]
+            "webhdfs" => {
+                let mut builder = Webhdfs::default();
+
+                let endpoint = if let Some(endpoint_config) = conf.get("webhdfs.endpoint") {
+                    endpoint_config.clone()
+                } else {
+                    format!("http://{}", bucket_or_container)
+                };
+
+                builder = builder.endpoint(&endpoint);
+
+                let root_path = conf.get("webhdfs.root").map(|s| s.as_str()).unwrap_or("/");
+                builder = builder.root(root_path);
+
+                let atomic_dir = format!("{}/atomic_write_dir", root_path);
+                builder = builder.atomic_write_dir(&atomic_dir);
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| {
+                        FsError::common(format!("Failed to create WebHDFS operator: {}", e))
+                    })?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
             #[cfg(feature = "opendal-s3")]
             "s3" | "s3a" => {
                 let mut builder = S3::default();
@@ -281,10 +384,10 @@ impl OpendalFileSystem {
                     builder = builder.secret_access_key(secret_key);
                 }
 
-                Operator::new(builder)
-                    .map_err(|e| FsError::common(format!("Failed to create S3 operator: {}", e)))?
-                    .layer(LoggingLayer::default())
-                    .finish()
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create S3 operator: {}", e)))?;
+
+                Self::add_stability_layers(base_op, &conf)?
             }
 
             #[cfg(feature = "opendal-oss")]
@@ -302,10 +405,11 @@ impl OpendalFileSystem {
                     builder = builder.secret_access_key(secret_key);
                 }
 
-                Operator::new(builder)
+                let base_op = Operator::new(builder)
                     .map_err(|e| FsError::common(format!("Failed to create OSS operator: {}", e)))?
-                    .layer(LoggingLayer::default())
-                    .finish()
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
             }
 
             #[cfg(feature = "opendal-gcs")]
@@ -320,10 +424,11 @@ impl OpendalFileSystem {
                     builder = builder.endpoint(endpoint);
                 }
 
-                Operator::new(builder)
+                let base_op = Operator::new(builder)
                     .map_err(|e| FsError::common(format!("Failed to create GCS operator: {}", e)))?
-                    .layer(LoggingLayer::default())
-                    .finish()
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
             }
 
             #[cfg(feature = "opendal-azblob")]
@@ -341,12 +446,13 @@ impl OpendalFileSystem {
                     builder = builder.endpoint(endpoint);
                 }
 
-                Operator::new(builder)
+                let base_op = Operator::new(builder)
                     .map_err(|e| {
                         FsError::common(format!("Failed to create Azure operator: {}", e))
                     })?
-                    .layer(LoggingLayer::default())
-                    .finish()
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
             }
 
             _ => {
@@ -370,14 +476,25 @@ impl OpendalFileSystem {
         } else {
             // Remove the scheme and bucket from the path
             let full_path = path.path();
-            Ok(full_path.trim_start_matches('/').to_string())
+            let trimmed = full_path.trim_start_matches('/');
+            if trimmed.is_empty() {
+                Ok("/".to_string())
+            } else {
+                // Keep the trailing slash for directories if it exists
+                Ok(trimmed.to_string())
+            }
         }
     }
 }
 
 impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     async fn mkdir(&self, path: &Path, _create_parent: bool) -> FsResult<bool> {
-        let object_path = self.get_object_path(path)?;
+        let mut object_path = self.get_object_path(path)?;
+        // Ensure directory paths end with '/' for WebHDFS
+        if !object_path.ends_with('/') && !object_path.is_empty() {
+            object_path.push('/');
+        }
+        // Debug: Creating directory
 
         self.operator
             .create_dir(&object_path)
@@ -389,6 +506,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
 
     async fn create(&self, path: &Path, _overwrite: bool) -> FsResult<OpendalWriter> {
         let object_path = self.get_object_path(path)?;
+        // Debug: Creating file
 
         let status = FileStatus {
             path: path.full_path().to_owned(),
@@ -426,7 +544,6 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
         let object_path = self.get_object_path(path)?;
-
         match self.operator.stat(&object_path).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(false),
@@ -500,7 +617,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             mtime: metadata
                 .last_modified()
                 .map(|t| t.timestamp_millis())
-                .unwrap_or(0),
+                .unwrap_or(946684800000),
             is_complete: true,
             len: metadata.content_length() as i64,
             replicas: 1,
@@ -515,7 +632,10 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     }
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
-        let object_path = self.get_object_path(path)?;
+        let mut object_path = self.get_object_path(path)?;
+        if self.scheme == "hdfs" && !object_path.ends_with('/') && !object_path.is_empty() {
+            object_path.push('/');
+        }
 
         let list_result = self
             .operator
@@ -533,16 +653,36 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             );
 
             let metadata = entry.metadata();
+            let (mtime, content_length) =
+                if self.scheme == "hdfs" && metadata.is_dir() && metadata.last_modified().is_none()
+                {
+                    match self.operator.stat(entry.path()).await {
+                        Ok(stat_metadata) => (
+                            stat_metadata
+                                .last_modified()
+                                .map(|t| t.timestamp_millis())
+                                .unwrap_or(946684800000),
+                            stat_metadata.content_length() as i64,
+                        ),
+                        Err(_) => (946684800000, metadata.content_length() as i64),
+                    }
+                } else {
+                    (
+                        metadata
+                            .last_modified()
+                            .map(|t| t.timestamp_millis())
+                            .unwrap_or(946684800000),
+                        metadata.content_length() as i64,
+                    )
+                };
+
             statuses.push(FileStatus {
                 path: entry_path.clone(),
                 name: entry.name().to_owned(),
                 is_dir: metadata.is_dir(),
-                mtime: metadata
-                    .last_modified()
-                    .map(|t| t.timestamp_millis())
-                    .unwrap_or(0),
+                mtime,
                 is_complete: true,
-                len: metadata.content_length() as i64,
+                len: content_length,
                 replicas: 1,
                 block_size: 4 * 1024 * 1024,
                 file_type: if metadata.is_dir() {

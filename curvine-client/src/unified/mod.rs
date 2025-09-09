@@ -83,8 +83,12 @@ impl UfsFileSystem {
 
             #[cfg(feature = "opendal")]
             Some(scheme)
-                if ["s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs"].contains(&scheme) =>
+                if [
+                    "s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs",
+                ]
+                .contains(&scheme) =>
             {
+                // JVM initialization for HDFS is handled in OpendalFileSystem::new
                 let fs = OpendalFileSystem::new(path, conf)?;
                 Ok(UfsFileSystem::OpenDAL(fs))
             }

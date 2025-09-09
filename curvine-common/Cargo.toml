@@ -40,5 +40,11 @@ slog-stdlog  = { workspace = true }
 chrono = { workspace = true }
 trait-variant = { workspace = true }
 
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+
 [build-dependencies]
 prost-build = { workspace = true }
