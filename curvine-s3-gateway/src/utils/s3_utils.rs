@@ -21,10 +21,14 @@ use std::collections::HashMap;
 
 pub fn format_s3_timestamp(timestamp_ms: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(timestamp_ms / 1000, 0)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.%3fZ").to_string())
+}
+
+pub fn format_http_timestamp(timestamp_ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(timestamp_ms / 1000, 0)
         .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string())
 }
 
-/// Map Curvine storage type to S3 storage class
 pub fn map_storage_class(storage_type: &StorageType) -> String {
     match storage_type.as_str_name() {
         "MEM" => "REDUCED_REDUNDANCY",
@@ -147,13 +151,15 @@ pub fn fill_ttl_info(head: &mut HeadObjectResult, file_status: &FileStatus) {
 }
 
 /// Convert FileStatus to complete HeadObjectResult
+/// Note: For HTTP headers, use format_http_timestamp() to convert the last_modified field
 pub fn file_status_to_head_object_result(
     file_status: &FileStatus,
     object_name: &str,
 ) -> HeadObjectResult {
     let mut head = HeadObjectResult {
         content_length: Some(file_status.len as usize),
-        last_modified: format_s3_timestamp(file_status.mtime),
+        // Use HTTP timestamp format for Last-Modified header
+        last_modified: format_http_timestamp(file_status.mtime),
         accept_ranges: Some("bytes".to_string()),
         etag: Some(generate_etag(file_status)),
         storage_class: Some(map_storage_class(&file_status.storage_policy.storage_type)),

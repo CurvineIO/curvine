@@ -260,7 +260,9 @@ impl Display for ClusterConf {
 pub struct S3GatewayConf {
     pub listen: String,
     pub region: String,
-    pub multipart_temp: String,
+    pub put_temp_dir: String,
+    pub put_memory_buffer_threshold: usize,
+    pub put_max_memory_buffer: usize,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
     pub enable_distributed_auth: bool,
@@ -273,7 +275,9 @@ impl Default for S3GatewayConf {
         Self {
             listen: "0.0.0.0:9900".to_string(),
             region: "us-east-1".to_string(),
-            multipart_temp: "/tmp/curvine-multipart".to_string(),
+            put_temp_dir: "/tmp/curvine-temp".to_string(),
+            put_memory_buffer_threshold: 1048576, // 1MB
+            put_max_memory_buffer: 16777216,      // 16MB
             access_key: None,
             secret_key: None,
             enable_distributed_auth: false,
