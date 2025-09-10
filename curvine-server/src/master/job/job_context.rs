@@ -80,7 +80,7 @@ impl JobContext {
             storage_type,
             ttl_ms,
             ttl_action,
-            ufs_conf: mnt.properties.clone(),
+            mount_info: mnt.clone(),
             create_time: LocalTime::mills() as i64,
         };
 

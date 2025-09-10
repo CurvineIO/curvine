@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::JobContext;
-use curvine_common::state::JobTaskProgress;
+use curvine_common::state::{JobTaskProgress, JobTaskState};
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::sync::FastDashMap;
@@ -54,6 +54,12 @@ impl JobStore {
         };
 
         job.update_progress(task_id, progress)
+    }
+
+    pub fn update_state(&self, job_id: &str, state: JobTaskState, message: impl Into<String>) {
+        if let Some(mut job) = self.jobs.get_mut(job_id) {
+            job.update_state(state, message);
+        }
     }
 }
 

@@ -12,24 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::UfsFactory;
 use crate::worker::task::load_task_runner::LoadTaskRunner;
-use crate::worker::task::{TaskContext, TaskStore};
+use crate::worker::task::TaskStore;
 use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::LoadTaskInfo;
 use curvine_common::FsResult;
 use log::info;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::channel::{AsyncReceiver, AsyncSender};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 pub struct TaskManager {
     rt: Arc<Runtime>,
     fs: CurvineFileSystem,
     tasks: TaskStore,
-    sender: AsyncSender<Arc<TaskContext>>,
+    factory: Arc<UfsFactory>,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
+    worker_task_semaphore: Arc<Semaphore>,
 }
 
 impl TaskManager {
@@ -43,7 +45,6 @@ impl TaskManager {
     ///
     /// * `rt` - An existing Arc-wrapped Runtime for async task execution
     /// * `conf` - The cluster configuration containing job and client settings
-    /// * `sender` - Async channel sender for dispatching task contexts to workers
     ///
     /// # Returns
     ///
@@ -56,50 +57,68 @@ impl TaskManager {
     /// - This ensures data distribution across all workers instead of local bias
     /// - Initializes filesystem client with the modified configuration
     /// - Sets up task store and timing configurations from job settings
-    pub fn with_rt(
-        rt: Arc<Runtime>,
-        conf: &ClusterConf,
-        sender: AsyncSender<Arc<TaskContext>>,
-    ) -> FsResult<Self> {
+    /// - **Concurrency Control**: Uses a Semaphore to limit concurrent load tasks
+    ///   based on `conf.job.load_task_concurrency_limit` to prevent excessive
+    ///   bandwidth and resource consumption during data copy operations.
+    ///
+    /// # Example Configuration
+    ///
+    /// ```toml
+    /// [job]
+    /// # Limit concurrent load tasks to prevent resource exhaustion
+    /// worker_max_concurrent_tasks = 10
+    /// ```
+    pub fn with_rt(rt: Arc<Runtime>, conf: &ClusterConf) -> FsResult<Self> {
         let mut new_conf = conf.clone();
         new_conf.client.hostname = "localhost".to_string();
 
         let fs = CurvineFileSystem::with_rt(new_conf, rt.clone())?;
-
+        let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
+        let worker_task_semaphore = Arc::new(Semaphore::new(conf.job.worker_max_concurrent_tasks));
         let mgr = Self {
             rt,
             fs,
             tasks: TaskStore::new(),
-            sender,
+            factory,
             progress_interval_ms: conf.job.task_report_interval.as_millis() as u64,
             task_timeout_ms: conf.job.task_timeout.as_millis() as u64,
+            worker_task_semaphore,
         };
 
         Ok(mgr)
     }
 
-    pub fn start(&self, mut receiver: AsyncReceiver<Arc<TaskContext>>) {
-        let task_store = self.tasks.clone();
-        let rt = self.rt.clone();
-        let fs = self.fs.clone();
-        let progress_interval_ms = self.progress_interval_ms;
-        let task_timeout_ms = self.task_timeout_ms;
-
-        self.rt.spawn(async move {
-            while let Some(task) = receiver.recv().await {
-                let task_id = task.info.task_id.clone();
-                let store = task_store.clone();
-                let runner =
-                    LoadTaskRunner::new(task, fs.clone(), progress_interval_ms, task_timeout_ms);
-
-                rt.spawn(async move {
-                    runner.run().await;
-                    let _ = store.remove(&task_id);
-                });
-            }
-        });
-    }
-
+    /// Submits a load task for execution with concurrency control.
+    ///
+    /// This method queues a data copy task to be executed by the TaskManager.
+    /// The execution is controlled by a Semaphore to prevent too many concurrent
+    /// tasks from overwhelming the system's bandwidth and resources.
+    ///
+    /// # Arguments
+    ///
+    /// * `task` - The LoadTaskInfo containing source path, target path, and job configuration
+    ///
+    /// # Returns
+    ///
+    /// Returns `FsResult<()>` indicating whether the task was successfully submitted.
+    /// Note: This only indicates submission success, not task completion.
+    ///
+    /// # Concurrency Control
+    ///
+    /// - Tasks wait to acquire a permit from the load_task_semaphore before execution
+    /// - Maximum concurrent tasks is limited by `conf.job.load_task_concurrency_limit`
+    /// - Permits are automatically released when tasks complete or fail
+    /// - This prevents excessive bandwidth usage during bulk data operations
+    ///
+    /// # Behavior
+    ///
+    /// 1. Checks if task already exists (idempotent operation)
+    /// 2. Creates task context and stores it in TaskStore
+    /// 3. Spawns async task that:
+    ///    - Acquires semaphore permit (blocks if limit reached)
+    ///    - Executes LoadTaskRunner.run()
+    ///    - Automatically releases permit on completion
+    ///    - Removes task from store
     pub fn submit_task(&self, task: LoadTaskInfo) -> FsResult<()> {
         let task_id = task.task_id.clone();
         if self.tasks.contains(&task_id) {
@@ -107,11 +126,34 @@ impl TaskManager {
         }
 
         let context = self.tasks.insert(task);
-        if let Err(e) = self.rt.block_on(self.sender.send(context.clone())) {
-            let _ = self.tasks.remove(&task_id);
-            return Err(e.into());
-        }
+        let runner = LoadTaskRunner::new(
+            context.clone(),
+            self.fs.clone(),
+            self.factory.clone(),
+            self.progress_interval_ms,
+            self.task_timeout_ms,
+        );
+
         info!("submit task {}", task_id);
+
+        let tasks = self.tasks.clone();
+        let semaphore = self.worker_task_semaphore.clone();
+
+        // Spawn task with concurrency control
+        self.rt.spawn(async move {
+            let _permit = semaphore.acquire().await;
+            match _permit {
+                Ok(permit) => {
+                    runner.run().await;
+                    drop(permit);
+                }
+                Err(e) => {
+                    log::error!("task {} failed to acquire permit: {}", task_id, e);
+                }
+            }
+
+            let _ = tasks.remove(&task_id);
+        });
 
         Ok(())
     }
@@ -130,5 +172,9 @@ impl TaskManager {
 
     pub fn get_fs_context(&self) -> Arc<FsContext> {
         self.fs.fs_context()
+    }
+
+    pub fn available_worker_task_permits(&self) -> usize {
+        self.worker_task_semaphore.available_permits()
     }
 }

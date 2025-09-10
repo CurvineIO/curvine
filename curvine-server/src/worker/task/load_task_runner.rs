@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::UfsFactory;
 use crate::worker::task::TaskContext;
 use curvine_client::file::{CurvineFileSystem, FsWriter};
 use curvine_client::rpc::JobMasterClient;
-use curvine_client::unified::{UfsFileSystem, UnifiedReader};
+use curvine_client::unified::UnifiedReader;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{CreateFileOptsBuilder, JobTaskState};
 use curvine_common::FsResult;
@@ -27,6 +28,7 @@ use std::sync::Arc;
 pub struct LoadTaskRunner {
     task: Arc<TaskContext>,
     fs: CurvineFileSystem,
+    factory: Arc<UfsFactory>,
     master_client: JobMasterClient,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
@@ -36,6 +38,7 @@ impl LoadTaskRunner {
     pub fn new(
         task: Arc<TaskContext>,
         fs: CurvineFileSystem,
+        factory: Arc<UfsFactory>,
         progress_interval_ms: u64,
         task_timeout_ms: u64,
     ) -> Self {
@@ -43,6 +46,7 @@ impl LoadTaskRunner {
         Self {
             task,
             fs,
+            factory,
             master_client,
             progress_interval_ms,
             task_timeout_ms,
@@ -80,6 +84,7 @@ impl LoadTaskRunner {
 
         loop {
             if self.task.is_cancel() {
+                info!("task {} was cancelled", self.task.info.task_id);
                 break;
             }
 
@@ -130,7 +135,7 @@ impl LoadTaskRunner {
 
         // create ufs reader
         let source_path = Path::from_str(&info.source_path)?;
-        let ufs = UfsFileSystem::new(&source_path, info.job.ufs_conf.clone())?;
+        let ufs = self.factory.get_ufs(&self.task.info.job.mount_info)?;
         let reader = ufs.open(&source_path).await?;
         let source_status = ufs.get_status(&source_path).await?;
 
