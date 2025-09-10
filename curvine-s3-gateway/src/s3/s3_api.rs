@@ -381,6 +381,91 @@ pub trait ListObjectHandler {
     ) -> Result<Vec<ListObjectContent>, String>;
 }
 
+/// List Object Versions API structures and handler
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListVersionsResult")]
+pub struct ListObjectVersionsResult {
+    #[serde(
+        rename = "xmlns",
+        default = "s3_namespace",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub xmlns: String,
+
+    #[serde(rename = "Name")]
+    pub name: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_marker: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id_marker: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_key_marker: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_version_id_marker: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_keys: Option<u32>,
+
+    pub is_truncated: bool,
+
+    #[serde(rename = "Version", default)]
+    pub versions: Vec<ObjectVersion>,
+
+    #[serde(rename = "DeleteMarker", default)]
+    pub delete_markers: Vec<DeleteMarker>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ObjectVersion {
+    pub key: String,
+    pub version_id: String,
+    pub is_latest: bool,
+    pub last_modified: String,
+    pub etag: String,
+    pub size: u64,
+    pub storage_class: Option<String>,
+    pub owner: Option<Owner>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct DeleteMarker {
+    pub key: String,
+    pub version_id: String,
+    pub is_latest: bool,
+    pub last_modified: String,
+    pub owner: Option<Owner>,
+}
+
+#[derive(Debug)]
+pub struct ListObjectVersionsOption {
+    pub bucket: String,
+
+    pub delimiter: Option<String>,
+    pub encoding_type: Option<String>,
+    pub key_marker: Option<String>,
+    pub max_keys: Option<i32>,
+    pub prefix: Option<String>,
+    pub version_id_marker: Option<String>,
+}
+
+#[async_trait::async_trait]
+pub trait ListObjectVersionsHandler {
+    async fn handle(
+        &self,
+        opt: &ListObjectVersionsOption,
+        bucket: &str,
+    ) -> Result<ListObjectVersionsResult, String>;
+}
+
 pub fn handle_head_object<T: VRequest, F: VResponse, E: HeadHandler>(
     _req: &T,
     _resp: &mut F,
@@ -649,6 +734,53 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
 /// - `404 Not Found`: Bucket does not exist
 /// - `405 Method Not Allowed`: Non-GET request
 /// - `500 Internal Server Error`: Backend listing error
+pub async fn handle_get_list_object_versions<T: VRequest, F: VResponse>(
+    req: T,
+    resp: &mut F,
+    handler: &std::sync::Arc<dyn ListObjectVersionsHandler + Send + Sync>,
+) {
+    // Parse bucket name from URL path
+    let url_path = req.url_path();
+    let bucket_name = url_path.trim_start_matches('/');
+
+    // Parse query parameters
+    let opt = ListObjectVersionsOption {
+        bucket: bucket_name.to_string(),
+        delimiter: req.get_query("delimiter"),
+        encoding_type: req.get_query("encoding-type"),
+        key_marker: req.get_query("key-marker"),
+        max_keys: req.get_query("max-keys").and_then(|s| s.parse().ok()),
+        prefix: req.get_query("prefix"),
+        version_id_marker: req.get_query("version-id-marker"),
+    };
+
+    // Execute handler
+    match handler.handle(&opt, bucket_name).await {
+        Ok(result) => {
+            // Set response headers
+            resp.set_header("content-type", "application/xml");
+            resp.set_status(200);
+
+            // Serialize to XML
+            match quick_xml::se::to_string(&result) {
+                Ok(xml) => {
+                    if let Ok(mut writer) = resp.get_body_writer().await {
+                        let _ = writer.poll_write(xml.as_bytes()).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to serialize ListObjectVersions response: {}", e);
+                    resp.set_status(500);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("ListObjectVersions handler error: {}", e);
+            resp.set_status(500);
+        }
+    }
+}
+
 pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
     req: T,
     resp: &mut F,
@@ -1101,7 +1233,8 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
     }
 
     let content_sha256 = req.get_header("x-amz-content-sha256").map_or_else(
-        || None,
+        // Default to UNSIGNED-PAYLOAD for requests without x-amz-content-sha256 (e.g., V2 requests)
+        || Some(ContentSha256::Unsigned),
         |content_sha256| {
             if content_sha256.as_str() == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
                 Some(ContentSha256::Streaming)
@@ -1193,7 +1326,7 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
                     .write(true)
                     .read(true)
                     .mode(0o644)
-                    .open(format!("{}{}", ".sys_bws/", cs))
+                    .open(format!("/tmp/curvine-temp/{}", cs))
                     .await
                 {
                     Ok(mut fd) => match parse_body(r, &mut fd, &cs, content_length).await {
@@ -1244,7 +1377,7 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         }
         ContentSha256::Streaming => {
             let file_name = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let file_name = format!("{}{}", ".sys_bws/", file_name);
+            let file_name = format!("/tmp/curvine-temp/{}", file_name);
             let ret = match tokio::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -1306,7 +1439,7 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         ContentSha256::Unsigned => {
             // No hash verification; stream body into a temp file, then pass to handler
             let file_name = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let file_name = format!("{}{}", ".sys_bws/", file_name);
+            let file_name = format!("/tmp/curvine-temp/{}", file_name);
             let ret = match tokio::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -2185,8 +2318,10 @@ async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::s
                     None,
                 ));
             } else {
-                let file_name =
-                    format!("{}{}", ".sys_bws/", &uuid::Uuid::new_v4().to_string()[..8]);
+                let file_name = format!(
+                    "/tmp/curvine-temp/{}",
+                    &uuid::Uuid::new_v4().to_string()[..8]
+                );
                 let mut fd = tokio::fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)

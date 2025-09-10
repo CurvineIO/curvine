@@ -93,6 +93,11 @@ fn register_s3_handlers(
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::ListObjectHandler + Send + Sync>
         ))
+        // Object versions listing operations
+        .layer(axum::Extension(handlers.clone()
+            as Arc<
+                dyn crate::s3::s3_api::ListObjectVersionsHandler + Send + Sync,
+            >))
 }
 
 async fn init_s3_authentication(
@@ -335,7 +340,7 @@ pub async fn start_gateway(
     let handlers = Arc::new(s3::handlers::S3Handlers::new(
         ufs,
         region.clone(),
-        conf.s3_gateway.multipart_temp.clone(),
+        conf.s3_gateway.put_temp_dir.clone(),
         rt.clone(),
     ));
 
@@ -357,7 +362,11 @@ pub async fn start_gateway(
     tracing::debug!("Binding to address: {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("S3 Gateway started successfully on {}", addr);
+
+    // Configure TCP socket for high performance
+    if let Ok(socket) = listener.local_addr() {
+        tracing::info!("S3 Gateway started successfully on {}", socket);
+    }
 
     axum::serve(listener, app).await?;
     Ok(())

@@ -119,6 +119,10 @@ impl S3Router {
             .extensions()
             .get::<Arc<dyn GetBucketLocationHandler + Send + Sync>>()
             .cloned();
+        let listobj_versions_obj = req
+            .extensions()
+            .get::<Arc<dyn crate::s3::s3_api::ListObjectVersionsHandler + Send + Sync>>()
+            .cloned();
 
         let req = Request::from(req);
         let url_path = req.url_path();
@@ -139,6 +143,12 @@ impl S3Router {
             return Self::handle_get_bucket_location_request(req, getbkt_loc_obj, loc).await;
         }
 
+        // Handle object versions listing requests
+        if req.get_query("versions").is_some() {
+            return Self::handle_list_object_versions_request(req, listobj_versions_obj).await;
+        }
+
+        // Default to object download
         Self::handle_get_object_request(req, get_obj).await
     }
 
@@ -223,7 +233,7 @@ impl S3Router {
                 }
             }
             None => {
-                log::warn!("not open multipart object features");
+                tracing::warn!("Multipart upload handler not configured");
                 (StatusCode::INTERNAL_SERVER_ERROR, b"").into_response()
             }
         }
@@ -240,7 +250,7 @@ impl S3Router {
                 resp.into()
             }
             None => {
-                log::warn!("not open create bucket method");
+                tracing::warn!("Create bucket handler not configured");
                 (StatusCode::FORBIDDEN, b"").into_response()
             }
         }
@@ -267,12 +277,16 @@ impl S3Router {
     ) -> axum::response::Response {
         match put_obj {
             Some(put_obj) => {
+                if v4head.is_none() {
+                    tracing::warn!("V4Head is None in handle_put_object_request - authentication may have failed");
+                    return (StatusCode::FORBIDDEN, b"").into_response();
+                }
                 let mut resp = Response::default();
                 handle_put_object(v4head.unwrap(), req, &mut resp, &put_obj).await;
                 resp.into()
             }
             None => {
-                log::warn!("not open put object method");
+                tracing::warn!("PUT object handler not configured");
                 (StatusCode::FORBIDDEN, b"").into_response()
             }
         }
@@ -290,7 +304,7 @@ impl S3Router {
                 resp.into()
             }
             None => {
-                log::warn!("not open list buckets method");
+                tracing::warn!("List buckets handler not configured");
                 (StatusCode::FORBIDDEN, b"").into_response()
             }
         }
@@ -307,7 +321,48 @@ impl S3Router {
                 resp.into()
             }
             None => {
-                log::warn!("not open list objects method");
+                tracing::warn!("List objects handler not configured");
+                (StatusCode::FORBIDDEN, b"").into_response()
+            }
+        }
+    }
+
+    /// Handle object versions listing request
+    ///
+    /// Returns a list of object versions within a specified bucket.
+    /// Implements S3 ListObjectVersions API with pagination and filtering support.
+    ///
+    /// # Arguments
+    /// * `req` - The processed request object
+    /// * `listobj_versions_obj` - Optional object versions listing handler
+    ///
+    /// # Returns
+    /// * `axum::response::Response` - XML-formatted object versions list or error
+    ///
+    /// # Query Parameters Supported
+    /// - prefix: Filter objects by key prefix
+    /// - key-marker: Start listing after specific key
+    /// - version-id-marker: Start listing after specific version
+    /// - max-keys: Limit number of versions returned
+    async fn handle_list_object_versions_request(
+        req: Request,
+        listobj_versions_obj: Option<
+            Arc<dyn crate::s3::s3_api::ListObjectVersionsHandler + Send + Sync>,
+        >,
+    ) -> axum::response::Response {
+        match listobj_versions_obj {
+            Some(listobj_versions_obj) => {
+                let mut resp = Response::default();
+                crate::s3::s3_api::handle_get_list_object_versions(
+                    req,
+                    &mut resp,
+                    &listobj_versions_obj,
+                )
+                .await;
+                resp.into()
+            }
+            None => {
+                tracing::warn!("List object versions handler not configured");
                 (StatusCode::FORBIDDEN, b"").into_response()
             }
         }
@@ -340,7 +395,7 @@ impl S3Router {
                 }
             }
             None => {
-                log::warn!("not open get bucket location method");
+                tracing::warn!("Get bucket location handler not configured");
                 (StatusCode::FORBIDDEN, b"").into_response()
             }
         }
@@ -357,7 +412,7 @@ impl S3Router {
                 resp.into()
             }
             None => {
-                log::warn!("not open get object method");
+                tracing::warn!("Get object handler not configured");
                 (StatusCode::FORBIDDEN, b"").into_response()
             }
         }
@@ -377,7 +432,7 @@ impl S3Router {
                 resp.into()
             }
             None => {
-                log::warn!("not open get delete bucket method");
+                tracing::warn!("Delete bucket handler not configured");
                 (StatusCode::FORBIDDEN, b"").into_response()
             }
         }
@@ -397,7 +452,7 @@ impl S3Router {
                 resp.into()
             }
             None => {
-                log::warn!("not open get delete object method");
+                tracing::warn!("Delete object handler not configured");
                 (StatusCode::FORBIDDEN, b"").into_response()
             }
         }

@@ -22,6 +22,7 @@ use crate::utils::consts::*;
 pub type GenericResult<T> = Result<T, String>;
 pub mod consts;
 pub mod s3_utils;
+pub mod temp_file_manager;
 #[derive(Debug)]
 pub struct BaseKv<K: PartialOrd, V> {
     pub key: K,

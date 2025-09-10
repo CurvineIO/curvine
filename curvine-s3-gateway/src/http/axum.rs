@@ -311,12 +311,97 @@ pub async fn handle_authorization_middleware(
     };
 
     let req = Request::from(req);
-    let base_arg = match crate::auth::sig_v4::extract_args(&req) {
-        Ok(arg) => arg,
-        Err(_) => {
-            return (axum::http::StatusCode::BAD_REQUEST, b"").into_response();
+
+    // Try AWS Signature V4 first, then fall back to V2
+    let auth_result = crate::auth::sig_v4::extract_args(&req);
+
+    if auth_result.is_err() {
+        // Try AWS Signature V2 authentication
+        match crate::auth::sig_v2::extract_v2_args(&req) {
+            Ok(v2_args) => {
+                tracing::debug!(
+                    "Using AWS Signature V2 authentication for access key: {}",
+                    v2_args.access_key
+                );
+
+                // Get secret key for V2 authentication
+                let secretkey = match ak_store.get(&v2_args.access_key).await {
+                    Ok(secretkey) => {
+                        if secretkey.is_none() {
+                            tracing::warn!("V2 auth: access key not found: {}", v2_args.access_key);
+                            return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
+                        }
+                        secretkey.unwrap()
+                    }
+                    Err(_) => {
+                        tracing::error!("V2 auth: failed to retrieve secret key");
+                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, b"")
+                            .into_response();
+                    }
+                };
+
+                // Parse query parameters for V2 signature verification
+                let mut query_params = std::collections::HashMap::new();
+                if let Some(query_str) = req.request.uri().query() {
+                    for pair in query_str.split('&') {
+                        if let Some(eq_pos) = pair.find('=') {
+                            let key = &pair[..eq_pos];
+                            let value = &pair[eq_pos + 1..];
+                            query_params.insert(key.to_string(), value.to_string());
+                        } else {
+                            // Handle key without value (like "uploads")
+                            query_params.insert(pair.to_string(), String::new());
+                        }
+                    }
+                }
+
+                // Verify V2 signature
+                if let Err(e) = crate::auth::sig_v2::verify_v2_signature(
+                    &v2_args,
+                    &secretkey,
+                    req.method().as_str(),
+                    req.url_path().as_str(),
+                    &query_params,
+                    &req,
+                ) {
+                    tracing::warn!("V2 signature verification failed: {}", e);
+                    return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
+                }
+
+                // Create a V4Head for V2 requests to satisfy middleware expectations
+                // This is a compatibility layer - V2 auth is complete but we need V4Head for handlers
+                let dummy_ksigning = [0u8; 32]; // Dummy signing key for V2 compatibility
+                let dummy_hasher = crate::auth::sig_v4::HmacSha256CircleHasher::new(
+                    dummy_ksigning,
+                    "v2-signature".to_string(),
+                    v2_args.date.clone(),
+                    "us-east-1".to_string(),
+                );
+                let v4head = crate::auth::sig_v4::V4Head::new(
+                    v2_args.signature.clone(),
+                    "us-east-1".to_string(),
+                    v2_args.access_key.clone(),
+                    dummy_hasher,
+                );
+
+                let mut axum_req: axum::http::Request<axum::body::Body> = req.into();
+                axum_req.extensions_mut().insert(v4head);
+
+                tracing::debug!("V2 authentication successful, proceeding to next middleware");
+                return next.run(axum_req).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Authentication failed: neither V4 nor V2 signature found. V2 error: {:?}. Request method: {}, URI: {}",
+                    e, req.method(), req.url_path()
+                );
+                return (axum::http::StatusCode::BAD_REQUEST, b"").into_response();
+            }
         }
-    };
+    }
+
+    // Continue with V4 authentication
+    let base_arg = auth_result.unwrap();
 
     // Get raw query string for signature calculation
     let mut query = Vec::new();
