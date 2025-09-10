@@ -21,7 +21,8 @@ pub struct MasterInfo {
     pub active_master: String,
     pub journal_nodes: Vec<String>,
 
-    pub inode_num: i64,
+    pub inode_dir_num: i64,
+    pub inode_file_num: i64,
     pub block_num: i64,
     pub capacity: i64,
     pub available: i64,

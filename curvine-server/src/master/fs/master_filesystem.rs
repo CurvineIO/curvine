@@ -17,7 +17,7 @@ use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodePath, InodeView, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
-use crate::master::{MasterMonitor, SyncFsDir, SyncWorkerManager};
+use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
 use curvine_common::state::*;
@@ -504,7 +504,12 @@ impl MasterFilesystem {
     }
 
     pub fn master_info(&self) -> FsResult<MasterInfo> {
-        let mut info = MasterInfo::default();
+        let metrics = Master::get_metrics();
+        let mut info = MasterInfo {
+            inode_dir_num: metrics.inode_dir_num.get(),
+            inode_file_num: metrics.inode_file_num.get(),
+            ..Default::default()
+        };
 
         let wm = self.worker_manager.read();
 
@@ -513,14 +518,6 @@ impl MasterFilesystem {
         for peer in &wm.conf.journal.journal_addrs {
             info.journal_nodes.push(peer.to_string())
         }
-        let files = match self.list_status("/") {
-            Ok(v) => v.len(),
-            Err(e) => {
-                warn!("Failed to list root directory: {}", e);
-                0
-            }
-        };
-        info.inode_num = files as i64;
 
         for (_, worker) in wm.worker_map.workers() {
             info.capacity += worker.capacity;
