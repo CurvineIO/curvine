@@ -135,13 +135,14 @@ message GetMasterInfoResponse {
     required string active_master = 1;
     repeated string journal_nodes = 2;
 
-    required int64 inode_num = 3;
-    required int64 block_num = 4;
-    required int64 capacity = 5;
-    required int64 available = 6;
-    required int64 fs_used = 7;
-    required int64 non_fs_used = 8;
-    required int64 reserved_bytes = 9 [default = 0];
+    required int64 inode_dir_num = 3;
+    required int64 inode_file_num = 4;
+    required int64 block_num = 5;
+    required int64 capacity = 6;
+    required int64 available = 7;
+    required int64 fs_used = 8;
+    required int64 non_fs_used = 9;
+    required int64 reserved_bytes = 10 [default = 0];
 
     repeated WorkerInfoProto live_workers = 11;
     repeated WorkerInfoProto blacklist_workers = 12;

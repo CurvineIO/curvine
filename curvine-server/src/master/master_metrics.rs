@@ -42,6 +42,9 @@ pub struct MasterMetrics {
     pub(crate) journal_flush_time: Counter,
 
     pub(crate) used_memory_bytes: Gauge,
+
+    pub(crate) inode_dir_num: Gauge,
+    pub(crate) inode_file_num: Gauge,
 }
 
 impl MasterMetrics {
@@ -74,6 +77,10 @@ impl MasterMetrics {
             journal_flush_time: m::new_counter("journal_flush_time", "Log entry flush time")?,
 
             used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
+
+            inode_dir_num: m::new_gauge("inode_dir_num", "Total dir")?,
+
+            inode_file_num: m::new_gauge("inode_file_num", "Total file")?,
         };
 
         Ok(wm)

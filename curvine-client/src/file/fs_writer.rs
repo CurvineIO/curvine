@@ -28,6 +28,7 @@ pub struct FsWriter {
     inner: Inner,
     buf: BytesMut,
     chunk_size: usize,
+    pos: i64,
 }
 
 impl FsWriter {
@@ -58,6 +59,7 @@ impl FsWriter {
             inner,
             buf: BytesMut::with_capacity(chunk_size),
             chunk_size,
+            pos,
         }
     }
 
@@ -80,11 +82,11 @@ impl Writer for FsWriter {
     }
 
     fn pos(&self) -> i64 {
-        self.inner.pos()
+        self.pos
     }
 
     fn pos_mut(&mut self) -> &mut i64 {
-        self.inner.pos_mut()
+        &mut self.pos
     }
 
     fn chunk_mut(&mut self) -> &mut BytesMut {
