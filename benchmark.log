@@ -1,0 +1,16 @@
+Wed, 10 Sep 2025 12:02:47 GMT: Parameters: url=http://localhost:9900, bucket=quick-test, region=us-east-1, duration=5, threads=1, loops=1, size=1K
+Wed, 10 Sep 2025 12:02:52 GMT: Loop 1: PUT time 5.0 secs, objects = 3205, speed = 641KB/sec, 641.0 operations/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:02:57 GMT: Loop 1: GET time 5.0 secs, objects = 5559, speed = 1.1MB/sec, 1111.8 operations/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:02:58 GMT: Loop 1: DELETE time 0.6 secs, 5524.3 deletes/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:02:58 GMT: Parameters: url=http://localhost:9900, bucket=medium-test, region=us-east-1, duration=15, threads=3, loops=1, size=10K
+Wed, 10 Sep 2025 12:03:50 GMT: Loop 1: PUT time 52.4 secs, objects = 20081, speed = 3.7MB/sec, 383.5 operations/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:04:05 GMT: Loop 1: GET time 15.0 secs, objects = 16111, speed = 10.5MB/sec, 1074.0 operations/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:04:06 GMT: Loop 1: DELETE time 1.0 secs, 20287.8 deletes/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:04:06 GMT: Parameters: url=http://localhost:9900, bucket=concurrent-test, region=us-east-1, duration=20, threads=5, loops=1, size=5K
+Wed, 10 Sep 2025 12:04:54 GMT: Loop 1: PUT time 47.4 secs, objects = 12119, speed = 1.2MB/sec, 255.7 operations/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:05:15 GMT: Loop 1: GET time 21.9 secs, objects = 34122, speed = 7.6MB/sec, 1556.5 operations/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:05:16 GMT: Loop 1: DELETE time 0.4 secs, 28758.8 deletes/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:05:16 GMT: Parameters: url=http://localhost:9900, bucket=large-test, region=us-east-1, duration=30, threads=2, loops=1, size=100K
+Wed, 10 Sep 2025 12:06:02 GMT: Loop 1: PUT time 46.4 secs, objects = 3637, speed = 7.7MB/sec, 78.4 operations/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:06:32 GMT: Loop 1: GET time 30.0 secs, objects = 207042, speed = 674MB/sec, 6901.3 operations/sec. Slowdowns = 0
+Wed, 10 Sep 2025 12:06:33 GMT: Loop 1: DELETE time 0.5 secs, 8039.7 deletes/sec. Slowdowns = 0
