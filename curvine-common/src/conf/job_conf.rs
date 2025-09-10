@@ -58,7 +58,7 @@ impl JobConf {
     pub const DEFAULT_JOB_MAX_FILES: usize = 100000;
     pub const DEFAULT_TASK_TIMEOUT: &'static str = "1h";
     pub const DEFAULT_TASK_REPORT_INTERVAL: &'static str = "10s";
-    pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 1000;
+    pub const DEFAULT_WORKER_MAX_CONCURRENT_TASKS: usize = 100;
 
     pub fn init(&mut self) -> FsResult<()> {
         self.job_life_ttl = DurationUnit::from_str(&self.job_life_ttl_str)?.as_duration();

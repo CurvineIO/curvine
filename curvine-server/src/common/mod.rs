@@ -16,3 +16,6 @@ pub mod ufs_manager;
 
 pub mod ufs_client;
 pub use self::ufs_client::UfsClient;
+
+mod ufs_factory;
+pub use self::ufs_factory::UfsFactory;

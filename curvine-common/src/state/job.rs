@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{StorageType, TtlAction, WorkerAddress};
+use crate::state::{MountInfo, StorageType, TtlAction, WorkerAddress};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(
     Clone,
@@ -156,7 +155,7 @@ pub struct LoadJobInfo {
     pub storage_type: StorageType,
     pub ttl_ms: i64,
     pub ttl_action: TtlAction,
-    pub ufs_conf: HashMap<String, String>,
+    pub mount_info: MountInfo,
     pub create_time: i64,
 }
 

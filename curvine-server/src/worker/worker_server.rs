@@ -28,7 +28,6 @@ use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
-use orpc::sync::channel::AsyncChannel;
 use orpc::CommonResult;
 use std::sync::Arc;
 use std::thread;
@@ -50,9 +49,7 @@ impl WorkerService {
     pub fn with_conf(conf: &ClusterConf, rt: Arc<Runtime>) -> CommonResult<Self> {
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
 
-        let (sender, receiver) = AsyncChannel::new(0).split();
-        let task_manager = TaskManager::with_rt(rt.clone(), conf, sender)?;
-        task_manager.start(receiver);
+        let task_manager = TaskManager::with_rt(rt.clone(), conf)?;
 
         let replication_manager =
             WorkerReplicationManager::new(&store, &rt, conf, &task_manager.get_fs_context());

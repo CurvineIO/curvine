@@ -33,6 +33,14 @@ where
         Self(inner)
     }
 
+    pub fn with_ttl(ttl: Duration) -> Self {
+        let inner = CacheBuilder::default()
+            .time_to_live(ttl)
+            .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
+
+        Self(inner)
+    }
+
     pub fn into_inner(self) -> Cache<K, V, BuildHasherDefault<FxHasher>> {
         self.0
     }
