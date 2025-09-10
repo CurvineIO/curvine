@@ -59,3 +59,13 @@ impl<T: Eq + Hash> DerefMut for FastHashSet<T> {
         &mut self.0
     }
 }
+
+impl<K> Clone for FastHashSet<K>
+where
+    K: Clone,
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}

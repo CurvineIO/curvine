@@ -12,28 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::fs::policy::ChooseContext;
+use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
-use crate::master::{JobContext, JobStore, JobWorkerClient, MountManager, TaskDetail};
+use crate::master::{JobStore, LoadJobRunner, MountManager};
 use core::time::Duration;
-use curvine_client::unified::UfsFileSystem;
-use curvine_common::conf::{ClientConf, ClusterConf};
+use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::executor::ScheduledExecutor;
-use curvine_common::fs::{FileSystem, Path};
+use curvine_common::fs::Path;
 use curvine_common::state::{
-    FileStatus, JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult,
-    LoadTaskInfo, MountInfo, WorkerAddress,
+    JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult,
 };
 use curvine_common::FsResult;
-use futures::future;
-use log::{error, info, warn};
-use orpc::client::ClientFactory;
-use orpc::common::{ByteUnit, FastHashMap, LocalTime, Utils};
+use log::{info, warn};
+use orpc::common::LocalTime;
 use orpc::err_box;
-use orpc::io::net::InetAddr;
 use orpc::runtime::{LoopTask, RpcRuntime, Runtime};
-use std::collections::linked_list::LinkedList;
+use orpc::sync::channel::BlockingChannel;
 use std::sync::Arc;
 
 /// Load the Task Manager
@@ -41,7 +36,7 @@ pub struct JobManager {
     rt: Arc<Runtime>,
     jobs: JobStore,
     master_fs: MasterFilesystem,
-    client_factory: Arc<ClientFactory>,
+    factory: Arc<UfsFactory>,
     mount_manager: Arc<MountManager>,
     job_life_ttl: Duration,
     job_cleanup_ttl: Duration,
@@ -55,16 +50,13 @@ impl JobManager {
         rt: Arc<Runtime>,
         conf: &ClusterConf,
     ) -> Self {
-        let client_factory = Arc::new(ClientFactory::with_rt(
-            conf.client.client_rpc_conf(),
-            rt.clone(),
-        ));
+        let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));
 
         Self {
             rt,
             jobs: JobStore::new(),
             master_fs,
-            client_factory,
+            factory,
             mount_manager,
             job_life_ttl: conf.job.job_life_ttl,
             job_cleanup_ttl: conf.job.job_cleanup_ttl,
@@ -88,70 +80,8 @@ impl JobManager {
         info!("JobManager started");
     }
 
-    fn create_job_id(source: impl AsRef<str>) -> String {
-        format!("job_{}", Utils::md5(source))
-    }
-
     fn update_state(&self, job_id: &str, state: JobTaskState, message: impl Into<String>) {
-        if let Some(mut job) = self.jobs.get_mut(job_id) {
-            job.update_state(state, message);
-        }
-    }
-
-    async fn get_worker_client(&self, worker: &WorkerAddress) -> FsResult<JobWorkerClient> {
-        let worker_addr = InetAddr::new(worker.ip_addr.clone(), worker.rpc_port as u16);
-
-        let client = self.client_factory.get(&worker_addr).await?;
-        let timeout = Duration::from_millis(self.client_factory.conf().rpc_timeout_ms);
-        let client = JobWorkerClient::new(client, timeout);
-        Ok(client)
-    }
-
-    pub fn choose_worker(&self, block_size: i64) -> FsResult<WorkerAddress> {
-        let ctx = ChooseContext::with_num(1, block_size, vec![]);
-        let worker_mgr = self.master_fs.worker_manager.read();
-        let workers = worker_mgr.choose_worker(ctx)?;
-        if let Some(worker) = workers.first() {
-            Ok(worker.clone())
-        } else {
-            err_box!("No available worker found")
-        }
-    }
-
-    fn check_job_exists(
-        &self,
-        job_id: &str,
-        source_status: &FileStatus,
-        target_path: &Path,
-    ) -> bool {
-        let job = if let Some(job) = self.jobs.get(job_id) {
-            job
-        } else {
-            return false;
-        };
-
-        let state: JobTaskState = job.state.state();
-        if state == JobTaskState::Pending || state == JobTaskState::Loading {
-            return true;
-        }
-
-        if !source_status.is_dir {
-            // Files are generally auto-loaded and executed in parallel.
-            // Validate ufs_mtime to prevent distributing a large number of duplicate tasks.
-            if let Ok(cv_status) = self.master_fs.file_status(target_path.path()) {
-                if cv_status.is_expired() || !cv_status.is_complete {
-                    false
-                } else {
-                    source_status.len == cv_status.len
-                        && cv_status.storage_policy.ufs_mtime != 0
-                        && cv_status.storage_policy.ufs_mtime == source_status.mtime
-                }
-            } else {
-                false
-            }
-        } else {
-            true
-        }
+        self.jobs.update_state(job_id, state, message)
     }
 
     pub fn get_job_status(&self, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
@@ -167,6 +97,41 @@ impl JobManager {
         } else {
             err_box!("Not fond job {}", job_id)
         }
+    }
+
+    pub fn create_runner(&self) -> LoadJobRunner {
+        LoadJobRunner::new(
+            self.jobs.clone(),
+            self.master_fs.clone(),
+            self.factory.clone(),
+            self.job_max_files,
+        )
+    }
+
+    pub fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+        let source_path = Path::from_str(&command.source_path)?;
+        if source_path.is_cv() {
+            return err_box!("No need to load cv path");
+        }
+
+        // check mount
+        let mnt = if let Some(mnt) = self.mount_manager.get_mount_info(&source_path)? {
+            mnt
+        } else {
+            return err_box!("Not found mount info for path: {}", source_path);
+        };
+
+        let job_runner = self.create_runner();
+
+        let (tx, mut rx) = BlockingChannel::new(1).split();
+        self.rt.spawn(async move {
+            let res = job_runner.submit_load_task(command, mnt).await;
+            if let Err(e) = tx.send(res) {
+                warn!("send submit_load_job result: {}", e);
+            }
+        });
+
+        rx.recv_check()?
     }
 
     /// Handle cancellation of tasks
@@ -191,29 +156,13 @@ impl JobManager {
 
         self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user");
 
-        // Send a cancel request to all assigned Workers
-        for worker in assigned_workers {
-            let res = self.rt.block_on(async {
-                let client = self.get_worker_client(&worker).await?;
-                client.cancel_job(&job_id).await
-            });
-
-            // Just print logs.
-            if let Err(e) = res {
-                error!(
-                    "Failed to send cancel load request to worker{}: {}",
-                    worker, e
-                );
-                self.update_state(
-                    job_id,
-                    JobTaskState::Canceled,
-                    format!(
-                        "Failed to send cancel load request to worker {}: {}",
-                        worker, e
-                    ),
-                );
+        let job_runner = self.create_runner();
+        let job_id = job_id.to_string();
+        self.rt.spawn(async move {
+            if let Err(e) = job_runner.cancel_job(&job_id, assigned_workers).await {
+                warn!("Cancel job {} error: {}", job_id, e);
             }
-        }
+        });
 
         Ok(())
     }
@@ -225,148 +174,6 @@ impl JobManager {
         progress: JobTaskProgress,
     ) -> FsResult<()> {
         self.jobs.update_progress(job_id, task_id, progress)
-    }
-
-    pub fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
-        let source_path = Path::from_str(&command.source_path)?;
-        if source_path.is_cv() {
-            return err_box!("No need to load cv path");
-        }
-
-        // check mount
-        let mnt = if let Some(mnt) = self.mount_manager.get_mount_info(&source_path)? {
-            mnt
-        } else {
-            return err_box!("Not found mount info for path: {}", source_path);
-        };
-
-        let target_path = mnt.get_cv_path(&source_path)?;
-        let job_id = Self::create_job_id(source_path.full_path());
-        let result = LoadJobResult {
-            job_id: job_id.clone(),
-            target_path: target_path.clone_path(),
-        };
-
-        let ufs = UfsFileSystem::with_mount(&mnt)?;
-        let source_status = self.rt.block_on(ufs.get_status(&source_path))?;
-
-        // check job status
-        if self.check_job_exists(&job_id, &source_status, &target_path) {
-            info!(
-                "job {}, source_path {} already exists",
-                job_id,
-                source_path.full_path()
-            );
-            return Ok(result);
-        }
-
-        info!("Submitting load job {}", job_id);
-        let mut job_context = JobContext::with_conf(
-            &command,
-            job_id.clone(),
-            source_path.clone_uri(),
-            target_path.clone_path(),
-            &mnt,
-            &ClientConf::default(),
-        );
-
-        let res =
-            self.rt
-                .block_on(self.create_all_tasks(&mut job_context, source_status, &ufs, &mnt));
-
-        match res {
-            Err(e) => {
-                warn!("Create load job {} failed: {}", job_id, e);
-                Err(e)
-            }
-
-            Ok(size) => {
-                info!(
-                    "Submit load job {} success, tasks {}, total_size {}",
-                    job_id,
-                    job_context.tasks.len(),
-                    ByteUnit::byte_to_string(size as u64)
-                );
-
-                let tasks = job_context.tasks.clone();
-                self.jobs.insert(job_id, job_context);
-                // @todo Whether to cancel some tasks that may have been dispatched.
-                self.rt.block_on(self.submit_all_task(tasks))?;
-
-                Ok(result)
-            }
-        }
-    }
-
-    async fn submit_all_task(&self, tasks: FastHashMap<String, TaskDetail>) -> FsResult<()> {
-        let submit_futures: Vec<_> = tasks
-            .take()
-            .into_iter()
-            .map(|(id, task)| async move {
-                let client = self.get_worker_client(&task.task.worker).await?;
-                client.submit_load_task(task.task).await?;
-                info!("Submit sub-task {}", id);
-                Ok::<(), FsError>(())
-            })
-            .collect();
-
-        future::try_join_all(submit_futures).await?;
-        Ok(())
-    }
-
-    async fn create_all_tasks(
-        &self,
-        job: &mut JobContext,
-        source_status: FileStatus,
-        ufs: &UfsFileSystem,
-        mnt: &MountInfo,
-    ) -> FsResult<i64> {
-        job.update_state(JobTaskState::Pending, "Assigning workers");
-        let block_size = job.info.block_size;
-
-        let mut total_size = 0;
-        let mut stack = LinkedList::new();
-        let mut task_index = 0;
-        stack.push_back(source_status);
-        while let Some(status) = stack.pop_front() {
-            if status.is_dir {
-                let dir_path = Path::from_str(status.path)?;
-                let childs = ufs.list_status(&dir_path).await?;
-                for child in childs {
-                    stack.push_back(child);
-                }
-            } else {
-                let worker = self.choose_worker(block_size)?;
-
-                let source_path = Path::from_str(status.path)?;
-                let target_path = mnt.get_cv_path(&source_path)?;
-
-                let task_id = format!("{}_task_{}", job.info.job_id, task_index);
-                task_index += 1;
-                total_size += status.len;
-
-                let task = LoadTaskInfo {
-                    job: job.info.clone(),
-                    task_id: task_id.clone(),
-                    worker: worker.clone(),
-                    source_path: source_path.clone_uri(),
-                    target_path: target_path.clone_path(),
-                    create_time: LocalTime::mills() as i64,
-                };
-                job.add_task(task.clone());
-
-                if job.tasks.len() > self.job_max_files {
-                    return err_box!(
-                        "Job {} files exceeds {}",
-                        job.info.job_id,
-                        self.job_max_files
-                    );
-                }
-                info!("Added sub-task {}", task_id);
-            }
-        }
-
-        Ok(total_size)
     }
 }
 

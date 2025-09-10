@@ -67,8 +67,8 @@ impl BlocksCommand {
         let separator = format!("{:-<80}", "");
         println!("{}", separator);
         println!(
-            "{:<6} {:<15} {:<12} {:<12} {:<6} {}",
-            "Block", "Block ID", "Size", "Storage", "Count", "Workers"
+            "{:<6} {:<15} {:<12} {:<12} {:<6} Workers",
+            "Block", "Block ID", "Size", "Storage", "Count"
         );
         println!("{}", separator);
 
