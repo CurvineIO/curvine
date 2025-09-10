@@ -278,7 +278,8 @@ impl ProtoUtils {
         let mut pb = GetMasterInfoResponse {
             active_master: src.active_master,
             journal_nodes: src.journal_nodes,
-            inode_num: src.inode_num,
+            inode_dir_num: src.inode_dir_num,
+            inode_file_num: src.inode_file_num,
             block_num: src.block_num,
             capacity: src.capacity,
             available: src.available,
@@ -331,7 +332,8 @@ impl ProtoUtils {
         MasterInfo {
             active_master: src.active_master,
             journal_nodes: src.journal_nodes,
-            inode_num: src.inode_num,
+            inode_dir_num: src.inode_dir_num,
+            inode_file_num: src.inode_file_num,
             block_num: src.block_num,
             capacity: src.capacity,
             available: src.available,

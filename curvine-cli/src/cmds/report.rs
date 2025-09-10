@@ -140,7 +140,14 @@ impl CurvineReport {
             "lost_worker_num",
             self.info.lost_workers.len()
         ));
-        builder.push_str(&format!("{:>20}: {}\n", "inode_num", self.info.inode_num));
+        builder.push_str(&format!(
+            "{:>20}: {}\n",
+            "inode_dir_num", self.info.inode_dir_num
+        ));
+        builder.push_str(&format!(
+            "{:>20}: {}\n",
+            "inode_file_num", self.info.inode_file_num
+        ));
         builder.push_str(&format!("{:>20}: {}\n", "block_num", self.info.block_num));
 
         if !show_workers {

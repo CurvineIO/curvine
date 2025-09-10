@@ -12,59 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use crate::master::{Master, MasterMetrics};
 
 /// File system statistics tracker for maintaining real-time counts
 /// of files and directories without expensive traversal operations.
 #[derive(Debug)]
 pub struct FileSystemStats {
-    /// Total number of files in the file system
-    file_count: AtomicI64,
-    /// Total number of directories in the file system (excluding root)
-    dir_count: AtomicI64,
+    metrics: &'static MasterMetrics,
 }
 
 impl FileSystemStats {
-    /// Create a new FileSystemStats instance with zero counts
     pub fn new() -> Self {
         Self {
-            file_count: AtomicI64::new(0),
-            dir_count: AtomicI64::new(0),
+            metrics: Master::get_metrics(),
         }
     }
 
-    /// Increment file count by 1
     pub fn increment_file_count(&self) {
-        self.file_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics.inode_file_num.inc()
     }
 
-    /// Increment directory count by 1
     pub fn increment_dir_count(&self) {
-        self.dir_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics.inode_dir_num.inc()
     }
 
-    /// Add multiple files to the count
     pub fn add_file_count(&self, count: i64) {
-        self.file_count.fetch_add(count, Ordering::Relaxed);
+        self.metrics.inode_file_num.add(count)
     }
 
-    /// Add multiple directories to the count
     pub fn add_dir_count(&self, count: i64) {
-        self.dir_count.fetch_add(count, Ordering::Relaxed);
+        self.metrics.inode_dir_num.add(count)
     }
 
-    /// Get both counts as a tuple (file_count, dir_count)
     pub fn counts(&self) -> (i64, i64) {
         (
-            self.file_count.load(Ordering::Relaxed),
-            self.dir_count.load(Ordering::Relaxed),
+            self.metrics.inode_dir_num.get(),
+            self.metrics.inode_file_num.get(),
         )
     }
 
-    /// Set specific counts (useful for initialization from existing data)
     pub fn set_counts(&self, file_count: i64, dir_count: i64) {
-        self.file_count.store(file_count, Ordering::Relaxed);
-        self.dir_count.store(dir_count, Ordering::Relaxed);
+        self.metrics.inode_file_num.set(file_count);
+        self.metrics.inode_file_num.set(dir_count);
     }
 }
 

@@ -78,7 +78,8 @@ public class CurvineFsStat extends FsStatus {
         builder.append(String.format("%20s: %s\n", "non_fs_used", Utils.bytesToString(info.getNonFsUsed())));
         builder.append(String.format("%20s: %s\n", "live_worker_num", info.getLiveWorkersCount()));
         builder.append(String.format("%20s: %s\n", "lost_worker_num", info.getLostWorkersCount()));
-        builder.append(String.format("%20s: %s\n", "inode_num", info.getInodeNum()));
+        builder.append(String.format("%20s: %s\n", "inode_dir_num", info.getInodeDirNum()));
+        builder.append(String.format("%20s: %s\n", "inode_file_num", info.getInodeFileNum()));
         builder.append(String.format("%20s: %s\n", "block_num", info.getBlockNum()));
 
         if (!showWorkers) {
@@ -109,9 +110,9 @@ public class CurvineFsStat extends FsStatus {
             builder.append("\n");
         }
 
-        // Output worker details
+        // Output lost worker details
         builder.append(String.format("%20s: ", "lost_worker_list"));
-        for (int i = 0; i < info.getLiveWorkersCount(); i++) {
+        for (int i = 0; i < info.getLostWorkersCount(); i++) {
             WorkerInfoProto worker = info.getLostWorkers(i);
             String str = String.format(
                     "%s:%s",
