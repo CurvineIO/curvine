@@ -2,10 +2,10 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: curvine-config
-  namespace: default
+  namespace: curvine-system
   labels:
     app.kubernetes.io/component: controller
-    app.kubernetes.io/name: curvine-controller
+    app.kubernetes.io/name: curvine-csi-controller
 data:
   curvine-cluster.toml: |
     # Customer service configuration.
@@ -25,4 +25,4 @@ data:
     file_name = "curvine.log"
   curvine-env.sh: |
     export CURVINE_HOME="$(cd "$(dirname "$0")"/..; pwd)"
-    export CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml 
+    export CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml

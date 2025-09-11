@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: curvine-system
+  labels:
+    name: curvine-system
+    app.kubernetes.io/name: curvine-csi
+    app.kubernetes.io/component: storage

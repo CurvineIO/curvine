@@ -22,7 +22,7 @@ controller:
   name: curvine-controller
   replicas: 1
   priorityClassName: system-cluster-critical
-  
+
   # Controller container settings
   container:
     name: csi-plugin
@@ -32,7 +32,7 @@ controller:
       - --nodeid=$(NODE_NAME)
     env:
       CSI_ENDPOINT: unix:///csi/csi.sock
-    
+
     # Liveness probe settings
     livenessProbe:
       failureThreshold: 5
@@ -42,18 +42,18 @@ controller:
       initialDelaySeconds: 10
       periodSeconds: 10
       timeoutSeconds: 3
-    
+
     # Ports
     ports:
       healthz: 9909
-    
+
     # Security context
     securityContext:
       privileged: true
       capabilities:
         add:
           - SYS_ADMIN
-  
+
   # Sidecar containers
   sidecars:
     provisioner:
@@ -62,13 +62,13 @@ controller:
         - --csi-address=$(ADDRESS)
         - --timeout=60s
         - --v=5
-    
+
     attacher:
       image: registry.k8s.io/sig-storage/csi-attacher:v4.5.0
       args:
         - --csi-address=$(ADDRESS)
         - --v=5
-    
+
     livenessProbe:
       image: registry.k8s.io/sig-storage/livenessprobe:v2.11.0
       args:
@@ -76,7 +76,7 @@ controller:
         - --health-port=$(HEALTH_PORT)
       env:
         HEALTH_PORT: "9909"
-  
+
   # Tolerations
   tolerations:
     - key: CriticalAddonsOnly
@@ -87,7 +87,7 @@ node:
   name: curvine-csi-node
   priorityClassName: system-node-critical
   dnsPolicy: ClusterFirstWithHostNet
-  
+
   # Node container settings
   container:
     name: csi-plugin
@@ -97,7 +97,7 @@ node:
       - --nodeid=$(NODE_NAME)
     env:
       CSI_ENDPOINT: unix:///csi/csi.sock
-    
+
     # Liveness probe settings
     livenessProbe:
       failureThreshold: 5
@@ -107,15 +107,15 @@ node:
       initialDelaySeconds: 10
       periodSeconds: 10
       timeoutSeconds: 3
-    
+
     # Ports
     ports:
       healthz: 9909
-    
+
     # Security context
     securityContext:
       privileged: true
-    
+
     # Lifecycle
     lifecycle:
       preStop:
@@ -124,7 +124,7 @@ node:
             - /bin/sh
             - -c
             - rm /csi/csi.sock
-  
+
   # Sidecar containers
   sidecars:
     nodeDriverRegistrar:
@@ -137,7 +137,7 @@ node:
         ADDRESS: /csi/csi.sock
         DRIVER_REG_SOCK_PATH: /var/lib/kubelet/csi-plugins/csi.curvine.io/csi.sock
         CURVINE_CONF_FILE: /opt/curvine/conf/curvine-cluster.toml
-    
+
     livenessProbe:
       image: registry.k8s.io/sig-storage/livenessprobe:v2.11.0
       args:
@@ -146,11 +146,11 @@ node:
       env:
         ADDRESS: /csi/csi.sock
         HEALTH_PORT: "9909"
-  
+
   # Tolerations
   tolerations:
     - operator: Exists
-  
+
   # Host paths
   hostPaths:
     pluginDir:
@@ -166,9 +166,9 @@ node:
 # Service Account settings
 serviceAccount:
   controller:
-    name: csi-controller
+    name: curvine-csi-controller-sa
   node:
-    name: csi-node
+    name: curvine-csi-node-sa
 
 # RBAC settings
 rbac:
@@ -195,7 +195,7 @@ configMap:
       level = "info"
       log_dir = "stdout"
       file_name = "curvine.log"
-    
+
     curvineEnvSh: |
       export CURVINE_HOME="$(cd "$(dirname "$0")"/..; pwd)"
       export CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml

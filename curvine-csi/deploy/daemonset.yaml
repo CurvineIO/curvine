@@ -2,7 +2,7 @@ kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: curvine-csi-node
-  namespace: default
+  namespace: curvine-system
 spec:
   selector:
     matchLabels:
@@ -12,11 +12,13 @@ spec:
       labels:
         app: curvine-csi-node
     spec:
-      serviceAccountName: csi-node
+      serviceAccountName: curvine-csi-node-sa
       tolerations:
         - operator: Exists
       priorityClassName: system-node-critical
       dnsPolicy: ClusterFirstWithHostNet
+      #nodeSelector:
+      #  curvine-fuse: 'true'
 
       containers:
         - name: csi-plugin

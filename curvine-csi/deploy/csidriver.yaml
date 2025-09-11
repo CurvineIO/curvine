@@ -3,5 +3,5 @@ kind: CSIDriver
 metadata:
   name: curvine
 spec:
-  attachRequired: true
+  attachRequired: false
   podInfoOnMount: false

@@ -1,13 +1,13 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: csi-node
+  name: curvine-csi-node-role
 rules: []
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: csi-controller
+  name: curvine-csi-controller-role
 rules:
   - apiGroups:
       - ""

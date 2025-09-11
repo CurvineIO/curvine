@@ -1,25 +1,25 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: csi-node
+  name: curvine-csi-node-binding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: csi-node
+  name: curvine-csi-node-role
 subjects:
   - kind: ServiceAccount
-    name: csi-node
-    namespace: default
+    name: curvine-csi-node-sa
+    namespace: curvine-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: csi-controller
+  name: curvine-csi-controller-binding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: csi-controller
+  name: curvine-csi-controller-role
 subjects:
   - kind: ServiceAccount
-    name: csi-controller
-    namespace: default
+    name: curvine-csi-controller-sa
+    namespace: curvine-system

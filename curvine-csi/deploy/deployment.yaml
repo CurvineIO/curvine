@@ -3,9 +3,9 @@ kind: Deployment
 metadata:
   labels:
     app.kubernetes.io/component: controller
-    app.kubernetes.io/name: curvine-controller
-  name: curvine-controller
-  namespace: default
+    app.kubernetes.io/name: curvine-csi-controller
+  name: curvine-csi-controller
+  namespace: curvine-system
 spec:
   replicas: 1
   selector:
@@ -17,10 +17,12 @@ spec:
         app: curvine-csi-controller
     spec:
       priorityClassName: system-cluster-critical
-      serviceAccountName: csi-controller
+      serviceAccountName: curvine-csi-controller-sa
       tolerations:
         - key: CriticalAddonsOnly
           operator: Exists
+      #nodeSelector:
+      #  curvine-master: 'true'
 
       containers:
         - name: csi-plugin
@@ -102,4 +104,4 @@ spec:
         - name: curvine-config
           configMap:
             name: curvine-config
-            defaultMode: 0755 
+            defaultMode: 0755
