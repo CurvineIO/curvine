@@ -31,7 +31,7 @@ impl StatCommand {
                         println!("Children num: {}", status.children_num);
                         println!("Is complete: {}", status.is_complete);
                         println!("Len: {}", status.len);
-                        println!("Replics: {}", status.replicas);
+                        println!("Replicas: {}", status.replicas);
                         println!("Block size: {}", status.block_size);
                         println!("File type: {:?}", status.file_type);
                         println!("Xattr: {:?}", status.x_attr);
