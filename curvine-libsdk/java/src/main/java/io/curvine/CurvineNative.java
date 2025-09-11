@@ -14,8 +14,7 @@
 
 package io.curvine;
 
-import io.netty.util.CharsetUtil;
-import io.netty.util.internal.PlatformDependent;
+import java.nio.charset.StandardCharsets;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -112,7 +111,7 @@ public class CurvineNative {
 
         BufferedReader reader;
         try {
-            reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), CharsetUtil.UTF_8));
+            reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8));
             String line = null;
             String id = null;
             String version = null;
@@ -220,7 +219,7 @@ public class CurvineNative {
             }
             return f;
         } else {
-            return PlatformDependent.tmpdir();
+            return new File(System.getProperty("java.io.tmpdir"));
         }
     }
 

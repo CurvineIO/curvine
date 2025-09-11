@@ -2963,6 +2963,7 @@ dependencies = [
 name = "orpc"
 version = "0.2.1-beta"
 dependencies = [
+ "anyhow",
  "axum 0.7.9",
  "bincode",
  "bytes",

@@ -26,6 +26,9 @@ pub mod server;
 pub mod sync;
 pub mod sys;
 pub mod test;
+pub mod ucp;
+
+// include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 pub type CommonError = Box<dyn std::error::Error + Send + Sync>;
 

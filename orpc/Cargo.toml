@@ -43,3 +43,6 @@ tracing-log = { workspace = true }
 fxhash = { workspace = true }
 moka = { workspace = true }
 md-5 = { workspace = true }
+
+[build-dependencies]
+bindgen = "0.66"
