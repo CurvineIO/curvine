@@ -23,3 +23,8 @@ yarn.lock
 
 # macOS
 .DS_Store
+
+# Scala/Metals related files (not needed for Rust project)
+.metals/
+.scala-build/
+.bloop/

@@ -50,16 +50,10 @@ use std::{
     str::FromStr,
 };
 
-/// S3 Archive Status enumeration for object lifecycle management
-///
-/// Represents the current archive status of an S3 object in various storage tiers.
-/// This follows AWS S3 Glacier and Intelligent Tiering specifications.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ArchiveStatus {
-    /// Object is being restored from archive storage
     #[serde(rename = "ARCHIVE_ACCESS")]
     ArchiveAccess,
-    /// Object is in deep archive storage (Glacier Deep Archive)
     #[serde(rename = "DEEP_ARCHIVE_ACCESS")]
     DeepArchiveAccess,
 }
@@ -71,7 +65,7 @@ impl std::str::FromStr for ArchiveStatus {
         match s {
             "ARCHIVE_ACCESS" => Ok(ArchiveStatus::ArchiveAccess),
             "DEEP_ARCHIVE_ACCESS" => Ok(ArchiveStatus::DeepArchiveAccess),
-            _ => Err(Error::Other(format!("Invalid ArchiveStatus value: {s}"))),
+            _ => Err(Error::Other(format!("Invalid ArchiveStatus value: {}", s))),
         }
     }
 }
@@ -166,11 +160,11 @@ pub struct HeadObjectResult {
     #[serde(rename = "Expiration")]
     pub expiration: Option<String>,
     #[serde(rename = "Expires")]
-    pub expires: Option<String>, // 原是 `time.Time`，可转换为 ISO8601 字符串
+    pub expires: Option<String>,
     #[serde(rename = "ExpiresString")]
     pub expires_string: Option<String>,
     #[serde(rename = "LastModified")]
-    pub last_modified: Option<String>, // 可考虑使用 chrono::DateTime 类型
+    pub last_modified: Option<String>,
     #[serde(rename = "Metadata")]
     pub metadata: Option<HashMap<String, String>>,
     #[serde(rename = "MissingMeta")]
@@ -431,12 +425,15 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
 
     let rpath = req.url_path();
     let raw = rpath.trim_matches('/');
-    let r = raw.find('/');
-    if r.is_none() {
-        resp.set_status(400);
-        resp.send_header();
-        return;
-    }
+    let r = match raw.find('/') {
+        Some(val) => val,
+        None => {
+            log::error!("{}", orpc::err_msg!("Invalid path format"));
+            resp.set_status(404);
+            resp.send_header();
+            return;
+        }
+    };
 
     // build option from query first
     let mut opt = GetObjectOption {
@@ -478,36 +475,38 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         }
     }
 
-    let next = r.unwrap();
+    let next = r;
     let bucket = &raw[..next];
     let object = &raw[next + 1..];
 
-    let head = handler.lookup(bucket, object).await;
-    if let Err(e) = head {
-        log::error!("lookup {bucket} {object} error: {e}");
-        resp.set_status(500);
-        resp.send_header();
-        return;
-    }
-
-    let head = head.unwrap();
-    if head.is_none() {
-        log::info!("not found {bucket} {object}");
-        resp.set_status(404);
-        resp.send_header();
-        return;
-    }
+    let head = match handler.lookup(bucket, object).await {
+        Ok(val) => val,
+        Err(err) => {
+            log::error!("{}", orpc::err_msg!("lookup bucket object error: {}", err));
+            resp.set_status(500);
+            resp.send_header();
+            return;
+        }
+    };
+    let head = match head {
+        Some(val) => val,
+        None => {
+            log::error!("{}", orpc::err_msg!("Object not found"));
+            resp.set_status(404);
+            resp.send_header();
+            return;
+        }
+    };
 
     //send header info to client
-    let head = head.unwrap();
     let total_len = head.content_length.unwrap_or(0) as u64;
 
     // Default: full content
     let mut status = 200u16;
     let mut resp_len = total_len;
-    let mut header_last_modified = head.last_modified.clone();
-    let mut header_etag = head.etag.clone();
-    let mut header_ct = head.content_type.clone();
+    let header_last_modified = head.last_modified.clone();
+    let header_etag = head.etag.clone();
+    let header_ct = head.content_type.clone();
 
     // If range requested, validate and compute
     if opt.range_start.is_some() || opt.range_end.is_some() {
@@ -573,15 +572,15 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
 
     // Apply headers
     resp.set_header("content-length", resp_len.to_string().as_str());
-    if let Some(v) = header_etag.take() {
+    if let Some(v) = header_etag {
         resp.set_header("etag", &v)
     }
 
-    if let Some(v) = header_ct.take() {
+    if let Some(v) = header_ct {
         resp.set_header("content-type", &v)
     }
 
-    if let Some(v) = header_last_modified.take() {
+    if let Some(v) = header_last_modified {
         resp.set_header("last-modified", &v)
     }
 
@@ -907,7 +906,7 @@ impl std::str::FromStr for ChecksumAlgorithm {
             "SHA1" => Ok(ChecksumAlgorithm::Sha1),
             "SHA256" => Ok(ChecksumAlgorithm::Sha256),
             "CRC64NVME" => Ok(ChecksumAlgorithm::Crc64nvme),
-            _ => Err(format!("Invalid checksum algorithm: {}", s)),
+            _ => orpc::err_box!("Invalid checksum algorithm: {}", s),
         }
     }
 }
@@ -983,12 +982,10 @@ pub trait PutObjectHandler {
 /// - `Err(())`: Invalid path format
 fn parse_put_object_path(url_path: &str) -> Result<(&str, &str), ()> {
     let url_path = url_path.trim_matches('/');
-    let ret = url_path.find('/');
-    if ret.is_none() {
-        return Err(());
-    }
-
-    let next = ret.unwrap();
+    let next = match url_path.find('/') {
+        Some(pos) => pos,
+        None => return Err(()),
+    };
     let bucket = &url_path[..next];
     let object = &url_path[next + 1..];
     Ok((bucket, object))
@@ -1116,29 +1113,35 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         },
     );
 
-    if content_sha256.is_none() {
-        resp.set_status(403);
-        return;
-    }
-
-    let content_sha256 = content_sha256.unwrap();
-    let ret = req.get_body_reader().await;
-    if let Err(err) = ret {
-        resp.set_status(500);
-        resp.send_header();
-        log::error!("get body reader error: {err}");
-        return;
-    }
-
-    let r = ret.unwrap();
+    let content_sha256 = match content_sha256 {
+        Some(val) => val,
+        None => {
+            log::error!("{}", orpc::err_msg!("Missing content SHA256"));
+            resp.set_status(404);
+            resp.send_header();
+            return;
+        }
+    };
+    let r = match req.get_body_reader().await {
+        Ok(val) => val,
+        Err(err) => {
+            log::error!("{}", orpc::err_msg!("get body reader error: {}", err));
+            resp.set_status(500);
+            resp.send_header();
+            return;
+        }
+    };
     let ret: Result<(), String> = match content_sha256 {
         ContentSha256::Hash(cs) => {
-            if opt.content_length.is_none() {
-                resp.set_status(403);
-                resp.send_header();
-                return;
-            }
-            let content_length = opt.content_length.unwrap() as usize;
+            let content_length = match opt.content_length {
+                Some(val) => val as usize,
+                None => {
+                    log::error!("{}", orpc::err_msg!("Missing content length"));
+                    resp.set_status(404);
+                    resp.send_header();
+                    return;
+                }
+            };
             if content_length <= 10 << 20 {
                 match read_body_to_vec(r, &cs, content_length).await {
                     Ok(vec) => {
@@ -1148,26 +1151,41 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
                         };
                         handler.handle(&opt, bucket, object, &mut reader).await
                     }
-                    Err(err) => match err {
-                        ParseBodyError::HashNoMatch => {
-                            log::warn!("put object hash not match");
-                            resp.set_status(400);
-                            resp.send_header();
-                            return;
+                    Err(err) => {
+                        use crate::error::BodyParseError;
+                        match err {
+                            BodyParseError::HashMismatch => {
+                                log::warn!("{}", orpc::err_msg!("Hash validation failed"));
+                                resp.set_status(400);
+                                resp.send_header();
+                                return;
+                            }
+                            BodyParseError::ContentLengthMismatch => {
+                                log::warn!("{}", orpc::err_msg!("Content length mismatch"));
+                                resp.set_status(400);
+                                resp.send_header();
+                                return;
+                            }
+                            BodyParseError::InvalidEncoding(_) => {
+                                log::error!(
+                                    "{}",
+                                    orpc::err_msg!("Invalid content encoding: {}", err)
+                                );
+                                resp.set_status(400);
+                                resp.send_header();
+                                return;
+                            }
+                            BodyParseError::Io(_) => {
+                                log::error!(
+                                    "{}",
+                                    orpc::err_msg!("I/O error during body parsing: {}", err)
+                                );
+                                resp.set_status(500);
+                                resp.send_header();
+                                return;
+                            }
                         }
-                        ParseBodyError::ContentLengthIncorrect => {
-                            log::warn!("content length invalid");
-                            resp.set_status(400);
-                            resp.send_header();
-                            return;
-                        }
-                        ParseBodyError::Io(err) => {
-                            log::error!("parse body io error {err}");
-                            resp.set_status(500);
-                            resp.send_header();
-                            return;
-                        }
-                    },
+                    }
                 }
             } else {
                 match tokio::fs::OpenOptions::new()
@@ -1189,13 +1207,13 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
                             handler.handle(&opt, bucket, object, &mut fd).await
                         }
                         Err(err) => match err {
-                            ParseBodyError::HashNoMatch => {
+                            ParseBodyError::HashMismatch => {
                                 log::warn!("put object hash not match");
                                 resp.set_status(400);
                                 resp.send_header();
                                 return;
                             }
-                            ParseBodyError::ContentLengthIncorrect => {
+                            ParseBodyError::ContentLengthMismatch => {
                                 log::warn!("content length invalid");
                                 resp.set_status(400);
                                 resp.send_header();
@@ -1204,6 +1222,12 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
                             ParseBodyError::Io(err) => {
                                 log::error!("parse body io error {err}");
                                 resp.set_status(500);
+                                resp.send_header();
+                                return;
+                            }
+                            ParseBodyError::InvalidEncoding(err) => {
+                                log::error!("invalid content encoding: {err}");
+                                resp.set_status(400);
                                 resp.send_header();
                                 return;
                             }
@@ -1238,9 +1262,7 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
                 }
             };
             if let Err(err) = ret {
-                tokio::fs::remove_file(file_name.as_str())
-                    .await
-                    .unwrap_or_else(|err| log::error!("remove file {file_name} error {err}"));
+                orpc::try_log!(tokio::fs::remove_file(file_name.as_str()).await, ());
                 match err {
                     crate::utils::ChunkParseError::HashNoMatch => {
                         log::warn!("accept hash no match request");
@@ -1269,18 +1291,14 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
             {
                 Ok(mut fd) => {
                     let ret = handler.handle(&opt, bucket, object, &mut fd).await;
-                    tokio::fs::remove_file(file_name.as_str())
-                        .await
-                        .unwrap_or_else(|err| log::error!("remove file {file_name} error {err}"));
+                    orpc::try_log!(tokio::fs::remove_file(file_name.as_str()).await, ());
                     ret
                 }
                 Err(err) => {
                     log::error!("open file {file_name} error {err}");
                     resp.set_status(500);
                     resp.send_header();
-                    tokio::fs::remove_file(file_name.as_str())
-                        .await
-                        .unwrap_or_else(|err| log::error!("remove file {file_name} error {err}"));
+                    orpc::try_log!(tokio::fs::remove_file(file_name.as_str()).await, ());
                     return;
                 }
             }
@@ -1529,83 +1547,89 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
     let upload_id = req.get_query("uploadId");
     let part_number = req.get_query("partNumber");
 
-    if upload_id.is_none() || part_number.is_none() {
+    let upload_id = match upload_id {
+        Some(id) => id,
+        None => {
+            resp.set_status(400);
+            return;
+        }
+    };
+    let part_number = match part_number {
+        Some(num) => num,
+        None => {
+            resp.set_status(400);
+            return;
+        }
+    };
+
+    let part_number = match part_number.as_str().parse::<u32>() {
+        Ok(num) => num,
+        Err(_) => {
+            resp.set_status(400);
+            return;
+        }
+    };
+    let raw_path = req.url_path();
+
+    let raw = raw_path
+        .trim_start_matches('/')
+        .splitn(2, '/')
+        .collect::<Vec<&str>>();
+    if raw.len() != 2 {
         resp.set_status(400);
-    } else {
-        let ret = part_number.unwrap().as_str().parse::<u32>();
-        if ret.is_err() {
-            resp.set_status(400);
-            return;
-        }
-        let part_number = ret.unwrap();
-        let raw_path = req.url_path();
+        return;
+    }
 
-        let raw = raw_path
-            .trim_start_matches('/')
-            .splitn(2, '/')
-            .collect::<Vec<&str>>();
-        if raw.len() != 2 {
-            resp.set_status(400);
-            return;
-        }
-
-        let header = req.take_header();
-        let body_reader = match req.get_body_reader().await {
-            Ok(body_reader) => body_reader,
-            Err(err) => {
-                log::error!("get body reader failed {err}");
-                resp.set_status(500);
-                resp.send_header();
-                return;
-            }
-        };
-
-        let (body, release) = match get_body_stream(body_reader, &header).await {
-            Ok(data) => data,
-            Err(err) => {
-                log::error!("get body stream error {err}");
-                resp.set_status(500);
-                resp.send_header();
-                return;
-            }
-        };
-
-        let ret = match body {
-            StreamType::File(mut file) => {
-                handler
-                    .handle_upload_part(
-                        raw[0],
-                        raw[1],
-                        upload_id.unwrap().as_str(),
-                        part_number,
-                        &mut file,
-                    )
-                    .await
-            }
-
-            StreamType::Buff(mut buf_reader) => {
-                handler
-                    .handle_upload_part(
-                        raw[0],
-                        raw[1],
-                        upload_id.unwrap().as_str(),
-                        part_number,
-                        &mut buf_reader,
-                    )
-                    .await
-            }
-        };
-
-        if let Some(release) = release {
-            release.await;
-        }
-
-        if let Ok(etag) = ret {
-            resp.set_header("etag", &etag);
-        } else {
+    let header = req.take_header();
+    let body_reader = match req.get_body_reader().await {
+        Ok(body_reader) => body_reader,
+        Err(err) => {
+            log::error!("get body reader failed {err}");
             resp.set_status(500);
             resp.send_header();
+            return;
         }
+    };
+
+    let (body, release) = match get_body_stream(body_reader, &header).await {
+        Ok(data) => data,
+        Err(err) => {
+            log::error!("get body stream error {err}");
+            resp.set_status(500);
+            resp.send_header();
+            return;
+        }
+    };
+
+    let ret = match body {
+        StreamType::File(mut file) => {
+            handler
+                .handle_upload_part(raw[0], raw[1], upload_id.as_str(), part_number, &mut file)
+                .await
+        }
+
+        StreamType::Buff(mut buf_reader) => {
+            handler
+                .handle_upload_part(
+                    raw[0],
+                    raw[1],
+                    upload_id.as_str(),
+                    part_number,
+                    &mut buf_reader,
+                )
+                .await
+        }
+    };
+
+    if let Some(release) = release {
+        release.await;
+    }
+
+    if let Ok(etag) = ret {
+        resp.set_header("etag", &etag);
+    } else {
+        resp.set_status(500);
+        resp.send_header();
     }
 }
 
@@ -2100,22 +2124,8 @@ pub async fn handle_delete_bucket<T: VRequest, F: VResponse>(
 }
 
 //utils
-#[derive(Debug)]
-enum ParseBodyError {
-    HashNoMatch,
-    ContentLengthIncorrect,
-    Io(String),
-}
-impl Display for ParseBodyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            ParseBodyError::HashNoMatch => "hash no match",
-            ParseBodyError::ContentLengthIncorrect => "content length incorrect",
-            ParseBodyError::Io(err) => err.as_str(),
-        })
-    }
-}
-impl std::error::Error for ParseBodyError {}
+// Use unified BodyParseError from crate::error module
+pub use crate::error::BodyParseError as ParseBodyError;
 enum StreamType {
     File(tokio::fs::File),
     Buff(tokio::io::BufReader<std::io::Cursor<Vec<u8>>>),
@@ -2134,12 +2144,12 @@ async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::s
     let cl = header.get_header("content-length");
     let acs = header
         .get_header("x-amz-content-sha256")
-        .ok_or(ParseBodyError::HashNoMatch)?;
+        .ok_or(ParseBodyError::HashMismatch)?;
     if let Some(cl) = cl {
         let cl = cl
             .as_str()
             .parse::<usize>()
-            .or(Err(ParseBodyError::ContentLengthIncorrect))?;
+            .or(Err(ParseBodyError::ContentLengthMismatch))?;
         if acs.as_str() != "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
             if cl <= 10 << 20 {
                 // Use BytesMut to avoid zero-prefilled Vec allocation
@@ -2152,7 +2162,7 @@ async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::s
                 while let Some(chunk) = src.poll_read().await.map_err(ParseBodyError::Io)? {
                     let chunk_len = chunk.len();
                     if remaining < chunk_len {
-                        return Err(ParseBodyError::ContentLengthIncorrect);
+                        return Err(ParseBodyError::ContentLengthMismatch);
                     }
                     remaining -= chunk_len;
                     let _ = hsh.write_all(&chunk);
@@ -2164,7 +2174,7 @@ async fn get_body_stream<T: crate::utils::io::PollRead + Send, H: crate::auth::s
                     let ret = hsh.finalize();
                     let real_sha256 = hex::encode(ret);
                     if real_sha256.as_str() != acs.as_str() {
-                        return Err(ParseBodyError::HashNoMatch);
+                        return Err(ParseBodyError::HashMismatch);
                     }
                 }
 
@@ -2218,32 +2228,23 @@ async fn parse_body<
     T: crate::utils::io::PollRead + Send,
     E: tokio::io::AsyncWrite + Send + Unpin,
 >(
-    mut src: T,
+    src: T,
     dst: &mut E,
     content_sha256: &str,
-    mut content_length: usize,
+    content_length: usize,
 ) -> Result<(), ParseBodyError> {
     use tokio::io::AsyncWriteExt;
-    let mut hsh = sha2::Sha256::new();
-    // if content length > 10MB, it will store on disk instead memory
-    while let Some(buff) = src.poll_read().await.map_err(ParseBodyError::Io)? {
-        let buff_len = buff.len();
-        if content_length < buff_len {
-            return Err(ParseBodyError::ContentLengthIncorrect);
-        }
-        content_length -= buff_len;
-        let _ = hsh.write_all(&buff);
-        dst.write_all(&buff)
+
+    let (chunks, _hash) = read_and_validate_body(src, content_sha256, content_length).await?;
+
+    // Write all chunks to destination
+    for chunk in chunks {
+        dst.write_all(&chunk)
             .await
             .map_err(|err| ParseBodyError::Io(format!("write error {err}")))?;
     }
-    let ret = hsh.finalize();
-    let real_sha256 = hex::encode(ret);
-    if real_sha256.as_str() != content_sha256 {
-        Err(ParseBodyError::HashNoMatch)
-    } else {
-        Ok(())
-    }
+
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -2298,29 +2299,54 @@ impl crate::utils::io::PollRead for InMemoryPollReader {
 }
 
 // Helper: read entire body into Vec<u8> and verify sha256
-async fn read_body_to_vec<T: crate::utils::io::PollRead + Send>(
+/// Core body reading and validation logic
+///
+/// This function provides the common logic for reading request bodies with
+/// SHA256 validation and content length checking.
+async fn read_and_validate_body<T>(
     mut src: T,
     expected_sha256: &str,
     mut content_length: usize,
-) -> Result<Vec<u8>, ParseBodyError> {
-    use bytes::BytesMut;
+) -> Result<(Vec<Vec<u8>>, sha2::digest::Output<sha2::Sha256>), ParseBodyError>
+where
+    T: crate::utils::io::PollRead + Send,
+{
+    use std::io::Write;
     let mut hasher = sha2::Sha256::new();
-    let mut out = BytesMut::with_capacity(content_length);
+    let mut chunks = Vec::new();
 
     while let Some(buff) = src.poll_read().await.map_err(ParseBodyError::Io)? {
         let buff_len = buff.len();
         if content_length < buff_len {
-            return Err(ParseBodyError::ContentLengthIncorrect);
+            return Err(ParseBodyError::ContentLengthMismatch);
         }
         content_length -= buff_len;
-        let _ = std::io::Write::write_all(&mut hasher, &buff);
-        out.extend_from_slice(&buff);
+        let _ = hasher.write_all(&buff);
+        chunks.push(buff);
     }
 
-    let real_sha256 = hex::encode(hasher.finalize());
+    let hash_result = hasher.finalize();
+    let real_sha256 = hex::encode(hash_result);
     if real_sha256.as_str() != expected_sha256 {
-        Err(ParseBodyError::HashNoMatch)
-    } else {
-        Ok(out.freeze().to_vec())
+        return Err(ParseBodyError::HashMismatch);
     }
+
+    Ok((chunks, hash_result))
+}
+
+async fn read_body_to_vec<T: crate::utils::io::PollRead + Send>(
+    src: T,
+    expected_sha256: &str,
+    content_length: usize,
+) -> Result<Vec<u8>, ParseBodyError> {
+    let (chunks, _hash) = read_and_validate_body(src, expected_sha256, content_length).await?;
+
+    // Combine all chunks into a single Vec
+    let total_size = chunks.iter().map(|chunk| chunk.len()).sum();
+    let mut result = Vec::with_capacity(total_size);
+    for chunk in chunks {
+        result.extend_from_slice(&chunk);
+    }
+
+    Ok(result)
 }

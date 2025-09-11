@@ -1361,12 +1361,14 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

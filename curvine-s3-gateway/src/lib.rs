@@ -37,253 +37,301 @@
 //! 3. **Authentication Layer** (`auth` module): AWS SigV4 signature verification
 //! 4. **Storage Layer**: Integration with Curvine unified file system`
 
-// Module declarations with brief descriptions
-pub mod auth; // Authentication and authorization mechanisms
-pub mod http; // HTTP layer with Axum integration and routing
-pub mod s3; // S3 API implementation and protocol handlers
-pub mod utils; // Utility functions and helper types
+pub mod auth;
+pub mod error;
+pub mod http;
+pub mod s3;
+pub mod utils;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use auth::StaticAccessKeyStore;
+use auth::{
+    AccessKeyStoreEnum, CredentialEntry, CredentialStore, CurvineAccessKeyStore,
+    LocalAccessKeyStore,
+};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 
-/// Register all S3 handlers with the Axum router
-///
-/// This function sets up the complete S3 API handler chain by registering all
-/// required handler implementations as Axum extensions. Each handler is wrapped
-/// in an Arc for thread-safe sharing across request handlers.
-///
-/// # Arguments
-///
-/// * `router` - The base Axum router to extend with S3 handlers
-/// * `handlers` - Shared S3 handlers implementation containing all S3 operations
-///
-/// # Returns
-///
-/// * `axum::Router` - Extended router with all S3 handlers registered
-///
-/// # Handler Types Registered
-///
-/// - `PutObjectHandler`: Object upload operations
-/// - `HeadHandler`: Object metadata retrieval  
-/// - `ListBucketHandler`: Bucket listing operations
-/// - `CreateBucketHandler`: Bucket creation operations
-/// - `DeleteBucketHandler`: Bucket deletion operations
-/// - `DeleteObjectHandler`: Object deletion operations
-/// - `GetObjectHandler`: Object download operations
-/// - `GetBucketLocationHandler`: Bucket location retrieval
-/// - `MultiUploadObjectHandler`: Multipart upload operations
-/// - `ListObjectHandler`: Object listing operations
-///
-/// # Design Notes
-///
-/// Each handler is registered as a separate extension to enable fine-grained
-/// feature control. This allows disabling specific operations by not registering
-/// their handlers, improving security and resource usage.
 fn register_s3_handlers(
     router: axum::Router,
     handlers: Arc<s3::handlers::S3Handlers>,
 ) -> axum::Router {
     router
-        // Object upload operations
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::PutObjectHandler + Send + Sync>
         ))
-        // Object metadata operations
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::HeadHandler + Send + Sync>
         ))
-        // Bucket listing operations
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::ListBucketHandler + Send + Sync>
         ))
-        // Bucket creation operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::CreateBucketHandler + Send + Sync,
             >))
-        // Bucket deletion operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::DeleteBucketHandler + Send + Sync,
             >))
-        // Object deletion operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::DeleteObjectHandler + Send + Sync,
             >))
-        // Object download operations
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::GetObjectHandler + Send + Sync>
         ))
-        // Bucket location operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::GetBucketLocationHandler + Send + Sync,
             >))
-        // Multipart upload operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::MultiUploadObjectHandler + Send + Sync,
             >))
-        // Object listing operations
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::ListObjectHandler + Send + Sync>
         ))
 }
 
-/// Initialize S3 authentication credentials with comprehensive fallback strategy
-///
-/// This function implements a robust credential loading strategy that attempts
-/// multiple sources in order of preference:
-///
-/// 1. **Configuration File**: S3 gateway configuration (access_key, secret_key)
-/// 2. **Environment Variables**: Standard AWS credential environment variables
-/// 3. **Error**: No fallback credentials, gateway fails to start
-///
-/// # Arguments
-///
-/// * `s3_conf` - S3 gateway configuration containing optional credentials
-///
-/// # Returns
-///
-/// * `CommonResult<Arc<dyn AccesskeyStore + Send + Sync>>` - Thread-safe access key store
-///
-/// # Environment Variables
-///
-/// The function looks for these standard AWS environment variables:
-/// - `AWS_ACCESS_KEY_ID` or `CURVINE_ACCESS_KEY`: Access key identifier
-/// - `AWS_SECRET_ACCESS_KEY` or `CURVINE_SECRET_KEY`: Secret access key
-///
-/// # Error Handling
-///
-/// Returns an error if no credentials can be loaded from any source.
-/// This ensures the gateway doesn't start with insecure default credentials.
-///
-/// # Security Notes
-///
-/// - Configuration-based credentials are preferred for production deployments
-/// - Environment-based credentials provide compatibility with AWS tooling
-/// - No default credentials are provided to prevent security issues
 async fn init_s3_authentication(
     s3_conf: &curvine_common::conf::S3GatewayConf,
-) -> orpc::CommonResult<Arc<dyn crate::auth::AccesskeyStore + Send + Sync>> {
-    // First priority: Check configuration file credentials
-    if let (Some(access_key), Some(secret_key)) = (&s3_conf.access_key, &s3_conf.secret_key) {
-        if !access_key.trim().is_empty() && !secret_key.trim().is_empty() {
-            tracing::info!("Using S3 credentials from configuration file");
-            let store =
-                StaticAccessKeyStore::with_single_key(access_key.clone(), secret_key.clone());
-            return Ok(Arc::new(store));
-        }
-    }
+    ufs: &UnifiedFileSystem,
+    rt: std::sync::Arc<orpc::runtime::AsyncRuntime>,
+) -> orpc::CommonResult<AccessKeyStoreEnum> {
+    let credentials_path = s3_conf.credentials_path.as_deref();
+    let cache_refresh_interval =
+        std::time::Duration::from_secs(s3_conf.cache_refresh_interval_secs);
 
-    // Second priority: Attempt to load credentials from environment variables
-    match StaticAccessKeyStore::from_env() {
-        Ok(store) => {
-            tracing::info!("Using S3 credentials from environment variables");
-            Ok(Arc::new(store))
-        }
-        Err(env_err) => {
-            tracing::error!(
-                "Failed to load S3 credentials from both configuration and environment: {}",
-                env_err
-            );
-            tracing::error!("Please configure S3 credentials in one of the following ways:");
-            tracing::error!(
-                "1. Set access_key and secret_key in [s3_gateway] section of config file"
-            );
-            tracing::error!(
-                "2. Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"
-            );
-            tracing::error!(
-                "3. Set CURVINE_ACCESS_KEY and CURVINE_SECRET_KEY environment variables"
-            );
+    let initialize_result = if s3_conf.enable_distributed_auth {
+        let store =
+            CurvineAccessKeyStore::new(ufs.clone(), credentials_path, cache_refresh_interval)
+                .map_err(|e| {
+                    tracing::warn!("Failed to create Curvine credential store: {}", e);
+                    format!("Failed to create distributed credential store: {}", e)
+                })?;
 
-            Err(format!(
-                "No S3 credentials configured. Gateway cannot start without authentication. {env_err}"
-            ).into())
+        let store_enum = AccessKeyStoreEnum::Curvine(Arc::new(store));
+        initialize_credential_store(store_enum, "distributed", rt.clone()).await
+    } else {
+        let store = LocalAccessKeyStore::new(credentials_path, Some(cache_refresh_interval))
+            .map_err(|e| {
+                tracing::warn!("Failed to create local credential store: {}", e);
+                format!("Failed to create local credential store: {}", e)
+            })?;
+
+        let store_enum = AccessKeyStoreEnum::Local(Arc::new(store));
+        initialize_credential_store(store_enum, "local", rt.clone()).await
+    };
+
+    match initialize_result {
+        Ok(store) => Ok(store),
+        Err(_) => {
+            tracing::info!("Credential store is empty, trying environment variables...");
+            match try_env_credentials(s3_conf, rt.clone()).await {
+                Ok(store) => {
+                    tracing::info!("Successfully loaded credentials from environment variables");
+                    Ok(store)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "No credentials found in primary store or environment variables"
+                    );
+                    log_credential_configuration_warning(s3_conf);
+                    create_empty_store(s3_conf, rt.clone()).await
+                }
+            }
         }
     }
 }
 
-/// Start the S3 gateway server with specified configuration
-///
-/// This is the main entry point for starting the Curvine S3 Object Gateway.
-/// It initializes all necessary components and starts the HTTP server.
-///
-/// # Arguments
-///
-/// * `conf` - Cluster configuration containing file system and runtime settings
-/// * `listen` - Network address and port to bind the HTTP server (e.g., "0.0.0.0:9900")
-/// * `region` - S3 region identifier to report in responses (e.g., "us-east-1")
-///
-/// # Returns
-///
-/// * `orpc::CommonResult<()>` - Success or detailed error information
-///
-/// # Initialization Process
-///
-/// 1. **Logging Setup**: Initialize structured logging with environment-based filtering
-/// 2. **Runtime Creation**: Set up shared async runtime for file system operations
-/// 3. **File System Initialization**: Create unified file system interface
-/// 4. **Handler Creation**: Initialize S3 operation handlers
-/// 5. **Authentication Setup**: Configure S3 credential verification
-/// 6. **Router Configuration**: Set up Axum router with middleware chain
-/// 7. **Server Startup**: Bind to network address and start serving requests
-///
-/// # Server Configuration
-///
-/// The server is configured with the following middleware chain:
-/// - S3 request handler (main routing logic)
-/// - AWS Signature V4 authentication middleware
-/// - Access key store for credential verification
-/// - Health check endpoint (`/healthz`)
-///
-/// # Error Handling
-///
-/// The function handles various initialization errors:
-/// - Invalid network address format
-/// - File system initialization failures
-/// - Authentication setup failures
-/// - Network binding failures
-///
-/// # Performance Characteristics
-///
-/// - **Async I/O**: All operations use Tokio's async runtime
-/// - **Thread Safety**: Shared state is protected with Arc for concurrent access
-/// - **Resource Management**: Proper cleanup and resource management
-/// - **Memory Efficiency**: Streaming operations for large objects
-///
+async fn try_env_credentials(
+    s3_conf: &curvine_common::conf::S3GatewayConf,
+    rt: std::sync::Arc<orpc::runtime::AsyncRuntime>,
+) -> orpc::CommonResult<AccessKeyStoreEnum> {
+    let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+        .or_else(|_| std::env::var("CURVINE_ACCESS_KEY"))
+        .map_err(|_| "No access key found in environment variables")?;
+
+    let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+        .or_else(|_| std::env::var("CURVINE_SECRET_KEY"))
+        .map_err(|_| "No secret key found in environment variables")?;
+
+    tracing::info!(
+        "Found credentials in environment variables, access_key: {}",
+        &access_key[..4.min(access_key.len())]
+    );
+
+    let cache_refresh_interval =
+        std::time::Duration::from_secs(s3_conf.cache_refresh_interval_secs);
+    let store = LocalAccessKeyStore::new(
+        s3_conf.credentials_path.as_deref(),
+        Some(cache_refresh_interval),
+    )
+    .map_err(|e| {
+        format!(
+            "Failed to create local credential store for env vars: {}",
+            e
+        )
+    })?;
+
+    let store_enum = AccessKeyStoreEnum::Local(Arc::new(store));
+
+    store_enum
+        .initialize()
+        .await
+        .map_err(|e| format!("Failed to initialize env credential store: {}", e))?;
+
+    let credential = CredentialEntry::new(
+        access_key,
+        secret_key,
+        Some("Environment Variable".to_string()),
+    );
+    store_enum
+        .add_credential(credential)
+        .await
+        .map_err(|e| format!("Failed to add environment credential: {}", e))?;
+
+    start_cache_refresh_task(&store_enum, rt);
+
+    Ok(store_enum)
+}
+
+async fn create_empty_store(
+    s3_conf: &curvine_common::conf::S3GatewayConf,
+    rt: std::sync::Arc<orpc::runtime::AsyncRuntime>,
+) -> orpc::CommonResult<AccessKeyStoreEnum> {
+    tracing::info!("Creating empty credential store - credentials can be added later via CLI");
+
+    let cache_refresh_interval =
+        std::time::Duration::from_secs(s3_conf.cache_refresh_interval_secs);
+    let store = LocalAccessKeyStore::new(
+        s3_conf.credentials_path.as_deref(),
+        Some(cache_refresh_interval),
+    )
+    .map_err(|e| format!("Failed to create empty credential store: {}", e))?;
+
+    let store_enum = AccessKeyStoreEnum::Local(Arc::new(store));
+
+    store_enum
+        .initialize()
+        .await
+        .map_err(|e| format!("Failed to initialize empty credential store: {}", e))?;
+
+    start_cache_refresh_task(&store_enum, rt);
+
+    tracing::info!("Empty credential store created successfully");
+    Ok(store_enum)
+}
+
+async fn initialize_credential_store(
+    store_enum: AccessKeyStoreEnum,
+    store_type_name: &str,
+    rt: std::sync::Arc<orpc::runtime::AsyncRuntime>,
+) -> orpc::CommonResult<AccessKeyStoreEnum> {
+    store_enum.initialize().await.map_err(|e| {
+        tracing::warn!(
+            "Failed to initialize {} credential store: {}",
+            store_type_name,
+            e
+        );
+        format!(
+            "Failed to initialize {} credential store: {}",
+            store_type_name, e
+        )
+    })?;
+
+    match store_enum.list_credentials().await {
+        Ok(credentials) if !credentials.is_empty() => {
+            tracing::info!(
+                "Using {} credential store with {} credentials",
+                store_type_name,
+                credentials.len()
+            );
+
+            start_cache_refresh_task(&store_enum, rt);
+
+            Ok(store_enum)
+        }
+        Ok(_) => {
+            tracing::info!("{} credential store is empty", store_type_name);
+            orpc::err_box!("Empty {} credential store", store_type_name)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to list credentials from {} store: {}",
+                store_type_name,
+                e
+            );
+            orpc::err_box!(
+                "Failed to validate {} credential store: {}",
+                store_type_name,
+                e
+            )
+        }
+    }
+}
+
+fn start_cache_refresh_task(
+    store_enum: &AccessKeyStoreEnum,
+    rt: std::sync::Arc<orpc::runtime::AsyncRuntime>,
+) {
+    match store_enum.start_cache_refresh_task(rt) {
+        Ok(()) => {
+            tracing::info!(
+                "Started cache refresh task for {} credential store",
+                store_enum.store_type()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to start cache refresh task for {} store: {}",
+                store_enum.store_type(),
+                e
+            );
+        }
+    }
+}
+
+fn log_credential_configuration_warning(s3_conf: &curvine_common::conf::S3GatewayConf) {
+    tracing::warn!("No S3 credentials configured. Gateway started with empty credential store.");
+    tracing::warn!("Please configure S3 credentials using one of the following methods:");
+
+    if s3_conf.enable_distributed_auth {
+        tracing::warn!("1. Add credentials to distributed store: curvine-s3-gateway credential add --access-key <key> --secret-key <secret>");
+    } else {
+        tracing::warn!("1. Add credentials to local store: curvine-s3-gateway credential add --access-key <key> --secret-key <secret>");
+    }
+
+    tracing::warn!("2. Generate random credentials: curvine-s3-gateway credential generate");
+    tracing::warn!("3. Set environment variables: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
+    tracing::warn!(
+        "   Or use Curvine-specific variables: CURVINE_ACCESS_KEY and CURVINE_SECRET_KEY"
+    );
+    tracing::warn!("Note: S3 requests will fail until credentials are configured.");
+}
+
 pub async fn start_gateway(
     conf: ClusterConf,
     listen: String,
     region: String,
     rt: std::sync::Arc<orpc::runtime::AsyncRuntime>,
 ) -> orpc::CommonResult<()> {
-    // Initialize logging for standalone mode; ignore error if already set
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
         .with_ansi(false)
         .try_init();
 
-    tracing::info!(
+    tracing::debug!(
         "Try to start Curvine S3 Gateway on {} with region {}",
         listen,
         region
     );
 
-    // Use the provided unified runtime (no need to create a new one)
-    // This shared runtime is managed at the application level
-
-    // Initialize the unified file system with the shared runtime
     let ufs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
-
-    // Create S3 handlers with file system, region, and multipart temp configuration
+    let ak_store = init_s3_authentication(&conf.s3_gateway, &ufs, rt.clone()).await?;
     let handlers = Arc::new(s3::handlers::S3Handlers::new(
         ufs,
         region.clone(),
@@ -291,35 +339,26 @@ pub async fn start_gateway(
         rt.clone(),
     ));
 
-    // Initialize S3 authentication with fallback strategy
-    let ak_store = init_s3_authentication(&conf.s3_gateway).await?;
     tracing::info!("S3 Gateway authentication configured successfully");
 
-    // Configure the Axum application with middleware chain
     let app = axum::Router::new()
-        // Main S3 request handling middleware (routes all S3 operations)
         .layer(axum::middleware::from_fn(crate::http::handle_fn))
-        // AWS Signature V4 authentication middleware (verifies all requests)
         .layer(axum::middleware::from_fn(
             crate::http::handle_authorization_middleware,
         ))
-        // Access key store for credential verification
         .layer(axum::Extension(ak_store))
-        // Health check endpoint for monitoring and load balancing
         .route("/healthz", axum::routing::get(|| async { "ok" }));
 
-    // Register all S3 handlers with the router
     let app = register_s3_handlers(app, handlers);
 
-    // Parse the listen address and bind the server
-    let addr: SocketAddr = listen.parse().expect("invalid listen address");
+    let addr: SocketAddr = listen
+        .parse()
+        .map_err(|e| format!("Invalid listen address '{}': {}", listen, e))?;
     tracing::debug!("Binding to address: {}", addr);
 
-    // Create TCP listener for incoming connections
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("S3 Gateway started successfully on {}", addr);
 
-    // Start serving requests (this blocks until shutdown)
     axum::serve(listener, app).await?;
     Ok(())
 }

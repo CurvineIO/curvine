@@ -4,6 +4,10 @@ version = "0.2.1-beta"
 edition = "2021"
 license = "Apache-2.0"
 
+[[bin]]
+name = "curvine-s3-gateway"
+path = "src/bin/curvine-s3-gateway.rs"
+
 [dependencies]
 clap = { workspace = true }
 axum = { version = "0.8.4", features = ["macros"] }
@@ -14,7 +18,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 async-trait = { workspace = true }
-chrono = { workspace = true, default-features = false, features = ["clock"] }
+chrono = { workspace = true, default-features = false, features = ["clock", "serde"] }
 uuid = { workspace = true }
 md5 = "0.7"
 thiserror = { workspace = true }
@@ -27,6 +31,8 @@ sha2 = "0.10"
 base64 = "0.21"
 hex = "0.4"
 log = { workspace = true }
+zeroize = "1.7"
+subtle = "2.5"
 quick-xml = { version = "0.31", features = ["serialize"] }
 serde-xml-rs = "0.6"
 futures = { workspace = true }
@@ -34,6 +40,3 @@ futures = { workspace = true }
 curvine-common = { path = "../curvine-common" }
 curvine-client = { path = "../curvine-client" }
 orpc = { path = "../orpc" }
-
-# bws-rs removed: migrated source in-tree
-# bws-rs = { path = "/home/oppo/Documents/bws-rs" } 
