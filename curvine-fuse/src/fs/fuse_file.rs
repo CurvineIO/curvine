@@ -20,6 +20,17 @@ use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::FileStatus;
 
+/// File operation mode to track current file state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileMode {
+    /// File is idle, no active read or write operations
+    Idle,
+    /// File is currently being read
+    Reading,
+    /// File is currently being written
+    Writing,
+}
+
 pub struct FuseFile {
     fs: UnifiedFileSystem,
     fh: u64,
@@ -27,6 +38,7 @@ pub struct FuseFile {
     flags: u32,
     writer: Option<FuseWriter>,
     reader: Option<FuseReader>,
+    mode: FileMode,
 }
 
 impl FuseFile {
@@ -62,6 +74,7 @@ impl FuseFile {
             flags,
             writer,
             reader,
+            mode: FileMode::Idle,
         };
         Ok(file)
     }
@@ -75,6 +88,7 @@ impl FuseFile {
             flags,
             writer: Some(writer),
             reader: None,
+            mode: FileMode::Idle,
         };
         Ok(file)
     }
@@ -95,6 +109,15 @@ impl FuseFile {
     }
 
     pub async fn write(&mut self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
+        // Check if file is currently being read
+        if self.mode == FileMode::Reading {
+            return err_fuse!(
+                libc::EBUSY,
+                "File {} is currently being read, cannot write",
+                self.path
+            );
+        }
+
         let writer = match &mut self.writer {
             Some(v) => v,
 
@@ -110,6 +133,9 @@ impl FuseFile {
                 self.writer.get_or_insert(writer)
             }
         };
+
+        // Set file mode to writing
+        self.mode = FileMode::Writing;
 
         let off = op.arg.offset;
         let pos = writer.pos() as u64;
@@ -143,6 +169,15 @@ impl FuseFile {
     }
 
     pub async fn read(&mut self, op: Read<'_>, rep: FuseResponse) -> FuseResult<()> {
+        // Check if file is currently being written
+        if self.mode == FileMode::Writing {
+            return err_fuse!(
+                libc::EBUSY,
+                "File {} is currently being written, cannot read",
+                self.path
+            );
+        }
+
         let reader = match &mut self.reader {
             Some(v) => v,
             None => {
@@ -157,6 +192,10 @@ impl FuseFile {
                 self.reader.get_or_insert(reader)
             }
         };
+
+        // Set file mode to reading
+        self.mode = FileMode::Reading;
+
         reader.read(op, rep).await?;
         Ok(())
     }
@@ -176,6 +215,9 @@ impl FuseFile {
         if let Some(mut reader) = self.reader.take() {
             reader.complete().await?;
         }
+
+        // Reset file mode to idle when completing
+        self.mode = FileMode::Idle;
         Ok(())
     }
 
@@ -193,5 +235,10 @@ impl FuseFile {
 
     pub fn set_fh(&mut self, fh: u64) {
         self.fh = fh;
+    }
+
+    /// Get current file operation mode
+    pub fn mode(&self) -> FileMode {
+        self.mode
     }
 }
