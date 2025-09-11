@@ -1203,22 +1203,22 @@ impl fs::FileSystem for CurvineFileSystem {
         let name = try_option!(op.name.to_str());
         let oldnodeid = op.arg.oldnodeid;
 
-        let new_path = self.state.get_path_common(op.header.nodeid, Some(name))?;
-        let old_path = self.state.get_path(oldnodeid)?;
-        let old_status = self.fs_get_status(&old_path).await?;
+        let des_path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+        let src_path = self.state.get_path(oldnodeid)?;
+        let src_status = self.fs_get_status(&src_path).await?;
 
-        if self.fs.exists(&new_path).await? {
-            return err_fuse!(libc::EEXIST, "File already exists: {}", new_path);
+        if self.fs.exists(&des_path).await? {
+            return err_fuse!(libc::EEXIST, "File already exists: {}", des_path);
         }
 
         if old_status.is_dir {
-            return err_fuse!(libc::EPERM, "Cannot create link to directory: {}", old_path);
+            return err_fuse!(libc::EPERM, "Cannot create link to directory: {}", src_path);
         }
 
-        self.fs.link(&old_path, &new_path).await?;
+        self.fs.link(&src_path, &des_path).await?;
 
         let entry = self
-            .lookup_path(op.header.nodeid, Some(name), &new_path)
+            .lookup_path(op.header.nodeid, Some(name), &des_path)
             .await?;
         //entry.ino = oldnodeid;
         let result = Self::create_entry_out(&self.conf, entry);
