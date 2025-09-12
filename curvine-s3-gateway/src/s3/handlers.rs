@@ -310,8 +310,17 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 
             log::debug!("GetObject: will read {target_read} bytes directly");
 
-            // Use configured chunk size from S3Handlers instance
-            let chunk_size_conf = self.get_chunk_size_bytes;
+            // Dynamic chunk size based on file size for optimal performance
+            let chunk_size_conf = if target_read <= 64 * 1024 {
+                // Small files (<=64KB): use smaller chunks to reduce memory overhead
+                std::cmp::min(self.get_chunk_size_bytes, target_read as usize).max(4 * 1024)
+            } else if target_read <= 1024 * 1024 {
+                // Medium files (<=1MB): use moderate chunk size
+                std::cmp::min(self.get_chunk_size_bytes, 256 * 1024)
+            } else {
+                // Large files (>1MB): use configured chunk size for maximum throughput
+                self.get_chunk_size_bytes
+            };
             let mut total_read = 0u64;
             let mut remaining_to_read = target_read;
 
