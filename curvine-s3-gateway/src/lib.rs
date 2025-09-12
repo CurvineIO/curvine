@@ -53,7 +53,6 @@ use auth::{
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 
-
 fn register_s3_handlers(
     router: axum::Router,
     handlers: Arc<s3::handlers::S3Handlers>,
