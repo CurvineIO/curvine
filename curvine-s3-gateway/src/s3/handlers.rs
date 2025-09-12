@@ -379,8 +379,8 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                     }
                 }
                 
-                // Write current buffer
-                guard.poll_write(&current_buffer).await.map_err(|e| {
+                // Write current buffer using zero-copy Vec->Bytes conversion when possible
+                guard.poll_write_vec(current_buffer).await.map_err(|e| {
                     tracing::error!("Failed to write chunk to output: {}", e);
                     e.to_string()
                 })?;
