@@ -134,7 +134,7 @@ public class CurvineFallbackInputStream extends FSInputStream {
 
     @Override
     public boolean seekToNewSource(long l) throws IOException {
-        throw new IOException();
+        throw new IOException("This method seekToNewSource is not supported.");
     }
 
     @Override

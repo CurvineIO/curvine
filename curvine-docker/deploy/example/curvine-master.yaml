@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cv-master
+  labels:
+    role: cv-master
+  namespace: curvine
+spec:
+  selector:
+    matchLabels:
+      role: cv-master
+  serviceName: "cv-master"
+  podManagementPolicy: "Parallel"
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        role: cv-master
+    spec:
+      setHostnameAsFQDN: true
+      nodeSelector:
+        karpenter.k8s.aws/instance-family: m5
+        karpenter.k8s.aws/instance-size: 2xlarge
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                - key: bigdata/role
+                  operator: In
+                  values:
+                  - cv-master
+                - key: topology.kubernetes.io/zone
+                  operator: In
+                  values:
+                  - ap-southeast
+      containers:
+        - name: cv-master
+          image: docker.io/curvine:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - master
+          readinessProbe:
+            tcpSocket:
+              port: 8995
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            tcpSocket:
+              port: 8995
+            initialDelaySeconds: 15
+            periodSeconds: 300
+            timeoutSeconds: 60
+            failureThreshold: 5
+          ports:
+            - containerPort: 8995
+            - containerPort: 8996
+            - containerPort: 9001
+          volumeMounts:
+          - name: curvine-conf
+            mountPath: /app/curvine/conf
+      volumes:
+        - name: curvine-conf
+          configMap:
+            name: curvine-conf
+      restartPolicy: Always

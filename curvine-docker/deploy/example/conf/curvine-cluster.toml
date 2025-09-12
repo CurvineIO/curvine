@@ -1,0 +1,46 @@
+
+format_master = false
+format_worker = false
+cluster_id = "curvine"
+
+[master]
+rpc_port = 8995
+web_port = 9000
+meta_dir = "./data/meta"
+audit_logging_enabled = true
+log = { level = "info", log_dir = "./logs", file_name = "master.log" }
+
+[journal]
+rpc_port = 8996
+journal_addrs = [
+    {id = 1, hostname = "cv-master-0.svc.cluster.local", port = 8996},
+    {id = 2, hostname = "cv-master-1.svc.cluster.local", port = 8996},
+    {id = 3, hostname = "cv-master-2.svc.cluster.local", port = 8996}
+]
+journal_dir = "./data/journal"
+
+[worker]
+rpc_port = 8997
+web_port = 9000
+dir_reserved = "10GB"
+data_dir = [
+    "[SSD]/data/data1",
+]
+log = { level = "info", log_dir = "./logs", file_name = "worker.log" }
+
+
+[client]
+master_addrs = [
+    { hostname = "cv-master-0.svc.cluster.local", port = 8995 },
+    { hostname = "cv-master-1.svc.cluster.local", port = 8995 },
+    { hostname = "cv-master-2.svc.cluster.local", port = 8995 }
+]
+
+[fuse]
+debug = false
+
+
+[log]
+level = "info"
+log_dir = "./logs"
+file_name = "client.log"

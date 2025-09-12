@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cv-worker
+  labels:
+    role: cv-worker
+  namespace: curvine
+spec:
+  selector:
+    matchLabels:
+      role: cv-worker
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        role: cv-worker
+    spec:
+      hostNetwork: true
+      dnsConfig:
+        nameservers:
+          - 172.20.0.10
+        options:
+          - name: ndots
+            value: "4"
+      dnsPolicy: "ClusterFirstWithHostNet"
+      nodeSelector:
+        karpenter.k8s.aws/instance-family: i3en
+        karpenter.k8s.aws/instance-size: xlarge
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: role
+                operator: In
+                values:
+                - cv-worker
+            topologyKey: "kubernetes.io/hostname"
+      setHostnameAsFQDN: true
+      containers:
+        - name: cv-worker
+          image: docker.io/curvine:latest
+          imagePullPolicy: IfNotPresent
+          readinessProbe:
+            tcpSocket:
+              port: 8997
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            tcpSocket:
+              port: 8997
+            initialDelaySeconds: 15
+            periodSeconds: 300
+            timeoutSeconds: 60
+            failureThreshold: 5
+          ports:
+          - containerPort: 8997
+          - containerPort: 9001
+          args:
+            - worker
+          env:
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: status.podIP
+          - name: POD_NAMESPACE
+            value: bigdata
+          - name:  POD_CLUSTER_DOMAIN
+            value: cluster.local
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: curvine-conf
+            mountPath: /app/curvine/conf
+          - name: shuttle-worker-localdisk1
+            mountPath: /data/data1
+      volumes:
+      - name: curvine-conf
+        configMap:
+          name: curvine-conf
+      - name: shuttle-worker-localdisk1
+        hostPath:
+          path: /local-data
+          type: ""
+      restartPolicy: Always

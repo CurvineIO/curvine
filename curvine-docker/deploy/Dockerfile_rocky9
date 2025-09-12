@@ -17,7 +17,7 @@
 # Use the official Rocky Linux 9 image as a base
 FROM rockylinux:9
 
-# RUN dnf install -y   java-1.8.0-openjdk-devel && dnf clean all
+RUN yum install -y java-1.8.0-openjdk-devel procps net-tools && yum clean all
 
 ENV APP_HOME=/app
 WORKDIR $APP_HOME
