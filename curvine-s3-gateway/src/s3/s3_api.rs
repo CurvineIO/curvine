@@ -683,9 +683,7 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         }
     }
 
-    // Fix for leading zeros: force connection close for GET responses
-    resp.set_header("Connection", "close");
-    //
+    // Keep default HTTP connection behavior (enable keep-alive by default)
     resp.set_status(status);
     resp.send_header();
 

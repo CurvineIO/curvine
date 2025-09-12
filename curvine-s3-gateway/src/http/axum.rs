@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use axum::response::IntoResponse;
 use futures::StreamExt;
+use futures::stream::StreamExt as _; // for map on ReceiverStream
 
 use crate::auth::{sig_v4, AccesskeyStore};
 use crate::s3::s3_api::VRequest;
@@ -285,6 +286,89 @@ impl crate::s3::s3_api::VResponse for Response {
     }
 
     fn send_header(&mut self) {}
+}
+
+// Streaming VResponse for high-throughput GET object
+struct StreamingResponse {
+    status: std::sync::Arc<tokio::sync::Mutex<u16>>,
+    headers: std::sync::Arc<tokio::sync::Mutex<axum::http::HeaderMap>>,
+    header_ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+}
+
+struct StreamBodyWriter {
+    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+}
+
+#[async_trait::async_trait]
+impl crate::utils::io::PollWrite for StreamBodyWriter {
+    async fn poll_write(&mut self, buff: &[u8]) -> Result<usize, std::io::Error> {
+        if buff.is_empty() {
+            return Ok(0);
+        }
+        // Copy into Bytes and send; channel provides backpressure.
+        let bytes = bytes::Bytes::copy_from_slice(buff);
+        self.tx
+            .send(bytes)
+            .await
+            .map_err(|e| std::io::Error::other(format!("stream send error: {}", e)))?;
+        Ok(buff.len())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::s3::s3_api::BodyWriter for StreamingResponse {
+    type BodyWriter<'a> = StreamBodyWriter where Self: 'a;
+
+    async fn get_body_writer(&mut self) -> Result<Self::BodyWriter<'_>, String> {
+        Ok(StreamBodyWriter { tx: self.tx.clone() })
+    }
+}
+
+impl crate::s3::s3_api::VResponse for StreamingResponse {
+    fn set_status(&mut self, status: u16) {
+        let mut_guard = self.status.clone();
+        // fire-and-forget lock update
+        let _ = futures::executor::block_on(async move {
+            let mut st = mut_guard.lock().await;
+            *st = status;
+        });
+    }
+
+    fn send_header(&mut self) {
+        if let Some(tx) = self.header_ready_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl crate::auth::sig_v4::VHeader for StreamingResponse {
+    fn get_header(&self, key: &str) -> Option<String> {
+        let headers = futures::executor::block_on(self.headers.lock());
+        headers
+            .get(key)
+            .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+    }
+
+    fn set_header(&mut self, key: &str, val: &str) {
+        let mut headers = futures::executor::block_on(self.headers.lock());
+        let name: axum::http::HeaderName = key.to_string().parse().unwrap();
+        headers.insert(name, val.parse().unwrap());
+    }
+
+    fn delete_header(&mut self, key: &str) {
+        let mut headers = futures::executor::block_on(self.headers.lock());
+        headers.remove(key);
+    }
+
+    fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
+        let headers = futures::executor::block_on(self.headers.lock());
+        for (k, v) in headers.iter() {
+            if !cb(k.as_str(), unsafe { std::str::from_utf8_unchecked(v.as_bytes()) }) {
+                return;
+            }
+        }
+    }
 }
 
 pub async fn handle_fn(
