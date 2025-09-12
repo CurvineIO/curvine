@@ -209,6 +209,33 @@ impl S3Router {
     async fn handle_post_request(
         req: axum::extract::Request<axum::body::Body>,
     ) -> axum::response::Response {
+        // First handle DeleteObjects (POST ?delete)
+        if req
+            .uri()
+            .query()
+            .map(|q| q.contains("delete"))
+            .unwrap_or(false)
+        {
+            let delete_obj = req
+                .extensions()
+                .get::<Arc<dyn DeleteObjectHandler + Send + Sync>>()
+                .cloned();
+            if let Some(delete_obj) = delete_obj {
+                let mut resp = Response::default();
+                crate::s3::s3_api::handle_post_delete_objects(
+                    Request::from(req),
+                    &mut resp,
+                    &delete_obj,
+                )
+                .await;
+                return resp.into();
+            } else {
+                tracing::warn!("DeleteObjects handler not configured");
+                return (StatusCode::FORBIDDEN, b"").into_response();
+            }
+        }
+
+        // Multipart-related POSTs
         let multipart_obj = req
             .extensions()
             .get::<Arc<dyn MultiUploadObjectHandler + Send + Sync>>()
@@ -407,9 +434,8 @@ impl S3Router {
     ) -> axum::response::Response {
         match get_obj {
             Some(obj) => {
-                let mut resp = Response::default();
-                handle_get_object(req, &mut resp, &obj).await;
-                resp.into()
+                // Use streaming response to avoid buffering full body in memory
+                crate::http::axum::stream_get_object(req, obj).await
             }
             None => {
                 tracing::warn!("Get object handler not configured");
