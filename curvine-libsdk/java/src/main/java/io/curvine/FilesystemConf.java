@@ -74,7 +74,9 @@ public class FilesystemConf {
 
     public boolean enable_unified_fs  = true;
 
-    public boolean enable_read_ufs  = false;
+    public boolean enable_rust_read_ufs  = false;
+
+    public boolean enable_fallback_read_ufs = true;
 
     public int umask = 022;
 
@@ -219,7 +221,8 @@ public class FilesystemConf {
                 ", drop_cache_len='" + drop_cache_len + '\'' +
                 ", failed_worker_ttl='" + failed_worker_ttl + '\'' +
                 ", enable_unified_fs=" + enable_unified_fs +
-                ", enable_read_ufs=" + enable_read_ufs +
+                ", enable_read_ufs=" + enable_rust_read_ufs +
+                ", enable_fallback_read_ufs=" + enable_fallback_read_ufs +
                 ", umask=" + umask +
                 ", mount_update_ttl='" + mount_update_ttl + '\'' +
                 ", log_level='" + log_level + '\'' +

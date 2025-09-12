@@ -122,18 +122,31 @@ public class CurvineFileSystem extends FileSystem {
         String formatPath = formatPath(path);
         try {
             long nativeHandle = libFs.open(formatPath, tmp);
-            return new FSDataInputStream(new CurvineInputStream(libFs, nativeHandle, tmp[0], statistics));
+            FSInputStream inputStream = new CurvineInputStream(libFs, nativeHandle, tmp[0], statistics);
+
+            if (filesystemConf.enable_fallback_read_ufs) {
+                Optional<Path> ufsPath = libFs.getUfsPath(formatPath).map(Path::new);
+                if (ufsPath.isPresent()) {
+                    inputStream = new CurvineFallbackInputStream(inputStream, () -> {
+                        try {
+                            return FileSystem.get(ufsPath.get().toUri(), getConf()).open(ufsPath.get(), bufferSize);
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    });
+                }
+            }
+            return new FSDataInputStream(inputStream);
         } catch (CurvineException e) {
-            if (filesystemConf.enable_unified_fs && !filesystemConf.enable_read_ufs) {
-                Optional<String> optUfsPath = libFs.getUfsPath(formatPath);
-                if (!optUfsPath.isPresent()) {
+            if (filesystemConf.enable_unified_fs && !filesystemConf.enable_rust_read_ufs) {
+                Optional<Path> ufsPath = libFs.getUfsPath(formatPath).map(Path::new);
+                if (!ufsPath.isPresent()) {
                     throw new CurvineException(formatPath + "{} not find ufs path");
                 }
 
-                Path ufsPath = new Path(optUfsPath.get());
                 LOGGER.warn("Not support reading using the Rust API, " +
                         "it will be read using the Java API. path: {} -> {}", formatPath, ufsPath);
-                return FileSystem.get(ufsPath.toUri(), getConf()).open(ufsPath, bufferSize);
+                return FileSystem.get(ufsPath.get().toUri(), getConf()).open(ufsPath.get(), bufferSize);
             } else {
                 throw e;
             }

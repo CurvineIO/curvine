@@ -55,7 +55,7 @@ impl UnifiedFileSystem {
     pub fn with_rt(conf: ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
         let update_interval = conf.client.mount_update_ttl;
         let enable_unified = conf.client.enable_unified_fs;
-        let enable_read_ufs = conf.client.enable_read_ufs;
+        let enable_read_ufs = conf.client.enable_rust_read_ufs;
 
         let cv = CurvineFileSystem::with_rt(conf, rt.clone())?;
         let fs = UnifiedFileSystem {

@@ -91,7 +91,7 @@ pub struct FilesystemConf {
     pub failed_worker_ttl: String,
 
     pub enable_unified_fs: bool,
-    pub enable_read_ufs: bool,
+    pub enable_rust_read_ufs: bool,
 
     pub mount_update_ttl: String,
 }
@@ -173,7 +173,7 @@ impl FilesystemConf {
             failed_worker_ttl_str: self.failed_worker_ttl,
 
             enable_unified_fs: self.enable_unified_fs,
-            enable_read_ufs: self.enable_read_ufs,
+            enable_rust_read_ufs: self.enable_rust_read_ufs,
             mount_update_ttl_str: self.mount_update_ttl,
 
             ..Default::default()

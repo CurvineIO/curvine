@@ -144,7 +144,7 @@ pub struct ClientConf {
     pub enable_unified_fs: bool,
     // If the cache hits, read data from Curvine.
     // If the cache misses, determine whether to allow Curvine to directly read data from the unified file system (UFS).
-    pub enable_read_ufs: bool,
+    pub enable_rust_read_ufs: bool,
 
     // Mount information update interval
     #[serde(skip)]
@@ -311,7 +311,7 @@ impl Default for ClientConf {
             failed_worker_ttl_str: "10m".to_owned(),
 
             enable_unified_fs: true,
-            enable_read_ufs: true,
+            enable_rust_read_ufs: true,
 
             mount_update_ttl: Default::default(),
             mount_update_ttl_str: "10m".to_string(),
