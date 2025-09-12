@@ -1211,7 +1211,7 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::EEXIST, "File already exists: {}", des_path);
         }
 
-        if old_status.is_dir {
+        if src_status.is_dir {
             return err_fuse!(libc::EPERM, "Cannot create link to directory: {}", src_path);
         }
 
