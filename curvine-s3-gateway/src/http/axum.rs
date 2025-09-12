@@ -15,8 +15,9 @@
 use std::collections::HashMap;
 
 use axum::response::IntoResponse;
-use futures::StreamExt;
 use futures::stream::StreamExt as _; // for map on ReceiverStream
+use futures::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::{sig_v4, AccesskeyStore};
 use crate::s3::s3_api::VRequest;
@@ -318,10 +319,15 @@ impl crate::utils::io::PollWrite for StreamBodyWriter {
 
 #[async_trait::async_trait]
 impl crate::s3::s3_api::BodyWriter for StreamingResponse {
-    type BodyWriter<'a> = StreamBodyWriter where Self: 'a;
+    type BodyWriter<'a>
+        = StreamBodyWriter
+    where
+        Self: 'a;
 
     async fn get_body_writer(&mut self) -> Result<Self::BodyWriter<'_>, String> {
-        Ok(StreamBodyWriter { tx: self.tx.clone() })
+        Ok(StreamBodyWriter {
+            tx: self.tx.clone(),
+        })
     }
 }
 
@@ -364,11 +370,54 @@ impl crate::auth::sig_v4::VHeader for StreamingResponse {
     fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
         let headers = futures::executor::block_on(self.headers.lock());
         for (k, v) in headers.iter() {
-            if !cb(k.as_str(), unsafe { std::str::from_utf8_unchecked(v.as_bytes()) }) {
+            if !cb(k.as_str(), unsafe {
+                std::str::from_utf8_unchecked(v.as_bytes())
+            }) {
                 return;
             }
         }
     }
+}
+
+/// Build an axum streaming response by running S3 GET handler with StreamingResponse
+pub async fn stream_get_object(
+    req: super::axum::Request,
+    obj: std::sync::Arc<dyn crate::s3::s3_api::GetObjectHandler + Send + Sync>,
+) -> axum::response::Response {
+    // Prepare shared state
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+    let (hdr_tx, hdr_rx) = tokio::sync::oneshot::channel::<()>();
+    let status = std::sync::Arc::new(tokio::sync::Mutex::new(200u16));
+    let headers = std::sync::Arc::new(tokio::sync::Mutex::new(axum::http::HeaderMap::new()));
+
+    // Spawn the GET handler in background to stream data into channel
+    let mut streaming_resp = StreamingResponse {
+        status: status.clone(),
+        headers: headers.clone(),
+        header_ready_tx: Some(hdr_tx),
+        tx: tx.clone(),
+    };
+    tokio::spawn(async move {
+        crate::s3::s3_api::handle_get_object(req, &mut streaming_resp, &obj).await;
+        // Drop sender to close stream on completion
+        drop(tx);
+    });
+
+    // Wait until headers are set (send_header called) before building response
+    let _ = hdr_rx.await;
+
+    // Build response
+    let st = *status.lock().await;
+    let mut builder = axum::response::Response::builder().status(st);
+    if let Some(hdrs_mut) = builder.headers_mut() {
+        *hdrs_mut = headers.lock().await.clone();
+    }
+
+    // Convert channel into stream body
+    let body_stream = ReceiverStream::from(rx).map(|b| Ok::<_, std::io::Error>(b));
+    let body = axum::body::Body::from_stream(body_stream);
+
+    builder.body(body).unwrap()
 }
 
 pub async fn handle_fn(
