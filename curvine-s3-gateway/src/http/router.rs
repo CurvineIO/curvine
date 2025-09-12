@@ -434,7 +434,9 @@ impl S3Router {
     ) -> axum::response::Response {
         match get_obj {
             Some(obj) => {
-                return crate::http::axum::stream_get_object(req, obj).await;
+                // For now, use default mpsc capacity since we need to refactor parameter passing
+                // TODO: Pass configuration through proper channels
+                return crate::http::axum::stream_get_object(req, obj, 32).await;
             }
             None => {
                 tracing::warn!("Get object handler not configured");

@@ -379,18 +379,14 @@ impl crate::auth::sig_v4::VHeader for StreamingResponse {
     }
 }
 
-// Config: mpsc channel capacity for GET streaming from global config
-fn get_mpsc_capacity() -> usize {
-    crate::get_s3_gateway_config().get_mpsc_capacity
-}
-
 /// Build an axum streaming response by running S3 GET handler with StreamingResponse
 pub async fn stream_get_object(
     req: super::axum::Request,
     obj: std::sync::Arc<dyn crate::s3::s3_api::GetObjectHandler + Send + Sync>,
+    mpsc_capacity: usize,
 ) -> axum::response::Response {
     // Prepare shared state
-    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(get_mpsc_capacity());
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(mpsc_capacity);
     let (hdr_tx, hdr_rx) = tokio::sync::oneshot::channel::<()>();
     let status = std::sync::Arc::new(tokio::sync::Mutex::new(200u16));
     let headers = std::sync::Arc::new(tokio::sync::Mutex::new(axum::http::HeaderMap::new()));

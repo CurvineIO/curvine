@@ -45,7 +45,6 @@ pub mod utils;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use auth::{
     AccessKeyStoreEnum, CredentialEntry, CredentialStore, CurvineAccessKeyStore,
@@ -54,13 +53,6 @@ use auth::{
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 
-/// Global S3 Gateway configuration for performance settings
-static S3_GATEWAY_CONFIG: OnceLock<curvine_common::conf::S3GatewayConf> = OnceLock::new();
-
-/// Get the global S3 Gateway configuration
-pub fn get_s3_gateway_config() -> &'static curvine_common::conf::S3GatewayConf {
-    S3_GATEWAY_CONFIG.get().expect("S3 Gateway config not initialized")
-}
 
 fn register_s3_handlers(
     router: axum::Router,
@@ -345,11 +337,6 @@ pub async fn start_gateway(
         listen,
         region
     );
-
-    // Initialize global S3 Gateway configuration for performance settings
-    S3_GATEWAY_CONFIG.set(conf.s3_gateway.clone()).map_err(|_| 
-        "Failed to initialize S3 Gateway configuration"
-    )?;
 
     let ufs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let ak_store = init_s3_authentication(&conf.s3_gateway, &ufs, rt.clone()).await?;
