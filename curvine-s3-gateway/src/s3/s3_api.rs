@@ -255,6 +255,45 @@ use tokio::io::AsyncSeekExt;
 use crate::utils::consts::*;
 use crate::utils::io::{PollRead, PollWrite};
 
+/// Generate a unique request ID for S3 API responses
+fn generate_request_id() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    format!("{:016X}", hasher.finish())
+}
+
+/// Generate a host ID for S3 API responses
+fn generate_host_id() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    "curvine-s3-gateway".hash(&mut hasher);
+    std::time::SystemTime::now().hash(&mut hasher);
+    let hash = hasher.finish();
+
+    // Generate a base64-like string similar to AWS S3 host IDs
+    format!(
+        "{:016X}{:016X}",
+        hash,
+        hash.wrapping_mul(0x9e3779b97f4a7c15)
+    )
+}
+
+/// Set error status with S3-standard headers (request-id and host-id)
+fn set_error_response<F: VResponse>(resp: &mut F, status: u16) {
+    resp.set_status(status);
+    resp.set_header("x-amz-request-id", &generate_request_id());
+    resp.set_header("x-amz-id-2", &generate_host_id());
+    if status >= 400 {
+        resp.set_header("content-type", "application/xml");
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 #[serde(rename = "ListBucketResult")]
@@ -683,7 +722,8 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         }
     }
 
-    // Keep default HTTP connection behavior (enable keep-alive by default)
+    // Keep-alive and Content-Length help avoid chunked encoding and extra handshakes
+    resp.set_header("connection", "keep-alive");
     resp.set_status(status);
     resp.send_header();
 
@@ -2299,9 +2339,9 @@ pub async fn handle_create_bucket<T: VRequest, F: VResponse>(
     let url_path = req.url_path();
     if let Err(e) = handler.handle(&opt, url_path.trim_matches('/')).await {
         if e.contains("BucketAlreadyExists") {
-            resp.set_status(409); // Conflict
+            set_error_response(resp, 409); // Conflict
         } else {
-            resp.set_status(500); // Internal Server Error
+            set_error_response(resp, 500); // Internal Server Error
         }
         log::info!("create bucket handler error: {e}")
     }
