@@ -39,6 +39,11 @@ pub mod io {
     #[async_trait::async_trait]
     pub trait PollWrite {
         async fn poll_write(&mut self, buff: &[u8]) -> Result<usize, std::io::Error>;
+        
+        /// Optional: write Vec<u8> directly to avoid copy (default implementation falls back to slice)
+        async fn poll_write_vec(&mut self, vec: Vec<u8>) -> Result<usize, std::io::Error> {
+            self.poll_write(&vec).await
+        }
     }
 
     pub struct BuffIo<const N: usize> {
