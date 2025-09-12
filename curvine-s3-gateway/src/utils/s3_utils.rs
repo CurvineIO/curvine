@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! File converter utilities for S3 API
-//! Converts Curvine FileStatus to S3 object representations
+//! S3 API utilities
+//!
+//! This module provides utility functions for S3 API operations including:
+//! - File converter utilities for S3 API
+//! - Response header generation
+//! - S3-compatible identifiers
 
 use crate::s3::s3_api::{HeadObjectResult, ListObjectContent, Owner};
 use curvine_common::state::{FileStatus, StorageType, TtlAction};
@@ -188,5 +192,86 @@ pub fn file_status_to_list_object_content(
         size: file_status.len as u64,
         storage_class: Some(map_storage_class(&file_status.storage_policy.storage_type)),
         owner: Some(create_owner_info(file_status)),
+    }
+}
+
+// S3 Response Utilities
+
+/// Generate a unique request ID for S3 API responses
+///
+/// Creates a unique identifier for each request, used in x-amz-request-id header.
+/// Format: 16-character hexadecimal string based on timestamp and thread ID.
+pub fn generate_request_id() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    format!("{:016X}", hasher.finish())
+}
+
+/// Generate a stable host ID for S3 API responses
+///
+/// Creates a consistent identifier for the gateway instance, used in x-amz-id-2 header.
+/// The host ID remains stable throughout the gateway process lifetime but is unique
+/// per process instance.
+///
+/// Format: 32-character hexadecimal string based on stable identifiers:
+/// - Service name ("curvine-s3-gateway")
+/// - Hostname (from environment variables)
+/// - Process ID (for uniqueness within same host)
+pub fn generate_host_id() -> String {
+    use std::sync::OnceLock;
+
+    static HOST_ID: OnceLock<String> = OnceLock::new();
+    HOST_ID
+        .get_or_init(|| {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher = DefaultHasher::new();
+
+            // Use stable identifiers for consistent host ID
+            "curvine-s3-gateway".hash(&mut hasher);
+
+            // Try to get hostname, fallback to localhost
+            let hostname = std::env::var("HOSTNAME")
+                .or_else(|_| std::env::var("COMPUTERNAME"))
+                .unwrap_or_else(|_| "localhost".to_string());
+            hostname.hash(&mut hasher);
+
+            // Use process ID for uniqueness within same host
+            std::process::id().hash(&mut hasher);
+
+            let hash = hasher.finish();
+
+            // Generate a base64-like string similar to AWS S3 host IDs
+            format!(
+                "{:016X}{:016X}",
+                hash,
+                hash.wrapping_mul(0x9e3779b97f4a7c15)
+            )
+        })
+        .clone()
+}
+
+/// Set error status with S3-standard headers (request-id and host-id)
+///
+/// Helper function to set HTTP status code along with required S3 response headers.
+/// Automatically adds:
+/// - x-amz-request-id: Unique request identifier
+/// - x-amz-id-2: Stable host identifier  
+/// - content-type: application/xml (for error responses)
+///
+/// # Arguments
+/// * `resp` - Mutable reference to response object implementing VResponse
+/// * `status` - HTTP status code to set
+pub fn set_error_response<F: crate::s3::s3_api::VResponse>(resp: &mut F, status: u16) {
+    resp.set_status(status);
+    resp.set_header("x-amz-request-id", &generate_request_id());
+    resp.set_header("x-amz-id-2", &generate_host_id());
+    if status >= 400 {
+        resp.set_header("content-type", "application/xml");
     }
 }

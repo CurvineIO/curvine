@@ -255,63 +255,6 @@ use tokio::io::AsyncSeekExt;
 use crate::utils::consts::*;
 use crate::utils::io::{PollRead, PollWrite};
 
-/// Generate a unique request ID for S3 API responses
-fn generate_request_id() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    std::time::SystemTime::now().hash(&mut hasher);
-    std::thread::current().id().hash(&mut hasher);
-    format!("{:016X}", hasher.finish())
-}
-
-/// Generate a stable host ID for S3 API responses
-fn generate_host_id() -> String {
-    use std::sync::OnceLock;
-
-    static HOST_ID: OnceLock<String> = OnceLock::new();
-    HOST_ID
-        .get_or_init(|| {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-
-            let mut hasher = DefaultHasher::new();
-
-            // Use stable identifiers for consistent host ID
-            "curvine-s3-gateway".hash(&mut hasher);
-
-            // Try to get hostname, fallback to localhost
-            let hostname = std::env::var("HOSTNAME")
-                .or_else(|_| std::env::var("COMPUTERNAME"))
-                .unwrap_or_else(|_| "localhost".to_string());
-            hostname.hash(&mut hasher);
-
-            // Use process ID for uniqueness within same host
-            std::process::id().hash(&mut hasher);
-
-            let hash = hasher.finish();
-
-            // Generate a base64-like string similar to AWS S3 host IDs
-            format!(
-                "{:016X}{:016X}",
-                hash,
-                hash.wrapping_mul(0x9e3779b97f4a7c15)
-            )
-        })
-        .clone()
-}
-
-/// Set error status with S3-standard headers (request-id and host-id)
-fn set_error_response<F: VResponse>(resp: &mut F, status: u16) {
-    resp.set_status(status);
-    resp.set_header("x-amz-request-id", &generate_request_id());
-    resp.set_header("x-amz-id-2", &generate_host_id());
-    if status >= 400 {
-        resp.set_header("content-type", "application/xml");
-    }
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 #[serde(rename = "ListBucketResult")]
@@ -2357,9 +2300,9 @@ pub async fn handle_create_bucket<T: VRequest, F: VResponse>(
     let url_path = req.url_path();
     if let Err(e) = handler.handle(&opt, url_path.trim_matches('/')).await {
         if e.contains("BucketAlreadyExists") {
-            set_error_response(resp, 409); // Conflict
+            crate::utils::s3_utils::set_error_response(resp, 409); // Conflict
         } else {
-            set_error_response(resp, 500); // Internal Server Error
+            crate::utils::s3_utils::set_error_response(resp, 500); // Internal Server Error
         }
         log::info!("create bucket handler error: {e}")
     }
