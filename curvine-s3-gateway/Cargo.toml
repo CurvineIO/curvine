@@ -37,6 +37,7 @@ quick-xml = { version = "0.31", features = ["serialize"] }
 serde-xml-rs = "0.6"
 futures = { workspace = true }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
 
 curvine-common = { path = "../curvine-common" }
 curvine-client = { path = "../curvine-client" }

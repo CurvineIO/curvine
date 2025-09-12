@@ -35,7 +35,6 @@ use curvine_common::state::FileType;
 use curvine_common::FsResult;
 use orpc::runtime::AsyncRuntime;
 
-use std::sync::OnceLock;
 use tokio::io::AsyncWriteExt;
 use tracing;
 use uuid;
@@ -50,6 +49,11 @@ pub struct S3Handlers {
     /// Shared async runtime for executing blocking file system operations
     /// Prevents blocking the main async executor with CPU-intensive tasks
     pub rt: std::sync::Arc<AsyncRuntime>,
+
+    /// GET performance optimization settings
+    pub get_mpsc_capacity: usize,
+    pub get_chunk_size_bytes: usize,
+    pub get_prefetch_depth: usize,
 }
 
 impl S3Handlers {
@@ -78,17 +82,25 @@ impl S3Handlers {
         region: String,
         put_temp_dir: String,
         rt: std::sync::Arc<AsyncRuntime>,
+        get_mpsc_capacity: usize,
+        get_chunk_size_mb: f32,
+        get_prefetch_depth: usize,
     ) -> Self {
+        let get_chunk_size_bytes = (get_chunk_size_mb * 1024.0 * 1024.0) as usize;
+
         tracing::debug!(
-            "Creating new S3Handlers with region: {}, put_temp_dir: {}",
-            region,
-            put_temp_dir
+            "Creating new S3Handlers with region: {}, put_temp_dir: {}, GET optimizations: mpsc_cap={}, chunk_size={}MB, prefetch_depth={}",
+            region, put_temp_dir, get_mpsc_capacity, get_chunk_size_mb, get_prefetch_depth
         );
+
         Self {
             fs,
             region,
             put_temp_dir,
             rt,
+            get_mpsc_capacity: get_mpsc_capacity.clamp(1, 1024),
+            get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024), // 512KB - 4MB
+            get_prefetch_depth: get_prefetch_depth.clamp(1, 3),
         }
     }
 
@@ -298,50 +310,28 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 
             log::debug!("GetObject: will read {target_read} bytes directly");
 
-            // Configurable chunk size: default 1MB, supports 512KB/1MB/2MB via env
-            fn get_chunk_size() -> usize {
-                static SZ: OnceLock<usize> = OnceLock::new();
-                *SZ.get_or_init(|| {
-                    match std::env::var("CURVINE_S3_GET_CHUNK_MB")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                    {
-                        Some(2) => 2 * 1024 * 1024,
-                        Some(1) => 1 * 1024 * 1024,
-                        Some(0) => 512 * 1024, // treat 0 as 512KB for convenience
-                        Some(_) => 1 * 1024 * 1024,
-                        None => 1 * 1024 * 1024,
-                    }
-                })
-            }
-            let chunk_size_conf = get_chunk_size();
+            // Use configured chunk size from S3Handlers instance
+            let chunk_size_conf = self.get_chunk_size_bytes;
             let mut total_read = 0u64;
             let mut remaining_to_read = target_read;
 
             // Dual-buffer prefetch: read ahead multiple chunks, write while reading next
-            fn get_prefetch_depth() -> usize {
-                std::env::var("CURVINE_S3_GET_PREFETCH_DEPTH")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .map(|n| n.clamp(1, 3))
-                    .unwrap_or(2)
-            }
-            let prefetch_depth = get_prefetch_depth();
+            let prefetch_depth = self.get_prefetch_depth;
 
             let mut guard = out.lock().await;
 
             // Pre-read multiple chunks into buffer queue for overlapped I/O
             let mut buffer_queue: Vec<Vec<u8>> = Vec::with_capacity(prefetch_depth);
-            
+
             // Initial prefetch: read first few chunks
             for _ in 0..prefetch_depth {
                 if remaining_to_read == 0 {
                     break;
                 }
-                
+
                 let chunk_size = std::cmp::min(chunk_size_conf, remaining_to_read as usize);
                 let mut buffer = vec![0u8; chunk_size];
-                
+
                 let bytes_read = reader
                     .read_full(&mut buffer[..chunk_size])
                     .await
@@ -350,7 +340,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                 if bytes_read == 0 {
                     break;
                 }
-                
+
                 buffer.truncate(bytes_read);
                 buffer_queue.push(buffer);
                 remaining_to_read -= bytes_read as u64;
@@ -361,24 +351,25 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                 // Take first buffer from queue
                 let current_buffer = buffer_queue.remove(0);
                 let bytes_to_write = current_buffer.len();
-                
+
                 // Try to read next chunk while we have current buffer (overlapped I/O)
                 if remaining_to_read > 0 && buffer_queue.len() < prefetch_depth {
-                    let next_chunk_size = std::cmp::min(chunk_size_conf, remaining_to_read as usize);
+                    let next_chunk_size =
+                        std::cmp::min(chunk_size_conf, remaining_to_read as usize);
                     let mut next_buffer = vec![0u8; next_chunk_size];
-                    
+
                     let bytes_read = reader
                         .read_full(&mut next_buffer[..next_chunk_size])
                         .await
                         .map_err(|e| e.to_string())?;
-                    
+
                     if bytes_read > 0 {
                         next_buffer.truncate(bytes_read);
                         buffer_queue.push(next_buffer);
                         remaining_to_read -= bytes_read as u64;
                     }
                 }
-                
+
                 // Write current buffer using zero-copy Vec->Bytes conversion when possible
                 guard.poll_write_vec(current_buffer).await.map_err(|e| {
                     tracing::error!("Failed to write chunk to output: {}", e);
