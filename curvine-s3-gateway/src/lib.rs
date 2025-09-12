@@ -58,6 +58,8 @@ fn register_s3_handlers(
     handlers: Arc<s3::handlers::S3Handlers>,
 ) -> axum::Router {
     router
+        // Expose concrete handlers for advanced streaming paths
+        .layer(axum::Extension(handlers.clone()))
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::PutObjectHandler + Send + Sync>
         ))
@@ -351,6 +353,7 @@ pub async fn start_gateway(
         .layer(axum::middleware::from_fn(
             crate::http::handle_authorization_middleware,
         ))
+        .layer(axum::middleware::from_fn(http_performance_middleware))
         .layer(axum::Extension(ak_store))
         .route("/healthz", axum::routing::get(|| async { "ok" }));
 
@@ -364,10 +367,44 @@ pub async fn start_gateway(
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     // Configure TCP socket for high performance
+    // Note: TCP socket options like NODELAY and KEEPALIVE are best configured at system level:
+    // - Set net.ipv4.tcp_keepalive_time = 30 in /etc/sysctl.conf
+    // - Use SO_REUSEADDR and SO_REUSEPORT for high-concurrency scenarios
+    // - Modern Linux kernels enable TCP_NODELAY by default for most applications
+    tracing::debug!("TCP listener created - consider system-level TCP tuning for optimal performance");
+
     if let Ok(socket) = listener.local_addr() {
         tracing::info!("S3 Gateway started successfully on {}", socket);
     }
 
+    // Configure HTTP server with performance optimizations
+    // Note: axum 0.7+ serve API doesn't expose TCP socket options directly
+    // TCP keepalive and nodelay should be configured at the OS/system level or via TcpListener
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// HTTP performance middleware to set connection keep-alive and other optimization headers
+async fn http_performance_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    
+    // Ensure HTTP keep-alive is enabled (unless explicitly disabled)
+    let headers = response.headers_mut();
+    if !headers.contains_key("connection") {
+        headers.insert(
+            axum::http::header::CONNECTION,
+            axum::http::HeaderValue::from_static("keep-alive"),
+        );
+    }
+    
+    // Add performance-related headers
+    headers.insert(
+        "server",
+        axum::http::HeaderValue::from_static("curvine-s3-gateway"),
+    );
+    
+    response
 }
