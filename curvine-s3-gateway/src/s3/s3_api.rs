@@ -266,22 +266,40 @@ fn generate_request_id() -> String {
     format!("{:016X}", hasher.finish())
 }
 
-/// Generate a host ID for S3 API responses
+/// Generate a stable host ID for S3 API responses
 fn generate_host_id() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::sync::OnceLock;
 
-    let mut hasher = DefaultHasher::new();
-    "curvine-s3-gateway".hash(&mut hasher);
-    std::time::SystemTime::now().hash(&mut hasher);
-    let hash = hasher.finish();
+    static HOST_ID: OnceLock<String> = OnceLock::new();
+    HOST_ID
+        .get_or_init(|| {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
 
-    // Generate a base64-like string similar to AWS S3 host IDs
-    format!(
-        "{:016X}{:016X}",
-        hash,
-        hash.wrapping_mul(0x9e3779b97f4a7c15)
-    )
+            let mut hasher = DefaultHasher::new();
+
+            // Use stable identifiers for consistent host ID
+            "curvine-s3-gateway".hash(&mut hasher);
+
+            // Try to get hostname, fallback to localhost
+            let hostname = std::env::var("HOSTNAME")
+                .or_else(|_| std::env::var("COMPUTERNAME"))
+                .unwrap_or_else(|_| "localhost".to_string());
+            hostname.hash(&mut hasher);
+
+            // Use process ID for uniqueness within same host
+            std::process::id().hash(&mut hasher);
+
+            let hash = hasher.finish();
+
+            // Generate a base64-like string similar to AWS S3 host IDs
+            format!(
+                "{:016X}{:016X}",
+                hash,
+                hash.wrapping_mul(0x9e3779b97f4a7c15)
+            )
+        })
+        .clone()
 }
 
 /// Set error status with S3-standard headers (request-id and host-id)
