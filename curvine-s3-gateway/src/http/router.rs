@@ -434,8 +434,7 @@ impl S3Router {
     ) -> axum::response::Response {
         match get_obj {
             Some(obj) => {
-                // Use streaming response to avoid buffering full body in memory
-                crate::http::axum::stream_get_object(req, obj).await
+                return crate::http::axum::stream_get_object(req, obj).await;
             }
             None => {
                 tracing::warn!("Get object handler not configured");

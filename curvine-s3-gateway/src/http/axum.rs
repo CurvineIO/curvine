@@ -16,7 +16,6 @@ use std::collections::HashMap;
 
 use axum::response::IntoResponse;
 use futures::StreamExt;
-use std::sync::OnceLock;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::{sig_v4, AccesskeyStore};
@@ -289,7 +288,6 @@ struct StreamBodyWriter {
     tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
 }
 
-
 #[async_trait::async_trait]
 impl crate::utils::io::PollWrite for StreamBodyWriter {
     async fn poll_write(&mut self, buff: &[u8]) -> Result<usize, std::io::Error> {
@@ -304,7 +302,7 @@ impl crate::utils::io::PollWrite for StreamBodyWriter {
             .map_err(|e| std::io::Error::other(format!("stream send error: {}", e)))?;
         Ok(buff.len())
     }
-    
+
     /// Zero-copy write for Vec<u8> -> Bytes conversion
     async fn poll_write_vec(&mut self, vec: Vec<u8>) -> Result<usize, std::io::Error> {
         if vec.is_empty() {
@@ -381,16 +379,9 @@ impl crate::auth::sig_v4::VHeader for StreamingResponse {
     }
 }
 
-// Config: mpsc channel capacity for GET streaming
+// Config: mpsc channel capacity for GET streaming from global config
 fn get_mpsc_capacity() -> usize {
-    static CAP: OnceLock<usize> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("CURVINE_S3_GET_MPSC_CAP")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|n| n.clamp(1, 1024))
-            .unwrap_or(32)
-    })
+    crate::get_s3_gateway_config().get_mpsc_capacity
 }
 
 /// Build an axum streaming response by running S3 GET handler with StreamingResponse

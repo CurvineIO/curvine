@@ -268,6 +268,14 @@ pub struct S3GatewayConf {
     pub enable_distributed_auth: bool,
     pub credentials_path: Option<String>,
     pub cache_refresh_interval_secs: u64,
+    
+    // GET performance optimization settings
+    /// MPSC channel capacity for GET streaming (default: 32, range: 1-1024)
+    pub get_mpsc_capacity: usize,
+    /// GET read/write chunk size in MB (default: 1, options: 0.5/1/2)
+    pub get_chunk_size_mb: f32,
+    /// GET prefetch depth for dual-buffer optimization (default: 2, range: 1-3)
+    pub get_prefetch_depth: usize,
 }
 
 impl Default for S3GatewayConf {
@@ -283,6 +291,11 @@ impl Default for S3GatewayConf {
             enable_distributed_auth: false,
             credentials_path: None,
             cache_refresh_interval_secs: 30,
+            
+            // GET performance optimization defaults
+            get_mpsc_capacity: 32,
+            get_chunk_size_mb: 1.0,
+            get_prefetch_depth: 2,
         }
     }
 }

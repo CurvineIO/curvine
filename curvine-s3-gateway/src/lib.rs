@@ -45,6 +45,7 @@ pub mod utils;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use auth::{
     AccessKeyStoreEnum, CredentialEntry, CredentialStore, CurvineAccessKeyStore,
@@ -52,6 +53,14 @@ use auth::{
 };
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
+
+/// Global S3 Gateway configuration for performance settings
+static S3_GATEWAY_CONFIG: OnceLock<curvine_common::conf::S3GatewayConf> = OnceLock::new();
+
+/// Get the global S3 Gateway configuration
+pub fn get_s3_gateway_config() -> &'static curvine_common::conf::S3GatewayConf {
+    S3_GATEWAY_CONFIG.get().expect("S3 Gateway config not initialized")
+}
 
 fn register_s3_handlers(
     router: axum::Router,
@@ -337,6 +346,11 @@ pub async fn start_gateway(
         region
     );
 
+    // Initialize global S3 Gateway configuration for performance settings
+    S3_GATEWAY_CONFIG.set(conf.s3_gateway.clone()).map_err(|_| 
+        "Failed to initialize S3 Gateway configuration"
+    )?;
+
     let ufs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let ak_store = init_s3_authentication(&conf.s3_gateway, &ufs, rt.clone()).await?;
     let handlers = Arc::new(s3::handlers::S3Handlers::new(
@@ -344,6 +358,9 @@ pub async fn start_gateway(
         region.clone(),
         conf.s3_gateway.put_temp_dir.clone(),
         rt.clone(),
+        conf.s3_gateway.get_mpsc_capacity,
+        conf.s3_gateway.get_chunk_size_mb,
+        conf.s3_gateway.get_prefetch_depth,
     ));
 
     tracing::info!("S3 Gateway authentication configured successfully");
@@ -366,32 +383,20 @@ pub async fn start_gateway(
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    // Configure TCP socket for high performance
-    // Note: TCP socket options like NODELAY and KEEPALIVE are best configured at system level:
-    // - Set net.ipv4.tcp_keepalive_time = 30 in /etc/sysctl.conf
-    // - Use SO_REUSEADDR and SO_REUSEPORT for high-concurrency scenarios
-    // - Modern Linux kernels enable TCP_NODELAY by default for most applications
-    tracing::debug!("TCP listener created - consider system-level TCP tuning for optimal performance");
-
     if let Ok(socket) = listener.local_addr() {
         tracing::info!("S3 Gateway started successfully on {}", socket);
     }
 
-    // Configure HTTP server with performance optimizations
-    // Note: axum 0.7+ serve API doesn't expose TCP socket options directly
-    // TCP keepalive and nodelay should be configured at the OS/system level or via TcpListener
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-/// HTTP performance middleware to set connection keep-alive and other optimization headers
 async fn http_performance_middleware(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let mut response = next.run(request).await;
-    
-    // Ensure HTTP keep-alive is enabled (unless explicitly disabled)
+
     let headers = response.headers_mut();
     if !headers.contains_key("connection") {
         headers.insert(
@@ -399,12 +404,11 @@ async fn http_performance_middleware(
             axum::http::HeaderValue::from_static("keep-alive"),
         );
     }
-    
-    // Add performance-related headers
+
     headers.insert(
         "server",
         axum::http::HeaderValue::from_static("curvine-s3-gateway"),
     );
-    
+
     response
 }
