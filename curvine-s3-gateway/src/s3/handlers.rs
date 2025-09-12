@@ -298,22 +298,21 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 
             log::debug!("GetObject: will read {target_read} bytes directly");
 
-            const CHUNK_SIZE: usize = 65536;
+            // Increase chunk size to reduce syscalls and improve throughput under high RTT.
+            const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
             let mut total_read = 0u64;
             let mut remaining_to_read = target_read;
 
-            let mut buffer = BytesMut::with_capacity(CHUNK_SIZE);
+            // Reusable Vec buffer to avoid repeated zero-fill reallocations from BytesMut::resize
+            let mut buffer: Vec<u8> = vec![0u8; CHUNK_SIZE];
 
             let mut guard = out.lock().await;
 
             while remaining_to_read > 0 {
                 let chunk_size = std::cmp::min(CHUNK_SIZE, remaining_to_read as usize);
 
-                buffer.clear();
-                buffer.resize(chunk_size, 0);
-
                 let bytes_read = reader
-                    .read_full(&mut buffer)
+                    .read_full(&mut buffer[..chunk_size])
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -321,9 +320,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                     break;
                 }
 
-                buffer.truncate(bytes_read);
-
-                guard.poll_write(&buffer).await.map_err(|e| {
+                guard.poll_write(&buffer[..bytes_read]).await.map_err(|e| {
                     tracing::error!("Failed to write chunk to output: {}", e);
                     e.to_string()
                 })?;
@@ -331,7 +328,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                 total_read += bytes_read as u64;
                 remaining_to_read -= bytes_read as u64;
 
-                if total_read % (CHUNK_SIZE * 16) as u64 == 0 {
+                if total_read % (CHUNK_SIZE as u64 * 16) == 0 {
                     log::trace!(
                         "GetObject: streamed {} KB (total: {} KB)",
                         bytes_read / 1024,
