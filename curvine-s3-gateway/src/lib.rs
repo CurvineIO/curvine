@@ -342,7 +342,6 @@ pub async fn start_gateway(
         conf.s3_gateway.put_temp_dir.clone(),
         rt.clone(),
         conf.s3_gateway.get_chunk_size_mb,
-        conf.s3_gateway.get_prefetch_depth,
     ));
 
     tracing::info!("S3 Gateway authentication configured successfully");
