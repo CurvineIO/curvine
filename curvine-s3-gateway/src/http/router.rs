@@ -438,7 +438,7 @@ impl S3Router {
             .get::<Arc<crate::s3::handlers::S3Handlers>>()
             .cloned()
         {
-            return crate::http::axum::stream_get_object_optimized(req, &handlers).await;
+            return crate::http::axum::stream_get_object(req, &handlers).await;
         }
 
         tracing::error!("S3Handlers not found in request extensions");

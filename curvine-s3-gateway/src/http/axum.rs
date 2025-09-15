@@ -283,7 +283,7 @@ impl crate::s3::s3_api::VResponse for Response {
 
 /// Optimized streaming GET object handler using ReaderStream (similar to s3s approach)
 /// This avoids the MPSC channel overhead and provides better performance
-pub async fn stream_get_object_optimized(
+pub async fn stream_get_object(
     req: super::axum::Request,
     handlers: &crate::s3::handlers::S3Handlers,
 ) -> axum::response::Response {
