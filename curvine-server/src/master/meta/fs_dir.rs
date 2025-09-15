@@ -323,11 +323,8 @@ impl FsDir {
         // Update the parent directory for the last modification time.
         parent.update_mtime(child.mtime());
 
-        // Update inode data.
-        let child_for_store = child.clone();
         let added = parent.add_child(child)?;
-        // Persist full inode, not FileEntry placeholder
-        self.store.apply_add(parent.as_ref(), &child_for_store)?;
+        self.store.apply_add(parent.as_ref(), added.as_ref())?;
         inp.append(added)?;
 
         Ok(inp)
