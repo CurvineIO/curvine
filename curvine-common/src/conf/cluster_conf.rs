@@ -269,7 +269,6 @@ pub struct S3GatewayConf {
     pub credentials_path: Option<String>,
     pub cache_refresh_interval_secs: u64,
     pub get_chunk_size_mb: f32,
-    pub get_prefetch_depth: usize,
 }
 
 impl Default for S3GatewayConf {
@@ -286,7 +285,6 @@ impl Default for S3GatewayConf {
             credentials_path: None,
             cache_refresh_interval_secs: 30,
             get_chunk_size_mb: 1.0,
-            get_prefetch_depth: 2,
         }
     }
 }
