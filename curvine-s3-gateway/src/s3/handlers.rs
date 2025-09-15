@@ -44,7 +44,6 @@ pub struct S3Handlers {
     pub put_temp_dir: String,
     pub rt: std::sync::Arc<AsyncRuntime>,
     pub get_chunk_size_bytes: usize,
-    pub get_prefetch_depth: usize,
 }
 
 impl S3Handlers {
@@ -54,13 +53,12 @@ impl S3Handlers {
         put_temp_dir: String,
         rt: std::sync::Arc<AsyncRuntime>,
         get_chunk_size_mb: f32,
-        get_prefetch_depth: usize,
     ) -> Self {
         let get_chunk_size_bytes = (get_chunk_size_mb * 1024.0 * 1024.0) as usize;
 
         tracing::debug!(
-            "Creating new S3Handlers with region: {}, put_temp_dir: {}, GET optimizations: chunk_size={}MB, prefetch_depth={}",
-            region, put_temp_dir, get_chunk_size_mb, get_prefetch_depth
+            "Creating new S3Handlers with region: {}, put_temp_dir: {}, GET optimizations: chunk_size={}MB",
+            region, put_temp_dir, get_chunk_size_mb
         );
 
         Self {
@@ -69,7 +67,6 @@ impl S3Handlers {
             put_temp_dir,
             rt,
             get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024), // 512KB - 4MB
-            get_prefetch_depth: get_prefetch_depth.clamp(1, 3),
         }
     }
 
@@ -279,76 +276,47 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 
             log::debug!("GetObject: will read {target_read} bytes directly");
 
-            let chunk_size_conf = if target_read <= 64 * 1024 {
+            // Dynamic chunk size based on file size for optimal performance
+            let chunk_size = if target_read <= 64 * 1024 {
                 std::cmp::min(self.get_chunk_size_bytes, target_read as usize).max(4 * 1024)
             } else if target_read <= 1024 * 1024 {
                 std::cmp::min(self.get_chunk_size_bytes, 256 * 1024)
             } else {
                 self.get_chunk_size_bytes
             };
+
             let mut total_read = 0u64;
             let mut remaining_to_read = target_read;
-
-            let prefetch_depth = self.get_prefetch_depth;
-
             let mut guard = out.lock().await;
 
-            let mut buffer_queue: Vec<Vec<u8>> = Vec::with_capacity(prefetch_depth);
-
-            for _ in 0..prefetch_depth {
-                if remaining_to_read == 0 {
-                    break;
-                }
-
-                let chunk_size = std::cmp::min(chunk_size_conf, remaining_to_read as usize);
-                let mut buffer = vec![0u8; chunk_size];
+            // Simple streaming loop without complex prefetching
+            while remaining_to_read > 0 {
+                let read_size = std::cmp::min(chunk_size, remaining_to_read as usize);
+                let mut buffer = vec![0u8; read_size];
 
                 let bytes_read = reader
-                    .read_full(&mut buffer[..chunk_size])
+                    .read_full(&mut buffer[..read_size])
                     .await
                     .map_err(|e| e.to_string())?;
 
                 if bytes_read == 0 {
-                    break;
+                    break; // End of file
                 }
 
                 buffer.truncate(bytes_read);
-                buffer_queue.push(buffer);
-                remaining_to_read -= bytes_read as u64;
-            }
 
-            while !buffer_queue.is_empty() {
-                let current_buffer = buffer_queue.remove(0);
-                let bytes_to_write = current_buffer.len();
-
-                if remaining_to_read > 0 && buffer_queue.len() < prefetch_depth {
-                    let next_chunk_size =
-                        std::cmp::min(chunk_size_conf, remaining_to_read as usize);
-                    let mut next_buffer = vec![0u8; next_chunk_size];
-
-                    let bytes_read = reader
-                        .read_full(&mut next_buffer[..next_chunk_size])
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                    if bytes_read > 0 {
-                        next_buffer.truncate(bytes_read);
-                        buffer_queue.push(next_buffer);
-                        remaining_to_read -= bytes_read as u64;
-                    }
-                }
-
-                guard.poll_write_vec(current_buffer).await.map_err(|e| {
+                guard.poll_write_vec(buffer).await.map_err(|e| {
                     tracing::error!("Failed to write chunk to output: {}", e);
                     e.to_string()
                 })?;
 
-                total_read += bytes_to_write as u64;
+                total_read += bytes_read as u64;
+                remaining_to_read -= bytes_read as u64;
 
-                if total_read % (chunk_size_conf as u64 * 16) == 0 {
+                if total_read % (chunk_size as u64 * 16) == 0 {
                     log::trace!(
                         "GetObject: streamed {} KB (total: {} KB)",
-                        bytes_to_write / 1024,
+                        bytes_read / 1024,
                         total_read / 1024
                     );
                 }
