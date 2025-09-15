@@ -66,8 +66,6 @@ put_memory_buffer_threshold = 1048576
 put_max_memory_buffer = 16777216
 
 # GET Performance Optimization Settings
-# MPSC channel capacity for GET streaming (default: 32, range: 1-1024)
-get_mpsc_capacity = 32
 # GET read/write chunk size in MB (default: 1.0, options: 0.5/1/2)
 get_chunk_size_mb = 1.0
 # GET prefetch depth for dual-buffer optimization (default: 2, range: 1-3)

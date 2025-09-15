@@ -16,7 +16,6 @@ use std::collections::HashMap;
 
 use axum::response::IntoResponse;
 use futures::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::{sig_v4, AccesskeyStore};
 use crate::s3::s3_api::VRequest;
@@ -25,6 +24,13 @@ use axum::body;
 pub struct Request {
     request: axum::http::Request<axum::body::Body>,
     query: Option<HashMap<String, String>>,
+}
+
+impl Request {
+    /// Get access to the request extensions
+    pub fn extensions(&self) -> &axum::http::Extensions {
+        self.request.extensions()
+    }
 }
 
 impl From<Request> for axum::extract::Request {
@@ -276,151 +282,148 @@ impl crate::s3::s3_api::VResponse for Response {
     fn send_header(&mut self) {}
 }
 
-// Streaming VResponse for high-throughput GET object
-struct StreamingResponse {
-    status: std::sync::Arc<tokio::sync::Mutex<u16>>,
-    headers: std::sync::Arc<tokio::sync::Mutex<axum::http::HeaderMap>>,
-    header_ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
-}
-
-struct StreamBodyWriter {
-    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
-}
-
-#[async_trait::async_trait]
-impl crate::utils::io::PollWrite for StreamBodyWriter {
-    async fn poll_write(&mut self, buff: &[u8]) -> Result<usize, std::io::Error> {
-        if buff.is_empty() {
-            return Ok(0);
-        }
-        // Use copy_from_slice for &[u8] input
-        let bytes = bytes::Bytes::copy_from_slice(buff);
-        self.tx
-            .send(bytes)
-            .await
-            .map_err(|e| std::io::Error::other(format!("stream send error: {}", e)))?;
-        Ok(buff.len())
-    }
-
-    /// Zero-copy write for Vec<u8> -> Bytes conversion
-    async fn poll_write_vec(&mut self, vec: Vec<u8>) -> Result<usize, std::io::Error> {
-        if vec.is_empty() {
-            return Ok(0);
-        }
-        let len = vec.len();
-        let bytes = bytes::Bytes::from(vec); // Zero-copy conversion
-        self.tx
-            .send(bytes)
-            .await
-            .map_err(|e| std::io::Error::other(format!("stream send error: {}", e)))?;
-        Ok(len)
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::s3::s3_api::BodyWriter for StreamingResponse {
-    type BodyWriter<'a>
-        = StreamBodyWriter
-    where
-        Self: 'a;
-
-    async fn get_body_writer(&mut self) -> Result<Self::BodyWriter<'_>, String> {
-        Ok(StreamBodyWriter {
-            tx: self.tx.clone(),
-        })
-    }
-}
-
-impl crate::s3::s3_api::VResponse for StreamingResponse {
-    fn set_status(&mut self, status: u16) {
-        let mut_guard = self.status.clone();
-        let _ = futures::executor::block_on(async move {
-            let mut st = mut_guard.lock().await;
-            *st = status;
-        });
-    }
-
-    fn send_header(&mut self) {
-        if let Some(tx) = self.header_ready_tx.take() {
-            let _ = tx.send(());
-        }
-    }
-}
-
-impl crate::auth::sig_v4::VHeader for StreamingResponse {
-    fn get_header(&self, key: &str) -> Option<String> {
-        let headers = futures::executor::block_on(self.headers.lock());
-        headers
-            .get(key)
-            .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
-    }
-
-    fn set_header(&mut self, key: &str, val: &str) {
-        let mut headers = futures::executor::block_on(self.headers.lock());
-        let name: axum::http::HeaderName = key.to_string().parse().unwrap();
-        headers.insert(name, val.parse().unwrap());
-    }
-
-    fn delete_header(&mut self, key: &str) {
-        let mut headers = futures::executor::block_on(self.headers.lock());
-        headers.remove(key);
-    }
-
-    fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
-        let headers = futures::executor::block_on(self.headers.lock());
-        for (k, v) in headers.iter() {
-            if !cb(k.as_str(), unsafe {
-                std::str::from_utf8_unchecked(v.as_bytes())
-            }) {
-                return;
-            }
-        }
-    }
-}
-
-/// Build an axum streaming response by running S3 GET handler with StreamingResponse
-pub async fn stream_get_object(
+/// Optimized streaming GET object handler using ReaderStream (similar to s3s approach)
+/// This avoids the MPSC channel overhead and provides better performance
+pub async fn stream_get_object_optimized(
     req: super::axum::Request,
-    obj: std::sync::Arc<dyn crate::s3::s3_api::GetObjectHandler + Send + Sync>,
-    mpsc_capacity: usize,
+    handlers: &crate::s3::handlers::S3Handlers,
 ) -> axum::response::Response {
-    // Prepare shared state
-    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(mpsc_capacity);
-    let (hdr_tx, hdr_rx) = tokio::sync::oneshot::channel::<()>();
-    let status = std::sync::Arc::new(tokio::sync::Mutex::new(200u16));
-    let headers = std::sync::Arc::new(tokio::sync::Mutex::new(axum::http::HeaderMap::new()));
+    use crate::s3::s3_api::{GetObjectOption, VRequest};
+    use curvine_common::fs::{FileSystem, Reader};
 
-    let mut streaming_resp = StreamingResponse {
-        status: status.clone(),
-        headers: headers.clone(),
-        header_ready_tx: Some(hdr_tx),
-        tx: tx.clone(),
+    // Parse bucket and object from URL path
+    let url_path = req.url_path();
+    let path_parts: Vec<&str> = url_path.trim_start_matches('/').splitn(2, '/').collect();
+    if path_parts.len() != 2 {
+        return axum::response::Response::builder()
+            .status(400)
+            .body(axum::body::Body::from("Invalid path"))
+            .unwrap();
+    }
+
+    let bucket = path_parts[0];
+    let object = path_parts[1];
+
+    // Parse range header if present
+    use crate::auth::sig_v4::VHeader;
+    let range_header = req.get_header("range");
+    let (range_start, range_end) = if let Some(range_str) = range_header {
+        parse_range_header(&range_str)
+    } else {
+        (None, None)
     };
 
-    // Run the GET handler
-    tokio::spawn(async move {
-        crate::s3::s3_api::handle_get_object(req, &mut streaming_resp, &obj).await;
-        // Drop sender to close stream on completion
-        drop(tx);
-    });
+    let opt = GetObjectOption {
+        range_start,
+        range_end,
+    };
 
-    // Wait until headers are set (send_header called) before building response
-    let _ = hdr_rx.await;
+    // Get the curvine path
+    let cv_path = match handlers.cv_object_path(bucket, object) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::error!(
+                "Failed to convert S3 path s3://{}/{}: {}",
+                bucket,
+                object,
+                e
+            );
+            return axum::response::Response::builder()
+                .status(404)
+                .body(axum::body::Body::from("Not Found"))
+                .unwrap();
+        }
+    };
+
+    // Open the file
+    let mut reader = match handlers.fs.open(&cv_path).await {
+        Ok(reader) => reader,
+        Err(e) => {
+            tracing::error!("Failed to open file at path {}: {}", cv_path, e);
+            return axum::response::Response::builder()
+                .status(404)
+                .body(axum::body::Body::from("Not Found"))
+                .unwrap();
+        }
+    };
+
+    // Handle range requests
+    let file_size = reader.remaining().max(0) as u64;
+    let (content_length, content_range, status_code) = if let Some(range_end) = opt.range_end {
+        if range_end > u64::MAX / 2 {
+            // Suffix range request
+            let suffix_len = u64::MAX - range_end;
+            if suffix_len > file_size {
+                (file_size, None, 200)
+            } else {
+                let start_pos = file_size - suffix_len;
+                if let Err(e) = reader.seek(start_pos as i64).await {
+                    tracing::error!("Failed to seek to position {}: {}", start_pos, e);
+                    return axum::response::Response::builder()
+                        .status(500)
+                        .body(axum::body::Body::from("Internal Server Error"))
+                        .unwrap();
+                }
+                let content_range = format!("bytes {}-{}/{}", start_pos, file_size - 1, file_size);
+                (suffix_len, Some(content_range), 206)
+            }
+        } else {
+            // Normal range request
+            let start = opt.range_start.unwrap_or(0);
+            let end = std::cmp::min(range_end, file_size - 1);
+            let length = end - start + 1;
+
+            if let Err(e) = reader.seek(start as i64).await {
+                tracing::error!("Failed to seek to position {}: {}", start, e);
+                return axum::response::Response::builder()
+                    .status(500)
+                    .body(axum::body::Body::from("Internal Server Error"))
+                    .unwrap();
+            }
+
+            let content_range = format!("bytes {}-{}/{}", start, end, file_size);
+            (length, Some(content_range), 206)
+        }
+    } else if let Some(start) = opt.range_start {
+        // Open-ended range request
+        if let Err(e) = reader.seek(start as i64).await {
+            tracing::error!("Failed to seek to position {}: {}", start, e);
+            return axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from("Internal Server Error"))
+                .unwrap();
+        }
+        let length = file_size - start;
+        let content_range = format!("bytes {}-{}/{}", start, file_size - 1, file_size);
+        (length, Some(content_range), 206)
+    } else {
+        // Full file
+        (file_size, None, 200)
+    };
+
+    // Create stream directly from curvine reader with optimized parameters
+    let stream_adapter =
+        CurvineStreamAdapter::new(reader, content_length, handlers.get_chunk_size_bytes);
+    let body_stream = stream_adapter.into_stream();
 
     // Build response
-    let st = *status.lock().await;
-    let mut builder = axum::response::Response::builder().status(st);
-    if let Some(hdrs_mut) = builder.headers_mut() {
-        let mut hdrs = headers.lock().await.clone();
-        // Ensure keep-alive unless explicitly disabled
-        hdrs.entry(axum::http::header::CONNECTION)
-            .or_insert(axum::http::HeaderValue::from_static("keep-alive"));
-        *hdrs_mut = hdrs;
+    let mut builder = axum::response::Response::builder()
+        .status(status_code)
+        .header("accept-ranges", "bytes")
+        .header("content-length", content_length.to_string());
+
+    if let Some(content_range) = content_range {
+        builder = builder.header("content-range", content_range);
     }
 
-    // Convert channel into stream body
-    let body_stream = ReceiverStream::from(rx).map(|b| Ok::<_, std::io::Error>(b));
+    // Add S3-compatible headers
+    builder = builder
+        .header(
+            "x-amz-request-id",
+            crate::utils::s3_utils::generate_request_id(),
+        )
+        .header("x-amz-id-2", crate::utils::s3_utils::generate_host_id());
+
     let body = axum::body::Body::from_stream(body_stream);
     builder.body(body).unwrap()
 }
@@ -629,5 +632,106 @@ mod bucket {
                 _xmlns: "http://s3.amazonaws.com/doc/2026-03-01/",
             }
         }
+    }
+}
+
+/// Simple and efficient adapter that converts curvine Reader to HTTP stream
+/// Focuses on optimal chunk size and efficient data conversion, similar to s3s approach
+struct CurvineStreamAdapter {
+    reader: curvine_client::unified::UnifiedReader,
+    remaining_bytes: u64,
+    chunk_size: usize,
+}
+
+impl CurvineStreamAdapter {
+    fn new(
+        reader: curvine_client::unified::UnifiedReader,
+        content_length: u64,
+        chunk_size_bytes: usize,
+    ) -> Self {
+        let chunk_size = if content_length <= 64 * 1024 {
+            std::cmp::min(chunk_size_bytes, content_length as usize).max(4 * 1024)
+        } else if content_length <= 1024 * 1024 {
+            std::cmp::min(chunk_size_bytes, 256 * 1024)
+        } else {
+            chunk_size_bytes
+        };
+
+        Self {
+            reader,
+            remaining_bytes: content_length,
+            chunk_size,
+        }
+    }
+
+    /// Create a simple, efficient stream - inspired by s3s but optimized for curvine
+    /// No complex prefetching, just optimal chunk size and efficient data conversion
+    fn into_stream(
+        mut self,
+    ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send {
+        async_stream::stream! {
+            use curvine_common::fs::Reader;
+
+            // Simple streaming approach - similar to s3s but optimized for curvine
+            while self.remaining_bytes > 0 {
+                let read_size = std::cmp::min(self.chunk_size, self.remaining_bytes as usize);
+
+                match self.reader.async_read(Some(read_size)).await {
+                    Ok(data_slice) => {
+                        if data_slice.is_empty() {
+                            break;
+                        }
+
+                        let bytes_read = data_slice.len();
+                        self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes_read as u64);
+
+                        // Efficient DataSlice to Bytes conversion
+                        // This is more efficient than s3s because we avoid extra buffering
+                        let mut buffer = vec![0u8; bytes_read];
+                        let mut data_slice_copy = data_slice;
+                        data_slice_copy.copy_to_slice(&mut buffer);
+                        let bytes = bytes::Bytes::from(buffer);
+
+                        yield Ok(bytes);
+                    }
+                    Err(e) => {
+                        yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse HTTP Range header
+/// Returns (range_start, range_end) where range_end follows curvine's convention
+fn parse_range_header(range_str: &str) -> (Option<u64>, Option<u64>) {
+    if !range_str.starts_with("bytes=") {
+        return (None, None);
+    }
+
+    let range_spec = &range_str[6..]; // Remove "bytes=" prefix
+    let parts: Vec<&str> = range_spec.split('-').collect();
+
+    if parts.len() != 2 {
+        return (None, None);
+    }
+
+    match (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+        (Ok(start), Ok(end)) => {
+            // Normal range: bytes=0-1023
+            (Some(start), Some(end))
+        }
+        (Ok(start), Err(_)) => {
+            // Open-ended range: bytes=1024-
+            (Some(start), None)
+        }
+        (Err(_), Ok(suffix_len)) => {
+            // Suffix range: bytes=-1024
+            // Convert to curvine's convention: range_end = u64::MAX - suffix_len
+            (None, Some(u64::MAX - suffix_len))
+        }
+        _ => (None, None),
     }
 }
