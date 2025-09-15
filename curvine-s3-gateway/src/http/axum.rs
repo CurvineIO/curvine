@@ -256,7 +256,6 @@ pub struct BodyWriter<'a>(&'a mut Vec<u8>);
 #[async_trait::async_trait]
 impl<'b> crate::utils::io::PollWrite for BodyWriter<'b> {
     async fn poll_write(&mut self, buff: &[u8]) -> Result<usize, std::io::Error> {
-        // append to body buffer
         self.0.extend_from_slice(buff);
         Ok(buff.len())
     }
@@ -291,7 +290,6 @@ pub async fn stream_get_object_optimized(
     use crate::s3::s3_api::{GetObjectOption, VRequest};
     use curvine_common::fs::{FileSystem, Reader};
 
-    // Parse bucket and object from URL path
     let url_path = req.url_path();
     let path_parts: Vec<&str> = url_path.trim_start_matches('/').splitn(2, '/').collect();
     if path_parts.len() != 2 {
@@ -304,7 +302,6 @@ pub async fn stream_get_object_optimized(
     let bucket = path_parts[0];
     let object = path_parts[1];
 
-    // Parse range header if present
     use crate::auth::sig_v4::VHeader;
     let range_header = req.get_header("range");
     let (range_start, range_end) = if let Some(range_str) = range_header {
@@ -318,7 +315,6 @@ pub async fn stream_get_object_optimized(
         range_end,
     };
 
-    // Get the curvine path
     let cv_path = match handlers.cv_object_path(bucket, object) {
         Ok(path) => path,
         Err(e) => {
@@ -335,7 +331,6 @@ pub async fn stream_get_object_optimized(
         }
     };
 
-    // Open the file
     let mut reader = match handlers.fs.open(&cv_path).await {
         Ok(reader) => reader,
         Err(e) => {
@@ -347,11 +342,9 @@ pub async fn stream_get_object_optimized(
         }
     };
 
-    // Handle range requests
     let file_size = reader.remaining().max(0) as u64;
     let (content_length, content_range, status_code) = if let Some(range_end) = opt.range_end {
         if range_end > u64::MAX / 2 {
-            // Suffix range request
             let suffix_len = u64::MAX - range_end;
             if suffix_len > file_size {
                 (file_size, None, 200)
@@ -368,7 +361,6 @@ pub async fn stream_get_object_optimized(
                 (suffix_len, Some(content_range), 206)
             }
         } else {
-            // Normal range request
             let start = opt.range_start.unwrap_or(0);
             let end = std::cmp::min(range_end, file_size - 1);
             let length = end - start + 1;
@@ -385,7 +377,6 @@ pub async fn stream_get_object_optimized(
             (length, Some(content_range), 206)
         }
     } else if let Some(start) = opt.range_start {
-        // Open-ended range request
         if let Err(e) = reader.seek(start as i64).await {
             tracing::error!("Failed to seek to position {}: {}", start, e);
             return axum::response::Response::builder()
@@ -397,16 +388,13 @@ pub async fn stream_get_object_optimized(
         let content_range = format!("bytes {}-{}/{}", start, file_size - 1, file_size);
         (length, Some(content_range), 206)
     } else {
-        // Full file
         (file_size, None, 200)
     };
 
-    // Create stream directly from curvine reader with optimized parameters
     let stream_adapter =
         CurvineStreamAdapter::new(reader, content_length, handlers.get_chunk_size_bytes);
     let body_stream = stream_adapter.into_stream();
 
-    // Build response
     let mut builder = axum::response::Response::builder()
         .status(status_code)
         .header("accept-ranges", "bytes")
@@ -416,7 +404,6 @@ pub async fn stream_get_object_optimized(
         builder = builder.header("content-range", content_range);
     }
 
-    // Add S3-compatible headers
     builder = builder
         .header(
             "x-amz-request-id",
@@ -453,11 +440,9 @@ pub async fn handle_authorization_middleware(
 
     let req = Request::from(req);
 
-    // Try AWS Signature V4 first, then fall back to V2
     let auth_result = crate::auth::sig_v4::extract_args(&req);
 
     if auth_result.is_err() {
-        // Try AWS Signature V2 authentication
         match crate::auth::sig_v2::extract_v2_args(&req) {
             Ok(v2_args) => {
                 tracing::debug!(
@@ -465,7 +450,6 @@ pub async fn handle_authorization_middleware(
                     v2_args.access_key
                 );
 
-                // Get secret key for V2 authentication
                 let secretkey = match ak_store.get(&v2_args.access_key).await {
                     Ok(secretkey) => {
                         if secretkey.is_none() {
@@ -481,7 +465,6 @@ pub async fn handle_authorization_middleware(
                     }
                 };
 
-                // Parse query parameters for V2 signature verification
                 let mut query_params = std::collections::HashMap::new();
                 if let Some(query_str) = req.request.uri().query() {
                     for pair in query_str.split('&') {
@@ -490,13 +473,11 @@ pub async fn handle_authorization_middleware(
                             let value = &pair[eq_pos + 1..];
                             query_params.insert(key.to_string(), value.to_string());
                         } else {
-                            // Handle key without value (like "uploads")
                             query_params.insert(pair.to_string(), String::new());
                         }
                     }
                 }
 
-                // Verify V2 signature
                 if let Err(e) = crate::auth::sig_v2::verify_v2_signature(
                     &v2_args,
                     &secretkey,
@@ -509,9 +490,7 @@ pub async fn handle_authorization_middleware(
                     return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
                 }
 
-                // Create a V4Head for V2 requests to satisfy middleware expectations
-                // This is a compatibility layer - V2 auth is complete but we need V4Head for handlers
-                let dummy_ksigning = [0u8; 32]; // Dummy signing key for V2 compatibility
+                let dummy_ksigning = [0u8; 32];
                 let dummy_hasher = crate::auth::sig_v4::HmacSha256CircleHasher::new(
                     dummy_ksigning,
                     "v2-signature".to_string(),
@@ -541,13 +520,10 @@ pub async fn handle_authorization_middleware(
         }
     }
 
-    // Continue with V4 authentication
     let base_arg = auth_result.unwrap();
 
-    // Get raw query string for signature calculation
     let mut query = Vec::new();
     if let Some(query_str) = req.request.uri().query() {
-        // Parse query string manually to preserve original encoding
         for pair in query_str.split('&') {
             if let Some(eq_pos) = pair.find('=') {
                 let key = &pair[..eq_pos];
@@ -557,7 +533,6 @@ pub async fn handle_authorization_middleware(
                     val: value.to_string(),
                 });
             } else {
-                // Handle key without value (like "uploads")
                 query.push(crate::utils::BaseKv {
                     key: pair.to_string(),
                     val: String::new(),
@@ -613,6 +588,7 @@ pub async fn handle_authorization_middleware(
     req.extensions_mut().insert(v4head);
     next.run(req).await
 }
+
 mod bucket {
     #[derive(serde::Serialize, Debug)]
     #[serde(rename = "LocationConstraint", rename_all = "PascalCase")]
@@ -635,8 +611,6 @@ mod bucket {
     }
 }
 
-/// Simple and efficient adapter that converts curvine Reader to HTTP stream
-/// Focuses on optimal chunk size and efficient data conversion, similar to s3s approach
 struct CurvineStreamAdapter {
     reader: curvine_client::unified::UnifiedReader,
     remaining_bytes: u64,
@@ -664,15 +638,12 @@ impl CurvineStreamAdapter {
         }
     }
 
-    /// Create a simple, efficient stream - inspired by s3s but optimized for curvine
-    /// No complex prefetching, just optimal chunk size and efficient data conversion
     fn into_stream(
         mut self,
     ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send {
         async_stream::stream! {
             use curvine_common::fs::Reader;
 
-            // Simple streaming approach - similar to s3s but optimized for curvine
             while self.remaining_bytes > 0 {
                 let read_size = std::cmp::min(self.chunk_size, self.remaining_bytes as usize);
 
@@ -685,8 +656,6 @@ impl CurvineStreamAdapter {
                         let bytes_read = data_slice.len();
                         self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes_read as u64);
 
-                        // Efficient DataSlice to Bytes conversion
-                        // This is more efficient than s3s because we avoid extra buffering
                         let mut buffer = vec![0u8; bytes_read];
                         let mut data_slice_copy = data_slice;
                         data_slice_copy.copy_to_slice(&mut buffer);
@@ -704,14 +673,12 @@ impl CurvineStreamAdapter {
     }
 }
 
-/// Parse HTTP Range header
-/// Returns (range_start, range_end) where range_end follows curvine's convention
 fn parse_range_header(range_str: &str) -> (Option<u64>, Option<u64>) {
     if !range_str.starts_with("bytes=") {
         return (None, None);
     }
 
-    let range_spec = &range_str[6..]; // Remove "bytes=" prefix
+    let range_spec = &range_str[6..];
     let parts: Vec<&str> = range_spec.split('-').collect();
 
     if parts.len() != 2 {
@@ -719,19 +686,9 @@ fn parse_range_header(range_str: &str) -> (Option<u64>, Option<u64>) {
     }
 
     match (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
-        (Ok(start), Ok(end)) => {
-            // Normal range: bytes=0-1023
-            (Some(start), Some(end))
-        }
-        (Ok(start), Err(_)) => {
-            // Open-ended range: bytes=1024-
-            (Some(start), None)
-        }
-        (Err(_), Ok(suffix_len)) => {
-            // Suffix range: bytes=-1024
-            // Convert to curvine's convention: range_end = u64::MAX - suffix_len
-            (None, Some(u64::MAX - suffix_len))
-        }
+        (Ok(start), Ok(end)) => (Some(start), Some(end)),
+        (Ok(start), Err(_)) => (Some(start), None),
+        (Err(_), Ok(suffix_len)) => (None, Some(u64::MAX - suffix_len)),
         _ => (None, None),
     }
 }

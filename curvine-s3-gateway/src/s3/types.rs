@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! S3 types and helper functions for upload operations
-
 use crate::utils::io::PollRead;
 use curvine_client::unified::{UnifiedFileSystem, UnifiedWriter};
 use curvine_common::fs::{FileSystem, Path, Writer};
@@ -48,7 +46,6 @@ impl UploadStats {
     }
 }
 
-/// S3 PUT operation context containing all necessary resources
 pub struct PutContext {
     pub fs: UnifiedFileSystem,
     pub rt: Arc<AsyncRuntime>,
@@ -58,7 +55,6 @@ pub struct PutContext {
 }
 
 impl PutContext {
-    /// Create new PUT operation context
     pub fn new(
         fs: UnifiedFileSystem,
         rt: Arc<AsyncRuntime>,
@@ -75,12 +71,10 @@ impl PutContext {
         }
     }
 
-    /// Log start of PUT operation
     pub fn log_start(&self) {
         tracing::info!("PUT object s3://{}/{}", self.bucket, self.object);
     }
 
-    /// Log completion of PUT operation
     pub fn log_completion(&self, stats: &UploadStats) {
         tracing::info!(
             "PUT object s3://{}/{} completed, total bytes: {}",
@@ -90,7 +84,6 @@ impl PutContext {
         );
     }
 
-    /// Convert path with error handling
     pub fn get_validated_path(&self) -> Result<Path, String> {
         self.path.as_ref().map(|p| p.clone()).map_err(|e| {
             tracing::error!(
@@ -103,7 +96,6 @@ impl PutContext {
         })
     }
 
-    /// Create file writer with error handling
     pub async fn create_writer(&self) -> Result<UnifiedWriter, String> {
         let path = self.get_validated_path()?;
         self.fs.create(&path, true).await.map_err(|e| {
@@ -113,11 +105,9 @@ impl PutContext {
     }
 }
 
-/// Chunk processor for handling data chunks during upload
 pub struct ChunkProcessor;
 
 impl ChunkProcessor {
-    /// Process a data chunk with logging and validation
     pub fn process_chunk(chunk: &[u8], stats: &mut UploadStats) -> Result<(), String> {
         if chunk.is_empty() {
             return Ok(());
@@ -126,7 +116,6 @@ impl ChunkProcessor {
         let n = chunk.len();
         log::debug!("POLLREAD-CHUNK: {n} bytes");
 
-        // Log hex dump for debugging
         if n > 0 {
             log::debug!(
                 "POLLREAD-HEX: {}",
@@ -139,7 +128,6 @@ impl ChunkProcessor {
             );
         }
 
-        // Log first chunk details for debugging
         if stats.should_log_first_chunk() {
             log::debug!("PUT DEBUG - First chunk: {n} bytes");
             log::debug!(
@@ -164,7 +152,6 @@ impl ChunkProcessor {
     }
 }
 
-/// Stream reader for handling input data stream
 pub struct StreamReader;
 
 impl StreamReader {
@@ -184,11 +171,9 @@ impl StreamReader {
     }
 }
 
-/// Writer helper for handling file writing operations
 pub struct WriterHelper;
 
 impl WriterHelper {
-    /// Write chunk to file with error handling
     pub async fn write_chunk(writer: &mut UnifiedWriter, chunk: &[u8]) -> Result<(), String> {
         writer.write(chunk).await.map_err(|e| {
             tracing::error!("Failed to write chunk to file: {}", e);
@@ -196,7 +181,6 @@ impl WriterHelper {
         })
     }
 
-    /// Complete file writing with error handling
     pub async fn complete_write(writer: &mut UnifiedWriter) -> Result<(), String> {
         writer.complete().await.map_err(|e| {
             tracing::error!("Failed to complete file write: {}", e);
@@ -205,11 +189,9 @@ impl WriterHelper {
     }
 }
 
-/// Main PUT operation orchestrator
 pub struct PutOperation;
 
 impl PutOperation {
-    /// Execute complete PUT operation
     pub async fn execute(
         context: PutContext,
         body: &mut (dyn PollRead + Unpin + Send),
@@ -219,11 +201,10 @@ impl PutOperation {
         let mut writer = context.create_writer().await?;
         let mut stats = UploadStats::new();
 
-        // Main upload loop
         loop {
             let chunk = match StreamReader::read_next_chunk(body).await? {
                 Some(data) => data,
-                None => break, // End of stream
+                None => break,
             };
 
             ChunkProcessor::process_chunk(&chunk, &mut stats)?;
@@ -237,9 +218,6 @@ impl PutOperation {
     }
 }
 
-/// HTTP Range header representation (similar to s3s implementation)
-///
-/// Supports standard HTTP range requests as defined in RFC 9110
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Range {
     Int { first: u64, last: Option<u64> },

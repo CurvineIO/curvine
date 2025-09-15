@@ -28,10 +28,9 @@ pub struct TempFileManager {
     pub use_memory_optimization: bool,
 }
 
-/// Temporary storage abstraction
 pub enum TempStorage {
     Memory(Vec<u8>),
-    File(File, String), // (file, path)
+    File(File, String),
 }
 
 impl TempFileManager {

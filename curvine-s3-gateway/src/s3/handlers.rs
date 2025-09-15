@@ -48,26 +48,6 @@ pub struct S3Handlers {
 }
 
 impl S3Handlers {
-    /// Create a new S3Handlers instance
-    ///
-    /// Initializes the S3 handlers with the necessary dependencies for
-    /// handling S3 operations against the Curvine file system.
-    ///
-    /// # Arguments
-    ///
-    /// * `fs` - The unified filesystem instance for storage operations
-    /// * `region` - The S3 region identifier to report in responses
-    /// * `put_temp_dir` - Temporary directory path for all PUT operations
-    /// * `rt` - Shared runtime for scheduling internal blocking tasks
-    ///
-    /// # Returns
-    ///
-    /// * `Self` - Configured S3 handlers ready to process requests
-    ///
-    /// # Design Notes
-    ///
-    /// The handlers are designed to be cloneable and thread-safe, allowing
-    /// the same instance to handle multiple concurrent requests efficiently.
     pub fn new(
         fs: UnifiedFileSystem,
         region: String,
@@ -299,29 +279,22 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
 
             log::debug!("GetObject: will read {target_read} bytes directly");
 
-            // Dynamic chunk size based on file size for optimal performance
             let chunk_size_conf = if target_read <= 64 * 1024 {
-                // Small files (<=64KB): use smaller chunks to reduce memory overhead
                 std::cmp::min(self.get_chunk_size_bytes, target_read as usize).max(4 * 1024)
             } else if target_read <= 1024 * 1024 {
-                // Medium files (<=1MB): use moderate chunk size
                 std::cmp::min(self.get_chunk_size_bytes, 256 * 1024)
             } else {
-                // Large files (>1MB): use configured chunk size for maximum throughput
                 self.get_chunk_size_bytes
             };
             let mut total_read = 0u64;
             let mut remaining_to_read = target_read;
 
-            // Dual-buffer prefetch: read ahead multiple chunks, write while reading next
             let prefetch_depth = self.get_prefetch_depth;
 
             let mut guard = out.lock().await;
 
-            // Pre-read multiple chunks into buffer queue for overlapped I/O
             let mut buffer_queue: Vec<Vec<u8>> = Vec::with_capacity(prefetch_depth);
 
-            // Initial prefetch: read first few chunks
             for _ in 0..prefetch_depth {
                 if remaining_to_read == 0 {
                     break;
@@ -344,13 +317,10 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                 remaining_to_read -= bytes_read as u64;
             }
 
-            // Process buffered chunks with read-ahead
             while !buffer_queue.is_empty() {
-                // Take first buffer from queue
                 let current_buffer = buffer_queue.remove(0);
                 let bytes_to_write = current_buffer.len();
 
-                // Try to read next chunk while we have current buffer (overlapped I/O)
                 if remaining_to_read > 0 && buffer_queue.len() < prefetch_depth {
                     let next_chunk_size =
                         std::cmp::min(chunk_size_conf, remaining_to_read as usize);
@@ -368,7 +338,6 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                     }
                 }
 
-                // Write current buffer using zero-copy Vec->Bytes conversion when possible
                 guard.poll_write_vec(current_buffer).await.map_err(|e| {
                     tracing::error!("Failed to write chunk to output: {}", e);
                     e.to_string()
@@ -435,7 +404,6 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
         _opt: &crate::s3::s3_api::DeleteObjectOption,
         object: &str,
     ) -> Result<(), String> {
-        // Clone necessary data for async block
         let fs = self.fs.clone();
         let object = object.to_string();
         let path = Path::from_str(format!("/{object}"));
@@ -445,7 +413,6 @@ impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
             Ok(_) => Ok(()),
             Err(e) => {
                 let msg = e.to_string();
-                // Treat not-found as success to be S3 compatible (idempotent)
                 if msg.contains("No such file")
                     || msg.contains("not exists")
                     || msg.contains("not found")
@@ -585,7 +552,6 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
             use bytes::BytesMut;
             use tokio::io::AsyncReadExt;
 
-            // Create temporary directory for this upload session using configured path
             let dir = format!("{}/{}", self.put_temp_dir, upload_id);
             let _ = tokio::fs::create_dir_all(&dir).await;
 
@@ -654,7 +620,6 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                 Err(_) => return Err(()),
             };
 
-            // Prepare temporary directory path using configured multipart temp directory
             let put_temp_dir = self.put_temp_dir.clone();
             let dir = format!("{put_temp_dir}/{upload_id}");
 
@@ -746,38 +711,8 @@ impl ListObjectHandler for S3Handlers {
     }
 }
 
-/// Implementation of ListObjectVersionsHandler trait for object versions listing
-///
-/// Provides S3 ListObjectVersions functionality by treating each file as a single version.
-/// Since Curvine may not support true versioning, we simulate versioning by using
-/// file metadata to create version information.
 #[async_trait::async_trait]
 impl ListObjectVersionsHandler for S3Handlers {
-    /// Handle LIST object versions request
-    ///
-    /// Lists object versions within a specified bucket. Since Curvine doesn't support
-    /// true versioning, each file is treated as a single "latest" version.
-    ///
-    /// # Arguments
-    ///
-    /// * `opt` - List object versions options including prefix and pagination parameters
-    /// * `bucket` - S3 bucket name to list object versions from
-    ///
-    /// # Returns
-    ///
-    /// * `Future<Result<ListObjectVersionsResult, String>>` - Structured response with versions
-    ///
-    /// # Version Simulation Strategy
-    ///
-    /// - Each file is treated as its own latest version
-    /// - Version ID is generated from file metadata (mtime + size)
-    /// - All versions are marked as `IsLatest=true`
-    /// - No delete markers are generated (since no versioning)
-    ///
-    /// # S3 Compatibility
-    ///
-    /// This implementation provides enough compatibility for tools like s3-benchmark
-    /// to work correctly, even without true versioning support.
     async fn handle(
         &self,
         opt: &ListObjectVersionsOption,
@@ -785,10 +720,8 @@ impl ListObjectVersionsHandler for S3Handlers {
     ) -> Result<ListObjectVersionsResult, String> {
         tracing::info!("ListObjectVersions request for bucket: {}", bucket);
 
-        // Convert bucket name to file system path
         let bkt_path = self.cv_bucket_path(bucket).map_err(|e| e.to_string())?;
 
-        // List directory contents
         let list = self
             .fs
             .list_status(&bkt_path)
@@ -797,32 +730,25 @@ impl ListObjectVersionsHandler for S3Handlers {
 
         let mut versions = Vec::new();
 
-        // Process each file system entry
         for st in list {
             if st.is_dir {
-                // Skip directories for object versions listing
                 continue;
             }
 
-            // Object key is just the file name
             let key = st.name.clone();
 
-            // Apply prefix filtering if specified
             if let Some(prefix) = &opt.prefix {
                 if !key.starts_with(prefix) {
                     continue;
                 }
             }
 
-            // Generate a version ID based on file metadata
-            // Use mtime + size to create a reasonably unique version identifier
             let version_id = format!("{}-{}", st.mtime, st.len);
 
-            // Convert file status to ObjectVersion
             let version = ObjectVersion {
                 key: key.clone(),
                 version_id,
-                is_latest: true, // Always latest since we don't support true versioning
+                is_latest: true,
                 last_modified: crate::utils::s3_utils::format_s3_timestamp(st.mtime)
                     .unwrap_or_else(|| {
                         chrono::Utc::now()
@@ -840,26 +766,24 @@ impl ListObjectVersionsHandler for S3Handlers {
             versions.push(version);
         }
 
-        // Apply max_keys limit if specified
         if let Some(max_keys) = opt.max_keys {
             if max_keys > 0 && versions.len() > max_keys as usize {
                 versions.truncate(max_keys as usize);
             }
         }
 
-        // Create the response structure
         let result = ListObjectVersionsResult {
             xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
             name: bucket.to_string(),
             prefix: opt.prefix.clone(),
             key_marker: opt.key_marker.clone(),
             version_id_marker: opt.version_id_marker.clone(),
-            next_key_marker: None, // TODO: Implement pagination if needed
+            next_key_marker: None,
             next_version_id_marker: None,
             max_keys: opt.max_keys.map(|k| k as u32),
-            is_truncated: false, // TODO: Set to true if results are truncated
+            is_truncated: false,
             versions,
-            delete_markers: Vec::new(), // No delete markers since no versioning
+            delete_markers: Vec::new(),
         };
 
         tracing::info!(

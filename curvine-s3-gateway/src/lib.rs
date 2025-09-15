@@ -58,8 +58,6 @@ fn register_s3_handlers(
     handlers: Arc<s3::handlers::S3Handlers>,
 ) -> axum::Router {
     router
-        // Expose concrete handlers for advanced streaming paths
-        .layer(axum::Extension(handlers.clone()))
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::PutObjectHandler + Send + Sync>
         ))
@@ -95,7 +93,6 @@ fn register_s3_handlers(
         .layer(axum::Extension(
             handlers.clone() as Arc<dyn crate::s3::s3_api::ListObjectHandler + Send + Sync>
         ))
-        // Object versions listing operations
         .layer(axum::Extension(handlers.clone()
             as Arc<
                 dyn crate::s3::s3_api::ListObjectVersionsHandler + Send + Sync,
