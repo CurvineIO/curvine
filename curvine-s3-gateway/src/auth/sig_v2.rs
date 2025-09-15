@@ -234,7 +234,7 @@ pub fn canonicalize_amz_headers<R: VHeader>(headers: &R) -> String {
         if name_lower.starts_with("x-amz-") {
             header_map
                 .entry(name_lower)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(value.trim().to_string());
         }
         true // Continue iteration

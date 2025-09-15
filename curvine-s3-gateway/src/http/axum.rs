@@ -668,7 +668,7 @@ impl CurvineStreamAdapter {
                         yield Ok(bytes);
                     }
                     Err(e) => {
-                        yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                        yield Err(std::io::Error::other(e));
                         break;
                     }
                 }
