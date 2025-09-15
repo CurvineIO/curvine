@@ -41,17 +41,8 @@ use uuid;
 pub struct S3Handlers {
     pub fs: UnifiedFileSystem,
     pub region: String,
-
-    /// Temporary directory for all PUT operations (multipart and regular)
-    /// Configurable path where all temporary files for PUT operations are stored
     pub put_temp_dir: String,
-
-    /// Shared async runtime for executing blocking file system operations
-    /// Prevents blocking the main async executor with CPU-intensive tasks
     pub rt: std::sync::Arc<AsyncRuntime>,
-
-    /// GET performance optimization settings
-    pub get_mpsc_capacity: usize,
     pub get_chunk_size_bytes: usize,
     pub get_prefetch_depth: usize,
 }
@@ -82,15 +73,14 @@ impl S3Handlers {
         region: String,
         put_temp_dir: String,
         rt: std::sync::Arc<AsyncRuntime>,
-        get_mpsc_capacity: usize,
         get_chunk_size_mb: f32,
         get_prefetch_depth: usize,
     ) -> Self {
         let get_chunk_size_bytes = (get_chunk_size_mb * 1024.0 * 1024.0) as usize;
 
         tracing::debug!(
-            "Creating new S3Handlers with region: {}, put_temp_dir: {}, GET optimizations: mpsc_cap={}, chunk_size={}MB, prefetch_depth={}",
-            region, put_temp_dir, get_mpsc_capacity, get_chunk_size_mb, get_prefetch_depth
+            "Creating new S3Handlers with region: {}, put_temp_dir: {}, GET optimizations: chunk_size={}MB, prefetch_depth={}",
+            region, put_temp_dir, get_chunk_size_mb, get_prefetch_depth
         );
 
         Self {
@@ -98,13 +88,12 @@ impl S3Handlers {
             region,
             put_temp_dir,
             rt,
-            get_mpsc_capacity: get_mpsc_capacity.clamp(1, 1024),
             get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024), // 512KB - 4MB
             get_prefetch_depth: get_prefetch_depth.clamp(1, 3),
         }
     }
 
-    fn cv_object_path(&self, bucket: &str, key: &str) -> FsResult<Path> {
+    pub fn cv_object_path(&self, bucket: &str, key: &str) -> FsResult<Path> {
         tracing::debug!("Converting S3 path: s3://{}/{}", bucket, key);
 
         if bucket.is_empty() || key.is_empty() {

@@ -430,19 +430,19 @@ impl S3Router {
 
     async fn handle_get_object_request(
         req: Request,
-        get_obj: Option<Arc<dyn GetObjectHandler + Send + Sync>>,
+        _get_obj: Option<Arc<dyn GetObjectHandler + Send + Sync>>,
     ) -> axum::response::Response {
-        match get_obj {
-            Some(obj) => {
-                // For now, use default mpsc capacity since we need to refactor parameter passing
-                // TODO: Pass configuration through proper channels
-                return crate::http::axum::stream_get_object(req, obj, 32).await;
-            }
-            None => {
-                tracing::warn!("Get object handler not configured");
-                (StatusCode::FORBIDDEN, b"").into_response()
-            }
+        // Use the optimized streaming version directly
+        if let Some(handlers) = req
+            .extensions()
+            .get::<Arc<crate::s3::handlers::S3Handlers>>()
+            .cloned()
+        {
+            return crate::http::axum::stream_get_object_optimized(req, &handlers).await;
         }
+
+        tracing::error!("S3Handlers not found in request extensions");
+        (StatusCode::INTERNAL_SERVER_ERROR, b"Internal Server Error").into_response()
     }
 
     async fn handle_delete_bucket_request(

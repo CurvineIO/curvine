@@ -344,7 +344,6 @@ pub async fn start_gateway(
         region.clone(),
         conf.s3_gateway.put_temp_dir.clone(),
         rt.clone(),
-        conf.s3_gateway.get_mpsc_capacity,
         conf.s3_gateway.get_chunk_size_mb,
         conf.s3_gateway.get_prefetch_depth,
     ));
