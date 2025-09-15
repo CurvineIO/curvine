@@ -1570,7 +1570,7 @@ pub async fn handle_post_delete_objects<T: VRequestPlus, F: VResponse>(
     let url_path = req.url_path();
     let bucket = url_path
         .trim_start_matches('/')
-        .splitn(2, '/')
+        .split('/')
         .next()
         .unwrap_or("");
     if bucket.is_empty() {
