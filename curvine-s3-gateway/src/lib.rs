@@ -97,6 +97,7 @@ fn register_s3_handlers(
             as Arc<
                 dyn crate::s3::s3_api::ListObjectVersionsHandler + Send + Sync,
             >))
+        .layer(axum::Extension(handlers))
 }
 
 async fn init_s3_authentication(

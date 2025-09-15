@@ -438,6 +438,8 @@ pub async fn handle_authorization_middleware(
         }
     };
 
+    // Store original extensions before conversion
+    let original_extensions = req.extensions().clone();
     let req = Request::from(req);
 
     let auth_result = crate::auth::sig_v4::extract_args(&req);
@@ -505,6 +507,8 @@ pub async fn handle_authorization_middleware(
                 );
 
                 let mut axum_req: axum::http::Request<axum::body::Body> = req.into();
+                // Restore original extensions and add V4Head
+                *axum_req.extensions_mut() = original_extensions;
                 axum_req.extensions_mut().insert(v4head);
 
                 tracing::debug!("V2 authentication successful, proceeding to next middleware");
@@ -584,9 +588,11 @@ pub async fn handle_authorization_middleware(
         circle_hasher,
     );
 
-    let mut req: axum::http::Request<axum::body::Body> = req.into();
-    req.extensions_mut().insert(v4head);
-    next.run(req).await
+    let mut axum_req: axum::http::Request<axum::body::Body> = req.into();
+    // Restore original extensions and add V4Head
+    *axum_req.extensions_mut() = original_extensions;
+    axum_req.extensions_mut().insert(v4head);
+    next.run(axum_req).await
 }
 
 mod bucket {
@@ -656,10 +662,8 @@ impl CurvineStreamAdapter {
                         let bytes_read = data_slice.len();
                         self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes_read as u64);
 
-                        let mut buffer = vec![0u8; bytes_read];
-                        let mut data_slice_copy = data_slice;
-                        data_slice_copy.copy_to_slice(&mut buffer);
-                        let bytes = bytes::Bytes::from(buffer);
+                        // Convert DataSlice to Bytes efficiently using as_slice()
+                        let bytes = bytes::Bytes::copy_from_slice(data_slice.as_slice());
 
                         yield Ok(bytes);
                     }
