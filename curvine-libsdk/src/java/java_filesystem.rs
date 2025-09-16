@@ -104,10 +104,17 @@ impl JavaFilesystem {
         Ok(byte_arr)
     }
 
-    pub fn get_ufs_path(&self, env: &mut JNIEnv, path: JString) -> FsResult<jstring> {
+    pub fn toggle_path(
+        &self,
+        env: &mut JNIEnv,
+        path: JString,
+        check_cache: jboolean,
+    ) -> FsResult<jstring> {
         let path = JavaUtils::jstring_to_string(env, &path)?;
-        let ufs_path = self.inner.get_ufs_path(path)?;
-        let string = JavaUtils::new_jstring(env, ufs_path)?;
+        let ufs_path = self
+            .inner
+            .toggle_path(path, JavaUtils::jbool_to_bool(check_cache))?;
+        let string = JavaUtils::new_jstring(env, ufs_path.map(|x| x.clone_display_path()))?;
         Ok(string)
     }
 

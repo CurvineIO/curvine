@@ -32,13 +32,68 @@ impl MountValue {
         self.info.get_ufs_path(cv_path)
     }
 
+    pub fn get_cv_path(&self, ufs_path: &Path) -> CommonResult<Path> {
+        self.info.get_cv_path(ufs_path)
+    }
+
+    pub fn toggle_path(&self, path: &Path) -> CommonResult<Path> {
+        self.info.toggle_path(path)
+    }
+
     pub fn mount_id(&self) -> &str {
         &self.mount_id
     }
 }
 
+#[derive(Default)]
+struct InnerMap {
+    ufs_map: FastHashMap<String, Arc<MountValue>>,
+    cv_map: FastHashMap<String, Arc<MountValue>>,
+}
+
+impl InnerMap {
+    pub fn insert(&mut self, info: MountInfo) -> CommonResult<()> {
+        let value = Arc::new(MountValue::new(info)?);
+        self.cv_map
+            .insert(value.info.cv_path.clone(), value.clone());
+        self.ufs_map.insert(value.info.ufs_path.clone(), value);
+        Ok(())
+    }
+
+    pub fn clear(&mut self) {
+        self.cv_map.clear();
+        self.ufs_map.clear();
+    }
+
+    pub fn remove(&mut self, path: &Path) {
+        if path.is_cv() {
+            if let Some(info) = self.cv_map.remove(path.path()) {
+                let _ = self.ufs_map.remove(&info.info.ufs_path);
+            }
+        } else if let Some(info) = self.ufs_map.remove(path.full_path()) {
+            let _ = self.cv_map.remove(&info.info.cv_path);
+        }
+    }
+
+    pub fn get(&self, is_cv: bool, path: &str) -> Option<Arc<MountValue>> {
+        if is_cv {
+            self.cv_map.get(path).cloned()
+        } else {
+            self.ufs_map.get(path).cloned()
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.cv_map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 pub struct MountCache {
-    mounts: RwLock<FastHashMap<String, Arc<MountValue>>>,
+    mounts: RwLock<InnerMap>,
     update_interval: u64,
     last_update: AtomicCounter,
 }
@@ -46,7 +101,7 @@ pub struct MountCache {
 impl MountCache {
     pub fn new(update_interval: u64) -> Self {
         Self {
-            mounts: RwLock::new(FastHashMap::new()),
+            mounts: RwLock::new(InnerMap::default()),
             update_interval,
             last_update: AtomicCounter::new(0),
         }
@@ -64,8 +119,7 @@ impl MountCache {
             state.clear();
 
             for item in mounts {
-                let value = MountValue::new(item)?;
-                state.insert(value.info.cv_path.clone(), Arc::new(value));
+                state.insert(item)?;
             }
 
             debug!("update mounts {:?}", state.len());
@@ -88,7 +142,7 @@ impl MountCache {
         }
 
         for mount_path in path.get_possible_mounts() {
-            if let Some(mount) = state.get(&mount_path).cloned() {
+            if let Some(mount) = state.get(path.is_cv(), &mount_path) {
                 return Ok(Some(mount));
             }
         }
@@ -98,6 +152,6 @@ impl MountCache {
 
     pub fn remove(&self, path: &Path) {
         let mut state = self.mounts.write().unwrap();
-        state.remove(path.path());
+        state.remove(path);
     }
 }

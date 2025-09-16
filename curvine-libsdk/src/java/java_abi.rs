@@ -263,12 +263,13 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getMountInfo(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn Java_io_curvine_CurvineNative_getUfsPath(
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_togglePath(
     mut env: JNIEnv,
     _this: JObject,
     fs_ptr: *mut JavaFilesystem,
     path: JString,
+    check_cache: jboolean,
 ) -> jarray {
     let fs = &*fs_ptr;
-    java_err2!(env, fs.get_ufs_path(&mut env, path))
+    java_err2!(env, fs.toggle_path(&mut env, path, check_cache))
 }
