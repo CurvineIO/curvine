@@ -432,7 +432,6 @@ impl S3Router {
         req: Request,
         _get_obj: Option<Arc<dyn GetObjectHandler + Send + Sync>>,
     ) -> axum::response::Response {
-        // Use the optimized streaming version directly
         if let Some(handlers) = req
             .extensions()
             .get::<Arc<crate::s3::handlers::S3Handlers>>()

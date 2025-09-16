@@ -34,7 +34,7 @@ use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::FileType;
 use curvine_common::FsResult;
 use orpc::runtime::AsyncRuntime;
-
+use std::fs;
 use tokio::io::AsyncWriteExt;
 use tracing;
 use uuid;
@@ -56,6 +56,14 @@ impl S3Handlers {
     ) -> Self {
         let get_chunk_size_bytes = (get_chunk_size_mb * 1024.0 * 1024.0) as usize;
 
+        let put_temp_path = std::path::Path::new(&put_temp_dir);
+        if !put_temp_path.exists() {
+            tracing::debug!("Creating put_temp_dir: {}", put_temp_dir);
+            if let Err(e) = fs::create_dir_all(put_temp_path) {
+                tracing::error!("Failed to create put_temp_dir {}: {}", put_temp_dir, e);
+            }
+        }
+
         tracing::debug!(
             "Creating new S3Handlers with region: {}, put_temp_dir: {}, GET optimizations: chunk_size={}MB",
             region, put_temp_dir, get_chunk_size_mb
@@ -66,7 +74,7 @@ impl S3Handlers {
             region,
             put_temp_dir,
             rt,
-            get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024), // 512KB - 4MB
+            get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024),
         }
     }
 
