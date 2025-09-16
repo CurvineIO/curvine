@@ -19,6 +19,16 @@ use crate::{err_fuse, FuseResult, FuseUtils, FUSE_SUCCESS};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::FileStatus;
+use log::info;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum IoPhase {
+    Unset,
+    Reading,
+    Writing,
+    SealedToReading,
+    SealedToWriting,
+}
 
 pub struct FuseFile {
     fs: UnifiedFileSystem,
@@ -27,6 +37,7 @@ pub struct FuseFile {
     flags: u32,
     writer: Option<FuseWriter>,
     reader: Option<FuseReader>,
+    phase: IoPhase,
 }
 
 impl FuseFile {
@@ -55,6 +66,14 @@ impl FuseFile {
             }
         };
 
+        let phase = if reader.is_some() {
+            IoPhase::Reading
+        } else if writer.is_some() {
+            IoPhase::Writing
+        } else {
+            IoPhase::Unset
+        };
+
         let file = Self {
             fs,
             fh: 0,
@@ -62,7 +81,16 @@ impl FuseFile {
             flags,
             writer,
             reader,
+            phase,
         };
+        info!(
+            "FuseFile::create path={} flags=0x{:x} action={:?} has_writer={} has_reader={}",
+            file.path,
+            file.flags,
+            action,
+            file.writer.is_some(),
+            file.reader.is_some()
+        );
         Ok(file)
     }
 
@@ -75,6 +103,7 @@ impl FuseFile {
             flags,
             writer: Some(writer),
             reader: None,
+            phase: IoPhase::Writing,
         };
         Ok(file)
     }
@@ -95,16 +124,35 @@ impl FuseFile {
     }
 
     pub async fn write(&mut self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
+        let action = OpenAction::try_from(self.flags)?;
+
+        // Phase transition: allow at most one switch; never concurrent
+        match self.phase {
+            IoPhase::Unset => {
+                self.phase = IoPhase::Writing;
+            }
+            IoPhase::Reading => {
+                if let Some(mut reader) = self.reader.take() {
+                    reader.complete().await?;
+                }
+                self.phase = IoPhase::SealedToWriting;
+            }
+            IoPhase::SealedToReading => {
+                return err_fuse!(
+                    libc::EBUSY,
+                    "Cannot switch from reading back to writing: {}",
+                    self.path
+                );
+            }
+            IoPhase::Writing | IoPhase::SealedToWriting => {}
+        }
         let writer = match &mut self.writer {
             Some(v) => v,
 
             None => {
-                if self.reader.is_some() {
-                    return err_fuse!(
-                        libc::ENOSYS,
-                        "File {} is reading, and cannot be writing",
-                        self.path
-                    );
+                // If opened with write capability (e.g., O_RDWR), allow creating writer
+                if !action.write() {
+                    return err_fuse!(libc::EBADF, "Write not permitted for fh on {}", self.path);
                 }
                 let writer = Self::create_writer(&self.fs, &self.path, self.flags).await?;
                 self.writer.get_or_insert(writer)
@@ -143,20 +191,41 @@ impl FuseFile {
     }
 
     pub async fn read(&mut self, op: Read<'_>, rep: FuseResponse) -> FuseResult<()> {
+        let action = OpenAction::try_from(self.flags)?;
+
+        // Phase transition: allow at most one switch; never concurrent
+        match self.phase {
+            IoPhase::Unset => {
+                self.phase = IoPhase::Reading;
+            }
+            IoPhase::Writing => {
+                if let Some(mut writer) = self.writer.take() {
+                    writer.flush().await?;
+                    writer.complete().await?;
+                }
+                self.phase = IoPhase::SealedToReading;
+            }
+            IoPhase::SealedToWriting => {
+                return err_fuse!(
+                    libc::EBUSY,
+                    "Cannot switch from writing back to reading: {}",
+                    self.path
+                );
+            }
+            IoPhase::Reading | IoPhase::SealedToReading => {}
+        }
         let reader = match &mut self.reader {
             Some(v) => v,
             None => {
-                if self.writer.is_some() {
-                    return err_fuse!(
-                        libc::ENOSYS,
-                        "File {} is writing, and cannot be reading",
-                        self.path
-                    );
+                // If opened with read capability (e.g., O_RDWR), allow creating reader
+                if !action.read() {
+                    return err_fuse!(libc::EBADF, "Read not permitted for fh on {}", self.path);
                 }
                 let reader = Self::create_reader(&self.fs, &self.path).await?;
                 self.reader.get_or_insert(reader)
             }
         };
+        // Allow random read: just forward to reader
         reader.read(op, rep).await?;
         Ok(())
     }
