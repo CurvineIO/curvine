@@ -125,7 +125,7 @@ public class CurvineFileSystem extends FileSystem {
             FSInputStream inputStream = new CurvineInputStream(libFs, nativeHandle, tmp[0], statistics);
 
             if (filesystemConf.enable_fallback_read_ufs) {
-                Optional<Path> ufsPath = libFs.getUfsPath(formatPath).map(Path::new);
+                Optional<Path> ufsPath = getUfsPath(formatPath);
                 if (ufsPath.isPresent()) {
                     inputStream = new CurvineFallbackInputStream(inputStream, () -> {
                         try {
@@ -139,7 +139,7 @@ public class CurvineFileSystem extends FileSystem {
             return new FSDataInputStream(inputStream);
         } catch (CurvineException e) {
             if (filesystemConf.enable_unified_fs && !filesystemConf.enable_rust_read_ufs) {
-                Optional<Path> ufsPath = libFs.getUfsPath(formatPath).map(Path::new);
+                Optional<Path> ufsPath = getUfsPath(formatPath);
                 if (!ufsPath.isPresent()) {
                     throw new CurvineException(formatPath + "{} not find ufs path");
                 }
@@ -291,5 +291,13 @@ public class CurvineFileSystem extends FileSystem {
         }  else {
             return Optional.empty();
         }
+    }
+
+    public Optional<Path> getUfsPath(Path path) throws IOException {
+        return getUfsPath(formatPath(path));
+    }
+
+    public Optional<Path> getUfsPath(String path) throws IOException {
+        return libFs.getUfsPath(path).map(Path::new);
     }
 }

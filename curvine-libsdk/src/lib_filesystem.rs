@@ -102,10 +102,10 @@ impl LibFilesystem {
             .block_on(async { self.inner.get_mount_info_bytes(&path).await })
     }
 
-    pub fn get_ufs_path(&self, path: impl AsRef<str>) -> FsResult<Option<String>> {
+    pub fn toggle_path(&self, path: impl AsRef<str>, check_cache: bool) -> FsResult<Option<Path>> {
         let path = Path::from_str(path)?;
         self.rt
-            .block_on(async { self.inner.get_ufs_path(&path).await })
+            .block_on(async { self.inner.toggle_path(&path, check_cache).await })
     }
 
     pub fn cleanup(&self) {

@@ -139,11 +139,23 @@ impl UnifiedFileSystem {
         Ok(())
     }
 
-    // According to cv_path, find the mount point and get the corresponding ufs_path path.
-    pub async fn get_ufs_path(&self, path: &Path) -> FsResult<Option<String>> {
-        match self.get_mount(path).await? {
-            Some((ufs_path, _)) => Ok(Some(ufs_path.to_string())),
-            None => Ok(None),
+    pub async fn toggle_path(&self, path: &Path, check_cache: bool) -> FsResult<Option<Path>> {
+        if check_cache {
+            let state = self.mount_cache.get_mount(self, path).await?;
+            if let Some(mnt) = state {
+                let toggle_path = mnt.toggle_path(path)?;
+                Ok(Some(toggle_path))
+            } else {
+                Ok(None)
+            }
+        } else {
+            match self.get_mount_info(path).await? {
+                Some(mnt) => {
+                    let toggle_path = mnt.toggle_path(path)?;
+                    Ok(Some(toggle_path))
+                }
+                None => Ok(None),
+            }
         }
     }
 

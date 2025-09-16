@@ -214,6 +214,18 @@ impl Path {
 
         true
     }
+
+    pub fn display_path(&self) -> &str {
+        if self.is_cv() {
+            self.path()
+        } else {
+            self.full_path()
+        }
+    }
+
+    pub fn clone_display_path(&self) -> String {
+        self.display_path().to_string()
+    }
 }
 
 impl Display for Path {

@@ -134,6 +134,14 @@ impl MountInfo {
         let sub_path = path.full_path().replacen(&self.ufs_path, "", 1);
         Path::from_str(format!("{}/{}", self.cv_path, sub_path))
     }
+
+    pub fn toggle_path(&self, path: &Path) -> CommonResult<Path> {
+        if path.is_cv() {
+            self.get_ufs_path(path)
+        } else {
+            self.get_cv_path(path)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
