@@ -281,7 +281,6 @@ impl crate::s3::s3_api::VResponse for Response {
     fn send_header(&mut self) {}
 }
 
-/// Optimized streaming GET object handler using ReaderStream (similar to s3s approach)
 /// This avoids the MPSC channel overhead and provides better performance
 pub async fn stream_get_object(
     req: super::axum::Request,
@@ -649,6 +648,7 @@ impl CurvineStreamAdapter {
     ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send {
         async_stream::stream! {
             use curvine_common::fs::Reader;
+            use orpc::sys::DataSlice;
 
             while self.remaining_bytes > 0 {
                 let read_size = std::cmp::min(self.chunk_size, self.remaining_bytes as usize);
@@ -662,8 +662,14 @@ impl CurvineStreamAdapter {
                         let bytes_read = data_slice.len();
                         self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes_read as u64);
 
-                        // Convert DataSlice to Bytes efficiently using as_slice()
-                        let bytes = bytes::Bytes::copy_from_slice(data_slice.as_slice());
+                        let bytes = match data_slice {
+                            DataSlice::Bytes(bytes) => bytes,
+                            DataSlice::Buffer(buf) => buf.freeze(),
+                            DataSlice::IOSlice(_) | DataSlice::MemSlice(_) => {
+                                bytes::Bytes::copy_from_slice(data_slice.as_slice())
+                            },
+                            DataSlice::Empty => bytes::Bytes::new(),
+                        };
 
                         yield Ok(bytes);
                     }
