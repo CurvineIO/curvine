@@ -119,38 +119,9 @@ public class CurvineFileSystem extends FileSystem {
         }
 
         long[] tmp = new long[] {0, 0};
-        String formatPath = formatPath(path);
-        try {
-            long nativeHandle = libFs.open(formatPath, tmp);
-            FSInputStream inputStream = new CurvineInputStream(libFs, nativeHandle, tmp[0], statistics);
-
-            if (filesystemConf.enable_fallback_read_ufs) {
-                Optional<Path> ufsPath = getUfsPath(formatPath);
-                if (ufsPath.isPresent()) {
-                    inputStream = new CurvineFallbackInputStream(inputStream, () -> {
-                        try {
-                            return FileSystem.get(ufsPath.get().toUri(), getConf()).open(ufsPath.get(), bufferSize);
-                        } catch (IOException e) {
-                            throw new RuntimeException(e);
-                        }
-                    });
-                }
-            }
-            return new FSDataInputStream(inputStream);
-        } catch (CurvineException e) {
-            if (filesystemConf.enable_unified_fs && !filesystemConf.enable_rust_read_ufs) {
-                Optional<Path> ufsPath = getUfsPath(formatPath);
-                if (!ufsPath.isPresent()) {
-                    throw new CurvineException(formatPath + "{} not find ufs path");
-                }
-
-                LOGGER.warn("Not support reading using the Rust API, " +
-                        "it will be read using the Java API. path: {} -> {}", formatPath, ufsPath);
-                return FileSystem.get(ufsPath.get().toUri(), getConf()).open(ufsPath.get(), bufferSize);
-            } else {
-                throw e;
-            }
-        }
+        long nativeHandle = libFs.open(formatPath(path), tmp);
+        FSInputStream inputStream = new CurvineInputStream(libFs, nativeHandle, tmp[0], statistics);
+        return new FSDataInputStream(inputStream);
     }
 
     @Override
@@ -293,11 +264,21 @@ public class CurvineFileSystem extends FileSystem {
         }
     }
 
-    public Optional<Path> getUfsPath(Path path) throws IOException {
-        return getUfsPath(formatPath(path));
+    private boolean isCv(Path path) {
+        String scheme = path.toUri().getScheme();
+        return StringUtils.isEmpty(scheme) || scheme.equals(getScheme());
+    }
+    public Optional<Path> togglePath(Path path, boolean checkCache) throws IOException {
+        String pathString;
+        if (isCv(path)) {
+            pathString = formatPath(path);
+        } else {
+            pathString = path.toString();
+        }
+        return togglePath(pathString, checkCache);
     }
 
-    public Optional<Path> getUfsPath(String path) throws IOException {
-        return libFs.getUfsPath(path).map(Path::new);
+    public Optional<Path> togglePath(String path, boolean checkCache) throws IOException {
+        return libFs.togglePath(path, checkCache).map(Path::new);
     }
 }

@@ -37,6 +37,7 @@
         <dependency.scope>compile</dependency.scope>
         <hadoop.version>3.4.0</hadoop.version>
         <protobuf.version>3.25.7</protobuf.version>
+        <hadoop.version>3.3.4</hadoop.version>
     </properties>
 
     <dependencies>
@@ -87,6 +88,20 @@
             <artifactId>protobuf-java-util</artifactId>
             <version>${protobuf.version}</version>
             <scope>${dependency.scope}</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-aws</artifactId>
+            <version>${hadoop.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-java-sdk-bundle</artifactId>
+            <version>1.12.262</version>
+            <scope>provided</scope>
         </dependency>
     </dependencies>
 
