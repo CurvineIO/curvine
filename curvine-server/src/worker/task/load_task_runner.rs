@@ -96,7 +96,7 @@ impl LoadTaskRunner {
                 break;
             }
 
-            writer.write_chunk(chunk).await?;
+            writer.async_write(chunk).await?;
             total_cost_ms += spend.used_ms();
 
             if LocalTime::mills() > last_progress_time + self.progress_interval_ms {
