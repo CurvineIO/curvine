@@ -268,5 +268,5 @@ public class CurvineNative {
 
     public static native byte[] getMountInfo(long nativeHandle, String path) throws IOException;
 
-    public static native String getUfsPath(long nativeHandle, String path) throws IOException;
+    public static native String togglePath(long nativeHandle, String path, boolean checkCache) throws IOException;
 }

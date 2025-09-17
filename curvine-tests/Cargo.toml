@@ -8,7 +8,6 @@ orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-server = { workspace = true }
 curvine-client = { workspace = true }
-curvine-fuse = { workspace = true }
 curvine-ufs = { workspace = true }
 tokio  = { workspace = true }
 tracing = { workspace = true }

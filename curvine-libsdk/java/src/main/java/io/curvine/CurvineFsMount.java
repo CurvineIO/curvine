@@ -139,8 +139,8 @@ public class CurvineFsMount {
         return bytes;
     }
 
-    public Optional<String> getUfsPath(String path) throws IOException {
-        String ufsPath = CurvineNative.getUfsPath(nativeHandle, path);
+    public Optional<String> togglePath(String path, boolean checkCache) throws IOException {
+        String ufsPath = CurvineNative.togglePath(nativeHandle, path, checkCache);
         return Optional.ofNullable(ufsPath);
     }
 }

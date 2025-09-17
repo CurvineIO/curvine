@@ -1445,7 +1445,6 @@ dependencies = [
  "clap",
  "curvine-client",
  "curvine-common",
- "curvine-fuse",
  "curvine-server",
  "curvine-tracing-appender",
  "curvine-ufs",
