@@ -28,9 +28,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-const UFS_PATH: &str =
-    "s3://flink/savepoints/006810e8385c1eade44cfe618fb3ef72/savepoint-006810-6d218be90e9f";
-const TEST_FILE: &str = "s3://flink/savepoints/006810e8385c1eade44cfe618fb3ef72/savepoint-006810-6d218be90e9f/03754607-a9bd-4fe9-8938-214066c79525";
+const UFS_PATH: &str = "s3://flink/user/";
+const TEST_FILE: &str = "s3://flink/user/gosu-amd64";
 // Test the load function of curvine-client
 #[test]
 fn load_client_test() -> CommonResult<()> {

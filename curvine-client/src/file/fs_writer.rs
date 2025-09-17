@@ -100,6 +100,7 @@ impl Writer for FsWriter {
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
         let len = chunk.len();
         self.inner.write(chunk).await?;
+        self.pos = self.inner.pos();
         Ok(len as i64)
     }
 
