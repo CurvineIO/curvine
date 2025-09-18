@@ -1,4 +1,5 @@
 use std::{mem, ptr};
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use crate::err_box;
 use crate::io::IOResult;
@@ -19,11 +20,11 @@ impl UcpWorker {
             params.field_mask = ucp_worker_params_field::UCP_WORKER_PARAM_FIELD_THREAD_MODE.0 as _;
             params.thread_mode = ucs_thread_mode_t::UCS_THREAD_MODE_SINGLE;
 
-            let mut handle = ptr::null_mut();
+            let mut handle = MaybeUninit::<ucp_worker_h>::uninit();
             let status = ucp_worker_create(
                 context.handle(),
                 &params,
-                &mut handle
+                handle.as_mut_ptr(),
             );
             if status != UCS_OK {
                 return err_box!("context {:?}", status)
@@ -31,7 +32,7 @@ impl UcpWorker {
 
             Ok(Self {
                 context,
-                handle,
+                handle:   handle.assume_init()
             })
         }
     }
