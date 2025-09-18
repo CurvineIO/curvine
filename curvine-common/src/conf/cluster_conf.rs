@@ -21,7 +21,7 @@ use orpc::common::{LogConf, Utils};
 use orpc::io::net::{InetAddr, NodeAddr};
 use orpc::io::retry::TimeBondedRetryBuilder;
 use orpc::server::ServerConf;
-use orpc::{try_err, CommonResult};
+use orpc::{err_box, try_err, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fmt::{Display, Formatter};
@@ -76,9 +76,27 @@ impl ClusterConf {
         let str = try_err!(read_to_string(path.as_ref()));
         let mut conf = try_err!(toml::from_str::<Self>(&str));
 
-        // Check the environment variable configuration.
         if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
             conf.master.hostname = v.to_owned();
+            let hostname_exists = conf
+                .journal
+                .journal_addrs
+                .iter()
+                .any(|peer| peer.hostname == v);
+
+            if !hostname_exists {
+                return err_box!(
+                    "Hostname '{}' from {} is not found in journal_addrs. Available hostnames: [{}]",
+                    v,
+                    Self::ENV_MASTER_HOSTNAME,
+                    conf.journal.journal_addrs
+                        .iter()
+                        .map(|peer| peer.hostname.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+
             conf.journal.hostname = v;
         }
         if let Ok(v) = env::var(Self::ENV_WORKER_HOSTNAME) {
