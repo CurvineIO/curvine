@@ -20,7 +20,7 @@ export CURVINE_HOME="$(cd "$(dirname "$0")"/..; pwd)"
 
 OS_NAME=$(uname)
 # Get the IP address from hostname, taking the last network interface address
-LOCAL_HOSTNAME="localhost"
+LOCAL_HOSTNAME="$(hostname || echo localhost)"
 
 if [ "$OS_NAME" == "Linux" ]; then
     LOCAL_IP=$(hostname -I | awk '{print $NF}')
