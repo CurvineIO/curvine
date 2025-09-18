@@ -58,18 +58,6 @@ pub struct ServerArgs {
     // Configuration file path
     #[arg(long, default_value = "")]
     conf: String,
-
-    // Enable S3 object gateway alongside master
-    #[arg(long, default_value_t = false)]
-    enable_s3_gateway: bool,
-
-    // Gateway listen address
-    #[arg(long, default_value = "0.0.0.0:9900")]
-    object_listen: String,
-
-    // Gateway region
-    #[arg(long, default_value = "us-east-1")]
-    object_region: String,
 }
 
 impl ServerArgs {

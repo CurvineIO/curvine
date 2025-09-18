@@ -679,6 +679,10 @@ impl CurvineStreamAdapter {
                     }
                 }
             }
+
+            if let Err(e) = self.reader.complete().await {
+                tracing::warn!("Failed to complete reader cleanup in stream adapter: {}", e);
+            }
         }
     }
 }

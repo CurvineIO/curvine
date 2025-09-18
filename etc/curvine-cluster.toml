@@ -35,6 +35,7 @@ data_dir = [
     "[DISK]testing/data",
 ]
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
+enable_s3_gateway = false
 
 
 # Customer service configuration.
@@ -68,5 +69,3 @@ put_max_memory_buffer = 16777216
 # GET Performance Optimization Settings
 # GET read/write chunk size in MB (default: 1.0, options: 0.5/1/2)
 get_chunk_size_mb = 1.0
-# GET prefetch depth for dual-buffer optimization (default: 2, range: 1-3)
-get_prefetch_depth = 2 

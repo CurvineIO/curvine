@@ -165,7 +165,9 @@ async fn create_credential_store(
     conf: &ClusterConf,
     rt: Arc<AsyncRuntime>,
 ) -> CommonResult<AccessKeyStoreEnum> {
-    if conf.s3_gateway.enable_distributed_auth {
+    let use_distributed_auth =
+        conf.s3_gateway.enable_distributed_auth || conf.worker.enable_s3_gateway;
+    if use_distributed_auth {
         create_distributed_store(conf, rt).await
     } else {
         create_local_store(conf).await

@@ -290,16 +290,25 @@ impl FsReaderBuffer {
             let select_task = tokio::select! {
                 biased;
 
-                task = task_receiver.recv_check() => {
-                    SelectTask::Control(task?)
+                task_opt = task_receiver.recv() => {
+                    match task_opt {
+                        Some(task) => SelectTask::Control(task),
+                        None => return Ok(()), // control channel closed: normal shutdown
+                    }
                 }
 
-                premit = chunk_sender.reserve() => {
+                premit_res = chunk_sender.reserve() => {
                     if !paused {
-                        SelectTask::Permit(premit?)
+                        match premit_res {
+                            Ok(permit) => SelectTask::Permit(permit),
+                            Err(_e) => return Ok(()), // data channel closed: normal shutdown
+                        }
                     } else {
                         // Wait for the next command to prevent the CPU from idling.
-                        SelectTask::Control(task_receiver.recv_check().await?)
+                        match task_receiver.recv().await {
+                            Some(task) => SelectTask::Control(task),
+                            None => return Ok(()), // control channel closed while paused
+                        }
                     }
                 }
             };
