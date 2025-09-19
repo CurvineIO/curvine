@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use log::{info, debug, error};
 use crate::CommonResult;
-use crate::ucp::{UcpContext, UcpWorker, UcpListener, UcsSockAddr};
+use crate::ucp::{Context, UcpWorker, UcpListener, UcsSockAddr};
 
 /// 简单的UCX Stream服务器
 /// 功能：
@@ -12,7 +12,7 @@ use crate::ucp::{UcpContext, UcpWorker, UcpListener, UcsSockAddr};
 /// 3. 输出接收到的数据内容（字符串形式）
 /// 4. 返回"res: 原始消息"给客户端
 pub struct UcpServer {
-    context: Arc<UcpContext>,
+    context: Arc<Context>,
     pub worker: UcpWorker,
     listener: Option<UcpListener>,
     addr: SocketAddr,
@@ -31,7 +31,7 @@ impl UcpServer {
         }
         
         // 创建UCX组件
-        let context = Arc::new(UcpContext::new()?);
+        let context = Arc::new(Context::new()?);
         let worker = UcpWorker::new(context.clone())?;
         
         Ok(Self {

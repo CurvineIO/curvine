@@ -6,11 +6,11 @@ use crate::ucp::bindings::*;
 use crate::ucp::UcpConf;
 
 #[derive(Debug)]
-pub struct UcpContext {
+pub struct Context {
     handle: ucp_context_h,
 }
 
-impl UcpContext {
+impl Context {
     pub fn new() -> IOResult<Self> {
         Self::with_config(&UcpConf::default())
     }
@@ -59,7 +59,7 @@ impl UcpContext {
 }
 
 
-impl Drop for UcpContext {
+impl Drop for Context {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             unsafe {
@@ -69,6 +69,6 @@ impl Drop for UcpContext {
     }
 }
 
-unsafe impl Send for UcpContext {}
+unsafe impl Send for Context {}
 
-unsafe impl Sync for UcpContext {}
+unsafe impl Sync for Context {}

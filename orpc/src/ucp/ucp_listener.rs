@@ -7,7 +7,7 @@ use crate::err_box;
 use crate::io::IOResult;
 use crate::ucp::bindings::*;
 use crate::ucp::ucs_sock_addr::UcsSockAddr;
-use crate::ucp::{UcpContext, UcpWorker, UcpEndpoint};
+use crate::ucp::{Context, UcpWorker, UcpEndpoint};
 
 pub struct UcpListener {
     handle: ucp_listener_h,
@@ -149,7 +149,7 @@ impl UcpListener {
         info!("🔄 开始处理连接 {} 的数据", conn_id);
         
         // 创建临时worker包装器用于数据处理
-        let temp_context = match UcpContext::new() {
+        let temp_context = match Context::new() {
             Ok(ctx) => Arc::new(ctx),
             Err(e) => {
                 error!("❌ 创建临时context失败: {:?}", e);

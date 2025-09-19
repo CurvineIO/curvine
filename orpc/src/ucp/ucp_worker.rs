@@ -5,15 +5,15 @@ use crate::err_box;
 use crate::io::IOResult;
 use crate::ucp::bindings::*;
 use crate::ucp::bindings::ucs_status_t::UCS_OK;
-use crate::ucp::UcpContext;
+use crate::ucp::Context;
 
 pub struct UcpWorker {
     handle: ucp_worker_h,
-    context: Arc<UcpContext>
+    context: Arc<Context>
 }
 
 impl UcpWorker {
-    pub fn new(context: Arc<UcpContext>) -> IOResult<Self> {
+    pub fn new(context: Arc<Context>) -> IOResult<Self> {
         unsafe {
             let mut params: ucp_worker_params_t = mem::zeroed();
 

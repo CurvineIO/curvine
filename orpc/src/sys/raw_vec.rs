@@ -45,7 +45,7 @@ impl RawVec {
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_mut_ptr(), self.len) }
     }
 
     pub fn split_to(&mut self, at: usize) -> Self {
@@ -56,7 +56,7 @@ impl RawVec {
             self.len,
         );
 
-        let res = RawVec::from_raw(self.ptr.as_ptr(), at);
+        let res = RawVec::from_raw(self.ptr.as_mut_ptr(), at);
         self.ptr.add(at);
         self.len -= at;
 
@@ -71,7 +71,7 @@ impl RawVec {
             self.len,
         );
 
-        let other = unsafe { self.ptr.as_ptr().add(at) };
+        let other = unsafe { self.ptr.as_mut_ptr().add(at) };
         let res = RawVec::from_raw(other, self.len - at);
         self.len = at;
 
@@ -112,7 +112,7 @@ impl Debug for RawVec {
         write!(
             f,
             "ptr = {}, len = {}",
-            self.ptr.as_ptr() as usize,
+            self.ptr.as_mut_ptr() as usize,
             self.len
         )
     }
