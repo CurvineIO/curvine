@@ -213,7 +213,7 @@ version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dbfd150b5dbdb988bcc8fb1fe787eb6b7ee6180ca24da683b61ea5405f3d43ff"
 dependencies = [
- "bindgen",
+ "bindgen 0.69.5",
  "cc",
  "cmake",
  "dunce",
@@ -732,6 +732,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "bindgen"
+version = "0.66.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2b84e06fc203107bfbad243f4aba2af864eb7db3b1cf46ea0a023b0b433d2a7"
+dependencies = [
+ "bitflags 2.9.3",
+ "cexpr",
+ "clang-sys",
+ "lazy_static",
+ "lazycell",
+ "log",
+ "peeking_take_while",
+ "prettyplease 0.2.37",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex",
+ "syn 2.0.106",
+ "which",
 ]
 
 [[package]]
@@ -1286,7 +1309,7 @@ dependencies = [
 name = "curvine-fuse"
 version = "0.2.1-beta"
 dependencies = [
- "bindgen",
+ "bindgen 0.69.5",
  "clap",
  "curvine-client",
  "curvine-common",
@@ -2523,7 +2546,7 @@ version = "0.16.0+8.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce3d60bc059831dc1c83903fb45c103f75db65c5a7bf22272764d9cc683e348c"
 dependencies = [
- "bindgen",
+ "bindgen 0.69.5",
  "bzip2-sys",
  "cc",
  "glob",
@@ -2963,9 +2986,9 @@ dependencies = [
 name = "orpc"
 version = "0.2.1-beta"
 dependencies = [
- "anyhow",
  "axum 0.7.9",
  "bincode",
+ "bindgen 0.66.1",
  "bytes",
  "chrono",
  "crc32fast",
@@ -3051,6 +3074,12 @@ dependencies = [
  "digest",
  "hmac",
 ]
+
+[[package]]
+name = "peeking_take_while"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
 
 [[package]]
 name = "pem"

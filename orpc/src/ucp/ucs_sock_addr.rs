@@ -85,6 +85,15 @@ impl UcsSockAddr {
     
     /// 返回正确的ucs_sock_addr_t结构
     pub fn handle(&self) -> ucs_sock_addr_t {
+        // 验证指针有效性
+        if self.ucs_addr.addr.is_null() {
+            println!("⚠️  警告：UCX地址指针为空！");
+        }
+        
+        if self.ucs_addr.addrlen == 0 {
+            println!("⚠️  警告：UCX地址长度为0！");
+        }
+        
         self.ucs_addr
     }
     
@@ -109,7 +118,13 @@ impl UcsSockAddr {
     /// 调试用：从UCX指针直接读取地址族（验证UCX收到什么）
     pub fn debug_ucx_address_family(&self) -> u16 {
         unsafe {
-            // 直接从UCX指针读取地址族
+            // 安全检查：确保指针不为空
+            if self.ucs_addr.addr.is_null() {
+                println!("⚠️  UCX addr指针为空，返回0");
+                return 0;
+            }
+            
+            // 从UCX指针安全读取地址族
             let family_ptr = self.ucs_addr.addr as *const sa_family_t;
             *family_ptr
         }

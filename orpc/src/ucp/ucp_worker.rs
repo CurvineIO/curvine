@@ -38,6 +38,10 @@ impl UcpWorker {
     }
 
     pub fn progress(&self) -> u32 {
+        if self.handle.is_null() {
+            println!("⚠️  Worker handle is null, returning 0");
+            return 0;
+        }
         unsafe {
             ucp_worker_progress(self.handle)
         }

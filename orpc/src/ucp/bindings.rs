@@ -15,28 +15,27 @@ pub const UCT_DMABUF_FD_INVALID: i32 = -1;
 pub const UCS_CALLBACKQ_FAST_COUNT: u32 = 7;
 pub const UCS_CALLBACKQ_ID_NULL: i32 = -1;
 pub const UCT_VERNO_MAJOR: u32 = 1;
-pub const UCT_VERNO_MINOR: u32 = 14;
+pub const UCT_VERNO_MINOR: u32 = 18;
 pub const UCT_VERNO_PATCH: u32 = 1;
 pub const UCT_VERNO_EXTRA: &[u8; 1] = b"\0";
-pub const UCT_VERNO_STRING: &[u8; 7] = b"1.14.1\0";
-pub const UCT_SCM_VERSION: &[u8; 8] = b"04897a0\0";
+pub const UCT_VERNO_STRING: &[u8; 7] = b"1.18.1\0";
+pub const UCT_SCM_VERSION: &[u8; 1] = b"\0";
 pub const UCT_SCM_BRANCH: &[u8; 1] = b"\0";
 pub const UCT_MINOR_BIT: u32 = 16;
 pub const UCT_MAJOR_BIT: u32 = 24;
-pub const UCT_API: u32 = 17694720;
+pub const UCT_API: u32 = 17956864;
 pub const UCS_CPU_SETSIZE: u32 = 1024;
+pub const UCS_NUMA_NODE_DEFAULT: u32 = 0;
+pub const UCS_NUMA_NODE_UNDEFINED: i32 = -1;
 pub const UCS_SYS_DEVICE_ID_MAX: u32 = 255;
 pub const UCS_SYS_DEVICE_ID_UNKNOWN: u32 = 255;
 pub const UCS_SYS_BDF_NAME_MAX: u32 = 16;
-pub const UCS_SYS_DEVICE_PRIORITY_TCP: u32 = 10;
-pub const UCS_SYS_DEVICE_PRIORITY_IB: u32 = 20;
-pub const UCS_SYS_DEVICE_PRIORITY_CUDA: u32 = 10;
 pub const UCT_TL_RESOURCE_DESC_FMT: &[u8; 6] = b"%s/%s\0";
 pub const UCP_ENTITY_NAME_MAX: u32 = 32;
 pub const UCP_VERSION_MAJOR_SHIFT: u32 = 24;
 pub const UCP_VERSION_MINOR_SHIFT: u32 = 16;
 pub const UCP_API_MAJOR: u32 = 1;
-pub const UCP_API_MINOR: u32 = 14;
+pub const UCP_API_MINOR: u32 = 18;
 pub type __off_t = ::std::os::raw::c_long;
 pub type __off64_t = ::std::os::raw::c_long;
 pub type __socklen_t = ::std::os::raw::c_uint;
@@ -137,6 +136,7 @@ fn bindgen_test_layout_sockaddr_storage() {
     );
 }
 #[repr(u32)]
+#[doc = " Logging levels."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucs_log_level_t {
     UCS_LOG_LEVEL_FATAL = 0,
@@ -159,6 +159,7 @@ impl ucs_async_mode_t {
         ucs_async_mode_t::UCS_ASYNC_MODE_THREAD;
 }
 #[repr(u32)]
+#[doc = " Async progress mode."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucs_async_mode_t {
     UCS_ASYNC_MODE_SIGNAL = 0,
@@ -171,6 +172,7 @@ extern "C" {
     pub static mut ucs_async_mode_names: [*const ::std::os::raw::c_char; 0usize];
 }
 #[repr(u32)]
+#[doc = " Ternary logic or Auto value."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucs_ternary_auto_value {
     UCS_NO = 0,
@@ -179,8 +181,10 @@ pub enum ucs_ternary_auto_value {
     UCS_AUTO = 3,
     UCS_TERNARY_LAST = 4,
 }
+#[doc = " Ternary logic or Auto value."]
 pub use self::ucs_ternary_auto_value as ucs_ternary_auto_value_t;
 #[repr(u32)]
+#[doc = " On/Off/Auto logic value."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucs_on_off_auto_value {
     UCS_CONFIG_OFF = 0,
@@ -188,8 +192,10 @@ pub enum ucs_on_off_auto_value {
     UCS_CONFIG_AUTO = 2,
     UCS_CONFIG_ON_OFF_LAST = 3,
 }
+#[doc = " On/Off/Auto logic value."]
 pub use self::ucs_on_off_auto_value as ucs_on_off_auto_value_t;
 #[repr(u32)]
+#[doc = " Error handling modes"]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucs_handle_error_t {
     UCS_HANDLE_ERROR_BACKTRACE = 0,
@@ -241,6 +247,7 @@ impl ::std::ops::BitAndAssign for ucs_config_print_flags_t {
     }
 }
 #[repr(transparent)]
+#[doc = " Configuration printing flags"]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucs_config_print_flags_t(pub ::std::os::raw::c_uint);
 #[repr(C)]
@@ -297,6 +304,7 @@ fn bindgen_test_layout_ucs_config_names_array_t() {
     );
 }
 #[repr(u32)]
+#[doc = " Enum for representing possible modes of an \"allow-list\""]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucs_config_allow_list_mode_t {
     UCS_CONFIG_ALLOW_LIST_ALLOW_ALL = 0,
@@ -345,10 +353,13 @@ fn bindgen_test_layout_ucs_config_allow_list_t() {
         )
     );
 }
+#[doc = " @ingroup UCS_RESOURCE\n BSD socket address specification."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucs_sock_addr {
+    #[doc = "< Pointer to socket address"]
     pub addr: *const sockaddr,
+    #[doc = "< Address length"]
     pub addrlen: socklen_t,
 }
 #[test]
@@ -386,7 +397,9 @@ fn bindgen_test_layout_ucs_sock_addr() {
         )
     );
 }
+#[doc = " @ingroup UCS_RESOURCE\n BSD socket address specification."]
 pub type ucs_sock_addr_t = ucs_sock_addr;
+#[doc = " Logging component."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucs_log_component_config {
@@ -440,8 +453,10 @@ fn bindgen_test_layout_ucs_log_component_config() {
         )
     );
 }
+#[doc = " Logging component."]
 pub type ucs_log_component_config_t = ucs_log_component_config;
 #[repr(i8)]
+#[doc = " @ingroup UCS_RESOURCE\n @brief Status codes\n\n @note In order to evaluate the necessary steps to recover from a certain\n error, all error codes which can be returned by the external API are grouped\n by the largest entity permanently effected by the error. Each group ranges\n between its UCS_ERR_FIRST_<name> and UCS_ERR_LAST_<name> enum values.\n For example, if a link fails it may be sufficient to destroy (and possibly\n replace) it, in contrast to an endpoint-level error."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucs_status_t {
     UCS_OK = 0,
@@ -478,11 +493,14 @@ pub enum ucs_status_t {
     UCS_ERR_LAST_ENDPOINT_FAILURE = -89,
     UCS_ERR_LAST = -100,
 }
+#[doc = " @ingroup UCS_RESOURCE\n @brief Status pointer\n\n A pointer can represent one of these values:\n - NULL / UCS_OK\n - Error code pointer (UCS_ERR_xx)\n - Valid pointer"]
 pub type ucs_status_ptr_t = *mut ::std::os::raw::c_void;
 extern "C" {
+    #[doc = " @param  status UCS status code.\n\n @return Verbose status message."]
     pub fn ucs_status_string(status: ucs_status_t) -> *const ::std::os::raw::c_char;
 }
 #[repr(u32)]
+#[doc = " @ingroup UCT_AM\n @brief Trace types for active message tracer."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_am_trace_type {
     UCT_AM_TRACE_TYPE_SEND = 0,
@@ -527,6 +545,7 @@ impl ::std::ops::BitAndAssign for uct_cb_param_flags {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief Flags for active message and tag-matching offload callbacks (callback's parameters).\n\n If UCT_CB_PARAM_FLAG_DESC flag is enabled, then data is part of a descriptor\n which includes the user-defined rx_headroom, and the callback may return\n UCS_INPROGRESS and hold on to that descriptor. Otherwise, the data can't be\n used outside the callback. If needed, the data must be copied-out.\n\n@verbatim\ndescriptor    data\n|             |\n+-------------+-------------------------+\n| rx_headroom | payload                 |\n+-------------+-------------------------+\n@endverbatim\n\n UCT_CB_PARAM_FLAG_FIRST and UCT_CB_PARAM_FLAG_MORE flags are relevant for\n @ref uct_tag_unexp_eager_cb_t callback only. The former value indicates that\n the data is the first fragment of the message. The latter value means that\n more fragments of the message yet to be delivered."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_cb_param_flags(pub ::std::os::raw::c_uint);
 #[repr(C)]
@@ -534,6 +553,7 @@ pub struct uct_cb_param_flags(pub ::std::os::raw::c_uint);
 pub struct uct_component {
     _unused: [u8; 0],
 }
+#[doc = " @addtogroup UCT_RESOURCE\n @{"]
 pub type uct_component_h = *mut uct_component;
 pub type uct_iface_h = *mut uct_iface;
 #[repr(C)]
@@ -570,7 +590,9 @@ pub struct uct_md_ops {
 }
 pub type uct_md_ops_t = uct_md_ops;
 pub type uct_rkey_ctx_h = *mut ::std::os::raw::c_void;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Interface attributes: capabilities and limitations."]
 pub type uct_iface_attr_t = uct_iface_attr;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Parameters used for interface creation.\n\n This structure should be allocated by the user and should be passed to\n @ref uct_iface_open. User has to initialize all fields of this structure."]
 pub type uct_iface_params_t = uct_iface_params;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -578,11 +600,15 @@ pub struct uct_ep_attr {
     _unused: [u8; 0],
 }
 pub type uct_ep_attr_t = uct_ep_attr;
+#[doc = " @ingroup UCT_MD\n @brief  Memory domain attributes.\n\n This structure defines the attributes of a Memory Domain which includes\n maximum memory that can be allocated, credentials required for accessing the memory,\n CPU mask indicating the proximity of CPUs, and bitmaps indicating the types\n of memory (CPU/CUDA/ROCM) that can be detected, allocated and accessed."]
 pub type uct_md_attr_t = uct_md_attr;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Completion handle.\n\n This structure should be allocated by the user and can be passed to communication\n primitives. The user must initialize all fields of the structure.\n  If the operation returns UCS_INPROGRESS, this structure will be in use by the\n transport until the operation completes. When the operation completes, \"count\"\n field is decremented by 1, and whenever it reaches 0 - the callback is called.\n\n Notes:\n  - The same structure can be passed multiple times to communication functions\n    without the need to wait for completion.\n  - If the number of operations is smaller than the initial value of the counter,\n    the callback will not be called at all, so it may be left undefined.\n  - status field is required to track the first time the error occurred, and\n    report it via a callback when count reaches 0."]
 pub type uct_completion_t = uct_completion;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Pending request.\n\n This structure should be passed to @ref uct_ep_pending_add() and is used to signal\n new available resources back to user."]
 pub type uct_pending_req_t = uct_pending_req;
 pub type uct_worker_h = *mut uct_worker;
 pub type uct_md_t = uct_md;
+#[doc = " @ingroup UCT_AM\n @brief Trace types for active message tracer."]
 pub use self::uct_am_trace_type as uct_am_trace_type_t;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -602,8 +628,11 @@ pub struct uct_ep_addr {
     _unused: [u8; 0],
 }
 pub type uct_ep_addr_t = uct_ep_addr;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Parameters for creating a UCT endpoint by @ref uct_ep_create"]
 pub type uct_ep_params_t = uct_ep_params;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Parameters for connecting a UCT endpoint by @ref uct_ep_connect."]
 pub type uct_ep_connect_params_t = uct_ep_connect_params;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Connection manager attributes, capabilities and limitations."]
 pub type uct_cm_attr_t = uct_cm_attr;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -612,20 +641,29 @@ pub struct uct_cm {
 }
 pub type uct_cm_t = uct_cm;
 pub type uct_cm_h = *mut uct_cm_t;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief UCT listener attributes, capabilities and limitations."]
 pub type uct_listener_attr_t = uct_listener_attr;
 pub type uct_listener_h = *mut uct_listener;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Parameters for creating a listener object @ref uct_listener_h by\n @ref uct_listener_create"]
 pub type uct_listener_params_t = uct_listener_params;
+#[doc = " @ingroup UCT_TAG\n @brief Posted tag context.\n\n Tag context is an object which tracks a tag posted to the transport. It\n contains callbacks for matching events on this tag."]
 pub type uct_tag_context_t = uct_tag_context;
 pub type uct_tag_t = u64;
 pub type uct_worker_cb_id_t = ::std::os::raw::c_int;
 pub type uct_conn_request_h = *mut ::std::os::raw::c_void;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Structure for scatter-gather I/O.\n\n Specifies a list of buffers which can be used within a single data transfer\n function call.\n\n@verbatim\nbuffer\n|\n+-----------+-------+-----------+-------+-----------+\n|  payload  | empty |  payload  | empty |  payload  |\n+-----------+-------+-----------+-------+-----------+\n|<-length-->|       |<-length-->|       |<-length-->|\n|<---- stride ----->|<---- stride ----->|\n@endverbatim\n\n @note The sum of lengths in all iov list must be less or equal to max_zcopy\n       of the respective communication operation.\n @note If @a length or @a count are zero, the memory pointed to by @a buffer\n       will not be accessed. Otherwise, @a buffer must point to valid memory.\n\n @note If @a count is one, every iov entry specifies a single contiguous data block\n\n @note If @a count > 1, each iov entry specifies a strided block of @a count\n       elements and distance of @a stride byte between consecutive elements\n"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iov {
+    #[doc = "< Data buffer"]
     pub buffer: *mut ::std::os::raw::c_void,
+    #[doc = "< Length of the payload in bytes"]
     pub length: usize,
+    #[doc = "< Local memory key descriptor for the data"]
     pub memh: uct_mem_h,
+    #[doc = "< Stride between beginnings of payload elements in\nthe buffer in bytes"]
     pub stride: usize,
+    #[doc = "< Number of payload elements in the buffer"]
     pub count: ::std::os::raw::c_uint,
 }
 #[test]
@@ -693,8 +731,10 @@ fn bindgen_test_layout_uct_iov() {
         )
     );
 }
+#[doc = " @ingroup UCT_RESOURCE\n @brief Structure for scatter-gather I/O.\n\n Specifies a list of buffers which can be used within a single data transfer\n function call.\n\n@verbatim\nbuffer\n|\n+-----------+-------+-----------+-------+-----------+\n|  payload  | empty |  payload  | empty |  payload  |\n+-----------+-------+-----------+-------+-----------+\n|<-length-->|       |<-length-->|       |<-length-->|\n|<---- stride ----->|<---- stride ----->|\n@endverbatim\n\n @note The sum of lengths in all iov list must be less or equal to max_zcopy\n       of the respective communication operation.\n @note If @a length or @a count are zero, the memory pointed to by @a buffer\n       will not be accessed. Otherwise, @a buffer must point to valid memory.\n\n @note If @a count is one, every iov entry specifies a single contiguous data block\n\n @note If @a count > 1, each iov entry specifies a strided block of @a count\n       elements and distance of @a stride byte between consecutive elements\n"]
 pub type uct_iov_t = uct_iov;
 impl uct_cm_ep_priv_data_pack_args_field {
+    #[doc = " Enables @ref uct_cm_ep_priv_data_pack_args::dev_name\n  Indicates that dev_name field in uct_cm_ep_priv_data_pack_args_t is\n  valid."]
     pub const UCT_CM_EP_PRIV_DATA_PACK_ARGS_FIELD_DEVICE_NAME: uct_cm_ep_priv_data_pack_args_field =
         uct_cm_ep_priv_data_pack_args_field(1);
 }
@@ -729,13 +769,16 @@ impl ::std::ops::BitAndAssign for uct_cm_ep_priv_data_pack_args_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Client-Server private data pack callback arguments field mask.\n\n The enumeration allows specifying which fields in\n @ref uct_cm_ep_priv_data_pack_args are present, for backward compatibility\n support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_cm_ep_priv_data_pack_args_field(pub ::std::os::raw::c_uint);
 impl uct_cm_ep_resolve_args_field {
+    #[doc = " Indicates that @ref uct_cm_ep_resolve_args::dev_name is valid."]
     pub const UCT_CM_EP_RESOLVE_ARGS_FIELD_DEV_NAME: uct_cm_ep_resolve_args_field =
         uct_cm_ep_resolve_args_field(1);
 }
 impl uct_cm_ep_resolve_args_field {
+    #[doc = " Indicates that @ref uct_cm_ep_resolve_args::status is valid."]
     pub const UCT_CM_EP_RESOLVE_ARGS_FIELD_STATUS: uct_cm_ep_resolve_args_field =
         uct_cm_ep_resolve_args_field(2);
 }
@@ -766,12 +809,16 @@ impl ::std::ops::BitAndAssign for uct_cm_ep_resolve_args_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Client-Server resolve callback arguments field mask.\n\n The enumeration allows specifying which fields in\n @ref uct_cm_ep_resolve_args are present, for backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_cm_ep_resolve_args_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Arguments to the client-server private data pack callback.\n\n Used with the client-server API on a connection manager."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_cm_ep_priv_data_pack_args {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_cm_ep_priv_data_pack_args_field.\n Fields not specified by this mask should not be accessed by the callback."]
     pub field_mask: u64,
+    #[doc = " Device name. This routine may fill the user's private data according to\n the given device name. The device name that is passed to this routine,\n corresponds to @ref uct_tl_resource_desc_t::dev_name as returned from\n @ref uct_md_query_tl_resources."]
     pub dev_name: [::std::os::raw::c_char; 32usize],
 }
 #[test]
@@ -810,12 +857,17 @@ fn bindgen_test_layout_uct_cm_ep_priv_data_pack_args() {
         )
     );
 }
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Arguments to the client-server private data pack callback.\n\n Used with the client-server API on a connection manager."]
 pub type uct_cm_ep_priv_data_pack_args_t = uct_cm_ep_priv_data_pack_args;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Arguments to the client-server resolved callback.\n\n Used with the client-server API on a connection manager."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_cm_ep_resolve_args {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_cm_ep_resolve_args_field.\n Fields not specified by this mask should not be accessed by the callback."]
     pub field_mask: u64,
+    #[doc = " Device name indicates the device that the endpoint was bound to during\n address and route resolution. The device name that is passed to this\n callback corresponds to @ref uct_tl_resource_desc_t::dev_name as\n returned from @ref uct_md_query_tl_resources."]
     pub dev_name: [::std::os::raw::c_char; 32usize],
+    #[doc = " Indicates address resolution status:\n UCS_OK                   - address of the remote server was resolved\n                            successfully.\n UCS_ERR_UNREACHABLE      - the remote server is unreachable.\n Otherwise                - indicates an internal connection establishment\n                            error on the local (client) side."]
     pub status: ucs_status_t,
 }
 #[test]
@@ -864,20 +916,25 @@ fn bindgen_test_layout_uct_cm_ep_resolve_args() {
         )
     );
 }
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Arguments to the client-server resolved callback.\n\n Used with the client-server API on a connection manager."]
 pub type uct_cm_ep_resolve_args_t = uct_cm_ep_resolve_args;
 impl uct_cm_remote_data_field {
+    #[doc = " Enables @ref uct_cm_remote_data::dev_addr"]
     pub const UCT_CM_REMOTE_DATA_FIELD_DEV_ADDR: uct_cm_remote_data_field =
         uct_cm_remote_data_field(1);
 }
 impl uct_cm_remote_data_field {
+    #[doc = " Enables @ref uct_cm_remote_data::dev_addr_length"]
     pub const UCT_CM_REMOTE_DATA_FIELD_DEV_ADDR_LENGTH: uct_cm_remote_data_field =
         uct_cm_remote_data_field(2);
 }
 impl uct_cm_remote_data_field {
+    #[doc = " Enables @ref uct_cm_remote_data::conn_priv_data"]
     pub const UCT_CM_REMOTE_DATA_FIELD_CONN_PRIV_DATA: uct_cm_remote_data_field =
         uct_cm_remote_data_field(4);
 }
 impl uct_cm_remote_data_field {
+    #[doc = " Enables @ref uct_cm_remote_data::conn_priv_data_length"]
     pub const UCT_CM_REMOTE_DATA_FIELD_CONN_PRIV_DATA_LENGTH: uct_cm_remote_data_field =
         uct_cm_remote_data_field(8);
 }
@@ -908,15 +965,22 @@ impl ::std::ops::BitAndAssign for uct_cm_remote_data_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Remote data attributes field mask.\n\n The enumeration allows specifying which fields in @ref uct_cm_remote_data are\n present, for backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_cm_remote_data_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Data received from the remote peer.\n\n The remote peer's device address, the data received from it and their lengths.\n Used with the client-server API on a connection manager."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_cm_remote_data {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_cm_remote_data_field. Fields not specified by this mask\n will be ignored."]
     pub field_mask: u64,
+    #[doc = " Device address of the remote peer."]
     pub dev_addr: *const uct_device_addr_t,
+    #[doc = " Length of the remote device address."]
     pub dev_addr_length: usize,
+    #[doc = " Pointer to the received data. This is the private data that was passed to\n @ref uct_ep_params_t::sockaddr_pack_cb."]
     pub conn_priv_data: *const ::std::os::raw::c_void,
+    #[doc = " Length of the received data from the peer."]
     pub conn_priv_data_length: usize,
 }
 #[test]
@@ -984,20 +1048,25 @@ fn bindgen_test_layout_uct_cm_remote_data() {
         )
     );
 }
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Data received from the remote peer.\n\n The remote peer's device address, the data received from it and their lengths.\n Used with the client-server API on a connection manager."]
 pub type uct_cm_remote_data_t = uct_cm_remote_data;
 impl uct_cm_listener_conn_request_args_field {
+    #[doc = " Enables @ref uct_cm_listener_conn_request_args::dev_name\n  Indicates that dev_name field in uct_cm_listener_conn_request_args_t is\n  valid."]
     pub const UCT_CM_LISTENER_CONN_REQUEST_ARGS_FIELD_DEV_NAME:
         uct_cm_listener_conn_request_args_field = uct_cm_listener_conn_request_args_field(1);
 }
 impl uct_cm_listener_conn_request_args_field {
+    #[doc = " Enables @ref uct_cm_listener_conn_request_args::conn_request\n  Indicates that conn_request field in uct_cm_listener_conn_request_args_t\n  is valid."]
     pub const UCT_CM_LISTENER_CONN_REQUEST_ARGS_FIELD_CONN_REQUEST:
         uct_cm_listener_conn_request_args_field = uct_cm_listener_conn_request_args_field(2);
 }
 impl uct_cm_listener_conn_request_args_field {
+    #[doc = " Enables @ref uct_cm_listener_conn_request_args::remote_data\n  Indicates that remote_data field in uct_cm_listener_conn_request_args_t\n  is valid."]
     pub const UCT_CM_LISTENER_CONN_REQUEST_ARGS_FIELD_REMOTE_DATA:
         uct_cm_listener_conn_request_args_field = uct_cm_listener_conn_request_args_field(4);
 }
 impl uct_cm_listener_conn_request_args_field {
+    #[doc = " Enables @ref uct_cm_listener_conn_request_args::client_address\n  Indicates that client_address field in uct_cm_listener_conn_request_args_t\n  is valid."]
     pub const UCT_CM_LISTENER_CONN_REQUEST_ARGS_FIELD_CLIENT_ADDR:
         uct_cm_listener_conn_request_args_field = uct_cm_listener_conn_request_args_field(8);
 }
@@ -1032,15 +1101,22 @@ impl ::std::ops::BitAndAssign for uct_cm_listener_conn_request_args_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Listener's connection request callback arguments field mask.\n\n The enumeration allows specifying which fields in\n @ref uct_cm_listener_conn_request_args are present, for backward compatibility\n support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_cm_listener_conn_request_args_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Arguments to the listener's connection request callback.\n\n The local device name, connection request handle and the data the client sent.\n Used with the client-server API on a connection manager."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_cm_listener_conn_request_args {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_cm_listener_conn_request_args_field.\n Fields not specified by this mask should not be accessed by the callback."]
     pub field_mask: u64,
+    #[doc = " Local device name which handles the incoming connection request."]
     pub dev_name: [::std::os::raw::c_char; 32usize],
+    #[doc = " Connection request handle. Can be passed to this callback from the\n transport and will be used by it to accept or reject the connection\n request from the client."]
     pub conn_request: uct_conn_request_h,
+    #[doc = " Remote data from the client."]
     pub remote_data: *const uct_cm_remote_data_t,
+    #[doc = " Client's address."]
     pub client_address: ucs_sock_addr_t,
 }
 #[test]
@@ -1112,12 +1188,15 @@ fn bindgen_test_layout_uct_cm_listener_conn_request_args() {
         )
     );
 }
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Arguments to the listener's connection request callback.\n\n The local device name, connection request handle and the data the client sent.\n Used with the client-server API on a connection manager."]
 pub type uct_cm_listener_conn_request_args_t = uct_cm_listener_conn_request_args;
 impl uct_cm_ep_client_connect_args_field {
+    #[doc = " Enables @ref uct_cm_ep_client_connect_args::remote_data"]
     pub const UCT_CM_EP_CLIENT_CONNECT_ARGS_FIELD_REMOTE_DATA: uct_cm_ep_client_connect_args_field =
         uct_cm_ep_client_connect_args_field(1);
 }
 impl uct_cm_ep_client_connect_args_field {
+    #[doc = " Enables @ref uct_cm_ep_client_connect_args::status"]
     pub const UCT_CM_EP_CLIENT_CONNECT_ARGS_FIELD_STATUS: uct_cm_ep_client_connect_args_field =
         uct_cm_ep_client_connect_args_field(2);
 }
@@ -1152,13 +1231,18 @@ impl ::std::ops::BitAndAssign for uct_cm_ep_client_connect_args_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Field mask flags for client-side connection established callback.\n\n The enumeration allows specifying which fields in\n @ref uct_cm_ep_client_connect_args are present, for backward compatibility\n support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_cm_ep_client_connect_args_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Arguments to the client's connect callback.\n\n Used with the client-server API on a connection manager."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_cm_ep_client_connect_args {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_cm_ep_client_connect_args_field.\n Fields not specified by this mask should not be accessed by the callback."]
     pub field_mask: u64,
+    #[doc = " Remote data from the server."]
     pub remote_data: *const uct_cm_remote_data_t,
+    #[doc = " Indicates the connection establishment response from the remote server:\n UCS_OK                   - the remote server accepted the connection request.\n UCS_ERR_REJECTED         - the remote server rejected the connection request.\n UCS_ERR_CONNECTION_RESET - the server's connection was reset during\n                            the connection establishment to the client.\n Otherwise                - indicates an internal connection establishment\n                            error on the local (client) side."]
     pub status: ucs_status_t,
 }
 #[test]
@@ -1207,8 +1291,10 @@ fn bindgen_test_layout_uct_cm_ep_client_connect_args() {
         )
     );
 }
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Arguments to the client's connect callback.\n\n Used with the client-server API on a connection manager."]
 pub type uct_cm_ep_client_connect_args_t = uct_cm_ep_client_connect_args;
 impl uct_cm_ep_server_conn_notify_args_field {
+    #[doc = " Enables @ref uct_cm_ep_server_conn_notify_args::status\n  Indicates that status field in uct_cm_ep_server_conn_notify_args_t is valid."]
     pub const UCT_CM_EP_SERVER_CONN_NOTIFY_ARGS_FIELD_STATUS:
         uct_cm_ep_server_conn_notify_args_field = uct_cm_ep_server_conn_notify_args_field(1);
 }
@@ -1243,12 +1329,16 @@ impl ::std::ops::BitAndAssign for uct_cm_ep_server_conn_notify_args_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Field mask flags for server-side connection established notification\n        callback.\n\n The enumeration allows specifying which fields in\n @ref uct_cm_ep_server_conn_notify_args are present, for backward compatibility\n support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_cm_ep_server_conn_notify_args_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Arguments to the server's notify callback.\n\n Used with the client-server API on a connection manager."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_cm_ep_server_conn_notify_args {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_cm_ep_server_conn_notify_args_field.\n Fields not specified by this mask should not be accessed by the callback."]
     pub field_mask: u64,
+    #[doc = " Indicates the client's @ref ucs_status_t status:\n UCS_OK                   - the client completed its connection\n                            establishment and called\n                            @ref uct_cm_client_ep_conn_notify\n UCS_ERR_CONNECTION_RESET - the client's connection was reset during\n                            the connection establishment to the server.\n Otherwise                - indicates an internal connection establishment\n                            error on the local (server) side."]
     pub status: ucs_status_t,
 }
 #[test]
@@ -1290,7 +1380,9 @@ fn bindgen_test_layout_uct_cm_ep_server_conn_notify_args() {
         )
     );
 }
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Arguments to the server's notify callback.\n\n Used with the client-server API on a connection manager."]
 pub type uct_cm_ep_server_conn_notify_args_t = uct_cm_ep_server_conn_notify_args;
+#[doc = " @ingroup UCT_AM\n @brief Callback to process incoming active message\n\n When the callback is called, @a flags indicates how @a data should be handled.\n If @a flags contain @ref UCT_CB_PARAM_FLAG_DESC value, it means @a data is part of\n a descriptor which must be released later by @ref uct_iface_release_desc by\n the user if the callback returns @ref UCS_INPROGRESS.\n\n @param [in]  arg      User-defined argument.\n @param [in]  data     Points to the received data. This may be a part of\n                       a descriptor which may be released later.\n @param [in]  length   Length of data.\n @param [in]  flags    Mask with @ref uct_cb_param_flags\n\n @note This callback could be set and released\n       by @ref uct_iface_set_am_handler function.\n\n @retval UCS_OK         - descriptor was consumed, and can be released\n                          by the caller.\n @retval UCS_INPROGRESS - descriptor is owned by the callee, and would be\n                          released later. Supported only if @a flags contain\n                          @ref UCT_CB_PARAM_FLAG_DESC value. Otherwise, this is\n                          an error.\n"]
 pub type uct_am_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         arg: *mut ::std::os::raw::c_void,
@@ -1299,6 +1391,7 @@ pub type uct_am_callback_t = ::std::option::Option<
         flags: ::std::os::raw::c_uint,
     ) -> ucs_status_t,
 >;
+#[doc = " @ingroup UCT_AM\n @brief Callback to trace active messages.\n\n Writes a string which represents active message contents into 'buffer'.\n\n @param [in]  arg      User-defined argument.\n @param [in]  type     Message type.\n @param [in]  id       Active message id.\n @param [in]  data     Points to the received data.\n @param [in]  length   Length of data.\n @param [out] buffer   Filled with a debug information string.\n @param [in]  max      Maximal length of the string."]
 pub type uct_am_tracer_t = ::std::option::Option<
     unsafe extern "C" fn(
         arg: *mut ::std::os::raw::c_void,
@@ -1310,10 +1403,13 @@ pub type uct_am_tracer_t = ::std::option::Option<
         max: usize,
     ),
 >;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Callback to process send completion.\n\n @param [in]  self     Pointer to relevant completion structure, which was\n                       initially passed to the operation."]
 pub type uct_completion_callback_t =
     ::std::option::Option<unsafe extern "C" fn(self_: *mut uct_completion_t)>;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Callback to process pending requests.\n\n @param [in]  self     Pointer to relevant pending structure, which was\n                       initially passed to the operation.\n\n @return @ref UCS_OK         - This pending request has completed and\n                               should be removed.\n         @ref UCS_INPROGRESS - Some progress was made, but not completed.\n                               Keep this request and keep processing the queue.\n         Otherwise           - Could not make any progress. Keep this pending\n                               request on the queue, and stop processing the queue."]
 pub type uct_pending_callback_t =
     ::std::option::Option<unsafe extern "C" fn(self_: *mut uct_pending_req_t) -> ucs_status_t>;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Callback to process peer failure.\n\n @note User should purge a pending queue and do not post any TX operations\n and cancel all possible outstanding operations prior closing a UCT endpoint.\n\n @param [in]  arg      User argument to be passed to the callback.\n @param [in]  ep       Endpoint which has failed. Upon return from the callback,\n                       this @a ep is no longer usable and all subsequent\n                       operations on this @a ep will fail with the error code\n                       passed in @a status.\n @param [in]  status   Status indicating error.\n\n @return @ref UCS_OK   - The error was handled successfully.\n         Otherwise     - The error was not handled and is returned back to\n                         the transport."]
 pub type uct_error_handler_t = ::std::option::Option<
     unsafe extern "C" fn(
         arg: *mut ::std::os::raw::c_void,
@@ -1321,15 +1417,18 @@ pub type uct_error_handler_t = ::std::option::Option<
         status: ucs_status_t,
     ) -> ucs_status_t,
 >;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Callback to purge pending requests.\n\n @param [in]  self     Pointer to relevant pending structure, which was\n                       initially passed to the operation.\n @param [in]  arg      User argument to be passed to the callback."]
 pub type uct_pending_purge_callback_t = ::std::option::Option<
     unsafe extern "C" fn(self_: *mut uct_pending_req_t, arg: *mut ::std::os::raw::c_void),
 >;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Callback for producing data.\n\n @param [in]  dest     Memory buffer to pack the data to.\n @param [in]  arg      Custom user-argument.\n\n @return  Size of the data was actually produced."]
 pub type uct_pack_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         dest: *mut ::std::os::raw::c_void,
         arg: *mut ::std::os::raw::c_void,
     ) -> usize,
 >;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Callback for consuming data.\n\n @param [in]  arg      Custom user-argument.\n @param [in]  data     Memory buffer to unpack the data from.\n @param [in]  length   How much data to consume (size of \"data\")\n\n @note The arguments for this callback are in the same order as libc's memcpy()."]
 pub type uct_unpack_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         arg: *mut ::std::os::raw::c_void,
@@ -1337,6 +1436,7 @@ pub type uct_unpack_callback_t = ::std::option::Option<
         length: usize,
     ),
 >;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Callback to process an incoming connection request on the server side.\n\n This callback routine will be invoked on the server side upon receiving an\n incoming connection request. It should be set by the server side while\n initializing an interface.\n Incoming data is placed inside the conn_priv_data buffer.\n This callback has to be thread safe.\n Other than communication progress routines, it is allowed to call other UCT\n communication routines from this callback.\n\n @param [in]  iface            Transport interface.\n @param [in]  arg              User defined argument for this callback.\n @param [in]  conn_request     Transport level connection request. The user\n                               should accept or reject the request by calling\n                               @ref uct_iface_accept or @ref uct_iface_reject\n                               routines respectively.\n                               conn_request should not be used outside the\n                               scope of this callback.\n @param [in]  conn_priv_data   Points to the received data.\n                               This is the private data that was passed to the\n                               @ref uct_ep_params_t::sockaddr_pack_cb on the\n                               client side.\n @param [in]  length           Length of the received data.\n"]
 pub type uct_sockaddr_conn_request_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         iface: uct_iface_h,
@@ -1346,6 +1446,7 @@ pub type uct_sockaddr_conn_request_callback_t = ::std::option::Option<
         length: usize,
     ),
 >;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Callback to process an incoming connection request on the server side\n        listener in a connection manager.\n\n This callback routine will be invoked on the server side upon receiving an\n incoming connection request. It should be set by the server side while\n initializing a listener in a connection manager.\n This callback has to be thread safe.\n Other than communication progress routines, it is allowed to call other UCT\n communication routines from this callback.\n\n @param [in]  listener         Transport listener.\n @param [in]  arg              User argument for this callback as defined in\n                               @ref uct_listener_params_t::user_data\n @param [in]  conn_req_args    Listener's arguments to handle the connection\n                               request from the client."]
 pub type uct_cm_listener_conn_request_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         listener: uct_listener_h,
@@ -1353,6 +1454,7 @@ pub type uct_cm_listener_conn_request_callback_t = ::std::option::Option<
         conn_req_args: *const uct_cm_listener_conn_request_args_t,
     ),
 >;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Callback to process an incoming connection establishment acknowledgment\n        on the server side listener, from the client, which indicates that the\n        client side is connected.\n        The callback also notifies the server side of a local error on a\n        not-yet-connected endpoint.\n\n This callback routine will be invoked on the server side upon receiving an\n incoming connection establishment acknowledgment from the client, which is sent\n from it once the client is connected to the server. Used to connect the server\n side to the client or handle an error from it - depending on the status field.\n This callback will also be invoked in the event of an internal local error\n with a failed @ref uct_cm_ep_server_conn_notify_args::status if the endpoint\n was not connected yet.\n This callback has to be thread safe.\n Other than communication progress routines, it is permissible to call other UCT\n communication routines from this callback.\n\n @param [in]  ep               Transport endpoint.\n @param [in]  arg              User argument for this callback as defined in\n                               @ref uct_ep_params_t::user_data\n @param [in]  connect_args     Server's connect callback arguments."]
 pub type uct_cm_ep_server_conn_notify_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         ep: uct_ep_h,
@@ -1360,6 +1462,7 @@ pub type uct_cm_ep_server_conn_notify_callback_t = ::std::option::Option<
         connect_args: *const uct_cm_ep_server_conn_notify_args_t,
     ),
 >;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Callback to process an incoming connection response on the client side\n        from the server or handle a local error on a not-yet-connected endpoint.\n\n This callback routine will be invoked on the client side upon receiving an\n incoming connection response from the server. Used to connect the client side\n to the server or handle an error from it - depending on the status field.\n This callback will also be invoked in the event of an internal local error\n with a failed @ref uct_cm_ep_client_connect_args::status if the endpoint was\n not connected yet.\n This callback has to be thread safe.\n Other than communication progress routines, it is permissible to call other UCT\n communication routines from this callback.\n\n @param [in]  ep               Transport endpoint.\n @param [in]  arg              User argument for this callback as defined in\n                               @ref uct_ep_params_t::user_data.\n @param [in]  connect_args     Client's connect callback arguments"]
 pub type uct_cm_ep_client_connect_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         ep: uct_ep_h,
@@ -1367,8 +1470,10 @@ pub type uct_cm_ep_client_connect_callback_t = ::std::option::Option<
         connect_args: *const uct_cm_ep_client_connect_args_t,
     ),
 >;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Callback to handle the disconnection of the remote peer.\n\n This callback routine will be invoked on the client and server sides upon\n a disconnect of the remote peer. It will disconnect the given endpoint from\n the remote peer.\n This callback won't be invoked if the endpoint was not connected to the remote\n peer yet.\n This callback has to be thread safe.\n Other than communication progress routines, it is permissible to call other UCT\n communication routines from this callback.\n\n @param [in]  ep               Transport endpoint to disconnect.\n @param [in]  arg              User argument for this callback as defined in\n                               @ref uct_ep_params_t::user_data."]
 pub type uct_ep_disconnect_cb_t =
     ::std::option::Option<unsafe extern "C" fn(ep: uct_ep_h, arg: *mut ::std::os::raw::c_void)>;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Callback to fill the user's private data in a client-server flow.\n\n This callback routine will be invoked on the client side, before sending the\n transport's connection request to the server, or on the server side before\n sending a connection response to the client.\n This callback routine can be set when creating an endpoint.\n The user's private data should be placed inside the priv_data buffer to be\n sent to the remote side.\n The maximal allowed length of the private data is indicated by the field\n max_conn_priv inside @ref uct_iface_attr or inside @ref uct_cm_attr when using a\n connection manager.\n Communication progress routines should not be called from this callback.\n It is allowed to call other UCT communication routines from this callback.\n\n @param [in]  arg          User defined argument for this callback.\n @param [in]  pack_args    Handle for the the private data packing.\n @param [out] priv_data    User's private data to be passed to the remote side.\n\n @return Negative value indicates an error according to @ref ucs_status_t.\n         On success, a non-negative value indicates actual number of\n         bytes written to the @a priv_data buffer."]
 pub type uct_cm_ep_priv_data_pack_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         arg: *mut ::std::os::raw::c_void,
@@ -1376,12 +1481,14 @@ pub type uct_cm_ep_priv_data_pack_callback_t = ::std::option::Option<
         priv_data: *mut ::std::os::raw::c_void,
     ) -> isize,
 >;
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Callback to notify that the client side endpoint is bound to a\n        local device.\n\n This callback routine will be invoked, when the client side endpoint is bound\n to a local device.\n The callback routine can be set when creating an endpoint.\n Communication progress routines should not be called from this callback.\n It is allowed to call other UCT communication routines from this callback.\n\n @param [in]  user_data       User argument as defined in\n                              @ref uct_ep_params_t::user_data.\n @param [in]  resolve_args    Handle for the extra arguments provided by the\n                              transport.\n\n @return UCS_OK on success or error as defined in @ref ucs_status_t."]
 pub type uct_cm_ep_resolve_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         user_data: *mut ::std::os::raw::c_void,
         resolve_args: *const uct_cm_ep_resolve_args_t,
     ) -> ucs_status_t,
 >;
+#[doc = " @ingroup UCT_TAG\n @brief Callback to process unexpected eager tagged message.\n\n This callback is invoked when tagged message sent by eager protocol has\n arrived and no corresponding tag has been posted.\n\n @note The callback is always invoked from the context (thread, process)\n       that called @a uct_iface_progress().\n\n @note It is allowed to call other communication routines from the callback.\n\n @param [in]     arg     User-defined argument\n @param [in]     data    Points to the received unexpected data.\n @param [in]     length  Length of data.\n @param [in]     flags   Mask with @ref uct_cb_param_flags flags. If it\n                         contains @ref UCT_CB_PARAM_FLAG_DESC value, this means\n                         @a data is part of a descriptor which must be released\n                         later using @ref uct_iface_release_desc by the user if\n                         the callback returns @ref UCS_INPROGRESS.\n @param [in]     stag    Tag from sender.\n @param [in]     imm     Immediate data from sender.\n\n @param [inout]  context Storage for a per-message user-defined context. In\n                         this context, the message is defined by the sender\n                         side as a single call to uct_ep_tag_eager_short/bcopy/zcopy.\n                         On the transport level the message can be fragmented\n                         and delivered to the target over multiple fragments.\n                         The fragments will preserve the original order of the\n                         message. Each fragment will result in invocation of\n                         the above callback. The user can use\n                         UCT_CB_PARAM_FLAG_FIRST to identify the first fragment,\n                         allocate the context object and use the context as a\n                         token that is set by the user and passed to subsequent\n                         callbacks of the same message. The user is responsible\n                         for allocation and release of the context.\n\n @note No need to allocate the context in the case of a single fragment message\n       (i.e. @a flags contains @ref UCT_CB_PARAM_FLAG_FIRST, but does not\n       contain @ref UCT_CB_PARAM_FLAG_MORE).\n\n @retval UCS_OK          - data descriptor was consumed, and can be released\n                           by the caller.\n @retval UCS_INPROGRESS  - data descriptor is owned by the callee, and will be\n                           released later."]
 pub type uct_tag_unexp_eager_cb_t = ::std::option::Option<
     unsafe extern "C" fn(
         arg: *mut ::std::os::raw::c_void,
@@ -1393,6 +1500,7 @@ pub type uct_tag_unexp_eager_cb_t = ::std::option::Option<
         context: *mut *mut ::std::os::raw::c_void,
     ) -> ucs_status_t,
 >;
+#[doc = " @ingroup UCT_TAG\n @brief Callback to process unexpected rendezvous tagged message.\n\n This callback is invoked when rendezvous send notification has arrived\n and no corresponding tag has been posted.\n\n @note The callback is always invoked from the context (thread, process)\n       that called @a uct_iface_progress().\n\n @note It is allowed to call other communication routines from the callback.\n\n @param [in]  arg           User-defined argument\n @param [in]  flags         Mask with @ref uct_cb_param_flags\n @param [in]  stag          Tag from sender.\n @param [in]  header        User defined header.\n @param [in]  header_length User defined header length in bytes.\n @param [in]  remote_addr   Sender's buffer virtual address.\n @param [in]  length        Sender's buffer length.\n @param [in]  rkey_buf      Sender's buffer packed remote key. It can be\n                            passed to uct_rkey_unpack() to create uct_rkey_t.\n\n @warning If the user became the owner of the @a desc (by returning\n          @ref UCS_INPROGRESS) the descriptor must be released later by\n          @ref uct_iface_release_desc by the user.\n\n @retval UCS_OK         - descriptor was consumed, and can be released\n                          by the caller.\n @retval UCS_INPROGRESS - descriptor is owned by the callee, and would be\n                          released later."]
 pub type uct_tag_unexp_rndv_cb_t = ::std::option::Option<
     unsafe extern "C" fn(
         arg: *mut ::std::os::raw::c_void,
@@ -1405,9 +1513,22 @@ pub type uct_tag_unexp_rndv_cb_t = ::std::option::Option<
         rkey_buf: *const ::std::os::raw::c_void,
     ) -> ucs_status_t,
 >;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Callback to process asynchronous events.\n\n @param [in]  arg      User argument to be passed to the callback.\n @param [in]  flags    Flags to be passed to the callback (reserved for\n                       future use)."]
 pub type uct_async_event_cb_t = ::std::option::Option<
     unsafe extern "C" fn(arg: *mut ::std::os::raw::c_void, flags: ::std::os::raw::c_uint),
 >;
+extern "C" {
+    #[doc = " Disable signal handling in UCS for signal.\n Previous signal handler is set.\n @param signum   Signal number to disable handling."]
+    pub fn ucs_debug_disable_signal(signum: ::std::os::raw::c_int);
+}
+extern "C" {
+    pub fn ucs_debug_asan_validate_address(
+        ptr_name: *const ::std::os::raw::c_char,
+        address: *mut ::std::os::raw::c_void,
+        size: usize,
+    );
+}
+#[doc = " A link in a circular list."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucs_list_link {
@@ -1449,60 +1570,38 @@ fn bindgen_test_layout_ucs_list_link() {
         )
     );
 }
+#[doc = " A link in a circular list."]
 pub type ucs_list_link_t = ucs_list_link;
+#[doc = " A queue of callback to execute"]
 pub type ucs_callbackq_t = ucs_callbackq;
+#[doc = " Callback queue element."]
 pub type ucs_callbackq_elem_t = ucs_callbackq_elem;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ucs_callbackq_priv {
+    _unused: [u8; 0],
+}
+pub type ucs_callbackq_priv_t = ucs_callbackq_priv;
+pub type ucs_callbackq_key_t = *mut ::std::os::raw::c_void;
+#[doc = " Callback which can be placed in a queue.\n\n @param [in] arg  User-defined argument for the callback.\n\n @return Count of how much \"work\" was done by the callback. For example, zero\n         means that no work was done, and any nonzero value means that something\n         was done."]
 pub type ucs_callback_t = ::std::option::Option<
     unsafe extern "C" fn(arg: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_uint,
 >;
+#[doc = " Callback queue element predicate.\n\n @param [in] elem  Callback queue element to check.\n @param [in] arg   User-defined argument.\n\n @return Predicate result value - nonzero means \"true\", zero means \"false\"."]
 pub type ucs_callbackq_predicate_t = ::std::option::Option<
     unsafe extern "C" fn(
         elem: *const ucs_callbackq_elem_t,
         arg: *mut ::std::os::raw::c_void,
     ) -> ::std::os::raw::c_int,
 >;
-impl ucs_callbackq_flags {
-    pub const UCS_CALLBACKQ_FLAG_FAST: ucs_callbackq_flags = ucs_callbackq_flags(1);
-}
-impl ucs_callbackq_flags {
-    pub const UCS_CALLBACKQ_FLAG_ONESHOT: ucs_callbackq_flags = ucs_callbackq_flags(2);
-}
-impl ::std::ops::BitOr<ucs_callbackq_flags> for ucs_callbackq_flags {
-    type Output = Self;
-    #[inline]
-    fn bitor(self, other: Self) -> Self {
-        ucs_callbackq_flags(self.0 | other.0)
-    }
-}
-impl ::std::ops::BitOrAssign for ucs_callbackq_flags {
-    #[inline]
-    fn bitor_assign(&mut self, rhs: ucs_callbackq_flags) {
-        self.0 |= rhs.0;
-    }
-}
-impl ::std::ops::BitAnd<ucs_callbackq_flags> for ucs_callbackq_flags {
-    type Output = Self;
-    #[inline]
-    fn bitand(self, other: Self) -> Self {
-        ucs_callbackq_flags(self.0 & other.0)
-    }
-}
-impl ::std::ops::BitAndAssign for ucs_callbackq_flags {
-    #[inline]
-    fn bitand_assign(&mut self, rhs: ucs_callbackq_flags) {
-        self.0 &= rhs.0;
-    }
-}
-#[repr(transparent)]
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
-pub struct ucs_callbackq_flags(pub ::std::os::raw::c_uint);
+#[doc = " Callback queue element."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucs_callbackq_elem {
+    #[doc = "< Callback function"]
     pub cb: ucs_callback_t,
+    #[doc = "< Function argument"]
     pub arg: *mut ::std::os::raw::c_void,
-    pub flags: ::std::os::raw::c_uint,
-    pub id: ::std::os::raw::c_int,
 }
 #[test]
 fn bindgen_test_layout_ucs_callbackq_elem() {
@@ -1510,7 +1609,7 @@ fn bindgen_test_layout_ucs_callbackq_elem() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::std::mem::size_of::<ucs_callbackq_elem>(),
-        24usize,
+        16usize,
         concat!("Size of: ", stringify!(ucs_callbackq_elem))
     );
     assert_eq!(
@@ -1538,32 +1637,15 @@ fn bindgen_test_layout_ucs_callbackq_elem() {
             stringify!(arg)
         )
     );
-    assert_eq!(
-        unsafe { ::std::ptr::addr_of!((*ptr).flags) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(ucs_callbackq_elem),
-            "::",
-            stringify!(flags)
-        )
-    );
-    assert_eq!(
-        unsafe { ::std::ptr::addr_of!((*ptr).id) as usize - ptr as usize },
-        20usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(ucs_callbackq_elem),
-            "::",
-            stringify!(id)
-        )
-    );
 }
+#[doc = " A queue of callback to execute"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucs_callbackq {
+    #[doc = " Array of fast-path element, the last is reserved as a sentinel to mark\n array end."]
     pub fast_elems: [ucs_callbackq_elem_t; 8usize],
-    pub priv_: [::std::os::raw::c_char; 72usize],
+    #[doc = " Private data, which we don't want to expose in API to avoid pulling\n more header files"]
+    pub priv_: *mut ucs_callbackq_priv_t,
 }
 #[test]
 fn bindgen_test_layout_ucs_callbackq() {
@@ -1571,7 +1653,7 @@ fn bindgen_test_layout_ucs_callbackq() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::std::mem::size_of::<ucs_callbackq>(),
-        264usize,
+        136usize,
         concat!("Size of: ", stringify!(ucs_callbackq))
     );
     assert_eq!(
@@ -1591,7 +1673,7 @@ fn bindgen_test_layout_ucs_callbackq() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).priv_) as usize - ptr as usize },
-        192usize,
+        128usize,
         concat!(
             "Offset of field: ",
             stringify!(ucs_callbackq),
@@ -1601,40 +1683,62 @@ fn bindgen_test_layout_ucs_callbackq() {
     );
 }
 extern "C" {
+    #[doc = " Initialize the callback queue.\n\n @param  [in] cbq      Callback queue to initialize."]
     pub fn ucs_callbackq_init(cbq: *mut ucs_callbackq_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Clean up the callback queue and release associated memory.\n\n @param  [in] cbq      Callback queue to clean up."]
     pub fn ucs_callbackq_cleanup(cbq: *mut ucs_callbackq_t);
 }
 extern "C" {
+    #[doc = " Add a callback to the queue.\n This is *not* safe to call while another thread might be dispatching callbacks.\n However, it can be used from the dispatch context (e.g a callback may use this\n function to add another callback).\n\n @param  [in] cbq      Callback queue to add the callback to.\n @param  [in] cb       Callback to add.\n @param  [in] arg      User-defined argument for the callback.\n\n @return Unique identifier of the callback in the queue."]
     pub fn ucs_callbackq_add(
         cbq: *mut ucs_callbackq_t,
         cb: ucs_callback_t,
         arg: *mut ::std::os::raw::c_void,
-        flags: ::std::os::raw::c_uint,
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
-    pub fn ucs_callbackq_remove(cbq: *mut ucs_callbackq_t, id: ::std::os::raw::c_int);
+    #[doc = " Remove a callback from the queue immediately.\n This is *not* safe to call while another thread might be dispatching callbacks.\n However, it can be used from the dispatch context (e.g a callback may use this\n function to remove itself or another callback). In this case, the callback may\n still be dispatched once after this function returned.\n\n @param  [in] cbq      Callback queue to remove the callback from.\n @param  [in] id       Callback identifier to remove.\n\n @return The user-defined argument provided when the callback was added."]
+    pub fn ucs_callbackq_remove(
+        cbq: *mut ucs_callbackq_t,
+        id: ::std::os::raw::c_int,
+    ) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
+    #[doc = " Add a callback to the queue.\n This can be used from any context and any thread, including but not limited to:\n - A callback can add another callback.\n - A thread can add a callback while another thread is dispatching callbacks.\n\n @param  [in] cbq      Callback queue to add the callback to.\n @param  [in] cb       Callback to add.\n @param  [in] arg      User-defined argument for the callback.\n\n @return Unique identifier of the callback in the queue."]
     pub fn ucs_callbackq_add_safe(
         cbq: *mut ucs_callbackq_t,
         cb: ucs_callback_t,
         arg: *mut ::std::os::raw::c_void,
-        flags: ::std::os::raw::c_uint,
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
-    pub fn ucs_callbackq_remove_safe(cbq: *mut ucs_callbackq_t, id: ::std::os::raw::c_int);
+    #[doc = " Remove a callback from the queue in a safe but lazy fashion. The callback will\n be removed at some point in the near future.\n This can be used from any context and any thread, including but not limited to:\n - A callback can remove another callback or itself.\n - A thread can't remove a callback while another thread is dispatching callbacks.\n\n @param  [in] cbq      Callback queue to remove the callback from.\n @param  [in] id       Callback identifier to remove.\n\n @return The user-defined argument provided when the callback was added."]
+    pub fn ucs_callbackq_remove_safe(
+        cbq: *mut ucs_callbackq_t,
+        id: ::std::os::raw::c_int,
+    ) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
-    pub fn ucs_callbackq_remove_if(
+    #[doc = " Add a slowpath oneshot callback to the queue.\n This can be used from any context and any thread.\n\n @note Callbacks with the same key will be called in the same order they were\n added. On the other hand, callbacks with different keys can be called in any\n order.\n\n @param  [in] cbq      Callback queue to add the callback to.\n @param  [in] key      User-defind key, used to remove the callback later.\n @param  [in] cb       Callback to add.\n @param  [in] arg      User-defined argument for the callback."]
+    pub fn ucs_callbackq_add_oneshot(
         cbq: *mut ucs_callbackq_t,
+        key: ucs_callbackq_key_t,
+        cb: ucs_callback_t,
+        arg: *mut ::std::os::raw::c_void,
+    );
+}
+extern "C" {
+    #[doc = " Remove all slowpath callbacks from the queue with the given key and for which\n the given predicate returns \"true\" (nonzero) value.\n This can be used from any context and any thread.\n\n @param  [in] cbq       Callback queue.\n @param  [in] key       Callback key to remove.\n @param  [in] pred      Predicate to check candidates for removal.\n @param  [in] arg       User-defined argument for the predicate."]
+    pub fn ucs_callbackq_remove_oneshot(
+        cbq: *mut ucs_callbackq_t,
+        key: ucs_callbackq_key_t,
         pred: ucs_callbackq_predicate_t,
         arg: *mut ::std::os::raw::c_void,
     );
 }
+#[doc = " @file tl.h"]
 pub type uct_ep_put_short_func_t = ::std::option::Option<
     unsafe extern "C" fn(
         ep: uct_ep_h,
@@ -1961,6 +2065,7 @@ pub type uct_iface_is_reachable_func_t = ::std::option::Option<
         iface_addr: *const uct_iface_addr_t,
     ) -> ::std::os::raw::c_int,
 >;
+#[doc = " Transport interface operations.\n Every operation exposed in the API must appear in the table below, to allow\n creating interface/endpoint with custom operations."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_ops {
@@ -2530,7 +2635,9 @@ fn bindgen_test_layout_uct_iface_ops() {
         )
     );
 }
+#[doc = " Transport interface operations.\n Every operation exposed in the API must appear in the table below, to allow\n creating interface/endpoint with custom operations."]
 pub type uct_iface_ops_t = uct_iface_ops;
+#[doc = "  A progress engine and a domain for allocating communication resources.\n  Different workers are progressed independently."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_worker {
@@ -2542,7 +2649,7 @@ fn bindgen_test_layout_uct_worker() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::std::mem::size_of::<uct_worker>(),
-        264usize,
+        136usize,
         concat!("Size of: ", stringify!(uct_worker))
     );
     assert_eq!(
@@ -2561,7 +2668,9 @@ fn bindgen_test_layout_uct_worker() {
         )
     );
 }
+#[doc = "  A progress engine and a domain for allocating communication resources.\n  Different workers are progressed independently."]
 pub type uct_worker_t = uct_worker;
+#[doc = " Communication interface context"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface {
@@ -2592,7 +2701,9 @@ fn bindgen_test_layout_uct_iface() {
         )
     );
 }
+#[doc = " Communication interface context"]
 pub type uct_iface_t = uct_iface;
+#[doc = " Remote endpoint"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_ep {
@@ -2623,7 +2734,9 @@ fn bindgen_test_layout_uct_ep() {
         )
     );
 }
+#[doc = " Remote endpoint"]
 pub type uct_ep_t = uct_ep;
+#[doc = " Listener for incoming connections"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_listener {
@@ -2654,11 +2767,14 @@ fn bindgen_test_layout_uct_listener() {
         )
     );
 }
+#[doc = " Listener for incoming connections"]
 pub type uct_listener_t = uct_listener;
+#[doc = " Receive descriptor"]
 pub type uct_recv_desc_t = uct_recv_desc;
 pub type uct_desc_release_callback_t = ::std::option::Option<
     unsafe extern "C" fn(self_: *mut uct_recv_desc_t, desc: *mut ::std::os::raw::c_void),
 >;
+#[doc = " Receive descriptor"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_recv_desc {
@@ -2689,14 +2805,18 @@ fn bindgen_test_layout_uct_recv_desc() {
         )
     );
 }
+#[doc = " @ingroup UCS_RESOURCE\n\n UCS time units.\n These are not necessarily aligned with metric time units.\n MUST compare short time values with UCS_SHORT_TIME_CMP to handle wrap-around."]
 pub type ucs_time_t = ::std::os::raw::c_ulong;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucs_sys_event_set {
     _unused: [u8; 0],
 }
+#[doc = " ucs_sys_event_set_t structure used in ucs_event_set_XXX functions.\n"]
 pub type ucs_sys_event_set_t = ucs_sys_event_set;
+#[doc = " Bit set composed using the available event types"]
 pub type ucs_event_set_types_t = u8;
+#[doc = " ucs_event_set_handler call this handler for notifying event\n\n @param [in] callback_data  User data which set in ucs_event_set_add().\n @param [in] events         Detection event. Sets of ucs_event_set_types_t.\n @param [in] arg            User data which set in ucs_event_set_wait().\n"]
 pub type ucs_event_set_handler_t = ::std::option::Option<
     unsafe extern "C" fn(
         callback_data: *mut ::std::os::raw::c_void,
@@ -2705,6 +2825,7 @@ pub type ucs_event_set_handler_t = ::std::option::Option<
     ),
 >;
 #[repr(u32)]
+#[doc = " Event types that could be requested to notify"]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucs_event_set_type_t {
     UCS_EVENT_SET_EVREAD = 1,
@@ -2716,15 +2837,18 @@ extern "C" {
     pub static ucs_sys_event_set_max_wait_events: ::std::os::raw::c_uint;
 }
 extern "C" {
+    #[doc = " Allocate ucs_sys_event_set_t structure and assign provided file\n descriptor to wait for events on.\n\n @param [out] event_set_p  Event set pointer to initialize.\n @param [in]  event_fd     File descriptor to wait for events on.\n\n @return UCS_OK on success or an error code on failure."]
     pub fn ucs_event_set_create_from_fd(
         event_set_p: *mut *mut ucs_sys_event_set_t,
         event_fd: ::std::os::raw::c_int,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Allocate ucs_sys_event_set_t structure.\n\n @param [out] event_set_p  Event set pointer to initialize.\n\n @return UCS_OK on success or an error code on failure."]
     pub fn ucs_event_set_create(event_set_p: *mut *mut ucs_sys_event_set_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Register the target event.\n\n @param [in] event_set_p   Event set pointer to initialize.\n @param [in] fd            Register the target file descriptor fd.\n @param [in] events        Operation events.\n @param [in] callback_data ucs_event_set_handler_t accepts this data.\n\n @return UCS_OK on success or an error code on failure."]
     pub fn ucs_event_set_add(
         event_set: *mut ucs_sys_event_set_t,
         fd: ::std::os::raw::c_int,
@@ -2733,6 +2857,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Modify the target event.\n\n @param [in] event_set     Event set created by ucs_event_set_create.\n @param [in] fd            Register the target file descriptor fd.\n @param [in] events        Operation events.\n @param [in] callback_data ucs_event_set_handler_t accepts this data.\n\n @return UCS_OK on success or an error code on failure."]
     pub fn ucs_event_set_mod(
         event_set: *mut ucs_sys_event_set_t,
         fd: ::std::os::raw::c_int,
@@ -2741,12 +2866,14 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Remove the target event.\n\n @param [in] event_set    Event set created by ucs_event_set_create.\n @param [in] fd           Register the target file descriptor fd.\n\n @return UCS_OK on success or an error code on failure."]
     pub fn ucs_event_set_del(
         event_set: *mut ucs_sys_event_set_t,
         fd: ::std::os::raw::c_int,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Wait for an I/O events\n\n @param [in]     event_set          Event set created by ucs_event_set_create.\n @param [in/out] num_events         Number of expected/read events.\n @param [in]     timeout_ms         Timeout period in ms.\n @param [in]     event_set_handler  Callback functions.\n @param [in]     arg                User data variables.\n\n @return return UCS_OK on success, UCS_INPROGRESS - call was interrupted by a\n         signal handler, UCS_ERR_IO_ERROR - an error occurred during waiting\n         for I/O events."]
     pub fn ucs_event_set_wait(
         event_set: *mut ucs_sys_event_set_t,
         num_events: *mut ::std::os::raw::c_uint,
@@ -2756,9 +2883,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Cleanup event set\n\n @param [in] event_set    Event set created by ucs_event_set_create.\n"]
     pub fn ucs_event_set_cleanup(event_set: *mut ucs_sys_event_set_t);
 }
 extern "C" {
+    #[doc = " Get file descriptor for watching events.\n\n @param [in]  event_set    Event set created by ucs_event_set_create.\n @param [out] event_fd_p   File descriptor that is used by Event set to wait\n                           for events on.\n\n @return UCS_OK on success or an error code on failure."]
     pub fn ucs_event_set_fd_get(
         event_set: *mut ucs_sys_event_set_t,
         event_fd_p: *mut ::std::os::raw::c_int,
@@ -2770,6 +2899,7 @@ pub struct ucs_async_context {
     _unused: [u8; 0],
 }
 pub type ucs_async_context_t = ucs_async_context;
+#[doc = " @ingroup UCS_RESOURCE\n\n Async event callback.\n\n @param id           Event id (timer or file descriptor).\n @param events       The events that triggered the callback.\n @param arg          User-defined argument."]
 pub type ucs_async_event_cb_t = ::std::option::Option<
     unsafe extern "C" fn(
         id: ::std::os::raw::c_int,
@@ -2778,6 +2908,7 @@ pub type ucs_async_event_cb_t = ::std::option::Option<
     ),
 >;
 extern "C" {
+    #[doc = " @ingroup UCS_RESOURCE\n\n Register a file descriptor for monitoring (call handler upon events).\n Every fd can have only one handler.\n\n @param mode            Thread or signal.\n @param event_fd        File descriptor to set handler for.\n @param events          Events to wait on (UCS_EVENT_SET_EVxxx bits).\n @param cb              Callback function to execute.\n @param arg             Argument to callback.\n @param async           Async context to which events are delivered.\n                        If NULL, safety is up to the user.\n\n @return Error code as defined by @ref ucs_status_t."]
     pub fn ucs_async_set_event_handler(
         mode: ucs_async_mode_t,
         event_fd: ::std::os::raw::c_int,
@@ -2788,6 +2919,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCS_RESOURCE\n\n Add timer handler.\n\n @param mode            Thread or signal.\n @param interval        Timer interval.\n @param cb              Callback function to execute.\n @param arg             Argument to callback.\n @param async           Async context to which events are delivered.\n                        If NULL, safety is up to the user.\n @param timer_id_p      Filled with timer id.\n\n @return Error code as defined by @ref ucs_status_t."]
     pub fn ucs_async_add_timer(
         mode: ucs_async_mode_t,
         interval: ucs_time_t,
@@ -2798,29 +2930,73 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCS_RESOURCE\n\n Remove an event handler (Timer or event file).\n\n @param id        Timer/FD to remove.\n @param sync      If nonzero, wait until the handler for this event is not\n                  running anymore. If called from the context of the callback,\n                  the handler will be removed immediately after the current\n                  callback returns.\n\n @return Error code as defined by @ref ucs_status_t."]
     pub fn ucs_async_remove_handler(
         id: ::std::os::raw::c_int,
         sync: ::std::os::raw::c_int,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCS_RESOURCE\n\n Modify events mask for an existing event handler (event file).\n\n @param fd        File descriptor modify events for.\n @param events    New set of events to wait on (UCS_EVENT_SET_EVxxx bits).\n\n @return Error code as defined by @ref ucs_status_t."]
     pub fn ucs_async_modify_handler(
         fd: ::std::os::raw::c_int,
         events: ucs_event_set_types_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCS_RESOURCE\n @brief Create an asynchronous execution context\n\n Allocate and initialize an asynchronous execution context.\n This can be used to ensure safe event delivery.\n\n @param mode            Indicates whether to use signals or polling threads\n                        for waiting.\n @param async_p         Event context pointer to initialize.\n\n @return Error code as defined by @ref ucs_status_t."]
     pub fn ucs_async_context_create(
         mode: ucs_async_mode_t,
         async_p: *mut *mut ucs_async_context_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCS_RESOURCE\n @brief Destroy the asynchronous execution context\n\n Clean up the async context, and release system resources if possible.\n The context memory released.\n\n @param async           Asynchronous context to clean up."]
     pub fn ucs_async_context_destroy(async_: *mut ucs_async_context_t);
 }
 extern "C" {
+    #[doc = " @ingroup UCS_RESOURCE\n\n Poll on async context.\n\n @param async Async context to poll on. NULL polls on all."]
     pub fn ucs_async_poll(async_: *mut ucs_async_context_t);
 }
+impl ucs_callbackq_flags {
+    #[doc = "< Fast-path (best effort)"]
+    pub const UCS_CALLBACKQ_FLAG_FAST: ucs_callbackq_flags = ucs_callbackq_flags(1);
+}
+impl ucs_callbackq_flags {
+    #[doc = "< Call the callback only once\n(cannot be used with FAST)"]
+    pub const UCS_CALLBACKQ_FLAG_ONESHOT: ucs_callbackq_flags = ucs_callbackq_flags(2);
+}
+impl ::std::ops::BitOr<ucs_callbackq_flags> for ucs_callbackq_flags {
+    type Output = Self;
+    #[inline]
+    fn bitor(self, other: Self) -> Self {
+        ucs_callbackq_flags(self.0 | other.0)
+    }
+}
+impl ::std::ops::BitOrAssign for ucs_callbackq_flags {
+    #[inline]
+    fn bitor_assign(&mut self, rhs: ucs_callbackq_flags) {
+        self.0 |= rhs.0;
+    }
+}
+impl ::std::ops::BitAnd<ucs_callbackq_flags> for ucs_callbackq_flags {
+    type Output = Self;
+    #[inline]
+    fn bitand(self, other: Self) -> Self {
+        ucs_callbackq_flags(self.0 & other.0)
+    }
+}
+impl ::std::ops::BitAndAssign for ucs_callbackq_flags {
+    #[inline]
+    fn bitand_assign(&mut self, rhs: ucs_callbackq_flags) {
+        self.0 &= rhs.0;
+    }
+}
+#[repr(transparent)]
+#[doc = " @ingroup UCS_RESOURCE\n Callback backward compatibility flags"]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct ucs_callbackq_flags(pub ::std::os::raw::c_uint);
+#[doc = " A 1d linear function, represented as f(x) = c + x * m."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucs_linear_func_t {
@@ -2866,27 +3042,48 @@ impl ucs_memory_type {
     pub const UCS_MEMORY_TYPE_UNKNOWN: ucs_memory_type = ucs_memory_type::UCS_MEMORY_TYPE_LAST;
 }
 #[repr(u32)]
+#[doc = " @ingroup UCS_RESOURCE\n @brief Memory types\n\n List of supported memory types."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucs_memory_type {
+    #[doc = "< Default system memory"]
     UCS_MEMORY_TYPE_HOST = 0,
+    #[doc = "< NVIDIA CUDA memory"]
     UCS_MEMORY_TYPE_CUDA = 1,
+    #[doc = "< NVIDIA CUDA managed (or unified) memory"]
     UCS_MEMORY_TYPE_CUDA_MANAGED = 2,
+    #[doc = "< AMD ROCM memory"]
     UCS_MEMORY_TYPE_ROCM = 3,
+    #[doc = "< AMD ROCM managed system memory"]
     UCS_MEMORY_TYPE_ROCM_MANAGED = 4,
-    UCS_MEMORY_TYPE_LAST = 5,
+    #[doc = "< RDMA device memory"]
+    UCS_MEMORY_TYPE_RDMA = 5,
+    #[doc = "< Intel ZE memory (USM host)"]
+    UCS_MEMORY_TYPE_ZE_HOST = 6,
+    #[doc = "< Intel ZE memory (USM device)"]
+    UCS_MEMORY_TYPE_ZE_DEVICE = 7,
+    #[doc = "< Intel ZE managed memory (USM shared)"]
+    UCS_MEMORY_TYPE_ZE_MANAGED = 8,
+    UCS_MEMORY_TYPE_LAST = 9,
 }
+#[doc = " @ingroup UCS_RESOURCE\n @brief Memory types\n\n List of supported memory types."]
 pub use self::ucs_memory_type as ucs_memory_type_t;
 extern "C" {
+    #[doc = " Array of string names for each memory type"]
     pub static mut ucs_memory_type_names: [*const ::std::os::raw::c_char; 0usize];
 }
 extern "C" {
+    #[doc = " Array of string descriptions for each memory type"]
     pub static mut ucs_memory_type_descs: [*const ::std::os::raw::c_char; 0usize];
 }
 #[repr(u32)]
+#[doc = " @ingroup UCS_RESOURCE\n @brief Thread sharing mode\n\n Specifies thread sharing mode of an object."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucs_thread_mode_t {
+    #[doc = "< Only the master thread can access (i.e. the thread that initialized the context; multiple threads may exist and never access)"]
     UCS_THREAD_MODE_SINGLE = 0,
+    #[doc = "< Multiple threads can access, but only one at a time"]
     UCS_THREAD_MODE_SERIALIZED = 1,
+    #[doc = "< Multiple threads can access concurrently"]
     UCS_THREAD_MODE_MULTI = 2,
     UCS_THREAD_MODE_LAST = 3,
 }
@@ -2924,6 +3121,7 @@ fn bindgen_test_layout_ucs_cpu_set_t() {
         )
     );
 }
+#[doc = " @file stats_fwd.h"]
 pub type ucs_stats_counter_t = u64;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -2956,6 +3154,38 @@ extern "C" {
 }
 extern "C" {
     pub fn ucs_stats_get_root() -> *mut ucs_stats_node_t;
+}
+pub type ucs_numa_distance_t = ::std::os::raw::c_int;
+pub type ucs_numa_node_t = i16;
+extern "C" {
+    pub static mut ucs_numa_policy_names: [*const ::std::os::raw::c_char; 0usize];
+}
+extern "C" {
+    pub fn ucs_numa_init();
+}
+extern "C" {
+    pub fn ucs_numa_cleanup();
+}
+extern "C" {
+    #[doc = " @return The number of CPU cores in the system."]
+    pub fn ucs_numa_num_configured_cpus() -> ::std::os::raw::c_uint;
+}
+extern "C" {
+    #[doc = " @return The number of memory nodes in the system."]
+    pub fn ucs_numa_num_configured_nodes() -> ::std::os::raw::c_uint;
+}
+extern "C" {
+    #[doc = " @param [in]  cpu CPU to query.\n\n @return The NUMA node that the cpu belongs to."]
+    pub fn ucs_numa_node_of_cpu(cpu: ::std::os::raw::c_int) -> ucs_numa_node_t;
+}
+extern "C" {
+    #[doc = " @param [in]  dev_path sysfs path of the device.\n\n @return The node that the device belongs to."]
+    pub fn ucs_numa_node_of_device(dev_path: *const ::std::os::raw::c_char) -> ucs_numa_node_t;
+}
+extern "C" {
+    #[doc = " Reports the distance between two nodes according to the machine topology.\n\n @param [in]  node1 first NUMA node.\n @param [in]  node2 second NUMA node.\n\n @return NUMA distance between the two NUMA nodes."]
+    pub fn ucs_numa_distance(node1: ucs_numa_node_t, node2: ucs_numa_node_t)
+        -> ucs_numa_distance_t;
 }
 pub type FILE = _IO_FILE;
 #[repr(C)]
@@ -3376,11 +3606,14 @@ fn bindgen_test_layout_ucs_sys_bus_id() {
     );
 }
 pub type ucs_sys_bus_id_t = ucs_sys_bus_id;
+#[doc = " @ingroup UCS_RESOURCE\n System Device Index\n Obtained from a translation of the device bus id into a short integer\n Refer ucs_topo_find_device_by_bus_id()"]
 pub type ucs_sys_device_t = u8;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucs_sys_dev_distance {
+    #[doc = "< in seconds"]
     pub latency: f64,
+    #[doc = "< in bytes/second"]
     pub bandwidth: f64,
 }
 #[test]
@@ -3429,75 +3662,25 @@ pub type ucs_topo_get_distance_func_t = ::std::option::Option<
         distance: *mut ucs_sys_dev_distance_t,
     ) -> ucs_status_t,
 >;
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct ucs_sys_topo_method_t {
-    pub name: *const ::std::os::raw::c_char,
-    pub get_distance: ucs_topo_get_distance_func_t,
-    pub list: ucs_list_link_t,
-}
-#[test]
-fn bindgen_test_layout_ucs_sys_topo_method_t() {
-    const UNINIT: ::std::mem::MaybeUninit<ucs_sys_topo_method_t> =
-        ::std::mem::MaybeUninit::uninit();
-    let ptr = UNINIT.as_ptr();
-    assert_eq!(
-        ::std::mem::size_of::<ucs_sys_topo_method_t>(),
-        32usize,
-        concat!("Size of: ", stringify!(ucs_sys_topo_method_t))
-    );
-    assert_eq!(
-        ::std::mem::align_of::<ucs_sys_topo_method_t>(),
-        8usize,
-        concat!("Alignment of ", stringify!(ucs_sys_topo_method_t))
-    );
-    assert_eq!(
-        unsafe { ::std::ptr::addr_of!((*ptr).name) as usize - ptr as usize },
-        0usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(ucs_sys_topo_method_t),
-            "::",
-            stringify!(name)
-        )
-    );
-    assert_eq!(
-        unsafe { ::std::ptr::addr_of!((*ptr).get_distance) as usize - ptr as usize },
-        8usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(ucs_sys_topo_method_t),
-            "::",
-            stringify!(get_distance)
-        )
-    );
-    assert_eq!(
-        unsafe { ::std::ptr::addr_of!((*ptr).list) as usize - ptr as usize },
-        16usize,
-        concat!(
-            "Offset of field: ",
-            stringify!(ucs_sys_topo_method_t),
-            "::",
-            stringify!(list)
-        )
-    );
+extern "C" {
+    pub static mut ucs_sys_topo_providers_list: ucs_list_link_t;
 }
 extern "C" {
-    pub static mut ucs_sys_topo_methods_list: ucs_list_link_t;
-}
-extern "C" {
+    #[doc = " Find system device by pci bus id.\n\n @param [in]  bus_id  pointer to bus id of the device of interest.\n @param [out] sys_dev system device index associated with the bus_id.\n\n @return UCS_OK or error in case device cannot be found."]
     pub fn ucs_topo_find_device_by_bus_id(
         bus_id: *const ucs_sys_bus_id_t,
         sys_dev: *mut ucs_sys_device_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Find pci bus id of the given system device.\n\n @param [in]  sys_dev system device index.\n @param [out] bus_id  pointer to bus id to be populated.\n\n @return UCS_OK or error in case system device or its bus id cannot be found."]
     pub fn ucs_topo_get_device_bus_id(
         sys_dev: ucs_sys_device_t,
         bus_id: *mut ucs_sys_bus_id_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Find the distance between two system devices (in terms of latency,\n bandwidth, hops, etc).\n\n @param [in]  device1   System device index of the first device.\n @param [in]  device2   System device index of the second device.\n @param [out] distance  Result populated with distance details between the two\n                        devices.\n\n @return UCS_OK or error in case distance cannot be determined."]
     pub fn ucs_topo_get_distance(
         device1: ucs_sys_device_t,
         device2: ucs_sys_device_t,
@@ -3505,6 +3688,14 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Find the memory distance of the device according to process affinity.\n\n @param [in]  device   System device index.\n @param [out] distance Result populated with the device memory distance.\n"]
+    pub fn ucs_topo_get_memory_distance(
+        device: ucs_sys_device_t,
+        distance: *mut ucs_sys_dev_distance_t,
+    );
+}
+extern "C" {
+    #[doc = " Convert the distance to a human-readable string.\n\n @param [in]  distance   Distance between two devices.\n @param [out] buffer     String buffer to fill with distance string.\n @param [in]  max        Maximal size of the string buffer.\n\n @return Pointer to the distance string."]
     pub fn ucs_topo_distance_str(
         distance: *const ucs_sys_dev_distance_t,
         buffer: *mut ::std::os::raw::c_char,
@@ -3512,6 +3703,7 @@ extern "C" {
     ) -> *const ::std::os::raw::c_char;
 }
 extern "C" {
+    #[doc = " Gets a system device. If the device doesn't exist, it will be added.\n\n @param [in]  dev_name       Device Name.\n @param [in]  sysfs_path     sysfs path for the required device.\n @param [in]  name_priority  Indicates whether to override device name\n                             if it already exists.\n\n @return A topo module identifier for the device."]
     pub fn ucs_topo_get_sysfs_dev(
         dev_name: *const ::std::os::raw::c_char,
         sysfs_path: *const ::std::os::raw::c_char,
@@ -3519,6 +3711,7 @@ extern "C" {
     ) -> ucs_sys_device_t;
 }
 extern "C" {
+    #[doc = " Return system device name in BDF format: \"<domain>:<bus>:<device>.<function>\".\n\n @param [in]  sys_dev  System device id, as returned from\n                       @ref ucs_topo_find_device_by_bus_id.\n @param [out] buffer   String buffer, filled the device name.\n @param [in]  max      Maximal size of @a buffer."]
     pub fn ucs_topo_sys_device_bdf_name(
         sys_dev: ucs_sys_device_t,
         buffer: *mut ::std::os::raw::c_char,
@@ -3526,12 +3719,14 @@ extern "C" {
     ) -> *const ::std::os::raw::c_char;
 }
 extern "C" {
+    #[doc = " Find a system device by its BDF name: \"[<domain>:]<bus>:<device>.<function>\".\n\n @param [in]  name     BDF name to search for.\n @param [out] sys_dev  Filled with system device id, if found.\n\n @return UCS_OK if the device was found, error otherwise."]
     pub fn ucs_topo_find_device_by_bdf_name(
         name: *const ::std::os::raw::c_char,
         sys_dev: *mut ucs_sys_device_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Sets a name for a given system device. If the name exists, it will be replaced\n only if @ref priority is higher then current device name priority.\n\n @param [in]  sys_dev  System device to set the name for.\n @param [in]  name     Name to set for this system device. Note: the name can\n                       be released after this call.\n @param [in]  priority Determine whether device name will be overridden,\n                       in case it already exists.\n\n @return UCS_OK if the name was set, error otherwise."]
     pub fn ucs_topo_sys_device_set_name(
         sys_dev: ucs_sys_device_t,
         name: *const ::std::os::raw::c_char,
@@ -3539,30 +3734,49 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " Calculates and returns a specific PCIe device BW.\n\n @param dev_name   Device name of the underlying sysfs_path (eg. 'ib0').\n @param sysfs_path Path to the device system folder.\n\n @return BW of the PCIe device on success, or MAX_DBL on failure."]
     pub fn ucs_topo_get_pci_bw(
         dev_name: *const ::std::os::raw::c_char,
         sysfs_path: *const ::std::os::raw::c_char,
     ) -> f64;
 }
 extern "C" {
+    #[doc = " Returns sysfs path of a given device. for example:\n input:  '/sys/class/infiniband/mlx5_1'\n output: '/sys/devices/pci0000:80/0000:80:01.1/0000:83:00.0'\n\n @param [in]  dev_path    Device file path.\n @param [out] path_buffer Filled with the result path.\n\n @return Pointer to sysfs path or NULL on error."]
+    pub fn ucs_topo_resolve_sysfs_path(
+        dev_path: *const ::std::os::raw::c_char,
+        path_buffer: *mut ::std::os::raw::c_char,
+    ) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+    #[doc = " Get the name of a given system device. If the name was never set, it defaults\n to the BDF representation of the system device bus id.\n\n @param [in]  sys_dev System device's name to get.\n\n @return The name of the system device, or NULL if the system device is\n         invalid."]
     pub fn ucs_topo_sys_device_get_name(sys_dev: ucs_sys_device_t)
         -> *const ::std::os::raw::c_char;
 }
 extern "C" {
+    #[doc = " Get the closest NUMA node for a given system device.\n\n @param [in] sys_dev input system device.\n\n @return The number of NUMA node closest to given device."]
+    pub fn ucs_topo_sys_device_get_numa_node(sys_dev: ucs_sys_device_t) -> ucs_numa_node_t;
+}
+extern "C" {
+    #[doc = " Get the number of registered system devices.\n\n @return Number of system devices."]
     pub fn ucs_topo_num_devices() -> ::std::os::raw::c_uint;
 }
 extern "C" {
+    #[doc = " Print a map indicating the topology information between system devices\n discovered."]
     pub fn ucs_topo_print_info(stream: *mut FILE);
 }
 extern "C" {
+    #[doc = " Initialize UCS topology subsystem."]
     pub fn ucs_topo_init();
 }
 extern "C" {
+    #[doc = " Cleanup UCS topology subsystem."]
     pub fn ucs_topo_cleanup();
 }
+#[doc = " @ingroup UCT_RESOURCE\n @brief Memory domain resource descriptor.\n\n This structure describes a memory domain resource."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_md_resource_desc {
+    #[doc = "< Memory domain name"]
     pub md_name: [::std::os::raw::c_char; 16usize],
 }
 #[test]
@@ -3590,19 +3804,24 @@ fn bindgen_test_layout_uct_md_resource_desc() {
         )
     );
 }
+#[doc = " @ingroup UCT_RESOURCE\n @brief Memory domain resource descriptor.\n\n This structure describes a memory domain resource."]
 pub type uct_md_resource_desc_t = uct_md_resource_desc;
 impl uct_component_attr_field {
+    #[doc = "< Component name"]
     pub const UCT_COMPONENT_ATTR_FIELD_NAME: uct_component_attr_field = uct_component_attr_field(1);
 }
 impl uct_component_attr_field {
+    #[doc = "< MD resource count"]
     pub const UCT_COMPONENT_ATTR_FIELD_MD_RESOURCE_COUNT: uct_component_attr_field =
         uct_component_attr_field(2);
 }
 impl uct_component_attr_field {
+    #[doc = "< MD resources array"]
     pub const UCT_COMPONENT_ATTR_FIELD_MD_RESOURCES: uct_component_attr_field =
         uct_component_attr_field(4);
 }
 impl uct_component_attr_field {
+    #[doc = "< Capability flags"]
     pub const UCT_COMPONENT_ATTR_FIELD_FLAGS: uct_component_attr_field =
         uct_component_attr_field(8);
 }
@@ -3633,15 +3852,22 @@ impl ::std::ops::BitAndAssign for uct_component_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief UCT component attributes field mask\n\n The enumeration allows specifying which fields in @ref uct_component_attr_t\n are present. It is used for backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_component_attr_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCT_RESOURCE\n @brief UCT component attributes\n\n This structure defines the attributes for UCT component. It is used for\n @ref uct_component_query"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_component_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_component_attr_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Component name"]
     pub name: [::std::os::raw::c_char; 16usize],
+    #[doc = " Number of memory-domain resources"]
     pub md_resource_count: ::std::os::raw::c_uint,
+    #[doc = " Array of memory domain resources. When used, it should be initialized\n prior to calling @ref uct_component_query with a pointer to an array,\n which is large enough to hold all memory domain resource entries. After\n the call, this array will be filled with information about existing\n memory domain resources.\n In order to allocate this array, you can call @ref uct_component_query\n twice: The first time would only obtain the amount of entries required,\n by specifying @ref UCT_COMPONENT_ATTR_FIELD_MD_RESOURCE_COUNT in\n field_mask. Then the array could be allocated with the returned number of\n entries, and passed to a second call to @ref uct_component_query, this\n time setting field_mask to @ref UCT_COMPONENT_ATTR_FIELD_MD_RESOURCES."]
     pub md_resources: *mut uct_md_resource_desc_t,
+    #[doc = " Flags as defined by UCT_COMPONENT_FLAG_xx."]
     pub flags: u64,
 }
 #[test]
@@ -3709,30 +3935,44 @@ fn bindgen_test_layout_uct_component_attr() {
         )
     );
 }
+#[doc = " @ingroup UCT_RESOURCE\n @brief UCT component attributes\n\n This structure defines the attributes for UCT component. It is used for\n @ref uct_component_query"]
 pub type uct_component_attr_t = uct_component_attr;
 pub const UCT_COMPONENT_FLAG_CM: _bindgen_ty_5 = _bindgen_ty_5::UCT_COMPONENT_FLAG_CM;
 pub const UCT_COMPONENT_FLAG_RKEY_PTR: _bindgen_ty_5 = _bindgen_ty_5::UCT_COMPONENT_FLAG_RKEY_PTR;
 #[repr(u32)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief Capability flags of @ref uct_component_h.\n\n The enumeration defines bit mask of @ref uct_component_h capabilities in\n @ref uct_component_attr_t::flags which is set by @ref uct_component_query."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum _bindgen_ty_5 {
+    #[doc = " If set, the component supports @ref uct_cm_h functionality.\n See @ref uct_cm_open for details."]
     UCT_COMPONENT_FLAG_CM = 1,
+    #[doc = " If set, the component supports direct access to remote memory using a\n local pointer returned from @ref uct_rkey_ptr function."]
     UCT_COMPONENT_FLAG_RKEY_PTR = 2,
 }
 #[repr(u32)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief  List of UCX device types."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_device_type_t {
+    #[doc = "< Network devices"]
     UCT_DEVICE_TYPE_NET = 0,
+    #[doc = "< Shared memory devices"]
     UCT_DEVICE_TYPE_SHM = 1,
+    #[doc = "< Acceleration devices"]
     UCT_DEVICE_TYPE_ACC = 2,
+    #[doc = "< Loop-back device"]
     UCT_DEVICE_TYPE_SELF = 3,
     UCT_DEVICE_TYPE_LAST = 4,
 }
+#[doc = " @ingroup UCT_RESOURCE\n @brief Communication resource descriptor.\n\n Resource descriptor is an object representing the network resource.\n Resource descriptor could represent a stand-alone communication resource\n such as an HCA port, network interface, or multiple resources such as\n multiple network interfaces or communication ports. It could also represent\n virtual communication resources that are defined over a single physical\n network interface."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_tl_resource_desc {
+    #[doc = "< Transport name"]
     pub tl_name: [::std::os::raw::c_char; 10usize],
+    #[doc = "< Hardware device name"]
     pub dev_name: [::std::os::raw::c_char; 32usize],
+    #[doc = "< The device represented by this resource\n(e.g. UCT_DEVICE_TYPE_NET for a network interface)"]
     pub dev_type: uct_device_type_t,
+    #[doc = "< The identifier associated with the device\nbus_id as captured in ucs_sys_bus_id_t struct"]
     pub sys_device: ucs_sys_device_t,
 }
 #[test]
@@ -3790,47 +4030,69 @@ fn bindgen_test_layout_uct_tl_resource_desc() {
         )
     );
 }
+#[doc = " @ingroup UCT_RESOURCE\n @brief Communication resource descriptor.\n\n Resource descriptor is an object representing the network resource.\n Resource descriptor could represent a stand-alone communication resource\n such as an HCA port, network interface, or multiple resources such as\n multiple network interfaces or communication ports. It could also represent\n virtual communication resources that are defined over a single physical\n network interface."]
 pub type uct_tl_resource_desc_t = uct_tl_resource_desc;
 #[repr(u32)]
+#[doc = " @brief Atomic operation requested for uct_ep_atomic32_post, uct_ep_atomic64_post,\n uct_ep_atomic32_fetch and uct_ep_atomic64_fetch.\n\n This enumeration defines which atomic memory operation should be\n performed by the uct_ep_atomic family of functions."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_atomic_op {
+    #[doc = "< Atomic add"]
     UCT_ATOMIC_OP_ADD = 0,
+    #[doc = "< Atomic and"]
     UCT_ATOMIC_OP_AND = 1,
+    #[doc = "< Atomic or"]
     UCT_ATOMIC_OP_OR = 2,
+    #[doc = "< Atomic xor"]
     UCT_ATOMIC_OP_XOR = 3,
+    #[doc = "< Atomic swap"]
     UCT_ATOMIC_OP_SWAP = 4,
+    #[doc = "< Atomic compare-and-swap"]
     UCT_ATOMIC_OP_CSWAP = 5,
     UCT_ATOMIC_OP_LAST = 6,
 }
+#[doc = " @brief Atomic operation requested for uct_ep_atomic32_post, uct_ep_atomic64_post,\n uct_ep_atomic32_fetch and uct_ep_atomic64_fetch.\n\n This enumeration defines which atomic memory operation should be\n performed by the uct_ep_atomic family of functions."]
 pub use self::uct_atomic_op as uct_atomic_op_t;
 impl uct_alloc_method_t {
     pub const UCT_ALLOC_METHOD_DEFAULT: uct_alloc_method_t =
         uct_alloc_method_t::UCT_ALLOC_METHOD_LAST;
 }
 #[repr(u32)]
+#[doc = " @ingroup UCT_CONTEXT\n @brief  Memory allocation methods."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_alloc_method_t {
+    #[doc = "< Allocate from OS using libc allocator with\nTransparent Huge Pages enabled"]
     UCT_ALLOC_METHOD_THP = 0,
+    #[doc = "< Allocate using memory domain"]
     UCT_ALLOC_METHOD_MD = 1,
+    #[doc = "< Allocate from heap using libc allocator"]
     UCT_ALLOC_METHOD_HEAP = 2,
+    #[doc = "< Allocate from OS using mmap() syscall"]
     UCT_ALLOC_METHOD_MMAP = 3,
+    #[doc = "< Allocate huge pages"]
     UCT_ALLOC_METHOD_HUGE = 4,
     UCT_ALLOC_METHOD_LAST = 5,
 }
 #[repr(u32)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief  Asynchronous event types.\n\n @note The UCT_EVENT_RECV and UCT_EVENT_RECV_SIG event types are used to\n       indicate receive-side completions for both tag matching and active\n       messages. If the interface supports signaled receives\n       (@ref UCT_IFACE_FLAG_EVENT_RECV_SIG), then for the messages sent with\n       UCT_SEND_FLAG_SIGNALED flag, UCT_EVENT_RECV_SIG should be triggered\n       on the receiver. Otherwise, UCT_EVENT_RECV should be triggered."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_iface_event_types {
+    #[doc = "< Send completion event"]
     UCT_EVENT_SEND_COMP = 1,
+    #[doc = "< Tag or active message received"]
     UCT_EVENT_RECV = 2,
+    #[doc = "< Signaled tag or active message\nreceived"]
     UCT_EVENT_RECV_SIG = 4,
 }
 impl uct_flush_flags {
+    #[doc = "< Guarantees that the data\ntransfer is completed but the\ntarget buffer may not be\nupdated yet."]
     pub const UCT_FLUSH_FLAG_LOCAL: uct_flush_flags = uct_flush_flags(0);
 }
 impl uct_flush_flags {
+    #[doc = "< The library will make a best\neffort attempt to cancel all\nuncompleted operations.\nHowever, there is a chance that\nsome operations will not be\ncanceled in which case the user\nwill need to handle their\ncompletions through\nthe relevant callbacks.\nAfter @ref uct_ep_flush\nwith this flag is completed,\nthe endpoint will be set to\nerror state, and it becomes\nunusable for send operations\nand should be destroyed."]
     pub const UCT_FLUSH_FLAG_CANCEL: uct_flush_flags = uct_flush_flags(1);
 }
 impl uct_flush_flags {
+    #[doc = "< Guarantees that all previous\nUCP memory update operations\n(put, atomics, etc.) are\ncompleted, the target memory\nof these operation was updated,\nand the updated memory is\nglobally visible for all\nprocessing elements in the\nsystem."]
     pub const UCT_FLUSH_FLAG_REMOTE: uct_flush_flags = uct_flush_flags(2);
 }
 impl ::std::ops::BitOr<uct_flush_flags> for uct_flush_flags {
@@ -3860,19 +4122,26 @@ impl ::std::ops::BitAndAssign for uct_flush_flags {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief  Flush modifiers."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_flush_flags(pub ::std::os::raw::c_uint);
 #[repr(u32)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief UCT progress types"]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_progress_types {
+    #[doc = "< Progress send operations"]
     UCT_PROGRESS_SEND = 1,
+    #[doc = "< Progress receive operations"]
     UCT_PROGRESS_RECV = 2,
+    #[doc = "< Enable/disable progress while\nanother thread may be calling\n@ref ucp_worker_progress()."]
     UCT_PROGRESS_THREAD_SAFE = 128,
 }
 impl uct_msg_flags {
+    #[doc = "< Trigger @ref UCT_EVENT_RECV_SIG\nevent on remote side. Make best\neffort attempt to avoid\ntriggering @ref UCT_EVENT_RECV\nevent. Ignored if not supported\nby interface."]
     pub const UCT_SEND_FLAG_SIGNALED: uct_msg_flags = uct_msg_flags(1);
 }
 impl uct_msg_flags {
+    #[doc = "< Forces checking connectivity to\na peer. If the connection is\nnot alive, an error callback\nwill be invoked. If the flag is\nnot set, there is no guarantee\nthat a connectivity error could\nbe detected."]
     pub const UCT_SEND_FLAG_PEER_CHECK: uct_msg_flags = uct_msg_flags(2);
 }
 impl ::std::ops::BitOr<uct_msg_flags> for uct_msg_flags {
@@ -3902,12 +4171,15 @@ impl ::std::ops::BitAndAssign for uct_msg_flags {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_AM\n @brief Flags for active message send operation."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_msg_flags(pub ::std::os::raw::c_uint);
 impl uct_cb_flags {
+    #[doc = "< Reserved for future use."]
     pub const UCT_CB_FLAG_RESERVED: uct_cb_flags = uct_cb_flags(2);
 }
 impl uct_cb_flags {
+    #[doc = "< Callback is allowed to be called\nfrom any thread in the process, and\ntherefore should be thread-safe. For\nexample, it may be called from a\ntransport async progress thread. To\nguarantee async invocation, the\ninterface must have the @ref\nUCT_IFACE_FLAG_CB_ASYNC flag set. If\nasync callback is requested on an\ninterface which only supports sync\ncallback (i.e., only the @ref\nUCT_IFACE_FLAG_CB_SYNC flag is set),\nthe callback will be invoked only\nfrom the context that called @ref\nuct_iface_progress)."]
     pub const UCT_CB_FLAG_ASYNC: uct_cb_flags = uct_cb_flags(4);
 }
 impl ::std::ops::BitOr<uct_cb_flags> for uct_cb_flags {
@@ -3937,83 +4209,107 @@ impl ::std::ops::BitAndAssign for uct_cb_flags {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief Callback flags.\n\n List of flags for a callback."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_cb_flags(pub ::std::os::raw::c_uint);
 #[repr(u32)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief Mode in which to open the interface."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_iface_open_mode {
+    #[doc = " Interface is opened on a specific device"]
     UCT_IFACE_OPEN_MODE_DEVICE = 1,
+    #[doc = " Interface is opened on a specific address on the server side. This mode\nwill be deprecated in the near future for a better API."]
     UCT_IFACE_OPEN_MODE_SOCKADDR_SERVER = 2,
+    #[doc = " Interface is opened on a specific address on the client side This mode\nwill be deprecated in the near future for a better API."]
     UCT_IFACE_OPEN_MODE_SOCKADDR_CLIENT = 4,
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::cpu_mask"]
     pub const UCT_IFACE_PARAM_FIELD_CPU_MASK: uct_iface_params_field = uct_iface_params_field(1);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::open_mode"]
     pub const UCT_IFACE_PARAM_FIELD_OPEN_MODE: uct_iface_params_field = uct_iface_params_field(2);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t_mode_device\n  \"uct_iface_params_t::mode::device\""]
     pub const UCT_IFACE_PARAM_FIELD_DEVICE: uct_iface_params_field = uct_iface_params_field(4);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t_mode_sockaddr\n  \"uct_iface_params_t::mode::sockaddr\""]
     pub const UCT_IFACE_PARAM_FIELD_SOCKADDR: uct_iface_params_field = uct_iface_params_field(8);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::stats_root"]
     pub const UCT_IFACE_PARAM_FIELD_STATS_ROOT: uct_iface_params_field = uct_iface_params_field(16);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::rx_headroom"]
     pub const UCT_IFACE_PARAM_FIELD_RX_HEADROOM: uct_iface_params_field =
         uct_iface_params_field(32);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::err_handler_arg"]
     pub const UCT_IFACE_PARAM_FIELD_ERR_HANDLER_ARG: uct_iface_params_field =
         uct_iface_params_field(64);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::err_handler"]
     pub const UCT_IFACE_PARAM_FIELD_ERR_HANDLER: uct_iface_params_field =
         uct_iface_params_field(128);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::err_handler_flags"]
     pub const UCT_IFACE_PARAM_FIELD_ERR_HANDLER_FLAGS: uct_iface_params_field =
         uct_iface_params_field(256);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::eager_arg"]
     pub const UCT_IFACE_PARAM_FIELD_HW_TM_EAGER_ARG: uct_iface_params_field =
         uct_iface_params_field(512);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::eager_cb"]
     pub const UCT_IFACE_PARAM_FIELD_HW_TM_EAGER_CB: uct_iface_params_field =
         uct_iface_params_field(1024);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::rndv_arg"]
     pub const UCT_IFACE_PARAM_FIELD_HW_TM_RNDV_ARG: uct_iface_params_field =
         uct_iface_params_field(2048);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::rndv_cb"]
     pub const UCT_IFACE_PARAM_FIELD_HW_TM_RNDV_CB: uct_iface_params_field =
         uct_iface_params_field(4096);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::async_event_arg"]
     pub const UCT_IFACE_PARAM_FIELD_ASYNC_EVENT_ARG: uct_iface_params_field =
         uct_iface_params_field(8192);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::async_event_cb"]
     pub const UCT_IFACE_PARAM_FIELD_ASYNC_EVENT_CB: uct_iface_params_field =
         uct_iface_params_field(16384);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::keepalive_interval"]
     pub const UCT_IFACE_PARAM_FIELD_KEEPALIVE_INTERVAL: uct_iface_params_field =
         uct_iface_params_field(32768);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::am_alignment"]
     pub const UCT_IFACE_PARAM_FIELD_AM_ALIGNMENT: uct_iface_params_field =
         uct_iface_params_field(65536);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::am_align_offset"]
     pub const UCT_IFACE_PARAM_FIELD_AM_ALIGN_OFFSET: uct_iface_params_field =
         uct_iface_params_field(131072);
 }
 impl uct_iface_params_field {
+    #[doc = " Enables @ref uct_iface_params_t::features"]
     pub const UCT_IFACE_PARAM_FIELD_FEATURES: uct_iface_params_field =
         uct_iface_params_field(262144);
 }
@@ -4044,12 +4340,16 @@ impl ::std::ops::BitAndAssign for uct_iface_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief UCT interface created by @ref uct_iface_open parameters field mask.\n\n The enumeration allows specifying which fields in @ref uct_iface_params_t are\n present, for backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_iface_params_field(pub ::std::os::raw::c_uint);
 #[repr(u32)]
+#[doc = " @ingroup UCT_MD\n @brief Socket address accessibility type."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_sockaddr_accessibility_t {
+    #[doc = "< Check if local address exists.\nAddress should belong to a local\nnetwork interface"]
     UCT_SOCKADDR_ACC_LOCAL = 0,
+    #[doc = "< Check if remote address can be reached.\nAddress is routable from one of the\nlocal network interfaces"]
     UCT_SOCKADDR_ACC_REMOTE = 1,
 }
 pub const UCT_MD_FLAG_ALLOC: _bindgen_ty_6 = _bindgen_ty_6::UCT_MD_FLAG_ALLOC;
@@ -4063,52 +4363,86 @@ pub const UCT_MD_FLAG_SOCKADDR: _bindgen_ty_6 = _bindgen_ty_6::UCT_MD_FLAG_SOCKA
 pub const UCT_MD_FLAG_INVALIDATE: _bindgen_ty_6 = _bindgen_ty_6::UCT_MD_FLAG_INVALIDATE;
 pub const UCT_MD_FLAG_EXPORTED_MKEY: _bindgen_ty_6 = _bindgen_ty_6::UCT_MD_FLAG_EXPORTED_MKEY;
 pub const UCT_MD_FLAG_REG_DMABUF: _bindgen_ty_6 = _bindgen_ty_6::UCT_MD_FLAG_REG_DMABUF;
+pub const UCT_MD_FLAG_LAST: _bindgen_ty_6 = _bindgen_ty_6::UCT_MD_FLAG_LAST;
 #[repr(u32)]
+#[doc = " @ingroup UCT_MD\n @brief  Memory domain capability flags."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum _bindgen_ty_6 {
+    #[doc = " MD supports memory allocation"]
     UCT_MD_FLAG_ALLOC = 1,
+    #[doc = " MD supports memory registration"]
     UCT_MD_FLAG_REG = 2,
+    #[doc = " The transport needs a valid local memory handle for zero-copy operations"]
     UCT_MD_FLAG_NEED_MEMH = 4,
+    #[doc = " The transport needs a valid remote memory key for remote memory\n operations"]
     UCT_MD_FLAG_NEED_RKEY = 8,
+    #[doc = " MD supports memory advice"]
     UCT_MD_FLAG_ADVISE = 16,
+    #[doc = " MD supports memory allocation with fixed address"]
     UCT_MD_FLAG_FIXED = 32,
+    #[doc = " MD supports direct access to remote memory via a pointer that is\n returned by @ref uct_rkey_ptr.\n @note This flag is deprecated and replaced by\n @a UCT_COMPONENT_FLAG_RKEY_PTR."]
     UCT_MD_FLAG_RKEY_PTR = 64,
+    #[doc = " MD support for client-server connection establishment via sockaddr"]
     UCT_MD_FLAG_SOCKADDR = 128,
+    #[doc = " MD supports memory invalidation.\n @note This flag is equivalent to the combination of\n       UCT_MD_FLAG_INVALIDATE_RMA and UCT_MD_FLAG_INVALIDATE_AMO for\n       uct_md_attr_v2_t.flags"]
     UCT_MD_FLAG_INVALIDATE = 256,
+    #[doc = " MD supports exporting memory keys with another process using the same\n device or attaching to an exported memory key."]
     UCT_MD_FLAG_EXPORTED_MKEY = 512,
+    #[doc = " MD supports registering a dmabuf file descriptor."]
     UCT_MD_FLAG_REG_DMABUF = 1024,
+    #[doc = " The enum must not be extended. Any additional flags must be defined in\n API v2 uct_md_flags_v2_t."]
+    UCT_MD_FLAG_LAST = 2048,
 }
 impl uct_md_mem_flags {
+    #[doc = " Hint to perform non-blocking allocation/registration: page mapping may\n be deferred until it is accessed by the CPU or a transport."]
     pub const UCT_MD_MEM_FLAG_NONBLOCK: uct_md_mem_flags = uct_md_mem_flags(1);
 }
 impl uct_md_mem_flags {
+    #[doc = " Place the mapping at exactly defined address."]
     pub const UCT_MD_MEM_FLAG_FIXED: uct_md_mem_flags = uct_md_mem_flags(2);
 }
 impl uct_md_mem_flags {
+    #[doc = " Registered memory should be locked. May incur extra cost for\n registration, but memory access is usually faster."]
     pub const UCT_MD_MEM_FLAG_LOCK: uct_md_mem_flags = uct_md_mem_flags(4);
 }
 impl uct_md_mem_flags {
+    #[doc = " Hide errors on memory registration and allocation. If this flag is set,\n no error messages will be printed."]
     pub const UCT_MD_MEM_FLAG_HIDE_ERRORS: uct_md_mem_flags = uct_md_mem_flags(8);
 }
 impl uct_md_mem_flags {
+    #[doc = " Enable remote put access."]
     pub const UCT_MD_MEM_ACCESS_REMOTE_PUT: uct_md_mem_flags = uct_md_mem_flags(32);
 }
 impl uct_md_mem_flags {
+    #[doc = " Enable remote get access."]
     pub const UCT_MD_MEM_ACCESS_REMOTE_GET: uct_md_mem_flags = uct_md_mem_flags(64);
 }
 impl uct_md_mem_flags {
+    #[doc = " Enable remote atomic access."]
     pub const UCT_MD_MEM_ACCESS_REMOTE_ATOMIC: uct_md_mem_flags = uct_md_mem_flags(128);
 }
 impl uct_md_mem_flags {
+    #[doc = " Enable local read access."]
     pub const UCT_MD_MEM_ACCESS_LOCAL_READ: uct_md_mem_flags = uct_md_mem_flags(256);
 }
 impl uct_md_mem_flags {
+    #[doc = " Enable local write access."]
     pub const UCT_MD_MEM_ACCESS_LOCAL_WRITE: uct_md_mem_flags = uct_md_mem_flags(512);
 }
 impl uct_md_mem_flags {
+    #[doc = " Register the memory region so its remote access key would likely be\n equal to remote access keys received from other peers, when compared\n with @a uct_rkey_compare. This flag is a hint. When remote access keys\n received from different peers are compared equal, they can be used\n interchangeably, avoiding the need to keep all of them in memory."]
+    pub const UCT_MD_MEM_SYMMETRIC_RKEY: uct_md_mem_flags = uct_md_mem_flags(1024);
+}
+impl uct_md_mem_flags {
+    #[doc = " Register global VA to access all process virtual address space."]
+    pub const UCT_MD_MEM_GVA: uct_md_mem_flags = uct_md_mem_flags(2048);
+}
+impl uct_md_mem_flags {
+    #[doc = " Enable local and remote access for all operations."]
     pub const UCT_MD_MEM_ACCESS_ALL: uct_md_mem_flags = uct_md_mem_flags(992);
 }
 impl uct_md_mem_flags {
+    #[doc = " Enable local and remote access for put and get operations."]
     pub const UCT_MD_MEM_ACCESS_RMA: uct_md_mem_flags = uct_md_mem_flags(864);
 }
 impl ::std::ops::BitOr<uct_md_mem_flags> for uct_md_mem_flags {
@@ -4138,15 +4472,20 @@ impl ::std::ops::BitAndAssign for uct_md_mem_flags {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_MD\n @brief  Memory allocation/registration flags."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_md_mem_flags(pub ::std::os::raw::c_uint);
 #[repr(u32)]
+#[doc = " @ingroup UCT_MD\n @brief list of UCT memory use advice"]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_mem_advice_t {
+    #[doc = "< No special treatment"]
     UCT_MADV_NORMAL = 0,
+    #[doc = "< can be used on the memory mapped with\n@ref UCT_MD_MEM_FLAG_NONBLOCK to speed up\nmemory mapping and to avoid page faults when\nthe memory is accessed for the first time."]
     UCT_MADV_WILLNEED = 1,
 }
 impl uct_cm_attr_field {
+    #[doc = " Enables @ref uct_cm_attr::max_conn_priv"]
     pub const UCT_CM_ATTR_FIELD_MAX_CONN_PRIV: uct_cm_attr_field = uct_cm_attr_field(1);
 }
 impl ::std::ops::BitOr<uct_cm_attr_field> for uct_cm_attr_field {
@@ -4176,9 +4515,11 @@ impl ::std::ops::BitAndAssign for uct_cm_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief UCT connection manager attributes field mask.\n\n The enumeration allows specifying which fields in @ref uct_cm_attr_t are\n present, for backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_cm_attr_field(pub ::std::os::raw::c_uint);
 impl uct_listener_attr_field {
+    #[doc = " Enables @ref uct_listener_attr::sockaddr"]
     pub const UCT_LISTENER_ATTR_FIELD_SOCKADDR: uct_listener_attr_field =
         uct_listener_attr_field(1);
 }
@@ -4209,17 +4550,21 @@ impl ::std::ops::BitAndAssign for uct_listener_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief UCT listener attributes field mask.\n\n The enumeration allows specifying which fields in @ref uct_listener_attr_t are\n present, for backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_listener_attr_field(pub ::std::os::raw::c_uint);
 impl uct_listener_params_field {
+    #[doc = " Enables @ref uct_listener_params::backlog"]
     pub const UCT_LISTENER_PARAM_FIELD_BACKLOG: uct_listener_params_field =
         uct_listener_params_field(1);
 }
 impl uct_listener_params_field {
+    #[doc = " Enables @ref uct_listener_params::conn_request_cb"]
     pub const UCT_LISTENER_PARAM_FIELD_CONN_REQUEST_CB: uct_listener_params_field =
         uct_listener_params_field(2);
 }
 impl uct_listener_params_field {
+    #[doc = " Enables @ref uct_listener_params::user_data"]
     pub const UCT_LISTENER_PARAM_FIELD_USER_DATA: uct_listener_params_field =
         uct_listener_params_field(4);
 }
@@ -4250,61 +4595,88 @@ impl ::std::ops::BitAndAssign for uct_listener_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief UCT listener created by @ref uct_listener_create parameters field mask.\n\n The enumeration allows specifying which fields in @ref uct_listener_params_t\n are present, for backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_listener_params_field(pub ::std::os::raw::c_uint);
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::iface"]
     pub const UCT_EP_PARAM_FIELD_IFACE: uct_ep_params_field = uct_ep_params_field(1);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::user_data"]
     pub const UCT_EP_PARAM_FIELD_USER_DATA: uct_ep_params_field = uct_ep_params_field(2);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::dev_addr"]
     pub const UCT_EP_PARAM_FIELD_DEV_ADDR: uct_ep_params_field = uct_ep_params_field(4);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::iface_addr"]
     pub const UCT_EP_PARAM_FIELD_IFACE_ADDR: uct_ep_params_field = uct_ep_params_field(8);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::sockaddr"]
     pub const UCT_EP_PARAM_FIELD_SOCKADDR: uct_ep_params_field = uct_ep_params_field(16);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::sockaddr_cb_flags"]
     pub const UCT_EP_PARAM_FIELD_SOCKADDR_CB_FLAGS: uct_ep_params_field = uct_ep_params_field(32);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::sockaddr_pack_cb"]
     pub const UCT_EP_PARAM_FIELD_SOCKADDR_PACK_CB: uct_ep_params_field = uct_ep_params_field(64);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::cm"]
     pub const UCT_EP_PARAM_FIELD_CM: uct_ep_params_field = uct_ep_params_field(128);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::conn_request"]
     pub const UCT_EP_PARAM_FIELD_CONN_REQUEST: uct_ep_params_field = uct_ep_params_field(256);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::sockaddr_cb_client"]
     pub const UCT_EP_PARAM_FIELD_SOCKADDR_CONNECT_CB_CLIENT: uct_ep_params_field =
         uct_ep_params_field(512);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::sockaddr_cb_server"]
     pub const UCT_EP_PARAM_FIELD_SOCKADDR_NOTIFY_CB_SERVER: uct_ep_params_field =
         uct_ep_params_field(1024);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::disconnect_cb"]
     pub const UCT_EP_PARAM_FIELD_SOCKADDR_DISCONNECT_CB: uct_ep_params_field =
         uct_ep_params_field(2048);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::path_index"]
     pub const UCT_EP_PARAM_FIELD_PATH_INDEX: uct_ep_params_field = uct_ep_params_field(4096);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::cm_resolve_cb"]
     pub const UCT_EP_PARAM_FIELD_CM_RESOLVE_CB: uct_ep_params_field = uct_ep_params_field(8192);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::private_data"]
     pub const UCT_EP_PARAM_FIELD_PRIV_DATA: uct_ep_params_field = uct_ep_params_field(16384);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::private_data_length"]
     pub const UCT_EP_PARAM_FIELD_PRIV_DATA_LENGTH: uct_ep_params_field = uct_ep_params_field(32768);
 }
 impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::local_sockaddr"]
     pub const UCT_EP_PARAM_FIELD_LOCAL_SOCKADDR: uct_ep_params_field = uct_ep_params_field(65536);
+}
+impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::dev_addr_length"]
+    pub const UCT_EP_PARAM_FIELD_DEV_ADDR_LENGTH: uct_ep_params_field = uct_ep_params_field(131072);
+}
+impl uct_ep_params_field {
+    #[doc = " Enables @ref uct_ep_params::iface_addr_length"]
+    pub const UCT_EP_PARAM_FIELD_IFACE_ADDR_LENGTH: uct_ep_params_field =
+        uct_ep_params_field(262144);
 }
 impl ::std::ops::BitOr<uct_ep_params_field> for uct_ep_params_field {
     type Output = Self;
@@ -4333,13 +4705,16 @@ impl ::std::ops::BitAndAssign for uct_ep_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief UCT endpoint created by @ref uct_ep_create parameters field mask.\n\n The enumeration allows specifying which fields in @ref uct_ep_params_t are\n present, for backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_ep_params_field(pub ::std::os::raw::c_uint);
 impl uct_ep_connect_params_field {
+    #[doc = " Enables @ref uct_ep_connect_params::private_data"]
     pub const UCT_EP_CONNECT_PARAM_FIELD_PRIVATE_DATA: uct_ep_connect_params_field =
         uct_ep_connect_params_field(1);
 }
 impl uct_ep_connect_params_field {
+    #[doc = " Enables @ref uct_ep_connect_params::private_data_length"]
     pub const UCT_EP_CONNECT_PARAM_FIELD_PRIVATE_DATA_LENGTH: uct_ep_connect_params_field =
         uct_ep_connect_params_field(2);
 }
@@ -4370,24 +4745,36 @@ impl ::std::ops::BitAndAssign for uct_ep_connect_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief UCT endpoint connected by @ref uct_ep_connect parameters field mask.\n\n The enumeration allows specifying which fields in\n @ref uct_ep_connect_params_t are present, for backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_ep_connect_params_field(pub ::std::os::raw::c_uint);
 #[repr(u32)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief UCT interface configuration features\n\n The enumeration list describes the features supported by UCT. An\n application can request the features using @ref uct_iface_params \"UCT parameters\"\n during @ref uct_iface_open \"UCT iface initialization\" process."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_iface_feature {
+    #[doc = " Request Active Message support"]
     UCT_IFACE_FEATURE_AM = 1,
+    #[doc = " Request PUT support"]
     UCT_IFACE_FEATURE_PUT = 2,
+    #[doc = " Request GET support"]
     UCT_IFACE_FEATURE_GET = 4,
+    #[doc = " Request 32-bit atomic operations support"]
     UCT_IFACE_FEATURE_AMO32 = 8,
+    #[doc = " Request 64-bit atomic operations support"]
     UCT_IFACE_FEATURE_AMO64 = 16,
+    #[doc = " Request tag matching offload support"]
     UCT_IFACE_FEATURE_TAG = 32,
+    #[doc = " Request remote flush support"]
     UCT_IFACE_FEATURE_FLUSH_REMOTE = 64,
+    #[doc = " Used to determine the number of features"]
     UCT_IFACE_FEATURE_LAST = 128,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_ppn_bandwidth {
+    #[doc = "< Dedicated bandwidth, bytes/second"]
     pub dedicated: f64,
+    #[doc = "< Shared bandwidth, bytes/second"]
     pub shared: f64,
 }
 #[test]
@@ -4426,43 +4813,71 @@ fn bindgen_test_layout_uct_ppn_bandwidth() {
     );
 }
 pub type uct_ppn_bandwidth_t = uct_ppn_bandwidth;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Interface attributes: capabilities and limitations."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_attr {
+    #[doc = "< Interface capabilities"]
     pub cap: uct_iface_attr__bindgen_ty_1,
+    #[doc = "< Size of device address"]
     pub device_addr_len: usize,
+    #[doc = "< Size of interface address"]
     pub iface_addr_len: usize,
+    #[doc = "< Size of endpoint address"]
     pub ep_addr_len: usize,
+    #[doc = "< Max size of the iface's private data.\nused for connection\nestablishment with sockaddr"]
     pub max_conn_priv: usize,
+    #[doc = "< Sockaddr on which this iface\nis listening."]
     pub listen_sockaddr: sockaddr_storage,
+    #[doc = "< Message overhead, seconds"]
     pub overhead: f64,
+    #[doc = "< Bandwidth model"]
     pub bandwidth: uct_ppn_bandwidth_t,
+    #[doc = "< Latency as function of number of\nactive endpoints"]
     pub latency: ucs_linear_func_t,
+    #[doc = "< Priority of device"]
     pub priority: u8,
+    #[doc = "< Maximum number of endpoints"]
     pub max_num_eps: usize,
+    #[doc = "< How many network paths can be\nutilized on the device used by\nthis interface for optimal\nperformance. Endpoints that connect\nto the same remote address but use\ndifferent paths can potentially\nachieve higher total bandwidth\ncompared to using only a single\nendpoint."]
     pub dev_num_paths: ::std::os::raw::c_uint,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_attr__bindgen_ty_1 {
+    #[doc = "< Attributes for PUT operations"]
     pub put: uct_iface_attr__bindgen_ty_1__bindgen_ty_1,
+    #[doc = "< Attributes for GET operations"]
     pub get: uct_iface_attr__bindgen_ty_1__bindgen_ty_2,
+    #[doc = "< Attributes for AM operations"]
     pub am: uct_iface_attr__bindgen_ty_1__bindgen_ty_3,
+    #[doc = "< Attributes for TAG operations"]
     pub tag: uct_iface_attr__bindgen_ty_1__bindgen_ty_4,
+    #[doc = "< Attributes for atomic operations"]
     pub atomic32: uct_iface_attr__bindgen_ty_1__bindgen_ty_5,
+    #[doc = "< Attributes for atomic operations"]
     pub atomic64: uct_iface_attr__bindgen_ty_1__bindgen_ty_5,
+    #[doc = "< Flags from @ref UCT_RESOURCE_IFACE_CAP"]
     pub flags: u64,
+    #[doc = "< Flags from @ref UCT_RESOURCE_IFACE_EVENT_CAP"]
     pub event_flags: u64,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_attr__bindgen_ty_1__bindgen_ty_1 {
+    #[doc = "< Maximal size for put_short"]
     pub max_short: usize,
+    #[doc = "< Maximal size for put_bcopy"]
     pub max_bcopy: usize,
+    #[doc = "< Minimal size for put_zcopy (total\nof @ref uct_iov_t::length of the\n@a iov parameter)"]
     pub min_zcopy: usize,
+    #[doc = "< Maximal size for put_zcopy (total\nof @ref uct_iov_t::length of the\n@a iov parameter)"]
     pub max_zcopy: usize,
+    #[doc = "< Optimal alignment for zero-copy\nbuffer address"]
     pub opt_zcopy_align: usize,
+    #[doc = "< MTU used for alignment"]
     pub align_mtu: usize,
+    #[doc = "< Maximal @a iovcnt parameter in\n@ref ::uct_ep_put_zcopy\n@anchor uct_iface_attr_cap_put_max_iov"]
     pub max_iov: usize,
 }
 #[test]
@@ -4560,12 +4975,19 @@ fn bindgen_test_layout_uct_iface_attr__bindgen_ty_1__bindgen_ty_1() {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_attr__bindgen_ty_1__bindgen_ty_2 {
+    #[doc = "< Maximal size for get_short"]
     pub max_short: usize,
+    #[doc = "< Maximal size for get_bcopy"]
     pub max_bcopy: usize,
+    #[doc = "< Minimal size for get_zcopy (total\nof @ref uct_iov_t::length of the\n@a iov parameter)"]
     pub min_zcopy: usize,
+    #[doc = "< Maximal size for get_zcopy (total\nof @ref uct_iov_t::length of the\n@a iov parameter)"]
     pub max_zcopy: usize,
+    #[doc = "< Optimal alignment for zero-copy\nbuffer address"]
     pub opt_zcopy_align: usize,
+    #[doc = "< MTU used for alignment"]
     pub align_mtu: usize,
+    #[doc = "< Maximal @a iovcnt parameter in\n@ref uct_ep_get_zcopy\n@anchor uct_iface_attr_cap_get_max_iov"]
     pub max_iov: usize,
 }
 #[test]
@@ -4663,13 +5085,21 @@ fn bindgen_test_layout_uct_iface_attr__bindgen_ty_1__bindgen_ty_2() {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_attr__bindgen_ty_1__bindgen_ty_3 {
+    #[doc = "< Total maximum size (incl. the header)\n@anchor uct_iface_attr_cap_am_max_short"]
     pub max_short: usize,
+    #[doc = "< Total maximum size (incl. the header)"]
     pub max_bcopy: usize,
+    #[doc = "< Minimal size for am_zcopy (incl. the\nheader and total of @ref uct_iov_t::length\nof the @a iov parameter)"]
     pub min_zcopy: usize,
+    #[doc = "< Total max. size (incl. the header\nand total of @ref uct_iov_t::length\nof the @a iov parameter)"]
     pub max_zcopy: usize,
+    #[doc = "< Optimal alignment for zero-copy\nbuffer address"]
     pub opt_zcopy_align: usize,
+    #[doc = "< MTU used for alignment"]
     pub align_mtu: usize,
+    #[doc = "< Max. header size for zcopy"]
     pub max_hdr: usize,
+    #[doc = "< Maximal @a iovcnt parameter in\n@ref ::uct_ep_am_zcopy\n@anchor uct_iface_attr_cap_am_max_iov"]
     pub max_iov: usize,
 }
 #[test]
@@ -4778,15 +5208,21 @@ fn bindgen_test_layout_uct_iface_attr__bindgen_ty_1__bindgen_ty_3() {
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_attr__bindgen_ty_1__bindgen_ty_4 {
     pub recv: uct_iface_attr__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1,
+    #[doc = "< Attributes related to eager protocol"]
     pub eager: uct_iface_attr__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2,
+    #[doc = "< Attributes related to rendezvous protocol"]
     pub rndv: uct_iface_attr__bindgen_ty_1__bindgen_ty_4__bindgen_ty_3,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_attr__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1 {
+    #[doc = "< Minimal allowed length of posted receive buffer"]
     pub min_recv: usize,
+    #[doc = "< Maximal allowed data length in\n@ref uct_iface_tag_recv_zcopy"]
     pub max_zcopy: usize,
+    #[doc = "< Maximal @a iovcnt parameter in\n@ref uct_iface_tag_recv_zcopy\n@anchor uct_iface_attr_cap_tag_recv_iov"]
     pub max_iov: usize,
+    #[doc = "< Maximal number of simultaneous\nreceive operations"]
     pub max_outstanding: usize,
 }
 #[test]
@@ -4855,9 +5291,13 @@ fn bindgen_test_layout_uct_iface_attr__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1(
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_attr__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2 {
+    #[doc = "< Maximal allowed data length in\n@ref uct_ep_tag_eager_short"]
     pub max_short: usize,
+    #[doc = "< Maximal allowed data length in\n@ref uct_ep_tag_eager_bcopy"]
     pub max_bcopy: usize,
+    #[doc = "< Maximal allowed data length in\n@ref uct_ep_tag_eager_zcopy"]
     pub max_zcopy: usize,
+    #[doc = "< Maximal @a iovcnt parameter in\n@ref uct_ep_tag_eager_zcopy"]
     pub max_iov: usize,
 }
 #[test]
@@ -4926,8 +5366,11 @@ fn bindgen_test_layout_uct_iface_attr__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2(
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_attr__bindgen_ty_1__bindgen_ty_4__bindgen_ty_3 {
+    #[doc = "< Maximal allowed data length in\n@ref uct_ep_tag_rndv_zcopy"]
     pub max_zcopy: usize,
+    #[doc = "< Maximal allowed header length in\n@ref uct_ep_tag_rndv_zcopy and\n@ref uct_ep_tag_rndv_request"]
     pub max_hdr: usize,
+    #[doc = "< Maximal @a iovcnt parameter in\n@ref uct_ep_tag_rndv_zcopy"]
     pub max_iov: usize,
 }
 #[test]
@@ -5038,7 +5481,9 @@ fn bindgen_test_layout_uct_iface_attr__bindgen_ty_1__bindgen_ty_4() {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_attr__bindgen_ty_1__bindgen_ty_5 {
+    #[doc = "< Attributes for atomic-post operations"]
     pub op_flags: u64,
+    #[doc = "< Attributes for atomic-fetch operations"]
     pub fop_flags: u64,
 }
 #[test]
@@ -5314,39 +5759,59 @@ fn bindgen_test_layout_uct_iface_attr() {
         )
     );
 }
+#[doc = " @ingroup UCT_RESOURCE\n @brief Parameters used for interface creation.\n\n This structure should be allocated by the user and should be passed to\n @ref uct_iface_open. User has to initialize all fields of this structure."]
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct uct_iface_params {
+    #[doc = " Mask of valid fields in this structure, using bits from\n  @ref uct_iface_params_field. Fields not specified in this mask will be\n  ignored."]
     pub field_mask: u64,
+    #[doc = " Mask of CPUs to use for resources"]
     pub cpu_mask: ucs_cpu_set_t,
+    #[doc = " Interface open mode bitmap. @ref uct_iface_open_mode"]
     pub open_mode: u64,
     pub mode: uct_iface_params__bindgen_ty_1,
+    #[doc = " Root in the statistics tree. Can be NULL. If non NULL, it will be\na root of @a uct_iface object in the statistics tree."]
     pub stats_root: *mut ucs_stats_node_t,
+    #[doc = " How much bytes to reserve before the receive segment."]
     pub rx_headroom: usize,
+    #[doc = " Custom argument of @a err_handler."]
     pub err_handler_arg: *mut ::std::os::raw::c_void,
+    #[doc = " The callback to handle transport level error."]
     pub err_handler: uct_error_handler_t,
+    #[doc = " Callback flags to indicate where the @a err_handler callback can be\n invoked from. @ref uct_cb_flags"]
     pub err_handler_flags: u32,
+    #[doc = " These callbacks are only relevant for HW Tag Matching"]
     pub eager_arg: *mut ::std::os::raw::c_void,
+    #[doc = " Callback for tag matching unexpected eager messages"]
     pub eager_cb: uct_tag_unexp_eager_cb_t,
     pub rndv_arg: *mut ::std::os::raw::c_void,
+    #[doc = " Callback for tag matching unexpected rndv messages"]
     pub rndv_cb: uct_tag_unexp_rndv_cb_t,
     pub async_event_arg: *mut ::std::os::raw::c_void,
+    #[doc = " Callback for asynchronous event handling. The callback will be\n invoked from UCT transport when there are new events to be\n read by user if the iface has @ref UCT_IFACE_FLAG_EVENT_ASYNC_CB\n capability"]
     pub async_event_cb: uct_async_event_cb_t,
     pub keepalive_interval: ucs_time_t,
+    #[doc = " Desired alignment for Active Messages on the receiver. Note that only\n data received in the UCT descriptor can be aligned (i.e.\n @a UCT_CB_PARAM_FLAG_DESC flag is provided in the Active Message\n handler callback). The provided value must be power of 2. The default\n value is 1."]
     pub am_alignment: usize,
+    #[doc = " Offset in the Active Message receive buffer, which should be aligned to\n the @a am_alignment boundary. Note this parameter has no effect without\n setting @a am_alignment parameter. The provided value must be less than\n the given @a am_alignment value. The default value is 0.\n\n +-+ pointer to @a data in @ref uct_am_callback_t\n |\n |        + alignment boundary\n |        |\n v        v\n +-------------------+\n | align  |          |\n | offset |          |\n +-------------------+"]
     pub am_align_offset: usize,
+    #[doc = " UCT @ref uct_iface_feature \"features\" that are used for interface\n initialization."]
     pub features: u64,
 }
+#[doc = " Mode-specific parameters"]
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union uct_iface_params__bindgen_ty_1 {
     pub device: uct_iface_params__bindgen_ty_1__bindgen_ty_1,
     pub sockaddr: uct_iface_params__bindgen_ty_1__bindgen_ty_2,
 }
+#[doc = " @anchor uct_iface_params_t_mode_device\n  The fields in this structure (tl_name and dev_name) need to be set only when\n  the @ref UCT_IFACE_OPEN_MODE_DEVICE bit is set in @ref\n  uct_iface_params_t.open_mode This will make @ref uct_iface_open\n  open the interface on the specified device."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_params__bindgen_ty_1__bindgen_ty_1 {
+    #[doc = "< Transport name"]
     pub tl_name: *const ::std::os::raw::c_char,
+    #[doc = "< Device Name"]
     pub dev_name: *const ::std::os::raw::c_char,
 }
 #[test]
@@ -5391,12 +5856,16 @@ fn bindgen_test_layout_uct_iface_params__bindgen_ty_1__bindgen_ty_1() {
         )
     );
 }
+#[doc = " @anchor uct_iface_params_t_mode_sockaddr\n  These callbacks and address are only relevant for client-server\n  connection establishment with sockaddr and are needed on the server side.\n  The callbacks and address need to be set when the @ref\n  UCT_IFACE_OPEN_MODE_SOCKADDR_SERVER bit is set in @ref\n  uct_iface_params_t.open_mode. This will make @ref uct_iface_open\n  open the interface on the specified address as a server."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_iface_params__bindgen_ty_1__bindgen_ty_2 {
     pub listen_sockaddr: ucs_sock_addr_t,
+    #[doc = " Argument for connection request callback"]
     pub conn_request_arg: *mut ::std::os::raw::c_void,
+    #[doc = " Callback for an incoming connection request on the server"]
     pub conn_request_cb: uct_sockaddr_conn_request_callback_t,
+    #[doc = " Callback flags to indicate where the callback can be invoked from.\n @ref uct_cb_flags"]
     pub cb_flags: u32,
 }
 #[test]
@@ -5702,27 +6171,50 @@ fn bindgen_test_layout_uct_iface_params() {
         )
     );
 }
+#[doc = " @ingroup UCT_RESOURCE\n @brief Parameters for creating a UCT endpoint by @ref uct_ep_create"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_ep_params {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_ep_params_field. Fields not specified by this mask will be\n ignored."]
     pub field_mask: u64,
+    #[doc = " Interface to create the endpoint on.\n Either @a iface or @a cm field must be initialized but not both."]
     pub iface: uct_iface_h,
+    #[doc = " User data associated with the endpoint."]
     pub user_data: *mut ::std::os::raw::c_void,
+    #[doc = " The device address to connect to on the remote peer. This must be defined\n together with @ref uct_ep_params_t::iface_addr to create an endpoint\n connected to a remote interface."]
     pub dev_addr: *const uct_device_addr_t,
+    #[doc = " This specifies the remote address to use when creating an endpoint that\n is connected to a remote interface.\n @note This requires @ref UCT_IFACE_FLAG_CONNECT_TO_IFACE capability."]
     pub iface_addr: *const uct_iface_addr_t,
+    #[doc = " The sockaddr to connect to on the remote peer. If set, @ref uct_ep_create\n will create an endpoint for a connection to the remote peer, specified by\n its socket address.\n @note The interface in this routine requires the\n @ref UCT_IFACE_FLAG_CONNECT_TO_SOCKADDR capability."]
     pub sockaddr: *const ucs_sock_addr_t,
+    #[doc = " @ref uct_cb_flags to indicate @ref uct_ep_params_t::sockaddr_pack_cb,\n @ref uct_ep_params_t::sockaddr_cb_client,\n @ref uct_ep_params_t::sockaddr_cb_server,\n @ref uct_ep_params_t::disconnect_cb and\n @ref uct_ep_params_t::cm_resolve_cb behavior.\n If none from these are not set, this field will be ignored."]
     pub sockaddr_cb_flags: u32,
+    #[doc = " Callback that will be used for filling the user's private data to be\n delivered to the remote peer by the callback on the server or client side.\n This field is only valid if @ref uct_ep_params_t::sockaddr is set.\n @note It is never guaranteed that the callback will be called. If, for\n example, the endpoint goes into error state before issuing the connection\n request, the callback will not be invoked.\n @note Can not be set together with @ref uct_ep_params_t::private_data or\n @ref uct_ep_params_t::cm_resolve_cb."]
     pub sockaddr_pack_cb: uct_cm_ep_priv_data_pack_callback_t,
+    #[doc = " The connection manager object as created by @ref uct_cm_open.\n Either @a cm or @a iface field must be initialized but not both."]
     pub cm: uct_cm_h,
+    #[doc = " Connection request that was passed to\n @ref uct_cm_listener_conn_request_args_t::conn_request.\n @note After a call to @ref uct_ep_create, @a params.conn_request is\n       consumed and should not be used anymore, even if the call returns\n       with an error."]
     pub conn_request: uct_conn_request_h,
+    #[doc = " Callback that will be invoked when the endpoint on the client side\n is being connected to the server by a connection manager @ref uct_cm_h ."]
     pub sockaddr_cb_client: uct_cm_ep_client_connect_callback_t,
+    #[doc = " Callback that will be invoked when the endpoint on the server side\n is being connected to a client by a connection manager @ref uct_cm_h ."]
     pub sockaddr_cb_server: uct_cm_ep_server_conn_notify_callback_t,
+    #[doc = " Callback that will be invoked when the endpoint is disconnected."]
     pub disconnect_cb: uct_ep_disconnect_cb_t,
+    #[doc = " Index of the path which the endpoint should use, must be in the range\n 0..(@ref uct_iface_attr_t.dev_num_paths - 1)."]
     pub path_index: ::std::os::raw::c_uint,
+    #[doc = " This callback is invoked when the remote server address provided in field\n @ref uct_ep_params_t::sockaddr is resolved to the local device to be used\n for connection establishment.\n @note This field is mutually exclusive with\n       @ref uct_ep_params::sockaddr_pack_cb."]
     pub cm_resolve_cb: uct_cm_ep_resolve_callback_t,
+    #[doc = " Private data to be passed from server to client. Can be used only along\n with @ref uct_ep_params::conn_request.\n @note This field is mutually exclusive with\n       @ref uct_ep_params::sockaddr_pack_cb."]
     pub private_data: *const ::std::os::raw::c_void,
+    #[doc = " Length of @ref uct_ep_params::private_data, the maximal allowed value is\n indicated by the @ref uct_cm_attr::max_conn_priv."]
     pub private_data_length: usize,
+    #[doc = " The sockaddr to bind locally. If set, @ref uct_ep_create\n will create an endpoint binding to this local sockaddr.\n @note The interface in this routine requires the\n @ref UCT_IFACE_FLAG_CONNECT_TO_SOCKADDR capability."]
     pub local_sockaddr: *const ucs_sock_addr_t,
+    #[doc = " Device address length. If not provided, the transport will assume a\n default minimum length according to the address buffer contents."]
+    pub dev_addr_length: usize,
+    #[doc = " Iface address length. If not provided, the transport will assume a\n default minimum length according to the address buffer contents."]
+    pub iface_addr_length: usize,
 }
 #[test]
 fn bindgen_test_layout_uct_ep_params() {
@@ -5730,7 +6222,7 @@ fn bindgen_test_layout_uct_ep_params() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::std::mem::size_of::<uct_ep_params>(),
-        144usize,
+        160usize,
         concat!("Size of: ", stringify!(uct_ep_params))
     );
     assert_eq!(
@@ -5918,12 +6410,36 @@ fn bindgen_test_layout_uct_ep_params() {
             stringify!(local_sockaddr)
         )
     );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).dev_addr_length) as usize - ptr as usize },
+        144usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(uct_ep_params),
+            "::",
+            stringify!(dev_addr_length)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).iface_addr_length) as usize - ptr as usize },
+        152usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(uct_ep_params),
+            "::",
+            stringify!(iface_addr_length)
+        )
+    );
 }
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Parameters for connecting a UCT endpoint by @ref uct_ep_connect."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_ep_connect_params {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_ep_connect_params_field. Fields not specified by this mask\n will be ignored."]
     pub field_mask: u64,
+    #[doc = " User's private data to be passed from client to server."]
     pub private_data: *const ::std::os::raw::c_void,
+    #[doc = " Length of @ref uct_ep_connect_params::private_data, the maximal allowed\n value is indicated by the @ref uct_cm_attr::max_conn_priv."]
     pub private_data_length: usize,
 }
 #[test]
@@ -5972,10 +6488,13 @@ fn bindgen_test_layout_uct_ep_connect_params() {
         )
     );
 }
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Connection manager attributes, capabilities and limitations."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_cm_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_cm_attr_field. Fields not specified by this mask\n will be ignored."]
     pub field_mask: u64,
+    #[doc = " Max size of the connection manager's private data used for connection\n establishment with sockaddr."]
     pub max_conn_priv: usize,
 }
 #[test]
@@ -6013,10 +6532,13 @@ fn bindgen_test_layout_uct_cm_attr() {
         )
     );
 }
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief UCT listener attributes, capabilities and limitations."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_listener_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_listener_attr_field. Fields not specified by this mask\n will be ignored."]
     pub field_mask: u64,
+    #[doc = " Sockaddr on which this listener is listening."]
     pub sockaddr: sockaddr_storage,
 }
 #[test]
@@ -6054,12 +6576,17 @@ fn bindgen_test_layout_uct_listener_attr() {
         )
     );
 }
+#[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Parameters for creating a listener object @ref uct_listener_h by\n @ref uct_listener_create"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_listener_params {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_listener_params_field. Fields not specified by this mask\n will be ignored."]
     pub field_mask: u64,
+    #[doc = " Backlog of incoming connection requests. If specified, must be a positive value.\n If not specified, each CM component will use its maximal allowed value,\n based on the system's setting."]
     pub backlog: ::std::os::raw::c_int,
+    #[doc = " Callback function for handling incoming connection requests."]
     pub conn_request_cb: uct_cm_listener_conn_request_callback_t,
+    #[doc = " User data associated with the listener."]
     pub user_data: *mut ::std::os::raw::c_void,
 }
 #[test]
@@ -6117,24 +6644,36 @@ fn bindgen_test_layout_uct_listener_params() {
         )
     );
 }
+#[doc = " @ingroup UCT_MD\n @brief  Memory domain attributes.\n\n This structure defines the attributes of a Memory Domain which includes\n maximum memory that can be allocated, credentials required for accessing the memory,\n CPU mask indicating the proximity of CPUs, and bitmaps indicating the types\n of memory (CPU/CUDA/ROCM) that can be detected, allocated and accessed."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_md_attr {
     pub cap: uct_md_attr__bindgen_ty_1,
+    #[doc = "< Memory registration cost estimation\n(time,seconds) as a linear function\nof the buffer size."]
     pub reg_cost: ucs_linear_func_t,
+    #[doc = "< Component name"]
     pub component_name: [::std::os::raw::c_char; 16usize],
+    #[doc = "< Size of buffer needed for packed rkey"]
     pub rkey_packed_size: usize,
+    #[doc = "< Mask of CPUs near the resource"]
     pub local_cpus: ucs_cpu_set_t,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_md_attr__bindgen_ty_1 {
+    #[doc = "< Maximal allocation size"]
     pub max_alloc: u64,
+    #[doc = "< Maximal registration size"]
     pub max_reg: usize,
+    #[doc = "< UCT_MD_FLAG_xx"]
     pub flags: u64,
+    #[doc = "< Bitmap of memory types that Memory Domain can be registered with"]
     pub reg_mem_types: u64,
+    #[doc = "< Bitmap of memory types that Memory Domain can detect if address belongs to it"]
     pub detect_mem_types: u64,
+    #[doc = "< Bitmap of memory types that Memory Domain can allocate memory on"]
     pub alloc_mem_types: u64,
+    #[doc = "< Memory types that Memory Domain can access"]
     pub access_mem_types: u64,
 }
 #[test]
@@ -6289,21 +6828,27 @@ fn bindgen_test_layout_uct_md_attr() {
     );
 }
 impl uct_md_mem_attr_field {
+    #[doc = " Indicate if memory type is populated. E.g. CPU/GPU"]
     pub const UCT_MD_MEM_ATTR_FIELD_MEM_TYPE: uct_md_mem_attr_field = uct_md_mem_attr_field(1);
 }
 impl uct_md_mem_attr_field {
+    #[doc = " Indicate if details of system device backing the pointer are populated.\n For example: GPU device, NUMA domain, etc."]
     pub const UCT_MD_MEM_ATTR_FIELD_SYS_DEV: uct_md_mem_attr_field = uct_md_mem_attr_field(2);
 }
 impl uct_md_mem_attr_field {
+    #[doc = " Request base address of the allocation to which the buffer belongs."]
     pub const UCT_MD_MEM_ATTR_FIELD_BASE_ADDRESS: uct_md_mem_attr_field = uct_md_mem_attr_field(4);
 }
 impl uct_md_mem_attr_field {
+    #[doc = " Request the whole length of the allocation to which the buffer belongs."]
     pub const UCT_MD_MEM_ATTR_FIELD_ALLOC_LENGTH: uct_md_mem_attr_field = uct_md_mem_attr_field(8);
 }
 impl uct_md_mem_attr_field {
+    #[doc = " Request a cross-device dmabuf file descriptor that represents a memory\n region, and can be used to register the region with another memory\n domain."]
     pub const UCT_MD_MEM_ATTR_FIELD_DMABUF_FD: uct_md_mem_attr_field = uct_md_mem_attr_field(16);
 }
 impl uct_md_mem_attr_field {
+    #[doc = " Request the offset of the provided virtual address relative to the\n beginning of its backing dmabuf region."]
     pub const UCT_MD_MEM_ATTR_FIELD_DMABUF_OFFSET: uct_md_mem_attr_field =
         uct_md_mem_attr_field(32);
 }
@@ -6334,18 +6879,28 @@ impl ::std::ops::BitAndAssign for uct_md_mem_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCT_MD\n @brief UCT MD memory attributes field mask\n\n The enumeration allows specifying which fields in @ref uct_md_mem_attr_t\n are present."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct uct_md_mem_attr_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCT_MD\n @brief UCT MD memory attributes field mask\n\n The enumeration allows specifying which fields in @ref uct_md_mem_attr_t\n are present."]
 pub use self::uct_md_mem_attr_field as uct_md_mem_attr_field_t;
+#[doc = " @ingroup UCT_MD\n @brief  Memory domain attributes.\n\n This structure defines the attributes of a memory pointer which may\n include the memory type of the pointer, and the system device that backs\n the pointer depending on the bit fields populated in field_mask."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_md_mem_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_md_mem_attr_field_t."]
     pub field_mask: u64,
+    #[doc = " The type of memory. E.g. CPU/GPU memory or some other valid type.\n If the md does not support sys_dev query, then UCS_MEMORY_TYPE_UNKNOWN\n is returned."]
     pub mem_type: ucs_memory_type_t,
+    #[doc = " Index of the system device on which the buffer resides. eg: NUMA/GPU\n If the md does not support sys_dev query, then UCS_SYS_DEVICE_ID_UNKNOWN\n is returned."]
     pub sys_dev: ucs_sys_device_t,
+    #[doc = " Base address of the allocation to which the provided buffer belongs to.\n If the md not support base address query, then the pointer passed to\n uct_md_mem_query is returned as is."]
     pub base_address: *mut ::std::os::raw::c_void,
+    #[doc = " Length of the whole allocation to which the provided buffer belongs to.\n If the md not support querying allocation length, then the length passed\n to uct_md_mem_query is returned as is."]
     pub alloc_length: usize,
+    #[doc = " Dmabuf file descriptor to expose memory regions across devices. Refer\n (https://01.org/linuxgraphics/gfx-docs/drm/driver-api/dma-buf.html).\n If the md does not support querying the fd object associated with the\n region, then dmabuf_fd is set to UCT_DMABUF_FD_INVALID by\n uct_md_mem_query(). It is the responsibility of the user to close the\n returned fd using close (2) when it's no longer needed."]
     pub dmabuf_fd: ::std::os::raw::c_int,
+    #[doc = " Offset of the given address from the start of the memory region\n (identified by dmabuf_fd) backing the memory region being queried."]
     pub dmabuf_offset: usize,
 }
 #[test]
@@ -6433,8 +6988,10 @@ fn bindgen_test_layout_uct_md_mem_attr() {
         )
     );
 }
+#[doc = " @ingroup UCT_MD\n @brief  Memory domain attributes.\n\n This structure defines the attributes of a memory pointer which may\n include the memory type of the pointer, and the system device that backs\n the pointer depending on the bit fields populated in field_mask."]
 pub type uct_md_mem_attr_t = uct_md_mem_attr;
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n @brief Query attributes of a given pointer\n\n Return attributes such as memory type, base address, allocation length,\n and system device for the given pointer of specific length.\n\n @param [in]     md          Memory domain to run the query on. This function\n                             returns an error if the md does not recognize the\n                             pointer.\n @param [in]     address     The address of the pointer. Must be non-NULL\n                             else UCS_ERR_INVALID_PARAM error is returned.\n @param [in]     length      Length of the memory region to examine.\n                             Must be nonzero else UCS_ERR_INVALID_PARAM error\n                             is returned.\n @param [inout]  mem_attr    If successful, filled with ptr attributes.\n\n @return UCS_OK if at least one attribute is successfully queried otherwise\n         an error code as defined by @ref ucs_status_t is returned."]
     pub fn uct_md_mem_query(
         md: uct_md_h,
         address: *const ::std::os::raw::c_void,
@@ -6442,14 +6999,21 @@ extern "C" {
         mem_attr: *mut uct_md_mem_attr_t,
     ) -> ucs_status_t;
 }
+#[doc = " @ingroup UCT_MD\n @brief Describes a memory allocated by UCT.\n\n This structure describes the memory block which includes the address, size, and\n Memory Domain used for allocation. This structure is passed to interface\n and the memory is allocated by memory allocation functions @ref uct_mem_alloc."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_allocated_memory {
+    #[doc = "< Address of allocated memory"]
     pub address: *mut ::std::os::raw::c_void,
+    #[doc = "< Real size of allocated memory"]
     pub length: usize,
+    #[doc = "< Method used to allocate the memory"]
     pub method: uct_alloc_method_t,
+    #[doc = "< type of allocated memory"]
     pub mem_type: ucs_memory_type_t,
+    #[doc = "< if method==MD: MD used to allocate the memory"]
     pub md: uct_md_h,
+    #[doc = "< if method==MD: MD memory handle"]
     pub memh: uct_mem_h,
 }
 #[test]
@@ -6527,12 +7091,17 @@ fn bindgen_test_layout_uct_allocated_memory() {
         )
     );
 }
+#[doc = " @ingroup UCT_MD\n @brief Describes a memory allocated by UCT.\n\n This structure describes the memory block which includes the address, size, and\n Memory Domain used for allocation. This structure is passed to interface\n and the memory is allocated by memory allocation functions @ref uct_mem_alloc."]
 pub type uct_allocated_memory_t = uct_allocated_memory;
+#[doc = " @ingroup UCT_MD\n @brief Remote key with its type\n\n This structure describes the credentials (typically key) and information\n required to access the remote memory by the communication interfaces."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_rkey_bundle {
+    #[doc = "< Remote key descriptor, passed to RMA functions"]
     pub rkey: uct_rkey_t,
+    #[doc = "< Handle, used internally for releasing the key"]
     pub handle: *mut ::std::os::raw::c_void,
+    #[doc = "< Remote key type"]
     pub type_: *mut ::std::os::raw::c_void,
 }
 #[test]
@@ -6580,12 +7149,17 @@ fn bindgen_test_layout_uct_rkey_bundle() {
         )
     );
 }
+#[doc = " @ingroup UCT_MD\n @brief Remote key with its type\n\n This structure describes the credentials (typically key) and information\n required to access the remote memory by the communication interfaces."]
 pub type uct_rkey_bundle_t = uct_rkey_bundle;
+#[doc = " @ingroup UCT_RESOURCE\n @brief Completion handle.\n\n This structure should be allocated by the user and can be passed to communication\n primitives. The user must initialize all fields of the structure.\n  If the operation returns UCS_INPROGRESS, this structure will be in use by the\n transport until the operation completes. When the operation completes, \"count\"\n field is decremented by 1, and whenever it reaches 0 - the callback is called.\n\n Notes:\n  - The same structure can be passed multiple times to communication functions\n    without the need to wait for completion.\n  - If the number of operations is smaller than the initial value of the counter,\n    the callback will not be called at all, so it may be left undefined.\n  - status field is required to track the first time the error occurred, and\n    report it via a callback when count reaches 0."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_completion {
+    #[doc = "< User callback function"]
     pub func: uct_completion_callback_t,
+    #[doc = "< Completion counter"]
     pub count: ::std::os::raw::c_int,
+    #[doc = "< Completion status, this field must\nbe initialized with UCS_OK before\nfirst operation is started."]
     pub status: ucs_status_t,
 }
 #[test]
@@ -6633,10 +7207,13 @@ fn bindgen_test_layout_uct_completion() {
         )
     );
 }
+#[doc = " @ingroup UCT_RESOURCE\n @brief Pending request.\n\n This structure should be passed to @ref uct_ep_pending_add() and is used to signal\n new available resources back to user."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_pending_req {
+    #[doc = "< User callback function"]
     pub func: uct_pending_callback_t,
+    #[doc = "< Used internally by UCT"]
     pub priv_: [::std::os::raw::c_char; 40usize],
 }
 #[test]
@@ -6674,10 +7251,13 @@ fn bindgen_test_layout_uct_pending_req() {
         )
     );
 }
+#[doc = " @ingroup UCT_TAG\n @brief Posted tag context.\n\n Tag context is an object which tracks a tag posted to the transport. It\n contains callbacks for matching events on this tag."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_tag_context {
+    #[doc = " Tag is consumed by the transport and should not be matched in software.\n\n @param [in]  self    Pointer to relevant context structure, which was\n                      initially passed to @ref uct_iface_tag_recv_zcopy."]
     pub tag_consumed_cb: ::std::option::Option<unsafe extern "C" fn(self_: *mut uct_tag_context_t)>,
+    #[doc = " Tag processing is completed by the transport.\n\n @param [in]  self        Pointer to relevant context structure, which was\n                          initially passed to @ref uct_iface_tag_recv_zcopy.\n @param [in]  stag        Tag from sender.\n @param [in]  imm         Immediate data from sender. For rendezvous, it's always 0.\n @param [in]  length      Completed length.\n @param [in]  inline_data If non-null, points to a temporary buffer which contains\nthe received data. In this case the received data was not\nplaced directly in the receive buffer. This callback routine\nis responsible for copy-out the inline data, otherwise it is\nreleased.\n @param [in]  status  Completion status:\n (a)   UCS_OK - Success, data placed in provided buffer.\n (b)   UCS_ERR_TRUNCATED - Sender's length exceed posted\nbuffer, no data is copied.\n (c)   UCS_ERR_CANCELED - Canceled by user."]
     pub completed_cb: ::std::option::Option<
         unsafe extern "C" fn(
             self_: *mut uct_tag_context_t,
@@ -6688,6 +7268,7 @@ pub struct uct_tag_context {
             status: ucs_status_t,
         ),
     >,
+    #[doc = " Tag was matched by a rendezvous request, which should be completed by\n the protocol layer.\n\n @param [in]  self          Pointer to relevant context structure, which was\n                            initially passed to @ref uct_iface_tag_recv_zcopy.\n @param [in]  stag          Tag from sender.\n @param [in]  header        User defined header.\n @param [in]  header_length User defined header length in bytes.\n @param [in]  status        Completion status.\n @param [in]  flags         Flags defined by UCT_TAG_RECV_CB_xx."]
     pub rndv_cb: ::std::option::Option<
         unsafe extern "C" fn(
             self_: *mut uct_tag_context_t,
@@ -6698,6 +7279,7 @@ pub struct uct_tag_context {
             flags: ::std::os::raw::c_uint,
         ),
     >,
+    #[doc = " A placeholder for the private data used by the transport"]
     pub priv_: [::std::os::raw::c_char; 32usize],
 }
 #[test]
@@ -6757,6 +7339,7 @@ fn bindgen_test_layout_uct_tag_context() {
 }
 pub const UCT_TAG_RECV_CB_INLINE_DATA: _bindgen_ty_7 = _bindgen_ty_7::UCT_TAG_RECV_CB_INLINE_DATA;
 #[repr(u32)]
+#[doc = " @ingroup UCT_RESOURCE\n @brief flags of @ref uct_tag_context."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum _bindgen_ty_7 {
     UCT_TAG_RECV_CB_INLINE_DATA = 1,
@@ -6768,21 +7351,25 @@ extern "C" {
     pub static mut uct_device_type_names: [*const ::std::os::raw::c_char; 0usize];
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Query for list of components.\n\n Obtain the list of transport components available on the current system.\n\n @param [out] components_p      Filled with a pointer to an array of component\n                                handles.\n @param [out] num_components_p  Filled with the number of elements in the array.\n\n @return UCS_OK if successful, or UCS_ERR_NO_MEMORY if failed to allocate the\n         array of component handles."]
     pub fn uct_query_components(
         components_p: *mut *mut uct_component_h,
         num_components_p: *mut ::std::os::raw::c_uint,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Release the list of components returned from @ref uct_query_components.\n\n This routine releases the memory associated with the list of components\n allocated by @ref uct_query_components.\n\n @param [in] components  Array of component handles to release."]
     pub fn uct_release_component_list(components: *mut uct_component_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Get component attributes\n\n Query various attributes of a component.\n\n @param [in] component          Component handle to query attributes for. The\n                                handle can be obtained from @ref uct_query_components.\n @param [inout] component_attr  Filled with component attributes.\n\n @return UCS_OK if successful, or nonzero error code in case of failure."]
     pub fn uct_component_query(
         component: uct_component_h,
         component_attr: *mut uct_component_attr_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Open a memory domain.\n\n Open a specific memory domain. All communications and memory operations\n are performed in the context of a specific memory domain. Therefore it\n must be created before communication resources.\n\n @param [in]  component       Component on which to open the memory domain,\n                              as returned from @ref uct_query_components.\n @param [in]  md_name         Memory domain name, as returned from @ref\n                              uct_component_query.\n @param [in]  config          MD configuration options. Should be obtained\n                              from uct_md_config_read() function, or point to\n                              MD-specific structure which extends uct_md_config_t.\n @param [out] md_p            Filled with a handle to the memory domain.\n\n @return Error code."]
     pub fn uct_md_open(
         component: uct_component_h,
         md_name: *const ::std::os::raw::c_char,
@@ -6791,9 +7378,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Close a memory domain.\n\n @param [in]  md               Memory domain to close."]
     pub fn uct_md_close(md: uct_md_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Query for transport resources.\n\n This routine queries the @ref uct_md_h \"memory domain\" for communication\n resources that are available for it.\n\n @param [in]  md              Handle to memory domain.\n @param [out] resources_p     Filled with a pointer to an array of resource\n                              descriptors.\n @param [out] num_resources_p Filled with the number of resources in the array.\n\n @return Error code."]
     pub fn uct_md_query_tl_resources(
         md: uct_md_h,
         resources_p: *mut *mut uct_tl_resource_desc_t,
@@ -6801,9 +7390,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Release the list of resources returned from @ref uct_md_query_tl_resources.\n\n This routine releases the memory associated with the list of resources\n allocated by @ref uct_md_query_tl_resources.\n\n @param [in] resources  Array of resource descriptors to release."]
     pub fn uct_release_tl_resource_list(resources: *mut uct_tl_resource_desc_t);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CONTEXT\n @brief Create a worker object.\n\n  The worker represents a progress engine. Multiple progress engines can be\n created in an application, for example to be used by multiple threads.\n  Transports can allocate separate communication resources for every worker,\n so that every worker can be progressed independently of others.\n\n @param [in]  async         Context for async event handlers. Must not be NULL.\n @param [in]  thread_mode   Thread access mode to the worker and all interfaces\n                             and endpoints associated with it.\n @param [out] worker_p      Filled with a pointer to the worker object."]
     pub fn uct_worker_create(
         async_: *mut ucs_async_context_t,
         thread_mode: ucs_thread_mode_t,
@@ -6811,9 +7402,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CONTEXT\n @brief Destroy a worker object.\n\n @param [in]  worker        Worker object to destroy."]
     pub fn uct_worker_destroy(worker: uct_worker_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CONTEXT\n @brief Add a slow path callback function to a worker progress.\n\n If *id_p is equal to UCS_CALLBACKQ_ID_NULL, this function will add a callback\n which will be invoked every time progress is made on the worker. *id_p will\n be updated with an id which refers to this callback and can be used in\n @ref uct_worker_progress_unregister_safe to remove it from the progress path.\n\n @param [in]    worker        Handle to the worker whose progress should invoke\n                              the callback.\n @param [in]    func          Pointer to the callback function.\n @param [in]    arg           Argument for the callback function.\n @param [in]    flags         Callback flags, see @ref ucs_callbackq_flags.\n @param [inout] id_p          Points to a location to store a callback identifier.\n                              If *id_p is equal to UCS_CALLBACKQ_ID_NULL, a\n                              callback will be added and *id_p will be replaced\n                              with a callback identifier which can be subsequently\n                              used to remove the callback. Otherwise, no callback\n                              will be added and *id_p will be left unchanged.\n\n @note This function is thread safe."]
     pub fn uct_worker_progress_register_safe(
         worker: uct_worker_h,
         func: ucs_callback_t,
@@ -6823,9 +7416,11 @@ extern "C" {
     );
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CONTEXT\n @brief Remove a slow path callback function from worker's progress.\n\n If *id_p is not equal to UCS_CALLBACKQ_ID_NULL, remove a callback which was\n previously added by @ref uct_worker_progress_register_safe. *id_p will be reset\n to UCS_CALLBACKQ_ID_NULL.\n\n @param [in]    worker        Handle to the worker whose progress should invoke\n                              the callback.\n @param [inout] id_p          Points to a callback identifier which indicates\n                              the callback to remove. If *id_p is not equal to\n                              UCS_CALLBACKQ_ID_NULL, the callback will be removed\n                              and *id_p will be reset to UCS_CALLBACKQ_ID_NULL.\n                              If *id_p is equal to UCS_CALLBACKQ_ID_NULL, no\n                              operation will be performed and *id_p will be\n                              left unchanged.\n\n @note This function is thread safe."]
     pub fn uct_worker_progress_unregister_safe(worker: uct_worker_h, id_p: *mut uct_worker_cb_id_t);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Read transport-specific interface configuration.\n\n @param [in]  md            Memory domain on which the transport's interface\n                            was registered.\n @param [in]  tl_name       Transport name. If @e md supports\n                            @ref UCT_MD_FLAG_SOCKADDR, the transport name\n                            is allowed to be NULL. In this case, the configuration\n                            returned from this routine should be passed to\n                            @ref uct_iface_open with\n                            @ref UCT_IFACE_OPEN_MODE_SOCKADDR_SERVER or\n                            @ref UCT_IFACE_OPEN_MODE_SOCKADDR_CLIENT set in\n                            @ref uct_iface_params_t.open_mode.\n                            In addition, if tl_name is not NULL, the configuration\n                            returned from this routine should be passed to\n                            @ref uct_iface_open with @ref UCT_IFACE_OPEN_MODE_DEVICE\n                            set in @ref uct_iface_params_t.open_mode.\n @param [in]  env_prefix    If non-NULL, search for environment variables\n                            starting with this UCT_<prefix>_. Otherwise, search\n                            for environment variables starting with just UCT_.\n @param [in]  filename      If non-NULL, read configuration from this file. If\n                            the file does not exist, it will be ignored.\n @param [out] config_p      Filled with a pointer to configuration.\n\n @return Error code."]
     pub fn uct_md_iface_config_read(
         md: uct_md_h,
         tl_name: *const ::std::os::raw::c_char,
@@ -6835,9 +7430,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Release configuration memory returned from uct_md_iface_config_read(),\n uct_md_config_read(), or from uct_cm_config_read().\n\n @param [in]  config        Configuration to release."]
     pub fn uct_config_release(config: *mut ::std::os::raw::c_void);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CONTEXT\n @brief Get value by name from interface configuration (@ref uct_iface_config_t),\n        memory domain configuration (@ref uct_md_config_t)\n        or connection manager configuration (@ref uct_cm_config_t).\n\n @param [in]  config        Configuration to get from.\n @param [in]  name          Configuration variable name.\n @param [out] value         Pointer to get value. Should be allocated/freed by\n                            caller.\n @param [in]  max           Available memory space at @a value pointer.\n\n @return UCS_OK if found, otherwise UCS_ERR_INVALID_PARAM or UCS_ERR_NO_ELEM\n         if error."]
     pub fn uct_config_get(
         config: *mut ::std::os::raw::c_void,
         name: *const ::std::os::raw::c_char,
@@ -6846,6 +7443,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CONTEXT\n @brief Modify interface configuration (@ref uct_iface_config_t),\n        memory domain configuration (@ref uct_md_config_t)\n        or connection manager configuration (@ref uct_cm_config_t).\n\n @param [in]  config        Configuration to modify.\n @param [in]  name          Configuration variable name.\n @param [in]  value         Value to set.\n\n @return Error code."]
     pub fn uct_config_modify(
         config: *mut ::std::os::raw::c_void,
         name: *const ::std::os::raw::c_char,
@@ -6853,6 +7451,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Open a communication interface.\n\n @param [in]  md            Memory domain to create the interface on.\n @param [in]  worker        Handle to worker which will be used to progress\n                            communications on this interface.\n @param [in]  params        User defined @ref uct_iface_params_t parameters.\n @param [in]  config        Interface configuration options. Should be obtained\n                            from uct_md_iface_config_read() function, or point to\n                            transport-specific structure which extends uct_iface_config_t.\n @param [out] iface_p       Filled with a handle to opened communication interface.\n\n @return Error code."]
     pub fn uct_iface_open(
         md: uct_md_h,
         worker: uct_worker_h,
@@ -6862,21 +7461,26 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Close and destroy an interface.\n\n @param [in]  iface  Interface to close."]
     pub fn uct_iface_close(iface: uct_iface_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Get interface attributes.\n\n @param [in]  iface      Interface to query.\n @param [out] iface_attr Filled with interface attributes."]
     pub fn uct_iface_query(iface: uct_iface_h, iface_attr: *mut uct_iface_attr_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Get address of the device the interface is using.\n\n  Get underlying device address of the interface. All interfaces using the same\n device would return the same address.\n\n @param [in]  iface       Interface to query.\n @param [out] addr        Filled with device address. The size of the buffer\n                          provided must be at least @ref uct_iface_attr_t::device_addr_len."]
     pub fn uct_iface_get_device_address(
         iface: uct_iface_h,
         addr: *mut uct_device_addr_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Get interface address.\n\n requires @ref UCT_IFACE_FLAG_CONNECT_TO_IFACE.\n\n @param [in]  iface       Interface to query.\n @param [out] addr        Filled with interface address. The size of the buffer\n                          provided must be at least @ref uct_iface_attr_t::iface_addr_len."]
     pub fn uct_iface_get_address(iface: uct_iface_h, addr: *mut uct_iface_addr_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Check if remote iface address is reachable.\n\n This function checks if a remote address can be reached from a local interface.\n If the function returns true, it does not necessarily mean a connection and/or\n data transfer would succeed, since the reachability check is a local operation\n it does not detect issues such as network mis-configuration or lack of connectivity.\n\n @param [in]  iface      Interface to check reachability from.\n @param [in]  dev_addr   Device address to check reachability to. It is NULL\n                         if iface_attr.dev_addr_len == 0, and must be non-NULL otherwise.\n @param [in]  iface_addr Interface address to check reachability to. It is\n                         NULL if iface_attr.iface_addr_len == 0, and must\n                         be non-NULL otherwise.\n\n @return Nonzero if reachable, 0 if not."]
     pub fn uct_iface_is_reachable(
         iface: uct_iface_h,
         dev_addr: *const uct_device_addr_t,
@@ -6884,6 +7488,7 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief check if the destination endpoint is alive in respect to UCT library\n\n This function checks if the destination endpoint is alive with respect to the\n UCT library. If the status of @a ep is known, either @ref UCS_OK or an error\n is returned immediately. Otherwise, @ref UCS_INPROGRESS is returned,\n indicating that synchronization on the status is needed. In this case, the\n status will be be propagated by @a comp callback.\n\n @param [in]  ep      Endpoint to check\n @param [in]  flags   Flags that define level of check\n                      (currently unsupported - set to 0).\n @param [in]  comp    Handler to process status of @a ep\n\n @return              Error code."]
     pub fn uct_ep_check(
         ep: uct_ep_h,
         flags: ::std::os::raw::c_uint,
@@ -6891,15 +7496,18 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Obtain a notification file descriptor for polling.\n\n Only interfaces that support at least one of the UCT_IFACE_FLAG_EVENT* flags\n will implement this function.\n\n @param [in]  iface      Interface to get the notification descriptor.\n @param [out] fd_p       Location to write the notification file descriptor.\n\n @return Error code."]
     pub fn uct_iface_event_fd_get(
         iface: uct_iface_h,
         fd_p: *mut ::std::os::raw::c_int,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Turn on event notification for the next event.\n\n This routine needs to be called before waiting on each notification on this\n interface, so will typically be called once the processing of the previous\n event is over.\n\n @param [in] iface       Interface to arm.\n @param [in] events      Events to wakeup on. See @ref uct_iface_event_types\n\n @return ::UCS_OK        The operation completed successfully. File descriptor\n                         will be signaled by new events.\n @return ::UCS_ERR_BUSY  There are unprocessed events which prevent the\n                         file descriptor from being armed.\n                         The operation is not completed. File descriptor\n                         will not be signaled by new events.\n @return @ref ucs_status_t \"Other\" different error codes in case of issues."]
     pub fn uct_iface_event_arm(iface: uct_iface_h, events: ::std::os::raw::c_uint) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Allocate memory which can be used for zero-copy communications.\n\n Allocate a region of memory which can be used for zero-copy data transfer or\n remote access on a particular transport interface.\n\n @param [in]  iface    Interface to allocate memory on.\n @param [in]  length   Size of memory region to allocate.\n @param [in]  flags    Memory allocation flags, see @ref uct_md_mem_flags.\n @param [in]  name     Allocation name, for debug purposes.\n @param [out] mem      Descriptor of allocated memory.\n\n @return UCS_OK if allocation was successful, error code otherwise."]
     pub fn uct_iface_mem_alloc(
         iface: uct_iface_h,
         length: usize,
@@ -6909,9 +7517,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Release memory allocated with @ref uct_iface_mem_alloc().\n\n @param [in]  mem      Descriptor of memory to release."]
     pub fn uct_iface_mem_free(mem: *const uct_allocated_memory_t);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_AM\n @brief Set active message handler for the interface.\n\n Only one handler can be set of each active message ID, and setting a handler\n replaces the previous value. If cb == NULL, the current handler is removed.\n\n\n @param [in]  iface    Interface to set the active message handler for.\n @param [in]  id       Active message id. Must be 0..UCT_AM_ID_MAX-1.\n @param [in]  cb       Active message callback. NULL to clear.\n @param [in]  arg      Active message argument.\n @param [in]  flags    Required @ref uct_cb_flags \"callback flags\"\n\n @return error code if the interface does not support active messages or\n         requested callback flags"]
     pub fn uct_iface_set_am_handler(
         iface: uct_iface_h,
         id: u8,
@@ -6921,6 +7531,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_AM\n @brief Set active message tracer for the interface.\n\n Sets a function which dumps active message debug information to a buffer,\n which is printed every time an active message is sent or received, when\n data tracing is on. Without the tracer, only transport-level information is\n printed.\n\n @param [in]  iface    Interface to set the active message tracer for.\n @param [in]  tracer   Active message tracer. NULL to clear.\n @param [in]  arg      Tracer custom argument."]
     pub fn uct_iface_set_am_tracer(
         iface: uct_iface_h,
         tracer: uct_am_tracer_t,
@@ -6928,27 +7539,35 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Accept connection request.\n\n @param [in] iface        Transport interface which generated connection\n                          request @a conn_request.\n @param [in] conn_request Connection establishment request passed as parameter\n                          of @ref uct_sockaddr_conn_request_callback_t.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn uct_iface_accept(iface: uct_iface_h, conn_request: uct_conn_request_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Reject connection request. Will invoke an error handler @ref\n        uct_error_handler_t on the remote transport interface, if set.\n\n @param [in] iface        Interface which generated connection establishment\n                          request @a conn_request.\n @param [in] conn_request Connection establishment request passed as parameter\n                          of @ref uct_sockaddr_conn_request_callback_t.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn uct_iface_reject(iface: uct_iface_h, conn_request: uct_conn_request_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Create new endpoint.\n\n Create a UCT endpoint in one of the available modes:\n -# Unconnected endpoint: If no any address is present in @ref uct_ep_params,\n    this creates an unconnected endpoint. To establish a connection to a\n    remote endpoint, @ref uct_ep_connect_to_ep will need to be called. Use of\n    this mode requires @ref uct_ep_params_t::iface has the\n    @ref UCT_IFACE_FLAG_CONNECT_TO_EP capability flag. It may be obtained by\n    @ref uct_iface_query.\n -# Connect to a remote interface: If @ref uct_ep_params_t::dev_addr and\n    @ref uct_ep_params_t::iface_addr are set, this will establish an endpoint\n    that is connected to a remote interface. This requires that\n    @ref uct_ep_params_t::iface has the @ref UCT_IFACE_FLAG_CONNECT_TO_IFACE\n    capability flag. It may be obtained by @ref uct_iface_query.\n -# Connect to a remote socket address: If @ref uct_ep_params_t::sockaddr is\n    set, this will create an endpoint that is connected to a remote socket.\n    This requires that either @ref uct_ep_params::cm, or\n    @ref uct_ep_params::iface will be set. In the latter case, the interface\n    has to support @ref UCT_IFACE_FLAG_CONNECT_TO_SOCKADDR flag, which can be\n    checked by calling @ref uct_iface_query.\n @param [in]  params  User defined @ref uct_ep_params_t configuration for the\n                      @a ep_p.\n @param [out] ep_p    Filled with handle to the new endpoint.\n\n @return UCS_OK       The endpoint is created successfully. This does not\n                      guarantee that the endpoint has been connected to\n                      the destination defined in @a params; in case of failure,\n                      the error will be reported to the interface error\n                      handler callback provided to @ref uct_iface_open\n                      via @ref uct_iface_params_t.err_handler.\n @return              Error code as defined by @ref ucs_status_t"]
     pub fn uct_ep_create(params: *const uct_ep_params_t, ep_p: *mut uct_ep_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Connect a client side endpoint after it is bound to a local network\n        device, i.e. @ref uct_ep_params_t::cm_resolve_cb was invoked.\n\n This non-blocking routine establishes connection of the client side endpoint\n and sends private data to the peer.\n\n @param [in] ep       Endpoint to connect.\n @param [in] params   Parameters as defined in @ref uct_ep_connect_params_t.\n\n @return UCS_OK       Operation has been initiated successfully.\n         Other error codes as defined by @ref ucs_status_t."]
     pub fn uct_ep_connect(ep: uct_ep_h, params: *const uct_ep_connect_params_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Initiate a disconnection of an endpoint connected to a\n        sockaddr by a connection manager @ref uct_cm_h.\n\n This non-blocking routine will send a disconnect notification on the endpoint,\n so that @ref uct_ep_disconnect_cb_t will be called on the remote peer.\n The remote side should also call this routine when handling the initiator's\n disconnect.\n After a call to this function, the given endpoint may not be used for\n communications anymore.\n The @ref uct_ep_flush / @ref uct_iface_flush routines will guarantee that the\n disconnect notification is delivered to the remote peer.\n @ref uct_ep_destroy should be called on this endpoint after invoking this\n routine and @ref uct_ep_params::disconnect_cb was called.\n\n @param [in] ep       Endpoint to disconnect.\n @param [in] flags    Reserved for future use.\n\n @return UCS_OK                Operation has completed successfully.\n         UCS_ERR_BUSY          The @a ep is not connected yet (either\n                               @ref uct_cm_ep_client_connect_callback_t or\n                               @ref uct_cm_ep_server_conn_notify_callback_t\n                               was not invoked).\n         UCS_INPROGRESS        The disconnect request has been initiated, but\n                               the remote peer has not yet responded to this\n                               request, and consequently the registered\n                               callback @ref uct_ep_disconnect_cb_t has not\n                               been invoked to handle the request.\n         UCS_ERR_NOT_CONNECTED The @a ep is disconnected locally and remotely.\n         Other error codes as defined by @ref ucs_status_t ."]
     pub fn uct_ep_disconnect(ep: uct_ep_h, flags: ::std::os::raw::c_uint) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Destroy an endpoint.\n\n @param [in] ep       Endpoint to destroy."]
     pub fn uct_ep_destroy(ep: uct_ep_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Get endpoint address.\n\n @param [in]  ep       Endpoint to query.\n @param [out] addr     Filled with endpoint address. The size of the buffer\n                       provided must be at least @ref uct_iface_attr_t::ep_addr_len."]
     pub fn uct_ep_get_address(ep: uct_ep_h, addr: *mut uct_ep_addr_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_RESOURCE\n @brief Connect endpoint to a remote endpoint.\n\n requires @ref UCT_IFACE_FLAG_CONNECT_TO_EP capability.\n\n @param [in] ep           Endpoint to connect.\n @param [in] dev_addr     Remote device address.\n @param [in] ep_addr      Remote endpoint address."]
     pub fn uct_ep_connect_to_ep(
         ep: uct_ep_h,
         dev_addr: *const uct_device_addr_t,
@@ -6956,31 +7575,46 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n @brief Query for memory domain attributes.\n\n @param [in]  md       Memory domain to query.\n @param [out] md_attr  Filled with memory domain attributes."]
     pub fn uct_md_query(md: uct_md_h, md_attr: *mut uct_md_attr_t) -> ucs_status_t;
 }
 #[repr(u32)]
+#[doc = " @ingroup UCT_MD\n @brief UCT allocation parameters specification field mask\n\n The enumeration allows specifying which fields in @ref uct_mem_alloc_params_t\n are present."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum uct_mem_alloc_params_field_t {
+    #[doc = " Enables @ref uct_mem_alloc_params_t::flags"]
     UCT_MEM_ALLOC_PARAM_FIELD_FLAGS = 1,
+    #[doc = " Enables @ref uct_mem_alloc_params_t::address"]
     UCT_MEM_ALLOC_PARAM_FIELD_ADDRESS = 2,
+    #[doc = " Enables @ref uct_mem_alloc_params_t::mem_type"]
     UCT_MEM_ALLOC_PARAM_FIELD_MEM_TYPE = 4,
+    #[doc = " Enables @ref uct_mem_alloc_params_t::mds"]
     UCT_MEM_ALLOC_PARAM_FIELD_MDS = 8,
+    #[doc = " Enables @ref uct_mem_alloc_params_t::name"]
     UCT_MEM_ALLOC_PARAM_FIELD_NAME = 16,
 }
+#[doc = " @ingroup UCT_MD\n @brief Parameters for allocating memory using @ref uct_mem_alloc"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_mem_alloc_params_t {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref uct_mem_alloc_params_field_t. Fields not specified in this mask will\n be ignored."]
     pub field_mask: u64,
+    #[doc = " Memory allocation flags, see @ref uct_md_mem_flags\n If UCT_MEM_ALLOC_PARAM_FIELD_FLAGS is not specified in field_mask, then\n (UCT_MD_MEM_ACCESS_LOCAL_READ | UCT_MD_MEM_ACCESS_LOCAL_WRITE) is used by\n default."]
     pub flags: ::std::os::raw::c_uint,
+    #[doc = " If @a address is NULL, the underlying allocation routine will\n choose the address at which to create the mapping. If @a address\n is non-NULL and UCT_MD_MEM_FLAG_FIXED is not set, the address\n will be interpreted as a hint as to where to establish the mapping. If\n @a address is non-NULL and UCT_MD_MEM_FLAG_FIXED is set, then the\n specified address is interpreted as a requirement. In this case, if the\n mapping to the exact address cannot be made, the allocation request\n fails."]
     pub address: *mut ::std::os::raw::c_void,
+    #[doc = " Type of memory to be allocated."]
     pub mem_type: ucs_memory_type_t,
     pub mds: uct_mem_alloc_params_t__bindgen_ty_1,
+    #[doc = " Name of the allocated region, used to track memory\n usage for debugging and profiling.\n If UCT_MEM_ALLOC_PARAM_FIELD_NAME is not specified in field_mask, then\n \"anonymous-uct_mem_alloc\" is used by default."]
     pub name: *const ::std::os::raw::c_char,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct uct_mem_alloc_params_t__bindgen_ty_1 {
+    #[doc = " Array of memory domains to attempt to allocate\n the memory with, for MD allocation method."]
     pub mds: *const uct_md_h,
+    #[doc = "  Length of 'mds' array. May be empty, in such case\n  'mds' may be NULL, and MD allocation method will\n  be skipped."]
     pub count: ::std::os::raw::c_uint,
 }
 #[test]
@@ -7102,6 +7736,7 @@ fn bindgen_test_layout_uct_mem_alloc_params_t() {
     );
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n @brief Give advice about the use of memory\n\n This routine advises the UCT about how to handle memory range beginning at\n address and size of length bytes. This call does not influence the semantics\n of the application, but may influence its performance. The advice may be\n ignored.\n\n @param [in]     md          Memory domain memory was allocated or registered on.\n @param [in]     memh        Memory handle, as returned from @ref uct_mem_alloc\n @param [in]     addr        Memory base address. Memory range must belong to the\n                             @a memh\n @param [in]     length      Length of memory to advise. Must be >0.\n @param [in]     advice      Memory use advice as defined in the\n                             @ref uct_mem_advice_t list"]
     pub fn uct_md_mem_advise(
         md: uct_md_h,
         memh: uct_mem_h,
@@ -7111,6 +7746,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n @brief Register memory for zero-copy sends and remote access.\n\n  Register memory on the memory domain. In order to use this function, MD\n must support @ref UCT_MD_FLAG_REG flag.\n\n @param [in]     md        Memory domain to register memory on.\n @param [in]     address   Memory to register.\n @param [in]     length    Size of memory to register. Must be >0.\n @param [in]     flags     Memory allocation flags, see @ref uct_md_mem_flags.\n @param [out]    memh_p    Filled with handle for allocated region."]
     pub fn uct_md_mem_reg(
         md: uct_md_h,
         address: *mut ::std::os::raw::c_void,
@@ -7120,9 +7756,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n @brief Undo the operation of @ref uct_md_mem_reg().\n\n @param [in]  md          Memory domain which was used to register the memory.\n @param [in]  memh        Local access key to memory region."]
     pub fn uct_md_mem_dereg(md: uct_md_h, memh: uct_mem_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n @brief Detect memory type\n\n @param [in]     md           Memory domain to detect memory type\n @param [in]     addr         Memory address to detect.\n @param [in]     length       Size of memory\n @param [out]    mem_type_p   Filled with memory type of the address range if\nfunction succeeds\n @return UCS_OK               If memory type is successfully detected\n         UCS_ERR_INVALID_ADDR If failed to detect memory type"]
     pub fn uct_md_detect_memory_type(
         md: uct_md_h,
         addr: *const ::std::os::raw::c_void,
@@ -7131,6 +7769,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n @brief Allocate memory for zero-copy communications and remote access.\n\n Allocate potentially registered memory.\n\n @param [in]     length      The minimal size to allocate. The actual size may\n                             be larger, for example because of alignment\n                             restrictions. Must be >0.\n @param [in]     methods     Array of memory allocation methods to attempt.\n                             Each of the provided allocation methods will be\n                             tried in array order, to perform the allocation,\n                             until one succeeds. Whenever the MD method is\n                             encountered, each of the provided MDs will be\n                             tried in array order, to allocate the memory,\n                             until one succeeds, or they are exhausted. In\n                             this case the next allocation method from the\n                             initial list will be attempted.\n @param [in]     num_methods Length of 'methods' array.\n @param [in]     params      Memory allocation characteristics, see\n                             @ref uct_mem_alloc_params_t.\n @param [out]    mem         In case of success, filled with information about\n                             the allocated memory. @ref uct_allocated_memory_t"]
     pub fn uct_mem_alloc(
         length: usize,
         methods: *const uct_alloc_method_t,
@@ -7140,9 +7779,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n @brief Release allocated memory.\n\n Release the memory allocated by @ref uct_mem_alloc.\n\n @param [in]  mem         Description of allocated memory, as returned from\n                          @ref uct_mem_alloc."]
     pub fn uct_mem_free(mem: *const uct_allocated_memory_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n @brief Read the configuration for a memory domain.\n\n @param [in]  component     Read the configuration of this component.\n @param [in]  env_prefix    If non-NULL, search for environment variables\n                            starting with this UCT_<prefix>_. Otherwise, search\n                            for environment variables starting with just UCT_.\n @param [in]  filename      If non-NULL, read configuration from this file. If\n                            the file does not exist, it will be ignored.\n @param [out] config_p      Filled with a pointer to the configuration.\n\n @return Error code."]
     pub fn uct_md_config_read(
         component: uct_component_h,
         env_prefix: *const ::std::os::raw::c_char,
@@ -7151,6 +7792,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n @brief Check if remote sock address is accessible from the memory domain.\n\n This function checks if a remote sock address can be accessed from a local\n memory domain. Accessibility can be checked in local or remote mode.\n\n @param [in]  md         Memory domain to check accessibility from.\n                         This memory domain must support the @ref\n                         UCT_MD_FLAG_SOCKADDR flag.\n @param [in]  sockaddr   Socket address to check accessibility to.\n @param [in]  mode       Mode for checking accessibility, as defined in @ref\n                         uct_sockaddr_accessibility_t.\n                         Indicates if accessibility is tested on the server side -\n                         for binding to the given sockaddr, or on the\n                         client side - for connecting to the given remote\n                         peer's sockaddr.\n\n @return Nonzero if accessible, 0 if inaccessible."]
     pub fn uct_md_is_sockaddr_accessible(
         md: uct_md_h,
         sockaddr: *const ucs_sock_addr_t,
@@ -7158,6 +7800,7 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n\n @brief Pack a remote key.\n\n @param [in]  md           Handle to memory domain.\n @param [in]  memh         Local key, whose remote key should be packed.\n @param [out] rkey_buffer  Filled with packed remote key.\n\n @return Error code."]
     pub fn uct_md_mkey_pack(
         md: uct_md_h,
         memh: uct_mem_h,
@@ -7165,6 +7808,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n\n @brief Unpack a remote key.\n\n @param [in]  component    Component on which to unpack the remote key.\n @param [in]  rkey_buffer  Packed remote key buffer.\n @param [out] rkey_ob      Filled with the unpacked remote key and its type.\n\n @note The remote key must be unpacked with the same component that was used\n       to pack it. For example, if a remote device address on the remote\n       memory domain which was used to pack the key is reachable by a\n       transport on a local component, then that component is eligible to\n       unpack the key.\n       If the remote key buffer cannot be unpacked with the given component,\n       UCS_ERR_INVALID_PARAM will be returned.\n\n @return Error code."]
     pub fn uct_rkey_unpack(
         component: uct_component_h,
         rkey_buffer: *const ::std::os::raw::c_void,
@@ -7172,6 +7816,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n\n @brief Get a local pointer to remote memory.\n\n This routine returns a local pointer to the remote memory\n described by the rkey bundle. The @a component must support\n @ref UCT_COMPONENT_FLAG_RKEY_PTR flag.\n\n @param [in]  component    Component on which to obtain the pointer to the\n                           remote key.\n @param [in]  rkey_ob      A remote key bundle as returned by\n                           the @ref uct_rkey_unpack function.\n @param [in]  remote_addr  A remote address within the memory area described\n                           by the rkey_ob.\n @param [out] addr_p       A pointer that can be used for direct access to\n                           the remote memory.\n\n @note The component used to obtain a local pointer to the remote memory must\n       be the same component that was used to pack the remote key. See notes\n       section for @ref uct_rkey_unpack.\n\n @return Error code if the remote memory cannot be accessed directly or\n         the remote address is not valid."]
     pub fn uct_rkey_ptr(
         component: uct_component_h,
         rkey_ob: *mut uct_rkey_bundle_t,
@@ -7180,12 +7825,14 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_MD\n\n @brief Release a remote key.\n\n @param [in]  component    Component which was used to unpack the remote key.\n @param [in]  rkey_ob      Remote key to release."]
     pub fn uct_rkey_release(
         component: uct_component_h,
         rkey_ob: *const uct_rkey_bundle_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Open a connection manager.\n\n Open a connection manager. All client server connection\n establishment operations are performed in the context of a specific\n connection manager.\n @note This is an alternative API for\n       @ref uct_iface_open_mode::UCT_IFACE_OPEN_MODE_SOCKADDR_SERVER and\n       @ref uct_iface_open_mode::UCT_IFACE_OPEN_MODE_SOCKADDR_CLIENT .\n\n @param [in]  component   Component on which to open the connection manager,\n                          as returned from @ref uct_query_components.\n @param [in]  worker      Worker on which to open the connection manager.\n @param [in]  config      CM configuration options. Either obtained\n                          from @ref uct_cm_config_read() function, or pointer\n                          to CM-specific structure that extends\n                          @ref uct_cm_config_t.\n @param [out] cm_p        Filled with a handle to the connection manager.\n\n @return Error code."]
     pub fn uct_cm_open(
         component: uct_component_h,
         worker: uct_worker_h,
@@ -7194,12 +7841,15 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Close a connection manager.\n\n @param [in]  cm    Connection manager to close."]
     pub fn uct_cm_close(cm: uct_cm_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Get connection manager attributes.\n\n This routine queries the @ref uct_cm_h \"cm\" for its attributes\n @ref uct_cm_attr_t.\n\n @param [in]  cm      Connection manager to query.\n @param [out] cm_attr Filled with connection manager attributes."]
     pub fn uct_cm_query(cm: uct_cm_h, cm_attr: *mut uct_cm_attr_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Read the configuration for a connection manager.\n\n @param [in]  component     Read the configuration of the connection manager\n                            on this component.\n @param [in]  env_prefix    If non-NULL, search for environment variables\n                            starting with this UCT_<prefix>_. Otherwise, search\n                            for environment variables starting with just UCT_.\n @param [in]  filename      If non-NULL, read configuration from this file. If\n                            the file does not exist, or exists but cannot be\n                            opened or read, it will be ignored.\n @param [out] config_p      Filled with a pointer to the configuration.\n\n @return Error code."]
     pub fn uct_cm_config_read(
         component: uct_component_h,
         env_prefix: *const ::std::os::raw::c_char,
@@ -7208,9 +7858,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Notify the server about client-side connection establishment.\n\n This routine should be called on the client side after the client completed\n establishing its connection to the server. The routine will send a\n notification message to the server indicating that the client is connected.\n\n @param [in]  ep      The connected endpoint on the client side.\n\n @return Error code."]
     pub fn uct_cm_client_ep_conn_notify(ep: uct_ep_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Create a new transport listener object.\n\n This routine creates a new listener on the given CM which will start\n listening on a given sockaddr.\n\n @param [in]  cm          Connection manager on which to open the listener.\n                          This cm should not be closed as long as there are\n                          open listeners on it.\n @param [in]  saddr       The socket address to listen on.\n @param [in]  socklen     The saddr length.\n @param [in]  params      User defined @ref uct_listener_params_t\n                          configurations for the @a listener_p.\n @param [out] listener_p  Filled with handle to the new listener.\n\n @return Error code."]
     pub fn uct_listener_create(
         cm: uct_cm_h,
         saddr: *const sockaddr,
@@ -7220,56 +7872,69 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Destroy a transport listener.\n\n @param [in]  listener    Listener to destroy."]
     pub fn uct_listener_destroy(listener: uct_listener_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Reject a connection request.\n\n This routine can be invoked on the server side. It rejects a connection request\n from the client.\n\n @param [in] listener     Listener which will reject the connection request.\n @param [in] conn_request Connection establishment request passed as parameter\n                          of @ref uct_cm_listener_conn_request_callback_t in\n                          @ref uct_cm_listener_conn_request_args_t::conn_request.\n\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn uct_listener_reject(
         listener: uct_listener_h,
         conn_request: uct_conn_request_h,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCT_CLIENT_SERVER\n @brief Get attributes specific to a particular listener.\n\n This routine queries the @ref uct_listener_h \"listener\" for its attributes\n @ref uct_listener_attr_t.\n\n @param [in]  listener      Listener object to query.\n @param [out] listener_attr Filled with attributes of the listener.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn uct_listener_query(
         listener: uct_listener_h,
         listener_attr: *mut uct_listener_attr_t,
     ) -> ucs_status_t;
 }
+#[doc = " @ingroup UCP_CONTEXT\n @brief UCP receive information descriptor\n\n The UCP receive information descriptor is allocated by application and filled\n in with the information about the received message by @ref ucp_tag_probe_nb\n or @ref ucp_tag_recv_request_test routines or\n @ref ucp_tag_recv_callback_t callback argument."]
 pub type ucp_tag_recv_info_t = ucp_tag_recv_info;
+#[doc = " @ingroup UCP_WORKER\n @brief Operation parameters provided in @ref ucp_am_recv_callback_t callback."]
 pub type ucp_am_recv_param_t = ucp_am_recv_param;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_context {
     _unused: [u8; 0],
 }
+#[doc = " @ingroup UCP_CONTEXT\n @brief UCP Application Context\n\n UCP application context (or just a context) is an opaque handle that holds a\n UCP communication instance's global information.  It represents a single UCP\n communication instance.  The communication instance could be an OS process\n (an application) that uses UCP library.  This global information includes\n communication resources, endpoints, memory, temporary file storage, and\n other communication information directly associated with a specific UCP\n instance.  The context also acts as an isolation mechanism, allowing\n resources associated with the context to manage multiple concurrent\n communication instances. For example, users using both MPI and OpenSHMEM\n sessions simultaneously can isolate their communication by allocating and\n using separate contexts for each of them. Alternatively, users can share the\n communication resources (memory, network resource context, etc.) between\n them by using the same application context. A message sent or a RMA\n operation performed in one application context cannot be received in any\n other application context."]
 pub type ucp_context_h = *mut ucp_context;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_config {
     _unused: [u8; 0],
 }
+#[doc = " @ingroup UCP_CONFIG\n @brief UCP configuration descriptor\n\n This descriptor defines the configuration for @ref ucp_context_h\n \"UCP application context\". The configuration is loaded from the run-time\n environment (using configuration files of environment variables)\n using @ref ucp_config_read \"ucp_config_read\" routine and can be printed\n using @ref ucp_config_print \"ucp_config_print\" routine. In addition,\n application is responsible to release the descriptor using\n @ref ucp_config_release \"ucp_config_release\" routine.\n\n @todo This structure will be modified through a dedicated function."]
 pub type ucp_config_t = ucp_config;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_ep {
     _unused: [u8; 0],
 }
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP Endpoint\n\n The endpoint handle is an opaque object that is used to address a remote\n @ref ucp_worker_h \"worker\". It typically provides a description of source,\n destination, or both. All UCP communication routines address a destination\n with the endpoint handle. The endpoint handle is associated with only one\n @ref ucp_context_h \"UCP context\". UCP provides the @ref ucp_ep_create\n \"endpoint create\" routine to create the endpoint handle and the @ref\n ucp_ep_destroy \"destroy\" routine to destroy the endpoint handle."]
 pub type ucp_ep_h = *mut ucp_ep;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_conn_request {
     _unused: [u8; 0],
 }
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP connection request\n\n A server-side handle to incoming connection request. Can be used to create an\n endpoint which connects back to the client."]
 pub type ucp_conn_request_h = *mut ucp_conn_request;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_address {
     _unused: [u8; 0],
 }
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker address\n\n The address handle is an opaque object that is used as an identifier for a\n @ref ucp_worker_h \"worker\" instance."]
 pub type ucp_address_t = ucp_address;
 #[repr(u32)]
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Error handling mode for the UCP endpoint.\n\n Specifies error handling mode for the UCP endpoint."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucp_err_handling_mode_t {
+    #[doc = "< No guarantees about error\n   reporting, imposes minimal\n   overhead from a performance\n   perspective. @note In this\n   mode, any error reporting will\n   not generate calls to @ref\n   ucp_ep_params_t::err_handler."]
     UCP_ERR_HANDLING_MODE_NONE = 0,
+    #[doc = "< Guarantees that send requests\n   are always completed\n   (successfully or error) even in\n   case of remote failure, disables\n   protocols and APIs which may\n   cause a hang or undefined\n   behavior in case of peer failure,\n   may affect performance and\n   memory footprint"]
     UCP_ERR_HANDLING_MODE_PEER = 1,
 }
 #[repr(C)]
@@ -7277,25 +7942,33 @@ pub enum ucp_err_handling_mode_t {
 pub struct ucp_rkey {
     _unused: [u8; 0],
 }
+#[doc = " @ingroup UCP_MEM\n @brief UCP Remote memory handle\n\n Remote memory handle is an opaque object representing remote memory access\n information. Typically, the handle includes a memory access key and other\n network hardware specific information, which are input to remote memory\n access operations, such as PUT, GET, and ATOMIC. The object is\n communicated to remote peers to enable an access to the memory region."]
 pub type ucp_rkey_h = *mut ucp_rkey;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_mem {
     _unused: [u8; 0],
 }
+#[doc = " @ingroup UCP_MEM\n @brief UCP Memory handle\n\n Memory handle is an opaque object representing a memory region allocated\n through UCP library, which is optimized for remote memory access\n operations (zero-copy operations).  The memory handle is a self-contained\n object, which includes the information required to access the memory region\n locally, while @ref ucp_rkey_h \"remote key\" is used to access it\n remotely. The memory could be registered to one or multiple network resources\n that are supported by UCP, such as InfiniBand, Gemini, and others."]
 pub type ucp_mem_h = *mut ucp_mem;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_listener {
     _unused: [u8; 0],
 }
+#[doc = " @ingroup UCP_WORKER\n @brief UCP listen handle.\n\n The listener handle is an opaque object that is used for listening on a\n specific address and accepting connections from clients."]
 pub type ucp_listener_h = *mut ucp_listener;
+#[doc = " @ingroup UCP_MEM\n @brief Attributes of the @ref ucp_mem_h \"UCP Memory handle\", filled by\n        @ref ucp_mem_query function."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_mem_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from @ref ucp_mem_attr_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Address of the memory segment."]
     pub address: *mut ::std::os::raw::c_void,
+    #[doc = " Size of the memory segment."]
     pub length: usize,
+    #[doc = " Type of allocated or registered memory"]
     pub mem_type: ucs_memory_type_t,
 }
 #[test]
@@ -7353,14 +8026,18 @@ fn bindgen_test_layout_ucp_mem_attr() {
         )
     );
 }
+#[doc = " @ingroup UCP_MEM\n @brief Attributes of the @ref ucp_mem_h \"UCP Memory handle\", filled by\n        @ref ucp_mem_query function."]
 pub type ucp_mem_attr_t = ucp_mem_attr;
 impl ucp_mem_attr_field {
+    #[doc = "< Virtual address"]
     pub const UCP_MEM_ATTR_FIELD_ADDRESS: ucp_mem_attr_field = ucp_mem_attr_field(1);
 }
 impl ucp_mem_attr_field {
+    #[doc = "< The size of memory region"]
     pub const UCP_MEM_ATTR_FIELD_LENGTH: ucp_mem_attr_field = ucp_mem_attr_field(2);
 }
 impl ucp_mem_attr_field {
+    #[doc = "< Type of allocated or registered memory"]
     pub const UCP_MEM_ATTR_FIELD_MEM_TYPE: ucp_mem_attr_field = ucp_mem_attr_field(4);
 }
 impl ::std::ops::BitOr<ucp_mem_attr_field> for ucp_mem_attr_field {
@@ -7390,6 +8067,7 @@ impl ::std::ops::BitAndAssign for ucp_mem_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_MEM\n @brief UCP Memory handle attributes field mask.\n\n The enumeration allows specifying which fields in @ref ucp_mem_attr_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_mem_attr_field(pub ::std::os::raw::c_uint);
 #[repr(C)]
@@ -7397,22 +8075,30 @@ pub struct ucp_mem_attr_field(pub ::std::os::raw::c_uint);
 pub struct ucp_worker {
     _unused: [u8; 0],
 }
+#[doc = " @ingroup UCP_WORKER\n @brief UCP Worker\n\n UCP worker is an opaque object representing the communication context.  The\n worker represents an instance of a local communication resource and the\n progress engine associated with it. The progress engine is a construct that\n is responsible for asynchronous and independent progress of communication\n directives. The progress engine could be implemented in hardware or software.\n The worker object abstracts an instance of network resources such as a host\n channel adapter port, network interface, or multiple resources such as\n multiple network interfaces or communication ports. It could also represent\n virtual communication resources that are defined across multiple devices.\n Although the worker can represent multiple network resources, it is\n associated with a single @ref ucp_context_h \"UCX application context\".\n All communication functions require a context to perform the operation on\n the dedicated hardware resource(s) and an @ref ucp_ep_h \"endpoint\" to address the\n destination.\n\n @note Worker are parallel \"threading points\" that an upper layer may use to\n optimize concurrent communications."]
 pub type ucp_worker_h = *mut ucp_worker;
+#[doc = " @ingroup UCP_COMM\n @brief UCP Tag Identifier\n\n UCP tag identifier is a 64bit object used for message identification.\n UCP tag send and receive operations use the object for an implementation\n tag matching semantics (derivative of MPI tag matching semantics)."]
 pub type ucp_tag_t = u64;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_recv_desc {
     _unused: [u8; 0],
 }
+#[doc = " @ingroup UCP_COMM\n @brief UCP Message descriptor.\n\n UCP Message descriptor is an opaque handle for a message returned by\n @ref ucp_tag_probe_nb. This handle can be passed to @ref ucp_tag_msg_recv_nb\n in order to receive the message data to a specific buffer."]
 pub type ucp_tag_message_h = *mut ucp_recv_desc;
+#[doc = " @ingroup UCP_COMM\n @brief UCP Datatype Identifier\n\n UCP datatype identifier is a 64bit object used for datatype identification.\n Predefined UCP identifiers are defined by @ref ucp_dt_type."]
 pub type ucp_datatype_t = u64;
+#[doc = " @ingroup UCP_CONTEXT\n @brief Request initialization callback.\n\n This callback routine is responsible for the request initialization.\n\n @param [in]  request   Request handle to initialize."]
 pub type ucp_request_init_callback_t =
     ::std::option::Option<unsafe extern "C" fn(request: *mut ::std::os::raw::c_void)>;
+#[doc = " @ingroup UCP_CONTEXT\n @brief Request cleanup callback.\n\n This callback routine is responsible for cleanup of the memory\n associated with the request.\n\n @param [in]  request   Request handle to cleanup."]
 pub type ucp_request_cleanup_callback_t =
     ::std::option::Option<unsafe extern "C" fn(request: *mut ::std::os::raw::c_void)>;
+#[doc = " @ingroup UCP_COMM\n @brief Completion callback for non-blocking sends.\n\n This callback routine is invoked whenever the @ref ucp_tag_send_nb\n \"send operation\" is completed. It is important to note that the call-back is\n only invoked in a case when the operation cannot be completed in place.\n\n @param [in]  request   The completed send request.\n @param [in]  status    Completion status. If the send operation was completed\n                        successfully UCS_OK is returned. If send operation was\n                        canceled UCS_ERR_CANCELED is returned.\n                        Otherwise, an @ref ucs_status_t \"error status\" is\n                        returned."]
 pub type ucp_send_callback_t = ::std::option::Option<
     unsafe extern "C" fn(request: *mut ::std::os::raw::c_void, status: ucs_status_t),
 >;
+#[doc = " @ingroup UCP_COMM\n @brief Completion callback for non-blocking sends.\n\n This callback routine is invoked whenever the @ref ucp_tag_send_nbx,\n @ref ucp_am_send_nbx, @ref ucp_stream_send_nbx, @ref ucp_put_nbx,\n @ref ucp_get_nbx, @ref ucp_atomic_op_nbx or any other \"send operation\" is\n completed.\n\n @param [in]  request   The completed send request.\n @param [in]  status    Completion status. If the send operation was completed\n                        successfully UCS_OK is returned. If send operation was\n                        canceled UCS_ERR_CANCELED is returned.\n                        Otherwise, an @ref ucs_status_t \"error status\" is\n                        returned.\n @param [in]  user_data User data passed to \"user_data\" value,\n                        see @ref ucp_request_param_t"]
 pub type ucp_send_nbx_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         request: *mut ::std::os::raw::c_void,
@@ -7420,13 +8106,17 @@ pub type ucp_send_nbx_callback_t = ::std::option::Option<
         user_data: *mut ::std::os::raw::c_void,
     ),
 >;
+#[doc = " @ingroup UCP_COMM\n @brief Callback to process peer failure.\n\n This callback routine is invoked when transport level error detected.\n\n @param [in]  arg      User argument to be passed to the callback.\n @param [in]  ep       Endpoint to handle transport level error. Upon return\n                       from the callback, this @a ep is no longer usable and\n                       all subsequent operations on this @a ep will fail with\n                       the error code passed in @a status.\n @param [in]  status   @ref ucs_status_t \"error status\"."]
 pub type ucp_err_handler_cb_t = ::std::option::Option<
     unsafe extern "C" fn(arg: *mut ::std::os::raw::c_void, ep: ucp_ep_h, status: ucs_status_t),
 >;
+#[doc = " @ingroup UCP_COMM\n @brief UCP endpoint error handling context.\n\n This structure should be initialized in @ref ucp_ep_params_t to handle peer failure"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_err_handler {
+    #[doc = "< Error handler callback, if NULL, will\nnot be called."]
     pub cb: ucp_err_handler_cb_t,
+    #[doc = "< User defined argument associated with\nan endpoint, it will be overridden by\n@ref ucp_ep_params_t::user_data if both\nare set."]
     pub arg: *mut ::std::os::raw::c_void,
 }
 #[test]
@@ -7464,16 +8154,22 @@ fn bindgen_test_layout_ucp_err_handler() {
         )
     );
 }
+#[doc = " @ingroup UCP_COMM\n @brief UCP endpoint error handling context.\n\n This structure should be initialized in @ref ucp_ep_params_t to handle peer failure"]
 pub type ucp_err_handler_t = ucp_err_handler;
+#[doc = " @ingroup UCP_WORKER\n @brief A callback for accepting client/server connections on a listener\n        @ref ucp_listener_h.\n\n  This callback routine is invoked on the server side upon creating a connection\n  to a remote client. The user can pass an argument to this callback.\n  The user is responsible for releasing the @a ep handle using the\n  @ref ucp_ep_destroy \"ucp_ep_destroy()\" routine.\n\n  @param [in]  ep      Handle to a newly created endpoint which is connected\n                       to the remote peer which has initiated the connection.\n  @param [in]  arg     User's argument for the callback."]
 pub type ucp_listener_accept_callback_t =
     ::std::option::Option<unsafe extern "C" fn(ep: ucp_ep_h, arg: *mut ::std::os::raw::c_void)>;
+#[doc = " @ingroup UCP_WORKER\n @brief A callback for handling of incoming connection request @a conn_request\n from a client.\n\n This callback routine is invoked on the server side to handle incoming\n connections from remote clients. The user can pass an argument to this\n callback. The @a conn_request handle has to be released, either by @ref\n ucp_ep_create or @ref ucp_listener_reject routine.\n\n  @param [in]  conn_request   Connection request handle.\n  @param [in]  arg            User's argument for the callback."]
 pub type ucp_listener_conn_callback_t = ::std::option::Option<
     unsafe extern "C" fn(conn_request: ucp_conn_request_h, arg: *mut ::std::os::raw::c_void),
 >;
+#[doc = " @ingroup UCP_WORKER\n @brief UCP callback to handle the connection request in a client-server\n connection establishment flow.\n\n This structure is used for handling an incoming connection request on\n the listener. Setting this type of handler allows creating an endpoint on\n any other worker and not limited to the worker on which the listener was\n created.\n @note\n - Other than communication progress routines, it is allowed to call all\n   other communication routines from the callback in the struct.\n - The callback is thread safe with respect to the worker it is invoked on.\n - It is the user's responsibility to avoid potential dead lock accessing\n   different worker."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_listener_conn_handler {
+    #[doc = "< Connection request callback"]
     pub cb: ucp_listener_conn_callback_t,
+    #[doc = "< User defined argument for the\ncallback"]
     pub arg: *mut ::std::os::raw::c_void,
 }
 #[test]
@@ -7512,10 +8208,13 @@ fn bindgen_test_layout_ucp_listener_conn_handler() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @brief UCP callback to handle the connection request in a client-server\n connection establishment flow.\n\n This structure is used for handling an incoming connection request on\n the listener. Setting this type of handler allows creating an endpoint on\n any other worker and not limited to the worker on which the listener was\n created.\n @note\n - Other than communication progress routines, it is allowed to call all\n   other communication routines from the callback in the struct.\n - The callback is thread safe with respect to the worker it is invoked on.\n - It is the user's responsibility to avoid potential dead lock accessing\n   different worker."]
 pub type ucp_listener_conn_handler_t = ucp_listener_conn_handler;
+#[doc = " @ingroup UCP_COMM\n @brief Completion callback for non-blocking stream oriented receives.\n\n This callback routine is invoked whenever the @ref ucp_stream_recv_nb\n \"receive operation\" is completed and the data is ready in the receive buffer.\n\n @param [in]  request   The completed receive request.\n @param [in]  status    Completion status. If the send operation was completed\n                        successfully UCS_OK is returned. Otherwise,\n                        an @ref ucs_status_t \"error status\" is returned.\n @param [in]  length    The size of the received data in bytes, always\n                        boundary of base datatype size. The value is valid\n                        only if the status is UCS_OK."]
 pub type ucp_stream_recv_callback_t = ::std::option::Option<
     unsafe extern "C" fn(request: *mut ::std::os::raw::c_void, status: ucs_status_t, length: usize),
 >;
+#[doc = " @ingroup UCP_COMM\n @brief Completion callback for non-blocking stream receives\n ucp_stream_recv_nbx call.\n\n This callback routine is invoked whenever the @ref ucp_stream_recv_nbx\n \"receive operation\" is completed and the data is ready in the receive buffer.\n\n @param [in]  request   The completed receive request.\n @param [in]  status    Completion status. If the send operation was completed\n                        successfully UCS_OK is returned. Otherwise,\n                        an @ref ucs_status_t \"error status\" is returned.\n @param [in]  length    The size of the received data in bytes, always on the\n                        boundary of base datatype size. The value is valid\n                        only if the status is UCS_OK.\n @param [in]  user_data User data passed to \"user_data\" value,\n                        see @ref ucp_request_param_t."]
 pub type ucp_stream_recv_nbx_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         request: *mut ::std::os::raw::c_void,
@@ -7524,6 +8223,7 @@ pub type ucp_stream_recv_nbx_callback_t = ::std::option::Option<
         user_data: *mut ::std::os::raw::c_void,
     ),
 >;
+#[doc = " @ingroup UCP_COMM\n @brief Completion callback for non-blocking tag receives.\n\n This callback routine is invoked whenever the @ref ucp_tag_recv_nb\n \"receive operation\" is completed and the data is ready in the receive buffer.\n\n @param [in]  request   The completed receive request.\n @param [in]  status    Completion status. If the send operation was completed\n                        successfully UCS_OK is returned. If send operation was\n                        canceled UCS_ERR_CANCELED is returned. If the data can\n                        not fit into the receive buffer the\n                        @ref UCS_ERR_MESSAGE_TRUNCATED error code is returned.\n                        Otherwise, an @ref ucs_status_t \"error status\" is\n                        returned.\n @param [in]  info      @ref ucp_tag_recv_info_t \"Completion information\"\n                        The @a info descriptor is Valid only if the status is\n                        UCS_OK."]
 pub type ucp_tag_recv_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         request: *mut ::std::os::raw::c_void,
@@ -7531,6 +8231,7 @@ pub type ucp_tag_recv_callback_t = ::std::option::Option<
         info: *mut ucp_tag_recv_info_t,
     ),
 >;
+#[doc = " @ingroup UCP_COMM\n @brief Completion callback for non-blocking tag receives ucp_tag_recv_nbx call.\n\n This callback routine is invoked whenever the @ref ucp_tag_recv_nbx\n \"receive operation\" is completed and the data is ready in the receive buffer.\n\n @param [in]  request   The completed receive request.\n @param [in]  status    Completion status. If the receive operation was completed\n                        successfully UCS_OK is returned. If send operation was\n                        canceled, UCS_ERR_CANCELED is returned. If the data can\n                        not fit into the receive buffer the\n                        @ref UCS_ERR_MESSAGE_TRUNCATED error code is returned.\n                        Otherwise, an @ref ucs_status_t \"error status\" is\n                        returned.\n @param [in]  tag_info  @ref ucp_tag_recv_info_t \"Completion information\"\n                        The @a info descriptor is Valid only if the status is\n                        UCS_OK.\n @param [in]  user_data User data passed to \"user_data\" value,\n                        see @ref ucp_request_param_t"]
 pub type ucp_tag_recv_nbx_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         request: *mut ::std::os::raw::c_void,
@@ -7539,6 +8240,7 @@ pub type ucp_tag_recv_nbx_callback_t = ::std::option::Option<
         user_data: *mut ::std::os::raw::c_void,
     ),
 >;
+#[doc = " @ingroup UCP_COMM\n @brief Completion callback for non-blocking Active Message receives.\n\n This callback routine is invoked whenever the @ref ucp_am_recv_data_nbx\n \"receive operation\" is completed and the data is ready in the receive buffer.\n\n @param [in]  request   The completed receive request.\n @param [in]  status    Completion status. If the receive operation was\n                        completed successfully UCS_OK is returned. Otherwise,\n                        an @ref ucs_status_t \"error status\" is returned.\n @param [in]  length    The size of the received data in bytes, always\n                        boundary of base datatype size. The value is valid\n                        only if the status is UCS_OK.\n @param [in]  user_data User data passed to \"user_data\" value,\n                        see @ref ucp_request_param_t"]
 pub type ucp_am_recv_data_nbx_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         request: *mut ::std::os::raw::c_void,
@@ -7548,17 +8250,27 @@ pub type ucp_am_recv_data_nbx_callback_t = ::std::option::Option<
     ),
 >;
 #[repr(u32)]
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker wakeup events mask.\n\n The enumeration allows specifying which events are expected on wakeup. Empty\n events are possible for any type of event except for @ref UCP_WAKEUP_TX and\n @ref UCP_WAKEUP_RX.\n\n @note Send completions are reported by POLLIN-like events (see poll man\n page). Since outgoing operations can be initiated at any time, UCP does not\n generate POLLOUT-like events, although it must be noted that outgoing\n operations may be queued depending upon resource availability."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucp_wakeup_event_types {
+    #[doc = "< Remote memory access send completion"]
     UCP_WAKEUP_RMA = 1,
+    #[doc = "< Atomic operation send completion"]
     UCP_WAKEUP_AMO = 2,
+    #[doc = "< Tag send completion"]
     UCP_WAKEUP_TAG_SEND = 4,
+    #[doc = "< Tag receive completion"]
     UCP_WAKEUP_TAG_RECV = 8,
+    #[doc = "< This event type will generate an\nevent on completion of any\noutgoing operation (complete or\npartial, according to the\nunderlying protocol) for any type\nof transfer (send, atomic, or\nRMA)."]
     UCP_WAKEUP_TX = 1024,
+    #[doc = "< This event type will generate an\nevent on completion of any receive\noperation (complete or partial,\naccording to the underlying\nprotocol)."]
     UCP_WAKEUP_RX = 2048,
+    #[doc = "< Use edge-triggered wakeup. The event\nfile descriptor will be signaled only\nfor new events, rather than existing\nones."]
     UCP_WAKEUP_EDGE = 65536,
 }
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker wakeup events mask.\n\n The enumeration allows specifying which events are expected on wakeup. Empty\n events are possible for any type of event except for @ref UCP_WAKEUP_TX and\n @ref UCP_WAKEUP_RX.\n\n @note Send completions are reported by POLLIN-like events (see poll man\n page). Since outgoing operations can be initiated at any time, UCP does not\n generate POLLOUT-like events, although it must be noted that outgoing\n operations may be queued depending upon resource availability."]
 pub use self::ucp_wakeup_event_types as ucp_wakeup_event_t;
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Callback to process incoming Active Message.\n\n When the callback is called, @a flags indicates how @a data should be handled.\n\n @param [in]  arg      User-defined argument.\n @param [in]  data     Points to the received data. This data may\n                       persist after the callback returns and needs\n                       to be freed with @ref ucp_am_data_release.\n @param [in]  length   Length of data.\n @param [in]  reply_ep If the Active Message is sent with the\n                       UCP_AM_SEND_FLAG_REPLY flag, the sending ep\n                       will be passed in. If not, NULL will be passed.\n @param [in]  flags    If this flag is set to UCP_CB_PARAM_FLAG_DATA,\n                       the callback can return UCS_INPROGRESS and\n                       data will persist after the callback returns.\n\n @return UCS_OK        @a data will not persist after the callback returns.\n\n @return UCS_INPROGRESS Can only be returned if flags is set to\n                        UCP_CB_PARAM_FLAG_DATA. If UCP_INPROGRESS\n                        is returned, data will persist after the\n                        callback has returned. To free the memory,\n                        a pointer to the data must be passed into\n                        @ref ucp_am_data_release.\n\n @note This callback should be set and released\n       by @ref ucp_worker_set_am_handler function.\n"]
 pub type ucp_am_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         arg: *mut ::std::os::raw::c_void,
@@ -7568,6 +8280,7 @@ pub type ucp_am_callback_t = ::std::option::Option<
         flags: ::std::os::raw::c_uint,
     ) -> ucs_status_t,
 >;
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Callback to process incoming Active Message sent by\n @ref ucp_am_send_nbx routine.\n\n The callback is always called from the progress context, therefore calling\n @ref ucp_worker_progress() is not allowed. It is recommended to define\n callbacks with relatively short execution time to avoid blocking of\n communication progress.\n\n @param [in]  arg           User-defined argument.\n @param [in]  header        User defined active message header.\n                            If @a header_length is 0, this value is undefined\n                            and must not be accessed.\n @param [in]  header_length Active message header length in bytes.\n @param [in]  data          Points to the received data if @a\n                            UCP_AM_RECV_ATTR_FLAG_RNDV flag is not set in\n                            @ref ucp_am_recv_param_t.recv_attr. Otherwise\n                            it points to the internal UCP descriptor which\n                            can further be used for initiating data receive\n                            by using @ref ucp_am_recv_data_nbx routine.\n @param [in]  length        Length of data. If @a UCP_AM_RECV_ATTR_FLAG_RNDV\n                            flag is set in @ref ucp_am_recv_param_t.recv_attr,\n                            it indicates the required receive buffer size for\n                            initiating rendezvous protocol.\n @param [in]  param         Data receive parameters.\n\n @return UCS_OK         @a data will not persist after the callback returns.\n                        If UCP_AM_RECV_ATTR_FLAG_RNDV flag is set in\n                        @a param->recv_attr and @ref ucp_am_recv_data_nbx was\n                        not called for this data, the data descriptor will be\n                        dropped and the corresponding @ref ucp_am_send_nbx\n                        call will complete with UCS_OK status.\n\n @return UCS_INPROGRESS Can only be returned if @a param->recv_attr flags\n                        contains UCP_AM_RECV_ATTR_FLAG_DATA or\n                        UCP_AM_RECV_ATTR_FLAG_RNDV. The @a data will persist\n                        after the callback has returned. To free the memory,\n                        a pointer to the data must be passed into\n                        @ref ucp_am_data_release or data receive is initiated\n                        by @ref ucp_am_recv_data_nbx.\n\n @return otherwise      Can only be returned if @a param->recv_attr contains\n                        UCP_AM_RECV_ATTR_FLAG_RNDV. In this case data\n                        descriptor @a data will be dropped and the\n                        corresponding @ref ucp_am_send_nbx call on the\n                        sender side will complete with the status returned\n                        from the callback.\n\n @note This callback should be set and released\n       by @ref ucp_worker_set_am_recv_handler function.\n"]
 pub type ucp_am_recv_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         arg: *mut ::std::os::raw::c_void,
@@ -7578,18 +8291,29 @@ pub type ucp_am_recv_callback_t = ::std::option::Option<
         param: *const ucp_am_recv_param_t,
     ) -> ucs_status_t,
 >;
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Tuning parameters for the UCP endpoint.\n\n The structure defines the parameters that are used for the\n UCP endpoint tuning during the UCP ep @ref ucp_ep_create \"creation\"."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_ep_params {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_ep_params_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Destination address; this field should be set along with its\n corresponding bit in the field_mask - @ref\n UCP_EP_PARAM_FIELD_REMOTE_ADDRESS and must be obtained using @ref\n ucp_worker_get_address."]
     pub address: *const ucp_address_t,
+    #[doc = " Desired error handling mode, optional parameter. Default value is\n @ref UCP_ERR_HANDLING_MODE_NONE."]
     pub err_mode: ucp_err_handling_mode_t,
+    #[doc = " Handler to process transport level failure."]
     pub err_handler: ucp_err_handler_t,
+    #[doc = " User data associated with an endpoint. See @ref ucp_stream_poll_ep_t and\n @ref ucp_err_handler_t"]
     pub user_data: *mut ::std::os::raw::c_void,
+    #[doc = " Endpoint flags from @ref ucp_ep_params_flags_field.\n This value is optional.\n If it's not set (along with its corresponding bit in the field_mask -\n @ref UCP_EP_PARAM_FIELD_FLAGS), the @ref ucp_ep_create() routine will\n consider the flags as set to zero."]
     pub flags: ::std::os::raw::c_uint,
+    #[doc = " Destination address in the form of a sockaddr; this field should be set\n along with its corresponding bit in the field_mask - @ref\n UCP_EP_PARAM_FIELD_SOCK_ADDR and must be obtained from the user, it means\n that this type of the endpoint creation is possible only on client side\n in client-server connection establishment flow."]
     pub sockaddr: ucs_sock_addr_t,
+    #[doc = " Connection request from client; this field should be set along with its\n corresponding bit in the field_mask - @ref\n UCP_EP_PARAM_FIELD_CONN_REQUEST and must be obtained from @ref\n ucp_listener_conn_callback_t, it means that this type of the endpoint\n creation is possible only on server side in client-server connection\n establishment flow."]
     pub conn_request: ucp_conn_request_h,
+    #[doc = " Endpoint name. Tracing and analysis tools can identify the endpoint using\n this name. To retrieve the endpoint's name, use @ref ucp_ep_query, as the\n name you supply may be changed by UCX under some circumstances, e.g. a\n name conflict. This field is only assigned if you set\n @ref UCP_EP_PARAM_FIELD_NAME in the field mask. If not, then a default\n unique name will be created for you."]
     pub name: *const ::std::os::raw::c_char,
+    #[doc = " The sockaddr to bind locally. Specifies the associated network device\n to bind locally to establish new connections.\n To retrieve the endpoint's local_sockaddr, use @ref ucp_ep_query.\n This setting is optional. To enable it, the corresponding - @ref\n UCP_EP_PARAM_FIELD_LOCAL_SOCK_ADDR bit in the field mask must be set."]
     pub local_sockaddr: ucs_sock_addr_t,
 }
 #[test]
@@ -7707,11 +8431,15 @@ fn bindgen_test_layout_ucp_ep_params() {
         )
     );
 }
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Tuning parameters for the UCP endpoint.\n\n The structure defines the parameters that are used for the\n UCP endpoint tuning during the UCP ep @ref ucp_ep_create \"creation\"."]
 pub type ucp_ep_params_t = ucp_ep_params;
+#[doc = " @ingroup UCP_ENDPOINT\n @brief A transport name and device name pair used by this endpoint. The\n caller is responsible for the allocation and deallocation of an array of\n these structures large enough to contain the desired number of transport\n and device name pairs.\n\n Any new fields must be added to the end of this structure."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_transport_entry_t {
+    #[doc = " The name of a transport layer used by this endpoint. This '\\0'-terminated\n string is valid until the endpoint is closed using a\n @ref ucp_ep_close_nbx call."]
     pub transport_name: *const ::std::os::raw::c_char,
+    #[doc = " The name of the device used with this transport by this endpoint.\n This '\\0'-terminated string is valid until the endpoint is closed using\n a @ref ucp_ep_close_nbx call."]
     pub device_name: *const ::std::os::raw::c_char,
 }
 #[test]
@@ -7750,11 +8478,15 @@ fn bindgen_test_layout_ucp_transport_entry_t() {
         )
     );
 }
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Structure containing an array of transport layers and device names\n used by an endpoint.\n\n The caller is responsible for allocation and deallocation of\n this structure."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_transports_t {
+    #[doc = " Pointer to array of transport/device name pairs used by this endpoint.\n The caller is responsible for the allocation and deallocation of this\n array."]
     pub entries: *mut ucp_transport_entry_t,
+    #[doc = " Number of transport/device name pairs. The caller must set this to\n the maximum number of pairs the structure can contain. On return,\n this is set to the actual number of transport and device name pairs used\n by the endpoint."]
     pub num_entries: ::std::os::raw::c_uint,
+    #[doc = " Size of a single @ref ucp_transport_entry_t object. The caller sets this\n to the size of the ucp_transport_entry_t they are using. UCP code must\n not set any fields in the ucp_transport_entry_t structure beyond this\n size."]
     pub entry_size: usize,
 }
 #[test]
@@ -7802,10 +8534,13 @@ fn bindgen_test_layout_ucp_transports_t() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @deprecated Replaced by @ref ucp_listener_conn_handler_t."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_listener_accept_handler {
+    #[doc = "< Endpoint creation callback"]
     pub cb: ucp_listener_accept_callback_t,
+    #[doc = "< User defined argument for the\ncallback"]
     pub arg: *mut ::std::os::raw::c_void,
 }
 #[test]
@@ -7844,26 +8579,33 @@ fn bindgen_test_layout_ucp_listener_accept_handler() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @deprecated Replaced by @ref ucp_listener_conn_handler_t."]
 pub type ucp_listener_accept_handler_t = ucp_listener_accept_handler;
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @deprecated Replaced by @ref ucp_request_test."]
     pub fn ucp_request_is_completed(request: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n @deprecated Replaced by @ref ucp_request_free."]
     pub fn ucp_request_release(request: *mut ::std::os::raw::c_void);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n @deprecated Replaced by @ref ucp_ep_close_nb."]
     pub fn ucp_ep_destroy(ep: ucp_ep_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n @deprecated Replaced by @ref ucp_ep_close_nb."]
     pub fn ucp_disconnect_nb(ep: ucp_ep_h) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n @deprecated Replaced by @ref ucp_tag_recv_request_test and\n             @ref ucp_request_check_status depends on use case.\n\n @note Please use @ref ucp_request_check_status for cases that only need to\n       check the completion status of an outstanding request.\n       @ref ucp_request_check_status can be used for any type of request.\n       @ref ucp_tag_recv_request_test should only be used for requests\n       returned by @ref ucp_tag_recv_nb (or request allocated by user for\n       @ref ucp_tag_recv_nbr) for which additional information\n       (returned via the @a info pointer) is needed."]
     pub fn ucp_request_test(
         request: *mut ::std::os::raw::c_void,
         info: *mut ucp_tag_recv_info_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @deprecated Replaced by @ref ucp_memh_pack \"ucp_memh_pack()\".\n @brief Pack memory region remote access key.\n\n This routine allocates a memory buffer and packs a remote access key (RKEY)\n object into it. RKEY is an opaque object that provides the information that is\n necessary for remote memory access.\n This routine packs the RKEY object in a portable format such that the\n object can be @ref ucp_ep_rkey_unpack \"unpacked\" on any platform supported by the\n UCP library. In order to release the memory buffer allocated by this routine,\n the application is responsible for calling the @ref ucp_rkey_buffer_release\n \"ucp_rkey_buffer_release()\" routine.\n\n\n @note\n @li RKEYs for InfiniBand and Cray Aries networks typically include\n the InfiniBand and Aries key.\n @li In order to enable remote direct memory access to the memory associated\n with the memory handle, the application is responsible for sharing the RKEY with\n the peers that will initiate the access.\n\n @param [in]  context       Application @ref ucp_context_h \"context\" which was\n                            used to allocate/map the memory.\n @param [in]  memh          @ref ucp_mem_h \"Handle\" to the memory region.\n @param [out] rkey_buffer_p Memory buffer allocated by the library.\n                            The buffer contains the packed RKEY.\n @param [out] size_p        Size (in bytes) of the packed RKEY.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_rkey_pack(
         context: ucp_context_h,
         memh: ucp_mem_h,
@@ -7872,15 +8614,19 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @deprecated Replaced by @ref ucp_memh_buffer_release\n             \"ucp_memh_buffer_release()\".\n @brief Release packed remote key buffer.\n\n This routine releases the buffer that was allocated using @ref ucp_rkey_pack\n \"ucp_rkey_pack()\".\n\n @warning\n @li Once memory is released, an access to the memory may cause undefined\n behavior.\n @li If the input memory address was not allocated using\n @ref ucp_rkey_pack \"ucp_rkey_pack()\" routine, the behavior of this routine\n is undefined.\n\n @param [in]  rkey_buffer   Buffer to release."]
     pub fn ucp_rkey_buffer_release(rkey_buffer: *mut ::std::os::raw::c_void);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n @deprecated Replaced by @ref ucp_ep_flush_nb."]
     pub fn ucp_ep_flush(ep: ucp_ep_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n\n @brief Flush outstanding AMO and RMA operations on the @ref ucp_worker_h\n \"worker\"\n @deprecated Replaced by @ref ucp_worker_flush_nb. The following example\n implements the same functionality using @ref ucp_worker_flush_nb :\n @code\n ucs_status_t worker_flush(ucp_worker_h worker)\n {\n     void *request = ucp_worker_flush_nb(worker);\n     if (request == NULL) {\n         return UCS_OK;\n     } else if (UCS_PTR_IS_ERR(request)) {\n         return UCS_PTR_STATUS(request);\n     } else {\n         ucs_status_t status;\n         do {\n             ucp_worker_progress(worker);\n             status = ucp_request_check_status(request);\n         } while (status == UCS_INPROGRESS);\n         ucp_request_release(request);\n         return status;\n     }\n }\n @endcode\n\n\n This routine flushes all outstanding AMO and RMA communications on the\n @ref ucp_worker_h \"worker\". All the AMO and RMA operations issued on the\n @a worker prior to this call are completed both at the origin and at the\n target when this call returns.\n\n @note For description of the differences between @ref ucp_worker_flush\n \"flush\" and @ref ucp_worker_fence \"fence\" operations please see\n @ref ucp_worker_fence \"ucp_worker_fence()\"\n\n @param [in] worker        UCP worker.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_worker_flush(worker: ucp_worker_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Blocking remote memory put operation.\n @deprecated Replaced by @ref ucp_put_nb. The following example implements\n the same functionality using @ref ucp_put_nb :\n @code\n void empty_callback(void *request, ucs_status_t status)\n {\n }\n\n ucs_status_t put(ucp_ep_h ep, const void *buffer, size_t length,\n                   uint64_t remote_addr, ucp_rkey_h rkey)\n {\n     void *request = ucp_put_nb(ep, buffer, length, remote_addr, rkey,\n                                empty_callback),\n     if (request == NULL) {\n         return UCS_OK;\n     } else if (UCS_PTR_IS_ERR(request)) {\n         return UCS_PTR_STATUS(request);\n     } else {\n         ucs_status_t status;\n         do {\n             ucp_worker_progress(worker);\n             status = ucp_request_check_status(request);\n         } while (status == UCS_INPROGRESS);\n         ucp_request_release(request);\n         return status;\n     }\n }\n @endcode\n\n This routine stores contiguous block of data that is described by the\n local address @a buffer in the remote contiguous memory region described by\n @a remote_addr address and the @ref ucp_rkey_h \"memory handle\" @a rkey.  The\n routine returns when it is safe to reuse the source address @e buffer.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  buffer       Pointer to the local source address.\n @param [in]  length       Length of the data (in bytes) stored under the\n                           source address.\n @param [in]  remote_addr  Pointer to the destination remote address\n                           to write to.\n @param [in]  rkey         Remote memory key associated with the\n                           remote address.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_put(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -7890,6 +8636,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Blocking remote memory get operation.\n @deprecated Replaced by @ref ucp_get_nb. @see ucp_put.\n\n This routine loads contiguous block of data that is described by the remote\n address @a remote_addr and the @ref ucp_rkey_h \"memory handle\" @a rkey in\n the local contiguous memory region described by @a buffer address.  The\n routine returns when remote data is loaded and stored under the local address\n @e buffer.\n\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  buffer       Pointer to the local source address.\n @param [in]  length       Length of the data (in bytes) stored under the\n                           source address.\n @param [in]  remote_addr  Pointer to the destination remote address\n                           to write to.\n @param [in]  rkey         Remote memory key associated with the\n                           remote address.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_get(
         ep: ucp_ep_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -7899,6 +8646,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Blocking atomic add operation for 32 bit integers\n @deprecated Replaced by @ref ucp_atomic_post with opcode UCP_ATOMIC_POST_OP_ADD.\n @see ucp_put.\n\n This routine performs an add operation on a 32 bit integer value atomically.\n The remote integer value is described by the combination of the remote\n memory address @a remote_addr and the @ref ucp_rkey_h \"remote memory handle\"\n @a rkey. The @a add value is the value that is used for the add operation.\n When the operation completes the sum of the original remote value and the\n operand value (@a add) is stored in remote memory.\n The call to the routine returns immediately, independent of operation\n completion.\n\n @note The remote address must be aligned to 32 bit.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  add          Value to add.\n @param [in]  remote_addr  Pointer to the destination remote address\n                           of the atomic variable.\n @param [in]  rkey         Remote memory key associated with the\n                           remote address.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_atomic_add32(
         ep: ucp_ep_h,
         add: u32,
@@ -7907,6 +8655,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Blocking atomic add operation for 64 bit integers\n @deprecated Replaced by @ref ucp_atomic_post with opcode UCP_ATOMIC_POST_OP_ADD.\n @see ucp_put.\n\n This routine performs an add operation on a 64 bit integer value atomically.\n The remote integer value is described by the combination of the remote\n memory address @a remote_addr and the @ref ucp_rkey_h \"remote memory handle\"\n @a rkey. The @a add value is the value that is used for the add operation.\n When the operation completes the sum of the original remote value and the\n operand value (@a add) is stored in remote memory.\n The call to the routine returns immediately, independent of operation\n completion.\n\n @note The remote address must be aligned to 64 bit.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  add          Value to add.\n @param [in]  remote_addr  Pointer to the destination remote address\n                           of the atomic variable.\n @param [in]  rkey         Remote memory key associated with the\n                           remote address.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_atomic_add64(
         ep: ucp_ep_h,
         add: u64,
@@ -7915,6 +8664,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Blocking atomic fetch and add operation for 32 bit integers\n @deprecated Replaced by @ref ucp_atomic_fetch_nb with opcode UCP_ATOMIC_FETCH_OP_FADD.\n @see ucp_put.\n\n This routine performs an add operation on a 32 bit integer value atomically.\n The remote integer value is described by the combination of the remote\n memory address @a remote_addr and the @ref ucp_rkey_h \"remote memory handle\"\n @a rkey. The @a add value is the value that is used for the add operation.\n When the operation completes, the original remote value is stored in the\n local memory @a result, and the sum of the original remote value and the\n operand value is stored in remote memory.\n The call to the routine returns when the operation is completed and the\n @a result value is updated.\n\n @note The remote address must be aligned to 32 bit.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  add          Value to add.\n @param [in]  remote_addr  Pointer to the destination remote address\n                           of the atomic variable.\n @param [in]  rkey         Remote memory key associated with the\n                           remote address.\n @param [out] result       Pointer to the address that is used to store\n                           the previous value of the atomic variable described\n                           by the @a remote_addr\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_atomic_fadd32(
         ep: ucp_ep_h,
         add: u32,
@@ -7924,6 +8674,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Blocking atomic fetch and add operation for 64 bit integers\n @deprecated Replaced by @ref ucp_atomic_fetch_nb with opcode UCP_ATOMIC_FETCH_OP_FADD.\n @see ucp_put.\n\n This routine performs an add operation on a 64 bit integer value atomically.\n The remote integer value is described by the combination of the remote\n memory address @a remote_addr and the @ref ucp_rkey_h \"remote memory handle\"\n @a rkey. The @a add value is the value that is used for the add operation.\n When the operation completes, the original remote value is stored in the\n local memory @a result, and the sum of the original remote value and the\n operand value is stored in remote memory.\n The call to the routine returns when the operation is completed and the\n @a result value is updated.\n\n @note The remote address must be aligned to 64 bit.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  add          Value to add.\n @param [in]  remote_addr  Pointer to the destination remote address\n                           of the atomic variable.\n @param [in]  rkey         Remote memory key associated with the\n                           remote address.\n @param [out] result       Pointer to the address that is used to store\n                           the previous value of the atomic variable described\n                           by the @a remote_addr\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_atomic_fadd64(
         ep: ucp_ep_h,
         add: u64,
@@ -7933,6 +8684,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Blocking atomic swap operation for 32 bit values\n @deprecated Replaced by @ref ucp_atomic_fetch_nb with opcode UCP_ATOMIC_FETCH_OP_SWAP.\n @see ucp_put.\n\n This routine swaps a 32 bit value between local and remote memory.\n The remote value is described by the combination of the remote\n memory address @a remote_addr and the @ref ucp_rkey_h \"remote memory handle\"\n @a rkey. The @a swap value is the value that is used for the swap operation.\n When the operation completes, the remote value is stored in the\n local memory @a result, and the operand value (@a swap) is stored in remote\n memory.  The call to the routine returns when the operation is completed and\n the @a result value is updated.\n\n @note The remote address must be aligned to 32 bit.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  swap         Value to swap.\n @param [in]  remote_addr  Pointer to the destination remote address\n                           of the atomic variable.\n @param [in]  rkey         Remote memory key associated with the\n                           remote address.\n @param [out] result       Pointer to the address that is used to store\n                           the previous value of the atomic variable described\n                           by the @a remote_addr\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_atomic_swap32(
         ep: ucp_ep_h,
         swap: u32,
@@ -7942,6 +8694,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Blocking atomic swap operation for 64 bit values\n @deprecated Replaced by @ref ucp_atomic_fetch_nb with opcode UCP_ATOMIC_FETCH_OP_SWAP.\n @see ucp_put.\n\n This routine swaps a 64 bit value between local and remote memory.\n The remote value is described by the combination of the remote\n memory address @a remote_addr and the @ref ucp_rkey_h \"remote memory handle\"\n @a rkey. The @a swap value is the value that is used for the swap operation.\n When the operation completes, the remote value is stored in the\n local memory @a result, and the operand value (@a swap) is stored in remote\n memory.  The call to the routine returns when the operation is completed and\n the @a result value is updated.\n\n @note The remote address must be aligned to 64 bit.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  swap         Value to swap.\n @param [in]  remote_addr  Pointer to the destination remote address\n                           of the atomic variable.\n @param [in]  rkey         Remote memory key associated with the\n                           remote address.\n @param [out] result       Pointer to the address that is used to store\n                           the previous value of the atomic variable described\n                           by the @a remote_addr\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_atomic_swap64(
         ep: ucp_ep_h,
         swap: u64,
@@ -7951,6 +8704,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Blocking atomic conditional swap (cswap) operation for 32 bit values.\n @deprecated Replaced by @ref ucp_atomic_fetch_nb with opcode UCP_ATOMIC_FETCH_OP_CSWAP.\n @see ucp_put.\n\n This routine conditionally swaps a 32 bit value between local and remote\n memory. The swap occurs only if the condition value (@a continue) is equal\n to the remote value, otherwise the remote memory is not modified.  The\n remote value is described by the combination of the remote memory address @p\n remote_addr and the @ref ucp_rkey_h \"remote memory handle\" @a rkey. The @p\n swap value is the value that is used to update the remote memory if the\n condition is true.  The call to the routine returns when the operation is\n completed and the @a result value is updated.\n\n @note The remote address must be aligned to 32 bit.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  compare      Value to compare to.\n @param [in]  swap         Value to swap.\n @param [in]  remote_addr  Pointer to the destination remote address\n                           of the atomic variable.\n @param [in]  rkey         Remote memory key associated with the\n                           remote address.\n @param [out] result       Pointer to the address that is used to store\n                           the previous value of the atomic variable described\n                           by the @a remote_addr\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_atomic_cswap32(
         ep: ucp_ep_h,
         compare: u32,
@@ -7961,6 +8715,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Blocking atomic conditional swap (cswap) operation for 64 bit values.\n @deprecated Replaced by @ref ucp_atomic_fetch_nb with opcode UCP_ATOMIC_FETCH_OP_CSWAP.\n @see ucp_put.\n\n This routine conditionally swaps a 64 bit value between local and remote\n memory. The swap occurs only if the condition value (@a continue) is equal\n to the remote value, otherwise the remote memory is not modified.  The\n remote value is described by the combination of the remote memory address @p\n remote_addr and the @ref ucp_rkey_h \"remote memory handle\" @a rkey. The @p\n swap value is the value that is used to update the remote memory if the\n condition is true.  The call to the routine returns when the operation is\n completed and the @a result value is updated.\n\n @note The remote address must be aligned to 64 bit.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  compare      Value to compare to.\n @param [in]  swap         Value to swap.\n @param [in]  remote_addr  Pointer to the destination remote address\n                           of the atomic variable.\n @param [in]  rkey         Remote memory key associated with the\n                           remote address.\n @param [out] result       Pointer to the address that is used to store\n                           the previous value of the atomic variable described\n                           by the @a remote_addr\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_atomic_cswap64(
         ep: ucp_ep_h,
         compare: u64,
@@ -7971,9 +8726,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n @brief Modify endpoint parameters.\n\n @deprecated Use @ref ucp_listener_conn_handler_t instead of @ref\n             ucp_listener_accept_handler_t, if you have other use case please\n             submit an issue on https://github.com/openucx/ucx or report to\n             ucx-group@elist.ornl.gov\n\n This routine modifies @ref ucp_ep_h \"endpoint\" created by @ref ucp_ep_create\n or @ref ucp_listener_accept_callback_t. For example, this API can be used\n to setup custom parameters like @ref ucp_ep_params_t::user_data or\n @ref ucp_ep_params_t::err_handler to endpoint created by\n @ref ucp_listener_accept_callback_t.\n\n @param [in]  ep          A handle to the endpoint.\n @param [in]  params      User defined @ref ucp_ep_params_t configurations\n                          for the @ref ucp_ep_h \"UCP endpoint\".\n\n @return NULL             - The endpoint is modified successfully.\n @return UCS_PTR_IS_ERR(_ptr) - The reconfiguration failed and an error code\n                                indicates the status. However, the @a endpoint\n                                is not modified and can be used further.\n @return otherwise        - The reconfiguration process is started, and can be\n                            completed at any point in time. A request handle\n                            is returned to the application in order to track\n                            progress of the endpoint modification.\n                            The application is responsible for releasing the\n                            handle using the @ref ucp_request_free routine.\n\n @note See the documentation of @ref ucp_ep_params_t for details, only some of\n       the parameters can be modified."]
     pub fn ucp_ep_modify_nb(ep: ucp_ep_h, params: *const ucp_ep_params_t) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Get the address of the worker object.\n\n @deprecated Use @ref ucp_worker_query with the flag\n             @ref UCP_WORKER_ATTR_FIELD_ADDRESS in order to obtain the worker\n             address.\n\n This routine returns the address of the worker object.  This address can be\n passed to remote instances of the UCP library in order to connect to this\n worker. The memory for the address handle is allocated by this function, and\n must be released by using @ref ucp_worker_release_address\n \"ucp_worker_release_address()\" routine.\n\n @param [in]  worker            Worker object whose address to return.\n @param [out] address_p         A pointer to the worker address.\n @param [out] address_length_p  The size in bytes of the address.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_worker_get_address(
         worker: ucp_worker_h,
         address_p: *mut *mut ucp_address_t,
@@ -7981,9 +8738,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n\n @brief Non-blocking @ref ucp_ep_h \"endpoint\" closure.\n\n @deprecated Use @ref ucp_ep_close_nbx instead.\n\n This routine releases the @ref ucp_ep_h \"endpoint\". The endpoint closure\n process depends on the selected @a mode.\n\n @param [in]  ep      Handle to the endpoint to close.\n @param [in]  mode    One from @ref ucp_ep_close_mode value.\n\n @return UCS_OK           - The endpoint is closed successfully.\n @return UCS_PTR_IS_ERR(_ptr) - The closure failed and an error code indicates\n                                the transport level status. However, resources\n                                are released and the @a endpoint can no longer\n                                be used.\n @return otherwise        - The closure process is started, and can be\n                            completed at any point in time. A request handle\n                            is returned to the application in order to track\n                            progress of the endpoint closure. The application\n                            is responsible for releasing the handle using the\n                            @ref ucp_request_free routine.\n\n @note @ref ucp_ep_close_nb replaces deprecated @ref ucp_disconnect_nb and\n       @ref ucp_ep_destroy"]
     pub fn ucp_ep_close_nb(ep: ucp_ep_h, mode: ::std::os::raw::c_uint) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n\n @brief Non-blocking flush of outstanding AMO and RMA operations on the\n @ref ucp_ep_h \"endpoint\".\n\n @deprecated Use @ref ucp_ep_flush_nbx instead.\n\n This routine flushes all outstanding AMO and RMA communications on the\n @ref ucp_ep_h \"endpoint\". All the AMO and RMA operations issued on the\n @a ep prior to this call are completed both at the origin and at the target\n @ref ucp_ep_h \"endpoint\" when this call returns.\n\n @param [in] ep        UCP endpoint.\n @param [in] flags     Flags for flush operation. Reserved for future use.\n @param [in] cb        Callback which will be called when the flush operation\n                       completes.\n\n @return NULL             - The flush operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The flush operation failed.\n @return otherwise        - Flush operation was scheduled and can be completed\n                          in any point in time. The request handle is returned\n                          to the application in order to track progress. The\n                          application is responsible for releasing the handle\n                          using @ref ucp_request_free \"ucp_request_free()\"\n                          routine."]
     pub fn ucp_ep_flush_nb(
         ep: ucp_ep_h,
         flags: ::std::os::raw::c_uint,
@@ -7991,6 +8750,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Add user defined callback for Active Message.\n\n @deprecated Use @ref ucp_worker_set_am_recv_handler instead.\n\n This routine installs a user defined callback to handle incoming Active\n Messages with a specific id. This callback is called whenever an Active\n Message that was sent from the remote peer by @ref ucp_am_send_nb is\n received on this worker.\n\n @param [in]  worker      UCP worker on which to set the Active Message\n                          handler.\n @param [in]  id          Active Message id.\n @param [in]  cb          Active Message callback. NULL to clear.\n @param [in]  arg         Active Message argument, which will be passed\n                          in to every invocation of the callback as the\n                          arg argument.\n @param [in]  flags       Dictates how an Active Message is handled on the\n                          remote endpoint. Currently only\n                          UCP_AM_FLAG_WHOLE_MSG is supported, which\n                          indicates the callback will not be invoked\n                          until all data has arrived.\n\n @return error code if the worker does not support Active Messages or\n         requested callback flags."]
     pub fn ucp_worker_set_am_handler(
         worker: ucp_worker_h,
         id: u16,
@@ -8000,6 +8760,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Send Active Message.\n\n @deprecated Use @ref ucp_am_send_nbx instead.\n\n This routine sends an Active Message to an ep. It does not support\n CUDA memory.\n\n @param [in]  ep          UCP endpoint where the Active Message will be run.\n @param [in]  id          Active Message id. Specifies which registered\n                          callback to run.\n @param [in]  buffer      Pointer to the data to be sent to the target node\n                          of the Active Message.\n @param [in]  count       Number of elements to send.\n @param [in]  datatype    Datatype descriptor for the elements in the buffer.\n @param [in]  cb          Callback that is invoked upon completion of the\n                          data transfer if it is not completed immediately.\n @param [in]  flags       Operation flags as defined by @ref ucp_send_am_flags.\n\n @return NULL             Active Message was sent immediately.\n @return UCS_PTR_IS_ERR(_ptr) Error sending Active Message.\n @return otherwise        Pointer to request, and Active Message is known\n                          to be completed after cb is run."]
     pub fn ucp_am_send_nb(
         ep: ucp_ep_h,
         id: u16,
@@ -8011,6 +8772,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking stream send operation.\n\n @deprecated Use @ref ucp_stream_send_nbx instead.\n\n This routine sends data that is described by the local address @a buffer,\n size @a count, and @a datatype object to the destination endpoint @a ep.\n The routine is non-blocking and therefore returns immediately, however\n the actual send operation may be delayed. The send operation is considered\n completed when it is safe to reuse the source @e buffer. If the send\n operation is completed immediately the routine returns UCS_OK and the\n callback function @a cb is @b not invoked. If the operation is\n @b not completed immediately and no error reported, then the UCP library will\n schedule invocation of the callback @a cb upon completion of the send\n operation. In other words, the completion of the operation will be signaled\n either by the return code or by the callback.\n\n @note The user should not modify any part of the @a buffer after this\n       operation is called, until the operation completes.\n\n @param [in]  ep          Destination endpoint handle.\n @param [in]  buffer      Pointer to the message buffer (payload).\n @param [in]  count       Number of elements to send.\n @param [in]  datatype    Datatype descriptor for the elements in the buffer.\n @param [in]  cb          Callback function that is invoked whenever the\n                          send operation is completed. It is important to note\n                          that the callback is only invoked in the event that\n                          the operation cannot be completed in place.\n @param [in]  flags       Reserved for future use.\n\n @return NULL             - The send operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The send operation failed.\n @return otherwise        - Operation was scheduled for send and can be\n                          completed in any point in time. The request handle\n                          is returned to the application in order to track\n                          progress of the message. The application is\n                          responsible for releasing the handle using\n                          @ref ucp_request_free routine."]
     pub fn ucp_stream_send_nb(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -8021,6 +8783,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking stream receive operation of structured data into a\n        user-supplied buffer.\n\n @deprecated Use @ref ucp_stream_recv_nbx instead.\n\n This routine receives data that is described by the local address @a buffer,\n size @a count, and @a datatype object on the endpoint @a ep. The routine is\n non-blocking and therefore returns immediately. The receive operation is\n considered complete when the message is delivered to the buffer. If data is\n not immediately available, the operation will be scheduled for receive and\n a request handle will be returned. In order to notify the application about\n completion of a scheduled receive operation, the UCP library will invoke\n the call-back @a cb when data is in the receive buffer and ready for\n application access. If the receive operation cannot be started, the routine\n returns an error.\n\n @param [in]     ep       UCP endpoint that is used for the receive operation.\n @param [in]     buffer   Pointer to the buffer to receive the data.\n @param [in]     count    Number of elements to receive into @a buffer.\n @param [in]     datatype Datatype descriptor for the elements in the buffer.\n @param [in]     cb       Callback function that is invoked whenever the\n                          receive operation is completed and the data is ready\n                          in the receive @a buffer. It is important to note\n                          that the call-back is only invoked in a case when\n                          the operation cannot be completed immediately.\n @param [out]    length   Size of the received data in bytes. The value is\n                          valid only if return code is UCS_OK.\n @note                    The amount of data received, in bytes, is always an\n                          integral multiple of the @a datatype size.\n @param [in]     flags    Flags defined in @ref ucp_stream_recv_flags_t.\n\n @return NULL                 - The receive operation was completed\n                                immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The receive operation failed.\n @return otherwise            - Operation was scheduled for receive. A request\n                                handle is returned to the application in order\n                                to track progress of the operation.\n                                The application is responsible for releasing\n                                the handle by calling the\n                                @ref ucp_request_free routine."]
     pub fn ucp_stream_recv_nb(
         ep: ucp_ep_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -8032,6 +8795,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking tagged-send operations\n\n @deprecated Use @ref ucp_tag_send_nbx instead.\n\n This routine sends a messages that is described by the local address @a\n buffer, size @a count, and @a datatype object to the destination endpoint\n @a ep. Each message is associated with a @a tag value that is used for\n message matching on the @ref ucp_tag_recv_nb \"receiver\". The routine is\n non-blocking and therefore returns immediately, however the actual send\n operation may be delayed. The send operation is considered completed when\n it is safe to reuse the source @e buffer. If the send operation is\n completed immediately the routine return UCS_OK and the call-back function\n @a cb is @b not invoked. If the operation is @b not completed immediately\n and no error reported then the UCP library will schedule to invoke the\n call-back @a cb whenever the send operation will be completed. In other\n words, the completion of a message can be signaled by the return code or\n the call-back.\n\n @note The user should not modify any part of the @a buffer after this\n       operation is called, until the operation completes.\n\n @param [in]  ep          Destination endpoint handle.\n @param [in]  buffer      Pointer to the message buffer (payload).\n @param [in]  count       Number of elements to send\n @param [in]  datatype    Datatype descriptor for the elements in the buffer.\n @param [in]  tag         Message tag.\n @param [in]  cb          Callback function that is invoked whenever the\n                          send operation is completed. It is important to note\n                          that the call-back is only invoked in a case when\n                          the operation cannot be completed in place.\n\n @return NULL            - The send operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The send operation failed.\n @return otherwise        - Operation was scheduled for send and can be\n                          completed in any point in time. The request handle\n                          is returned to the application in order to track\n                          progress of the message. The application is\n                          responsible for releasing the handle using\n                          @ref ucp_request_free \"ucp_request_free()\" routine."]
     pub fn ucp_tag_send_nb(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -8042,6 +8806,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking tagged-send operations with user provided request\n\n @deprecated Use @ref ucp_tag_send_nbx with the flag\n             @ref UCP_OP_ATTR_FIELD_REQUEST instead.\n\n This routine provides a convenient and efficient way to implement a\n blocking send pattern. It also completes requests faster than\n @ref ucp_tag_send_nb() because:\n @li it always uses eager protocol to send data up to the\n     rendezvous threshold.\n @li its rendezvous threshold is higher than the one used by\n     the @ref ucp_tag_send_nb(). The threshold is controlled by\n     the @b UCX_SEND_NBR_RNDV_THRESH environment variable.\n @li its request handling is simpler. There is no callback and no need\n     to allocate and free requests. In fact request can be allocated by\n     caller on the stack.\n\n This routine sends a messages that is described by the local address @a\n buffer, size @a count, and @a datatype object to the destination endpoint\n @a ep. Each message is associated with a @a tag value that is used for\n message matching on the @ref ucp_tag_recv_nbr \"receiver\".\n\n The routine is non-blocking and therefore returns immediately, however\n the actual send operation may be delayed. The send operation is considered\n completed when it is safe to reuse the source @e buffer. If the send\n operation is completed immediately the routine returns UCS_OK.\n\n If the operation is @b not completed immediately and no error reported\n then the UCP library will fill a user provided @a req and\n return UCS_INPROGRESS status. In order to monitor completion of the\n operation @ref ucp_request_check_status() should be used.\n\n Following pseudo code implements a blocking send function:\n @code\n MPI_send(...)\n {\n     char *request;\n     ucs_status_t status;\n\n     // allocate request on the stack\n     // ucp_context_query() was used to get ucp_request_size\n     request = alloca(ucp_request_size);\n\n     // note: make sure that there is enough memory before the\n     // request handle\n     status = ucp_tag_send_nbr(ep, ..., request + ucp_request_size);\n     if (status != UCS_INPROGRESS) {\n         return status;\n     }\n\n     do {\n         ucp_worker_progress(worker);\n         status = ucp_request_check_status(request + ucp_request_size);\n     } while (status == UCS_INPROGRESS);\n\n     return status;\n }\n @endcode\n\n @note The user should not modify any part of the @a buffer after this\n       operation is called, until the operation completes.\n\n\n @param [in]  ep          Destination endpoint handle.\n @param [in]  buffer      Pointer to the message buffer (payload).\n @param [in]  count       Number of elements to send\n @param [in]  datatype    Datatype descriptor for the elements in the buffer.\n @param [in]  tag         Message tag.\n @param [in]  req         Request handle allocated by the user. There should\n                          be at least UCP request size bytes of available\n                          space before the @a req. The size of UCP request\n                          can be obtained by @ref ucp_context_query function.\n\n @return UCS_OK           - The send operation was completed immediately.\n @return UCS_INPROGRESS   - The send was not completed and is in progress.\n                            @ref ucp_request_check_status() should be used to\n                            monitor @a req status.\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_tag_send_nbr(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -8052,6 +8817,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking synchronous tagged-send operation.\n\n @deprecated Use @ref ucp_tag_send_sync_nbx instead.\n\n Same as @ref ucp_tag_send_nb, except the request completes only after there\n is a remote tag match on the message (which does not always mean the remote\n receive has been completed). This function never completes \"in-place\", and\n always returns a request handle.\n\n @note The user should not modify any part of the @a buffer after this\n       operation is called, until the operation completes.\n @note Returns @ref UCS_ERR_UNSUPPORTED if @ref UCP_ERR_HANDLING_MODE_PEER is\n       enabled. This is a temporary implementation-related constraint that\n       will be addressed in future releases.\n\n @param [in]  ep          Destination endpoint handle.\n @param [in]  buffer      Pointer to the message buffer (payload).\n @param [in]  count       Number of elements to send\n @param [in]  datatype    Datatype descriptor for the elements in the buffer.\n @param [in]  tag         Message tag.\n @param [in]  cb          Callback function that is invoked whenever the\n                          send operation is completed.\n\n @return UCS_PTR_IS_ERR(_ptr) - The send operation failed.\n @return otherwise        - Operation was scheduled for send and can be\n                          completed in any point in time. The request handle\n                          is returned to the application in order to track\n                          progress of the message. The application is\n                          responsible for releasing the handle using\n                          @ref ucp_request_free \"ucp_request_free()\" routine."]
     pub fn ucp_tag_send_sync_nb(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -8062,6 +8828,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking tagged-receive operation.\n\n @deprecated Use @ref ucp_tag_recv_nbx instead.\n\n This routine receives a message that is described by the local address @a\n buffer, size @a count, and @a datatype object on the @a worker. The tag\n value of the receive message has to match the @a tag and @a tag_mask values,\n where the @a tag_mask indicates which bits of the tag have to be matched. The\n routine is non-blocking and therefore returns immediately. The receive\n operation is considered completed when the message is delivered to the @a\n buffer.  In order to notify the application about completion of the receive\n operation the UCP library will invoke the call-back @a cb when the received\n message is in the receive buffer and ready for application access.  If the\n receive operation cannot be stated the routine returns an error.\n\n @note This routine cannot return UCS_OK. It always returns a request\n       handle or an error.\n\n @param [in]  worker      UCP worker that is used for the receive operation.\n @param [in]  buffer      Pointer to the buffer to receive the data.\n @param [in]  count       Number of elements to receive\n @param [in]  datatype    Datatype descriptor for the elements in the buffer.\n @param [in]  tag         Message tag to expect.\n @param [in]  tag_mask    Bit mask that indicates the bits that are used for\n                          the matching of the incoming tag\n                          against the expected tag.\n @param [in]  cb          Callback function that is invoked whenever the\n                          receive operation is completed and the data is ready\n                          in the receive @a buffer.\n\n @return UCS_PTR_IS_ERR(_ptr) - The receive operation failed.\n @return otherwise          - Operation was scheduled for receive. The request\n                              handle is returned to the application in order\n                              to track progress of the operation. The\n                              application is responsible for releasing the\n                              handle using @ref ucp_request_free\n                              \"ucp_request_free()\" routine."]
     pub fn ucp_tag_recv_nb(
         worker: ucp_worker_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -8073,6 +8840,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking tagged-receive operation.\n\n @deprecated Use @ref ucp_tag_recv_nbx with the flag\n             @ref UCP_OP_ATTR_FIELD_REQUEST instead.\n\n This routine receives a message that is described by the local address @a\n buffer, size @a count, and @a datatype object on the @a worker. The tag\n value of the receive message has to match the @a tag and @a tag_mask values,\n where the @a tag_mask indicates which bits of the tag have to be matched. The\n routine is non-blocking and therefore returns immediately. The receive\n operation is considered completed when the message is delivered to the @a\n buffer. In order to monitor completion of the operation\n @ref ucp_request_check_status or @ref ucp_tag_recv_request_test should be\n used.\n\n @param [in]  worker      UCP worker that is used for the receive operation.\n @param [in]  buffer      Pointer to the buffer to receive the data.\n @param [in]  count       Number of elements to receive\n @param [in]  datatype    Datatype descriptor for the elements in the buffer.\n @param [in]  tag         Message tag to expect.\n @param [in]  tag_mask    Bit mask that indicates the bits that are used for\n                          the matching of the incoming tag\n                          against the expected tag.\n @param [in]  req         Request handle allocated by the user. There should\n                          be at least UCP request size bytes of available\n                          space before the @a req. The size of UCP request\n                          can be obtained by @ref ucp_context_query function.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_tag_recv_nbr(
         worker: ucp_worker_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -8084,6 +8852,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking receive operation for a probed message.\n\n @deprecated Use @ref ucp_tag_recv_nbx instead.\n\n This routine receives a message that is described by the local address @a\n buffer, size @a count, @a message handle, and @a datatype object on the @a\n worker. The @a message handle can be obtained by calling the @ref\n ucp_tag_probe_nb \"ucp_tag_probe_nb()\" routine. The @ref ucp_tag_msg_recv_nb\n \"ucp_tag_msg_recv_nb()\" routine is non-blocking and therefore returns\n immediately. The receive operation is considered completed when the message\n is delivered to the @a buffer. In order to notify the application about\n completion of the receive operation the UCP library will invoke the\n call-back @a cb when the received message is in the receive buffer and ready\n for application access. If the receive operation cannot be started the\n routine returns an error.\n\n @param [in]  worker      UCP worker that is used for the receive operation.\n @param [in]  buffer      Pointer to the buffer that will receive the data.\n @param [in]  count       Number of elements to receive\n @param [in]  datatype    Datatype descriptor for the elements in the buffer.\n @param [in]  message     Message handle.\n @param [in]  cb          Callback function that is invoked whenever the\n                          receive operation is completed and the data is ready\n                          in the receive @a buffer.\n\n @return UCS_PTR_IS_ERR(_ptr) - The receive operation failed.\n @return otherwise          - Operation was scheduled for receive. The request\n                              handle is returned to the application in order\n                              to track progress of the operation. The\n                              application is responsible for releasing the\n                              handle using @ref ucp_request_free\n                              \"ucp_request_free()\" routine."]
     pub fn ucp_tag_msg_recv_nb(
         worker: ucp_worker_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -8094,6 +8863,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking implicit remote memory put operation.\n\n @deprecated Use @ref ucp_put_nbx without passing the flag\n             @ref UCP_OP_ATTR_FIELD_CALLBACK instead. If a request pointer\n             is returned, release it immediately by @ref ucp_request_free.\n\n This routine initiates a storage of contiguous block of data that is\n described by the local address @a buffer in the remote contiguous memory\n region described by @a remote_addr address and the @ref ucp_rkey_h \"memory\n handle\" @a rkey. The routine returns immediately and @b does @b not\n guarantee re-usability of the source address @e buffer. If the operation is\n completed immediately the routine return UCS_OK, otherwise UCS_INPROGRESS\n or an error is returned to user.\n\n @note A user can use @ref ucp_worker_flush_nb \"ucp_worker_flush_nb()\"\n in order to guarantee re-usability of the source address @e buffer.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  buffer       Pointer to the local source address.\n @param [in]  length       Length of the data (in bytes) stored under the\n                           source address.\n @param [in]  remote_addr  Pointer to the destination remote memory address\n                           to write to.\n @param [in]  rkey         Remote memory key associated with the\n                           remote memory address.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_put_nbi(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -8103,6 +8873,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking remote memory put operation.\n\n @deprecated Use @ref ucp_put_nbx instead.\n\n This routine initiates a storage of contiguous block of data that is\n described by the local address @a buffer in the remote contiguous memory\n region described by @a remote_addr address and the @ref ucp_rkey_h \"memory\n handle\" @a rkey.  The routine returns immediately and @b does @b not\n guarantee re-usability of the source address @e buffer. If the operation is\n completed immediately the routine return UCS_OK, otherwise UCS_INPROGRESS\n or an error is returned to user. If the put operation completes immediately,\n the routine returns UCS_OK and the call-back routine @a cb is @b not\n invoked. If the operation is @b not completed immediately and no error is\n reported, then the UCP library will schedule invocation of the call-back\n routine @a cb upon completion of the put operation. In other words, the\n completion of a put operation can be signaled by the return code or\n execution of the call-back.\n\n @note A user can use @ref ucp_worker_flush_nb \"ucp_worker_flush_nb()\"\n in order to guarantee re-usability of the source address @e buffer.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  buffer       Pointer to the local source address.\n @param [in]  length       Length of the data (in bytes) stored under the\n                           source address.\n @param [in]  remote_addr  Pointer to the destination remote memory address\n                           to write to.\n @param [in]  rkey         Remote memory key associated with the\n                           remote memory address.\n @param [in]  cb           Call-back function that is invoked whenever the\n                           put operation is completed and the local buffer\n                           can be modified. Does not guarantee remote\n                           completion.\n\n @return NULL                 - The operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The operation failed.\n @return otherwise            - Operation was scheduled and can be\n                              completed at any point in time. The request handle\n                              is returned to the application in order to track\n                              progress of the operation. The application is\n                              responsible for releasing the handle using\n                              @ref ucp_request_free \"ucp_request_free()\" routine."]
     pub fn ucp_put_nb(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -8113,6 +8884,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking implicit remote memory get operation.\n\n @deprecated Use @ref ucp_get_nbx without passing the flag\n             @ref UCP_OP_ATTR_FIELD_CALLBACK instead. If a request pointer\n             is returned, release it immediately by @ref ucp_request_free.\n\n This routine initiate a load of contiguous block of data that is described\n by the remote memory address @a remote_addr and the @ref ucp_rkey_h \"memory handle\"\n @a rkey in the local contiguous memory region described by @a buffer\n address. The routine returns immediately and @b does @b not guarantee that\n remote data is loaded and stored under the local address @e buffer.\n\n @note A user can use @ref ucp_worker_flush_nb \"ucp_worker_flush_nb()\" in order\n guarantee that remote data is loaded and stored under the local address\n @e buffer.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  buffer       Pointer to the local destination address.\n @param [in]  length       Length of the data (in bytes) stored under the\n                           destination address.\n @param [in]  remote_addr  Pointer to the source remote memory address\n                           to read from.\n @param [in]  rkey         Remote memory key associated with the\n                           remote memory address.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_get_nbi(
         ep: ucp_ep_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -8122,6 +8894,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking remote memory get operation.\n\n @deprecated Use @ref ucp_get_nbx instead.\n\n This routine initiates a load of a contiguous block of data that is\n described by the remote memory address @a remote_addr and the @ref ucp_rkey_h\n \"memory handle\" @a rkey in the local contiguous memory region described\n by @a buffer address. The routine returns immediately and @b does @b not\n guarantee that remote data is loaded and stored under the local address @e\n buffer. If the operation is completed immediately the routine return UCS_OK,\n otherwise UCS_INPROGRESS or an error is returned to user. If the get\n operation completes immediately, the routine returns UCS_OK and the\n call-back routine @a cb is @b not invoked. If the operation is @b not\n completed immediately and no error is reported, then the UCP library will\n schedule invocation of the call-back routine @a cb upon completion of the\n get operation. In other words, the completion of a get operation can be\n signaled by the return code or execution of the call-back.\n\n @note A user can use @ref ucp_worker_flush_nb \"ucp_worker_flush_nb()\"\n in order to guarantee re-usability of the source address @e buffer.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  buffer       Pointer to the local destination address.\n @param [in]  length       Length of the data (in bytes) stored under the\n                           destination address.\n @param [in]  remote_addr  Pointer to the source remote memory address\n                           to read from.\n @param [in]  rkey         Remote memory key associated with the\n                           remote memory address.\n @param [in]  cb           Call-back function that is invoked whenever the\n                           get operation is completed and the data is\n                           visible to the local process.\n\n @return NULL                 - The operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The operation failed.\n @return otherwise            - Operation was scheduled and can be\n                              completed at any point in time. The request handle\n                              is returned to the application in order to track\n                              progress of the operation. The application is\n                              responsible for releasing the handle using\n                              @ref ucp_request_free \"ucp_request_free()\" routine."]
     pub fn ucp_get_nb(
         ep: ucp_ep_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -8132,15 +8905,21 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 #[repr(u32)]
+#[doc = " @ingroup UCP_COMM\n @brief Atomic operation requested for ucp_atomic_post\n\n @deprecated Use @ref ucp_atomic_op_nbx and @ref ucp_atomic_op_t instead.\n\n This enumeration defines which atomic memory operation should be\n performed by the ucp_atomic_post family of functions. All of these are\n non-fetching atomics and will not result in a request handle."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucp_atomic_post_op_t {
+    #[doc = "< Atomic add"]
     UCP_ATOMIC_POST_OP_ADD = 0,
+    #[doc = "< Atomic and"]
     UCP_ATOMIC_POST_OP_AND = 1,
+    #[doc = "< Atomic or"]
     UCP_ATOMIC_POST_OP_OR = 2,
+    #[doc = "< Atomic xor"]
     UCP_ATOMIC_POST_OP_XOR = 3,
     UCP_ATOMIC_POST_OP_LAST = 4,
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Post an atomic memory operation.\n\n @deprecated Use @ref ucp_atomic_op_nbx without the flag\n             @ref UCP_OP_ATTR_FIELD_REPLY_BUFFER instead.\n\n This routine posts an atomic memory operation to a remote value.\n The remote value is described by the combination of the remote\n memory address @a remote_addr and the @ref ucp_rkey_h \"remote memory handle\"\n @a rkey.\n Return from the function does not guarantee completion. A user must\n call @ref ucp_ep_flush_nb or @ref ucp_worker_flush_nb to guarantee that the\n remote value has been updated.\n\n @param [in] ep          UCP endpoint.\n @param [in] opcode      One of @ref ucp_atomic_post_op_t.\n @param [in] value       Source operand for the atomic operation.\n @param [in] op_size     Size of value in bytes\n @param [in] remote_addr Remote address to operate on.\n @param [in] rkey        Remote key handle for the remote memory address.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_atomic_post(
         ep: ucp_ep_h,
         opcode: ucp_atomic_post_op_t,
@@ -8151,17 +8930,25 @@ extern "C" {
     ) -> ucs_status_t;
 }
 #[repr(u32)]
+#[doc = " @ingroup UCP_COMM\n @brief Atomic operation requested for ucp_atomic_fetch\n\n @deprecated Use @ref ucp_atomic_op_nbx and @ref ucp_atomic_op_t instead.\n\n This enumeration defines which atomic memory operation should be performed\n by the ucp_atomic_fetch family of functions. All of these functions\n will fetch data from the remote node."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucp_atomic_fetch_op_t {
+    #[doc = "< Atomic Fetch and add"]
     UCP_ATOMIC_FETCH_OP_FADD = 0,
+    #[doc = "< Atomic swap"]
     UCP_ATOMIC_FETCH_OP_SWAP = 1,
+    #[doc = "< Atomic conditional swap"]
     UCP_ATOMIC_FETCH_OP_CSWAP = 2,
+    #[doc = "< Atomic Fetch and and"]
     UCP_ATOMIC_FETCH_OP_FAND = 3,
+    #[doc = "< Atomic Fetch and or"]
     UCP_ATOMIC_FETCH_OP_FOR = 4,
+    #[doc = "< Atomic Fetch and xor"]
     UCP_ATOMIC_FETCH_OP_FXOR = 5,
     UCP_ATOMIC_FETCH_OP_LAST = 6,
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Post an atomic fetch operation.\n\n @deprecated Use @ref ucp_atomic_op_nbx with the flag\n             @ref UCP_OP_ATTR_FIELD_REPLY_BUFFER instead.\n\n This routine will post an atomic fetch operation to remote memory.\n The remote value is described by the combination of the remote\n memory address @a remote_addr and the @ref ucp_rkey_h \"remote memory handle\"\n @a rkey.\n The routine is non-blocking and therefore returns immediately. However the\n actual atomic operation may be delayed. The atomic operation is not considered complete\n until the values in remote and local memory are completed. If the atomic operation\n completes immediately, the routine returns UCS_OK and the call-back routine\n @a cb is @b not invoked. If the operation is @b not completed immediately and no\n error is reported, then the UCP library will schedule invocation of the call-back\n routine @a cb upon completion of the atomic operation. In other words, the completion\n of an atomic operation can be signaled by the return code or execution of the call-back.\n\n @note The user should not modify any part of the @a result after this\n       operation is called, until the operation completes.\n\n @param [in] ep          UCP endpoint.\n @param [in] opcode      One of @ref ucp_atomic_fetch_op_t.\n @param [in] value       Source operand for atomic operation. In the case of CSWAP\n                         this is the conditional for the swap. For SWAP this is\n                         the value to be placed in remote memory.\n @param [inout] result   Local memory address to store resulting fetch to.\n                         In the case of CSWAP the value in result will be\n                         swapped into the @a remote_addr if the condition\n                         is true.\n @param [in] op_size     Size of value in bytes and pointer type for result\n @param [in] remote_addr Remote address to operate on.\n @param [in] rkey        Remote key handle for the remote memory address.\n @param [in] cb          Call-back function that is invoked whenever the\n                         send operation is completed. It is important to note\n                         that the call-back function is only invoked in a case when\n                         the operation cannot be completed in place.\n\n @return NULL                 - The operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The operation failed.\n @return otherwise            - Operation was scheduled and can be\n                              completed at any point in time. The request handle\n                              is returned to the application in order to track\n                              progress of the operation. The application is\n                              responsible for releasing the handle using\n                              @ref ucp_request_free \"ucp_request_free()\" routine."]
     pub fn ucp_atomic_fetch_nb(
         ep: ucp_ep_h,
         opcode: ucp_atomic_fetch_op_t,
@@ -8174,37 +8961,56 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n\n @brief Flush outstanding AMO and RMA operations on the @ref ucp_worker_h\n \"worker\"\n\n @deprecated Use @ref ucp_worker_flush_nbx instead.\n\n This routine flushes all outstanding AMO and RMA communications on the\n @ref ucp_worker_h \"worker\". All the AMO and RMA operations issued on the\n @a worker prior to this call are completed both at the origin and at the\n target when this call returns.\n\n @note For description of the differences between @ref ucp_worker_flush_nb\n \"flush\" and @ref ucp_worker_fence \"fence\" operations please see\n @ref ucp_worker_fence \"ucp_worker_fence()\"\n\n @param [in] worker    UCP worker.\n @param [in] flags     Flags for flush operation. Reserved for future use.\n @param [in] cb        Callback which will be called when the flush operation\n                       completes.\n\n @return NULL             - The flush operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The flush operation failed.\n @return otherwise        - Flush operation was scheduled and can be completed\n                          in any point in time. The request handle is returned\n                          to the application in order to track progress. The\n                          application is responsible for releasing the handle\n                          using @ref ucp_request_free \"ucp_request_free()\"\n                          routine."]
     pub fn ucp_worker_flush_nb(
         worker: ucp_worker_h,
         flags: ::std::os::raw::c_uint,
         cb: ucp_send_callback_t,
     ) -> ucs_status_ptr_t;
 }
+#[repr(u32)]
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Close UCP endpoint modes.\n\n @deprecated Use @ref ucp_ep_close_nbx and @ref ucp_ep_close_flags_t instead.\n\n The enumeration is used to specify the behavior of @ref ucp_ep_close_nb."]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum ucp_ep_close_mode {
+    #[doc = "< @ref ucp_ep_close_nb releases\nthe endpoint without any\nconfirmation from the peer. All\noutstanding requests will be\ncompleted with\n@ref UCS_ERR_CANCELED error.\n@note This mode may cause\ntransport level errors on remote\nside, so it requires set\n@ref UCP_ERR_HANDLING_MODE_PEER\nfor all endpoints created on\nboth (local and remote) sides to\navoid undefined behavior."]
+    UCP_EP_CLOSE_MODE_FORCE = 0,
+    #[doc = "< @ref ucp_ep_close_nb schedules\nflushes on all outstanding\noperations."]
+    UCP_EP_CLOSE_MODE_FLUSH = 1,
+}
 impl ucp_params_field {
+    #[doc = "< features"]
     pub const UCP_PARAM_FIELD_FEATURES: ucp_params_field = ucp_params_field(1);
 }
 impl ucp_params_field {
+    #[doc = "< request_size"]
     pub const UCP_PARAM_FIELD_REQUEST_SIZE: ucp_params_field = ucp_params_field(2);
 }
 impl ucp_params_field {
+    #[doc = "< request_init"]
     pub const UCP_PARAM_FIELD_REQUEST_INIT: ucp_params_field = ucp_params_field(4);
 }
 impl ucp_params_field {
+    #[doc = "< request_cleanup"]
     pub const UCP_PARAM_FIELD_REQUEST_CLEANUP: ucp_params_field = ucp_params_field(8);
 }
 impl ucp_params_field {
+    #[doc = "< tag_sender_mask"]
     pub const UCP_PARAM_FIELD_TAG_SENDER_MASK: ucp_params_field = ucp_params_field(16);
 }
 impl ucp_params_field {
+    #[doc = "< mt_workers_shared"]
     pub const UCP_PARAM_FIELD_MT_WORKERS_SHARED: ucp_params_field = ucp_params_field(32);
 }
 impl ucp_params_field {
+    #[doc = "< estimated_num_eps"]
     pub const UCP_PARAM_FIELD_ESTIMATED_NUM_EPS: ucp_params_field = ucp_params_field(64);
 }
 impl ucp_params_field {
+    #[doc = "< estimated_num_ppn"]
     pub const UCP_PARAM_FIELD_ESTIMATED_NUM_PPN: ucp_params_field = ucp_params_field(128);
 }
 impl ucp_params_field {
+    #[doc = "< name"]
     pub const UCP_PARAM_FIELD_NAME: ucp_params_field = ucp_params_field(256);
 }
 impl ::std::ops::BitOr<ucp_params_field> for ucp_params_field {
@@ -8234,30 +9040,39 @@ impl ::std::ops::BitAndAssign for ucp_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_CONTEXT\n @brief UCP context parameters field mask.\n\n The enumeration allows specifying which fields in @ref ucp_params_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_params_field(pub ::std::os::raw::c_uint);
 impl ucp_feature {
+    #[doc = " Request tag matching support"]
     pub const UCP_FEATURE_TAG: ucp_feature = ucp_feature(1);
 }
 impl ucp_feature {
+    #[doc = " Request remote memory access support"]
     pub const UCP_FEATURE_RMA: ucp_feature = ucp_feature(2);
 }
 impl ucp_feature {
+    #[doc = " Request 32-bit atomic operations support"]
     pub const UCP_FEATURE_AMO32: ucp_feature = ucp_feature(4);
 }
 impl ucp_feature {
+    #[doc = " Request 64-bit atomic operations support"]
     pub const UCP_FEATURE_AMO64: ucp_feature = ucp_feature(8);
 }
 impl ucp_feature {
+    #[doc = " Request interrupt notification support"]
     pub const UCP_FEATURE_WAKEUP: ucp_feature = ucp_feature(16);
 }
 impl ucp_feature {
+    #[doc = " Request stream support"]
     pub const UCP_FEATURE_STREAM: ucp_feature = ucp_feature(32);
 }
 impl ucp_feature {
+    #[doc = " Request Active Message support"]
     pub const UCP_FEATURE_AM: ucp_feature = ucp_feature(64);
 }
 impl ucp_feature {
+    #[doc = " Request support mapping a peer's memory handle that was created by\n @ref ucp_mem_map and packed by @ref ucp_memh_pack with the flag\n @ref UCP_MEMH_PACK_FLAG_EXPORT and use it for local operations"]
     pub const UCP_FEATURE_EXPORTED_MEMH: ucp_feature = ucp_feature(128);
 }
 impl ::std::ops::BitOr<ucp_feature> for ucp_feature {
@@ -8287,37 +9102,47 @@ impl ::std::ops::BitAndAssign for ucp_feature {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_CONTEXT\n @brief UCP configuration features\n\n The enumeration list describes the features supported by UCP.  An\n application can request the features using @ref ucp_params_t \"UCP parameters\"\n during @ref ucp_init \"UCP initialization\" process."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_feature(pub ::std::os::raw::c_uint);
 impl ucp_worker_params_field {
+    #[doc = "< UCP thread mode"]
     pub const UCP_WORKER_PARAM_FIELD_THREAD_MODE: ucp_worker_params_field =
         ucp_worker_params_field(1);
 }
 impl ucp_worker_params_field {
+    #[doc = "< Worker's CPU bitmap"]
     pub const UCP_WORKER_PARAM_FIELD_CPU_MASK: ucp_worker_params_field = ucp_worker_params_field(2);
 }
 impl ucp_worker_params_field {
+    #[doc = "< Worker's events bitmap"]
     pub const UCP_WORKER_PARAM_FIELD_EVENTS: ucp_worker_params_field = ucp_worker_params_field(4);
 }
 impl ucp_worker_params_field {
+    #[doc = "< User data"]
     pub const UCP_WORKER_PARAM_FIELD_USER_DATA: ucp_worker_params_field =
         ucp_worker_params_field(8);
 }
 impl ucp_worker_params_field {
+    #[doc = "< External event file\ndescriptor"]
     pub const UCP_WORKER_PARAM_FIELD_EVENT_FD: ucp_worker_params_field =
         ucp_worker_params_field(16);
 }
 impl ucp_worker_params_field {
+    #[doc = "< Worker flags"]
     pub const UCP_WORKER_PARAM_FIELD_FLAGS: ucp_worker_params_field = ucp_worker_params_field(32);
 }
 impl ucp_worker_params_field {
+    #[doc = "< Worker name"]
     pub const UCP_WORKER_PARAM_FIELD_NAME: ucp_worker_params_field = ucp_worker_params_field(64);
 }
 impl ucp_worker_params_field {
+    #[doc = "< Alignment of active\nmessages on the receiver"]
     pub const UCP_WORKER_PARAM_FIELD_AM_ALIGNMENT: ucp_worker_params_field =
         ucp_worker_params_field(128);
 }
 impl ucp_worker_params_field {
+    #[doc = "< Client id"]
     pub const UCP_WORKER_PARAM_FIELD_CLIENT_ID: ucp_worker_params_field =
         ucp_worker_params_field(256);
 }
@@ -8348,9 +9173,11 @@ impl ::std::ops::BitAndAssign for ucp_worker_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker parameters field mask.\n\n The enumeration allows specifying which fields in @ref ucp_worker_params_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_worker_params_field(pub ::std::os::raw::c_uint);
 impl ucp_worker_flags_t {
+    #[doc = "< Do not print warnings\nabout request leaks"]
     pub const UCP_WORKER_FLAG_IGNORE_REQUEST_LEAK: ucp_worker_flags_t = ucp_worker_flags_t(1);
 }
 impl ::std::ops::BitOr<ucp_worker_flags_t> for ucp_worker_flags_t {
@@ -8380,13 +9207,16 @@ impl ::std::ops::BitAndAssign for ucp_worker_flags_t {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker flags\n\n This enumeration allows specifying flags for @ref ucp_worker_params_t.flags,\n which is used as parameter for @ref ucp_worker_create."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_worker_flags_t(pub ::std::os::raw::c_uint);
 impl ucp_listener_params_field {
+    #[doc = " Sock address and length."]
     pub const UCP_LISTENER_PARAM_FIELD_SOCK_ADDR: ucp_listener_params_field =
         ucp_listener_params_field(1);
 }
 impl ucp_listener_params_field {
+    #[doc = " User's callback and argument for handling the creation of an endpoint."]
     pub const UCP_LISTENER_PARAM_FIELD_ACCEPT_HANDLER: ucp_listener_params_field =
         ucp_listener_params_field(2);
 }
@@ -8421,6 +9251,7 @@ impl ::std::ops::BitAndAssign for ucp_listener_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_WORKER\n @brief UCP listener parameters field mask.\n\n The enumeration allows specifying which fields in @ref ucp_listener_params_t\n are present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_listener_params_field(pub ::std::os::raw::c_uint);
 impl ucp_worker_address_flags_t {
@@ -8454,33 +9285,42 @@ impl ::std::ops::BitAndAssign for ucp_worker_address_flags_t {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker address flags.\n\n The enumeration list describes possible UCP worker address flags, indicating\n what needs to be included to the worker address returned by\n @ref ucp_worker_query \"ucp_worker_query()\" routine."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_worker_address_flags_t(pub ::std::os::raw::c_uint);
 impl ucp_ep_params_field {
+    #[doc = "< Address of remote\npeer"]
     pub const UCP_EP_PARAM_FIELD_REMOTE_ADDRESS: ucp_ep_params_field = ucp_ep_params_field(1);
 }
 impl ucp_ep_params_field {
+    #[doc = "< Error handling mode.\n@ref ucp_err_handling_mode_t"]
     pub const UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE: ucp_ep_params_field = ucp_ep_params_field(2);
 }
 impl ucp_ep_params_field {
+    #[doc = "< Handler to process\ntransport level errors"]
     pub const UCP_EP_PARAM_FIELD_ERR_HANDLER: ucp_ep_params_field = ucp_ep_params_field(4);
 }
 impl ucp_ep_params_field {
+    #[doc = "< User data pointer"]
     pub const UCP_EP_PARAM_FIELD_USER_DATA: ucp_ep_params_field = ucp_ep_params_field(8);
 }
 impl ucp_ep_params_field {
+    #[doc = "< Socket address field"]
     pub const UCP_EP_PARAM_FIELD_SOCK_ADDR: ucp_ep_params_field = ucp_ep_params_field(16);
 }
 impl ucp_ep_params_field {
+    #[doc = "< Endpoint flags */\n/**< Connection request field"]
     pub const UCP_EP_PARAM_FIELD_FLAGS: ucp_ep_params_field = ucp_ep_params_field(32);
 }
 impl ucp_ep_params_field {
     pub const UCP_EP_PARAM_FIELD_CONN_REQUEST: ucp_ep_params_field = ucp_ep_params_field(64);
 }
 impl ucp_ep_params_field {
+    #[doc = "< Endpoint name"]
     pub const UCP_EP_PARAM_FIELD_NAME: ucp_ep_params_field = ucp_ep_params_field(128);
 }
 impl ucp_ep_params_field {
+    #[doc = "< Local socket Address"]
     pub const UCP_EP_PARAM_FIELD_LOCAL_SOCK_ADDR: ucp_ep_params_field = ucp_ep_params_field(256);
 }
 impl ::std::ops::BitOr<ucp_ep_params_field> for ucp_ep_params_field {
@@ -8510,17 +9350,21 @@ impl ::std::ops::BitAndAssign for ucp_ep_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP endpoint parameters field mask.\n\n The enumeration allows specifying which fields in @ref ucp_ep_params_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_ep_params_field(pub ::std::os::raw::c_uint);
 impl ucp_ep_params_flags_field {
+    #[doc = "< Using a client-server\nconnection establishment\nmechanism.\n@ref ucs_sock_addr_t\nsockaddr field\nmust be provided and\ncontain the address\nof the remote peer"]
     pub const UCP_EP_PARAMS_FLAGS_CLIENT_SERVER: ucp_ep_params_flags_field =
         ucp_ep_params_flags_field(1);
 }
 impl ucp_ep_params_flags_field {
+    #[doc = "< Avoid connecting the\nendpoint to itself when\nconnecting the endpoint\nto the same worker it\nwas created on.\nAffects protocols which\nsend to a particular\nremote endpoint, for\nexample stream"]
     pub const UCP_EP_PARAMS_FLAGS_NO_LOOPBACK: ucp_ep_params_flags_field =
         ucp_ep_params_flags_field(2);
 }
 impl ucp_ep_params_flags_field {
+    #[doc = "< Send client id\nwhen connecting to remote\nsocket address as part of the\nconnection request payload.\nOn the remote side value\ncan be obtained from\n@ref ucp_conn_request_h using\n@ref ucp_conn_request_query"]
     pub const UCP_EP_PARAMS_FLAGS_SEND_CLIENT_ID: ucp_ep_params_flags_field =
         ucp_ep_params_flags_field(4);
 }
@@ -8551,9 +9395,11 @@ impl ::std::ops::BitAndAssign for ucp_ep_params_flags_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP endpoint parameters flags.\n\n The enumeration list describes the endpoint's parameters flags supported by\n @ref ucp_ep_create() function."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_ep_params_flags_field(pub ::std::os::raw::c_uint);
 impl ucp_ep_close_flags_t {
+    #[doc = "< @ref ucp_ep_close_nbx releases\nthe endpoint without any\nconfirmation from the peer. All\noutstanding requests will be\ncompleted with\n@ref UCS_ERR_CANCELED error.\n@note This mode may cause\ntransport level errors on remote\nside, so it requires set\n@ref UCP_ERR_HANDLING_MODE_PEER\nfor all endpoints created on\nboth (local and remote) sides to\navoid undefined behavior. If this\nflag is not set then\n@ref ucp_ep_close_nbx schedules\nflushes on all outstanding\noperations.\n@note this flag is incompatible\nwith @ref UCP_OP_ATTR_FLAG_NO_IMM_CMPL,\nsince it forces immediate completion."]
     pub const UCP_EP_CLOSE_FLAG_FORCE: ucp_ep_close_flags_t = ucp_ep_close_flags_t(1);
 }
 impl ::std::ops::BitOr<ucp_ep_close_flags_t> for ucp_ep_close_flags_t {
@@ -8583,15 +9429,11 @@ impl ::std::ops::BitAndAssign for ucp_ep_close_flags_t {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Close UCP endpoint modes.\n\n The enumeration is used to specify the behavior of @ref ucp_ep_close_nbx."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_ep_close_flags_t(pub ::std::os::raw::c_uint);
-#[repr(u32)]
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
-pub enum ucp_ep_close_mode {
-    UCP_EP_CLOSE_MODE_FORCE = 0,
-    UCP_EP_CLOSE_MODE_FLUSH = 1,
-}
 impl ucp_ep_perf_param_field {
+    #[doc = " Enables @ref ucp_ep_evaluate_perf_param_t::message_size"]
     pub const UCP_EP_PERF_PARAM_FIELD_MESSAGE_SIZE: ucp_ep_perf_param_field =
         ucp_ep_perf_param_field(1);
 }
@@ -8622,10 +9464,13 @@ impl ::std::ops::BitAndAssign for ucp_ep_perf_param_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP performance fields and flags\n\n The enumeration allows specifying which fields in @ref ucp_ep_evaluate_perf_param_t are\n present and operation flags are used. It is used to enable backward\n compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_ep_perf_param_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP performance fields and flags\n\n The enumeration allows specifying which fields in @ref ucp_ep_evaluate_perf_param_t are\n present and operation flags are used. It is used to enable backward\n compatibility support."]
 pub use self::ucp_ep_perf_param_field as ucp_ep_perf_param_field_t;
 impl ucp_ep_perf_attr_field {
+    #[doc = " Enables @ref ucp_ep_evaluate_perf_attr_t::estimated_time"]
     pub const UCP_EP_PERF_ATTR_FIELD_ESTIMATED_TIME: ucp_ep_perf_attr_field =
         ucp_ep_perf_attr_field(1);
 }
@@ -8656,28 +9501,36 @@ impl ::std::ops::BitAndAssign for ucp_ep_perf_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP performance fields and flags\n\n The enumeration allows specifying which fields in @ref ucp_ep_evaluate_perf_attr_t are\n present and operation flags are used. It is used to enable backward\n compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_ep_perf_attr_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP performance fields and flags\n\n The enumeration allows specifying which fields in @ref ucp_ep_evaluate_perf_attr_t are\n present and operation flags are used. It is used to enable backward\n compatibility support."]
 pub use self::ucp_ep_perf_attr_field as ucp_ep_perf_attr_field_t;
 impl ucp_mem_map_params_field {
+    #[doc = " Address of the memory that will be used in the @ref ucp_mem_map routine."]
     pub const UCP_MEM_MAP_PARAM_FIELD_ADDRESS: ucp_mem_map_params_field =
         ucp_mem_map_params_field(1);
 }
 impl ucp_mem_map_params_field {
+    #[doc = " The size of memory that will be allocated or registered in the\n @ref ucp_mem_map routine."]
     pub const UCP_MEM_MAP_PARAM_FIELD_LENGTH: ucp_mem_map_params_field =
         ucp_mem_map_params_field(2);
 }
 impl ucp_mem_map_params_field {
+    #[doc = " Allocation flags."]
     pub const UCP_MEM_MAP_PARAM_FIELD_FLAGS: ucp_mem_map_params_field = ucp_mem_map_params_field(4);
 }
 impl ucp_mem_map_params_field {
+    #[doc = " Memory protection mode."]
     pub const UCP_MEM_MAP_PARAM_FIELD_PROT: ucp_mem_map_params_field = ucp_mem_map_params_field(8);
 }
 impl ucp_mem_map_params_field {
+    #[doc = " Memory type."]
     pub const UCP_MEM_MAP_PARAM_FIELD_MEMORY_TYPE: ucp_mem_map_params_field =
         ucp_mem_map_params_field(16);
 }
 impl ucp_mem_map_params_field {
+    #[doc = " Exported memory handle buffer."]
     pub const UCP_MEM_MAP_PARAM_FIELD_EXPORTED_MEMH_BUFFER: ucp_mem_map_params_field =
         ucp_mem_map_params_field(32);
 }
@@ -8708,17 +9561,21 @@ impl ::std::ops::BitAndAssign for ucp_mem_map_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_MEM\n @brief UCP memory mapping parameters field mask.\n\n The enumeration allows specifying which fields in @ref ucp_mem_map_params_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_mem_map_params_field(pub ::std::os::raw::c_uint);
 impl ucp_mem_advise_params_field {
+    #[doc = "< Address of the memory"]
     pub const UCP_MEM_ADVISE_PARAM_FIELD_ADDRESS: ucp_mem_advise_params_field =
         ucp_mem_advise_params_field(1);
 }
 impl ucp_mem_advise_params_field {
+    #[doc = "< The size of memory"]
     pub const UCP_MEM_ADVISE_PARAM_FIELD_LENGTH: ucp_mem_advise_params_field =
         ucp_mem_advise_params_field(2);
 }
 impl ucp_mem_advise_params_field {
+    #[doc = "< Advice on memory usage"]
     pub const UCP_MEM_ADVISE_PARAM_FIELD_ADVICE: ucp_mem_advise_params_field =
         ucp_mem_advise_params_field(4);
 }
@@ -8749,6 +9606,7 @@ impl ::std::ops::BitAndAssign for ucp_mem_advise_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_MEM\n @brief UCP memory advice parameters field mask.\n\n The enumeration allows specifying which fields in @ref ucp_mem_advise_params_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_mem_advise_params_field(pub ::std::os::raw::c_uint);
 impl ucp_lib_attr_field {
@@ -8781,18 +9639,23 @@ impl ::std::ops::BitAndAssign for ucp_lib_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_CONTEXT\n @brief UCP library attributes field mask.\n\n The enumeration allows specifying which fields in @ref ucp_lib_attr_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_lib_attr_field(pub ::std::os::raw::c_uint);
 impl ucp_context_attr_field {
+    #[doc = "< UCP request size"]
     pub const UCP_ATTR_FIELD_REQUEST_SIZE: ucp_context_attr_field = ucp_context_attr_field(1);
 }
 impl ucp_context_attr_field {
+    #[doc = "< UCP context thread flag"]
     pub const UCP_ATTR_FIELD_THREAD_MODE: ucp_context_attr_field = ucp_context_attr_field(2);
 }
 impl ucp_context_attr_field {
+    #[doc = "< UCP supported memory types"]
     pub const UCP_ATTR_FIELD_MEMORY_TYPES: ucp_context_attr_field = ucp_context_attr_field(4);
 }
 impl ucp_context_attr_field {
+    #[doc = "< UCP context name"]
     pub const UCP_ATTR_FIELD_NAME: ucp_context_attr_field = ucp_context_attr_field(8);
 }
 impl ::std::ops::BitOr<ucp_context_attr_field> for ucp_context_attr_field {
@@ -8822,24 +9685,31 @@ impl ::std::ops::BitAndAssign for ucp_context_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_CONTEXT\n @brief UCP context attributes field mask.\n\n The enumeration allows specifying which fields in @ref ucp_context_attr_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_context_attr_field(pub ::std::os::raw::c_uint);
 impl ucp_worker_attr_field {
+    #[doc = "< UCP thread mode"]
     pub const UCP_WORKER_ATTR_FIELD_THREAD_MODE: ucp_worker_attr_field = ucp_worker_attr_field(1);
 }
 impl ucp_worker_attr_field {
+    #[doc = "< UCP address"]
     pub const UCP_WORKER_ATTR_FIELD_ADDRESS: ucp_worker_attr_field = ucp_worker_attr_field(2);
 }
 impl ucp_worker_attr_field {
+    #[doc = "< UCP address flags"]
     pub const UCP_WORKER_ATTR_FIELD_ADDRESS_FLAGS: ucp_worker_attr_field = ucp_worker_attr_field(4);
 }
 impl ucp_worker_attr_field {
+    #[doc = "< Maximum header size\nused by UCP AM API"]
     pub const UCP_WORKER_ATTR_FIELD_MAX_AM_HEADER: ucp_worker_attr_field = ucp_worker_attr_field(8);
 }
 impl ucp_worker_attr_field {
+    #[doc = "< UCP worker name"]
     pub const UCP_WORKER_ATTR_FIELD_NAME: ucp_worker_attr_field = ucp_worker_attr_field(16);
 }
 impl ucp_worker_attr_field {
+    #[doc = "< Maximum size of\ninfo string"]
     pub const UCP_WORKER_ATTR_FIELD_MAX_INFO_STRING: ucp_worker_attr_field =
         ucp_worker_attr_field(32);
 }
@@ -8870,9 +9740,11 @@ impl ::std::ops::BitAndAssign for ucp_worker_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker attributes field mask.\n\n The enumeration allows specifying which fields in @ref ucp_worker_attr_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_worker_attr_field(pub ::std::os::raw::c_uint);
 impl ucp_worker_address_attr_field {
+    #[doc = "< Unique id of the worker"]
     pub const UCP_WORKER_ADDRESS_ATTR_FIELD_UID: ucp_worker_address_attr_field =
         ucp_worker_address_attr_field(1);
 }
@@ -8903,9 +9775,11 @@ impl ::std::ops::BitAndAssign for ucp_worker_address_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker address attributes field mask.\n\n The enumeration allows specifying which fields in\n @ref ucp_worker_address_attr_t are present. It is used to enable backward\n compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_worker_address_attr_field(pub ::std::os::raw::c_uint);
 impl ucp_listener_attr_field {
+    #[doc = "< Sockaddr used for listening"]
     pub const UCP_LISTENER_ATTR_FIELD_SOCKADDR: ucp_listener_attr_field =
         ucp_listener_attr_field(1);
 }
@@ -8936,13 +9810,16 @@ impl ::std::ops::BitAndAssign for ucp_listener_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_WORKER\n @brief UCP listener attributes field mask.\n\n The enumeration allows specifying which fields in @ref ucp_listener_attr_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_listener_attr_field(pub ::std::os::raw::c_uint);
 impl ucp_conn_request_attr_field {
+    #[doc = "< Client's address"]
     pub const UCP_CONN_REQUEST_ATTR_FIELD_CLIENT_ADDR: ucp_conn_request_attr_field =
         ucp_conn_request_attr_field(1);
 }
 impl ucp_conn_request_attr_field {
+    #[doc = "< Remote client id"]
     pub const UCP_CONN_REQUEST_ATTR_FIELD_CLIENT_ID: ucp_conn_request_attr_field =
         ucp_conn_request_attr_field(2);
 }
@@ -8973,28 +9850,38 @@ impl ::std::ops::BitAndAssign for ucp_conn_request_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_WORKER\n @brief UCP listener's connection request attributes field mask.\n\n The enumeration allows specifying which fields in @ref ucp_conn_request_attr_t\n are present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_conn_request_attr_field(pub ::std::os::raw::c_uint);
 impl ucp_dt_type {
     pub const UCP_DATATYPE_CLASS_MASK: ucp_dt_type = ucp_dt_type::UCP_DATATYPE_GENERIC;
 }
 #[repr(u32)]
+#[doc = " @ingroup UCP_DATATYPE\n @brief UCP data type classification\n\n The enumeration list describes the datatypes supported by UCP."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucp_dt_type {
+    #[doc = "< Contiguous datatype"]
     UCP_DATATYPE_CONTIG = 0,
+    #[doc = "< Strided datatype"]
     UCP_DATATYPE_STRIDED = 1,
+    #[doc = "< Scatter-gather list with multiple pointers"]
     UCP_DATATYPE_IOV = 2,
+    #[doc = "< Generic datatype with\nuser-defined pack/unpack routines"]
     UCP_DATATYPE_GENERIC = 7,
+    #[doc = "< Number of bits defining\nthe datatype classification"]
     UCP_DATATYPE_SHIFT = 3,
 }
 impl ucp_datatype_attr_field {
+    #[doc = " @ref ucp_datatype_attr_t::packed_size field is queried."]
     pub const UCP_DATATYPE_ATTR_FIELD_PACKED_SIZE: ucp_datatype_attr_field =
         ucp_datatype_attr_field(1);
 }
 impl ucp_datatype_attr_field {
+    #[doc = " @ref ucp_datatype_attr_t::buffer field is set."]
     pub const UCP_DATATYPE_ATTR_FIELD_BUFFER: ucp_datatype_attr_field = ucp_datatype_attr_field(2);
 }
 impl ucp_datatype_attr_field {
+    #[doc = " @ref ucp_datatype_attr_t::count field is set."]
     pub const UCP_DATATYPE_ATTR_FIELD_COUNT: ucp_datatype_attr_field = ucp_datatype_attr_field(4);
 }
 impl ::std::ops::BitOr<ucp_datatype_attr_field> for ucp_datatype_attr_field {
@@ -9024,17 +9911,28 @@ impl ::std::ops::BitAndAssign for ucp_datatype_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_DATATYPE\n @brief UCP datatype attributes field mask.\n\n The enumeration allows specifying which fields in @ref ucp_datatype_attr_t\n are present and which datatype attributes are queried."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_datatype_attr_field(pub ::std::os::raw::c_uint);
 pub const UCP_MEM_MAP_NONBLOCK: _bindgen_ty_8 = _bindgen_ty_8::UCP_MEM_MAP_NONBLOCK;
 pub const UCP_MEM_MAP_ALLOCATE: _bindgen_ty_8 = _bindgen_ty_8::UCP_MEM_MAP_ALLOCATE;
 pub const UCP_MEM_MAP_FIXED: _bindgen_ty_8 = _bindgen_ty_8::UCP_MEM_MAP_FIXED;
+pub const UCP_MEM_MAP_SYMMETRIC_RKEY: _bindgen_ty_8 = _bindgen_ty_8::UCP_MEM_MAP_SYMMETRIC_RKEY;
+pub const UCP_MEM_MAP_LOCK: _bindgen_ty_8 = _bindgen_ty_8::UCP_MEM_MAP_LOCK;
 #[repr(u32)]
+#[doc = " @ingroup UCP_MEM\n @brief UCP memory mapping flags.\n\n The enumeration list describes the memory mapping flags supported by @ref\n ucp_mem_map() function."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum _bindgen_ty_8 {
+    #[doc = " Complete the mapping faster, possibly by not populating the pages in the\n mapping up-front, and mapping them later when they are accessed by\n communication routines."]
     UCP_MEM_MAP_NONBLOCK = 1,
+    #[doc = " Identify requirement for allocation, if passed address is not a\n null-pointer, then it will be used as a hint or direct address for\n allocation."]
     UCP_MEM_MAP_ALLOCATE = 2,
+    #[doc = " Don't interpret address as a hint: place the mapping at exactly that\n address. The address must be a multiple of the page size."]
     UCP_MEM_MAP_FIXED = 4,
+    #[doc = " Register the memory region so its remote access key would likely be\n equal to remote access keys received from other peers, when compared with\n @ref ucp_rkey_compare. This flag is a hint. When remote access keys\n received from different peers are compared equal, they can be used\n interchangeably, avoiding the need to keep all of them in memory."]
+    UCP_MEM_MAP_SYMMETRIC_RKEY = 8,
+    #[doc = " Enforce pinning of the memory pages in the mapping and populate them up-front.\n This flag is mutually exclusive with UCP_MEM_MAP_NONBLOCK."]
+    UCP_MEM_MAP_LOCK = 16,
 }
 pub const UCP_MEM_MAP_PROT_LOCAL_READ: _bindgen_ty_9 = _bindgen_ty_9::UCP_MEM_MAP_PROT_LOCAL_READ;
 pub const UCP_MEM_MAP_PROT_LOCAL_WRITE: _bindgen_ty_9 = _bindgen_ty_9::UCP_MEM_MAP_PROT_LOCAL_WRITE;
@@ -9042,17 +9940,24 @@ pub const UCP_MEM_MAP_PROT_REMOTE_READ: _bindgen_ty_9 = _bindgen_ty_9::UCP_MEM_M
 pub const UCP_MEM_MAP_PROT_REMOTE_WRITE: _bindgen_ty_9 =
     _bindgen_ty_9::UCP_MEM_MAP_PROT_REMOTE_WRITE;
 #[repr(u32)]
+#[doc = " @ingroup UCP_MEM\n @brief UCP memory mapping protection mode.\n\n The enumeration list describes the memory mapping protections supported by the @ref\n ucp_mem_map() function."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum _bindgen_ty_9 {
+    #[doc = "< Enable local read access."]
     UCP_MEM_MAP_PROT_LOCAL_READ = 1,
+    #[doc = "< Enable local write access."]
     UCP_MEM_MAP_PROT_LOCAL_WRITE = 2,
+    #[doc = "< Enable remote read access."]
     UCP_MEM_MAP_PROT_REMOTE_READ = 256,
+    #[doc = "< Enable remote write access."]
     UCP_MEM_MAP_PROT_REMOTE_WRITE = 512,
 }
 impl ucp_am_cb_flags {
+    #[doc = " Indicates that the entire message will be handled in one callback."]
     pub const UCP_AM_FLAG_WHOLE_MSG: ucp_am_cb_flags = ucp_am_cb_flags(1);
 }
 impl ucp_am_cb_flags {
+    #[doc = " Guarantees that the specified @ref ucp_am_recv_callback_t callback,\n will always be called with @ref UCP_AM_RECV_ATTR_FLAG_DATA flag set,\n so the data will be accessible outside the callback, until\n @ref ucp_am_data_release is called."]
     pub const UCP_AM_FLAG_PERSISTENT_DATA: ucp_am_cb_flags = ucp_am_cb_flags(2);
 }
 impl ::std::ops::BitOr<ucp_am_cb_flags> for ucp_am_cb_flags {
@@ -9082,21 +9987,27 @@ impl ::std::ops::BitAndAssign for ucp_am_cb_flags {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_WORKER\n @brief Flags for a UCP Active Message callback.\n\n Flags that indicate how to handle UCP Active Messages."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_am_cb_flags(pub ::std::os::raw::c_uint);
 impl ucp_send_am_flags {
+    #[doc = " Force relevant reply endpoint to be passed to the data callback on the receiver."]
     pub const UCP_AM_SEND_FLAG_REPLY: ucp_send_am_flags = ucp_send_am_flags(1);
 }
 impl ucp_send_am_flags {
+    #[doc = " Force UCP to use only eager protocol for AM sends."]
     pub const UCP_AM_SEND_FLAG_EAGER: ucp_send_am_flags = ucp_send_am_flags(2);
 }
 impl ucp_send_am_flags {
+    #[doc = " Force UCP to use only rendezvous protocol for AM sends."]
     pub const UCP_AM_SEND_FLAG_RNDV: ucp_send_am_flags = ucp_send_am_flags(4);
 }
 impl ucp_send_am_flags {
+    #[doc = " The flag indicates that the header should be copied to an internal buffer\n in case it's needed after the send function returns. If this flag is\n specified, the header can be released immediately after the send\n function returns, even if the non-blocking send request is not completed."]
     pub const UCP_AM_SEND_FLAG_COPY_HEADER: ucp_send_am_flags = ucp_send_am_flags(8);
 }
 impl ucp_send_am_flags {
+    #[doc = " Backward compatibility."]
     pub const UCP_AM_SEND_REPLY: ucp_send_am_flags = ucp_send_am_flags(1);
 }
 impl ::std::ops::BitOr<ucp_send_am_flags> for ucp_send_am_flags {
@@ -9126,6 +10037,7 @@ impl ::std::ops::BitAndAssign for ucp_send_am_flags {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_WORKER\n @brief Flags for sending a UCP Active Message.\n\n Flags dictate the behavior of @ref ucp_am_send_nb and @ref ucp_am_send_nbx\n routines."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_send_am_flags(pub ::std::os::raw::c_uint);
 impl ucp_cb_param_flags {
@@ -9158,20 +10070,29 @@ impl ::std::ops::BitAndAssign for ucp_cb_param_flags {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Descriptor flags for Active Message callback.\n\n In a callback, if flags is set to UCP_CB_PARAM_FLAG_DATA in\n a callback then data was allocated, so if UCS_INPROGRESS is\n returned from the callback, the data parameter will persist\n and the user has to call @ref ucp_am_data_release when data is\n no longer needed."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_cb_param_flags(pub ::std::os::raw::c_uint);
 #[repr(u32)]
+#[doc = " @ingroup UCP_COMM\n @brief Atomic operation requested for ucp_atomic_op_nbx\n\n This enumeration defines which atomic memory operation should be\n performed by the @ref ucp_atomic_op_nbx routine."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucp_atomic_op_t {
+    #[doc = "< Atomic add"]
     UCP_ATOMIC_OP_ADD = 0,
+    #[doc = "< Atomic swap"]
     UCP_ATOMIC_OP_SWAP = 1,
+    #[doc = "< Atomic conditional swap"]
     UCP_ATOMIC_OP_CSWAP = 2,
+    #[doc = "< Atomic and"]
     UCP_ATOMIC_OP_AND = 3,
+    #[doc = "< Atomic or"]
     UCP_ATOMIC_OP_OR = 4,
+    #[doc = "< Atomic xor"]
     UCP_ATOMIC_OP_XOR = 5,
     UCP_ATOMIC_OP_LAST = 6,
 }
 impl ucp_stream_recv_flags_t {
+    #[doc = "< This flag requests that\nthe operation will not be\ncompleted until all\nrequested data is received\nand placed in the user\nbuffer."]
     pub const UCP_STREAM_RECV_FLAG_WAITALL: ucp_stream_recv_flags_t = ucp_stream_recv_flags_t(1);
 }
 impl ::std::ops::BitOr<ucp_stream_recv_flags_t> for ucp_stream_recv_flags_t {
@@ -9201,23 +10122,38 @@ impl ::std::ops::BitAndAssign for ucp_stream_recv_flags_t {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_COMM\n @brief Flags to define behavior of @ref ucp_stream_recv_nb function\n\n This enumeration defines behavior of @ref ucp_stream_recv_nb function."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_stream_recv_flags_t(pub ::std::os::raw::c_uint);
 #[repr(u32)]
+#[doc = " @ingroup UCP_COMM\n @brief UCP operation fields and flags\n\n The enumeration allows specifying which fields in @ref ucp_request_param_t are\n present and operation flags are used. It is used to enable backward\n compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucp_op_attr_t {
+    #[doc = "< request field"]
     UCP_OP_ATTR_FIELD_REQUEST = 1,
+    #[doc = "< cb field"]
     UCP_OP_ATTR_FIELD_CALLBACK = 2,
+    #[doc = "< user_data field"]
     UCP_OP_ATTR_FIELD_USER_DATA = 4,
+    #[doc = "< datatype field"]
     UCP_OP_ATTR_FIELD_DATATYPE = 8,
+    #[doc = "< operation-specific flags"]
     UCP_OP_ATTR_FIELD_FLAGS = 16,
+    #[doc = "< reply_buffer field"]
     UCP_OP_ATTR_FIELD_REPLY_BUFFER = 32,
+    #[doc = "< memory type field"]
     UCP_OP_ATTR_FIELD_MEMORY_TYPE = 64,
+    #[doc = "< recv_info field"]
     UCP_OP_ATTR_FIELD_RECV_INFO = 128,
+    #[doc = "< memory handle field"]
     UCP_OP_ATTR_FIELD_MEMH = 256,
+    #[doc = "< Deny immediate completion,\ni.e NULL cannot be returned.\nIf a completion callback is\nprovided, it can be called\nbefore the function\nreturns."]
     UCP_OP_ATTR_FLAG_NO_IMM_CMPL = 65536,
+    #[doc = "< expedite local completion,\neven if it delays remote\ndata delivery. Note for\nimplementer: this option\ncan disable zero copy\nand/or rendezvous protocols\nwhich require\nsynchronization with the\nremote peer before releasing\nthe local send buffer"]
     UCP_OP_ATTR_FLAG_FAST_CMPL = 131072,
+    #[doc = "< force immediate complete\noperation, fail if the\noperation cannot be\ncompleted immediately"]
     UCP_OP_ATTR_FLAG_FORCE_IMM_CMPL = 262144,
+    #[doc = "< optimize for bandwidth of\nmultiple in-flight operations,\nrather than for the latency\nof a single operation.\nThis flag and UCP_OP_ATTR_FLAG_FAST_CMPL\nare mutually exclusive."]
     UCP_OP_ATTR_FLAG_MULTI_SEND = 524288,
 }
 impl ucp_req_attr_field {
@@ -9259,28 +10195,37 @@ impl ::std::ops::BitAndAssign for ucp_req_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_COMM\n @brief UCP request query attributes\n\n The enumeration allows specifying which fields in @ref ucp_request_attr_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_req_attr_field(pub ::std::os::raw::c_uint);
 #[repr(u32)]
+#[doc = " @ingroup UCP_COMM\n @brief UCP AM receive data parameter fields and flags\n\n The enumeration allows specifying which fields in @ref ucp_am_recv_param_t\n are present and receive operation flags are used. It is used to enable\n backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucp_am_recv_attr_t {
+    #[doc = "< reply_ep field"]
     UCP_AM_RECV_ATTR_FIELD_REPLY_EP = 1,
+    #[doc = " Indicates that the data provided in @ref ucp_am_recv_callback_t callback\n can be held by the user. If UCS_INPROGRESS is returned from the callback,\n the data parameter will persist and the user has to call\n @ref ucp_am_data_release when data is no longer needed. This flag is\n mutually exclusive with @a UCP_AM_RECV_ATTR_FLAG_RNDV."]
     UCP_AM_RECV_ATTR_FLAG_DATA = 65536,
+    #[doc = " Indicates that the arriving data was sent using rendezvous protocol.\n In this case @a data parameter of the @ref ucp_am_recv_callback_t points\n to the internal UCP descriptor, which can be used for obtaining the actual\n data by calling @ref ucp_am_recv_data_nbx routine. This flag is mutually\n exclusive with @a UCP_AM_RECV_ATTR_FLAG_DATA."]
     UCP_AM_RECV_ATTR_FLAG_RNDV = 131072,
 }
 impl ucp_am_handler_param_field {
+    #[doc = " Indicates that @ref ucp_am_handler_param_t.id field is valid."]
     pub const UCP_AM_HANDLER_PARAM_FIELD_ID: ucp_am_handler_param_field =
         ucp_am_handler_param_field(1);
 }
 impl ucp_am_handler_param_field {
+    #[doc = " Indicates that @ref ucp_am_handler_param_t.flags field is valid."]
     pub const UCP_AM_HANDLER_PARAM_FIELD_FLAGS: ucp_am_handler_param_field =
         ucp_am_handler_param_field(2);
 }
 impl ucp_am_handler_param_field {
+    #[doc = " Indicates that @ref ucp_am_handler_param_t.cb field is valid."]
     pub const UCP_AM_HANDLER_PARAM_FIELD_CB: ucp_am_handler_param_field =
         ucp_am_handler_param_field(4);
 }
 impl ucp_am_handler_param_field {
+    #[doc = " Indicates that @ref ucp_am_handler_param_t.arg field is valid."]
     pub const UCP_AM_HANDLER_PARAM_FIELD_ARG: ucp_am_handler_param_field =
         ucp_am_handler_param_field(8);
 }
@@ -9311,12 +10256,16 @@ impl ::std::ops::BitAndAssign for ucp_am_handler_param_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_COMM\n @brief UCP AM receive data parameters fields and flags\n\n The enumeration allows specifying which fields in @ref ucp_am_handler_param_t\n are present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_am_handler_param_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCP_DATATYPE\n @brief Structure for scatter-gather I/O.\n\n This structure is used to specify a list of buffers which can be used\n within a single data transfer function call. This list should remain valid\n until the data transfer request is completed.\n\n @note If @a length is zero, the memory pointed to by @a buffer\n       will not be accessed. Otherwise, @a buffer must point to valid memory."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_dt_iov {
+    #[doc = "< Pointer to a data buffer"]
     pub buffer: *mut ::std::os::raw::c_void,
+    #[doc = "< Length of the @a buffer in bytes"]
     pub length: usize,
 }
 #[test]
@@ -9354,10 +10303,13 @@ fn bindgen_test_layout_ucp_dt_iov() {
         )
     );
 }
+#[doc = " @ingroup UCP_DATATYPE\n @brief Structure for scatter-gather I/O.\n\n This structure is used to specify a list of buffers which can be used\n within a single data transfer function call. This list should remain valid\n until the data transfer request is completed.\n\n @note If @a length is zero, the memory pointed to by @a buffer\n       will not be accessed. Otherwise, @a buffer must point to valid memory."]
 pub type ucp_dt_iov_t = ucp_dt_iov;
+#[doc = " @ingroup UCP_DATATYPE\n @brief UCP generic data type descriptor\n\n This structure provides a generic datatype descriptor that\n is used for definition of application defined datatypes.\n\n Typically, the descriptor is used for an integration with datatype\n engines implemented within MPI and SHMEM implementations.\n\n @note In case of partial receive, any amount of received data is acceptable\n       which matches buffer size."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_generic_dt_ops {
+    #[doc = " @ingroup UCP_DATATYPE\n @brief Start a packing request.\n\n The pointer refers to application defined start-to-pack routine. It will\n be called from the @ref ucp_tag_send_nb routine.\n\n @param [in]  context        User-defined context.\n @param [in]  buffer         Buffer to pack.\n @param [in]  count          Number of elements to pack into the buffer.\n\n @return  A custom state that is passed to the following\n          @ref ucp_generic_dt_ops::pack \"pack()\" routine."]
     pub start_pack: ::std::option::Option<
         unsafe extern "C" fn(
             context: *mut ::std::os::raw::c_void,
@@ -9365,6 +10317,7 @@ pub struct ucp_generic_dt_ops {
             count: usize,
         ) -> *mut ::std::os::raw::c_void,
     >,
+    #[doc = " @ingroup UCP_DATATYPE\n @brief Start an unpacking request.\n\n The pointer refers to application defined start-to-unpack routine. It will\n be called from the @ref ucp_tag_recv_nb routine.\n\n @param [in]  context        User-defined context.\n @param [in]  buffer         Buffer to unpack to.\n @param [in]  count          Number of elements to unpack in the buffer.\n\n @return  A custom state that is passed later to the following\n          @ref ucp_generic_dt_ops::unpack \"unpack()\" routine."]
     pub start_unpack: ::std::option::Option<
         unsafe extern "C" fn(
             context: *mut ::std::os::raw::c_void,
@@ -9372,8 +10325,10 @@ pub struct ucp_generic_dt_ops {
             count: usize,
         ) -> *mut ::std::os::raw::c_void,
     >,
+    #[doc = " @ingroup UCP_DATATYPE\n @brief Get the total size of packed data.\n\n The pointer refers to user defined routine that returns the size of data\n in a packed format.\n\n @param [in]  state          State as returned by\n                             @ref ucp_generic_dt_ops::start_pack\n                             \"start_pack()\" routine.\n\n @return  The size of the data in a packed form."]
     pub packed_size:
         ::std::option::Option<unsafe extern "C" fn(state: *mut ::std::os::raw::c_void) -> usize>,
+    #[doc = " @ingroup UCP_DATATYPE\n @brief Pack data.\n\n The pointer refers to application defined pack routine.\n\n @param [in]  state          State as returned by\n                             @ref ucp_generic_dt_ops::start_pack\n                             \"start_pack()\" routine.\n @param [in]  offset         Virtual offset in the output stream.\n @param [in]  dest           Destination buffer to pack the data.\n @param [in]  max_length     Maximum length to pack.\n\n @return The size of the data that was written to the destination buffer.\n         Must be less than or equal to @e max_length."]
     pub pack: ::std::option::Option<
         unsafe extern "C" fn(
             state: *mut ::std::os::raw::c_void,
@@ -9382,6 +10337,7 @@ pub struct ucp_generic_dt_ops {
             max_length: usize,
         ) -> usize,
     >,
+    #[doc = " @ingroup UCP_DATATYPE\n @brief Unpack data.\n\n The pointer refers to application defined unpack routine.\n\n @param [in]  state          State as returned by\n                             @ref ucp_generic_dt_ops::start_unpack\n                             \"start_unpack()\" routine.\n @param [in]  offset         Virtual offset in the input stream.\n @param [in]  src            Source to unpack the data from.\n @param [in]  length         Length to unpack.\n\n @return UCS_OK or an error if unpacking failed."]
     pub unpack: ::std::option::Option<
         unsafe extern "C" fn(
             state: *mut ::std::os::raw::c_void,
@@ -9390,6 +10346,7 @@ pub struct ucp_generic_dt_ops {
             length: usize,
         ) -> ucs_status_t,
     >,
+    #[doc = " @ingroup UCP_DATATYPE\n @brief Finish packing/unpacking.\n\n The pointer refers to application defined finish routine.\n\n @param [in]  state          State as returned by\n                             @ref ucp_generic_dt_ops::start_pack\n                             \"start_pack()\"\n                             and\n                             @ref ucp_generic_dt_ops::start_unpack\n                             \"start_unpack()\"\n                             routines."]
     pub finish: ::std::option::Option<unsafe extern "C" fn(state: *mut ::std::os::raw::c_void)>,
 }
 #[test]
@@ -9467,13 +10424,19 @@ fn bindgen_test_layout_ucp_generic_dt_ops() {
         )
     );
 }
+#[doc = " @ingroup UCP_DATATYPE\n @brief UCP generic data type descriptor\n\n This structure provides a generic datatype descriptor that\n is used for definition of application defined datatypes.\n\n Typically, the descriptor is used for an integration with datatype\n engines implemented within MPI and SHMEM implementations.\n\n @note In case of partial receive, any amount of received data is acceptable\n       which matches buffer size."]
 pub type ucp_generic_dt_ops_t = ucp_generic_dt_ops;
+#[doc = " @ingroup UCP_DATATYPE\n @brief UCP datatype attributes\n\n This structure provides attributes of a UCP datatype."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_datatype_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from @ref\n ucp_datatype_attr_field. Fields not specified in this mask will be\n ignored. Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Packed size of the given datatype. (output parameter)"]
     pub packed_size: usize,
+    #[doc = " Pointer to a data buffer of the associated data type.\n This field is optional.\n If @ref UCP_DATATYPE_ATTR_FIELD_BUFFER is not set in @ref field_mask,\n this field defaults to @e NULL."]
     pub buffer: *const ::std::os::raw::c_void,
+    #[doc = " Number of elements in @a buffer.\n This value is optional.\n If @ref UCP_DATATYPE_ATTR_FIELD_COUNT is not set in @ref field_mask, the\n value of this field defaults to 1."]
     pub count: usize,
 }
 #[test]
@@ -9531,19 +10494,31 @@ fn bindgen_test_layout_ucp_datatype_attr() {
         )
     );
 }
+#[doc = " @ingroup UCP_DATATYPE\n @brief UCP datatype attributes\n\n This structure provides attributes of a UCP datatype."]
 pub type ucp_datatype_attr_t = ucp_datatype_attr;
+#[doc = " @ingroup UCP_CONFIG\n @brief Tuning parameters for UCP library.\n\n The structure defines the parameters that are used for\n UCP library tuning during UCP library @ref ucp_init \"initialization\".\n\n @note UCP library implementation uses the @ref ucp_feature \"features\"\n parameter to optimize the library functionality that minimize memory\n footprint. For example, if the application does not require send/receive\n semantics UCP library may avoid allocation of expensive resources associated with\n send/receive queues."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_params {
+    #[doc = " Mask of valid fields in this structure, using bits from @ref ucp_params_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " UCP @ref ucp_feature \"features\" that are used for library\n initialization. It is recommended for applications only to request\n the features that are required for an optimal functionality\n This field must be specified."]
     pub features: u64,
+    #[doc = " The size of a reserved space in a non-blocking requests. Typically\n applications use this space for caching own structures in order to avoid\n costly memory allocations, pointer dereferences, and cache misses.\n For example, MPI implementation can use this memory for caching MPI\n descriptors\n This field defaults to 0 if not specified."]
     pub request_size: usize,
+    #[doc = " Pointer to a routine that is used for the request initialization.\n This function will be called only on the very first time a request memory\n is initialized, and may not be called again if a request is reused.\n If a request should be reset before the next reuse, it can be done before\n calling @ref ucp_request_free.\n\n @e NULL can be used if no such is function required, which is also the\n default if this field is not specified by @ref field_mask."]
     pub request_init: ucp_request_init_callback_t,
+    #[doc = " Pointer to a routine that is responsible for final cleanup of the memory\n associated with the request. This routine may not be called every time a\n request is released. For some implementations, the cleanup call may be\n delayed and only invoked at @ref ucp_worker_destroy.\n\n @e NULL can be used if no such function is required, which is also the\n default if this field is not specified by @ref field_mask."]
     pub request_cleanup: ucp_request_cleanup_callback_t,
+    #[doc = " Mask which specifies particular bits of the tag which can uniquely\n identify the sender (UCP endpoint) in tagged operations.\n This field defaults to 0 if not specified."]
     pub tag_sender_mask: u64,
+    #[doc = " This flag indicates if this context is shared by multiple workers\n from different threads. If so, this context needs thread safety\n support; otherwise, the context does not need to provide thread\n safety.\n For example, if the context is used by single worker, and that\n worker is shared by multiple threads, this context does not need\n thread safety; if the context is used by worker 1 and worker 2,\n and worker 1 is used by thread 1 and worker 2 is used by thread 2,\n then this context needs thread safety.\n Note that actual thread mode may be different from mode passed\n to @ref ucp_init. To get actual thread mode use\n @ref ucp_context_query."]
     pub mt_workers_shared: ::std::os::raw::c_int,
+    #[doc = " An optimization hint of how many endpoints will be created on this context.\n For example, when used from MPI or SHMEM libraries, this number will specify\n the number of ranks (or processing elements) in the job.\n Does not affect semantics, but only transport selection criteria and the\n resulting performance.\n The value can be also set by UCX_NUM_EPS environment variable. In such case\n it will override the number of endpoints set by @e estimated_num_eps"]
     pub estimated_num_eps: usize,
+    #[doc = " An optimization hint for a single node. For example, when used from MPI or\n OpenSHMEM libraries, this number will specify the number of Processes Per\n Node (PPN) in the job. Does not affect semantics, only transport selection\n criteria and the resulting performance.\n The value can be also set by the UCX_NUM_PPN environment variable, which\n will override the number of endpoints set by @e estimated_num_ppn"]
     pub estimated_num_ppn: usize,
+    #[doc = " Tracing and analysis tools can identify the context using this name.\n To retrieve the context's name, use @ref ucp_context_query, as the name\n you supply may be changed by UCX under some circumstances, e.g. a name\n conflict. This field is only assigned if you set\n @ref UCP_PARAM_FIELD_NAME in the field mask. If not, then a default\n unique name will be created for you."]
     pub name: *const ::std::os::raw::c_char,
 }
 #[test]
@@ -9661,11 +10636,15 @@ fn bindgen_test_layout_ucp_params() {
         )
     );
 }
+#[doc = " @ingroup UCP_CONFIG\n @brief Tuning parameters for UCP library.\n\n The structure defines the parameters that are used for\n UCP library tuning during UCP library @ref ucp_init \"initialization\".\n\n @note UCP library implementation uses the @ref ucp_feature \"features\"\n parameter to optimize the library functionality that minimize memory\n footprint. For example, if the application does not require send/receive\n semantics UCP library may avoid allocation of expensive resources associated with\n send/receive queues."]
 pub type ucp_params_t = ucp_params;
+#[doc = " @ingroup UCP_CONTEXT\n @brief Lib attributes.\n\n The structure defines the attributes that characterize the Library."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_lib_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_lib_attr_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Maximum level of thread support of the library, which is permanent\n throughout the lifetime of the library. Accordingly, the user can call\n @ref ucp_worker_create with appropriate\n @ref ucp_worker_params_t.thread_mode.\n For supported thread levels please see @ref ucs_thread_mode_t."]
     pub max_thread_level: ucs_thread_mode_t,
 }
 #[test]
@@ -9703,14 +10682,21 @@ fn bindgen_test_layout_ucp_lib_attr() {
         )
     );
 }
+#[doc = " @ingroup UCP_CONTEXT\n @brief Lib attributes.\n\n The structure defines the attributes that characterize the Library."]
 pub type ucp_lib_attr_t = ucp_lib_attr;
+#[doc = " @ingroup UCP_CONTEXT\n @brief Context attributes.\n\n The structure defines the attributes that characterize\n the particular context."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_context_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_context_attr_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Size of UCP non-blocking request. When pre-allocated request is used\n (e.g. in @ref ucp_tag_recv_nbr) it should have enough space to fit\n UCP request data, which is defined by this value."]
     pub request_size: usize,
+    #[doc = " Thread safe level of the context. For supported thread levels please\n see @ref ucs_thread_mode_t."]
     pub thread_mode: ucs_thread_mode_t,
+    #[doc = " Mask of which memory types are supported, for supported memory types\n please see @ref ucs_memory_type_t."]
     pub memory_types: u64,
+    #[doc = " Tracing and analysis tools can use name to identify this UCX context."]
     pub name: [::std::os::raw::c_char; 32usize],
 }
 #[test]
@@ -9778,17 +10764,27 @@ fn bindgen_test_layout_ucp_context_attr() {
         )
     );
 }
+#[doc = " @ingroup UCP_CONTEXT\n @brief Context attributes.\n\n The structure defines the attributes that characterize\n the particular context."]
 pub type ucp_context_attr_t = ucp_context_attr;
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker attributes.\n\n The structure defines the attributes which characterize\n the particular worker."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_worker_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_worker_attr_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Thread safe level of the worker."]
     pub thread_mode: ucs_thread_mode_t,
+    #[doc = " Flags indicating requested details of the worker address.\n If @ref UCP_WORKER_ATTR_FIELD_ADDRESS_FLAGS bit is set in the field_mask,\n this value should be set as well. Possible flags are specified\n in @ref ucp_worker_address_flags_t. @note This is an input attribute."]
     pub address_flags: u32,
+    #[doc = " Worker address, which can be passed to remote instances of the UCP library\n in order to connect to this worker. The memory for the address handle is\n allocated by @ref ucp_worker_query \"ucp_worker_query()\" routine, and\n must be released by using @ref ucp_worker_release_address\n \"ucp_worker_release_address()\" routine."]
     pub address: *mut ucp_address_t,
+    #[doc = " Size of worker address in bytes."]
     pub address_length: usize,
+    #[doc = " Maximum allowed header size for @ref ucp_am_send_nbx routine."]
     pub max_am_header: usize,
+    #[doc = " Tracing and analysis tools can identify the worker using this name."]
     pub name: [::std::os::raw::c_char; 32usize],
+    #[doc = " Maximum debug string size that can be filled with @ref ucp_request_query."]
     pub max_debug_string: usize,
 }
 #[test]
@@ -9886,19 +10882,66 @@ fn bindgen_test_layout_ucp_worker_attr() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker attributes.\n\n The structure defines the attributes which characterize\n the particular worker."]
 pub type ucp_worker_attr_t = ucp_worker_attr;
+#[doc = " @ingroup UCP_MEM\n @brief Tuning parameters for the comparison function @ref ucp_rkey_compare\n\n The structure defines the parameters that can be used for UCP library remote\n keys comparison using @ref ucp_rkey_compare routine.\n"]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ucp_rkey_compare_params {
+    #[doc = " Mask of valid fields in this structure, must currently be zero. Fields\n not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
+    pub field_mask: u64,
+}
+#[test]
+fn bindgen_test_layout_ucp_rkey_compare_params() {
+    const UNINIT: ::std::mem::MaybeUninit<ucp_rkey_compare_params> =
+        ::std::mem::MaybeUninit::uninit();
+    let ptr = UNINIT.as_ptr();
+    assert_eq!(
+        ::std::mem::size_of::<ucp_rkey_compare_params>(),
+        8usize,
+        concat!("Size of: ", stringify!(ucp_rkey_compare_params))
+    );
+    assert_eq!(
+        ::std::mem::align_of::<ucp_rkey_compare_params>(),
+        8usize,
+        concat!("Alignment of ", stringify!(ucp_rkey_compare_params))
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).field_mask) as usize - ptr as usize },
+        0usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(ucp_rkey_compare_params),
+            "::",
+            stringify!(field_mask)
+        )
+    );
+}
+#[doc = " @ingroup UCP_MEM\n @brief Tuning parameters for the comparison function @ref ucp_rkey_compare\n\n The structure defines the parameters that can be used for UCP library remote\n keys comparison using @ref ucp_rkey_compare routine.\n"]
+pub type ucp_rkey_compare_params_t = ucp_rkey_compare_params;
+#[doc = " @ingroup UCP_WORKER\n @brief Tuning parameters for the UCP worker.\n\n The structure defines the parameters that are used for the\n UCP worker tuning during the UCP worker @ref ucp_worker_create \"creation\"."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_worker_params {
+    #[doc = " Mask of valid fields in this structure, using bits from @ref ucp_worker_params_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " The parameter thread_mode suggests the thread safety mode which worker\n and the associated resources should be created with. This is an\n optional parameter. The default value is UCS_THREAD_MODE_SINGLE and\n it is used when the value of the parameter is not set. When this\n parameter along with its corresponding bit in the\n field_mask - UCP_WORKER_PARAM_FIELD_THREAD_MODE is set, the\n @ref ucp_worker_create attempts to create worker with this thread mode.\n The thread mode with which worker is created can differ from the\n suggested mode. The actual thread mode of the worker should be obtained\n using the query interface @ref ucp_worker_query."]
     pub thread_mode: ucs_thread_mode_t,
+    #[doc = " Mask of which CPUs worker resources should preferably be allocated on.\n This value is optional.\n If it's not set (along with its corresponding bit in the field_mask -\n UCP_WORKER_PARAM_FIELD_CPU_MASK), resources are allocated according to\n system's default policy."]
     pub cpu_mask: ucs_cpu_set_t,
+    #[doc = " Mask of events (@ref ucp_wakeup_event_t) which are expected on wakeup.\n This value is optional.\n If it's not set (along with its corresponding bit in the field_mask -\n UCP_WORKER_PARAM_FIELD_EVENTS), all types of events will trigger on\n wakeup."]
     pub events: ::std::os::raw::c_uint,
+    #[doc = " User data associated with the current worker.\n This value is optional.\n If it's not set (along with its corresponding bit in the field_mask -\n UCP_WORKER_PARAM_FIELD_USER_DATA), it will default to NULL."]
     pub user_data: *mut ::std::os::raw::c_void,
+    #[doc = " External event file descriptor.\n This value is optional.\n If @ref UCP_WORKER_PARAM_FIELD_EVENT_FD is set in the field_mask, events\n on the worker will be reported on the provided event file descriptor. In\n this case, calling @ref ucp_worker_get_efd will result in an error.\n The provided file descriptor must be capable of aggregating notifications\n for arbitrary events, for example @c epoll(7) on Linux systems.\n @ref user_data will be used as the event user-data on systems which\n support it. For example, on Linux, it will be placed in\n @c epoll_data_t::ptr, when returned from @c epoll_wait(2).\n\n Otherwise, events will be reported to the event file descriptor returned\n from @ref ucp_worker_get_efd()."]
     pub event_fd: ::std::os::raw::c_int,
+    #[doc = " Worker flags.\n This value is optional.\n If @ref UCP_WORKER_PARAM_FIELD_FLAGS is not set in the field_mask, the\n value of this field will default to 0."]
     pub flags: u64,
+    #[doc = " Tracing and analysis tools can identify the worker using this name. To\n retrieve the worker's name, use @ref ucp_worker_query, as the name you\n supply may be changed by UCX under some circumstances, e.g. a name\n conflict. This field is only assigned if you set\n @ref UCP_WORKER_PARAM_FIELD_NAME in the field mask. If not, then a\n default unique name will be created for you."]
     pub name: *const ::std::os::raw::c_char,
+    #[doc = " Minimal address alignment of the active message data pointer as passed\n in argument @a data to the active message handler, defined as\n @a ucp_am_recv_callback_t."]
     pub am_alignment: usize,
+    #[doc = " Client id that is sent as part of the connection request payload\n when connecting to a remote socket address. On the remote side,\n this value can be obtained from @ref ucp_conn_request_h\n using @ref ucp_conn_request_query."]
     pub client_id: u64,
 }
 #[test]
@@ -10016,11 +11059,15 @@ fn bindgen_test_layout_ucp_worker_params() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @brief Tuning parameters for the UCP worker.\n\n The structure defines the parameters that are used for the\n UCP worker tuning during the UCP worker @ref ucp_worker_create \"creation\"."]
 pub type ucp_worker_params_t = ucp_worker_params;
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker address attributes.\n\n The structure defines the attributes of the particular worker address."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_worker_address_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_worker_address_attr_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Unique id of the worker this address belongs to."]
     pub worker_uid: u64,
 }
 #[test]
@@ -10059,11 +11106,15 @@ fn bindgen_test_layout_ucp_worker_address_attr() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @brief UCP worker address attributes.\n\n The structure defines the attributes of the particular worker address."]
 pub type ucp_worker_address_attr_t = ucp_worker_address_attr;
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP endpoint performance evaluation request attributes.\n\n The structure defines the attributes which characterize\n the request for performance estimation of a particular endpoint."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_ep_evaluate_perf_param_t {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_ep_perf_param_field_t.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Message size to use for determining performance.\n This field must be initialized by the caller."]
     pub message_size: usize,
 }
 #[test]
@@ -10102,10 +11153,13 @@ fn bindgen_test_layout_ucp_ep_evaluate_perf_param_t() {
         )
     );
 }
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP endpoint performance evaluation result attributes.\n\n The structure defines the attributes which characterize\n the result of performance estimation of a particular endpoint."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_ep_evaluate_perf_attr_t {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_ep_perf_attr_field_t.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Estimated time (in seconds) required to send a message of a given size\n on this endpoint.\n This field is set by the @ref ucp_ep_evaluate_perf function."]
     pub estimated_time: f64,
 }
 #[test]
@@ -10144,10 +11198,13 @@ fn bindgen_test_layout_ucp_ep_evaluate_perf_attr_t() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @brief UCP listener attributes.\n\n The structure defines the attributes which characterize\n the particular listener."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_listener_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_listener_attr_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Sockaddr on which this listener is listening for incoming connection\n requests."]
     pub sockaddr: sockaddr_storage,
 }
 #[test]
@@ -10185,12 +11242,17 @@ fn bindgen_test_layout_ucp_listener_attr() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @brief UCP listener attributes.\n\n The structure defines the attributes which characterize\n the particular listener."]
 pub type ucp_listener_attr_t = ucp_listener_attr;
+#[doc = " @ingroup UCP_WORKER\n @brief UCP listener's connection request attributes.\n\n The structure defines the attributes that characterize\n the particular connection request received on the server side."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_conn_request_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_conn_request_attr_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " The address of the remote client that sent the connection request to the\n server."]
     pub client_address: sockaddr_storage,
+    #[doc = " Remote client id if remote endpoint's flag\n @ref UCP_EP_PARAMS_FLAGS_SEND_CLIENT_ID is set."]
     pub client_id: u64,
 }
 #[test]
@@ -10239,13 +11301,19 @@ fn bindgen_test_layout_ucp_conn_request_attr() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @brief UCP listener's connection request attributes.\n\n The structure defines the attributes that characterize\n the particular connection request received on the server side."]
 pub type ucp_conn_request_attr_t = ucp_conn_request_attr;
+#[doc = " @ingroup UCP_WORKER\n @brief Parameters for a UCP listener object.\n\n This structure defines parameters for @ref ucp_listener_create, which is used to\n listen for incoming client/server connections."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_listener_params {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_listener_params_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " An address in the form of a sockaddr.\n This field is mandatory for filling (along with its corresponding bit\n in the field_mask - @ref UCP_LISTENER_PARAM_FIELD_SOCK_ADDR).\n The @ref ucp_listener_create routine will return with an error if sockaddr\n is not specified."]
     pub sockaddr: ucs_sock_addr_t,
+    #[doc = " Handler to endpoint creation in a client-server connection flow.\n In order for the callback inside this handler to be invoked, the\n UCP_LISTENER_PARAM_FIELD_ACCEPT_HANDLER needs to be set in the\n field_mask."]
     pub accept_handler: ucp_listener_accept_handler_t,
+    #[doc = " Handler of an incoming connection request in a client-server connection\n flow. In order for the callback inside this handler to be invoked, the\n @ref UCP_LISTENER_PARAM_FIELD_CONN_HANDLER needs to be set in the\n field_mask.\n @note User is expected to call ucp_ep_create with set\n       @ref UCP_EP_PARAM_FIELD_CONN_REQUEST flag to\n       @ref ucp_ep_params_t::field_mask and\n       @ref ucp_ep_params_t::conn_request in order to be able to receive\n       communications."]
     pub conn_handler: ucp_listener_conn_handler_t,
 }
 #[test]
@@ -10303,13 +11371,19 @@ fn bindgen_test_layout_ucp_listener_params() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @brief Parameters for a UCP listener object.\n\n This structure defines parameters for @ref ucp_listener_create, which is used to\n listen for incoming client/server connections."]
 pub type ucp_listener_params_t = ucp_listener_params;
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Output parameter of @ref ucp_stream_worker_poll function.\n\n The structure defines the endpoint and its user data."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_stream_poll_ep {
+    #[doc = " Endpoint handle."]
     pub ep: ucp_ep_h,
+    #[doc = " User data associated with an endpoint passed in\n @ref ucp_ep_params_t::user_data."]
     pub user_data: *mut ::std::os::raw::c_void,
+    #[doc = " Reserved for future use."]
     pub flags: ::std::os::raw::c_uint,
+    #[doc = " Reserved for future use."]
     pub reserved: [u8; 16usize],
 }
 #[test]
@@ -10367,16 +11441,24 @@ fn bindgen_test_layout_ucp_stream_poll_ep() {
         )
     );
 }
+#[doc = " @ingroup UCP_ENDPOINT\n @brief Output parameter of @ref ucp_stream_worker_poll function.\n\n The structure defines the endpoint and its user data."]
 pub type ucp_stream_poll_ep_t = ucp_stream_poll_ep;
+#[doc = " @ingroup UCP_MEM\n @brief Tuning parameters for the UCP memory mapping.\n\n The structure defines the parameters that are used for the\n UCP memory mapping tuning during the @ref ucp_mem_map \"ucp_mem_map\" routine."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_mem_map_params {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_mem_map_params_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " If the address is not NULL, the routine maps (registers) the memory segment\n pointed to by this address.\n If the pointer is NULL, the library allocates mapped (registered) memory\n segment and returns its address in this argument.\n Therefore, this value is optional.\n If it's not set (along with its corresponding bit in the field_mask -\n @ref UCP_MEM_MAP_PARAM_FIELD_ADDRESS), the ucp_mem_map routine will consider\n address as set to NULL and will allocate memory."]
     pub address: *mut ::std::os::raw::c_void,
+    #[doc = " Length (in bytes) to allocate or map (register).\n This field is mandatory for filling (along with its corresponding bit\n in the field_mask - @ref UCP_MEM_MAP_PARAM_FIELD_LENGTH).\n The @ref ucp_mem_map routine will return with an error if the length isn't\n specified."]
     pub length: usize,
+    #[doc = " Allocation flags, e.g. @ref UCP_MEM_MAP_NONBLOCK.\n This value is optional.\n If it's not set (along with its corresponding bit in the field_mask -\n @ref UCP_MEM_MAP_PARAM_FIELD_FLAGS), the @ref ucp_mem_map routine will\n consider the flags as set to zero."]
     pub flags: ::std::os::raw::c_uint,
+    #[doc = " Memory protection mode, e.g. @ref UCP_MEM_MAP_PROT_LOCAL_READ.\n This value is optional.\n If it's not set, the @ref ucp_mem_map routine will consider\n the flags as set to UCP_MEM_MAP_PROT_LOCAL_READ|UCP_MEM_MAP_PROT_LOCAL_WRITE|\n UCP_MEM_MAP_PROT_REMOTE_READ|UCP_MEM_MAP_PROT_REMOTE_WRITE."]
     pub prot: ::std::os::raw::c_uint,
     pub memory_type: ucs_memory_type_t,
+    #[doc = " Exported memory handle buffer as returned by @ref ucp_mem_map\n function for a memory handle created and packed by @ref ucp_memh_pack\n with @ref UCP_MEMH_PACK_FLAG_EXPORT flag.\n If this field is specified for @ref ucp_mem_map function, a resulting\n memory handle will be a mapping of peer memory instead of local\n memory.\n If the field is not set (along with its corresponding bit in the\n field_mask - @ref UCP_MEM_MAP_PARAM_FIELD_EXPORTED_MEMH_BUFFER), the\n @ref ucp_mem_map routine will consider the memory handle buffer to be\n set to NULL by default."]
     pub exported_memh_buffer: *const ::std::os::raw::c_void,
 }
 #[test]
@@ -10464,11 +11546,15 @@ fn bindgen_test_layout_ucp_mem_map_params() {
         )
     );
 }
+#[doc = " @ingroup UCP_MEM\n @brief Tuning parameters for the UCP memory mapping.\n\n The structure defines the parameters that are used for the\n UCP memory mapping tuning during the @ref ucp_mem_map \"ucp_mem_map\" routine."]
 pub type ucp_mem_map_params_t = ucp_mem_map_params;
+#[doc = " @ingroup UCP_CONTEXT\n @brief UCP receive information descriptor\n\n The UCP receive information descriptor is allocated by application and filled\n in with the information about the received message by @ref ucp_tag_probe_nb\n or @ref ucp_tag_recv_request_test routines or\n @ref ucp_tag_recv_callback_t callback argument."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_tag_recv_info {
+    #[doc = " Sender tag"]
     pub sender_tag: ucp_tag_t,
+    #[doc = " The size of the received data"]
     pub length: usize,
 }
 #[test]
@@ -10506,20 +11592,29 @@ fn bindgen_test_layout_ucp_tag_recv_info() {
         )
     );
 }
+#[doc = " @ingroup UCP_CONTEXT\n @brief Operation parameters passed to @ref ucp_tag_send_nbx,\n        @ref ucp_tag_send_sync_nbx, @ref ucp_tag_recv_nbx, @ref ucp_put_nbx,\n        @ref ucp_get_nbx, @ref ucp_am_send_nbx and @ref ucp_am_recv_data_nbx.\n\n The structure @ref ucp_request_param_t is used to specify datatype of\n operation, provide user request in case the external request is used,\n set completion callback and custom user data passed to this callback.\n\n Example: implementation of function to send contiguous buffer to ep and\n          invoke callback function at operation completion. If the\n          operation completed immediately (status == UCS_OK) then\n          callback is not called.\n\n @code{.c}\n ucs_status_ptr_t send_data(ucp_ep_h ep, void *buffer, size_t length,\n                            ucp_tag_t tag, void *request)\n {\n     ucp_request_param_t param = {\n         .op_attr_mask               = UCP_OP_ATTR_FIELD_CALLBACK |\n                                       UCP_OP_ATTR_FIELD_REQUEST,\n         .request                    = request,\n         .cb.send                    = custom_send_callback_f,\n         .user_data                  = pointer_to_user_context_passed_to_cb\n     };\n\n     ucs_status_ptr_t status;\n\n     status = ucp_tag_send_nbx(ep, buffer, length, tag, &param);\n     if (UCS_PTR_IS_ERR(status)) {\n         handle_error(status);\n     } else if (status == UCS_OK) {\n         // operation is completed\n     }\n\n     return status;\n }\n @endcode"]
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct ucp_request_param_t {
+    #[doc = " Mask of valid fields in this structure and operation flags, using\n bits from @ref ucp_op_attr_t. Fields not specified in this mask will be\n ignored. Provides ABI compatibility with respect to adding new fields."]
     pub op_attr_mask: u32,
     pub flags: u32,
+    #[doc = " Request handle allocated by the user. There should\n be at least UCP request size bytes of available\n space before the @a request. The size of the UCP request\n can be obtained by @ref ucp_context_query function."]
     pub request: *mut ::std::os::raw::c_void,
     pub cb: ucp_request_param_t__bindgen_ty_1,
+    #[doc = " Datatype descriptor for the elements in the buffer. In case the\n op_attr_mask & UCP_OP_ATTR_FIELD_DATATYPE bit is not set, then use\n default datatype ucp_dt_make_contig(1)"]
     pub datatype: ucp_datatype_t,
+    #[doc = " Pointer to user data passed to callback function."]
     pub user_data: *mut ::std::os::raw::c_void,
+    #[doc = " Reply buffer. Can be used for storing operation result, for example by\n @ref ucp_atomic_op_nbx."]
     pub reply_buffer: *mut ::std::os::raw::c_void,
+    #[doc = " Memory type of the buffer. see @ref ucs_memory_type_t for possible memory types.\n An optimization hint to avoid memory type detection for request buffer.\n If this value is not set (along with its corresponding bit in the op_attr_mask -\n @ref UCP_OP_ATTR_FIELD_MEMORY_TYPE), then use default @ref UCS_MEMORY_TYPE_UNKNOWN\n which means the memory type will be detected internally."]
     pub memory_type: ucs_memory_type_t,
     pub recv_info: ucp_request_param_t__bindgen_ty_2,
+    #[doc = " Memory handle for pre-registered buffer.\n If the handle is provided, protocols that require registered memory can\n skip the registration step. As a result, the communication request\n overhead can be reduced and the request can be completed faster.\n The memory handle should be obtained by calling @ref ucp_mem_map."]
     pub memh: ucp_mem_h,
 }
+#[doc = " Callback function that is invoked whenever the\n send or receive operation is completed."]
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union ucp_request_param_t__bindgen_ty_1 {
@@ -10587,6 +11682,7 @@ fn bindgen_test_layout_ucp_request_param_t__bindgen_ty_1() {
         )
     );
 }
+#[doc = " Pointer to the information where received data details are stored\n in case of an immediate completion of receive operation. The user has to\n provide a pointer to valid memory/variable which will be updated on function\n return."]
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union ucp_request_param_t__bindgen_ty_2 {
@@ -10747,13 +11843,19 @@ fn bindgen_test_layout_ucp_request_param_t() {
         )
     );
 }
+#[doc = " @ingroup UCP_COMM\n @brief Attributes of a particular request."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_request_attr_t {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_req_attr_field. Fields not specified in this mask will\n be ignored. Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Pointer to allocated string of size @ref debug_string_size that will be filled\n with debug information about transports and protocols that were selected\n to complete the request."]
     pub debug_string: *mut ::std::os::raw::c_char,
+    #[doc = " Size of the @ref debug_string. String will be filled up to this size.\n Maximum possible size debug string can be obtained by querying the worker\n via @ref ucp_worker_query."]
     pub debug_string_size: usize,
+    #[doc = " Status of the request. The same as @ref ucp_request_check_status."]
     pub status: ucs_status_t,
+    #[doc = " Detected memory type of the buffer passed to the operation."]
     pub mem_type: ucs_memory_type_t,
 }
 #[test]
@@ -10821,13 +11923,19 @@ fn bindgen_test_layout_ucp_request_attr_t() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @brief Active Message handler parameters passed to\n        @ref ucp_worker_set_am_recv_handler routine."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_am_handler_param {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_am_handler_param_field. Fields not specified in this mask will\n be ignored. Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Active Message id.\n @warning Value must be between 0 and UINT16_MAX."]
     pub id: ::std::os::raw::c_uint,
+    #[doc = " Handler flags as defined by @ref ucp_am_cb_flags."]
     pub flags: u32,
+    #[doc = " Active Message callback. To clear the already set callback, this value\n should be set to NULL."]
     pub cb: ucp_am_recv_callback_t,
+    #[doc = " Active Message argument, which will be passed in to every invocation of\n @ref ucp_am_recv_callback_t function as the @a arg argument."]
     pub arg: *mut ::std::os::raw::c_void,
 }
 #[test]
@@ -10895,11 +12003,15 @@ fn bindgen_test_layout_ucp_am_handler_param() {
         )
     );
 }
+#[doc = " @ingroup UCP_WORKER\n @brief Active Message handler parameters passed to\n        @ref ucp_worker_set_am_recv_handler routine."]
 pub type ucp_am_handler_param_t = ucp_am_handler_param;
+#[doc = " @ingroup UCP_WORKER\n @brief Operation parameters provided in @ref ucp_am_recv_callback_t callback."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_am_recv_param {
+    #[doc = " Mask of valid fields in this structure and receive operation flags, using\n bits from @ref ucp_am_recv_attr_t. Fields not specified in this mask will\n be ignored. Provides ABI compatibility with respect to adding new fields."]
     pub recv_attr: u64,
+    #[doc = " Endpoint, which can be used for the reply to this message."]
     pub reply_ep: ucp_ep_h,
 }
 #[test]
@@ -10938,9 +12050,11 @@ fn bindgen_test_layout_ucp_am_recv_param() {
     );
 }
 extern "C" {
+    #[doc = " @ingroup UCP_CONTEXT\n @brief Get attributes of the UCP library.\n\n This routine fetches information about the UCP library attributes.\n\n @param [out] attr       Filled with attributes of the UCP library.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_lib_query(attr: *mut ucp_lib_attr_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_CONFIG\n @brief Read UCP configuration descriptor\n\n The routine fetches the information about UCP library configuration from\n the run-time environment. Then, the fetched descriptor is used for\n UCP library @ref ucp_init \"initialization\". The Application can print out the\n descriptor using @ref ucp_config_print \"print\" routine. In addition\n the application is responsible for @ref ucp_config_release \"releasing\" the\n descriptor back to the UCP library.\n\n @param [in]  env_prefix    If non-NULL, the routine searches for the\n                            environment variables that start with\n                            @e \\<env_prefix\\>_UCX_ prefix.\n                            Otherwise, the routine searches for the\n                            environment variables that start with\n                            @e UCX_ prefix.\n @param [in]  filename      If non-NULL, read configuration from the file\n                            defined by @e filename. If the file does not\n                            exist, it will be ignored and no error reported\n                            to the application.\n @param [out] config_p      Pointer to configuration descriptor as defined by\n                            @ref ucp_config_t \"ucp_config_t\".\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_config_read(
         env_prefix: *const ::std::os::raw::c_char,
         filename: *const ::std::os::raw::c_char,
@@ -10948,9 +12062,11 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_CONFIG\n @brief Release configuration descriptor\n\n The routine releases the configuration descriptor that was allocated through\n @ref ucp_config_read \"ucp_config_read()\" routine.\n\n @param [out] config        Configuration descriptor as defined by\n                            @ref ucp_config_t \"ucp_config_t\"."]
     pub fn ucp_config_release(config: *mut ucp_config_t);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_CONFIG\n @brief Modify context configuration.\n\n The routine changes one configuration setting stored in @ref ucp_config_t\n \"configuration\" descriptor.\n\n @param [in]  config        Configuration to modify.\n @param [in]  name          Configuration variable name.\n @param [in]  value         Value to set.\n\n @return Error code."]
     pub fn ucp_config_modify(
         config: *mut ucp_config_t,
         name: *const ::std::os::raw::c_char,
@@ -10958,6 +12074,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_CONFIG\n @brief Print configuration information\n\n The routine prints the configuration information that is stored in\n @ref ucp_config_t \"configuration\" descriptor.\n\n @todo Expose ucs_config_print_flags_t\n\n @param [in]  config        @ref ucp_config_t \"Configuration descriptor\"\n                            to print.\n @param [in]  stream        Output stream to print the configuration to.\n @param [in]  title         Configuration title to print.\n @param [in]  print_flags   Flags that control various printing options."]
     pub fn ucp_config_print(
         config: *const ucp_config_t,
         stream: *mut FILE,
@@ -10966,6 +12083,7 @@ extern "C" {
     );
 }
 extern "C" {
+    #[doc = " @ingroup UCP_CONTEXT\n @brief Get UCP library version.\n\n This routine returns the UCP library version.\n\n @param [out] major_version       Filled with library major version.\n @param [out] minor_version       Filled with library minor version.\n @param [out] release_number      Filled with library release number."]
     pub fn ucp_get_version(
         major_version: *mut ::std::os::raw::c_uint,
         minor_version: *mut ::std::os::raw::c_uint,
@@ -10973,9 +12091,11 @@ extern "C" {
     );
 }
 extern "C" {
+    #[doc = " @ingroup UCP_CONTEXT\n @brief Get UCP library version as a string.\n\n This routine returns the UCP library version as a string which consists of:\n \"major.minor.release\"."]
     pub fn ucp_get_version_string() -> *const ::std::os::raw::c_char;
 }
 extern "C" {
+    #[doc = " @cond PRIVATE_INTERFACE */\n/**\n @ingroup UCP_CONTEXT\n @brief UCP context initialization with particular API version.\n\n  This is an internal routine used to check compatibility with a particular\n API version. @ref ucp_init should be used to create UCP context."]
     pub fn ucp_init_version(
         api_major_version: ::std::os::raw::c_uint,
         api_minor_version: ::std::os::raw::c_uint,
@@ -10985,18 +12105,32 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_CONTEXT\n @brief Release UCP application context.\n\n This routine finalizes and releases the resources associated with a\n @ref ucp_context_h \"UCP application context\".\n\n @warning An application cannot call any UCP routine\n once the UCP application context released.\n\n The cleanup process releases and shuts down all resources associated    with\n the application context. After calling this routine, calling any UCP\n routine without calling @ref ucp_init \"UCP initialization routine\" is invalid.\n\n @param [in] context_p   Handle to @ref ucp_context_h\n                         \"UCP application context\"."]
     pub fn ucp_cleanup(context_p: ucp_context_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_CONTEXT\n @brief Get attributes specific to a particular context.\n\n This routine fetches information about the context.\n\n @param [in]  context_p  Handle to @ref ucp_context_h\n                         \"UCP application context\".\n\n @param [out] attr       Filled with attributes of @p context_p context.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_context_query(
         context_p: ucp_context_h,
         attr: *mut ucp_context_attr_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief Compare two remote keys\n\n This routine compares two remote keys. They must belong to the same worker.\n\n It sets the @a result argument to < 0 if rkey1 is lower than rkey2, 0 if they\n are equal or > 0 if rkey1 is greater than rkey2. The result value can be used\n for sorting remote keys.\n\n @param [in]  worker      Worker object both rkeys are referring to\n @param [in]  rkey1       First rkey to compare\n @param [in]  rkey2       Second rkey to compare\n @param [in]  params      Additional parameters to the comparison\n @param [out] result      Result of the comparison\n\n @return UCS_OK                - @a result contains the comparison result\n @return UCS_ERR_INVALID_PARAM - The routine arguments are invalid\n @return Other                 - Error code as defined by @ref ucs_status_t"]
+    pub fn ucp_rkey_compare(
+        worker: ucp_worker_h,
+        rkey1: ucp_rkey_h,
+        rkey2: ucp_rkey_h,
+        params: *const ucp_rkey_compare_params_t,
+        result: *mut ::std::os::raw::c_int,
+    ) -> ucs_status_t;
+}
+extern "C" {
+    #[doc = " @ingroup UCP_CONTEXT\n @brief Print context information.\n\n This routine prints information about the context configuration: including\n memory domains, transport resources, and other useful information associated\n with the context.\n\n @param [in] context      Print this context object's configuration.\n @param [in] stream       Output stream on which to print the information."]
     pub fn ucp_context_print_info(context: ucp_context_h, stream: *mut FILE);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Create a worker object.\n\n This routine allocates and initializes a @ref ucp_worker_h \"worker\" object.\n Each worker is associated with one and only one @ref ucp_context_h\n \"application\" context.  In the same time, an application context can create\n multiple @ref ucp_worker_h \"workers\" in order to enable concurrent access to\n communication resources. For example, application can allocate a dedicated\n worker for each application thread, where every worker can be progressed\n independently of others.\n\n @note The worker object is allocated within context of the calling thread\n\n @param [in] context     Handle to @ref ucp_context_h\n                         \"UCP application context\".\n @param [in] params      User defined @ref ucp_worker_params_t configurations for the\n                         @ref ucp_worker_h \"UCP worker\".\n @param [out] worker_p   A pointer to the worker object allocated by the\n                         UCP library\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_worker_create(
         context: ucp_context_h,
         params: *const ucp_worker_params_t,
@@ -11004,27 +12138,34 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Destroy a worker object.\n\n This routine releases the resources associated with a\n @ref ucp_worker_h \"UCP worker\".\n\n @warning Once the UCP worker destroy the worker handle cannot be used with any\n UCP routine.\n\n The destroy process releases and shuts down all resources associated    with\n the @ref ucp_worker_h \"worker\".\n\n @param [in]  worker        Worker object to destroy."]
     pub fn ucp_worker_destroy(worker: ucp_worker_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Get attributes specific to a particular worker.\n\n This routine fetches information about the worker.\n\n @param [in]  worker     Worker object to query.\n @param [out] attr       Filled with attributes of worker.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_worker_query(worker: ucp_worker_h, attr: *mut ucp_worker_attr_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Print information about the worker.\n\n This routine prints information about the protocols being used, thresholds,\n UCT transport methods, and other useful information associated with the worker.\n\n @param [in] worker       Worker object to print information for.\n @param [in] stream       Output stream to print the information to."]
     pub fn ucp_worker_print_info(worker: ucp_worker_h, stream: *mut FILE);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Release an address of the worker object.\n\n This routine release an @ref ucp_address_t \"address handle\" associated within\n the @ref ucp_worker_h \"worker\" object.\n\n @warning Once the address released the address handle cannot be used with any\n UCP routine.\n\n @param [in]  worker            Worker object that is associated with the\n                                address object.\n @param [in] address            Address to release; the address object has to\n                                be allocated using @ref ucp_worker_query\n                                \"ucp_worker_query()\" routine.\n\n @todo We should consider to change it to return int so we can catch the\n errors when worker != address"]
     pub fn ucp_worker_release_address(worker: ucp_worker_h, address: *mut ucp_address_t);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Get attributes of the particular worker address.\n\n This routine fetches information about the worker address. The address can be\n either of local or remote worker.\n\n @param [in]  address    Worker address to query.\n @param [out] attr       Filled with attributes of the worker address.\n\n @return Error code as defined by @ref ucs_status_t."]
     pub fn ucp_worker_address_query(
         address: *mut ucp_address_t,
         attr: *mut ucp_worker_address_attr_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Progress all communications on a specific worker.\n\n This routine explicitly progresses all communication operations on a worker.\n\n @note\n @li Typically, request wait and test routines call @ref\n ucp_worker_progress \"this routine\" to progress any outstanding operations.\n @li Transport layers, implementing asynchronous progress using threads,\n require callbacks and other user code to be thread safe.\n @li The state of communication can be advanced (progressed) by blocking\n routines. Nevertheless, the non-blocking routines can not be used for\n communication progress.\n\n @param [in]  worker    Worker to progress.\n\n @return Non-zero if any communication was progressed, zero otherwise."]
     pub fn ucp_worker_progress(worker: ucp_worker_h) -> ::std::os::raw::c_uint;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Poll for endpoints that are ready to consume streaming data.\n\n This non-blocking routine returns endpoints on a worker which are ready\n to consume streaming data. The ready endpoints are placed in @a poll_eps\n array, and the function return value indicates how many are there.\n\n @param [in]   worker    Worker to poll.\n @param [out]  poll_eps  Pointer to array of endpoints, should be\n                         allocated by user.\n @param [in]   max_eps   Maximum number of endpoints that should be filled\n                         in @a poll_eps.\n @param [in]   flags     Reserved for future use.\n\n @return Negative value indicates an error according to @ref ucs_status_t.\n         On success, non-negative value (less or equal @a max_eps) indicates\n         actual number of endpoints filled in @a poll_eps array.\n"]
     pub fn ucp_stream_worker_poll(
         worker: ucp_worker_h,
         poll_eps: *mut ucp_stream_poll_ep_t,
@@ -11033,22 +12174,28 @@ extern "C" {
     ) -> isize;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WAKEUP\n @brief Obtain an event file descriptor for event notification.\n\n This routine returns a valid file descriptor for polling functions.\n The file descriptor will get signaled when an event occurs, as part of the\n wake-up mechanism. Signaling means a call to poll() or select() with this\n file descriptor will return at this point, with this descriptor marked as the\n reason (or one of the reasons) the function has returned. The user does not\n need to release the obtained file descriptor.\n\n The wake-up mechanism exists to allow for the user process to register for\n notifications on events of the underlying interfaces, and wait until such\n occur. This is an alternative to repeated polling for request completion.\n The goal is to allow for waiting while consuming minimal resources from the\n system. This is recommended for cases where traffic is infrequent, and\n latency can be traded for lower resource consumption while waiting for it.\n\n There are two alternative ways to use the wakeup mechanism: the first is the\n file descriptor obtained per worker (this function) and the second is the\n @ref ucp_worker_wait function for waiting on the next event internally.\n\n @note UCP @ref ucp_feature \"features\" have to be triggered\n   with @ref UCP_FEATURE_WAKEUP to select proper transport\n\n @param [in]  worker    Worker of notified events.\n @param [out] fd        File descriptor.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_worker_get_efd(worker: ucp_worker_h, fd: *mut ::std::os::raw::c_int)
         -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WAKEUP\n @brief Wait for an event of the worker.\n\n This routine waits (blocking) until an event has happened, as part of the\n wake-up mechanism.\n\n This function is guaranteed to return only if new communication events occur\n on the @a worker. Therefore one must drain all existing events before waiting\n on the file descriptor. This can be achieved by calling\n @ref ucp_worker_progress repeatedly until it returns 0.\n\n There are two alternative ways to use the wakeup mechanism. The first is by\n polling on a per-worker file descriptor obtained from @ref ucp_worker_get_efd.\n The second is by using this function to perform an internal wait for the next\n event associated with the specified worker.\n\n @note During the blocking call the wake-up mechanism relies on other means of\n notification and may not progress some of the requests as it would when\n calling @ref ucp_worker_progress (which is not invoked in that duration).\n\n @note UCP @ref ucp_feature \"features\" have to be triggered\n   with @ref UCP_FEATURE_WAKEUP to select proper transport\n\n @param [in]  worker    Worker to wait for events on.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_worker_wait(worker: ucp_worker_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WAKEUP\n @brief Wait for memory update on the address\n\n This routine waits for a memory update at the local memory @a address.  This\n is a blocking routine. The routine returns when the memory address is\n updated (\"write\") or an event occurs in the system.\n\n This function is guaranteed to return only if new communication events occur\n on the worker or @a address is modified. Therefore one must drain all existing\n events before waiting on the file descriptor. This can be achieved by calling\n @ref ucp_worker_progress repeatedly until it returns 0.\n\n @note This routine can be used by an application that executes busy-waiting\n loop checking for a memory update. Instead of continuous busy-waiting on an\n address the application can use @a ucp_worker_wait_mem, which may suspend\n execution until the memory is updated. The goal of the routine is to provide\n an opportunity for energy savings for architectures that support this\n functionality.\n\n @param [in] worker           Worker to wait for updates on.\n @param [in] address          Local memory address"]
     pub fn ucp_worker_wait_mem(worker: ucp_worker_h, address: *mut ::std::os::raw::c_void);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WAKEUP\n @brief Turn on event notification for the next event.\n\n This routine needs to be called before waiting on each notification on this\n worker, so will typically be called once the processing of the previous event\n is over, as part of the wake-up mechanism.\n\n The worker must be armed before waiting on an event (must be re-armed after\n it has been signaled for reuse) with @ref ucp_worker_arm.\n The events triggering a signal of the file descriptor from\n @ref ucp_worker_get_efd depend on the interfaces used by the worker and\n defined in the transport layer, and typically represent a request completion\n or newly available resources. It can also be triggered by calling\n @ref ucp_worker_signal .\n\n The file descriptor is guaranteed to become signaled only if new communication\n events occur on the @a worker. Therefore one must drain all existing events\n before waiting on the file descriptor. This can be achieved by calling\n @ref ucp_worker_progress repeatedly until it returns 0.\n\n @code {.c}\n void application_initialization() {\n // should be called once in application init flow and before\n // process_communication() is used\n     ...\n     status = ucp_worker_get_efd(worker, &fd);\n     ...\n }\n\n void process_communication() {\n // should be called every time need to wait for some condition such as\n // ucp request completion in sleep mode.\n\n     for (;;) {\n         // check for stop condition as long as progress is made\n         if (check_for_events()) {\n              break;\n         } else if (ucp_worker_progress(worker)) {\n              continue;                 // some progress happened but condition not met\n         }\n\n         // arm the worker and clean-up fd\n         status = ucp_worker_arm(worker);\n         if (UCS_OK == status) {\n             poll(&fds, nfds, timeout);  // wait for events (sleep mode)\n         } else if (UCS_ERR_BUSY == status) {\n             continue;                   // could not arm, need to progress more\n         } else {\n             abort();\n         }\n     }\n }\n @endcode\n\n @note UCP @ref ucp_feature \"features\" have to be triggered\n   with @ref UCP_FEATURE_WAKEUP to select proper transport\n\n @param [in]  worker    Worker of notified events.\n\n @return ::UCS_OK        The operation completed successfully. File descriptor\n                         will be signaled by new events.\n @return ::UCS_ERR_BUSY  There are unprocessed events which prevent the\n                         file descriptor from being armed. These events should\n                         be removed by calling @ref ucp_worker_progress().\n                         The operation is not completed. File descriptor\n                         will not be signaled by new events.\n @return @ref ucs_status_t \"Other\" different error codes in case of issues."]
     pub fn ucp_worker_arm(worker: ucp_worker_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WAKEUP\n @brief Cause an event of the worker.\n\n This routine signals that the event has happened, as part of the wake-up\n mechanism. This function causes a blocking call to @ref ucp_worker_wait or\n waiting on a file descriptor from @ref ucp_worker_get_efd to return, even\n if no event from the underlying interfaces has taken place.\n\n @note It's safe to use this routine from any thread, even if UCX is compiled\n       without multi-threading support and/or initialized with any value of\n       @ref ucp_params_t::mt_workers_shared and\n       @ref ucp_worker_params_t::thread_mode parameters\n\n @param [in]  worker    Worker to wait for events on.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_worker_signal(worker: ucp_worker_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Create a listener to accept connections on. Connection requests on\n the listener will arrive at a local address specified by the user.\n\n This routine creates a new listener object that is bound to a specific\n local address.\n The listener will listen to incoming connection requests.\n After receiving a request from the remote peer, an endpoint to this peer\n will be created - either right away or by calling @ref ucp_ep_create,\n as specified by the callback type in @ref ucp_listener_params_t.\n The user's callback will be invoked once the endpoint is created.\n\n @param [in]  worker           Worker object to create the listener on.\n @param [in]  params           User defined @ref ucp_listener_params_t\n                               configurations for the @ref ucp_listener_h.\n @param [out] listener_p       A handle to the created listener, can be released\n                               by calling @ref ucp_listener_destroy\n\n @return Error code as defined by @ref ucs_status_t\n\n @note @ref ucp_listener_params_t::conn_handler or\n       @ref ucp_listener_params_t::accept_handler must be provided to be\n       able to handle incoming connections."]
     pub fn ucp_listener_create(
         worker: ucp_worker_h,
         params: *const ucp_listener_params_t,
@@ -11056,27 +12203,32 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Stop accepting connections on a local address of the worker object.\n\n This routine unbinds the worker from the given handle and stops\n listening for incoming connection requests on it.\n\n @param [in] listener        A handle to the listener to stop listening on."]
     pub fn ucp_listener_destroy(listener: ucp_listener_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Get attributes specific to a particular listener.\n\n This routine fetches information about the listener.\n\n @param [in]  listener   listener object to query.\n @param [out] attr       Filled with attributes of the listener.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_listener_query(
         listener: ucp_listener_h,
         attr: *mut ucp_listener_attr_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Get attributes specific to a particular connection request received\n on the server side.\n\n This routine fetches information about the connection request.\n\n @param [in]  conn_request  connection request object to query.\n @param [out] attr          Filled with attributes of the connection request.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_conn_request_query(
         conn_request: ucp_conn_request_h,
         attr: *mut ucp_conn_request_attr_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Get information about ucp_request.\n\n @param [in]  request Non-blocking request to query.\n @param [out] attr    Filled with attributes of the request.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_request_query(
         request: *mut ::std::os::raw::c_void,
         attr: *mut ucp_request_attr_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n @brief Create and connect an endpoint.\n\n This routine creates and connects an @ref ucp_ep_h \"endpoint\" on a @ref\n ucp_worker_h \"local worker\" for a destination @ref ucp_address_t \"address\"\n that identifies the remote @ref ucp_worker_h \"worker\". This function is\n non-blocking, and communications may begin immediately after it returns. If\n the connection process is not completed, communications may be delayed.\n The created @ref ucp_ep_h \"endpoint\" is associated with one and only one\n @ref ucp_worker_h \"worker\".\n\n @param [in]  worker      Handle to the worker; the endpoint\n                          is associated with the worker.\n @param [in]  params      User defined @ref ucp_ep_params_t configurations\n                          for the @ref ucp_ep_h \"UCP endpoint\".\n @param [out] ep_p        A handle to the created endpoint.\n\n @return Error code as defined by @ref ucs_status_t\n\n @note One of the following fields has to be specified:\n  - ucp_ep_params_t::address\n  - ucp_ep_params_t::sockaddr\n  - ucp_ep_params_t::conn_request\n\n @note By default, ucp_ep_create() will connect an endpoint to itself if\n the endpoint is destined to the same @a worker on which it was created,\n i.e. @a params.address belongs to @a worker. This behavior can be changed by\n passing the @ref UCP_EP_PARAMS_FLAGS_NO_LOOPBACK flag in @a params.flags.\n In that case, the endpoint will be connected to the *next* endpoint created\n in the same way on the same @a worker."]
     pub fn ucp_ep_create(
         worker: ucp_worker_h,
         params: *const ucp_ep_params_t,
@@ -11084,21 +12236,26 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n\n @brief Non-blocking @ref ucp_ep_h \"endpoint\" closure.\n\n @param [in]  ep      Handle to the endpoint to close.\n @param [in]  param   Operation parameters, see @ref ucp_request_param_t.\n                      This operation supports specific flags, which can be\n                      passed in @a param by @ref ucp_request_param_t.flags.\n                      The exact set of flags is defined\n                      by @ref ucp_ep_close_flags_t.\n\n @return NULL                 - The endpoint is closed successfully.\n @return UCS_PTR_IS_ERR(_ptr) - The closure failed and an error code indicates\n                                the transport level status. However, resources\n                                are released and the @a endpoint can no longer\n                                be used.\n @return otherwise            - The closure process is started, and can be\n                                completed at any point in time. A request\n                                handle is returned to the application in order\n                                to track progress of the endpoint closure."]
     pub fn ucp_ep_close_nbx(ep: ucp_ep_h, param: *const ucp_request_param_t) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n\n @brief Reject an incoming connection request.\n\n Reject the incoming connection request and release associated resources. If\n the remote initiator endpoint has set an @ref ucp_ep_params_t::err_handler,\n it will be invoked with status @ref UCS_ERR_REJECTED.\n\n @param [in]  listener        Handle to the listener on which the connection\n                              request was received.\n @param [in]  conn_request    Handle to the connection request to reject.\n\n @return Error code as defined by @ref ucs_status_t\n"]
     pub fn ucp_listener_reject(
         listener: ucp_listener_h,
         conn_request: ucp_conn_request_h,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n @brief Print endpoint information.\n\n This routine prints information about the endpoint transport methods, their\n thresholds, and other useful information associated with the endpoint.\n\n @param [in] ep           Endpoint object whose configuration to print.\n @param [in] stream       Output stream to print the information to."]
     pub fn ucp_ep_print_info(ep: ucp_ep_h, stream: *mut FILE);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n\n @brief Non-blocking flush of outstanding AMO and RMA operations on the\n @ref ucp_ep_h \"endpoint\".\n\n This routine flushes all outstanding AMO and RMA communications on the\n @ref ucp_ep_h \"endpoint\". All the AMO and RMA operations issued on the\n @a ep prior to this call are completed both at the origin and at the target\n @ref ucp_ep_h \"endpoint\" when this call returns.\n\n @param [in] ep        UCP endpoint.\n @param [in] param     Operation parameters, see @ref ucp_request_param_t.\n\n @return NULL                 - The flush operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The flush operation failed.\n @return otherwise            - Flush operation was scheduled and can be\n                                completed in any point in time. The request\n                                handle is returned to the application in\n                                order to track progress.\n\n\n The following example demonstrates how blocking flush can be implemented\n using non-blocking flush:\n @code {.c}\n ucs_status_t blocking_ep_flush(ucp_ep_h ep, ucp_worker_h worker)\n {\n     ucp_request_param_t param;\n     void *request;\n\n     param.op_attr_mask = 0;\n     request            = ucp_ep_flush_nbx(ep, &param);\n     if (request == NULL) {\n         return UCS_OK;\n     } else if (UCS_PTR_IS_ERR(request)) {\n         return UCS_PTR_STATUS(request);\n     } else {\n         ucs_status_t status;\n         do {\n             ucp_worker_progress(worker);\n             status = ucp_request_check_status(request);\n         } while (status == UCS_INPROGRESS);\n         ucp_request_free(request);\n         return status;\n     }\n }\n @endcode"]
     pub fn ucp_ep_flush_nbx(ep: ucp_ep_h, param: *const ucp_request_param_t) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n @brief Estimate performance characteristics of a specific endpoint.\n\n This routine fetches information about the endpoint.\n\n @param [in]  ep    Endpoint to query.\n @param [in]  param Filled by the user with request params.\n @param [out] attr  Filled with performance estimation of the given operation\n                    on the endpoint.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_ep_evaluate_perf(
         ep: ucp_ep_h,
         param: *const ucp_ep_evaluate_perf_param_t,
@@ -11106,6 +12263,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief Map or allocate memory for zero-copy operations.\n\n This routine maps or/and allocates a user-specified memory segment with @ref\n ucp_context_h \"UCP application context\" and the network resources associated\n with it. If the application specifies NULL as an address for the memory\n segment, the routine allocates a mapped memory segment and returns its\n address in the @a address_p argument.  The network stack associated with an\n application context can typically send and receive data from the mapped\n memory without CPU intervention; some devices and associated network stacks\n require the memory to be mapped to send and receive data. The @ref ucp_mem_h\n \"memory handle\" includes all information required to access the memory\n locally using UCP routines, while @ref ucp_rkey_h\n \"remote registration handle\" provides an information that is necessary for\n remote memory access.\n\n @note\n Another well know terminology for the \"map\" operation that is typically\n used in the context of networking is memory \"registration\" or \"pinning\". The\n UCP library registers the memory the available hardware so it can be\n assessed directly by the hardware.\n\n Memory mapping assumptions:\n @li A given memory segment can be mapped by several different communication\n stacks, if these are compatible.\n @li The @a memh_p handle returned may be used with any sub-region of the\n mapped memory.\n @li If a large segment is registered, and then segmented for subsequent use\n by a user, then the user is responsible for segmentation and subsequent\n management.\n\n <table>\n <caption>Matrix of behavior</caption>\n <tr><th>parameter/flag <td align=\"center\">@ref UCP_MEM_MAP_NONBLOCK \"NONBLOCK\"</td>\n                        <td align=\"center\">@ref UCP_MEM_MAP_ALLOCATE \"ALLOCATE\"</td>\n                        <td align=\"center\">@ref UCP_MEM_MAP_FIXED \"FIXED\"</td>\n                        <td align=\"center\">@ref ucp_mem_map_params.address \"address\"</td>\n                        <td align=\"center\">@b result\n <tr><td rowspan=\"8\" align=\"center\">@b value <td rowspan=\"8\" align=\"center\">0/1 - the value\\n only affects the\\n register/map\\n phase</td>\n                                               <td align=\"center\">0 <td align=\"center\">0 <td align=\"center\">0 <td align=\"center\">@ref anch_err \"error\" if length > 0\n <tr>                                          <td align=\"center\">1 <td align=\"center\">0 <td align=\"center\">0 <td align=\"center\">@ref anch_alloc_reg \"alloc+register\"\n <tr>                                          <td align=\"center\">0 <td align=\"center\">1 <td align=\"center\">0 <td align=\"center\">@ref anch_err \"error\"</td>\n <tr>                                          <td align=\"center\">0 <td align=\"center\">0 <td align=\"center\">defined <td align=\"center\">@ref anch_reg \"register\"\n <tr>                                          <td align=\"center\">1 <td align=\"center\">1 <td align=\"center\">0 <td align=\"center\">@ref anch_err \"error\"</td>\n <tr>                                          <td align=\"center\">1 <td align=\"center\">0 <td align=\"center\">defined <td align=\"center\">@ref anch_alloc_hint_reg \"alloc+register,hint\"\n <tr>                                          <td align=\"center\">0 <td align=\"center\">1 <td align=\"center\">defined <td align=\"center\">@ref anch_err \"error\"</td>\n <tr>                                          <td align=\"center\">1 <td align=\"center\">1 <td align=\"center\">defined <td align=\"center\">@ref anch_alloc_fixed_reg \"alloc+register,fixed\"\n </table>\n\n @note\n @li \\anchor anch_reg @b register means that the memory will be registered in\n     corresponding transports for RMA/AMO operations. This case intends that\n     the memory was allocated by user before.\n @li \\anchor anch_alloc_reg @b alloc+register means that the memory will be allocated\n     in the memory provided by the system and registered in corresponding\n     transports for RMA/AMO operations.\n @li \\anchor anch_alloc_hint_reg <b>alloc+register,hint</b> means that\n     the memory will be allocated with using @ref ucp_mem_map_params.address\n     as a hint and registered in corresponding transports for RMA/AMO operations.\n @li \\anchor anch_alloc_fixed_reg <b>alloc+register,fixed</b> means that the memory\n     will be allocated and registered in corresponding transports for RMA/AMO\n     operations.\n @li \\anchor anch_err @b error is an erroneous combination of the parameters.\n\n @param [in]     context    Application @ref ucp_context_h \"context\" to map\n                            (register) and allocate the memory on.\n @param [in]     params     User defined @ref ucp_mem_map_params_t configurations\n                            for the @ref ucp_mem_h \"UCP memory handle\".\n @param [out]    memh_p     UCP @ref ucp_mem_h \"handle\" for the allocated\n                            segment.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_mem_map(
         context: ucp_context_h,
         params: *const ucp_mem_map_params_t,
@@ -11113,12 +12271,15 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief Unmap memory segment\n\n This routine unmaps a user specified memory segment, that was previously\n mapped using the @ref ucp_mem_map \"ucp_mem_map()\" routine.  The unmap\n routine will also release the resources associated with the memory\n @ref ucp_mem_h \"handle\".  When the function returns, the @ref ucp_mem_h\n and associated @ref ucp_rkey_h \"remote key\" will be invalid and cannot be\n used with any UCP routine.\n\n @note\n Another well know terminology for the \"unmap\" operation that is typically\n used in the context of networking is memory \"de-registration\". The UCP\n library de-registers the memory the available hardware so it can be returned\n back to the operation system.\n\n Error cases:\n @li Once memory is unmapped a network access to the region may cause a\n failure.\n\n @param [in]  context     Application @ref ucp_context_h \"context\" which was\n                          used to allocate/map the memory.\n @param [in]  memh        @ref ucp_mem_h \"Handle\" to memory region.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_mem_unmap(context: ucp_context_h, memh: ucp_mem_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief query mapped memory segment\n\n This routine returns address and length of memory segment mapped with\n @ref ucp_mem_map \"ucp_mem_map()\" routine.\n\n @param [in]  memh    @ref ucp_mem_h \"Handle\" to memory region.\n @param [out] attr    Filled with attributes of the @ref ucp_mem_h\n                      \"UCP memory handle\".\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_mem_query(memh: ucp_mem_h, attr: *mut ucp_mem_attr_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief Print memory mapping information.\n\n This routine maps memory and prints information about the created memory handle:\n including the mapped memory length, the allocation method, and other useful\n information associated with the memory handle.\n\n @param [in] mem_spec     Size and optional type of the memory to map.\n                          The format of the string is: \"<size>[,<type>]\".\n                          For example:\n                           - \"32768\"   : allocate 32 kilobytes of host memory.\n                           - \"1m,cuda\" : allocate 1 megabyte of cuda memory.\n @param [in] context      The context on which the memory is mapped.\n @param [in] stream       Output stream on which to print the information."]
     pub fn ucp_mem_print_info(
         mem_spec: *const ::std::os::raw::c_char,
         context: ucp_context_h,
@@ -11126,18 +12287,27 @@ extern "C" {
     );
 }
 #[repr(u32)]
+#[doc = " @ingroup UCP_MEM\n @brief list of UCP memory use advice.\n\n The enumeration list describes memory advice supported by @ref\n ucp_mem_advise() function."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucp_mem_advice {
+    #[doc = "< No special treatment"]
     UCP_MADV_NORMAL = 0,
+    #[doc = "< can be used on the memory mapped with\n@ref UCP_MEM_MAP_NONBLOCK to speed up memory\nmapping and to avoid page faults when\nthe memory is accessed for the first time."]
     UCP_MADV_WILLNEED = 1,
 }
+#[doc = " @ingroup UCP_MEM\n @brief list of UCP memory use advice.\n\n The enumeration list describes memory advice supported by @ref\n ucp_mem_advise() function."]
 pub use self::ucp_mem_advice as ucp_mem_advice_t;
+#[doc = " @ingroup UCP_MEM\n @brief Tuning parameters for the UCP memory advice.\n\n This structure defines the parameters that are used for the\n UCP memory advice tuning during the @ref ucp_mem_advise \"ucp_mem_advise\"\n routine."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_mem_advise_params {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_mem_advise_params_field. All fields are mandatory.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Memory base address."]
     pub address: *mut ::std::os::raw::c_void,
+    #[doc = " Length (in bytes) to allocate or map (register)."]
     pub length: usize,
+    #[doc = " Memory use advice @ref ucp_mem_advice"]
     pub advice: ucp_mem_advice_t,
 }
 #[test]
@@ -11196,8 +12366,10 @@ fn bindgen_test_layout_ucp_mem_advise_params() {
         )
     );
 }
+#[doc = " @ingroup UCP_MEM\n @brief Tuning parameters for the UCP memory advice.\n\n This structure defines the parameters that are used for the\n UCP memory advice tuning during the @ref ucp_mem_advise \"ucp_mem_advise\"\n routine."]
 pub type ucp_mem_advise_params_t = ucp_mem_advise_params;
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief give advice about the use of memory\n\n This routine advises the UCP about how to handle memory range beginning at\n address and size of length bytes. This call does not influence the semantics\n of the application, but may influence its performance. The UCP may ignore\n the advice.\n\n @param [in]  context     Application @ref ucp_context_h \"context\" which was\n                          used to allocate/map the memory.\n @param [in]  memh        @ref ucp_mem_h \"Handle\" to memory region.\n @param [in]  params      Memory base address and length. The advice field\n                          is used to pass memory use advice as defined in\n                          the @ref ucp_mem_advice list\n                          The memory range must belong to the @a memh\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_mem_advise(
         context: ucp_context_h,
         memh: ucp_mem_h,
@@ -11205,6 +12377,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 impl ucp_memh_pack_params_field {
+    #[doc = " Memory handle packing field that will be used in the @ref ucp_memh_pack\n routine."]
     pub const UCP_MEMH_PACK_PARAM_FIELD_FLAGS: ucp_memh_pack_params_field =
         ucp_memh_pack_params_field(1);
 }
@@ -11235,9 +12408,11 @@ impl ::std::ops::BitAndAssign for ucp_memh_pack_params_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_MEM\n @brief UCP memory handle packing parameters field mask.\n\n The enumeration allows specifying which fields in\n @ref ucp_memh_pack_params_t are present. It is used to enable backward\n compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_memh_pack_params_field(pub ::std::os::raw::c_uint);
 impl ucp_memh_pack_flags {
+    #[doc = " Pack a memory handle to be exported and used by peers for their local\n operations on a memory buffer allocated from same or another virtual\n memory space, but physically registered on the same network device.\n A peer should call @ref ucp_mem_map with the\n flag @ref UCP_MEM_MAP_PARAM_FIELD_EXPORTED_MEMH_BUFFER in order to\n import and use a memory handle buffer obtained from @ref ucp_memh_pack."]
     pub const UCP_MEMH_PACK_FLAG_EXPORT: ucp_memh_pack_flags = ucp_memh_pack_flags(1);
 }
 impl ::std::ops::BitOr<ucp_memh_pack_flags> for ucp_memh_pack_flags {
@@ -11267,12 +12442,16 @@ impl ::std::ops::BitAndAssign for ucp_memh_pack_flags {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_MEM\n @brief UCP memory handle flags.\n\n The enumeration list describes the memory handle packing flags supported by\n @ref ucp_memh_pack() function."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_memh_pack_flags(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCP_MEM\n @brief Memory handle pack parameters passed to @ref ucp_memh_pack.\n\n This structure defines the parameters that are used for packing the\n UCP memory handle during the @ref ucp_memh_pack \"ucp_memh_pack\"\n routine."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_memh_pack_params {
+    #[doc = " Mask of valid fields in this structure. Fields not specified in this\n mask will be ignored. Provides ABI compatibility with respect to adding\n new fields."]
     pub field_mask: u64,
+    #[doc = " Flags to control packing of a memory handle."]
     pub flags: u64,
 }
 #[test]
@@ -11310,8 +12489,10 @@ fn bindgen_test_layout_ucp_memh_pack_params() {
         )
     );
 }
+#[doc = " @ingroup UCP_MEM\n @brief Memory handle pack parameters passed to @ref ucp_memh_pack.\n\n This structure defines the parameters that are used for packing the\n UCP memory handle during the @ref ucp_memh_pack \"ucp_memh_pack\"\n routine."]
 pub type ucp_memh_pack_params_t = ucp_memh_pack_params;
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief Pack a memory handle to a buffer specified by the user.\n\n This routine allocates a memory buffer and packs a memory handle into the\n buffer. A packed memory key is an opaque object that provides\n the information that is necessary for a peer.\n This routine packs the memory handle in a portable format such that the\n object can be unpacked on any platform supported by the UCP library, e.g.\n if the memory handle was packed as a remote memory key (RKEY), it should be\n unpacked by @ref ucp_ep_rkey_unpack \"ucp_ep_rkey_unpack()\".\n In order to release the memory buffer allocated by this routine,\n the application is responsible for calling the @ref ucp_memh_buffer_release\n \"ucp_memh_buffer_release()\" routine.\n\n\n @note\n @li RKEYs for InfiniBand and Cray Aries networks typically includes\n InfiniBand and Aries key.\n @li In order to enable remote direct memory access to the memory associated\n with the memory handle the application is responsible for sharing the RKEY with\n the peers that will initiate the access.\n\n @param [in]  memh          @ref ucp_mem_h \"Handle\" to memory region.\n @param [in]  params        Memory handle packing parameters, as defined by\n                            @ref ucp_memh_pack_params_t.\n @param [out] buffer_p      Memory buffer allocated by the library.\n                            The buffer contains the packed memory handle.\n @param [out] buffer_size_p Size (in bytes) of the buffer which contains\n                            packed memory handle.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_memh_pack(
         memh: ucp_mem_h,
         params: *const ucp_memh_pack_params_t,
@@ -11319,9 +12500,11 @@ extern "C" {
         buffer_size_p: *mut usize,
     ) -> ucs_status_t;
 }
+#[doc = " @ingroup UCP_MEM\n @brief Memory handle release parameters passed to\n @ref ucp_memh_buffer_release.\n\n This structure defines the parameters that are used for releasing the\n UCP memory handle buffer during the @ref ucp_memh_buffer_release\n \"ucp_memh_buffer_release\" routine."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_memh_buffer_release_params {
+    #[doc = " Mask of valid fields in this structure. All fields are mandatory.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
 }
 #[test]
@@ -11350,14 +12533,17 @@ fn bindgen_test_layout_ucp_memh_buffer_release_params() {
         )
     );
 }
+#[doc = " @ingroup UCP_MEM\n @brief Memory handle release parameters passed to\n @ref ucp_memh_buffer_release.\n\n This structure defines the parameters that are used for releasing the\n UCP memory handle buffer during the @ref ucp_memh_buffer_release\n \"ucp_memh_buffer_release\" routine."]
 pub type ucp_memh_buffer_release_params_t = ucp_memh_buffer_release_params;
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief Release packed memory handle buffer.\n\n This routine releases the buffer that was allocated using @ref ucp_memh_pack\n \"ucp_memh_pack()\".\n\n @warning\n @li Once memory is released, an access to the memory may cause undefined\n behavior.\n @li If the input memory address was not allocated using\n @ref ucp_memh_pack \"ucp_memh_pack()\" routine, the behavior of this routine\n is undefined.\n\n @param [in]  buffer   Buffer to release.\n @param [in]  params   Memory handle buffer release parameters, as defined by\n                       @ref ucp_memh_buffer_release_params_t."]
     pub fn ucp_memh_buffer_release(
         buffer: *mut ::std::os::raw::c_void,
         params: *const ucp_memh_buffer_release_params_t,
     );
 }
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief Create remote access key from packed buffer.\n\n This routine unpacks the remote key (RKEY) object into the local memory\n such that it can be accessed and used by UCP routines. The RKEY object has\n to be packed using the @ref ucp_rkey_pack \"ucp_rkey_pack()\" routine.\n Application code should not make any changes to the content of the RKEY\n buffer.\n\n @note The application is responsible for releasing the RKEY object when\n       it is no longer needed, by calling the @ref ucp_rkey_destroy\n       \"ucp_rkey_destroy()\" routine.\n @note The remote key object can be used for communications only on the\n       endpoint on which it was unpacked.\n\n @param [in]  ep            Endpoint to access using the remote key.\n @param [in]  rkey_buffer   Packed rkey.\n @param [out] rkey_p        Remote key handle.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_ep_rkey_unpack(
         ep: ucp_ep_h,
         rkey_buffer: *const ::std::os::raw::c_void,
@@ -11365,6 +12551,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief Get a local pointer to remote memory.\n\n This routine returns a local pointer to the remote memory described\n by the rkey.\n\n @note This routine can return a valid pointer only for the endpoints\n that are reachable via shared memory.\n\n @param [in]  rkey          A remote key handle.\n @param [in]  raddr         A remote memory address within the memory area\n                            described by the rkey.\n @param [out] addr_p        A pointer that can be used for direct\n                            access to the remote memory.\n\n @return Error code as defined by @ref ucs_status_t if the remote memory\n         cannot be accessed directly or the remote memory address is not valid."]
     pub fn ucp_rkey_ptr(
         rkey: ucp_rkey_h,
         raddr: u64,
@@ -11372,15 +12559,18 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_MEM\n @brief Destroy the remote key\n\n This routine destroys the RKEY object and the memory that was allocated\n using the @ref ucp_ep_rkey_unpack \"ucp_ep_rkey_unpack()\" routine. This\n routine also releases any resources that are associated with the RKEY\n object.\n\n @warning\n @li Once the RKEY object is released an access to the memory will cause an\n undefined failure.\n @li If the RKEY object was not created using\n @ref ucp_ep_rkey_unpack \"ucp_ep_rkey_unpack()\" routine the behavior of this\n routine is undefined.\n @li The RKEY object must be destroyed after all outstanding operations which\n are using it are flushed, and before the endpoint on which it was unpacked\n is destroyed.\n\n @param [in]  rkey         Remote key to destroy."]
     pub fn ucp_rkey_destroy(rkey: ucp_rkey_h);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n @brief Add user defined callback for Active Message.\n\n This routine installs a user defined callback to handle incoming Active\n Messages with a specific id. This callback is called whenever an Active\n Message that was sent from the remote peer by @ref ucp_am_send_nbx is\n received on this worker.\n\n @warning Handlers set by this function are not compatible with\n@ref ucp_am_send_nb routine.\n\n @param [in]  worker      UCP worker on which to set the Active Message\n                          handler.\n @param [in]  param       Active Message handler parameters, as defined by\n                          @ref ucp_am_handler_param_t.\n\n @return error code if the worker does not support Active Messages or\n         requested callback flags."]
     pub fn ucp_worker_set_am_recv_handler(
         worker: ucp_worker_h,
         param: *const ucp_am_handler_param_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Send Active Message.\n\n This routine sends an Active Message to an ep. If the operation completes\n immediately, then the routine returns NULL and the callback function is\n ignored, even if specified. Otherwise, if no error is reported and a callback\n is requested (i.e. the UCP_OP_ATTR_FIELD_CALLBACK flag is set in the\n op_attr_mask field of @a param), then the UCP library will schedule\n invocation of the callback routine @a param->cb.send upon completion of the\n operation.\n\n @note If UCP_OP_ATTR_FLAG_NO_IMM_CMPL flag is set in the op_attr_mask field\n       of @a param, then the operation will return a request handle, even if\n       it completes immediately.\n @note This operation supports specific flags, which can be passed\n       in @a param by @ref ucp_request_param_t.flags. The exact set of flags\n       is defined by @ref ucp_send_am_flags.\n\n @param [in]  ep            UCP endpoint where the Active Message will be run.\n @param [in]  id            Active Message id. Specifies which registered\n                            callback to run.\n @param [in]  header        User defined Active Message header. NULL value is\n                            allowed if no header needed. In this case\n                            @a header_length must be set to 0.\n                            By default the header must be valid until\n                            the active message send operation completes.\n                            If the flag @ref UCP_AM_SEND_FLAG_COPY_HEADER\n                            is specified, the header is only required to be\n                            valid until this function call returns.\n @param [in]  header_length Active message header length in bytes.\n @param [in]  buffer        Pointer to the data to be sent to the target node\n                            of the Active Message.\n @param [in]  count         Number of elements to send.\n @param [in]  param         Operation parameters, see @ref ucp_request_param_t.\n\n @note Sending only header without actual data is allowed and is recommended\n       for transferring a latency-critical amount of data.\n @note The maximum allowed header size can be obtained by querying worker\n       attributes by the @ref ucp_worker_query routine.\n\n\n @return NULL                 - Active Message was sent immediately.\n @return UCS_PTR_IS_ERR(_ptr) - Error sending Active Message.\n @return otherwise            - Operation was scheduled for send and can be\n                                completed at any point in time. The request\n                                handle is returned to the application in order\n                                to track progress of the message. If user\n                                request was not provided in @a param->request,\n                                the application is responsible for releasing\n                                the handle using @ref ucp_request_free routine."]
     pub fn ucp_am_send_nbx(
         ep: ucp_ep_h,
         id: ::std::os::raw::c_uint,
@@ -11392,6 +12582,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Receive Active Message as defined by provided data descriptor.\n\n This routine receives a message that is described by the data descriptor\n @a data_desc, local address @a buffer, size @a count and @a param\n parameters on the @a worker. The routine is non-blocking and therefore\n returns immediately. The receive operation is considered completed when the\n message is delivered to the @a buffer. If the receive operation cannot be\n started the routine returns an error.\n\n @note This routine can be performed on any valid data descriptor delivered in\n       @ref ucp_am_recv_callback_t.\n       Data descriptor is considered to be valid if:\n       - It is a rendezvous request (@a UCP_AM_RECV_ATTR_FLAG_RNDV is set in\n         @ref ucp_am_recv_param_t.recv_attr) or\n       - It is a persistent data pointer (@a UCP_AM_RECV_ATTR_FLAG_DATA is set\n         in @ref ucp_am_recv_param_t.recv_attr). In this case receive\n         operation may be needed to unpack data to device memory (for example\n         GPU device) or some specific datatype.\n @note After this call UCP takes ownership of @a data_desc descriptor, so\n       there is no need to release it even if the operation fails.\n       The routine returns a request handle instead, which can be used for\n       tracking operation progress.\n\n @param [in]  worker     Worker that is used for the receive operation.\n @param [in]  data_desc  Data descriptor, provided in\n@ref ucp_am_recv_callback_t routine.\n @param [in]  buffer     Pointer to the buffer to receive the data.\n @param [in]  count      Number of elements to receive into @a buffer.\n @param [in]  param      Operation parameters, see @ref ucp_request_param_t.\n\n @return NULL                 - The receive operation was completed\n                                immediately. In this case, if\n                                @a param->recv_info.length is specified in the\n                                @a param, the value to which it points is updated\n                                with the size of the received message.\n @return UCS_PTR_IS_ERR(_ptr) - The receive operation failed.\n @return otherwise            - Receive operation was scheduled and can be\n                                completed at any point in time. The request\n                                handle is returned to the application in order\n                                to track operation progress. If user\n                                request was not provided in @a param->request,\n                                the application is responsible for releasing\n                                the handle using @ref ucp_request_free routine."]
     pub fn ucp_am_recv_data_nbx(
         worker: ucp_worker_h,
         data_desc: *mut ::std::os::raw::c_void,
@@ -11401,9 +12592,11 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Releases Active Message data.\n\n This routine releases data that persisted through an Active Message\n callback because that callback returned UCS_INPROGRESS.\n\n @param [in] worker       Worker which received the Active Message.\n @param [in] data         Pointer to data that was passed into\n                          the Active Message callback as the data\n                          parameter."]
     pub fn ucp_am_data_release(worker: ucp_worker_h, data: *mut ::std::os::raw::c_void);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking stream send operation.\n\n This routine sends data that is described by the local address @a buffer,\n size @a count object to the destination endpoint @a ep. The routine is\n non-blocking and therefore returns immediately, however the actual send\n operation may be delayed. The send operation is considered completed when\n it is safe to reuse the source @e buffer. If the send operation is\n completed immediately the routine returns UCS_OK.\n\n @note The user should not modify any part of the @a buffer after this\n       operation is called, until the operation completes.\n\n @param [in]  ep          Destination endpoint handle.\n @param [in]  buffer      Pointer to the message buffer (payload).\n @param [in]  count       Number of elements to send.\n @param [in]  param       Operation parameters, see @ref ucp_request_param_t.\n\n @return NULL                 - The send operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The send operation failed.\n @return otherwise            - Operation was scheduled for send and can be\n                                completed at any point in time. The request\n                                handle is returned to the application in\n                                order to track progress of the message."]
     pub fn ucp_stream_send_nbx(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -11412,6 +12605,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking tagged-send operation\n\n This routine sends a messages that is described by the local address @a\n buffer, size @a count object to the destination endpoint @a ep. Each\n message is associated with a @a tag value that is used for message\n matching on the @ref ucp_tag_recv_nb or @ref ucp_tag_recv_nbx \"receiver\".\n The routine is non-blocking and therefore returns immediately, however the\n actual send operation may be delayed. The send operation is considered\n completed when it is safe to reuse the source @e buffer. If the send\n operation is completed immediately the routine returns UCS_OK and the\n call-back function is @b not invoked. If the operation is @b not completed\n immediately and no error reported then the UCP library will schedule to\n invoke the call-back whenever the send operation is completed. In other\n words, the completion of a message can be signaled by the return code or\n the call-back.\n Immediate completion signals can be fine-tuned via the\n @ref ucp_request_param_t.op_attr_mask field in the\n @ref ucp_request_param_t structure. The values of this field\n are a bit-wise OR of the @ref ucp_op_attr_t enumeration.\n\n @note The user should not modify any part of the @a buffer after this\n       operation is called, until the operation completes.\n\n @param [in]  ep          Destination endpoint handle.\n @param [in]  buffer      Pointer to the message buffer (payload).\n @param [in]  count       Number of elements to send\n @param [in]  tag         Message tag.\n @param [in]  param       Operation parameters, see @ref ucp_request_param_t\n\n @return UCS_OK               - The send operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The send operation failed.\n @return otherwise            - Operation was scheduled for send and can be\n                                completed in any point in time. The request handle\n                                is returned to the application in order to track\n                                progress of the message."]
     pub fn ucp_tag_send_nbx(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -11421,6 +12615,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking synchronous tagged-send operation.\n\n Same as @ref ucp_tag_send_nbx, except the request completes only after there\n is a remote tag match on the message (which does not always mean the remote\n receive has been completed). This function never completes \"in-place\", and\n always returns a request handle.\n\n @note The user should not modify any part of the @a buffer after this\n       operation is called, until the operation completes.\n @note Returns @ref UCS_ERR_UNSUPPORTED if @ref UCP_ERR_HANDLING_MODE_PEER is\n       enabled. This is a temporary implementation-related constraint that\n       will be addressed in future releases.\n\n @param [in]  ep          Destination endpoint handle.\n @param [in]  buffer      Pointer to the message buffer (payload).\n @param [in]  count       Number of elements to send\n @param [in]  tag         Message tag.\n @param [in]  param       Operation parameters, see @ref ucp_request_param_t\n\n @return UCS_OK               - The send operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The send operation failed.\n @return otherwise            - Operation was scheduled for send and can be\n                                completed in any point in time. The request handle\n                                is returned to the application in order to track\n                                progress of the message."]
     pub fn ucp_tag_send_sync_nbx(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -11430,6 +12625,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking stream receive operation of structured data into a\n        user-supplied buffer.\n\n This routine receives data that is described by the local address @a buffer,\n size @a count object on the endpoint @a ep. The routine is non-blocking\n and therefore returns immediately. The receive operation is considered\n complete when the message is delivered to the buffer. If the receive\n operation cannot be started, then the routine returns an error.\n\n @param [in]     ep       UCP endpoint that is used for the receive operation.\n @param [in]     buffer   Pointer to the buffer that will receive the data.\n @param [in]     count    Number of elements to receive into @a buffer.\n @param [out]    length   Size of the received data in bytes. The value is\n                          valid only if return code is NULL.\n @param [in]     param    Operation parameters, see @ref ucp_request_param_t.\n                          This operation supports specific flags, which can be\n                          passed in @a param by @ref ucp_request_param_t.flags.\n                          The exact set of flags is defined by\n                          @ref ucp_stream_recv_flags_t.\n\n @return NULL                 - The receive operation was completed\n                                immediately. In this case the value pointed by\n                                @a length is updated by the size of received\n                                data. Note @a param->recv_info is not relevant\n                                for this function.\n @return UCS_PTR_IS_ERR(_ptr) - The receive operation failed.\n @return otherwise            - Operation was scheduled for receive. A request\n                                handle is returned to the application in order\n                                to track progress of the operation.\n\n @note The amount of data received, in bytes, is always an integral multiple\n       of the @a datatype size."]
     pub fn ucp_stream_recv_nbx(
         ep: ucp_ep_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -11439,9 +12635,11 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking stream receive operation of unstructured data into\n        a UCP-supplied buffer.\n\n This routine receives any available data from endpoint @a ep.\n Unlike @ref ucp_stream_recv_nb, the returned data is unstructured and is\n treated as an array of bytes. If data is immediately available,\n UCS_STATUS_PTR(_ptr) is returned as a pointer to the data, and @a length\n is set to the size of the returned data buffer. The routine is non-blocking\n and therefore returns immediately.\n\n @param [in]   ep               UCP endpoint that is used for the receive\n                                operation.\n @param [out]  length           Length of received data.\n\n @return NULL                 - No received data available on the @a ep.\n @return UCS_PTR_IS_ERR(_ptr) - the receive operation failed and\n                                UCS_PTR_STATUS(_ptr) indicates an error.\n @return otherwise            - The pointer to the data UCS_STATUS_PTR(_ptr)\n                                is returned to the application. After the data\n                                is processed, the application is responsible\n                                for releasing the data buffer by calling the\n                                @ref ucp_stream_data_release routine.\n\n @note This function returns packed data (equivalent to ucp_dt_make_contig(1)).\n @note This function returns a pointer to a UCP-supplied buffer, whereas\n       @ref ucp_stream_recv_nb places the data into a user-provided buffer.\n       In some cases, receiving data directly into a UCP-supplied buffer can\n       be more optimal, for example by processing the incoming data in-place\n       and thus avoiding extra memory copy operations."]
     pub fn ucp_stream_recv_data_nb(ep: ucp_ep_h, length: *mut usize) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking tagged-receive operation.\n\n This routine receives a message that is described by the local address @a\n buffer, size @a count, and @a info object on the @a worker. The tag\n value of the receive message has to match the @a tag and @a tag_mask values,\n where the @a tag_mask indicates what bits of the tag have to be matched. The\n routine is a non-blocking and therefore returns immediately. The receive\n operation is considered completed when the message is delivered to the @a\n buffer.  In order to notify the application about completion of the receive\n operation the UCP library will invoke the call-back @a cb when the received\n message is in the receive buffer and ready for application access.  If the\n receive operation cannot be started, then the routine returns an error.\n\n @param [in]  worker      UCP worker that is used for the receive operation.\n @param [in]  buffer      Pointer to the buffer to receive the data.\n @param [in]  count       Number of elements to receive\n @param [in]  tag         Message tag to expect.\n @param [in]  tag_mask    Bit mask that indicates the bits that are used for\n                          the matching of the incoming tag\n                          against the expected tag.\n @param [in]  param       Operation parameters, see @ref ucp_request_param_t\n\n @return NULL                 - The receive operation was completed\n                                immediately. In this case, if\n                                @a param->recv_info.tag_info is specified in the\n                                @a param, the value to which it points is updated\n                                with the information about the received message.\n @return UCS_PTR_IS_ERR(_ptr) - The receive operation failed.\n @return otherwise            - Operation was scheduled for receive. The request\n                                handle is returned to the application in order\n                                to track progress of the operation. The\n                                application is responsible for releasing the\n                                handle using @ref ucp_request_free\n                                \"ucp_request_free()\" routine."]
     pub fn ucp_tag_recv_nbx(
         worker: ucp_worker_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -11452,6 +12650,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking probe and return a message.\n\n This routine probes (checks) if a messages described by the @a tag and\n @a tag_mask was received (fully or partially) on the @a worker. The tag\n value of the received message has to match the @a tag and @a tag_mask\n values, where the @a tag_mask indicates what bits of the tag have to be\n matched. The function returns immediately and if the message is matched it\n returns a handle for the message.\n\n @param [in]  worker      UCP worker that is used for the probe operation.\n @param [in]  tag         Message tag to probe for.\n @param [in]  tag_mask    Bit mask that indicates the bits that are used for\n                          the matching of the incoming tag\n                          against the expected tag.\n @param [in]  remove      The flag indicates if the matched message has to\n                          be removed from UCP library.\n                          If true (1), the message handle is removed from\n                          the UCP library and the application is responsible\n                          to call @ref ucp_tag_msg_recv_nb\n                          \"ucp_tag_msg_recv_nb()\" in order to receive the data\n                          and release the resources associated with the\n                          message handle.\n                          If false (0), the return value is merely an indication\n                          to whether a matching message is present, and it cannot\n                          be used in any other way, and in particular it cannot\n                          be passed to @ref ucp_tag_msg_recv_nb().\n @param [out] info        If the matching message is found the descriptor is\n                          filled with the details about the message.\n\n @return NULL                      - No match found.\n @return Message handle (not NULL) - If message is matched the message handle\n                                     is returned.\n\n @note This function does not advance the communication state of the network.\n       If this routine is used in busy-poll mode, need to make sure\n       @ref ucp_worker_progress() is called periodically to extract messages\n       from the transport."]
     pub fn ucp_tag_probe_nb(
         worker: ucp_worker_h,
         tag: ucp_tag_t,
@@ -11461,6 +12660,7 @@ extern "C" {
     ) -> ucp_tag_message_h;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking receive operation for a probed message.\n\n This routine receives a message that is described by the local address @a\n buffer, size @a count, and @a message handle on the @a worker.\n The @a message handle can be obtained by calling the @ref\n ucp_tag_probe_nb \"ucp_tag_probe_nb()\" routine. The @ref ucp_tag_msg_recv_nbx\n \"ucp_tag_msg_recv_nbx()\" routine is non-blocking and therefore returns\n immediately. The receive operation is considered completed when the message\n is delivered to the @a buffer. In order to notify the application about\n completion of the receive operation the UCP library will invoke the\n call-back @a cb when the received message is in the receive buffer and ready\n for application access. If the receive operation cannot be started, then the\n routine returns an error.\n\n @param [in]  worker      UCP worker that is used for the receive operation.\n @param [in]  buffer      Pointer to the buffer that will receive the data.\n @param [in]  count       Number of elements to receive\n @param [in]  message     Message handle.\n @param [in]  param       Operation parameters, see @ref ucp_request_param_t\n\n @return UCS_PTR_IS_ERR(_ptr) - The receive operation failed.\n @return otherwise            - Operation was scheduled for receive. The request\n                                handle is returned to the application in order\n                                to track progress of the operation. The\n                                application is responsible for releasing the\n                                handle using @ref ucp_request_free\n                                \"ucp_request_free()\" routine."]
     pub fn ucp_tag_msg_recv_nbx(
         worker: ucp_worker_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -11470,6 +12670,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking remote memory put operation.\n\n This routine initiates a storage of contiguous block of data that is\n described by the local address @a buffer in the remote contiguous memory\n region described by @a remote_addr address and the\n @ref ucp_rkey_h \"memory handle\" rkey.  The routine returns immediately and\n @b does @b not guarantee re-usability of the source address @e buffer. If\n the operation is completed immediately the routine return UCS_OK, otherwise\n UCS_INPROGRESS or an error is returned to user. If the put operation\n completes immediately, the routine returns UCS_OK and the call-back routine\n @a param.cb.send is @b not invoked. If the operation is @b not completed\n immediately and no error is reported, then the UCP library will schedule\n invocation of the call-back routine @a param.cb.send upon completion of\n the put operation. In other words, the completion of a put operation can be\n signaled by the return code or execution of the call-back.\n Immediate completion signals can be fine-tuned via the\n @ref ucp_request_param_t.op_attr_mask field in the\n @ref ucp_request_param_t structure. The values of this field\n are a bit-wise OR of the @ref ucp_op_attr_t enumeration.\n\n @note The completion of a put operation signals the local @e buffer can be\n reused. The completion of the operation on the remote address requires use\n of @ref ucp_worker_flush_nbx \"ucp_worker_flush_nbx()\" or\n @ref ucp_ep_flush_nbx \"ucp_ep_flush_nbx()\", after completion of which the\n data in @e remote_addr is guaranteed to be available.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  buffer       Pointer to the local source address.\n @param [in]  count        Number of elements of type\n                           @ref ucp_request_param_t.datatype to put. If\n                           @ref ucp_request_param_t.datatype is not specified,\n                           the type defaults to ucp_dt_make_contig(1), which\n                           corresponds to byte elements.\n @param [in]  remote_addr  Pointer to the destination remote memory address\n                           to write to.\n @param [in]  rkey         Remote memory key associated with the\n                           remote memory address.\n @param [in]  param       Operation parameters, see @ref ucp_request_param_t\n\n @return UCS_OK               - The operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The operation failed.\n @return otherwise            - Operation was scheduled and can be\n                                completed at any point in time. The request handle\n                                is returned to the application in order to track\n                                progress of the operation. The application is\n                                responsible for releasing the handle using\n                                @ref ucp_request_free \"ucp_request_free()\" routine.\n\n @note Only the datatype ucp_dt_make_contig(1) is supported\n for @a param->datatype, see @ref ucp_dt_make_contig."]
     pub fn ucp_put_nbx(
         ep: ucp_ep_h,
         buffer: *const ::std::os::raw::c_void,
@@ -11480,6 +12681,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Non-blocking remote memory get operation.\n\n This routine initiates a load of a contiguous block of data that is\n described by the remote memory address @a remote_addr and the @ref ucp_rkey_h\n \"memory handle\" @a rkey in the local contiguous memory region described\n by @a buffer address. The routine returns immediately and @b does @b not\n guarantee that remote data is loaded and stored under the local address @e\n buffer. If the operation is completed immediately the routine return UCS_OK,\n otherwise UCS_INPROGRESS or an error is returned to user. If the get\n operation completes immediately, the routine returns UCS_OK and the\n call-back routine @a param.cb.send is @b not invoked. If the operation is\n @b not completed immediately and no error is reported, then the UCP library\n will schedule invocation of the call-back routine @a param.cb.send upon\n completion of the get operation. In other words, the completion of a get\n operation can be signaled by the return code or execution of the call-back.\n\n @note A user can use @ref ucp_worker_flush_nb \"ucp_worker_flush_nb()\"\n in order to guarantee re-usability of the source address @e buffer.\n @note The completion of a get operation signals the local @e buffer holds the\n the expected data and that both local @e buffer and remote @e remote_addr are\n safe to be reused, unlike with @ref ucp_put_nbx \"ucp_put_nbx\" where the use\n of @ref ucp_worker_flush_nbx \"ucp_worker_flush_nbx()\" or\n @ref ucp_ep_flush_nbx \"ucp_ep_flush_nbx()\" is required before the remote data\n is available.\n\n @param [in]  ep           Remote endpoint handle.\n @param [in]  buffer       Pointer to the local destination address.\n @param [in]  count        Number of elements of type\n                           @ref ucp_request_param_t.datatype to put. If\n                           @ref ucp_request_param_t.datatype is not specified,\n                           the type defaults to ucp_dt_make_contig(1), which\n                           corresponds to byte elements.\n @param [in]  remote_addr  Pointer to the source remote memory address\n                           to read from.\n @param [in]  rkey         Remote memory key associated with the\n                           remote memory address.\n @param [in]  param        Operation parameters, see @ref ucp_request_param_t.\n\n @return UCS_OK               - The operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The operation failed.\n @return otherwise            - Operation was scheduled and can be\n                                completed at any point in time. The request handle\n                                is returned to the application in order to track\n                                progress of the operation. The application is\n                                responsible for releasing the handle using\n                                @ref ucp_request_free \"ucp_request_free()\" routine.\n\n @note Only the datatype ucp_dt_make_contig(1) is supported\n for @a param->datatype, see @ref ucp_dt_make_contig."]
     pub fn ucp_get_nbx(
         ep: ucp_ep_h,
         buffer: *mut ::std::os::raw::c_void,
@@ -11490,6 +12692,7 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Post an atomic memory operation.\n\n This routine will post an atomic operation to remote memory.\n The remote value is described by the combination of the remote\n memory address @a remote_addr and the @ref ucp_rkey_h \"remote memory handle\"\n @a rkey. The routine is non-blocking and therefore returns immediately.\n However, the actual atomic operation may be delayed. In order to enable\n fetching semantics for atomic operations user has to specify\n @a param.reply_buffer. Please see @ref atomic_ops \"table\" below for more\n details.\n\n @note    The user should not modify any part of the @a buffer (or also\n          @a param->reply_buffer for fetch operations), until the operation\n          completes.\n @note    Only ucp_dt_make_config(4) and ucp_dt_make_contig(8) are supported\n          in @a param->datatype, see @ref ucp_dt_make_contig. Also, currently\n          atomic operations can handle one element only. Thus, @a count\n          argument must be set to 1.\n\n <table>\n <caption id=\"atomic_ops\">Atomic Operations Semantic</caption>\n <tr> <th align=\"center\">Atomic Operation <th align=\"center\">Pseudo code\n      <th align=\"center\">X <th align=\"center\">Y <th align=\"center\">Z\n      <th align=\"center\">Result\n <tr> <td align=\"left\">@ref UCP_ATOMIC_OP_ADD <td align=\"left\"> Result=Y; Y+=X\n      <td align=\"left\">buffer<td align=\"left\">remote_addr<td align=\"center\">-\n      <td align=\"left\">param.reply_buffer(optional)\n <tr> <td align=\"left\">@ref UCP_ATOMIC_OP_SWAP <td align=\"left\"> Result=Y; Y=X\n      <td align=\"left\">buffer<td align=\"left\">remote_addr <td align=\"center\">-\n      <td align=\"left\">param.reply_buffer\n <tr> <td align=\"left\">@ref UCP_ATOMIC_OP_CSWAP\n      <td align=\"left\">Result=Y; if (X==Y) then Y=Z<td align=\"left\">buffer\n      <td align=\"left\">remote_addr <td align=\"left\">param.reply_buffer\n      <td align=\"left\">param.reply_buffer\n <tr> <td align=\"left\">@ref UCP_ATOMIC_OP_AND <td align=\"left\"> Result=Y; Y&=X\n      <td align=\"left\">buffer<td align=\"left\">remote_addr <td align=\"center\">-\n      <td align=\"left\">param.reply_buffer(optional)\n <tr> <td align=\"left\">@ref UCP_ATOMIC_OP_OR <td align=\"left\"> Result=Y; Y|=X\n      <td align=\"left\">buffer<td align=\"left\">remote_addr <td align=\"center\">-\n      <td align=\"left\">param.reply_buffer(optional)\n <tr> <td align=\"left\">@ref UCP_ATOMIC_OP_XOR <td align=\"left\"> Result=Y; Y^=X\n      <td align=\"left\">buffer<td align=\"left\">remote_addr <td align=\"center\">-\n      <td align=\"left\">param.reply_buffer(optional)\n </table>\n\n @param [in] ep          UCP endpoint.\n @param [in] opcode      One of @ref ucp_atomic_op_t.\n @param [in] buffer      Address of operand for the atomic operation. See\n                         @ref atomic_ops \"Atomic Operations Semantic table\"\n                         for exact usage by different atomic operations.\n @param [in] count       Number of elements in @a buffer and @a result. The\n                         size of each element is specified by\n                         @ref ucp_request_param_t.datatype\n @param [in] remote_addr Remote address to operate on.\n @param [in] rkey        Remote key handle for the remote memory address.\n @param [in] param       Operation parameters, see @ref ucp_request_param_t.\n\n @return NULL                 - The operation completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The operation failed.\n @return otherwise            - Operation was scheduled and can be\n                                completed at some time in the future. The\n                                request handle is returned to the application\n                                in order to track progress of the operation."]
     pub fn ucp_atomic_op_nbx(
         ep: ucp_ep_h,
         opcode: ucp_atomic_op_t,
@@ -11501,33 +12704,41 @@ extern "C" {
     ) -> ucs_status_ptr_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Check the status of non-blocking request.\n\n This routine checks the state of the request and returns its current status.\n Any value different from UCS_INPROGRESS means that request is in a completed\n state.\n\n @param [in]  request     Non-blocking request to check.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_request_check_status(request: *mut ::std::os::raw::c_void) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Check the status and currently available state of non-blocking request\n        returned from @ref ucp_tag_recv_nb routine.\n\n This routine checks the state and returns current status of the request\n returned from @ref ucp_tag_recv_nb routine or the user allocated request\n for @ref ucp_tag_recv_nbr. Any value different from UCS_INPROGRESS means\n that the request is in a completed state.\n\n @param [in]  request     Non-blocking request to check.\n @param [out] info        It is filled with the details about the message\n                          available at the moment of calling.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_tag_recv_request_test(
         request: *mut ::std::os::raw::c_void,
         info: *mut ucp_tag_recv_info_t,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Check the status and currently available state of non-blocking request\n        returned from @ref ucp_stream_recv_nb routine.\n\n This routine checks the state and returns current status of the request\n returned from @ref ucp_stream_recv_nb routine. Any value different from\n UCS_INPROGRESS means that the request is in a completed state.\n\n @param [in]  request     Non-blocking request to check.\n @param [out] length_p    The size of the received data in bytes. This value\n                          is only valid if the status is UCS_OK. If valid, it\n                          is always an integral multiple of the datatype size\n                          associated with the request.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_stream_recv_request_test(
         request: *mut ::std::os::raw::c_void,
         length_p: *mut usize,
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Cancel an outstanding communications request.\n\n @param [in]  worker       UCP worker.\n @param [in]  request      Non-blocking request to cancel.\n\n This routine tries to cancels an outstanding communication request.  After\n calling this routine, the @a request will be in completed or canceled (but\n not both) state regardless of the status of the target endpoint associated\n with the communication request.  If the request is completed successfully,\n the @ref ucp_send_callback_t \"send\" or @ref ucp_tag_recv_callback_t\n \"receive\" completion callbacks (based on the type of the request) will be\n called with the @a status argument of the callback set to UCS_OK, and in a\n case it is canceled the @a status argument is set to UCS_ERR_CANCELED.  It is\n important to note that in order to release the request back to the library\n the application is responsible for calling @ref ucp_request_free\n \"ucp_request_free()\"."]
     pub fn ucp_request_cancel(worker: ucp_worker_h, request: *mut ::std::os::raw::c_void);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Release UCP data buffer returned by @ref ucp_stream_recv_data_nb.\n\n @param [in]  ep        Endpoint @a data received from.\n @param [in]  data      Data pointer to release, which was returned from\n                        @ref ucp_stream_recv_data_nb.\n\n This routine releases internal UCP data buffer returned by\n @ref ucp_stream_recv_data_nb when @a data is processed, the application can't\n use this buffer after calling this function."]
     pub fn ucp_stream_data_release(ep: ucp_ep_h, data: *mut ::std::os::raw::c_void);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Release a communications request.\n\n @param [in]  request      Non-blocking request to release.\n\n This routine releases the non-blocking request back to the library, regardless\n of its current state. Communications operations associated with this request\n will make progress internally, however no further notifications or callbacks\n will be invoked for this request."]
     pub fn ucp_request_free(request: *mut ::std::os::raw::c_void);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_COMM\n @brief Create an empty communications request.\n\n @param [in]  worker       UCP worker.\n\n @return Error code as defined by @ref ucs_status_t\n\n This routine creates request which may be used in functions\n @ref ucp_tag_send_nbx, @ref ucp_tag_recv_nbx, etc. The application\n is responsible for releasing the handle using the @ref ucp_request_free\n routine"]
     pub fn ucp_request_alloc(worker: ucp_worker_h) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_DATATYPE\n @brief Create a generic datatype.\n\n This routine create a generic datatype object.\n The generic datatype is described by the @a ops @ref ucp_generic_dt_ops_t\n \"object\" which provides a table of routines defining the operations for\n generic datatype manipulation. Typically, generic datatypes are used for\n integration with datatype engines provided with MPI implementations (MPICH,\n Open MPI, etc).\n The application is responsible for releasing the @a datatype_p  object using\n @ref ucp_dt_destroy \"ucp_dt_destroy()\" routine.\n\n @param [in]  ops          Generic datatype function table as defined by\n                           @ref ucp_generic_dt_ops_t .\n @param [in]  context      Application defined context passed to this\n                           routine.  The context is passed as a parameter\n                           to the routines in the @a ops table.\n @param [out] datatype_p   A pointer to datatype object.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_dt_create_generic(
         ops: *const ucp_generic_dt_ops_t,
         context: *mut ::std::os::raw::c_void,
@@ -11535,31 +12746,43 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_DATATYPE\n @brief Destroy a datatype and release its resources.\n\n This routine destroys the @a datatype object and\n releases any resources that are associated with the object.\n The @a datatype object must be allocated using @ref ucp_dt_create_generic\n \"ucp_dt_create_generic()\" routine.\n\n @warning\n @li Once the @a datatype object is released an access to this object may\n cause an undefined failure.\n\n @param [in]  datatype     Datatype object to destroy."]
     pub fn ucp_dt_destroy(datatype: ucp_datatype_t);
 }
 extern "C" {
+    #[doc = " @ingroup UCP_DATATYPE\n @brief Query attributes of a datatype.\n\n This routine fetches information about the attributes of a datatype.\n When @ref UCP_DATATYPE_ATTR_FIELD_PACKED_SIZE is set in @a field_mask of @a attr,\n the field @a packed_size is set to the packed size (bytes) of the datatype.\n\n @param [in]    datatype   Datatype object to query.\n @param [inout] attr       Filled with attributes of the datatype.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_dt_query(datatype: ucp_datatype_t, attr: *mut ucp_datatype_attr_t) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n\n @brief Assures ordering between non-blocking operations\n\n This routine ensures ordering of non-blocking communication operations on\n the @ref ucp_worker_h \"UCP worker\". Communication operations issued on a\n particular endpoint created on the @a worker prior to this call are\n guaranteed to be completed before any communication operations issued on the\n same endpoint after this call.\n\n @note The primary difference between @ref ucp_worker_fence \"ucp_worker_fence()\"\n and the @ref ucp_worker_flush_nb \"ucp_worker_flush_nb()\" is the fact the fence\n routine does not guarantee completion of the operations on the call return but\n only ensures the order between communication operations. The\n @ref ucp_worker_flush_nb \"flush\" operation on return guarantees that all\n operations are completed and corresponding memory regions were updated.\n\n @param [in] worker        UCP worker.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_worker_fence(worker: ucp_worker_h) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @ingroup UCP_WORKER\n\n @brief Flush outstanding AMO and RMA operations on the @ref ucp_worker_h\n \"worker\"\n\n This routine flushes all outstanding AMO and RMA communications on the\n @ref ucp_worker_h \"worker\". All the AMO and RMA operations issued on the\n @a worker prior to this call are completed both at the origin and at the\n target when this call returns.\n\n @note For description of the differences between @ref ucp_worker_flush_nb\n \"flush\" and @ref ucp_worker_fence \"fence\" operations please see\n @ref ucp_worker_fence \"ucp_worker_fence()\"\n\n @param [in] worker    UCP worker.\n @param [in] param     Operation parameters, see @ref ucp_request_param_t\n\n @return NULL                 - The flush operation was completed immediately.\n @return UCS_PTR_IS_ERR(_ptr) - The flush operation failed.\n @return otherwise            - Flush operation was scheduled and can be\n                                completed in any point in time. The request\n                                handle is returned to the application in order\n                                to track progress."]
     pub fn ucp_worker_flush_nbx(
         worker: ucp_worker_h,
         param: *const ucp_request_param_t,
     ) -> ucs_status_ptr_t;
 }
 impl ucp_ep_attr_field {
+    #[doc = "< UCP endpoint name"]
     pub const UCP_EP_ATTR_FIELD_NAME: ucp_ep_attr_field = ucp_ep_attr_field(1);
 }
 impl ucp_ep_attr_field {
+    #[doc = "< Sockaddr used by the endpoint"]
     pub const UCP_EP_ATTR_FIELD_LOCAL_SOCKADDR: ucp_ep_attr_field = ucp_ep_attr_field(2);
 }
 impl ucp_ep_attr_field {
+    #[doc = "< Sockaddr the endpoint is connected to"]
     pub const UCP_EP_ATTR_FIELD_REMOTE_SOCKADDR: ucp_ep_attr_field = ucp_ep_attr_field(4);
 }
 impl ucp_ep_attr_field {
+    #[doc = "< Transport and device used by endpoint"]
     pub const UCP_EP_ATTR_FIELD_TRANSPORTS: ucp_ep_attr_field = ucp_ep_attr_field(8);
+}
+impl ucp_ep_attr_field {
+    #[doc = "< User data associated with the endpoint"]
+    pub const UCP_EP_ATTR_FIELD_USER_DATA: ucp_ep_attr_field = ucp_ep_attr_field(16);
 }
 impl ::std::ops::BitOr<ucp_ep_attr_field> for ucp_ep_attr_field {
     type Output = Self;
@@ -11588,16 +12811,25 @@ impl ::std::ops::BitAndAssign for ucp_ep_attr_field {
     }
 }
 #[repr(transparent)]
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP endpoint attributes field mask.\n\n The enumeration allows specifying which fields in @ref ucp_ep_attr_t are\n present. It is used to enable backward compatibility support."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ucp_ep_attr_field(pub ::std::os::raw::c_uint);
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP endpoint attributes.\n\n The structure defines the attributes that characterize the particular\n endpoint."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucp_ep_attr {
+    #[doc = " Mask of valid fields in this structure, using bits from\n @ref ucp_ep_attr_field.\n Fields not specified in this mask will be ignored.\n Provides ABI compatibility with respect to adding new fields."]
     pub field_mask: u64,
+    #[doc = " Endpoint name. Tracing and analysis tools can identify the endpoint using\n this name."]
     pub name: [::std::os::raw::c_char; 32usize],
+    #[doc = " Local socket address for this endpoint. Valid only for endpoints created\n by connecting to a socket address.\n If this field is specified for an endpoint not connected to a socket address,\n UCS_ERR_NOT_CONNECTED will be returned."]
     pub local_sockaddr: sockaddr_storage,
+    #[doc = " Remote socket address this endpoint is connected to. Valid only for endpoints\n created by connecting to a socket address.\n If this field is specified for an endpoint not connected to a socket address,\n UCS_ERR_NOT_CONNECTED will be returned."]
     pub remote_sockaddr: sockaddr_storage,
+    #[doc = " Structure defining an array containing transport and device names used\n by this endpoint. The caller is responsible for allocation and\n deallocation of this array."]
     pub transports: ucp_transports_t,
+    #[doc = " User data associated with an endpoint passed in\n @ref ucp_ep_params_t::user_data."]
+    pub user_data: *mut ::std::os::raw::c_void,
 }
 #[test]
 fn bindgen_test_layout_ucp_ep_attr() {
@@ -11605,7 +12837,7 @@ fn bindgen_test_layout_ucp_ep_attr() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::std::mem::size_of::<ucp_ep_attr>(),
-        320usize,
+        328usize,
         concat!("Size of: ", stringify!(ucp_ep_attr))
     );
     assert_eq!(
@@ -11663,12 +12895,25 @@ fn bindgen_test_layout_ucp_ep_attr() {
             stringify!(transports)
         )
     );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).user_data) as usize - ptr as usize },
+        320usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(ucp_ep_attr),
+            "::",
+            stringify!(user_data)
+        )
+    );
 }
+#[doc = " @ingroup UCP_ENDPOINT\n @brief UCP endpoint attributes.\n\n The structure defines the attributes that characterize the particular\n endpoint."]
 pub type ucp_ep_attr_t = ucp_ep_attr;
 extern "C" {
+    #[doc = " @ingroup UCP_ENDPOINT\n @brief Get attributes of a given endpoint.\n\n This routine fetches information about the endpoint.\n\n @param [in]  ep   Endpoint object to query.\n @param [out] attr Filled with attributes of the endpoint.\n\n @return Error code as defined by @ref ucs_status_t"]
     pub fn ucp_ep_query(ep: ucp_ep_h, attr: *mut ucp_ep_attr_t) -> ucs_status_t;
 }
 #[repr(u32)]
+#[doc = " @brief Memory event types"]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucm_event_type {
     UCM_EVENT_NONE = 0,
@@ -11687,8 +12932,10 @@ pub enum ucm_event_type {
     UCM_EVENT_FLAG_NO_INSTALL = 16777216,
     UCM_EVENT_FLAG_EXISTING_ALLOC = 33554432,
 }
+#[doc = " @brief Memory event types"]
 pub use self::ucm_event_type as ucm_event_type_t;
 #[repr(u32)]
+#[doc = " @brief MMAP hook modes"]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucm_mmap_hook_mode {
     UCM_MMAP_HOOK_NONE = 0,
@@ -11696,8 +12943,10 @@ pub enum ucm_mmap_hook_mode {
     UCM_MMAP_HOOK_BISTRO = 2,
     UCM_MMAP_HOOK_LAST = 3,
 }
+#[doc = " @brief MMAP hook modes"]
 pub use self::ucm_mmap_hook_mode as ucm_mmap_hook_mode_t;
 #[repr(u32)]
+#[doc = " @brief UCM module unload prevent mode"]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ucm_module_unload_prevent_mode {
     UCM_UNLOAD_PREVENT_MODE_LAZY = 0,
@@ -11705,7 +12954,9 @@ pub enum ucm_module_unload_prevent_mode {
     UCM_UNLOAD_PREVENT_MODE_NONE = 2,
     UCM_UNLOAD_PREVENT_MODE_LAST = 3,
 }
+#[doc = " @brief UCM module unload prevent mode"]
 pub use self::ucm_module_unload_prevent_mode as ucm_module_unload_prevent_mode_t;
+#[doc = " @brief Memory event parameters and result."]
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union ucm_event {
@@ -11879,6 +13130,7 @@ pub struct ucm_event__bindgen_ty_3 {
     pub old_size: usize,
     pub new_size: usize,
     pub flags: ::std::os::raw::c_int,
+    pub new_address: *mut ::std::os::raw::c_void,
 }
 #[test]
 fn bindgen_test_layout_ucm_event__bindgen_ty_3() {
@@ -11887,7 +13139,7 @@ fn bindgen_test_layout_ucm_event__bindgen_ty_3() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::std::mem::size_of::<ucm_event__bindgen_ty_3>(),
-        40usize,
+        48usize,
         concat!("Size of: ", stringify!(ucm_event__bindgen_ty_3))
     );
     assert_eq!(
@@ -11943,6 +13195,16 @@ fn bindgen_test_layout_ucm_event__bindgen_ty_3() {
             stringify!(ucm_event__bindgen_ty_3),
             "::",
             stringify!(flags)
+        )
+    );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).new_address) as usize - ptr as usize },
+        40usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(ucm_event__bindgen_ty_3),
+            "::",
+            stringify!(new_address)
         )
     );
 }
@@ -12420,7 +13682,9 @@ fn bindgen_test_layout_ucm_event() {
         )
     );
 }
+#[doc = " @brief Memory event parameters and result."]
 pub type ucm_event_t = ucm_event;
+#[doc = " @brief Global UCM configuration.\n\n Can be safely modified before using UCM functions."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ucm_global_config {
@@ -12429,11 +13693,12 @@ pub struct ucm_global_config {
     pub mmap_hook_mode: ucm_mmap_hook_mode_t,
     pub enable_malloc_hooks: ::std::os::raw::c_int,
     pub enable_malloc_reloc: ::std::os::raw::c_int,
-    pub cuda_hook_modes: ::std::os::raw::c_int,
+    pub cuda_hook_modes: u64,
     pub enable_dynamic_mmap_thresh: ::std::os::raw::c_int,
     pub alloc_alignment: usize,
     pub dlopen_process_rpath: ::std::os::raw::c_int,
     pub module_unload_prevent_mode: ::std::os::raw::c_int,
+    pub bistro_force_far_jump: ::std::os::raw::c_int,
 }
 #[test]
 fn bindgen_test_layout_ucm_global_config() {
@@ -12441,7 +13706,7 @@ fn bindgen_test_layout_ucm_global_config() {
     let ptr = UNINIT.as_ptr();
     assert_eq!(
         ::std::mem::size_of::<ucm_global_config>(),
-        48usize,
+        64usize,
         concat!("Size of: ", stringify!(ucm_global_config))
     );
     assert_eq!(
@@ -12501,7 +13766,7 @@ fn bindgen_test_layout_ucm_global_config() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).cuda_hook_modes) as usize - ptr as usize },
-        20usize,
+        24usize,
         concat!(
             "Offset of field: ",
             stringify!(ucm_global_config),
@@ -12511,7 +13776,7 @@ fn bindgen_test_layout_ucm_global_config() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).enable_dynamic_mmap_thresh) as usize - ptr as usize },
-        24usize,
+        32usize,
         concat!(
             "Offset of field: ",
             stringify!(ucm_global_config),
@@ -12521,7 +13786,7 @@ fn bindgen_test_layout_ucm_global_config() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).alloc_alignment) as usize - ptr as usize },
-        32usize,
+        40usize,
         concat!(
             "Offset of field: ",
             stringify!(ucm_global_config),
@@ -12531,7 +13796,7 @@ fn bindgen_test_layout_ucm_global_config() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).dlopen_process_rpath) as usize - ptr as usize },
-        40usize,
+        48usize,
         concat!(
             "Offset of field: ",
             stringify!(ucm_global_config),
@@ -12541,7 +13806,7 @@ fn bindgen_test_layout_ucm_global_config() {
     );
     assert_eq!(
         unsafe { ::std::ptr::addr_of!((*ptr).module_unload_prevent_mode) as usize - ptr as usize },
-        44usize,
+        52usize,
         concat!(
             "Offset of field: ",
             stringify!(ucm_global_config),
@@ -12549,11 +13814,23 @@ fn bindgen_test_layout_ucm_global_config() {
             stringify!(module_unload_prevent_mode)
         )
     );
+    assert_eq!(
+        unsafe { ::std::ptr::addr_of!((*ptr).bistro_force_far_jump) as usize - ptr as usize },
+        56usize,
+        concat!(
+            "Offset of field: ",
+            stringify!(ucm_global_config),
+            "::",
+            stringify!(bistro_force_far_jump)
+        )
+    );
 }
+#[doc = " @brief Global UCM configuration.\n\n Can be safely modified before using UCM functions."]
 pub type ucm_global_config_t = ucm_global_config;
 extern "C" {
     pub static mut ucm_global_opts: ucm_global_config_t;
 }
+#[doc = " @brief Memory event callback.\n\n  This type describes a callback which handles memory events in the current process.\n\n @param [in]     event_type  Type of the event being fired. see @ref ucm_event_type_t.\n @param [inout]  event       Event information. This structure can be updated by\n                               this callback, as described below.\n @param [in]     arg         User-defined argument as passed to @ref ucm_set_event_handler.\n\n\n  Events are dispatched in order of callback priority (low to high).\n\n The fields of the relevant part of the union are initialized as follows:\n  - \"result\" - to an invalid erroneous return value (depends on the specific event).\n  - the rest - to the input parameters of the event.\n\n  The callback is allowed to modify the fields, and those modifications will\n be passed to the next callback. Also, the callback is allowed to modify the\n result, but **only if it's currently invalid**. A valid result indicates that\n a previous callback already performed the requested memory operation, so a\n callback should **refrain from actions with side-effects** in this case.\n\n  If the result is still invalid after all callbacks are called, the parameters,\n possibly modified by the callbacks, will be passed to the original handler.\n\n\n Important Note: The callback must not call any memory allocation routines, or\n       anything which may trigger or wait for memory allocation, because it\n       may lead to deadlock or infinite recursion.\n\n @todo describe use cases\n"]
 pub type ucm_event_callback_t = ::std::option::Option<
     unsafe extern "C" fn(
         event_type: ucm_event_type_t,
@@ -12562,9 +13839,11 @@ pub type ucm_event_callback_t = ::std::option::Option<
     ),
 >;
 extern "C" {
+    #[doc = " Set UCM library configuration.\n\n @param [in]  ucm_opts   UCM library global configuration."]
     pub fn ucm_set_global_opts(ucm_opts: *const ucm_global_config_t);
 }
 extern "C" {
+    #[doc = " @brief Install a handler for memory events.\n\n @param [in]  events     Bit-mask of events to handle.\n @param [in]  priority   Priority value which defines the order in which event\n                          callbacks are called.\n                           <  0 - called before the original implementation,\n                           >= 0 - called after the original implementation.\n @param [in]  cb         Event-handling callback.\n @param [in]  arg        User-defined argument for the callback.\n\n @note If UCM_EVENT_FLAG_NO_INSTALL flag is passed in @a events argument,\n       only @cb handler will be registered for @a events. No memory\n       events/hooks will be installed.\n\n @return Status code."]
     pub fn ucm_set_event_handler(
         events: ::std::os::raw::c_int,
         priority: ::std::os::raw::c_int,
@@ -12573,6 +13852,7 @@ extern "C" {
     ) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @brief Remove a handler for memory events.\n\n @param [in]  events     Which events to remove. The handler is removed\n                          completely when all its events are removed.\n @param [in]  cb         Event-handling callback.\n @param [in]  arg        User-defined argument for the callback."]
     pub fn ucm_unset_event_handler(
         events: ::std::os::raw::c_int,
         cb: ucm_event_callback_t,
@@ -12580,18 +13860,23 @@ extern "C" {
     );
 }
 extern "C" {
+    #[doc = " @brief Add memory events to the external events list.\n\n When the event is set to be external, it means that user is responsible for\n handling it. So, setting a handler for external event will not trigger\n installing of UCM memory hooks (if they were not installed before). In this\n case the corresponding UCM function needs to be invoked to trigger event\n handlers.\n Usage example is when the user disables UCM memory hooks (he may have its\n own hooks, like Open MPI), but it wants to use some UCM based functionality,\n e.g. IB registration cache. IB registration cache needs to be notified about\n UCM_EVENT_VM_UNMAPPED events, therefore it adds specific handler for it.\n In this case user needs to declare UCM_EVENT_VM_UNMAPPED event as external\n and explicitly call ucm_vm_munmap() when some memory release operation\n occurs.\n\n @param [in]  events    Bit-mask of events which are supposed to be handled\n                        externally.\n\n @note To take an effect, the event should be set external prior to adding\n       event handlers for it."]
     pub fn ucm_set_external_event(events: ::std::os::raw::c_int);
 }
 extern "C" {
+    #[doc = " @brief Remove memory events from the external events list.\n\n When the event is removed from the external events list, any subsequent call\n to ucm_set_event_handler() for that event will trigger installing of UCM\n memory hooks (if they are enabled and were not installed before).\n\n @param [in]  events     Which events to remove from the external events list."]
     pub fn ucm_unset_external_event(events: ::std::os::raw::c_int);
 }
 extern "C" {
+    #[doc = " @brief Test event handlers\n\n This routine checks if event handlers are called when corresponding system API\n is invoked.\n\n @param [in]  events    Bit-mask of events which are supposed to be handled\n                        externally.\n\n @return Status code."]
     pub fn ucm_test_events(events: ::std::os::raw::c_int) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @brief Test event external handlers\n\n This routine checks if external events, as set by @ref ucm_set_external_event,\n are actually being reported (by calling APIs such as @ref ucm_vm_munmap).\n\n @param [in]  events    Bit-mask of events which are supposed to be handled\n                        externally.\n\n @return Status code."]
     pub fn ucm_test_external_events(events: ::std::os::raw::c_int) -> ucs_status_t;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref mmap without triggering events."]
     pub fn ucm_orig_mmap(
         addr: *mut ::std::os::raw::c_void,
         length: usize,
@@ -12602,20 +13887,24 @@ extern "C" {
     ) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref munmap without triggering events."]
     pub fn ucm_orig_munmap(
         addr: *mut ::std::os::raw::c_void,
         length: usize,
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref mremap without triggering events."]
     pub fn ucm_orig_mremap(
         old_address: *mut ::std::os::raw::c_void,
         old_size: usize,
         new_size: usize,
         flags: ::std::os::raw::c_int,
+        new_address: *mut ::std::os::raw::c_void,
     ) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref shmat without triggering events."]
     pub fn ucm_orig_shmat(
         shmid: ::std::os::raw::c_int,
         shmaddr: *const ::std::os::raw::c_void,
@@ -12623,15 +13912,19 @@ extern "C" {
     ) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref shmdt without triggering events."]
     pub fn ucm_orig_shmdt(shmaddr: *const ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref sbrk without triggering events."]
     pub fn ucm_orig_sbrk(increment: isize) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref brk without triggering events."]
     pub fn ucm_orig_brk(addr: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref madvise without triggering events."]
     pub fn ucm_orig_madvise(
         addr: *mut ::std::os::raw::c_void,
         length: usize,
@@ -12639,6 +13932,7 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref mmap and all handlers\n associated with it."]
     pub fn ucm_mmap(
         addr: *mut ::std::os::raw::c_void,
         length: usize,
@@ -12649,23 +13943,29 @@ extern "C" {
     ) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref munmap and all handlers\n associated with it."]
     pub fn ucm_munmap(addr: *mut ::std::os::raw::c_void, length: usize) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @brief Call the handlers registered for aggregated VM_MMAP event."]
     pub fn ucm_vm_mmap(addr: *mut ::std::os::raw::c_void, length: usize);
 }
 extern "C" {
+    #[doc = " @brief Call the handlers registered for aggregated VM_MUNMAP event."]
     pub fn ucm_vm_munmap(addr: *mut ::std::os::raw::c_void, length: usize);
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref mremap and all handlers\n associated with it."]
     pub fn ucm_mremap(
         old_address: *mut ::std::os::raw::c_void,
         old_size: usize,
         new_size: usize,
         flags: ::std::os::raw::c_int,
+        ...
     ) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref shmat and all handlers\n associated with it."]
     pub fn ucm_shmat(
         shmid: ::std::os::raw::c_int,
         shmaddr: *const ::std::os::raw::c_void,
@@ -12673,15 +13973,19 @@ extern "C" {
     ) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref shmdt and all handlers\n associated with it."]
     pub fn ucm_shmdt(shmaddr: *const ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref sbrk and all handlers\n associated with it."]
     pub fn ucm_sbrk(increment: isize) -> *mut ::std::os::raw::c_void;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref brk and all handlers\n associated with it."]
     pub fn ucm_brk(addr: *mut ::std::os::raw::c_void) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref madvise and all handlers\n associated with it."]
     pub fn ucm_madvise(
         addr: *mut ::std::os::raw::c_void,
         length: usize,
@@ -12689,6 +13993,7 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    #[doc = " @brief Call the original implementation of @ref dlopen and all handlers\n associated with it."]
     pub fn ucm_dlopen(
         filename: *const ::std::os::raw::c_char,
         flag: ::std::os::raw::c_int,

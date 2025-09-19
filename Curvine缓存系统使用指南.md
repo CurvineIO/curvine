@@ -408,54 +408,6 @@ model.fit(
 )
 ```
 
-##### 3. Jupyter Notebook 中的数据科学工作流
-
-```python
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
-import os
-
-# 直接读取 FUSE 挂载的数据文件
-# Curvine 自动处理缓存和数据一致性
-data_path = '/curvine-fuse/datasets/tabular/customer_data.csv'
-df = pd.read_csv(data_path)
-
-# 数据探索
-print(f"数据集大小: {df.shape}")
-print(f"数据类型:\n{df.dtypes}")
-
-# 数据预处理（结果可以保存回 FUSE 挂载点）
-processed_data_path = '/curvine-fuse/datasets/processed/customer_data_clean.csv'
-df_clean = df.dropna()
-df_clean.to_csv(processed_data_path, index=False)
-
-# 模型训练和保存
-from sklearn.ensemble import RandomForestClassifier
-import joblib
-
-# 训练模型
-model = RandomForestClassifier(n_estimators=100, random_state=42)
-model.fit(X_train, y_train)
-
-# 模型保存到 FUSE 挂载点，自动同步到 Curvine 集群
-model_path = '/curvine-fuse/models/customer_classification_v1.joblib'
-joblib.dump(model, model_path)
-
-# 实验结果记录
-results = {
-    'accuracy': model.score(X_test, y_test),
-    'timestamp': pd.Timestamp.now(),
-    'model_path': model_path
-}
-
-results_df = pd.DataFrame([results])
-results_df.to_csv('/curvine-fuse/experiments/results.csv', 
-                  mode='a', header=False, index=False)
-```
-
-
 ---
 
 ## 🗄️ 大数据生态集成
@@ -503,6 +455,124 @@ Curvine 与主流大数据框架无缝集成，提供透明的缓存加速能力
     <name>fs.cv.ml-cluster.master_addrs</name>
     <value>ml-master1:8995,ml-master2:8995,ml-master3:8995</value>
 </property>
+```
+
+
+### 🔄 UFS透明代理
+
+为了更好地支持现有Java应用无缝接入Curvine缓存，我们提供了UFS透明代理解决方案。该方案的核心优势是**零代码修改**，让现有应用可以立即享受Curvine的缓存加速效果。
+
+#### ✨ 透明代理核心特性
+
+- **🚫 零代码修改**: 保留原有所有接口不变，业务代码无需任何修改
+- **🔍 智能路径识别**: 仅在文件打开时判断路径是否已挂载到Curvine
+- **⚡ 自动缓存加速**: 已挂载路径自动启用缓存加速，未挂载路径走原生S3访问
+- **🔄 平滑切换**: 支持在运行时动态切换是否使用缓存，无需重启应用
+
+#### 🛠️ 配置方式
+
+只需要替换Hadoop配置中的S3FileSystem实现类：
+
+```xml
+<!-- 传统S3访问配置 -->
+<!--
+<property>
+    <name>fs.s3a.impl</name>
+    <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+</property>
+-->
+
+<!-- 替换为Curvine透明代理 -->
+<property>
+    <name>fs.s3a.impl</name>
+    <value>io.curvine.S3AProxyFileSystem</value>
+</property>
+
+<property>
+    <name>fs.cv.impl</name>
+    <value>io.curvine.CurvineFileSystem</value>
+</property>
+
+<!-- Curvine集群配置 -->
+<property>
+    <name>fs.curvine.master_addrs</name>
+    <value>master1:8995,master2:8995,master3:8995</value>
+</property>
+
+```
+
+#### 🔧 工作原理
+
+```mermaid
+sequenceDiagram
+    participant App as Java应用
+    participant Proxy as S3AProxyFileSystem
+    participant Curvine as Curvine集群
+    participant S3 as 原生S3
+
+    App->>Proxy: 打开文件(s3a://bucket/data/file.parquet)
+    Proxy->>Curvine: 查询路径挂载状态
+    alt 路径已挂载
+        Curvine-->>Proxy: 返回cv://路径
+        Proxy->>Curvine: 使用缓存访问
+        Curvine-->>App: 高速返回数据
+    else 路径未挂载
+        Curvine-->>Proxy: 路径未挂载
+        Proxy->>S3: 使用原生S3访问
+        S3-->>App: 返回数据
+    end
+```
+
+#### 🚀 使用示例
+
+**无需修改任何业务代码，原有代码直接享受加速：**
+
+```java
+// 业务代码完全不变！
+Configuration conf = new Configuration();
+FileSystem fs = FileSystem.get(URI.create("s3a://my-bucket/"), conf);
+
+// 这个路径如果已挂载到Curvine，自动享受缓存加速
+FSDataInputStream input = fs.open(new Path("s3a://my-bucket/warehouse/data.parquet"));
+
+// 这个路径如果未挂载，走原生S3访问
+FSDataInputStream input2 = fs.open(new Path("s3a://my-bucket/archive/old-data.parquet"));
+```
+
+**Spark/MapReduce代码示例：**
+
+```java
+// Spark代码无需任何修改
+Dataset<Row> df = spark.read()
+    .option("header", "true")
+    // 如果/warehouse/路径已挂载，自动使用缓存加速
+    .csv("s3a://data-lake/warehouse/customer_data/");
+    
+df.groupBy("region")
+  .agg(sum("revenue").alias("total_revenue"))
+  .orderBy(desc("total_revenue"))
+  .show(20);
+```
+
+**Python PySpark示例：**
+
+```python
+# Python代码也无需修改
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import sum, desc
+
+spark = SparkSession.builder.appName("TransparentCache").getOrCreate()
+
+# 自动判断是否使用缓存
+df = spark.read \
+    .option("header", "true") \
+    .csv("s3a://data-lake/analytics/events/")
+
+result = df.groupBy("event_type") \
+    .agg(sum("count").alias("total_events")) \
+    .orderBy(desc("total_events"))
+    
+result.show()
 ```
 
 ### Apache Spark 优化配置

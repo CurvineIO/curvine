@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use log::info;
 use orpc::common::Logger;
 use orpc::CommonResult;
@@ -15,6 +17,7 @@ fn test() -> CommonResult<()> {
     // 设置UCX环境变量以使用TCP传输
     unsafe { std::env::set_var("UCX_TLS", "tcp"); }
     unsafe { std::env::set_var("UCX_NET_DEVICES", "lo"); }
+    unsafe { std::env::set_var("UCX_LOG_LEVEL", "error"); }
     
     let context = Arc::new(UcpContext::new()?);
     let worker = UcpWorker::new(context)?;
@@ -37,8 +40,20 @@ fn test() -> CommonResult<()> {
     
     // 尝试连接（如果没有服务器会失败，但不应该是address family错误）
     match UcpEndpoint::connect(&worker, &ucs_addr) {
-        Ok(ep) => {
+        Ok(mut ep) => {
             info!("Connection successful!");
+
+            let buf = [0, 1, 2, 3];
+            ep.stream_send(&buf).unwrap();
+            // 给连接一些稳定时间
+            println!("🔄 连接稳定期...");
+            for i in 0..20 {
+                let count = worker.progress();
+                if count > 0 {
+                    println!("   连接稳定进度: {} operations (轮次 {})", count, i + 1);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             
             // 使用改进的发送方法
             println!("=== 发送消息 ===");
@@ -50,18 +65,22 @@ fn test() -> CommonResult<()> {
                 Err(e) => println!("❌ 消息发送失败: {:?}", e),
             }
 
-            // 最终确保所有操作完成
-            info!("Final cleanup progress...");
-            for i in 0..50 {
-                let count = worker.progress();
-                if count > 0 {
-                    info!("Final progress: {} operations (round {})", count, i + 1);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            // 使用安全关闭方法
+            info!("🔒 安全关闭endpoint...");
+            match ep.close_safely(&worker) {
+                Ok(_) => info!("✅ Endpoint安全关闭成功"),
+                Err(e) => info!("❌ Endpoint关闭失败: {:?}", e),
             }
             
-            info!("All messages sent, connection will close...");
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            // 最终清理
+            info!("🧹 最终清理...");
+            for i in 0..5 {
+                let count = worker.progress();
+                if count > 0 {
+                    info!("最终清理: {} operations (轮次 {})", count, i + 1);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
         Err(e) => {
             info!("Connection failed (expected without server): {:?}", e);
@@ -71,6 +90,8 @@ fn test() -> CommonResult<()> {
                     "Should not have 'address family: 0' error anymore");
         }
     }
+
+    thread::sleep(Duration::from_secs(20));
 
     Ok(())
 }
