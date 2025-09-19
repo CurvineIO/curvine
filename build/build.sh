@@ -99,6 +99,7 @@ print_help() {
   echo "                          - opendal-gcs: OpenDAL GCS"
   echo
   echo "  -d, --debug           Build in debug mode (default: release mode)"
+  echo "  -s, --static          Build static binaries using musl target"
   echo "  -z, --zip             Create zip archive"
   echo "  -h, --help            Show this help message"
   echo
@@ -106,6 +107,7 @@ print_help() {
   echo "  $0                                      # Build all packages in release mode with opendal-s3"
   echo "  $0 --package core --ufs s3             # Build core packages with server, client and cli"
   echo "  $0 -p web --package fuse --debug       # Build web and fuse in debug mode"
+  echo "  $0 --package server --static           # Build server package as static binary"
   echo "  $0 --package all --ufs opendal-s3 -z   # Build all packages with OpenDAL S3 and create zip"
 }
 
@@ -130,9 +132,11 @@ PROFILE="--release"
 declare -a PACKAGES=("all")  # Default to build all packages
 declare -a UFS_TYPES=("s3")  # Default UFS type
 CRATE_ZIP=""
+STATIC_BUILD=""
+CARGO_TARGET=""
 
 # Parse command line arguments
-TEMP=$(getopt -o p:u:dzhv --long package:,ufs:,debug,zip,help -n "$0" -- "$@")
+TEMP=$(getopt -o p:u:dszhv --long package:,ufs:,debug,static,zip,help -n "$0" -- "$@")
 if [ $? != 0 ] ; then print_help ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -153,6 +157,11 @@ while true ; do
       ;;
     -d|--debug)
       PROFILE=""
+      shift
+      ;;
+    -s|--static)
+      STATIC_BUILD="yes"
+      CARGO_TARGET="--target x86_64-unknown-linux-musl"
       shift
       ;;
     -z|--zip)
@@ -268,6 +277,11 @@ fi
 # Base command
 cmd="cargo build $PROFILE"
 
+# Add target for static build
+if [ -n "$CARGO_TARGET" ]; then
+  cmd="$cmd $CARGO_TARGET"
+fi
+
 # Add package arguments if any
 if [ ${#RUST_BUILD_ARGS[@]} -gt 0 ]; then
   cmd="$cmd ${RUST_BUILD_ARGS[@]}"
@@ -332,6 +346,25 @@ if [ ${#PACKAGES[@]} -eq 1 ] && [ "${PACKAGES[0]}" = "web" ]; then
   echo "Only building web module, skipping cargo build..."
 else
   echo "Building crates with command: $cmd"
+
+  # Set environment variables for static build
+  if [ "$STATIC_BUILD" = "yes" ]; then
+    export RUSTFLAGS="-C target-feature=+crt-static"
+    # Use the downloaded musl cross-compiler if available, otherwise fall back to system musl-gcc
+    if command -v x86_64-linux-musl-gcc > /dev/null 2>&1; then
+      export CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc
+      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc
+      echo "Static build enabled with musl cross-compiler"
+    elif command -v musl-gcc > /dev/null 2>&1; then
+      export CC_x86_64_unknown_linux_musl=musl-gcc
+      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+      echo "Static build enabled with system musl-gcc"
+    else
+      echo "Warning: No musl compiler found, using default settings"
+      echo "Static build enabled with default musl target"
+    fi
+  fi
+
   eval "$cmd"
 
   if [ $? -ne 0 ]; then
@@ -342,7 +375,21 @@ fi
 
 # Copy all built binaries
 for target in "${COPY_TARGETS[@]}"; do
-  cp -f "$FS_HOME"/target/${PROFILE#--}/${target} "$DIST_DIR"/lib
+  if [ "$STATIC_BUILD" = "yes" ]; then
+    # Try musl target first, fallback to regular target
+    if [ -f "$FS_HOME/target/x86_64-unknown-linux-musl/${PROFILE#--}/${target}" ]; then
+      cp -f "$FS_HOME"/target/x86_64-unknown-linux-musl/${PROFILE#--}/${target} "$DIST_DIR"/lib
+      echo "Copied static binary: ${target} (musl target)"
+    elif [ -f "$FS_HOME/target/${PROFILE#--}/${target}" ]; then
+      cp -f "$FS_HOME"/target/${PROFILE#--}/${target} "$DIST_DIR"/lib
+      echo "Copied binary: ${target} (regular target, may not be fully static)"
+    else
+      echo "Warning: Binary ${target} not found in either musl or regular target directory"
+    fi
+  else
+    cp -f "$FS_HOME"/target/${PROFILE#--}/${target} "$DIST_DIR"/lib
+    echo "Copied binary: ${target}"
+  fi
 done
 
 # Build optional non-rust packages
@@ -356,12 +403,17 @@ fi
 
 if should_build_package "java"; then
   mkdir -p "$FS_HOME"/curvine-libsdk/java/native
-  
+
   # Handle java native library
-  if [ -e "$FS_HOME/target/${PROFILE#--}/curvine_libsdk.dll" ]; then
-    cp -f "$FS_HOME/target/${PROFILE#--}/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
-  elif [ -e "$FS_HOME/target/${PROFILE#--}/libcurvine_libsdk.so" ]; then
-    cp -f "$FS_HOME/target/${PROFILE#--}/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
+  TARGET_DIR="target/${PROFILE#--}"
+  if [ "$STATIC_BUILD" = "yes" ]; then
+    TARGET_DIR="target/x86_64-unknown-linux-musl/${PROFILE#--}"
+  fi
+
+  if [ -e "$FS_HOME/$TARGET_DIR/curvine_libsdk.dll" ]; then
+    cp -f "$FS_HOME/$TARGET_DIR/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
+  elif [ -e "$FS_HOME/$TARGET_DIR/libcurvine_libsdk.so" ]; then
+    cp -f "$FS_HOME/$TARGET_DIR/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
   fi
 
   # Build java package
