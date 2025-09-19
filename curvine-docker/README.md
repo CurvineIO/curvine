@@ -5,7 +5,7 @@ This directory contains Docker configuration files and scripts for building and 
 ## File Description
 
 - `Dockerfile` - Multi-stage Dockerfile with volume mount support
-- `build-simple.sh` - Simple build script using volume mounts, generates build artifacts only
+- `build-simple.sh` - Simple build script using volume mounts, generates static build artifacts by default
 - `build-runtime.sh` - Build runtime image based on build artifacts
 - `build-with-volumes.sh` - Complete build script that generates final runtime image
 - `deploy/` - Deployment related files
@@ -22,6 +22,18 @@ This method separates compilation and runtime image building for easier developm
 # Run from project root
 cd /path/to/curvine
 ./curvine-docker/build-simple.sh
+```
+
+The build script now defaults to static compilation to avoid runtime library dependency issues. You can override this behavior by passing custom arguments:
+```bash
+# Default: builds static binaries
+./curvine-docker/build-simple.sh
+
+# Custom: build with specific packages in debug mode
+./curvine-docker/build-simple.sh --package core --debug
+
+# Custom: build dynamic binaries without static flag
+./curvine-docker/build-simple.sh --package all
 ```
 
 After building:

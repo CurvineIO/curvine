@@ -3,6 +3,10 @@
 [profile.release]
 panic = "abort"
 
+[profile.release-static]
+inherits = "release"
+panic = "abort"
+
 # [profile.dev]
 # panic = "abort"
 

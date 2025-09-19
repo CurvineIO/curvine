@@ -18,6 +18,7 @@
 
 # Simple build using Docker with volume mounts
 # This script builds curvine using the builder stage only
+# By default, it builds static binaries to avoid runtime library dependency issues
 
 set -e
 
@@ -28,6 +29,16 @@ DOCKER_DIR="$(cd "$(dirname "$0")"; pwd)"
 # Create build directories on host
 BUILD_OUTPUT_DIR="$PROJECT_ROOT/docker-build-output"
 BUILD_CACHE_DIR="$PROJECT_ROOT/docker-build-cache"
+
+# Default build arguments - use static compilation unless overridden
+DEFAULT_ARGS="--static"
+if [ $# -gt 0 ]; then
+    BUILD_ARGS="$@"
+    echo "Using custom build arguments: $BUILD_ARGS"
+else
+    BUILD_ARGS="$DEFAULT_ARGS"
+    echo "Using default build arguments: $BUILD_ARGS (static compilation)"
+fi
 
 echo "Project root: $PROJECT_ROOT"
 echo "Build output directory: $BUILD_OUTPUT_DIR"
@@ -49,11 +60,13 @@ docker run --rm \
     -v "$PROJECT_ROOT:/workspace" \
     -v "$BUILD_OUTPUT_DIR:/build-output" \
     -v "$BUILD_CACHE_DIR:/build-cache" \
+    -e "BUILD_ARGS=$BUILD_ARGS" \
     curvine-builder:latest \
     bash -c "
         cd /workspace &&
         # Build using the default script (without --zip to preserve directory structure)
-        ./build/build.sh
+        # Use static compilation by default to avoid runtime library dependency issues
+        ./build/build.sh \$BUILD_ARGS
         echo 'Copying build artifacts to output directory...'
         cp -r /workspace/build/dist/* /build-output/
         echo 'Build completed! Artifacts are in /build-output'
