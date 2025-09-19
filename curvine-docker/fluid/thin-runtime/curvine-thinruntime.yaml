@@ -1,0 +1,32 @@
+apiVersion: data.fluid.io/v1alpha1
+kind: ThinRuntimeProfile
+metadata:
+  name: curvine-profile
+spec:
+  fileSystemType: fuse
+  fuse:
+    image: fluid-cloudnative/curvine-thinruntime
+    imageTag: v1.0.0
+    imagePullPolicy: IfNotPresent
+---
+# Dataset definition
+apiVersion: data.fluid.io/v1alpha1
+kind: Dataset
+metadata:
+  name: curvine-dataset
+spec:
+  mounts:
+  - mountPoint: curvine:///data  # curvine://path format
+    name: curvine
+    options:
+      master-endpoints: "10.119.43.216:8995"  # Replace with your Curvine master
+  accessModes:
+    - ReadOnlyMany
+---
+# ThinRuntime definition
+apiVersion: data.fluid.io/v1alpha1
+kind: ThinRuntime
+metadata:
+  name: curvine-dataset
+spec:
+  profileName: curvine-profile
