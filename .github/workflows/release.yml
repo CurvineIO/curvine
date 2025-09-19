@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build Rocky Linux 9 binary file
+  build:
+    name: Build for Rocky Linux 9
+    runs-on: ubuntu-latest
+    container:
+      image: curvine-compile:latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: rocky9-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build and package
+      env:
+        RELEASE_VERSION: ${{ github.ref_name }}
+      run: |
+        make dist
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: curvine-rocky9-x86_64
+        path: curvine-*.tar.gz
+
+  # Create GitHub Release
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: artifacts/*/*
+        generate_release_notes: true
+        draft: false
+        prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}
+        body: |
+          ## Binary Downloads
+          
+          ### Rocky Linux 9
+          - **x86_64**: Download the `.tar.gz` file from the assets below
+          
+          ### Installation
+          1. Download the binary package
+          2. Extract: `tar -xzf curvine-*.tar.gz`
+          3. Navigate to the extracted directory
+          4. Follow the installation instructions in the package
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,4 +1,4 @@
-.PHONY: help check-env format build cargo docker-build docker-build-img docker-build-cached all
+.PHONY: help check-env format build cargo docker-build docker-build-img docker-build-cached all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -24,6 +24,8 @@ help:
 	@echo "Building:"
 	@echo "  make build ARGS='<args>'         - Build with specific arguments passed to build.sh"
 	@echo "  make all                         - Same as 'make build'"
+	@echo "  make dist                        - Build and create distribution package (tar.gz)"
+	@echo "  make dist-only                   - Create distribution package without building"
 	@echo "  make format                      - Format code using pre-commit hooks"
 	@echo ""
 	@echo "Docker:"
@@ -46,7 +48,8 @@ help:
 	@echo "  make help                        - Show this help message"
 	@echo ""
 	@echo "Parameters:"
-	@echo "  ARGS='<args>'  - Additional arguments to pass to build.sh"
+	@echo "  ARGS='<args>'         - Additional arguments to pass to build.sh"
+	@echo "  RELEASE_VERSION='...' - Version string for distribution packages (optional)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build                                  - Build entire project in release mode"
@@ -54,6 +57,8 @@ help:
 	@echo "  make build ARGS='-p server -p client'       - Build only server and client components"
 	@echo "  make build ARGS='-p object'                  - Build S3 object gateway"
 	@echo "  make build ARGS='--package core --ufs s3'   - Build core packages with S3 native SDK"
+	@echo "  make dist                                   - Build and create distribution package"
+	@echo "  RELEASE_VERSION=v1.0.0 make dist           - Build and package with specific version"
 	@echo "  make cargo ARGS='test --verbose'            - Run cargo test with verbose output"
 	@echo "  make csi-docker-fast                        - Build curvine-csi Docker image quickly"
 
@@ -75,10 +80,10 @@ cargo:
 
 # 5. Build through docker compilation image
 docker-build:
-	docker run --rm -v $(PWD):/workspace -w /workspace curvine/curvine-compile:latest make all
+	docker run --rm --entrypoint="" -v $(PWD):/workspace -w /workspace curvine/curvine-compile:latest bash -c "make all"
 
 docker-build-cached:
-	docker run --rm -v $(PWD):/workspace -w /workspace curvine/curvine-compile:build-cached make all
+	docker run --rm --entrypoint="" -v $(PWD):/workspace -w /workspace curvine/curvine-compile:build-cached bash -c "make all"
 
 # 6. Build compilation image under curvine-docker
 docker-build-img:
@@ -143,3 +148,43 @@ csi-docker-fast:
 
 # 8. All in one
 all: build
+
+# 9. Distribution packaging
+dist: all
+	@$(MAKE) dist-only
+
+dist-only:
+	@echo "Creating distribution package..."
+	@if [ ! -d "build/dist" ]; then \
+		echo "Error: build/dist directory not found. Please run 'make all' first."; \
+		exit 1; \
+	fi
+	@# Get version from environment variable only
+	@PLATFORM=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	ARCH=$$(uname -m); \
+	if [ -n "$$RELEASE_VERSION" ]; then \
+		VERSION="$$RELEASE_VERSION"; \
+		echo "Using provided version: $$VERSION"; \
+		if [ -n "$$GITHUB_ACTIONS" ]; then \
+			DIST_NAME="curvine-$${VERSION}-$${PLATFORM}-$${ARCH}"; \
+			echo "GitHub Actions detected - using clean naming"; \
+		else \
+			TIMESTAMP=$$(date +%Y%m%d-%H%M%S); \
+			DIST_NAME="curvine-$${VERSION}-$${PLATFORM}-$${ARCH}-$${TIMESTAMP}"; \
+			echo "Local build - adding timestamp"; \
+		fi; \
+	else \
+		echo "No version provided via RELEASE_VERSION environment variable"; \
+		if [ -n "$$GITHUB_ACTIONS" ]; then \
+			DIST_NAME="curvine-$${PLATFORM}-$${ARCH}"; \
+			echo "GitHub Actions detected - no version in package name"; \
+		else \
+			TIMESTAMP=$$(date +%Y%m%d-%H%M%S); \
+			DIST_NAME="curvine-$${PLATFORM}-$${ARCH}-$${TIMESTAMP}"; \
+			echo "Local build - no version, adding timestamp"; \
+		fi; \
+	fi; \
+	echo "Packaging as: $${DIST_NAME}.tar.gz"; \
+	cd build && tar -czf "../$${DIST_NAME}.tar.gz" dist/; \
+	echo "Distribution package created: $${DIST_NAME}.tar.gz"; \
+	ls -lh "../$${DIST_NAME}.tar.gz"
