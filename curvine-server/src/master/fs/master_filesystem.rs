@@ -124,7 +124,7 @@ impl MasterFilesystem {
         }
 
         if inp.is_empty() || inp.get_last_inode().is_none() {
-            return err_box!("F ailed to remove {} because it does not exist", inp.path());
+            return err_box!("Failed to remove {} because it does not exist", inp.path());
         }
 
         let delete_result = fs_dir.delete(&inp, recursive)?;
@@ -152,12 +152,14 @@ impl MasterFilesystem {
         }
 
         // dst cannot be in the src directory, /a/b -> /a/b/c is not allowed operations.
-        if dst.starts_with(src) && &dst[src.len()..src.len() + 1] == PATH_SEPARATOR {
-            return err_box!(
-                "Rename dst {} is a directory or file under src {}",
-                dst,
-                src
-            );
+        if let Some(rest) = dst.strip_prefix(src) {
+            if rest.starts_with(PATH_SEPARATOR) {
+                return err_box!(
+                    "Rename dst {} is a directory or file under src {}",
+                    dst,
+                    src
+                );
+            }
         }
 
         fs_dir.rename(&src_inp, &dst_inp)?;
@@ -595,7 +597,7 @@ impl MasterFilesystem {
                     let exists = match self.block_exists(item.id) {
                         Ok(v) => v,
                         Err(e) => {
-                            warn!("block_report {:?}: {}", item, e);
+                            warn!("block_report {item:?}: {e}");
                             continue;
                         }
                     };
@@ -655,7 +657,8 @@ impl MasterFilesystem {
 impl Default for MasterFilesystem {
     fn default() -> Self {
         let conf = ClusterConf::format();
-        let journal_system = JournalSystem::from_conf(&conf).unwrap();
+        let journal_system = JournalSystem::from_conf(&conf)
+            .expect("Failed to initialize JournalSystem from default ClusterConf");
         journal_system.fs()
     }
 }
