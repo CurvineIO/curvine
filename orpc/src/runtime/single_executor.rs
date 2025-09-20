@@ -64,16 +64,16 @@ impl SingleExecutor {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (rx, tx) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::sync_channel(1);
         let task = move || {
             let res = task();
-            let res = rx.send(res);
+            let res = tx.send(res);
             let _ = try_log!(res);
         };
 
         try_err!(self.sender.send(Box::new(task)));
 
-        match tx.recv() {
+        match rx.recv() {
             Ok(v) => Ok(v),
             Err(e) => err_box!("{}", e),
         }
