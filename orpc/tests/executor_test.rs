@@ -27,15 +27,15 @@ fn single() -> CommonResult<()> {
     let executor = Arc::new(SingleExecutor::new("test", 10));
 
     let counter = Arc::new(AtomicCounter::new(0));
-    let (rx, tx) = mpsc::sync_channel(1);
+    let (tx, rx) = mpsc::sync_channel(1);
 
     let c1 = counter.clone();
     executor.spawn(move || {
         c1.next();
-        rx.send(()).unwrap();
+        tx.send(()).unwrap();
     })?;
 
-    tx.recv()?;
+    rx.recv()?;
     assert_eq!(counter.get(), 1);
 
     let c2 = counter.clone();
