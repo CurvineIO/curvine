@@ -1,0 +1,102 @@
+apiVersion: data.fluid.io/v1alpha1
+kind: CacheRuntimeClass
+metadata:
+  name: curvine
+fileSystemType: fuse
+topology:
+    master:
+      workloadType:
+        apiVersion: apps/v1
+        kind: StatefulSet
+      service:
+        headless: {}
+      dependencies:
+        encryptOption: {}
+      podTemplateSpec:
+        spec:
+          restartPolicy: Always
+          containers:
+          - name: master
+            image: curvine:latest
+            args:
+            - master
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: CURVINE_HOME
+              value: "/opt/curvine"
+            - name: ORPC_BIND_HOSTNAME
+              value: "0.0.0.0"
+            ports:
+            - containerPort: 8995
+              name: rpc
+              protocol: TCP
+            - containerPort: 8996
+              name: journal
+              protocol: TCP
+            - containerPort: 9000
+              name: web
+              protocol: TCP
+            # volumeMounts and resources can be configured in CacheRuntime spec
+    
+    worker:
+      workloadType:
+        apiVersion: apps/v1
+        kind: StatefulSet
+      service:
+        headless: {}
+      dependencies: {}
+      podTemplateSpec:
+        spec:
+          restartPolicy: Always
+          containers:
+          - name: worker
+            image: curvine:latest
+            args:
+            - worker
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: CURVINE_HOME
+              value: "/opt/curvine"
+            - name: ORPC_BIND_HOSTNAME
+              value: "0.0.0.0"
+            ports:
+            - containerPort: 8997
+              name: worker-rpc
+              protocol: TCP
+            - containerPort: 9001
+              name: worker-web
+              protocol: TCP
+            # volumeMounts and resources can be configured in CacheRuntime spec
+    
+    client:
+      workloadType:
+        apiVersion: apps/v1
+        kind: DaemonSet
+      dependencies:
+        encryptOption: {}
+      podTemplateSpec:
+        spec:
+          restartPolicy: Always
+          containers:
+          - name: client
+            image: curvine:latest
+            securityContext:
+              privileged: true
+              runAsUser: 0
+            args:
+            - client
+            imagePullPolicy: IfNotPresent
+            lifecycle:
+              preStop:
+                exec:
+                  command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    echo "PreStop: Cleaning up FUSE mount..."
+                    target_path="${CURVINE_TARGET_PATH:-/runtime-mnt/cache/default/curvine-demo/cache-fuse}"
+                    if mountpoint -q "$target_path" 2>/dev/null; then
+                      echo "Unmounting $target_path"
+                      fusermount -u "$target_path" || umount -f "$target_path" || true
+                    fi
+                    echo "PreStop: Cleanup completed"
