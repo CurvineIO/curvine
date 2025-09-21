@@ -1,0 +1,99 @@
+---
+apiVersion: data.fluid.io/v1alpha1
+kind: Dataset
+metadata:
+  name: curvine-demo
+  namespace: default
+spec:
+  placement: Shared
+  accessModes:
+  - ReadWriteMany
+  mounts:
+  - name: demo
+    mountPoint: "curvine:///"
+    options:
+      cluster_id: "curvine-demo"
+      cache_dir: "/cache-data"
+    # encryptOptions:
+    # - name: access-key
+    #   valueFrom:
+    #     secretKeyRef:
+    #       name: curvine-secret
+    #       key: access-key
+---
+apiVersion: data.fluid.io/v1alpha1
+kind: CacheRuntime
+metadata:
+  name: curvine-demo
+  namespace: default
+spec:
+  runtimeClassName: curvine
+  # Define volumes that can be used by all components
+  volumes:
+  - name: curvine-logs
+    emptyDir: {}
+  - name: curvine-cache
+    emptyDir: {}
+  master:
+    options:
+      format_master: "false"
+      rpc_port: "8995"
+      journal_port: "8996"
+      web_port: "9000"
+    replicas: 3
+    # Master component volume mounts and resources
+    volumeMounts:
+    - name: curvine-logs
+      mountPath: /opt/curvine/logs
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+  worker:
+    options:
+      format_worker: "false"
+      rpc_port: "8997"
+      web_port: "9001"
+      dir_reserved: "5GB"
+    replicas: 1
+    # Worker component volume mounts and resources
+    volumeMounts:
+    - name: curvine-logs
+      mountPath: /opt/curvine/logs
+    - name: curvine-cache
+      mountPath: /cache-data
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "200m"
+      limits:
+        memory: "2Gi"
+        cpu: "1000m"
+    tieredStore:
+      levels:
+      - quota: 5Gi
+        low: "0.5"
+        high: "0.8"
+        path: "/cache-data"
+        medium:
+          emptyDir: {}
+  client:
+    options:
+      debug: "true"
+      log_level: "info"
+    # Client component volume mounts and resources
+    volumeMounts:
+    - name: curvine-logs
+      mountPath: /opt/curvine/logs
+    - name: curvine-cache
+      mountPath: /tmp/curvine/cache
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "512Mi"
+        cpu: "200m"
