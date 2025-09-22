@@ -3,8 +3,8 @@
 set -e
 
 # Configuration
-CURVINE_BUILD_PATH="../../../../build/dist"
-IMAGE_NAME="fluid-cloudnative/curvine-thinruntime"
+CURVINE_BUILD_PATH="../../../build/dist"
+IMAGE_NAME="curvine-fluid-thinruntime"
 IMAGE_TAG="v1.0.0"
 
 # Color output functions

@@ -17,27 +17,10 @@ topology:
           restartPolicy: Always
           containers:
           - name: master
-            image: curvine:latest
+            image: curvine-fluid-cacheruntime:latest
             args:
             - master
             imagePullPolicy: IfNotPresent
-            env:
-            - name: CURVINE_HOME
-              value: "/opt/curvine"
-            - name: ORPC_BIND_HOSTNAME
-              value: "0.0.0.0"
-            ports:
-            - containerPort: 8995
-              name: rpc
-              protocol: TCP
-            - containerPort: 8996
-              name: journal
-              protocol: TCP
-            - containerPort: 9000
-              name: web
-              protocol: TCP
-            # volumeMounts and resources can be configured in CacheRuntime spec
-    
     worker:
       workloadType:
         apiVersion: apps/v1
@@ -50,24 +33,10 @@ topology:
           restartPolicy: Always
           containers:
           - name: worker
-            image: curvine:latest
+            image: curvine-fluid-cacheruntime:latest
             args:
             - worker
             imagePullPolicy: IfNotPresent
-            env:
-            - name: CURVINE_HOME
-              value: "/opt/curvine"
-            - name: ORPC_BIND_HOSTNAME
-              value: "0.0.0.0"
-            ports:
-            - containerPort: 8997
-              name: worker-rpc
-              protocol: TCP
-            - containerPort: 9001
-              name: worker-web
-              protocol: TCP
-            # volumeMounts and resources can be configured in CacheRuntime spec
-    
     client:
       workloadType:
         apiVersion: apps/v1
@@ -79,7 +48,7 @@ topology:
           restartPolicy: Always
           containers:
           - name: client
-            image: curvine:latest
+            image: curvine-fluid-cacheruntime:latest
             securityContext:
               privileged: true
               runAsUser: 0

@@ -1,5 +1,5 @@
 # Build stage
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 
 # Add metadata labels
 ARG REPO_URL=https://github.com/curvineio/curvine
@@ -11,11 +11,11 @@ LABEL org.opencontainers.image.source="${REPO_URL}"
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Use Alibaba Cloud mirror for faster package downloads in China
-RUN mv /etc/apt/sources.list /etc/apt/sources.list.backup && \
-    echo 'deb http://mirrors.aliyun.com/ubuntu/ jammy main restricted universe multiverse' > /etc/apt/sources.list && \
-    echo 'deb http://mirrors.aliyun.com/ubuntu/ jammy-updates main restricted universe multiverse' >> /etc/apt/sources.list && \
-    echo 'deb http://mirrors.aliyun.com/ubuntu/ jammy-backports main restricted universe multiverse' >> /etc/apt/sources.list && \
-    echo 'deb http://mirrors.aliyun.com/ubuntu/ jammy-security main restricted universe multiverse' >> /etc/apt/sources.list && \
+RUN mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.backup 2>/dev/null || true && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble main restricted universe multiverse' > /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-updates main restricted universe multiverse' >> /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-backports main restricted universe multiverse' >> /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-security main restricted universe multiverse' >> /etc/apt/sources.list && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # 1. Install the basic toolchain and dependencies
@@ -49,14 +49,14 @@ RUN export RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup && \
 
 # 3. Install protoc
 RUN mkdir -p /app/protoc && cd /app/protoc && \
-    curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip && \
+    curl -k -LO https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip && \
     unzip protoc-27.2-linux-x86_64.zip && \
     chmod +x bin/protoc && \
     rm -f *.zip
 
 # 4. Install Maven
 RUN cd /app && \
-    curl -LO https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz && \
+    curl -k -LO https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz && \
     tar -xzf apache-maven-3.9.11-bin.tar.gz && \
     mv apache-maven-3.9.11 maven && \
     rm -f *.tar.gz
@@ -111,17 +111,17 @@ RUN echo '#!/bin/bash' > /build-output/bin/curvine-fuse && \
     echo 'format_master = false' > /build-output/conf/curvine-cluster.toml
 
 # Runtime stage
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Set non-interactive mode for apt
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Use Alibaba Cloud mirror for faster package downloads in China
-RUN mv /etc/apt/sources.list /etc/apt/sources.list.backup && \
-    echo 'deb http://mirrors.aliyun.com/ubuntu/ jammy main restricted universe multiverse' > /etc/apt/sources.list && \
-    echo 'deb http://mirrors.aliyun.com/ubuntu/ jammy-updates main restricted universe multiverse' >> /etc/apt/sources.list && \
-    echo 'deb http://mirrors.aliyun.com/ubuntu/ jammy-backports main restricted universe multiverse' >> /etc/apt/sources.list && \
-    echo 'deb http://mirrors.aliyun.com/ubuntu/ jammy-security main restricted universe multiverse' >> /etc/apt/sources.list && \
+RUN mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.backup 2>/dev/null || true && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble main restricted universe multiverse' > /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-updates main restricted universe multiverse' >> /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-backports main restricted universe multiverse' >> /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-security main restricted universe multiverse' >> /etc/apt/sources.list && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Install runtime dependencies

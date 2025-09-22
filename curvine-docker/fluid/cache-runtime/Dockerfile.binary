@@ -11,47 +11,62 @@ RUN mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sou
     echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-security main restricted universe multiverse' >> /etc/apt/sources.list && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install runtime dependencies
+# Install runtime dependencies for Fluid CacheRuntime integration
 RUN apt-get update && apt-get install -y --fix-missing \
     python3 \
+    python3-pip \
     fuse3 \
     libfuse3-3 \
     libfuse3-dev \
     curl \
     bash \
+    util-linux \
+    procps \
+    net-tools \
     openjdk-8-jre-headless \
+    python3-yaml \
+    python3-toml \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/cache/apt/*
 
 # Create curvine directories
 RUN mkdir -p /opt/curvine \
-    && mkdir -p /tmp/curvine/meta
+    && mkdir -p /opt/curvine/conf \
+    && mkdir -p /opt/curvine/data \
+    && mkdir -p /opt/curvine/logs \
+    && mkdir -p /tmp/curvine/meta \
+    && mkdir -p /tmp/curvine/cache
 
 # Copy pre-built artifacts
 COPY build/ /opt/curvine/
 
-# Copy fluid config parser and entrypoint script
-COPY fluid-config-parse.py /opt/curvine/
+# Copy entrypoint script and config generator
 COPY entrypoint.sh /opt/curvine/
+COPY generate_config.py /opt/curvine/
 
 # Make all binaries and scripts executable
 RUN find /opt/curvine -type f -name "*.sh" -exec chmod +x {} \; \
     && find /opt/curvine -type f -path "*/bin/*" -exec chmod +x {} \; \
     && find /opt/curvine -type f -path "*/lib/*" -exec chmod +x {} \; \
-    && chmod +x /opt/curvine/fluid-config-parse.py \
-    && chmod +x /opt/curvine/entrypoint.sh
+    && chmod +x /opt/curvine/entrypoint.sh \
+    && chmod +x /opt/curvine/generate_config.py
 
 # Set environment variables
 ENV CURVINE_HOME=/opt/curvine
-ENV PATH=$PATH:$CURVINE_HOME/bin
+ENV PATH=$PATH:$CURVINE_HOME/bin:$CURVINE_HOME/lib
 
 # Override environment settings for container
 ENV ORPC_BIND_HOSTNAME=0.0.0.0
-ENV CURVINE_CONF_FILE=$CURVINE_HOME/conf/curvine-cluster.toml
+
+# Fluid-specific environment variables
+ENV FLUID_RUNTIME=curvine
+ENV FLUID_MOUNT_TYPE=fuse
 
 WORKDIR $CURVINE_HOME
 
-# Set entrypoint and default command
+# Expose ports for Curvine services
+EXPOSE 8995 8996 8997 9000 9001
+
+# Use unified entrypoint
 ENTRYPOINT ["/opt/curvine/entrypoint.sh"]
-CMD ["fluid-thin-runtime"]
