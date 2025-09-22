@@ -195,6 +195,16 @@ impl DataSlice {
             _ => self,
         }
     }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        match self {
+            Empty => std::ptr::null() as *const _,
+            Buffer(s) => s.as_ptr(),
+            IOSlice(s) => panic!("Not support IOSlice"),
+            MemSlice(s) => s.as_ptr(),
+            Bytes(s) => s.as_ptr(),
+        }
+    }
 }
 
 impl Clone for DataSlice {
