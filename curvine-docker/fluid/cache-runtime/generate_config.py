@@ -86,6 +86,9 @@ def _generate_journal_addrs(fluid_config, master_service, namespace):
     topology = fluid_config.get('topology', {})
     master_pods = topology.get('master', {}).get('podConfigs', [])
     
+    # Use actual number of master pods as replica count
+    master_replicas = len(master_pods) if master_pods else 1
+    
     # Extract runtime name from pod names or use fallback
     runtime_name = 'curvine'
     if master_pods:
@@ -93,10 +96,10 @@ def _generate_journal_addrs(fluid_config, master_service, namespace):
         if first_pod and '-master-' in first_pod:
             runtime_name = first_pod.split('-master-')[0]
     
-    # Track which master indices we have
+    # Track which master indices we have from actual pods
     expected_masters = set()
     
-    # Add masters from podConfigs
+    # Add masters from podConfigs (actual running pods)
     for i, pod in enumerate(master_pods):
         pod_name = pod.get('podName', '')
         if pod_name:
@@ -109,14 +112,6 @@ def _generate_journal_addrs(fluid_config, master_service, namespace):
                     expected_masters.add(master_idx)
                 except ValueError:
                     pass
-    
-    # Fill in missing masters (assume 3 masters total)
-    for i in range(3):
-        if i not in expected_masters:
-            pod_name = f"{runtime_name}-master-{i}"
-            hostname = f"{pod_name}.{master_service}.{namespace}.svc.cluster.local"
-            journal_addrs.append({"id": len(journal_addrs) + 1, "hostname": hostname, "port": journal_port})
-    
     # Sort and reassign IDs
     journal_addrs.sort(key=lambda x: x['hostname'])
     for i, addr in enumerate(journal_addrs):
@@ -200,14 +195,47 @@ def _set_hostnames_and_journal(merged_config, component_type, current_hostname,
 def _set_cache_paths(merged_config, fluid_config):
     """Set cache paths from tieredStore configuration"""
     worker_config = fluid_config.get('worker', {})
-    tiered_store = worker_config.get('tieredStore', [])
     
-    cache_path = '/cache-data'
-    if tiered_store and len(tiered_store) > 0:
-        cache_path = tiered_store[0].get('cacheDir', '/cache-data')
-    
-    merged_config['worker']['data_dir'] = [f"[SSD]{cache_path}"]
-
+    # Check if data_dir is explicitly configured in options
+    if 'data_dir' in worker_config.get('options', {}):
+        # Use the explicitly configured data_dir
+        data_dir = worker_config['options']['data_dir']
+        if isinstance(data_dir, str):
+            # Handle comma-separated multi-tier paths
+            data_dirs = [path.strip() for path in data_dir.split(',')]
+            merged_config['worker']['data_dir'] = data_dirs
+        elif isinstance(data_dir, list):
+            merged_config['worker']['data_dir'] = data_dir
+        else:
+            merged_config['worker']['data_dir'] = [str(data_dir)]
+    else:
+        # Fallback to tieredStore configuration
+        tiered_store = worker_config.get('tieredStore', [])
+        
+        if tiered_store and len(tiered_store) > 0:
+            # Build data_dir from tieredStore levels
+            data_dirs = []
+            for level in tiered_store:
+                path = level.get('path', '/cache-data')
+                # Try to determine storage type from medium configuration
+                medium = level.get('medium', {})
+                if 'emptyDir' in medium and medium['emptyDir'].get('medium') == 'Memory':
+                    storage_type = 'MEM'
+                else:
+                    storage_type = 'SSD'  # Default to SSD for persistent storage
+                
+                # Add capacity if quota is specified
+                quota = level.get('quota', '')
+                if quota:
+                    data_dirs.append(f"[{storage_type}:{quota}]{path}")
+                else:
+                    data_dirs.append(f"[{storage_type}]{path}")
+            
+            merged_config['worker']['data_dir'] = data_dirs if data_dirs else [f"[SSD]/cache-data"]
+        else:
+            # Default single-tier configuration
+            merged_config['worker']['data_dir'] = [f"[SSD]/cache-data"]
+        
 def _set_client_endpoints(merged_config, journal_addrs):
     """Set client master endpoints"""
     master_rpc_port = merged_config.get('master', {}).get('rpc_port', 8995)
@@ -221,13 +249,13 @@ def _set_client_endpoints(merged_config, journal_addrs):
         master_endpoints.append({'hostname': 'localhost', 'port': 8995})
     
     merged_config['client']['master_addrs'] = master_endpoints
-
+        
 def _set_target_path(merged_config, fluid_config):
     """Set FUSE target path"""
     client_config = fluid_config.get('client', {})
     target_path = client_config.get('targetPath', '/runtime-mnt/cache/default/curvine-demo/fuse')
     merged_config['fuse']['mnt_path'] = target_path
-
+        
 def _export_environment_variables(component_type, master_service, worker_service, 
                                 journal_addrs, fluid_config):
     """Export environment variables for entrypoint script"""

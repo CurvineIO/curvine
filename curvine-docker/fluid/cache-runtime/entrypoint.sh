@@ -39,8 +39,20 @@ if [ -n "$FLUID_RUNTIME_COMPONENT_TYPE" ] || [ -f "$FLUID_RUNTIME_CONFIG_PATH" ]
     FLUID_MODE=true
 fi
 
-# Service type: master, worker, client, all
+# Service type: master, worker, client, all, fluid-cache-runtime
 SERVER_TYPE="${1:-${FLUID_RUNTIME_COMPONENT_TYPE:-all}}"
+
+# Handle fluid-cache-runtime parameter
+if [ "$SERVER_TYPE" = "fluid-cache-runtime" ]; then
+    # For cache-runtime, we typically start both master and worker
+    # But check if specific component type is provided
+    if [ -n "$FLUID_RUNTIME_COMPONENT_TYPE" ]; then
+        SERVER_TYPE="$FLUID_RUNTIME_COMPONENT_TYPE"
+    else
+        SERVER_TYPE="master"
+    fi
+    FLUID_MODE=true
+fi
 
 # Operation type: start, stop, restart, health-check
 ACTION_TYPE="${2:-start}"
