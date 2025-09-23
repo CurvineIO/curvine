@@ -16,11 +16,16 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use crate::ucp::bindings::ucs_sock_addr;
 
+#[derive(Debug)]
 pub struct SockAddr {
     inner: socket2::SockAddr
 }
 
 impl SockAddr {
+    pub fn new(inner: socket2::SockAddr) -> Self {
+        Self { inner }
+    }
+
     pub fn as_ucs_sock_addr(&self) -> ucs_sock_addr {
         ucs_sock_addr {
             addr: self.inner.as_ptr() as _,

@@ -1,3 +1,17 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::os::raw::c_void;
@@ -11,7 +25,7 @@ use crate::io::IOResult;
 use crate::sync::StateCtl;
 use crate::sys::{DataSlice, RawPtr, RawVec};
 use crate::ucp::bindings::*;
-use crate::ucp::{Request, RequestFuture, SockAddr, stderr, UcpUtils, Worker};
+use crate::ucp::{ConnRequest, Request, RequestFuture, SockAddr, stderr, UcpUtils, Worker};
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
@@ -139,7 +153,7 @@ impl Endpoint {
         request.waker.wake();
     }
 
-    pub async fn stream_recv(&self, mut buf: BytesMut) ->  IOResult<usize> {
+    pub async fn stream_recv(&self, mut buf: BytesMut) ->  IOResult<BytesMut> {
         let mut len = buf.len();
         let status = unsafe {
             ucp_stream_recv_nb(
@@ -154,15 +168,25 @@ impl Endpoint {
         };
 
         if status.is_null() {
-            Ok(len)
+            Ok(BytesMut::new())
         } else if UcpUtils::ucs_ptr_is_ptr(status) {
             let f = RequestFuture::new(status, poll_recv);
             let len = f.await?;
-            Ok(len)
+            Ok(buf.split_to(len))
         } else {
             err_ucs!(UcpUtils::ucs_ptr_raw_status(status))?;
             err_box!("未预期的状态: {:?}", status)
         }
+    }
+
+    pub async fn accept(worker: Arc<Worker>, conn: ConnRequest) -> IOResult<Self> {
+        let params = ucp_ep_params {
+            field_mask: ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST.0 as u64,
+            conn_request: conn.as_mut_ptr(),
+            ..unsafe { MaybeUninit::zeroed().assume_init() }
+        };
+        let endpoint = Endpoint::new(worker, params)?;
+        Ok(endpoint)
     }
 
     pub fn print(&self) {

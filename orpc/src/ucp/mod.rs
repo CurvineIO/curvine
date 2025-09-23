@@ -38,6 +38,12 @@ pub use self::endpoint::Endpoint;
 mod ucp_utils;
 pub use self::ucp_utils::UcpUtils;
 
+mod listener;
+pub use self::listener::Listener;
+
+mod conn_request;
+pub use self::conn_request::ConnRequest;
+
 extern "C" {
     pub static stderr: *mut FILE;
 }

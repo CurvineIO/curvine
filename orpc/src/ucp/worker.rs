@@ -63,7 +63,8 @@ impl Worker {
     }
 
     pub async fn polling(&self) {
-        while self.progress() != 0 {
+        loop {
+            while self.progress() != 0 {}
             yield_now().await
         }
     }

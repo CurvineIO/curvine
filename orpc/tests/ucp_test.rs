@@ -1,6 +1,5 @@
 use std::sync::Arc;
-use std::thread::spawn;
-use tokio::task::spawn_local;
+use orpc::common::Logger;
 use orpc::ucp::{Config, Context, Endpoint, SockAddr, Worker};
 
 #[test]
@@ -26,6 +25,7 @@ fn worker() {
 
 #[tokio::test]
 async fn endpoint() {
+    Logger::default();
     let worker = Arc::new(Worker::default());
     let addr = "127.0.0.1:8080".into();
 
