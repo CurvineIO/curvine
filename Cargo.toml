@@ -52,7 +52,7 @@ serde = { version = "1.0.215", features = ["derive"] }
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
 raft = { version = "0.7.0", features = ["prost-codec"], default-features = false }
 trait-variant = "0.1.2"
-nix = { version = "0.29.0", features = ["ioctl"] }
+nix = { version = "0.30.1", features = ["ioctl", "user"] }
 
 # The most important library end
 

@@ -17,5 +17,5 @@ pub mod fuse_abi;
 mod fuse_dirent_list;
 pub use self::fuse_dirent_list::FuseDirentList;
 
-mod fuse_sys;
-pub use self::fuse_sys::*;
+mod fuse_pure;
+pub use self::fuse_pure::*;

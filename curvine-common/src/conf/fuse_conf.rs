@@ -176,12 +176,11 @@ impl FuseConf {
     }
 
     // Get all mount points.
-    pub fn get_all_mnt_path(&self) -> CommonResult<Vec<CString>> {
+    pub fn get_all_mnt_path(&self) -> CommonResult<Vec<PathBuf>> {
         let base = self.check_mnt()?;
         // There is only 1 mount point.
         if self.mnt_number <= 1 {
-            let point = CString::new(base.to_string_lossy().to_string())?;
-            return Ok(vec![point]);
+            return Ok(vec![base]);
         }
 
         let mut res = vec![];
@@ -191,8 +190,8 @@ impl FuseConf {
                 FileUtils::create_dir(&path, false)?;
             }
 
-            let point = CString::new(path.to_string_lossy().to_string())?;
-            res.push(point)
+            //let point = CString::new(path.to_string_lossy().to_string())?;
+            res.push(path)
         }
 
         Ok(res)
@@ -221,6 +220,26 @@ impl FuseConf {
         let args = opts.iter().map(|x| x.as_ptr()).collect();
 
         args
+    }
+
+    pub fn set_fuse_opts(&self, mount_options: &mut String) {
+        self.fuse_opts.iter().for_each(|opt| {
+            match opt.as_str() {
+                "default_permissions" => {
+                    mount_options.push_str(",default_permissions");
+                }
+                // "auto_unmount" => {
+                //     mount_options.push_str(",auto_unmount");
+                // },
+                "allow_other" => {
+                    mount_options.push_str(",allow_other");
+                }
+                "allow_root" => {
+                    mount_options.push_str(",allow_root");
+                }
+                _ => {}
+            }
+        });
     }
 
     pub fn auto_umount(&self) -> bool {

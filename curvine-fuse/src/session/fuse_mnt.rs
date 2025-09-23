@@ -15,37 +15,42 @@
 #![allow(unused)]
 
 use crate::raw::fuse_abi::fuse_args;
-use crate::raw::{fuse_mount, fuse_unmount};
+use crate::raw::fuse_mount_pure;
+use crate::raw::fuse_umount_pure;
 use crate::{FuseUtils, RawSession, FUSE_CLONE_FD_MIN_VERSION, UNIX_KERNEL_VERSION};
+use curvine_common::conf::FuseConf;
 use log::{error, info};
 use orpc::io::IOResult;
 use orpc::sys;
 use orpc::sys::pipe::{AsyncFd, BorrowedFd, OwnedFd};
 use orpc::sys::{CString, RawIO};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub struct FuseMnt {
-    pub(crate) path: CString,
+    pub(crate) path: PathBuf,
     // OwnedFd is not used here, and in some cases fd cannot be turned off by rust.
     pub(crate) fd: RawIO,
-    pub(crate) session: Option<RawSession>,
     pub(crate) clone_fds: Mutex<Vec<OwnedFd>>,
 }
 
 impl FuseMnt {
-    pub fn new(path: &CString, args: *const fuse_args, auto_unmount: bool) -> Self {
-        let (fd, session) = fuse_mount(path.as_ptr(), args).unwrap();
-        sys::set_pipe_blocking(fd, false).unwrap();
-        info!(
-            "mount success, path {:?}, fd {}, auto_unmount {}",
-            path, fd, auto_unmount
-        );
-
-        Self {
-            path: path.clone(),
-            fd,
-            session,
-            clone_fds: Mutex::new(vec![]),
+    pub fn new(path: PathBuf, conf: &FuseConf) -> Self {
+        let res = fuse_mount_pure(path.as_path(), conf);
+        match res {
+            Ok(fd) => {
+                sys::set_pipe_blocking(fd, false).unwrap();
+                info!("fuse mount success, path {:?}, fd {}", path, fd);
+                Self {
+                    path,
+                    fd,
+                    clone_fds: Mutex::new(vec![]),
+                }
+            }
+            Err(e) => {
+                error!("fuse mount failed, path {:?}, err {:?}", path, e);
+                panic!("fuse mount failed");
+            }
         }
     }
 
@@ -90,13 +95,7 @@ impl FuseMnt {
 
 impl Drop for FuseMnt {
     fn drop(&mut self) {
-        #[cfg(feature = "fuse2")]
-        {
-            if let Err(e) = sys::close(self.fd) {
-                log::warn!("close fd {}: {}", self.fd, e)
-            }
-        }
-        fuse_unmount(self);
+        fuse_umount_pure(self.path.as_path());
         info!("unmount {:?}", self.path)
     }
 }
