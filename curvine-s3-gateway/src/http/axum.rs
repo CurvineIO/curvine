@@ -45,10 +45,23 @@ impl From<axum::extract::Request> for Request {
             query
                 .split("&")
                 .map(|item| {
-                    item.find("=")
-                        .map_or((item.to_string(), "".to_string()), |pos| {
-                            (item[..pos].to_string(), item[pos + 1..].to_string())
-                        })
+                    item.find("=").map_or(
+                        (
+                            urlencoding::decode(item)
+                                .unwrap_or_else(|_| item.into())
+                                .to_string(),
+                            "".to_string(),
+                        ),
+                        |pos| {
+                            let key = urlencoding::decode(&item[..pos])
+                                .unwrap_or_else(|_| item[..pos].into())
+                                .to_string();
+                            let value = urlencoding::decode(&item[pos + 1..])
+                                .unwrap_or_else(|_| item[pos + 1..].into())
+                                .to_string();
+                            (key, value)
+                        },
+                    )
                 })
                 .collect::<std::collections::HashMap<String, String>>()
         });

@@ -658,21 +658,47 @@ impl ListObjectHandler for S3Handlers {
     ) -> Result<Vec<ListObjectContent>, String> {
         let bkt_path = self.cv_bucket_path(bucket).map_err(|e| e.to_string())?;
 
-        let root = bkt_path;
+        let list_path = if let Some(prefix) = &opt.prefix {
+            let prefix_path = prefix.trim_end_matches('/');
+            if prefix_path.is_empty() {
+                bkt_path.clone()
+            } else {
+                Path::from_str(format!("{}/{}", bkt_path, prefix_path).as_str())
+                    .map_err(|e| e.to_string())?
+            }
+        } else {
+            bkt_path.clone()
+        };
 
         let list = self
             .fs
-            .list_status(&root)
+            .list_status(&list_path)
             .await
             .map_err(|e| e.to_string())?;
+
         let mut contents = Vec::new();
 
         for st in list {
-            if st.is_dir {
-                continue;
-            }
+            let full_path = st.path.clone();
+            let bucket_root = bkt_path.to_string();
 
-            let key = st.name.clone();
+            let key = if full_path.starts_with(&bucket_root) {
+                let relative_path = full_path.strip_prefix(&bucket_root).unwrap_or(&full_path);
+                relative_path.trim_start_matches('/').to_string()
+            } else {
+                let list_path_str = list_path.to_string();
+                if list_path_str.starts_with(&bucket_root) {
+                    let relative_dir = list_path_str.strip_prefix(&bucket_root).unwrap_or("");
+                    let relative_dir = relative_dir.trim_start_matches('/');
+                    if relative_dir.is_empty() {
+                        st.name.clone()
+                    } else {
+                        format!("{}/{}", relative_dir, st.name)
+                    }
+                } else {
+                    st.name.clone()
+                }
+            };
 
             if let Some(pref) = &opt.prefix {
                 if !key.starts_with(pref) {

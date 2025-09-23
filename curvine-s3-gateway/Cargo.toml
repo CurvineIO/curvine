@@ -39,6 +39,7 @@ futures = { workspace = true }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 async-stream = "0.3"
+urlencoding = "2.1"
 
 curvine-common = { path = "../curvine-common" }
 curvine-client = { path = "../curvine-client" }
