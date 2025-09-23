@@ -19,7 +19,7 @@ use orpc::common::Utils;
 use orpc::io::LocalFile;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::{DataSlice, RawPtr};
-use orpc::try_option;
+use orpc::{err_box, try_option};
 use std::sync::Arc;
 
 pub struct BlockWriterLocal {
@@ -39,11 +39,33 @@ impl BlockWriterLocal {
         block: ExtendedBlock,
         worker_address: WorkerAddress,
     ) -> FsResult<Self> {
+        // 默认追加模式：从 block.len 位置开始
+        Self::with_offset(fs_context, block, worker_address, None).await
+    }
+
+    // 🔑 新增：支持指定起始偏移量的构造方法
+    pub async fn with_offset(
+        fs_context: Arc<FsContext>,
+        block: ExtendedBlock,
+        worker_address: WorkerAddress,
+        block_off: Option<i64>, // None 表示追加模式
+    ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let seq_id = 0;
 
-        let pos = block.len;
-        let len = fs_context.block_size();
+        let (pos, len) = match block_off {
+            Some(off) => {
+                // 🔑 随机写模式：从指定偏移量开始
+                if off < 0 || off >= block.len {
+                    return err_box!("Invalid block offset: {off}, block length: {}", block.len);
+                }
+                (off, block.len) // pos从偏移量开始，len为整个block大小
+            }
+            None => {
+                // 追加模式：从block末尾开始
+                (block.len, fs_context.block_size())
+            }
+        };
 
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
@@ -150,8 +172,36 @@ impl BlockWriterLocal {
     pub fn pos(&self) -> i64 {
         self.file.pos()
     }
+    
+    pub fn len(&self) -> i64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+    
+    // 🔑 实现随机写 seek 支持（本地文件）
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return Err(format!("Cannot seek to negative position: {pos}").into());
+        }
+        
+        if pos >= self.len {
+            return Err(format!("Seek position {pos} exceeds block length {}", self.len).into());
+        }
+        
+        // 对于本地文件，直接调用seek
+        let file = self.file.clone();
+        self.rt
+            .spawn_blocking(move || {
+                file.as_mut().seek(pos)?;
+                Ok(())
+            })
+            .await?
     }
 }

@@ -140,6 +140,11 @@ macro_rules! impl_writer_for_enum {
             async fn cancel(&mut self) -> ::curvine_common::FsResult<()> {
                 match_variants_async!(self, cancel)
             }
+
+            // 🔑 新增：随机写 seek 支持
+            async fn seek(&mut self, pos: i64) -> ::curvine_common::FsResult<()> {
+                match_variants_async!(self, seek, pos)
+            }
         }
     };
 }

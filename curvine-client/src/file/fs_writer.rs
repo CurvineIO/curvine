@@ -119,6 +119,23 @@ impl Writer for FsWriter {
     async fn cancel(&mut self) -> FsResult<()> {
         Ok(())
     }
+    
+    // 🔑 实现随机写 seek 支持
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return Err(format!("Cannot seek to negative position: {}", pos).into());
+        }
+        
+        // 刷新当前缓冲区
+        self.flush_chunk().await?;
+        
+        // 委托给内层writer执行seek
+        self.inner.seek(pos).await?;
+        
+        // 更新当前位置
+        self.pos = pos;
+        Ok(())
+    }
 }
 
 impl Drop for FsWriter {

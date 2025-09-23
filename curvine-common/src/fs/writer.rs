@@ -101,4 +101,17 @@ pub trait Writer {
     fn complete(&mut self) -> impl Future<Output = FsResult<()>>;
 
     fn cancel(&mut self) -> impl Future<Output = FsResult<()>>;
+    
+    // 🔑 新增：随机写 seek 支持
+    fn seek(&mut self, pos: i64) -> impl Future<Output = FsResult<()>> {
+        async move {
+            if pos < 0 {
+                return Err(format!("Cannot seek to negative position: {}", pos).into());
+            }
+            // 默认实现：清空缓冲区，更新位置
+            self.flush_chunk().await?;
+            *self.pos_mut() = pos;
+            Ok(())
+        }
+    }
 }

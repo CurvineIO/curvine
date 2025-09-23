@@ -205,6 +205,17 @@ impl BlockMeta {
             LocalFile::with_write(file, false)
         }
     }
+    
+    // 🔑 新增：支持指定offset的writer创建方法（随机写支持）
+    pub fn create_writer_with_offset(&self, is_append: bool, offset: i64) -> IOResult<LocalFile> {
+        let file = self.get_block_file()?;
+        if is_append {
+            LocalFile::with_append(file)
+        } else {
+            // 对于随机写，使用支持offset的方法
+            LocalFile::with_write_offset(file, false, offset)
+        }
+    }
 
     pub fn create_reader(&self, offset: u64) -> IOResult<LocalFile> {
         LocalFile::with_read(self.get_block_file()?, offset)

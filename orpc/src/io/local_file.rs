@@ -78,6 +78,18 @@ impl LocalFile {
         let file = try_err!(file);
         Self::new(path.as_ref(), file)
     }
+    
+    // 🔑 新增：支持指定初始写入位置的方法
+    pub fn with_write_offset<T: AsRef<str>>(path: T, overwrite: bool, offset: i64) -> IOResult<Self> {
+        let mut local_file = Self::with_write(path, overwrite)?;
+        
+        if offset > 0 {
+            // 如果指定了偏移量，seek到指定位置
+            local_file.seek(offset)?;
+        }
+        
+        Ok(local_file)
+    }
 
     pub fn from_file(path: &str, inner: fs::File) -> IOResult<Self> {
         Self::new(path, inner)

@@ -103,7 +103,7 @@ mini-moka = "0.10.3"
 moka = { version = "0.12.10", features = ["sync", "future"] }
 flate2 = { version = "1.0.29", features = ["zlib"], default-features = false }
 crossbeam = "0.8.4"
-dashmap = "5.5.3"
+dashmap = "5.1.0"
 linked-hash-map = "0.5.6"
 fxhash = "0.2.1"
 serde_with = "3.12.0"

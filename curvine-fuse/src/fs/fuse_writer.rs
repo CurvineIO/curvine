@@ -32,6 +32,7 @@ enum WriteTask {
     Write(DataSlice, FuseResponse),
     Flush(CallSender<i8>),
     Complete(CallSender<i8>),
+    Seek((i64, CallSender<i8>)), // 🔑 新增：随机写 seek 支持
 }
 
 pub struct FuseWriter {
@@ -56,7 +57,7 @@ impl FuseWriter {
             match res {
                 Ok(_) => {}
                 Err(e) => {
-                    error!("fuse writer error: {}", e);
+                    error!("fuse writer error: {e}");
                     monitor.set_error(e);
                 }
             }
@@ -130,6 +131,26 @@ impl FuseWriter {
         }
     }
 
+    // 🔑 新增：随机写 seek 支持
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        let res: FsResult<()> = {
+            let (rx, tx) = CallChannel::channel();
+            self.sender.send(WriteTask::Seek((pos, rx))).await?;
+            tx.receive().await?;
+            Ok(())
+        };
+
+        // 更新位置（注意：实际seek由后台任务执行）
+        if res.is_ok() {
+            self.pos = pos;
+        }
+
+        match res {
+            Err(e) => Err(self.check_error(e)),
+            Ok(_) => Ok(()),
+        }
+    }
+
     async fn writer_future(
         mut writer: UnifiedWriter,
         mut req_receiver: AsyncReceiver<WriteTask>,
@@ -159,6 +180,12 @@ impl FuseWriter {
 
                 WriteTask::Flush(tx) => {
                     writer.flush().await?;
+                    tx.send(1)?;
+                }
+
+                // 🔑 处理随机写 seek 任务
+                WriteTask::Seek((pos, tx)) => {
+                    writer.seek(pos).await?;
                     tx.send(1)?;
                 }
             }

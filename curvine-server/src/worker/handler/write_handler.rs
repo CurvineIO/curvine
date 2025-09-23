@@ -125,11 +125,32 @@ impl WriteHandler {
         let context = try_option_mut!(self.context);
         Self::check_context(context, msg)?;
 
+        // msg.header
+        // 🔑 处理header中的seek信息（随机写支持）
+        if msg.header_len() > 0 {
+            let header: DataHeaderProto = msg.parse_header()?;
+            // 如果header中包含offset信息，执行seek操作
+            if header.offset != file.pos() {
+                if header.offset < 0 || header.offset >= context.len {
+                    return err_box!("Invalid seek offset: {}, block length: {}", 
+                        header.offset, context.len);
+                }
+                file.seek(header.offset)?;
+            }
+            
+            // 处理flush请求
+            if header.flush {
+                file.flush()?;
+            }
+        }
+        
         // Write existing data blocks.
         let data_len = msg.data_len() as i64;
         if data_len > 0 {
+            // 🔑 随机写边界检查：检查写入范围而非连续性
             if file.pos() + data_len > context.len {
-                return err_box!("Writing data exceeds block_size");
+                return err_box!("Write range [{}, {}) exceeds block size {}", 
+                    file.pos(), file.pos() + data_len, context.len);
             }
 
             let spend = TimeSpent::new();
@@ -147,14 +168,6 @@ impl WriteHandler {
             }
             self.metrics.write_bytes.inc_by(msg.data_len() as i64);
             self.metrics.write_time_us.inc_by(used as i64);
-        }
-
-        // parse the header header and whether flush data is required.
-        if msg.header_len() > 0 {
-            let header: DataHeaderProto = msg.parse_header()?;
-            if header.flush {
-                file.flush()?;
-            }
         }
 
         Ok(msg.success())

@@ -153,7 +153,7 @@ impl ReadHandler {
             let header: DataHeaderProto = msg.parse_header()?;
             // The customer service initiated seek and skip operations.
             if header.offset != file.pos() {
-                file.seek(header.offset)?;
+                file.seek(header.offset)?; 
             }
         }
 

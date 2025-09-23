@@ -97,15 +97,20 @@ impl BlockClient {
         Ok(context)
     }
 
-    pub async fn write_data(&self, buf: DataSlice, req_id: i64, seq_id: i32) -> CommonResult<()> {
-        let msg = Builder::new()
+    pub async fn write_data(&self, buf: DataSlice, req_id: i64, seq_id: i32, header: Option<DataHeaderProto>) -> CommonResult<()> {
+        let mut builder = Builder::new()
             .code(RpcCode::WriteBlock)
             .request(RequestStatus::Running)
             .req_id(req_id)
             .seq_id(seq_id)
-            .data(buf)
-            .build();
-
+            .data(buf);
+        
+        // 🔑 如果有header信息（包含seek位置），添加到消息中
+        if let Some(header) = header {
+            builder = builder.proto_header(header);
+        }
+        
+        let msg = builder.build();
         let _ = self.rpc(msg).await?;
         Ok(())
     }

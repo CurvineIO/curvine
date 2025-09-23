@@ -162,27 +162,24 @@ impl FuseFile {
         let off = op.arg.offset;
         let pos = writer.pos() as u64;
         let len = op.data.len() as u64;
-        if off != pos && off + len > pos {
-            return err_fuse!(
-                libc::EIO,
-                "Only sequential write is supported, path={} offset={} size={}, pos={}",
-                writer.path_str(),
-                off,
-                len,
-                pos
-            );
+        
+        // 🔑 支持随机写：如果 offset != pos，执行 seek 操作
+        if off != pos {
+            writer.seek(off as i64).await?;
         }
 
-        if off + len <= pos {
-            // for fulfill vim :wq
-            // Business layer error, but the return to the fuse kernel is successful.
+        // 🔑 移除顺序写限制，支持真正的随机写
+        // 处理一些特殊情况：如果写入长度为0或者写入位置已经超过了当前位置
+        if len == 0 || (off + len <= pos && off < pos) {
+            // 对于长度为0的写入或者重复写入，返回成功但不实际写入
+            // 这是为了兼容某些编辑器（如vim）的行为
             return err_fuse!(
                 FUSE_SUCCESS,
-                "Skip writing to file {} offset={} size={} when {} bytes has written to file",
+                "Skip zero-length or redundant write to file {} offset={} size={}, current pos={}",
                 writer.path_str(),
                 off,
                 len,
-                pos
+                writer.pos()
             );
         }
 

@@ -28,6 +28,7 @@ use std::sync::Arc;
 enum WriterTask {
     Flush(CallSender<i8>),
     Complete((bool, CallSender<i8>)),
+    Seek((i64, CallSender<i8>)),  // 🔑 新增 Seek 任务
 }
 
 enum SelectTask {
@@ -162,6 +163,26 @@ impl FsWriterBuffer {
             Ok(_) => Ok(()),
         }
     }
+    
+    // 🔑 实现随机写 seek 支持
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        let res: FsResult<()> = {
+            let (tx, rx) = CallChannel::channel();
+            self.task_sender
+                .send(WriterTask::Seek((pos, tx)))
+                .await?;
+            rx.receive().await?;
+            Ok(())
+        };
+
+        // 更新位置（注意：实际seek由后台任务执行）
+        self.pos = pos;
+
+        match res {
+            Err(e) => Err(self.check_error(e)),
+            Ok(_) => Ok(()),
+        }
+    }
 
     async fn write_future(
         mut chunk_receiver: AsyncReceiver<DataSlice>,
@@ -199,6 +220,17 @@ impl FsWriterBuffer {
                         writer.complete().await?;
                         tx.send(1)?;
                         return Ok(());
+                    }
+                    
+                    // 🔑 处理 Seek 任务
+                    WriterTask::Seek((pos, tx)) => {
+                        // 先处理缓冲区中的所有数据
+                        while let Some(chunk) = chunk_receiver.try_recv()? {
+                            writer.write(chunk).await?;
+                        }
+                        // 执行seek操作
+                        writer.seek(pos).await?;
+                        tx.send(1)?;
                     }
                 },
 
