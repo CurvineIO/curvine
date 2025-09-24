@@ -19,10 +19,11 @@ use std::ptr;
 use std::sync::Arc;
 use std::task::Poll;
 use bytes::BytesMut;
-use log::warn;
+use futures::future::err;
+use log::{info, warn};
 use crate::{err_box, err_ucs};
-use crate::io::IOResult;
-use crate::sync::StateCtl;
+use crate::io::{IOError, IOResult};
+use crate::sync::{ErrorMonitor, StateCtl};
 use crate::sys::{DataSlice, RawPtr, RawVec};
 use crate::ucp::bindings::*;
 use crate::ucp::{ConnRequest, Request, RequestFuture, SockAddr, stderr, UcpUtils, Worker};
@@ -30,15 +31,17 @@ use crate::ucp::{ConnRequest, Request, RequestFuture, SockAddr, stderr, UcpUtils
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
     worker: Arc<Worker>,
-    state_ctl: Arc<StateCtl>,
+    err_monitor: Arc<ErrorMonitor<IOError>>,
 }
 
 impl Endpoint {
     pub fn new(worker: Arc<Worker>, mut params: ucp_ep_params) -> IOResult<Self> {
+        let err_monitor = Arc::new(ErrorMonitor::new());
+
         params.field_mask |= (ucp_ep_params_field::UCP_EP_PARAM_FIELD_USER_DATA
             | ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLER)
             .0 as u64;
-        params.user_data = ptr::null_mut();
+        params.user_data = &*err_monitor as *const _ as *mut c_void;
         params.err_handler = ucp_err_handler {
             cb: Some(Self::err_cb),
             arg: ptr::null_mut()
@@ -53,7 +56,7 @@ impl Endpoint {
         Ok(Self {
             inner: RawPtr::from_uninit(inner),
             worker,
-            state_ctl: Arc::new(StateCtl::new(0)),
+            err_monitor,
         })
     }
 
@@ -65,8 +68,13 @@ impl Endpoint {
         self.inner.as_mut_ptr()
     }
 
-    pub unsafe extern "C" fn err_cb(_arg: *mut c_void, ep: ucp_ep_h, status: ucs_status_t) {
-        warn!("endpoint handler error: {:?}", status);
+
+    // @todo 可能来不及回调，触发段错误。需要加一个await
+    pub unsafe extern "C" fn err_cb(arg: *mut c_void, ep: ucp_ep_h, status: ucs_status_t) {
+        let err_monitor = &*(arg as *mut ErrorMonitor<IOError>);
+        err_monitor.set_error(format!("endpoint handler error: {:?}", status).into());
+
+        info!("xxx");
         let status = ucp_ep_close_nb(ep, ucp_ep_close_mode::UCP_EP_CLOSE_MODE_FORCE as _);
         if let Err(e) = err_ucs!(UcpUtils::ucs_ptr_raw_status(status)) {
             warn!("Force close endpoint failed, {}", e);
@@ -120,6 +128,8 @@ impl Endpoint {
     }
 
     pub async fn stream_send(&self, buf: DataSlice) -> IOResult<usize> {
+        self.err_monitor.check_error()?;
+
         let status = unsafe {
             ucp_stream_send_nb(
                 self.as_mut_ptr(),

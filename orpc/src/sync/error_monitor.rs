@@ -15,6 +15,7 @@
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use log::{info, warn};
 
 // Used to set errors in asynchronous environments.
 pub struct ErrorMonitor<E: Error> {
@@ -50,6 +51,21 @@ impl<E: Error> ErrorMonitor<E> {
         }
         let mut e = self.error.lock().unwrap();
         e.take()
+    }
+
+    pub fn check_error(&self) -> Result<(), E> {
+        if !self.has_error() {
+            return Ok(());
+        }
+
+        let mut e = self.error.lock().unwrap();
+        match e.take() {
+            Some(e) => {
+                warn!("error monitor has error: {:?}", e);
+                Err(e)
+            },
+            None => Ok(()),
+        }
     }
 }
 

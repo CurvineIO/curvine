@@ -17,11 +17,11 @@ use std::mem::MaybeUninit;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
-use futures::channel::mpsc;
 use log::{error, info};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::err_ucs;
 use crate::io::IOResult;
-use crate::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
 use crate::ucp::{ConnRequest, SockAddr, Worker};
@@ -29,13 +29,14 @@ use crate::ucp::{ConnRequest, SockAddr, Worker};
 pub struct Listener {
     inner: RawPtr<ucp_listener>,
     #[allow(unused)]
-    sender: BlockingSender<ConnRequest>,
-    receiver: BlockingReceiver<ConnRequest>,
+    sender: Rc<UnboundedSender<ConnRequest>>,
+    receiver: UnboundedReceiver<ConnRequest>,
 }
 
 impl Listener {
     pub fn new(worker: Arc<Worker>, addr: &SockAddr) -> IOResult<Self> {
-        let (sender, receiver) = BlockingChannel::new(0).split();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let sender = Rc::new(sender);
 
         let params = ucp_listener_params_t {
             field_mask: (ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_SOCK_ADDR
@@ -50,7 +51,7 @@ impl Listener {
 
             conn_handler: ucp_listener_conn_handler_t {
                 cb: Some(Self::connect_handler),
-                arg: &sender as *const BlockingSender<ConnRequest> as _,
+                arg: &*sender as *const UnboundedSender<ConnRequest> as _,
             },
         };
 
@@ -68,12 +69,14 @@ impl Listener {
     }
 
     unsafe extern "C" fn connect_handler(conn_request: ucp_conn_request_h, arg: *mut c_void) {
-        let sender = &*(arg as *const BlockingSender<ConnRequest>);
+        let sender = &*(arg as *const UnboundedSender<ConnRequest>);
         let conn = ConnRequest::new(conn_request);
+        info!("accept conn request: {:?}", conn.as_mut_ptr());
         if let Err(e) = sender.send(conn) {
             error!("send conn request failed: {:?}", e);
             // @todo 处理错误
         }
+        info!("send xxx")
     }
 
     pub fn as_ptr(&self) -> *const ucp_listener {
@@ -104,7 +107,7 @@ impl Listener {
     }
 
     pub async fn next(&mut self) -> IOResult<ConnRequest> {
-        let conn = self.receiver.recv_check()?;
+        let conn = self.receiver.recv().await.unwrap();
         Ok(conn)
     }
 

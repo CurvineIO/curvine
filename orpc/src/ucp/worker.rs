@@ -15,8 +15,9 @@
 use std::mem;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
+use log::info;
 use tokio::task::yield_now;
-use crate::err_ucs;
+use crate::{err_box, err_ucs};
 use crate::io::IOResult;
 use crate::sys::{RawIO, RawPtr};
 use crate::sys::pipe::{AsyncFd, BorrowedFd};
@@ -92,6 +93,21 @@ impl Worker {
         Ok(fd)
     }
 
+    pub fn arm(&self) -> IOResult<bool> {
+        let status = unsafe {
+            ucp_worker_arm(self.as_mut_ptr())
+        };
+
+        match status {
+            ucs_status_t::UCS_OK => Ok(true),
+            ucs_status_t::UCS_ERR_BUSY => Ok(false),
+            status => {
+                err_ucs!(status)?;
+                err_box!("ucp_worker_arm failed: {:?}", status)
+            }
+        }
+    }
+
     pub fn async_fd(&self) -> IOResult<AsyncFd> {
         let fd = self.raw_fd()?;
         AsyncFd::new(BorrowedFd::new(fd))
@@ -100,9 +116,14 @@ impl Worker {
     pub async fn event_poll(&self) -> IOResult<()> {
         let fd = self.async_fd()?.into_inner();
         loop {
+            info!("xxx");
+
             while self.progress() != 0 {}
-            let mut ready = fd.readable().await.unwrap();
-            ready.clear_ready();
+            info!("xxx");
+            if self.arm()? {
+                let mut ready = fd.readable().await.unwrap();
+                ready.clear_ready();
+            }
         }
     }
 }
