@@ -163,7 +163,7 @@ impl DataSlice {
         match self {
             Empty => Empty,
             Buffer(s) => Buffer(s.split_to(at)),
-            IOSlice(s) => IOSlice(s.split_to()),
+            IOSlice(s) => IOSlice(s.split_to(at)),
             MemSlice(s) => MemSlice(s.split_to(at)),
             Bytes(s) => Bytes(s.split_to(at)),
         }
@@ -173,7 +173,7 @@ impl DataSlice {
         match self {
             Empty => Empty,
             Buffer(s) => Buffer(s.split_off(at)),
-            IOSlice(s) => IOSlice(s.split_off()),
+            IOSlice(s) => IOSlice(s.split_off(at)),
             MemSlice(s) => MemSlice(s.split_off(at)),
             Bytes(s) => Bytes(s.split_off(at)),
         }
@@ -183,7 +183,7 @@ impl DataSlice {
         match self {
             Empty => (),
             Buffer(s) => s.copy_to_slice(dst),
-            IOSlice(s) => s.copy_to_slice(),
+            IOSlice(s) => s.copy_to_slice(dst),
             MemSlice(s) => s.copy_to_slice(dst),
             Bytes(s) => s.copy_to_slice(dst),
         }
@@ -193,7 +193,7 @@ impl DataSlice {
         match self {
             Empty => (),
             Buffer(s) => s.advance(cnt),
-            IOSlice(s) => s.advance(),
+            IOSlice(s) => s.advance(cnt),
             MemSlice(s) => s.advance(cnt),
             Bytes(s) => s.advance(cnt),
         }

@@ -169,6 +169,9 @@ pub fn splice(
     }
 }
 
+// Synchronous splice with improved error handling and retry logic.
+// This function handles EAGAIN/EWOULDBLOCK by yielding and retrying.
+// Note: This is a blocking operation and should be called from worker threads, not async runtime.
 pub fn splice_out_full(
     fd_in: RawIO,
     mut off_in: Option<i64>,
@@ -176,18 +179,43 @@ pub fn splice_out_full(
     mut off_out: Option<i64>,
     len: usize,
 ) -> IOResult<()> {
-    let mut reaming = len;
-    while reaming > 0 {
-        let transferred = splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), reaming)?;
-        if transferred == 0 {
-            return err_box!("unsupported operation");
+    let mut remaining = len;
+    let mut retry_count = 0;
+    const MAX_RETRIES: usize = 1000;
+
+    while remaining > 0 {
+        match splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), remaining) {
+            Ok(transferred) => {
+                if transferred == 0 {
+                    return err_box!("splice returned 0, possible unsupported operation");
+                }
+                remaining -= transferred as usize;
+                retry_count = 0; // Reset retry count on successful transfer
+            }
+
+            Err(e) if e.is_would_block() => {
+                retry_count += 1;
+                if retry_count > MAX_RETRIES {
+                    return err_box!(
+                        "splice exceeded max retries ({}), remaining {} bytes",
+                        MAX_RETRIES,
+                        remaining
+                    );
+                }
+                // Yield to avoid busy-waiting
+                std::thread::yield_now();
+                continue;
+            }
+
+            Err(e) => return Err(e),
         }
-        reaming -= transferred as usize;
     }
 
     Ok(())
 }
 
+// Async splice from network to file descriptor.
+// Uses RpcFrame's async_read to properly handle non-blocking I/O in tokio runtime.
 pub async fn splice_in_full(
     io_in: &RpcFrame,
     mut off_in: Option<i64>,
@@ -196,17 +224,24 @@ pub async fn splice_in_full(
     len: usize,
 ) -> IOResult<()> {
     let fd_in = get_raw_io(io_in)?;
+    let mut remaining = len;
 
-    let mut reaming = len;
-    while reaming > 0 {
-        let write_res = io_in
-            .async_read(|| splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), reaming))
+    while remaining > 0 {
+        let res = io_in
+            .async_read(|| splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), remaining))
             .await;
 
-        match write_res {
-            Ok(transferred) => reaming -= transferred as usize,
+        match res {
+            Ok(transferred) => {
+                if transferred == 0 {
+                    return err_box!("splice returned 0");
+                }
+                remaining -= transferred as usize;
+            }
 
-            Err(e) if e.is_would_block() => continue,
+            Err(e) if e.is_would_block() => {
+                continue;
+            }
 
             Err(e) => return Err(e),
         }

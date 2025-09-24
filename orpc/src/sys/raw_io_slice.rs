@@ -47,23 +47,63 @@ impl RawIOSlice {
         panic!("IoSlice does not support as_bytes")
     }
 
-    pub fn split_to(&mut self) -> Self {
-        panic!("IoSlice does not support split_to")
+    pub fn split_to(&mut self, at: usize) -> Self {
+        if at >= self.len {
+            let result = self.clone();
+            self.len = 0;
+            result
+        } else {
+            let result = Self {
+                raw: self.raw,
+                off: self.off,
+                len: at,
+            };
+
+            // Update current slice
+            if let Some(ref mut offset) = self.off {
+                *offset += at as i64;
+            }
+            self.len -= at;
+
+            result
+        }
     }
 
-    pub fn split_off(&mut self) -> Self {
-        panic!("IoSlice does not support split_off")
+    pub fn split_off(&mut self, at: usize) -> Self {
+        if at >= self.len {
+            Self {
+                raw: self.raw,
+                off: self.off.map(|o| o + self.len as i64),
+                len: 0,
+            }
+        } else {
+            let result = Self {
+                raw: self.raw,
+                off: self.off.map(|o| o + at as i64),
+                len: self.len - at,
+            };
+
+            self.len = at;
+
+            result
+        }
     }
 
-    pub fn copy_to_slice(&mut self) {
-        panic!("IoSlice does not support copy_to_slice")
+    pub fn copy_to_slice(&mut self, _dst: &mut [u8]) {
+        panic!("IOSlice does not support copy_to_slice: use read system call instead")
     }
 
-    pub fn advance(&mut self) {
-        panic!("IoSlice does not support advance")
+    pub fn advance(&mut self, cnt: usize) {
+        let advance_len = cnt.min(self.len);
+
+        if let Some(ref mut offset) = self.off {
+            *offset += advance_len as i64;
+        }
+
+        self.len -= advance_len;
     }
 
     pub fn clear(&mut self) {
-        panic!("IoSlice does not support clear")
+        self.len = 0;
     }
 }

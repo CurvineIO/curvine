@@ -125,7 +125,29 @@ impl LocalFile {
                 bytes.len()
             }
 
-            DataSlice::IOSlice(_) => return err_box!("Not support"),
+            DataSlice::IOSlice(io_slice) => {
+                #[cfg(target_os = "linux")]
+                {
+                    use crate::sys;
+                    use std::os::unix::io::AsRawFd;
+
+                    let src_off = io_slice.off();
+                    sys::splice_out_full(
+                        io_slice.raw_io(),
+                        src_off,
+                        self.inner.as_raw_fd(),
+                        Some(self.pos),
+                        io_slice.len(),
+                    )?;
+                    io_slice.len()
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return err_box!(
+                        "IOSlice zero-copy write not supported on non-Linux platforms"
+                    );
+                }
+            }
 
             DataSlice::MemSlice(bytes) => {
                 self.inner.write_all(bytes.as_slice())?;
