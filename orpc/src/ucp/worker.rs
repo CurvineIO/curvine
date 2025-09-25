@@ -17,7 +17,7 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 use log::info;
 use tokio::task::yield_now;
-use crate::{err_box, err_ucs};
+use crate::{err_box, err_ucs, sys};
 use crate::io::IOResult;
 use crate::sys::{RawIO, RawPtr};
 use crate::sys::pipe::{AsyncFd, BorrowedFd};
@@ -108,21 +108,30 @@ impl Worker {
         }
     }
 
-    pub fn async_fd(&self) -> IOResult<AsyncFd> {
-        let fd = self.raw_fd()?;
-        AsyncFd::new(BorrowedFd::new(fd))
-    }
-
     pub async fn event_poll(&self) -> IOResult<()> {
-        let fd = self.async_fd()?.into_inner();
-        loop {
-            info!("xxx");
+        let fd = self.raw_fd()?;
+        sys::set_pipe_blocking(fd, false)?;
+        let fd = AsyncFd::new(BorrowedFd::new(fd))?.into_inner();
 
-            while self.progress() != 0 {}
-            info!("xxx");
+        let mut total_events = 0;
+        loop {
+            let mut guard = fd.readable().await?;
+
+            loop {
+                let events = self.progress();
+                total_events += events;
+                if events == 0 {
+                    break;
+                }
+
+                if total_events > 1000 {
+                    yield_now().await;
+                    total_events = 0;
+                }
+            }
+
             if self.arm()? {
-                let mut ready = fd.readable().await.unwrap();
-                ready.clear_ready();
+                guard.clear_ready();
             }
         }
     }

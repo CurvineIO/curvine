@@ -68,17 +68,11 @@ impl Endpoint {
         self.inner.as_mut_ptr()
     }
 
-
     // @todo 可能来不及回调，触发段错误。需要加一个await
     pub unsafe extern "C" fn err_cb(arg: *mut c_void, ep: ucp_ep_h, status: ucs_status_t) {
         let err_monitor = &*(arg as *mut ErrorMonitor<IOError>);
         err_monitor.set_error(format!("endpoint handler error: {:?}", status).into());
-
-        info!("xxx");
-        let status = ucp_ep_close_nb(ep, ucp_ep_close_mode::UCP_EP_CLOSE_MODE_FORCE as _);
-        if let Err(e) = err_ucs!(UcpUtils::ucs_ptr_raw_status(status)) {
-            warn!("Force close endpoint failed, {}", e);
-        }
+        info!("endpoint handler error: {:?}", status);
     }
 
     pub async fn connect(worker: Arc<Worker>, addr: &SockAddr) -> IOResult<Self> {
@@ -159,6 +153,7 @@ impl Endpoint {
         _status: ucs_status_t,
         _length: usize
     ) {
+        info!("xxx");
         let request = &mut *(request as *mut Request);
         request.waker.wake();
     }
@@ -202,6 +197,7 @@ impl Endpoint {
     pub fn print(&self) {
         unsafe { ucp_ep_print_info(self.as_mut_ptr(), stderr) };
     }
+
 }
 
 impl Drop for Endpoint {

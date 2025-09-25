@@ -35,6 +35,16 @@ impl<T> AsyncSender<T> {
         Ok(())
     }
 
+    pub fn send_sync(&self, value: T) -> IOResult<()> {
+        match self {
+            AsyncSender::Unbounded(s) => {
+                s.send(value)?;
+                Ok(())
+            },
+            AsyncSender::Bounded(_) => err_box!("Not support")
+        }
+    }
+
     pub fn try_reserve(&self) -> IOResult<Option<Permit<'_, T>>> {
         match self {
             AsyncSender::Unbounded(_) => {

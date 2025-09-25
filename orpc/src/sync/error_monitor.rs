@@ -54,16 +54,8 @@ impl<E: Error> ErrorMonitor<E> {
     }
 
     pub fn check_error(&self) -> Result<(), E> {
-        if !self.has_error() {
-            return Ok(());
-        }
-
-        let mut e = self.error.lock().unwrap();
-        match e.take() {
-            Some(e) => {
-                warn!("error monitor has error: {:?}", e);
-                Err(e)
-            },
+        match self.take_error() {
+            Some(e) => Err(e),
             None => Ok(()),
         }
     }

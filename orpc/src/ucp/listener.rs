@@ -17,26 +17,43 @@ use std::mem::MaybeUninit;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::task::{LocalSet, spawn_local};
 use crate::err_ucs;
-use crate::io::IOResult;
+use crate::io::{IOError, IOResult};
+use crate::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
+use crate::sync::ErrorMonitor;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
-use crate::ucp::{ConnRequest, SockAddr, Worker};
+use crate::ucp::{ConnRequest, Context, Endpoint, SockAddr, Worker};
+
+struct ConnContext {
+    sender: AsyncSender<ConnRequest>,
+    error_monitor: Arc<ErrorMonitor<IOError>>,
+}
+
+impl ConnContext {
+    pub fn new(sender: AsyncSender<ConnRequest>) -> Self {
+        Self {
+            sender,
+            error_monitor: Arc::new(ErrorMonitor::new()),
+        }
+    }
+}
 
 pub struct Listener {
     inner: RawPtr<ucp_listener>,
-    #[allow(unused)]
-    sender: Rc<UnboundedSender<ConnRequest>>,
-    receiver: UnboundedReceiver<ConnRequest>,
+    worker: Arc<Worker>,
+    conn_context: Rc<ConnContext>,
+    receiver: AsyncReceiver<ConnRequest>,
 }
 
 impl Listener {
-    pub fn new(worker: Arc<Worker>, addr: &SockAddr) -> IOResult<Self> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let sender = Rc::new(sender);
+    pub async fn bind(context: Arc<Context>, addr: &SockAddr) -> IOResult<Self> {
+        let (sender, receiver) = AsyncChannel::new(0).split();
+        let conn_context = Rc::new(ConnContext::new(sender));
 
         let params = ucp_listener_params_t {
             field_mask: (ucp_listener_params_field::UCP_LISTENER_PARAM_FIELD_SOCK_ADDR
@@ -50,33 +67,41 @@ impl Listener {
             },
 
             conn_handler: ucp_listener_conn_handler_t {
-                cb: Some(Self::connect_handler),
-                arg: &*sender as *const UnboundedSender<ConnRequest> as _,
+                cb: Some(Self::conn_handler),
+                arg: &*conn_context as *const ConnContext as _,
             },
         };
 
+        // 创建worker和listener
+        let worker = Arc::new(Worker::new(context)?);
         let mut handle = MaybeUninit::<*mut ucp_listener>::uninit();
         let status = unsafe {
             ucp_listener_create(worker.as_mut_ptr(), &params, handle.as_mut_ptr())
         };
         err_ucs!(status)?;
 
+        // 启动event_poll
+        let poll_worker = worker.clone();
+        let poll_context = conn_context.clone();
+        spawn_local(async move {
+            if let Err(e) = poll_worker.event_poll().await {
+                poll_context.error_monitor.set_error(e);
+            }
+        });
+
         Ok(Listener {
             inner: RawPtr::from_uninit(handle),
-            sender,
+            worker,
             receiver,
+            conn_context,
         })
     }
 
-    unsafe extern "C" fn connect_handler(conn_request: ucp_conn_request_h, arg: *mut c_void) {
-        let sender = &*(arg as *const UnboundedSender<ConnRequest>);
-        let conn = ConnRequest::new(conn_request);
-        info!("accept conn request: {:?}", conn.as_mut_ptr());
-        if let Err(e) = sender.send(conn) {
-            error!("send conn request failed: {:?}", e);
-            // @todo 处理错误
+    unsafe extern "C" fn conn_handler(conn_request: ucp_conn_request_h, arg: *mut c_void) {
+        let context = &*(arg as *const ConnContext);
+        if let Err(e) = context.sender.send_sync(ConnRequest::new(conn_request)) {
+            context.error_monitor.set_error(e)
         }
-        info!("send xxx")
     }
 
     pub fn as_ptr(&self) -> *const ucp_listener {
@@ -106,8 +131,13 @@ impl Listener {
         Ok(SockAddr::new(sockaddr))
     }
 
-    pub async fn next(&mut self) -> IOResult<ConnRequest> {
-        let conn = self.receiver.recv().await.unwrap();
+    pub fn check_error(&self) -> IOResult<()> {
+        self.conn_context.error_monitor.check_error()
+    }
+
+    pub async fn accept(&mut self) -> IOResult<ConnRequest> {
+        self.check_error()?;
+        let conn = self.receiver.recv_check().await?;
         Ok(conn)
     }
 
@@ -117,6 +147,11 @@ impl Listener {
         };
         err_ucs!(status)
     }
+
+    pub fn worker(&self) -> &Arc<Worker> {
+        &self.worker
+    }
+
 }
 
 impl Drop for Listener {
