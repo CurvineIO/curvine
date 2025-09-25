@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use bytes::BytesMut;
-use log::info;
+use log::{error, info};
+use tokio::task::spawn_local;
 use orpc::common::Logger;
 use orpc::ucp::{Context, Endpoint, Listener, Worker};
 
@@ -15,11 +16,18 @@ async fn main() {
 
     let local = tokio::task::LocalSet::new();
     local.run_until(async move {
-        let mut listener = Listener::bind(context.clone(), &addr).await.unwrap();
+        let worker = context.create_worker().unwrap();
+
+        let w = worker.clone();
+        spawn_local(async move {
+            w.polling().await.unwrap();
+        });
+
+        let mut listener = Listener::bind(&worker, &addr).await.unwrap();
 
         let conn = listener.accept().await.unwrap();
 
-        let ep = Endpoint::accept(listener.worker().clone(), conn).unwrap();
+        let ep = Endpoint::accept(&worker, conn).unwrap();
 
         ep.print();
         let buf = BytesMut::zeroed(1024);

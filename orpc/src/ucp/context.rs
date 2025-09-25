@@ -14,11 +14,12 @@
 
 use std::{mem, ptr};
 use std::mem::MaybeUninit;
+use std::sync::Arc;
 use crate::{err_box, err_ucs};
 use crate::io::IOResult;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
-use crate::ucp::{Config, stderr};
+use crate::ucp::{Config, stderr, Worker};
 use crate::ucp::Request;
 
 #[derive(Debug)]
@@ -77,6 +78,11 @@ impl Context {
         unsafe {
             ucp_context_print_info(self.as_mut_ptr(), stderr)
         }
+    }
+
+    pub fn create_worker(self: &Arc<Self>) -> IOResult<Arc<Worker>> {
+        let worker = Worker::new(self.clone())?;
+        Ok(Arc::new(worker))
     }
 }
 

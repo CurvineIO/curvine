@@ -19,6 +19,7 @@ use log::info;
 use tokio::task::yield_now;
 use crate::{err_box, err_ucs, sys};
 use crate::io::IOResult;
+use crate::sync::{AtomicBool, StateCtl};
 use crate::sys::{RawIO, RawPtr};
 use crate::sys::pipe::{AsyncFd, BorrowedFd};
 use crate::ucp::bindings::*;
@@ -27,6 +28,7 @@ use crate::ucp::{Context, stderr};
 pub struct Worker {
     inner: RawPtr<ucp_worker>,
     context: Arc<Context>,
+    poll_start: AtomicBool
 }
 
 impl Worker {
@@ -45,7 +47,8 @@ impl Worker {
 
         Ok(Self {
             inner: RawPtr::from_uninit(inner),
-            context
+            context,
+            poll_start: AtomicBool::new(false),
         })
     }
 
@@ -60,13 +63,6 @@ impl Worker {
     pub fn progress(&self) -> u32 {
         unsafe {
             ucp_worker_progress(self.inner.as_mut_ptr())
-        }
-    }
-
-    pub async fn polling(&self) {
-        loop {
-            while self.progress() != 0 {}
-            yield_now().await
         }
     }
 
@@ -108,7 +104,22 @@ impl Worker {
         }
     }
 
+    pub async fn polling(&self) -> IOResult<()> {
+        if !self.poll_start.compare_and_set(false, true) {
+            return err_box!("worker polling already started");
+        }
+
+        loop {
+            while self.progress() != 0 {}
+            yield_now().await
+        }
+    }
+
     pub async fn event_poll(&self) -> IOResult<()> {
+        if !self.poll_start.compare_and_set(false, true) {
+            return err_box!("worker polling already started");
+        }
+
         let fd = self.raw_fd()?;
         sys::set_pipe_blocking(fd, false)?;
         let fd = AsyncFd::new(BorrowedFd::new(fd))?.into_inner();
@@ -134,6 +145,10 @@ impl Worker {
                 guard.clear_ready();
             }
         }
+    }
+
+    pub fn context(&self) -> &Arc<Context> {
+        &self.context
     }
 }
 

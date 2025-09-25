@@ -30,12 +30,11 @@ use crate::ucp::{ConnRequest, Request, RequestFuture, SockAddr, stderr, UcpUtils
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
-    worker: Arc<Worker>,
     err_monitor: Arc<ErrorMonitor<IOError>>,
 }
 
 impl Endpoint {
-    fn new(worker: Arc<Worker>, mut params: ucp_ep_params) -> IOResult<Self> {
+    fn new(worker: &Worker, mut params: ucp_ep_params) -> IOResult<Self> {
         let err_monitor = Arc::new(ErrorMonitor::new());
 
         params.field_mask |= (ucp_ep_params_field::UCP_EP_PARAM_FIELD_USER_DATA
@@ -55,7 +54,6 @@ impl Endpoint {
 
         Ok(Self {
             inner: RawPtr::from_uninit(inner),
-            worker,
             err_monitor,
         })
     }
@@ -78,7 +76,7 @@ impl Endpoint {
         self.err_monitor.check_error()
     }
 
-    pub fn connect(worker: Arc<Worker>, addr: &SockAddr) -> IOResult<Self> {
+    pub fn connect(worker: &Worker, addr: &SockAddr) -> IOResult<Self> {
         let params = ucp_ep_params {
             field_mask: (ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS
                 | ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR
@@ -99,7 +97,7 @@ impl Endpoint {
         Ok(endpoint)
     }
 
-    pub fn accept(worker: Arc<Worker>, conn: ConnRequest) -> IOResult<Self> {
+    pub fn accept(worker: &Worker, conn: ConnRequest) -> IOResult<Self> {
         let params = ucp_ep_params {
             field_mask: ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST.0 as u64,
             conn_request: conn.as_mut_ptr(),

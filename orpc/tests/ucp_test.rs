@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use log::info;
+use tokio::task::spawn_local;
 use orpc::common::Logger;
 use orpc::ucp::{Config, Context, Endpoint, SockAddr, Worker};
 
@@ -24,21 +25,22 @@ fn worker() {
     println!("fd = {}", fd);
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test]
 async fn endpoint() {
     Logger::default();
-    let worker = Arc::new(Worker::default());
+    let context = Arc::new(Context::default());
     let addr = "127.0.0.1:8080".into();
 
     let local = tokio::task::LocalSet::new();
     local.run_until(async move {
-        let polling_worker = worker.clone();
-        tokio::spawn(async move {
-            polling_worker.polling().await;
+        let worker = context.create_worker().unwrap();
+
+        let w = worker.clone();
+        spawn_local(async move {
+            w.polling().await.unwrap();
         });
 
-        info!("xxx");
-        let endpoint = Endpoint::connect(worker.clone(), &addr).unwrap();
+        let endpoint = Endpoint::connect(&worker, &addr).unwrap();
         endpoint.print();
         endpoint.stream_send("hello world".into()).await.unwrap();
     }).await;

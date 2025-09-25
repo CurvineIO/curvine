@@ -45,13 +45,12 @@ impl ConnContext {
 
 pub struct Listener {
     inner: RawPtr<ucp_listener>,
-    worker: Arc<Worker>,
     conn_context: Rc<ConnContext>,
     receiver: AsyncReceiver<ConnRequest>,
 }
 
 impl Listener {
-    pub async fn bind(context: Arc<Context>, addr: &SockAddr) -> IOResult<Self> {
+    pub async fn bind(worker: &Worker, addr: &SockAddr) -> IOResult<Self> {
         let (sender, receiver) = AsyncChannel::new(0).split();
         let conn_context = Rc::new(ConnContext::new(sender));
 
@@ -72,26 +71,15 @@ impl Listener {
             },
         };
 
-        // 创建worker和listener
-        let worker = Arc::new(Worker::new(context)?);
         let mut handle = MaybeUninit::<*mut ucp_listener>::uninit();
         let status = unsafe {
             ucp_listener_create(worker.as_mut_ptr(), &params, handle.as_mut_ptr())
         };
         err_ucs!(status)?;
 
-        // 启动event_poll
-        let poll_worker = worker.clone();
-        let poll_context = conn_context.clone();
-        spawn_local(async move {
-            if let Err(e) = poll_worker.event_poll().await {
-                poll_context.error_monitor.set_error(e);
-            }
-        });
 
         Ok(Listener {
             inner: RawPtr::from_uninit(handle),
-            worker,
             receiver,
             conn_context,
         })
@@ -147,11 +135,6 @@ impl Listener {
         };
         err_ucs!(status)
     }
-
-    pub fn worker(&self) -> &Arc<Worker> {
-        &self.worker
-    }
-
 }
 
 impl Drop for Listener {
