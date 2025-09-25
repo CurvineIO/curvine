@@ -16,6 +16,7 @@ use std::mem;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use log::info;
+use num_enum::{FromPrimitive, IntoPrimitive};
 use tokio::task::yield_now;
 use crate::{err_box, err_ucs, sys};
 use crate::io::IOResult;
@@ -25,10 +26,19 @@ use crate::sys::pipe::{AsyncFd, BorrowedFd};
 use crate::ucp::bindings::*;
 use crate::ucp::{Context, stderr};
 
+#[repr(i8)]
+#[derive(PartialEq, PartialOrd, Debug, Clone, Copy, IntoPrimitive, FromPrimitive)]
+enum State {
+    #[num_enum(default)]
+    Init,
+    Polling,
+    Stopped
+}
+
 pub struct Worker {
     inner: RawPtr<ucp_worker>,
     context: Arc<Context>,
-    poll_start: AtomicBool
+    state: StateCtl
 }
 
 impl Worker {
@@ -48,7 +58,7 @@ impl Worker {
         Ok(Self {
             inner: RawPtr::from_uninit(inner),
             context,
-            poll_start: AtomicBool::new(false),
+            state: StateCtl::new(State::Init.into()),
         })
     }
 
@@ -104,19 +114,8 @@ impl Worker {
         }
     }
 
-    pub async fn polling(&self) -> IOResult<()> {
-        if !self.poll_start.compare_and_set(false, true) {
-            return err_box!("worker polling already started");
-        }
-
-        loop {
-            while self.progress() != 0 {}
-            yield_now().await
-        }
-    }
-
     pub async fn event_poll(&self) -> IOResult<()> {
-        if !self.poll_start.compare_and_set(false, true) {
+        if !self.state.compare_and_set(State::Init.into(), State::Polling.into()) {
             return err_box!("worker polling already started");
         }
 
@@ -125,30 +124,30 @@ impl Worker {
         let fd = AsyncFd::new(BorrowedFd::new(fd))?.into_inner();
 
         let mut total_events = 0;
-        loop {
-            let mut guard = fd.readable().await?;
-
-            loop {
-                let events = self.progress();
-                total_events += events;
-                if events == 0 {
-                    break;
-                }
-
-                if total_events > 1000 {
+        while self.state.value() == State::Polling.into() {
+            while self.progress() != 0 {
+                total_events += 1;
+                if total_events > 100 {
                     yield_now().await;
                     total_events = 0;
                 }
             }
 
             if self.arm()? {
-                guard.clear_ready();
+                let mut ready = fd.readable().await?;
+                ready.clear_ready();
             }
         }
+
+        Ok(())
     }
 
     pub fn context(&self) -> &Arc<Context> {
         &self.context
+    }
+
+    pub fn stop(&self) {
+        self.state.set_state(State::Stopped);
     }
 }
 

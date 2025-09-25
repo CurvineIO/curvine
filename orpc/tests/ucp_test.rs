@@ -37,7 +37,7 @@ async fn endpoint() {
 
         let w = worker.clone();
         spawn_local(async move {
-            w.polling().await.unwrap();
+            w.event_poll().await.unwrap();
         });
 
         let endpoint = Endpoint::connect(&worker, &addr).unwrap();
