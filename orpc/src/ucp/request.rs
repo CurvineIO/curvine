@@ -56,12 +56,15 @@ impl <T> Future for RequestFuture<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {
-        if let ret @ Poll::Ready(_) = unsafe { (self.poll_fn)(self.ptr) } {
-            return ret;
+        let ret = unsafe { (self.poll_fn)(self.ptr) };
+        match ret {
+            Poll::Ready(v) => Poll::Ready(v),
+            Poll::Pending => {
+                let request = unsafe { &mut *(self.ptr as *mut Request) };
+                request.waker.register(cx.waker());
+                Poll::Pending
+            }
         }
-        let request = unsafe { &mut *(self.ptr as *mut Request) };
-        request.waker.register(cx.waker());
-        unsafe { (self.poll_fn)(self.ptr) }
     }
 }
 

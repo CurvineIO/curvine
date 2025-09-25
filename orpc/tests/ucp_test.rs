@@ -38,7 +38,7 @@ async fn endpoint() {
         });
 
         info!("xxx");
-        let endpoint = Endpoint::connect(worker.clone(), &addr).await.unwrap();
+        let endpoint = Endpoint::connect(worker.clone(), &addr).unwrap();
         endpoint.print();
         endpoint.stream_send("hello world".into()).await.unwrap();
     }).await;

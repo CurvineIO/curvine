@@ -19,7 +19,7 @@ async fn main() {
 
         let conn = listener.accept().await.unwrap();
 
-        let ep = Endpoint::accept(listener.worker().clone(), conn).await.unwrap();
+        let ep = Endpoint::accept(listener.worker().clone(), conn).unwrap();
 
         ep.print();
         let buf = BytesMut::zeroed(1024);

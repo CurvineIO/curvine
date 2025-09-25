@@ -35,7 +35,7 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    pub fn new(worker: Arc<Worker>, mut params: ucp_ep_params) -> IOResult<Self> {
+    fn new(worker: Arc<Worker>, mut params: ucp_ep_params) -> IOResult<Self> {
         let err_monitor = Arc::new(ErrorMonitor::new());
 
         params.field_mask |= (ucp_ep_params_field::UCP_EP_PARAM_FIELD_USER_DATA
@@ -43,7 +43,7 @@ impl Endpoint {
             .0 as u64;
         params.user_data = &*err_monitor as *const _ as *mut c_void;
         params.err_handler = ucp_err_handler {
-            cb: Some(Self::err_cb),
+            cb: Some(Self::err_handler),
             arg: ptr::null_mut()
         };
 
@@ -60,6 +60,12 @@ impl Endpoint {
         })
     }
 
+    pub unsafe extern "C" fn err_handler(arg: *mut c_void, _: ucp_ep_h, status: ucs_status_t) {
+        let err_monitor = &*(arg as *mut ErrorMonitor<IOError>);
+        let err = format!("endpoint handler error: {:?}", status).into();
+        err_monitor.set_error(err);
+    }
+
     pub fn as_ptr(&self) -> *const ucp_ep {
         self.inner.as_ptr()
     }
@@ -68,14 +74,11 @@ impl Endpoint {
         self.inner.as_mut_ptr()
     }
 
-    // @todo 可能来不及回调，触发段错误。需要加一个await
-    pub unsafe extern "C" fn err_cb(arg: *mut c_void, ep: ucp_ep_h, status: ucs_status_t) {
-        let err_monitor = &*(arg as *mut ErrorMonitor<IOError>);
-        err_monitor.set_error(format!("endpoint handler error: {:?}", status).into());
-        info!("endpoint handler error: {:?}", status);
+    fn check_error(&self) -> IOResult<()> {
+        self.err_monitor.check_error()
     }
 
-    pub async fn connect(worker: Arc<Worker>, addr: &SockAddr) -> IOResult<Self> {
+    pub fn connect(worker: Arc<Worker>, addr: &SockAddr) -> IOResult<Self> {
         let params = ucp_ep_params {
             field_mask: (ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS
                 | ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR
@@ -96,19 +99,32 @@ impl Endpoint {
         Ok(endpoint)
     }
 
+    pub fn accept(worker: Arc<Worker>, conn: ConnRequest) -> IOResult<Self> {
+        let params = ucp_ep_params {
+            field_mask: ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST.0 as u64,
+            conn_request: conn.as_mut_ptr(),
+            ..unsafe { MaybeUninit::zeroed().assume_init() }
+        };
+        let endpoint = Endpoint::new(worker, params)?;
+        Ok(endpoint)
+    }
+
     unsafe extern "C" fn flush_handler(request: *mut c_void, _status: ucs_status_t) {
         let request = &mut *(request as *mut Request);
         request.waker.wake();
     }
 
     pub async fn flush(&self) -> IOResult<()> {
+        self.check_error()?;
+
         let status = unsafe {
             ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_handler))
         };
+
         if status.is_null() {
             Ok(())
         } else if UcpUtils::ucs_ptr_is_ptr(status) {
-            let f = RequestFuture::new(status, poll_send);
+            let f = RequestFuture::new(status, poll_request);
             f.await?;
             Ok(())
         } else {
@@ -116,13 +132,13 @@ impl Endpoint {
         }
     }
 
-    unsafe extern "C" fn send_cb(request: *mut c_void, _status: ucs_status_t) {
+    unsafe extern "C" fn send_handler(request: *mut c_void, _status: ucs_status_t) {
         let request = &mut *(request as *mut Request);
         request.waker.wake();
     }
 
     pub async fn stream_send(&self, buf: DataSlice) -> IOResult<usize> {
-        self.err_monitor.check_error()?;
+        self.check_error()?;
 
         let status = unsafe {
             ucp_stream_send_nb(
@@ -130,7 +146,7 @@ impl Endpoint {
                 buf.as_ptr() as _,
                 buf.len() as _,
                 UcpUtils::ucp_dt_make_contig(1),
-                Some(Self::send_cb),
+                Some(Self::send_handler),
                 0
             )
         };
@@ -138,7 +154,7 @@ impl Endpoint {
         if status.is_null() {
             Ok(buf.len())
         } else if UcpUtils::ucs_ptr_is_ptr(status) {
-            let f = RequestFuture::new(status, poll_send);
+            let f = RequestFuture::new(status, poll_request);
             f.await?;
             Ok(buf.len())
         } else {
@@ -148,17 +164,18 @@ impl Endpoint {
 
     }
 
-    unsafe extern "C" fn recv_cb(
+    unsafe extern "C" fn recv_handler(
         request: *mut c_void,
         _status: ucs_status_t,
         _length: usize
     ) {
-        info!("xxx");
         let request = &mut *(request as *mut Request);
         request.waker.wake();
     }
 
     pub async fn stream_recv(&self, mut buf: BytesMut) ->  IOResult<BytesMut> {
+        self.check_error()?;
+
         let mut len = buf.len();
         let status = unsafe {
             ucp_stream_recv_nb(
@@ -166,7 +183,7 @@ impl Endpoint {
                 buf.as_mut_ptr() as _,
                 buf.len() as _,
                 UcpUtils::ucp_dt_make_contig(1),
-                Some(Self::recv_cb),
+                Some(Self::recv_handler),
                 &mut len,
                 0
             )
@@ -175,23 +192,13 @@ impl Endpoint {
         if status.is_null() {
             Ok(BytesMut::new())
         } else if UcpUtils::ucs_ptr_is_ptr(status) {
-            let f = RequestFuture::new(status, poll_recv);
+            let f = RequestFuture::new(status, poll_strem_recv);
             let len = f.await?;
             Ok(buf.split_to(len))
         } else {
             err_ucs!(UcpUtils::ucs_ptr_raw_status(status))?;
             err_box!("未预期的状态: {:?}", status)
         }
-    }
-
-    pub async fn accept(worker: Arc<Worker>, conn: ConnRequest) -> IOResult<Self> {
-        let params = ucp_ep_params {
-            field_mask: ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST.0 as u64,
-            conn_request: conn.as_mut_ptr(),
-            ..unsafe { MaybeUninit::zeroed().assume_init() }
-        };
-        let endpoint = Endpoint::new(worker, params)?;
-        Ok(endpoint)
     }
 
     pub fn print(&self) {
@@ -214,7 +221,7 @@ impl Drop for Endpoint {
     }
 }
 
-unsafe fn poll_send(ptr: ucs_status_ptr_t) -> Poll<IOResult<()>> {
+unsafe fn poll_request(ptr: ucs_status_ptr_t) -> Poll<IOResult<()>> {
     let status = ucp_request_check_status(ptr as _);
     if status == ucs_status_t::UCS_INPROGRESS {
         Poll::Pending
@@ -223,7 +230,7 @@ unsafe fn poll_send(ptr: ucs_status_ptr_t) -> Poll<IOResult<()>> {
     }
 }
 
-unsafe fn poll_recv(ptr: ucs_status_ptr_t) -> Poll<IOResult<usize>> {
+unsafe fn poll_strem_recv(ptr: ucs_status_ptr_t) -> Poll<IOResult<usize>> {
     let mut len = 0;
     let status = ucp_stream_recv_request_test(ptr as _, &mut len);
     if status == ucs_status_t::UCS_INPROGRESS {
