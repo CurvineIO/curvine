@@ -11,6 +11,14 @@ use crate::cmds::fs::{
 
 #[derive(Parser, Debug)]
 pub struct FsCommand {
+    #[clap(
+        short = 'c',
+        long,
+        global = true,
+        help = "Query only Curvine cached data"
+    )]
+    pub cache_only: bool,
+
     #[clap(subcommand)]
     action: FsSubCommand,
 }
@@ -177,7 +185,10 @@ pub enum FsSubCommand {
 }
 
 impl FsCommand {
-    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, mut client: UnifiedFileSystem) -> CommonResult<()> {
+        if self.cache_only {
+            client.disable_unified();
+        }
         match &self.action {
             FsSubCommand::Ls {
                 path,

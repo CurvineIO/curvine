@@ -224,6 +224,10 @@ impl UnifiedFileSystem {
     pub async fn cleanup(&self) {
         self.cv.cleanup().await
     }
+
+    pub fn disable_unified(&mut self) {
+        self.enable_unified = false
+    }
 }
 
 impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {

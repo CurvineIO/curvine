@@ -13,9 +13,10 @@ pub enum CountCommand {
 }
 
 impl CountCommand {
-    pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
+    pub async fn execute(&self, mut client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
             CountCommand::Count { path } => {
+                client.disable_unified();
                 let path = CurvineURI::new(path)?;
 
                 match crate::cmds::fs::common::calculate_content_summary(&client, &path).await {
