@@ -40,8 +40,8 @@ impl<T> AsyncSender<T> {
             AsyncSender::Unbounded(s) => {
                 s.send(value)?;
                 Ok(())
-            },
-            AsyncSender::Bounded(_) => err_box!("Not support")
+            }
+            AsyncSender::Bounded(_) => err_box!("Not support"),
         }
     }
 

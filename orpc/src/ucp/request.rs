@@ -12,24 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::ucp::bindings::{ucp_request_free, ucs_status_ptr_t};
+use futures::task::AtomicWaker;
 use std::future::Future;
 use std::os::raw::c_void;
 use std::pin::Pin;
 use std::task::Poll;
-use futures::future::ok;
-use futures::task::AtomicWaker;
-use crate::err_ucs;
-use crate::io::IOResult;
-use crate::ucp::bindings::{ucp_request_check_status, ucp_request_free, ucp_stream_recv_request_test, ucs_numa_distance_t, ucs_status_ptr_t, ucs_status_t};
-use crate::ucp::{Context, UcpUtils};
 
 #[derive(Default)]
 pub struct Request {
-    pub waker: AtomicWaker
+    pub waker: AtomicWaker,
 }
 
 impl Request {
-    pub unsafe extern "C" fn init<'a>(request: *mut c_void) {
+    pub unsafe extern "C" fn init(request: *mut c_void) {
         (request as *mut Self).write(Request::default());
     }
 
@@ -43,21 +39,17 @@ pub struct RequestFuture<T> {
     poll_fn: unsafe fn(ucs_status_ptr_t) -> Poll<T>,
 }
 
-impl <T> RequestFuture<T> {
+impl<T> RequestFuture<T> {
     pub fn new(ptr: ucs_status_ptr_t, poll_fn: unsafe fn(ucs_status_ptr_t) -> Poll<T>) -> Self {
-        Self {
-            ptr,
-            poll_fn,
-        }
+        Self { ptr, poll_fn }
     }
 }
 
-unsafe impl <T> Send for RequestFuture<T> {}
+unsafe impl<T> Send for RequestFuture<T> {}
 
-unsafe impl <T> Sync for RequestFuture<T> {}
+unsafe impl<T> Sync for RequestFuture<T> {}
 
-
-impl <T> Future for RequestFuture<T> {
+impl<T> Future for RequestFuture<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {

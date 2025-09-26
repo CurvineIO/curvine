@@ -193,7 +193,7 @@ impl Utils {
     }
 
     pub fn thread_name() -> String {
-        format!("{}", thread::current().name().unwrap_or(""))
+        thread::current().name().unwrap_or("").to_string()
     }
 }
 

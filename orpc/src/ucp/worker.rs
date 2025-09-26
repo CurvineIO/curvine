@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::io::IOResult;
+use crate::sync::StateCtl;
+use crate::sys::pipe::{AsyncFd, BorrowedFd};
+use crate::sys::{RawIO, RawPtr};
+use crate::ucp::bindings::*;
+use crate::ucp::{stderr, Context};
+use crate::{err_box, err_ucs, sys};
+use num_enum::{FromPrimitive, IntoPrimitive};
 use std::mem;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
-use log::info;
-use num_enum::{FromPrimitive, IntoPrimitive};
 use tokio::task::yield_now;
-use crate::{err_box, err_ucs, sys};
-use crate::io::IOResult;
-use crate::sync::{AtomicBool, StateCtl};
-use crate::sys::{RawIO, RawPtr};
-use crate::sys::pipe::{AsyncFd, BorrowedFd};
-use crate::ucp::bindings::*;
-use crate::ucp::{Context, stderr};
 
 #[repr(i8)]
 #[derive(PartialEq, PartialOrd, Debug, Clone, Copy, IntoPrimitive, FromPrimitive)]
@@ -32,13 +31,13 @@ enum State {
     #[num_enum(default)]
     Init,
     Polling,
-    Stopped
+    Stopped,
 }
 
 pub struct Worker {
     inner: RawPtr<ucp_worker>,
     context: Arc<Context>,
-    state: StateCtl
+    state: StateCtl,
 }
 
 impl Worker {
@@ -50,9 +49,8 @@ impl Worker {
         };
 
         let mut inner = MaybeUninit::<*mut ucp_worker>::uninit();
-        let status = unsafe {
-            ucp_worker_create(context.as_mut_ptr(), &params, inner.as_mut_ptr())
-        };
+        let status =
+            unsafe { ucp_worker_create(context.as_mut_ptr(), &params, inner.as_mut_ptr()) };
         err_ucs!(status)?;
 
         Ok(Self {
@@ -71,38 +69,28 @@ impl Worker {
     }
 
     pub fn progress(&self) -> u32 {
-        unsafe {
-            ucp_worker_progress(self.inner.as_mut_ptr())
-        }
+        unsafe { ucp_worker_progress(self.inner.as_mut_ptr()) }
     }
 
     pub fn print(&self) {
-        unsafe {
-            ucp_worker_print_info(self.inner.as_mut_ptr(), stderr)
-        }
+        unsafe { ucp_worker_print_info(self.inner.as_mut_ptr(), stderr) }
     }
 
     /// Waits (blocking) until an event has happened.
     pub fn wait(&self) -> IOResult<()> {
-        let status = unsafe {
-            ucp_worker_wait(self.inner.as_mut_ptr())
-        };
+        let status = unsafe { ucp_worker_wait(self.inner.as_mut_ptr()) };
         err_ucs!(status)
     }
 
     pub fn raw_fd(&self) -> IOResult<RawIO> {
         let mut fd: RawIO = 0;
-        let status = unsafe {
-            ucp_worker_get_efd(self.inner.as_mut_ptr(), &mut fd)
-        };
+        let status = unsafe { ucp_worker_get_efd(self.inner.as_mut_ptr(), &mut fd) };
         err_ucs!(status)?;
         Ok(fd)
     }
 
     pub fn arm(&self) -> IOResult<bool> {
-        let status = unsafe {
-            ucp_worker_arm(self.as_mut_ptr())
-        };
+        let status = unsafe { ucp_worker_arm(self.as_mut_ptr()) };
 
         match status {
             ucs_status_t::UCS_OK => Ok(true),
@@ -115,7 +103,10 @@ impl Worker {
     }
 
     pub async fn event_poll(&self) -> IOResult<()> {
-        if !self.state.compare_and_set(State::Init.into(), State::Polling.into()) {
+        if !self
+            .state
+            .compare_and_set(State::Init.into(), State::Polling.into())
+        {
             return err_box!("worker polling already started");
         }
 
@@ -153,9 +144,7 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        unsafe {
-            ucp_worker_destroy(self.inner.as_mut_ptr())
-        }
+        unsafe { ucp_worker_destroy(self.inner.as_mut_ptr()) }
     }
 }
 

@@ -29,7 +29,8 @@ pub struct AsyncRuntime {
 impl AsyncRuntime {
     pub fn new<T: AsRef<str>>(name_prefix: T, io_threads: usize, worker_threads: usize) -> Self {
         let mut builder = Builder::new_multi_thread();
-        builder.worker_threads(io_threads)
+        builder
+            .worker_threads(io_threads)
             .thread_keep_alive(Duration::from_secs(6 * 3600))
             .thread_name(name_prefix.as_ref())
             .enable_all();
@@ -58,7 +59,7 @@ impl AsyncRuntime {
             inner: rt,
             name_prefix: name.to_string(),
             io_threads: 1,
-            worker_threads: 0
+            worker_threads: 0,
         }
     }
 

@@ -15,7 +15,6 @@
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use log::{info, warn};
 
 // Used to set errors in asynchronous environments.
 pub struct ErrorMonitor<E: Error> {

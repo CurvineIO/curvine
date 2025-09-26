@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::ucp::bindings::ucs_sock_addr;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use crate::ucp::bindings::ucs_sock_addr;
 
 #[derive(Debug)]
 pub struct SockAddr {
-    inner: socket2::SockAddr
+    inner: socket2::SockAddr,
 }
 
 impl SockAddr {

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::missing_safety_doc, clippy::missing_transmute_annotations)]
+
 use crate::ucp::bindings::FILE;
 
 // #[cfg(not(target_os = "linux"))]

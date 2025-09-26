@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::mem::MaybeUninit;
-use std::ptr;
-use std::sync::Arc;
 use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::{CString, RawPtr};
 use crate::ucp::bindings::*;
-use crate::ucp::{Context, stderr};
+use crate::ucp::{stderr, Context};
+use std::mem::MaybeUninit;
+use std::ptr;
 
 #[derive(Debug)]
 pub struct Config {
@@ -54,9 +53,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         let mut inner = MaybeUninit::<*mut ucp_config>::uninit();
-        let status = unsafe {
-            ucp_config_read(ptr::null(), ptr::null(), inner.as_mut_ptr())
-        };
+        let status = unsafe { ucp_config_read(ptr::null(), ptr::null(), inner.as_mut_ptr()) };
         err_ucs!(status).unwrap();
 
         Self {
@@ -69,8 +66,6 @@ impl Default for Config {
 
 impl Drop for Config {
     fn drop(&mut self) {
-        unsafe {
-            ucp_config_release(self.as_mut_ptr())
-        }
+        unsafe { ucp_config_release(self.as_mut_ptr()) }
     }
 }

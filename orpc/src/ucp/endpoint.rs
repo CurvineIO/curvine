@@ -12,22 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::io::{IOError, IOResult};
+use crate::sync::ErrorMonitor;
+use crate::sys::{DataSlice, RawPtr};
+use crate::ucp::bindings::*;
+use crate::ucp::{stderr, ConnRequest, Request, RequestFuture, SockAddr, UcpUtils, WorkerExecutor};
+use crate::{err_box, err_ucs};
+use bytes::BytesMut;
+use log::warn;
 use std::mem::MaybeUninit;
-use std::net::SocketAddr;
 use std::os::raw::c_void;
-use std::{ptr, thread};
+use std::ptr;
 use std::sync::Arc;
 use std::task::Poll;
-use bytes::BytesMut;
-use futures::future::err;
-use log::{info, warn};
-use crate::{err_box, err_ucs};
-use crate::common::Utils;
-use crate::io::{IOError, IOResult};
-use crate::sync::{ErrorMonitor, StateCtl};
-use crate::sys::{DataSlice, RawPtr, RawVec};
-use crate::ucp::bindings::*;
-use crate::ucp::{ConnRequest, Request, RequestFuture, SockAddr, stderr, UcpUtils, Worker, WorkerExecutor};
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
@@ -45,13 +42,12 @@ impl Endpoint {
         params.user_data = &*err_monitor as *const _ as *mut c_void;
         params.err_handler = ucp_err_handler {
             cb: Some(Self::err_handler),
-            arg: ptr::null_mut()
+            arg: ptr::null_mut(),
         };
 
         let mut inner = MaybeUninit::<*mut ucp_ep>::uninit();
-        let status = unsafe {
-            ucp_ep_create(executor.worker().as_mut_ptr(), &params, inner.as_mut_ptr())
-        };
+        let status =
+            unsafe { ucp_ep_create(executor.worker().as_mut_ptr(), &params, inner.as_mut_ptr()) };
         err_ucs!(status)?;
 
         Ok(Self {
@@ -114,9 +110,7 @@ impl Endpoint {
     pub async fn flush(&self) -> IOResult<()> {
         self.check_error()?;
 
-        let status = unsafe {
-            ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_handler))
-        };
+        let status = unsafe { ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_handler)) };
 
         if status.is_null() {
             Ok(())
@@ -144,7 +138,7 @@ impl Endpoint {
                 buf.len() as _,
                 UcpUtils::ucp_dt_make_contig(1),
                 Some(Self::send_handler),
-                0
+                0,
             )
         };
 
@@ -158,19 +152,14 @@ impl Endpoint {
             err_ucs!(UcpUtils::ucs_ptr_raw_status(status))?;
             err_box!("未预期的状态: {:?}", status)
         }
-
     }
 
-    unsafe extern "C" fn recv_handler(
-        request: *mut c_void,
-        _status: ucs_status_t,
-        _length: usize
-    ) {
+    unsafe extern "C" fn recv_handler(request: *mut c_void, _status: ucs_status_t, _length: usize) {
         let request = &mut *(request as *mut Request);
         request.waker.wake();
     }
 
-    pub async fn stream_recv(&self, mut buf: BytesMut) ->  IOResult<BytesMut> {
+    pub async fn stream_recv(&self, mut buf: BytesMut) -> IOResult<BytesMut> {
         self.check_error()?;
 
         let mut len = buf.len();
@@ -182,7 +171,7 @@ impl Endpoint {
                 UcpUtils::ucp_dt_make_contig(1),
                 Some(Self::recv_handler),
                 &mut len,
-                0
+                0,
             )
         };
 
@@ -212,7 +201,7 @@ impl Drop for Endpoint {
         let status = unsafe {
             ucp_ep_close_nb(
                 self.as_mut_ptr(),
-                ucp_ep_close_mode::UCP_EP_CLOSE_MODE_FORCE as u32
+                ucp_ep_close_mode::UCP_EP_CLOSE_MODE_FORCE as u32,
             )
         };
         if let Err(e) = err_ucs!(UcpUtils::ucs_ptr_raw_status(status)) {

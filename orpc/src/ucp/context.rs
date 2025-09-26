@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{mem, ptr};
-use std::mem::MaybeUninit;
-use std::sync::Arc;
-use crate::{err_box, err_ucs};
+use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
-use crate::ucp::{Config, stderr, Worker};
 use crate::ucp::Request;
+use crate::ucp::{stderr, Config, Worker};
+use std::mem;
+use std::mem::MaybeUninit;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct Context {
@@ -33,7 +33,6 @@ impl Context {
             | ucp_feature::UCP_FEATURE_TAG
             | ucp_feature::UCP_FEATURE_STREAM
             | ucp_feature::UCP_FEATURE_WAKEUP;
-
 
         let params = ucp_params_t {
             field_mask: (ucp_params_field::UCP_PARAM_FIELD_FEATURES
@@ -62,7 +61,7 @@ impl Context {
         err_ucs!(status)?;
 
         Ok(Self {
-            inner: RawPtr::from_uninit(context_ptr)
+            inner: RawPtr::from_uninit(context_ptr),
         })
     }
 
@@ -75,9 +74,7 @@ impl Context {
     }
 
     pub fn print(&self) {
-        unsafe {
-            ucp_context_print_info(self.as_mut_ptr(), stderr)
-        }
+        unsafe { ucp_context_print_info(self.as_mut_ptr(), stderr) }
     }
 
     pub fn create_worker(self: &Arc<Self>) -> IOResult<Worker> {

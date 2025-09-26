@@ -12,22 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ffi::c_void;
-use std::mem::MaybeUninit;
-use std::ptr;
-use std::rc::Rc;
-use std::sync::Arc;
-use log::{error, info, warn};
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::task::{LocalSet, spawn_local};
 use crate::err_ucs;
 use crate::io::{IOError, IOResult};
 use crate::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
 use crate::sync::ErrorMonitor;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
-use crate::ucp::{ConnRequest, Context, Endpoint, SockAddr, Worker, WorkerExecutor};
+use crate::ucp::{ConnRequest, SockAddr, WorkerExecutor};
+use std::ffi::c_void;
+use std::mem::MaybeUninit;
+use std::ptr;
+use std::rc::Rc;
+use std::sync::Arc;
 
 struct ConnContext {
     sender: AsyncSender<ConnRequest>,
@@ -78,7 +74,6 @@ impl Listener {
         };
         err_ucs!(status)?;
 
-
         Ok(Listener {
             inner: RawPtr::from_uninit(handle),
             executor,
@@ -109,14 +104,10 @@ impl Listener {
             sockaddr: unsafe { MaybeUninit::zeroed().assume_init() },
         };
 
-        let status = unsafe {
-            ucp_listener_query(self.as_mut_ptr(), &mut attr)
-        };
+        let status = unsafe { ucp_listener_query(self.as_mut_ptr(), &mut attr) };
         err_ucs!(status)?;
 
-        let sockaddr = unsafe {
-            socket2::SockAddr::new(std::mem::transmute(attr.sockaddr), 8)
-        };
+        let sockaddr = unsafe { socket2::SockAddr::new(std::mem::transmute(attr.sockaddr), 8) };
 
         Ok(SockAddr::new(sockaddr))
     }
@@ -132,9 +123,7 @@ impl Listener {
     }
 
     pub fn reject(&self, conn: ConnRequest) -> IOResult<()> {
-        let status = unsafe {
-            ucp_listener_reject(self.as_mut_ptr(), conn.as_mut_ptr())
-        };
+        let status = unsafe { ucp_listener_reject(self.as_mut_ptr(), conn.as_mut_ptr()) };
         err_ucs!(status)
     }
 
@@ -145,9 +134,6 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        unsafe {
-            ucp_listener_destroy(self.as_mut_ptr())
-        }
+        unsafe { ucp_listener_destroy(self.as_mut_ptr()) }
     }
 }
-

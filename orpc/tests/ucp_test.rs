@@ -1,11 +1,7 @@
-use std::sync::Arc;
-use std::thread;
-use log::info;
-use tokio::task::spawn_local;
-use orpc::common::{Logger, Utils};
+use orpc::common::Logger;
 use orpc::runtime::RpcRuntime;
 use orpc::sync::channel::CallChannel;
-use orpc::ucp::{Config, Context, Endpoint, SockAddr, Worker, WorkerRuntime};
+use orpc::ucp::{Config, Context, Endpoint, Worker, WorkerRuntime};
 
 #[test]
 fn config() {
@@ -36,13 +32,16 @@ fn endpoint() {
     let addr = "127.0.0.1:8080".into();
 
     let executor = wr.worker_executor().clone();
-    let rt =  executor.rt().clone();
+    let rt = executor.rt().clone();
 
     let (tx, rx) = CallChannel::channel();
     rt.spawn(async move {
         let endpoint = Endpoint::connect(executor, &addr).unwrap();
         for i in 0..100 {
-            endpoint.stream_send(format!("hello world {}", i).into()).await.unwrap();
+            endpoint
+                .stream_send(format!("hello world {}", i).into())
+                .await
+                .unwrap();
         }
         let _ = tx.send(1);
     });

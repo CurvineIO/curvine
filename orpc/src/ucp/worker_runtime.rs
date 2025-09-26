@@ -12,18 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-use std::thread;
-use futures::future::err;
-use log::error;
-use tokio::runtime;
-use tokio::task::LocalSet;
 use crate::io::IOResult;
-use crate::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use crate::sync::AtomicLen;
-use crate::{err_box, try_option};
-use crate::ucp::{Config, ConnRequest, Context, Endpoint, Listener, SockAddr, Worker, WorkerExecutor};
-
+use crate::ucp::{Config, ConnRequest, Endpoint, Listener, SockAddr, WorkerExecutor};
+use std::sync::Arc;
 
 pub struct WorkerRuntime {
     pub boss: WorkerExecutor,
@@ -52,7 +44,7 @@ impl WorkerRuntime {
         })
     }
 
-    pub fn bind(&self, addr: &SockAddr) -> IOResult<Listener>  {
+    pub fn bind(&self, addr: &SockAddr) -> IOResult<Listener> {
         Listener::bind(self.boss.clone(), addr)
     }
 

@@ -12,15 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-use std::thread;
-use log::{error, info};
-use tokio::task::LocalSet;
-use crate::common::Utils;
-use crate::io::{IOError, IOResult};
+use crate::io::IOResult;
 use crate::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use crate::sync::channel::CallChannel;
 use crate::ucp::{Context, Worker};
+use log::error;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct WorkerExecutor {
@@ -44,10 +41,7 @@ impl WorkerExecutor {
 
         let worker = rt.block_on(rx.receive()).expect("receive  ucp worker");
 
-        Ok(Self {
-            worker,
-            rt,
-        })
+        Ok(Self { worker, rt })
     }
 
     pub fn rt(&self) -> &Arc<Runtime> {

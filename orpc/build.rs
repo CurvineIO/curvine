@@ -1,6 +1,5 @@
 use std::env;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 fn main() {
     let dst = PathBuf::from(env::var_os("OUT_DIR").unwrap());
