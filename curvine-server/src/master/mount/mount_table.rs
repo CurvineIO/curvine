@@ -68,6 +68,11 @@ impl MountTable {
         false
     }
 
+    pub fn cv_path_exists(&self, cv_path: &str) -> bool {
+        let inner = self.inner.read().unwrap();
+        inner.mountpath2id.contains_key(cv_path)
+    }
+
     pub fn check_conflict(&self, cv_path: &str, _ufs_path: &str) -> FsResult<()> {
         let inner = self.inner.read().unwrap();
         for info in inner.mountid2entry.values() {
