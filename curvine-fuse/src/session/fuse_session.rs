@@ -43,18 +43,11 @@ impl<T: FileSystem> FuseSession<T> {
 
         // Analyze the mount parameters.
         let fuse_opts = conf.parse_fuse_opts();
-        let arg_ptrs = FuseConf::convert_fuse_args(&fuse_opts);
-        let fuse_args = fuse_args {
-            argc: arg_ptrs.len() as i32,
-            argv: arg_ptrs.as_ptr(),
-            allocated: 0,
-        };
 
         // Create all mount points.
         let mut mnts = vec![];
-        let auto_unmount = conf.auto_umount();
         for path in all_mnt_paths {
-            mnts.push(FuseMnt::new(&path, &fuse_args, auto_unmount));
+            mnts.push(FuseMnt::new(path, &conf));
         }
 
         let mut channels = vec![];
