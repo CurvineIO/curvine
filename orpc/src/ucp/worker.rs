@@ -124,7 +124,7 @@ impl Worker {
         let fd = AsyncFd::new(BorrowedFd::new(fd))?.into_inner();
 
         let mut total_events = 0;
-        while self.state.value() == State::Polling.into() {
+        while self.state.state::<State>() == State::Polling {
             while self.progress() != 0 {
                 total_events += 1;
                 if total_events > 100 {

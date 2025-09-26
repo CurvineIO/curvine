@@ -1,0 +1,81 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::sync::Arc;
+use std::thread;
+use futures::future::err;
+use log::error;
+use tokio::runtime;
+use tokio::task::LocalSet;
+use crate::io::IOResult;
+use crate::runtime::{AsyncRuntime, RpcRuntime, Runtime};
+use crate::sync::AtomicLen;
+use crate::{err_box, try_option};
+use crate::ucp::{Config, ConnRequest, Context, Endpoint, Listener, SockAddr, Worker, WorkerExecutor};
+
+
+pub struct WorkerRuntime {
+    pub boss: WorkerExecutor,
+    pub workers: Vec<WorkerExecutor>,
+    pub conf: Config,
+    index: AtomicLen,
+}
+
+impl WorkerRuntime {
+    pub fn with_conf(conf: Config) -> IOResult<Self> {
+        let context = Arc::new(conf.create_context()?);
+
+        let boss = WorkerExecutor::new(format!("{}-boss", &conf.name), &context)?;
+
+        let mut workers = vec![];
+        for i in 0..conf.threads {
+            let wr = WorkerExecutor::new(format!("{}-worker-{}", &conf.name, i), &context)?;
+            workers.push(wr);
+        }
+
+        Ok(Self {
+            boss,
+            workers,
+            conf,
+            index: AtomicLen::new(0),
+        })
+    }
+
+    pub fn bind(&self, addr: &SockAddr) -> IOResult<Listener>  {
+        Listener::bind(self.boss.clone(), addr)
+    }
+
+    pub fn worker_executor(&self) -> &WorkerExecutor {
+        let index = self.index.next();
+        &self.workers[index % self.workers.len()]
+    }
+
+    pub fn boss_executor(&self) -> &WorkerExecutor {
+        &self.boss
+    }
+
+    pub fn accept(&self, conn: ConnRequest) -> IOResult<Endpoint> {
+        Endpoint::accept(self.boss.clone(), conn)
+    }
+
+    pub async fn connect(&self, addr: &SockAddr) -> IOResult<Endpoint> {
+        Endpoint::connect(self.worker_executor().clone(), addr)
+    }
+}
+
+impl Default for WorkerRuntime {
+    fn default() -> Self {
+        Self::with_conf(Config::default()).unwrap()
+    }
+}

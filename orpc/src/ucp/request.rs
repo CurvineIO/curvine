@@ -21,7 +21,7 @@ use futures::task::AtomicWaker;
 use crate::err_ucs;
 use crate::io::IOResult;
 use crate::ucp::bindings::{ucp_request_check_status, ucp_request_free, ucp_stream_recv_request_test, ucs_numa_distance_t, ucs_status_ptr_t, ucs_status_t};
-use crate::ucp::UcpUtils;
+use crate::ucp::{Context, UcpUtils};
 
 #[derive(Default)]
 pub struct Request {
@@ -51,6 +51,11 @@ impl <T> RequestFuture<T> {
         }
     }
 }
+
+unsafe impl <T> Send for RequestFuture<T> {}
+
+unsafe impl <T> Sync for RequestFuture<T> {}
+
 
 impl <T> Future for RequestFuture<T> {
     type Output = T;

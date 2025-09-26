@@ -1,8 +1,11 @@
 use std::sync::Arc;
+use std::thread;
 use log::info;
 use tokio::task::spawn_local;
-use orpc::common::Logger;
-use orpc::ucp::{Config, Context, Endpoint, SockAddr, Worker};
+use orpc::common::{Logger, Utils};
+use orpc::runtime::RpcRuntime;
+use orpc::sync::channel::CallChannel;
+use orpc::ucp::{Config, Context, Endpoint, SockAddr, Worker, WorkerRuntime};
 
 #[test]
 fn config() {
@@ -25,23 +28,24 @@ fn worker() {
     println!("fd = {}", fd);
 }
 
-#[tokio::test]
-async fn endpoint() {
+#[test]
+fn endpoint() {
     Logger::default();
-    let context = Arc::new(Context::default());
+
+    let wr = WorkerRuntime::default();
     let addr = "127.0.0.1:8080".into();
 
-    let local = tokio::task::LocalSet::new();
-    local.run_until(async move {
-        let worker = context.create_worker().unwrap();
+    let executor = wr.worker_executor().clone();
+    let rt =  executor.rt().clone();
 
-        let w = worker.clone();
-        spawn_local(async move {
-            w.event_poll().await.unwrap();
-        });
+    let (tx, rx) = CallChannel::channel();
+    rt.spawn(async move {
+        let endpoint = Endpoint::connect(executor, &addr).unwrap();
+        for i in 0..100 {
+            endpoint.stream_send(format!("hello world {}", i).into()).await.unwrap();
+        }
+        let _ = tx.send(1);
+    });
 
-        let endpoint = Endpoint::connect(&worker, &addr).unwrap();
-        endpoint.print();
-        endpoint.stream_send("hello world".into()).await.unwrap();
-    }).await;
+    let _ = rt.block_on(rx.receive());
 }

@@ -14,14 +14,18 @@
 
 use std::mem::MaybeUninit;
 use std::ptr;
+use std::sync::Arc;
 use crate::err_ucs;
+use crate::io::IOResult;
 use crate::sys::{CString, RawPtr};
 use crate::ucp::bindings::*;
-use crate::ucp::stderr;
+use crate::ucp::{Context, stderr};
 
 #[derive(Debug)]
 pub struct Config {
-    inner: RawPtr<ucp_config_t> ,
+    inner: RawPtr<ucp_config_t>,
+    pub name: String,
+    pub threads: usize,
 }
 
 impl Config {
@@ -41,6 +45,10 @@ impl Config {
         let title = CString::new("UCP conf").expect("Not a valid CStr");
         unsafe { ucp_config_print(self.as_ptr(), stderr, title.as_ptr(), flags) };
     }
+
+    pub fn create_context(&self) -> IOResult<Context> {
+        Context::with_config(self)
+    }
 }
 
 impl Default for Config {
@@ -53,6 +61,8 @@ impl Default for Config {
 
         Self {
             inner: RawPtr::from_uninit(inner),
+            name: "orpc-udp".to_string(),
+            threads: 32,
         }
     }
 }

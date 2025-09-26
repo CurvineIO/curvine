@@ -28,20 +28,37 @@ pub struct AsyncRuntime {
 
 impl AsyncRuntime {
     pub fn new<T: AsRef<str>>(name_prefix: T, io_threads: usize, worker_threads: usize) -> Self {
-        let rt = Builder::new_multi_thread()
-            .worker_threads(io_threads)
-            .max_blocking_threads(worker_threads)
+        let mut builder = Builder::new_multi_thread();
+        builder.worker_threads(io_threads)
             .thread_keep_alive(Duration::from_secs(6 * 3600))
             .thread_name(name_prefix.as_ref())
-            .enable_all()
-            .build()
-            .unwrap();
+            .enable_all();
+        if worker_threads > 0 {
+            builder.max_blocking_threads(worker_threads);
+        }
 
+        let rt = builder.build().unwrap();
         AsyncRuntime {
             inner: rt,
             name_prefix: String::from(name_prefix.as_ref()),
             io_threads,
             worker_threads,
+        }
+    }
+
+    pub fn current_thread(name: impl AsRef<str>) -> Self {
+        let name = name.as_ref();
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .thread_name(name)
+            .build()
+            .unwrap();
+
+        AsyncRuntime {
+            inner: rt,
+            name_prefix: name.to_string(),
+            io_threads: 1,
+            worker_threads: 0
         }
     }
 

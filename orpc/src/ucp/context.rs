@@ -80,9 +80,8 @@ impl Context {
         }
     }
 
-    pub fn create_worker(self: &Arc<Self>) -> IOResult<Arc<Worker>> {
-        let worker = Worker::new(self.clone())?;
-        Ok(Arc::new(worker))
+    pub fn create_worker(self: &Arc<Self>) -> IOResult<Worker> {
+        Worker::new(self.clone())
     }
 }
 

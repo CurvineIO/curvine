@@ -15,26 +15,28 @@
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::os::raw::c_void;
-use std::ptr;
+use std::{ptr, thread};
 use std::sync::Arc;
 use std::task::Poll;
 use bytes::BytesMut;
 use futures::future::err;
 use log::{info, warn};
 use crate::{err_box, err_ucs};
+use crate::common::Utils;
 use crate::io::{IOError, IOResult};
 use crate::sync::{ErrorMonitor, StateCtl};
 use crate::sys::{DataSlice, RawPtr, RawVec};
 use crate::ucp::bindings::*;
-use crate::ucp::{ConnRequest, Request, RequestFuture, SockAddr, stderr, UcpUtils, Worker};
+use crate::ucp::{ConnRequest, Request, RequestFuture, SockAddr, stderr, UcpUtils, Worker, WorkerExecutor};
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
+    executor: WorkerExecutor,
     err_monitor: Arc<ErrorMonitor<IOError>>,
 }
 
 impl Endpoint {
-    fn new(worker: &Worker, mut params: ucp_ep_params) -> IOResult<Self> {
+    fn new(executor: WorkerExecutor, mut params: ucp_ep_params) -> IOResult<Self> {
         let err_monitor = Arc::new(ErrorMonitor::new());
 
         params.field_mask |= (ucp_ep_params_field::UCP_EP_PARAM_FIELD_USER_DATA
@@ -48,12 +50,13 @@ impl Endpoint {
 
         let mut inner = MaybeUninit::<*mut ucp_ep>::uninit();
         let status = unsafe {
-            ucp_ep_create(worker.as_mut_ptr(), &params, inner.as_mut_ptr())
+            ucp_ep_create(executor.worker().as_mut_ptr(), &params, inner.as_mut_ptr())
         };
         err_ucs!(status)?;
 
         Ok(Self {
             inner: RawPtr::from_uninit(inner),
+            executor,
             err_monitor,
         })
     }
@@ -76,7 +79,7 @@ impl Endpoint {
         self.err_monitor.check_error()
     }
 
-    pub fn connect(worker: &Worker, addr: &SockAddr) -> IOResult<Self> {
+    pub fn connect(executor: WorkerExecutor, addr: &SockAddr) -> IOResult<Self> {
         let params = ucp_ep_params {
             field_mask: (ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS
                 | ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR
@@ -88,22 +91,18 @@ impl Endpoint {
             ..unsafe { MaybeUninit::zeroed().assume_init() }
         };
 
-        let endpoint = Self::new(worker, params)?;
-
-        // Workaround for UCX bug: https://github.com/openucx/ucx/issues/6872
-        // let buf = [0, 1, 2, 3];
-        // endpoint.stream_send(&buf).await?;
+        let endpoint = Self::new(executor, params)?;
 
         Ok(endpoint)
     }
 
-    pub fn accept(worker: &Worker, conn: ConnRequest) -> IOResult<Self> {
+    pub fn accept(executor: WorkerExecutor, conn: ConnRequest) -> IOResult<Self> {
         let params = ucp_ep_params {
             field_mask: ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST.0 as u64,
             conn_request: conn.as_mut_ptr(),
             ..unsafe { MaybeUninit::zeroed().assume_init() }
         };
-        let endpoint = Endpoint::new(worker, params)?;
+        let endpoint = Endpoint::new(executor, params)?;
         Ok(endpoint)
     }
 
@@ -190,7 +189,7 @@ impl Endpoint {
         if status.is_null() {
             Ok(BytesMut::new())
         } else if UcpUtils::ucs_ptr_is_ptr(status) {
-            let f = RequestFuture::new(status, poll_strem_recv);
+            let f = RequestFuture::new(status, poll_stream_recv);
             let len = f.await?;
             Ok(buf.split_to(len))
         } else {
@@ -203,6 +202,9 @@ impl Endpoint {
         unsafe { ucp_ep_print_info(self.as_mut_ptr(), stderr) };
     }
 
+    pub fn executor(&self) -> &WorkerExecutor {
+        &self.executor
+    }
 }
 
 impl Drop for Endpoint {
@@ -228,7 +230,7 @@ unsafe fn poll_request(ptr: ucs_status_ptr_t) -> Poll<IOResult<()>> {
     }
 }
 
-unsafe fn poll_strem_recv(ptr: ucs_status_ptr_t) -> Poll<IOResult<usize>> {
+unsafe fn poll_stream_recv(ptr: ucs_status_ptr_t) -> Poll<IOResult<usize>> {
     let mut len = 0;
     let status = ucp_stream_recv_request_test(ptr as _, &mut len);
     if status == ucs_status_t::UCS_INPROGRESS {

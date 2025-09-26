@@ -187,6 +187,14 @@ impl Utils {
         let hash = hasher.finalize();
         format!("{:x}", hash)
     }
+
+    pub fn thread_id() -> String {
+        format!("{:?}", thread::current().id())
+    }
+
+    pub fn thread_name() -> String {
+        format!("{}", thread::current().name().unwrap_or(""))
+    }
 }
 
 #[cfg(test)]
