@@ -31,3 +31,4 @@ yarn.lock
 .metals/
 .scala-build/
 .bloop/
+.memory-bank

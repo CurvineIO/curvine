@@ -90,6 +90,7 @@ impl Testing {
 
     pub fn get_cluster_conf() -> CommonResult<ClusterConf> {
         let save_path = Self::get_conf_path()?;
+        println!("save_path: {}", save_path);
         ClusterConf::from(save_path)
     }
 

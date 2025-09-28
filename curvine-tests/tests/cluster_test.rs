@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 // Cluster functional unit test.
 
+#[test]
 fn block_delete_test() -> CommonResult<()> {
     let mut conf = ClusterConf::default();
     conf.client.block_size = 64 * 1024;

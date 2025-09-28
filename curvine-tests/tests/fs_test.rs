@@ -33,6 +33,7 @@ fn fs_test() -> FsResult<()> {
     let rt = Arc::new(AsyncRuntime::single());
 
     let mut conf = Testing::get_cluster_conf()?;
+    println!("conf: {:?}", conf);
     conf.client.metric_report_enable = true;
     let fs = Testing::get_fs(Some(rt.clone()), Some(conf))?;
     let res: FsResult<()> = rt.block_on(async move {
