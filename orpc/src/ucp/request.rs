@@ -24,7 +24,7 @@ use std::task::Poll;
 use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::RawPtr;
-use crate::ucp::SockAddr;
+use crate::ucp::{Context, SockAddr};
 
 #[derive(Default)]
 pub struct RequestWaker(AtomicWaker);
@@ -202,3 +202,7 @@ impl RequestParam {
         self
     }
 }
+
+unsafe impl Send for RequestParam {}
+
+unsafe impl Sync for RequestParam {}

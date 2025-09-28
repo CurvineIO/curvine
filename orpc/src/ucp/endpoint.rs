@@ -17,7 +17,7 @@ use crate::sync::{AtomicBool, ErrorMonitor};
 use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::bindings::*;
 use crate::ucp::{stderr, ConnRequest, RequestWaker, RequestFuture, SockAddr, UcpUtils, WorkerExecutor, RequestParam};
-use crate::{err_box, err_ucs};
+use crate::{err_box, err_ucs, poll_status};
 use bytes::BytesMut;
 use log::{info, warn};
 use std::mem::MaybeUninit;
@@ -111,22 +111,6 @@ impl Endpoint {
         request.wake();
     }
 
-    pub async fn poll_status<T>(
-        status: *mut c_void,
-        ptr: MaybeUninit<T>,
-        poll_fn: fn(ucs_status_ptr_t) -> Poll<IOResult<T>>,
-    ) -> IOResult<T> {
-        if UcpUtils::ucs_ptr_raw_status(status) == ucs_status_t::UCS_OK {
-            Ok(unsafe { ptr.assume_init() })
-        } else if UcpUtils::ucs_ptr_is_err(status) {
-            err_ucs!(UcpUtils::ucs_ptr_raw_status(status))?;
-            err_box!("未预期的状态: {:?}", status)
-        } else {
-            let f = RequestFuture::new(status, poll_fn);
-            f.await
-        }
-    }
-
     pub async fn stream_send(&self, buf: DataSlice) -> IOResult<usize> {
         self.check_error()?;
 
@@ -140,7 +124,7 @@ impl Endpoint {
                 params.as_ptr()
             )
         };
-        Self::poll_status(status, MaybeUninit::uninit(), poll_normal).await?;
+        poll_status!(status, poll_normal)?;
         Ok(buf.len())
     }
 
@@ -169,7 +153,7 @@ impl Endpoint {
                 param.as_ptr(),
             )
         };
-        let len = Self::poll_status(status, len, poll_stream).await?;
+        let len = poll_status!(status, len, poll_stream)?;
         Ok(buf.split_to(len))
     }
 
@@ -184,7 +168,7 @@ impl Endpoint {
         let status = unsafe {
             ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_handler))
         };
-        Self::poll_status(status, MaybeUninit::uninit(), poll_normal).await
+        poll_status!(status, poll_normal)
     }
 
     pub fn print(&self) {
