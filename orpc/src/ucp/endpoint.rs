@@ -88,7 +88,6 @@ impl Endpoint {
         };
 
         let endpoint = Self::new(executor, params)?;
-
         Ok(endpoint)
     }
 
@@ -98,6 +97,7 @@ impl Endpoint {
             conn_request: conn.as_mut_ptr(),
             ..unsafe { MaybeUninit::zeroed().assume_init() }
         };
+        
         let endpoint = Endpoint::new(executor, params)?;
         Ok(endpoint)
     }
@@ -138,7 +138,7 @@ impl Endpoint {
         request.wake();
     }
 
-    pub async fn stream_recv(&self, mut buf: BytesMut) -> IOResult<BytesMut> {
+    pub async fn stream_recv(&self, mut buf: BytesMut) -> IOResult<Option<BytesMut>> {
         self.check_error()?;
 
         let mut len = MaybeUninit::<usize>::uninit();
@@ -153,8 +153,11 @@ impl Endpoint {
                 param.as_ptr(),
             )
         };
-        let len = poll_status!(status, len, poll_stream)?;
-        Ok(buf.split_to(len))
+
+        match poll_status!(status, len, poll_stream)? {
+            None => Ok(None),
+            Some(v) => Ok(Some(buf.split_to(v)))
+        }
     }
 
     unsafe extern "C" fn flush_handler(request: *mut c_void, _status: ucs_status_t) {
@@ -194,7 +197,7 @@ impl Drop for Endpoint {
     }
 }
 
-fn poll_stream(ptr: ucs_status_ptr_t) -> Poll<IOResult<usize>> {
+fn poll_stream(ptr: ucs_status_ptr_t) -> Poll<IOResult<Option<usize>>> {
     let mut len = MaybeUninit::<usize>::uninit();
 
     let status = unsafe {
@@ -202,9 +205,11 @@ fn poll_stream(ptr: ucs_status_ptr_t) -> Poll<IOResult<usize>> {
     };
     if status == ucs_status_t::UCS_INPROGRESS {
         Poll::Pending
+    } else if status == ucs_status_t::UCS_ERR_CONNECTION_RESET  {
+        Poll::Ready(Ok(None))
     } else {
         err_ucs!(status)?;
-        Poll::Ready(Ok(unsafe { len.assume_init() }))
+        Poll::Ready(Ok(Some(unsafe { len.assume_init() })))
     }
 }
 

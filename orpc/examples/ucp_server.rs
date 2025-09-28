@@ -22,10 +22,9 @@ fn main() {
             let rt = endpoint.executor().clone_rt();
 
             rt.spawn(async move {
-                let buf = BytesMut::zeroed(1024);
-                let recv_buf = endpoint.stream_recv(buf).await.unwrap();
-
-                info!("recv: {:?}", String::from_utf8_lossy(&recv_buf));
+                while let Some(recv_buf) = endpoint.stream_recv(BytesMut::zeroed(1024)).await.unwrap() {
+                    info!("recv: {:?}", String::from_utf8_lossy(&recv_buf));
+                }
             });
         }
     });

@@ -43,8 +43,6 @@ fn endpoint() {
                 .stream_send(format!("hello world {}", i).into())
                 .await
                 .unwrap();
-
-            endpoint.flush().await.unwrap();
         }
         let _ = tx.send(1);
     });

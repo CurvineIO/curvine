@@ -69,7 +69,7 @@ macro_rules! err_ucs {
 macro_rules! poll_status {
     ($status:expr, $init_value:expr, $poll_fn:expr) => {{
         if UcpUtils::ucs_ptr_raw_status($status) == ucs_status_t::UCS_OK {
-            Ok(unsafe { $init_value.assume_init() })
+            Ok(Some(unsafe { $init_value.assume_init() }))
         } else if UcpUtils::ucs_ptr_is_err($status) {
             err_ucs!(UcpUtils::ucs_ptr_raw_status($status))?;
             err_box!("Unexpected status: {:?}", $status)
