@@ -16,7 +16,7 @@ use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
-use crate::ucp::Request;
+use crate::ucp::RequestWaker;
 use crate::ucp::{stderr, Config, Worker};
 use std::mem;
 use std::mem::MaybeUninit;
@@ -32,7 +32,8 @@ impl Context {
         let features = ucp_feature::UCP_FEATURE_RMA
             | ucp_feature::UCP_FEATURE_TAG
             | ucp_feature::UCP_FEATURE_STREAM
-            | ucp_feature::UCP_FEATURE_WAKEUP;
+            | ucp_feature::UCP_FEATURE_WAKEUP
+            | ucp_feature::UCP_FEATURE_AM;
 
         let params = ucp_params_t {
             field_mask: (ucp_params_field::UCP_PARAM_FIELD_FEATURES
@@ -42,9 +43,9 @@ impl Context {
                 | ucp_params_field::UCP_PARAM_FIELD_MT_WORKERS_SHARED)
                 .0 as u64,
             features: features.0 as u64,
-            request_size: size_of::<Request>(),
-            request_init: Some(Request::init),
-            request_cleanup: Some(Request::cleanup),
+            request_size: size_of::<RequestWaker>(),
+            request_init: Some(RequestWaker::init),
+            request_cleanup: Some(RequestWaker::cleanup),
             mt_workers_shared: 1,
             ..unsafe { mem::zeroed() }
         };
@@ -79,6 +80,15 @@ impl Context {
 
     pub fn create_worker(self: &Arc<Self>) -> IOResult<Worker> {
         Worker::new(self.clone())
+    }
+
+    pub fn get_attr(&self) -> IOResult<ucp_context_attr> {
+        let mut attr = MaybeUninit::<ucp_context_attr>::uninit();
+        let status = unsafe {
+            ucp_context_query(self.as_mut_ptr(), attr.as_mut_ptr())
+        };
+        err_ucs!(status)?;
+        Ok(unsafe { attr.assume_init() })
     }
 }
 

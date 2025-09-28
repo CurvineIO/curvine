@@ -43,9 +43,6 @@ pub use self::ucp_utils::UcpUtils;
 mod listener;
 pub use self::listener::Listener;
 
-mod conn_request;
-pub use self::conn_request::ConnRequest;
-
 mod worker_runtime;
 pub use self::worker_runtime::*;
 

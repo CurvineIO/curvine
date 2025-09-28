@@ -1,3 +1,4 @@
+use log::info;
 use orpc::common::Logger;
 use orpc::runtime::RpcRuntime;
 use orpc::sync::channel::CallChannel;
@@ -42,6 +43,8 @@ fn endpoint() {
                 .stream_send(format!("hello world {}", i).into())
                 .await
                 .unwrap();
+
+            endpoint.flush().await.unwrap();
         }
         let _ = tx.send(1);
     });

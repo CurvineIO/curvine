@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use crate::io::{IOError, IOResult};
-use crate::sync::ErrorMonitor;
+use crate::sync::{AtomicBool, ErrorMonitor};
 use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::bindings::*;
-use crate::ucp::{stderr, ConnRequest, Request, RequestFuture, SockAddr, UcpUtils, WorkerExecutor};
+use crate::ucp::{stderr, ConnRequest, RequestWaker, RequestFuture, SockAddr, UcpUtils, WorkerExecutor, RequestParam};
 use crate::{err_box, err_ucs};
 use bytes::BytesMut;
-use log::warn;
+use log::{info, warn};
 use std::mem::MaybeUninit;
 use std::os::raw::c_void;
 use std::ptr;
@@ -102,89 +102,89 @@ impl Endpoint {
         Ok(endpoint)
     }
 
-    unsafe extern "C" fn flush_handler(request: *mut c_void, _status: ucs_status_t) {
-        let request = &mut *(request as *mut Request);
-        request.waker.wake();
+    unsafe extern "C" fn stream_handler(
+        request: *mut c_void,
+        _status: ucs_status_t,
+        _user_data: *mut c_void
+    ) {
+        let request = &mut *(request as *mut RequestWaker);
+        request.wake();
     }
 
-    pub async fn flush(&self) -> IOResult<()> {
-        self.check_error()?;
-
-        let status = unsafe { ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_handler)) };
-
-        if status.is_null() {
-            Ok(())
-        } else if UcpUtils::ucs_ptr_is_ptr(status) {
-            let f = RequestFuture::new(status, poll_request);
-            f.await?;
-            Ok(())
+    pub async fn poll_status<T>(
+        status: *mut c_void,
+        ptr: MaybeUninit<T>,
+        poll_fn: fn(ucs_status_ptr_t) -> Poll<IOResult<T>>,
+    ) -> IOResult<T> {
+        if UcpUtils::ucs_ptr_raw_status(status) == ucs_status_t::UCS_OK {
+            Ok(unsafe { ptr.assume_init() })
+        } else if UcpUtils::ucs_ptr_is_err(status) {
+            err_ucs!(UcpUtils::ucs_ptr_raw_status(status))?;
+            err_box!("未预期的状态: {:?}", status)
         } else {
-            err_ucs!(UcpUtils::ucs_ptr_raw_status(status))
+            let f = RequestFuture::new(status, poll_fn);
+            f.await
         }
-    }
-
-    unsafe extern "C" fn send_handler(request: *mut c_void, _status: ucs_status_t) {
-        let request = &mut *(request as *mut Request);
-        request.waker.wake();
     }
 
     pub async fn stream_send(&self, buf: DataSlice) -> IOResult<usize> {
         self.check_error()?;
 
+        let params = RequestParam::new()
+            .send_cb(Some(Self::stream_handler));
         let status = unsafe {
-            ucp_stream_send_nb(
+            ucp_stream_send_nbx(
                 self.as_mut_ptr(),
                 buf.as_ptr() as _,
                 buf.len() as _,
-                UcpUtils::ucp_dt_make_contig(1),
-                Some(Self::send_handler),
-                0,
+                params.as_ptr()
             )
         };
-
-        if status.is_null() {
-            Ok(buf.len())
-        } else if UcpUtils::ucs_ptr_is_ptr(status) {
-            let f = RequestFuture::new(status, poll_request);
-            f.await?;
-            Ok(buf.len())
-        } else {
-            err_ucs!(UcpUtils::ucs_ptr_raw_status(status))?;
-            err_box!("未预期的状态: {:?}", status)
-        }
+        Self::poll_status(status, MaybeUninit::uninit(), poll_normal).await?;
+        Ok(buf.len())
     }
 
-    unsafe extern "C" fn recv_handler(request: *mut c_void, _status: ucs_status_t, _length: usize) {
-        let request = &mut *(request as *mut Request);
-        request.waker.wake();
+    unsafe extern "C" fn recv_handler(
+        request: *mut c_void,
+        _status: ucs_status_t,
+        _length: usize,
+        _user_data: *mut c_void,
+    ) {
+        let request = &mut *(request as *mut RequestWaker);
+        request.wake();
     }
 
     pub async fn stream_recv(&self, mut buf: BytesMut) -> IOResult<BytesMut> {
         self.check_error()?;
 
-        let mut len = buf.len();
+        let mut len = MaybeUninit::<usize>::uninit();
+        let param = RequestParam::new()
+            .recv_stream_cb(Some(Self::recv_handler));
         let status = unsafe {
-            ucp_stream_recv_nb(
+            ucp_stream_recv_nbx(
                 self.as_mut_ptr(),
                 buf.as_mut_ptr() as _,
                 buf.len() as _,
-                UcpUtils::ucp_dt_make_contig(1),
-                Some(Self::recv_handler),
-                &mut len,
-                0,
+                len.as_mut_ptr(),
+                param.as_ptr(),
             )
         };
+        let len = Self::poll_status(status, len, poll_stream).await?;
+        Ok(buf.split_to(len))
+    }
 
-        if status.is_null() {
-            Ok(BytesMut::new())
-        } else if UcpUtils::ucs_ptr_is_ptr(status) {
-            let f = RequestFuture::new(status, poll_stream_recv);
-            let len = f.await?;
-            Ok(buf.split_to(len))
-        } else {
-            err_ucs!(UcpUtils::ucs_ptr_raw_status(status))?;
-            err_box!("未预期的状态: {:?}", status)
-        }
+    unsafe extern "C" fn flush_handler(request: *mut c_void, _status: ucs_status_t) {
+        let request = &mut *(request as *mut RequestWaker);
+        request.wake();
+    }
+
+    pub async fn flush(&self) -> IOResult<()> {
+        self.check_error()?;
+
+        let status = unsafe {
+            ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_handler))
+        };
+        Self::poll_status(status, MaybeUninit::uninit(), poll_normal).await
     }
 
     pub fn print(&self) {
@@ -210,22 +210,26 @@ impl Drop for Endpoint {
     }
 }
 
-unsafe fn poll_request(ptr: ucs_status_ptr_t) -> Poll<IOResult<()>> {
-    let status = ucp_request_check_status(ptr as _);
-    if status == ucs_status_t::UCS_INPROGRESS {
-        Poll::Pending
-    } else {
-        Poll::Ready(err_ucs!(status))
-    }
-}
+fn poll_stream(ptr: ucs_status_ptr_t) -> Poll<IOResult<usize>> {
+    let mut len = MaybeUninit::<usize>::uninit();
 
-unsafe fn poll_stream_recv(ptr: ucs_status_ptr_t) -> Poll<IOResult<usize>> {
-    let mut len = 0;
-    let status = ucp_stream_recv_request_test(ptr as _, &mut len);
+    let status = unsafe {
+        ucp_stream_recv_request_test(ptr as _, len.as_mut_ptr() as _)
+    };
     if status == ucs_status_t::UCS_INPROGRESS {
         Poll::Pending
     } else {
         err_ucs!(status)?;
-        Poll::Ready(Ok(len))
+        Poll::Ready(Ok(unsafe { len.assume_init() }))
+    }
+}
+
+fn poll_normal(ptr: ucs_status_ptr_t) -> Poll<IOResult<()>> {
+    let status = unsafe { ucp_request_check_status(ptr as _) };
+    if status == ucs_status_t::UCS_INPROGRESS {
+        Poll::Pending
+    } else {
+        err_ucs!(status)?;
+        Poll::Ready(Ok(()))
     }
 }
