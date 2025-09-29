@@ -16,7 +16,7 @@ use crate::io::{IOError, IOResult};
 use crate::sync::{AtomicBool, ErrorMonitor};
 use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::bindings::*;
-use crate::ucp::{stderr, ConnRequest, RequestWaker, RequestFuture, SockAddr, UcpUtils, WorkerExecutor, RequestParam};
+use crate::ucp::{stderr, ConnRequest, RequestWaker, RequestFuture, SockAddr, UcpUtils, WorkerExecutor, RequestParam, RKey};
 use crate::{err_box, err_ucs, poll_status};
 use bytes::BytesMut;
 use log::{info, warn};
@@ -170,6 +170,50 @@ impl Endpoint {
 
         let status = unsafe {
             ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_handler))
+        };
+        poll_status!(status, poll_normal)
+    }
+
+    unsafe extern "C" fn rma_handler(
+        request: *mut c_void,
+        _status: ucs_status_t,
+        _user_data: *mut c_void,
+    ) {
+        let request = &mut *(request as *mut RequestWaker);
+        request.wake();
+    }
+
+    /// 将数据写入远程内存中
+    pub async fn put(&self, buf: DataSlice, remote_addr: u64, rkey: &RKey) -> IOResult<()> {
+        let param = RequestParam::new()
+            .send_cb(Some(Self::rma_handler));
+
+        let status = unsafe {
+            ucp_put_nbx(
+                self.as_mut_ptr(),
+                buf.as_ptr() as _,
+                buf.len() as _,
+                remote_addr,
+                rkey.as_mut_ptr(),
+                param.as_ptr(),
+            )
+        };
+        poll_status!(status, poll_normal)
+    }
+
+    // 从远程内存读取数据。
+    pub async fn get(&self, buf: &mut [u8], remote_addr: u64, rkey: &RKey) -> IOResult<()> {
+        let param = RequestParam::new()
+            .send_cb(Some(Self::rma_handler));
+        let status = unsafe {
+            ucp_get_nbx(
+                self.as_mut_ptr(),
+                buf.as_mut_ptr() as _,
+                buf.len() as _,
+                remote_addr,
+                rkey.as_mut_ptr(),
+                param.as_ptr()
+            )
         };
         poll_status!(status, poll_normal)
     }

@@ -14,13 +14,14 @@
 
 use crate::io::IOResult;
 use crate::sync::AtomicLen;
-use crate::ucp::{Config, ConnRequest, Endpoint, Listener, SockAddr, WorkerExecutor};
+use crate::ucp::{Config, ConnRequest, Context, Endpoint, Listener, RmaMemory, SockAddr, WorkerExecutor};
 use std::sync::Arc;
+use bytes::BytesMut;
 
 pub struct WorkerRuntime {
     pub boss: WorkerExecutor,
     pub workers: Vec<WorkerExecutor>,
-    pub conf: Config,
+    pub context: Arc<Context>,
     index: AtomicLen,
 }
 
@@ -39,7 +40,7 @@ impl WorkerRuntime {
         Ok(Self {
             boss,
             workers,
-            conf,
+            context,
             index: AtomicLen::new(0),
         })
     }
@@ -63,6 +64,10 @@ impl WorkerRuntime {
 
     pub async fn connect(&self, addr: &SockAddr) -> IOResult<Endpoint> {
         Endpoint::connect(self.worker_executor().clone(), addr)
+    }
+
+    pub fn register_memory(&self,  buffer: BytesMut) -> IOResult<RmaMemory> {
+        RmaMemory::new(self.context.clone(), buffer)
     }
 }
 

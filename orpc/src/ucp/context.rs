@@ -25,10 +25,11 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct Context {
     inner: RawPtr<ucp_context>,
+    config: Config,
 }
 
 impl Context {
-    pub fn with_config(conf: &Config) -> IOResult<Self> {
+    pub fn with_config(config: Config) -> IOResult<Self> {
         let features = ucp_feature::UCP_FEATURE_RMA
             | ucp_feature::UCP_FEATURE_TAG
             | ucp_feature::UCP_FEATURE_STREAM
@@ -55,7 +56,7 @@ impl Context {
                 UCP_API_MAJOR,
                 UCP_API_MINOR,
                 &params,
-                conf.as_ptr(),
+                config.as_ptr(),
                 context_ptr.as_mut_ptr(),
             )
         };
@@ -63,6 +64,7 @@ impl Context {
 
         Ok(Self {
             inner: RawPtr::from_uninit(context_ptr),
+            config,
         })
     }
 
@@ -90,11 +92,15 @@ impl Context {
         err_ucs!(status)?;
         Ok(unsafe { attr.assume_init() })
     }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
 }
 
 impl Default for Context {
     fn default() -> Self {
-        Self::with_config(&Config::default()).unwrap()
+        Self::with_config(Config::default()).unwrap()
     }
 }
 

@@ -16,15 +16,18 @@ use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::{CString, RawPtr};
 use crate::ucp::bindings::*;
-use crate::ucp::{stderr, Context};
+use crate::ucp::{stderr, Context, RmaMemory};
 use std::mem::MaybeUninit;
 use std::ptr;
+use crate::common::ByteUnit;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Config {
     inner: RawPtr<ucp_config_t>,
     pub name: String,
     pub threads: usize,
+    pub rdma_region_size: usize,
+    pub rdma_buffer_size: usize,
 }
 
 impl Config {
@@ -46,7 +49,7 @@ impl Config {
     }
 
     pub fn create_context(&self) -> IOResult<Context> {
-        Context::with_config(self)
+        Context::with_config(self.clone())
     }
 }
 
@@ -60,6 +63,8 @@ impl Default for Config {
             inner: RawPtr::from_uninit(inner),
             name: "orpc-udp".to_string(),
             threads: 32,
+            rdma_region_size: 32 * 1024 * 1024,
+            rdma_buffer_size: 128 * 1024
         }
     }
 }
