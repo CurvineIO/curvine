@@ -29,5 +29,6 @@ yarn.lock
 .cursor
 # Scala/Metals related files (not needed for Rust project)
 .metals/
+#.metals/metals.lock.db
 .scala-build/
 .bloop/

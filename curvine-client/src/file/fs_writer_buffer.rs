@@ -28,6 +28,7 @@ use std::sync::Arc;
 enum WriterTask {
     Flush(CallSender<i8>),
     Complete((bool, CallSender<i8>)),
+    Seek((i64, CallSender<i8>)),
 }
 
 enum SelectTask {
@@ -162,6 +163,40 @@ impl FsWriterBuffer {
             Ok(_) => Ok(()),
         }
     }
+    
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        
+        let res: FsResult<()> = {
+            let (tx, rx) = CallChannel::channel();
+            
+            match self.task_sender.send(WriterTask::Seek((pos, tx))).await {
+                Err(e) => {
+                    return Err(e.into());
+                },
+                Ok(_) => {
+                }
+            }
+            
+            match rx.receive().await {
+                Err(e) => {
+                    return Err(e.into());
+                },
+                Ok(_) => {
+                }
+            }
+            Ok(())
+        };
+
+        // Update position (note: actual seek is executed by background task)
+        if res.is_ok() {
+            self.pos = pos;
+        }
+
+        match res {
+            Err(e) => Err(self.check_error(e)),
+            Ok(_) => Ok(()),
+        }
+    }
 
     async fn write_future(
         mut chunk_receiver: AsyncReceiver<DataSlice>,
@@ -199,6 +234,43 @@ impl FsWriterBuffer {
                         writer.complete().await?;
                         tx.send(1)?;
                         return Ok(());
+                    }
+                    
+                    WriterTask::Seek((pos, tx)) => {
+                        
+                        // Process all buffered data first
+                        let mut buffered_chunks = 0;
+                        while let Some(chunk) = chunk_receiver.try_recv()? {
+                            buffered_chunks += 1;
+                            
+                            match writer.write(chunk).await {
+                                Err(e) => {
+                                    return Err(e);
+                                },
+                                Ok(_) => {
+                                }
+                            }
+                        }
+                        
+                        if buffered_chunks > 0 {
+                        }
+                        
+                        // Execute seek operation
+                        match writer.seek(pos).await {
+                            Err(e) => {
+                                return Err(e);
+                            },
+                            Ok(_) => {
+                            }
+                        }
+                        
+                        match tx.send(1) {
+                            Err(e) => {
+                                return Err(e.into());
+                            },
+                            Ok(_) => {
+                            }
+                        }
                     }
                 },
 

@@ -390,13 +390,22 @@ impl FsDir {
         file: &mut InodeFile,
         commit: Option<&CommitBlock>,
     ) -> FsResult<()> {
+        
         let commit = match commit {
-            None => return Ok(()),
+            None => {
+                return Ok(());
+            },
             Some(v) => v,
         };
 
+
         let last_block = match file.blocks.last_mut() {
             None => {
+                log::error!(
+                    "[FsDir::commit_block] No blocks found in file={}, file_id={}",
+                    name,
+                    file.id
+                );
                 return err_box!(
                     "Inode file {}({}) block status is abnormal, no blocks",
                     file.id,
@@ -405,12 +414,25 @@ impl FsDir {
             }
             Some(v) => v,
         };
+        
+        
         if last_block.id != commit.block_id {
+            log::error!(
+                "[FsDir::commit_block] Block ID mismatch: file={}, expected={}, actual={}",
+                name,
+                last_block.id,
+                commit.block_id
+            );
             return err_box!("Inode file {}({}) block status is abnormal, expected last block id {}, actual submitted block id {}",
                  file.id, name, last_block.id, commit.block_id);
         }
 
         if !last_block.is_writing() {
+            log::error!(
+                "[FsDir::commit_block] Block not in writing status: file={}, block_id={}",
+                name,
+                commit.block_id
+            );
             return err_box!(
                 "Inode file {}({}), block {} not writing status",
                 file.id,
@@ -418,7 +440,10 @@ impl FsDir {
                 commit.block_id
             );
         }
+        
+        
         last_block.commit(commit);
+        
 
         Ok(())
     }
@@ -692,12 +717,6 @@ impl FsDir {
         self.update_last_inode_id(last_inode_id)?;
         let time2 = spend.used_ms();
 
-        info!(
-            "Restore from {}, restore rocksdb used {} ms, \
-        build in-memory directory tree used {} ms, \
-        statistics updated during tree reconstruction",
-            path, time1, time2
-        );
 
         Ok(())
     }

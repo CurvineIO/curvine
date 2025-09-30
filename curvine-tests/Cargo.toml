@@ -19,3 +19,5 @@ once_cell = { workspace = true }
 clap = { workspace = true }
 awaitility = "0.4"
 tempfile = { workspace = true }
+env_logger = "0.10"
+rand = "0.8"

@@ -23,9 +23,11 @@ use curvine_common::state::{
     MkdirOptsBuilder, MountInfo, MountOptions, MountType, SetAttrOpts,
 };
 use curvine_common::utils::ProtoUtils;
-use curvine_common::version::GIT_VERSION;
 use curvine_common::FsResult;
-use log::{info, warn};
+use curvine_common::version::GIT_VERSION;
+use log::warn;
+use log::info;
+use orpc::common::ByteUnit;
 use orpc::client::ClientConf;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, err_ext};
@@ -49,7 +51,6 @@ impl CurvineFileSystem {
         };
 
         FsContext::start_metrics_report_task(fs.clone());
-
         let c = &fs.conf().client;
         info!(
             "Create new filesystem, git version: {}, masters: {}, threads: {}-{}, \
@@ -138,12 +139,39 @@ impl CurvineFileSystem {
             .build();
 
         let status = self.fs_client.append(path, opts).await?;
-        let writer = FsWriterBase::new(
-            self.fs_context.clone(),
-            path.clone(),
-            status.file_status,
-            status.last_block,
-        );
+        
+        let writer = if status.file_status.len > 0 {
+            // Existing file: get block information
+            match self.fs_client.get_block_locations(path).await {
+                Ok(file_blocks) => {
+                    FsWriterBase::with_blocks(
+                        self.fs_context.clone(),
+                        path.clone(),
+                        status.file_status,
+                        file_blocks,
+                        status.last_block,
+                    )
+                },
+                Err(_e) => {
+                    // If unable to get block information, fall back to original logic
+                    FsWriterBase::new(
+                        self.fs_context.clone(),
+                        path.clone(),
+                        status.file_status,
+                        status.last_block,
+                    )
+                }
+            }
+        } else {
+            // New file: use original logic
+            FsWriterBase::new(
+                self.fs_context.clone(),
+                path.clone(),
+                status.file_status,
+                status.last_block,
+            )
+        };
+        
         Ok(writer)
     }
 
