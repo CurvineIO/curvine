@@ -282,6 +282,28 @@ impl VfsDir {
         Ok(new_meta)
     }
 
+    pub fn reopen_finalized_block(&self, finalized_meta: &BlockMeta, new_block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        // Create new metadata in writing state
+        let cow_meta = BlockMeta::with_cow(finalized_meta, new_block.len, self);
+        
+        // Get source file (finalized) and target file (writing) paths
+        let src_file = finalized_meta.get_block_path()?;
+        let dst_file = cow_meta.get_block_path()?;
+        
+        
+        // Ensure target directory exists
+        let parent = try_option!(dst_file.parent());
+        if !parent.exists() {
+            FileUtils::create_dir(parent, true)?;
+        }
+        
+        // Copy file content
+        try_err!(fs::copy(&src_file, &dst_file));
+        
+        
+        Ok(cow_meta)
+    }
+
     // Scan all blocks in the directory
     pub fn scan_blocks(&self) -> CommonResult<Vec<BlockMeta>> {
         let finalized_files = FileUtils::list_files(&self.finalized_dir, true)?;

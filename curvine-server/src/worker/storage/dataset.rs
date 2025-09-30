@@ -46,6 +46,9 @@ pub trait Dataset {
     fn append_block(&mut self, expected_len: i64, block: &ExtendedBlock)
         -> CommonResult<BlockMeta>;
 
+    // 🔧 Reopen a finalized block with copy-on-write for random writes
+    fn reopen_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta>;
+
     // Submit block
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta>;
 

@@ -181,6 +181,7 @@ impl<T: FileSystem> FuseSession<T> {
 
     async fn dispatch(rt: &Runtime, fs: Arc<T>, req: FuseRequest, reply: FuseResponse) {
         let unique = req.unique();
+        
         if reply.debug {
             info!(
                 "receive unique: {}, code: {:?}, op: {:?}",
@@ -208,6 +209,8 @@ impl<T: FileSystem> FuseSession<T> {
     async fn dispatch_data(fs: Arc<T>, req: FuseRequest, reply: FuseResponse) -> FuseResult<()> {
         let operator = req.parse_operator()?;
         let err_reply = reply.clone();
+        
+        
         let res: FuseResult<()> = match operator {
             FuseOperator::Write(op) => fs.write(op, reply).await,
             FuseOperator::Read(op) => fs.read(op, reply).await,
@@ -224,6 +227,7 @@ impl<T: FileSystem> FuseSession<T> {
 
     async fn dispatch_meta(fs: Arc<T>, req: FuseRequest, reply: FuseResponse) -> FuseResult<()> {
         let operator = req.parse_operator()?;
+        
         let res = match operator {
             FuseOperator::Init(op) => reply.send_rep(fs.init(op).await).await,
 

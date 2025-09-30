@@ -14,6 +14,7 @@
 
 use crate::block::block_client::BlockClient;
 use crate::file::FsContext;
+use curvine_common::proto::DataHeaderProto;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
@@ -28,6 +29,7 @@ pub struct BlockWriterRemote {
     len: i64,
     seq_id: i32,
     req_id: i64,
+    pending_header: Option<DataHeaderProto>,
 }
 
 impl BlockWriterRemote {
@@ -36,11 +38,33 @@ impl BlockWriterRemote {
         block: ExtendedBlock,
         worker_address: WorkerAddress,
     ) -> FsResult<Self> {
+        // Default append mode: start from block.len position
+        Self::with_offset(fs_context, block, worker_address, None).await
+    }
+
+    pub async fn with_offset(
+        fs_context: &FsContext,
+        block: ExtendedBlock,
+        worker_address: WorkerAddress,
+        block_off: Option<i64>, // None means append mode
+    ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let seq_id = 0;
 
-        let pos = block.len;
-        let len = fs_context.block_size();
+        let (pos, len) = match block_off {
+            Some(off) => {
+                let block_capacity = fs_context.block_size();
+                if off < 0 || off >= block_capacity {
+                    return err_box!("Invalid block offset: {off}, block capacity: {}", block_capacity);
+                }
+                // Random write mode: use block capacity as len
+                (off, block_capacity)
+            }
+            None => {
+                // Append mode: start from block end
+                (block.len, fs_context.block_size())
+            }
+        };
 
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
@@ -71,6 +95,7 @@ impl BlockWriterRemote {
             seq_id,
             req_id,
             worker_address,
+            pending_header: None,
         };
 
         Ok(writer)
@@ -85,8 +110,11 @@ impl BlockWriterRemote {
     pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
         let len = chunk.len() as i64;
         let next_seq_id = self.next_seq_id();
+        
+        let header = self.pending_header.take();
+        
         self.client
-            .write_data(chunk, self.req_id, next_seq_id)
+            .write_data(chunk, self.req_id, next_seq_id, header)
             .await?;
 
         self.pos += len;
@@ -144,5 +172,33 @@ impl BlockWriterRemote {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+    
+    pub fn len(&self) -> i64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return Err(format!("Cannot seek to negative position: {pos}").into());
+        }
+        
+        if pos >= self.len {
+            return Err(format!("Seek position {pos} exceeds block capacity {}", self.len).into());
+        }
+        
+        // Set new position and pending header
+        self.pos = pos;
+        self.pending_header = Some(DataHeaderProto {
+            offset: pos,
+            flush: false,
+            is_last: false,
+        });
+        
+        Ok(())
     }
 }

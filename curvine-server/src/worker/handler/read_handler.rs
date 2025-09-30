@@ -129,7 +129,6 @@ impl ReadHandler {
         let _ = self.context.replace(context);
 
         self.metrics.read_blocks.with_label_values(&[label]).inc();
-        info!("{}", log_msg);
 
         Ok(Builder::success(msg).proto_header(response).build())
     }
@@ -153,7 +152,7 @@ impl ReadHandler {
             let header: DataHeaderProto = msg.parse_header()?;
             // The customer service initiated seek and skip operations.
             if header.offset != file.pos() {
-                file.seek(header.offset)?;
+                file.seek(header.offset)?; 
             }
         }
 
@@ -197,7 +196,6 @@ impl ReadHandler {
         let file = self.file.take();
         drop(file);
 
-        info!("Read block end for req_id {}", msg.req_id());
         Ok(msg.success())
     }
 }

@@ -41,7 +41,6 @@ impl FsWriter {
         let chunk_size = fs_context.write_chunk_size();
         let chunk_num = fs_context.write_chunk_num();
         let pos = status.len;
-
         info!(
             "Create writer, path={}, pos={}, block_size={}, chunk_size={}, chunk_number={}, replicas={}",
             &status.path,
@@ -119,10 +118,25 @@ impl Writer for FsWriter {
     async fn cancel(&mut self) -> FsResult<()> {
         Ok(())
     }
+    
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return Err(format!("Cannot seek to negative position: {}", pos).into());
+        }
+        
+        // Flush current buffer
+        self.flush_chunk().await?;
+        
+        // Delegate to inner writer to execute seek
+        self.inner.seek(pos).await?;
+        
+        // Update current position
+        self.pos = pos;
+        Ok(())
+    }
 }
 
 impl Drop for FsWriter {
     fn drop(&mut self) {
-        info!("Close writer, path={}", self.path())
     }
 }

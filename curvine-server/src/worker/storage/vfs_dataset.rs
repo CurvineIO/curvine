@@ -59,17 +59,16 @@ impl VfsDataset {
             let storage_path = data_dir.storage_path(&conf.cluster_id);
             if conf.format_worker && FileUtils::exists(&storage_path) {
                 FileUtils::delete_path(&storage_path, true)?;
-                info!("Delete(format) data dir {}", storage_path);
             }
 
-            let mut version = StorageVersion::read_version(&storage_path, &conf.cluster_id)?;
-
+            let version = StorageVersion::read_version(&storage_path, &conf.cluster_id)?;
             match worker_id {
-                None => {
-                    worker_id = Some(version.worker_id);
+                None => worker_id = Some(version.worker_id),
+                Some(v) => {
+                    if v != version.worker_id {
+                        return err_box!("Worker ID mismatch: expected {}, found {}", v, version.worker_id);
+                    }
                 }
-
-                Some(v) => version.worker_id = v,
             }
 
             let vfs_dir = VfsDir::new(version, data_dir, dir_reserved)?;
@@ -78,7 +77,7 @@ impl VfsDataset {
 
         Ok(Self::new(cluster_id, dir_list))
     }
-
+ 
     // Initialize.
     // 1. Scan all blocks in the directory
     // 2. Block is added to block_map.
@@ -93,11 +92,6 @@ impl VfsDataset {
             }
         }
 
-        info!(
-            "Dataset initialize, used {} ms, total block {}",
-            spent.used_ms(),
-            self.block_map.len()
-        );
     }
 
     pub fn find_dir(&self, id: u32) -> CommonResult<&VfsDir> {
@@ -157,14 +151,29 @@ impl Dataset for VfsDataset {
 
     fn create_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         if let Some(v) = self.block_map.get(&block.id) {
-            return err_box!(
-                "Block {} already exists in state {:?} and thus cannot be created in worker_id: {}",
-                block.id,
-                v.state(),
-                self.worker_id
-            );
+            match v.state() {
+                // Allow reusing blocks already in Writing state
+                &crate::worker::block::BlockState::Writing => {
+                    return Ok(v.clone());
+                }
+                
+                &crate::worker::block::BlockState::Finalized => {
+                    return self.reopen_block(block);
+                }
+                
+                // Recovering state does not allow operations
+                &crate::worker::block::BlockState::Recovering => {
+                    return err_box!(
+                        "Block {} is in recovering state and cannot be created in worker_id: {}",
+                        block.id,
+                        self.worker_id
+                    );
+                }
+            }
         }
 
+        // Create a brand new block
+        
         let dir = self.dir_list.choose_dir(block)?;
         let meta = dir.create_block(block)?;
 
@@ -202,6 +211,39 @@ impl Dataset for VfsDataset {
         Ok(new_meta)
     }
 
+    fn reopen_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        // First get finalized block info to avoid borrow conflicts
+        let (finalized_len, finalized_state, finalized_meta_clone) = {
+            let finalized_meta = self.get_block_check(block.id)?;
+            (finalized_meta.len(), *finalized_meta.state(), finalized_meta.clone())
+        };
+        
+        // Can only reopen blocks in finalized state
+        if finalized_state != BlockState::Finalized {
+            return err_box!(
+                "Block {} is not in finalized state, current state: {:?}",
+                block.id,
+                finalized_state
+            );
+        }
+        
+        
+        // Choose a directory to store copy-on-write blocks
+        let cow_dir = self.dir_list.choose_dir(block)?;
+        
+        // Execute copy-on-write operation
+        let cow_meta = cow_dir.reopen_finalized_block(&finalized_meta_clone, block)?;
+        
+        // Update block mapping, replace finalized block with writing state block
+        self.block_map.insert(cow_meta.id(), cow_meta.clone());
+        
+        // Update space statistics
+        cow_dir.reserve_space(false, block.len);
+        
+        
+        Ok(cow_meta)
+    }
+
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let meta = self.get_block_check(block.id)?;
         if meta.state() != &BlockState::Writing {
@@ -216,9 +258,32 @@ impl Dataset for VfsDataset {
         let dir = self.find_dir(meta.dir_id())?;
         let final_meta = dir.finalize_block(meta)?;
 
+        let original_finalized_path = {
+            let original_meta = BlockMeta {
+                id: final_meta.id(),
+                len: final_meta.len(),
+                state: BlockState::Finalized,
+                dir: final_meta.dir.clone(),
+            };
+            original_meta.get_block_path().ok()
+        };
+
+        // If original finalized file exists, need to replace it
+        if let Some(original_path) = original_finalized_path {
+            let new_finalized_path = final_meta.get_block_path()?;
+            
+            if original_path != new_finalized_path && original_path.exists() {
+                
+                // Delete original finalized file
+                try_err!(fs::remove_file(&original_path));
+                
+            }
+        }
+
         dir.release_space(false, meta.len);
         dir.reserve_space(true, final_meta.len);
         self.block_map.insert(final_meta.id(), final_meta.clone());
+
 
         Ok(final_meta)
     }

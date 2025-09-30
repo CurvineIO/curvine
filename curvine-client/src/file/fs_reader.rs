@@ -117,6 +117,5 @@ impl Reader for FsReader {
 
 impl Drop for FsReader {
     fn drop(&mut self) {
-        info!("Close reader, path={}", self.path())
     }
 }

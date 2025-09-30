@@ -19,7 +19,7 @@ use orpc::common::Utils;
 use orpc::io::LocalFile;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::{DataSlice, RawPtr};
-use orpc::try_option;
+use orpc::{err_box, try_option};
 use std::sync::Arc;
 
 pub struct BlockWriterLocal {
@@ -39,11 +39,33 @@ impl BlockWriterLocal {
         block: ExtendedBlock,
         worker_address: WorkerAddress,
     ) -> FsResult<Self> {
+        // Default append mode: start from block.len position
+        Self::with_offset(fs_context, block, worker_address, None).await
+    }
+
+    pub async fn with_offset(
+        fs_context: Arc<FsContext>,
+        block: ExtendedBlock,
+        worker_address: WorkerAddress,
+        block_off: Option<i64>, // None means append mode
+    ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let seq_id = 0;
 
-        let pos = block.len;
-        let len = fs_context.block_size();
+        let (pos, len) = match block_off {
+            Some(off) => {
+                let block_capacity = fs_context.block_size();
+                if off < 0 || off >= block_capacity {
+                    return err_box!("Invalid block offset: {off}, block capacity: {}", block_capacity);
+                }
+                // Random write mode: use block capacity as len
+                (off, block_capacity)
+            }
+            None => {
+                // Append mode: start from block end
+                (block.len, fs_context.block_size())
+            }
+        };
 
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
@@ -150,8 +172,35 @@ impl BlockWriterLocal {
     pub fn pos(&self) -> i64 {
         self.file.pos()
     }
+    
+    pub fn len(&self) -> i64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+    
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return Err(format!("Cannot seek to negative position: {pos}").into());
+        }
+        
+        if pos >= self.len {
+            return Err(format!("Seek position {pos} exceeds block capacity {}", self.len).into());
+        }
+        
+        // For local files, call seek directly
+        let file = self.file.clone();
+        self.rt
+            .spawn_blocking(move || {
+                file.as_mut().seek(pos)?;
+                Ok(())
+            })
+            .await?
     }
 }

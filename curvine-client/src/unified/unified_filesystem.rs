@@ -25,7 +25,7 @@ use curvine_common::state::{
     MountOptions, SetAttrOpts,
 };
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::warn;
 use orpc::runtime::Runtime;
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
@@ -269,10 +269,6 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
         // Read data from the curvine cache
         if read_cache.is_valid() {
-            info!(
-                "Read from Curvine(cache), ufs path {}, cv path: {}",
-                ufs_path, path
-            );
             self.metrics
                 .mount_cache_hits
                 .with_label_values(&[mount.mount_id()])
@@ -289,16 +285,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         if mount.info.auto_cache() {
             match self.async_cache(&ufs_path).await {
                 Err(e) => warn!("Submit async cache error for {}: {}", ufs_path, e),
-                Ok(res) => info!(
-                    "Submit async cache successfully for {}, job id {}, target_path {}",
-                    ufs_path, res.job_id, res.target_path
-                ),
+                Ok(_) => {}
             }
         }
 
         // Reading from ufs
         if self.enable_read_ufs {
-            info!("Read from ufs, ufs path {}, cv path: {}", ufs_path, path);
             mount.ufs.open(&ufs_path).await
         } else {
             err_ext!(FsError::unsupported_ufs_read(path.path()))

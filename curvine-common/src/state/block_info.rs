@@ -125,7 +125,7 @@ impl FileBlocks {
             start_pos = end_pos;
         }
 
-        err_box!("Not found block for pos {}", file_pos)
+        err_box!("Not found block for pos {file_pos}")
     }
 }
 
@@ -161,7 +161,17 @@ impl SearchFileBlocks {
             let block_off = file_pos - self.search_off[index].start;
             Ok((block_off, lc.clone()))
         } else {
-            err_box!("Not found block for pos {}", file_pos)
+            err_box!("Not found block for pos {file_pos}")
+        }
+    }
+
+    pub fn get_write_block(&self, file_pos: i64) -> FsResult<(i64, LocatedBlock)> {
+        let index = self.search_off.partition_point(|x| x.end <= file_pos);
+        if let Some(lc) = self.block_locs.get(index) {
+            let block_off = file_pos - self.search_off[index].start;
+            Ok((block_off, lc.clone()))
+        } else {
+            err_box!("Position {file_pos} exceeds file range, need new block allocation")
         }
     }
 }
