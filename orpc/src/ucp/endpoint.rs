@@ -16,9 +16,9 @@ use crate::io::{IOError, IOResult};
 use crate::sync::{AtomicBool, ErrorMonitor};
 use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::bindings::*;
-use crate::ucp::{stderr, ConnRequest, RequestWaker, RequestFuture, SockAddr, UcpUtils, WorkerExecutor, RequestParam, RKey};
+use crate::ucp::{stderr, ConnRequest, RequestWaker, RequestFuture, SockAddr, UcpUtils, WorkerExecutor, RequestParam, RKey, RmaMemory};
 use crate::{err_box, err_ucs, poll_status};
-use bytes::BytesMut;
+use bytes::{Buf, BufMut, BytesMut};
 use log::{info, warn};
 use std::mem::MaybeUninit;
 use std::os::raw::c_void;
@@ -30,6 +30,7 @@ pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
     executor: WorkerExecutor,
     err_monitor: Arc<ErrorMonitor<IOError>>,
+    pub buffer: RmaMemory
 }
 
 impl Endpoint {
@@ -50,10 +51,12 @@ impl Endpoint {
             unsafe { ucp_ep_create(executor.worker().as_mut_ptr(), &params, inner.as_mut_ptr()) };
         err_ucs!(status)?;
 
+        let buffer = executor.register_memory(BytesMut::zeroed(1024))?;
         Ok(Self {
             inner: RawPtr::from_uninit(inner),
             executor,
             err_monitor,
+            buffer,
         })
     }
 
@@ -216,6 +219,27 @@ impl Endpoint {
             )
         };
         poll_status!(status, poll_normal)
+    }
+
+    pub fn get_memory(&self) -> IOResult<BytesMut> {
+        let mut addr_buf = BytesMut::new();
+        addr_buf.put_u64(self.buffer.buffer_addr());
+
+        let pack  = self.buffer.pack()?;
+
+        addr_buf.extend_from_slice(pack.as_slice());
+
+        Ok(addr_buf)
+    }
+
+    pub async fn send_get_memory(&self) -> IOResult<(u64, RKey)> {
+        self.stream_send("get".into()).await?;
+        let buf = BytesMut::zeroed(1024);
+        let mut buf = self.stream_recv(buf).await?.unwrap();
+
+        let addr = buf.get_u64();
+        let rkey = RKey::unpack(&self, &buf)?;
+        Ok((addr, rkey))
     }
 
     pub fn print(&self) {

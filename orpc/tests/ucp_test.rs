@@ -98,3 +98,43 @@ fn endpoint_rma() {
 
     let _ = rt.block_on(rx.receive());
 }
+
+
+#[test]
+fn endpoint_rma1() {
+    Logger::default();
+
+    let wr = WorkerRuntime::default();
+    let addr = "127.0.0.1:8080".into();
+
+    let executor = wr.worker_executor().clone();
+    let rt = executor.rt().clone();
+
+    let (tx, rx) = CallChannel::channel();
+
+
+    rt.spawn(async move {
+        let endpoint = Endpoint::connect(executor, &addr).unwrap();
+        let (addr, rkey) = endpoint.send_get_memory().await.unwrap();
+
+
+
+        for i in 0..10 {
+            // 写入数据。
+            // 1. 注册内存（使用现有缓冲区）
+            let data = format!("abc{}", i);
+
+            // 写入数据。
+            endpoint.put(DataSlice::Buffer(BytesMut::from(data.as_bytes())), addr, &rkey).await.unwrap();
+
+            // 2. 通知写入完成。
+            endpoint.stream_send("start".into()).await.unwrap();
+            let buf = endpoint.stream_recv(BytesMut::zeroed(1000)).await.unwrap().unwrap();
+            info!("rma send: {:?}", String::from_utf8_lossy(&buf));
+        }
+
+        let _ = tx.send(1);
+    });
+
+    let _ = rt.block_on(rx.receive());
+}

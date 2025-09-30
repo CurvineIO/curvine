@@ -46,7 +46,6 @@ impl RmaMemory {
         let status = unsafe {
             ucp_mem_map(context.as_mut_ptr(), &params, inner.as_mut_ptr())
         };
-        info!("xxx {:?}", status);
         err_ucs!(status)?;
 
         Ok(Self {

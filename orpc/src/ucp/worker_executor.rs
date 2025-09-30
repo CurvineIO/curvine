@@ -15,9 +15,10 @@
 use crate::io::IOResult;
 use crate::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use crate::sync::channel::CallChannel;
-use crate::ucp::{Context, Worker};
+use crate::ucp::{Context, RmaMemory, Worker};
 use log::error;
 use std::sync::Arc;
+use bytes::BytesMut;
 
 #[derive(Clone)]
 pub struct WorkerExecutor {
@@ -58,5 +59,9 @@ impl WorkerExecutor {
 
     pub fn clone_worker(&self) -> Arc<Worker> {
         self.worker.clone()
+    }
+
+    pub fn register_memory(&self, buffer: BytesMut) -> IOResult<RmaMemory> {
+        RmaMemory::new(self.worker.context().clone(), buffer)
     }
 }

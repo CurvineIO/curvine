@@ -66,7 +66,7 @@ impl WorkerRuntime {
         Endpoint::connect(self.worker_executor().clone(), addr)
     }
 
-    pub fn register_memory(&self,  buffer: BytesMut) -> IOResult<RmaMemory> {
+    pub fn register_memory(&self, buffer: BytesMut) -> IOResult<RmaMemory> {
         RmaMemory::new(self.context.clone(), buffer)
     }
 }
