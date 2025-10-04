@@ -66,7 +66,7 @@ impl RawVec {
     pub fn split_off(&mut self, at: usize) -> Self {
         assert!(
             at <= self.len,
-            "split_to out of bounds: {:?} <= {:?}",
+            "split_off out of bounds: {:?} <= {:?}",
             at,
             self.len,
         );
@@ -81,7 +81,7 @@ impl RawVec {
     pub fn copy_to_slice(&mut self, dst: &mut [u8]) {
         assert!(
             self.len >= dst.len(),
-            "advance out of bounds: the len is {} but advancing by {}",
+            "copy_to_slice out of bounds: the len is {} but advancing by {}",
             self.len,
             dst.len(),
         );
