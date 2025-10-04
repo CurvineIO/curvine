@@ -154,7 +154,7 @@ impl DataSlice {
             Empty => Empty,
             Buffer(s) => Buffer(s.split_off(at)),
             IOSlice(s) => IOSlice(s.split_off()),
-            MemSlice(s) => MemSlice(s.split_to(at)),
+            MemSlice(s) => MemSlice(s.split_off(at)),
             Bytes(s) => Bytes(s.split_off(at)),
         }
     }
