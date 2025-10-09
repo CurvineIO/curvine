@@ -1,0 +1,301 @@
+---
+apiVersion: data.fluid.io/v1alpha1
+kind: Dataset
+metadata:
+  name: curvine-demo
+  namespace: default
+spec:
+  placement: Shared
+  accessModes:
+  - ReadWriteMany
+  mounts:
+  - name: demo
+    mountPoint: "curvine:///"
+    options:
+      cluster_id: "curvine-demo"
+      cache_dir: "/cache-data"
+    # encryptOptions:
+    # - name: access-key
+    #   valueFrom:
+    #     secretKeyRef:
+    #       name: curvine-secret
+    #       key: access-key
+---
+apiVersion: data.fluid.io/v1alpha1
+kind: CacheRuntime
+metadata:
+  name: curvine-demo
+  namespace: default
+spec:
+  runtimeClassName: curvine
+  
+  # Basic volumes for testing/development
+  volumes:
+  - name: curvine-logs
+    emptyDir: {}
+  - name: curvine-cache
+    emptyDir: {}
+  - name: curvine-meta
+    emptyDir: {}
+  - name: curvine-journal
+    emptyDir: {}
+  
+  # Advanced: Multi-tier storage volumes (uncomment for production)
+  # - name: memory-cache
+  #   emptyDir:
+  #     medium: Memory      # Memory storage for hot data
+  #     sizeLimit: 32Gi
+  # - name: ssd-cache
+  #   persistentVolumeClaim:
+  #     claimName: ssd-pvc  # SSD storage for warm data
+  # - name: hdd-cache
+  #   persistentVolumeClaim:
+  #     claimName: hdd-pvc  # HDD storage for cold data
+  
+  # Advanced: Production persistent volumes (uncomment for production)
+  # - name: master-meta
+  #   persistentVolumeClaim:
+  #     claimName: master-meta-pvc
+  # - name: master-journal
+  #   persistentVolumeClaim:
+  #     claimName: master-journal-pvc
+  
+  master:
+    options:
+      format_master: "false"
+      rpc_port: "8995"
+      journal_port: "8996"
+      web_port: "9000"
+      # Basic metadata storage configuration
+      meta_dir: "/opt/curvine/data/meta"
+      meta_disable_wal: "false"
+      meta_compression_type: "lz4"
+      meta_write_buffer_size: "64MB"
+      # Advanced: Production RocksDB tuning (uncomment for production)
+      # meta_db_write_buffer_size: "256MB"
+      # heartbeat_interval: "3s"
+      # worker_check_interval: "10s"
+      # worker_lost_interval: "5m"
+      # audit_logging_enabled: "true"
+    replicas: 1  # Change to 3 for HA production deployment
+    
+    volumeMounts:
+    - name: curvine-logs
+      mountPath: /opt/curvine/logs
+    - name: curvine-meta
+      mountPath: /opt/curvine/data/meta
+    - name: curvine-journal
+      mountPath: /opt/curvine/data/journal
+    # Advanced: Production persistent storage (uncomment for production)
+    # - name: master-meta
+    #   mountPath: /opt/curvine/data/meta
+    # - name: master-journal
+    #   mountPath: /opt/curvine/data/journal
+    
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+    # Advanced: Production resources (uncomment for production)
+    # resources:
+    #   requests:
+    #     memory: "1Gi"
+    #     cpu: "500m"
+    #   limits:
+    #     memory: "4Gi"
+    #     cpu: "2000m"
+    
+    # Advanced: Node affinity for production (uncomment for production)
+    # nodeSelector:
+    #   node-role: master-node
+    # tolerations:
+    # - key: "master-only"
+    #   operator: "Equal"
+    #   value: "true"
+    #   effect: "NoSchedule"
+  
+  worker:
+    options:
+      format_worker: "false"
+      rpc_port: "8997"
+      web_port: "9001"
+      dir_reserved: "5GB"
+      # Basic single-tier storage configuration
+      data_dir: "[SSD]/cache-data"
+      # Advanced: Multi-tier storage configuration (uncomment for production)
+      # Examples: [MEM:32GB]/cache-mem, [SSD:500GB]/cache-ssd, [HDD:2TB]/cache-hdd
+      # data_dir: "[MEM:32GB]/cache-mem,[SSD:500GB]/cache-ssd,[HDD:2TB]/cache-hdd"
+      # Advanced: Performance tuning (uncomment for production)
+      # io_threads: "64"
+      # worker_threads: "32"
+      # executor_threads: "16"
+      # enable_splice: "true"
+      # enable_send_file: "true"
+    replicas: 1  # Change to 4+ for production load distribution
+    
+    volumeMounts:
+    - name: curvine-logs
+      mountPath: /opt/curvine/logs
+    - name: curvine-cache
+      mountPath: /cache-data
+    # Advanced: Multi-tier storage mounts (uncomment for production)
+    # - name: memory-cache
+    #   mountPath: /cache-mem
+    # - name: ssd-cache
+    #   mountPath: /cache-ssd
+    # - name: hdd-cache
+    #   mountPath: /cache-hdd
+    
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "200m"
+      limits:
+        memory: "2Gi"
+        cpu: "1000m"
+    # Advanced: Production resources (uncomment for production)
+    # resources:
+    #   requests:
+    #     memory: "2Gi"
+    #     cpu: "1000m"
+    #   limits:
+    #     memory: "8Gi"
+    #     cpu: "4000m"
+    
+    # Basic single-tier cache configuration
+    tieredStore:
+      levels:
+      - quota: 5Gi
+        low: "0.5"
+        high: "0.8"
+        path: "/cache-data"
+        medium:
+          emptyDir: {}
+    # Advanced: Multi-tier cache configuration (uncomment for production)
+    # tieredStore:
+    #   levels:
+    #   # Memory tier - ultra-high performance for hot data
+    #   - quota: 32Gi
+    #     low: "0.85"
+    #     high: "0.95"
+    #     path: "/cache-mem"
+    #     medium:
+    #       emptyDir:
+    #         medium: Memory
+    #         sizeLimit: 32Gi
+    #   # SSD tier - high performance for warm data
+    #   - quota: 500Gi
+    #     low: "0.7"
+    #     high: "0.9"
+    #     path: "/cache-ssd"
+    #     medium:
+    #       persistentVolumeClaim:
+    #         claimName: ssd-pvc
+    #   # HDD tier - large capacity for cold data
+    #   - quota: 2Ti
+    #     low: "0.5"
+    #     high: "0.8"
+    #     path: "/cache-hdd"
+    #     medium:
+    #       persistentVolumeClaim:
+    #         claimName: hdd-pvc
+    
+    # Advanced: Node affinity for production (uncomment for production)
+    # nodeSelector:
+    #   node-role: worker-node
+    # tolerations:
+    # - key: "worker-only"
+    #   operator: "Equal"
+    #   value: "true"
+    #   effect: "NoSchedule"
+  
+  client:
+    options:
+      debug: "true"
+      log_level: "info"
+      rpc_timeout_ms: "1000"
+      data_timeout_ms: "3000"
+      # Advanced: Production client tuning (uncomment for production)
+      # debug: "false"
+      # log_level: "warn"
+      # rpc_timeout_ms: "10000"
+      # data_timeout_ms: "30000"
+      # fuse_debug: "false"
+      # fuse_kernel_cache: "true"
+      # fuse_attr_timeout: "1.0"
+      # fuse_entry_timeout: "1.0"
+    
+    volumeMounts:
+    - name: curvine-logs
+      mountPath: /opt/curvine/logs
+    - name: curvine-cache
+      mountPath: /tmp/curvine/cache
+    
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "512Mi"
+        cpu: "200m"
+    # Advanced: Production client resources (uncomment for production)
+    # resources:
+    #   requests:
+    #     memory: "512Mi"
+    #     cpu: "200m"
+    #   limits:
+    #     memory: "2Gi"
+    #     cpu: "1000m"
+    
+    # Advanced: Client pod scheduling (uncomment for production)
+    # nodeSelector:
+    #   node-role: compute-node
+
+# Advanced: Production PersistentVolumeClaims (uncomment and apply separately for production)
+# ---
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: master-meta-pvc
+# spec:
+#   accessModes: [ReadWriteOnce]
+#   resources:
+#     requests:
+#       storage: 50Gi
+#   storageClassName: fast-ssd
+# ---
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: master-journal-pvc
+# spec:
+#   accessModes: [ReadWriteOnce]
+#   resources:
+#     requests:
+#       storage: 20Gi
+#   storageClassName: fast-ssd
+# ---
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: ssd-pvc
+# spec:
+#   accessModes: [ReadWriteOnce]
+#   resources:
+#     requests:
+#       storage: 500Gi
+#   storageClassName: fast-ssd
+# ---
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: hdd-pvc
+# spec:
+#   accessModes: [ReadWriteOnce]
+#   resources:
+#     requests:
+#       storage: 2Ti
+#   storageClassName: standard

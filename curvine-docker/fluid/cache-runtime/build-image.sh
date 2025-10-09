@@ -4,7 +4,7 @@ set -e
 
 # Configuration
 CURVINE_BUILD_PATH="../../../build/dist"
-IMAGE_NAME="curvine-fluid-thinruntime"
+IMAGE_NAME="curvine-fluid-cacheruntime"
 IMAGE_TAG="v1.0.0"
 
 # Color output functions
@@ -27,7 +27,7 @@ print_error() {
 # Interactive build mode selection
 select_build_mode() {
     echo "==========================================="
-    echo "    Curvine Fluid ThinRuntime Builder"
+    echo "    Curvine Fluid CacheRuntime Builder"
     echo "==========================================="
     echo ""
     echo "Please select build mode:"
@@ -88,21 +88,24 @@ build_from_binaries() {
     print_success "Found build directory: $CURVINE_BUILD_PATH"
     
     # Create build context with proper error handling
-    BUILD_DIR=$(mktemp -d -t curvine-binary-build-XXXXXX)
+    BUILD_DIR=$(mktemp -d -t curvine-cache-binary-build-XXXXXX)
     if [ ! -d "$BUILD_DIR" ]; then
         print_error "Failed to create temporary build directory"
         exit 1
     fi
     print_info "Creating build context: $BUILD_DIR"
     
-    # Copy Dockerfile for binary builds and fluid config parser
+    # Copy Dockerfile for binary builds and scripts
     cp Dockerfile.binary "$BUILD_DIR/Dockerfile"
-    cp fluid-config-parse.py "$BUILD_DIR/"
     cp entrypoint.sh "$BUILD_DIR/"
+    cp generate_config.py "$BUILD_DIR/"
     
     # Copy entire build directory
     print_info "Copying build artifacts..."
     cp -r "$CURVINE_BUILD_PATH" "$BUILD_DIR/build"
+    
+     # Copy curvine-docker/compile directory for build configs
+    cp -r "../../compile" "$BUILD_DIR/"
     
     # Build Docker image
     print_info "Building Docker image: $IMAGE_NAME:$IMAGE_TAG"
@@ -120,22 +123,22 @@ build_from_local() {
     
     # Navigate to project root
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+    PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
     
     print_info "Project root directory: $PROJECT_ROOT"
     
     # Create build context with proper error handling
-    BUILD_DIR=$(mktemp -d -t curvine-source-build-XXXXXX)
+    BUILD_DIR=$(mktemp -d -t curvine-cache-source-build-XXXXXX)
     if [ ! -d "$BUILD_DIR" ]; then
         print_error "Failed to create temporary build directory"
         exit 1
     fi
     print_info "Creating build context: $BUILD_DIR"
     
-    # Copy Dockerfile and fluid config parser
+    # Copy Dockerfile and scripts
     cp Dockerfile "$BUILD_DIR/"
-    cp fluid-config-parse.py "$BUILD_DIR/"
     cp entrypoint.sh "$BUILD_DIR/"
+    cp generate_config.py "$BUILD_DIR/"
     
     # Copy curvine-docker/compile directory for build configs
     cp -r "../../compile" "$BUILD_DIR/"
@@ -145,7 +148,7 @@ build_from_local() {
     mkdir -p "$BUILD_DIR/workspace"
     
     # Copy curvine directories (the actual source code)
-    for dir in curvine-cli curvine-client curvine-common curvine-server curvine-libsdk curvine-tests curvine-fuse curvine-web curvine-ufs curvine-s3-gateway orpc; do
+    for dir in curvine-cli curvine-client curvine-common curvine-server curvine-libsdk curvine-tests curvine-fuse curvine-web curvine-ufs curvine-s3-gateway orpc build; do
         if [ -d "$PROJECT_ROOT/$dir" ]; then
             print_info "Copying $dir..."
             cp -r "$PROJECT_ROOT/$dir" "$BUILD_DIR/workspace/"
@@ -169,7 +172,7 @@ build_from_local() {
     print_info "Building Docker image (with source compilation): $IMAGE_NAME:$IMAGE_TAG"
     print_warning "Note: Source build requires longer time, please be patient..."
     
-    docker build -t "$IMAGE_NAME:$IMAGE_TAG" "$BUILD_DIR"
+    docker build --no-cache -t "$IMAGE_NAME:$IMAGE_TAG" "$BUILD_DIR"
     
     # Clean up
     rm -rf "$BUILD_DIR"
@@ -218,7 +221,7 @@ main() {
 
 # Check for help flag
 if [[ "$1" == "-h" || "$1" == "--help" ]]; then
-    echo "Curvine Fluid ThinRuntime Docker Build Tool"
+    echo "Curvine Fluid CacheRuntime Docker Build Tool"
     echo ""
     echo "Usage: $0 [OPTIONS]"
     echo ""
