@@ -30,8 +30,6 @@ pub struct FsWriterBase {
     path: Path,
     pos: i64,
     status: FileStatus,
-
-    // File block information for random write support
     file_blocks: Option<SearchFileBlocks>,
 
     // Block management
@@ -420,7 +418,7 @@ impl FsWriterBase {
                 let commit_block = old.to_commit_block();
                 self.pending_commit_block = Some(commit_block);
             } else if has_data && self.close_writer_times <= self.close_writer_limit {
-                // Block has data but not full, cache for reuse 
+                // Block has data but not full, cache for reuse
                 self.all_writers.insert(block_id, old);
             } else {
                 // Either no data or cache limit exceeded, complete and close

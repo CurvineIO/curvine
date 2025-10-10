@@ -282,3 +282,183 @@ async fn seek(fs: &CurvineFileSystem, path: &Path) -> CommonResult<()> {
 
     Ok(())
 }
+
+#[test]
+fn random_write_multiple_blocks() -> CommonResult<()> {
+    let mut conf = Testing::get_cluster_conf()?;
+    conf.client.short_circuit = true;
+    conf.client.block_size = 1024 * 1024; // 1MB block size
+    let path = Path::from_str("/random_write_multiple_blocks.data")?;
+
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = Testing::get_fs(Some(rt.clone()), Some(conf))?;
+
+    rt.block_on(async move { random_write_multiple_blocks_test(&fs, &path).await })
+        .unwrap();
+
+    Ok(())
+}
+
+async fn random_write_multiple_blocks_test(
+    fs: &CurvineFileSystem,
+    path: &Path,
+) -> CommonResult<()> {
+    let block_size = 1024 * 1024; // 1MB
+    let total_blocks = 3;
+    let total_size = block_size * total_blocks;
+    let mut expected_content = vec![0u8; total_size];
+
+    // Create writer
+    let mut writer = fs.create(path, true).await?;
+
+    // Phase 1: Initial writes across all blocks
+    let initial_writes = vec![
+        // Block 0 initial writes
+        (0, "INITIAL_START_BLOCK0".as_bytes()),
+        (block_size / 4, "INITIAL_QUARTER_BLOCK0".as_bytes()),
+        (block_size / 2, "INITIAL_MIDDLE_BLOCK0".as_bytes()),
+        (block_size * 3 / 4, "INITIAL_3QUARTER_BLOCK0".as_bytes()),
+        // Block 1 initial writes
+        (block_size + 100, "INITIAL_START_BLOCK1".as_bytes()),
+        (
+            block_size + block_size / 4,
+            "INITIAL_QUARTER_BLOCK1".as_bytes(),
+        ),
+        (
+            block_size + block_size / 2,
+            "INITIAL_MIDDLE_BLOCK1".as_bytes(),
+        ),
+        (
+            block_size + block_size * 3 / 4,
+            "INITIAL_3QUARTER_BLOCK1".as_bytes(),
+        ),
+        // Block 2 initial writes
+        (block_size * 2 + 200, "INITIAL_START_BLOCK2".as_bytes()),
+        (
+            block_size * 2 + block_size / 4,
+            "INITIAL_QUARTER_BLOCK2".as_bytes(),
+        ),
+        (
+            block_size * 2 + block_size / 2,
+            "INITIAL_MIDDLE_BLOCK2".as_bytes(),
+        ),
+        (
+            block_size * 2 + block_size * 3 / 4,
+            "INITIAL_3QUARTER_BLOCK2".as_bytes(),
+        ),
+        // Cross-block boundary writes
+        (block_size - 20, "INITIAL_CROSS_BLOCK01_BOUNDARY".as_bytes()),
+        (
+            block_size * 2 - 25,
+            "INITIAL_CROSS_BLOCK12_BOUNDARY".as_bytes(),
+        ),
+    ];
+
+    // Apply initial writes
+    for (offset, data) in &initial_writes {
+        writer.seek(*offset as i64).await?;
+        writer.write(data).await?;
+
+        // Update expected content
+        let end_pos = (*offset + data.len()).min(expected_content.len());
+        if *offset < expected_content.len() {
+            let copy_len = end_pos - offset;
+            expected_content[*offset..end_pos].copy_from_slice(&data[0..copy_len]);
+        }
+    }
+
+    // Phase 2: Overwrite operations - later writes overwrite earlier content
+    let overwrite_operations = vec![
+        // Overwrite in Block 0 - should overwrite initial content
+        (0, "OVERWRITE_START_B0".as_bytes()), // Overwrites "INITIAL_START_BLOCK0"
+        (block_size / 4 + 5, "OVERWRITE_QUARTER_B0".as_bytes()), // Partial overwrite of quarter position
+        (
+            block_size / 2 - 10,
+            "OVERWRITE_MIDDLE_B0_EXTENDED".as_bytes(),
+        ), // Overwrites and extends middle
+        // Overwrite in Block 1 - should overwrite initial content
+        (block_size + 100, "OVERWRITE_START_B1".as_bytes()), // Overwrites "INITIAL_START_BLOCK1"
+        (
+            block_size + block_size / 2 + 8,
+            "OVERWRITE_MID_B1".as_bytes(),
+        ), // Partial overwrite of middle
+        (
+            block_size + block_size * 3 / 4 - 5,
+            "OVERWRITE_3Q_B1_LONG".as_bytes(),
+        ), // Overwrites 3/4 position
+        // Overwrite in Block 2 - should overwrite initial content
+        (block_size * 2 + 200, "OVERWRITE_START_B2".as_bytes()), // Overwrites "INITIAL_START_BLOCK2"
+        (
+            block_size * 2 + block_size / 4 + 10,
+            "OVERWRITE_Q_B2".as_bytes(),
+        ), // Partial overwrite
+        // Cross-block boundary overwrites - should overwrite initial boundary writes
+        (block_size - 20, "OVERWRITE_CROSS_01".as_bytes()), // Overwrites initial cross-block write
+        (block_size * 2 - 25, "OVERWRITE_CROSS_12".as_bytes()), // Overwrites initial cross-block write
+        // Additional overwrites to test multiple overwrite layers
+        (50, "FINAL_OVERWRITE_B0".as_bytes()), // Another overwrite in block 0
+        (block_size + 150, "FINAL_OVERWRITE_B1".as_bytes()), // Another overwrite in block 1
+        (block_size * 2 + 250, "FINAL_OVERWRITE_B2".as_bytes()), // Another overwrite in block 2
+    ];
+
+    // Apply overwrite operations
+    for (offset, data) in &overwrite_operations {
+        writer.seek(*offset as i64).await?;
+        writer.write(data).await?;
+
+        // Update expected content (this simulates the overwrite effect)
+        let end_pos = (*offset + data.len()).min(expected_content.len());
+        if *offset < expected_content.len() {
+            let copy_len = end_pos - offset;
+            expected_content[*offset..end_pos].copy_from_slice(&data[0..copy_len]);
+        }
+    }
+
+    writer.complete().await?;
+
+    // Calculate expected checksum from final content (after all overwrites)
+    let expected_checksum = Utils::crc32(&expected_content) as u64;
+
+    // Read back and verify using existing read function
+    let (_actual_len, actual_checksum) = read(fs, path).await?;
+
+    // Verify checksums match after all overwrites
+    assert_eq!(
+        expected_checksum, actual_checksum,
+        "Checksums don't match after overwrite operations"
+    );
+
+    // Phase 3: Verify specific overwrite results using existing seek function
+    let mut reader = fs.open(path).await?;
+
+    // Test positions that should contain the final overwritten data
+    let verification_positions = vec![
+        // Verify final overwritten content
+        (0, "OVERWRITE_START_B0".as_bytes()),
+        (50, "FINAL_OVERWRITE_B0".as_bytes()),
+        (block_size + 100, "OVERWRITE_START_B1".as_bytes()),
+        (block_size + 150, "FINAL_OVERWRITE_B1".as_bytes()),
+        (block_size * 2 + 200, "OVERWRITE_START_B2".as_bytes()),
+        (block_size * 2 + 250, "FINAL_OVERWRITE_B2".as_bytes()),
+        (block_size - 20, "OVERWRITE_CROSS_01".as_bytes()),
+        (block_size * 2 - 25, "OVERWRITE_CROSS_12".as_bytes()),
+    ];
+
+    for (pos, expected_data) in verification_positions {
+        reader.seek(pos as i64).await?;
+        let mut verify_buf = vec![0u8; expected_data.len()];
+        let n = reader.read_full(&mut verify_buf).await?;
+        assert_eq!(n, expected_data.len());
+        assert_eq!(
+            &verify_buf[..n],
+            expected_data,
+            "Overwrite verification failed at position {} (block {})",
+            pos,
+            pos / block_size
+        );
+    }
+
+    reader.complete().await?;
+
+    Ok(())
+}

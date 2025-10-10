@@ -32,6 +32,7 @@ enum WriteTask {
     Write(DataSlice, FuseResponse),
     Flush(CallSender<i8>),
     Complete(CallSender<i8>),
+    Seek((i64, CallSender<i8>)), // Random write seek support
 }
 
 pub struct FuseWriter {
@@ -130,6 +131,31 @@ impl FuseWriter {
         }
     }
 
+    // Random write seek support
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        let res: FsResult<()> = {
+            let (rx, tx) = CallChannel::channel();
+            if let Err(e) = self.sender.send(WriteTask::Seek((pos, rx))).await {
+                return Err(e.into());
+            }
+
+            if let Err(e) = tx.receive().await {
+                return Err(e.into());
+            }
+            Ok(())
+        };
+
+        // Update position (note: actual seek is executed by background task)
+        if res.is_ok() {
+            self.pos = pos;
+        }
+
+        match res {
+            Err(e) => Err(self.check_error(e)),
+            Ok(_) => Ok(()),
+        }
+    }
+
     async fn writer_future(
         mut writer: UnifiedWriter,
         mut req_receiver: AsyncReceiver<WriteTask>,
@@ -138,6 +164,7 @@ impl FuseWriter {
             match task {
                 WriteTask::Write(data, reply) => {
                     let len = data.len();
+
                     let res = match writer.fuse_write(data).await {
                         Err(e) => Err(e.into()),
                         Ok(()) => {
@@ -149,7 +176,9 @@ impl FuseWriter {
                         }
                     };
 
-                    reply.send_rep(res).await?;
+                    if let Err(e) = reply.send_rep(res).await {
+                        return Err(e.into());
+                    }
                 }
 
                 WriteTask::Complete(tx) => {
@@ -161,8 +190,15 @@ impl FuseWriter {
                     writer.flush().await?;
                     tx.send(1)?;
                 }
+
+                // Handle random write seek task
+                WriteTask::Seek((pos, tx)) => {
+                    writer.seek(pos).await?;
+                    tx.send(1)?;
+                }
             }
         }
+
         Ok(())
     }
 }

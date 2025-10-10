@@ -19,6 +19,7 @@ use curvine_common::state::{FileStatus, LastBlockStatus, LocatedBlock};
 use curvine_common::FsResult;
 use log::info;
 use orpc::common::ByteUnit;
+use orpc::err_box;
 use orpc::sys::DataSlice;
 use std::sync::Arc;
 
@@ -122,7 +123,7 @@ impl Writer for FsWriter {
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 {
-            return Err(format!("Cannot seek to negative position: {}", pos).into());
+            return err_box!(format!("Cannot seek to negative position: {}", pos));
         }
 
         // Flush current buffer

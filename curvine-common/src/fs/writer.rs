@@ -15,6 +15,7 @@
 use crate::fs::Path;
 use crate::state::FileStatus;
 use crate::FsResult;
+use orpc::err_box;
 use orpc::runtime::RpcRuntime;
 use orpc::{runtime::Runtime, sys::DataSlice};
 use std::future::Future;
@@ -106,7 +107,7 @@ pub trait Writer {
     fn seek(&mut self, pos: i64) -> impl Future<Output = FsResult<()>> {
         async move {
             if pos < 0 {
-                return Err(format!("Cannot seek to negative position: {}", pos).into());
+                return err_box!(format!("Cannot seek to negative position: {}", pos));
             }
             // Default implementation: flush buffer, update position
             self.flush_chunk().await?;
