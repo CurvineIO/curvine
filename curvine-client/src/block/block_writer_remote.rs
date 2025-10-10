@@ -14,6 +14,7 @@
 
 use crate::block::block_client::BlockClient;
 use crate::file::FsContext;
+use curvine_common::proto::DataHeaderProto;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
@@ -28,6 +29,7 @@ pub struct BlockWriterRemote {
     len: i64,
     seq_id: i32,
     req_id: i64,
+    pending_header: Option<DataHeaderProto>,
 }
 
 impl BlockWriterRemote {
@@ -39,6 +41,7 @@ impl BlockWriterRemote {
         let req_id = Utils::req_id();
         let seq_id = 0;
 
+        // Always start from append mode (block.len position)
         let pos = block.len;
         let len = fs_context.block_size();
 
@@ -71,6 +74,7 @@ impl BlockWriterRemote {
             seq_id,
             req_id,
             worker_address,
+            pending_header: None,
         };
 
         Ok(writer)
@@ -85,8 +89,11 @@ impl BlockWriterRemote {
     pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
         let len = chunk.len() as i64;
         let next_seq_id = self.next_seq_id();
+
+        let header = self.pending_header.take();
+
         self.client
-            .write_data(chunk, self.req_id, next_seq_id)
+            .write_data(chunk, self.req_id, next_seq_id, header)
             .await?;
 
         self.pos += len;
@@ -144,5 +151,33 @@ impl BlockWriterRemote {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+
+    pub fn len(&self) -> i64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return Err(format!("Cannot seek to negative position: {pos}").into());
+        }
+
+        if pos >= self.len {
+            return Err(format!("Seek position {pos} exceeds block capacity {}", self.len).into());
+        }
+
+        // Set new position and pending header
+        self.pos = pos;
+        self.pending_header = Some(DataHeaderProto {
+            offset: pos,
+            flush: false,
+            is_last: false,
+        });
+
+        Ok(())
     }
 }
