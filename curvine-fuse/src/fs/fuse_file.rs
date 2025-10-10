@@ -22,7 +22,7 @@ use curvine_common::state::FileStatus;
 use log::info;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum IoPhase {
+pub enum IoPhase {
     Unset,
     Reading,
     Writing,
@@ -41,8 +41,21 @@ pub struct FuseFile {
 }
 
 impl FuseFile {
+    pub fn path_str(&self) -> &str {
+        self.path.path()
+    }
+
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    pub fn phase(&self) -> IoPhase {
+        self.phase
+    }
+
     pub async fn create(fs: UnifiedFileSystem, path: Path, flags: u32) -> FuseResult<Self> {
         let action = OpenAction::try_from(flags)?;
+
         let (writer, reader) = match action {
             OpenAction::ReadOnly => {
                 let reader = Self::create_reader(&fs, &path).await?;
@@ -114,8 +127,29 @@ impl FuseFile {
         flags: u32,
     ) -> FuseResult<FuseWriter> {
         let overwrite = FuseUtils::has_truncate(flags);
-        let writer = fs.create(path, overwrite).await?;
-        Ok(FuseWriter::new(&fs.conf().fuse, fs.clone_runtime(), writer))
+        let _want_create = FuseUtils::has_create(flags);
+        let exists = fs.exists(path).await.unwrap_or(false);
+
+        let unified_writer = if exists {
+            // File already exists:
+            if overwrite {
+                // O_TRUNC semantics: allow overwrite/truncate
+                fs.create(path, true).await?
+            } else {
+                // No O_TRUNC: follow open(O_CREAT, ...) semantics -> open existing file, don't create again
+                // Use append to get writer, then implement writing from any offset via seek in upper layer write
+                fs.append(path).await?
+            }
+        } else {
+            // File does not exist:
+            // Only create when explicitly requested or O_TRUNC, otherwise should not reach here
+            fs.create(path, overwrite).await?
+        };
+        Ok(FuseWriter::new(
+            &fs.conf().fuse,
+            fs.clone_runtime(),
+            unified_writer,
+        ))
     }
 
     async fn create_reader(fs: &UnifiedFileSystem, path: &Path) -> FuseResult<FuseReader> {
@@ -160,33 +194,28 @@ impl FuseFile {
         };
 
         let off = op.arg.offset;
-        let pos = writer.pos() as u64;
         let len = op.data.len() as u64;
-        if off != pos && off + len > pos {
-            return err_fuse!(
-                libc::EIO,
-                "Only sequential write is supported, path={} offset={} size={}, pos={}",
-                writer.path_str(),
-                off,
-                len,
-                pos
-            );
-        }
 
-        if off + len <= pos {
-            // for fulfill vim :wq
-            // Business layer error, but the return to the fuse kernel is successful.
+        // Only skip true zero-length writes
+        if len == 0 {
             return err_fuse!(
                 FUSE_SUCCESS,
-                "Skip writing to file {} offset={} size={} when {} bytes has written to file",
+                "Skip zero-length write to file {} offset={} size={}",
                 writer.path_str(),
                 off,
-                len,
-                pos
+                len
             );
         }
 
-        writer.write(op, reply).await?;
+        // Support random writes: perform seek operation to specified offset
+        if let Err(e) = writer.seek(off as i64).await {
+            return Err(e.into());
+        }
+
+        if let Err(e) = writer.write(op, reply).await {
+            return Err(e.into());
+        }
+
         Ok(())
     }
 

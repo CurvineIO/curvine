@@ -121,6 +121,15 @@ impl BlockMeta {
         }
     }
 
+    pub fn with_cow(finalized_meta: &BlockMeta, new_block_size: i64, dir: &VfsDir) -> Self {
+        Self {
+            id: finalized_meta.id,
+            len: new_block_size,
+            state: BlockState::Writing,
+            dir: dir.state.clone(),
+        }
+    }
+
     pub fn id(&self) -> i64 {
         self.id
     }
@@ -202,7 +211,18 @@ impl BlockMeta {
         if is_append {
             LocalFile::with_append(file)
         } else {
+            // truncate=false keeps existing content while allowing seek + write for random writes
             LocalFile::with_write(file, false)
+        }
+    }
+
+    pub fn create_writer_with_offset(&self, is_append: bool, offset: i64) -> IOResult<LocalFile> {
+        let file = self.get_block_file()?;
+        if is_append {
+            LocalFile::with_append(file)
+        } else {
+            // For random writes, use method that supports offset
+            LocalFile::with_write_offset(file, false, offset)
         }
     }
 
