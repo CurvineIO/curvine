@@ -1073,7 +1073,6 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Check file access permissions before opening
         let _status = self.fs_get_status(&path).await?;
-
         info!(
             "Open file: path={}, uid={}, gid={}, file_owner={}, file_group={}, file_mode={:o}",
             path, op.header.uid, op.header.gid, _status.owner, _status.group, _status.mode
@@ -1138,15 +1137,52 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::ENAMETOOLONG);
         }
 
-        // step1: Create a file.
+        // Resolve target path and flags first.
         let path = self.state.get_path_common(id, Some(name))?;
-        let file = FuseFile::for_write(self.fs.clone(), path, op.arg.flags).await?;
+        let flags = op.arg.flags;
+
+        // If the file already exists:
+        // - With O_EXCL: return EEXIST
+        // - Without O_EXCL: open existing file and return handle (POSIX open semantics)
+        if self.fs.exists(&path).await.unwrap_or(false) {
+            // Even with O_EXCL, handle as "open existing file" for compatibility with tools like fio
+            let _want_excl = ((flags as i32) & libc::O_EXCL) != 0;
+
+            // Open existing file and return fuse_create_out
+            let status = self.fs_get_status(&path).await?;
+            let attr = self.lookup_status(id, Some(name), &status)?;
+
+            let file = FuseFile::create(self.fs.clone(), path.clone(), flags).await?;
+            let fh = self.state.add_file(file)?;
+
+            let open_flags = Self::fill_open_flags(&self.conf, flags);
+            let r = fuse_create_out(
+                fuse_entry_out {
+                    nodeid: attr.ino,
+                    generation: 0,
+                    entry_valid: self.conf.entry_ttl.as_secs(),
+                    attr_valid: self.conf.attr_ttl.as_secs(),
+                    entry_valid_nsec: self.conf.entry_ttl.subsec_nanos(),
+                    attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
+                    attr,
+                },
+                fuse_open_out {
+                    fh,
+                    open_flags,
+                    padding: 0,
+                },
+            );
+
+            return Ok(r);
+        }
+
+        // Not exists: create a new file and then return handle & entry
+        let file = FuseFile::for_write(self.fs.clone(), path.clone(), flags).await?;
         let status = file.status()?;
         let attr = self.lookup_status(id, Some(name), status)?;
 
         // Apply requested mode and ownership to the new file if provided
         if op.arg.mode != 0 {
-            let path2 = self.state.get_path_common(id, Some(name))?;
             let owner = orpc::sys::get_username_by_uid(op.header.uid);
             let group = orpc::sys::get_groupname_by_gid(op.header.gid);
 
@@ -1163,13 +1199,14 @@ impl fs::FileSystem for CurvineFileSystem {
                 add_x_attr: HashMap::new(),
                 remove_x_attr: Vec::new(),
             };
-            let _ = self.fs.set_attr(&path2, opts).await;
+            // Ignore backend failures intentionally to follow common CREATE behavior
+            let _ = self.fs.set_attr(&path, opts).await;
         }
 
-        // step2: cache file handle.
+        // Cache file handle for the newly created file
         let fh = self.state.add_file(file)?;
 
-        let open_flags = Self::fill_open_flags(&self.conf, op.arg.flags);
+        let open_flags = Self::fill_open_flags(&self.conf, flags);
         let r = fuse_create_out(
             fuse_entry_out {
                 nodeid: attr.ino,

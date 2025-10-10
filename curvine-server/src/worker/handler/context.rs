@@ -30,14 +30,23 @@ pub struct WriteContext {
 impl WriteContext {
     pub fn from_req(msg: &Message) -> FsResult<Self> {
         let req: BlockWriteRequest = msg.parse_header()?;
+
+        // Fix: Distinguish between true append mode and random write mode
+        // In the modified client logic:
+        // - Sequential write (append): off = block.len (actual data length), len = block_capacity
+        // - Random write: off = any position, len = block_capacity
+        // Therefore, only when off == block.len (actual data length) is it true append mode
+        let block = ExtendedBlock::from_req(&req);
+        let is_append = req.off > 0 && req.off == block.len;
+
         let context = Self {
-            block: ExtendedBlock::from_req(&req),
+            block,
             req_id: msg.req_id(),
             chunk_size: req.chunk_size,
             short_circuit: req.short_circuit,
             off: req.off,
             len: req.len,
-            is_append: req.off > 0,
+            is_append,
         };
 
         Ok(context)

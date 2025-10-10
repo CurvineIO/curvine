@@ -17,7 +17,7 @@ use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::state::{CommitBlock, CreateFileOpts, ExtendedBlock, FileType, StoragePolicy};
-use orpc::{err_box, ternary, CommonResult};
+use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
@@ -147,14 +147,23 @@ impl InodeFile {
 
     pub fn compute_len(&self) -> i64 {
         let mut sum = 0;
+
         for (i, x) in self.blocks.iter().enumerate() {
-            sum += ternary!(i == self.blocks.len() - 1 && !x.is_committed(), 0, x.len);
+            let is_last = i == self.blocks.len() - 1;
+            let is_committed = x.is_committed();
+            let block_len = if is_last && !is_committed { 0 } else { x.len };
+
+            sum += block_len;
         }
+
         sum
     }
 
     pub fn commit_len(&self, last: Option<&CommitBlock>) -> i64 {
-        self.compute_len() + last.map(|x| x.block_len).unwrap_or(0)
+        let computed_len = self.compute_len();
+        let last_block_len = last.map(|x| x.block_len).unwrap_or(0);
+
+        computed_len + last_block_len
     }
 
     fn calc_pos(&self, pos: i32) -> usize {
