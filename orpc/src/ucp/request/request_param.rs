@@ -12,112 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ucp::bindings::*;
-use futures::task::AtomicWaker;
-use std::future::Future;
 use std::mem;
-use std::mem::MaybeUninit;
-use std::ops::Deref;
-use std::os::raw::c_void;
-use std::pin::Pin;
-use std::task::Poll;
-use crate::err_ucs;
-use crate::io::IOResult;
-use crate::sys::RawPtr;
-use crate::ucp::{Context, SockAddr};
-
-#[derive(Default)]
-pub struct RequestWaker(AtomicWaker);
-
-impl RequestWaker {
-    pub unsafe extern "C" fn init(request: *mut c_void) {
-        (request as *mut Self).write(RequestWaker::default());
-    }
-
-    pub unsafe extern "C" fn cleanup(request: *mut c_void) {
-        std::ptr::drop_in_place(request as *mut Self)
-    }
-}
-
-impl Deref for RequestWaker {
-    type Target = AtomicWaker;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-pub struct ConnRequest {
-    inner: RawPtr<ucp_conn_request>,
-}
-
-impl ConnRequest {
-    pub fn new(ptr: ucp_conn_request_h) -> Self {
-        Self {
-            inner: RawPtr::from_raw(ptr),
-        }
-    }
-    pub fn as_ptr(&self) -> *const ucp_conn_request {
-        self.inner.as_ptr()
-    }
-
-    pub fn as_mut_ptr(&self) -> *mut ucp_conn_request {
-        self.inner.as_mut_ptr()
-    }
-
-    pub fn remote_addr(&self) -> IOResult<SockAddr> {
-        let mut attr = ucp_conn_request_attr {
-            field_mask: ucp_conn_request_attr_field::UCP_CONN_REQUEST_ATTR_FIELD_CLIENT_ADDR.0
-                as u64,
-            ..unsafe { MaybeUninit::zeroed().assume_init() }
-        };
-        let status = unsafe { ucp_conn_request_query(self.as_mut_ptr(), &mut attr) };
-        err_ucs!(status)?;
-
-        let sock_addr =
-            unsafe { socket2::SockAddr::new(mem::transmute(attr.client_address), 8) };
-        Ok(SockAddr::new(sock_addr))
-    }
-}
-
-unsafe impl Send for ConnRequest {}
-
-pub struct RequestFuture<T> {
-    ptr: ucs_status_ptr_t,
-    poll_fn: unsafe fn(ucs_status_ptr_t) -> Poll<T>,
-}
-
-impl<T> RequestFuture<T> {
-    pub fn new(ptr: ucs_status_ptr_t, poll_fn: unsafe fn(ucs_status_ptr_t) -> Poll<T>) -> Self {
-        Self { ptr, poll_fn }
-    }
-}
-
-unsafe impl<T> Send for RequestFuture<T> {}
-
-unsafe impl<T> Sync for RequestFuture<T> {}
-
-impl<T> Future for RequestFuture<T> {
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {
-        let ret = unsafe { (self.poll_fn)(self.ptr) };
-        match ret {
-            Poll::Ready(v) => Poll::Ready(v),
-            Poll::Pending => {
-                let request = unsafe { &mut *(self.ptr as *mut RequestWaker) };
-                request.register(cx.waker());
-                Poll::Pending
-            }
-        }
-    }
-}
-
-impl<T> Drop for RequestFuture<T> {
-    fn drop(&mut self) {
-        unsafe { ucp_request_free(self.ptr as _) };
-    }
-}
+use crate::ucp::bindings::*;
 
 pub struct RequestParam {
     inner: ucp_request_param_t
@@ -206,4 +102,3 @@ impl RequestParam {
 unsafe impl Send for RequestParam {}
 
 unsafe impl Sync for RequestParam {}
-

@@ -15,10 +15,11 @@
 use crate::io::IOResult;
 use crate::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use crate::sync::channel::CallChannel;
-use crate::ucp::{Context, RmaMemory, Worker};
 use log::error;
 use std::sync::Arc;
 use bytes::BytesMut;
+use crate::ucp::core::{Context, Worker};
+use crate::ucp::rma::Memory;
 
 #[derive(Clone)]
 pub struct UcpExecutor {
@@ -61,7 +62,7 @@ impl UcpExecutor {
         self.worker.clone()
     }
 
-    pub fn register_memory(&self, buffer: BytesMut) -> IOResult<RmaMemory> {
-        RmaMemory::new(self.worker.context().clone(), buffer)
+    pub fn register_memory(&self, buffer: BytesMut) -> IOResult<Memory> {
+        Memory::new(self.worker.context().clone(), buffer)
     }
 }

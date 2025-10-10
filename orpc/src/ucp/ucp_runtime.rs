@@ -14,9 +14,12 @@
 
 use crate::io::IOResult;
 use crate::sync::AtomicLen;
-use crate::ucp::{Config, ConnRequest, Context, Endpoint, Listener, RmaMemory, SockAddr, UcpExecutor};
+use crate::ucp::UcpExecutor;
 use std::sync::Arc;
 use bytes::BytesMut;
+use crate::ucp::core::{Config, Context, Endpoint, Listener, SockAddr};
+use crate::ucp::request::ConnRequest;
+use crate::ucp::rma::Memory;
 
 pub struct UcpRuntime {
     pub boss: UcpExecutor,
@@ -66,8 +69,8 @@ impl UcpRuntime {
         Endpoint::connect(self.worker_executor().clone(), addr)
     }
 
-    pub fn register_memory(&self, buffer: BytesMut) -> IOResult<RmaMemory> {
-        RmaMemory::new(self.context.clone(), buffer)
+    pub fn register_memory(&self, buffer: BytesMut) -> IOResult<Memory> {
+        Memory::new(self.context.clone(), buffer)
     }
 }
 

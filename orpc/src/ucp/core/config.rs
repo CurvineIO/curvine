@@ -16,10 +16,11 @@ use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::{CString, RawPtr};
 use crate::ucp::bindings::*;
-use crate::ucp::{stderr, Context, RmaMemory};
+use crate::ucp::stderr;
 use std::mem::MaybeUninit;
 use std::ptr;
 use crate::common::ByteUnit;
+use crate::ucp::core::Context;
 
 #[derive(Debug, Clone)]
 pub struct Config {

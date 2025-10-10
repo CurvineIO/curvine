@@ -16,7 +16,7 @@ use crate::io::{IOError, IOResult};
 use crate::sync::{AtomicBool, ErrorMonitor};
 use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::bindings::*;
-use crate::ucp::{stderr, ConnRequest, RequestWaker, RequestFuture, SockAddr, UcpUtils, RequestParam, RKey, RmaMemory, UcpExecutor};
+use crate::ucp::{stderr, UcpUtils, UcpExecutor};
 use crate::{err_box, err_ucs, poll_status};
 use bytes::{Buf, BufMut, BytesMut};
 use log::{info, warn};
@@ -25,12 +25,15 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
 use std::task::Poll;
+use crate::ucp::core::SockAddr;
+use crate::ucp::request::{ConnRequest, RequestParam, RequestWaker};
+use crate::ucp::rma::{Memory, RKey};
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
     executor: UcpExecutor,
     err_monitor: Arc<ErrorMonitor<IOError>>,
-    pub buffer: RmaMemory
+    pub buffer: Memory
 }
 
 impl Endpoint {

@@ -6,7 +6,9 @@ use tokio::io::AsyncReadExt;
 use orpc::common::Logger;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
-use orpc::ucp::{RKey, SockAddr, UcpRuntime};
+use orpc::ucp::core::SockAddr;
+use orpc::ucp::rma::RKey;
+use orpc::ucp::UcpRuntime;
 
 // cargo run --example ucp_server
 fn main() {

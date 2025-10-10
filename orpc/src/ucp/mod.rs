@@ -16,35 +16,13 @@
 
 use crate::ucp::bindings::FILE;
 
-// #[cfg(not(target_os = "linux"))]
 pub mod bindings;
-
-mod config;
-pub use self::config::Config;
-
-mod request;
-pub use self::request::*;
-
-mod context;
-pub use self::context::Context;
-
-mod sock_addr;
-pub use self::sock_addr::SockAddr;
-
-mod worker;
-pub use self::worker::Worker;
-
-mod endpoint;
-pub use self::endpoint::Endpoint;
+pub mod core;
+pub mod request;
+pub mod rma;
 
 mod ucp_utils;
 pub use self::ucp_utils::UcpUtils;
-
-mod listener;
-pub use self::listener::Listener;
-
-mod rma;
-pub use self::rma::*;
 
 mod ucp_executor;
 pub use self::ucp_executor::UcpExecutor;
@@ -77,7 +55,7 @@ macro_rules! poll_status {
             err_ucs!(UcpUtils::ucs_ptr_raw_status($status))?;
             err_box!("Unexpected status: {:?}", $status)
         } else {
-            let f = RequestFuture::new($status, $poll_fn);
+            let f = $crate::ucp::request::RequestFuture::new($status, $poll_fn);
             f.await
         }
     }};
@@ -89,7 +67,7 @@ macro_rules! poll_status {
             err_ucs!(UcpUtils::ucs_ptr_raw_status($status))?;
             err_box!("Unexpected status: {:?}", $status)
         } else {
-            let f = RequestFuture::new($status, $poll_fn);
+            let f = $crate::ucp::request::RequestFuture::new($status, $poll_fn);
             f.await
         }
     }};

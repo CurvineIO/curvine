@@ -16,11 +16,12 @@ use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
-use crate::ucp::RequestWaker;
-use crate::ucp::{stderr, Config, Worker};
+use crate::ucp::stderr;
 use std::mem;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
+use crate::ucp::core::{Config, Worker};
+use crate::ucp::request::RequestWaker;
 
 #[derive(Debug)]
 pub struct Context {

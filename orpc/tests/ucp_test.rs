@@ -4,7 +4,8 @@ use orpc::common::{Logger, Utils};
 use orpc::runtime::RpcRuntime;
 use orpc::sync::channel::CallChannel;
 use orpc::sys::DataSlice;
-use orpc::ucp::{Config, Context, Endpoint, RmaMemory, Worker, UcpRuntime};
+use orpc::ucp::core::{Config, Context, Endpoint, Worker};
+use orpc::ucp::UcpRuntime;
 
 #[test]
 fn config() {

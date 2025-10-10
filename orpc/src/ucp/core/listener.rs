@@ -18,12 +18,14 @@ use crate::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
 use crate::sync::ErrorMonitor;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
-use crate::ucp::{ConnRequest, SockAddr, UcpExecutor};
+use crate::ucp::UcpExecutor;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
+use crate::ucp::core::SockAddr;
+use crate::ucp::request::ConnRequest;
 
 struct ConnContext {
     sender: AsyncSender<ConnRequest>,
