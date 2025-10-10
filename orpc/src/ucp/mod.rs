@@ -43,15 +43,14 @@ pub use self::ucp_utils::UcpUtils;
 mod listener;
 pub use self::listener::Listener;
 
-mod worker_runtime;
-pub use self::worker_runtime::*;
-
-mod worker_executor;
-pub use self::worker_executor::WorkerExecutor;
-
 mod rma;
 pub use self::rma::*;
 
+mod ucp_executor;
+pub use self::ucp_executor::UcpExecutor;
+
+pub mod ucp_runtime;
+pub use self::ucp_runtime::UcpRuntime;
 
 extern "C" {
     pub static stderr: *mut FILE;

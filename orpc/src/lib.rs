@@ -26,6 +26,7 @@ pub mod server;
 pub mod sync;
 pub mod sys;
 pub mod test;
+#[cfg(feature = "ucp")]
 pub mod ucp;
 
 // include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

@@ -6,19 +6,19 @@ use tokio::io::AsyncReadExt;
 use orpc::common::Logger;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
-use orpc::ucp::{RKey, SockAddr, WorkerRuntime};
+use orpc::ucp::{RKey, SockAddr, UcpRuntime};
 
 // cargo run --example ucp_server
 fn main() {
     Logger::default();
 
-    let pool = WorkerRuntime::default();
+    let pool = UcpRuntime::default();
     let addr = "127.0.0.1:8080".into();
 
     rma2(pool, addr);
 }
 
-fn stream(pool: WorkerRuntime, addr: SockAddr) {
+fn stream(pool: UcpRuntime, addr: SockAddr) {
     let mut listener = pool.bind(&addr).unwrap();
     let rt = listener.executor().clone_rt();
 
@@ -38,7 +38,7 @@ fn stream(pool: WorkerRuntime, addr: SockAddr) {
     });
 }
 
-fn rma(pool: WorkerRuntime, addr: SockAddr) {
+fn rma(pool: UcpRuntime, addr: SockAddr) {
     let mut listener = pool.bind(&addr).unwrap();
     let rt = listener.executor().clone_rt();
 
@@ -75,7 +75,7 @@ fn rma(pool: WorkerRuntime, addr: SockAddr) {
 }
 
 
-fn rma2(pool: WorkerRuntime, addr: SockAddr) {
+fn rma2(pool: UcpRuntime, addr: SockAddr) {
     let mut listener = pool.bind(&addr).unwrap();
     let rt = listener.executor().clone_rt();
 

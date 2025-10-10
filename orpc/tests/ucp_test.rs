@@ -4,7 +4,7 @@ use orpc::common::{Logger, Utils};
 use orpc::runtime::RpcRuntime;
 use orpc::sync::channel::CallChannel;
 use orpc::sys::DataSlice;
-use orpc::ucp::{Config, Context, Endpoint, RmaMemory, Worker, WorkerRuntime};
+use orpc::ucp::{Config, Context, Endpoint, RmaMemory, Worker, UcpRuntime};
 
 #[test]
 fn config() {
@@ -31,7 +31,7 @@ fn worker() {
 fn endpoint_stream() {
     Logger::default();
 
-    let wr = WorkerRuntime::default();
+    let wr = UcpRuntime::default();
     let addr = "127.0.0.1:8080".into();
 
     let executor = wr.worker_executor().clone();
@@ -57,7 +57,7 @@ fn endpoint_stream() {
 fn endpoint_rma() {
     Logger::default();
 
-    let wr = WorkerRuntime::default();
+    let wr = UcpRuntime::default();
     let addr = "127.0.0.1:8080".into();
 
     let executor = wr.worker_executor().clone();
@@ -104,7 +104,7 @@ fn endpoint_rma() {
 fn endpoint_rma1() {
     Logger::default();
 
-    let wr = WorkerRuntime::default();
+    let wr = UcpRuntime::default();
     let addr = "127.0.0.1:8080".into();
 
     let executor = wr.worker_executor().clone();

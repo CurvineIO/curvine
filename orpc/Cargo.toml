@@ -46,3 +46,7 @@ md-5 = { workspace = true }
 
 [build-dependencies]
 bindgen = "0.66"
+
+[features]
+default = ['ucp']
+ucp = []

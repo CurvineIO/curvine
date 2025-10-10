@@ -14,26 +14,26 @@
 
 use crate::io::IOResult;
 use crate::sync::AtomicLen;
-use crate::ucp::{Config, ConnRequest, Context, Endpoint, Listener, RmaMemory, SockAddr, WorkerExecutor};
+use crate::ucp::{Config, ConnRequest, Context, Endpoint, Listener, RmaMemory, SockAddr, UcpExecutor};
 use std::sync::Arc;
 use bytes::BytesMut;
 
-pub struct WorkerRuntime {
-    pub boss: WorkerExecutor,
-    pub workers: Vec<WorkerExecutor>,
+pub struct UcpRuntime {
+    pub boss: UcpExecutor,
+    pub workers: Vec<UcpExecutor>,
     pub context: Arc<Context>,
     index: AtomicLen,
 }
 
-impl WorkerRuntime {
+impl UcpRuntime {
     pub fn with_conf(conf: Config) -> IOResult<Self> {
         let context = Arc::new(conf.create_context()?);
 
-        let boss = WorkerExecutor::new(format!("{}-boss", &conf.name), &context)?;
+        let boss = UcpExecutor::new(format!("{}-boss", &conf.name), &context)?;
 
         let mut workers = vec![];
         for i in 0..conf.threads {
-            let wr = WorkerExecutor::new(format!("{}-worker-{}", &conf.name, i), &context)?;
+            let wr = UcpExecutor::new(format!("{}-worker-{}", &conf.name, i), &context)?;
             workers.push(wr);
         }
 
@@ -49,12 +49,12 @@ impl WorkerRuntime {
         Listener::bind(self.boss.clone(), addr)
     }
 
-    pub fn worker_executor(&self) -> &WorkerExecutor {
+    pub fn worker_executor(&self) -> &UcpExecutor {
         let index = self.index.next();
         &self.workers[index % self.workers.len()]
     }
 
-    pub fn boss_executor(&self) -> &WorkerExecutor {
+    pub fn boss_executor(&self) -> &UcpExecutor {
         &self.boss
     }
 
@@ -71,7 +71,7 @@ impl WorkerRuntime {
     }
 }
 
-impl Default for WorkerRuntime {
+impl Default for UcpRuntime {
     fn default() -> Self {
         Self::with_conf(Config::default()).unwrap()
     }

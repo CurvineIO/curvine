@@ -18,7 +18,7 @@ use crate::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
 use crate::sync::ErrorMonitor;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
-use crate::ucp::{ConnRequest, SockAddr, WorkerExecutor};
+use crate::ucp::{ConnRequest, SockAddr, UcpExecutor};
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::ptr;
@@ -41,13 +41,13 @@ impl ConnContext {
 
 pub struct Listener {
     inner: RawPtr<ucp_listener>,
-    executor: WorkerExecutor,
+    executor: UcpExecutor,
     conn_context: Rc<ConnContext>,
     receiver: AsyncReceiver<ConnRequest>,
 }
 
 impl Listener {
-    pub fn bind(executor: WorkerExecutor, addr: &SockAddr) -> IOResult<Self> {
+    pub fn bind(executor: UcpExecutor, addr: &SockAddr) -> IOResult<Self> {
         let (sender, receiver) = AsyncChannel::new(0).split();
         let conn_context = Rc::new(ConnContext::new(sender));
 
@@ -127,7 +127,7 @@ impl Listener {
         err_ucs!(status)
     }
 
-    pub fn executor(&self) -> &WorkerExecutor {
+    pub fn executor(&self) -> &UcpExecutor {
         &self.executor
     }
 }

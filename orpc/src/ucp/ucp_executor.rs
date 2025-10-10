@@ -21,12 +21,12 @@ use std::sync::Arc;
 use bytes::BytesMut;
 
 #[derive(Clone)]
-pub struct WorkerExecutor {
+pub struct UcpExecutor {
     worker: Arc<Worker>,
     rt: Arc<Runtime>,
 }
 
-impl WorkerExecutor {
+impl UcpExecutor {
     pub fn new(name: impl AsRef<str>, context: &Arc<Context>) -> IOResult<Self> {
         let rt = Arc::new(AsyncRuntime::new(name, 1, 0));
         let context = context.clone();

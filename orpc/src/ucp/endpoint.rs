@@ -16,7 +16,7 @@ use crate::io::{IOError, IOResult};
 use crate::sync::{AtomicBool, ErrorMonitor};
 use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::bindings::*;
-use crate::ucp::{stderr, ConnRequest, RequestWaker, RequestFuture, SockAddr, UcpUtils, WorkerExecutor, RequestParam, RKey, RmaMemory};
+use crate::ucp::{stderr, ConnRequest, RequestWaker, RequestFuture, SockAddr, UcpUtils, RequestParam, RKey, RmaMemory, UcpExecutor};
 use crate::{err_box, err_ucs, poll_status};
 use bytes::{Buf, BufMut, BytesMut};
 use log::{info, warn};
@@ -28,13 +28,13 @@ use std::task::Poll;
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
-    executor: WorkerExecutor,
+    executor: UcpExecutor,
     err_monitor: Arc<ErrorMonitor<IOError>>,
     pub buffer: RmaMemory
 }
 
 impl Endpoint {
-    fn new(executor: WorkerExecutor, mut params: ucp_ep_params) -> IOResult<Self> {
+    fn new(executor: UcpExecutor, mut params: ucp_ep_params) -> IOResult<Self> {
         let err_monitor = Arc::new(ErrorMonitor::new());
 
         params.field_mask |= (ucp_ep_params_field::UCP_EP_PARAM_FIELD_USER_DATA
@@ -78,7 +78,7 @@ impl Endpoint {
         self.err_monitor.check_error()
     }
 
-    pub fn connect(executor: WorkerExecutor, addr: &SockAddr) -> IOResult<Self> {
+    pub fn connect(executor: UcpExecutor, addr: &SockAddr) -> IOResult<Self> {
         let params = ucp_ep_params {
             field_mask: (ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS
                 | ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR
@@ -94,7 +94,7 @@ impl Endpoint {
         Ok(endpoint)
     }
 
-    pub fn accept(executor: WorkerExecutor, conn: ConnRequest) -> IOResult<Self> {
+    pub fn accept(executor: UcpExecutor, conn: ConnRequest) -> IOResult<Self> {
         let params = ucp_ep_params {
             field_mask: ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST.0 as u64,
             conn_request: conn.as_mut_ptr(),
@@ -246,7 +246,7 @@ impl Endpoint {
         unsafe { ucp_ep_print_info(self.as_mut_ptr(), stderr) };
     }
 
-    pub fn executor(&self) -> &WorkerExecutor {
+    pub fn executor(&self) -> &UcpExecutor {
         &self.executor
     }
 }
