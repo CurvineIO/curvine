@@ -53,7 +53,7 @@ impl FileSystemStats {
 
     pub fn set_counts(&self, file_count: i64, dir_count: i64) {
         self.metrics.inode_file_num.set(file_count);
-        self.metrics.inode_file_num.set(dir_count);
+        self.metrics.inode_dir_num.set(dir_count);
     }
 }
 

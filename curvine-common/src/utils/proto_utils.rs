@@ -511,6 +511,7 @@ impl ProtoUtils {
             block_size: info.block_size,
             replicas: info.replicas,
             mount_type: info.mount_type.into(),
+            quota_rate: info.quota_rate,
         }
     }
 
@@ -527,6 +528,7 @@ impl ProtoUtils {
             block_size: info.block_size,
             replicas: info.replicas,
             mount_type: info.mount_type.into(),
+            quota_rate: info.quota_rate,
         }
     }
 
@@ -542,6 +544,7 @@ impl ProtoUtils {
             replicas: opts.replicas,
             mount_type: opts.mount_type.into(),
             remove_properties: opts.remove_properties,
+            quota_rate: opts.quota_rate,
         }
     }
 
@@ -557,6 +560,7 @@ impl ProtoUtils {
             replicas: opts.replicas,
             mount_type: MountType::from(opts.mount_type),
             remove_properties: opts.remove_properties,
+            quota_rate: opts.quota_rate,
         }
     }
 

@@ -89,7 +89,7 @@ impl TryFrom<&str> for ConsistencyStrategy {
 }
 
 /// Mount information structure
-#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct MountInfo {
     pub cv_path: String,
     pub ufs_path: String,
@@ -102,6 +102,7 @@ pub struct MountInfo {
     pub block_size: Option<i64>,
     pub replicas: Option<i32>,
     pub mount_type: MountType,
+    pub quota_rate: Option<f64>,
 }
 
 impl MountInfo {
@@ -156,6 +157,7 @@ pub struct MountOptions {
     pub replicas: Option<i32>,
     pub mount_type: MountType,
     pub remove_properties: Vec<String>,
+    pub quota_rate: Option<f64>,
 }
 
 impl MountOptions {
@@ -179,6 +181,7 @@ impl MountOptions {
             block_size: self.block_size,
             replicas: self.replicas,
             mount_type: self.mount_type,
+            quota_rate: self.quota_rate,
         }
     }
 }
@@ -195,6 +198,7 @@ pub struct MountOptionsBuilder {
     replicas: Option<i32>,
     mount_type: MountType,
     remove_properties: Vec<String>,
+    quota_rate: Option<f64>,
 }
 
 impl MountOptionsBuilder {
@@ -266,6 +270,11 @@ impl MountOptionsBuilder {
         self
     }
 
+    pub fn quota_rate(mut self, quota_rate: f64) -> Self {
+        self.quota_rate = Some(quota_rate);
+        self
+    }
+
     pub fn build(self) -> MountOptions {
         MountOptions {
             update: self.update,
@@ -278,6 +287,7 @@ impl MountOptionsBuilder {
             replicas: self.replicas,
             mount_type: self.mount_type,
             remove_properties: self.remove_properties,
+            quota_rate: self.quota_rate,
         }
     }
 }
