@@ -28,6 +28,7 @@ use std::sync::Arc;
 enum WriterTask {
     Flush(CallSender<i8>),
     Complete((bool, CallSender<i8>)),
+    Seek((i64, CallSender<i8>)),
 }
 
 enum SelectTask {
@@ -163,6 +164,31 @@ impl FsWriterBuffer {
         }
     }
 
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        let res: FsResult<()> = {
+            let (tx, rx) = CallChannel::channel();
+
+            if let Err(e) = self.task_sender.send(WriterTask::Seek((pos, tx))).await {
+                return Err(e.into());
+            }
+
+            if let Err(e) = rx.receive().await {
+                return Err(e.into());
+            }
+            Ok(())
+        };
+
+        // Update position (note: actual seek is executed by background task)
+        if res.is_ok() {
+            self.pos = pos;
+        }
+
+        match res {
+            Err(e) => Err(self.check_error(e)),
+            Ok(_) => Ok(()),
+        }
+    }
+
     async fn write_future(
         mut chunk_receiver: AsyncReceiver<DataSlice>,
         mut task_receiver: AsyncReceiver<WriterTask>,
@@ -199,6 +225,20 @@ impl FsWriterBuffer {
                         writer.complete().await?;
                         tx.send(1)?;
                         return Ok(());
+                    }
+
+                    WriterTask::Seek((pos, tx)) => {
+                        // Process all buffered data first
+                        while let Some(chunk) = chunk_receiver.try_recv()? {
+                            writer.write(chunk).await?
+                        }
+
+                        // Execute seek operation
+                        writer.seek(pos).await?;
+
+                        if let Err(e) = tx.send(1) {
+                            return Err(e.into());
+                        }
                     }
                 },
 
