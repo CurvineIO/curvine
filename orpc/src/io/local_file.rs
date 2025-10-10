@@ -79,6 +79,21 @@ impl LocalFile {
         Self::new(path.as_ref(), file)
     }
 
+    pub fn with_write_offset<T: AsRef<str>>(
+        path: T,
+        overwrite: bool,
+        offset: i64,
+    ) -> IOResult<Self> {
+        let mut local_file = Self::with_write(path, overwrite)?;
+
+        if offset > 0 {
+            // If offset is specified, seek to the specified position
+            local_file.seek(offset)?;
+        }
+
+        Ok(local_file)
+    }
+
     pub fn from_file(path: &str, inner: fs::File) -> IOResult<Self> {
         Self::new(path, inner)
     }
@@ -127,12 +142,22 @@ impl LocalFile {
         };
 
         self.pos += len as i64;
+
+        if self.pos > self.len {
+            self.len = self.pos;
+        }
+
         Ok(())
     }
 
     pub fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {
         try_err!(self.inner.write_all(buf));
         self.pos += buf.len() as i64;
+
+        if self.pos > self.len {
+            self.len = self.pos;
+        }
+
         Ok(())
     }
 

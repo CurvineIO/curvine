@@ -42,6 +42,7 @@ impl BlockWriterLocal {
         let req_id = Utils::req_id();
         let seq_id = 0;
 
+        // Always start from append mode (block.len position)
         let pos = block.len;
         let len = fs_context.block_size();
 
@@ -151,7 +152,34 @@ impl BlockWriterLocal {
         self.file.pos()
     }
 
+    pub fn len(&self) -> i64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return Err(format!("Cannot seek to negative position: {pos}").into());
+        }
+
+        if pos >= self.len {
+            return Err(format!("Seek position {pos} exceeds block capacity {}", self.len).into());
+        }
+
+        // For local files, call seek directly
+        let file = self.file.clone();
+        self.rt
+            .spawn_blocking(move || {
+                file.as_mut().seek(pos)?;
+                Ok(())
+            })
+            .await?
     }
 }

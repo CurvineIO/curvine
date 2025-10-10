@@ -69,6 +69,11 @@ pub struct ClientConf {
     // If seek is detected that causes block switching to exceed this value, all block readers will be cached.
     pub close_reader_limit: u32,
 
+    // In random write scenarios, the seek operation may frequently switch blocks, and the connection will be closed by default.
+    // This will have huge overhead.
+    // If seek is detected that causes block switching to exceed this value, all block writers will be cached.
+    pub close_writer_limit: u32,
+
     pub short_circuit: bool,
 
     #[serde(skip)]
@@ -273,6 +278,7 @@ impl Default for ClientConf {
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
             close_reader_limit: 20,
+            close_writer_limit: 20,
 
             short_circuit: true,
 

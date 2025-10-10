@@ -54,27 +54,44 @@ impl WriteHandler {
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let context = WriteContext::from_req(msg)?;
 
-        // When creating a block, there are 2 cases:
-        // 1. In non-append mode, a new block file will be created.block's len = block_size
-        // 2. Append mode, append data to the block.block len = block file size.
+        // 1. Append mode: use append_block, continue writing from file end
+        // 2. Random write mode: use create_block or reuse existing block, support writing at any position
         let meta = if context.is_append {
             self.store.append_block(context.off, &context.block)?
         } else {
             self.store.create_block(&context.block)?
         };
 
-        if context.off >= meta.len {
-            return err_box!("The write start position exceeds the block size");
-        }
-
-        let file = meta.create_writer(context.is_append)?;
-        if file.len() != context.off {
+        // Only check if it exceeds block capacity limit
+        if context.off >= context.len {
             return err_box!(
-                "Append write initial length error, expected {}, actual {}",
+                "The write start position {} exceeds the block capacity {}",
                 context.off,
-                file.len()
+                context.len
             );
         }
+
+        let file = if context.is_append {
+            // Append mode: use traditional append method
+            let file = meta.create_writer(true)?;
+            // Validate file length for append mode
+            if file.len() != context.off {
+                return err_box!(
+                    "Append write initial length error, expected {}, actual {}",
+                    context.off,
+                    file.len()
+                );
+            }
+            file
+        } else {
+            // Random write mode: use write method with offset support
+            let mut file = meta.create_writer(false)?;
+            // For random writes, seek directly to specified position
+            if context.off > 0 {
+                file.seek(context.off)?;
+            }
+            file
+        };
 
         let (label, path, file) = if context.short_circuit {
             ("local", file.path().to_string(), None)
@@ -104,8 +121,8 @@ impl WriteHandler {
         let _ = self.context.replace(context);
 
         self.metrics.write_blocks.with_label_values(&[label]).inc();
-        info!("{}", log_msg);
 
+        info!("{}", log_msg);
         Ok(Builder::success(msg).proto_header(response).build())
     }
 
@@ -125,11 +142,37 @@ impl WriteHandler {
         let context = try_option_mut!(self.context);
         Self::check_context(context, msg)?;
 
+        // msg.header
+        if msg.header_len() > 0 {
+            let header: DataHeaderProto = msg.parse_header()?;
+            // If header contains offset information, execute seek operation
+            if header.offset != file.pos() {
+                if header.offset < 0 || header.offset >= context.len {
+                    return err_box!(
+                        "Invalid seek offset: {}, block length: {}",
+                        header.offset,
+                        context.len
+                    );
+                }
+                file.seek(header.offset)?;
+            }
+
+            // Handle flush request
+            if header.flush {
+                file.flush()?;
+            }
+        }
+
         // Write existing data blocks.
         let data_len = msg.data_len() as i64;
         if data_len > 0 {
             if file.pos() + data_len > context.len {
-                return err_box!("Writing data exceeds block_size");
+                return err_box!(
+                    "Write range [{}, {}) exceeds block size {}",
+                    file.pos(),
+                    file.pos() + data_len,
+                    context.len
+                );
             }
 
             let spend = TimeSpent::new();
@@ -147,14 +190,6 @@ impl WriteHandler {
             }
             self.metrics.write_bytes.inc_by(msg.data_len() as i64);
             self.metrics.write_time_us.inc_by(used as i64);
-        }
-
-        // parse the header header and whether flush data is required.
-        if msg.header_len() > 0 {
-            let header: DataHeaderProto = msg.parse_header()?;
-            if header.flush {
-                file.flush()?;
-            }
         }
 
         Ok(msg.success())

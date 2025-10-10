@@ -84,6 +84,48 @@ impl WriterAdapter {
             Remote(f) => f.pos(),
         }
     }
+
+    // Add seek support for WriterAdapter
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        match self {
+            Local(f) => f.seek(pos).await,
+            Remote(f) => f.seek(pos).await,
+        }
+    }
+
+    fn len(&self) -> i64 {
+        match self {
+            Local(f) => f.len(),
+            Remote(f) => f.len(),
+        }
+    }
+
+    // Create new WriterAdapter
+    async fn new(
+        fs_context: Arc<FsContext>,
+        located_block: &LocatedBlock,
+        worker_addr: &WorkerAddress,
+    ) -> FsResult<Self> {
+        let conf = &fs_context.conf.client;
+        let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
+
+        let adapter = if short_circuit {
+            let writer =
+                BlockWriterLocal::new(fs_context, located_block.block.clone(), worker_addr.clone())
+                    .await?;
+            Local(writer)
+        } else {
+            let writer = BlockWriterRemote::new(
+                &fs_context,
+                located_block.block.clone(),
+                worker_addr.clone(),
+            )
+            .await?;
+            Remote(writer)
+        };
+
+        Ok(adapter)
+    }
 }
 
 pub struct BlockWriter {
@@ -98,21 +140,9 @@ impl BlockWriter {
             return err_box!("There is no available worker");
         }
 
-        let conf = &fs_context.conf.client;
         let mut inners = Vec::with_capacity(locate.locs.len());
         for addr in &locate.locs {
-            let short_circuit = conf.short_circuit && fs_context.is_local_worker(addr);
-
-            let adapter = if short_circuit {
-                let writer =
-                    BlockWriterLocal::new(fs_context.clone(), locate.block.clone(), addr.clone())
-                        .await?;
-                Local(writer)
-            } else {
-                let writer =
-                    BlockWriterRemote::new(&fs_context, locate.block.clone(), addr.clone()).await?;
-                Remote(writer)
-            };
+            let adapter = WriterAdapter::new(fs_context.clone(), &locate, addr).await?;
             inners.push(adapter);
         }
 
@@ -227,6 +257,43 @@ impl BlockWriter {
 
     pub fn pos(&self) -> i64 {
         self.inners[0].pos()
+    }
+
+    pub fn len(&self) -> i64 {
+        self.inners[0].len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    // Get block ID for cache management
+    pub fn block_id(&self) -> i64 {
+        self.locate.block.id
+    }
+
+    // Implement seek support for random writes
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return Err(format!("Cannot seek to negative position: {pos}").into());
+        }
+
+        let mut futures = Vec::with_capacity(self.inners.len());
+        for writer in self.inners.iter_mut() {
+            let task = async move {
+                writer
+                    .seek(pos)
+                    .await
+                    .map_err(|e| (writer.worker_address().clone(), e))
+            };
+            futures.push(task);
+        }
+
+        if let Err((worker_addr, e)) = try_join_all(futures).await {
+            self.fs_context.add_failed_worker(&worker_addr);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn to_commit_block(&self) -> CommitBlock {
