@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod memory;
-pub use self::memory::Memory;
+mod local_mem;
+pub use self::local_mem::LocalMem;
 
 mod r_key;
 pub use self::r_key::RKey;
 
 mod r_key_buffer;
 pub use self::r_key_buffer::RKeyBuffer;
+
+mod remote_mem;
+pub use self::remote_mem::RemoteMem;

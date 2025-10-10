@@ -28,6 +28,8 @@ mod ucp_executor;
 pub use self::ucp_executor::UcpExecutor;
 
 pub mod ucp_runtime;
+mod ucp_frame;
+
 pub use self::ucp_runtime::UcpRuntime;
 
 extern "C" {

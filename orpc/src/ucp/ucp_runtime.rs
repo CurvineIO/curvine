@@ -19,7 +19,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use crate::ucp::core::{Config, Context, Endpoint, Listener, SockAddr};
 use crate::ucp::request::ConnRequest;
-use crate::ucp::rma::Memory;
+use crate::ucp::rma::LocalMem;
 
 pub struct UcpRuntime {
     pub boss: UcpExecutor,
@@ -69,8 +69,8 @@ impl UcpRuntime {
         Endpoint::connect(self.worker_executor().clone(), addr)
     }
 
-    pub fn register_memory(&self, size: usize) -> IOResult<Memory> {
-        Memory::new(self.context.clone(), size)
+    pub fn register_memory(&self, size: usize) -> IOResult<LocalMem> {
+        LocalMem::new(self.context.clone(), size)
     }
 }
 

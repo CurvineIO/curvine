@@ -27,13 +27,12 @@ use std::sync::Arc;
 use std::task::Poll;
 use crate::ucp::core::SockAddr;
 use crate::ucp::request::{ConnRequest, RequestParam, RequestWaker};
-use crate::ucp::rma::{Memory, RKey};
+use crate::ucp::rma::{RemoteMem, RKey};
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
     executor: UcpExecutor,
     err_monitor: Arc<ErrorMonitor<IOError>>,
-    pub memory: Memory
 }
 
 impl Endpoint {
@@ -54,12 +53,10 @@ impl Endpoint {
             unsafe { ucp_ep_create(executor.worker().as_mut_ptr(), &params, inner.as_mut_ptr()) };
         err_ucs!(status)?;
 
-        let memory = executor.register_memory(1024)?;
         Ok(Self {
             inner: RawPtr::from_uninit(inner),
             executor,
             err_monitor,
-            memory,
         })
     }
 
@@ -117,7 +114,7 @@ impl Endpoint {
         request.wake();
     }
 
-    pub async fn stream_send(&self, buf: DataSlice) -> IOResult<usize> {
+    pub async fn stream_send(&self, buf: &[u8]) -> IOResult<usize> {
         self.check_error()?;
 
         let params = RequestParam::new()
@@ -144,7 +141,7 @@ impl Endpoint {
         request.wake();
     }
 
-    pub async fn stream_recv(&self, mut buf: BytesMut) -> IOResult<Option<BytesMut>> {
+    pub async fn stream_recv(&self, buf: &mut [u8]) -> IOResult<usize> {
         self.check_error()?;
 
         let mut len = MaybeUninit::<usize>::uninit();
@@ -161,8 +158,8 @@ impl Endpoint {
         };
 
         match poll_status!(status, len, poll_stream)? {
-            None => Ok(None),
-            Some(v) => Ok(Some(buf.split_to(v)))
+            None => Ok(0),
+            Some(v) => Ok(v)
         }
     }
 
@@ -190,7 +187,9 @@ impl Endpoint {
     }
 
     /// 将数据写入远程内存中
-    pub async fn put(&self, buf: DataSlice, remote_addr: u64, rkey: &RKey) -> IOResult<()> {
+    pub async fn put(&self, buf: &[u8], remote_mem: &RemoteMem) -> IOResult<()> {
+        self.check_error()?;
+
         let param = RequestParam::new()
             .send_cb(Some(Self::rma_handler));
 
@@ -199,8 +198,8 @@ impl Endpoint {
                 self.as_mut_ptr(),
                 buf.as_ptr() as _,
                 buf.len() as _,
-                remote_addr,
-                rkey.as_mut_ptr(),
+                remote_mem.addr(),
+                remote_mem.rkey_mut_ptr(),
                 param.as_ptr(),
             )
         };
@@ -208,7 +207,9 @@ impl Endpoint {
     }
 
     // 从远程内存读取数据。
-    pub async fn get(&self, buf: &mut [u8], remote_addr: u64, rkey: &RKey) -> IOResult<()> {
+    pub async fn get(&self, buf: &mut [u8], remote_mem: &RemoteMem) -> IOResult<()> {
+        self.check_error()?;
+
         let param = RequestParam::new()
             .send_cb(Some(Self::rma_handler));
         let status = unsafe {
@@ -216,33 +217,12 @@ impl Endpoint {
                 self.as_mut_ptr(),
                 buf.as_mut_ptr() as _,
                 buf.len() as _,
-                remote_addr,
-                rkey.as_mut_ptr(),
+                remote_mem.addr(),
+                remote_mem.rkey_mut_ptr(),
                 param.as_ptr()
             )
         };
         poll_status!(status, poll_normal)
-    }
-
-    pub fn get_memory(&self) -> IOResult<BytesMut> {
-        let mut addr_buf = BytesMut::new();
-        addr_buf.put_u64(self.memory.addr());
-
-        let pack  = self.memory.pack()?;
-
-        addr_buf.extend_from_slice(pack.as_slice());
-
-        Ok(addr_buf)
-    }
-
-    pub async fn send_get_memory(&self) -> IOResult<(u64, RKey)> {
-        self.stream_send("get".into()).await?;
-        let buf = BytesMut::zeroed(1024);
-        let mut buf = self.stream_recv(buf).await?.unwrap();
-
-        let addr = buf.get_u64();
-        let rkey = RKey::unpack(&self, &buf)?;
-        Ok((addr, rkey))
     }
 
     pub fn print(&self) {

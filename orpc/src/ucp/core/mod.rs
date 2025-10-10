@@ -29,3 +29,6 @@ pub use self::endpoint::Endpoint;
 
 mod listener;
 pub use self::listener::Listener;
+
+mod rma_endpoint;
+pub use self::rma_endpoint::RmaEndpoint;

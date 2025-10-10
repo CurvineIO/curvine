@@ -19,7 +19,7 @@ use log::error;
 use std::sync::Arc;
 use bytes::BytesMut;
 use crate::ucp::core::{Context, Worker};
-use crate::ucp::rma::Memory;
+use crate::ucp::rma::LocalMem;
 
 #[derive(Clone)]
 pub struct UcpExecutor {
@@ -62,7 +62,7 @@ impl UcpExecutor {
         self.worker.clone()
     }
 
-    pub fn register_memory(&self, size: usize) -> IOResult<Memory> {
-        Memory::new(self.worker.context().clone(), size)
+    pub fn register_memory(&self, size: usize) -> IOResult<LocalMem> {
+        LocalMem::new(self.worker.context().clone(), size)
     }
 }

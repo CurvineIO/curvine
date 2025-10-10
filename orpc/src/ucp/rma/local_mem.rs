@@ -22,15 +22,15 @@ use crate::io::IOResult;
 use crate::sys::{RawPtr, RawVec};
 use crate::ucp::bindings::*;
 use crate::ucp::core::Context;
-use crate::ucp::rma::RKeyBuffer;
+use crate::ucp::rma::{RemoteMem, RKeyBuffer};
 
-pub struct Memory {
+pub struct LocalMem {
     inner: RawPtr<ucp_mem>,
     context: Arc<Context>,
     buffer: BytesMut,
 }
 
-impl Memory {
+impl LocalMem {
     pub fn new(context: Arc<Context>, size: usize) -> IOResult<Self> {
         let buffer = BytesMut::zeroed(size);
 
@@ -106,7 +106,7 @@ impl Memory {
     }
 }
 
-impl Drop for Memory {
+impl Drop for LocalMem {
     fn drop(&mut self) {
         unsafe {
             let status = ucp_mem_unmap(self.context.as_mut_ptr(), self.as_mut_ptr());
