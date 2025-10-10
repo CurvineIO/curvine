@@ -33,7 +33,7 @@ pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
     executor: UcpExecutor,
     err_monitor: Arc<ErrorMonitor<IOError>>,
-    pub buffer: Memory
+    pub memory: Memory
 }
 
 impl Endpoint {
@@ -54,12 +54,12 @@ impl Endpoint {
             unsafe { ucp_ep_create(executor.worker().as_mut_ptr(), &params, inner.as_mut_ptr()) };
         err_ucs!(status)?;
 
-        let buffer = executor.register_memory(BytesMut::zeroed(1024))?;
+        let memory = executor.register_memory(1024)?;
         Ok(Self {
             inner: RawPtr::from_uninit(inner),
             executor,
             err_monitor,
-            buffer,
+            memory,
         })
     }
 
@@ -226,9 +226,9 @@ impl Endpoint {
 
     pub fn get_memory(&self) -> IOResult<BytesMut> {
         let mut addr_buf = BytesMut::new();
-        addr_buf.put_u64(self.buffer.buffer_addr());
+        addr_buf.put_u64(self.memory.addr());
 
-        let pack  = self.buffer.pack()?;
+        let pack  = self.memory.pack()?;
 
         addr_buf.extend_from_slice(pack.as_slice());
 

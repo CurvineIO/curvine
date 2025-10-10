@@ -101,7 +101,7 @@ fn rma2(pool: UcpRuntime, addr: SockAddr) {
                     info!("recv control {}", String::from_utf8_lossy(&recv));
 
                     // loop读取到永远是相同的数据。
-                    let data = endpoint.buffer.buffer();
+                    let data = endpoint.memory.as_slice();
                     info!("读取到的字符串: {:?}", String::from_utf8_lossy(&data[..4]));
 
                     endpoint.stream_send("xxxx".into()).await.unwrap();

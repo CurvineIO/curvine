@@ -62,7 +62,7 @@ impl UcpExecutor {
         self.worker.clone()
     }
 
-    pub fn register_memory(&self, buffer: BytesMut) -> IOResult<Memory> {
-        Memory::new(self.worker.context().clone(), buffer)
+    pub fn register_memory(&self, size: usize) -> IOResult<Memory> {
+        Memory::new(self.worker.context().clone(), size)
     }
 }

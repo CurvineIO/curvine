@@ -69,8 +69,8 @@ impl UcpRuntime {
         Endpoint::connect(self.worker_executor().clone(), addr)
     }
 
-    pub fn register_memory(&self, buffer: BytesMut) -> IOResult<Memory> {
-        Memory::new(self.context.clone(), buffer)
+    pub fn register_memory(&self, size: usize) -> IOResult<Memory> {
+        Memory::new(self.context.clone(), size)
     }
 }
 

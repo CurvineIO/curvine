@@ -15,7 +15,7 @@
 use std::mem::MaybeUninit;
 use std::os::raw::c_void;
 use std::sync::Arc;
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use log::warn;
 use crate::err_ucs;
 use crate::io::IOResult;
@@ -31,7 +31,9 @@ pub struct Memory {
 }
 
 impl Memory {
-    pub fn new(context: Arc<Context>, buffer: BytesMut) -> IOResult<Self> {
+    pub fn new(context: Arc<Context>, size: usize) -> IOResult<Self> {
+        let buffer = BytesMut::zeroed(size);
+
         let params = ucp_mem_map_params_t {
             field_mask: (ucp_mem_map_params_field::UCP_MEM_MAP_PARAM_FIELD_ADDRESS
                 | ucp_mem_map_params_field::UCP_MEM_MAP_PARAM_FIELD_LENGTH)
@@ -62,22 +64,13 @@ impl Memory {
         self.inner.as_mut_ptr()
     }
 
-    pub fn buffer_addr(&self) -> u64 {
+    pub fn addr(&self) -> u64 {
         self.buffer.as_ptr() as u64
     }
 
-    pub fn buffer_size(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.buffer.len()
     }
-
-    pub fn buffer(&self) -> &[u8] {
-        &self.buffer
-    }
-
-    pub fn buffer_mut(&mut self) -> &mut [u8] {
-        &mut self.buffer
-    }
-
 
     pub fn pack(&self) -> IOResult<RKeyBuffer> {
         let mut buf = MaybeUninit::<*mut c_void>::uninit();
@@ -102,6 +95,14 @@ impl Memory {
             )
         };
         Ok(RKeyBuffer::new(vec))
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        self.buffer.put_slice(bytes)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.buffer
     }
 }
 

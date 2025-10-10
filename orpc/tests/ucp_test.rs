@@ -69,18 +69,19 @@ fn endpoint_rma() {
 
     rt.spawn(async move {
         // 1. 注册内存（使用现有缓冲区）
-        let buf: BytesMut = BytesMut::from("abcd");
-        info!("rma send: {:?}", String::from_utf8_lossy(&buf));
+        let mut mem = wr.register_memory(4).unwrap();
+        mem.write_bytes("abcd".as_bytes());
+
+        info!("rma send: {:?}", String::from_utf8_lossy(mem.as_slice()));
 
         let endpoint = Endpoint::connect(executor, &addr).unwrap();
-        let mem = wr.register_memory(buf).unwrap();
         let pack = mem.pack().unwrap();
 
         // 2. 发送内存地址
         let mut addr_buf = BytesMut::new();
 
-        info!("send: rma_addr={:#x}", mem.buffer_addr());
-        addr_buf.put_u64_ne(mem.buffer_addr());
+        info!("send: rma_addr={:#x}", mem.addr());
+        addr_buf.put_u64_ne(mem.addr());
 
         info!("pack: {:?}", pack.as_slice());
         addr_buf.extend_from_slice(pack.as_slice());
