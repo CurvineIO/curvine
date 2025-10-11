@@ -80,8 +80,8 @@ fn endpoint_rma() {
 
             // 2. 通知写入完成。
             let mut buf = BytesMut::zeroed(1000);
-            endpoint.stream_send("start".as_bytes()).await.unwrap();
-            let recv_size = endpoint.stream_recv(&mut buf).await.unwrap();
+            endpoint.tag_send("start".as_bytes()).await.unwrap();
+            let recv_size = endpoint.tag_recv(&mut buf).await.unwrap();
             info!("rma send: {:?}", String::from_utf8_lossy(&buf[..recv_size]));
         }
 

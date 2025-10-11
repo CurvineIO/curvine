@@ -126,6 +126,8 @@ impl RmaEndpoint {
     /// 2. 发送自己的内存信息给客服端。
     pub async fn accept_memory(&mut self) -> IOResult<()> {
         let remote_mem = self.get_mem().await?;
+
+        self.ep_id = remote_mem.ep_id();
         let _ = self.remote_mem.insert(remote_mem);
 
         self.send_mem().await?;
@@ -161,6 +163,18 @@ impl RmaEndpoint {
 
     pub async fn stream_recv(&self, buf: &mut [u8]) -> IOResult<usize> {
         self.inner.stream_recv(buf).await
+    }
+
+    pub async fn stream_recv_full(&self, buf: &mut [u8]) -> IOResult<()> {
+        self.inner.stream_recv_full(buf).await
+    }
+
+    pub async fn tag_recv(&self, buf: &mut [u8]) -> IOResult<usize> {
+        self.inner.tag_recv(self.ep_id, buf).await
+    }
+
+    pub async fn tag_send(&self, buf: & [u8]) -> IOResult<()> {
+        self.inner.tag_send(self.ep_id, buf).await
     }
 
     pub fn endpoint(&self) -> &Endpoint {
