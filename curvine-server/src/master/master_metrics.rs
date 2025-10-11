@@ -52,6 +52,12 @@ pub struct MasterMetrics {
     pub(crate) replication_failure_count: Counter,
 
     pub(crate) operation_duration: HistogramVec,
+
+    // for quota eviction (LRU)
+    pub(crate) eviction_lru_cache_size: Gauge,
+    pub(crate) eviction_trigger_count: Counter,
+    pub(crate) eviction_files_deleted: Counter,
+    pub(crate) eviction_bytes_freed: Counter,
 }
 
 impl MasterMetrics {
@@ -112,6 +118,24 @@ impl MasterMetrics {
                 "Operation duration except WorkerHeartbeat",
                 &["operation"],
                 &buckets,
+            )?,
+
+            // Quota eviction metrics
+            eviction_lru_cache_size: m::new_gauge(
+                "eviction_lru_cache_size",
+                "Number of files tracked in LRU cache for eviction",
+            )?,
+            eviction_trigger_count: m::new_counter(
+                "eviction_trigger_count",
+                "Number of times eviction was triggered",
+            )?,
+            eviction_files_deleted: m::new_counter(
+                "eviction_files_deleted",
+                "Total number of files deleted by eviction",
+            )?,
+            eviction_bytes_freed: m::new_counter(
+                "eviction_bytes_freed",
+                "Total bytes freed by eviction",
             )?,
         };
 
