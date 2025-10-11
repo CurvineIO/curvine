@@ -23,3 +23,6 @@ pub use self::request_future::RequestFuture;
 
 mod request_param;
 pub use self::request_param::RequestParam;
+
+mod request_status;
+pub use self::request_status::RequestStatus;

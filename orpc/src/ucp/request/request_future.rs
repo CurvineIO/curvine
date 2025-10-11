@@ -24,7 +24,7 @@ pub struct RequestFuture<T> {
 }
 
 impl<T> RequestFuture<T> {
-    pub fn new(ptr: ucs_status_ptr_t, poll_fn: unsafe fn(ucs_status_ptr_t) -> Poll<T>) -> Self {
+    pub fn new(ptr: ucs_status_ptr_t, poll_fn: fn(ucs_status_ptr_t) -> Poll<T>) -> Self {
         Self { ptr, poll_fn }
     }
 }

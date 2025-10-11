@@ -51,26 +51,19 @@ macro_rules! err_ucs {
 #[macro_export]
 macro_rules! poll_status {
     ($status:expr, $init_value:expr, $poll_fn:expr) => {{
-        if UcpUtils::ucs_ptr_raw_status($status) == ucs_status_t::UCS_OK {
-            Ok(Some(unsafe { $init_value.assume_init() }))
-        } else if UcpUtils::ucs_ptr_is_err($status) {
-            err_ucs!(UcpUtils::ucs_ptr_raw_status($status))?;
-            err_box!("Unexpected status: {:?}", $status)
-        } else {
-            let f = $crate::ucp::request::RequestFuture::new($status, $poll_fn);
-            f.await
+        let request = $crate::ucp::request::RequestStatus::new($status, $init_value, $poll_fn);
+        match request {
+            $crate::ucp::request::RequestStatus::Ready(v) => v,
+            $crate::ucp::request::RequestStatus::Pending(f) => f.await,
         }
     }};
 
     ($status:expr, $poll_fn:expr) => {{
-        if UcpUtils::ucs_ptr_raw_status($status) == ucs_status_t::UCS_OK {
-            Ok(())
-        } else if UcpUtils::ucs_ptr_is_err($status) {
-            err_ucs!(UcpUtils::ucs_ptr_raw_status($status))?;
-            err_box!("Unexpected status: {:?}", $status)
-        } else {
-            let f = $crate::ucp::request::RequestFuture::new($status, $poll_fn);
-            f.await
+        let request = $crate::ucp::request::RequestStatus::new($status, std::mem::MaybeUninit::uninit(), $poll_fn);
+        match request {
+            $crate::ucp::request::RequestStatus::Ready(v) => v,
+            $crate::ucp::request::RequestStatus::Pending(f) => f.await,
         }
     }};
 }
+

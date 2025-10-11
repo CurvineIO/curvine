@@ -25,8 +25,9 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
 use std::task::Poll;
+use serde::__private::de::Content::U64;
 use crate::ucp::core::SockAddr;
-use crate::ucp::request::{ConnRequest, RequestParam, RequestWaker};
+use crate::ucp::request::{ConnRequest, RequestParam, RequestStatus, RequestWaker};
 use crate::ucp::rma::{RemoteMem, RKey};
 
 pub struct Endpoint {
@@ -114,7 +115,7 @@ impl Endpoint {
         request.wake();
     }
 
-    pub async fn stream_send(&self, buf: &[u8]) -> IOResult<usize> {
+    pub async fn stream_send(&self, buf: &[u8]) -> IOResult<()> {
         self.check_error()?;
 
         let params = RequestParam::new()
@@ -127,11 +128,10 @@ impl Endpoint {
                 params.as_ptr()
             )
         };
-        poll_status!(status, poll_normal)?;
-        Ok(buf.len())
+        poll_status!(status, poll_normal)
     }
 
-    unsafe extern "C" fn recv_handler(
+    unsafe extern "C" fn stream_recv_callback(
         request: *mut c_void,
         _status: ucs_status_t,
         _length: usize,
@@ -146,7 +146,7 @@ impl Endpoint {
 
         let mut len = MaybeUninit::<usize>::uninit();
         let param = RequestParam::new()
-            .recv_stream_cb(Some(Self::recv_handler));
+            .recv_stream_cb(Some(Self::stream_recv_callback));
         let status = unsafe {
             ucp_stream_recv_nbx(
                 self.as_mut_ptr(),
@@ -156,14 +156,10 @@ impl Endpoint {
                 param.as_ptr(),
             )
         };
-
-        match poll_status!(status, len, poll_stream)? {
-            None => Ok(0),
-            Some(v) => Ok(v)
-        }
+        poll_status!(status, len, poll_stream_recv)
     }
 
-    unsafe extern "C" fn flush_handler(request: *mut c_void, _status: ucs_status_t) {
+    unsafe extern "C" fn flush_callback(request: *mut c_void, _status: ucs_status_t) {
         let request = &mut *(request as *mut RequestWaker);
         request.wake();
     }
@@ -172,14 +168,24 @@ impl Endpoint {
         self.check_error()?;
 
         let status = unsafe {
-            ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_handler))
+            ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_callback))
         };
         poll_status!(status, poll_normal)
     }
 
-    unsafe extern "C" fn rma_handler(
+    unsafe extern "C" fn custom_callback(
         request: *mut c_void,
         _status: ucs_status_t,
+        _user_data: *mut c_void,
+    ) {
+        let request = &mut *(request as *mut RequestWaker);
+        request.wake();
+    }
+
+    unsafe extern "C" fn tag_recv_callback(
+        request: *mut c_void,
+        _status: ucs_status_t,
+        _info: *const ucp_tag_recv_info,
         _user_data: *mut c_void,
     ) {
         let request = &mut *(request as *mut RequestWaker);
@@ -191,7 +197,7 @@ impl Endpoint {
         self.check_error()?;
 
         let param = RequestParam::new()
-            .send_cb(Some(Self::rma_handler));
+            .send_cb(Some(Self::custom_callback));
 
         let status = unsafe {
             ucp_put_nbx(
@@ -211,7 +217,7 @@ impl Endpoint {
         self.check_error()?;
 
         let param = RequestParam::new()
-            .send_cb(Some(Self::rma_handler));
+            .send_cb(Some(Self::custom_callback));
         let status = unsafe {
             ucp_get_nbx(
                 self.as_mut_ptr(),
@@ -223,6 +229,41 @@ impl Endpoint {
             )
         };
         poll_status!(status, poll_normal)
+    }
+
+    pub async fn tag_send(&self, tag: u64, buf: &[u8]) -> IOResult<()> {
+        self.check_error()?;
+
+        let param = RequestParam::new()
+            .send_cb(Some(Self::custom_callback));
+        let status = unsafe {
+            ucp_tag_send_nbx(
+                self.as_mut_ptr(),
+                buf.as_ptr() as _,
+                buf.len() as _,
+                tag,
+                param.as_ptr(),
+            )
+        };
+        poll_status!(status, poll_normal)
+    }
+
+    pub async fn tag_recv(&self, tag: u64, buf: &mut [u8]) -> IOResult<usize> {
+        self.check_error()?;
+        let param = RequestParam::new()
+            .recv_tag_cb(Some(Self::tag_recv_callback));
+        let status = unsafe {
+            ucp_tag_recv_nbx(
+                self.executor.worker().as_mut_ptr(),
+                buf.as_mut_ptr() as _,
+                buf.len() as _,
+                tag,
+                u64::MAX,
+                param.as_ptr(),
+            )
+        };
+
+        poll_status!(status, poll_tag).map(|x| x.1)
     }
 
     pub fn print(&self) {
@@ -248,28 +289,51 @@ impl Drop for Endpoint {
     }
 }
 
-fn poll_stream(ptr: ucs_status_ptr_t) -> Poll<IOResult<Option<usize>>> {
+fn poll_stream_recv(ptr: ucs_status_ptr_t) -> Poll<IOResult<usize>> {
     let mut len = MaybeUninit::<usize>::uninit();
 
     let status = unsafe {
         ucp_stream_recv_request_test(ptr as _, len.as_mut_ptr() as _)
     };
+
     if status == ucs_status_t::UCS_INPROGRESS {
-        Poll::Pending
-    } else if status == ucs_status_t::UCS_ERR_CONNECTION_RESET  {
-        Poll::Ready(Ok(None))
-    } else {
-        err_ucs!(status)?;
-        Poll::Ready(Ok(Some(unsafe { len.assume_init() })))
+        return Poll::Pending
+    }
+
+    match err_ucs!(status) {
+        Ok(_) => Poll::Ready(Ok(unsafe { len.assume_init() })),
+        Err(e) => Poll::Ready(Err(e))
     }
 }
 
 fn poll_normal(ptr: ucs_status_ptr_t) -> Poll<IOResult<()>> {
     let status = unsafe { ucp_request_check_status(ptr as _) };
+
     if status == ucs_status_t::UCS_INPROGRESS {
-        Poll::Pending
-    } else {
-        err_ucs!(status)?;
-        Poll::Ready(Ok(()))
+        return Poll::Pending
+    }
+
+    match err_ucs!(status) {
+        Ok(_) => Poll::Ready(Ok(())),
+        Err(e) => Poll::Ready(Err(e))
+    }
+}
+
+fn poll_tag(ptr: ucs_status_ptr_t) -> Poll<IOResult<(u64, usize)>> {
+    let mut info = MaybeUninit::<ucp_tag_recv_info>::uninit();
+    let status = unsafe {
+        ucp_tag_recv_request_test(ptr as _, info.as_mut_ptr() as _)
+    };
+
+    if status == ucs_status_t::UCS_INPROGRESS {
+        return Poll::Pending
+    }
+
+    match err_ucs!(status) {
+        Ok(_) => {
+            let info = unsafe { info.assume_init() };
+            Poll::Ready(Ok((info.sender_tag, info.length)))
+        }
+        Err(e) => Poll::Ready(Err(e))
     }
 }

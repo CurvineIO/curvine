@@ -146,7 +146,7 @@ impl RmaEndpoint {
         self.inner.get(buf, mem).await
     }
 
-    pub async fn stream_send(&self, buf: &[u8]) -> IOResult<usize> {
+    pub async fn stream_send(&self, buf: &[u8]) -> IOResult<()> {
         self.inner.stream_send(buf).await
     }
 
