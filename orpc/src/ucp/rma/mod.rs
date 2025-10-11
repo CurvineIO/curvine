@@ -15,11 +15,11 @@
 mod local_mem;
 pub use self::local_mem::LocalMem;
 
-mod r_key;
-pub use self::r_key::RKey;
+mod rkey;
+pub use self::rkey::RKey;
 
-mod r_key_buffer;
-pub use self::r_key_buffer::RKeyBuffer;
+mod rkey_buffer;
+pub use self::rkey_buffer::RKeyBuffer;
 
 mod remote_mem;
 pub use self::remote_mem::RemoteMem;

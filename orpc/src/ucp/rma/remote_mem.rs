@@ -16,14 +16,16 @@ use crate::ucp::bindings::ucp_rkey;
 use crate::ucp::rma::RKey;
 
 pub struct RemoteMem {
+    ep_id: u64,
     addr: u64,
     len: usize,
     rkey: RKey
 }
 
 impl RemoteMem {
-    pub fn new(addr: u64, len: usize, rkey: RKey) -> Self {
+    pub fn new(ep_id: u64, addr: u64, len: usize, rkey: RKey) -> Self {
         RemoteMem {
+            ep_id,
             addr,
             len,
             rkey
@@ -48,5 +50,9 @@ impl RemoteMem {
 
     pub fn rkey_mut_ptr(&self) -> *mut ucp_rkey {
         self.rkey.as_mut_ptr()
+    }
+
+    pub fn ep_id(& self) -> u64 {
+        self.ep_id
     }
 }

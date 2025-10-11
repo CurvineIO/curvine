@@ -14,6 +14,7 @@
 
 use bincode::config::BigEndian;
 use bytes::{Buf, BufMut, BytesMut};
+use crate::common::Utils;
 use crate::err_box;
 use crate::io::IOResult;
 use crate::sys::DataSlice;
@@ -30,16 +31,20 @@ use crate::ucp::UcpExecutor;
 /// Uses a dual-end memory model where both client and server hold remote memory addresses
 pub struct RmaEndpoint {
     inner: Endpoint,
+    ep_id: u64,
     local_mem: LocalMem,
     remote_mem: Option<RemoteMem>
 }
 
 impl RmaEndpoint {
     pub const MEM_MAGIC: u64 = 0xFEED1234;
+    pub const MEM_HEADER_LEN: u32 = 28;
+    pub const MEM_LEN_BYTES: usize = 4;
 
     pub fn new(inner: Endpoint, local_mem: LocalMem) -> Self {
         RmaEndpoint {
             inner,
+            ep_id: Utils::unique_id(),
             local_mem,
             remote_mem: None,
         }
@@ -53,31 +58,30 @@ impl RmaEndpoint {
 
     fn encode_local_mem(&self) -> IOResult<BytesMut> {
         let mut buf = BytesMut::new();
+        let pack = self.local_mem.pack()?;
 
+        buf.put_u32(Self::MEM_HEADER_LEN + pack.as_slice().len() as u32);
         buf.put_u64(Self::MEM_MAGIC);
+        buf.put_u64(self.ep_id);
         buf.put_u64(self.local_mem.addr());
         buf.put_u32(self.local_mem.len() as u32);
-
-        let pack = self.local_mem.pack()?;
         buf.extend_from_slice(pack.as_slice());
+
         Ok(buf)
     }
 
     fn decode_remote_mem(&self, mut buf: BytesMut) -> IOResult<RemoteMem> {
         let magic = buf.get_u64();
         if magic != Self::MEM_MAGIC {
-            return err_box!("invalid magic number: {}", magic)
+            return err_box!("invalid magic number: 0x{:x}", magic)
         }
+
+        let ep_id = buf.get_u64();
         let addr = buf.get_u64();
         let len = buf.get_u32() as usize;
         let r_key = RKey::unpack(&self.inner, &buf)?;
 
-        let remote_mem = RemoteMem::new(
-            addr,
-            len,
-            r_key
-        );
-
+        let remote_mem = RemoteMem::new(ep_id, addr, len, r_key);
         Ok(remote_mem)
     }
 
@@ -88,9 +92,14 @@ impl RmaEndpoint {
     }
 
     async fn get_mem(&self) -> IOResult<RemoteMem> {
-        let mut buf = BytesMut::zeroed(128);
-        let recv_size = self.inner.stream_recv(&mut buf).await?;
-        self.decode_remote_mem(buf.split_to(recv_size))
+        let mut buf = BytesMut::zeroed(Self::MEM_LEN_BYTES);
+        self.inner.stream_recv_full(&mut buf).await?;
+
+        // read memory bytes
+        let total_len = buf.get_u32() as usize;
+        let mut buf = BytesMut::zeroed(total_len);
+        self.inner.stream_recv_full(&mut buf).await?;
+        self.decode_remote_mem(buf)
     }
 
     async fn send_mem(&self) -> IOResult<()> {

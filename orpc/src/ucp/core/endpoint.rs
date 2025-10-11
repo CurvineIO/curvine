@@ -159,6 +159,26 @@ impl Endpoint {
         poll_status!(status, len, poll_stream_recv)
     }
 
+    pub async fn stream_recv_full(&self, buf: &mut [u8]) -> IOResult<()> {
+        let mut offset = 0;
+        let len = buf.len();
+
+        while offset < len {
+            let remaining_buf = &mut buf[offset..];
+            match self.stream_recv(remaining_buf).await {
+                Ok(recv_len) => {
+                    if recv_len == 0 {
+                        return err_box!("Connection closed while reading data, expected {} bytes but got only {}", len, offset);
+                    }
+                    offset += recv_len;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
+    }
+
     unsafe extern "C" fn flush_callback(request: *mut c_void, _status: ucs_status_t) {
         let request = &mut *(request as *mut RequestWaker);
         request.wake();
