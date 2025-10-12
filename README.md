@@ -22,7 +22,6 @@
 
 **Curvine** is a high-performance, concurrent distributed cache system written in Rust, designed for low-latency and high-throughput workloads.
 
-**[Roadmap 2025](https://github.com/CurvineIO/curvine/issues/29)**
 
 ## 📚 Documentation Resources
 
@@ -31,6 +30,7 @@ For more detailed information, please refer to:
 - [Official Documentation](https://curvineio.github.io/docs/Overview/instroduction)
 - [Quick Start](https://curvineio.github.io/docs/Deploy/quick-start)
 - [User Manuals](https://curvineio.github.io/docs/category/user-manuals)
+- [Detailed Usage Instructions](https://curvineio.github.io/blog/2025/09/28/user-guide/)
 - [Benchmark](https://curvineio.github.io/docs/category/benchmark)
 - [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
 - [Commit convention](COMMIT_CONVENTION.md)
