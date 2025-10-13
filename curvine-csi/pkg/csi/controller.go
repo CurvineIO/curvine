@@ -42,18 +42,24 @@ func newControllerService(config *Config) *controllerService {
 	return &controllerService{config: config}
 }
 
+// - check if the driver has ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME capability
+// - check request argument, e.g. req.VolumeCapabilities is not nil.
+
 // CreateVolume creates a volume
 func (d *controllerService) CreateVolume(ctx context.Context, request *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	// Generate request ID for log tracking
 	requestID := generateRequestID()
 	klog.Infof("RequestID: %s, CreateVolume called with request: %+v", requestID, request)
 
-	if len(request.Name) == 0 {
+	volumeID := request.GetName()
+	if len(volumeID) == 0 {
 		klog.Errorf("RequestID: %s, Volume name not provided in CreateVolume request", requestID)
 		return nil, status.Error(codes.InvalidArgument, "Volume Name cannot be empty")
 	}
+
+	// FIXME: check if the driver has create volume capability.
 	if request.VolumeCapabilities == nil {
-		klog.Errorf("RequestID: %s, Volume capabilities not provided for volume: %s", requestID, request.Name)
+		klog.Errorf("RequestID: %s, Volume capabilities not provided for volume: %s", requestID, volumeID)
 		return nil, status.Error(codes.InvalidArgument, "Volume Capabilities cannot be empty")
 	}
 
@@ -66,6 +72,7 @@ func (d *controllerService) CreateVolume(ctx context.Context, request *csi.Creat
 		volCtx[k] = v
 	}
 	volCtx["author"] = "curvine.io"
+
 	// Get "curvinePath" from volCtx
 	curvinePath, ok := volCtx["curvinePath"]
 	if !ok {
@@ -77,8 +84,12 @@ func (d *controllerService) CreateVolume(ctx context.Context, request *csi.Creat
 	volType, ok := volCtx["type"]
 	if ok {
 		klog.Infof("RequestID: %s, Volume type specified: %s", requestID, volType)
+	} else {
+		klog.Infof("RequestID: %s, Volume type NOT specified, so set to Directory", requestID)
+		volType = "Directory"
 	}
-	if ok && volType == "DirectoryOrCreate" {
+
+	if volType == "DirectoryOrCreate" {
 		// Check if directory exists
 		klog.Infof("RequestID: %s, Checking if curvine path exists: %s", requestID, curvinePath)
 		err := d.isCurvinePathExists(ctx, requestID, curvinePath)
@@ -112,7 +123,7 @@ func (d *controllerService) CreateVolume(ctx context.Context, request *csi.Creat
 		VolumeContext: volCtx,
 	}
 
-	klog.Infof("RequestID: %s, Successfully created volume: %s", requestID, curvinePath)
+	klog.Infof("RequestID: %s, Successfully created volume: %s, volumeID: %v", requestID, curvinePath, volumeID)
 	return &csi.CreateVolumeResponse{Volume: &volume}, nil
 }
 
@@ -127,33 +138,7 @@ func (d *controllerService) DeleteVolume(ctx context.Context, request *csi.Delet
 		return nil, status.Error(codes.InvalidArgument, "Volume ID cannot be empty")
 	}
 
-	klog.Infof("RequestID: %s, Deleting volume: %s", requestID, request.VolumeId)
-
-	// In CreateVolume, we use curvinePath as VolumeId
-	// So here we can directly use VolumeId as curvinePath
-	curvinePath := request.VolumeId
-	klog.Infof("RequestID: %s, Using curvinePath: %s for deletion", requestID, curvinePath)
-
-	// Build delete command
-	cmd := exec.Command(d.config.CurvineCliPath, "fs", "rm", "-r", curvinePath)
-	klog.Infof("RequestID: %s, Executing command: %s %s %s %s %s", requestID, d.config.CurvineCliPath, "fs", "rm", "-r", curvinePath)
-
-	// Execute command with retry and timeout
-	output, err := ExecuteWithRetry(
-		cmd,
-		d.config.RetryCount,
-		time.Duration(d.config.RetryInterval)*time.Second,
-		time.Duration(d.config.CommandTimeout)*time.Second,
-	)
-
-	if err != nil {
-		klog.Errorf("RequestID: %s, Failed to delete volume %s: %v, output: %s",
-			requestID, request.VolumeId, err, string(output))
-		return nil, status.Errorf(codes.Internal, "Failed to delete volume %s: %v, output: %s",
-			request.VolumeId, err, string(output))
-	}
-
-	klog.Infof("RequestID: %s, Successfully deleted volume: %s", requestID, request.VolumeId)
+	klog.Infof("RequestID: %s, Delete volume: %s", requestID, request.VolumeId)
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
@@ -176,70 +161,12 @@ func (d *controllerService) ControllerGetCapabilities(ctx context.Context, reque
 // ControllerPublishVolume publish a volume
 // In Kubernetes, this function is used to attach volume to node
 func (d *controllerService) ControllerPublishVolume(ctx context.Context, request *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
-	// Generate request ID for log tracking
-	requestID := generateRequestID()
-	klog.Infof("RequestID: %s, ControllerPublishVolume called with request: %v", requestID, request)
-
-	if len(request.VolumeId) == 0 {
-		klog.Errorf("RequestID: %s, Volume ID cannot be empty", requestID)
-		return nil, status.Error(codes.InvalidArgument, "Volume ID cannot be empty")
-	}
-
-	if len(request.NodeId) == 0 {
-		klog.Errorf("RequestID: %s, Node ID cannot be empty", requestID)
-		return nil, status.Error(codes.InvalidArgument, "Node ID cannot be empty")
-	}
-
-	// For filesystem-based CSI driver, we don't need to perform actual attach operation
-	// We only need to verify if volume exists, then return success
-	// Actual mount operation is handled in NodePublishVolume
-
-	// Get curvinePath parameter from VolumeContext
-	curvinePath, ok := request.VolumeContext["curvinePath"]
-	if !ok {
-		klog.Errorf("RequestID: %s, Parameter 'curvinePath' not found in volume context", requestID)
-		return nil, status.Error(codes.InvalidArgument, "Parameter 'curvinePath' not found in volume context")
-	}
-
-	// Check if curvinePath exists
-	klog.Infof("RequestID: %s, Checking if curvine path exists: %s", requestID, curvinePath)
-	err := d.isCurvinePathExists(ctx, requestID, curvinePath)
-	if err != nil {
-		klog.Errorf("RequestID: %s, Curvine path does not exist: %s, error: %v", requestID, curvinePath, err)
-		return nil, status.Errorf(codes.NotFound, "Volume %s does not exist: %v", curvinePath, err)
-	}
-
-	// Build publish context, this will be used in NodeStageVolume and NodePublishVolume
-	publishContext := map[string]string{
-		"curvinePath": curvinePath,
-	}
-
-	// Record node ID, indicating volume has been attached to this node
-	klog.Infof("RequestID: %s, Volume %s attached to node %s", requestID, curvinePath, request.NodeId)
-
-	klog.Infof("RequestID: %s, ControllerPublishVolume completed successfully", requestID)
-	return &csi.ControllerPublishVolumeResponse{
-		PublishContext: publishContext,
-	}, nil
+	return nil, status.Error(codes.Unimplemented, "")
 }
 
 // ControllerUnpublishVolume unpublish a volume
 func (d *controllerService) ControllerUnpublishVolume(ctx context.Context, request *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
-	// Generate request ID for log tracking
-	requestID := generateRequestID()
-	klog.Infof("RequestID: %s, ControllerUnpublishVolume called with request: %v", requestID, request)
-
-	if len(request.VolumeId) == 0 {
-		klog.Errorf("RequestID: %s, Volume ID cannot be empty", requestID)
-		return nil, status.Error(codes.InvalidArgument, "Volume ID cannot be empty")
-	}
-
-	// Here we don't need to perform actual operations, because Curvine CSI driver is filesystem-based
-	// Actual mount/unmount operations are handled in NodePublishVolume/NodeUnpublishVolume
-	// Here we just need to return success
-
-	klog.Infof("RequestID: %s, ControllerUnpublishVolume completed successfully", requestID)
-	return &csi.ControllerUnpublishVolumeResponse{}, nil
+	return nil, status.Error(codes.Unimplemented, "")
 }
 
 // ValidateVolumeCapabilities validate volume capabilities
@@ -299,6 +226,7 @@ func (d *controllerService) CreateCurinveDir(ctx context.Context, requestID stri
 		d.config.RetryCount,
 		time.Duration(d.config.RetryInterval)*time.Second,
 		time.Duration(d.config.CommandTimeout)*time.Second,
+		nil,
 	)
 
 	if err != nil {
@@ -328,6 +256,7 @@ func (d *controllerService) isCurvinePathExists(ctx context.Context, requestID s
 		d.config.RetryCount,
 		time.Duration(d.config.RetryInterval)*time.Second,
 		time.Duration(d.config.CommandTimeout)*time.Second,
+		nil,
 	)
 
 	if err != nil {

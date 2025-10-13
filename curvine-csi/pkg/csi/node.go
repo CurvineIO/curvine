@@ -63,18 +63,18 @@ func newNodeService(nodeID string, config *Config) *nodeService {
 func (n *nodeService) NodeStageVolume(ctx context.Context, request *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	klog.Infof("NodeStageVolume, request: %v", request)
 
+	stageingPath := request.GetStagingTargetPath()
 	// Check if staging path exists
-	if _, err := os.Stat(request.GetStagingTargetPath()); err == nil {
+	if _, err := os.Stat(stageingPath); err == nil {
 		klog.Infof("NodeStageVolume, staging path already exists: %v", request.GetStagingTargetPath())
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
-	// Create staging directory
-	stageingPath := request.GetStagingTargetPath()
 	// Generate request ID for log tracking
 	requestID := generateRequestID()
 	klog.Infof("RequestID: %s, Creating staging directory at: %s", requestID, stageingPath)
 
+	// Create staging directory
 	if err := os.MkdirAll(stageingPath, 0750); err != nil {
 		klog.Errorf("RequestID: %s, Failed to create staging directory at %s: %v", requestID, stageingPath, err)
 		return nil, status.Errorf(codes.Internal, "Failed to create staging directory at %s: %v", stageingPath, err)
@@ -223,6 +223,7 @@ func (n *nodeService) NodeUnpublishVolume(ctx context.Context, request *csi.Node
 		n.config.RetryCount,
 		time.Duration(n.config.RetryInterval)*time.Second,
 		time.Duration(n.config.CommandTimeout)*time.Second,
+		[]string{"not mounted"},
 	)
 
 	// Try to find and terminate related curvine-fuse processes
