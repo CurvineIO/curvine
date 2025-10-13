@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::IOResult;
-use crate::message::Message;
-use crate::sys::DataSlice;
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::net::TcpStream;
+use crate::io::IOResult;
+use crate::message::Message;
 
-// @todo and RpcFrame have duplicate code, and subsequent optimizations
 pub struct WriteFrame {
     io: WriteHalf<TcpStream>,
     buf: BytesMut,
@@ -31,16 +29,7 @@ impl WriteFrame {
     }
 
     pub async fn send(&mut self, msg: &Message) -> IOResult<()> {
-        let header_len = msg.header_len();
-        let data_len = msg.data_len();
-
-        // message protocol control block
-        self.buf.put_i32((18 + header_len + data_len) as i32);
-        self.buf.put_i32(header_len as i32);
-        self.buf.put_i8(msg.code());
-        self.buf.put_i8(msg.encode_status());
-        self.buf.put_i64(msg.req_id());
-        self.buf.put_i32(msg.seq_id());
+        msg.encode_protocol(&mut self.buf);
         self.io.write_all(&self.buf.split()).await?;
 
         // message header part
@@ -49,16 +38,10 @@ impl WriteFrame {
         }
 
         // message data section.
-        match &msg.data {
-            DataSlice::Empty => (),
-
-            DataSlice::Buffer(buf) => {
-                self.io.write_all(buf).await?;
-            }
-
-            _ => panic!(),
-        };
-
+        let slice = msg.data.as_slice();
+        if !slice.is_empty() {
+            self.io.write_all( slice).await?;
+        }
         self.io.flush().await?;
         Ok(())
     }

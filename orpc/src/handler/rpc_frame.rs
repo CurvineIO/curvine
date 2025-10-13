@@ -37,8 +37,7 @@ pub enum FrameSate {
 /// Custom data frame resolution
 pub struct RpcFrame {
     io: TcpStream,
-    read_buf: BytesMut,
-    write_buf: BytesMut,
+    buf: BytesMut,
     enable_splice: bool,
 }
 
@@ -52,8 +51,7 @@ impl RpcFrame {
 
         RpcFrame {
             io,
-            read_buf: BytesMut::with_capacity(buffer_size),
-            write_buf: BytesMut::with_capacity(buffer_size),
+            buf: BytesMut::with_capacity(buffer_size),
             enable_splice,
         }
     }
@@ -68,11 +66,11 @@ impl RpcFrame {
 
     // Read data of the specified length.
     pub async fn read_full(&mut self, len: i32) -> IOResult<BytesMut> {
-        self.read_buf.reserve(len as usize);
+        self.buf.reserve(len as usize);
         unsafe {
-            self.read_buf.set_len(len as usize);
+            self.buf.set_len(len as usize);
         }
-        let mut buf = self.read_buf.split_to(len as usize);
+        let mut buf = self.buf.split_to(len as usize);
         self.io.read_exact(&mut buf).await?;
         Ok(buf)
     }
@@ -87,16 +85,7 @@ impl RpcFrame {
                         Err(_) => return Ok(Message::empty()),
                     };
 
-                    let total_size = buf.get_i32();
-                    let header_size = buf.get_i32();
-                    let data_size = total_size - header_size - message::HEAD_SIZE;
-                    if data_size < 0 {
-                        return err_box!("data length is negative");
-                    } else if data_size > MAX_DATE_SIZE {
-                        return err_box!("Data exceeds maximum size: {}", MAX_DATE_SIZE);
-                    }
-
-                    let protocol = Protocol::create(&mut buf);
+                    let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
                     let _ = mem::replace(
                         &mut state,
                         FrameSate::Data(protocol, header_size, data_size),
@@ -148,17 +137,8 @@ impl RpcFrame {
     }
 
     pub async fn send(&mut self, msg: &Message) -> IOResult<()> {
-        let header_len = msg.header_len();
-        let data_len = msg.data_len();
-
-        // message protocol control block
-        self.write_buf.put_i32((18 + header_len + data_len) as i32);
-        self.write_buf.put_i32(header_len as i32);
-        self.write_buf.put_i8(msg.code());
-        self.write_buf.put_i8(msg.encode_status());
-        self.write_buf.put_i64(msg.req_id());
-        self.write_buf.put_i32(msg.seq_id());
-        self.io.write_all(&self.write_buf.split()).await?;
+        msg.encode_protocol(&mut self.buf);
+        self.io.write_all(&self.buf.split()).await?;
 
         // message header part
         if let Some(h) = &msg.header {
@@ -261,13 +241,13 @@ impl RpcFrame {
     }
 
     pub fn into_tokio_frame(self) -> Framed<TcpStream, RpcCodec> {
-        Framed::with_capacity(self.io, RpcCodec::new(), self.read_buf.capacity())
+        Framed::with_capacity(self.io, RpcCodec::new(), self.buf.capacity())
     }
 
     pub fn split(self) -> (ReadFrame, WriteFrame) {
         let (read, write) = tokio::io::split(self.io);
-        let read_frame = ReadFrame::new(read, self.read_buf);
-        let write_frame = WriteFrame::new(write, self.write_buf);
+        let read_frame = ReadFrame::new(read, BytesMut::with_capacity(self.buf.capacity()));
+        let write_frame = WriteFrame::new(write, self.buf);
         (read_frame, write_frame)
     }
 
