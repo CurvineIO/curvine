@@ -1024,7 +1024,8 @@ impl fs::FileSystem for CurvineFileSystem {
                 replicas: None,
                 owner,
                 group,
-                mode: Some(op.arg.mode & 0o7777),
+                // Apply umask: effective_mode = requested_mode & ~umask
+                mode: Some((op.arg.mode & 0o7777) & !op.arg.umask),
                 atime: None,
                 mtime: None,
                 ttl_ms: None,
@@ -1191,7 +1192,8 @@ impl fs::FileSystem for CurvineFileSystem {
                 replicas: None,
                 owner,
                 group,
-                mode: Some(op.arg.mode & 0o7777),
+                // Apply umask: effective_mode = requested_mode & ~umask
+                mode: Some((op.arg.mode & 0o7777) & !op.arg.umask),
                 atime: None,
                 mtime: None,
                 ttl_ms: None,
