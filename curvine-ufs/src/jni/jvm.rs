@@ -46,7 +46,8 @@
 use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use tracing::{error, info, warn};
 
 #[cfg(feature = "jni")]
@@ -56,6 +57,18 @@ pub static JVM: JavaVmWrapper = JavaVmWrapper;
 
 #[cfg(feature = "jni")]
 static INSTANCE: OnceLock<JavaVM> = OnceLock::new();
+
+// Mutex to protect JVM initialization from concurrent access
+#[cfg(feature = "jni")]
+static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+// Track initialization attempts to prevent infinite retries
+#[cfg(feature = "jni")]
+static INIT_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+
+// Maximum initialization attempts before giving up
+#[cfg(feature = "jni")]
+const MAX_INIT_ATTEMPTS: u32 = 3;
 
 static JVM_BUILDER: OnceLock<Box<dyn Fn() -> JavaVM + Send + Sync>> = OnceLock::new();
 
@@ -77,29 +90,90 @@ impl JavaVmWrapper {
 
     /// Get or initialize the JavaVM instance
     ///
+    /// Thread-safe: Uses double-checked locking to ensure only one thread initializes JVM.
+    /// Other threads will block on the mutex and wait for initialization to complete.
+    ///
+    /// # Failure Handling
+    /// - If initialization fails, other tasks can retry (up to MAX_INIT_ATTEMPTS)
+    /// - Handles poisoned mutex (when initialization panics)
+    /// - Tracks retry attempts to prevent infinite loops
+    ///
     /// # Returns
     /// Reference to the static JavaVM instance
     ///
     /// # Errors
-    /// Returns error if JVM builder is not registered or JVM creation fails
+    /// Returns error if:
+    /// - JVM builder is not registered
+    /// - JVM initialization fails after MAX_INIT_ATTEMPTS
+    /// - Mutex is poisoned and cannot be recovered
     #[cfg(feature = "jni")]
     pub fn get_or_init(&self) -> Result<&'static JavaVM> {
-        match INSTANCE.get() {
-            Some(jvm) => Ok(jvm),
-            None => {
-                let builder = JVM_BUILDER.get().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "JVM builder must be registered via register_jvm() before first use"
-                    )
-                })?;
-                let jvm = builder();
-                // Try to set the JVM, but if another thread beat us to it, use theirs
-                match INSTANCE.set(jvm) {
-                    Ok(()) => Ok(INSTANCE.get().unwrap()),
-                    Err(_) => Ok(INSTANCE.get().unwrap()),
-                }
-            }
+        // Fast path: JVM already initialized
+        if let Some(jvm) = INSTANCE.get() {
+            return Ok(jvm);
         }
+
+        // Check if we've exceeded retry limit
+        let attempts = INIT_ATTEMPTS.load(Ordering::Relaxed);
+        if attempts >= MAX_INIT_ATTEMPTS {
+            return Err(anyhow::anyhow!(
+                "JVM initialization failed after {} attempts, giving up",
+                attempts
+            ));
+        }
+
+        // Slow path: need to initialize JVM with lock protection
+        // Handle poisoned mutex (previous initialization panicked)
+        let _lock = match INIT_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("JVM initialization lock was poisoned (previous panic), recovering");
+                poisoned.into_inner()
+            }
+        };
+
+        // Double-check: another thread may have initialized while we waited for lock
+        if let Some(jvm) = INSTANCE.get() {
+            return Ok(jvm);
+        }
+
+        // Increment attempt counter
+        let attempt = INIT_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+        info!(
+            "Attempting JVM initialization (attempt {}/{})",
+            attempt, MAX_INIT_ATTEMPTS
+        );
+
+        // Get builder
+        let builder = JVM_BUILDER.get().ok_or_else(|| {
+            anyhow::anyhow!("JVM builder must be registered via register_jvm() before first use")
+        })?;
+
+        // Try to initialize JVM
+        info!("Initializing JVM for HDFS operations (thread-safe initialization)");
+        let jvm = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builder())) {
+            Ok(jvm) => {
+                info!("JVM initialized successfully on attempt {}", attempt);
+                jvm
+            }
+            Err(panic_err) => {
+                error!(
+                    "JVM initialization panicked on attempt {}: {:?}",
+                    attempt, panic_err
+                );
+                return Err(anyhow::anyhow!(
+                    "JVM initialization panicked on attempt {}",
+                    attempt
+                ));
+            }
+        };
+
+        // Store the initialized JVM instance
+        INSTANCE.set(jvm).map_err(|_| {
+            anyhow::anyhow!("Failed to store JVM instance (concurrent initialization conflict)")
+        })?;
+
+        Ok(INSTANCE.get().expect("JVM was just initialized"))
     }
 
     #[cfg(feature = "jni")]

@@ -474,16 +474,95 @@ impl OpendalFileSystem {
         if path.is_root() {
             Ok("/".to_string())
         } else {
-            // Remove the scheme and bucket from the path
             let full_path = path.path();
             let trimmed = full_path.trim_start_matches('/');
             if trimmed.is_empty() {
                 Ok("/".to_string())
             } else {
-                // Keep the trailing slash for directories if it exists
                 Ok(trimmed.to_string())
             }
         }
+    }
+
+    async fn process_entry(
+        &self,
+        entry: opendal::Entry,
+        parent_normalized: &str,
+    ) -> Option<FileStatus> {
+        let raw_path = format!(
+            "{}://{}/{}",
+            self.scheme,
+            self.bucket_or_container,
+            entry.path()
+        );
+        let entry_path = Path::from_str(&raw_path)
+            .ok()?
+            .normalize_uri()
+            .unwrap_or(raw_path.clone());
+
+        let metadata = entry.metadata();
+
+        // Critical: Skip self-references to prevent infinite recursion
+        if metadata.is_dir() && entry_path == parent_normalized {
+            log::warn!(
+                "Filtered self-reference: '{}' points to parent '{}'",
+                entry_path,
+                parent_normalized
+            );
+            return None;
+        }
+
+        // Get metadata with HDFS stat optimization
+        let (mtime, content_length) =
+            if self.scheme == "hdfs" && metadata.is_dir() && metadata.last_modified().is_none() {
+                self.get_hdfs_metadata(&entry)
+                    .await
+                    .unwrap_or((946684800000, metadata.content_length() as i64))
+            } else {
+                (
+                    metadata
+                        .last_modified()
+                        .map(|t| t.timestamp_millis())
+                        .unwrap_or(946684800000),
+                    metadata.content_length() as i64,
+                )
+            };
+
+        // Clean directory names (remove trailing slash)
+        let name = entry.name();
+        let cleaned_name = if metadata.is_dir() && name.ends_with('/') {
+            &name[..name.len() - 1]
+        } else {
+            name
+        };
+
+        Some(FileStatus {
+            path: entry_path,
+            name: cleaned_name.to_owned(),
+            is_dir: metadata.is_dir(),
+            file_type: if metadata.is_dir() {
+                FileType::Dir
+            } else {
+                FileType::File
+            },
+            mtime,
+            len: content_length,
+            is_complete: true,
+            replicas: 1,
+            block_size: 4 * 1024 * 1024,
+            ..Default::default()
+        })
+    }
+
+    async fn get_hdfs_metadata(&self, entry: &opendal::Entry) -> Option<(i64, i64)> {
+        self.operator.stat(entry.path()).await.ok().map(|stat| {
+            (
+                stat.last_modified()
+                    .map(|t| t.timestamp_millis())
+                    .unwrap_or(946684800000),
+                stat.content_length() as i64,
+            )
+        })
     }
 }
 
@@ -637,6 +716,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     }
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
+        // Build object path with HDFS trailing slash (needed for proper directory listing)
         let mut object_path = self.get_object_path(path)?;
         if self.scheme == "hdfs" && !object_path.ends_with('/') && !object_path.is_empty() {
             object_path.push('/');
@@ -648,63 +728,16 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             .await
             .map_err(|e| FsError::common(format!("Failed to list directory: {}", e)))?;
 
+        // Get parent path for self-reference filtering
+        let parent_normalized = path
+            .normalize_uri()
+            .unwrap_or_else(|| path.full_path().to_string());
+
         let mut statuses = Vec::new();
         for entry in list_result {
-            let entry_path = format!(
-                "{}://{}/{}",
-                self.scheme,
-                self.bucket_or_container,
-                entry.path()
-            );
-
-            let metadata = entry.metadata();
-            let (mtime, content_length) =
-                if self.scheme == "hdfs" && metadata.is_dir() && metadata.last_modified().is_none()
-                {
-                    match self.operator.stat(entry.path()).await {
-                        Ok(stat_metadata) => (
-                            stat_metadata
-                                .last_modified()
-                                .map(|t| t.timestamp_millis())
-                                .unwrap_or(946684800000),
-                            stat_metadata.content_length() as i64,
-                        ),
-                        Err(_) => (946684800000, metadata.content_length() as i64),
-                    }
-                } else {
-                    (
-                        metadata
-                            .last_modified()
-                            .map(|t| t.timestamp_millis())
-                            .unwrap_or(946684800000),
-                        metadata.content_length() as i64,
-                    )
-                };
-
-            // Remove trailing slash from directory names for FUSE compatibility
-            let name = entry.name();
-            let cleaned_name = if metadata.is_dir() && name.ends_with('/') {
-                &name[..name.len() - 1]
-            } else {
-                name
-            };
-
-            statuses.push(FileStatus {
-                path: entry_path.clone(),
-                name: cleaned_name.to_owned(),
-                is_dir: metadata.is_dir(),
-                mtime,
-                is_complete: true,
-                len: content_length,
-                replicas: 1,
-                block_size: 4 * 1024 * 1024,
-                file_type: if metadata.is_dir() {
-                    FileType::Dir
-                } else {
-                    FileType::File
-                },
-                ..Default::default()
-            });
+            if let Some(status) = self.process_entry(entry, &parent_normalized).await {
+                statuses.push(status);
+            }
         }
 
         Ok(statuses)
