@@ -283,7 +283,7 @@ pub struct ListObjectResult {
     pub common_prefixes: Vec<CommonPrefix>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ListObjectContent {
     pub key: String,
@@ -323,7 +323,7 @@ pub struct Bucket {
     pub bucket_region: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Owner {
     pub id: String,
@@ -831,16 +831,28 @@ pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
     let ret = handler.handle(&opt, bucket.as_str()).await;
     match ret {
         Ok(ans) => {
+            let (contents, common_prefixes) = if let Some(ref delim) = opt.delimiter {
+                let files = ans
+                    .into_iter()
+                    .filter(|item| !item.key.ends_with(delim))
+                    .collect();
+                (files, vec![])
+            } else {
+                (ans, vec![])
+            };
+
+            let total_count = contents.len() + common_prefixes.len();
+
             let result = ListObjectResult {
                 xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
                 name: bucket,
                 prefix: opt.prefix,
-                key_count: Some(ans.len() as u32),
+                key_count: Some(total_count as u32),
                 max_keys: Some(opt.max_keys.unwrap_or(1000) as u32),
                 delimiter: opt.delimiter,
                 is_truncated: false,
-                contents: ans,
-                common_prefixes: vec![],
+                contents,
+                common_prefixes,
             };
 
             match quick_xml::se::to_string(&result) {

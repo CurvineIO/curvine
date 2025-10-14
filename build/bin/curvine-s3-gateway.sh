@@ -17,7 +17,15 @@
 #
 
 # Source environment variables
-. "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
+# Check if the conf directory exists in build, otherwise use etc
+if [ -f "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh ]; then
+    . "$(cd "`dirname "$0"`"; pwd)"/../conf/curvine-env.sh
+elif [ -f "$(cd "`dirname "$0"`"; pwd)"/../../etc/curvine-env.sh ]; then
+    . "$(cd "`dirname "$0"`"; pwd)"/../../etc/curvine-env.sh
+else
+    # Set CURVINE_HOME if not defined
+    export CURVINE_HOME="$(cd "`dirname "$0"`"/../..; pwd)"
+fi
 
 # Service configuration
 SERVICE_NAME="curvine-s3-gateway"
@@ -210,9 +218,14 @@ start_service() {
     # Try to read from config file if not specified
     if [ -f "$CONFIG_FILE" ]; then
         if [ -z "$LISTEN" ]; then
-            local LISTEN_FROM_CONFIG=$(grep -E '^\s*listen\s*=' "$CONFIG_FILE" | head -1 | sed 's/.*=\s*"\([^"]*\)".*/\1/' 2>/dev/null || echo "")
+            local LISTEN_FROM_CONFIG=$(awk -F'=' '/listen/ {gsub(/^[ \t"]+|[ \t"]+$/, "", \$2); print \$2}' "$CONFIG_FILE" 2>/dev/null | head -1 || echo "")
             if [ -n "$LISTEN_FROM_CONFIG" ]; then
-                LISTEN_ADDR="$LISTEN_FROM_CONFIG"
+                # Handle the case where listen address is just ":port" by prepending "0.0.0.0"
+                if [[ "$LISTEN_FROM_CONFIG" =~ ^:[0-9]+$ ]]; then
+                    LISTEN_ADDR="0.0.0.0$LISTEN_FROM_CONFIG"
+                else
+                    LISTEN_ADDR="$LISTEN_FROM_CONFIG"
+                fi
                 echo "Using listen address from config: $LISTEN_ADDR"
             fi
         fi
@@ -243,11 +256,16 @@ start_service() {
     fi
 
     # Check if binary exists
-    local BINARY_PATH="${CURVINE_HOME}/lib/${SERVICE_NAME}"
+    # First check in build/dist/lib (new build structure)
+    local BINARY_PATH="${CURVINE_HOME}/build/dist/lib/${SERVICE_NAME}"
     if [ ! -f "$BINARY_PATH" ]; then
-        echo "Error: ${SERVICE_NAME} binary not found at $BINARY_PATH"
-        echo "Please ensure the project has been built with 'make all'"
-        exit 1
+        # Fallback to old structure
+        BINARY_PATH="${CURVINE_HOME}/lib/${SERVICE_NAME}"
+        if [ ! -f "$BINARY_PATH" ]; then
+            echo "Error: ${SERVICE_NAME} binary not found at $BINARY_PATH"
+            echo "Please ensure the project has been built with 'make all'"
+            exit 1
+        fi
     fi
     
     # Create log directory
@@ -328,11 +346,17 @@ stop_service() {
 
 # Handle credential management commands
 handle_credential() {
-    local BINARY_PATH="${CURVINE_HOME}/lib/${SERVICE_NAME}"
+    # Check if binary exists
+    # First check in build/dist/lib (new build structure)
+    local BINARY_PATH="${CURVINE_HOME}/build/dist/lib/${SERVICE_NAME}"
     if [ ! -f "$BINARY_PATH" ]; then
-        echo "Error: ${SERVICE_NAME} binary not found at $BINARY_PATH"
-        echo "Please ensure the project has been built with 'make all'"
-        exit 1
+        # Fallback to old structure
+        BINARY_PATH="${CURVINE_HOME}/lib/${SERVICE_NAME}"
+        if [ ! -f "$BINARY_PATH" ]; then
+            echo "Error: ${SERVICE_NAME} binary not found at $BINARY_PATH"
+            echo "Please ensure the project has been built with 'make all'"
+            exit 1
+        fi
     fi
     
     local CONFIG_FILE=${CONF:-${DEFAULT_CONF}}

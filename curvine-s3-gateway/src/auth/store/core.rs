@@ -102,29 +102,25 @@ impl<T: FileSystemAdapter> CredentialStoreCore<T> {
             .get_file_mtime(&self.credentials_path)
             .await?;
 
-        {
+        // Check if we need to refresh based on time or file modification
+        let should_refresh = {
             let cache = self.cache.read().await;
-            if let Some(last_modified) = cache.last_modified {
-                let needs_refresh = if let Some(last_refresh) = cache.last_refresh {
-                    last_refresh.elapsed() >= self.cache_refresh_interval
-                } else {
-                    true // No previous refresh, need to refresh
-                };
+            cache
+                .last_refresh
+                .is_none_or(|last| last.elapsed() >= self.cache_refresh_interval)
+                || cache.last_modified.is_none_or(|last| file_mtime > last)
+        };
 
-                if file_mtime <= last_modified && !needs_refresh {
-                    tracing::debug!("Cache is up to date, skipping refresh");
-                    return Ok(());
-                }
-            }
+        if !should_refresh {
+            tracing::debug!("Cache is up to date, skipping refresh");
+            return Ok(());
         }
 
-        // Read and parse credentials file
+        // Load credentials and update cache
         let credentials = self.load_credentials_from_file().await?;
-
         let size = {
             let mut cache = self.cache.write().await;
-            cache.credentials.clear(); // Clear existing credentials
-
+            cache.credentials.clear();
             for entry in credentials {
                 if entry.is_valid() {
                     cache.credentials.insert(
@@ -133,14 +129,12 @@ impl<T: FileSystemAdapter> CredentialStoreCore<T> {
                     );
                 }
             }
-
             cache.last_modified = Some(file_mtime);
             cache.last_refresh = Some(Instant::now());
-
             cache.credentials.len()
         };
-        tracing::debug!("Refreshed cache with {} credentials", size);
 
+        tracing::debug!("Refreshed cache with {} credentials", size);
         Ok(())
     }
 
@@ -196,6 +190,10 @@ impl<T: FileSystemAdapter> CredentialStoreCore<T> {
                 entry.secret_key.expose().to_string(),
             );
             cache.last_refresh = Some(Instant::now());
+
+            if let Ok(file_mtime) = self.fs_adapter.get_file_mtime(&self.credentials_path).await {
+                cache.last_modified = Some(file_mtime);
+            }
         }
 
         tracing::info!(
