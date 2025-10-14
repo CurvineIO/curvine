@@ -28,7 +28,6 @@ use futures::future;
 use log::{error, info, warn};
 use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime, Utils};
 use orpc::err_box;
-use std::collections::LinkedList;
 use std::sync::Arc;
 
 pub struct LoadJobRunner {
@@ -175,8 +174,8 @@ impl LoadJobRunner {
             .into_iter()
             .map(|(id, task)| async move {
                 let client = self.factory.get_worker_client(&task.task.worker).await?;
-                client.submit_load_task(task.task).await?;
-                info!("Submit sub-task {}", id);
+                client.submit_load_task(task.task.clone()).await?;
+                info!("Submit sub-task {} for file: {}", id, task.task.source_path);
                 Ok::<(), FsError>(())
             })
             .collect();
@@ -195,36 +194,38 @@ impl LoadJobRunner {
         job.update_state(JobTaskState::Pending, "Assigning workers");
         let block_size = job.info.block_size;
 
-        let mut total_size = 0;
-        let mut stack = LinkedList::new();
-        let mut task_index = 0;
-        stack.push_back(source_status);
-        while let Some(status) = stack.pop_front() {
-            if status.is_dir {
-                let dir_path = Path::from_str(status.path)?;
-                let childs = ufs.list_status(&dir_path).await?;
-                for child in childs {
-                    stack.push_back(child);
-                }
-            } else {
-                let worker = self.choose_worker(block_size)?;
+        let (mut total_size, mut stack) = (0i64, vec![source_status]);
+        let mut visited_paths = FastHashSet::<String>::with_capacity(128);
+        let (mut task_index, mut dir_count, mut file_count) = (0usize, 0u32, 0u32);
 
-                let source_path = Path::from_str(status.path)?;
+        while let Some(status) = stack.pop() {
+            if status.is_dir {
+                dir_count += 1;
+                let normalized_path = Path::from_str(&status.path)?
+                    .normalize_uri()
+                    .unwrap_or_else(|| status.path.clone());
+
+                if !visited_paths.insert(normalized_path) {
+                    continue;
+                }
+
+                stack.extend(ufs.list_status(&Path::from_str(&status.path)?).await?);
+            } else {
+                file_count += 1;
+                let source_path = Path::from_str(&status.path)?;
                 let target_path = mnt.get_cv_path(&source_path)?;
 
-                let task_id = format!("{}_task_{}", job.info.job_id, task_index);
-                task_index += 1;
-                total_size += status.len;
-
-                let task = LoadTaskInfo {
+                job.add_task(LoadTaskInfo {
                     job: job.info.clone(),
-                    task_id: task_id.clone(),
-                    worker: worker.clone(),
+                    task_id: format!("{}_task_{}", job.info.job_id, task_index),
+                    worker: self.choose_worker(block_size)?,
                     source_path: source_path.clone_uri(),
                     target_path: target_path.clone_path(),
                     create_time: LocalTime::mills() as i64,
-                };
-                job.add_task(task.clone());
+                });
+
+                task_index += 1;
+                total_size += status.len;
 
                 if job.tasks.len() > self.job_max_files {
                     return err_box!(
@@ -233,10 +234,13 @@ impl LoadJobRunner {
                         self.job_max_files
                     );
                 }
-                info!("Added sub-task {}", task_id);
             }
         }
 
+        info!(
+            "Job {} created {} tasks for {} files and processed {} directories",
+            job.info.job_id, task_index, file_count, dir_count
+        );
         Ok(total_size)
     }
 
