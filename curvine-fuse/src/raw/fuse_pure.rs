@@ -31,28 +31,41 @@ use orpc::sys::open;
 const FUSERMOUNT_BIN: &str = "fusermount";
 const FUSERMOUNT3_BIN: &str = "fusermount3";
 
+// Check whether a mount option exists as a standalone key (not a substring).
+// For example, "ro" should match token "ro" but NOT "rootmode=...".
+fn has_mount_opt(options: &str, key: &str) -> bool {
+    options.split(',').any(|token| {
+        let token = token.trim();
+        if token.is_empty() {
+            return false;
+        }
+        let k = token.split_once('=').map(|(k, _)| k).unwrap_or(token);
+        k == key
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub fn options_to_flag(mount_option: &str) -> libc::c_ulong {
     let mut flags = 0;
-    if mount_option.contains("ro") {
+    if has_mount_opt(mount_option, "ro") {
         flags |= libc::MS_RDONLY;
     }
-    if mount_option.contains("nodev") {
+    if has_mount_opt(mount_option, "nodev") {
         flags |= libc::MS_NODEV;
     }
-    if mount_option.contains("nosuid") {
+    if has_mount_opt(mount_option, "nosuid") {
         flags |= libc::MS_NOSUID;
     }
-    if mount_option.contains("noexec") {
+    if has_mount_opt(mount_option, "noexec") {
         flags |= libc::MS_NOEXEC;
     }
-    if mount_option.contains("noatime") {
+    if has_mount_opt(mount_option, "noatime") {
         flags |= libc::MS_NOATIME;
     }
-    if mount_option.contains("dirsync") {
+    if has_mount_opt(mount_option, "dirsync") {
         flags |= libc::MS_DIRSYNC;
     }
-    if mount_option.contains("sync") {
+    if has_mount_opt(mount_option, "sync") {
         flags |= libc::MS_SYNCHRONOUS;
     }
 
@@ -62,25 +75,25 @@ pub fn options_to_flag(mount_option: &str) -> libc::c_ulong {
 #[cfg(target_os = "macos")]
 pub fn options_to_flag(mount_option: &String) -> libc::c_long {
     let mut flags = 0;
-    if mount_option.contains("ro") {
+    if has_mount_opt(mount_option, "ro") {
         flags |= libc::MNT_RDONLY;
     }
-    if mount_option.contains("nodev") {
+    if has_mount_opt(mount_option, "nodev") {
         flags |= libc::MNT_NODEV;
     }
-    if mount_option.contains("nosuid") {
+    if has_mount_opt(mount_option, "nosuid") {
         flags |= libc::MNT_NOSUID;
     }
-    if mount_option.contains("noexec") {
+    if has_mount_opt(mount_option, "noexec") {
         flags |= libc::MNT_NOEXEC;
     }
-    if mount_option.contains("noatime") {
+    if has_mount_opt(mount_option, "noatime") {
         flags |= libc::MNT_NOATIME;
     }
-    if mount_option.contains("dirsync") {
+    if has_mount_opt(mount_option, "dirsync") {
         flags |= libc::MNT_DIRSYNC;
     }
-    if mount_option.contains("sync") {
+    if has_mount_opt(mount_option, "sync") {
         flags |= libc::MNT_SYNCHRONOUS;
     }
 
