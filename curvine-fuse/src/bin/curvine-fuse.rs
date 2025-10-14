@@ -185,12 +185,6 @@ impl FuseArgs {
             conf.master.web_port = web_port;
         }
 
-        // Client configuration (for connecting to master) - use current master config
-        conf.client.master_addrs = vec![orpc::io::net::InetAddr::new(
-            &conf.master.hostname,
-            conf.master.rpc_port,
-        )];
-
         // FUSE configuration - override with command line values
         // These have default values from clap, so always override
         conf.fuse.mnt_path = self.mnt_path.clone();
