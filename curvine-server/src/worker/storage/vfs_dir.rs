@@ -121,16 +121,12 @@ impl VfsDir {
     }
 
     pub fn available(&self) -> i64 {
-        let _disk_total = self.stats.total_space() as i64;
-        let disk_used = self.stats.used_space() as i64;
         let disk_available = self.stats.available_space() as i64;
 
         let capacity = self.capacity();
         let fs_used = self.fs_used();
         let reserved_bytes = self.reserved_bytes;
-        let non_fs_used = disk_used - fs_used;
-
-        let calculated_available = capacity - fs_used - non_fs_used - reserved_bytes;
+        let calculated_available = capacity - fs_used - reserved_bytes;
 
         0.max(calculated_available.min(disk_available))
     }
@@ -386,9 +382,12 @@ mod test {
         let conf = "[SSD:100MB]../testing";
         let version = StorageVersion::with_cluster("vfs-test");
         let conf = WorkerDataDir::from_str(conf)?;
+        let stg_dir = conf.storage_path("vfs-test");
+        FileUtils::delete_path(stg_dir, true)?;
 
         let dir = VfsDir::new(version, conf, 0)?;
-        FileUtils::delete_path(dir.path_str(), true)?;
+        println!("dir.path_str() = {}", dir.path_str());
+        assert_eq!(dir.available(), 100 * ByteUnit::MB as i64);
 
         // add tmp block
         let block = ExtendedBlock::with_size_str(1122, "10MB", StorageType::Mem)?;

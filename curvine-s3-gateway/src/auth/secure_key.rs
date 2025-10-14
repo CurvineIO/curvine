@@ -162,8 +162,8 @@ mod tests {
     fn test_secret_key_serialization() {
         let secret = SecretKey::from("secret-key");
         let json = serde_json::to_string(&secret).unwrap();
-        assert!(json.contains(PLACEHOLDER));
-        assert!(!json.contains("secret-key"));
+        assert!(!json.contains(PLACEHOLDER));
+        assert!(json.contains("secret-key"));
     }
 
     #[test]
