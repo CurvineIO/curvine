@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{MessageHandler, RpcFrame, StreamHandler, TestMessageHandler};
+use std::sync::Arc;
+use crate::handler::{Frame, MessageHandler, StreamHandler, TestMessageHandler};
 use crate::io::net::ConnState;
 use crate::runtime::Runtime;
 use crate::server::ServerConf;
-use std::sync::Arc;
 
 /// The message processor runs and manages the following functions:
 /// 1. Manage the creation of MessageHandler.
@@ -33,12 +33,12 @@ pub trait HandlerService: Send + Sync + 'static {
 
     fn get_message_handler(&self, conn_info: Option<ConnState>) -> Self::Item;
 
-    fn get_stream_handler(
+    fn get_stream_handler<F: Frame>(
         &self,
         rt: Arc<Runtime>,
-        frame: RpcFrame,
+        frame: F,
         conf: &ServerConf,
-    ) -> StreamHandler<Self::Item> {
+    ) -> StreamHandler<F, Self::Item> {
         let conn_state = if self.has_conn_state() {
             Some(frame.new_conn_state())
         } else {

@@ -1,11 +1,12 @@
 use bytes::{BufMut, BytesMut};
 use log::info;
 use orpc::common::{Logger, Utils};
+use orpc::io::net::InetAddr;
 use orpc::runtime::RpcRuntime;
 use orpc::sync::channel::CallChannel;
 use orpc::sys::DataSlice;
-use orpc::ucp::core::{Config, Context, Endpoint, RmaEndpoint, Worker};
-use orpc::ucp::UcpRuntime;
+use orpc::ucp::core::{Config, Context, Endpoint, Worker};
+use orpc::ucp::reactor::UcpRuntime;
 
 #[test]
 fn config() {
@@ -29,36 +30,11 @@ fn worker() {
 }
 
 #[test]
-fn endpoint_stream() {
-    Logger::default();
-
-    let wr = UcpRuntime::default();
-    let addr = "127.0.0.1:8080".into();
-
-    let executor = wr.worker_executor().clone();
-    let rt = executor.rt().clone();
-
-    let (tx, rx) = CallChannel::channel();
-    rt.spawn(async move {
-        let endpoint = Endpoint::connect(executor, &addr).unwrap();
-        for i in 0..100 {
-            endpoint
-                .stream_send(format!("hello world {}", i).as_bytes())
-                .await
-                .unwrap();
-        }
-        let _ = tx.send(1);
-    });
-
-    let _ = rt.block_on(rx.receive());
-}
-
-#[test]
 fn endpoint_rma() {
     Logger::default();
 
     let wr = UcpRuntime::default();
-    let addr = "127.0.0.1:8080".into();
+    let addr = InetAddr::new("127.0.0.1",8080);
 
     let executor = wr.worker_executor().clone();
     let rt = executor.rt().clone();
@@ -67,8 +43,8 @@ fn endpoint_rma() {
 
 
     rt.spawn(async move {
-        let mut endpoint = RmaEndpoint::connect(executor, &addr, 4).unwrap();
-        endpoint.exchange_mem().await.unwrap();
+        let mut endpoint = wr.connect(&addr, 4).unwrap().into_inner();
+        endpoint.handshake_request().await.unwrap();
 
         for i in 0..10 {
             // 写入数据。

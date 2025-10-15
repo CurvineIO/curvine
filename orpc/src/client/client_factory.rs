@@ -18,6 +18,7 @@ use crate::io::IOResult;
 use crate::runtime::{RpcRuntime, Runtime};
 use crate::sync::FastDashMap;
 use std::sync::{Arc, Mutex};
+use crate::ucp::reactor::UcpRuntime;
 
 struct ClientPool {
     clients: Vec<Option<RpcClient>>,
@@ -135,6 +136,11 @@ impl ClientFactory {
 
     pub fn create_sync(&self, addr: &InetAddr) -> IOResult<SyncClient> {
         let client = self.rt.block_on(RpcClient::with_raw(addr, &self.conf))?;
+        Ok(SyncClient::new(self.rt.clone(), client))
+    }
+
+    pub fn create_sync_ucp(&self, rt: Arc<UcpRuntime>, addr: &InetAddr) -> IOResult<SyncClient> {
+        let client = self.rt.block_on(RpcClient::with_ucp(rt, addr, &self.conf))?;
         Ok(SyncClient::new(self.rt.clone(), client))
     }
 

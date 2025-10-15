@@ -18,10 +18,10 @@ use crate::common::Utils;
 use crate::err_box;
 use crate::io::IOResult;
 use crate::runtime::Runtime;
-use crate::ucp::core::{Endpoint, SockAddr};
-use crate::ucp::request::HandshakeV1;
+use crate::ucp::core::{Endpoint, SockAddr, Worker};
+use crate::ucp::request::{ConnRequest, HandshakeV1};
 use crate::ucp::rma::{LocalMem, RemoteMem, RKey};
-use crate::ucp::{HANDSHAKE_LEN_BYTES, UcpExecutor};
+use crate::ucp::{HANDSHAKE_LEN_BYTES};
 
 /// RMA (Remote Memory Access) endpoint that supports high-performance remote memory operations.
 ///
@@ -47,40 +47,24 @@ impl RmaEndpoint {
         }
     }
 
-    pub fn connect(
-        executor: UcpExecutor,
-        addr: &SockAddr,
-        mem_len: usize
+    pub fn accept(
+        worker: Arc<Worker>,
+        conn: ConnRequest,
+        mem_len: usize,
     ) -> IOResult<Self> {
-        let local_mem = executor.register_memory(mem_len)?;
-        let inner = Endpoint::connect(executor, addr)?;
+        let local_mem = worker.register_memory(mem_len)?;
+        let inner = Endpoint::accept(worker, conn)?;
         Ok(Self::new(inner, local_mem))
     }
 
-    async fn handshake_send(&mut self) -> IOResult<()> {
-        let handshake = HandshakeV1::new(self.ep_id, &self.local_mem)?;
-        let buf = handshake.encode()?;
-        self.inner.stream_send(&buf).await
-    }
-
-    async fn handshake_recv(&mut self) -> IOResult<RemoteMem> {
-        let mut buf = BytesMut::zeroed(HANDSHAKE_LEN_BYTES);
-        self.inner.stream_recv_full(&mut buf).await?;
-
-        let total_len = buf.get_u32() as usize;
-        let mut buf = BytesMut::zeroed(total_len);
-        self.inner.stream_recv_full(&mut buf).await?;
-
-        let rep = HandshakeV1::decode(buf)?;
-        let rkey = RKey::unpack(&self.inner, &rep.rkey)?;
-
-        let remote_mem = RemoteMem::new(
-            rep.ep_id,
-            rep.mem_addr,
-            rep.mem_len as usize,
-            rkey
-        );
-        Ok(remote_mem)
+    pub fn connect(
+        worker: Arc<Worker>,
+        addr: &SockAddr,
+        mem_len: usize
+    ) -> IOResult<Self> {
+        let local_mem = worker.register_memory(mem_len)?;
+        let inner = Endpoint::connect(worker, addr)?;
+        Ok(Self::new(inner, local_mem))
     }
 
     /// 发送握手信息
@@ -116,6 +100,33 @@ impl RmaEndpoint {
             None => err_box!("remote memory not set")
         }
     }
+
+    async fn handshake_send(&mut self) -> IOResult<()> {
+        let handshake = HandshakeV1::new(self.ep_id, &self.local_mem)?;
+        let buf = handshake.encode()?;
+        self.inner.stream_send(&buf).await
+    }
+
+    async fn handshake_recv(&mut self) -> IOResult<RemoteMem> {
+        let mut buf = BytesMut::zeroed(HANDSHAKE_LEN_BYTES);
+        self.inner.stream_recv_full(&mut buf).await?;
+
+        let total_len = buf.get_u32() as usize;
+        let mut buf = BytesMut::zeroed(total_len);
+        self.inner.stream_recv_full(&mut buf).await?;
+
+        let rep = HandshakeV1::decode(buf)?;
+        let rkey = RKey::unpack(&self.inner, &rep.rkey)?;
+
+        let remote_mem = RemoteMem::new(
+            rep.ep_id,
+            rep.mem_addr,
+            rep.mem_len as usize,
+            rkey
+        );
+        Ok(remote_mem)
+    }
+
     pub async fn put(&self, buf: &[u8]) -> IOResult<()> {
         let mem = self.get_remote_mem(buf.len())?;
         self.inner.put(buf, mem).await
@@ -142,9 +153,6 @@ impl RmaEndpoint {
         self.inner.tag_recv(self.ep_id, buf).await
     }
 
-    pub fn executor(&self) -> &UcpExecutor {
-        self.inner.executor()
-    }
     pub async fn tag_send(&self, buf: &[u8]) -> IOResult<()> {
         self.inner.tag_send(self.ep_id, buf).await
     }
@@ -171,9 +179,5 @@ impl RmaEndpoint {
 
     pub fn remote_mem(&self) -> Option<&RemoteMem> {
         self.remote_mem.as_ref()
-    }
-
-    pub fn clone_rt(&self) -> Arc<Runtime> {
-        self.inner.clone_rt()
     }
 }

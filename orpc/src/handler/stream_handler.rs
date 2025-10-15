@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::err_box;
-use crate::handler::{MessageHandler, RpcFrame};
+use crate::handler::{Frame, MessageHandler, RpcFrame};
 use crate::io::IOResult;
 use crate::message::Message;
 use crate::runtime::{RpcRuntime, Runtime};
@@ -25,16 +25,16 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 // Network channel message processor. It associates network connection and message processing logic.
-pub struct StreamHandler<T> {
+pub struct StreamHandler<F, M> {
     rt: Arc<Runtime>,
-    frame: RpcFrame,
-    handler: RawPtr<T>,
+    frame: F,
+    handler: RawPtr<M>,
     close_idle: bool,
     timeout: Duration,
 }
 
-impl<T: MessageHandler> StreamHandler<T> {
-    pub fn new(rt: Arc<Runtime>, frame: RpcFrame, handler: T, conf: &ServerConf) -> Self {
+impl<F: Frame, M: MessageHandler, > StreamHandler<F, M> {
+    pub fn new(rt: Arc<Runtime>, frame: F, handler: M, conf: &ServerConf) -> Self {
         StreamHandler {
             rt,
             frame,
@@ -97,5 +97,9 @@ impl<T: MessageHandler> StreamHandler<T> {
         } else {
             Ok(())
         }
+    }
+
+    pub fn frame_mut(&mut self) -> &mut F {
+        &mut self.frame
     }
 }

@@ -16,7 +16,7 @@ use crate::io::{IOError, IOResult};
 use crate::sync::{AtomicBool, ErrorMonitor};
 use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::bindings::*;
-use crate::ucp::{stderr, UcpUtils, UcpExecutor};
+use crate::ucp::{stderr, UcpUtils};
 use crate::{err_box, err_ucs, poll_status};
 use bytes::{Buf, BufMut, BytesMut};
 use log::{info, warn};
@@ -26,18 +26,18 @@ use std::ptr;
 use std::sync::Arc;
 use std::task::Poll;
 use crate::runtime::Runtime;
-use crate::ucp::core::SockAddr;
+use crate::ucp::core::{SockAddr, Worker};
 use crate::ucp::request::{ConnRequest, RequestParam, RequestStatus, RequestWaker};
 use crate::ucp::rma::{LocalMem, RemoteMem, RKey};
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
-    executor: UcpExecutor,
+    worker: Arc<Worker>,
     err_monitor: Arc<ErrorMonitor<IOError>>,
 }
 
 impl Endpoint {
-    fn new(executor: UcpExecutor, mut params: ucp_ep_params) -> IOResult<Self> {
+    fn new(worker: Arc<Worker>, mut params: ucp_ep_params) -> IOResult<Self> {
         let err_monitor = Arc::new(ErrorMonitor::new());
 
         params.field_mask |= (ucp_ep_params_field::UCP_EP_PARAM_FIELD_USER_DATA
@@ -51,15 +51,43 @@ impl Endpoint {
 
         let mut inner = MaybeUninit::<*mut ucp_ep>::uninit();
         let status =
-            unsafe { ucp_ep_create(executor.worker().as_mut_ptr(), &params, inner.as_mut_ptr()) };
+            unsafe { ucp_ep_create(worker.as_mut_ptr(), &params, inner.as_mut_ptr()) };
         err_ucs!(status)?;
 
         Ok(Self {
             inner: RawPtr::from_uninit(inner),
-            executor,
+            worker,
             err_monitor,
         })
     }
+
+    pub fn connect(worker: Arc<Worker>, addr: &SockAddr) -> IOResult<Self> {
+        let params = ucp_ep_params {
+            field_mask: (ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS
+                | ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR
+                | ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE)
+                .0 as u64,
+            flags: ucp_ep_params_flags_field::UCP_EP_PARAMS_FLAGS_CLIENT_SERVER.0,
+            sockaddr: addr.as_ucs_sock_addr(),
+            err_mode: ucp_err_handling_mode_t::UCP_ERR_HANDLING_MODE_PEER,
+            ..unsafe { MaybeUninit::zeroed().assume_init() }
+        };
+
+        let endpoint = Self::new(worker, params)?;
+        Ok(endpoint)
+    }
+
+    pub fn accept(worker: Arc<Worker>, conn: ConnRequest) -> IOResult<Self> {
+        let params = ucp_ep_params {
+            field_mask: ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST.0 as u64,
+            conn_request: conn.as_mut_ptr(),
+            ..unsafe { MaybeUninit::zeroed().assume_init() }
+        };
+
+        let endpoint = Endpoint::new(worker, params)?;
+        Ok(endpoint)
+    }
+
 
     pub unsafe extern "C" fn err_handler(arg: *mut c_void, _: ucp_ep_h, status: ucs_status_t) {
         let err_monitor = &*(arg as *mut ErrorMonitor<IOError>);
@@ -77,33 +105,6 @@ impl Endpoint {
 
     fn check_error(&self) -> IOResult<()> {
         self.err_monitor.check_error()
-    }
-
-    pub fn connect(executor: UcpExecutor, addr: &SockAddr) -> IOResult<Self> {
-        let params = ucp_ep_params {
-            field_mask: (ucp_ep_params_field::UCP_EP_PARAM_FIELD_FLAGS
-                | ucp_ep_params_field::UCP_EP_PARAM_FIELD_SOCK_ADDR
-                | ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE)
-                .0 as u64,
-            flags: ucp_ep_params_flags_field::UCP_EP_PARAMS_FLAGS_CLIENT_SERVER.0,
-            sockaddr: addr.as_ucs_sock_addr(),
-            err_mode: ucp_err_handling_mode_t::UCP_ERR_HANDLING_MODE_PEER,
-            ..unsafe { MaybeUninit::zeroed().assume_init() }
-        };
-
-        let endpoint = Self::new(executor, params)?;
-        Ok(endpoint)
-    }
-
-    pub fn accept(executor: UcpExecutor, conn: ConnRequest) -> IOResult<Self> {
-        let params = ucp_ep_params {
-            field_mask: ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST.0 as u64,
-            conn_request: conn.as_mut_ptr(),
-            ..unsafe { MaybeUninit::zeroed().assume_init() }
-        };
-        
-        let endpoint = Endpoint::new(executor, params)?;
-        Ok(endpoint)
     }
 
     unsafe extern "C" fn stream_handler(
@@ -274,7 +275,7 @@ impl Endpoint {
             .recv_tag_cb(Some(Self::tag_recv_callback));
         let status = unsafe {
             ucp_tag_recv_nbx(
-                self.executor.worker().as_mut_ptr(),
+                self.worker.as_mut_ptr(),
                 buf.as_mut_ptr() as _,
                 buf.len() as _,
                 tag,
@@ -288,14 +289,6 @@ impl Endpoint {
 
     pub fn print(&self) {
         unsafe { ucp_ep_print_info(self.as_mut_ptr(), stderr) };
-    }
-
-    pub fn executor(&self) -> &UcpExecutor {
-        &self.executor
-    }
-
-    pub fn clone_rt(&self) -> Arc<Runtime> {
-        self.executor.clone_rt()
     }
 }
 

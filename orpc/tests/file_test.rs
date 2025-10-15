@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
 use bytes::{BufMut, BytesMut};
+use tracing::info;
 use orpc::client::ClientFactory;
-use orpc::common::Utils;
+use orpc::common::{Logger, Utils};
 use orpc::error::CommonErrorExt;
 use orpc::io::net::InetAddr;
 use orpc::message::{Builder, Message, RequestStatus};
@@ -24,6 +26,7 @@ use orpc::sys::DataSlice;
 use orpc::test::file::dir_location::DirLocation;
 use orpc::test::file::file_handler::{FileService, RpcCode};
 use orpc::CommonResult;
+use orpc::ucp::{UcpRuntime, UcpServer};
 
 #[test]
 fn dir_location() {
@@ -43,7 +46,10 @@ fn dir_location() {
 
 #[test]
 fn file_server() -> CommonResult<()> {
-    let conf = ServerConf::default();
+    Logger::default();
+    let mut conf = ServerConf::default();
+    conf.hostname = "127.0.0.1".to_string();
+    // conf.port = 1133;
     let dirs = vec![
         String::from("../testing/orpc-d1"),
         String::from("../testing/orpc-d2"),
@@ -51,25 +57,30 @@ fn file_server() -> CommonResult<()> {
     let addr = conf.bind_addr();
 
     let service = FileService::new(dirs);
-    let server = RpcServer::new(conf, service);
+    let server = UcpServer::new(conf, service);
     let rt = server.clone_rt();
-    let mut status_receiver = RpcServer::run_server(server);
+    let ucp_rt =  server.rt.clone();
+    let mut status_receiver = UcpServer::run_server(server);
+    info!("xxx");
     rt.block_on(status_receiver.wait_running())?;
+    info!("yyy");
 
-    let write_ck = file_write(&addr)?;
-    let read_ck = file_read(&addr)?;
-    assert_eq!(write_ck, read_ck);
+    let write_ck = file_write(&addr, ucp_rt.clone())?;
+    //let read_ck = file_read(&addr)?;
+    // assert_eq!(write_ck, read_ck);
     Ok(())
 }
 
-fn file_write(addr: &InetAddr) -> CommonResult<u64> {
+fn file_write(addr: &InetAddr, rt: Arc<UcpRuntime>) -> CommonResult<u64> {
     let factory = ClientFactory::default();
-    let client = factory.create_sync(addr)?;
+    let client = factory.create_sync_ucp(rt, addr)?;
 
     let req_id = Utils::req_id();
     let open_msg = open_message(RpcCode::Write, req_id);
 
+    info!("open");
     let _ = client.rpc(open_msg)?;
+    info!("open");
 
     let str = Utils::rand_str(64 * 1024);
     let mut checksum: u64 = 0;

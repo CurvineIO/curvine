@@ -14,16 +14,16 @@
 
 use crate::io::IOResult;
 use crate::sync::AtomicLen;
-use crate::ucp::UcpExecutor;
 use std::sync::Arc;
-use bytes::BytesMut;
+use crate::io::net::InetAddr;
+use crate::ucp::reactor::{AsyncEndpoint, RmaEndpoint, UcpExecutor};
 use crate::ucp::core::{Config, Context, Endpoint, Listener, SockAddr};
 use crate::ucp::request::ConnRequest;
 use crate::ucp::rma::LocalMem;
 
 pub struct UcpRuntime {
-    pub boss: UcpExecutor,
-    pub workers: Vec<UcpExecutor>,
+    pub boss: Arc<UcpExecutor>,
+    pub workers: Vec<Arc<UcpExecutor>>,
     pub context: Arc<Context>,
     index: AtomicLen,
 }
@@ -32,12 +32,13 @@ impl UcpRuntime {
     pub fn with_conf(conf: Config) -> IOResult<Self> {
         let context = Arc::new(conf.create_context()?);
 
-        let boss = UcpExecutor::new(format!("{}-boss", &conf.name), &context)?;
+        let boss = Arc::new(UcpExecutor::new(format!("{}-boss", &conf.name), &context)?);
 
         let mut workers = vec![];
         for i in 0..conf.threads {
-            let wr = UcpExecutor::new(format!("{}-worker-{}", &conf.name, i), &context)?;
-            workers.push(wr);
+            let name = format!("{}-worker-{}", &conf.name, i);
+            let worker = UcpExecutor::new(name, &context)?;
+            workers.push(Arc::new(worker));
         }
 
         Ok(Self {
@@ -49,28 +50,32 @@ impl UcpRuntime {
     }
 
     pub fn bind(&self, addr: &SockAddr) -> IOResult<Listener> {
-        Listener::bind(self.boss.clone(), addr)
+        Listener::bind(self.boss.worker().clone(), addr)
     }
 
-    pub fn worker_executor(&self) -> &UcpExecutor {
+    pub fn worker_executor(&self) -> Arc<UcpExecutor> {
         let index = self.index.next();
-        &self.workers[index % self.workers.len()]
+        self.workers[index % self.workers.len()].clone()
     }
 
     pub fn boss_executor(&self) -> &UcpExecutor {
         &self.boss
     }
 
-    pub fn accept(&self, conn: ConnRequest) -> IOResult<Endpoint> {
-        Endpoint::accept(self.boss.clone(), conn)
+    pub fn accept(&self, conn: ConnRequest, mem_len: usize) -> IOResult<AsyncEndpoint> {
+        let executor = self.boss.clone();
+        let endpoint = RmaEndpoint::accept(executor.worker().clone(), conn, mem_len)?;
+        Ok(AsyncEndpoint::new(executor, endpoint))
     }
 
-    pub async fn connect(&self, addr: &SockAddr) -> IOResult<Endpoint> {
-        Endpoint::connect(self.worker_executor().clone(), addr)
-    }
+    pub fn connect(&self, addr: &InetAddr, mem_len: usize) -> IOResult<AsyncEndpoint> {
+        let sockaddr = SockAddr::try_from(addr)?;
+        let rt = self.worker_executor();
 
-    pub fn register_memory(&self, size: usize) -> IOResult<LocalMem> {
-        LocalMem::new(self.context.clone(), size)
+        let endpoint = RmaEndpoint::connect(rt.worker().clone(), &sockaddr, mem_len)?;
+
+        let executor = self.worker_executor();
+        Ok(AsyncEndpoint::new(executor, endpoint))
     }
 }
 

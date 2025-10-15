@@ -13,6 +13,11 @@
 // limitations under the License.
 
 mod rpc_frame;
+
+use std::future::Future;
+use crate::io::IOResult;
+use crate::io::net::ConnState;
+use crate::message::Message;
 pub use self::rpc_frame::RpcFrame;
 
 mod message_handler;
@@ -32,3 +37,12 @@ pub use self::write_frame::WriteFrame;
 
 mod read_frame;
 pub use self::read_frame::ReadFrame;
+
+
+pub trait Frame {
+    fn send(&mut self, message: &Message) -> impl Future<Output = IOResult<()>>;
+
+    fn receive(&mut self) -> impl Future<Output = IOResult<Message>>;
+
+    fn new_conn_state(&self) -> ConnState;
+}

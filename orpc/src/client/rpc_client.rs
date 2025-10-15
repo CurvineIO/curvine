@@ -15,7 +15,7 @@
 use crate::client::client_state::InnerState;
 use crate::client::dispatch::Envelope;
 use crate::client::{BufferClient, ClientConf, ClientState, RawClient};
-use crate::handler::RpcFrame;
+use crate::handler::{Frame, RpcFrame};
 use crate::io::net::InetAddr;
 use crate::io::retry::TimeBondedRetry;
 use crate::io::{IOError, IOResult};
@@ -23,23 +23,26 @@ use crate::message::{Message, RefMessage};
 use crate::runtime::Runtime;
 use crate::sys::RawPtr;
 use crate::{err_box, try_err};
-use log::warn;
+use log::{info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use crate::ucp::core::SockAddr;
+use crate::ucp::reactor::{UcpFrame, UcpRuntime};
 
 enum BoxSender {
     Frame(RawPtr<RpcFrame>),
     Channel(Sender<Envelope>),
+    UcpFrame(RawPtr<UcpFrame>),
 }
 
 impl Clone for BoxSender {
     fn clone(&self) -> Self {
         match self {
-            BoxSender::Frame(_) => panic!("The streaming client does not allow cloning"),
             BoxSender::Channel(v) => BoxSender::Channel(v.clone()),
+            _ => panic!("The streaming client does not allow cloning"),
         }
     }
 }
@@ -88,9 +91,25 @@ impl RpcClient {
         })
     }
 
+    pub async fn with_ucp(
+        rt: Arc<UcpRuntime>,
+        addr: &InetAddr,
+        conf: &ClientConf,
+    ) -> IOResult<Self> {
+        let mut endpoint = rt.connect(addr, conf.buffer_size)?;
+        endpoint.handshake_request().await?;
+        let frame = UcpFrame::new(endpoint);
+
+        Ok(Self {
+            sender: BoxSender::UcpFrame(RawPtr::from_owned(frame)),
+            state: Arc::new(ClientState::default()),
+        })
+    }
+
     pub async fn rpc(&self, msg: impl RefMessage) -> IOResult<Message> {
         let req_id = msg.req_id();
         let seq_id = msg.seq_id();
+        let msg = msg.into_box();
 
         let rep_msg = match &self.sender {
             BoxSender::Frame(f) => {
@@ -104,9 +123,20 @@ impl RpcClient {
                 }
             }
 
+            BoxSender::UcpFrame(f) => {
+                let frame = f.as_mut();
+                frame.send(msg.as_ref()).await?;
+                let msg = frame.receive().await?;
+                if msg.is_empty() {
+                    return err_box!("Connection {} is closed", self.state.conn_info());
+                } else {
+                    msg
+                }
+            }
+
             BoxSender::Channel(c) => {
                 let (tx, rx) = oneshot::channel();
-                try_err!(c.send(Envelope::new(msg.into_box(), tx)).await);
+                try_err!(c.send(Envelope::new(msg, tx)).await);
                 try_err!(rx.await)?
             }
         };
@@ -168,16 +198,13 @@ impl RpcClient {
 
     pub fn is_raw(&self) -> bool {
         match &self.sender {
-            BoxSender::Frame(_) => true,
             BoxSender::Channel(_) => false,
+            _ => true,
         }
     }
 
     pub fn is_buffer(&self) -> bool {
-        match &self.sender {
-            BoxSender::Frame(_) => false,
-            BoxSender::Channel(_) => true,
-        }
+        !self.is_raw()
     }
 
     pub fn is_closed(&self) -> bool {

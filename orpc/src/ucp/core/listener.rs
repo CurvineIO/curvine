@@ -18,13 +18,12 @@ use crate::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
 use crate::sync::ErrorMonitor;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
-use crate::ucp::UcpExecutor;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
-use crate::ucp::core::SockAddr;
+use crate::ucp::core::{SockAddr, Worker};
 use crate::ucp::request::ConnRequest;
 
 struct ConnContext {
@@ -43,13 +42,13 @@ impl ConnContext {
 
 pub struct Listener {
     inner: RawPtr<ucp_listener>,
-    executor: UcpExecutor,
+    worker: Arc<Worker>,
     conn_context: Rc<ConnContext>,
     receiver: AsyncReceiver<ConnRequest>,
 }
 
 impl Listener {
-    pub fn bind(executor: UcpExecutor, addr: &SockAddr) -> IOResult<Self> {
+    pub fn bind(worker: Arc<Worker>, addr: &SockAddr) -> IOResult<Self> {
         let (sender, receiver) = AsyncChannel::new(0).split();
         let conn_context = Rc::new(ConnContext::new(sender));
 
@@ -72,13 +71,13 @@ impl Listener {
 
         let mut handle = MaybeUninit::<*mut ucp_listener>::uninit();
         let status = unsafe {
-            ucp_listener_create(executor.worker().as_mut_ptr(), &params, handle.as_mut_ptr())
+            ucp_listener_create(worker.as_mut_ptr(), &params, handle.as_mut_ptr())
         };
         err_ucs!(status)?;
 
         Ok(Listener {
             inner: RawPtr::from_uninit(handle),
-            executor,
+            worker,
             receiver,
             conn_context,
         })
@@ -127,10 +126,6 @@ impl Listener {
     pub fn reject(&self, conn: ConnRequest) -> IOResult<()> {
         let status = unsafe { ucp_listener_reject(self.as_mut_ptr(), conn.as_mut_ptr()) };
         err_ucs!(status)
-    }
-
-    pub fn executor(&self) -> &UcpExecutor {
-        &self.executor
     }
 }
 

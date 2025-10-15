@@ -25,6 +25,7 @@ use std::mem::MaybeUninit;
 use std::sync::Arc;
 use tokio::task::yield_now;
 use crate::ucp::core::Context;
+use crate::ucp::rma::LocalMem;
 
 #[repr(i8)]
 #[derive(PartialEq, PartialOrd, Debug, Clone, Copy, IntoPrimitive, FromPrimitive)]
@@ -71,6 +72,10 @@ impl Worker {
 
     pub fn progress(&self) -> u32 {
         unsafe { ucp_worker_progress(self.inner.as_mut_ptr()) }
+    }
+
+    pub fn register_memory(&self, len: usize) -> IOResult<LocalMem> {
+        LocalMem::new(self.context().clone(), len)
     }
 
     pub fn print(&self) {
