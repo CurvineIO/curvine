@@ -32,3 +32,5 @@ pub use self::listener::Listener;
 
 mod rma_endpoint;
 pub use self::rma_endpoint::RmaEndpoint;
+
+pub mod async_endpoint;

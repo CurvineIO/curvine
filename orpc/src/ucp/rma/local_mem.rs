@@ -88,12 +88,7 @@ impl LocalMem {
 
         let rkey_len = unsafe { len.assume_init() };
         let rkey_buf = unsafe { buf.assume_init() };
-        let vec =  {
-            RawVec::new(
-                rkey_buf as _,
-                rkey_len,
-            )
-        };
+        let vec =  RawVec::new(rkey_buf as _, rkey_len);
         Ok(RKeyBuffer::new(vec))
     }
 

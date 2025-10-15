@@ -25,10 +25,10 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
 use std::task::Poll;
-use serde::__private::de::Content::U64;
+use crate::runtime::Runtime;
 use crate::ucp::core::SockAddr;
 use crate::ucp::request::{ConnRequest, RequestParam, RequestStatus, RequestWaker};
-use crate::ucp::rma::{RemoteMem, RKey};
+use crate::ucp::rma::{LocalMem, RemoteMem, RKey};
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
@@ -292,6 +292,10 @@ impl Endpoint {
 
     pub fn executor(&self) -> &UcpExecutor {
         &self.executor
+    }
+
+    pub fn clone_rt(&self) -> Arc<Runtime> {
+        self.executor.clone_rt()
     }
 }
 

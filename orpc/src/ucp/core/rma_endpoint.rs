@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bincode::config::BigEndian;
+use std::sync::Arc;
 use bytes::{Buf, BufMut, BytesMut};
 use crate::common::Utils;
 use crate::err_box;
 use crate::io::IOResult;
-use crate::sys::DataSlice;
+use crate::runtime::Runtime;
 use crate::ucp::core::{Endpoint, SockAddr};
+use crate::ucp::request::HandshakeV1;
 use crate::ucp::rma::{LocalMem, RemoteMem, RKey};
-use crate::ucp::UcpExecutor;
+use crate::ucp::{HANDSHAKE_LEN_BYTES, UcpExecutor};
 
 /// RMA (Remote Memory Access) endpoint that supports high-performance remote memory operations.
 ///
@@ -37,100 +38,69 @@ pub struct RmaEndpoint {
 }
 
 impl RmaEndpoint {
-    pub const MEM_MAGIC: u64 = 0xFEED1234;
-    pub const MEM_HEADER_LEN: u32 = 28;
-    pub const MEM_LEN_BYTES: usize = 4;
-
     pub fn new(inner: Endpoint, local_mem: LocalMem) -> Self {
-        RmaEndpoint {
+        Self {
             inner,
             ep_id: Utils::unique_id(),
             local_mem,
-            remote_mem: None,
+            remote_mem: None
         }
     }
 
-    pub fn connect(executor: UcpExecutor, addr: &SockAddr, mem_len: usize) -> IOResult<Self> {
+    pub fn connect(
+        executor: UcpExecutor,
+        addr: &SockAddr,
+        mem_len: usize
+    ) -> IOResult<Self> {
         let local_mem = executor.register_memory(mem_len)?;
         let inner = Endpoint::connect(executor, addr)?;
         Ok(Self::new(inner, local_mem))
     }
 
-    fn encode_local_mem(&self) -> IOResult<BytesMut> {
-        let mut buf = BytesMut::new();
-        let pack = self.local_mem.pack()?;
-
-        buf.put_u32(Self::MEM_HEADER_LEN + pack.as_slice().len() as u32);
-        buf.put_u64(Self::MEM_MAGIC);
-        buf.put_u64(self.ep_id);
-        buf.put_u64(self.local_mem.addr());
-        buf.put_u32(self.local_mem.len() as u32);
-        buf.extend_from_slice(pack.as_slice());
-
-        Ok(buf)
+    async fn handshake_send(&mut self) -> IOResult<()> {
+        let handshake = HandshakeV1::new(self.ep_id, &self.local_mem)?;
+        let buf = handshake.encode()?;
+        self.inner.stream_send(&buf).await
     }
 
-    fn decode_remote_mem(&self, mut buf: BytesMut) -> IOResult<RemoteMem> {
-        let magic = buf.get_u64();
-        if magic != Self::MEM_MAGIC {
-            return err_box!("invalid magic number: 0x{:x}", magic)
-        }
-
-        let ep_id = buf.get_u64();
-        let addr = buf.get_u64();
-        let len = buf.get_u32() as usize;
-        let r_key = RKey::unpack(&self.inner, &buf)?;
-
-        let remote_mem = RemoteMem::new(ep_id, addr, len, r_key);
-        Ok(remote_mem)
-    }
-
-    pub fn with_capacity(inner: Endpoint, size: usize) -> IOResult<Self> {
-        let local_mem = inner.executor().register_memory(size)?;
-
-        Ok(RmaEndpoint::new(inner, local_mem))
-    }
-
-    async fn get_mem(&self) -> IOResult<RemoteMem> {
-        let mut buf = BytesMut::zeroed(Self::MEM_LEN_BYTES);
+    async fn handshake_recv(&mut self) -> IOResult<RemoteMem> {
+        let mut buf = BytesMut::zeroed(HANDSHAKE_LEN_BYTES);
         self.inner.stream_recv_full(&mut buf).await?;
 
-        // read memory bytes
         let total_len = buf.get_u32() as usize;
         let mut buf = BytesMut::zeroed(total_len);
         self.inner.stream_recv_full(&mut buf).await?;
-        self.decode_remote_mem(buf)
+
+        let rep = HandshakeV1::decode(buf)?;
+        let rkey = RKey::unpack(&self.inner, &rep.rkey)?;
+
+        let remote_mem = RemoteMem::new(
+            rep.ep_id,
+            rep.mem_addr,
+            rep.mem_len as usize,
+            rkey
+        );
+        Ok(remote_mem)
     }
 
-    async fn send_mem(&self) -> IOResult<()> {
-        let buf = self.encode_local_mem()?;
-        self.inner.stream_send(&buf).await?;
-        Ok(())
-    }
+    /// 发送握手信息
+    pub async fn handshake_request(&mut self) -> IOResult<()> {
+        self.handshake_send().await?;
 
-    /// 客服端发起调用。
-    /// 1. 发送自己的内存信息给服务端。
-    /// 2. 获取服务端的内存信息。
-    pub async fn exchange_mem(&mut self) -> IOResult<()> {
-        self.send_mem().await?;
-
-        let remote_mem = self.get_mem().await?;
+        let remote_mem = self.handshake_recv().await?;
         let _ = self.remote_mem.insert(remote_mem);
 
         Ok(())
     }
 
-
-    /// 服务端发起调用。
-    /// 1. 接收客服端的内存信息。
-    /// 2. 发送自己的内存信息给客服端。
-    pub async fn accept_memory(&mut self) -> IOResult<()> {
-        let remote_mem = self.get_mem().await?;
+    /// 接收握手信息
+    pub async fn handshake_response(&mut self) -> IOResult<()> {
+        let remote_mem = self.handshake_recv().await?;
 
         self.ep_id = remote_mem.ep_id();
         let _ = self.remote_mem.insert(remote_mem);
 
-        self.send_mem().await?;
+        self.handshake_send().await?;
 
         Ok(())
     }
@@ -146,7 +116,6 @@ impl RmaEndpoint {
             None => err_box!("remote memory not set")
         }
     }
-
     pub async fn put(&self, buf: &[u8]) -> IOResult<()> {
         let mem = self.get_remote_mem(buf.len())?;
         self.inner.put(buf, mem).await
@@ -173,8 +142,15 @@ impl RmaEndpoint {
         self.inner.tag_recv(self.ep_id, buf).await
     }
 
-    pub async fn tag_send(&self, buf: & [u8]) -> IOResult<()> {
+    pub fn executor(&self) -> &UcpExecutor {
+        self.inner.executor()
+    }
+    pub async fn tag_send(&self, buf: &[u8]) -> IOResult<()> {
         self.inner.tag_send(self.ep_id, buf).await
+    }
+
+    pub async fn flush(&self) -> IOResult<()> {
+        self.inner.flush().await
     }
 
     pub fn endpoint(&self) -> &Endpoint {
@@ -195,5 +171,9 @@ impl RmaEndpoint {
 
     pub fn remote_mem(&self) -> Option<&RemoteMem> {
         self.remote_mem.as_ref()
+    }
+
+    pub fn clone_rt(&self) -> Arc<Runtime> {
+        self.inner.clone_rt()
     }
 }

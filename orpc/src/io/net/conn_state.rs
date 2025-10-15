@@ -14,7 +14,7 @@
 
 use crate::io::net::InetAddr;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnState {
     pub remote_addr: InetAddr,
     pub local_addr: InetAddr,

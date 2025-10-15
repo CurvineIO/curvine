@@ -139,3 +139,5 @@ impl Drop for Listener {
         unsafe { ucp_listener_destroy(self.as_mut_ptr()) }
     }
 }
+
+unsafe impl Send for Listener {}

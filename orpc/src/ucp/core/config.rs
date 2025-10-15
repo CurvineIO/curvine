@@ -62,7 +62,7 @@ impl Default for Config {
 
         Self {
             inner: RawPtr::from_uninit(inner),
-            name: "orpc-udp".to_string(),
+            name: "orpc-ucp".to_string(),
             threads: 32,
             rdma_region_size: 32 * 1024 * 1024,
             rdma_buffer_size: 128 * 1024

@@ -16,6 +16,16 @@
 
 use crate::ucp::bindings::FILE;
 
+pub const HANDSHAKE_MAGIC: u64 = 0xFEEDFACE;
+
+pub const HANDSHAKE_VERSION: u32 = 1;
+
+pub const HANDSHAKE_HEADER_LEN: u32 = 32;
+
+pub const HANDSHAKE_LEN_BYTES: usize = 4;
+
+pub const HANDSHAKE_MAX_LEN: usize = 1024;
+
 pub mod bindings;
 pub mod core;
 pub mod request;
@@ -28,9 +38,15 @@ mod ucp_executor;
 pub use self::ucp_executor::UcpExecutor;
 
 pub mod ucp_runtime;
-mod ucp_frame;
-
 pub use self::ucp_runtime::UcpRuntime;
+
+mod ucp_frame;
+pub use self::ucp_frame::UcpFrame;
+
+mod ucp_server;
+pub use self::ucp_server::UcpServer;
+
+pub use core::async_endpoint::AsyncEndpoint;
 
 extern "C" {
     pub static stderr: *mut FILE;

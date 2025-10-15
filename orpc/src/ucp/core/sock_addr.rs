@@ -15,6 +15,8 @@
 use crate::ucp::bindings::ucs_sock_addr;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use crate::CommonError;
+use crate::io::net::InetAddr;
 
 #[derive(Debug)]
 pub struct SockAddr {
@@ -39,5 +41,15 @@ impl From<&str> for SockAddr {
         let addr = SocketAddr::from_str(value).unwrap();
         let sockaddr = socket2::SockAddr::from(addr);
         Self { inner: sockaddr }
+    }
+}
+
+impl TryFrom<&InetAddr> for SockAddr {
+    type Error = CommonError;
+
+    fn try_from(value: &InetAddr) -> Result<Self, Self::Error> {
+        let addr = SocketAddr::from_str(value.to_string().as_str())?;
+        let sockaddr = socket2::SockAddr::from(addr);
+        Ok(Self { inner: sockaddr })
     }
 }
