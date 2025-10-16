@@ -17,6 +17,7 @@ use crate::master::fs::master_filesystem::MasterFilesystem;
 use crate::master::meta::inode::ttl::ttl_manager::InodeTtlManager;
 use crate::master::meta::inode::ttl::ttl_scheduler::TtlHeartbeatChecker;
 use crate::master::meta::inode::ttl_scheduler::TtlHeartbeatConfig;
+use crate::master::quota::QuotaManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
 use curvine_common::executor::ScheduledExecutor;
@@ -30,6 +31,7 @@ pub struct MasterActor {
     pub master_monitor: MasterMonitor,
     pub executor: Arc<GroupExecutor>,
     pub replication_manager: Arc<MasterReplicationManager>,
+    pub quota_manager: Arc<QuotaManager>,
 }
 
 impl MasterActor {
@@ -38,12 +40,14 @@ impl MasterActor {
         master_monitor: MasterMonitor,
         executor: Arc<GroupExecutor>,
         replication_manager: &Arc<MasterReplicationManager>,
+        quota_manager: Arc<QuotaManager>,
     ) -> Self {
         Self {
             fs,
             master_monitor,
             executor,
             replication_manager: replication_manager.clone(),
+            quota_manager,
         }
     }
 
@@ -54,6 +58,7 @@ impl MasterActor {
             self.master_monitor.clone(),
             self.executor.clone(),
             self.replication_manager.clone(),
+            self.quota_manager.clone(),
         )
         .unwrap();
 
@@ -105,11 +110,18 @@ impl MasterActor {
         master_monitor: MasterMonitor,
         executor: Arc<GroupExecutor>,
         replication_manager: Arc<MasterReplicationManager>,
+        quota_manager: Arc<QuotaManager>,
     ) -> CommonResult<()> {
         let check_ms = fs.conf.worker_check_interval_ms();
         let scheduler = ScheduledExecutor::new("worker-heartbeat", check_ms);
 
-        let task = HeartbeatChecker::new(fs, master_monitor, executor, replication_manager);
+        let task = HeartbeatChecker::new(
+            fs,
+            master_monitor,
+            executor,
+            replication_manager,
+            quota_manager,
+        );
 
         scheduler.start(task)?;
         Ok(())
