@@ -676,9 +676,17 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                     )
                 };
 
+            // Remove trailing slash from directory names for FUSE compatibility
+            let name = entry.name();
+            let cleaned_name = if metadata.is_dir() && name.ends_with('/') {
+                &name[..name.len() - 1]
+            } else {
+                name
+            };
+
             statuses.push(FileStatus {
                 path: entry_path.clone(),
-                name: entry.name().to_owned(),
+                name: cleaned_name.to_owned(),
                 is_dir: metadata.is_dir(),
                 mtime,
                 is_complete: true,
