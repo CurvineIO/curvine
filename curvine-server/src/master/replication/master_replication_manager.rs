@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::SyncWorkerManager;
+use crate::master::{MasterMetrics, SyncWorkerManager, MASTER_METRICS};
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
@@ -28,6 +28,7 @@ use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::sync::FastDashMap;
 use orpc::{err_box, try_log, try_option, CommonResult};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -49,7 +50,6 @@ pub struct MasterReplicationManager {
     worker_client_factory: Arc<ClientFactory>,
 
     replication_enabled: bool,
-    // todo: add some metrics here.
 }
 
 struct InflightReplicationJob {
@@ -198,6 +198,11 @@ impl MasterReplicationManager {
             },
         );
 
+        if let Some(metrics) = MASTER_METRICS.get() {
+            metrics.replication_staging_number.dec();
+            metrics.replication_inflight_number.inc();
+        }
+
         Ok(())
     }
 
@@ -212,7 +217,11 @@ impl MasterReplicationManager {
         self.runtime.block_on(async move {
             for block_id in &block_ids {
                 info!("Accepting block {} replication job", block_id);
-                let _ = try_log!(self.staging_queue_sender.send(*block_id).await);
+                if let Ok(_) = try_log!(self.staging_queue_sender.send(*block_id).await) {
+                    if let Some(metrics) = MASTER_METRICS.get() {
+                        metrics.replication_staging_number.inc();
+                    }
+                }
             }
         });
         Ok(())
@@ -241,8 +250,14 @@ impl MasterReplicationManager {
                         "Errors on block replication for block_id: {} to worker: {}. error: {:?}",
                         block_id, &entry.1.target_worker, message
                     );
+                    if let Some(metrics) = MASTER_METRICS.get() {
+                        metrics.replication_failure_count.inc();
+                    }
                 }
                 drop(entry.1.permit);
+                if let Some(metrics) = MASTER_METRICS.get() {
+                    metrics.replication_inflight_number.dec();
+                }
             }
         }
         Ok(())
