@@ -63,6 +63,10 @@ pub struct MountCommand {
 
     #[arg(short, long)]
     storage_type: Option<String>,
+
+    /// Set quota rate limit for the mount point as a ratio of cluster capacity (0.0-1.0, e.g., 0.5 for 50%)
+    #[arg(long = "quota-rate")]
+    quota_rate: Option<f64>,
 }
 
 impl MountCommand {
@@ -175,6 +179,12 @@ impl MountCommand {
         }
         if let Some(storage_type) = self.storage_type.as_ref() {
             opts = opts.storage_type(StorageType::try_from(storage_type.as_str())?);
+        }
+        if let Some(quota_rate) = self.quota_rate {
+            if quota_rate <= 0.0 || quota_rate > 1.0 {
+                return err_box!("quota rate must be in range (0.0, 1.0], got {}", quota_rate);
+            }
+            opts = opts.quota_rate(quota_rate);
         }
 
         Ok(opts.build())

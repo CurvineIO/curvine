@@ -241,3 +241,232 @@ async fn get_hdfs_test_config() -> HashMap<String, String> {
     config.insert("nameserver".to_string(), "test-cluster".to_string());
     config
 }
+
+// Test mount with quota_rate
+#[test]
+fn mount_with_quota_test() -> CommonResult<()> {
+    Logger::default();
+    // Create a test cluster configuration
+    let cluster_conf = Testing::get_cluster_conf()?;
+    println!("cluster_conf: {:?}", cluster_conf);
+
+    let client_rt = Arc::new(cluster_conf.client_rpc_conf().create_runtime());
+    let rt = client_rt.clone();
+
+    client_rt.block_on(async move {
+        let fs_context = Arc::new(FsContext::with_rt(cluster_conf.clone(), rt.clone())?);
+        let client = FsClient::new(fs_context);
+
+        // Clean up existing mount points
+        let exists_mnts = client.get_mount_table().await?;
+        for mnt in exists_mnts.mount_table {
+            info!("Unmounting existing mount point: {}", mnt.mount_id);
+            let path = mnt.cv_path.into();
+            let _ = client.umount(&path).await;
+        }
+
+        // Test 1: Mount with quota_rate
+        let s3_path_quota1 = "s3://flink/quota-test1/".into();
+        let s3_mnt_path_quota1 = "/quota/test1".into();
+        let quota_rate1: f64 = 0.1; // 10% of cluster capacity
+
+        let configs = get_s3_test_config().await;
+        let mnt_opt_with_quota = MountOptions::builder()
+            .set_properties(configs.clone())
+            .quota_rate(quota_rate1)
+            .build();
+
+        let mount_resp = client
+            .mount(&s3_path_quota1, &s3_mnt_path_quota1, mnt_opt_with_quota)
+            .await;
+        info!("Mount with quota_rate response: {:?}", mount_resp);
+        assert!(mount_resp.is_ok(), "mount with quota_rate should success");
+
+        // Verify mount info contains quota_rate
+        let mount_info_resp = client.get_mount_info(&s3_path_quota1).await?;
+        let mount_info = mount_info_resp.unwrap();
+        info!("Mount info: {:?}", mount_info);
+        assert_eq!(
+            mount_info.quota_rate,
+            Some(quota_rate1),
+            "quota_rate should be {}, actual {:?}",
+            quota_rate1,
+            mount_info.quota_rate
+        );
+
+        // Test 2: Mount without quota_rate (should have None)
+        let s3_path_no_quota = "s3://flink/no-quota/".into();
+        let s3_mnt_path_no_quota = "/quota/no-quota".into();
+
+        let mnt_opt_no_quota = MountOptions::builder()
+            .set_properties(configs.clone())
+            .build();
+
+        let mount_resp = client
+            .mount(&s3_path_no_quota, &s3_mnt_path_no_quota, mnt_opt_no_quota)
+            .await;
+        info!("Mount without quota response: {:?}", mount_resp);
+        assert!(mount_resp.is_ok(), "mount without quota should success");
+
+        let mount_info_resp = client.get_mount_info(&s3_path_no_quota).await?;
+        let mount_info = mount_info_resp.unwrap();
+        assert_eq!(
+            mount_info.quota_rate, None,
+            "quota_rate should be None, actual {:?}",
+            mount_info.quota_rate
+        );
+
+        // Test 3: Mount with different quota_rate
+        let s3_path_quota2 = "s3://flink/quota-test2/".into();
+        let s3_mnt_path_quota2 = "/quota/test2".into();
+        let quota_rate2: f64 = 0.05; // 5% of cluster capacity
+
+        let mnt_opt_with_quota2 = MountOptions::builder()
+            .set_properties(configs.clone())
+            .quota_rate(quota_rate2)
+            .build();
+
+        let mount_resp = client
+            .mount(&s3_path_quota2, &s3_mnt_path_quota2, mnt_opt_with_quota2)
+            .await;
+        assert!(
+            mount_resp.is_ok(),
+            "mount with different quota_rate should success"
+        );
+
+        let mount_info_resp = client.get_mount_info(&s3_path_quota2).await?;
+        let mount_info = mount_info_resp.unwrap();
+        assert_eq!(
+            mount_info.quota_rate,
+            Some(quota_rate2),
+            "quota_rate should be {}, actual {:?}",
+            quota_rate2,
+            mount_info.quota_rate
+        );
+
+        // Verify mount table contains all mount points with correct quota_rate
+        let resp = client.get_mount_table().await?;
+        info!("Final MountTable: {:?}", resp);
+        let mount_table = resp.mount_table;
+        assert_eq!(mount_table.len(), 3, "should have 3 mount points");
+
+        // Find and verify each mount point
+        let quota1_mount = mount_table
+            .iter()
+            .find(|m| m.cv_path == "/quota/test1")
+            .expect("quota test1 mount should exist");
+        assert_eq!(quota1_mount.quota_rate, Some(quota_rate1));
+
+        let no_quota_mount = mount_table
+            .iter()
+            .find(|m| m.cv_path == "/quota/no-quota")
+            .expect("no-quota mount should exist");
+        assert_eq!(no_quota_mount.quota_rate, None);
+
+        let quota2_mount = mount_table
+            .iter()
+            .find(|m| m.cv_path == "/quota/test2")
+            .expect("quota test2 mount should exist");
+        assert_eq!(quota2_mount.quota_rate, Some(quota_rate2));
+
+        // Test 4: Update mount point to change quota_rate (0.1 -> 0.2)
+        info!("Testing update quota_rate from 0.1 to 0.2");
+        let quota_rate_updated: f64 = 0.2; // 20% of cluster capacity
+
+        let mnt_opt_updated = MountOptions::builder()
+            .set_properties(configs.clone())
+            .quota_rate(quota_rate_updated)
+            .update(true) // Enable update mode
+            .build();
+
+        let update_resp = client
+            .mount(&s3_path_quota1, &s3_mnt_path_quota1, mnt_opt_updated)
+            .await;
+        info!(
+            "Update mount with new quota_rate response: {:?}",
+            update_resp
+        );
+        assert!(update_resp.is_ok(), "update mount should success");
+
+        // Verify quota_rate has been updated
+        let mount_info_resp = client.get_mount_info(&s3_path_quota1).await?;
+        let mount_info = mount_info_resp.unwrap();
+        info!("Updated mount info: {:?}", mount_info);
+        assert_eq!(
+            mount_info.quota_rate,
+            Some(quota_rate_updated),
+            "quota_rate should be updated to {}, actual {:?}",
+            quota_rate_updated,
+            mount_info.quota_rate
+        );
+
+        // Test 5: Update mount point to remove quota_rate (0.2 -> None)
+        info!("Testing update to remove quota_rate");
+        let mnt_opt_no_quota_update = MountOptions::builder()
+            .set_properties(configs.clone())
+            .update(true) // Enable update mode, but don't set quota_rate
+            .build();
+
+        let update_resp = client
+            .mount(
+                &s3_path_quota1,
+                &s3_mnt_path_quota1,
+                mnt_opt_no_quota_update,
+            )
+            .await;
+        info!(
+            "Update mount to remove quota_rate response: {:?}",
+            update_resp
+        );
+        assert!(update_resp.is_ok(), "update mount should success");
+
+        // Verify quota_rate has been removed
+        let mount_info_resp = client.get_mount_info(&s3_path_quota1).await?;
+        let mount_info = mount_info_resp.unwrap();
+        info!("Updated mount info (no quota): {:?}", mount_info);
+        assert_eq!(
+            mount_info.quota_rate, None,
+            "quota_rate should be None after update, actual {:?}",
+            mount_info.quota_rate
+        );
+
+        // Test 6: Update mount point to add quota_rate back (None -> 0.15)
+        info!("Testing update to add quota_rate back");
+        let quota_rate_readd: f64 = 0.15; // 15% of cluster capacity
+
+        let mnt_opt_readd = MountOptions::builder()
+            .set_properties(configs.clone())
+            .quota_rate(quota_rate_readd)
+            .update(true)
+            .build();
+
+        let update_resp = client
+            .mount(&s3_path_quota1, &s3_mnt_path_quota1, mnt_opt_readd)
+            .await;
+        info!(
+            "Update mount to add quota_rate back response: {:?}",
+            update_resp
+        );
+        assert!(update_resp.is_ok(), "update mount should success");
+
+        // Verify quota_rate has been added back
+        let mount_info_resp = client.get_mount_info(&s3_path_quota1).await?;
+        let mount_info = mount_info_resp.unwrap();
+        info!("Updated mount info (quota readded): {:?}", mount_info);
+        assert_eq!(
+            mount_info.quota_rate,
+            Some(quota_rate_readd),
+            "quota_rate should be {} after update, actual {:?}",
+            quota_rate_readd,
+            mount_info.quota_rate
+        );
+
+        // Clean up
+        let _ = client.umount(&s3_mnt_path_quota1).await;
+        let _ = client.umount(&s3_mnt_path_no_quota).await;
+        let _ = client.umount(&s3_mnt_path_quota2).await;
+
+        info!("All quota_rate tests passed, including update tests!");
+        Ok(())
+    })
+}
