@@ -36,14 +36,14 @@ fn endpoint_rma() {
     let wr = UcpRuntime::default();
     let addr = InetAddr::new("127.0.0.1",8080);
 
-    let executor = wr.worker_executor().clone();
+    let executor = wr.select_executor().clone();
     let rt = executor.rt().clone();
 
     let (tx, rx) = CallChannel::channel();
 
 
     rt.spawn(async move {
-        let mut endpoint = wr.connect(&addr, 4).unwrap().into_inner();
+        let mut endpoint = wr.connect_rma(&addr, 4).unwrap();
         endpoint.handshake_request().await.unwrap();
 
         for i in 0..10 {

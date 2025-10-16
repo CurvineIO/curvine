@@ -15,128 +15,155 @@
 use std::sync::Arc;
 use bytes::BytesMut;
 use crate::io::IOResult;
-use crate::runtime::Runtime;
+use crate::runtime::{RpcRuntime, Runtime};
 use crate::sync::channel::{AsyncSender, CallChannel};
-use crate::sys::{DataSlice, RawPtr, RawVec};
+use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::reactor::{RmaEndpoint, UcpExecutor};
-use crate::ucp::request::{Flush, OpRequest, RmaGet, RmaPut, StreamRecv, StreamSend, TagRecv, TagSend};
+use crate::ucp::request::*;
 
 #[derive(Clone)]
 pub struct AsyncEndpoint {
-    executor: Arc<UcpExecutor>,
     inner: RawPtr<RmaEndpoint>,
     sender: AsyncSender<OpRequest>
 }
 
 impl AsyncEndpoint {
-    pub fn new(executor: Arc<UcpExecutor>, endpoint: RmaEndpoint) -> Self {
-        let sender = executor.clone_sender();
+    pub fn new(endpoint: RmaEndpoint) -> Self {
+        let sender = endpoint.executor().clone_sender();
         AsyncEndpoint {
-            executor,
             inner: RawPtr::from_owned(endpoint),
             sender
         }
     }
 
     pub async fn handshake_request(&mut self) -> IOResult<()> {
-        self.inner.handshake_request().await
+        let (call, promise) = CallChannel::channel();
+        let req = OpRequest::HandshakeRequest(HandshakeRequest {
+            ep: self.inner.clone(),
+            call
+        });
+        self.sender.send(req).await?;
+        promise.receive().await?
     }
 
     pub async fn handshake_response(&mut self) -> IOResult<()> {
-        self.inner.handshake_response().await
+        let (call, promise) = CallChannel::channel();
+        let req = OpRequest::HandshakeResponse(HandshakeResponse {
+            ep: self.inner.clone(),
+            call
+        });
+        self.sender.send(req).await?;
+        promise.receive().await?
     }
 
     pub async fn stream_send(&self, buf: DataSlice) -> IOResult<()> {
-        let (tx, rx) = CallChannel::channel();
-        let req = OpRequest::StreamSend(StreamSend {
+        let (call, promise) = CallChannel::channel();
+            let req = OpRequest::StreamSend(StreamSend {
             ep: self.inner.clone(),
             buf,
-            cb: tx
+            call
         });
         self.sender.send(req).await?;
-        rx.receive().await?
+        promise.receive().await?
     }
 
     pub async fn stream_recv(&self, buf: BytesMut) -> IOResult<BytesMut> {
-        let (tx, rx) = CallChannel::channel();
+        let (call, promise) = CallChannel::channel();
         let req = OpRequest::StreamRecv(StreamRecv {
             ep: self.inner.clone(),
             buf,
             full: false,
-            cb: tx,
+            call,
         });
         self.sender.send(req).await?;
-        rx.receive().await?
+        promise.receive().await?
     }
 
     pub async fn put(&self, buf: DataSlice) -> IOResult<()> {
-        let (tx, rx) = CallChannel::channel();
+        let (call, promise) = CallChannel::channel();
         let req = OpRequest::RmaPut(RmaPut {
             ep: self.inner.clone(),
             buf,
-            cb: tx
+            call,
         });
         self.sender.send(req).await?;
-        rx.receive().await?
+        promise.receive().await?
     }
 
     pub async fn get(&self, buf: BytesMut) -> IOResult<BytesMut> {
-        let (tx, rx) = CallChannel::channel();
+        let (call, promise) = CallChannel::channel();
         let req = OpRequest::RmaGet(RmaGet {
             ep: self.inner.clone(),
             buf,
-            cb: tx
+            call,
         });
         self.sender.send(req).await?;
-        rx.receive().await?
+        promise.receive().await?
     }
 
     pub async fn flush(&self) -> IOResult<()> {
-        let (tx, rx) = CallChannel::channel();
+        let (call, promise) = CallChannel::channel();
         let req = OpRequest::Flush(Flush {
             ep: self.inner.clone(),
-            cb: tx
+            call,
         });
         self.sender.send(req).await?;
-        rx.receive().await?
+        promise.receive().await?
     }
 
     pub async fn tag_send(&self, buf: DataSlice) -> IOResult<()> {
-        let (tx, rx) = CallChannel::channel();
+        let (call, promise) = CallChannel::channel();
         let req = OpRequest::TagSend(TagSend {
             ep: self.inner.clone(),
             buf,
-            cb: tx
+            call,
         });
         self.sender.send(req).await?;
-        rx.receive().await?
+        promise.receive().await?
     }
 
     pub async fn tag_recv(&self, buf: BytesMut) -> IOResult<BytesMut> {
-        let (tx, rx) = CallChannel::channel();
+        let (call, promise) = CallChannel::channel();
         let req = OpRequest::TagRecv(TagRecv {
             ep: self.inner.clone(),
             buf,
-            cb: tx
+            call,
         });
         self.sender.send(req).await?;
-        rx.receive().await?
+        promise.receive().await?
+    }
+
+    pub fn executor(&self) -> &UcpExecutor {
+        self.inner.executor()
     }
 
     pub fn rt(&self) -> &Runtime {
-        self.executor.rt()
+        self.executor().rt()
     }
 
     pub fn clone_rt(&self) -> Arc<Runtime> {
-        self.executor.clone_rt()
-    }
-
-    pub fn into_inner(self) -> RawPtr<RmaEndpoint> {
-        self.inner
+        self.executor().clone_rt()
     }
 
     pub fn local_mem_slice(&self, len: usize) -> &[u8] {
         &self.inner.local_mem_slice()[..len]
+    }
+
+    pub fn inner(&self) -> &RmaEndpoint {
+        self.inner.as_ref()
+    }
+
+    pub fn inner_mut(&self) -> &mut RmaEndpoint {
+        self.inner.as_mut()
+    }
+}
+
+impl Drop for AsyncEndpoint {
+    fn drop(&mut self) {
+        let ep = self.inner.clone();
+        self.executor().rt().spawn(async move {
+            drop(ep)
+        });
     }
 }
 

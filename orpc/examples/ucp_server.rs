@@ -28,13 +28,10 @@ fn rma2(pool: UcpRuntime, addr: SockAddr) {
         loop {
             let conn = listener.accept().await.unwrap();
 
-            let mut endpoint = pool.accept(conn, 4).unwrap();
-            let rt = endpoint.clone_rt();
-            let mut endpoint = endpoint.into_inner();
+            let mut endpoint = pool.accept_rma(conn, 4).unwrap();
 
             rt.spawn(async move {
                 endpoint.handshake_response().await.unwrap();
-
                 loop {
                     let mut buf = BytesMut::zeroed(1024);
                     let recv = endpoint.tag_recv(&mut buf).await.unwrap();

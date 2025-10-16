@@ -22,6 +22,7 @@ use crate::ucp::core::{Endpoint, SockAddr, Worker};
 use crate::ucp::request::{ConnRequest, HandshakeV1};
 use crate::ucp::rma::{LocalMem, RemoteMem, RKey};
 use crate::ucp::{HANDSHAKE_LEN_BYTES};
+use crate::ucp::reactor::UcpExecutor;
 
 /// RMA (Remote Memory Access) endpoint that supports high-performance remote memory operations.
 ///
@@ -32,39 +33,45 @@ use crate::ucp::{HANDSHAKE_LEN_BYTES};
 /// Uses a dual-end memory model where both client and server hold remote memory addresses
 pub struct RmaEndpoint {
     inner: Endpoint,
+    executor: Arc<UcpExecutor>,
     ep_id: u64,
     local_mem: LocalMem,
     remote_mem: Option<RemoteMem>
 }
 
 impl RmaEndpoint {
-    pub fn new(inner: Endpoint, local_mem: LocalMem) -> Self {
+    fn new(
+        executor: Arc<UcpExecutor>,
+        inner: Endpoint,
+        local_mem: LocalMem
+    ) -> Self {
         Self {
             inner,
             ep_id: Utils::unique_id(),
+            executor,
             local_mem,
             remote_mem: None
         }
     }
 
     pub fn accept(
-        worker: Arc<Worker>,
+        executor: Arc<UcpExecutor>,
         conn: ConnRequest,
         mem_len: usize,
     ) -> IOResult<Self> {
-        let local_mem = worker.register_memory(mem_len)?;
-        let inner = Endpoint::accept(worker, conn)?;
-        Ok(Self::new(inner, local_mem))
+        let local_mem = executor.register_memory(mem_len)?;
+        let inner = Endpoint::accept(executor.worker().clone(), conn)?;
+        Ok(Self::new(executor, inner, local_mem))
     }
 
     pub fn connect(
-        worker: Arc<Worker>,
+        executor: Arc<UcpExecutor>,
         addr: &SockAddr,
         mem_len: usize
     ) -> IOResult<Self> {
-        let local_mem = worker.register_memory(mem_len)?;
-        let inner = Endpoint::connect(worker, addr)?;
-        Ok(Self::new(inner, local_mem))
+        let local_mem = executor.register_memory(mem_len)?;
+        let inner = Endpoint::connect(executor.worker().clone(), addr)?;
+        Ok(Self::new(executor, inner, local_mem))
     }
 
     /// 发送握手信息
@@ -159,6 +166,10 @@ impl RmaEndpoint {
 
     pub async fn flush(&self) -> IOResult<()> {
         self.inner.flush().await
+    }
+
+    pub fn executor(&self) -> &Arc<UcpExecutor> {
+        &self.executor
     }
 
     pub fn endpoint(&self) -> &Endpoint {

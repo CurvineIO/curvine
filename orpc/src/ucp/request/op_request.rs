@@ -15,25 +15,47 @@
 
 use bytes::BytesMut;
 use tracing::info;
+use crate::common::Utils;
 use crate::io::IOResult;
 use crate::sync::channel::CallSender;
 use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::reactor::RmaEndpoint;
 
+pub struct HandshakeRequest {
+    pub ep: RawPtr<RmaEndpoint>,
+    pub call: CallSender<IOResult<()>>,
+}
+
+impl HandshakeRequest {
+    pub async fn run(mut self) -> IOResult<()> {
+        let res = self.ep.handshake_request().await;
+        self.call.send(res)
+    }
+}
+
+pub struct HandshakeResponse {
+    pub ep: RawPtr<RmaEndpoint>,
+    pub call: CallSender<IOResult<()>>,
+}
+
+impl HandshakeResponse {
+    pub async fn run(mut self) -> IOResult<()> {
+        let res = self.ep.handshake_response().await;
+        self.call.send(res)
+    }
+}
+
+
 pub struct StreamSend {
     pub ep: RawPtr<RmaEndpoint>,
     pub buf: DataSlice,
-    pub cb: CallSender<IOResult<()>>,
+    pub call: CallSender<IOResult<()>>,
 }
 
 impl StreamSend {
     pub async fn run(self) -> IOResult<()> {
-        let res = {
-            self.ep.as_ref()
-                .stream_send(self.buf.as_slice())
-                .await
-        };
-        self.cb.send(res)
+        let res = self.ep.stream_send(self.buf.as_slice()).await;
+        self.call.send(res)
     }
 }
 
@@ -41,7 +63,7 @@ pub struct StreamRecv {
     pub ep: RawPtr<RmaEndpoint>,
     pub buf: BytesMut,
     pub full: bool,
-    pub cb: CallSender<IOResult<BytesMut>>,
+    pub call: CallSender<IOResult<BytesMut>>,
 }
 
 impl StreamRecv {
@@ -55,35 +77,32 @@ impl StreamRecv {
                 Ok(self.buf.split_to(size))
             }
         };
-        self.cb.send(res)
+        self.call.send(res)
     }
 }
 
 pub struct Flush {
     pub ep: RawPtr<RmaEndpoint>,
-    pub cb: CallSender<IOResult<()>>,
+    pub call: CallSender<IOResult<()>>,
 }
 
 impl Flush {
     pub async fn run(self) -> IOResult<()> {
         let res = self.ep.flush().await;
-        self.cb.send(res)
+        self.call.send(res)
     }
 }
 
 pub struct RmaPut {
     pub ep: RawPtr<RmaEndpoint>,
     pub buf: DataSlice,
-    pub cb: CallSender<IOResult<()>>,
+    pub call: CallSender<IOResult<()>>,
 }
 
 impl RmaPut {
     pub async fn run(self) -> IOResult<()> {
-        info!("RmaPut");
         let res = self.ep.put(self.buf.as_slice()).await;
-        info!("RmaPut");
-        self.cb.send(res).unwrap();
-        info!("RmaPut");
+        self.call.send(res).unwrap();
         Ok(())
     }
 }
@@ -91,7 +110,7 @@ impl RmaPut {
 pub struct RmaGet {
     pub ep: RawPtr<RmaEndpoint>,
     pub buf: BytesMut,
-    pub cb: CallSender<IOResult<BytesMut>>,
+    pub call: CallSender<IOResult<BytesMut>>,
 }
 
 impl RmaGet {
@@ -100,23 +119,20 @@ impl RmaGet {
             Ok(v) => Ok(self.buf),
             Err(e) => Err(e)
         };
-        self.cb.send(res)
+        self.call.send(res)
     }
 }
 
 pub struct TagSend {
     pub ep: RawPtr<RmaEndpoint>,
     pub buf: DataSlice,
-    pub cb: CallSender<IOResult<()>>,
+    pub call: CallSender<IOResult<()>>,
 }
 
 impl TagSend {
     pub async fn run(self) -> IOResult<()> {
-        info!("TagSend");
         let res = self.ep.tag_send(self.buf.as_slice()).await;
-        info!("TagSend");
-        self.cb.send(res).unwrap();
-        info!("TagSend");
+        self.call.send(res).unwrap();
         Ok(())
     }
 }
@@ -124,7 +140,7 @@ impl TagSend {
 pub struct TagRecv {
     pub ep: RawPtr<RmaEndpoint>,
     pub buf: BytesMut,
-    pub cb: CallSender<IOResult<BytesMut>>,
+    pub call: CallSender<IOResult<BytesMut>>,
 }
 
 impl TagRecv {
@@ -133,11 +149,13 @@ impl TagRecv {
             Ok(v) => Ok(self.buf.split_to(v)),
             Err(e) => Err(e)
         };
-        self.cb.send(res)
+        self.call.send(res)
     }
 }
 
 pub enum OpRequest {
+    HandshakeRequest(HandshakeRequest),
+    HandshakeResponse(HandshakeResponse),
     StreamSend(StreamSend),
     StreamRecv(StreamRecv),
     Flush(Flush),
@@ -149,7 +167,10 @@ pub enum OpRequest {
 
 impl OpRequest {
     pub async fn run(self) -> IOResult<()> {
+        info!("thread {}", Utils::thread_id());
         match self {
+            OpRequest::HandshakeRequest(req) => req.run().await,
+            OpRequest::HandshakeResponse(req) => req.run().await,
             OpRequest::StreamSend(req) => req.run().await,
             OpRequest::StreamRecv(req) => req.run().await,
             OpRequest::Flush(req) => req.run().await,

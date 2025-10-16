@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::IOResult;
-use crate::sync::AtomicLen;
 use std::sync::Arc;
+use crate::io::IOResult;
 use crate::io::net::InetAddr;
+use crate::sync::AtomicLen;
+use crate::ucp::core::{Config, Context, Listener, SockAddr};
 use crate::ucp::reactor::{AsyncEndpoint, RmaEndpoint, UcpExecutor};
-use crate::ucp::core::{Config, Context, Endpoint, Listener, SockAddr};
 use crate::ucp::request::ConnRequest;
-use crate::ucp::rma::LocalMem;
 
 pub struct UcpRuntime {
     pub boss: Arc<UcpExecutor>,
@@ -53,7 +52,7 @@ impl UcpRuntime {
         Listener::bind(self.boss.worker().clone(), addr)
     }
 
-    pub fn worker_executor(&self) -> Arc<UcpExecutor> {
+    pub fn select_executor(&self) -> Arc<UcpExecutor> {
         let index = self.index.next();
         self.workers[index % self.workers.len()].clone()
     }
@@ -62,20 +61,27 @@ impl UcpRuntime {
         &self.boss
     }
 
-    pub fn accept(&self, conn: ConnRequest, mem_len: usize) -> IOResult<AsyncEndpoint> {
-        let executor = self.boss.clone();
-        let endpoint = RmaEndpoint::accept(executor.worker().clone(), conn, mem_len)?;
-        Ok(AsyncEndpoint::new(executor, endpoint))
+    pub fn accept_rma(&self, conn: ConnRequest, mem_len: usize) -> IOResult<RmaEndpoint> {
+        let executor = self.select_executor();
+        let endpoint = RmaEndpoint::accept(executor, conn, mem_len)?;
+        Ok(endpoint)
     }
 
-    pub fn connect(&self, addr: &InetAddr, mem_len: usize) -> IOResult<AsyncEndpoint> {
+    pub fn accept_async(&self, conn: ConnRequest, mem_len: usize) -> IOResult<AsyncEndpoint> {
+        let ep = self.accept_rma(conn, mem_len)?;
+        Ok(AsyncEndpoint::new(ep))
+    }
+
+    pub fn connect_rma(&self, addr: &InetAddr, mem_len: usize) -> IOResult<RmaEndpoint> {
         let sockaddr = SockAddr::try_from(addr)?;
-        let rt = self.worker_executor();
+        let executor = self.select_executor();
+        let endpoint = RmaEndpoint::connect(executor, &sockaddr, mem_len)?;
+        Ok(endpoint)
+    }
 
-        let endpoint = RmaEndpoint::connect(rt.worker().clone(), &sockaddr, mem_len)?;
-
-        let executor = self.worker_executor();
-        Ok(AsyncEndpoint::new(executor, endpoint))
+    pub fn connect_async(&self, addr: &InetAddr, mem_len: usize) -> IOResult<AsyncEndpoint> {
+        let ep = self.connect_rma(addr, mem_len)?;
+        Ok(AsyncEndpoint::new(ep))
     }
 }
 

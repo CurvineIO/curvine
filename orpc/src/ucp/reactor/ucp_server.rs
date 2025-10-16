@@ -136,7 +136,7 @@ impl<S> UcpServer<S>
         loop {
             let req = listener.accept().await?;
 
-            let endpoint = self.rt.accept(req, self.conf.buffer_size)?;
+            let endpoint = self.rt.accept_async(req, self.conf.buffer_size)?;
             let rt = endpoint.clone_rt();
             let frame = UcpFrame::new(endpoint);
 

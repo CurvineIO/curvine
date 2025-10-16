@@ -96,7 +96,7 @@ impl RpcClient {
         addr: &InetAddr,
         conf: &ClientConf,
     ) -> IOResult<Self> {
-        let mut endpoint = rt.connect(addr, conf.buffer_size)?;
+        let mut endpoint = rt.connect_async(addr, conf.buffer_size)?;
         endpoint.handshake_request().await?;
         let frame = UcpFrame::new(endpoint);
 
