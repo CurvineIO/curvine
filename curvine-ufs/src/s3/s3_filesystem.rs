@@ -28,6 +28,7 @@ use aws_sdk_s3::Client;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use aws_types::region::Region;
 use aws_types::SdkConfig;
+use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
 use curvine_common::FsResult;
@@ -447,7 +448,7 @@ impl FileSystem<S3Writer, S3Reader> for S3FileSystem {
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
         let res = self.get_file_status(path).await?;
         match res {
-            None => err_ufs!("Path {} not found", path.full_path()),
+            None => Err(FsError::file_not_found(path.full_path())),
             Some(v) => Ok(v),
         }
     }

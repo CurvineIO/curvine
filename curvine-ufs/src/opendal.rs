@@ -604,11 +604,16 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
         let object_path = self.get_object_path(path)?;
 
-        let metadata = self
-            .operator
-            .stat(&object_path)
-            .await
-            .map_err(|e| FsError::common(format!("Failed to stat: {}", e)))?;
+        let metadata = match self.operator.stat(&object_path).await {
+            Ok(m) => m,
+            Err(e) => {
+                // Map backend NotFound to FsError::FileNotFound so FUSE can return ENOENT
+                if e.kind() == opendal::ErrorKind::NotFound {
+                    return Err(FsError::file_not_found(path.full_path()));
+                }
+                return Err(FsError::common(format!("Failed to stat: {}", e)));
+            }
+        };
 
         Ok(FileStatus {
             path: path.full_path().to_owned(),
