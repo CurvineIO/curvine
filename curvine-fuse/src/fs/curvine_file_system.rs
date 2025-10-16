@@ -197,7 +197,7 @@ impl CurvineFileSystem {
             Err(e) => {
                 return match e {
                     FsError::FileNotFound(_) => err_fuse!(libc::ENOENT, "{}", e),
-                    _ => err_fuse!(libc::ENOSYS, "{}", e),
+                    _ => Err(FuseError::from(e)),
                 }
             }
         };

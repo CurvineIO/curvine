@@ -21,7 +21,7 @@ use aws_smithy_types::byte_stream::ByteStream;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use bytes::{Bytes, BytesMut};
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::FileStatus;
+use curvine_common::state::{FileStatus, FileType};
 use curvine_common::FsResult;
 use log::{debug, info, warn};
 use orpc::common::ByteUnit;
@@ -39,6 +39,7 @@ pub struct S3Writer {
     path: Path,
     bucket: String,
     key: String,
+    status: FileStatus,
     pos: i64,
     buffer: BytesMut,
     buffer_size: usize,
@@ -79,11 +80,35 @@ impl S3Writer {
             ByteUnit::byte_to_string(buffer_size as u64)
         );
 
+        // Prepare a minimal file status for FUSE attribute derivation before upload completes
+        let status = FileStatus {
+            id: 0,
+            path: path.full_path().to_string(),
+            name: path.name().to_string(),
+            is_dir: false,
+            mtime: 0,
+            atime: 0,
+            children_num: 0,
+            is_complete: true,
+            len: 0,
+            replicas: 1,
+            block_size: 4 * 1024 * 1024,
+            file_type: FileType::File,
+            x_attr: std::collections::HashMap::new(),
+            storage_policy: Default::default(),
+            mode: 0o644,
+            owner: String::new(),
+            group: String::new(),
+            nlink: 1,
+            target: None,
+        };
+
         Ok(Self {
             client,
             path: path.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
+            status,
             pos: 0,
             buffer: BytesMut::with_capacity(buffer_size),
             buffer_size,
@@ -299,7 +324,7 @@ impl S3Writer {
 
 impl Writer for S3Writer {
     fn status(&self) -> &FileStatus {
-        todo!()
+        &self.status
     }
 
     fn path(&self) -> &Path {
@@ -368,6 +393,7 @@ impl Writer for S3Writer {
         // Get and clear the buffer
         let bytes_to_upload = self.buffer.split().freeze();
         if bytes_to_upload.is_empty() {
+            // Nothing in buffer to upload during flush
             return Ok(());
         }
 
@@ -392,7 +418,32 @@ impl Writer for S3Writer {
     }
 
     async fn complete(&mut self) -> FsResult<()> {
-        self.flush().await
+        // First, flush any pending buffered data
+        self.flush().await?;
+
+        // If multipart upload was initiated, ensure we finalize it even when buffer is empty
+        if self.upload_id.is_some() {
+            // If there are buffered bytes (should be none after flush), upload as last part
+            let leftover = self.buffer.split().freeze();
+            if !leftover.is_empty() {
+                let part = self.upload_part(leftover).await?;
+                let mut parts = self.parts.lock().await;
+                parts.push(part);
+                drop(parts);
+            }
+
+            // Complete multipart upload if we have any parts
+            self.complete_upload().await?;
+            return Ok(());
+        }
+
+        // Small object path: if no multipart and we still have data (rare due to flush), put directly
+        let leftover = self.buffer.split().freeze();
+        if !leftover.is_empty() {
+            let _ = self.put_object(leftover).await?;
+        }
+
+        Ok(())
     }
 
     async fn cancel(&mut self) -> FsResult<()> {
