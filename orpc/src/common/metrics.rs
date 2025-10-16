@@ -143,6 +143,14 @@ mod test {
         assert_eq!(gauge.get(), 1000);
 
         let output = Metrics::text_output().unwrap();
-        println!("output = {}", output)
+        println!("output = {}", output);
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(output.contains("process_threads"));
+            assert!(output.contains("process_cpu_seconds_total"));
+            assert!(output.contains("process_open_fds"));
+            assert!(output.contains("process_resident_memory_bytes"));
+        }
     }
 }
