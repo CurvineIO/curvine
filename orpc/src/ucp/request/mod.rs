@@ -18,14 +18,11 @@ pub use self::request_waker::RequestWaker;
 mod conn_request;
 pub use self::conn_request::ConnRequest;
 
-mod request_future;
-pub use self::request_future::RequestFuture;
-
 mod request_param;
 pub use self::request_param::RequestParam;
 
 mod request_status;
-pub use self::request_status::RequestStatus;
+pub use self::request_status::*;
 
 mod op_request;
 pub use self::op_request::*;

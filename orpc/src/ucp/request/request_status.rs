@@ -13,13 +13,54 @@
 // limitations under the License.
 
 use std::ffi::c_void;
+use std::future::Future;
 use std::mem::MaybeUninit;
+use std::pin::Pin;
 use std::task::Poll;
 use crate::err_ucs;
 use crate::io::IOResult;
-use crate::ucp::bindings::{ucs_status_ptr_t, ucs_status_t};
-use crate::ucp::request::RequestFuture;
+use crate::ucp::bindings::{ucp_request_free, ucs_status_ptr_t, ucs_status_t};
+use crate::ucp::request::RequestWaker;
 use crate::ucp::UcpUtils;
+
+
+pub struct RequestFuture<T> {
+    ptr: ucs_status_ptr_t,
+    poll_fn: unsafe fn(ucs_status_ptr_t) -> Poll<T>,
+}
+
+impl<T> RequestFuture<T> {
+    pub fn new(ptr: ucs_status_ptr_t, poll_fn: fn(ucs_status_ptr_t) -> Poll<T>) -> Self {
+        Self { ptr, poll_fn }
+    }
+}
+
+unsafe impl<T> Send for RequestFuture<T> {}
+
+unsafe impl<T> Sync for RequestFuture<T> {}
+
+impl<T> Future for RequestFuture<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context) -> Poll<Self::Output> {
+        let ret = unsafe { (self.poll_fn)(self.ptr) };
+        match ret {
+            Poll::Ready(v) => Poll::Ready(v),
+            Poll::Pending => {
+                let request = unsafe { &mut *(self.ptr as *mut RequestWaker) };
+                request.register(cx.waker());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<T> Drop for RequestFuture<T> {
+    fn drop(&mut self) {
+        unsafe { ucp_request_free(self.ptr as _) };
+    }
+}
+
 
 pub enum RequestStatus<T> {
     Ready(IOResult<T>),

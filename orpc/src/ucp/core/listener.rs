@@ -127,6 +127,10 @@ impl Listener {
         let status = unsafe { ucp_listener_reject(self.as_mut_ptr(), conn.as_mut_ptr()) };
         err_ucs!(status)
     }
+
+    pub fn worker(&self) -> &Arc<Worker> {
+        &self.worker
+    }
 }
 
 impl Drop for Listener {

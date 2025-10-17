@@ -57,7 +57,9 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         let mut inner = MaybeUninit::<*mut ucp_config>::uninit();
-        let status = unsafe { ucp_config_read(ptr::null(), ptr::null(), inner.as_mut_ptr()) };
+        let status = unsafe {
+            ucp_config_read(ptr::null(), ptr::null(), inner.as_mut_ptr())
+        };
         err_ucs!(status).unwrap();
 
         Self {

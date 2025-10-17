@@ -14,7 +14,11 @@
 
 #![allow(clippy::missing_safety_doc, clippy::missing_transmute_annotations)]
 
-use crate::ucp::bindings::FILE;
+use crate::{err_box, err_ext};
+use crate::error::ErrorExt;
+use crate::ucp::bindings::{FILE, ucs_status_t};
+use crate::ucp::bindings::ucs_status_t::UCS_OK;
+use crate::ucp::ucp_error::UcpError;
 
 pub const HANDSHAKE_MAGIC: u64 = 0xFEEDFACE;
 
@@ -33,6 +37,8 @@ pub mod rma;
 pub mod reactor;
 
 mod ucp_utils;
+mod ucp_error;
+
 pub use self::ucp_utils::UcpUtils;
 
 extern "C" {
@@ -42,11 +48,14 @@ extern "C" {
 #[macro_export]
 macro_rules! err_ucs {
     ($e:expr) => {{
-        if $e != $crate::ucp::bindings::ucs_status_t::UCS_OK {
-            let ctx = format!("errno: {}({}:{})", $e as i8, file!(), line!());
-            Err($crate::io::IOError::create(ctx))
-        } else {
-            Ok(())
+        match $crate::ucp::UcpError::from_status($e) {
+            Err(e) => {
+                use $crate::error::ErrorExt;
+                let err: $crate::io::IOError = e.into();
+                let ctx: String = format!("({}:{})", file!(), line!());
+                Err(err.ctx(ctx))
+            }
+            Ok(()) => Ok(())
         }
     }};
 }
