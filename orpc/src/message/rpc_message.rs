@@ -203,15 +203,9 @@ impl RpcMessage {
             return Ok(());
         }
 
-        match &self.data {
-            DataSlice::Buffer(buf) => {
-                let mut err_buf = BytesMut::new();
-                err_buf.extend_from_slice(&buf[..]);
-                let err = E::decode(err_buf);
-                Err(err)
-            }
-            _ => panic!("Not found error data"),
-        }
+        let err_buf = BytesMut::from(self.data.as_slice());
+        let err = E::decode(err_buf);
+        Err(err)
     }
 
     fn response(&self, status: Status, header: Option<BytesMut>, data: DataSlice) -> Self {

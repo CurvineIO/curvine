@@ -33,6 +33,7 @@ pub struct LocalFile {
     is_tmpfs: bool,
     len: i64,
     pos: i64,
+    buf: BytesMut,
 }
 
 impl LocalFile {
@@ -47,6 +48,7 @@ impl LocalFile {
             is_tmpfs,
             len,
             pos,
+            buf: BytesMut::new(),
         };
 
         Ok(file)
@@ -90,18 +92,18 @@ impl LocalFile {
                 "offset exceeds file length, length={}, offset={}",
                 self.len, self.pos
             );
-            Err(err_msg.as_str().into())
-        } else {
-            let region = DataSlice::from_file(
-                &mut (self.inner),
-                enable_send_file,
-                Some(self.pos),
-                chunk as i32,
-            )?;
-
-            self.pos += chunk;
-            Ok(region)
+            return  Err(err_msg.as_str().into())
         }
+
+        let region = DataSlice::from_file(
+            self,
+            enable_send_file,
+            Some(self.pos),
+            chunk as i32,
+        )?;
+
+        self.pos += chunk;
+        Ok(region)
     }
 
     pub fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
@@ -200,17 +202,19 @@ impl LocalFile {
         }
     }
 
-    pub fn read_full<T>(io: &mut T, off: Option<i64>, len: usize) -> IOResult<BytesMut>
-    where
-        T: Read + Seek,
-    {
+    pub fn read_full(&mut self, off: Option<i64>, len: usize) -> IOResult<BytesMut> {
         if let Some(v) = off {
-            io.seek(SeekFrom::Start(v as u64))?;
+            self.inner.seek(SeekFrom::Start(v as u64))?;
         }
 
-        let mut bytes = BytesMut::zeroed(len);
-        io.read_exact(&mut bytes)?;
-        Ok(bytes)
+        self.buf.reserve(len);
+        unsafe {
+            self.buf.set_len(len)
+        }
+        let mut buf = self.buf.split();
+
+        self.inner.read_exact(&mut buf)?;
+        Ok(buf)
     }
 
     // Write a string to the file and close the file immediately after the write is completed.

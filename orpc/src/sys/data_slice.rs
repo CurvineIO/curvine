@@ -88,7 +88,7 @@ impl DataSlice {
     // Create a file data fragment.
     // Usually created in business threads, it is a synchronization function.
     pub fn from_file(
-        io: &mut File,
+        file: &mut LocalFile,
         enable_send_file: bool,
         off: Option<i64>,
         len: i32,
@@ -99,17 +99,17 @@ impl DataSlice {
 
         #[cfg(not(target_os = "linux"))]
         {
-            let buf = LocalFile::read_full(io, off, len as usize)?;
+            let buf = file.read_full(off, len as usize)?;
             Ok(Buffer(buf))
         }
 
         #[cfg(target_os = "linux")]
         {
             if enable_send_file {
-                let fd = sys::get_raw_io(io)?;
+                let fd = sys::get_raw_io(file)?;
                 Ok(IOSlice(RawIOSlice::new(fd, off, len as usize)))
             } else {
-                let buf = LocalFile::read_full(io, off, len as usize)?;
+                let buf = file.read_full(off, len as usize)?;
                 Ok(Buffer(buf))
             }
         }

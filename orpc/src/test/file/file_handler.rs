@@ -87,7 +87,7 @@ impl FileHandler {
             RequestStatus::Running => {
                 if let Some(ref mut f) = self.file {
                     self.last_task = f.read_ahead(&self.os_cache, self.last_task.take());
-                    let region = f.read_region(true, self.chunk_size)?;
+                    let region = f.read_region(false, self.chunk_size)?;
                     Ok(msg.success_with_data(None, region))
                 } else {
                     err_box!("file not initialized")
