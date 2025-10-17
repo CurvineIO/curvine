@@ -30,23 +30,29 @@ use std::time::Duration;
 // Test local short-circuit read and write
 #[test]
 fn local() -> CommonResult<()> {
-    let mut conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
     let path = Path::from_str("/file_local.data")?;
-    run(conf, path)
+    run(testing, conf, path)
 }
 
 #[test]
 fn remote() -> CommonResult<()> {
-    let mut conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
     let path = Path::from_str("/file_remote.data")?;
-    run(conf, path)
+    run(testing, conf, path)
 }
 
 #[test]
 fn remote_parallel_1() -> CommonResult<()> {
-    let mut conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
 
     conf.client.write_chunk_num = 1;
@@ -57,12 +63,14 @@ fn remote_parallel_1() -> CommonResult<()> {
     conf.client.read_chunk_size = 65536;
 
     let path = Path::from_str("/file_remote_parallel_1.data")?;
-    run(conf, path)
+    run(testing, conf, path)
 }
 
 #[test]
 fn remote_parallel_4() -> CommonResult<()> {
-    let mut conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
 
     conf.client.write_chunk_num = 4;
@@ -73,12 +81,14 @@ fn remote_parallel_4() -> CommonResult<()> {
     conf.client.read_chunk_size = 65536;
 
     let path = Path::from_str("/file_remote_parallel_4.data")?;
-    run(conf, path)
+    run(testing, conf, path)
 }
 
 #[test]
 fn remote_parallel_4_cache() -> CommonResult<()> {
-    let mut conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
 
     conf.client.write_chunk_num = 4;
@@ -89,19 +99,22 @@ fn remote_parallel_4_cache() -> CommonResult<()> {
     conf.client.read_chunk_size = 65536;
 
     let path = Path::from_str("/file_remote_parallel_4_cache.data")?;
-    run(conf, path)
+    run(testing, conf, path)
 }
 
 #[test]
 fn replicas_3() -> CommonResult<()> {
-    let mut conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
     conf.client.replicas = 3;
+    conf.client.block_size = 1024 * 1024;
     let path = Path::from_str("/replicas_3.data")?;
 
-    conf.client.block_size = 1024 * 1024;
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-    let fs = Testing::get_fs(Some(rt.clone()), Some(conf))?;
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+
     rt.block_on(async move {
         let (write_len, write_ck) = write(&fs, &path).await?;
         let (read_len, read_ck) = read(&fs, &path).await?;
@@ -123,26 +136,30 @@ fn replicas_3() -> CommonResult<()> {
 
 #[test]
 fn append_local() -> CommonResult<()> {
-    let mut conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
     conf.client.replicas = 2;
     let path = Path::from_str("/append_local.data")?;
-    append(conf, path)
+    append(testing, conf, path)
 }
 
 #[test]
 fn append_remote() -> CommonResult<()> {
-    let mut conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
     conf.client.replicas = 2;
     let path = Path::from_str("/append_remote.data")?;
-    append(conf, path)
+    append(testing, conf, path)
 }
 
-fn append(mut conf: ClusterConf, path: Path) -> CommonResult<()> {
+fn append(testing: Testing, mut conf: ClusterConf, path: Path) -> CommonResult<()> {
     conf.client.block_size = 1024 * 1024;
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-    let fs = Testing::get_fs(Some(rt.clone()), Some(conf))?;
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
 
     rt.block_on(async move {
         fs.write_string(&path, "123").await.unwrap();
@@ -161,9 +178,11 @@ fn append(mut conf: ClusterConf, path: Path) -> CommonResult<()> {
 
 // @todo cannot be completed in parallel tests, follow-up optimization.
 fn _abort() -> CommonResult<()> {
-    let conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-    let fs = Testing::get_fs(Some(rt.clone()), Some(conf))?;
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
 
     let path = Path::from_str("/file-abort.log")?;
 
@@ -188,10 +207,10 @@ fn _abort() -> CommonResult<()> {
     Ok(())
 }
 
-fn run(mut conf: ClusterConf, path: Path) -> CommonResult<()> {
+fn run(testing: Testing, mut conf: ClusterConf, path: Path) -> CommonResult<()> {
     conf.client.block_size = 1024 * 1024;
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-    let fs = Testing::get_fs(Some(rt.clone()), Some(conf))?;
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
     rt.block_on(async move {
         let (write_len, write_ck) = write(&fs, &path).await?;
         let (read_len, read_ck) = read(&fs, &path).await?;
@@ -285,13 +304,15 @@ async fn seek(fs: &CurvineFileSystem, path: &Path) -> CommonResult<()> {
 
 #[test]
 fn random_write_multiple_blocks() -> CommonResult<()> {
-    let mut conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
     conf.client.block_size = 1024 * 1024; // 1MB block size
     let path = Path::from_str("/random_write_multiple_blocks.data")?;
 
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-    let fs = Testing::get_fs(Some(rt.clone()), Some(conf))?;
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
 
     rt.block_on(async move { random_write_multiple_blocks_test(&fs, &path).await })
         .unwrap();

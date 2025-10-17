@@ -37,7 +37,9 @@ fn load_client_test() -> CommonResult<()> {
     Logger::default();
 
     // Create a test cluster configuration
-    let conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
     println!("cluster_conf: {:?}", conf);
 
     // Create a test cluster configuration

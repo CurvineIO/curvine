@@ -32,9 +32,11 @@ const PATH: &str = "/fs_test/a.log";
 fn fs_test() -> FsResult<()> {
     let rt = Arc::new(AsyncRuntime::single());
 
-    let mut conf = Testing::get_cluster_conf()?;
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let mut conf = testing.get_active_cluster_conf()?;
     conf.client.metric_report_enable = true;
-    let fs = Testing::get_fs(Some(rt.clone()), Some(conf))?;
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
     let res: FsResult<()> = rt.block_on(async move {
         let path = Path::from_str("/fs_test")?;
         let _ = fs.delete(&path, true).await;

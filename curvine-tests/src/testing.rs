@@ -12,150 +12,109 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::Parser;
 use curvine_client::file::CurvineFileSystem;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_server::test::MiniCluster;
-use orpc::common::{FileUtils, Logger};
+use orpc::common::{FileUtils, Logger, Utils};
 use orpc::io::LocalFile;
 use orpc::runtime::Runtime;
-use orpc::{err_box, CommonResult};
+use orpc::CommonResult;
 use std::collections::HashMap;
-use std::env;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Parser, Clone)]
+type ConfMutator = Arc<dyn Fn(&mut ClusterConf) + Send + Sync>;
+
 pub struct Testing {
-    #[arg(long, default_value = "testing/curvine-cluster.toml")]
-    pub conf: String,
-
-    #[arg(long, default_value = "testing/s3.toml")]
-    pub s3_conf: String,
-
-    #[arg(long, default_value = "1")]
+    pub s3_conf_path: String,
     pub master_num: u16,
-
-    #[arg(long, default_value = "1")]
     pub worker_num: u16,
+    // Absolute path to the active cluster configuration file for this Testing instance
+    active_cluster_conf_path: String,
+    cluster_conf: ClusterConf,
+    #[allow(clippy::type_complexity)]
+    options: Option<ConfMutator>,
 }
 
 impl Testing {
-    pub const SAVE_CONF_PATH: &'static str = "testing/curvine-cluster.toml";
-    pub const S3_CONF_PATH: &'static str = "testing/s3.toml";
+    /// Create a unique temp config file path under /tmp for this Testing instance.
+    fn new_tmp_conf_path() -> String {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let pid = std::process::id();
+        let rand = Utils::rand_str(6);
+        let dir = format!("/tmp/curvine-tests/{}-{}-{}", ts, pid, rand);
+        format!("{}/curvine-cluster.toml", dir)
+    }
 
-    /// Get the workspace root directory by finding the workspace Cargo.toml
-    fn get_workspace_root() -> CommonResult<PathBuf> {
-        // Start from current directory or CARGO_MANIFEST_DIR
-        let start_dir = if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
-            PathBuf::from(manifest_dir)
-        } else {
-            env::current_dir()?
-        };
+    /// Start the cluster using the prepared configuration, and persist to active_cluster_conf.
+    pub fn start_cluster(&self) -> CommonResult<Arc<MiniCluster>> {
+        // Ensure parent dir exists
+        FileUtils::create_parent_dir(&self.active_cluster_conf_path, true)?;
 
-        let mut current = start_dir.as_path();
-
-        // Walk up the directory tree to find workspace root
-        loop {
-            let cargo_toml = current.join("Cargo.toml");
-            if cargo_toml.exists() {
-                // Check if this is the workspace root by looking for [workspace] section
-                if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
-                    if content.contains("[workspace]") {
-                        return Ok(current.to_path_buf());
-                    }
-                }
-            }
-
-            // Move to parent directory
-            match current.parent() {
-                Some(parent) => current = parent,
-                None => break,
-            }
+        // Prepare configuration (apply mutation if provided)
+        let mut conf = self.cluster_conf.clone();
+        if let Some(f) = &self.options {
+            (f)(&mut conf);
         }
 
-        err_box!("Could not find workspace root directory")
-    }
-
-    /// Get the absolute path for configuration file in workspace root
-    fn get_workspace_conf_path(relative_path: &str) -> CommonResult<String> {
-        let workspace_root = Self::get_workspace_root()?;
-        let conf_path = workspace_root.join(relative_path);
-        Ok(conf_path.to_string_lossy().to_string())
-    }
-
-    pub fn start_cluster(&self) -> CommonResult<()> {
-        let conf = ClusterConf::from(&self.conf)?;
-        self.start_cluster_with_conf(&conf)
-    }
-
-    fn get_conf_path() -> CommonResult<String> {
-        // First check environment variable
-        if let Ok(path) = env::var(ClusterConf::ENV_CONF_FILE) {
-            if FileUtils::exists(&path) {
-                return Ok(path);
-            } else {
-                return err_box!("Not found conf path {}", path);
-            }
+        // Clean master metadata and journal directories for fresh start
+        let meta_dir = conf.master.meta_dir.clone();
+        if !meta_dir.is_empty() {
+            let _ = FileUtils::delete_path(&meta_dir, true);
         }
 
-        // Use workspace root path
-        let workspace_conf_path = Self::get_workspace_conf_path(Self::SAVE_CONF_PATH)?;
-
-        if FileUtils::exists(&workspace_conf_path) {
-            Ok(workspace_conf_path)
-        } else {
-            err_box!("Not found conf {}", workspace_conf_path)
+        let journal_dir = conf.journal.journal_dir.clone();
+        if !journal_dir.is_empty() {
+            let _ = FileUtils::delete_path(&journal_dir, true);
         }
-    }
 
-    // Start the cluster.
-    pub fn start_cluster_with_conf(&self, conf: &ClusterConf) -> CommonResult<()> {
-        // Use workspace root path for saving configuration
-        let save_path = Self::get_workspace_conf_path(Self::SAVE_CONF_PATH)?;
-        FileUtils::create_parent_dir(&save_path, true)?;
+        //clean testing/data directory
+        let data_dir = "testing/data".to_string();
+        if FileUtils::exists(&data_dir) {
+            let _ = FileUtils::delete_path(&data_dir, true);
+        }
 
-        let cluster = MiniCluster::with_num(conf, self.master_num, self.worker_num);
+        let cluster = MiniCluster::with_num(&conf, self.master_num, self.worker_num);
 
-        // Save configuration file to workspace root
-        let mut file = LocalFile::with_write(&save_path, true)?;
+        // Save configuration file to active path
+        let mut file = LocalFile::with_write(&self.active_cluster_conf_path, true)?;
         let str = cluster.cluster_conf.to_pretty_toml()?;
         file.write_all(str.as_bytes())?;
         drop(file);
 
         cluster.start_cluster();
-        Ok(())
+        Ok(Arc::new(cluster))
     }
 
-    pub fn get_cluster_conf() -> CommonResult<ClusterConf> {
-        let save_path = Self::get_conf_path()?;
-        ClusterConf::from(save_path)
+    /// Read the active cluster configuration from the persisted path.
+    pub fn get_active_cluster_conf(&self) -> CommonResult<ClusterConf> {
+        ClusterConf::from(self.active_cluster_conf_path.clone())
     }
 
-    pub fn default_fs() -> CommonResult<CurvineFileSystem> {
-        Self::get_fs(None, None)
+    /// Expose the active config file path.
+    pub fn active_conf_path(&self) -> &str {
+        &self.active_cluster_conf_path
     }
 
-    pub fn get_fs_with_rt(rt: Arc<Runtime>) -> CommonResult<CurvineFileSystem> {
-        Self::get_fs(Some(rt), None)
-    }
-
-    pub fn get_fs_with_conf(conf: ClusterConf) -> CommonResult<CurvineFileSystem> {
-        Self::get_fs(None, Some(conf))
-    }
-
-    pub fn get_unified_fs_with_rt(rt: Arc<Runtime>) -> CommonResult<UnifiedFileSystem> {
-        Ok(UnifiedFileSystem::with_rt(Self::get_cluster_conf()?, rt)?)
+    pub fn get_unified_fs_with_rt(&self, rt: Arc<Runtime>) -> CommonResult<UnifiedFileSystem> {
+        Ok(UnifiedFileSystem::with_rt(
+            self.get_active_cluster_conf()?,
+            rt,
+        )?)
     }
 
     pub fn get_fs(
+        &self,
         rt: Option<Arc<Runtime>>,
         conf: Option<ClusterConf>,
     ) -> CommonResult<CurvineFileSystem> {
         let conf = match conf {
             Some(c) => c,
-            None => Self::get_cluster_conf()?,
+            None => self.get_active_cluster_conf()?,
         };
 
         let rt = match rt {
@@ -168,28 +127,111 @@ impl Testing {
         Ok(fs)
     }
 
-    pub fn get_s3_conf() -> Option<HashMap<String, String>> {
-        // Use workspace root path for S3 configuration
-        let path = match Self::get_workspace_conf_path(Self::S3_CONF_PATH) {
-            Ok(p) => p,
-            Err(_) => return None,
-        };
-
-        if !FileUtils::exists(&path) {
+    pub fn get_s3_conf(&self) -> Option<HashMap<String, String>> {
+        let path = &self.s3_conf_path;
+        if !FileUtils::exists(path) {
             return None;
         }
-
-        Some(FileUtils::read_toml_as_map(&path).unwrap())
+        Some(FileUtils::read_toml_as_map(path).unwrap())
     }
 }
 
-impl Default for Testing {
+impl Drop for Testing {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.active_cluster_conf_path);
+    }
+}
+
+pub struct TestingBuilder {
+    master_num: u16,
+    worker_num: u16,
+    base_conf: Option<ClusterConf>,
+    base_conf_path: Option<String>,
+    #[allow(clippy::type_complexity)]
+    options: Option<ConfMutator>,
+    s3_conf_path: Option<String>,
+}
+
+impl Default for TestingBuilder {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TestingBuilder {
+    pub fn new() -> Self {
         Self {
-            conf: "testing/curvine-cluster.toml".to_string(),
-            s3_conf: "testing/s3.toml".to_string(),
             master_num: 1,
             worker_num: 1,
+            base_conf: None,
+            base_conf_path: None,
+            options: None,
+            s3_conf_path: None,
         }
+    }
+
+    /// Set a sensible default base config path for tests if none provided.
+    /// After calling this, `build()` will attempt to load "../etc/curvine-cluster.toml".
+    pub fn default(mut self) -> Self {
+        if self.base_conf.is_none() && self.base_conf_path.is_none() {
+            self.base_conf_path = Some("../etc/curvine-cluster.toml".to_string());
+        }
+        if self.s3_conf_path.is_none() {
+            self.s3_conf_path = Some("../testing/s3.toml".to_string());
+        }
+        self
+    }
+
+    pub fn masters(mut self, n: u16) -> Self {
+        self.master_num = n;
+        self
+    }
+    pub fn workers(mut self, n: u16) -> Self {
+        self.worker_num = n;
+        self
+    }
+    pub fn with_base_conf_path<S: Into<String>>(mut self, path: S) -> Self {
+        self.base_conf_path = Some(path.into());
+        self
+    }
+    pub fn mutate_conf<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&mut ClusterConf) + Send + Sync + 'static,
+    {
+        self.options = Some(Arc::new(f));
+        self
+    }
+    pub fn with_s3_conf_path<S: Into<String>>(mut self, path: S) -> Self {
+        self.s3_conf_path = Some(path.into());
+        self
+    }
+
+    pub fn build(self) -> CommonResult<Testing> {
+        let conf = if let Some(c) = self.base_conf {
+            c
+        } else if let Some(p) = self.base_conf_path {
+            ClusterConf::from(p)?
+        } else {
+            ClusterConf::default()
+        };
+
+        let active_cluster_conf_path = Testing::new_tmp_conf_path();
+        let s3_conf_path = self
+            .s3_conf_path
+            .unwrap_or_else(|| "../testing/s3.toml".to_string());
+        Ok(Testing {
+            s3_conf_path,
+            master_num: self.master_num,
+            worker_num: self.worker_num,
+            active_cluster_conf_path,
+            cluster_conf: conf,
+            options: self.options,
+        })
+    }
+}
+
+impl Testing {
+    pub fn builder() -> TestingBuilder {
+        TestingBuilder::new()
     }
 }

@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use curvine_client::file::{FsClient, FsContext};
-use curvine_common::conf::{ClientConf, ClusterConf};
+use curvine_common::conf::ClientConf;
 use curvine_common::fs::Path;
 use curvine_common::state::{CreateFileOptsBuilder, MkdirOptsBuilder, StoragePolicy, TtlAction};
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::{LogConf, Logger};
+use orpc::common::{DurationUnit, LogConf, Logger};
 use orpc::runtime::RpcRuntime;
 use orpc::CommonResult;
 use std::sync::Arc;
@@ -35,20 +35,21 @@ fn test_ttl_cleanup() -> CommonResult<()> {
     Logger::init(LogConf::default());
 
     info!("Starting TTL cleanup test");
-    // Create test cluster configuration
-    let mut conf = ClusterConf::from("../etc/curvine-cluster.toml")?;
-    conf.master.ttl_checker_interval = "1s".to_string(); // 1 second check interval for testing
-    conf.master.ttl_bucket_interval = "1s".to_string(); // 1 second bucket interval
-    conf.master.ttl_checker_retry_attempts = 1; // 1 retry attempt
+    // Build and start test cluster via Testing builder
+    let testing = Testing::builder()
+        .workers(3)
+        .with_base_conf_path("../etc/curvine-cluster.toml")
+        .mutate_conf(|conf| {
+            conf.master.ttl_checker_interval_unit = DurationUnit::from_str("1s").unwrap();
+            conf.master.ttl_bucket_interval_unit = DurationUnit::from_str("1s").unwrap();
+            conf.master.ttl_checker_retry_attempts = 1;
+            print!("-----------------------------------------")
+        })
+        .build()?;
+    testing.start_cluster()?;
 
-    let testing = Testing {
-        worker_num: 3,
-        ..Default::default()
-    };
-    testing.start_cluster_with_conf(&conf)?;
-    // let conf = Testing::get_cluster_conf()?;
+    let conf = testing.get_active_cluster_conf()?;
     println!("conf: {:?}", conf);
-
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let fs_context = Arc::new(FsContext::with_rt(conf.clone(), rt.clone())?);
     let client = FsClient::new(fs_context);

@@ -23,7 +23,9 @@ use std::thread;
 use std::time::Duration;
 
 fn get_fs() -> CurvineFileSystem {
-    let mut conf = Testing::get_cluster_conf().unwrap();
+    let testing = Testing::builder().default().build().unwrap();
+    testing.start_cluster().unwrap();
+    let mut conf = testing.get_active_cluster_conf().unwrap();
     conf.client.rpc_timeout_ms = 3 * 1000;
     conf.client.master_conn_pool_size = 1;
     conf.master.io_timeout = "3s".to_string();
@@ -32,7 +34,7 @@ fn get_fs() -> CurvineFileSystem {
     conf.client.short_circuit = false;
 
     let rt = Arc::new(AsyncRuntime::single());
-    Testing::get_fs(Some(rt), Some(conf)).unwrap()
+    testing.get_fs(Some(rt), Some(conf)).unwrap()
 }
 
 // Test the master request timeout.

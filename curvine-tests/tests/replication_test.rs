@@ -17,16 +17,17 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{BlockLocation, CreateFileOptsBuilder, FileBlocks, WorkerAddress};
-use curvine_server::test::MiniCluster;
+use curvine_tests::Testing;
 use log::info;
 use orpc::common::Utils;
-use orpc::runtime::{AsyncRuntime, RpcRuntime};
+use orpc::runtime::RpcRuntime;
 use orpc::{CommonError, CommonResult};
 use std::sync::Arc;
-use tempfile::{tempdir, TempDir};
+use tempfile::TempDir;
 
 /// Create a test configuration for replication testing
 /// 2 masters, 3 workers, no S3 mounting
+#[allow(dead_code)]
 fn create_test_config(tmp_dir: &TempDir) -> ClusterConf {
     let root = tmp_dir.path().to_str().unwrap();
     let mut conf = ClusterConf::default();
@@ -60,22 +61,24 @@ fn create_test_config(tmp_dir: &TempDir) -> ClusterConf {
 /// the replication manager automatically replicates them to ensure data availability
 #[test]
 fn test_block_replication_e2e() -> CommonResult<()> {
-    let tmpdir = tempdir().unwrap();
-    let conf = create_test_config(&tmpdir);
+    // Build base config via Testing builder (loads default conf), then tweak replication params
+    let testing = Testing::builder()
+        .default()
+        .masters(2)
+        .workers(3)
+        .mutate_conf(|conf| {
+            conf.client.block_size = 64 * 1024;
+            conf.master.min_block_size = 64 * 1024;
+            conf.master.min_replication = 1;
+            conf.master.max_replication = 3;
+            conf.master.block_replication_enabled = true;
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
 
-    // Use 2 masters and 3 workers as requested
-    let cluster = MiniCluster::with_num(&conf, 2, 3);
-
-    info!("Starting cluster with 2 masters and 3 workers");
-    cluster.start_cluster();
-
-    // Wait for cluster to be fully ready
-    Utils::sleep(3000);
-
-    let rt = Arc::new(AsyncRuntime::single());
-    let fs = cluster.new_fs();
-
-    // Step 1: Write a file to create blocks
     let path = Path::from_str("/replication_test.dat")?;
     let test_data = generate_test_data(200 * 1024); // 200KB data (will create ~3-4 blocks)
 
@@ -187,20 +190,22 @@ fn test_block_replication_e2e() -> CommonResult<()> {
 /// Test replication with worker failure simulation  
 #[test]
 fn test_replication_with_simulated_worker_failure() -> CommonResult<()> {
-    let tmpdir = tempdir().unwrap();
-    let mut conf = create_test_config(&tmpdir);
-    conf.client.block_size = 32 * 1024; // 32KB blocks
-    conf.master.min_block_size = 32 * 1024;
-
-    // Use 2 masters and 4 workers for more comprehensive testing
-    let cluster = MiniCluster::with_num(&conf, 2, 4);
-
-    info!("Starting cluster with 2 masters and 4 workers");
-    cluster.start_cluster();
-    Utils::sleep(3000);
-
-    let fs = cluster.new_fs();
-    let rt = cluster.clone_client_rt();
+    let testing = Testing::builder()
+        .default()
+        .masters(2)
+        .workers(4)
+        .mutate_conf(|conf| {
+            conf.client.block_size = 32 * 1024; // 32KB blocks
+            conf.master.min_block_size = 32 * 1024;
+            conf.master.min_replication = 1;
+            conf.master.max_replication = 3;
+            conf.master.block_replication_enabled = true;
+        })
+        .build()?;
+    let cluster = testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
 
     // Write multiple files to distribute blocks across workers
     let files = vec![
