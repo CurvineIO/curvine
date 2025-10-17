@@ -18,6 +18,10 @@ message BlockWriteRequest {
     required bool short_circuit = 6 [default = false];
     required string client_name = 7 [default = ""];
     required int32 chunk_size = 8;
+
+    required bool pipeline = 9;
+    repeated WorkerAddressProto locations = 10;
+    required int32 location_index = 11;
 }
 
 message BlockWriteResponse {
@@ -26,6 +30,12 @@ message BlockWriteResponse {
     required int64 off = 3;
     required int64 len = 4;
     required StorageTypeProto storage_type = 5;
+}
+
+// if the pipeline is enabled, this could be retrieved by the client side
+message DataWritingHeader {
+    repeated int32 failure_location_index = 6;
+    repeated string failure_location_message = 7;
 }
 
 message BlockReadRequest {
