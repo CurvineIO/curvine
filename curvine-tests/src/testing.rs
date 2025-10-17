@@ -23,6 +23,7 @@ use orpc::runtime::Runtime;
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
 use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Debug, Parser, Clone)]
@@ -44,42 +45,81 @@ impl Testing {
     pub const SAVE_CONF_PATH: &'static str = "testing/curvine-cluster.toml";
     pub const S3_CONF_PATH: &'static str = "testing/s3.toml";
 
+    /// Get the workspace root directory by finding the workspace Cargo.toml
+    fn get_workspace_root() -> CommonResult<PathBuf> {
+        // Start from current directory or CARGO_MANIFEST_DIR
+        let start_dir = if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
+            PathBuf::from(manifest_dir)
+        } else {
+            env::current_dir()?
+        };
+
+        let mut current = start_dir.as_path();
+
+        // Walk up the directory tree to find workspace root
+        loop {
+            let cargo_toml = current.join("Cargo.toml");
+            if cargo_toml.exists() {
+                // Check if this is the workspace root by looking for [workspace] section
+                if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
+                    if content.contains("[workspace]") {
+                        return Ok(current.to_path_buf());
+                    }
+                }
+            }
+
+            // Move to parent directory
+            match current.parent() {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+
+        err_box!("Could not find workspace root directory")
+    }
+
+    /// Get the absolute path for configuration file in workspace root
+    fn get_workspace_conf_path(relative_path: &str) -> CommonResult<String> {
+        let workspace_root = Self::get_workspace_root()?;
+        let conf_path = workspace_root.join(relative_path);
+        Ok(conf_path.to_string_lossy().to_string())
+    }
+
     pub fn start_cluster(&self) -> CommonResult<()> {
         let conf = ClusterConf::from(&self.conf)?;
         self.start_cluster_with_conf(&conf)
     }
 
     fn get_conf_path() -> CommonResult<String> {
+        // First check environment variable
         if let Ok(path) = env::var(ClusterConf::ENV_CONF_FILE) {
             if FileUtils::exists(&path) {
-                Ok(path)
+                return Ok(path);
             } else {
-                err_box!("Not found conf path {}", path)
+                return err_box!("Not found conf path {}", path);
             }
-        } else {
-            let path = if FileUtils::exists(Self::SAVE_CONF_PATH) {
-                Self::SAVE_CONF_PATH.to_string()
-            } else {
-                // cargo test, you need to find the upper directory
-                format!("../{}", Self::SAVE_CONF_PATH)
-            };
+        }
 
-            if FileUtils::exists(&path) {
-                Ok(path)
-            } else {
-                err_box!("Not found conf {}", path)
-            }
+        // Use workspace root path
+        let workspace_conf_path = Self::get_workspace_conf_path(Self::SAVE_CONF_PATH)?;
+
+        if FileUtils::exists(&workspace_conf_path) {
+            Ok(workspace_conf_path)
+        } else {
+            err_box!("Not found conf {}", workspace_conf_path)
         }
     }
 
     // Start the cluster.
     pub fn start_cluster_with_conf(&self, conf: &ClusterConf) -> CommonResult<()> {
-        FileUtils::create_parent_dir(Self::SAVE_CONF_PATH, true)?;
+        // Use workspace root path for saving configuration
+        let save_path = Self::get_workspace_conf_path(Self::SAVE_CONF_PATH)?;
+        FileUtils::create_parent_dir(&save_path, true)?;
 
         let cluster = MiniCluster::with_num(conf, self.master_num, self.worker_num);
 
-        // Save configuration file
-        let mut file = LocalFile::with_write(Self::SAVE_CONF_PATH, true)?;
+        // Save configuration file to workspace root
+        let mut file = LocalFile::with_write(&save_path, true)?;
         let str = cluster.cluster_conf.to_pretty_toml()?;
         file.write_all(str.as_bytes())?;
         drop(file);
@@ -129,12 +169,12 @@ impl Testing {
     }
 
     pub fn get_s3_conf() -> Option<HashMap<String, String>> {
-        let path = if FileUtils::exists(Self::S3_CONF_PATH) {
-            Self::S3_CONF_PATH.to_string()
-        } else {
-            // cargo test, you need to find the upper directory
-            format!("../{}", Self::S3_CONF_PATH)
+        // Use workspace root path for S3 configuration
+        let path = match Self::get_workspace_conf_path(Self::S3_CONF_PATH) {
+            Ok(p) => p,
+            Err(_) => return None,
         };
+
         if !FileUtils::exists(&path) {
             return None;
         }

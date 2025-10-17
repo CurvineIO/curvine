@@ -108,12 +108,13 @@ impl UfsManager {
 
         let curvine_path = mount_point_info.cv_path.clone();
         let curvine_path = curvine_path.trim_end_matches('/');
+        let ufs_path = mount_point_info.ufs_path.trim_end_matches('/');
 
         // Extract the relative path by removing the mount point prefix
         // mount info ufs_path -> "s3://a/b/,        mnt_path -> /x
         //       ufs_norm_path -> "s3://a/b/c ,  curvine_path -> /x/c
-        let ufs_path = if ufs_norm_uri.starts_with(&mount_point_info.ufs_path) {
-            let prefix_len = mount_point_info.ufs_path.len();
+        let ufs_path = if ufs_norm_uri.starts_with(ufs_path) {
+            let prefix_len = ufs_path.len();
             if prefix_len < ufs_norm_path.len() {
                 &ufs_norm_path[prefix_len..]
             } else {

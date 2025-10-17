@@ -55,6 +55,14 @@ async fn get_mount(fs: &UnifiedFileSystem) -> FsResult<()> {
 }
 
 async fn mount(fs: &UnifiedFileSystem) -> FsResult<()> {
+    let exists_mnts = fs.get_mount_table().await?;
+    for mnt in exists_mnts {
+        println!("Unmounting existing mount point: {}", mnt.cv_path);
+        let path = mnt.cv_path.into();
+        let umount_resp = fs.umount(&path).await;
+        assert!(umount_resp.is_ok(), "{}", umount_resp.unwrap_err());
+    }
+
     let ttl_ms = DurationUnit::from_str("1h")?.as_millis() as i64;
 
     let s3_conf = Testing::get_s3_conf().unwrap();
@@ -65,7 +73,7 @@ async fn mount(fs: &UnifiedFileSystem) -> FsResult<()> {
         .mount_type(MountType::Orch)
         .build();
 
-    let ufs_path = "s3://flink/xuen-test".into();
+    let ufs_path = "s3://curvine-test/xuen-test".into();
     let cv_path = "/s3/xuen-test".into();
     fs.mount(&ufs_path, &cv_path, opts).await?;
     Ok(())
