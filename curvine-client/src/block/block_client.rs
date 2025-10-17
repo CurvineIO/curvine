@@ -66,6 +66,7 @@ impl BlockClient {
         short_circuit: bool,
         pipeline: bool,
         locations: Vec<WorkerAddress>,
+        location_index: i32,
     ) -> FsResult<CreateBlockContext> {
         let header = BlockWriteRequest {
             id: blk.id,
@@ -81,7 +82,7 @@ impl BlockClient {
                 .iter()
                 .map(|addr| ProtoUtils::worker_address_to_pb(addr))
                 .collect(),
-            location_index: 0,
+            location_index,
         };
 
         let msg = Builder::new()

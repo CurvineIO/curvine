@@ -167,6 +167,9 @@ pub struct ClientConf {
     pub metric_report_interval_str: String,
 
     pub close_timeout_secs: u64,
+
+    #[serde(skip)]
+    pub pipeline_write_enabled: bool,
 }
 
 impl ClientConf {

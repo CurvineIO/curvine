@@ -58,6 +58,7 @@ impl BlockWriterLocal {
                 true,
                 false,
                 vec![],
+                -1,
             )
             .await?;
 

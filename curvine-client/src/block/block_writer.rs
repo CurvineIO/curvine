@@ -22,8 +22,9 @@ use orpc::err_box;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use std::sync::Arc;
+use std::vec;
 
-enum WriterAdapter {
+pub enum WriterAdapter {
     Local(BlockWriterLocal),
     Remote(BlockWriterRemote),
 }
@@ -101,14 +102,16 @@ impl WriterAdapter {
     }
 
     // Create new WriterAdapter
-    async fn new(
+    pub async fn new(
         fs_context: Arc<FsContext>,
         located_block: &LocatedBlock,
         worker_addr: &WorkerAddress,
+        pipeline: bool,
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
         let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
 
+        // todo: local write also could support pipeline write.
         let adapter = if short_circuit {
             let writer =
                 BlockWriterLocal::new(fs_context, located_block.block.clone(), worker_addr.clone())
@@ -119,6 +122,8 @@ impl WriterAdapter {
                 &fs_context,
                 located_block.block.clone(),
                 worker_addr.clone(),
+                pipeline,
+                located_block.locs.clone(),
             )
             .await?;
             Remote(writer)
@@ -136,18 +141,23 @@ pub struct BlockWriter {
 
 impl BlockWriter {
     pub async fn new(fs_context: Arc<FsContext>, locate: LocatedBlock) -> FsResult<Self> {
-        if locate.locs.is_empty() {
-            return err_box!("There is no available worker");
-        }
-
-        let mut inners = Vec::with_capacity(locate.locs.len());
-        for addr in &locate.locs {
-            let adapter = WriterAdapter::new(fs_context.clone(), &locate, addr).await?;
-            inners.push(adapter);
-        }
+        let first_loc = locate
+            .locs
+            .first()
+            .ok_or(err_box!("There is no available worker"))?;
+        let writers = if fs_context.cluster_conf().client.pipeline_write_enabled {
+            vec![WriterAdapter::new(fs_context.clone(), &locate, first_loc, true).await?]
+        } else {
+            let mut inners = Vec::with_capacity(locate.locs.len());
+            for addr in &locate.locs {
+                let adapter = WriterAdapter::new(fs_context.clone(), &locate, addr, false).await?;
+                inners.push(adapter);
+            }
+            inners
+        };
 
         let writer = Self {
-            inners,
+            inners: writers,
             locate,
             fs_context,
         };
