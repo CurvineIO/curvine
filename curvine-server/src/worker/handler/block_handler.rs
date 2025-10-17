@@ -15,12 +15,14 @@
 use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler::{Reader, Writer};
 use crate::worker::handler::{ReadHandler, WriteHandler};
+use curvine_client::file::FsContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::FsResult;
 use orpc::handler::MessageHandler;
 use orpc::message::Message;
 use orpc::{err_box, CommonResult};
+use std::sync::Arc;
 
 pub enum BlockHandler {
     Writer(WriteHandler),
@@ -28,9 +30,9 @@ pub enum BlockHandler {
 }
 
 impl BlockHandler {
-    pub fn new(code: RpcCode, store: BlockStore) -> CommonResult<Self> {
+    pub fn new(code: RpcCode, store: BlockStore, fs_context: Arc<FsContext>) -> CommonResult<Self> {
         let handler = match code {
-            RpcCode::WriteBlock => Writer(WriteHandler::new(store)),
+            RpcCode::WriteBlock => Writer(WriteHandler::new(store, fs_context)),
 
             RpcCode::ReadBlock => Reader(ReadHandler::new(store)),
 

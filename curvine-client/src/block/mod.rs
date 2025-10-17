@@ -34,4 +34,6 @@ mod block_reader_local;
 pub use self::block_reader_local::BlockReaderLocal;
 
 mod block_reader_remote;
+mod block_writer_pipeline;
+
 pub use self::block_reader_remote::BlockReaderRemote;

@@ -14,7 +14,9 @@
 
 use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
+use crate::worker::pipeline::WritePipeline;
 use crate::worker::{Worker, WorkerMetrics};
+use curvine_client::file::FsContext;
 use curvine_common::error::FsError;
 use curvine_common::proto::{BlockWriteResponse, DataHeaderProto};
 use curvine_common::state::ExtendedBlock;
@@ -26,6 +28,7 @@ use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::{err_box, ternary, try_option_mut};
 use std::mem;
+use std::sync::Arc;
 
 pub struct WriteHandler {
     pub(crate) store: BlockStore,
@@ -34,10 +37,13 @@ pub struct WriteHandler {
     pub(crate) is_commit: bool,
     pub(crate) io_slow_us: u64,
     pub(crate) metrics: &'static WorkerMetrics,
+    pub(crate) fs_context: Arc<FsContext>,
+    // pipeline write
+    pub(crate) write_pipeline: Option<WritePipeline>,
 }
 
 impl WriteHandler {
-    pub fn new(store: BlockStore) -> Self {
+    pub fn new(store: BlockStore, fs_context: Arc<FsContext>) -> Self {
         let conf = Worker::get_conf();
         let metrics = Worker::get_metrics();
 
@@ -48,6 +54,8 @@ impl WriteHandler {
             is_commit: false,
             io_slow_us: conf.worker.io_slow_us(),
             metrics,
+            fs_context,
+            write_pipeline: None,
         }
     }
 
@@ -99,7 +107,7 @@ impl WriteHandler {
             ("remote", file.path().to_string(), Some(file))
         };
 
-        let log_msg = format!(
+        let mut log_msg = format!(
             "Write {}-block start req_id: {}, path: {:?}, off: {}, chunk_size: {}, block_size: {}",
             label,
             context.req_id,
@@ -108,6 +116,26 @@ impl WriteHandler {
             context.chunk_size,
             ByteUnit::byte_to_string(context.block.len as u64)
         );
+
+        if context.is_pipeline {
+            let locations = &context.locations;
+            let index = context.location_index;
+            if let Some(target) = locations.get((index + 1) as usize) {
+                let fs_context = self.fs_context.clone();
+                let block = context.block.clone();
+                let write_pipeline = tokio::runtime::Handle::current().block_on(async move {
+                    WritePipeline::new(&fs_context, block, target.clone()).await
+                })?;
+                let _ = self.write_pipeline.replace(write_pipeline);
+                log_msg = format!(
+                    "{}. Pipeline write with {} ({}/{})",
+                    log_msg,
+                    target,
+                    index,
+                    locations.len()
+                );
+            }
+        }
 
         let response = BlockWriteResponse {
             id: meta.id,
@@ -192,6 +220,11 @@ impl WriteHandler {
             self.metrics.write_time_us.inc_by(used as i64);
         }
 
+        if let Some(write_pipeline) = self.write_pipeline.as_mut() {
+            tokio::runtime::Handle::current()
+                .block_on(async { write_pipeline.write(msg.data.clone()).await })?;
+        }
+
         Ok(msg.success())
     }
 
@@ -243,6 +276,11 @@ impl WriteHandler {
             msg.req_id(),
             commit
         );
+
+        if let Some(write_pipeline) = self.write_pipeline.as_mut() {
+            tokio::runtime::Handle::current()
+                .block_on(async { write_pipeline.complete().await })?;
+        }
 
         Ok(msg.success())
     }

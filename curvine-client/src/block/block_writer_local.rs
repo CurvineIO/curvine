@@ -56,6 +56,8 @@ impl BlockWriterLocal {
                 seq_id,
                 fs_context.write_chunk_size() as i32,
                 true,
+                false,
+                vec![],
             )
             .await?;
 

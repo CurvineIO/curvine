@@ -22,7 +22,8 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse, DataHeaderProto,
 };
-use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_common::state::{ExtendedBlock, StorageType, WorkerAddress};
+use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::client::RpcClient;
 use orpc::message::{Builder, Message, RequestStatus};
@@ -63,6 +64,8 @@ impl BlockClient {
         seq_id: i32,
         chunk_size: i32,
         short_circuit: bool,
+        pipeline: bool,
+        locations: Vec<WorkerAddress>,
     ) -> FsResult<CreateBlockContext> {
         let header = BlockWriteRequest {
             id: blk.id,
@@ -73,6 +76,12 @@ impl BlockClient {
             short_circuit,
             client_name: self.client_name.to_string(),
             chunk_size,
+            pipeline,
+            locations: locations
+                .iter()
+                .map(|addr| ProtoUtils::worker_address_to_pb(addr))
+                .collect(),
+            location_index: 0,
         };
 
         let msg = Builder::new()

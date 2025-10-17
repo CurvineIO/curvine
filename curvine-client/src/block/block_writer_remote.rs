@@ -55,6 +55,8 @@ impl BlockWriterRemote {
                 seq_id,
                 fs_context.write_chunk_size() as i32,
                 false,
+                false,
+                vec![],
             )
             .await?;
 

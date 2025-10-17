@@ -59,7 +59,11 @@ impl MessageHandler for WorkerHandler {
 impl WorkerHandler {
     fn get_handler(&mut self, msg: &Message) -> FsResult<&mut BlockHandler> {
         if self.handler.is_none() {
-            let handler = BlockHandler::new(RpcCode::from(msg.code()), self.store.clone())?;
+            let handler = BlockHandler::new(
+                RpcCode::from(msg.code()),
+                self.store.clone(),
+                self.task_manager.get_fs_context(),
+            )?;
 
             let _ = self.handler.replace(handler);
         }

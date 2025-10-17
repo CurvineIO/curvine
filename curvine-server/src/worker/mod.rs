@@ -23,5 +23,6 @@ mod worker_metrics;
 pub use self::worker_metrics::WorkerMetrics;
 
 pub mod handler;
+mod pipeline;
 mod replication;
 pub mod task;
