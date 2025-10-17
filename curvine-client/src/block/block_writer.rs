@@ -100,6 +100,13 @@ impl WriterAdapter {
         }
     }
 
+    fn max_written_pos(&self) -> i64 {
+        match self {
+            Local(f) => f.max_written_pos(),
+            Remote(f) => f.max_written_pos(),
+        }
+    }
+
     // Create new WriterAdapter
     async fn new(
         fs_context: Arc<FsContext>,
@@ -272,6 +279,10 @@ impl BlockWriter {
         self.locate.block.id
     }
 
+    pub fn max_written_pos(&self) -> i64 {
+        self.inners[0].max_written_pos()
+    }
+
     // Implement seek support for random writes
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 {
@@ -309,7 +320,8 @@ impl BlockWriter {
 
         CommitBlock {
             block_id: self.locate.block.id,
-            block_len: self.pos(),
+            // Use max_written_pos instead of pos() for correct block length in random writes
+            block_len: self.max_written_pos(),
             locations: locs,
         }
     }

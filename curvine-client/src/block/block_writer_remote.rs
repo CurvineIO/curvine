@@ -30,6 +30,7 @@ pub struct BlockWriterRemote {
     seq_id: i32,
     req_id: i64,
     pending_header: Option<DataHeaderProto>,
+    max_written_pos: i64,
 }
 
 impl BlockWriterRemote {
@@ -75,6 +76,7 @@ impl BlockWriterRemote {
             req_id,
             worker_address,
             pending_header: None,
+            max_written_pos: pos,
         };
 
         Ok(writer)
@@ -97,6 +99,7 @@ impl BlockWriterRemote {
             .await?;
 
         self.pos += len;
+        self.max_written_pos = self.max_written_pos.max(self.pos);
         Ok(())
     }
 
@@ -151,6 +154,10 @@ impl BlockWriterRemote {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+
+    pub fn max_written_pos(&self) -> i64 {
+        self.max_written_pos
     }
 
     pub fn len(&self) -> i64 {
