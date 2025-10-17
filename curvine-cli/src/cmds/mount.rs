@@ -158,16 +158,23 @@ impl MountCommand {
             }
         }
 
-        // If any Kerberos-related config is present, require both principal and keytab.
+        // Check Kerberos configuration for HDFS
         let kerberos_present = configs.keys().any(|k| k.starts_with("hdfs.kerberos."));
         if kerberos_present {
-            let has_principal = configs.contains_key("hdfs.kerberos.principal");
-            let has_keytab = configs.contains_key("hdfs.kerberos.keytab");
-            if !(has_principal && has_keytab) {
+            let has_ccache = configs.contains_key("hdfs.kerberos.ccache");
+            let env_ccache = std::env::var("KRB5CCNAME").is_ok();
+
+            if !has_ccache && !env_ccache {
                 eprintln!(
-                    "Error: When using Kerberos, both 'hdfs.kerberos.principal' and 'hdfs.kerberos.keytab' must be provided via --config"
+                    "Warning: Kerberos configuration detected but no ticket cache specified."
                 );
-                std::process::exit(1);
+                eprintln!(
+                    "  Please provide 'hdfs.kerberos.ccache' via --config or set KRB5CCNAME environment variable."
+                );
+                eprintln!(
+                    "  You can generate a ticket cache using: kinit -kt /path/to/keytab principal@REALM"
+                );
+                eprintln!();
             }
         }
 

@@ -323,16 +323,10 @@ impl OpendalFileSystem {
                     builder = builder.user(&user);
                 }
 
-                if let Some(principal) = conf.get("hdfs.kerberos.principal") {
-                    builder = builder.kerberos_principal(principal);
-                }
-
-                if let Some(keytab) = conf.get("hdfs.kerberos.keytab") {
-                    builder = builder.kerberos_keytab(keytab);
-                }
-
                 if let Some(ccache) = conf.get("hdfs.kerberos.ccache") {
-                    std::env::set_var("KRB5CCNAME", ccache);
+                    builder = builder.kerberos_ticket_cache_path(ccache);
+                } else if let Ok(ccache) = std::env::var("KRB5CCNAME") {
+                    builder = builder.kerberos_ticket_cache_path(&ccache);
                 }
 
                 if let Some(krb5_conf) = conf.get("hdfs.kerberos.krb5_conf") {
