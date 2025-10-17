@@ -46,6 +46,10 @@ pub struct ClientConf {
     pub conn_size: usize,
 
     pub use_libc: bool,
+
+    pub ucp_tag_max_len: usize,
+
+    pub ucp_small_use_tag: bool,
 }
 
 impl ClientConf {
@@ -104,6 +108,9 @@ impl Default for ClientConf {
             conn_size: 1,
 
             use_libc: false,
+
+            ucp_tag_max_len: 4096,
+            ucp_small_use_tag: true,
         }
     }
 }

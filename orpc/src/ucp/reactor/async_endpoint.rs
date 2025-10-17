@@ -80,12 +80,12 @@ impl AsyncEndpoint {
         promise.receive().await?
     }
 
-    pub async fn stream_recv(&self, buf: BytesMut) -> IOResult<BytesMut> {
+    pub async fn stream_recv(&self, buf: BytesMut, full: bool) -> IOResult<BytesMut> {
         let (call, promise) = CallChannel::channel();
         let req = OpRequest::StreamRecv(StreamRecv {
             ep: self.ep()?,
             buf,
-            full: false,
+            full,
             call,
         });
         self.sender.send(req).await?;

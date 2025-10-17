@@ -98,7 +98,7 @@ impl RpcClient {
     ) -> IOResult<Self> {
         let mut endpoint = rt.connect_async(addr, conf.buffer_size)?;
         endpoint.handshake_request().await?;
-        let frame = UcpFrame::new(endpoint);
+        let frame = UcpFrame::with_client(endpoint, &conf);
 
         Ok(Self {
             sender: BoxSender::UcpFrame(RawPtr::from_owned(frame)),

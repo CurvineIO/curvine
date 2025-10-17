@@ -137,7 +137,7 @@ impl<S> UcpServer<S>
 
             let endpoint = self.rt.accept_async(req, self.conf.buffer_size)?;
             let rt = endpoint.clone_rt();
-            let frame = UcpFrame::new(endpoint);
+            let frame = UcpFrame::with_server(endpoint, &self.conf);
 
             let mut handler = self
                 .service

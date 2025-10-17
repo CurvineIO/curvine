@@ -48,6 +48,10 @@ pub struct ServerConf {
     pub pipe_pool_idle_time: usize,
 
     pub enable_send_file: bool,
+
+    pub ucp_tag_max_len: usize,
+
+    pub ucp_small_use_tag: bool,
 }
 
 impl ServerConf {
@@ -74,6 +78,9 @@ impl ServerConf {
             pipe_pool_idle_time: 0,
 
             enable_send_file: true,
+
+            ucp_tag_max_len: 4096,
+            ucp_small_use_tag: true,
         }
     }
 

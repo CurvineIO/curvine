@@ -17,22 +17,37 @@ use log::info;
 use crate::io::IOResult;
 use crate::message::{BoxMessage, HEAD_SIZE, MAX_DATE_SIZE, Message, Protocol, RefMessage};
 use crate::{err_box, message, sys};
+use crate::client::ClientConf;
 use crate::handler::Frame;
 use crate::io::net::ConnState;
+use crate::server::ServerConf;
 use crate::sys::{DataSlice, RawVec};
+use crate::ucp::bindings::ucp_ep;
 use crate::ucp::reactor::AsyncEndpoint;
 
 pub struct UcpFrame {
     endpoint: AsyncEndpoint,
     buf: BytesMut,
+    tag_max_len: usize,
+    small_use_tag: bool,
 }
 
 impl UcpFrame {
-    pub fn new(endpoint: AsyncEndpoint) -> Self {
-        UcpFrame {
+    pub fn new(endpoint: AsyncEndpoint, tag_max_len: usize, small_use_tag: bool) -> Self {
+        Self {
             endpoint,
             buf: BytesMut::new(),
+            tag_max_len,
+            small_use_tag
         }
+    }
+
+    pub fn with_server(endpoint: AsyncEndpoint, conf: &ServerConf) -> Self {
+        Self::new(endpoint, conf.ucp_tag_max_len, conf.ucp_small_use_tag)
+    }
+
+    pub fn with_client(endpoint: AsyncEndpoint, conf: &ClientConf) -> Self {
+       Self::new(endpoint, conf.ucp_tag_max_len, conf.ucp_small_use_tag)
     }
 
     fn get_buf(&mut self, len: usize) -> BytesMut {
@@ -50,7 +65,6 @@ impl UcpFrame {
     pub async fn handshake_response(&mut self) -> IOResult<()> {
         self.endpoint.handshake_response().await
     }
-
 }
 
 impl Frame for UcpFrame {
@@ -68,12 +82,23 @@ impl Frame for UcpFrame {
             BoxMessage::Arc(_) => return err_box!("Not support")
         };
 
-        let header_future = self.endpoint.tag_send(DataSlice::Buffer(self.buf.split()));
+        let header_buf = DataSlice::Buffer(self.buf.split());
+
         if !data.is_empty() {
             let data_future = self.endpoint.put(data);
-            tokio::try_join!(header_future, data_future)?;
+            if self.small_use_tag {
+                let header_future = self.endpoint.tag_send(header_buf);
+                tokio::try_join!(header_future, data_future)?;
+            } else {
+                let header_future = self.endpoint.stream_send(header_buf);
+                tokio::try_join!(header_future, data_future)?;
+            }
         } else {
-            header_future.await?;
+            if self.small_use_tag {
+                self.endpoint.tag_send(header_buf).await?;
+            } else {
+                self.endpoint.stream_send(header_buf).await?;
+            }
         }
 
         Ok(())
@@ -81,15 +106,27 @@ impl Frame for UcpFrame {
 
     async fn receive(&mut self) -> IOResult<Message> {
         loop {
-            let buf = self.get_buf(1024);
-            let mut buf = self.endpoint.tag_recv(buf).await?;
-            if buf.len() < message::PROTOCOL_SIZE as usize {
+            let mut proto_buf = if self.small_use_tag {
+                let buf = self.get_buf(self.tag_max_len);
+                self.endpoint.tag_recv(buf).await?
+            } else {
+                let buf = self.get_buf(message::PROTOCOL_SIZE as usize);
+                self.endpoint.stream_recv(buf, true).await?
+            };
+
+            if proto_buf.len() < message::PROTOCOL_SIZE as usize {
                 return err_box!("The data is smaller than the protocol header length");
             }
-            let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
+
+            let (protocol, header_size, data_size) = Message::decode_protocol(&mut proto_buf)?;
 
             let header = if header_size > 0 {
-                Some(buf.split_to(header_size as usize))
+                if self.small_use_tag {
+                    Some(proto_buf.split_to(header_size as usize))
+                } else {
+                    let header_buf = self.get_buf(header_size as usize);
+                    Some(self.endpoint.stream_recv(header_buf, true).await?)
+                }
             } else {
                 None
             };

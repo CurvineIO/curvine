@@ -74,6 +74,6 @@ impl Default for Config {
 
 impl Drop for Config {
     fn drop(&mut self) {
-        unsafe { ucp_config_release(self.as_mut_ptr()) }
+       // unsafe { ucp_config_release(self.as_mut_ptr()) }
     }
 }
