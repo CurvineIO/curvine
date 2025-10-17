@@ -33,7 +33,7 @@ use crate::master::{JobHandler, MountManager};
 use crate::master::{JobManager, MasterHandler};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
 
-static MASTER_METRICS: OnceCell<MasterMetrics> = OnceCell::new();
+pub static MASTER_METRICS: OnceCell<MasterMetrics> = OnceCell::new();
 
 #[derive(Clone)]
 pub struct MasterService {

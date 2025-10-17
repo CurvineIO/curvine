@@ -45,6 +45,11 @@ pub struct MasterMetrics {
 
     pub(crate) inode_dir_num: Gauge,
     pub(crate) inode_file_num: Gauge,
+
+    // for the replication manager
+    pub(crate) replication_staging_number: Gauge,
+    pub(crate) replication_inflight_number: Gauge,
+    pub(crate) replication_failure_count: Counter,
 }
 
 impl MasterMetrics {
@@ -81,6 +86,19 @@ impl MasterMetrics {
             inode_dir_num: m::new_gauge("inode_dir_num", "Total dir")?,
 
             inode_file_num: m::new_gauge("inode_file_num", "Total file")?,
+
+            replication_staging_number: m::new_gauge(
+                "replication_staging_number",
+                "Replication stage number",
+            )?,
+            replication_inflight_number: m::new_gauge(
+                "replication_inflight_number",
+                "Replication stage number",
+            )?,
+            replication_failure_count: m::new_counter(
+                "replication_failure_count",
+                "Total failure count",
+            )?,
         };
 
         Ok(wm)

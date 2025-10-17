@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::SyncWorkerManager;
+use crate::master::{Master, MasterMetrics, SyncWorkerManager};
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
@@ -49,7 +49,8 @@ pub struct MasterReplicationManager {
     worker_client_factory: Arc<ClientFactory>,
 
     replication_enabled: bool,
-    // todo: add some metrics here.
+
+    metrics: &'static MasterMetrics,
 }
 
 struct InflightReplicationJob {
@@ -78,6 +79,7 @@ impl MasterReplicationManager {
             inflight_blocks: Default::default(),
             worker_client_factory: Arc::new(Default::default()),
             replication_enabled: conf.master.block_replication_enabled,
+            metrics: Master::get_metrics(),
         };
         let manager = Arc::new(manager);
         Self::handle(async_runtime, manager.clone(), recv);
@@ -197,6 +199,8 @@ impl MasterReplicationManager {
                 target_worker: target_worker_addr,
             },
         );
+        self.metrics.replication_staging_number.dec();
+        self.metrics.replication_inflight_number.inc();
 
         Ok(())
     }
@@ -212,7 +216,9 @@ impl MasterReplicationManager {
         self.runtime.block_on(async move {
             for block_id in &block_ids {
                 info!("Accepting block {} replication job", block_id);
-                let _ = try_log!(self.staging_queue_sender.send(*block_id).await);
+                if try_log!(self.staging_queue_sender.send(*block_id).await).is_ok() {
+                    self.metrics.replication_staging_number.inc();
+                }
             }
         });
         Ok(())
@@ -241,8 +247,10 @@ impl MasterReplicationManager {
                         "Errors on block replication for block_id: {} to worker: {}. error: {:?}",
                         block_id, &entry.1.target_worker, message
                     );
+                    self.metrics.replication_failure_count.inc();
                 }
                 drop(entry.1.permit);
+                self.metrics.replication_inflight_number.dec();
             }
         }
         Ok(())
