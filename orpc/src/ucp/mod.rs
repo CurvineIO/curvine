@@ -51,8 +51,8 @@ macro_rules! err_ucs {
         match $crate::ucp::UcpError::from_status($e) {
             Err(e) => {
                 use $crate::error::ErrorExt;
+                let ctx: String = format!("({}:{}) {:?}", file!(), line!(), $e);
                 let err: $crate::io::IOError = e.into();
-                let ctx: String = format!("({}:{})", file!(), line!());
                 Err(err.ctx(ctx))
             }
             Ok(()) => Ok(())

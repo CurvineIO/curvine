@@ -65,6 +65,16 @@ impl UcpFrame {
     pub async fn handshake_response(&mut self) -> IOResult<()> {
         self.endpoint.handshake_response().await
     }
+
+    pub async fn receive_proto(&mut self) -> IOResult<BytesMut> {
+        if self.small_use_tag {
+            let buf = self.get_buf(self.tag_max_len);
+            self.endpoint.tag_recv(buf).await
+        } else {
+            let buf = self.get_buf(message::PROTOCOL_SIZE as usize);
+            self.endpoint.stream_recv(buf, true).await
+        }
+    }
 }
 
 impl Frame for UcpFrame {
@@ -106,17 +116,10 @@ impl Frame for UcpFrame {
 
     async fn receive(&mut self) -> IOResult<Message> {
         loop {
-            let mut proto_buf = if self.small_use_tag {
-                let buf = self.get_buf(self.tag_max_len);
-                self.endpoint.tag_recv(buf).await?
-            } else {
-                let buf = self.get_buf(message::PROTOCOL_SIZE as usize);
-                self.endpoint.stream_recv(buf, true).await?
+            let mut proto_buf = match self.receive_proto().await {
+                Ok(buf) => buf,
+                Err(_) => return Ok(Message::empty()),
             };
-
-            if proto_buf.len() < message::PROTOCOL_SIZE as usize {
-                return err_box!("The data is smaller than the protocol header length");
-            }
 
             let (protocol, header_size, data_size) = Message::decode_protocol(&mut proto_buf)?;
 

@@ -145,7 +145,7 @@ impl<S> UcpServer<S>
             rt.spawn(async move {
                 handler.frame_mut().handshake_response().await.unwrap();
                 if let Err(e) = handler.run().await {
-                    error!("error")
+                    error!("error {}", e)
                 }
             });
         }

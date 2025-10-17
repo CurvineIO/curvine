@@ -110,7 +110,7 @@ impl Default for ClientConf {
             use_libc: false,
 
             ucp_tag_max_len: 4096,
-            ucp_small_use_tag: true,
+            ucp_small_use_tag: false,
         }
     }
 }

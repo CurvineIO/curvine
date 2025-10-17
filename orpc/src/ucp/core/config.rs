@@ -46,11 +46,9 @@ impl Config {
             | ucs_config_print_flags_t::UCS_CONFIG_PRINT_HEADER
             | ucs_config_print_flags_t::UCS_CONFIG_PRINT_HIDDEN;
         let title = CString::new("UCP conf").expect("Not a valid CStr");
-        unsafe { ucp_config_print(self.as_ptr(), stderr, title.as_ptr(), flags) };
-    }
-
-    pub fn create_context(&self) -> IOResult<Context> {
-        Context::with_config(self.clone())
+        unsafe {
+            ucp_config_print(self.as_ptr(), stderr, title.as_ptr(), flags)
+        };
     }
 }
 
@@ -74,6 +72,6 @@ impl Default for Config {
 
 impl Drop for Config {
     fn drop(&mut self) {
-       // unsafe { ucp_config_release(self.as_mut_ptr()) }
+        unsafe { ucp_config_release(self.as_mut_ptr()) }
     }
 }

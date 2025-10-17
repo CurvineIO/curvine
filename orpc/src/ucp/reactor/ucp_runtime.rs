@@ -29,13 +29,13 @@ pub struct UcpRuntime {
 
 impl UcpRuntime {
     pub fn with_conf(conf: Config) -> IOResult<Self> {
-        let context = Arc::new(conf.create_context()?);
+        let context = Arc::new(Context::with_config(conf)?);
 
-        let boss = Arc::new(UcpExecutor::new(format!("{}-boss", &conf.name), &context)?);
+        let boss = Arc::new(UcpExecutor::new(format!("{}-boss",&context.config().name), &context)?);
 
         let mut workers = vec![];
-        for i in 0..conf.threads {
-            let name = format!("{}-worker-{}", &conf.name, i);
+        for i in 0..context.config().threads {
+            let name = format!("{}-worker-{}", &context.config().name, i);
             let worker = UcpExecutor::new(name, &context)?;
             workers.push(Arc::new(worker));
         }

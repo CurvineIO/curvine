@@ -16,6 +16,7 @@ use crate::io::IOResult;
 use crate::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use crate::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
 use std::sync::Arc;
+use log::error;
 use crate::ucp::core::{Context, Worker};
 use crate::ucp::request::OpRequest;
 use crate::ucp::rma::LocalMem;
@@ -80,7 +81,9 @@ impl UcpExecutor {
         });
         rt.spawn(async move {
             while let Some(request) = receiver.recv().await {
-                request.run().await.unwrap()
+                if let Err(e) = request.run().await {
+                    error!("ucp request error: {}", e);
+                }
             }
         });
     }

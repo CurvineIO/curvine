@@ -68,7 +68,7 @@ pub struct StreamRecv {
 
 impl StreamRecv {
     pub async fn run(mut self) -> IOResult<()> {
-        let res = {
+        let res = async {
             if self.full {
                 self.ep.stream_recv_full(&mut self.buf).await?;
                 Ok(self.buf)
@@ -76,7 +76,7 @@ impl StreamRecv {
                 let size = self.ep.stream_recv(&mut self.buf).await?;
                 Ok(self.buf.split_to(size))
             }
-        };
+        }.await;
         self.call.send(res)
     }
 }
@@ -116,7 +116,7 @@ pub struct RmaGet {
 impl RmaGet {
     pub async fn run(mut self) -> IOResult<()> {
         let res = match self.ep.get(&mut self.buf).await {
-            Ok(v) => Ok(self.buf),
+            Ok(_) => Ok(self.buf),
             Err(e) => Err(e)
         };
         self.call.send(res)
@@ -132,8 +132,7 @@ pub struct TagSend {
 impl TagSend {
     pub async fn run(self) -> IOResult<()> {
         let res = self.ep.tag_send(self.buf.as_slice()).await;
-        self.call.send(res).unwrap();
-        Ok(())
+        self.call.send(res)
     }
 }
 
