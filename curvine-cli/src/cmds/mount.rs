@@ -103,6 +103,19 @@ impl MountCommand {
             }
         }
 
+        // If any Kerberos-related config is present, require both principal and keytab.
+        let kerberos_present = configs.keys().any(|k| k.starts_with("hdfs.kerberos."));
+        if kerberos_present {
+            let has_principal = configs.contains_key("hdfs.kerberos.principal");
+            let has_keytab = configs.contains_key("hdfs.kerberos.keytab");
+            if !(has_principal && has_keytab) {
+                eprintln!(
+                    "Error: When using Kerberos, both 'hdfs.kerberos.principal' and 'hdfs.kerberos.keytab' must be provided via --config"
+                );
+                std::process::exit(1);
+            }
+        }
+
         let validation_result = validate_path_and_configs(&self.ufs_path, &configs);
         if let Err(error_msg) = validation_result {
             eprintln!("Error: {}", error_msg);
