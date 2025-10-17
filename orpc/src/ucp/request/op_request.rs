@@ -167,7 +167,6 @@ pub enum OpRequest {
 
 impl OpRequest {
     pub async fn run(self) -> IOResult<()> {
-        info!("thread {}", Utils::thread_id());
         match self {
             OpRequest::HandshakeRequest(req) => req.run().await,
             OpRequest::HandshakeResponse(req) => req.run().await,

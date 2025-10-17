@@ -29,15 +29,15 @@ pub enum RequestStatus<T> {
 impl <T> RequestStatus<T> {
     pub fn new(
         status: *mut c_void,
-        immediate: MaybeUninit<T>,
+        immediate: T,
         poll_fn: fn(ucs_status_ptr_t) -> Poll<IOResult<T>>,
     ) -> Self {
         if UcpUtils::ucs_ptr_raw_status(status) == ucs_status_t::UCS_OK {
-            Self::Ready(Ok(unsafe { immediate.assume_init() }))
+            Self::Ready(Ok(immediate))
         } else if UcpUtils::ucs_ptr_is_err(status) {
             match err_ucs!(UcpUtils::ucs_ptr_raw_status(status)) {
                 Err(err) => Self::Ready(Err(err)),
-                Ok(_) => Self::Ready(Ok(unsafe { immediate.assume_init() }))
+                Ok(_) => Self::Ready(Ok(immediate))
             }
         } else {
             Self::Pending(RequestFuture::new(status, poll_fn))

@@ -53,8 +53,8 @@ macro_rules! err_ucs {
 
 #[macro_export]
 macro_rules! poll_status {
-    ($status:expr, $init_value:expr, $poll_fn:expr) => {{
-        let request = $crate::ucp::request::RequestStatus::new($status, $init_value, $poll_fn);
+    ($status:expr, $immediate:expr, $poll_fn:expr) => {{
+        let request = $crate::ucp::request::RequestStatus::new($status, $immediate, $poll_fn);
         match request {
             $crate::ucp::request::RequestStatus::Ready(v) => v,
             $crate::ucp::request::RequestStatus::Pending(f) => f.await,
@@ -62,7 +62,7 @@ macro_rules! poll_status {
     }};
 
     ($status:expr, $poll_fn:expr) => {{
-        let request = $crate::ucp::request::RequestStatus::new($status, std::mem::MaybeUninit::uninit(), $poll_fn);
+        let request = $crate::ucp::request::RequestStatus::new($status, (), $poll_fn);
         match request {
             $crate::ucp::request::RequestStatus::Ready(v) => v,
             $crate::ucp::request::RequestStatus::Pending(f) => f.await,

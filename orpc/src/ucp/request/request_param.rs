@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::mem;
+use std::os::raw::c_void;
 use crate::ucp::bindings::*;
 
 pub struct RequestParam {
@@ -95,6 +96,12 @@ impl RequestParam {
     pub fn set_flag_reply(mut self) -> Self {
         self.set_flag();
         self.inner.flags |= ucp_send_am_flags::UCP_AM_SEND_FLAG_REPLY.0;
+        self
+    }
+
+    pub fn user_data(mut self, user_data: *mut c_void) -> Self {
+        self.inner.op_attr_mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA as u32;
+        self.inner.user_data = user_data;
         self
     }
 }

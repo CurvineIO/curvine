@@ -132,7 +132,6 @@ impl<S> UcpServer<S>
         let bind_addr = self.get_bind_addr();
         let mut listener = self.rt.bind(&bind_addr)?;
         self.monitor.advance_running();
-        info!("running");
         loop {
             let req = listener.accept().await?;
 

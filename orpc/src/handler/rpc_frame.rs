@@ -15,7 +15,7 @@
 use crate::handler::{Frame, ReadFrame, RpcCodec, WriteFrame};
 use crate::io::net::ConnState;
 use crate::io::IOResult;
-use crate::message::{Message, Protocol, MAX_DATE_SIZE, BoxMessage};
+use crate::message::{Message, Protocol, MAX_DATE_SIZE, BoxMessage, RefMessage};
 use crate::server::ServerConf;
 use crate::sys::{DataSlice, RawIOSlice};
 use crate::{err_box, message, sys};
@@ -200,7 +200,8 @@ impl AsRawFd for RpcFrame {
 }
 
 impl Frame for RpcFrame {
-    async fn send(&mut self, msg: &Message) -> IOResult<()> {
+    async fn send(&mut self, msg: impl RefMessage) -> IOResult<()> {
+        let msg = msg.as_ref();
         msg.encode_protocol(&mut self.buf);
         self.io.write_all(&self.buf.split()).await?;
 

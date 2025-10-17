@@ -54,13 +54,19 @@ impl UcpFrame {
 }
 
 impl Frame for UcpFrame {
-    async fn send(&mut self, msg: &Message) -> IOResult<()> {
+    async fn send(&mut self, msg: impl RefMessage) -> IOResult<()> {
+        let msg = msg.into_box();
+
         msg.encode_protocol(&mut self.buf);
         if let Some(header) = &msg.header {
             self.buf.put_slice(&header);
         }
 
-        let data = msg.data.clone();
+        let data = match msg {
+            BoxMessage::Msg(m) => m.data,
+            // @todo 没有考虑好
+            BoxMessage::Arc(_) => return err_box!("Not support")
+        };
         if !data.is_empty() {
             self.endpoint.put(data).await?;
         }

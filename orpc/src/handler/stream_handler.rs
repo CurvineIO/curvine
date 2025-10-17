@@ -93,7 +93,7 @@ impl<F: Frame, M: MessageHandler, > StreamHandler<F, M> {
         };
 
         if response.not_empty() {
-            self.frame.send(&response).await
+            self.frame.send(response).await
         } else {
             Ok(())
         }

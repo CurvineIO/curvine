@@ -145,7 +145,7 @@ impl Endpoint {
     pub async fn stream_recv(&self, buf: &mut [u8]) -> IOResult<usize> {
         self.check_error()?;
 
-        let mut len = MaybeUninit::<usize>::uninit();
+        let mut len = 0;
         let param = RequestParam::new()
             .recv_stream_cb(Some(Self::stream_recv_callback));
         let status = unsafe {
@@ -153,7 +153,7 @@ impl Endpoint {
                 self.as_mut_ptr(),
                 buf.as_mut_ptr() as _,
                 buf.len() as _,
-                len.as_mut_ptr(),
+                &mut len as *mut _,
                 param.as_ptr(),
             )
         };
@@ -161,17 +161,17 @@ impl Endpoint {
     }
 
     pub async fn stream_recv_full(&self, buf: &mut [u8]) -> IOResult<()> {
-        let mut offset = 0;
+        let mut off = 0;
         let len = buf.len();
 
-        while offset < len {
-            let remaining_buf = &mut buf[offset..];
+        while off < len {
+            let remaining_buf = &mut buf[off..];
             match self.stream_recv(remaining_buf).await {
                 Ok(recv_len) => {
                     if recv_len == 0 {
-                        return err_box!("Connection closed while reading data, expected {} bytes but got only {}", len, offset);
+                        return err_box!("Connection closed while reading data, expected {} bytes but got only {}", len, off);
                     }
-                    offset += recv_len;
+                    off += recv_len;
                 }
                 Err(e) => return Err(e),
             }
@@ -197,16 +197,6 @@ impl Endpoint {
     unsafe extern "C" fn custom_callback(
         request: *mut c_void,
         _status: ucs_status_t,
-        _user_data: *mut c_void,
-    ) {
-        let request = &mut *(request as *mut RequestWaker);
-        request.wake();
-    }
-
-    unsafe extern "C" fn tag_recv_callback(
-        request: *mut c_void,
-        _status: ucs_status_t,
-        _info: *const ucp_tag_recv_info,
         _user_data: *mut c_void,
     ) {
         let request = &mut *(request as *mut RequestWaker);
@@ -269,10 +259,22 @@ impl Endpoint {
         poll_status!(status, poll_normal)
     }
 
+    unsafe extern "C" fn tag_recv_callback(
+        request: *mut c_void,
+        _status: ucs_status_t,
+        _info: *const ucp_tag_recv_info,
+        _user_data: *mut c_void,
+    ) {
+        let request = &mut *(request as *mut RequestWaker);
+        request.wake();
+    }
+
     pub async fn tag_recv(&self, tag: u64, buf: &mut [u8]) -> IOResult<usize> {
         self.check_error()?;
+
         let param = RequestParam::new()
             .recv_tag_cb(Some(Self::tag_recv_callback));
+        
         let status = unsafe {
             ucp_tag_recv_nbx(
                 self.worker.as_mut_ptr(),
@@ -284,7 +286,10 @@ impl Endpoint {
             )
         };
 
-        poll_status!(status, poll_tag).map(|x| x.1)
+        // 如果立即完成（极少情况），使用 (tag, buf.len()) 作为默认值
+        // 返回的长度为buf.len，应用层需要自行处理实际数据长度。
+        let (_, len) = poll_status!(status, (tag, buf.len()), poll_tag)?;
+        Ok(len)
     }
 
     pub fn print(&self) {
@@ -337,9 +342,13 @@ fn poll_normal(ptr: ucs_status_ptr_t) -> Poll<IOResult<()>> {
 }
 
 fn poll_tag(ptr: ucs_status_ptr_t) -> Poll<IOResult<(u64, usize)>> {
-    let mut info = MaybeUninit::<ucp_tag_recv_info>::uninit();
+    let mut info = ucp_tag_recv_info {
+        sender_tag: 0,
+        length: 0,
+    };
+
     let status = unsafe {
-        ucp_tag_recv_request_test(ptr as _, info.as_mut_ptr() as _)
+        ucp_tag_recv_request_test(ptr as _, &mut info as *mut _ as _)
     };
 
     if status == ucs_status_t::UCS_INPROGRESS {
@@ -348,7 +357,6 @@ fn poll_tag(ptr: ucs_status_ptr_t) -> Poll<IOResult<(u64, usize)>> {
 
     match err_ucs!(status) {
         Ok(_) => {
-            let info = unsafe { info.assume_init() };
             Poll::Ready(Ok((info.sender_tag, info.length)))
         }
         Err(e) => Poll::Ready(Err(e))

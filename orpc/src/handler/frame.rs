@@ -12,31 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod rpc_frame;
-
 use std::future::Future;
+
 use crate::io::IOResult;
 use crate::io::net::ConnState;
-use crate::message::Message;
-pub use self::rpc_frame::RpcFrame;
+use crate::message::{Message, RefMessage};
 
-mod message_handler;
-pub use self::message_handler::*;
+pub trait Frame {
+    fn send(&mut self, message: impl RefMessage) -> impl Future<Output = IOResult<()>>;
 
-mod handler_service;
-pub use self::handler_service::HandlerService;
+    fn receive(&mut self) -> impl Future<Output = IOResult<Message>>;
 
-mod rpc_codec;
-pub use self::rpc_codec::RpcCodec;
-
-mod stream_handler;
-pub use self::stream_handler::StreamHandler;
-
-mod write_frame;
-pub use self::write_frame::WriteFrame;
-
-mod read_frame;
-pub use self::read_frame::ReadFrame;
-
-mod frame;
-pub use self::frame::Frame;
+    fn new_conn_state(&self) -> ConnState;
+}
