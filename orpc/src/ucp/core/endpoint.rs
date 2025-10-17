@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ffi::CStr;
 use crate::io::{IOError, IOResult};
 use crate::sync::{AtomicBool, ErrorMonitor};
 use crate::sys::{DataSlice, RawPtr};
@@ -54,11 +55,14 @@ impl Endpoint {
             unsafe { ucp_ep_create(worker.as_mut_ptr(), &params, inner.as_mut_ptr()) };
         err_ucs!(status)?;
 
-        Ok(Self {
+        let endpoint = Self {
             inner: RawPtr::from_uninit(inner),
             worker,
             err_monitor,
-        })
+        };
+        info!("Create endpoint, transports {:?}", endpoint.query_transports().unwrap_or(vec![]));
+
+        Ok(endpoint)
     }
 
     pub fn connect(worker: Arc<Worker>, addr: &SockAddr) -> IOResult<Self> {
@@ -292,6 +296,59 @@ impl Endpoint {
         Ok(len)
     }
 
+    /// 查询 endpoint 使用的传输层（硬件类型）
+    /// 
+    /// 返回传输层和设备名称列表，例如：
+    /// - ("rc_mlx5", "mlx5_0:1") - InfiniBand/RoCE
+    /// - ("tcp", "eth0") - TCP
+    /// - ("dc_mlx5", "mlx5_0:1") - Dynamically Connected Transport
+    pub fn query_transports(&self) -> IOResult<Vec<(String, String)>> {
+        const MAX_TRANSPORTS: usize = 10;
+        let mut entries: Vec<ucp_transport_entry_t> = vec![
+            ucp_transport_entry_t {
+                transport_name: ptr::null(),
+                device_name: ptr::null(),
+            };
+            MAX_TRANSPORTS
+        ];
+        
+        let mut attr = ucp_ep_attr {
+            field_mask: ucp_ep_attr_field::UCP_EP_ATTR_FIELD_TRANSPORTS.0 as u64,
+            transports: ucp_transports_t {
+                entries: entries.as_mut_ptr(),
+                num_entries: MAX_TRANSPORTS as u32,
+                entry_size: size_of::<ucp_transport_entry_t>(),
+            },
+            ..unsafe { MaybeUninit::zeroed().assume_init() }
+        };
+        
+        let status = unsafe {
+            ucp_ep_query(self.as_mut_ptr(), &mut attr as *mut _)
+        };
+        err_ucs!(status)?;
+        
+        // 解析传输层信息
+        let mut result = Vec::new();
+        let num = attr.transports.num_entries as usize;
+        
+        for i in 0..num {
+            unsafe {
+                let entry = &*attr.transports.entries.add(i);
+                if !entry.transport_name.is_null() && !entry.device_name.is_null() {
+                    let transport = CStr::from_ptr(entry.transport_name)
+                        .to_string_lossy()
+                        .into_owned();
+                    let device = CStr::from_ptr(entry.device_name)
+                        .to_string_lossy()
+                        .into_owned();
+                    result.push((transport, device));
+                }
+            }
+        }
+        
+        Ok(result)
+    }
+    
     pub fn print(&self) {
         unsafe { ucp_ep_print_info(self.as_mut_ptr(), stderr) };
     }
