@@ -28,7 +28,6 @@ use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::sync::FastDashMap;
 use orpc::{err_box, try_log, try_option, CommonResult};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -217,7 +216,7 @@ impl MasterReplicationManager {
         self.runtime.block_on(async move {
             for block_id in &block_ids {
                 info!("Accepting block {} replication job", block_id);
-                if let Ok(_) = try_log!(self.staging_queue_sender.send(*block_id).await) {
+                if try_log!(self.staging_queue_sender.send(*block_id).await).is_ok() {
                     self.metrics.replication_staging_number.inc();
                 }
             }
