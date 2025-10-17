@@ -205,7 +205,7 @@ fn mount_test() -> CommonResult<()> {
         info!("UmountResp: {:?}", umount_resp);
         assert!(umount_resp.is_err(), "{}", umount_resp.unwrap_err());
 
-        let invalid_mnt_path = "b/c".into();
+        let invalid_mnt_path = "/b/c".into();
         let umount_resp = client.umount(&invalid_mnt_path).await;
         info!("UmountResp: {:?}", umount_resp);
         assert!(umount_resp.is_err(), "{}", umount_resp.unwrap_err());
