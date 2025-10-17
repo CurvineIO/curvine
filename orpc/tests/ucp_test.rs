@@ -1,11 +1,10 @@
 use bytes::{BufMut, BytesMut};
 use log::info;
-use orpc::common::{Logger, Utils};
+use orpc::common::Logger;
 use orpc::io::net::InetAddr;
 use orpc::runtime::RpcRuntime;
 use orpc::sync::channel::CallChannel;
-use orpc::sys::DataSlice;
-use orpc::ucp::core::{Config, Context, Endpoint, Worker};
+use orpc::ucp::core::{Config, Context, Worker};
 use orpc::ucp::reactor::UcpRuntime;
 
 #[test]
@@ -34,13 +33,12 @@ fn endpoint_rma() {
     Logger::default();
 
     let wr = UcpRuntime::default();
-    let addr = InetAddr::new("127.0.0.1",8080);
+    let addr = InetAddr::new("127.0.0.1", 8080);
 
     let executor = wr.select_executor().clone();
-    let rt = executor.rt().clone();
+    let rt = executor.rt();
 
     let (tx, rx) = CallChannel::channel();
-
 
     rt.spawn(async move {
         let mut endpoint = wr.connect_rma(&addr, 4).unwrap();

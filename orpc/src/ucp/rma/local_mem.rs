@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::mem::MaybeUninit;
-use std::os::raw::c_void;
-use std::sync::Arc;
-use bytes::{BufMut, BytesMut};
-use log::warn;
 use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::{RawPtr, RawVec};
 use crate::ucp::bindings::*;
 use crate::ucp::core::Context;
-use crate::ucp::rma::{RemoteMem, RKeyBuffer};
+use crate::ucp::rma::RKeyBuffer;
+use bytes::{BufMut, BytesMut};
+use log::warn;
+use std::mem::MaybeUninit;
+use std::os::raw::c_void;
+use std::sync::Arc;
 
 pub struct LocalMem {
     inner: RawPtr<ucp_mem>,
@@ -43,10 +43,8 @@ impl LocalMem {
             ..unsafe { MaybeUninit::zeroed().assume_init() }
         };
 
-        let mut inner  = MaybeUninit::<*mut ucp_mem>::uninit();
-        let status = unsafe {
-            ucp_mem_map(context.as_mut_ptr(), &params, inner.as_mut_ptr())
-        };
+        let mut inner = MaybeUninit::<*mut ucp_mem>::uninit();
+        let status = unsafe { ucp_mem_map(context.as_mut_ptr(), &params, inner.as_mut_ptr()) };
         err_ucs!(status)?;
 
         Ok(Self {
@@ -88,7 +86,7 @@ impl LocalMem {
 
         let rkey_len = unsafe { len.assume_init() };
         let rkey_buf = unsafe { buf.assume_init() };
-        let vec =  RawVec::new(rkey_buf as _, rkey_len);
+        let vec = RawVec::new(rkey_buf as _, rkey_len);
         Ok(RKeyBuffer::new(vec))
     }
 

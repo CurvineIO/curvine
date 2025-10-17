@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::mem::MaybeUninit;
 use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
 use crate::ucp::core::Endpoint;
+use std::mem::MaybeUninit;
 
 // 远程内存访问的秘钥
 pub struct RKey {
-    inner: RawPtr<ucp_rkey>
+    inner: RawPtr<ucp_rkey>,
 }
 
 impl RKey {
@@ -39,7 +39,6 @@ impl RKey {
             inner: RawPtr::from_uninit(inner),
         })
     }
-
 
     pub fn as_ptr(&self) -> *const ucp_rkey {
         self.inner.as_ptr()

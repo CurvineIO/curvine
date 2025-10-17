@@ -17,7 +17,7 @@ use crate::error::ErrorExt;
 use crate::io::IOResult;
 use crate::message::{BoxMessage, Builder, RefMessage};
 use crate::sys::DataSlice;
-use crate::{err_box, CommonError, CommonResult, message};
+use crate::{err_box, CommonError, CommonResult};
 use bytes::{Buf, BufMut, BytesMut};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use prost::Message as PMessage;
@@ -337,7 +337,6 @@ impl RpcMessage {
         Ok((protocol, header_size, data_size))
     }
 
-
     pub fn encode(&self, buf: &mut BytesMut) -> IOResult<()> {
         self.encode_protocol(buf);
 
@@ -347,7 +346,7 @@ impl RpcMessage {
 
         let slice = self.data.as_slice();
         if !slice.is_empty() {
-            buf.put_slice( slice);
+            buf.put_slice(slice);
         }
 
         Ok(())

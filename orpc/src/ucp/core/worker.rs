@@ -17,6 +17,8 @@ use crate::sync::StateCtl;
 use crate::sys::pipe::{AsyncFd, BorrowedFd};
 use crate::sys::{RawIO, RawPtr};
 use crate::ucp::bindings::*;
+use crate::ucp::core::Context;
+use crate::ucp::rma::LocalMem;
 use crate::ucp::stderr;
 use crate::{err_box, err_ucs, sys};
 use num_enum::{FromPrimitive, IntoPrimitive};
@@ -24,8 +26,6 @@ use std::mem;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 use tokio::task::yield_now;
-use crate::ucp::core::Context;
-use crate::ucp::rma::LocalMem;
 
 #[repr(i8)]
 #[derive(PartialEq, PartialOrd, Debug, Clone, Copy, IntoPrimitive, FromPrimitive)]

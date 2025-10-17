@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::mem;
-use std::mem::MaybeUninit;
 use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
 use crate::ucp::core::SockAddr;
+use std::mem;
+use std::mem::MaybeUninit;
 
 pub struct ConnRequest {
     inner: RawPtr<ucp_conn_request>,
@@ -47,8 +47,7 @@ impl ConnRequest {
         let status = unsafe { ucp_conn_request_query(self.as_mut_ptr(), &mut attr) };
         err_ucs!(status)?;
 
-        let sock_addr =
-            unsafe { socket2::SockAddr::new(mem::transmute(attr.client_address), 8) };
+        let sock_addr = unsafe { socket2::SockAddr::new(mem::transmute(attr.client_address), 8) };
         Ok(SockAddr::new(sock_addr))
     }
 }

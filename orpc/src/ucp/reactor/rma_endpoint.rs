@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-use bytes::{Buf, BufMut, BytesMut};
 use crate::common::Utils;
 use crate::err_box;
 use crate::io::IOResult;
-use crate::runtime::Runtime;
-use crate::ucp::core::{Endpoint, SockAddr, Worker};
-use crate::ucp::request::{ConnRequest, HandshakeV1};
-use crate::ucp::rma::{LocalMem, RemoteMem, RKey};
-use crate::ucp::{HANDSHAKE_LEN_BYTES};
+use crate::ucp::core::{Endpoint, SockAddr};
 use crate::ucp::reactor::UcpExecutor;
+use crate::ucp::request::{ConnRequest, HandshakeV1};
+use crate::ucp::rma::{LocalMem, RKey, RemoteMem};
+use crate::ucp::HANDSHAKE_LEN_BYTES;
+use bytes::{Buf, BufMut, BytesMut};
+use std::sync::Arc;
 
 /// RMA (Remote Memory Access) endpoint that supports high-performance remote memory operations.
 ///
@@ -36,39 +35,27 @@ pub struct RmaEndpoint {
     executor: Arc<UcpExecutor>,
     ep_id: u64,
     local_mem: LocalMem,
-    remote_mem: Option<RemoteMem>
+    remote_mem: Option<RemoteMem>,
 }
 
 impl RmaEndpoint {
-    fn new(
-        executor: Arc<UcpExecutor>,
-        inner: Endpoint,
-        local_mem: LocalMem
-    ) -> Self {
+    fn new(executor: Arc<UcpExecutor>, inner: Endpoint, local_mem: LocalMem) -> Self {
         Self {
             inner,
             ep_id: Utils::unique_id(),
             executor,
             local_mem,
-            remote_mem: None
+            remote_mem: None,
         }
     }
 
-    pub fn accept(
-        executor: Arc<UcpExecutor>,
-        conn: ConnRequest,
-        mem_len: usize,
-    ) -> IOResult<Self> {
+    pub fn accept(executor: Arc<UcpExecutor>, conn: ConnRequest, mem_len: usize) -> IOResult<Self> {
         let local_mem = executor.register_memory(mem_len)?;
         let inner = Endpoint::accept(executor.worker().clone(), conn)?;
         Ok(Self::new(executor, inner, local_mem))
     }
 
-    pub fn connect(
-        executor: Arc<UcpExecutor>,
-        addr: &SockAddr,
-        mem_len: usize
-    ) -> IOResult<Self> {
+    pub fn connect(executor: Arc<UcpExecutor>, addr: &SockAddr, mem_len: usize) -> IOResult<Self> {
         let local_mem = executor.register_memory(mem_len)?;
         let inner = Endpoint::connect(executor.worker().clone(), addr)?;
         Ok(Self::new(executor, inner, local_mem))
@@ -100,11 +87,15 @@ impl RmaEndpoint {
         match self.remote_mem {
             Some(ref mem) => {
                 if len > mem.len() {
-                    return err_box!("Data length exceeds limit, data len {}, memory len {}", len, mem.len())
+                    return err_box!(
+                        "Data length exceeds limit, data len {}, memory len {}",
+                        len,
+                        mem.len()
+                    );
                 }
                 Ok(mem)
-            },
-            None => err_box!("remote memory not set")
+            }
+            None => err_box!("remote memory not set"),
         }
     }
 
@@ -125,12 +116,7 @@ impl RmaEndpoint {
         let rep = HandshakeV1::decode(buf)?;
         let rkey = RKey::unpack(&self.inner, &rep.rkey)?;
 
-        let remote_mem = RemoteMem::new(
-            rep.ep_id,
-            rep.mem_addr,
-            rep.mem_len as usize,
-            rkey
-        );
+        let remote_mem = RemoteMem::new(rep.ep_id, rep.mem_addr, rep.mem_len as usize, rkey);
         Ok(remote_mem)
     }
 

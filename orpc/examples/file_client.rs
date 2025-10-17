@@ -1,20 +1,15 @@
-use std::mem::transmute;
-use std::sync::Arc;
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use log::info;
-use tokio::io::AsyncReadExt;
 use orpc::client::ClientFactory;
 use orpc::common::{Logger, Utils};
-use orpc::CommonResult;
 use orpc::error::CommonErrorExt;
 use orpc::io::net::InetAddr;
 use orpc::message::{Builder, Message, RequestStatus};
-use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::server::ServerConf;
 use orpc::sys::DataSlice;
-use orpc::test::file::file_handler::{FileService, RpcCode};
+use orpc::test::file::file_handler::RpcCode;
 use orpc::ucp::reactor::UcpRuntime;
-use orpc::ucp::rma::RKey;
+use orpc::CommonResult;
+use std::sync::Arc;
 
 // cargo run --example file_client
 fn main() -> CommonResult<()> {
@@ -30,7 +25,6 @@ fn main() -> CommonResult<()> {
 
     Ok(())
 }
-
 
 fn file_write(addr: &InetAddr, rt: Arc<UcpRuntime>) -> CommonResult<u64> {
     let factory = ClientFactory::default();

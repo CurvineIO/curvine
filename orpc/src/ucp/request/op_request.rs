@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
-use bytes::BytesMut;
-use tracing::info;
-use crate::common::Utils;
 use crate::io::IOResult;
 use crate::sync::channel::CallSender;
 use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::reactor::RmaEndpoint;
+use bytes::BytesMut;
 
 pub struct HandshakeRequest {
     pub ep: RawPtr<RmaEndpoint>,
@@ -44,7 +41,6 @@ impl HandshakeResponse {
         self.call.send(res)
     }
 }
-
 
 pub struct StreamSend {
     pub ep: RawPtr<RmaEndpoint>,
@@ -76,7 +72,8 @@ impl StreamRecv {
                 let size = self.ep.stream_recv(&mut self.buf).await?;
                 Ok(self.buf.split_to(size))
             }
-        }.await;
+        }
+        .await;
         self.call.send(res)
     }
 }
@@ -117,7 +114,7 @@ impl RmaGet {
     pub async fn run(mut self) -> IOResult<()> {
         let res = match self.ep.get(&mut self.buf).await {
             Ok(_) => Ok(self.buf),
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         };
         self.call.send(res)
     }
@@ -146,7 +143,7 @@ impl TagRecv {
     pub async fn run(mut self) -> IOResult<()> {
         let res = match self.ep.tag_recv(&mut self.buf).await {
             Ok(v) => Ok(self.buf.split_to(v)),
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         };
         self.call.send(res)
     }

@@ -12,24 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ffi::CStr;
 use crate::io::{IOError, IOResult};
-use crate::sync::{AtomicBool, ErrorMonitor};
-use crate::sys::{DataSlice, RawPtr};
+use crate::sync::ErrorMonitor;
+use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
+use crate::ucp::core::{SockAddr, Worker};
+use crate::ucp::request::{ConnRequest, RequestParam, RequestWaker};
+use crate::ucp::rma::RemoteMem;
 use crate::ucp::{stderr, UcpUtils};
 use crate::{err_box, err_ucs, poll_status};
-use bytes::{Buf, BufMut, BytesMut};
 use log::{info, warn};
+use std::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
 use std::task::Poll;
-use crate::runtime::Runtime;
-use crate::ucp::core::{SockAddr, Worker};
-use crate::ucp::request::{ConnRequest, RequestParam, RequestStatus, RequestWaker};
-use crate::ucp::rma::{LocalMem, RemoteMem, RKey};
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
@@ -51,8 +49,7 @@ impl Endpoint {
         };
 
         let mut inner = MaybeUninit::<*mut ucp_ep>::uninit();
-        let status =
-            unsafe { ucp_ep_create(worker.as_mut_ptr(), &params, inner.as_mut_ptr()) };
+        let status = unsafe { ucp_ep_create(worker.as_mut_ptr(), &params, inner.as_mut_ptr()) };
         err_ucs!(status)?;
 
         let endpoint = Self {
@@ -60,7 +57,10 @@ impl Endpoint {
             worker,
             err_monitor,
         };
-        info!("Create endpoint, transports {:?}", endpoint.query_transports().unwrap_or(vec![]));
+        info!(
+            "Create endpoint, transports {:?}",
+            endpoint.query_transports().unwrap_or_default()
+        );
 
         Ok(endpoint)
     }
@@ -92,7 +92,6 @@ impl Endpoint {
         Ok(endpoint)
     }
 
-
     pub unsafe extern "C" fn err_handler(arg: *mut c_void, _: ucp_ep_h, status: ucs_status_t) {
         let err_monitor = &*(arg as *mut ErrorMonitor<IOError>);
         let err = format!("endpoint handler error: {:?}", status).into();
@@ -114,7 +113,7 @@ impl Endpoint {
     unsafe extern "C" fn stream_handler(
         request: *mut c_void,
         _status: ucs_status_t,
-        _user_data: *mut c_void
+        _user_data: *mut c_void,
     ) {
         let request = &mut *(request as *mut RequestWaker);
         request.wake();
@@ -123,14 +122,13 @@ impl Endpoint {
     pub async fn stream_send(&self, buf: &[u8]) -> IOResult<()> {
         self.check_error()?;
 
-        let params = RequestParam::new()
-            .send_cb(Some(Self::stream_handler));
+        let params = RequestParam::new().send_cb(Some(Self::stream_handler));
         let status = unsafe {
             ucp_stream_send_nbx(
                 self.as_mut_ptr(),
                 buf.as_ptr() as _,
                 buf.len() as _,
-                params.as_ptr()
+                params.as_ptr(),
             )
         };
         poll_status!(status, poll_normal)
@@ -150,8 +148,7 @@ impl Endpoint {
         self.check_error()?;
 
         let mut len = 0;
-        let param = RequestParam::new()
-            .recv_stream_cb(Some(Self::stream_recv_callback));
+        let param = RequestParam::new().recv_stream_cb(Some(Self::stream_recv_callback));
         let status = unsafe {
             ucp_stream_recv_nbx(
                 self.as_mut_ptr(),
@@ -192,9 +189,7 @@ impl Endpoint {
     pub async fn flush(&self) -> IOResult<()> {
         self.check_error()?;
 
-        let status = unsafe {
-            ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_callback))
-        };
+        let status = unsafe { ucp_ep_flush_nb(self.as_mut_ptr(), 0, Some(Self::flush_callback)) };
         poll_status!(status, poll_normal)
     }
 
@@ -211,8 +206,7 @@ impl Endpoint {
     pub async fn put(&self, buf: &[u8], remote_mem: &RemoteMem) -> IOResult<()> {
         self.check_error()?;
 
-        let param = RequestParam::new()
-            .send_cb(Some(Self::custom_callback));
+        let param = RequestParam::new().send_cb(Some(Self::custom_callback));
 
         let status = unsafe {
             ucp_put_nbx(
@@ -231,8 +225,7 @@ impl Endpoint {
     pub async fn get(&self, buf: &mut [u8], remote_mem: &RemoteMem) -> IOResult<()> {
         self.check_error()?;
 
-        let param = RequestParam::new()
-            .send_cb(Some(Self::custom_callback));
+        let param = RequestParam::new().send_cb(Some(Self::custom_callback));
         let status = unsafe {
             ucp_get_nbx(
                 self.as_mut_ptr(),
@@ -240,7 +233,7 @@ impl Endpoint {
                 buf.len() as _,
                 remote_mem.addr(),
                 remote_mem.rkey_mut_ptr(),
-                param.as_ptr()
+                param.as_ptr(),
             )
         };
         poll_status!(status, poll_normal)
@@ -249,8 +242,7 @@ impl Endpoint {
     pub async fn tag_send(&self, tag: u64, buf: &[u8]) -> IOResult<()> {
         self.check_error()?;
 
-        let param = RequestParam::new()
-            .send_cb(Some(Self::custom_callback));
+        let param = RequestParam::new().send_cb(Some(Self::custom_callback));
         let status = unsafe {
             ucp_tag_send_nbx(
                 self.as_mut_ptr(),
@@ -276,9 +268,8 @@ impl Endpoint {
     pub async fn tag_recv(&self, tag: u64, buf: &mut [u8]) -> IOResult<usize> {
         self.check_error()?;
 
-        let param = RequestParam::new()
-            .recv_tag_cb(Some(Self::tag_recv_callback));
-        
+        let param = RequestParam::new().recv_tag_cb(Some(Self::tag_recv_callback));
+
         let status = unsafe {
             ucp_tag_recv_nbx(
                 self.worker.as_mut_ptr(),
@@ -297,7 +288,7 @@ impl Endpoint {
     }
 
     /// 查询 endpoint 使用的传输层（硬件类型）
-    /// 
+    ///
     /// 返回传输层和设备名称列表，例如：
     /// - ("rc_mlx5", "mlx5_0:1") - InfiniBand/RoCE
     /// - ("tcp", "eth0") - TCP
@@ -311,7 +302,7 @@ impl Endpoint {
             };
             MAX_TRANSPORTS
         ];
-        
+
         let mut attr = ucp_ep_attr {
             field_mask: ucp_ep_attr_field::UCP_EP_ATTR_FIELD_TRANSPORTS.0 as u64,
             transports: ucp_transports_t {
@@ -321,16 +312,14 @@ impl Endpoint {
             },
             ..unsafe { MaybeUninit::zeroed().assume_init() }
         };
-        
-        let status = unsafe {
-            ucp_ep_query(self.as_mut_ptr(), &mut attr as *mut _)
-        };
+
+        let status = unsafe { ucp_ep_query(self.as_mut_ptr(), &mut attr as *mut _) };
         err_ucs!(status)?;
-        
+
         // 解析传输层信息
         let mut result = Vec::new();
         let num = attr.transports.num_entries as usize;
-        
+
         for i in 0..num {
             unsafe {
                 let entry = &*attr.transports.entries.add(i);
@@ -345,10 +334,10 @@ impl Endpoint {
                 }
             }
         }
-        
+
         Ok(result)
     }
-    
+
     pub fn print(&self) {
         unsafe { ucp_ep_print_info(self.as_mut_ptr(), stderr) };
     }
@@ -371,17 +360,15 @@ impl Drop for Endpoint {
 fn poll_stream_recv(ptr: ucs_status_ptr_t) -> Poll<IOResult<usize>> {
     let mut len = MaybeUninit::<usize>::uninit();
 
-    let status = unsafe {
-        ucp_stream_recv_request_test(ptr as _, len.as_mut_ptr() as _)
-    };
+    let status = unsafe { ucp_stream_recv_request_test(ptr as _, len.as_mut_ptr() as _) };
 
     if status == ucs_status_t::UCS_INPROGRESS {
-        return Poll::Pending
+        return Poll::Pending;
     }
 
     match err_ucs!(status) {
         Ok(_) => Poll::Ready(Ok(unsafe { len.assume_init() })),
-        Err(e) => Poll::Ready(Err(e))
+        Err(e) => Poll::Ready(Err(e)),
     }
 }
 
@@ -389,12 +376,12 @@ fn poll_normal(ptr: ucs_status_ptr_t) -> Poll<IOResult<()>> {
     let status = unsafe { ucp_request_check_status(ptr as _) };
 
     if status == ucs_status_t::UCS_INPROGRESS {
-        return Poll::Pending
+        return Poll::Pending;
     }
 
     match err_ucs!(status) {
         Ok(_) => Poll::Ready(Ok(())),
-        Err(e) => Poll::Ready(Err(e))
+        Err(e) => Poll::Ready(Err(e)),
     }
 }
 
@@ -404,18 +391,14 @@ fn poll_tag(ptr: ucs_status_ptr_t) -> Poll<IOResult<(u64, usize)>> {
         length: 0,
     };
 
-    let status = unsafe {
-        ucp_tag_recv_request_test(ptr as _, &mut info as *mut _ as _)
-    };
+    let status = unsafe { ucp_tag_recv_request_test(ptr as _, &mut info as *mut _ as _) };
 
     if status == ucs_status_t::UCS_INPROGRESS {
-        return Poll::Pending
+        return Poll::Pending;
     }
 
     match err_ucs!(status) {
-        Ok(_) => {
-            Poll::Ready(Ok((info.sender_tag, info.length)))
-        }
-        Err(e) => Poll::Ready(Err(e))
+        Ok(_) => Poll::Ready(Ok((info.sender_tag, info.length))),
+        Err(e) => Poll::Ready(Err(e)),
     }
 }

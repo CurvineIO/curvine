@@ -92,15 +92,10 @@ impl LocalFile {
                 "offset exceeds file length, length={}, offset={}",
                 self.len, self.pos
             );
-            return  Err(err_msg.as_str().into())
+            return Err(err_msg.as_str().into());
         }
 
-        let region = DataSlice::from_file(
-            self,
-            enable_send_file,
-            Some(self.pos),
-            chunk as i32,
-        )?;
+        let region = DataSlice::from_file(self, enable_send_file, Some(self.pos), chunk as i32)?;
 
         self.pos += chunk;
         Ok(region)
@@ -208,9 +203,7 @@ impl LocalFile {
         }
 
         self.buf.reserve(len);
-        unsafe {
-            self.buf.set_len(len)
-        }
+        unsafe { self.buf.set_len(len) }
         let mut buf = self.buf.split();
 
         self.inner.read_exact(&mut buf)?;

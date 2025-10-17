@@ -14,9 +14,9 @@
 
 use crate::handler::rpc_frame::FrameSate;
 use crate::io::IOResult;
+use crate::message;
 use crate::message::Message;
 use crate::sys::DataSlice;
-use crate::message;
 use bytes::BytesMut;
 use std::mem;
 use tokio::io::{AsyncReadExt, ReadHalf};

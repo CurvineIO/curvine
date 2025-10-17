@@ -14,7 +14,6 @@
 
 //! Asynchronous Rust bindings to UCX.
 
-use crate::CommonResult;
 use crate::io::IOError;
 use crate::ucp::bindings::{ucs_status_ptr_t, ucs_status_t};
 use crate::ucp::UcpUtils;
@@ -181,10 +180,10 @@ impl UcpError {
     }
 }
 
-impl Into<IOError> for UcpError {
-    fn into(self) -> IOError {
+impl From<UcpError> for IOError {
+    fn from(val: UcpError) -> Self {
         use std::io::ErrorKind::*;
-        let kind = match self {
+        let kind = match val {
             UcpError::Inprogress => WouldBlock,
             UcpError::NoMessage => WouldBlock,
             UcpError::NoReource => WouldBlock,
@@ -218,6 +217,6 @@ impl Into<IOError> for UcpError {
             UcpError::EndpointTimeout => TimedOut,
             _ => Other,
         };
-        IOError::new(std::io::Error::new(kind, self))
+        IOError::new(std::io::Error::new(kind, val))
     }
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::err_box;
-use crate::handler::{Frame, MessageHandler, RpcFrame};
+use crate::handler::{Frame, MessageHandler};
 use crate::io::IOResult;
 use crate::message::Message;
 use crate::runtime::{RpcRuntime, Runtime};
@@ -33,7 +33,7 @@ pub struct StreamHandler<F, M> {
     timeout: Duration,
 }
 
-impl<F: Frame, M: MessageHandler, > StreamHandler<F, M> {
+impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
     pub fn new(rt: Arc<Runtime>, frame: F, handler: M, conf: &ServerConf) -> Self {
         StreamHandler {
             rt,

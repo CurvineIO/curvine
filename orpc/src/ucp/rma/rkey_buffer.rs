@@ -12,20 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ops::Deref;
 use crate::sys::RawVec;
 use crate::ucp::bindings::ucp_rkey_buffer_release;
+use std::ops::Deref;
 
 // 可以访问远程内存区域（包含access key）
 pub struct RKeyBuffer {
-    inner: RawVec
+    inner: RawVec,
 }
 
 impl RKeyBuffer {
     pub fn new(inner: RawVec) -> Self {
-        Self {
-            inner,
-        }
+        Self { inner }
     }
 }
 
@@ -39,8 +37,6 @@ impl Deref for RKeyBuffer {
 
 impl Drop for RKeyBuffer {
     fn drop(&mut self) {
-        unsafe {
-            ucp_rkey_buffer_release(self.inner.as_ptr() as _)
-        }
+        unsafe { ucp_rkey_buffer_release(self.inner.as_ptr() as _) }
     }
 }

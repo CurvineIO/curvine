@@ -12,22 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{HandlerService, MessageHandler, RpcFrame};
+use crate::handler::{HandlerService, MessageHandler};
 use crate::io::net::InetAddr;
-use crate::runtime::{RpcRuntime, Runtime};
-use crate::server::{RpcServer, ServerConf, ServerMonitor, ServerStateListener};
-use crate::sync::StateCtl;
-use crate::CommonResult;
-use log::*;
-use socket2::SockRef;
-use std::sync::{Arc, Mutex};
-use std::{env, thread};
-use futures::future::err;
-use tokio::net::TcpListener;
 use crate::io::IOResult;
+use crate::runtime::{RpcRuntime, Runtime};
+use crate::server::{ServerConf, ServerMonitor, ServerStateListener};
+use crate::sync::StateCtl;
 use crate::ucp::core::SockAddr;
-use crate::ucp::rma::LocalMem;
-use crate::ucp::reactor::{AsyncEndpoint, RmaEndpoint, UcpFrame, UcpRuntime};
+use crate::ucp::reactor::{UcpFrame, UcpRuntime};
+use log::*;
+use std::sync::{Arc, Mutex};
 
 pub struct UcpServer<S> {
     pub rt: Arc<UcpRuntime>,
@@ -39,9 +33,9 @@ pub struct UcpServer<S> {
 }
 
 impl<S> UcpServer<S>
-    where
-        S: HandlerService,
-        S::Item: MessageHandler,
+where
+    S: HandlerService,
+    S::Item: MessageHandler,
 {
     pub fn new(conf: ServerConf, service: S) -> Self {
         let rt = Arc::new(UcpRuntime::default());
@@ -73,7 +67,6 @@ impl<S> UcpServer<S>
 
         listener
     }
-
 
     pub fn start(self) -> ServerStateListener {
         Self::run_server(self)

@@ -14,8 +14,8 @@
 
 use std::future::Future;
 
-use crate::io::IOResult;
 use crate::io::net::ConnState;
+use crate::io::IOResult;
 use crate::message::{Message, RefMessage};
 
 pub trait Frame {

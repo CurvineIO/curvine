@@ -13,14 +13,11 @@
 // limitations under the License.
 
 use crate::err_ucs;
-use crate::io::IOResult;
 use crate::sys::{CString, RawPtr};
 use crate::ucp::bindings::*;
 use crate::ucp::stderr;
 use std::mem::MaybeUninit;
 use std::ptr;
-use crate::common::ByteUnit;
-use crate::ucp::core::Context;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -46,18 +43,14 @@ impl Config {
             | ucs_config_print_flags_t::UCS_CONFIG_PRINT_HEADER
             | ucs_config_print_flags_t::UCS_CONFIG_PRINT_HIDDEN;
         let title = CString::new("UCP conf").expect("Not a valid CStr");
-        unsafe {
-            ucp_config_print(self.as_ptr(), stderr, title.as_ptr(), flags)
-        };
+        unsafe { ucp_config_print(self.as_ptr(), stderr, title.as_ptr(), flags) };
     }
 }
 
 impl Default for Config {
     fn default() -> Self {
         let mut inner = MaybeUninit::<*mut ucp_config>::uninit();
-        let status = unsafe {
-            ucp_config_read(ptr::null(), ptr::null(), inner.as_mut_ptr())
-        };
+        let status = unsafe { ucp_config_read(ptr::null(), ptr::null(), inner.as_mut_ptr()) };
         err_ucs!(status).unwrap();
 
         Self {
@@ -65,7 +58,7 @@ impl Default for Config {
             name: "orpc-ucp".to_string(),
             threads: 32,
             rdma_region_size: 32 * 1024 * 1024,
-            rdma_buffer_size: 128 * 1024
+            rdma_buffer_size: 128 * 1024,
         }
     }
 }

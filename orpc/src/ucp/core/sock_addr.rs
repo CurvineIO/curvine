@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::io::net::InetAddr;
 use crate::ucp::bindings::ucs_sock_addr;
+use crate::CommonError;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use crate::CommonError;
-use crate::io::net::InetAddr;
 
 #[derive(Debug)]
 pub struct SockAddr {

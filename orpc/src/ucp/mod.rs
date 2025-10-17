@@ -14,10 +14,7 @@
 
 #![allow(clippy::missing_safety_doc, clippy::missing_transmute_annotations)]
 
-use crate::{err_box, err_ext};
-use crate::error::ErrorExt;
-use crate::ucp::bindings::{FILE, ucs_status_t};
-use crate::ucp::bindings::ucs_status_t::UCS_OK;
+use crate::ucp::bindings::FILE;
 use crate::ucp::ucp_error::UcpError;
 
 pub const HANDSHAKE_MAGIC: u64 = 0xFEEDFACE;
@@ -32,12 +29,12 @@ pub const HANDSHAKE_MAX_LEN: usize = 1024;
 
 pub mod bindings;
 pub mod core;
+pub mod reactor;
 pub mod request;
 pub mod rma;
-pub mod reactor;
 
-mod ucp_utils;
 mod ucp_error;
+mod ucp_utils;
 
 pub use self::ucp_utils::UcpUtils;
 
@@ -55,7 +52,7 @@ macro_rules! err_ucs {
                 let err: $crate::io::IOError = e.into();
                 Err(err.ctx(ctx))
             }
-            Ok(()) => Ok(())
+            Ok(()) => Ok(()),
         }
     }};
 }
@@ -78,4 +75,3 @@ macro_rules! poll_status {
         }
     }};
 }
-

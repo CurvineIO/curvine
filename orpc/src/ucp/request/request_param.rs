@@ -12,18 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::ucp::bindings::*;
 use std::mem;
 use std::os::raw::c_void;
-use crate::ucp::bindings::*;
 
 pub struct RequestParam {
-    inner: ucp_request_param_t
+    inner: ucp_request_param_t,
+}
+
+impl Default for RequestParam {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RequestParam {
     pub fn new() -> Self {
         Self {
-            inner: unsafe { mem::zeroed() }
+            inner: unsafe { mem::zeroed() },
         }
     }
 
@@ -34,7 +40,7 @@ impl RequestParam {
     pub fn send_cb(mut self, cb: ucp_send_nbx_callback_t) -> Self {
         self.inner.op_attr_mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK as u32;
 
-        let mut ty1: ucp_request_param_t__bindgen_ty_1 = unsafe { mem::zeroed()};
+        let mut ty1: ucp_request_param_t__bindgen_ty_1 = unsafe { mem::zeroed() };
         ty1.send = cb;
         self.inner.cb = ty1;
 
@@ -44,7 +50,7 @@ impl RequestParam {
     pub fn recv_tag_cb(mut self, cb: ucp_tag_recv_nbx_callback_t) -> Self {
         self.inner.op_attr_mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK as u32;
 
-        let mut ty1: ucp_request_param_t__bindgen_ty_1 = unsafe { mem::zeroed()};
+        let mut ty1: ucp_request_param_t__bindgen_ty_1 = unsafe { mem::zeroed() };
         ty1.recv = cb;
         self.inner.cb = ty1;
 
@@ -54,7 +60,7 @@ impl RequestParam {
     pub fn recv_stream_cb(mut self, cb: ucp_stream_recv_nbx_callback_t) -> Self {
         self.inner.op_attr_mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK as u32;
 
-        let mut ty1: ucp_request_param_t__bindgen_ty_1 = unsafe { mem::zeroed()};
+        let mut ty1: ucp_request_param_t__bindgen_ty_1 = unsafe { mem::zeroed() };
         ty1.recv_stream = cb;
         self.inner.cb = ty1;
 
@@ -64,7 +70,7 @@ impl RequestParam {
     pub fn recv_am_cb(mut self, cb: ucp_am_recv_data_nbx_callback_t) -> Self {
         self.inner.op_attr_mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK as u32;
 
-        let mut ty1: ucp_request_param_t__bindgen_ty_1 = unsafe { mem::zeroed()};
+        let mut ty1: ucp_request_param_t__bindgen_ty_1 = unsafe { mem::zeroed() };
         ty1.recv_am = cb;
         self.inner.cb = ty1;
 

@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use futures::task::AtomicWaker;
 use std::ops::Deref;
 use std::os::raw::c_void;
-use futures::task::AtomicWaker;
 
 #[derive(Default)]
 pub struct RequestWaker(AtomicWaker);

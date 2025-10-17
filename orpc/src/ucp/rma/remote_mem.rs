@@ -19,7 +19,7 @@ pub struct RemoteMem {
     ep_id: u64,
     addr: u64,
     len: usize,
-    rkey: RKey
+    rkey: RKey,
 }
 
 impl RemoteMem {
@@ -28,7 +28,7 @@ impl RemoteMem {
             ep_id,
             addr,
             len,
-            rkey
+            rkey,
         }
     }
 
@@ -52,7 +52,7 @@ impl RemoteMem {
         self.rkey.as_mut_ptr()
     }
 
-    pub fn ep_id(& self) -> u64 {
+    pub fn ep_id(&self) -> u64 {
         self.ep_id
     }
 }

@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
 use crate::handler::{Frame, MessageHandler, StreamHandler, TestMessageHandler};
 use crate::io::net::ConnState;
 use crate::runtime::Runtime;
 use crate::server::ServerConf;
+use std::sync::Arc;
 
 /// The message processor runs and manages the following functions:
 /// 1. Manage the creation of MessageHandler.

@@ -12,17 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ffi::c_void;
-use std::future::Future;
-use std::mem::MaybeUninit;
-use std::pin::Pin;
-use std::task::Poll;
 use crate::err_ucs;
 use crate::io::IOResult;
 use crate::ucp::bindings::{ucp_request_free, ucs_status_ptr_t, ucs_status_t};
 use crate::ucp::request::RequestWaker;
 use crate::ucp::UcpUtils;
-
+use std::ffi::c_void;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::Poll;
 
 pub struct RequestFuture<T> {
     ptr: ucs_status_ptr_t,
@@ -61,13 +59,12 @@ impl<T> Drop for RequestFuture<T> {
     }
 }
 
-
 pub enum RequestStatus<T> {
     Ready(IOResult<T>),
-    Pending(RequestFuture<IOResult<T>>)
+    Pending(RequestFuture<IOResult<T>>),
 }
 
-impl <T> RequestStatus<T> {
+impl<T> RequestStatus<T> {
     pub fn new(
         status: *mut c_void,
         immediate: T,
@@ -78,7 +75,7 @@ impl <T> RequestStatus<T> {
         } else if UcpUtils::ucs_ptr_is_err(status) {
             match err_ucs!(UcpUtils::ucs_ptr_raw_status(status)) {
                 Err(err) => Self::Ready(Err(err)),
-                Ok(_) => Self::Ready(Ok(immediate))
+                Ok(_) => Self::Ready(Ok(immediate)),
             }
         } else {
             Self::Pending(RequestFuture::new(status, poll_fn))

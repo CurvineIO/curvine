@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-use crate::io::IOResult;
 use crate::io::net::InetAddr;
+use crate::io::IOResult;
 use crate::sync::AtomicLen;
 use crate::ucp::core::{Config, Context, Listener, SockAddr};
 use crate::ucp::reactor::{AsyncEndpoint, RmaEndpoint, UcpExecutor};
 use crate::ucp::request::ConnRequest;
+use std::sync::Arc;
 
 pub struct UcpRuntime {
     pub boss: Arc<UcpExecutor>,
@@ -31,7 +31,10 @@ impl UcpRuntime {
     pub fn with_conf(conf: Config) -> IOResult<Self> {
         let context = Arc::new(Context::with_config(conf)?);
 
-        let boss = Arc::new(UcpExecutor::new(format!("{}-boss",&context.config().name), &context)?);
+        let boss = Arc::new(UcpExecutor::new(
+            format!("{}-boss", &context.config().name),
+            &context,
+        )?);
 
         let mut workers = vec![];
         for i in 0..context.config().threads {

@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::io::IOResult;
+use crate::message::Message;
 use bytes::BytesMut;
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::net::TcpStream;
-use crate::io::IOResult;
-use crate::message::Message;
 
 pub struct WriteFrame {
     io: WriteHalf<TcpStream>,
@@ -40,7 +40,7 @@ impl WriteFrame {
         // message data section.
         let slice = msg.data.as_slice();
         if !slice.is_empty() {
-            self.io.write_all( slice).await?;
+            self.io.write_all(slice).await?;
         }
         self.io.flush().await?;
         Ok(())

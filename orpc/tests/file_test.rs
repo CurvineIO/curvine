@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
 use bytes::{BufMut, BytesMut};
-use tracing::info;
 use orpc::client::ClientFactory;
 use orpc::common::{Logger, Utils};
 use orpc::error::CommonErrorExt;
@@ -25,8 +23,10 @@ use orpc::server::{RpcServer, ServerConf};
 use orpc::sys::DataSlice;
 use orpc::test::file::dir_location::DirLocation;
 use orpc::test::file::file_handler::{FileService, RpcCode};
-use orpc::CommonResult;
 use orpc::ucp::{UcpRuntime, UcpServer};
+use orpc::CommonResult;
+use std::sync::Arc;
+use tracing::info;
 
 #[test]
 fn dir_location() {
@@ -59,7 +59,7 @@ fn file_server() -> CommonResult<()> {
     let service = FileService::new(dirs);
     let server = UcpServer::new(conf, service);
     let rt = server.clone_rt();
-    let ucp_rt =  server.rt.clone();
+    let ucp_rt = server.rt.clone();
     let mut status_receiver = UcpServer::run_server(server);
     info!("xxx");
     rt.block_on(status_receiver.wait_running())?;

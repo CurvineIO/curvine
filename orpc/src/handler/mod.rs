@@ -14,10 +14,6 @@
 
 mod rpc_frame;
 
-use std::future::Future;
-use crate::io::IOResult;
-use crate::io::net::ConnState;
-use crate::message::Message;
 pub use self::rpc_frame::RpcFrame;
 
 mod message_handler;

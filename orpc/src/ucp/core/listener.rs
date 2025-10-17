@@ -18,13 +18,13 @@ use crate::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
 use crate::sync::ErrorMonitor;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
+use crate::ucp::core::{SockAddr, Worker};
+use crate::ucp::request::ConnRequest;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
-use crate::ucp::core::{SockAddr, Worker};
-use crate::ucp::request::ConnRequest;
 
 struct ConnContext {
     sender: AsyncSender<ConnRequest>,
@@ -70,9 +70,8 @@ impl Listener {
         };
 
         let mut handle = MaybeUninit::<*mut ucp_listener>::uninit();
-        let status = unsafe {
-            ucp_listener_create(worker.as_mut_ptr(), &params, handle.as_mut_ptr())
-        };
+        let status =
+            unsafe { ucp_listener_create(worker.as_mut_ptr(), &params, handle.as_mut_ptr()) };
         err_ucs!(status)?;
 
         Ok(Listener {

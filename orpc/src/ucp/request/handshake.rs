@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bytes::{Buf, BufMut, BytesMut};
 use crate::err_box;
 use crate::io::IOResult;
-use crate::sys::RawVec;
-use crate::ucp::core::Endpoint;
-use crate::ucp::{HANDSHAKE_HEADER_LEN, HANDSHAKE_LEN_BYTES, HANDSHAKE_MAGIC, HANDSHAKE_MAX_LEN, HANDSHAKE_VERSION};
-use crate::ucp::rma::{LocalMem, RemoteMem, RKey, RKeyBuffer};
+use crate::ucp::rma::LocalMem;
+use crate::ucp::{
+    HANDSHAKE_HEADER_LEN, HANDSHAKE_LEN_BYTES, HANDSHAKE_MAGIC, HANDSHAKE_MAX_LEN,
+    HANDSHAKE_VERSION,
+};
+use bytes::{Buf, BufMut, BytesMut};
 
 pub struct HandshakeV1 {
     pub ep_id: u64,
@@ -51,28 +52,41 @@ impl HandshakeV1 {
         buf.put_slice(&self.rkey);
 
         if buf.len() > HANDSHAKE_MAX_LEN {
-            return err_box!("handshake request is too long: {}", buf.len())
+            return err_box!("handshake request is too long: {}", buf.len());
         }
         Ok(buf)
     }
 
     pub fn decode(mut buf: BytesMut) -> IOResult<Self> {
         if buf.len() + HANDSHAKE_LEN_BYTES > HANDSHAKE_MAX_LEN {
-            return err_box!("handshake request is too long: {}", buf.len())
+            return err_box!("handshake request is too long: {}", buf.len());
         }
         let magic = buf.get_u64();
         if magic != HANDSHAKE_MAGIC {
-            return err_box!("invalid magic number: {}, expected: {}", magic, HANDSHAKE_MAGIC)
+            return err_box!(
+                "invalid magic number: {}, expected: {}",
+                magic,
+                HANDSHAKE_MAGIC
+            );
         }
         let version = buf.get_u32();
         if version != HANDSHAKE_VERSION {
-            return err_box!("invalid version: {}, expected: {}", version, HANDSHAKE_VERSION)
+            return err_box!(
+                "invalid version: {}, expected: {}",
+                version,
+                HANDSHAKE_VERSION
+            );
         };
         let ep_id = buf.get_u64();
         let mem_addr = buf.get_u64();
         let mem_len = buf.get_u32();
         let rkey = buf.split();
 
-        Ok(Self { ep_id, mem_addr, mem_len, rkey })
+        Ok(Self {
+            ep_id,
+            mem_addr,
+            mem_len,
+            rkey,
+        })
     }
 }

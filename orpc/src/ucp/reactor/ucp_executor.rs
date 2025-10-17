@@ -15,11 +15,11 @@
 use crate::io::IOResult;
 use crate::runtime::{AsyncRuntime, RpcRuntime, Runtime};
 use crate::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
-use std::sync::Arc;
-use log::error;
 use crate::ucp::core::{Context, Worker};
 use crate::ucp::request::OpRequest;
 use crate::ucp::rma::LocalMem;
+use log::error;
+use std::sync::Arc;
 
 pub struct UcpExecutor {
     worker: Arc<Worker>,
@@ -50,7 +50,7 @@ impl UcpExecutor {
         Ok(Self { worker, rt, sender })
     }
 
-    pub fn rt(&self) -> &Runtime{
+    pub fn rt(&self) -> &Runtime {
         &self.rt
     }
 
@@ -71,11 +71,7 @@ impl UcpExecutor {
     }
 
     // @todo 使用select优化
-    fn event_loop(
-        mut receiver: AsyncReceiver<OpRequest>,
-        worker: Arc<Worker>,
-        rt: Arc<Runtime>,
-    ) {
+    fn event_loop(mut receiver: AsyncReceiver<OpRequest>, worker: Arc<Worker>, rt: Arc<Runtime>) {
         rt.spawn(async move {
             worker.event_poll().await.unwrap();
         });

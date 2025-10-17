@@ -12,10 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::mem;
-use std::sync::Arc;
-use bytes::BytesMut;
-use log::info;
 use crate::err_box;
 use crate::io::IOResult;
 use crate::runtime::{RpcRuntime, Runtime};
@@ -23,12 +19,14 @@ use crate::sync::channel::{AsyncSender, CallChannel};
 use crate::sys::{DataSlice, RawPtr};
 use crate::ucp::reactor::{RmaEndpoint, UcpExecutor};
 use crate::ucp::request::*;
+use bytes::BytesMut;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AsyncEndpoint {
     inner: Option<RawPtr<RmaEndpoint>>,
     executor: Arc<UcpExecutor>,
-    sender: AsyncSender<OpRequest>
+    sender: AsyncSender<OpRequest>,
 }
 
 impl AsyncEndpoint {
@@ -38,14 +36,14 @@ impl AsyncEndpoint {
         AsyncEndpoint {
             inner: Some(RawPtr::from_owned(endpoint)),
             executor,
-            sender
+            sender,
         }
     }
 
     fn ep(&self) -> IOResult<RawPtr<RmaEndpoint>> {
         match self.inner.as_ref() {
             Some(ep) => Ok(ep.clone()),
-            None => err_box!("endpoint is closed")
+            None => err_box!("endpoint is closed"),
         }
     }
 
@@ -53,7 +51,7 @@ impl AsyncEndpoint {
         let (call, promise) = CallChannel::channel();
         let req = OpRequest::HandshakeRequest(HandshakeRequest {
             ep: self.ep()?,
-            call
+            call,
         });
         self.sender.send(req).await?;
         promise.receive().await?
@@ -63,7 +61,7 @@ impl AsyncEndpoint {
         let (call, promise) = CallChannel::channel();
         let req = OpRequest::HandshakeResponse(HandshakeResponse {
             ep: self.ep()?,
-            call
+            call,
         });
         self.sender.send(req).await?;
         promise.receive().await?
@@ -71,10 +69,10 @@ impl AsyncEndpoint {
 
     pub async fn stream_send(&self, buf: DataSlice) -> IOResult<()> {
         let (call, promise) = CallChannel::channel();
-            let req = OpRequest::StreamSend(StreamSend {
-                ep: self.ep()?,
+        let req = OpRequest::StreamSend(StreamSend {
+            ep: self.ep()?,
             buf,
-            call
+            call,
         });
         self.sender.send(req).await?;
         promise.receive().await?
@@ -161,7 +159,6 @@ impl AsyncEndpoint {
     pub fn local_mem_slice(&self, len: usize) -> &[u8] {
         &self.inner.as_ref().unwrap().local_mem_slice()[..len]
     }
-
 }
 
 impl Drop for AsyncEndpoint {
@@ -171,7 +168,5 @@ impl Drop for AsyncEndpoint {
                 drop(ep);
             });
         }
-
     }
 }
-

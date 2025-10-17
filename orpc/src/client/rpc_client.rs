@@ -22,15 +22,14 @@ use crate::io::{IOError, IOResult};
 use crate::message::{Message, RefMessage};
 use crate::runtime::Runtime;
 use crate::sys::RawPtr;
+use crate::ucp::reactor::{UcpFrame, UcpRuntime};
 use crate::{err_box, try_err};
-use log::{info, warn};
+use log::warn;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use crate::ucp::core::SockAddr;
-use crate::ucp::reactor::{UcpFrame, UcpRuntime};
 
 enum BoxSender {
     Frame(RawPtr<RpcFrame>),
@@ -98,7 +97,7 @@ impl RpcClient {
     ) -> IOResult<Self> {
         let mut endpoint = rt.connect_async(addr, conf.buffer_size)?;
         endpoint.handshake_request().await?;
-        let frame = UcpFrame::with_client(endpoint, &conf);
+        let frame = UcpFrame::with_client(endpoint, conf);
 
         Ok(Self {
             sender: BoxSender::UcpFrame(RawPtr::from_owned(frame)),

@@ -12,18 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bytes::{Buf, BufMut, BytesMut};
-use log::info;
-use crate::io::IOResult;
-use crate::message::{BoxMessage, HEAD_SIZE, MAX_DATE_SIZE, Message, Protocol, RefMessage};
-use crate::{err_box, message, sys};
 use crate::client::ClientConf;
 use crate::handler::Frame;
 use crate::io::net::ConnState;
+use crate::io::IOResult;
+use crate::message::{BoxMessage, Message, RefMessage};
 use crate::server::ServerConf;
 use crate::sys::{DataSlice, RawVec};
-use crate::ucp::bindings::ucp_ep;
 use crate::ucp::reactor::AsyncEndpoint;
+use crate::{err_box, message};
+use bytes::{BufMut, BytesMut};
 
 pub struct UcpFrame {
     endpoint: AsyncEndpoint,
@@ -38,7 +36,7 @@ impl UcpFrame {
             endpoint,
             buf: BytesMut::new(),
             tag_max_len,
-            small_use_tag
+            small_use_tag,
         }
     }
 
@@ -47,14 +45,12 @@ impl UcpFrame {
     }
 
     pub fn with_client(endpoint: AsyncEndpoint, conf: &ClientConf) -> Self {
-       Self::new(endpoint, conf.ucp_tag_max_len, conf.ucp_small_use_tag)
+        Self::new(endpoint, conf.ucp_tag_max_len, conf.ucp_small_use_tag)
     }
 
     fn get_buf(&mut self, len: usize) -> BytesMut {
         self.buf.reserve(len);
-        unsafe {
-            self.buf.set_len(len)
-        }
+        unsafe { self.buf.set_len(len) }
         self.buf.split()
     }
 
@@ -83,13 +79,13 @@ impl Frame for UcpFrame {
 
         msg.encode_protocol(&mut self.buf);
         if let Some(header) = &msg.header {
-            self.buf.put_slice(&header);
+            self.buf.put_slice(header);
         }
 
         let data = match msg {
             BoxMessage::Msg(m) => m.data,
             // @todo 没有考虑好
-            BoxMessage::Arc(_) => return err_box!("Not support")
+            BoxMessage::Arc(_) => return err_box!("Not support"),
         };
 
         let header_buf = DataSlice::Buffer(self.buf.split());
@@ -103,12 +99,10 @@ impl Frame for UcpFrame {
                 let header_future = self.endpoint.stream_send(header_buf);
                 tokio::try_join!(header_future, data_future)?;
             }
+        } else if self.small_use_tag {
+            self.endpoint.tag_send(header_buf).await?;
         } else {
-            if self.small_use_tag {
-                self.endpoint.tag_send(header_buf).await?;
-            } else {
-                self.endpoint.stream_send(header_buf).await?;
-            }
+            self.endpoint.stream_send(header_buf).await?;
         }
 
         Ok(())

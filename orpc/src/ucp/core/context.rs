@@ -16,12 +16,12 @@ use crate::err_ucs;
 use crate::io::IOResult;
 use crate::sys::RawPtr;
 use crate::ucp::bindings::*;
+use crate::ucp::core::{Config, Worker};
+use crate::ucp::request::RequestWaker;
 use crate::ucp::stderr;
 use std::mem;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
-use crate::ucp::core::{Config, Worker};
-use crate::ucp::request::RequestWaker;
 
 #[derive(Debug)]
 pub struct Context {
@@ -87,9 +87,7 @@ impl Context {
 
     pub fn get_attr(&self) -> IOResult<ucp_context_attr> {
         let mut attr = MaybeUninit::<ucp_context_attr>::uninit();
-        let status = unsafe {
-            ucp_context_query(self.as_mut_ptr(), attr.as_mut_ptr())
-        };
+        let status = unsafe { ucp_context_query(self.as_mut_ptr(), attr.as_mut_ptr()) };
         err_ucs!(status)?;
         Ok(unsafe { attr.assume_init() })
     }
