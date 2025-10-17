@@ -15,10 +15,10 @@
 use crate::block::block_writer::WriterAdapter::{Local, Remote};
 use crate::block::{BlockWriterLocal, BlockWriterRemote};
 use crate::file::FsContext;
+use curvine_common::error::FsError;
 use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
-use orpc::err_box;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use std::sync::Arc;
@@ -144,7 +144,7 @@ impl BlockWriter {
         let first_loc = locate
             .locs
             .first()
-            .ok_or(err_box!("There is no available worker"))?;
+            .ok_or(FsError::common("There is no available worker"))?;
         let writers = if fs_context.cluster_conf().client.pipeline_write_enabled {
             vec![WriterAdapter::new(fs_context.clone(), &locate, first_loc, true).await?]
         } else {

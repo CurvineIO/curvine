@@ -168,7 +168,6 @@ pub struct ClientConf {
 
     pub close_timeout_secs: u64,
 
-    #[serde(skip)]
     pub pipeline_write_enabled: bool,
 }
 
@@ -331,6 +330,7 @@ impl Default for ClientConf {
             metric_report_interval: Default::default(),
             metric_report_interval_str: Self::DEFAULT_METRIC_REPORT_INTERVAL_STR.to_string(),
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
+            pipeline_write_enabled: false,
         };
 
         conf.init().unwrap();

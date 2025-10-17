@@ -93,6 +93,36 @@ fn remote_parallel_4_cache() -> CommonResult<()> {
 }
 
 #[test]
+fn replica_3_with_pipeline_write() -> CommonResult<()> {
+    let mut conf = Testing::get_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.replicas = 3;
+    conf.client.pipeline_write_enabled = true;
+    let path = Path::from_str("/replicas_3_with_pipeline_write.data")?;
+
+    conf.client.block_size = 1024 * 1024;
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = Testing::get_fs(Some(rt.clone()), Some(conf))?;
+    rt.block_on(async move {
+        let (write_len, write_ck) = write(&fs, &path).await?;
+        let (read_len, read_ck) = read(&fs, &path).await?;
+        assert_eq!(write_len, read_len);
+        assert_eq!(write_ck, read_ck);
+
+        let locate = fs.get_block_locations(&path).await?;
+        println!("locates {:#?}", locate);
+        for loc in locate.block_locs {
+            assert_eq!(loc.locs.len(), 3);
+        }
+
+        Ok::<(), FsError>(())
+    })
+    .unwrap();
+
+    Ok(())
+}
+
+#[test]
 fn replicas_3() -> CommonResult<()> {
     let mut conf = Testing::get_cluster_conf()?;
     conf.client.short_circuit = true;

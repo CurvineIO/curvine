@@ -20,7 +20,6 @@ use curvine_common::FsResult;
 use orpc::common::Utils;
 use orpc::err_box;
 use orpc::sys::DataSlice;
-use std::ops::Index;
 
 pub struct BlockWriterRemote {
     block: ExtendedBlock,

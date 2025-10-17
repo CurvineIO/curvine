@@ -124,7 +124,7 @@ impl WriteHandler {
                 let fs_context = self.fs_context.clone();
                 let block = context.block.clone();
                 let write_pipeline = tokio::runtime::Handle::current().block_on(async move {
-                    WritePipeline::new(&fs_context, block, target.clone()).await
+                    WritePipeline::new(&fs_context, block, target.clone(), locations.clone()).await
                 })?;
                 let _ = self.write_pipeline.replace(write_pipeline);
                 log_msg = format!(

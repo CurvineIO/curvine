@@ -27,8 +27,10 @@ impl WritePipeline {
         fs_context: &FsContext,
         block: ExtendedBlock,
         worker_address: WorkerAddress,
+        locations: Vec<WorkerAddress>,
     ) -> FsResult<Self> {
-        let client = BlockWriterRemote::new(fs_context, block, worker_address).await?;
+        let client =
+            BlockWriterRemote::new(fs_context, block, worker_address, true, locations).await?;
         let handler = Self {
             remote_worker_client: client,
         };
