@@ -67,11 +67,14 @@ impl Frame for UcpFrame {
             // @todo 没有考虑好
             BoxMessage::Arc(_) => return err_box!("Not support")
         };
-        if !data.is_empty() {
-            self.endpoint.put(data).await?;
-        }
 
-        self.endpoint.tag_send(DataSlice::Buffer(self.buf.split())).await?;
+        let header_future = self.endpoint.tag_send(DataSlice::Buffer(self.buf.split()));
+        if !data.is_empty() {
+            let data_future = self.endpoint.put(data);
+            tokio::try_join!(header_future, data_future)?;
+        } else {
+            header_future.await?;
+        }
 
         Ok(())
     }
