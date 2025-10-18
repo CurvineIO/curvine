@@ -63,6 +63,9 @@ pub struct MountCommand {
 
     #[arg(short, long)]
     storage_type: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    check: bool,
 }
 
 impl MountCommand {
@@ -70,6 +73,58 @@ impl MountCommand {
         // If no path argument is given, all mount points are listed.
         if self.ufs_path.trim().is_empty() && self.cv_path.trim().is_empty() {
             let rep = handle_rpc_result(client.get_mount_table()).await;
+            if self.check {
+                if rep.mount_table.is_empty() {
+                    println!("Mount Table: (empty)");
+                    return Ok(());
+                }
+                let mut status = vec![];
+                let mut max_len = 8;
+                for mnt in &rep.mount_table {
+                    let ufs_path = Path::from_str(&mnt.ufs_path)?;
+                    max_len = max_len.max(ufs_path.to_string().len());
+                    max_len = max_len.max(mnt.cv_path.len());
+                    max_len = max_len.max(mnt.mount_id.to_string().len());
+                    let res = UfsFileSystem::new(&ufs_path, mnt.properties.clone());
+                    match res {
+                        Err(_) => status.push("Invalid"),
+                        Ok(ufs) => {
+                            if (ufs.list_status(&ufs_path).await).is_err() {
+                                status.push("Invalid");
+                            } else {
+                                status.push("Valid");
+                            }
+                        }
+                    }
+                }
+                max_len += 2;
+                let separator = format!("{:-<1$}", "", max_len * 4 + 9);
+                println!("Mount Table:");
+                println!("{}", separator);
+                println!(
+                    "| {:<width$}| {:<width$}| {:<width$}| {:<width$}|",
+                    "ID",
+                    "CV Path",
+                    "UFS Path",
+                    "Status",
+                    width = max_len
+                );
+                println!("{}", separator);
+                for mnt in &rep.mount_table {
+                    let ufs_path = Path::from_str(&mnt.ufs_path)?;
+                    println!(
+                        "| {:<width$}| {:<width$}| {:<width$}| {:<width$}|",
+                        mnt.mount_id.to_string(),
+                        mnt.cv_path,
+                        ufs_path.to_string(),
+                        status.remove(0),
+                        width = max_len
+                    );
+                    println!("{}", separator);
+                }
+                println!("Total mount points: {}", rep.mount_table.len());
+                return Ok(());
+            }
             println!("{}", rep);
             return Ok(());
         }

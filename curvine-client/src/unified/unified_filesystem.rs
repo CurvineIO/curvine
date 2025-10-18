@@ -375,6 +375,9 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
-        self.cv.set_attr(path, opts).await
+        match self.get_mount(path).await? {
+            None => self.cv.set_attr(path, opts).await,
+            Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
+        }
     }
 }
