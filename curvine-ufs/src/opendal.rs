@@ -401,7 +401,8 @@ impl OpendalFileSystem {
                 }
 
                 let base_op = Operator::new(builder)
-                    .map_err(|e| FsError::common(format!("Failed to create S3 operator: {}", e)))?;
+                    .map_err(|e| FsError::common(format!("Failed to create S3 operator: {}", e)))?
+                    .finish();
 
                 Self::add_stability_layers(base_op, &conf)?
             }
@@ -466,6 +467,28 @@ impl OpendalFileSystem {
                     .map_err(|e| {
                         FsError::common(format!("Failed to create Azure operator: {}", e))
                     })?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
+            #[cfg(feature = "opendal-cos")]
+            "cos" => {
+                let mut builder = Cos::default();
+                builder = builder.bucket(&bucket_or_container);
+
+                if let Some(endpoint) = conf.get("cos.endpoint_url") {
+                    builder = builder.endpoint(endpoint);
+                }
+                if let Some(access_key) = conf.get("cos.credentials.access") {
+                    builder = builder.secret_id(access_key);
+                }
+                if let Some(secret_key) = conf.get("cos.credentials.secret") {
+                    builder = builder.secret_key(secret_key);
+                }
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create COS operator: {}", e)))?
                     .finish();
 
                 Self::add_stability_layers(base_op, &conf)?

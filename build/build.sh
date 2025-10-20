@@ -346,6 +346,11 @@ if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
         FEATURES+=("curvine-ufs/opendal-webhdfs")
         FEATURES+=("curvine-client/opendal-webhdfs")
         ;;
+      opendal-cos)
+        # COS features need to be added to the correct packages
+        FEATURES+=("curvine-ufs/opendal-cos")
+        FEATURES+=("curvine-client/opendal-cos")
+        ;;
       jni)
         # JNI features need to be added to curvine-ufs and curvine-server
         FEATURES+=("curvine-ufs/jni")
