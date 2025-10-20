@@ -49,8 +49,8 @@ pub struct ServerConf {
 
     pub enable_send_file: bool,
 
+    pub use_ucp: bool,
     pub ucp_tag_max_len: usize,
-
     pub ucp_small_use_tag: bool,
 }
 
@@ -79,6 +79,7 @@ impl ServerConf {
 
             enable_send_file: true,
 
+            use_ucp: true,
             ucp_tag_max_len: 4096,
             ucp_small_use_tag: false,
         }

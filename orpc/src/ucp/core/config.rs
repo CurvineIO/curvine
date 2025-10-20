@@ -18,17 +18,31 @@ use crate::ucp::bindings::*;
 use crate::ucp::stderr;
 use std::mem::MaybeUninit;
 use std::ptr;
+use crate::io::IOResult;
+use crate::server::ServerConf;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     inner: RawPtr<ucp_config_t>,
     pub name: String,
     pub threads: usize,
-    pub rdma_region_size: usize,
-    pub rdma_buffer_size: usize,
 }
 
 impl Config {
+    pub const DEFAULT_NAME: &'static str = "orpc-ucp";
+    pub const DEFAULT_THREADS: usize = 32;
+
+    pub fn new(name: impl Into<String>, threads: usize) -> IOResult<Self> {
+        let mut inner = MaybeUninit::<*mut ucp_config>::uninit();
+        let status = unsafe { ucp_config_read(ptr::null(), ptr::null(), inner.as_mut_ptr()) };
+        err_ucs!(status)?;
+        return Ok(Self {
+            inner: RawPtr::from_uninit(inner),
+            name: name.into(),
+            threads,
+        });
+    }
+
     pub fn as_ptr(&self) -> *const ucp_config_t {
         self.inner.as_ptr()
     }
@@ -49,17 +63,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let mut inner = MaybeUninit::<*mut ucp_config>::uninit();
-        let status = unsafe { ucp_config_read(ptr::null(), ptr::null(), inner.as_mut_ptr()) };
-        err_ucs!(status).unwrap();
-
-        Self {
-            inner: RawPtr::from_uninit(inner),
-            name: "orpc-ucp".to_string(),
-            threads: 32,
-            rdma_region_size: 32 * 1024 * 1024,
-            rdma_buffer_size: 128 * 1024,
-        }
+        Self::new(Self::DEFAULT_NAME, Self::DEFAULT_THREADS).unwrap()
     }
 }
 

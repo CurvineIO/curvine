@@ -22,7 +22,6 @@ use crate::io::{IOError, IOResult};
 use crate::message::{Message, RefMessage};
 use crate::runtime::Runtime;
 use crate::sys::RawPtr;
-use crate::ucp::reactor::{RmaType, UcpFrame, UcpRuntime};
 use crate::{err_box, try_err};
 use log::warn;
 use std::sync::Arc;
@@ -30,10 +29,16 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+#[cfg(feature = "ucp")]
+use crate::ucp::reactor::UcpFrame;
+#[cfg(feature = "ucp")]
+use crate::ucp::reactor::UcpRuntime;
+
 
 enum BoxSender {
     Frame(RawPtr<RpcFrame>),
     Channel(Sender<Envelope>),
+    #[cfg(feature = "ucp")]
     UcpFrame(RawPtr<UcpFrame>),
 }
 
@@ -90,11 +95,14 @@ impl RpcClient {
         })
     }
 
+
+    #[cfg(feature = "ucp")]
     pub async fn with_ucp(
         rt: Arc<UcpRuntime>,
         addr: &InetAddr,
         conf: &ClientConf,
     ) -> IOResult<Self> {
+        use crate::ucp::reactor::RmaType;
         let mut endpoint = rt.connect_async(addr)?;
         endpoint.handshake_request(RmaType::Both, conf.buffer_size).await?;
         let frame = UcpFrame::with_client(endpoint, conf);
@@ -122,6 +130,7 @@ impl RpcClient {
                 }
             }
 
+            #[cfg(feature = "ucp")]
             BoxSender::UcpFrame(f) => {
                 let frame = f.as_mut();
                 frame.send(msg).await?;

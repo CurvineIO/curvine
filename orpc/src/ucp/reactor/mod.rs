@@ -27,8 +27,5 @@ pub use ucp_executor::UcpExecutor;
 mod ucp_runtime;
 pub use self::ucp_runtime::UcpRuntime;
 
-mod ucp_server;
-pub use ucp_server::UcpServer;
-
 mod rma_type;
 pub use rma_type::RmaType;

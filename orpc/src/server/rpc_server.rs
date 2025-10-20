@@ -23,9 +23,14 @@ use socket2::SockRef;
 use std::sync::{Arc, Mutex};
 use std::{env, thread};
 use tokio::net::TcpListener;
+use crate::io::IOResult;
+#[cfg(feature = "ucp")]
+use crate::ucp::reactor::UcpRuntime;
 
 pub struct RpcServer<S> {
     rt: Arc<Runtime>,
+    #[cfg(feature = "ucp")]
+    ucp_rt: Arc<UcpRuntime>,
     service: S,
     conf: ServerConf,
     addr: InetAddr,
@@ -41,17 +46,8 @@ where
     pub const ORPC_BIND_HOSTNAME: &'static str = "ORPC_BIND_HOSTNAME";
 
     pub fn new(conf: ServerConf, service: S) -> Self {
-        let addr = InetAddr::new(conf.hostname.clone(), conf.port);
         let rt = Arc::new(conf.create_runtime());
-
-        RpcServer {
-            rt,
-            service,
-            conf,
-            addr,
-            monitor: ServerMonitor::new(),
-            shutdown_hook: Mutex::new(vec![]),
-        }
+        Self::with_rt(rt, conf, service)
     }
 
     pub fn with_rt(rt: Arc<Runtime>, conf: ServerConf, service: S) -> Self {
@@ -59,6 +55,8 @@ where
 
         RpcServer {
             rt,
+            #[cfg(feature = "ucp")]
+            ucp_rt: Arc::new(UcpRuntime::with_server(&conf).unwrap()),
             service,
             conf,
             addr,
@@ -138,14 +136,29 @@ where
     }
 
     pub async fn run(&self) -> CommonResult<()> {
+        #[cfg(feature = "ucp")] {
+            if self.conf.use_ucp {
+                self.run_ucp().await
+            } else {
+                self.run_tcp().await
+            }
+        }
+
+        #[cfg(not(feature = "ucp"))] {
+            if self.conf.use_ucp {
+                warn!("UCP is not supported in compilation, will use TCP instead")
+            }
+            self.run_tcp().await
+        }
+    }
+
+    pub async fn run_tcp(&self) -> CommonResult<()> {
         let bind_addr = self.get_bind_addr();
         let listener = TcpListener::bind(&bind_addr).await?;
         info!(
-            "Rpc server [{}] start successfully, bind address: {}, hostname: {}, thread_name: {}, io threads: {}, worker threads: {}",
+            "Tcp server [{}] start successfully, bind address: {}, io threads: {}, worker threads: {}",
             self.conf.name,
             bind_addr,
-            self.addr.hostname,
-            self.rt.thread_name(),
             self.rt.io_threads(),
             self.rt.worker_threads()
         );
@@ -165,6 +178,46 @@ where
                 .service
                 .get_stream_handler(self.rt.clone(), frame, &self.conf);
             self.rt.spawn(async move {
+                if let Err(e) = handler.run().await {
+                    error!("Connection[{} -> {}]: {}", bind_addr, client_addr, e);
+                }
+            });
+        }
+    }
+
+    #[cfg(feature = "ucp")]
+    pub async fn run_ucp(&self) -> CommonResult<()> {
+        use crate::ucp::reactor::UcpRuntime;
+        use crate::ucp::core::Listener;
+        use crate::ucp::core::SockAddr;
+        use crate::ucp::reactor::UcpFrame;
+
+        let bind_addr = SockAddr::from(self.get_bind_addr().as_str());
+        let mut listener = Listener::bind(self.ucp_rt.boss.worker().clone(), &bind_addr)?;
+        info!(
+            "Ucp server [{}] start successfully, bind address: {}, io threads: {}, worker threads: {}",
+            self.conf.name,
+            bind_addr,
+            self.rt.io_threads(),
+            self.rt.worker_threads()
+        );
+        self.monitor.advance_running();
+
+        loop {
+            let req = listener.accept().await?;
+            let endpoint = self.ucp_rt.accept_async(req)?;
+            let (bind_addr, client_addr) = endpoint.conn_sockaddr()?;
+
+            let frame = UcpFrame::with_server(endpoint, &self.conf);
+            let mut handler = self
+                .service
+                .get_stream_handler(self.rt.clone(), frame, &self.conf);
+            self.rt.spawn(async move {
+                if let Err(e) = handler.frame_mut().handshake_response().await {
+                    error!("Handshake[{} -> {}]: {}", bind_addr, client_addr, e);
+                    return;
+                }
+
                 if let Err(e) = handler.run().await {
                     error!("Connection[{} -> {}]: {}", bind_addr, client_addr, e);
                 }

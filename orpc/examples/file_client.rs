@@ -1,6 +1,6 @@
 use bytes::{BufMut, BytesMut};
 use log::info;
-use orpc::client::ClientFactory;
+use orpc::client::{ClientConf, ClientFactory};
 use orpc::common::{Logger, Utils};
 use orpc::error::CommonErrorExt;
 use orpc::io::net::InetAddr;
@@ -16,19 +16,21 @@ fn main() -> CommonResult<()> {
     Logger::default();
     let addr = InetAddr::new("127.0.0.1", 1122);
 
-    let ucp_rt = Arc::new(UcpRuntime::default());
-
-    let write_ck = file_write(&addr, ucp_rt.clone())?;
-    let read_ck = file_read(&addr, ucp_rt.clone())?;
+    let conf = ClientConf {
+        use_ucp: true,
+        ..Default::default()
+    };
+    let factory = Arc::new(ClientFactory::new(conf));
+    let write_ck = file_write(&addr, factory.clone())?;
+    let read_ck = file_read(&addr, factory.clone())?;
     info!("write_ck {}, read_ck {}", write_ck, read_ck);
     assert_eq!(write_ck, read_ck);
 
     Ok(())
 }
 
-fn file_write(addr: &InetAddr, rt: Arc<UcpRuntime>) -> CommonResult<u64> {
-    let factory = ClientFactory::default();
-    let client = factory.create_sync_ucp(rt, addr)?;
+fn file_write(addr: &InetAddr, factory: Arc<ClientFactory>) -> CommonResult<u64> {
+    let client = factory.create_sync(addr)?;
 
     let req_id = Utils::req_id();
     let open_msg = open_message(RpcCode::Write, req_id);
@@ -57,9 +59,8 @@ fn file_write(addr: &InetAddr, rt: Arc<UcpRuntime>) -> CommonResult<u64> {
     Ok(checksum)
 }
 
-fn file_read(addr: &InetAddr, rt: Arc<UcpRuntime>) -> CommonResult<u64> {
-    let factory = ClientFactory::default();
-    let client = factory.create_sync_ucp(rt, addr)?;
+fn file_read(addr: &InetAddr, factory: Arc<ClientFactory>) -> CommonResult<u64> {
+    let client = factory.create_sync(addr)?;
 
     let req_id = Utils::req_id();
     let open_msg = open_message(RpcCode::Read, req_id);

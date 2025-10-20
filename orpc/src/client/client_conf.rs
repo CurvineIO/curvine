@@ -47,8 +47,8 @@ pub struct ClientConf {
 
     pub use_libc: bool,
 
+    pub use_ucp: bool,
     pub ucp_tag_max_len: usize,
-
     pub ucp_small_use_tag: bool,
 }
 
@@ -109,6 +109,7 @@ impl Default for ClientConf {
 
             use_libc: false,
 
+            use_ucp: true,
             ucp_tag_max_len: 4096,
             ucp_small_use_tag: false,
         }

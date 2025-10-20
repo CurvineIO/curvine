@@ -19,6 +19,8 @@ use crate::ucp::core::{Config, Context, Listener, SockAddr};
 use crate::ucp::reactor::{AsyncEndpoint, RmaEndpoint, UcpExecutor};
 use crate::ucp::request::ConnRequest;
 use std::sync::Arc;
+use crate::client::ClientConf;
+use crate::server::ServerConf;
 
 pub struct UcpRuntime {
     pub boss: Arc<UcpExecutor>,
@@ -28,9 +30,7 @@ pub struct UcpRuntime {
 }
 
 impl UcpRuntime {
-    pub fn with_conf(conf: Config) -> IOResult<Self> {
-        let context = Arc::new(Context::with_config(conf)?);
-
+    pub fn new(context: Arc<Context>) -> IOResult<Self> {
         let boss = Arc::new(UcpExecutor::new(
             format!("{}-boss", &context.config().name),
             &context,
@@ -49,6 +49,18 @@ impl UcpRuntime {
             context,
             index: AtomicLen::new(0),
         })
+    }
+
+    pub fn with_server(conf: &ServerConf) -> IOResult<Self> {
+        let conf = Config::new(&conf.name, conf.io_threads)?;
+        let context = Arc::new(Context::with_config(conf)?);
+        Self::new(context)
+    }
+
+    pub fn with_client(conf: &ClientConf) -> IOResult<Self> {
+        let conf = Config::new("orpc-ucp", conf.io_threads)?;
+        let context = Arc::new(Context::with_config(conf)?);
+        Self::new(context)
     }
 
     pub fn bind(&self, addr: &SockAddr) -> IOResult<Listener> {
@@ -85,11 +97,5 @@ impl UcpRuntime {
     pub fn connect_async(&self, addr: &InetAddr) -> IOResult<AsyncEndpoint> {
         let ep = self.connect_rma(addr)?;
         Ok(AsyncEndpoint::new(ep))
-    }
-}
-
-impl Default for UcpRuntime {
-    fn default() -> Self {
-        Self::with_conf(Config::default()).unwrap()
     }
 }

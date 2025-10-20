@@ -17,8 +17,9 @@ use crate::io::net::InetAddr;
 use crate::io::IOResult;
 use crate::runtime::{RpcRuntime, Runtime};
 use crate::sync::FastDashMap;
-use crate::ucp::reactor::UcpRuntime;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "ucp")]
+use crate::ucp::reactor::UcpRuntime;
 
 struct ClientPool {
     clients: Vec<Option<RpcClient>>,
@@ -57,6 +58,8 @@ impl ClientPool {
 pub struct ClientFactory {
     pub(crate) conf: ClientConf,
     pub(crate) rt: Arc<Runtime>,
+    #[cfg(feature = "ucp")]
+    pub ucp_rt: Arc<UcpRuntime>,
     pool: FastDashMap<InetAddr, Arc<Mutex<ClientPool>>>,
 }
 
@@ -67,16 +70,39 @@ impl ClientFactory {
     }
 
     pub fn with_rt(conf: ClientConf, rt: Arc<Runtime>) -> Self {
-        ClientFactory {
-            conf,
-            rt,
-            pool: FastDashMap::default(),
+        #[cfg(feature = "ucp")] {
+            let ucp_rt = Arc::new(UcpRuntime::with_client(&conf).unwrap());
+            ClientFactory {
+                conf,
+                rt,
+                ucp_rt,
+                pool: FastDashMap::default(),
+            }
+        }
+
+        #[cfg(not(feature = "ucp"))] {
+            ClientFactory {
+                conf,
+                rt,
+                pool: FastDashMap::default(),
+            }
         }
     }
 
     pub async fn create_raw(&self, addr: &InetAddr) -> IOResult<RpcClient> {
-        RpcClient::new(false, self.rt.clone(), addr, &self.conf).await
+        #[cfg(feature = "ucp")] {
+            if self.conf.use_ucp {
+                RpcClient::with_ucp(self.ucp_rt.clone(), addr, &self.conf).await
+            } else {
+                RpcClient::new(false, self.rt.clone(), addr, &self.conf).await
+            }
+        }
+
+        #[cfg(not(feature = "ucp"))] {
+            RpcClient::new(false, self.rt.clone(), addr, &self.conf).await
+        }
     }
+
 
     pub async fn create_buffer(&self, addr: &InetAddr) -> IOResult<RpcClient> {
         RpcClient::new(true, self.rt.clone(), addr, &self.conf).await
@@ -135,16 +161,10 @@ impl ClientFactory {
     }
 
     pub fn create_sync(&self, addr: &InetAddr) -> IOResult<SyncClient> {
-        let client = self.rt.block_on(RpcClient::with_raw(addr, &self.conf))?;
+        let client = self.rt.block_on(self.create_raw(addr))?;
         Ok(SyncClient::new(self.rt.clone(), client))
     }
 
-    pub fn create_sync_ucp(&self, rt: Arc<UcpRuntime>, addr: &InetAddr) -> IOResult<SyncClient> {
-        let client = self
-            .rt
-            .block_on(RpcClient::with_ucp(rt, addr, &self.conf))?;
-        Ok(SyncClient::new(self.rt.clone(), client))
-    }
 
     pub fn clone_runtime(&self) -> Arc<Runtime> {
         self.rt.clone()
