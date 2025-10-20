@@ -22,6 +22,7 @@ use crate::sys::{DataSlice, RawVec};
 use crate::ucp::reactor::AsyncEndpoint;
 use crate::{err_box, message};
 use bytes::{BufMut, BytesMut};
+use log::{info, trace};
 
 pub struct UcpFrame {
     endpoint: AsyncEndpoint,
@@ -81,25 +82,25 @@ impl Frame for UcpFrame {
         if let Some(header) = &msg.header {
             self.buf.put_slice(header);
         }
+        let header_buf = DataSlice::Buffer(self.buf.split());
 
         let data = match msg {
             BoxMessage::Msg(m) => m.data,
-            // @todo 没有考虑好
             BoxMessage::Arc(_) => return err_box!("Not support"),
         };
 
-        let header_buf = DataSlice::Buffer(self.buf.split());
 
+        // rma操作顺序：put → flush → send（保证数据可见后再通知）
         if !data.is_empty() {
-            let data_future = self.endpoint.put(data);
-            if self.small_use_tag {
-                let header_future = self.endpoint.tag_send(header_buf);
-                tokio::try_join!(header_future, data_future)?;
-            } else {
-                let header_future = self.endpoint.stream_send(header_buf);
-                tokio::try_join!(header_future, data_future)?;
-            }
-        } else if self.small_use_tag {
+            // 步骤1：RMA 写入数据到远程内存
+            self.endpoint.put(data).await?;
+            
+            // 步骤2：flush 确保数据对远程 CPU 可见，必须在 send 之前，否则接收端会读取到旧的数据
+            self.endpoint.flush().await?;
+        }
+
+        // 步骤3：发送 header 通知接收端（rma数据已就绪）
+        if self.small_use_tag {
             self.endpoint.tag_send(header_buf).await?;
         } else {
             self.endpoint.stream_send(header_buf).await?;

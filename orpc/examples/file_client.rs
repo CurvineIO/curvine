@@ -37,9 +37,9 @@ fn file_write(addr: &InetAddr, rt: Arc<UcpRuntime>) -> CommonResult<u64> {
     let _ = client.rpc(open_msg)?;
     tracing::info!("open");
 
-    let str = Utils::rand_str(64 * 1024);
     let mut checksum: u64 = 0;
     for i in 0..100 {
+        let str = Utils::rand_str(64 * 1024);
         let data = BytesMut::from(str.as_str());
         checksum += Utils::crc32(&data) as u64;
 
