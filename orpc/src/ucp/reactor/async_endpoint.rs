@@ -21,6 +21,8 @@ use crate::ucp::reactor::{RmaEndpoint, RmaType, UcpExecutor};
 use crate::ucp::request::*;
 use bytes::BytesMut;
 use std::sync::Arc;
+use crate::io::net::InetAddr;
+use crate::ucp::core::SockAddr;
 
 #[derive(Clone)]
 pub struct AsyncEndpoint {
@@ -169,6 +171,13 @@ impl AsyncEndpoint {
                     Ok(&slice[..len])
                 }
             }
+            None => err_box!("endpoint is closed"),
+        }
+    }
+
+    pub fn conn_sockaddr(&self) -> IOResult<(SockAddr, SockAddr)> {
+        match self.inner.as_ref() {
+            Some(ep) => ep.conn_sockaddr(),
             None => err_box!("endpoint is closed"),
         }
     }

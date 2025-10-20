@@ -14,7 +14,7 @@
 
 use crate::client::ClientConf;
 use crate::handler::Frame;
-use crate::io::net::ConnState;
+use crate::io::net::{ConnState, InetAddr};
 use crate::io::IOResult;
 use crate::message::{BoxMessage, Message, RefMessage};
 use crate::server::ServerConf;
@@ -23,6 +23,7 @@ use crate::ucp::reactor::{AsyncEndpoint, RmaType};
 use crate::{err_box, message};
 use bytes::{BufMut, BytesMut};
 use log::{info, trace};
+use crate::ucp::core::SockAddr;
 
 pub struct UcpFrame {
     endpoint: AsyncEndpoint,
@@ -146,6 +147,10 @@ impl Frame for UcpFrame {
     }
 
     fn new_conn_state(&self) -> ConnState {
-        ConnState::default()
+        if let Ok((remote, local)) = self.endpoint.conn_sockaddr() {
+            ConnState::new(remote.to_inet_addr(), local.to_inet_addr())
+        } else {
+            ConnState::new(InetAddr::default(), InetAddr::default())
+        }
     }
 }

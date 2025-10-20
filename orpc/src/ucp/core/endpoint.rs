@@ -28,6 +28,7 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
 use std::task::Poll;
+use crate::io::net::InetAddr;
 
 pub struct Endpoint {
     inner: RawPtr<ucp_ep>,
@@ -282,6 +283,23 @@ impl Endpoint {
         let (_, len) = poll_status!(status, (tag, buf.len()), poll_tag)?;
         Ok(len)
     }
+
+    /// 获取连接的 socket 地址
+    pub fn conn_sockaddr(&self) -> IOResult<(SockAddr, SockAddr)> {
+        let mut attr = ucp_ep_attr {
+            field_mask: (ucp_ep_attr_field::UCP_EP_ATTR_FIELD_LOCAL_SOCKADDR.0
+                | ucp_ep_attr_field::UCP_EP_ATTR_FIELD_REMOTE_SOCKADDR.0) as u64,
+            ..unsafe { MaybeUninit::zeroed().assume_init() }
+        };
+
+        let status = unsafe { ucp_ep_query(self.as_mut_ptr(), &mut attr as *mut _) };
+        err_ucs!(status)?;
+
+        let local = SockAddr::from(attr.local_sockaddr);
+        let remote = SockAddr::from(attr.remote_sockaddr);
+        Ok((local, remote))
+    }
+
 
     /// 查询 endpoint 使用的传输层（硬件类型）
     ///

@@ -23,6 +23,7 @@ use crate::ucp::HANDSHAKE_LEN_BYTES;
 use bytes::{Buf, BufMut, BytesMut};
 use std::sync::Arc;
 use log::info;
+use crate::io::net::InetAddr;
 
 /// RMA (Remote Memory Access) endpoint that supports high-performance remote memory operations.
 ///
@@ -62,8 +63,11 @@ impl RmaEndpoint {
 
     /// 发送握手信息
     pub async fn handshake_request(&mut self, rma_type: RmaType, mem_len: usize) -> IOResult<()> {
+        let (local, remote) = self.conn_sockaddr()?;
         info!(
-            "handshake request endpoint, rma_type: {:?}, mem_len: {}, transports {:?}",
+            "handshake request, addr {} -> {}, rma_type: {:?}, mem_len: {}, transports {:?}",
+            local,
+            remote,
             rma_type,
             mem_len,
             self.inner.query_transports().unwrap_or_default()
@@ -88,9 +92,12 @@ impl RmaEndpoint {
 
     /// 接收握手信息
     pub async fn handshake_response(&mut self) -> IOResult<()> {
+        let (local, remote) = self.conn_sockaddr()?;
         let handshake = self.handshake_recv().await?;
         info!(
-            "handshake request endpoint, rma_type: {:?}, mem_len: {}, transports {:?}",
+            "handshake request, addr {} -> {}, rma_type: {:?}, mem_len: {}, transports {:?}",
+            local,
+            remote,
             handshake.rma_type,
             handshake.mem_len,
             self.inner.query_transports().unwrap_or_default()
@@ -211,5 +218,9 @@ impl RmaEndpoint {
             Some(mem) => Ok(mem),
             None => err_box!("remote memory not set"),
         }
+    }
+
+    pub fn conn_sockaddr(&self) -> IOResult<(SockAddr, SockAddr)> {
+        self.inner.conn_sockaddr()
     }
 }

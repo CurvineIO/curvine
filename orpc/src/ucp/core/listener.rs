@@ -130,6 +130,17 @@ impl Listener {
     pub fn worker(&self) -> &Arc<Worker> {
         &self.worker
     }
+
+    pub fn bind_addr(&self) -> IOResult<SockAddr> {
+        let mut attr = ucp_listener_attr_t {
+            field_mask: ucp_listener_attr_field::UCP_LISTENER_ATTR_FIELD_SOCKADDR.0 as u64,
+            sockaddr: unsafe { MaybeUninit::zeroed().assume_init() },
+        };
+        let status = unsafe { ucp_listener_query(self.inner.as_mut_ptr(), &mut attr) };
+        err_ucs!(status)?;
+
+        Ok(SockAddr::from(attr.sockaddr))
+    }
 }
 
 impl Drop for Listener {
