@@ -14,29 +14,63 @@
 
 use crate::err_box;
 use crate::io::IOResult;
-use crate::ucp::rma::LocalMem;
+use crate::ucp::rma::{LocalMem, RemoteMem, RKey};
 use crate::ucp::{
     HANDSHAKE_HEADER_LEN, HANDSHAKE_LEN_BYTES, HANDSHAKE_MAGIC, HANDSHAKE_MAX_LEN,
     HANDSHAKE_VERSION,
 };
 use bytes::{Buf, BufMut, BytesMut};
+use moka::ops::compute::Op;
+use crate::ucp::core::Endpoint;
+use crate::ucp::reactor::RmaType;
 
 pub struct HandshakeV1 {
     pub ep_id: u64,
+    pub rma_type: RmaType,
     pub mem_addr: u64,
-    pub mem_len: u32,
+    pub mem_len: u64,
     pub rkey: BytesMut,
 }
 
 impl HandshakeV1 {
-    pub fn new(ep_id: u64, mem: &LocalMem) -> IOResult<Self> {
-        let rkey = mem.pack()?;
-        Ok(Self {
-            ep_id,
-            mem_addr: mem.addr(),
-            mem_len: mem.len() as u32,
-            rkey: BytesMut::from(rkey.as_slice()),
-        })
+    pub fn new(
+        ep_id: u64,
+        rma_type: RmaType,
+        mem_len: usize,
+        local_mem: Option<&LocalMem>,
+    ) -> IOResult<Self> {
+        let handshake = match local_mem {
+            Some(mem) => {
+                Self {
+                    ep_id,
+                    rma_type,
+                    mem_addr: mem.addr(),
+                    mem_len: mem_len as u64,
+                    rkey: BytesMut::from(mem.pack()?.as_slice())
+                }
+            }
+            None => {
+                Self {
+                    ep_id,
+                    rma_type,
+                    mem_addr: 0,
+                    mem_len: mem_len as u64,
+                    rkey: BytesMut::new()
+                }
+            }
+        };
+
+        Ok(handshake)
+    }
+
+    pub fn get_remote_mem(&self, ep: &Endpoint) -> IOResult<Option<RemoteMem>> {
+        if self.rkey.len() > 0 {
+            let rkey = RKey::unpack(ep, &self.rkey)?;
+            let mem = RemoteMem::new(self.ep_id, self.mem_addr, self.mem_len as usize, rkey);
+            return Ok(Some(mem))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn encode(&self) -> IOResult<BytesMut> {
@@ -47,8 +81,9 @@ impl HandshakeV1 {
         buf.put_u32(HANDSHAKE_VERSION);
 
         buf.put_u64(self.ep_id);
+        buf.put_i8(self.rma_type as i8);
         buf.put_u64(self.mem_addr);
-        buf.put_u32(self.mem_len);
+        buf.put_u64(self.mem_len);
         buf.put_slice(&self.rkey);
 
         if buf.len() > HANDSHAKE_MAX_LEN {
@@ -78,12 +113,14 @@ impl HandshakeV1 {
             );
         };
         let ep_id = buf.get_u64();
+        let rma_type = RmaType::from(buf.get_i8());
         let mem_addr = buf.get_u64();
-        let mem_len = buf.get_u32();
+        let mem_len = buf.get_u64();
         let rkey = buf.split();
 
         Ok(Self {
             ep_id,
+            rma_type,
             mem_addr,
             mem_len,
             rkey,

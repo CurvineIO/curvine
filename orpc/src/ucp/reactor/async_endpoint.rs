@@ -17,7 +17,7 @@ use crate::io::IOResult;
 use crate::runtime::{RpcRuntime, Runtime};
 use crate::sync::channel::{AsyncSender, CallChannel};
 use crate::sys::{DataSlice, RawPtr};
-use crate::ucp::reactor::{RmaEndpoint, UcpExecutor};
+use crate::ucp::reactor::{RmaEndpoint, RmaType, UcpExecutor};
 use crate::ucp::request::*;
 use bytes::BytesMut;
 use std::sync::Arc;
@@ -33,6 +33,7 @@ impl AsyncEndpoint {
     pub fn new(endpoint: RmaEndpoint) -> Self {
         let sender = endpoint.executor().clone_sender();
         let executor = endpoint.executor().clone();
+
         AsyncEndpoint {
             inner: Some(RawPtr::from_owned(endpoint)),
             executor,
@@ -47,10 +48,12 @@ impl AsyncEndpoint {
         }
     }
 
-    pub async fn handshake_request(&mut self) -> IOResult<()> {
+    pub async fn handshake_request(&mut self, rma_type: RmaType, mem_len: usize) -> IOResult<()> {
         let (call, promise) = CallChannel::channel();
         let req = OpRequest::HandshakeRequest(HandshakeRequest {
             ep: self.ep()?,
+            rma_type,
+            mem_len,
             call,
         });
         self.sender.send(req).await?;
@@ -156,8 +159,18 @@ impl AsyncEndpoint {
         self.executor().clone_rt()
     }
 
-    pub fn local_mem_slice(&self, len: usize) -> &[u8] {
-        &self.inner.as_ref().unwrap().local_mem_slice()[..len]
+    pub fn local_mem_slice(&self, len: usize) -> IOResult<&[u8]> {
+        match self.inner.as_ref() {
+            Some(ep) => {
+                let slice = ep.local_mem_slice()?;
+                if len > slice.len() {
+                    err_box!("len length {} is larger than available local memory slice len {}", len, slice.len())
+                } else {
+                    Ok(&slice[..len])
+                }
+            }
+            None => err_box!("endpoint is closed"),
+        }
     }
 }
 

@@ -12,23 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod rma_endpoint;
-pub use rma_endpoint::RmaEndpoint;
+use num_enum::{FromPrimitive, IntoPrimitive};
 
-mod async_endpoint;
-pub use async_endpoint::AsyncEndpoint;
+/// 定义RMA类型
+#[repr(i8)]
+#[derive(Debug, IntoPrimitive, FromPrimitive, PartialEq, Eq, Hash, Copy, Clone)]
+pub enum RmaType {
+    #[default]
+    None = 0,
+    Client = 1,
+    Server = 2,
+    Both = 3,
+}
 
-mod ucp_frame;
-pub use ucp_frame::UcpFrame;
+impl RmaType {
+    pub fn client_need(&self) -> bool {
+        matches!(self, RmaType::Client | RmaType::Both)
+    }
 
-mod ucp_executor;
-pub use ucp_executor::UcpExecutor;
-
-mod ucp_runtime;
-pub use self::ucp_runtime::UcpRuntime;
-
-mod ucp_server;
-pub use ucp_server::UcpServer;
-
-mod rma_type;
-pub use rma_type::RmaType;
+    pub fn server_need(&self) -> bool {
+        matches!(self, RmaType::Server | RmaType::Both)
+    }
+}

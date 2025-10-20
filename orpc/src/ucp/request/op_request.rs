@@ -15,17 +15,22 @@
 use crate::io::IOResult;
 use crate::sync::channel::CallSender;
 use crate::sys::{DataSlice, RawPtr};
-use crate::ucp::reactor::RmaEndpoint;
+use crate::ucp::reactor::{RmaEndpoint, RmaType};
 use bytes::BytesMut;
 
 pub struct HandshakeRequest {
     pub ep: RawPtr<RmaEndpoint>,
+    pub rma_type: RmaType,
+    pub mem_len: usize,
     pub call: CallSender<IOResult<()>>,
 }
 
 impl HandshakeRequest {
     pub async fn run(mut self) -> IOResult<()> {
-        let res = self.ep.handshake_request().await;
+        let res = self.ep.handshake_request(
+            self.rma_type,
+            self.mem_len,
+        ).await;
         self.call.send(res)
     }
 }

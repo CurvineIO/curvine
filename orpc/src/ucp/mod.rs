@@ -21,7 +21,7 @@ pub const HANDSHAKE_MAGIC: u64 = 0xFEEDFACE;
 
 pub const HANDSHAKE_VERSION: u32 = 1;
 
-pub const HANDSHAKE_HEADER_LEN: u32 = 32;
+pub const HANDSHAKE_HEADER_LEN: u32 = 37;
 
 pub const HANDSHAKE_LEN_BYTES: usize = 4;
 

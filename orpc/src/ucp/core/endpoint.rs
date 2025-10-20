@@ -57,10 +57,6 @@ impl Endpoint {
             worker,
             err_monitor,
         };
-        info!(
-            "Create endpoint, transports {:?}",
-            endpoint.query_transports().unwrap_or_default()
-        );
 
         Ok(endpoint)
     }
@@ -289,11 +285,13 @@ impl Endpoint {
 
     /// 查询 endpoint 使用的传输层（硬件类型）
     ///
-    /// 返回传输层和设备名称列表，例如：
-    /// - ("rc_mlx5", "mlx5_0:1") - InfiniBand/RoCE
-    /// - ("tcp", "eth0") - TCP
-    /// - ("dc_mlx5", "mlx5_0:1") - Dynamically Connected Transport
-    pub fn query_transports(&self) -> IOResult<Vec<(String, String)>> {
+    /// 返回格式化字符串，格式：`"transport1:device1, transport2:device2"`
+    ///
+    /// # Examples
+    /// - `"rc_mlx5=mlx5_0:1, shm=memory"` - InfiniBand + 共享内存
+    /// - `"tcp=eth0"` - TCP
+    /// - `"dc_mlx5=mlx5_0:1"` - Dynamically Connected Transport
+    pub fn query_transports(&self) -> IOResult<String> {
         const MAX_TRANSPORTS: usize = 10;
         let mut entries: Vec<ucp_transport_entry_t> = vec![
             ucp_transport_entry_t {
@@ -316,26 +314,24 @@ impl Endpoint {
         let status = unsafe { ucp_ep_query(self.as_mut_ptr(), &mut attr as *mut _) };
         err_ucs!(status)?;
 
-        // 解析传输层信息
-        let mut result = Vec::new();
         let num = attr.transports.num_entries as usize;
+        if num == 0 {
+            return Ok(String::from("none"));
+        }
 
+        let mut parts = Vec::with_capacity(num);
         for i in 0..num {
             unsafe {
                 let entry = &*attr.transports.entries.add(i);
                 if !entry.transport_name.is_null() && !entry.device_name.is_null() {
-                    let transport = CStr::from_ptr(entry.transport_name)
-                        .to_string_lossy()
-                        .into_owned();
-                    let device = CStr::from_ptr(entry.device_name)
-                        .to_string_lossy()
-                        .into_owned();
-                    result.push((transport, device));
+                    let transport = CStr::from_ptr(entry.transport_name).to_string_lossy();
+                    let device = CStr::from_ptr(entry.device_name).to_string_lossy();
+                    parts.push(format!("{}={}", transport, device));
                 }
             }
         }
 
-        Ok(result)
+        Ok(parts.join(", "))
     }
 
     pub fn print(&self) {

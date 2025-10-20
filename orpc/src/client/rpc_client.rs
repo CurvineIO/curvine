@@ -22,7 +22,7 @@ use crate::io::{IOError, IOResult};
 use crate::message::{Message, RefMessage};
 use crate::runtime::Runtime;
 use crate::sys::RawPtr;
-use crate::ucp::reactor::{UcpFrame, UcpRuntime};
+use crate::ucp::reactor::{RmaType, UcpFrame, UcpRuntime};
 use crate::{err_box, try_err};
 use log::warn;
 use std::sync::Arc;
@@ -95,8 +95,8 @@ impl RpcClient {
         addr: &InetAddr,
         conf: &ClientConf,
     ) -> IOResult<Self> {
-        let mut endpoint = rt.connect_async(addr, conf.buffer_size)?;
-        endpoint.handshake_request().await?;
+        let mut endpoint = rt.connect_async(addr)?;
+        endpoint.handshake_request(RmaType::Both, conf.buffer_size).await?;
         let frame = UcpFrame::with_client(endpoint, conf);
 
         Ok(Self {

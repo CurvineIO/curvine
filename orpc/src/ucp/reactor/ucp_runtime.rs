@@ -64,26 +64,26 @@ impl UcpRuntime {
         &self.boss
     }
 
-    pub fn accept_rma(&self, conn: ConnRequest, mem_len: usize) -> IOResult<RmaEndpoint> {
+    pub fn accept_rma(&self, conn: ConnRequest) -> IOResult<RmaEndpoint> {
         let executor = self.select_executor();
-        let endpoint = RmaEndpoint::accept(executor, conn, mem_len)?;
+        let endpoint = RmaEndpoint::accept(executor, conn)?;
         Ok(endpoint)
     }
 
-    pub fn accept_async(&self, conn: ConnRequest, mem_len: usize) -> IOResult<AsyncEndpoint> {
-        let ep = self.accept_rma(conn, mem_len)?;
+    pub fn accept_async(&self, conn: ConnRequest) -> IOResult<AsyncEndpoint> {
+        let ep = self.accept_rma(conn)?;
         Ok(AsyncEndpoint::new(ep))
     }
 
-    pub fn connect_rma(&self, addr: &InetAddr, mem_len: usize) -> IOResult<RmaEndpoint> {
+    pub fn connect_rma(&self, addr: &InetAddr) -> IOResult<RmaEndpoint> {
         let sockaddr = SockAddr::try_from(addr)?;
         let executor = self.select_executor();
-        let endpoint = RmaEndpoint::connect(executor, &sockaddr, mem_len)?;
+        let endpoint = RmaEndpoint::connect(executor, &sockaddr)?;
         Ok(endpoint)
     }
 
-    pub fn connect_async(&self, addr: &InetAddr, mem_len: usize) -> IOResult<AsyncEndpoint> {
-        let ep = self.connect_rma(addr, mem_len)?;
+    pub fn connect_async(&self, addr: &InetAddr) -> IOResult<AsyncEndpoint> {
+        let ep = self.connect_rma(addr)?;
         Ok(AsyncEndpoint::new(ep))
     }
 }

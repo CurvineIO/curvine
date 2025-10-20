@@ -19,7 +19,7 @@ use crate::io::IOResult;
 use crate::message::{BoxMessage, Message, RefMessage};
 use crate::server::ServerConf;
 use crate::sys::{DataSlice, RawVec};
-use crate::ucp::reactor::AsyncEndpoint;
+use crate::ucp::reactor::{AsyncEndpoint, RmaType};
 use crate::{err_box, message};
 use bytes::{BufMut, BytesMut};
 use log::{info, trace};
@@ -55,8 +55,8 @@ impl UcpFrame {
         self.buf.split()
     }
 
-    pub async fn handshake_request(&mut self) -> IOResult<()> {
-        self.endpoint.handshake_request().await
+    pub async fn handshake_request(&mut self, rma_type: RmaType, mem_len: usize) -> IOResult<()> {
+        self.endpoint.handshake_request(rma_type, mem_len).await
     }
 
     pub async fn handshake_response(&mut self) -> IOResult<()> {
@@ -130,7 +130,7 @@ impl Frame for UcpFrame {
             };
 
             let data = if data_size > 0 {
-                let data = self.endpoint.local_mem_slice(data_size as usize);
+                let data = self.endpoint.local_mem_slice(data_size as usize)?;
                 DataSlice::MemSlice(RawVec::from_slice(data))
             } else {
                 DataSlice::Empty
