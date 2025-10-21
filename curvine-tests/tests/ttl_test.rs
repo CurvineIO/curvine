@@ -262,10 +262,11 @@ fn test_ttl_bucket_interval_impact() -> CommonResult<()> {
 
         let expiration_time_ms = current_time_ms + expiration_offset_ms;
         let bucket_start_ms = (expiration_time_ms / bucket_interval_ms) * bucket_interval_ms;
+        println!("bucket_start_ms: {:?}, expiration_time_ms: {:?}, current_time_ms: {:?}, expiration_offset_ms: {:?}", bucket_start_ms, expiration_time_ms, current_time_ms, expiration_offset_ms);
 
         assert_eq!(
             bucket_start_ms,
-            current_time_ms + expected_bucket_start_ms,
+            current_time_ms / bucket_interval_ms * bucket_interval_ms + expected_bucket_start_ms,
             "Bucket start time calculation incorrect for expiration offset {}ms",
             expiration_offset_ms
         );
