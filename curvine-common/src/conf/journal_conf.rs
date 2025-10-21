@@ -151,6 +151,7 @@ impl JournalConf {
             buffer_size: 128 * 1024,
 
             use_libc: false,
+            ..Default::default()
         }
     }
 

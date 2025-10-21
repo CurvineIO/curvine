@@ -79,7 +79,7 @@ impl ServerConf {
 
             enable_send_file: true,
 
-            use_ucp: true,
+            use_ucp: false,
             ucp_tag_max_len: 4096,
             ucp_small_use_tag: false,
         }

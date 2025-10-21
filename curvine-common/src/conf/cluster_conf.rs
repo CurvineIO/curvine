@@ -166,6 +166,13 @@ impl ClusterConf {
         conf.pipe_pool_idle_time = self.worker.pipe_pool_idle_time;
 
         conf.enable_send_file = self.worker.enable_send_file;
+
+        conf.use_ucp = self.worker.use_ucp;
+        if conf.use_ucp {
+            conf.enable_splice = false;
+            conf.enable_send_file = false;
+        }
+
         conf
     }
 

@@ -162,6 +162,8 @@ pub struct ClientConf {
     pub metric_report_interval_str: String,
 
     pub close_timeout_secs: u64,
+
+    pub use_ucp: bool,
 }
 
 impl ClientConf {
@@ -237,6 +239,9 @@ impl ClientConf {
             conn_size: conf.master_conn_pool_size,
 
             buffer_size: self.read_chunk_size.max(self.write_chunk_size),
+
+            use_ucp: self.use_ucp,
+
             ..Default::default()
         }
     }
@@ -322,6 +327,8 @@ impl Default for ClientConf {
             metric_report_interval: Default::default(),
             metric_report_interval_str: Self::DEFAULT_METRIC_REPORT_INTERVAL_STR.to_string(),
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
+
+            use_ucp: false,
         };
 
         conf.init().unwrap();
