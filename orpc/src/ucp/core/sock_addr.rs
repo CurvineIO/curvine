@@ -14,10 +14,12 @@
 
 use crate::io::net::InetAddr;
 use crate::ucp::bindings::{sockaddr_storage, ucs_sock_addr};
-use crate::CommonError;
+use crate::{CommonError, err_box};
 use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use log::info;
+use crate::io::IOError;
 
 #[derive(Debug)]
 pub struct SockAddr {
@@ -71,21 +73,26 @@ impl From<sockaddr_storage> for SockAddr {
     }
 }
 
-impl From<&str> for SockAddr {
-    fn from(value: &str) -> Self {
-        let addr = SocketAddr::from_str(value).unwrap();
-        let sockaddr = socket2::SockAddr::from(addr);
-        Self::new(sockaddr)
+impl TryFrom<&str> for SockAddr {
+    type Error = IOError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let addr = InetAddr::from_str(value)?;
+        Self::try_from(&addr)
     }
 }
 
 impl TryFrom<&InetAddr> for SockAddr {
-    type Error = CommonError;
+    type Error = IOError;
 
     fn try_from(value: &InetAddr) -> Result<Self, Self::Error> {
-        let addr = SocketAddr::from_str(value.to_string().as_str())?;
-        let sockaddr = socket2::SockAddr::from(addr);
-        Ok(Self::new(sockaddr))
+        let mut iter = value.resolved()?;
+        if let Some(v) = iter.next() {
+            let sockaddr = socket2::SockAddr::from(v);
+            Ok(Self::new(sockaddr))
+        } else {
+            err_box!("Not found addr")
+        }
     }
 }
 

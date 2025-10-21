@@ -14,7 +14,7 @@
 
 use crate::io::IOResult;
 use crate::runtime::{AsyncRuntime, RpcRuntime, Runtime};
-use crate::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
+use crate::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, BlockingChannel, CallChannel};
 use crate::ucp::core::{Context, Worker};
 use crate::ucp::request::OpRequest;
 use crate::ucp::rma::LocalMem;
@@ -34,7 +34,7 @@ impl UcpExecutor {
         let context = context.clone();
 
         // 创建worker。必须使用绑定的线程创建worker。
-        let (tx, rx) = CallChannel::channel();
+        let (tx, mut rx) = BlockingChannel::new(1).split();
         rt.spawn(async move {
             let res = match context.create_worker() {
                 Ok(worker) => Ok(Arc::new(worker)),
@@ -42,7 +42,7 @@ impl UcpExecutor {
             };
             tx.send(res).expect("send ucp worker");
         });
-        let worker = rt.block_on(rx.receive())??;
+        let worker = rx.recv().unwrap().expect("get ucp worker");
 
         // 启动事件轮询
         Self::event_loop(receiver, worker.clone(), rt.clone());
