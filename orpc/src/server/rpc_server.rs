@@ -17,20 +17,16 @@ use crate::io::net::InetAddr;
 use crate::runtime::{RpcRuntime, Runtime};
 use crate::server::{ServerConf, ServerMonitor, ServerStateListener};
 use crate::sync::StateCtl;
-use crate::CommonResult;
+use crate::{CommonError, CommonResult};
 use log::*;
 use socket2::SockRef;
 use std::sync::{Arc, Mutex};
 use std::{env, thread};
 use tokio::net::TcpListener;
 use crate::io::IOResult;
-#[cfg(feature = "ucp")]
-use crate::ucp::reactor::UcpRuntime;
 
 pub struct RpcServer<S> {
     rt: Arc<Runtime>,
-    #[cfg(feature = "ucp")]
-    ucp_rt: Arc<UcpRuntime>,
     service: S,
     conf: ServerConf,
     addr: InetAddr,
@@ -55,8 +51,6 @@ where
 
         RpcServer {
             rt,
-            #[cfg(feature = "ucp")]
-            ucp_rt: Arc::new(UcpRuntime::with_server(&conf).unwrap()),
             service,
             conf,
             addr,
@@ -192,8 +186,15 @@ where
         use crate::ucp::core::SockAddr;
         use crate::ucp::reactor::UcpFrame;
 
-        let bind_addr = SockAddr::from(self.get_bind_addr().as_str());
-        let mut listener = Listener::bind(self.ucp_rt.boss.worker().clone(), &bind_addr)?;
+        // Create ucp runtime
+        let conf = self.conf.clone();
+        let ucp_rt  = thread::spawn(move || {
+            let rt = UcpRuntime::with_server(&conf)?;
+            Ok::<Arc<UcpRuntime>, CommonError>(Arc::new(rt))
+        }).join().unwrap().expect("Failed to create ucp runtime");
+
+        let bind_addr = SockAddr::try_from(self.get_bind_addr().as_str())?;
+        let mut listener = ucp_rt.bind(&bind_addr)?;
         info!(
             "Ucp server [{}] start successfully, bind address: {}, io threads: {}, worker threads: {}",
             self.conf.name,
@@ -205,7 +206,7 @@ where
 
         loop {
             let req = listener.accept().await?;
-            let endpoint = self.ucp_rt.accept_async(req)?;
+            let endpoint = ucp_rt.accept_async(req)?;
             let (bind_addr, client_addr) = endpoint.conn_sockaddr()?;
 
             let frame = UcpFrame::with_server(endpoint, &self.conf);

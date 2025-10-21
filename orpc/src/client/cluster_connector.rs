@@ -86,8 +86,8 @@ impl ClusterConnector {
         self.leader_id.store(id, Ordering::SeqCst)
     }
 
-    pub async fn create_client(&self, addr: &InetAddr, buffer: bool) -> IOResult<RpcClient> {
-        self.factory.create(addr, buffer).await
+    pub async fn create_raw(&self, addr: &InetAddr) -> IOResult<RpcClient> {
+        self.factory.create_raw(addr).await
     }
 
     pub async fn get_client(&self, addr: &InetAddr) -> IOResult<RpcClient> {

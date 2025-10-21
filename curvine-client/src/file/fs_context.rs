@@ -108,7 +108,7 @@ impl FsContext {
 
     pub async fn block_client(&self, addr: &WorkerAddress) -> IOResult<BlockClient> {
         let addr = InetAddr::new(addr.hostname.clone(), addr.rpc_port as u16);
-        let client = self.connector.create_client(&addr, false).await?;
+        let client = self.connector.create_raw(&addr).await?;
         Ok(BlockClient::new(client, self))
     }
 

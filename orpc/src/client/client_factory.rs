@@ -18,8 +18,13 @@ use crate::io::IOResult;
 use crate::runtime::{RpcRuntime, Runtime};
 use crate::sync::FastDashMap;
 use std::sync::{Arc, Mutex};
+use crate::{try_option, try_option_ref};
+
 #[cfg(feature = "ucp")]
-use crate::ucp::reactor::UcpRuntime;
+type UcpRt = Arc<crate::ucp::reactor::UcpRuntime>;
+
+#[cfg(not(feature = "ucp"))]
+type UcpRt = ();
 
 struct ClientPool {
     clients: Vec<Option<RpcClient>>,
@@ -58,9 +63,8 @@ impl ClientPool {
 pub struct ClientFactory {
     pub(crate) conf: ClientConf,
     pub(crate) rt: Arc<Runtime>,
-    #[cfg(feature = "ucp")]
-    pub ucp_rt: Arc<UcpRuntime>,
     pool: FastDashMap<InetAddr, Arc<Mutex<ClientPool>>>,
+    pub ucp_rt: Option<UcpRt>,
 }
 
 impl ClientFactory {
@@ -71,12 +75,17 @@ impl ClientFactory {
 
     pub fn with_rt(conf: ClientConf, rt: Arc<Runtime>) -> Self {
         #[cfg(feature = "ucp")] {
-            let ucp_rt = Arc::new(UcpRuntime::with_client(&conf).unwrap());
+            let ucp_rt = if conf.use_ucp {
+                let rt = crate::ucp::reactor::UcpRuntime::with_client(&conf).unwrap();
+                Some(Arc::new(rt))
+            } else {
+                None
+            };
             ClientFactory {
                 conf,
                 rt,
-                ucp_rt,
                 pool: FastDashMap::default(),
+                ucp_rt
             }
         }
 
@@ -85,6 +94,7 @@ impl ClientFactory {
                 conf,
                 rt,
                 pool: FastDashMap::default(),
+                ucp_rt: None,
             }
         }
     }
@@ -92,9 +102,10 @@ impl ClientFactory {
     pub async fn create_raw(&self, addr: &InetAddr) -> IOResult<RpcClient> {
         #[cfg(feature = "ucp")] {
             if self.conf.use_ucp {
-                RpcClient::with_ucp(self.ucp_rt.clone(), addr, &self.conf).await
+                let rt = try_option_ref!(self.ucp_rt);
+                RpcClient::with_ucp(&rt, addr, &self.conf).await
             } else {
-                RpcClient::new(false, self.rt.clone(), addr, &self.conf).await
+                RpcClient::with_raw(addr, &self.conf).await
             }
         }
 
@@ -102,7 +113,6 @@ impl ClientFactory {
             RpcClient::new(false, self.rt.clone(), addr, &self.conf).await
         }
     }
-
 
     pub async fn create_buffer(&self, addr: &InetAddr) -> IOResult<RpcClient> {
         RpcClient::new(true, self.rt.clone(), addr, &self.conf).await

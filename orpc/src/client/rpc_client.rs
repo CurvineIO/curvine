@@ -98,7 +98,7 @@ impl RpcClient {
 
     #[cfg(feature = "ucp")]
     pub async fn with_ucp(
-        rt: Arc<UcpRuntime>,
+        rt: &UcpRuntime,
         addr: &InetAddr,
         conf: &ClientConf,
     ) -> IOResult<Self> {

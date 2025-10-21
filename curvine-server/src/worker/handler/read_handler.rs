@@ -44,6 +44,8 @@ impl ReadHandler {
     pub fn new(store: BlockStore) -> Self {
         let metrics = Worker::get_metrics();
         let conf = Worker::get_conf();
+        let enable_send_file = !conf.worker.use_ucp && conf.worker.enable_send_file;
+
         Self {
             store,
             os_cache: CacheManager::with_place(),
@@ -51,7 +53,7 @@ impl ReadHandler {
             file: None,
             last_task: None,
             io_slow_us: conf.worker.io_slow_us(),
-            enable_send_file: conf.worker.enable_send_file,
+            enable_send_file,
             metrics,
         }
     }
