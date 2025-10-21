@@ -19,9 +19,10 @@ use curvine_common::FsResult;
 use orpc::common::Utils;
 use orpc::io::LocalFile;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::{CacheManager, RawPtr, ReadAheadTask};
+use orpc::sys::{CacheManager, DataSlice, RawPtr, ReadAheadTask};
 use orpc::{err_box, try_option};
 use std::sync::Arc;
+use curvine_common::error::FsError;
 
 pub struct BlockReaderLocal {
     rt: Arc<Runtime>,
@@ -129,7 +130,7 @@ impl BlockReaderLocal {
         Ok(self.chunk.split())
     }
 
-    pub async fn read(&mut self) -> FsResult<BytesMut> {
+    pub async fn read(&mut self) -> FsResult<DataSlice> {
         let mut chunk = self.get_chunk()?;
         let file = self.file.clone();
 
@@ -138,22 +139,23 @@ impl BlockReaderLocal {
             .as_mut()
             .read_ahead(&self.os_cache, self.last_task.take());
 
-        self.rt
+        let chunk = self.rt
             .spawn_blocking(move || {
                 file.as_mut().read_all(&mut chunk)?;
-                Ok(chunk)
+                Ok::<BytesMut, FsError>(chunk)
             })
-            .await?
+            .await??;
+        Ok(DataSlice::buffer(chunk))
     }
 
-    pub fn blocking_read(&mut self) -> FsResult<BytesMut> {
+    pub fn blocking_read(&mut self) -> FsResult<DataSlice> {
         let mut chunk = self.get_chunk()?;
         self.last_task = self
             .file
             .as_mut()
             .read_ahead(&self.os_cache, self.last_task.take());
         self.file.as_mut().read_all(&mut chunk)?;
-        Ok(chunk)
+        Ok(DataSlice::buffer(chunk))
     }
 
     // Reading is completed and the server needs to be notified.

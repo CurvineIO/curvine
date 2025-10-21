@@ -23,6 +23,7 @@ use orpc::common::Utils;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;
+use orpc::sys::DataSlice;
 
 enum ReaderAdapter {
     Local(BlockReaderLocal),
@@ -30,14 +31,14 @@ enum ReaderAdapter {
 }
 
 impl ReaderAdapter {
-    async fn read(&mut self) -> FsResult<BytesMut> {
+    async fn read(&mut self) -> FsResult<DataSlice> {
         match self {
             Local(r) => r.read().await,
             Remote(r) => r.read().await,
         }
     }
 
-    fn blocking_read(&mut self, rt: &Runtime) -> FsResult<BytesMut> {
+    fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
         match self {
             Local(r) => r.blocking_read(),
             Remote(r) => rt.block_on(r.read()),
@@ -206,10 +207,10 @@ impl BlockReader {
     }
 
     // Based on network transmission efficiency considerations, the data size of the underlying tcp is fixed each time.
-    pub async fn read(&mut self) -> FsResult<BytesMut> {
+    pub async fn read(&mut self) -> FsResult<DataSlice> {
         if !self.has_remaining() {
             // end of block file
-            return Ok(BytesMut::new());
+            return Ok(DataSlice::empty());
         }
 
         let res = self.inner.read().await;
@@ -243,9 +244,9 @@ impl BlockReader {
         }
     }
 
-    pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<BytesMut> {
+    pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
         if !self.has_remaining() {
-            return Ok(BytesMut::new()); // end of block file
+            return Ok(DataSlice::empty()); // end of block file
         }
 
         let res = self.inner.blocking_read(rt);

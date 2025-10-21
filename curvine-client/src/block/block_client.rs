@@ -230,7 +230,7 @@ impl BlockClient {
         req_id: i64,
         seq_id: i32,
         header: Option<DataHeaderProto>,
-    ) -> FsResult<BytesMut> {
+    ) -> FsResult<DataSlice> {
         let builder = Builder::new()
             .code(RpcCode::ReadBlock)
             .request(RequestStatus::Running)
@@ -244,9 +244,6 @@ impl BlockClient {
         };
 
         let rep = self.rpc(msg).await?;
-        match rep.data {
-            DataSlice::Buffer(v) => Ok(v),
-            _ => err_box!("Unsupported type"),
-        }
+        Ok(rep.data)
     }
 }
