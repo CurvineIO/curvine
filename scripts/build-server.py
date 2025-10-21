@@ -10,13 +10,13 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# 用于存储构建状态
+# Build status storage
 build_status = {
     'status': 'idle',  # idle, building, completed, failed
     'message': ''
 }
 
-# 用于存储每日测试状态
+# Daily test status storage
 dailytest_status = {
     'status': 'idle',  # idle, testing, completed, failed
     'message': '',
@@ -24,24 +24,24 @@ dailytest_status = {
     'report_url': ''
 }
 
-# 创建锁对象
+# Create lock objects
 build_lock = threading.Lock()
 dailytest_lock = threading.Lock()
 
-# 项目路径（全局变量）
+# Project path (global)
 PROJECT_PATH = None
 
-# 测试结果目录（全局变量）
-TEST_RESULTS_DIR = "daily_test_results"
+# Test results directory (global)
+TEST_RESULTS_DIR = None
 
 def run_build_script(date, commit):
     global build_status
-    with build_lock:  # 确保同一时间只能有一个构建实例
+    with build_lock:  # Ensure only one build instance at a time
         build_status['status'] = 'building'
         build_status['message'] = f'Starting build for date: {date}, commit: {commit}'
 
         try:
-            # 使用 Popen 执行构建脚本，并实时输出日志
+            # Use Popen to run build script and stream logs
             process = subprocess.Popen(
                 ['./build.sh', date, commit],
                 stdout=subprocess.PIPE,
@@ -49,11 +49,11 @@ def run_build_script(date, commit):
                 universal_newlines=True
             )
 
-            # 实时读取输出
+            # Stream output in real time
             for line in process.stdout:
-                print(line, end='')  # 输出到控制台
+                print(line, end='')  # Print to console
 
-            # 等待进程结束
+            # Wait for process to finish
             process.wait()
 
             if process.returncode == 0:
@@ -61,7 +61,7 @@ def run_build_script(date, commit):
                 build_status['message'] = 'Build completed successfully.'
             else:
                 build_status['status'] = 'failed'
-                # 输出错误信息
+                # Print error output
                 stderr_output = process.stderr.read()
                 build_status['message'] = f'Build failed. Error: {stderr_output}'
 
@@ -71,25 +71,25 @@ def run_build_script(date, commit):
 
 def run_dailytest_script():
     global dailytest_status
-    with dailytest_lock:  # 确保同一时间只能有一个测试实例
+    with dailytest_lock:  # Ensure only one test instance at a time
         dailytest_status['status'] = 'testing'
         dailytest_status['message'] = 'Starting daily regression test...'
         dailytest_status['test_dir'] = ''
         dailytest_status['report_url'] = ''
 
         try:
-            # 使用 Popen 执行每日测试脚本，并实时输出日志
-            # 传递项目路径和结果目录作为参数
+            # Use Popen to run daily test script and stream logs
+            # Pass project path and results directory as arguments
             project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
             
-            # 自动查找脚本路径
+            # Auto-detect script path
             script_path = find_script_path()
             if not script_path:
                 dailytest_status['status'] = 'failed'
                 dailytest_status['message'] = 'Cannot find daily_regression_test.sh script'
                 return
             
-            # 检查脚本是否存在
+            # Check if script exists
             if not os.path.exists(script_path):
                 dailytest_status['status'] = 'failed'
                 dailytest_status['message'] = f'Test script not found: {script_path}'
@@ -104,28 +104,22 @@ def run_dailytest_script():
                 universal_newlines=True
             )
 
-            # 实时读取输出
+            # Stream output in real time
             for line in process.stdout:
-                print(line, end='')  # 输出到控制台
-                # Try to extract test directory from output
-                if 'Test directory:' in line:
-                    import re
-                    match = re.search(r'Test directory: (.+)', line)
-                    if match:
-                        dailytest_status['test_dir'] = match.group(1).strip()
+                print(line, end='')  # Print to console
 
-            # 等待进程结束
+            # Wait for process to finish
             process.wait()
 
             if process.returncode == 0:
                 dailytest_status['status'] = 'completed'
                 dailytest_status['message'] = 'Daily regression test completed successfully.'
-                # 生成报告URL
+                # Generate report URL
                 if dailytest_status['test_dir']:
                     dailytest_status['report_url'] = f"http://localhost:5002/result?date={dailytest_status['test_dir'].split('/')[-1]}"
             else:
                 dailytest_status['status'] = 'failed'
-                # 输出错误信息
+                # Print error output
                 stderr_output = process.stderr.read()
                 dailytest_status['message'] = f'Daily regression test failed. Error: {stderr_output}'
 
@@ -142,14 +136,14 @@ def build():
     if not date or not commit:
         return jsonify({'error': 'Missing date or commit parameter.'}), 400
 
-    # 检查当前构建状态
+    # Check current build status
     if build_status['status'] == 'building':
         return jsonify({
             'error': 'A build is already in progress.',
             'current_status': build_status
         }), 409
 
-    # 启动一个新线程来运行构建脚本
+    # Start a new thread to run build script
     threading.Thread(target=run_build_script, args=(date, commit)).start()
     return jsonify({'message': 'Build started.'}), 202
 
@@ -159,25 +153,25 @@ def status():
 
 @app.route('/dailytest', methods=['POST'])
 def dailytest():
-    """启动每日回归测试"""
-    # 检查当前测试状态
+    """Start daily regression test"""
+    # Check current test status
     if dailytest_status['status'] == 'testing':
         return jsonify({
             'error': 'A daily test is already in progress.',
             'current_status': dailytest_status
         }), 409
 
-    # 启动一个新线程来运行每日测试脚本
+    # Start a new thread to run daily test script
     threading.Thread(target=run_dailytest_script).start()
     return jsonify({'message': 'Daily regression test started.'}), 202
 
 @app.route('/dailytest/status', methods=['GET'])
 def get_dailytest_status():
-    """获取每日测试状态"""
+    """Get daily test status"""
     return jsonify(dailytest_status)
 
 def get_available_test_dates():
-    """获取可用的测试日期列表"""
+    """List available test dates"""
     if not os.path.exists(TEST_RESULTS_DIR):
         return []
     
@@ -185,7 +179,7 @@ def get_available_test_dates():
     for item in os.listdir(TEST_RESULTS_DIR):
         item_path = os.path.join(TEST_RESULTS_DIR, item)
         if os.path.isdir(item_path):
-            # 提取日期部分 (格式: YYYYMMDD_HHMMSS)
+            # Extract date part (format: YYYYMMDD_HHMMSS)
             try:
                 date_part = item.split('_')[0]
                 time_part = item.split('_')[1] if '_' in item else "000000"
@@ -200,12 +194,12 @@ def get_available_test_dates():
             except ValueError:
                 continue
     
-    # 按时间倒序排列
+    # Sort by time descending
     dates.sort(key=lambda x: x['sort_key'], reverse=True)
     return dates
 
 def get_test_result_summary(date_folder):
-    """获取指定日期的测试结果摘要"""
+    """Get test result summary for a given date"""
     summary_file = os.path.join(TEST_RESULTS_DIR, date_folder, "test_summary.json")
     if not os.path.exists(summary_file):
         return None
@@ -219,20 +213,19 @@ def get_test_result_summary(date_folder):
 
 @app.route('/result', methods=['GET'])
 def result():
-    """测试结果页面"""
+    """Test results page (supports new JSON structure, date selection and tables)"""
     date = request.args.get('date')
-    
-    # 获取所有可用的测试日期
+
     available_dates = get_available_test_dates()
-    
+
     if not available_dates:
         return render_template_string("""
         <!DOCTYPE html>
-        <html lang="zh-CN">
+        <html lang="en">
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Curvine 测试结果</title>
+            <title>Curvine Test Results</title>
             <style>
                 body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
                 .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
@@ -243,108 +236,154 @@ def result():
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>🧪 Curvine 测试结果</h1>
+                    <h1>🧪 Curvine Test Results</h1>
                 </div>
                 <div class="no-data">
-                    <p>暂无测试结果数据</p>
-                    <p>请先运行每日回归测试</p>
+                    <p>No test results available</p>
+                    <p>Please run the daily regression test first</p>
                 </div>
             </div>
         </body>
         </html>
         """)
-    
-    # 如果没有指定日期，使用最新的日期
+
     if not date:
         date = available_dates[0]['folder']
-    
-    # 获取指定日期的测试结果
+
     test_summary = get_test_result_summary(date)
-    
-    # 生成HTML页面
+
+    # Compatibility with old JSON structure (modules/results) and new JSON structure (packages/test_cases)
+    packages = []
+    test_cases = []
+    total_tests = 0
+    passed_tests = 0
+    failed_tests = 0
+    success_rate = 0
+
+    if test_summary:
+        if 'packages' in test_summary and 'test_cases' in test_summary:
+            packages = test_summary.get('packages', [])
+            test_cases = test_summary.get('test_cases', [])
+            total_tests = test_summary.get('total_tests', 0)
+            passed_tests = test_summary.get('passed_tests', 0)
+            failed_tests = test_summary.get('failed_tests', 0)
+            success_rate = test_summary.get('success_rate', 0)
+        else:
+            # Old structure conversion
+            modules = test_summary.get('modules', [])
+            results = test_summary.get('results', [])
+            for m in modules:
+                packages.append({
+                    'name': m.get('name', 'unknown'),
+                    'total': m.get('total', 0),
+                    'passed': m.get('passed', 0),
+                    'failed': m.get('failed', 0),
+                    'success_rate': m.get('success_rate', 0)
+                })
+            for r in results:
+                test_expr = r.get('test', '')
+                status = r.get('status', 'UNKNOWN')
+                log = r.get('log', '')
+                # Try to split: package::test_file::test_case or package::test_case
+                package = 'unknown'
+                test_file = 'lib'
+                test_case = test_expr
+                parts = test_expr.split('::')
+                if len(parts) >= 1:
+                    package = parts[0]
+                if len(parts) == 2:
+                    test_case = parts[1]
+                elif len(parts) >= 3:
+                    test_file = '::'.join(parts[1:-1])
+                    test_case = parts[-1]
+                test_cases.append({
+                    'package': package,
+                    'test_file': test_file,
+                    'test_case': test_case,
+                    'status': status,
+                    'log': log
+                })
+            total_tests = test_summary.get('total_tests', 0)
+            passed_tests = test_summary.get('passed_tests', 0)
+            failed_tests = test_summary.get('failed_tests', 0)
+            success_rate = test_summary.get('success_rate', 0)
+
+    # Group test cases by package
+    cases_by_package = {}
+    for c in test_cases:
+        pkg = c.get('package', 'unknown')
+        cases_by_package.setdefault(pkg, []).append(c)
+
+    # Further group TestFile and sort
+    cases_by_package_file = {}
+    for pkg_name, cases in cases_by_package.items():
+        file_map = {}
+        for c in cases:
+            tf = c.get('test_file', 'lib')
+            file_map.setdefault(tf, []).append(c)
+        # Sort each file's test cases by test_case
+        for tf in file_map:
+            file_map[tf] = sorted(file_map[tf], key=lambda x: x.get('test_case', ''))
+        # Sort files by name
+        cases_by_package_file[pkg_name] = dict(sorted(file_map.items(), key=lambda item: item[0]))
+
     html_template = """
     <!DOCTYPE html>
-    <html lang="zh-CN">
+    <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Curvine 测试结果</title>
+        <title>Curvine Test Results</title>
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; }
             .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
             .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; text-align: center; }
-            .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+            .header h1 { font-size: 2.2em; margin-bottom: 10px; }
             .date-selector { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
             .date-selector h3 { margin-bottom: 15px; color: #2c3e50; }
             .date-dropdown { display: flex; align-items: center; gap: 15px; }
             .date-dropdown label { color: #2c3e50; font-weight: bold; font-size: 16px; }
-            .date-dropdown select { 
-                flex: 1;
-                padding: 10px 15px; 
-                border: 2px solid #ddd; 
-                border-radius: 8px; 
-                font-size: 16px;
-                background: white;
-                color: #2c3e50;
-                cursor: pointer;
-                transition: border-color 0.3s;
-            }
+            .date-dropdown select { flex: 1; padding: 10px 15px; border: 2px solid #ddd; border-radius: 8px; font-size: 16px; background: white; color: #2c3e50; cursor: pointer; transition: border-color 0.3s; }
             .date-dropdown select:hover { border-color: #667eea; }
-            .date-dropdown select:focus { 
-                outline: none; 
-                border-color: #667eea; 
-                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
-            }
+            .date-dropdown select:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1); }
             .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
             .summary-card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }
             .summary-card h3 { color: #666; margin-bottom: 10px; }
-            .summary-card .number { font-size: 2.5em; font-weight: bold; }
+            .summary-card .number { font-size: 1.8em; font-weight: bold; }
             .total { color: #3498db; }
             .passed { color: #27ae60; }
             .failed { color: #e74c3c; }
             .success-rate { color: #f39c12; }
-            .results { background: white; border-radius: 10px; padding: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            .results h2 { color: #2c3e50; margin-bottom: 20px; }
-            .result-item { 
-                display: flex; 
-                justify-content: space-between; 
-                align-items: center; 
-                padding: 15px; 
-                border-bottom: 1px solid #eee; 
-                cursor: pointer;
-                transition: background-color 0.3s;
-            }
-            .result-item:hover { background-color: #f8f9fa; }
-            .result-item:last-child { border-bottom: none; }
-            .result-item > div { display: flex; align-items: center; gap: 10px; }
-            .status-badge { padding: 5px 15px; border-radius: 20px; font-weight: bold; }
-            .status-passed { background: #d4edda; color: #155724; }
-            .status-failed { background: #f8d7da; color: #721c24; }
-            .view-log-btn { 
-                color: #007acc; 
-                font-size: 0.9em; 
-                cursor: pointer;
-                padding: 5px 10px;
-                border-radius: 4px;
-                transition: background-color 0.3s;
-            }
-            .view-log-btn:hover { background-color: #e3f2fd; }
+            .package-section { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
+            .package-title { font-size: 1.3em; font-weight: bold; color: #2c3e50; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #3498db; }
+            .test-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+            .test-table th, .test-table td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+            .test-table th { background-color: #f8f9fa; font-weight: bold; color: #495057; }
+            .file-group { background: #eef; font-weight: bold; color: #2c3e50; }
+            .status-passed { background: #d4edda; color: #155724; padding: 3px 6px; border-radius: 4px; font-weight: bold; }
+            .status-failed { background: #f8d7da; color: #721c24; padding: 3px 6px; border-radius: 4px; font-weight: bold; }
+            .log-link { color: #007bff; text-decoration: none; font-size: 0.9em; }
+            .log-link:hover { text-decoration: underline; }
             .footer { text-align: center; margin-top: 40px; padding: 20px; color: #666; border-top: 1px solid #e0e0e0; }
-            .no-data { text-align: center; color: #666; font-size: 18px; padding: 40px; }
+            .file-block { margin: 18px 0; padding: 14px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa; }
+            .file-block-title { font-weight: 600; color: #2c3e50; margin-bottom: 8px; }
+            /* Fixed column widths for consistent cross-block alignment */
+            .test-table { table-layout: fixed; }
+            .test-table th, .test-table td { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
-                <h1>🧪 Curvine 测试结果</h1>
-                <div id="current-date">当前选择: {{ current_date }}</div>
+                <h1>🧪 Curvine Test Results</h1>
+                <div id="current-date">Selected: {{ current_date }}</div>
             </div>
-            
+
             <div class="date-selector">
-                <h3>📅 选择测试日期</h3>
+                <h3>📅 Select Test Date</h3>
                 <div class="date-dropdown">
-                    <label for="date-select">测试日期:</label>
+                    <label for="date-select">Test Date:</label>
                     <select id="date-select" onchange="loadTestResult(this.value)">
                         {% for date_info in available_dates %}
                         <option value="{{ date_info.folder }}" {% if date_info.folder == selected_date %}selected{% endif %}>
@@ -354,143 +393,162 @@ def result():
                     </select>
                 </div>
             </div>
-            
+
             {% if test_summary %}
             <div class="summary">
-                <div class="summary-card">
-                    <h3>总测试数</h3>
-                    <div class="number total">{{ test_summary.total_tests }}</div>
-                </div>
-                <div class="summary-card">
-                    <h3>通过</h3>
-                    <div class="number passed">{{ test_summary.passed_tests }}</div>
-                </div>
-                <div class="summary-card">
-                    <h3>失败</h3>
-                    <div class="number failed">{{ test_summary.failed_tests }}</div>
-                </div>
-                <div class="summary-card">
-                    <h3>成功率</h3>
-                    <div class="number success-rate">{{ test_summary.success_rate }}%</div>
-                </div>
+                <div class="summary-card"><h3>Total Tests</h3><div class="number total">{{ total_tests }}</div></div>
+                <div class="summary-card"><h3>Passed</h3><div class="number passed">{{ passed_tests }}</div></div>
+                <div class="summary-card"><h3>Failed</h3><div class="number failed">{{ failed_tests }}</div></div>
+                <div class="summary-card"><h3>Success Rate</h3><div class="number success-rate">{{ success_rate }}%</div></div>
             </div>
-            
-            <div class="results">
-                <h2>📊 测试结果详情</h2>
-                {% for result in test_summary.results %}
-                <div class="result-item" onclick="viewTestLog('{{ result.category }}')">
-                    <span><strong>{{ result.category }}</strong></span>
-                    <div>
-                        <span class="status-badge {% if result.status == 'PASSED' %}status-passed{% else %}status-failed{% endif %}">
-                            {% if result.status == 'PASSED' %}通过{% else %}失败{% endif %}
-                        </span>
-                        <span class="view-log-btn">📋 查看日志</span>
-                    </div>
+
+            {% for pkg in packages %}
+            <div class="package-section">
+                <div class="package-title">📦 Package: {{ pkg.name }} (Total: {{ pkg.total }}, Passed: {{ pkg.passed }}, Failed: {{ pkg.failed }}, Success Rate: {{ pkg.success_rate }}%)</div>
+                {% for test_file, file_cases in cases_by_package_file.get(pkg.name, {}).items() %}
+                <div class="file-block">
+                    <div class="file-block-title">{{ test_file }}</div>
+                    <table class="test-table">
+                        <colgroup>
+                            <col style="width: 20%">
+                            <col style="width: 50%">
+                            <col style="width: 15%">
+                            <col style="width: 15%">
+                        </colgroup>
+                        <thead>
+                            <tr>
+                                <th>TestFile</th>
+                                <th>TestCase</th>
+                                <th>Result</th>
+                                <th>Log</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for c in file_cases %}
+                            <tr>
+                                <td>{{ test_file }}</td>
+                                <td>{{ c.test_case }}</td>
+                                <td>
+                                    <span class="{% if c.status == 'PASSED' %}status-passed{% else %}status-failed{% endif %}">{{ 'PASS' if c.status == 'PASSED' else 'FAIL' }}</span>
+                                </td>
+                                <td>
+                                    <a class="log-link" href="/logs/{{ selected_date }}/{{ c.log }}" target="_blank">View Log</a>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
                 </div>
                 {% endfor %}
             </div>
+            {% endfor %}
+
             {% else %}
-            <div class="no-data">
-                <p>该日期没有测试结果数据</p>
-            </div>
+            <div class="package-section">No test results for the selected date</div>
             {% endif %}
-            
+
             <div class="footer">
-                <p>报告生成时间: {{ current_time }}</p>
-                <p>Curvine 测试结果查看系统</p>
+                <p>Report generated at: {{ current_time }}</p>
+                <p>Curvine Test Results Viewer</p>
             </div>
         </div>
-        
+
         <script>
-            function loadTestResult(date) {
-                window.location.href = '/result?date=' + date;
-            }
-            
-            function viewTestLog(testCategory) {
-                // 将测试分类名称转换为日志文件名
-                const logFileName = testCategory.toLowerCase().replace(/\s+/g, '_') + '.log';
-                window.location.href = '/logs/{{ selected_date }}/' + logFileName;
-            }
-            
-            // 自动刷新页面（每30秒）
-            setTimeout(function() {
-                location.reload();
-            }, 30000);
+            function loadTestResult(date) { window.location.href = '/result?date=' + date; }
+            setTimeout(function() { location.reload(); }, 30000);
         </script>
     </body>
     </html>
     """
-    
-    return render_template_string(html_template, 
-                                available_dates=available_dates,
-                                selected_date=date,
-                                current_date=next((d['datetime'] for d in available_dates if d['folder'] == date), '未知'),
-                                test_summary=test_summary,
-                                current_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    return render_template_string(
+        html_template,
+        available_dates=available_dates,
+        selected_date=date,
+        current_date=next((d['datetime'] for d in available_dates if d['folder'] == date), 'Unknown'),
+        test_summary=test_summary,
+        packages=packages,
+        cases_by_package=cases_by_package,
+        cases_by_package_file=cases_by_package_file,
+        total_tests=total_tests,
+        passed_tests=passed_tests,
+        failed_tests=failed_tests,
+        success_rate=success_rate,
+        current_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
 
 @app.route('/api/test-dates', methods=['GET'])
 def api_test_dates():
-    """API: 获取所有可用的测试日期"""
+    """API: List all available test dates"""
     dates = get_available_test_dates()
     return jsonify(dates)
 
 @app.route('/api/test-result/<date>', methods=['GET'])
 def api_test_result(date):
-    """API: 获取指定日期的测试结果"""
+    """API: Get test result for a specific date"""
     test_summary = get_test_result_summary(date)
     if test_summary is None:
         return jsonify({'error': 'Test result not found'}), 404
     return jsonify(test_summary)
 
 def get_available_logs(date_folder):
-    """获取指定日期的可用日志文件"""
-    logs_dir = os.path.join(TEST_RESULTS_DIR, date_folder)
-    if not os.path.exists(logs_dir):
+    """Get available log files for a given date (recursive scan)"""
+    base_dir = os.path.join(TEST_RESULTS_DIR, date_folder)
+    if not os.path.exists(base_dir):
         return []
-    
+
     log_files = []
-    for file in os.listdir(logs_dir):
-        if file.endswith('.log') and file != 'daily_test.log':
-            # 提取测试名称（去掉.log后缀）
-            test_name = file.replace('.log', '')
-            log_files.append({
-                'filename': file,
-                'test_name': test_name,
-                'display_name': test_name.replace('_', ' ').title()
-            })
-    
+    for root, dirs, files in os.walk(base_dir):
+        for file in files:
+            if file.endswith('.log') and file != 'daily_test.log':
+                abs_path = os.path.join(root, file)
+                rel_path = os.path.relpath(abs_path, base_dir)
+                test_name = rel_path.replace('.log', '')
+                log_files.append({
+                    'filename': rel_path.replace('\\', '/'),
+                    'test_name': test_name.replace('\\', '/'),
+                    'display_name': test_name.replace('\\', '/')
+                })
+
     return sorted(log_files, key=lambda x: x['test_name'])
 
-@app.route('/logs/<date>/<log_file>', methods=['GET'])
+@app.route('/logs/<date>/', defaults={'log_file': ''}, methods=['GET'])
+@app.route('/logs/<date>/<path:log_file>', methods=['GET'])
 def view_log(date, log_file):
-    """查看测试日志"""
-    # 验证日期格式
-    if not os.path.exists(os.path.join(TEST_RESULTS_DIR, date)):
+    """View test logs (nested paths supported)"""
+    # Validate date directory
+    base_dir = os.path.join(TEST_RESULTS_DIR, date)
+    if not os.path.exists(base_dir):
         return jsonify({'error': 'Date not found'}), 404
-    
-    log_path = os.path.join(TEST_RESULTS_DIR, date, log_file)
+
+    # If not specified a specific file, redirect to result page
+    if not log_file:
+        return render_template_string('<html><body><script>window.location.href="/result?date={{date}}"</script></body></html>', date=date)
+
+    # Join log file path
+    log_path = os.path.join(base_dir, log_file)
     if not os.path.exists(log_path):
         return jsonify({'error': 'Log file not found'}), 404
-    
-    # 读取日志内容
+
+    # Read log content
     try:
         with open(log_path, 'r', encoding='utf-8') as f:
             log_content = f.read()
     except Exception as e:
         return jsonify({'error': f'Failed to read log file: {str(e)}'}), 500
-    
-    # 获取可用的日志文件列表
+
+    # Get available log files list
     available_logs = get_available_logs(date)
     current_log = next((log for log in available_logs if log['filename'] == log_file), None)
-    
-    # 生成日志查看页面
+
+    # Generate log viewer page
     html_template = """
     <!DOCTYPE html>
-    <html lang="zh-CN">
+    <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>测试日志 - {{ current_log.display_name if current_log else log_file }}</title>
+        <title>Test Log - {{ current_log.display_name if current_log else log_file }}</title>
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
             body { font-family: 'Consolas', 'Monaco', 'Courier New', monospace; background: #1e1e1e; color: #d4d4d4; }
@@ -537,9 +595,9 @@ def view_log(date, log_file):
     </head>
     <body>
         <div class="header">
-            <h1>📋 测试日志查看器</h1>
+            <h1>📋 Test Log Viewer</h1>
             <div class="log-selector">
-                <label for="log-select">选择日志文件:</label>
+                <label for="log-select">Select Log File:</label>
                 <select id="log-select" onchange="switchLog()">
                     {% for log in available_logs %}
                     <option value="{{ log.filename }}" {% if log.filename == log_file %}selected{% endif %}>
@@ -547,7 +605,7 @@ def view_log(date, log_file):
                     </option>
                     {% endfor %}
                 </select>
-                <a href="/result?date={{ date }}" class="back-btn">← 返回测试结果</a>
+                <a href="/result?date={{ date }}" class="back-btn">← Back to Test Results</a>
             </div>
         </div>
         <div class="log-content" id="log-content">{{ log_content }}</div>
@@ -558,7 +616,7 @@ def view_log(date, log_file):
                 window.location.href = '/logs/{{ date }}/' + selectedLog;
             }
             
-            // 高亮日志行
+            // Highlight log lines
             function highlightLogLines() {
                 const content = document.getElementById('log-content');
                 const lines = content.innerHTML.split('\\n');
@@ -567,7 +625,7 @@ def view_log(date, log_file):
                 for (let line of lines) {
                     let highlightedLine = line;
                     
-                    // 高亮不同级别的日志
+                    // Highlight different log levels
                     if (line.includes('ERROR')) {
                         highlightedLine = '<span class="log-error">' + line + '</span>';
                     } else if (line.includes('WARN')) {
@@ -578,7 +636,7 @@ def view_log(date, log_file):
                         highlightedLine = '<span class="log-success">' + line + '</span>';
                     }
                     
-                    // 高亮时间戳
+                    // Highlight timestamps
                     highlightedLine = highlightedLine.replace(
                         /(\\d{2}\\/\\d{2}\\/\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3})/g,
                         '<span class="timestamp">$1</span>'
@@ -590,7 +648,7 @@ def view_log(date, log_file):
                 content.innerHTML = highlightedLines.join('\\n');
             }
             
-            // 页面加载完成后高亮日志
+            // Page load after highlighting logs
             document.addEventListener('DOMContentLoaded', highlightLogLines);
         </script>
     </body>
@@ -605,13 +663,13 @@ def view_log(date, log_file):
                                 current_log=current_log)
 
 def parse_arguments():
-    """解析命令行参数"""
+    """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
-        description='Curvine Build Server - 构建和测试服务器',
+        description='Curvine Build Server - Build & Test Server',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  python3 build-server.py                           # 使用默认路径
+Examples:
+  python3 build-server.py                           # Use default paths
   python3 build-server.py --project-path /path/to/curvine
   python3 build-server.py -p /home/user/curvine-project
         """
@@ -621,52 +679,52 @@ def parse_arguments():
         '--project-path', '-p',
         type=str,
         default=None,
-        help='指定curvine项目的路径（默认使用当前工作目录）'
+        help='Path to the curvine project (defaults to current working directory)'
     )
     
     parser.add_argument(
         '--port',
         type=int,
         default=5002,
-        help='服务器端口（默认5002）'
+        help='Server port (default 5002)'
     )
     
     parser.add_argument(
         '--host',
         type=str,
         default='0.0.0.0',
-        help='服务器主机地址（默认0.0.0.0）'
+        help='Server host address (default 0.0.0.0)'
     )
     
     parser.add_argument(
         '--results-dir', '-r',
         type=str,
-        default='daily_test_results',
-        help='测试结果目录（默认daily_test_results）'
+        default=None,
+        help='Test results directory (defaults to <project_path>/result)'
     )
     
     return parser.parse_args()
 
 def find_script_path(script_name="daily_regression_test.sh"):
-    """自动查找脚本路径"""
-    # 1. 首先检查当前目录
+    """Auto-detect script path"""
+    # 1. First check current directory
     current_dir = os.getcwd()
     script_in_current = os.path.join(current_dir, script_name)
     if os.path.exists(script_in_current):
         return script_in_current
     
-    # 2. 检查当前目录的scripts子目录
+    # 2. Check scripts subdirectory of current directory
     script_in_scripts = os.path.join(current_dir, 'scripts', script_name)
     if os.path.exists(script_in_scripts):
         return script_in_scripts
     
-    # 3. 检查PATH环境变量
+    # 3. Check PATH environment variable
     import shutil
     script_in_path = shutil.which(script_name)
     if script_in_path:
         return script_in_path
     
-    # 4. 在常见位置查找
+    # 4. Check common locations
     common_paths = [
         '/usr/local/bin',
         '/usr/bin',
@@ -682,59 +740,59 @@ def find_script_path(script_name="daily_regression_test.sh"):
     return None
 
 def validate_project_path(project_path):
-    """验证项目路径"""
+    """Validate project path"""
     if not os.path.exists(project_path):
-        print(f"错误: 指定的项目路径不存在: {project_path}")
+        print(f"Error: Specified project path does not exist: {project_path}")
         sys.exit(1)
     
     if not os.path.isdir(project_path):
-        print(f"错误: 指定的路径不是目录: {project_path}")
+        print(f"Error: Specified path is not a directory: {project_path}")
         sys.exit(1)
     
-    # 检查是否为curvine项目
+    # Check if it's a curvine project
     cargo_toml = os.path.join(project_path, 'Cargo.toml')
     if not os.path.exists(cargo_toml):
-        print(f"警告: 指定路径可能不是curvine项目（未找到Cargo.toml）: {project_path}")
+        print(f"Warning: Specified path may not be a curvine project (Cargo.toml not found): {project_path}")
     
-    # 检查是否存在scripts目录
+    # Check if scripts directory exists
     scripts_dir = os.path.join(project_path, 'scripts')
     if not os.path.exists(scripts_dir):
-        print(f"警告: 项目路径中未找到scripts目录: {scripts_dir}")
+        print(f"Warning: scripts directory not found in project path: {scripts_dir}")
     
     return project_path
 
 if __name__ == '__main__':
-    # 解析命令行参数
+    # Parse command-line arguments
     args = parse_arguments()
     
-    # 设置项目路径
+    # Set project path
     if args.project_path:
         PROJECT_PATH = validate_project_path(args.project_path)
-        print(f"使用指定的项目路径: {PROJECT_PATH}")
+        print(f"Using specified project path: {PROJECT_PATH}")
     else:
         PROJECT_PATH = os.getcwd()
-        print(f"使用当前工作目录作为项目路径: {PROJECT_PATH}")
+        print(f"Using current working directory as project path: {PROJECT_PATH}")
     
-    # 设置测试结果目录
-    TEST_RESULTS_DIR = args.results_dir
-    print(f"使用测试结果目录: {TEST_RESULTS_DIR}")
+    # Set test results directory: prefer argument, otherwise default <project_path>/result
+    TEST_RESULTS_DIR = args.results_dir if args.results_dir else os.path.join(PROJECT_PATH, 'result')
+    print(f"Using test results directory: {TEST_RESULTS_DIR}")
     
-    # 自动查找脚本路径
+    # Auto-detect script path
     script_path = find_script_path()
     if script_path:
-        print(f"自动找到脚本路径: {script_path}")
+        print(f"Script path auto-detected: {script_path}")
     else:
-        print("警告: 无法自动找到daily_regression_test.sh脚本")
-        print("请确保脚本在以下位置之一:")
-        print("  - 当前目录")
-        print("  - 当前目录的scripts子目录")
-        print("  - 系统PATH中")
+        print("Warning: Could not auto-detect daily_regression_test.sh")
+        print("Please ensure the script is in one of the following locations:")
+        print("  - Current directory")
+        print("  - scripts subdirectory of current directory")
+        print("  - In system PATH")
         print("  - /usr/local/bin, /usr/bin, /opt/curvine/bin, /home/curvine/bin")
     
-    # 启动服务器
-    print(f"启动服务器: http://{args.host}:{args.port}")
-    print(f"项目路径: {PROJECT_PATH}")
-    print(f"结果目录: {TEST_RESULTS_DIR}")
+    # Start server
+    print(f"Starting server: http://{args.host}:{args.port}")
+    print(f"Project path: {PROJECT_PATH}")
+    print(f"Results directory: {TEST_RESULTS_DIR}")
     if script_path:
-        print(f"脚本路径: {script_path}")
+        print(f"Script path: {script_path}")
     app.run(host=args.host, port=args.port)
