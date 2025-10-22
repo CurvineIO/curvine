@@ -221,7 +221,12 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
     let mut config = HashMap::new();
     config.insert("k1".to_string(), "v1".to_string());
     let mnt_opt = MountOptions::builder().set_properties(config).build();
-    mgr.mount(None, mount_uri.path(), ufs_uri.path(), &mnt_opt)?;
+    mgr.mount(
+        None,
+        mount_uri.path(),
+        ufs_uri.encode_uri().as_ref(),
+        &mnt_opt,
+    )?;
 
     //mount hdfs://cluster1/ -> /x/z/y
     let mount_uri = CurvineURI::new("/x/z/y")?;
@@ -229,7 +234,12 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
     let mut config = HashMap::new();
     config.insert("k2".to_string(), "v1".to_string());
     let mnt_opt = MountOptions::builder().build();
-    mgr.mount(None, mount_uri.path(), ufs_uri.path(), &mnt_opt)?;
+    mgr.mount(
+        None,
+        mount_uri.path(),
+        ufs_uri.encode_uri().as_ref(),
+        &mnt_opt,
+    )?;
 
     // umount
     let mount_uri = CurvineURI::new("/x/z/y")?;
