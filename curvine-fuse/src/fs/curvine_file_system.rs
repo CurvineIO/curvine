@@ -667,6 +667,15 @@ impl fs::FileSystem for CurvineFileSystem {
             String::from_utf8_lossy(value_slice)
         );
 
+        // Accept the SELinux labels in the FUSE layer. Add a guard in set_xattr so the driver simply ACKs the write instead of forwarding it.
+        match name {
+            "security.selinux" => {
+                debug!("Ignoring SELinux label on {}", path);
+                return Ok(());
+            }
+            _ => {}
+        }
+
         // Create SetAttrOpts with the xattr to add
         let mut add_x_attr = HashMap::new();
         add_x_attr.insert(name.to_string(), value_slice.to_vec());
