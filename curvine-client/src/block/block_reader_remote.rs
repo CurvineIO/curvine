@@ -14,12 +14,12 @@
 
 use crate::block::BlockClient;
 use crate::file::FsContext;
-use bytes::BytesMut;
 use curvine_common::proto::DataHeaderProto;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
 use orpc::err_box;
+use orpc::sys::DataSlice;
 
 pub struct BlockReaderRemote {
     client: BlockClient,
@@ -101,7 +101,7 @@ impl BlockReaderRemote {
         Ok(self.pos)
     }
 
-    pub async fn read(&mut self) -> FsResult<BytesMut> {
+    pub async fn read(&mut self) -> FsResult<DataSlice> {
         if self.remaining() <= 0 {
             return err_box!("No readable data");
         }
