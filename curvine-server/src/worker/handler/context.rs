@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use curvine_common::proto::{BlockReadRequest, BlockWriteRequest};
-use curvine_common::state::ExtendedBlock;
+use curvine_common::state::{ExtendedBlock, WorkerAddress};
+use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::message::Message;
 
@@ -25,6 +26,9 @@ pub struct WriteContext {
     pub off: i64,
     pub len: i64,
     pub is_append: bool,
+    pub is_pipeline: bool,
+    pub locations: Vec<WorkerAddress>,
+    pub location_index: i32,
 }
 
 impl WriteContext {
@@ -47,6 +51,13 @@ impl WriteContext {
             off: req.off,
             len: req.len,
             is_append,
+            is_pipeline: req.pipeline,
+            locations: req
+                .locations
+                .iter()
+                .map(|x| ProtoUtils::worker_address_from_pb(x))
+                .collect(),
+            location_index: req.location_index,
         };
 
         Ok(context)

@@ -38,6 +38,8 @@ impl BlockWriterRemote {
         fs_context: &FsContext,
         block: ExtendedBlock,
         worker_address: WorkerAddress,
+        pipeline: bool,
+        locations: Vec<WorkerAddress>,
     ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let seq_id = 0;
@@ -47,6 +49,7 @@ impl BlockWriterRemote {
         let len = fs_context.block_size();
 
         let client = fs_context.block_client(&worker_address).await?;
+        let location_idx = locations.iter().position(|x| x == &worker_address).unwrap() as i32;
         let write_context = client
             .write_block(
                 &block,
@@ -56,6 +59,9 @@ impl BlockWriterRemote {
                 seq_id,
                 fs_context.write_chunk_size() as i32,
                 false,
+                pipeline,
+                locations,
+                location_idx,
             )
             .await?;
 
