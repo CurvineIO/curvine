@@ -51,6 +51,13 @@ impl<E: Error> ErrorMonitor<E> {
         let mut e = self.error.lock().unwrap();
         e.take()
     }
+
+    pub fn check_error(&self) -> Result<(), E> {
+        match self.take_error() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 impl<E: Error> Default for ErrorMonitor<E> {

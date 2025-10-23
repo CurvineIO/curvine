@@ -148,9 +148,8 @@ impl JournalConf {
 
             conn_size: self.conn_size,
 
-            buffer_size: 128 * 1024,
-
             use_libc: false,
+            ..Default::default()
         }
     }
 

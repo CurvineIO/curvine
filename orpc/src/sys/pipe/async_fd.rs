@@ -157,6 +157,10 @@ impl AsyncFd {
 
         Ok(())
     }
+
+    pub fn into_inner(self) -> AsyncInner {
+        self.0
+    }
 }
 
 #[cfg(target_os = "linux")]

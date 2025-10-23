@@ -15,8 +15,7 @@
 use crate::common::Utils;
 use crate::error::ErrorExt;
 use crate::io::IOResult;
-use crate::message::ref_message::RefMessage;
-use crate::message::{BoxMessage, Builder};
+use crate::message::{BoxMessage, Builder, RefMessage};
 use crate::sys::DataSlice;
 use crate::{err_box, CommonError, CommonResult};
 use bytes::{Buf, BufMut, BytesMut};
@@ -204,15 +203,9 @@ impl RpcMessage {
             return Ok(());
         }
 
-        match &self.data {
-            DataSlice::Buffer(buf) => {
-                let mut err_buf = BytesMut::new();
-                err_buf.extend_from_slice(&buf[..]);
-                let err = E::decode(err_buf);
-                Err(err)
-            }
-            _ => panic!("Not found error data"),
-        }
+        let err_buf = BytesMut::from(self.data.as_slice());
+        let err = E::decode(err_buf);
+        Err(err)
     }
 
     fn response(&self, status: Status, header: Option<BytesMut>, data: DataSlice) -> Self {
@@ -305,42 +298,65 @@ impl RpcMessage {
         }
     }
 
-    pub fn encode(&self, buf: &mut BytesMut) -> IOResult<()> {
+    pub fn encode_protocol(&self, buf: &mut BytesMut) {
         let header_len = self.header_len();
         let data_len = self.data_len();
 
-        // protocol
         buf.put_i32((header_len + data_len) as i32 + HEAD_SIZE);
         buf.put_i32(header_len as i32);
         buf.put_i8(self.protocol.code);
         buf.put_i8(self.protocol.status.encode());
         buf.put_i64(self.protocol.req_id);
         buf.put_i32(self.protocol.seq_id);
+    }
 
-        // header
-        if header_len > 0 {
-            buf.put_slice(self.header.as_ref().unwrap());
+    /// Decode protocol data
+    ///
+    /// Parse the protocol header information from the byte buffer, including the total size, header size, and data size.
+    /// Create a protocol object.
+    ///
+    /// # Parameters
+    /// * `buf` - A mutable reference to the byte buffer containing the protocol data to be parsed
+    ///
+    /// # Return value
+    /// Returns an IOResult-wrapped tuple containing:
+    /// * Protocol - The protocol object created by parsing
+    /// * i32 - Header size
+    /// * i32 - Data size
+    pub fn decode_protocol(buf: &mut BytesMut) -> IOResult<(Protocol, i32, i32)> {
+        let total_size = buf.get_i32();
+        let header_size = buf.get_i32();
+        let data_size = total_size - header_size - HEAD_SIZE;
+        if data_size < 0 {
+            return err_box!("data length is negative");
+        } else if data_size > MAX_DATE_SIZE {
+            return err_box!("Data exceeds maximum size: {}", MAX_DATE_SIZE);
         }
 
-        match &self.data {
-            DataSlice::Empty => (),
-            DataSlice::Buffer(bytes) => buf.put_slice(bytes),
-            _ => return err_box!(""),
-        };
+        let protocol = Protocol::create(buf);
+        Ok((protocol, header_size, data_size))
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) -> IOResult<()> {
+        self.encode_protocol(buf);
+
+        if let Some(header) = &self.header {
+            buf.put_slice(header);
+        }
+
+        let slice = self.data.as_slice();
+        if !slice.is_empty() {
+            buf.put_slice(slice);
+        }
 
         Ok(())
     }
 
     pub fn decode(buf: &mut BytesMut) -> IOResult<Self> {
         // The BytesMut returned by tokio does not contain the first length byte.
-        let header_size = (buf.get_u32()) as usize;
+        let header_size = buf.get_u32() as usize;
 
-        let protocol = Protocol {
-            code: buf.get_i8(),
-            status: Status::from(buf.get_i8()),
-            req_id: buf.get_i64(),
-            seq_id: buf.get_i32(),
-        };
+        let protocol = Protocol::create(buf);
 
         let header = if header_size > 0 {
             Some(buf.split_to(header_size))

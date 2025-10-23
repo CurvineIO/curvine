@@ -42,7 +42,7 @@ impl StateCtl {
         }
     }
 
-    fn compare_and_set(&self, cur: i8, target: i8) -> bool {
+    pub fn compare_and_set(&self, cur: i8, target: i8) -> bool {
         let res = self.ctl.compare_exchange(cur, target, ORDER, ORDER);
         res.is_ok()
     }

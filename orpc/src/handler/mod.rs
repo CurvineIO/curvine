@@ -32,3 +32,6 @@ pub use self::write_frame::WriteFrame;
 
 mod read_frame;
 pub use self::read_frame::ReadFrame;
+
+mod frame;
+pub use self::frame::Frame;

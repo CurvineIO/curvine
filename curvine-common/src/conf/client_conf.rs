@@ -241,7 +241,7 @@ impl ClientConf {
 
             conn_size: conf.master_conn_pool_size,
 
-            buffer_size: 128 * 1024,
+            buffer_size: self.read_chunk_size.max(self.write_chunk_size),
             ..Default::default()
         }
     }

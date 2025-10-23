@@ -18,7 +18,7 @@ use crate::handler::RpcFrame;
 use crate::io::{IOResult, LocalFile};
 use crate::sys;
 use crate::sys::DataSlice::{Buffer, Bytes, Empty, IOSlice, MemSlice};
-use crate::sys::{RawIOSlice, RawVec};
+use crate::sys::{RawIO, RawIOSlice, RawVec};
 use crate::CommonResult;
 use bytes::{Buf, Bytes as TBytes, BytesMut};
 use std::fs::File;
@@ -46,6 +46,26 @@ pub enum DataSlice {
 }
 
 impl DataSlice {
+    pub fn empty() -> Self {
+        Empty
+    }
+
+    pub fn mem_slice(slice: &[u8]) -> Self {
+        MemSlice(RawVec::from_slice(slice))
+    }
+
+    pub fn buffer(buffer: BytesMut) -> Self {
+        Buffer(buffer)
+    }
+
+    pub fn bytes(bytes: TBytes) -> Self {
+        Bytes(bytes)
+    }
+
+    pub fn io_slice(raw: RawIO, off: Option<i64>, len: usize) -> Self {
+        IOSlice(RawIOSlice::new(raw, off, len))
+    }
+
     // Get the length of the data segment.
     pub fn len(&self) -> usize {
         match self {
@@ -88,7 +108,7 @@ impl DataSlice {
     // Create a file data fragment.
     // Usually created in business threads, it is a synchronization function.
     pub fn from_file(
-        io: &mut File,
+        file: &mut LocalFile,
         enable_send_file: bool,
         off: Option<i64>,
         len: i32,
@@ -99,17 +119,17 @@ impl DataSlice {
 
         #[cfg(not(target_os = "linux"))]
         {
-            let buf = LocalFile::read_full(io, off, len as usize)?;
+            let buf = file.read_full(off, len as usize)?;
             Ok(Buffer(buf))
         }
 
         #[cfg(target_os = "linux")]
         {
             if enable_send_file {
-                let fd = sys::get_raw_io(io)?;
+                let fd = sys::get_raw_io(file)?;
                 Ok(IOSlice(RawIOSlice::new(fd, off, len as usize)))
             } else {
-                let buf = LocalFile::read_full(io, off, len as usize)?;
+                let buf = file.read_full(off, len as usize)?;
                 Ok(Buffer(buf))
             }
         }
@@ -193,6 +213,16 @@ impl DataSlice {
         match self {
             Buffer(s) => Bytes(s.freeze()),
             _ => self,
+        }
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        match self {
+            Empty => std::ptr::null() as *const _,
+            Buffer(s) => s.as_ptr(),
+            IOSlice(s) => panic!("Not support IOSlice"),
+            MemSlice(s) => s.as_ptr(),
+            Bytes(s) => s.as_ptr(),
         }
     }
 }

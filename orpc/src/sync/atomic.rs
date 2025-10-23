@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::Deref;
 use std::sync::atomic::{AtomicI32, AtomicI64 as StdAtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 pub struct AtomicLong(StdAtomicI64);
@@ -181,5 +182,36 @@ impl AtomicHandle {
             .0
             .compare_exchange(old, new, ATOMIC_ORDERING, ATOMIC_ORDERING);
         res.is_ok()
+    }
+}
+
+pub struct AtomicBool(std::sync::atomic::AtomicBool);
+
+impl AtomicBool {
+    pub fn new(v: bool) -> Self {
+        Self(std::sync::atomic::AtomicBool::new(v))
+    }
+
+    pub fn get(&self) -> bool {
+        self.0.load(ATOMIC_ORDERING)
+    }
+
+    pub fn set(&self, v: bool) {
+        self.0.store(v, ATOMIC_ORDERING)
+    }
+
+    pub fn compare_and_set(&self, old: bool, new: bool) -> bool {
+        let res = self
+            .0
+            .compare_exchange(old, new, ATOMIC_ORDERING, ATOMIC_ORDERING);
+        res.is_ok()
+    }
+}
+
+impl Deref for AtomicBool {
+    type Target = std::sync::atomic::AtomicBool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }

@@ -150,8 +150,8 @@ impl FsReaderParallel {
         }
 
         let pos = self.inner.pos();
-        let bytes = self.inner.read().await?.freeze();
-        let chunk = FileChunk::with_bytes(pos, bytes);
+        let bytes = self.inner.read().await?;
+        let chunk = FileChunk::new(pos, bytes);
 
         Ok(chunk)
     }

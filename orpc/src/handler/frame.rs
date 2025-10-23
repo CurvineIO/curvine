@@ -12,19 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::net::InetAddr;
+use std::future::Future;
 
-#[derive(Debug, Clone, Default)]
-pub struct ConnState {
-    pub remote_addr: InetAddr,
-    pub local_addr: InetAddr,
-}
+use crate::io::net::ConnState;
+use crate::io::IOResult;
+use crate::message::{Message, RefMessage};
 
-impl ConnState {
-    pub fn new(remote_addr: InetAddr, local_addr: InetAddr) -> Self {
-        Self {
-            remote_addr,
-            local_addr,
-        }
-    }
+pub trait Frame {
+    fn send(&mut self, message: impl RefMessage) -> impl Future<Output = IOResult<()>>;
+
+    fn receive(&mut self) -> impl Future<Output = IOResult<Message>>;
+
+    fn new_conn_state(&self) -> ConnState;
 }

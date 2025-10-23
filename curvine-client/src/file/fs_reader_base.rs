@@ -14,12 +14,12 @@
 
 use crate::block::BlockReader;
 use crate::file::FsContext;
-use bytes::BytesMut;
 use curvine_common::fs::Path;
 use curvine_common::state::{FileBlocks, SearchFileBlocks};
 use curvine_common::FsResult;
 use orpc::common::FastHashMap;
 use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::sys::DataSlice;
 use orpc::{err_box, try_option_mut};
 use std::mem;
 use std::sync::Arc;
@@ -89,9 +89,9 @@ impl FsReaderBase {
         &self.fs_context
     }
 
-    pub async fn read(&mut self) -> FsResult<BytesMut> {
+    pub async fn read(&mut self) -> FsResult<DataSlice> {
         if !self.has_remaining() {
-            return Ok(BytesMut::new());
+            return Ok(DataSlice::empty());
         }
 
         let cur_reader = self.get_reader().await?;
@@ -100,9 +100,9 @@ impl FsReaderBase {
         Ok(chunk)
     }
 
-    pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<BytesMut> {
+    pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
         if self.pos == self.len {
-            return Ok(BytesMut::new());
+            return Ok(DataSlice::empty());
         }
 
         let cur_reader = rt.block_on(self.get_reader())?;

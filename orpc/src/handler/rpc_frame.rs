@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{ReadFrame, RpcCodec, WriteFrame};
+use crate::handler::{Frame, ReadFrame, RpcCodec, WriteFrame};
 use crate::io::net::ConnState;
 use crate::io::IOResult;
-use crate::message::{Message, Protocol, MAX_DATE_SIZE};
+use crate::message::{Message, Protocol, RefMessage};
 use crate::server::ServerConf;
 use crate::sys::{DataSlice, RawIOSlice};
-use crate::{err_box, message, sys};
-use bytes::{Buf, BufMut, BytesMut};
+use crate::{message, sys};
+use bytes::BytesMut;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
@@ -37,8 +37,7 @@ pub enum FrameSate {
 /// Custom data frame resolution
 pub struct RpcFrame {
     io: TcpStream,
-    read_buf: BytesMut,
-    write_buf: BytesMut,
+    buf: BytesMut,
     enable_splice: bool,
 }
 
@@ -52,8 +51,7 @@ impl RpcFrame {
 
         RpcFrame {
             io,
-            read_buf: BytesMut::with_capacity(buffer_size),
-            write_buf: BytesMut::with_capacity(buffer_size),
+            buf: BytesMut::with_capacity(buffer_size),
             enable_splice,
         }
     }
@@ -68,66 +66,13 @@ impl RpcFrame {
 
     // Read data of the specified length.
     pub async fn read_full(&mut self, len: i32) -> IOResult<BytesMut> {
-        self.read_buf.reserve(len as usize);
+        self.buf.reserve(len as usize);
         unsafe {
-            self.read_buf.set_len(len as usize);
+            self.buf.set_len(len as usize);
         }
-        let mut buf = self.read_buf.split_to(len as usize);
+        let mut buf = self.buf.split_to(len as usize);
         self.io.read_exact(&mut buf).await?;
         Ok(buf)
-    }
-
-    pub async fn receive(&mut self) -> IOResult<Message> {
-        let mut state = FrameSate::Head;
-        loop {
-            match state {
-                FrameSate::Head => {
-                    let mut buf = match self.read_full(message::PROTOCOL_SIZE).await {
-                        Ok(v) => v,
-                        Err(_) => return Ok(Message::empty()),
-                    };
-
-                    let total_size = buf.get_i32();
-                    let header_size = buf.get_i32();
-                    let data_size = total_size - header_size - message::HEAD_SIZE;
-                    if data_size < 0 {
-                        return err_box!("data length is negative");
-                    } else if data_size > MAX_DATE_SIZE {
-                        return err_box!("Data exceeds maximum size: {}", MAX_DATE_SIZE);
-                    }
-
-                    let protocol = Protocol::create(&mut buf);
-                    let _ = mem::replace(
-                        &mut state,
-                        FrameSate::Data(protocol, header_size, data_size),
-                    );
-                }
-
-                FrameSate::Data(protocol, header_size, data_size) => {
-                    let header = if header_size > 0 {
-                        let buf = self.read_full(header_size).await?;
-                        Some(buf)
-                    } else {
-                        None
-                    };
-                    let data = self.read_data(data_size).await?;
-                    let msg = Message {
-                        protocol,
-                        header,
-                        data,
-                    };
-
-                    let _ = mem::replace(&mut state, FrameSate::Head);
-
-                    // Heartbeat message.
-                    if msg.is_heartbeat() {
-                        continue;
-                    } else {
-                        return Ok(msg);
-                    }
-                }
-            }
-        }
     }
 
     async fn read_data(&mut self, len: i32) -> IOResult<DataSlice> {
@@ -145,31 +90,6 @@ impl RpcFrame {
             let buf = self.read_full(len).await?;
             Ok(DataSlice::Buffer(buf))
         }
-    }
-
-    pub async fn send(&mut self, msg: &Message) -> IOResult<()> {
-        let header_len = msg.header_len();
-        let data_len = msg.data_len();
-
-        // message protocol control block
-        self.write_buf.put_i32((18 + header_len + data_len) as i32);
-        self.write_buf.put_i32(header_len as i32);
-        self.write_buf.put_i8(msg.code());
-        self.write_buf.put_i8(msg.encode_status());
-        self.write_buf.put_i64(msg.req_id());
-        self.write_buf.put_i32(msg.seq_id());
-        self.io.write_all(&self.write_buf.split()).await?;
-
-        // message header part
-        if let Some(h) = &msg.header {
-            self.io.write_all(h).await?;
-        }
-
-        // message data section.
-        self.write_region(&msg.data).await?;
-
-        self.io.flush().await?;
-        Ok(())
     }
 
     async fn write_region(&mut self, region: &DataSlice) -> IOResult<()> {
@@ -261,21 +181,14 @@ impl RpcFrame {
     }
 
     pub fn into_tokio_frame(self) -> Framed<TcpStream, RpcCodec> {
-        Framed::with_capacity(self.io, RpcCodec::new(), self.read_buf.capacity())
+        Framed::with_capacity(self.io, RpcCodec::new(), self.buf.capacity())
     }
 
     pub fn split(self) -> (ReadFrame, WriteFrame) {
         let (read, write) = tokio::io::split(self.io);
-        let read_frame = ReadFrame::new(read, self.read_buf);
-        let write_frame = WriteFrame::new(write, self.write_buf);
+        let read_frame = ReadFrame::new(read, BytesMut::with_capacity(self.buf.capacity()));
+        let write_frame = WriteFrame::new(write, self.buf);
         (read_frame, write_frame)
-    }
-
-    pub fn new_conn_state(&self) -> ConnState {
-        let ip = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
-        let client_addr = self.io.peer_addr().unwrap_or(ip);
-        let local_addr = self.io.local_addr().unwrap_or(ip);
-        ConnState::new(client_addr.into(), local_addr.into())
     }
 }
 
@@ -283,5 +196,75 @@ impl RpcFrame {
 impl AsRawFd for RpcFrame {
     fn as_raw_fd(&self) -> RawFd {
         self.io.as_raw_fd()
+    }
+}
+
+impl Frame for RpcFrame {
+    async fn send(&mut self, msg: impl RefMessage) -> IOResult<()> {
+        let msg = msg.as_ref();
+        msg.encode_protocol(&mut self.buf);
+        self.io.write_all(&self.buf.split()).await?;
+
+        // message header part
+        if let Some(h) = &msg.header {
+            self.io.write_all(h).await?;
+        }
+
+        // message data section.
+        self.write_region(&msg.data).await?;
+
+        self.io.flush().await?;
+        Ok(())
+    }
+
+    async fn receive(&mut self) -> IOResult<Message> {
+        let mut state = FrameSate::Head;
+        loop {
+            match state {
+                FrameSate::Head => {
+                    let mut buf = match self.read_full(message::PROTOCOL_SIZE).await {
+                        Ok(v) => v,
+                        Err(_) => return Ok(Message::empty()),
+                    };
+
+                    let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
+                    let _ = mem::replace(
+                        &mut state,
+                        FrameSate::Data(protocol, header_size, data_size),
+                    );
+                }
+
+                FrameSate::Data(protocol, header_size, data_size) => {
+                    let header = if header_size > 0 {
+                        let buf = self.read_full(header_size).await?;
+                        Some(buf)
+                    } else {
+                        None
+                    };
+                    let data = self.read_data(data_size).await?;
+                    let msg = Message {
+                        protocol,
+                        header,
+                        data,
+                    };
+
+                    let _ = mem::replace(&mut state, FrameSate::Head);
+
+                    // Heartbeat message.
+                    if msg.is_heartbeat() {
+                        continue;
+                    } else {
+                        return Ok(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    fn new_conn_state(&self) -> ConnState {
+        let ip = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
+        let client_addr = self.io.peer_addr().unwrap_or(ip);
+        let local_addr = self.io.local_addr().unwrap_or(ip);
+        ConnState::new(client_addr.into(), local_addr.into())
     }
 }

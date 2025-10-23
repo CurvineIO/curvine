@@ -40,6 +40,14 @@ impl Utils {
         lsb
     }
 
+    pub fn unique_id() -> u64 {
+        let mut lsb: u64 = 0;
+        for b in Uuid::new_v4().as_bytes() {
+            lsb = (lsb << 8) | *b as u64
+        }
+        lsb
+    }
+
     pub fn new_rt<T: AsRef<str>>(name: T, threads: usize) -> Runtime {
         Runtime::new(name, threads, threads)
     }
@@ -186,6 +194,14 @@ impl Utils {
         hasher.update(source.as_ref().as_bytes());
         let hash = hasher.finalize();
         format!("{:x}", hash)
+    }
+
+    pub fn thread_id() -> String {
+        format!("{:?}", thread::current().id())
+    }
+
+    pub fn thread_name() -> String {
+        thread::current().name().unwrap_or("").to_string()
     }
 }
 

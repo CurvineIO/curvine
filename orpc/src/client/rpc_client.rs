@@ -15,7 +15,7 @@
 use crate::client::client_state::InnerState;
 use crate::client::dispatch::Envelope;
 use crate::client::{BufferClient, ClientConf, ClientState, RawClient};
-use crate::handler::RpcFrame;
+use crate::handler::{Frame, RpcFrame};
 use crate::io::net::InetAddr;
 use crate::io::retry::TimeBondedRetry;
 use crate::io::{IOError, IOResult};
@@ -95,7 +95,7 @@ impl RpcClient {
         let rep_msg = match &self.sender {
             BoxSender::Frame(f) => {
                 let frame = f.as_mut();
-                frame.send(msg.as_ref()).await?;
+                frame.send(msg).await?;
                 let msg = frame.receive().await?;
                 if msg.is_empty() {
                     return err_box!("Connection {} is closed", self.state.conn_info());

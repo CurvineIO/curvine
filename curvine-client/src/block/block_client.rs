@@ -16,7 +16,6 @@
 
 use crate::block::{BlockReadContext, CreateBlockContext};
 use crate::file::FsContext;
-use bytes::BytesMut;
 use curvine_common::conf::ClientConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
@@ -240,7 +239,7 @@ impl BlockClient {
         req_id: i64,
         seq_id: i32,
         header: Option<DataHeaderProto>,
-    ) -> FsResult<BytesMut> {
+    ) -> FsResult<DataSlice> {
         let builder = Builder::new()
             .code(RpcCode::ReadBlock)
             .request(RequestStatus::Running)
@@ -254,9 +253,6 @@ impl BlockClient {
         };
 
         let rep = self.rpc(msg).await?;
-        match rep.data {
-            DataSlice::Buffer(v) => Ok(v),
-            _ => err_box!("Unsupported type"),
-        }
+        Ok(rep.data)
     }
 }
