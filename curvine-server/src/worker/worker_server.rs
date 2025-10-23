@@ -26,6 +26,7 @@ use once_cell::sync::OnceCell;
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
+use orpc::io::net::NetUtils;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
@@ -123,13 +124,21 @@ impl Worker {
         let web_server = WebServer::with_rt(rt.clone(), conf.worker_web_conf(), service.clone());
 
         let net_addr = rpc_server.bind_addr();
+        // Try to get POD_IP from environment (set by Kubernetes)
+        let ip_addr = std::env::var("POD_IP")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| NetUtils::local_ip(&net_addr.hostname));
+
         let addr = WorkerAddress {
             worker_id,
-            hostname: net_addr.hostname.to_owned(),
-            ip_addr: net_addr.hostname.to_owned(),
+            hostname: ip_addr.clone(),
+            ip_addr,
             rpc_port: net_addr.port as u32,
             web_port: conf.worker.web_port as u32,
         };
+
+        println!("worker addr: {:#?}", addr);
         let block_actor = BlockActor::new(
             rt.clone(),
             &conf,

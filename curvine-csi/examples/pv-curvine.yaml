@@ -5,7 +5,7 @@ metadata:
   labels:
     type: curvine
 spec:
-  storageClassName: curvine-sc
+  storageClassName: ""
   capacity:
     storage: 10Gi
   accessModes:
@@ -16,4 +16,4 @@ spec:
     volumeHandle: curvine-volume-1
     volumeAttributes:
       curvinePath: "/"
-      type: "Directory"
+      type: "DirectoryOrCreate"

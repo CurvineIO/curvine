@@ -22,10 +22,9 @@ use crate::*;
 use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClusterConf, FuseConf};
-use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{FileStatus, SetAttrOpts};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use orpc::common::ByteUnit;
 use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
@@ -195,10 +194,12 @@ impl CurvineFileSystem {
         let status = match self.fs.get_status(path).await {
             Ok(v) => v,
             Err(e) => {
-                return match e {
-                    FsError::FileNotFound(_) => err_fuse!(libc::ENOENT, "{}", e),
-                    _ => err_fuse!(libc::ENOSYS, "{}", e),
-                }
+                let fuse_err: FuseError = e.into();
+                warn!(
+                    "fs_get_status failed for {}: {} (errno {})",
+                    path, fuse_err.error, fuse_err.errno
+                );
+                return Err(fuse_err);
             }
         };
         Ok(status)
@@ -659,6 +660,15 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Get the xattr value from the request
         let value_slice: &[u8] = op.value;
+
+        // Accept the SELinux labels in the FUSE layer. Add a guard in set_xattr so the driver simply ACKs the write instead of forwarding it.
+        match name {
+            "security.selinux" => {
+                debug!("Ignoring SELinux label on {}", path);
+                return Ok(());
+            }
+            _ => {}
+        }
 
         info!(
             "Setting xattr: path='{}' name='{}' value='{}'",

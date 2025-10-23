@@ -4,9 +4,10 @@ metadata:
   name: curvine-pvc
   namespace: curvine-system
 spec:
-  storageClassName: curvine-sc
+  storageClassName: ""
+  volumeName: curvine-pv
   accessModes:
-    - ReadWriteMany
+    - ReadWriteOnce
   resources:
     requests:
       storage: 5Gi

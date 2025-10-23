@@ -54,7 +54,11 @@ impl FsContext {
 
     pub fn with_rt(conf: ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
         let hostname = conf.client.hostname.to_owned();
-        let ip = NetUtils::local_ip(&hostname);
+        // Try to get POD_IP from environment (set by Kubernetes) for clients running in pods
+        let ip = std::env::var("POD_IP")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| NetUtils::local_ip(&hostname));
         let client_addr = ClientAddress {
             client_name: Utils::uuid(),
             hostname,

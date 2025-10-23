@@ -68,7 +68,7 @@ get_fuse_version() {
   elif command -v fusermount > /dev/null 2>&1; then
       echo "fuse2"
   else
-      echo ""  # No FUSE available
+      echo "fuse3"  # No FUSE available
   fi
 }
 
@@ -173,6 +173,19 @@ while true ; do
       ;;
   esac
 done
+
+echo "PACKAGES: ${PACKAGES[@]}"
+echo "UFS_TYPES: ${UFS_TYPES[@]}"
+echo "PROFILE: ${PROFILE}"
+echo "CRATE_ZIP: ${CRATE_ZIP}"
+echo "GIT_VERSION: ${GIT_VERSION}"
+echo "ARCH_NAME: ${ARCH_NAME}"
+echo "OS_VERSION: ${OS_VERSION}"
+echo "FUSE_VERSION: ${FUSE_VERSION}"
+echo "CURVINE_VERSION: ${CURVINE_VERSION}"
+echo "CURVINE_UFS_TYPE: ${CURVINE_UFS_TYPE}"
+echo "DIST_DIR: ${DIST_DIR}"
+echo "DIST_ZIP: ${DIST_ZIP}"
 
 # Check if "all" is specified along with other packages
 for pkg in "${PACKAGES[@]}"; do

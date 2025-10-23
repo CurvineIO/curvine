@@ -66,9 +66,29 @@ impl From<IOError> for FuseError {
 impl From<FsError> for FuseError {
     fn from(value: FsError) -> Self {
         match &value {
+            FsError::IO(_) => Self::new(libc::EIO, value.into()),
+            FsError::NotLeaderMaster(_) => Self::new(libc::EAGAIN, value.into()),
+            FsError::Raft(_) => Self::new(libc::EAGAIN, value.into()),
+            FsError::Timeout(_) => Self::new(libc::ETIMEDOUT, value.into()),
+            FsError::PBDecode(_) | FsError::PBEncode(_) => Self::new(libc::EPROTO, value.into()),
             FsError::FileAlreadyExists(_) => Self::new(libc::EEXIST, value.into()),
             FsError::FileNotFound(_) => Self::new(libc::ENOENT, value.into()),
-            _ => Self::new(libc::EIO, value.into()),
+            FsError::InvalidFileSize(_) | FsError::InvalidPath(_) => {
+                Self::new(libc::EINVAL, value.into())
+            }
+            FsError::ParentNotDir(_) => Self::new(libc::ENOTDIR, value.into()),
+            FsError::DirNotEmpty(_) => Self::new(libc::ENOTEMPTY, value.into()),
+            FsError::AbnormalData(_) | FsError::BlockInfo(_) | FsError::Ufs(_) => {
+                Self::new(libc::EIO, value.into())
+            }
+            FsError::BlockIsWriting(_) => Self::new(libc::EBUSY, value.into()),
+            FsError::Lease(_) | FsError::InProgress(_) => Self::new(libc::EAGAIN, value.into()),
+            FsError::DiskOutOfSpace(_) => Self::new(libc::ENOSPC, value.into()),
+            FsError::Unsupported(_) | FsError::UnsupportedUfsRead(_) => {
+                Self::new(libc::EOPNOTSUPP, value.into())
+            }
+            FsError::Expired(_) => Self::new(libc::ESTALE, value.into()),
+            FsError::Common(_) => Self::new(libc::EIO, value.into()),
         }
     }
 }

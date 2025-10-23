@@ -1,0 +1,64 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: curvine-config
+  namespace: curvine
+data:
+  curvine-cluster.toml: |
+    # Whether to format it.
+    # master formatting will delete rocksdb metadata
+    # Worker formatting will delete the data directory.
+    format_master = false
+    format_worker = false
+
+    # master configuration
+    [master]
+    meta_dir = "/app/curvine/meta"
+    log = { level = "info", log_dir = "/app/curvine/logs", file_name = "master.log" }
+
+    # TTL (Time-To-Live) configuration
+    ttl_checker_interval = "1h"
+    ttl_checker_retry_attempts = 3
+    ttl_bucket_interval = "1h"
+    ttl_max_retry_duration = "30m"
+    ttl_retry_interval = "5s"
+
+    # master HA raft configuration
+    [journal]
+    journal_addrs = [
+        {id = 1, hostname = "cv-master-0.cv-master.curvine.svc.cluster.local", port = 8996}
+    ]
+    journal_dir = "/app/curvine/journal"
+
+    # Worker configuration
+    [worker]
+    dir_reserved = "0"
+    data_dir = [
+        "[DISK]/data/curvine/worker",
+    ]
+    log = { level = "info", log_dir = "/app/curvine/logs", file_name = "worker.log" }
+
+    # Client configuration
+    [client]
+    master_addrs = [
+        { hostname = "cv-master.curvine.svc.cluster.local", port = 8995 }
+    ]
+
+    # fuse configuration
+    [fuse]
+
+    # Log configuration
+    [log]
+    level = "debug"
+    log_dir = "/app/curvine/logs"
+    file_name = "curvine.log"
+
+    # S3 Object Gateway configuration
+    [s3_gateway]
+    listen = "0.0.0.0:9900"
+    region = "us-east-1"
+    put_temp_dir = "/tmp/curvine-temp"
+    put_memory_buffer_threshold = 1048576
+    put_max_memory_buffer = 16777216
+    get_chunk_size_mb = 1.0
+    get_prefetch_depth = 2

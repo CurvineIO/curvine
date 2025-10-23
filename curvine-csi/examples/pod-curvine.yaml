@@ -1,21 +1,38 @@
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: curvine-test-pod
+  name: curvine-test-deployment
   namespace: curvine-system
   labels:
     app: curvine-test
 spec:
-  containers:
-    - name: web-server
-      image: nginx:stable-alpine
-      ports:
-        - containerPort: 80
-          name: "http-server"
-      volumeMounts:
-        - mountPath: "/usr/share/nginx/html"
-          name: curvine-storage
-  volumes:
-    - name: curvine-storage
-      persistentVolumeClaim:
-        claimName: curvine-pvc
+  replicas: 1
+  selector:
+    matchLabels:
+      app: curvine-test
+  template:
+    metadata:
+      labels:
+        app: curvine-test
+    spec:
+      nodeSelector:
+        topology.kubernetes.io/region: us-east-2
+        topology.kubernetes.io/zone: us-east-2c
+        sagemaker.amazonaws.com/compute-type: hyperpod
+      tolerations:
+        - key: "noetik.ai/node-type"
+          operator: Equal
+          value: gpu
+      containers:
+        - name: nginx-web-server
+          image: nginx:stable-alpine
+          ports:
+            - containerPort: 80
+              name: "http-server"
+          volumeMounts:
+            - mountPath: "/usr/share/nginx/html"
+              name: curvine-storage
+      volumes:
+        - name: curvine-storage
+          persistentVolumeClaim:
+            claimName: curvine-pvc

@@ -17,7 +17,7 @@
 # Execute fuse mount with parameter passthrough
 
 # Default mount point
-MNT_PATH=/curvine-fuse
+MNT_PATH=/Users/ruoyuhuang/curvine-fuse
 
 # Process arguments in a single loop
 for arg in "$@"; do

@@ -5,6 +5,7 @@ testing/
 resources/
 glacier-cache.iml
 # Cargo.lock - commented out to enable dependency caching in CI builds
+*.zip
 *.patch
 *.iml
 *.iws

@@ -17,18 +17,18 @@
 #
 
 # Build the curvine deployment image
+rm -rf curvine*.zip
+cp ../../build/dist/curvine*.zip .
 
 # Check for curvine*.zip
 if ls curvine*.zip> /dev/null 2>&1; then
     echo "Found curvine*.zip in current directory"
-elif ls ../../build/dist/curvine*.zip> /dev/null 2>&1; then
-    echo "Found curvine*.zip in ../../build/dist directory"
-    cp ../../build/dist/curvine*.zip .
 else
     echo "Error: curvine*.zip not found in current directory or ../../build/dist"
     exit 1
 fi
 
+rm -rf dist
 mkdir -p dist
 unzip -o curvine*.zip -d dist
 
@@ -39,6 +39,6 @@ else
   tag=$1
 fi
 
-docker build -t curvine:$tag -f Dockerfile_rocky9 .
+docker buildx build --no-cache --platform linux/amd64  -t curvine:$tag -f Dockerfile_rocky9 .
 
 echo "build image curvine:$tag"

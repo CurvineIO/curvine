@@ -13,16 +13,28 @@ spec:
         app: curvine-csi-node
     spec:
       serviceAccountName: curvine-csi-node-sa
-      tolerations:
-        - operator: Exists
+      # tolerations:
+      #   - operator: Exists
       priorityClassName: system-node-critical
       dnsPolicy: ClusterFirstWithHostNet
       #nodeSelector:
       #  curvine-fuse: 'true'
+      # nodeSelector:
+      #   topology.kubernetes.io/region: us-east-2
+      #   topology.kubernetes.io/zone: us-east-2c
+      #   sagemaker.amazonaws.com/compute-type: hyperpod
+      tolerations:
+        - key: "noetik.ai/node-type"
+          operator: Equal
+          value: gpu
+        - key: "noetik.ai/application"
+          operator: Equal
+          value: batch-inference
+          effect: NoSchedule
 
       containers:
         - name: csi-plugin
-          image: curvine/curvine-csi:latest
+          image: 050752647787.dkr.ecr.us-east-2.amazonaws.com/curvine-csi:latest
           imagePullPolicy: Always
           command: ["/opt/curvine/bin/csi"]
           args:
@@ -80,6 +92,7 @@ spec:
             - name: DRIVER_REG_SOCK_PATH
               value: /var/lib/kubelet/csi-plugins/csi.curvine.io/csi.sock
           image: quay.io/k8scsi/csi-node-driver-registrar:v2.1.0
+          imagePullPolicy: IfNotPresent
           volumeMounts:
             - mountPath: /csi
               name: plugin-dir
@@ -95,6 +108,7 @@ spec:
             - name: HEALTH_PORT
               value: "9909"
           image: registry.k8s.io/sig-storage/livenessprobe:v2.11.0
+          imagePullPolicy: IfNotPresent
           volumeMounts:
             - mountPath: /csi
               name: plugin-dir

@@ -11,7 +11,7 @@ data:
     # Customer service configuration.
     [client]
     master_addrs = [
-        { hostname = "localhost", port = 8995 }
+        { hostname = "cv-master-0.cv-master-svc.curvine.svc.cluster.local", port = 8995 },
     ]
 
     # fuse configuration

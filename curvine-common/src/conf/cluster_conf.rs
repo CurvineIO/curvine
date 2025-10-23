@@ -77,6 +77,7 @@ impl ClusterConf {
         let mut conf = try_err!(toml::from_str::<Self>(&str));
 
         // Check the environment variable configuration.
+        // FIXME: only check this if runing on master node
         if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
             conf.master.hostname = v.to_owned();
             let hostname_exists = conf
@@ -86,16 +87,22 @@ impl ClusterConf {
                 .any(|peer| peer.hostname == v);
 
             if !hostname_exists {
-                return err_box!(
-                    "Hostname '{}' from {} is not found in journal_addrs. Available hostnames: [{}]",
-                    v,
-                    Self::ENV_MASTER_HOSTNAME,
-                    conf.journal.journal_addrs
+                println!("Hostname '{}' from {} is not found in journal_addrs. Available hostnames: [{}]", v, Self::ENV_MASTER_HOSTNAME, conf.journal.journal_addrs
                         .iter()
                         .map(|peer| peer.hostname.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
+                // return err_box!(
+                //     "Hostname '{}' from {} is not found in journal_addrs. Available hostnames: [{}]",
+                //     v,
+                //     Self::ENV_MASTER_HOSTNAME,
+                //     conf.journal.journal_addrs
+                //         .iter()
+                //         .map(|peer| peer.hostname.as_str())
+                //         .collect::<Vec<_>>()
+                //         .join(", ")
+                // );
             }
 
             conf.journal.hostname = v;
