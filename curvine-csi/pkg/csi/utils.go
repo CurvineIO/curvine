@@ -28,58 +28,91 @@ import (
 )
 
 // ExecuteWithRetry executes command with retry and timeout control
-func ExecuteWithRetry(cmd *exec.Cmd, maxRetries int, retryInterval, timeout time.Duration) ([]byte, error) {
-	var output []byte
-	var err error
-
-	// Generate request ID for log tracking
+func ExecuteWithRetry(cmd *exec.Cmd, maxRetries int, retryInterval, timeout time.Duration, acceptableErrors []string) ([]byte, error) {
 	requestID := generateRequestID()
-	klog.Infof("RequestID: %s, Command: %s, Args: %v, MaxRetries: %d, Timeout: %v",
-		requestID, cmd.Path, cmd.Args, maxRetries, timeout)
+	cmdInfo := fmt.Sprintf("%s %v", cmd.Path, cmd.Args)
 
-	for i := 0; i <= maxRetries; i++ {
-		if i > 0 {
-			klog.Warningf("RequestID: %s, Retrying command (attempt %d/%d): %s %v",
-				requestID, i, maxRetries, cmd.Path, cmd.Args)
+	klog.Infof("RequestID: %s, Command: %s, MaxRetries: %d, Timeout: %v",
+		requestID, cmdInfo, maxRetries, timeout)
+
+	var lastOutput []byte
+	var lastErr error
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Sleep before retry (skip first attempt)
+		if attempt > 0 {
+			klog.Warningf("RequestID: %s, Retrying command (attempt %d/%d): %s",
+				requestID, attempt, maxRetries, cmdInfo)
 			time.Sleep(retryInterval)
 		}
 
-		// Create context with timeout
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
+		// Execute command with timeout
+		output, err := executeCommandWithTimeout(cmd, timeout)
 
-		// Create new command with context
-		execCmd := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
-		execCmd.Env = cmd.Env
-		execCmd.Dir = cmd.Dir
-
-		// Execute command
-		output, err = execCmd.CombinedOutput()
-
-		// Check if it's a timeout error
-		if ctx.Err() == context.DeadlineExceeded {
-			klog.Errorf("RequestID: %s, Command timed out after %v: %s %v",
-				requestID, timeout, cmd.Path, cmd.Args)
-			err = fmt.Errorf("command timed out after %v", timeout)
-			continue
-		}
-
-		// If command executes successfully, return result
-		if err == nil {
-			klog.Infof("RequestID: %s, Command executed successfully: %s %v",
-				requestID, cmd.Path, cmd.Args)
+		// Check if execution should be treated as success
+		if err == nil || isAcceptableError(err, output, acceptableErrors) {
+			if err != nil {
+				klog.Infof("RequestID: %s, Command error is acceptable, treating as success: %s",
+					requestID, cmdInfo)
+			} else {
+				klog.Infof("RequestID: %s, Command executed successfully: %s", requestID, cmdInfo)
+			}
 			return output, nil
 		}
 
-		klog.Errorf("RequestID: %s, Command failed: %s %v, Error: %v, Output: %s",
-			requestID, cmd.Path, cmd.Args, err, string(output))
+		// Log failure and continue retry
+		lastOutput = output
+		lastErr = err
+		klog.Errorf("RequestID: %s, Command failed: %s, Error: %v, Output: %s",
+			requestID, cmdInfo, err, string(output))
 	}
 
-	return output, fmt.Errorf("command failed after %d retries: %v, output: %s",
-		maxRetries, err, string(output))
+	return lastOutput, fmt.Errorf("command failed after %d retries: %v, output: %s",
+		maxRetries, lastErr, string(lastOutput))
+}
+
+// executeCommandWithTimeout executes a command with timeout control
+func executeCommandWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Create new command with context
+	execCmd := exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+	execCmd.Env = cmd.Env
+	execCmd.Dir = cmd.Dir
+
+	// Execute command
+	output, err := execCmd.CombinedOutput()
+
+	// Check if it's a timeout error
+	if ctx.Err() == context.DeadlineExceeded {
+		return output, fmt.Errorf("command timed out after %v", timeout)
+	}
+
+	return output, err
+}
+
+// isAcceptableError checks if the error contains any acceptable error patterns
+func isAcceptableError(err error, output []byte, acceptableErrors []string) bool {
+	if err == nil || len(acceptableErrors) == 0 {
+		return false
+	}
+
+	errMsg := err.Error()
+	outputStr := string(output)
+
+	for _, acceptable := range acceptableErrors {
+		if strings.Contains(errMsg, acceptable) || strings.Contains(outputStr, acceptable) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // waitForMount waits for mount point to appear and provides detailed error info
+//
+//nolint:unused
 func waitForMount(mountPath string, timeout time.Duration) error {
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -131,6 +164,8 @@ func waitForMount(mountPath string, timeout time.Duration) error {
 }
 
 // getMountInfo gets detailed mount point info for debugging
+//
+//nolint:unused
 func getMountInfo(mountPath string) string {
 	// Check if directory exists
 	if _, err := os.Stat(mountPath); err != nil {
