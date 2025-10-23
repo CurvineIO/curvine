@@ -14,15 +14,14 @@
 
 use crate::handler::rpc_frame::FrameSate;
 use crate::io::IOResult;
-use crate::message::{Message, Protocol, MAX_DATE_SIZE};
+use crate::message;
+use crate::message::Message;
 use crate::sys::DataSlice;
-use crate::{err_box, message};
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use std::mem;
 use tokio::io::{AsyncReadExt, ReadHalf};
 use tokio::net::TcpStream;
 
-// @todo and RpcFrame have duplicate code, and subsequent optimizations
 pub struct ReadFrame {
     io: ReadHalf<TcpStream>,
     buf: BytesMut,
@@ -55,16 +54,7 @@ impl ReadFrame {
                         Err(_) => return Ok(Message::empty()),
                     };
 
-                    let total_size = buf.get_i32();
-                    let header_size = buf.get_i32();
-                    let data_size = total_size - header_size - message::HEAD_SIZE;
-                    if data_size < 0 {
-                        return err_box!("data length is negative");
-                    } else if data_size > MAX_DATE_SIZE {
-                        return err_box!("Data exceeds maximum size: {}", MAX_DATE_SIZE);
-                    }
-
-                    let protocol = Protocol::create(&mut buf);
+                    let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
                     let _ = mem::replace(
                         &mut state,
                         FrameSate::Data(protocol, header_size, data_size),
