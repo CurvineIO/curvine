@@ -17,6 +17,7 @@
 use std::fmt;
 use std::fmt::{Debug, Pointer};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 
 // Encapsulated raw pointer, similar to the NotNull function in the rust standard library.
@@ -49,6 +50,10 @@ impl<T> RawPtr<T> {
         Self::new(false, r as *mut T)
     }
 
+    pub fn from_uninit(r: MaybeUninit<*mut T>) -> Self {
+        Self::from_raw(unsafe { r.assume_init() })
+    }
+
     pub fn as_mut(&self) -> &mut T {
         unsafe { &mut *self.ptr }
     }
@@ -57,8 +62,12 @@ impl<T> RawPtr<T> {
         unsafe { &*self.ptr }
     }
 
-    pub fn as_ptr(&self) -> *mut T {
+    pub fn as_mut_ptr(&self) -> *mut T {
         self.ptr
+    }
+
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr as *const _
     }
 
     pub fn add(&mut self, offset: usize) {
