@@ -668,12 +668,9 @@ impl fs::FileSystem for CurvineFileSystem {
         );
 
         // Accept the SELinux labels in the FUSE layer. Add a guard in set_xattr so the driver simply ACKs the write instead of forwarding it.
-        match name {
-            "security.selinux" => {
-                debug!("Ignoring SELinux label on {}", path);
-                return Ok(());
-            }
-            _ => {}
+        if name == "security.selinux" {
+            debug!("Ignoring SELinux label on {}", path);
+            return Ok(());
         }
 
         // Create SetAttrOpts with the xattr to add
