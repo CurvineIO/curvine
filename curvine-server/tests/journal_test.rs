@@ -89,6 +89,7 @@ fn check_raft_state() -> CommonResult<()> {
     let mut conf = ClusterConf::default();
     conf.journal.writer_flush_batch_size = 1;
     conf.journal.writer_flush_batch_ms = 10;
+    conf.journal.raft_tick_interval_ms = 100;
     conf.journal.journal_addrs = vec![
         RaftPeer::new(port1 as NodeId, &conf.master.hostname, port1),
         RaftPeer::new(port2 as NodeId, &conf.master.hostname, port2),

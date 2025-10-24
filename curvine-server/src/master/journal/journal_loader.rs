@@ -23,7 +23,7 @@ use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
 use curvine_common::raft::{RaftResult, RaftUtils};
 use curvine_common::utils::SerdeUtils;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use orpc::common::FileUtils;
 use orpc::sync::AtomicCounter;
 use orpc::{err_box, try_option, try_option_ref, CommonResult};
@@ -53,6 +53,7 @@ impl JournalLoader {
     }
 
     pub fn apply_entry(&self, entry: JournalEntry) -> CommonResult<()> {
+        debug!("replay entry: {:?}", entry);
         match entry {
             JournalEntry::Mkdir(e) => self.mkdir(e),
 
@@ -176,15 +177,14 @@ impl JournalLoader {
         self.mnt_mgr.unprotected_add_mount(entry.info.clone())?;
 
         let mut fs_dir = self.fs_dir.write();
-        fs_dir.store_mount(entry.info, false)?;
+        fs_dir.unprotected_store_mount(entry.info)?;
         Ok(())
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
-        self.mnt_mgr.unmount_by_id(entry.id)?;
-
+        self.mnt_mgr.unprotected_umount_by_id(entry.id)?;
         let mut fs_dir = self.fs_dir.write();
-        fs_dir.unmount(entry.id)?;
+        fs_dir.unprotected_unmount(entry.id)?;
         Ok(())
     }
 

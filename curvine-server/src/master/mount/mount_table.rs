@@ -233,4 +233,17 @@ impl MountTable {
         let table = inner.mountid2entry.values().cloned().collect();
         Ok(table)
     }
+
+    pub fn unprotected_umount_by_id(&self, mount_id: u32) -> FsResult<()> {
+        let mut inner = self.inner.write().unwrap();
+
+        let info = match inner.mountid2entry.remove(&mount_id) {
+            Some(entry) => entry,
+            None => return err_box!("failed found {} entry", mount_id),
+        };
+
+        inner.ufs2mountid.remove(&info.ufs_path);
+        inner.mountpath2id.remove(&info.cv_path);
+        Ok(())
+    }
 }

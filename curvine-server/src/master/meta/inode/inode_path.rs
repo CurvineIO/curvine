@@ -136,6 +136,11 @@ impl InodePath {
         self.get_path(self.components.len() - 1)
     }
 
+    // Get the parent path that already exists on the path, not target path.
+    pub fn get_valid_parent_path(&self) -> String {
+        self.get_path(self.existing_len())
+    }
+
     pub fn get_component(&self, pos: usize) -> CommonResult<&'_ str> {
         match self.components.get(pos) {
             None => err_box!("Path does not exist"),
