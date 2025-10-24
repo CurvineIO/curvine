@@ -15,7 +15,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::master::journal::*;
-use crate::master::meta::inode::{InodeFile, InodePath};
+use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
@@ -88,11 +88,11 @@ impl JournalWriter {
         Ok(())
     }
 
-    pub fn log_mkdir(&self, op_ms: u64, inp: &InodePath) -> FsResult<()> {
+    pub fn log_mkdir(&self, op_ms: u64, path: impl AsRef<str>, dir: &InodeDir) -> FsResult<()> {
         let entry = MkdirEntry {
             op_ms,
-            path: inp.path().to_string(),
-            dir: inp.clone_last_dir()?,
+            path: path.as_ref().to_string(),
+            dir: dir.clone(),
         };
         self.send(JournalEntry::Mkdir(entry))
     }

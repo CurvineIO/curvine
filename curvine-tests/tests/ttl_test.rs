@@ -22,8 +22,8 @@ use orpc::common::{DurationUnit, LogConf, Logger};
 use orpc::runtime::RpcRuntime;
 use orpc::CommonResult;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 use std::sync::{Once, OnceLock};
+use std::time::{Duration, SystemTime};
 
 static ONCE_SETUP: Once = Once::new();
 static TESTING: OnceLock<Testing> = OnceLock::new();

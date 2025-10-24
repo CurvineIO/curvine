@@ -131,6 +131,10 @@ impl MountManager {
         self.umount(&info.cv_path)
     }
 
+    pub fn unprotected_umount_by_id(&self, id: u32) -> FsResult<()> {
+        self.mount_table.unprotected_umount_by_id(id)
+    }
+
     /**
      * use ufs_uri to find mount entry
      */

@@ -53,6 +53,7 @@ impl JournalLoader {
     }
 
     pub fn apply_entry(&self, entry: JournalEntry) -> CommonResult<()> {
+        info!("replay entry: {:?}", entry);
         match entry {
             JournalEntry::Mkdir(e) => self.mkdir(e),
 
@@ -176,15 +177,14 @@ impl JournalLoader {
         self.mnt_mgr.unprotected_add_mount(entry.info.clone())?;
 
         let mut fs_dir = self.fs_dir.write();
-        fs_dir.store_mount(entry.info, false)?;
+        fs_dir.unprotected_store_mount(entry.info)?;
         Ok(())
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
-        self.mnt_mgr.unmount_by_id(entry.id)?;
-
+        self.mnt_mgr.unprotected_umount_by_id(entry.id)?;
         let mut fs_dir = self.fs_dir.write();
-        fs_dir.unmount(entry.id)?;
+        fs_dir.unprotected_unmount(entry.id)?;
         Ok(())
     }
 

@@ -22,13 +22,13 @@ use curvine_common::fs::Writer;
 use curvine_tests::Testing;
 use log::info;
 use orpc::common::{LocalTime, Utils};
+use orpc::common::{LogConf, Logger};
 use orpc::runtime::RpcRuntime;
 use orpc::{CommonError, CommonResult};
 use std::sync::Arc;
-use std::time::Duration;
 use std::sync::Once;
 use std::sync::OnceLock;
-use orpc::common::{LogConf, Logger};
+use std::time::Duration;
 
 static ONCE_SETUP: Once = Once::new();
 static TESTING: OnceLock<Testing> = OnceLock::new();
@@ -42,7 +42,6 @@ fn setup() -> CommonResult<&'static Testing> {
     });
     Ok(TESTING.get().expect("testing not initialized"))
 }
-
 
 // Test local short-circuit read and write
 #[test]
