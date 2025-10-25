@@ -22,7 +22,30 @@ use orpc::common::{DurationUnit, LogConf, Logger};
 use orpc::runtime::RpcRuntime;
 use orpc::CommonResult;
 use std::sync::Arc;
+use std::sync::{Once, OnceLock};
 use std::time::{Duration, SystemTime};
+
+static ONCE_SETUP: Once = Once::new();
+static TESTING: OnceLock<Testing> = OnceLock::new();
+
+fn setup() -> CommonResult<&'static Testing> {
+    ONCE_SETUP.call_once(|| {
+        Logger::init(LogConf::default());
+        let testing = Testing::builder()
+            .workers(3)
+            .with_base_conf_path("../etc/curvine-cluster.toml")
+            .mutate_conf(|conf| {
+                conf.master.ttl_checker_interval_unit = DurationUnit::from_str("1s").unwrap();
+                conf.master.ttl_bucket_interval_unit = DurationUnit::from_str("1s").unwrap();
+                conf.master.ttl_checker_retry_attempts = 1;
+            })
+            .build()
+            .expect("build testing");
+        testing.start_cluster().expect("start cluster");
+        TESTING.set(testing).ok();
+    });
+    Ok(TESTING.get().expect("testing not initialized"))
+}
 
 /// TTL functionality test
 ///
@@ -32,21 +55,8 @@ use std::time::{Duration, SystemTime};
 /// 3. Test TTL cleanup timing and effectiveness
 #[test]
 fn test_ttl_cleanup() -> CommonResult<()> {
-    Logger::init(LogConf::default());
-
     info!("Starting TTL cleanup test");
-    // Build and start test cluster via Testing builder
-    let testing = Testing::builder()
-        .workers(3)
-        .with_base_conf_path("../etc/curvine-cluster.toml")
-        .mutate_conf(|conf| {
-            conf.master.ttl_checker_interval_unit = DurationUnit::from_str("1s").unwrap();
-            conf.master.ttl_bucket_interval_unit = DurationUnit::from_str("1s").unwrap();
-            conf.master.ttl_checker_retry_attempts = 1;
-            print!("-----------------------------------------")
-        })
-        .build()?;
-    testing.start_cluster()?;
+    let testing = setup()?;
 
     let conf = testing.get_active_cluster_conf()?;
     println!("conf: {:?}", conf);

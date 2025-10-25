@@ -113,8 +113,10 @@ impl FsDir {
 
         let dir = InodeDir::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
 
-        inp = self.add_last_inode(inp, Dir(name, dir))?;
-        self.journal_writer.log_mkdir(op_ms, &inp)?;
+        inp = self.add_last_inode(inp, Dir(name.clone(), dir.clone()))?;
+
+        let parent_path = inp.get_valid_parent_path();
+        self.journal_writer.log_mkdir(op_ms, &parent_path, &dir)?;
 
         Ok(inp)
     }
@@ -769,11 +771,21 @@ impl FsDir {
         Ok(())
     }
 
+    pub fn unprotected_store_mount(&mut self, info: MountInfo) -> FsResult<()> {
+        self.store.store.add_mountpoint(info.mount_id, &info)?;
+        Ok(())
+    }
+
     pub fn unmount(&mut self, id: u32) -> FsResult<()> {
         // Create parent directory
         let op_ms = LocalTime::mills();
         self.store.store.remove_mountpoint(id)?;
         self.journal_writer.log_unmount(op_ms, id)?;
+        Ok(())
+    }
+
+    pub fn unprotected_unmount(&mut self, id: u32) -> FsResult<()> {
+        self.store.store.remove_mountpoint(id)?;
         Ok(())
     }
 
