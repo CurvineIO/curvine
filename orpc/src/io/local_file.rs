@@ -139,22 +139,12 @@ impl LocalFile {
         };
 
         self.pos += len as i64;
-
-        if self.pos > self.len {
-            self.len = self.pos;
-        }
-
         Ok(())
     }
 
     pub fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {
         try_err!(self.inner.write_all(buf));
         self.pos += buf.len() as i64;
-
-        if self.pos > self.len {
-            self.len = self.pos;
-        }
-
         Ok(())
     }
 
