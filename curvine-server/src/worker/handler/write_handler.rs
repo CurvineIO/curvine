@@ -53,46 +53,9 @@ impl WriteHandler {
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let context = WriteContext::from_req(msg)?;
+        let meta = self.store.open_block(&context.block)?;
 
-        // 1. Append mode: use append_block, continue writing from file end
-        // 2. Random write mode: use create_block or reuse existing block, support writing at any position
-        let meta = if context.is_append {
-            self.store.append_block(context.off, &context.block)?
-        } else {
-            self.store.create_block(&context.block)?
-        };
-
-        // Only check if it exceeds block capacity limit
-        if context.off >= context.len {
-            return err_box!(
-                "The write start position {} exceeds the block capacity {}",
-                context.off,
-                context.len
-            );
-        }
-
-        let file = if context.is_append {
-            // Append mode: use traditional append method
-            let file = meta.create_writer(true)?;
-            // Validate file length for append mode
-            if file.len() != context.off {
-                return err_box!(
-                    "Append write initial length error, expected {}, actual {}",
-                    context.off,
-                    file.len()
-                );
-            }
-            file
-        } else {
-            // Random write mode: use write method with offset support
-            let mut file = meta.create_writer(false)?;
-            // For random writes, seek directly to specified position
-            if context.off > 0 {
-                file.seek(context.off)?;
-            }
-            file
-        };
-
+        let file = meta.create_writer(context.off, false)?;
         let (label, path, file) = if context.short_circuit {
             ("local", file.path().to_string(), None)
         } else {
@@ -100,11 +63,10 @@ impl WriteHandler {
         };
 
         let log_msg = format!(
-            "Write {}-block start req_id: {}, path: {:?}, off: {}, chunk_size: {}, block_size: {}",
+            "Write {}-block start req_id: {}, path: {:?}, chunk_size: {}, block_size: {}",
             label,
             context.req_id,
             path,
-            context.off,
             context.chunk_size,
             ByteUnit::byte_to_string(context.block.len as u64)
         );
@@ -145,22 +107,14 @@ impl WriteHandler {
         // msg.header
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
-            // If header contains offset information, execute seek operation
-            if header.offset != file.pos() {
-                if header.offset < 0 || header.offset >= context.len {
-                    return err_box!(
-                        "Invalid seek offset: {}, block length: {}",
-                        header.offset,
-                        context.len
-                    );
-                }
-                file.seek(header.offset)?;
+            if header.offset < 0 || header.offset >= context.len {
+                return err_box!(
+                    "Invalid seek offset: {}, block length: {}",
+                    header.offset,
+                    context.len
+                );
             }
-
-            // Handle flush request
-            if header.flush {
-                file.flush()?;
-            }
+            file.seek(header.offset)?;
         }
 
         // Write existing data blocks.
@@ -247,19 +201,6 @@ impl WriteHandler {
         Ok(msg.success())
     }
 }
-
-// If the write process suddenly interrupts, we will not delete the unwritten block.
-/*impl Drop for WriteHandler {
-    fn drop(&mut self) {
-        if !self.is_commit {
-            if let Err(e) = self.commit_block(false) {
-                error!("Abort block {}", e);
-            }
-            self.is_commit = true;
-        }
-    }
-}
-*/
 
 impl MessageHandler for WriteHandler {
     type Error = FsError;

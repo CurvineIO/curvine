@@ -206,24 +206,9 @@ impl BlockMeta {
         Ok(file)
     }
 
-    pub fn create_writer(&self, is_append: bool) -> IOResult<LocalFile> {
+    pub fn create_writer(&self, off: i64, overwrite: bool) -> IOResult<LocalFile> {
         let file = self.get_block_file()?;
-        if is_append {
-            LocalFile::with_append(file)
-        } else {
-            // truncate=false keeps existing content while allowing seek + write for random writes
-            LocalFile::with_write(file, false)
-        }
-    }
-
-    pub fn create_writer_with_offset(&self, is_append: bool, offset: i64) -> IOResult<LocalFile> {
-        let file = self.get_block_file()?;
-        if is_append {
-            LocalFile::with_append(file)
-        } else {
-            // For random writes, use method that supports offset
-            LocalFile::with_write_offset(file, false, offset)
-        }
+        LocalFile::with_write_offset(file, overwrite, off)
     }
 
     pub fn create_reader(&self, offset: u64) -> IOResult<LocalFile> {
