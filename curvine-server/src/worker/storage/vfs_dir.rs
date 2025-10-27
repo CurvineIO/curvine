@@ -221,7 +221,7 @@ impl VfsDir {
         }
     }
 
-    pub fn create_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+    pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let meta = BlockMeta::with_tmp(block, self);
         let file = meta.get_block_path()?;
 
@@ -256,10 +256,10 @@ impl VfsDir {
         Ok(final_meta)
     }
 
-    pub fn append_block(&self, block: &ExtendedBlock, meta: &BlockMeta) -> CommonResult<BlockMeta> {
+    pub fn reopen_block(&self, block: &ExtendedBlock, meta: &BlockMeta) -> CommonResult<BlockMeta> {
         let cur_file = meta.get_block_path()?;
         let file_size = try_err!(cur_file.metadata()).len() as i64;
-        if file_size >= block.len {
+        if file_size > block.len {
             return err_box!(
                 "block file length is greater than block size, file size: {}, block size: {}",
                 file_size,
@@ -276,30 +276,6 @@ impl VfsDir {
         }
 
         Ok(new_meta)
-    }
-
-    pub fn reopen_finalized_block(
-        &self,
-        finalized_meta: &BlockMeta,
-        new_block: &ExtendedBlock,
-    ) -> CommonResult<BlockMeta> {
-        // Create new metadata in writing state
-        let cow_meta = BlockMeta::with_cow(finalized_meta, new_block.len, self);
-
-        // Get source file (finalized) and target file (writing) paths
-        let src_file = finalized_meta.get_block_path()?;
-        let dst_file = cow_meta.get_block_path()?;
-
-        // Ensure target directory exists
-        let parent = try_option!(dst_file.parent());
-        if !parent.exists() {
-            FileUtils::create_dir(parent, true)?;
-        }
-
-        // rename file content, do not copy
-        try_err!(fs::rename(&src_file, &dst_file));
-
-        Ok(cow_meta)
     }
 
     // Scan all blocks in the directory
@@ -391,7 +367,7 @@ mod test {
 
         // add tmp block
         let block = ExtendedBlock::with_size_str(1122, "10MB", StorageType::Mem)?;
-        let tmp = dir.create_block(&block)?;
+        let tmp = dir.open_block(&block)?;
         dir.reserve_space(false, block.len);
 
         let tmp_file = tmp.get_block_path()?;

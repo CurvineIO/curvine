@@ -17,6 +17,7 @@ use curvine_common::state::ExtendedBlock;
 use curvine_common::FsResult;
 use orpc::message::Message;
 
+#[derive(Debug)]
 pub struct WriteContext {
     pub block: ExtendedBlock,
     pub req_id: i64,
@@ -24,7 +25,6 @@ pub struct WriteContext {
     pub short_circuit: bool,
     pub off: i64,
     pub len: i64,
-    pub is_append: bool,
 }
 
 impl WriteContext {
@@ -37,7 +37,6 @@ impl WriteContext {
         // - Random write: off = any position, len = block_capacity
         // Therefore, only when off == block.len (actual data length) is it true append mode
         let block = ExtendedBlock::from_req(&req);
-        let is_append = req.off > 0 && req.off == block.len;
 
         let context = Self {
             block,
@@ -46,7 +45,6 @@ impl WriteContext {
             short_circuit: req.short_circuit,
             off: req.off,
             len: req.len,
-            is_append,
         };
 
         Ok(context)

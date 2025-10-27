@@ -130,6 +130,18 @@ impl VfsDataset {
         }
         vec
     }
+
+    fn reopen_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        let meta = self.get_block_check(block.id)?;
+
+        let dir = self.find_dir(meta.dir_id())?;
+        let new_meta = dir.reopen_block(block, meta)?;
+        dir.release_space(meta.is_final(), meta.len);
+        dir.reserve_space(false, block.len);
+        self.block_map.insert(new_meta.id(), new_meta.clone());
+
+        Ok(new_meta)
+    }
 }
 
 impl Dataset for VfsDataset {
@@ -153,101 +165,32 @@ impl Dataset for VfsDataset {
         self.block_map.get(&id)
     }
 
-    fn create_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+    fn open_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         if let Some(v) = self.block_map.get(&block.id) {
-            match *v.state() {
+            return match *v.state() {
                 // Allow reusing blocks already in Writing state
-                crate::worker::block::BlockState::Writing => {
-                    return Ok(v.clone());
-                }
+                BlockState::Writing => Ok(v.clone()),
 
-                crate::worker::block::BlockState::Finalized => {
-                    return self.reopen_block(block);
-                }
+                BlockState::Finalized => self.reopen_block(block),
 
                 // Recovering state does not allow operations
-                crate::worker::block::BlockState::Recovering => {
-                    return err_box!(
+                BlockState::Recovering => {
+                    err_box!(
                         "Block {} is in recovering state and cannot be created in worker_id: {}",
                         block.id,
                         self.worker_id
-                    );
+                    )
                 }
-            }
+            };
         }
 
-        // Create a brand new block
-
         let dir = self.dir_list.choose_dir(block)?;
-        let meta = dir.create_block(block)?;
+        let meta = dir.open_block(block)?;
 
         self.block_map.insert(meta.id(), meta.clone());
         dir.reserve_space(false, block.len);
 
         Ok(meta)
-    }
-
-    fn append_block(
-        &mut self,
-        expected_len: i64,
-        block: &ExtendedBlock,
-    ) -> CommonResult<BlockMeta> {
-        let meta = self.get_block_check(block.id)?;
-        if meta.len != expected_len {
-            return err_box!(
-                "{} length is incorrect, expected: {}, actual {}",
-                meta,
-                expected_len,
-                meta.len
-            );
-        }
-
-        if !meta.support_append() {
-            return err_box!("{} cannot execute append");
-        }
-
-        let dir = self.find_dir(meta.dir_id())?;
-        let new_meta = dir.append_block(block, meta)?;
-        dir.release_space(meta.is_final(), meta.len);
-        dir.reserve_space(false, block.len);
-        self.block_map.insert(new_meta.id(), new_meta.clone());
-
-        Ok(new_meta)
-    }
-
-    fn reopen_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        // First get finalized block info to avoid borrow conflicts
-        let (_finalized_len, finalized_state, finalized_meta_clone) = {
-            let finalized_meta = self.get_block_check(block.id)?;
-            (
-                finalized_meta.len(),
-                *finalized_meta.state(),
-                finalized_meta.clone(),
-            )
-        };
-
-        // Can only reopen blocks in finalized state
-        if finalized_state != BlockState::Finalized {
-            return err_box!(
-                "Block {} is not in finalized state, current state: {:?}",
-                block.id,
-                finalized_state
-            );
-        }
-
-        // Choose a directory to store copy-on-write blocks
-        let cow_dir = self.dir_list.choose_dir(block)?;
-
-        // Execute copy-on-write operation
-        let cow_meta = cow_dir.reopen_finalized_block(&finalized_meta_clone, block)?;
-
-        // Update block mapping, replace finalized block with writing state block
-        self.block_map.insert(cow_meta.id(), cow_meta.clone());
-
-        // Update space statistics
-        cow_dir.reserve_space(false, block.len);
-
-        Ok(cow_meta)
     }
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
@@ -341,7 +284,7 @@ mod test {
         // println!("{:#?}", dataset.dir_list.dirs());
 
         let block = ExtendedBlock::with_mem(11226688, "100B")?;
-        let tmp_meta = dataset.create_block(&block)?;
+        let tmp_meta = dataset.open_block(&block)?;
         assert_eq!(dataset.available(), 400);
 
         // commit block
@@ -352,7 +295,7 @@ mod test {
 
         // abort block。
         let block = ExtendedBlock::with_mem(11226699, "100B")?;
-        let tmp_meta1 = dataset.create_block(&block)?;
+        let tmp_meta1 = dataset.open_block(&block)?;
         assert_eq!(dataset.available(), 350);
         tmp_meta1.write_test_data("50B")?;
 
@@ -368,12 +311,12 @@ mod test {
         let mut dataset = create_data_set(true, "append");
         let block = ExtendedBlock::with_mem(11226688, "100B")?;
 
-        let tmp_meta = dataset.create_block(&block)?;
+        let tmp_meta = dataset.open_block(&block)?;
         tmp_meta.write_test_data("50B")?;
         dataset.finalize_block(&block)?;
 
         // append
-        let new_meta = dataset.append_block(50, &block)?;
+        let new_meta = dataset.reopen_block(&block)?;
         assert_eq!(dataset.available(), 400);
 
         new_meta.write_test_data("20B")?;
@@ -389,7 +332,7 @@ mod test {
         for id in 1..12 {
             let size = format!("{}B", id);
             let block = ExtendedBlock::with_mem(id, &size)?;
-            let tmp_meta = dataset.create_block(&block)?;
+            let tmp_meta = dataset.open_block(&block)?;
             tmp_meta.write_test_data(&size)?;
 
             if id != 11 {

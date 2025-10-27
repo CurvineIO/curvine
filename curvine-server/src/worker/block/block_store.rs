@@ -44,21 +44,8 @@ impl BlockStore {
         self.state.read().unwrap()
     }
 
-    pub fn create_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        self.write().create_block(block)
-    }
-
-    pub fn append_block(
-        &self,
-        expected_len: i64,
-        block: &ExtendedBlock,
-    ) -> CommonResult<BlockMeta> {
-        self.write().append_block(expected_len, block)
-    }
-
-    // Reopen finalized blocks using copy-on-write mechanism
-    pub fn reopen_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        self.write().reopen_block(block)
+    pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        self.write().open_block(block)
     }
 
     pub fn finalize_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
