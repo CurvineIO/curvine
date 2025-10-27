@@ -23,7 +23,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
-use curvine_common::state::{CreateFileOpts, FileStatus, HeartbeatStatus};
+use curvine_common::state::{CreateFileOpts, FileBlocks, FileStatus, HeartbeatStatus, OpenFlags};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
@@ -128,6 +128,35 @@ impl MasterHandler {
             file_status: ProtoUtils::file_status_to_pb(status),
         };
         ctx.response(rep_header)
+    }
+
+    pub fn retry_check_open_file(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: OpenFileRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+
+        let opts = ProtoUtils::create_opts_from_pb(header.opts);
+        let flags = OpenFlags::new(header.flags);
+        let file_blocks = self.open_file0(ctx.msg.req_id(), header.path, opts, flags)?;
+
+        let rep_header = OpenFileResponse {
+            file_blocks: ProtoUtils::file_blocks_to_pb(file_blocks),
+        };
+        ctx.response(rep_header)
+    }
+
+    fn open_file0(
+        &mut self,
+        req_id: i64,
+        path: String,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<FileBlocks> {
+        if self.check_is_retry(req_id)? {
+            return self.fs.get_block_locations(&path);
+        }
+
+        let res = self.fs.open_file(path, opts, flags);
+        self.set_req_cache(req_id, res)
     }
 
     pub fn file_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -238,10 +267,9 @@ impl MasterHandler {
         }
 
         let res = {
-            let (last_block, status) = self.fs.append_file(&req.path, opts)?;
+            let status = self.fs.append_file(&req.path, opts)?;
             let rep_header = AppendFileResponse {
-                file_status: ProtoUtils::file_status_to_pb(status),
-                last_block: last_block.map(ProtoUtils::located_block_to_pb),
+                status: ProtoUtils::file_blocks_to_pb(status),
             };
             ctx.response(rep_header)
         };
@@ -427,6 +455,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::Mkdir => self.mkdir(ctx),
             RpcCode::CreateFile => self.retry_check_create_file(ctx),
             RpcCode::AppendFile => self.retry_check_append_file(ctx),
+            RpcCode::OpenFile => self.retry_check_open_file(ctx),
             RpcCode::FileStatus => self.file_status(ctx),
             RpcCode::AddBlock => self.add_block(ctx),
             RpcCode::CompleteFile => self.complete_file(ctx),
