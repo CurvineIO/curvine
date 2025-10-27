@@ -477,7 +477,7 @@ impl FsWriterBase {
             _ => {
                 let (_block_off, lb) = if !self.file_blocks.block_locs.is_empty() {
                     // Try to find in existing file blocks
-                    match self.file_blocks.get_write_block(self.pos) {
+                    match self.file_blocks.get_read_block(self.pos) {
                         Ok((block_off, located_block)) => {
                             // Found existing block, check if there's a cached writer
                             let new_writer = match self.all_writers.remove(&located_block.block.id)

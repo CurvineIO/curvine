@@ -104,15 +104,7 @@ pub trait Writer {
     fn cancel(&mut self) -> impl Future<Output = FsResult<()>>;
 
     // Random write seek support
-    fn seek(&mut self, pos: i64) -> impl Future<Output = FsResult<()>> {
-        async move {
-            if pos < 0 {
-                return err_box!(format!("Cannot seek to negative position: {}", pos));
-            }
-            // Default implementation: flush buffer, update position
-            self.flush_chunk().await?;
-            *self.pos_mut() = pos;
-            Ok(())
-        }
+    fn seek(&mut self, _pos: i64) -> impl Future<Output = FsResult<()>> {
+        async move { err_box!("Not support") }
     }
 }

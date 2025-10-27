@@ -16,9 +16,9 @@ use crate::proto::BlockWriteRequest;
 use crate::state::{FileStatus, FileType, StorageType, WorkerAddress};
 use crate::FsResult;
 use orpc::common::ByteUnit;
-use orpc::{err_box, CommonResult};
+use orpc::{err_box, try_option, CommonResult};
 use serde::{Deserialize, Serialize};
-use std::ops::Range;
+use std::ops::{Deref, Range};
 
 // block location information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +106,14 @@ pub struct LocatedBlock {
     pub locs: Vec<WorkerAddress>,
 }
 
+impl Deref for LocatedBlock {
+    type Target = ExtendedBlock;
+
+    fn deref(&self) -> &Self::Target {
+        &self.block
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileBlocks {
     pub status: FileStatus,
@@ -113,6 +121,10 @@ pub struct FileBlocks {
 }
 
 impl FileBlocks {
+    pub fn new(status: FileStatus, block_locs: Vec<LocatedBlock>) -> Self {
+        Self { status, block_locs }
+    }
+
     // According to the file reading location, get the block that needs to be read and the offset in the block.
     pub fn get_read_block(&self, file_pos: i64) -> FsResult<(i64, LocatedBlock)> {
         let mut start_pos = 0;
@@ -126,6 +138,14 @@ impl FileBlocks {
         }
 
         err_box!("Not found block for pos {}", file_pos)
+    }
+}
+
+impl Deref for FileBlocks {
+    type Target = FileStatus;
+
+    fn deref(&self) -> &Self::Target {
+        &self.status
     }
 }
 
@@ -164,14 +184,94 @@ impl SearchFileBlocks {
             err_box!("Not found block for pos {}", file_pos)
         }
     }
+}
 
-    pub fn get_write_block(&self, file_pos: i64) -> FsResult<(i64, LocatedBlock)> {
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WriteFileBlocks {
+    pub status: FileStatus,
+    pub block_locs: Vec<LocatedBlock>,
+    search_off: Vec<Range<i64>>,
+    pub last_commit: Option<CommitBlock>,
+}
+
+impl WriteFileBlocks {
+    pub fn new(file_blocks: FileBlocks) -> Self {
+        let mut search_off = Vec::new();
+        let mut off = 0;
+        for _ in &file_blocks.block_locs {
+            let start = off;
+            off += file_blocks.status.block_size;
+            search_off.push(Range { start, end: off });
+        }
+
+        Self {
+            status: file_blocks.status,
+            block_locs: file_blocks.block_locs,
+            search_off,
+            last_commit: None,
+        }
+    }
+
+    pub fn get_block(&self, file_pos: i64) -> Option<(i64, LocatedBlock)> {
         let index = self.search_off.partition_point(|x| x.end <= file_pos);
         if let Some(lc) = self.block_locs.get(index) {
             let block_off = file_pos - self.search_off[index].start;
-            Ok((block_off, lc.clone()))
+            Some((block_off, lc.clone()))
         } else {
-            err_box!("Position {file_pos} exceeds file range, need new block allocation")
+            None
         }
+    }
+
+    pub fn get_block_check(&self, file_pos: i64) -> FsResult<(i64, LocatedBlock)> {
+        match self.get_block(file_pos) {
+            Some(lb) => Ok(lb),
+            None => err_box!("Not found block for pos {}, blocks: {:#?}", file_pos, self),
+        }
+    }
+
+    pub fn update_block(&mut self, commit: CommitBlock) -> FsResult<()> {
+        if let Some(v) = self.block_locs.last_mut() {
+            if v.id == commit.block_id {
+                v.block.len = commit.block_len;
+                let _ = self.last_commit.insert(commit);
+                Ok(())
+            } else {
+                Ok(())
+            }
+        } else {
+            err_box!("Not found last block")
+        }
+    }
+
+    pub fn add_block(&mut self, mut lb: LocatedBlock) -> FsResult<()> {
+        if let Some(v) = self.block_locs.last_mut() {
+            if v.id == lb.id {
+                v.block.len = self.status.block_size;
+
+                let last_search = try_option!(self.search_off.last_mut());
+                last_search.end = last_search.start + self.status.block_size;
+
+                return Ok(());
+            } else if v.id > lb.id {
+                return err_box!(
+                    "Cannot add block: existing block id {} does not match new block id {}",
+                    v.id,
+                    lb.id
+                );
+            }
+        };
+
+        lb.block.len = self.status.block_size;
+        self.block_locs.push(lb);
+
+        let start = self.search_off.last().map(|x| x.end).unwrap_or(0);
+        let end = start + self.status.block_size;
+        self.search_off.push(Range { start, end });
+
+        Ok(())
+    }
+
+    pub fn take_last_commit(&mut self) -> Option<CommitBlock> {
+        self.last_commit.take()
     }
 }

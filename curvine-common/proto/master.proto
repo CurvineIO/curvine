@@ -48,6 +48,17 @@ message CreateFileResponse {
     required FileStatusProto file_status = 1;
 }
 
+message OpenFileRequest {
+    required string path = 1;
+    required CreateFileOptsProto opts = 2;
+    required int32 flags = 3;
+}
+
+message OpenFileResponse {
+    required FileBlocksProto file_blocks = 1;
+}
+
+
 // Delete directories or files.
 message DeleteRequest {
     required string path = 1;

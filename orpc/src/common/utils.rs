@@ -76,15 +76,19 @@ impl Utils {
 
     pub fn rand_str(len: usize) -> String {
         let mut str = String::with_capacity(len);
-        for i in 0..len {
+        for _ in 0..len {
             let c = rand::thread_rng().gen_range(b'a'..b'z' + 1);
-            if i == len - 1 {
-                str.push('\n');
-            } else {
-                str.push(c as char);
-            }
+            str.push(c as char);
         }
         str
+    }
+
+    pub fn rand_str_line(len: usize) -> String {
+        let len = len.saturating_sub(1);
+        if len == 0 {
+            return "".to_string();
+        }
+        format!("{}\n", Self::rand_str(len))
     }
 
     pub fn uuid() -> String {
