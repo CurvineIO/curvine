@@ -15,12 +15,12 @@
 use crate::file::{FsContext, FsWriterBase, FsWriterBuffer};
 use bytes::BytesMut;
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileStatus, LastBlockStatus, LocatedBlock};
+use curvine_common::state::{FileBlocks, FileStatus};
 use curvine_common::FsResult;
-use log::info;
+use log::{info, warn};
 use orpc::common::ByteUnit;
-use orpc::err_box;
 use orpc::sys::DataSlice;
+use orpc::{err_box, ternary};
 use std::sync::Arc;
 
 type Inner = FsWriterBuffer;
@@ -30,18 +30,14 @@ pub struct FsWriter {
     buf: BytesMut,
     chunk_size: usize,
     pos: i64,
+    append: bool,
 }
 
 impl FsWriter {
-    pub fn new(
-        fs_context: Arc<FsContext>,
-        path: Path,
-        status: FileStatus,
-        last_block: Option<LocatedBlock>,
-    ) -> Self {
+    pub fn new(fs_context: Arc<FsContext>, path: Path, status: FileBlocks, append: bool) -> Self {
         let chunk_size = fs_context.write_chunk_size();
         let chunk_num = fs_context.write_chunk_num();
-        let pos = status.len;
+        let pos = ternary!(append, status.len, 0);
 
         info!(
             "Create writer, path={}, pos={}, block_size={}, chunk_size={}, chunk_number={}, replicas={}",
@@ -53,7 +49,7 @@ impl FsWriter {
             status.replicas
         );
 
-        let writer = FsWriterBase::new(fs_context, path, status, last_block);
+        let writer = FsWriterBase::new(fs_context, path, status, pos);
         let inner = FsWriterBuffer::new(writer, chunk_num);
 
         Self {
@@ -61,15 +57,16 @@ impl FsWriter {
             buf: BytesMut::with_capacity(chunk_size),
             chunk_size,
             pos,
+            append,
         }
     }
 
-    pub fn create(fs_context: Arc<FsContext>, path: Path, status: FileStatus) -> Self {
-        Self::new(fs_context, path, status, None)
+    pub fn create(fs_context: Arc<FsContext>, path: Path, file_blocks: FileBlocks) -> Self {
+        Self::new(fs_context, path, file_blocks, false)
     }
 
-    pub fn append(fs_context: Arc<FsContext>, path: Path, status: LastBlockStatus) -> Self {
-        Self::new(fs_context, path, status.file_status, status.last_block)
+    pub fn append(fs_context: Arc<FsContext>, path: Path, file_blocks: FileBlocks) -> Self {
+        Self::new(fs_context, path, file_blocks, true)
     }
 }
 
@@ -124,6 +121,14 @@ impl Writer for FsWriter {
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 {
             return err_box!(format!("Cannot seek to negative position: {}", pos));
+        }
+
+        if self.append {
+            warn!(
+                "Seek operation in append mode is ineffective,\
+             data will still be written in append mode"
+            );
+            return Ok(());
         }
 
         // Flush current buffer

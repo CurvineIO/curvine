@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::{FsClient, FsContext, FsReader, FsReaderBase, FsWriter, FsWriterBase};
+use crate::file::{FsClient, FsContext, FsReader, FsReaderBase, FsWriter};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
@@ -20,7 +20,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileBlocks, FileStatus, MasterInfo, MkdirOpts,
-    MkdirOptsBuilder, MountInfo, MountOptions, MountType, SetAttrOpts,
+    MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags, SetAttrOpts,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
@@ -91,7 +91,8 @@ impl CurvineFileSystem {
 
     pub async fn create_with_opts(&self, path: &Path, opts: CreateFileOpts) -> FsResult<FsWriter> {
         let status = self.fs_client.create_with_opts(path, opts).await?;
-        let writer = FsWriter::create(self.fs_context.clone(), path.clone(), status);
+        let file_blocks = FileBlocks::new(status, vec![]);
+        let writer = FsWriter::create(self.fs_context.clone(), path.clone(), file_blocks);
         Ok(writer)
     }
 
@@ -125,51 +126,16 @@ impl CurvineFileSystem {
         Ok(writer)
     }
 
-    // Create an FsWriterBase,
-    // FsWriterBase writes data directly to the network without any optimization,
-    // which may be required by model scenarios, such as custom write optimization, etc.
-    pub async fn append_direct(&self, path: &Path, create: bool) -> FsResult<FsWriterBase> {
-        let opts = self
-            .create_opts_builder()
-            .create(create)
-            .overwrite(false)
-            .append(true)
-            .create_parent(true)
-            .build();
-
-        let status = self.fs_client.append(path, opts).await?;
-
-        let writer = if status.file_status.len > 0 {
-            // Existing file: get block information
-            match self.fs_client.get_block_locations(path).await {
-                Ok(file_blocks) => FsWriterBase::with_blocks(
-                    self.fs_context.clone(),
-                    path.clone(),
-                    status.file_status,
-                    file_blocks,
-                    status.last_block,
-                ),
-                Err(_e) => {
-                    // If unable to get block information, fall back to original logic
-                    FsWriterBase::new(
-                        self.fs_context.clone(),
-                        path.clone(),
-                        status.file_status,
-                        status.last_block,
-                    )
-                }
-            }
-        } else {
-            // New file: use original logic
-            FsWriterBase::new(
-                self.fs_context.clone(),
-                path.clone(),
-                status.file_status,
-                status.last_block,
-            )
-        };
-
-        Ok(writer)
+    pub async fn open_with_opts(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<FileBlocks> {
+        if flags.read_write() {
+            return err_box!("Cannot open {} for read and write.", path);
+        }
+        self.fs_client.open_with_opts(path, opts, flags).await
     }
 
     pub async fn exists(&self, path: &Path) -> FsResult<bool> {
@@ -189,17 +155,55 @@ impl CurvineFileSystem {
     }
 
     pub async fn open(&self, path: &Path) -> FsResult<FsReader> {
-        let file_blocks = self.fs_client.get_block_locations(path).await?;
+        self.open_for_read(path).await
+    }
+
+    pub async fn open_for_read(&self, path: &Path) -> FsResult<FsReader> {
+        let create_opts = self
+            .create_opts_builder()
+            .create(false)
+            .overwrite(false)
+            .append(false)
+            .create_parent(false)
+            .build();
+
+        let file_blocks = self
+            .open_with_opts(path, create_opts, OpenFlags::with_read())
+            .await?;
         Self::check_read_status(path, &file_blocks)?;
 
         let reader = FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)?;
         Ok(reader)
     }
 
-    pub async fn open_direct(&self, path: &Path) -> FsResult<FsReaderBase> {
-        let file_blocks = self.fs_client.get_block_locations(path).await?;
-        Self::check_read_status(path, &file_blocks)?;
+    pub async fn open_for_write(&self, path: &Path, overwrite: bool) -> FsResult<FsWriter> {
+        let create_opts = self
+            .create_opts_builder()
+            .create(true)
+            .overwrite(overwrite)
+            .append(false)
+            .create_parent(false)
+            .build();
 
+        let file_blocks = self
+            .open_with_opts(path, create_opts, OpenFlags::with_write())
+            .await?;
+        let writer = FsWriter::create(self.fs_context.clone(), path.clone(), file_blocks);
+        Ok(writer)
+    }
+
+    pub async fn open_direct(&self, path: &Path) -> FsResult<FsReaderBase> {
+        let create_opts = self
+            .create_opts_builder()
+            .create(false)
+            .overwrite(false)
+            .append(false)
+            .create_parent(false)
+            .build();
+
+        let file_blocks = self
+            .open_with_opts(path, create_opts, OpenFlags::with_read())
+            .await?;
         let reader = FsReaderBase::new(path.clone(), self.fs_context.clone(), file_blocks);
         Ok(reader)
     }

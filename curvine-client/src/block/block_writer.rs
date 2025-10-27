@@ -100,32 +100,31 @@ impl WriterAdapter {
         }
     }
 
-    fn max_written_pos(&self) -> i64 {
-        match self {
-            Local(f) => f.max_written_pos(),
-            Remote(f) => f.max_written_pos(),
-        }
-    }
-
     // Create new WriterAdapter
     async fn new(
         fs_context: Arc<FsContext>,
         located_block: &LocatedBlock,
         worker_addr: &WorkerAddress,
+        pos: i64,
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
         let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
 
         let adapter = if short_circuit {
-            let writer =
-                BlockWriterLocal::new(fs_context, located_block.block.clone(), worker_addr.clone())
-                    .await?;
+            let writer = BlockWriterLocal::new(
+                fs_context,
+                located_block.block.clone(),
+                worker_addr.clone(),
+                pos,
+            )
+            .await?;
             Local(writer)
         } else {
             let writer = BlockWriterRemote::new(
                 &fs_context,
                 located_block.block.clone(),
                 worker_addr.clone(),
+                pos,
             )
             .await?;
             Remote(writer)
@@ -142,14 +141,14 @@ pub struct BlockWriter {
 }
 
 impl BlockWriter {
-    pub async fn new(fs_context: Arc<FsContext>, locate: LocatedBlock) -> FsResult<Self> {
+    pub async fn new(fs_context: Arc<FsContext>, locate: LocatedBlock, pos: i64) -> FsResult<Self> {
         if locate.locs.is_empty() {
             return err_box!("There is no available worker");
         }
 
         let mut inners = Vec::with_capacity(locate.locs.len());
         for addr in &locate.locs {
-            let adapter = WriterAdapter::new(fs_context.clone(), &locate, addr).await?;
+            let adapter = WriterAdapter::new(fs_context.clone(), &locate, addr, pos).await?;
             inners.push(adapter);
         }
 
@@ -279,14 +278,10 @@ impl BlockWriter {
         self.locate.block.id
     }
 
-    pub fn max_written_pos(&self) -> i64 {
-        self.inners[0].max_written_pos()
-    }
-
     // Implement seek support for random writes
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 {
-            return Err(format!("Cannot seek to negative position: {pos}").into());
+            return err_box!("Cannot seek to negative position: {}", pos);
         }
 
         let mut futures = Vec::with_capacity(self.inners.len());
@@ -320,8 +315,7 @@ impl BlockWriter {
 
         CommitBlock {
             block_id: self.locate.block.id,
-            // Use max_written_pos instead of pos() for correct block length in random writes
-            block_len: self.max_written_pos(),
+            block_len: self.len(),
             locations: locs,
         }
     }

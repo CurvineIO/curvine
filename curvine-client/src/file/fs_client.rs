@@ -78,16 +78,29 @@ impl FsClient {
         Ok(status)
     }
 
-    pub async fn append(&self, path: &Path, opts: CreateFileOpts) -> FsResult<LastBlockStatus> {
+    pub async fn append(&self, path: &Path, opts: CreateFileOpts) -> FsResult<FileBlocks> {
         let header = AppendFileRequest {
             path: path.encode(),
             opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
         };
         let rep_header: AppendFileResponse = self.rpc(RpcCode::AppendFile, header).await?;
-        let status = LastBlockStatus {
-            file_status: ProtoUtils::file_status_from_pb(rep_header.file_status),
-            last_block: rep_header.last_block.map(ProtoUtils::located_block_from_pb),
+        let status = ProtoUtils::file_blocks_from_pb(rep_header.status);
+        Ok(status)
+    }
+
+    pub async fn open_with_opts(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<FileBlocks> {
+        let header = OpenFileRequest {
+            path: path.encode(),
+            opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
+            flags: flags.value(),
         };
+        let rep_header: OpenFileResponse = self.rpc(RpcCode::OpenFile, header).await?;
+        let status = ProtoUtils::file_blocks_from_pb(rep_header.file_blocks);
         Ok(status)
     }
 
