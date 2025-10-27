@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::file::FsContext;
+use curvine_common::error::FsError;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
 use orpc::io::LocalFile;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::{DataSlice, RawPtr};
-use orpc::try_option;
+use orpc::{err_box, try_option};
 use std::sync::Arc;
 
 pub struct BlockWriterLocal {
@@ -28,10 +29,10 @@ pub struct BlockWriterLocal {
     block: ExtendedBlock,
     worker_address: WorkerAddress,
     file: RawPtr<LocalFile>,
+    block_size: i64,
     seq_id: i32,
     req_id: i64,
     len: i64,
-    max_written_pos: i64,
 }
 
 impl BlockWriterLocal {
@@ -39,14 +40,13 @@ impl BlockWriterLocal {
         fs_context: Arc<FsContext>,
         block: ExtendedBlock,
         worker_address: WorkerAddress,
+        pos: i64,
     ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let seq_id = 0;
 
-        // Always start from append mode (block.len position)
-        let pos = block.len;
-        let len = fs_context.block_size();
-
+        let block_size = fs_context.block_size();
+        let len = block.len;
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
             .write_block(
@@ -61,13 +61,7 @@ impl BlockWriterLocal {
             .await?;
 
         let path = try_option!(write_context.path);
-        let file = if pos > 0 {
-            let mut file = LocalFile::with_append(path)?;
-            file.seek(pos)?;
-            file
-        } else {
-            LocalFile::with_write(path, false)?
-        };
+        let file = LocalFile::with_write_offset(path, false, pos)?;
 
         let writer = Self {
             rt: fs_context.clone_runtime(),
@@ -75,10 +69,10 @@ impl BlockWriterLocal {
             block,
             worker_address,
             file: RawPtr::from_owned(file),
+            block_size,
             seq_id,
             req_id,
             len,
-            max_written_pos: pos,
         };
 
         Ok(writer)
@@ -91,25 +85,25 @@ impl BlockWriterLocal {
 
     pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
         let file = self.file.clone();
-        let res = self
-            .rt
+        self.rt
             .spawn_blocking(move || {
                 file.as_mut().write_all(chunk.as_slice())?;
-                Ok(())
+                Ok::<(), FsError>(())
             })
-            .await?;
+            .await??;
 
-        let new_pos = self.pos();
-        self.max_written_pos = self.max_written_pos.max(new_pos);
-        res
+        if self.pos() > self.len {
+            self.len = self.pos();
+        }
+        Ok(())
     }
 
     // Block write data.
     pub fn blocking_write(&mut self, chunk: DataSlice) -> FsResult<()> {
         self.file.as_mut().write_all(chunk.as_slice())?;
-
-        let new_pos = self.pos();
-        self.max_written_pos = self.max_written_pos.max(new_pos);
+        if self.pos() > self.len {
+            self.len = self.pos();
+        }
         Ok(())
     }
 
@@ -155,7 +149,7 @@ impl BlockWriterLocal {
     }
 
     pub fn remaining(&self) -> i64 {
-        self.len - self.pos()
+        self.block_size - self.pos()
     }
 
     pub fn pos(&self) -> i64 {
@@ -174,20 +168,13 @@ impl BlockWriterLocal {
         &self.worker_address
     }
 
-    pub fn max_written_pos(&self) -> i64 {
-        self.max_written_pos
-    }
-
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 {
-            return Err(format!("Cannot seek to negative position: {pos}").into());
+            return err_box!("Cannot seek to negative position: {}", pos);
+        } else if pos > self.block_size {
+            return err_box!("Seek position {} exceeds block capacity {}", pos, self.len);
         }
 
-        if pos >= self.len {
-            return Err(format!("Seek position {pos} exceeds block capacity {}", self.len).into());
-        }
-
-        // For local files, call seek directly
         let file = self.file.clone();
         self.rt
             .spawn_blocking(move || {

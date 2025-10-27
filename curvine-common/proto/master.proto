@@ -167,8 +167,7 @@ message AppendFileRequest {
 }
 
 message AppendFileResponse {
-    required FileStatusProto file_status = 1;
-    optional LocatedBlockProto last_block = 2;
+    required FileBlocksProto status = 1;
 }
 
 message SetAttrOptsProto {

@@ -135,6 +135,7 @@ impl WorkerReplicationManager {
             &self.fs_client_context,
             extend_block,
             job.target_worker_addr.clone(),
+            0,
         )
         .await?;
         let mut reader = block_meta.create_reader(0)?;

@@ -238,9 +238,14 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         }
     }
 
+    // In the UFS storage system, "create" only contains the semantics of "create".
+    // Curvine supports random writes, and "create" contains the semantics of both creating and opening existing files.
+    // To maintain API compatibility, the method name uses "create" to maintain compatibility.
     async fn create(&self, path: &Path, overwrite: bool) -> FsResult<UnifiedWriter> {
         match self.get_mount(path).await? {
-            None => Ok(UnifiedWriter::Cv(self.cv.create(path, overwrite).await?)),
+            None => Ok(UnifiedWriter::Cv(
+                self.cv.open_for_write(path, overwrite).await?,
+            )),
             Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, overwrite).await,
         }
     }
