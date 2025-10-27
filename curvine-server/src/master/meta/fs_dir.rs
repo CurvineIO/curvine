@@ -567,7 +567,7 @@ impl FsDir {
         &mut self,
         inp: &InodePath,
         client_name: impl AsRef<str>,
-    ) -> FsResult<(Option<ExtendedBlock>, FileStatus)> {
+    ) -> FsResult<FileStatus> {
         let op_ms = LocalTime::mills();
         let inode_ptr = match inp.get_last_inode() {
             None => return err_ext!(FsError::file_not_found(inp.path())),
@@ -586,21 +586,18 @@ impl FsDir {
             }
         };
 
-        let last_block;
-        {
-            let file = inode.as_file_mut()?;
-            if !file.is_complete() {
-                return err_box!("Cannot append not complete file {}", inp.path());
-            }
-            last_block = file.append(client_name);
+        let file = inode.as_file_mut()?;
+        if !file.is_complete() {
+            return err_box!("Cannot append not complete file {}", inp.path());
         }
+        let _ = file.append(client_name);
         let status = inode.to_file_status(inp.path());
 
         self.store.apply_append_file(&inode)?;
         self.journal_writer
             .log_append_file(op_ms, inp.path(), inode.as_file_ref()?)?;
 
-        Ok((last_block, status))
+        Ok(status)
     }
 
     // Determine whether the current block has been deleted.

@@ -15,7 +15,7 @@
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
-use crate::master::meta::inode::{InodePath, InodeView, PATH_SEPARATOR};
+use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
@@ -235,11 +235,45 @@ impl MasterFilesystem {
         Ok(status)
     }
 
+    pub fn open_file<T: AsRef<str>>(
+        &self,
+        path: T,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<FileBlocks> {
+        let path = path.as_ref();
+
+        let fs_dir = self.fs_dir.read();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+
+        let inode = match inp.get_last_inode() {
+            None => {
+                return if opts.create() && flags.write() {
+                    drop(fs_dir);
+                    let status = self.create_with_opts(path, opts)?;
+                    Ok(FileBlocks::new(status, vec![]))
+                } else {
+                    err_ext!(FsError::file_not_found(inp.path()))
+                }
+            }
+            Some(inode) => inode,
+        };
+
+        let file = inode.as_file_ref()?;
+        let status = fs_dir.file_status(&inp)?;
+        let blocks = if !file.blocks.is_empty() {
+            self.get_block_locs(path, &fs_dir, file)?
+        } else {
+            vec![]
+        };
+        Ok(FileBlocks::new(status, blocks))
+    }
+
     pub fn append_file<T: AsRef<str>>(
         &self,
         path: T,
         opts: CreateFileOpts,
-    ) -> FsResult<(Option<LocatedBlock>, FileStatus)> {
+    ) -> FsResult<FileBlocks> {
         if !opts.append() {
             return err_box!("Flag error {}, cannot append file", opts.create_flag);
         }
@@ -248,27 +282,22 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
-        if inp.get_last_inode().is_none() {
-            if opts.create() {
-                drop(fs_dir);
-                let status = self.create_with_opts(path, opts)?;
-                Ok((None, status))
-            } else {
-                err_ext!(FsError::file_not_found(inp.path()))
+        match inp.get_last_inode() {
+            None => {
+                if opts.create() {
+                    drop(fs_dir);
+                    let status = self.create_with_opts(path, opts)?;
+                    Ok(FileBlocks::new(status, vec![]))
+                } else {
+                    err_ext!(FsError::file_not_found(inp.path()))
+                }
             }
-        } else {
-            let (last_block, file_status) = fs_dir.append_file(&inp, &opts.client_name)?;
 
-            let last_block = if let Some(last_block) = last_block {
-                let block_locs = fs_dir.get_block_locations(last_block.id)?;
-                let wm = self.worker_manager.read();
-                let lb = wm.create_locate_block(inp.path(), last_block, &block_locs)?;
-                drop(wm);
-                Some(lb)
-            } else {
-                None
-            };
-            Ok((last_block, file_status))
+            Some(inode) => {
+                let file_status = fs_dir.append_file(&inp, &opts.client_name)?;
+                let blocks = self.get_block_locs(path, &fs_dir, inode.as_file_ref()?)?;
+                Ok(FileBlocks::new(file_status, blocks))
+            }
         }
     }
 
@@ -468,14 +497,12 @@ impl MasterFilesystem {
         fs_dir.complete_file(&inp, len, last)
     }
 
-    pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
-        let fs_dir = self.fs_dir.read();
-        let path = path.as_ref();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-
-        let inode = try_option!(inp.get_last_inode(), "File {} not exits", path);
-        let file = inode.as_file_ref()?;
-
+    fn get_block_locs(
+        &self,
+        path: &str,
+        fs_dir: &FsDir,
+        file: &InodeFile,
+    ) -> FsResult<Vec<LocatedBlock>> {
         let wm = self.worker_manager.read();
         let file_locs = fs_dir.get_file_locations(file)?;
         let mut block_locs = Vec::with_capacity(file_locs.len());
@@ -507,6 +534,17 @@ impl MasterFilesystem {
             block_locs.push(lb);
         }
 
+        Ok(block_locs)
+    }
+
+    pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
+        let fs_dir = self.fs_dir.read();
+        let path = path.as_ref();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+
+        let inode = try_option!(inp.get_last_inode(), "File {} not exits", path);
+        let file = inode.as_file_ref()?;
+        let block_locs = self.get_block_locs(path, &fs_dir, file)?;
         let locate_blocks = FileBlocks {
             status: inode.to_file_status(path),
             block_locs,
