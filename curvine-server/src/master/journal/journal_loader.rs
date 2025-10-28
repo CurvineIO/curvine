@@ -68,7 +68,7 @@ impl JournalLoader {
 
             JournalEntry::Delete(e) => self.delete(e),
 
-            JournalEntry::AppendFile(e) => self.append_file(e),
+            JournalEntry::ReopenFile(e) => self.reopen_file(e),
 
             JournalEntry::Mount(e) => self.mount(e),
 
@@ -99,7 +99,7 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn append_file(&self, entry: AppendFileEntry) -> CommonResult<()> {
+    fn reopen_file(&self, entry: ReopenFileEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
@@ -107,7 +107,7 @@ impl JournalLoader {
         let file = inode.as_file_mut()?;
         let _ = mem::replace(file, entry.file);
 
-        fs_dir.store.apply_append_file(inode.as_ref())?;
+        fs_dir.store.apply_reopen_file(inode.as_ref())?;
 
         Ok(())
     }

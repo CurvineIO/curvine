@@ -121,7 +121,10 @@ impl CurvineFileSystem {
             .create_parent(false)
             .build();
 
-        let status = self.fs_client.append(path, opts).await?;
+        let status = self
+            .fs_client
+            .open_with_opts(path, opts, OpenFlags::with_write())
+            .await?;
         let writer = FsWriter::append(self.fs_context.clone(), path.clone(), status);
         Ok(writer)
     }

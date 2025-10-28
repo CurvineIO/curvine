@@ -190,7 +190,7 @@ impl InodeFile {
         }
     }
 
-    pub fn append(&mut self, client_name: impl AsRef<str>) -> Option<ExtendedBlock> {
+    pub fn reopen(&mut self, client_name: impl AsRef<str>) -> Option<ExtendedBlock> {
         let _ = self
             .features
             .file_write
