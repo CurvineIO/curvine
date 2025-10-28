@@ -284,7 +284,7 @@ mod test {
         // println!("{:#?}", dataset.dir_list.dirs());
 
         let block = ExtendedBlock::with_mem(11226688, "100B")?;
-        let tmp_meta = dataset.create_block(&block)?;
+        let tmp_meta = dataset.open_block(&block)?;
         assert_eq!(dataset.available(), 400);
 
         // commit block
@@ -295,7 +295,7 @@ mod test {
 
         // abort block。
         let block = ExtendedBlock::with_mem(11226699, "100B")?;
-        let tmp_meta1 = dataset.create_block(&block)?;
+        let tmp_meta1 = dataset.open_block(&block)?;
         assert_eq!(dataset.available(), 350);
         tmp_meta1.write_test_data("50B")?;
 
@@ -311,12 +311,12 @@ mod test {
         let mut dataset = create_data_set(true, "append");
         let block = ExtendedBlock::with_mem(11226688, "100B")?;
 
-        let tmp_meta = dataset.create_block(&block)?;
+        let tmp_meta = dataset.open_block(&block)?;
         tmp_meta.write_test_data("50B")?;
         dataset.finalize_block(&block)?;
 
         // append
-        let new_meta = dataset.append_block(50, &block)?;
+        let new_meta = dataset.reopen_block(&block)?;
         assert_eq!(dataset.available(), 400);
 
         new_meta.write_test_data("20B")?;
@@ -332,7 +332,7 @@ mod test {
         for id in 1..12 {
             let size = format!("{}B", id);
             let block = ExtendedBlock::with_mem(id, &size)?;
-            let tmp_meta = dataset.create_block(&block)?;
+            let tmp_meta = dataset.open_block(&block)?;
             tmp_meta.write_test_data(&size)?;
 
             if id != 11 {

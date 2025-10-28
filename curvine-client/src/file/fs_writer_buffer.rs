@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::file::fs_writer_buffer::WriterAdapter::{Base, Buffer};
 use crate::file::FsWriterBase;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
@@ -36,44 +37,157 @@ enum SelectTask {
     Data(DataSlice),
 }
 
+struct BufferChannel {
+    chunk_sender: AsyncSender<DataSlice>,
+    task_sender: AsyncSender<WriterTask>,
+    err_monitor: Arc<ErrorMonitor<FsError>>,
+}
+
+impl BufferChannel {
+    fn check_error(&self, e: FsError) -> FsError {
+        self.err_monitor.take_error().unwrap_or(e)
+    }
+
+    async fn write(&mut self, data: DataSlice) -> FsResult<()> {
+        match self.chunk_sender.send(data).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(self.check_error(e.into())),
+        }
+    }
+
+    async fn complete(&mut self) -> FsResult<()> {
+        let res: FsResult<()> = {
+            let (tx, rx) = CallChannel::channel();
+            self.task_sender
+                .send(WriterTask::Complete((false, tx)))
+                .await?;
+            rx.receive().await?;
+            Ok(())
+        };
+
+        match res {
+            Err(e) => Err(self.check_error(e)),
+            Ok(_) => Ok(()),
+        }
+    }
+
+    async fn flush(&mut self) -> FsResult<()> {
+        let res: FsResult<()> = {
+            let (tx, rx) = CallChannel::channel();
+            self.task_sender.send(WriterTask::Flush(tx)).await?;
+            rx.receive().await?;
+            Ok(())
+        };
+
+        match res {
+            Err(e) => Err(self.check_error(e)),
+            Ok(_) => Ok(()),
+        }
+    }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        let res: FsResult<()> = {
+            let (tx, rx) = CallChannel::channel();
+
+            if let Err(e) = self.task_sender.send(WriterTask::Seek((pos, tx))).await {
+                return Err(e.into());
+            }
+
+            if let Err(e) = rx.receive().await {
+                return Err(e.into());
+            }
+            Ok(())
+        };
+
+        match res {
+            Err(e) => Err(self.check_error(e)),
+            Ok(_) => Ok(()),
+        }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+enum WriterAdapter {
+    Buffer(BufferChannel),
+    Base(FsWriterBase),
+}
+
+impl WriterAdapter {
+    async fn write(&mut self, data: DataSlice) -> FsResult<()> {
+        match self {
+            Base(w) => w.write(data).await,
+            Buffer(w) => w.write(data).await,
+        }
+    }
+
+    async fn flush(&mut self) -> FsResult<()> {
+        match self {
+            Base(w) => w.flush().await,
+            Buffer(w) => w.flush().await,
+        }
+    }
+    async fn complete(&mut self) -> FsResult<()> {
+        match self {
+            Base(w) => w.complete().await,
+            Buffer(w) => w.complete().await,
+        }
+    }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        match self {
+            Base(w) => w.seek(pos).await,
+            Buffer(w) => w.seek(pos).await,
+        }
+    }
+}
+
 // Reader with buffer.
 pub struct FsWriterBuffer {
     path: Path,
     status: FileStatus,
-    chunk_sender: AsyncSender<DataSlice>,
-    task_sender: AsyncSender<WriterTask>,
-    err_monitor: Arc<ErrorMonitor<FsError>>,
+    writer: WriterAdapter,
     pos: i64,
 }
 
 impl FsWriterBuffer {
     pub fn new(writer: FsWriterBase, chunk_num: usize) -> Self {
-        let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
-        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+        let err_monitor = Arc::new(ErrorMonitor::new());
+        let path = writer.path().clone();
+        let status = writer.status().clone();
+        let pos = writer.pos();
 
-        let buf_writer = Self {
-            path: writer.path().clone(),
-            status: writer.status().clone(),
-            chunk_sender,
-            task_sender,
-            err_monitor: Arc::new(ErrorMonitor::new()),
-            pos: writer.pos(),
+        let writer = if chunk_num == 1 {
+            Base(writer)
+        } else {
+            let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
+            let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+            let monitor = err_monitor.clone();
+
+            let rt = writer.fs_context().clone_runtime();
+            rt.spawn(async move {
+                let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
+                match res {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("buffer writer error: {:?}", e);
+                        monitor.set_error(e);
+                    }
+                }
+            });
+
+            Buffer(BufferChannel {
+                chunk_sender,
+                task_sender,
+                err_monitor,
+            })
         };
 
-        let rt = writer.fs_context().clone_runtime();
-        let err_monitor = buf_writer.err_monitor.clone();
-        rt.spawn(async move {
-            let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
-            match res {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("buffer writer error: {:?}", e);
-                    err_monitor.set_error(e);
-                }
-            }
-        });
-
-        buf_writer
+        Self {
+            path,
+            status,
+            writer,
+            pos,
+        }
     }
 
     pub fn path_str(&self) -> &str {
@@ -96,97 +210,28 @@ impl FsWriterBuffer {
         &mut self.pos
     }
 
-    pub fn check_error(&self, e: FsError) -> FsError {
-        match self.err_monitor.take_error() {
-            Some(e) => e,
-            None => e,
-        }
-    }
-
     pub async fn write(&mut self, data: DataSlice) -> FsResult<()> {
         let len = data.len();
         if len == 0 {
             return Ok(());
         }
-        match self.chunk_sender.send(data).await {
-            Ok(_) => {
-                self.pos += len as i64;
-                Ok(())
-            }
-
-            Err(e) => Err(self.check_error(e.into())),
-        }
+        self.writer.write(data).await?;
+        self.pos += len as i64;
+        Ok(())
     }
 
     pub async fn complete(&mut self) -> FsResult<()> {
-        let res: FsResult<()> = {
-            let (tx, rx) = CallChannel::channel();
-            self.task_sender
-                .send(WriterTask::Complete((false, tx)))
-                .await?;
-            rx.receive().await?;
-            Ok(())
-        };
-
-        match res {
-            Err(e) => Err(self.check_error(e)),
-            Ok(_) => Ok(()),
-        }
-    }
-
-    pub async fn cancel(&mut self) -> FsResult<()> {
-        let res: FsResult<()> = {
-            let (tx, rx) = CallChannel::channel();
-            self.task_sender
-                .send(WriterTask::Complete((true, tx)))
-                .await?;
-            rx.receive().await?;
-            Ok(())
-        };
-
-        match res {
-            Err(e) => Err(self.check_error(e)),
-            Ok(_) => Ok(()),
-        }
+        self.writer.complete().await
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        let res: FsResult<()> = {
-            let (tx, rx) = CallChannel::channel();
-            self.task_sender.send(WriterTask::Flush(tx)).await?;
-            rx.receive().await?;
-            Ok(())
-        };
-
-        match res {
-            Err(e) => Err(self.check_error(e)),
-            Ok(_) => Ok(()),
-        }
+        self.writer.flush().await
     }
 
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        let res: FsResult<()> = {
-            let (tx, rx) = CallChannel::channel();
-
-            if let Err(e) = self.task_sender.send(WriterTask::Seek((pos, tx))).await {
-                return Err(e.into());
-            }
-
-            if let Err(e) = rx.receive().await {
-                return Err(e.into());
-            }
-            Ok(())
-        };
-
-        // Update position (note: actual seek is executed by background task)
-        if res.is_ok() {
-            self.pos = pos;
-        }
-
-        match res {
-            Err(e) => Err(self.check_error(e)),
-            Ok(_) => Ok(()),
-        }
+        self.writer.seek(pos).await?;
+        self.pos = pos;
+        Ok(())
     }
 
     async fn write_future(

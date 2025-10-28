@@ -158,7 +158,19 @@ impl CurvineFileSystem {
     }
 
     pub async fn open(&self, path: &Path) -> FsResult<FsReader> {
-        self.open_for_read(path).await
+        let file_blocks = self.fs_client.get_block_locations(path).await?;
+        Self::check_read_status(path, &file_blocks)?;
+
+        let reader = FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)?;
+        Ok(reader)
+    }
+
+    pub async fn open_direct(&self, path: &Path) -> FsResult<FsReaderBase> {
+        let file_blocks = self.fs_client.get_block_locations(path).await?;
+        Self::check_read_status(path, &file_blocks)?;
+
+        let reader = FsReaderBase::new(path.clone(), self.fs_context.clone(), file_blocks);
+        Ok(reader)
     }
 
     pub async fn open_for_read(&self, path: &Path) -> FsResult<FsReader> {
@@ -193,22 +205,6 @@ impl CurvineFileSystem {
             .await?;
         let writer = FsWriter::create(self.fs_context.clone(), path.clone(), file_blocks);
         Ok(writer)
-    }
-
-    pub async fn open_direct(&self, path: &Path) -> FsResult<FsReaderBase> {
-        let create_opts = self
-            .create_opts_builder()
-            .create(false)
-            .overwrite(false)
-            .append(false)
-            .create_parent(false)
-            .build();
-
-        let file_blocks = self
-            .open_with_opts(path, create_opts, OpenFlags::with_read())
-            .await?;
-        let reader = FsReaderBase::new(path.clone(), self.fs_context.clone(), file_blocks);
-        Ok(reader)
     }
 
     pub async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {

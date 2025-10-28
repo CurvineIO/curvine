@@ -367,7 +367,7 @@ mod test {
 
         // add tmp block
         let block = ExtendedBlock::with_size_str(1122, "10MB", StorageType::Mem)?;
-        let tmp = dir.create_block(&block)?;
+        let tmp = dir.open_block(&block)?;
         dir.reserve_space(false, block.len);
 
         let tmp_file = tmp.get_block_path()?;

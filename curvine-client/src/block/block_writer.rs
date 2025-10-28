@@ -162,17 +162,15 @@ impl BlockWriter {
 
     pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
         let chunk = chunk.freeze();
-        let mut futures = Vec::with_capacity(self.inners.len());
-        for writer in self.inners.iter_mut() {
+        let futures = self.inners.iter_mut().map(|writer| {
             let chunk_clone = chunk.clone();
-            let task = async move {
+            async move {
                 writer
                     .write(chunk_clone)
                     .await
                     .map_err(|e| (writer.worker_address().clone(), e))
-            };
-            futures.push(task);
-        }
+            }
+        });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
             self.fs_context.add_failed_worker(&worker_addr);
@@ -197,16 +195,12 @@ impl BlockWriter {
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        let mut futures = Vec::with_capacity(self.inners.len());
-        for writer in self.inners.iter_mut() {
-            let task = async move {
-                writer
-                    .flush()
-                    .await
-                    .map_err(|e| (writer.worker_address().clone(), e))
-            };
-            futures.push(task);
-        }
+        let futures = self.inners.iter_mut().map(|writer| async move {
+            writer
+                .flush()
+                .await
+                .map_err(|e| (writer.worker_address().clone(), e))
+        });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
             self.fs_context.add_failed_worker(&worker_addr);
@@ -216,16 +210,12 @@ impl BlockWriter {
     }
 
     pub async fn complete(&mut self) -> FsResult<CommitBlock> {
-        let mut futures = Vec::with_capacity(self.inners.len());
-        for writer in self.inners.iter_mut() {
-            let task = async move {
-                writer
-                    .complete()
-                    .await
-                    .map_err(|e| (writer.worker_address().clone(), e))
-            };
-            futures.push(task);
-        }
+        let futures = self.inners.iter_mut().map(|writer| async move {
+            writer
+                .complete()
+                .await
+                .map_err(|e| (writer.worker_address().clone(), e))
+        });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
             self.fs_context.add_failed_worker(&worker_addr);
@@ -235,16 +225,12 @@ impl BlockWriter {
     }
 
     pub async fn cancel(&mut self) -> FsResult<()> {
-        let mut futures = Vec::with_capacity(self.inners.len());
-        for writer in self.inners.iter_mut() {
-            let task = async move {
-                writer
-                    .cancel()
-                    .await
-                    .map_err(|e| (writer.worker_address().clone(), e))
-            };
-            futures.push(task);
-        }
+        let futures = self.inners.iter_mut().map(|writer| async move {
+            writer
+                .cancel()
+                .await
+                .map_err(|e| (writer.worker_address().clone(), e))
+        });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
             self.fs_context.add_failed_worker(&worker_addr);
@@ -284,16 +270,12 @@ impl BlockWriter {
             return err_box!("Cannot seek to negative position: {}", pos);
         }
 
-        let mut futures = Vec::with_capacity(self.inners.len());
-        for writer in self.inners.iter_mut() {
-            let task = async move {
-                writer
-                    .seek(pos)
-                    .await
-                    .map_err(|e| (writer.worker_address().clone(), e))
-            };
-            futures.push(task);
-        }
+        let futures = self.inners.iter_mut().map(|writer| async move {
+            writer
+                .seek(pos)
+                .await
+                .map_err(|e| (writer.worker_address().clone(), e))
+        });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
             self.fs_context.add_failed_worker(&worker_addr);
