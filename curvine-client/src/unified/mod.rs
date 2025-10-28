@@ -39,6 +39,7 @@ pub use self::unified_filesystem::UnifiedFileSystem;
 mod mount_cache;
 pub use self::mount_cache::*;
 
+#[allow(clippy::large_enum_variant)]
 pub enum UnifiedWriter {
     Cv(FsWriter),
 
