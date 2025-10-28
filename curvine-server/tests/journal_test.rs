@@ -16,7 +16,7 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::fs::CurvineURI;
 use curvine_common::raft::{NodeId, RaftPeer};
 use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, WorkerInfo,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags, WorkerInfo,
 };
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{JournalLoader, JournalSystem};
@@ -207,7 +207,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
         block_len: 13,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
     };
-    fs_leader.append_file(path, CreateFileOpts::with_append())?;
+    fs_leader.open_file(path, CreateFileOpts::with_append(), OpenFlags::with_write())?;
     fs_leader.complete_file(path, 13, Some(commit), "")?;
 
     Ok(())

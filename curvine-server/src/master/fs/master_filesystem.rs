@@ -243,7 +243,7 @@ impl MasterFilesystem {
     ) -> FsResult<FileBlocks> {
         let path = path.as_ref();
 
-        let fs_dir = self.fs_dir.read();
+        let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
@@ -259,46 +259,19 @@ impl MasterFilesystem {
             Some(inode) => inode,
         };
 
+        let status = if flags.write() {
+            fs_dir.reopen_file(&inp, opts.client_name)?
+        } else {
+            fs_dir.file_status(&inp)?
+        };
+
         let file = inode.as_file_ref()?;
-        let status = fs_dir.file_status(&inp)?;
         let blocks = if !file.blocks.is_empty() {
             self.get_block_locs(path, &fs_dir, file)?
         } else {
             vec![]
         };
         Ok(FileBlocks::new(status, blocks))
-    }
-
-    pub fn append_file<T: AsRef<str>>(
-        &self,
-        path: T,
-        opts: CreateFileOpts,
-    ) -> FsResult<FileBlocks> {
-        if !opts.append() {
-            return err_box!("Flag error {}, cannot append file", opts.create_flag);
-        }
-        let path = path.as_ref();
-
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
-
-        match inp.get_last_inode() {
-            None => {
-                if opts.create() {
-                    drop(fs_dir);
-                    let status = self.create_with_opts(path, opts)?;
-                    Ok(FileBlocks::new(status, vec![]))
-                } else {
-                    err_ext!(FsError::file_not_found(inp.path()))
-                }
-            }
-
-            Some(inode) => {
-                let file_status = fs_dir.append_file(&inp, &opts.client_name)?;
-                let blocks = self.get_block_locs(path, &fs_dir, inode.as_file_ref()?)?;
-                Ok(FileBlocks::new(file_status, blocks))
-            }
-        }
     }
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {

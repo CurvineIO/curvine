@@ -78,16 +78,6 @@ impl FsClient {
         Ok(status)
     }
 
-    pub async fn append(&self, path: &Path, opts: CreateFileOpts) -> FsResult<FileBlocks> {
-        let header = AppendFileRequest {
-            path: path.encode(),
-            opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
-        };
-        let rep_header: AppendFileResponse = self.rpc(RpcCode::AppendFile, header).await?;
-        let status = ProtoUtils::file_blocks_from_pb(rep_header.status);
-        Ok(status)
-    }
-
     pub async fn open_with_opts(
         &self,
         path: &Path,

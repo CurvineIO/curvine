@@ -256,26 +256,6 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
-    pub fn retry_check_append_file(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let req: AppendFileRequest = ctx.parse_header()?;
-        let opts = ProtoUtils::create_opts_from_pb(req.opts);
-        ctx.set_audit(Some(req.path.to_string()), None);
-
-        if self.check_is_retry(ctx.msg.req_id())? {
-            // @todo Currently, it is directly reported, and subsequent optimizations are made.
-            return err_box!("append {} repeat request", req.path);
-        }
-
-        let res = {
-            let status = self.fs.append_file(&req.path, opts)?;
-            let rep_header = AppendFileResponse {
-                status: ProtoUtils::file_blocks_to_pb(status),
-            };
-            ctx.response(rep_header)
-        };
-        self.set_req_cache(ctx.msg.req_id(), res)
-    }
-
     pub fn get_block_locations(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: GetBlockLocationsRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.path.to_string()), None);
@@ -454,7 +434,6 @@ impl MessageHandler for MasterHandler {
             // File system operation request
             RpcCode::Mkdir => self.mkdir(ctx),
             RpcCode::CreateFile => self.retry_check_create_file(ctx),
-            RpcCode::AppendFile => self.retry_check_append_file(ctx),
             RpcCode::OpenFile => self.retry_check_open_file(ctx),
             RpcCode::FileStatus => self.file_status(ctx),
             RpcCode::AddBlock => self.add_block(ctx),

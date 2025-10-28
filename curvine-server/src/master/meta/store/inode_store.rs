@@ -211,7 +211,7 @@ impl InodeStore {
         batch.commit()
     }
 
-    pub fn apply_append_file(&self, file: &InodeView) -> CommonResult<()> {
+    pub fn apply_reopen_file(&self, file: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         batch.write_inode(file)?;
         batch.commit()

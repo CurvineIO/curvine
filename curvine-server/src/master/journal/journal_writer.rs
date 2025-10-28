@@ -106,18 +106,18 @@ impl JournalWriter {
         self.send(JournalEntry::CreateFile(entry))
     }
 
-    pub fn log_append_file<P: AsRef<str>>(
+    pub fn log_reopen_file<P: AsRef<str>>(
         &self,
         op_ms: u64,
         path: P,
         file: &InodeFile,
     ) -> FsResult<()> {
-        let entry = AppendFileEntry {
+        let entry = ReopenFileEntry {
             op_ms,
             path: path.as_ref().to_string(),
             file: file.clone(),
         };
-        self.send(JournalEntry::AppendFile(entry))
+        self.send(JournalEntry::ReopenFile(entry))
     }
 
     pub fn log_add_block<P: AsRef<str>>(

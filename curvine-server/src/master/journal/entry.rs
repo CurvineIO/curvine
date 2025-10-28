@@ -32,7 +32,7 @@ pub struct CreateFileEntry {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct AppendFileEntry {
+pub struct ReopenFileEntry {
     pub(crate) op_ms: u64,
     pub(crate) path: String,
     pub(crate) file: InodeFile,
@@ -121,7 +121,7 @@ pub struct LinkEntry {
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
-    AppendFile(AppendFileEntry),
+    ReopenFile(ReopenFileEntry),
     OverWriteFile(OverWriteFileEntry),
     AddBlock(AddBlockEntry),
     CompleteFile(CompleteFileEntry),

@@ -47,6 +47,22 @@ pub struct CommitBlock {
     pub locations: Vec<BlockLocation>,
 }
 
+impl From<&LocatedBlock> for CommitBlock {
+    fn from(located_block: &LocatedBlock) -> Self {
+        let locations: Vec<BlockLocation> = located_block
+            .locs
+            .iter()
+            .map(|x| BlockLocation::new(x.worker_id, located_block.storage_type))
+            .collect();
+
+        Self {
+            block_id: located_block.id,
+            block_len: located_block.block.len,
+            locations,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExtendedBlock {
     pub id: i64,
@@ -204,11 +220,14 @@ impl WriteFileBlocks {
             search_off.push(Range { start, end: off });
         }
 
+        // file commit needs to submit the last block
+        let last_commit = file_blocks.block_locs.last().map(|x| x.into());
+
         Self {
             status: file_blocks.status,
             block_locs: file_blocks.block_locs,
             search_off,
-            last_commit: None,
+            last_commit,
         }
     }
 

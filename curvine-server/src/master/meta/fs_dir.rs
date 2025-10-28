@@ -563,7 +563,7 @@ impl FsDir {
         Ok(self.store.get_block_locations(block_id)?)
     }
 
-    pub fn append_file(
+    pub fn reopen_file(
         &mut self,
         inp: &InodePath,
         client_name: impl AsRef<str>,
@@ -590,12 +590,12 @@ impl FsDir {
         if !file.is_complete() {
             return err_box!("Cannot append not complete file {}", inp.path());
         }
-        let _ = file.append(client_name);
+        let _ = file.reopen(client_name);
         let status = inode.to_file_status(inp.path());
 
-        self.store.apply_append_file(&inode)?;
+        self.store.apply_reopen_file(&inode)?;
         self.journal_writer
-            .log_append_file(op_ms, inp.path(), inode.as_file_ref()?)?;
+            .log_reopen_file(op_ms, inp.path(), inode.as_file_ref()?)?;
 
         Ok(status)
     }
