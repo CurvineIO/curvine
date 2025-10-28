@@ -16,6 +16,7 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_server::test::MiniCluster;
+use once_cell::sync::OnceCell;
 use orpc::common::{FileUtils, Logger, Utils};
 use orpc::io::LocalFile;
 use orpc::runtime::Runtime;
@@ -26,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type ConfMutator = Arc<dyn Fn(&mut ClusterConf) + Send + Sync>;
 
+#[derive(Clone)]
 pub struct Testing {
     pub s3_conf_path: String,
     pub master_num: u16,
@@ -39,15 +41,14 @@ pub struct Testing {
 
 impl Testing {
     /// Create a unique temp config file path under /tmp for this Testing instance.
-    fn new_tmp_conf_path() -> String {
+    fn new_tmp_path() -> String {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis();
         let pid = std::process::id();
         let rand = Utils::rand_str(6);
-        let dir = format!("/tmp/curvine-tests/{}-{}-{}", ts, pid, rand);
-        format!("{}/curvine-cluster.toml", dir)
+        format!("../testing/curvine-tests/{}-{}-{}", ts, pid, rand)
     }
 
     /// Start the cluster using the prepared configuration, and persist to active_cluster_conf.
@@ -136,6 +137,20 @@ impl Testing {
     }
 }
 
+static DEFAULT: OnceCell<Testing> = OnceCell::new();
+
+impl Default for Testing {
+    fn default() -> Self {
+        DEFAULT
+            .get_or_init(|| {
+                let testing = Testing::builder().workers(3).build().unwrap();
+                testing.start_cluster().unwrap();
+                testing
+            })
+            .clone()
+    }
+}
+
 impl Drop for Testing {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.active_cluster_conf_path);
@@ -207,7 +222,7 @@ impl TestingBuilder {
     }
 
     pub fn build(self) -> CommonResult<Testing> {
-        let conf = if let Some(c) = self.base_conf {
+        let mut conf = if let Some(c) = self.base_conf {
             c
         } else if let Some(p) = self.base_conf_path {
             ClusterConf::from(p)?
@@ -215,7 +230,13 @@ impl TestingBuilder {
             ClusterConf::default()
         };
 
-        let active_cluster_conf_path = Testing::new_tmp_conf_path();
+        let base_path = Testing::new_tmp_path();
+        let active_cluster_conf_path = format!("{}/curvine-cluster.toml", base_path);
+        conf.master.meta_dir = format!("{}/meta", base_path);
+        conf.journal.journal_dir = format!("{}/journal", base_path);
+        conf.worker.data_dir = vec![format!("{}/data", base_path)];
+        conf.master.min_block_size = 1024;
+        conf.journal.raft_tick_interval_ms = 100;
         let s3_conf_path = self
             .s3_conf_path
             .unwrap_or_else(|| "../testing/s3.toml".to_string());
