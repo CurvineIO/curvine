@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::useless_vec)]
+
 use bytes::BytesMut;
-use curvine_client::file::CurvineFileSystem;
+use curvine_client::file::{CurvineFileSystem, FsWriter};
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
@@ -26,12 +28,10 @@ use orpc::runtime::RpcRuntime;
 use orpc::{CommonError, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
-
 // Test local short-circuit read and write
 #[test]
 fn local() -> CommonResult<()> {
-    let testing = Testing::builder().default().build()?;
-    testing.start_cluster()?;
+    let testing = Testing::default();
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
     let path = Path::from_str("/file_local.data")?;
@@ -40,8 +40,7 @@ fn local() -> CommonResult<()> {
 
 #[test]
 fn remote() -> CommonResult<()> {
-    let testing = Testing::builder().default().build()?;
-    testing.start_cluster()?;
+    let testing = Testing::default();
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
     let path = Path::from_str("/file_remote.data")?;
@@ -50,8 +49,8 @@ fn remote() -> CommonResult<()> {
 
 #[test]
 fn remote_parallel_1() -> CommonResult<()> {
-    let testing = Testing::builder().default().build()?;
-    testing.start_cluster()?;
+    let testing = Testing::default();
+
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
 
@@ -68,8 +67,8 @@ fn remote_parallel_1() -> CommonResult<()> {
 
 #[test]
 fn remote_parallel_4() -> CommonResult<()> {
-    let testing = Testing::builder().default().build()?;
-    testing.start_cluster()?;
+    let testing = Testing::default();
+
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
 
@@ -86,8 +85,8 @@ fn remote_parallel_4() -> CommonResult<()> {
 
 #[test]
 fn remote_parallel_4_cache() -> CommonResult<()> {
-    let testing = Testing::builder().default().build()?;
-    testing.start_cluster()?;
+    let testing = Testing::default();
+
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
 
@@ -104,8 +103,8 @@ fn remote_parallel_4_cache() -> CommonResult<()> {
 
 #[test]
 fn replicas_3() -> CommonResult<()> {
-    let testing = Testing::builder().default().build()?;
-    testing.start_cluster()?;
+    let testing = Testing::default();
+
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
     conf.client.replicas = 3;
@@ -136,8 +135,8 @@ fn replicas_3() -> CommonResult<()> {
 
 #[test]
 fn append_local() -> CommonResult<()> {
-    let testing = Testing::builder().default().build()?;
-    testing.start_cluster()?;
+    let testing = Testing::default();
+
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
     conf.client.replicas = 2;
@@ -147,19 +146,19 @@ fn append_local() -> CommonResult<()> {
 
 #[test]
 fn append_remote() -> CommonResult<()> {
-    let testing = Testing::builder().default().build()?;
-    testing.start_cluster()?;
-    let mut conf = testing.get_active_cluster_conf()?;
+    let testing = Testing::default();
+
+    let mut conf = testing.get_active_cluster_conf().unwrap();
     conf.client.short_circuit = false;
     conf.client.replicas = 2;
-    let path = Path::from_str("/append_remote.data")?;
+    let path = Path::from_str("/append_remote.data").unwrap();
     append(testing, conf, path)
 }
 
 fn append(testing: Testing, mut conf: ClusterConf, path: Path) -> CommonResult<()> {
     conf.client.block_size = 1024 * 1024;
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf)).unwrap();
 
     rt.block_on(async move {
         fs.write_string(&path, "123").await.unwrap();
@@ -178,8 +177,7 @@ fn append(testing: Testing, mut conf: ClusterConf, path: Path) -> CommonResult<(
 
 // @todo cannot be completed in parallel tests, follow-up optimization.
 fn _abort() -> CommonResult<()> {
-    let testing = Testing::builder().default().build()?;
-    testing.start_cluster()?;
+    let testing = Testing::default();
     let conf = testing.get_active_cluster_conf()?;
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
@@ -303,183 +301,111 @@ async fn seek(fs: &CurvineFileSystem, path: &Path) -> CommonResult<()> {
 }
 
 #[test]
-fn random_write_multiple_blocks() -> CommonResult<()> {
-    let testing = Testing::builder().default().build()?;
-    testing.start_cluster()?;
+fn random_write_local() -> CommonResult<()> {
+    let testing = Testing::default();
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
-    conf.client.block_size = 1024 * 1024; // 1MB block size
-    let path = Path::from_str("/random_write_multiple_blocks.data")?;
+    random_write(conf, "local")
+}
+
+#[test]
+fn random_write_remote() -> CommonResult<()> {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    random_write(conf, "remote")
+}
+
+#[test]
+fn random_write_local_replicas() -> CommonResult<()> {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = true;
+    conf.client.replicas = 2;
+    random_write(conf, "local_replicas")
+}
+
+#[test]
+fn random_write_remote_replicas() -> CommonResult<()> {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.replicas = 2;
+    random_write(conf, "remote_replicas")
+}
+
+fn random_write(mut conf: ClusterConf, mark: &str) -> CommonResult<()> {
+    let block_size = 1024;
+    conf.client.block_size = block_size; // 1KB block size
 
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
-    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    let fs = Testing::default().get_fs(Some(rt.clone()), Some(conf))?;
 
-    rt.block_on(async move { random_write_multiple_blocks_test(&fs, &path).await })
-        .unwrap();
+    rt.block_on(async move {
+        let data = BytesMut::from(Utils::rand_str(2 * 1024).as_bytes());
+
+        // create mode
+        let path = Path::from_str(format!("/random_write_create_{}.data", mark))?;
+        let mut writer = fs.create(&path, true).await?;
+        writer.write(&data).await?;
+        test_random_write(&fs, writer, block_size, data.clone()).await?;
+
+        //  open mode
+        let path = Path::from_str(format!("/random_write_overwrite_{}.data", mark))?;
+        let mut writer = fs.create(&path, true).await?;
+        writer.write(&data).await?;
+        writer.complete().await?;
+        let writer = fs.open_for_write(&path, false).await?;
+        test_random_write(&fs, writer, block_size, data).await?;
+
+        Ok::<(), FsError>(())
+    })
+    .unwrap();
 
     Ok(())
 }
 
-async fn random_write_multiple_blocks_test(
+/// Test specified write mode
+async fn test_random_write(
     fs: &CurvineFileSystem,
-    path: &Path,
+    mut writer: FsWriter,
+    block_size: i64,
+    mut expect_data: BytesMut,
 ) -> CommonResult<()> {
-    let block_size = 1024 * 1024; // 1MB
-    let total_blocks = 3;
-    let total_size = block_size * total_blocks;
-    let mut expected_content = vec![0u8; total_size];
-
-    // Create writer
-    let mut writer = fs.create(path, true).await?;
-
-    // Phase 1: Initial writes across all blocks
-    let initial_writes = vec![
-        // Block 0 initial writes
-        (0, "INITIAL_START_BLOCK0".as_bytes()),
-        (block_size / 4, "INITIAL_QUARTER_BLOCK0".as_bytes()),
-        (block_size / 2, "INITIAL_MIDDLE_BLOCK0".as_bytes()),
-        (block_size * 3 / 4, "INITIAL_3QUARTER_BLOCK0".as_bytes()),
-        // Block 1 initial writes
-        (block_size + 100, "INITIAL_START_BLOCK1".as_bytes()),
-        (
-            block_size + block_size / 4,
-            "INITIAL_QUARTER_BLOCK1".as_bytes(),
-        ),
-        (
-            block_size + block_size / 2,
-            "INITIAL_MIDDLE_BLOCK1".as_bytes(),
-        ),
-        (
-            block_size + block_size * 3 / 4,
-            "INITIAL_3QUARTER_BLOCK1".as_bytes(),
-        ),
-        // Block 2 initial writes
-        (block_size * 2 + 200, "INITIAL_START_BLOCK2".as_bytes()),
-        (
-            block_size * 2 + block_size / 4,
-            "INITIAL_QUARTER_BLOCK2".as_bytes(),
-        ),
-        (
-            block_size * 2 + block_size / 2,
-            "INITIAL_MIDDLE_BLOCK2".as_bytes(),
-        ),
-        (
-            block_size * 2 + block_size * 3 / 4,
-            "INITIAL_3QUARTER_BLOCK2".as_bytes(),
-        ),
-        // Cross-block boundary writes
-        (block_size - 20, "INITIAL_CROSS_BLOCK01_BOUNDARY".as_bytes()),
-        (
-            block_size * 2 - 25,
-            "INITIAL_CROSS_BLOCK12_BOUNDARY".as_bytes(),
-        ),
+    let write_positions = vec![
+        256,              // block 0 1/4 position
+        0,                // block 0 start
+        768,              // block 0 3/4 position
+        512,              // block 0 middle
+        block_size + 128, // block 1 start
+        block_size + 384, // block 1 1/4 position
+        block_size + 896, // block 1 3/4 position
+        block_size + 640, // block 1 middle
+        // Random position test
+        100,
+        500,
+        1500,
+        1200,
+        1900,
+        1800,
     ];
 
-    // Apply initial writes
-    for (offset, data) in &initial_writes {
-        writer.seek(*offset as i64).await?;
-        writer.write(data).await?;
+    for pos in write_positions.iter() {
+        // Random data
+        let str = Utils::rand_str(20);
 
-        // Update expected content
-        let end_pos = (*offset + data.len()).min(expected_content.len());
-        if *offset < expected_content.len() {
-            let copy_len = end_pos - offset;
-            expected_content[*offset..end_pos].copy_from_slice(&data[0..copy_len]);
-        }
+        writer.seek(*pos).await?;
+        writer.write(str.as_bytes()).await?;
+
+        let (start, end) = (*pos as usize, writer.pos() as usize);
+        println!("pos {} {}", start, end);
+        expect_data[start..end].copy_from_slice(str.as_bytes());
     }
-
-    // Phase 2: Overwrite operations - later writes overwrite earlier content
-    let overwrite_operations = vec![
-        // Overwrite in Block 0 - should overwrite initial content
-        (0, "OVERWRITE_START_B0".as_bytes()), // Overwrites "INITIAL_START_BLOCK0"
-        (block_size / 4 + 5, "OVERWRITE_QUARTER_B0".as_bytes()), // Partial overwrite of quarter position
-        (
-            block_size / 2 - 10,
-            "OVERWRITE_MIDDLE_B0_EXTENDED".as_bytes(),
-        ), // Overwrites and extends middle
-        // Overwrite in Block 1 - should overwrite initial content
-        (block_size + 100, "OVERWRITE_START_B1".as_bytes()), // Overwrites "INITIAL_START_BLOCK1"
-        (
-            block_size + block_size / 2 + 8,
-            "OVERWRITE_MID_B1".as_bytes(),
-        ), // Partial overwrite of middle
-        (
-            block_size + block_size * 3 / 4 - 5,
-            "OVERWRITE_3Q_B1_LONG".as_bytes(),
-        ), // Overwrites 3/4 position
-        // Overwrite in Block 2 - should overwrite initial content
-        (block_size * 2 + 200, "OVERWRITE_START_B2".as_bytes()), // Overwrites "INITIAL_START_BLOCK2"
-        (
-            block_size * 2 + block_size / 4 + 10,
-            "OVERWRITE_Q_B2".as_bytes(),
-        ), // Partial overwrite
-        // Cross-block boundary overwrites - should overwrite initial boundary writes
-        (block_size - 20, "OVERWRITE_CROSS_01".as_bytes()), // Overwrites initial cross-block write
-        (block_size * 2 - 25, "OVERWRITE_CROSS_12".as_bytes()), // Overwrites initial cross-block write
-        // Additional overwrites to test multiple overwrite layers
-        (50, "FINAL_OVERWRITE_B0".as_bytes()), // Another overwrite in block 0
-        (block_size + 150, "FINAL_OVERWRITE_B1".as_bytes()), // Another overwrite in block 1
-        (block_size * 2 + 250, "FINAL_OVERWRITE_B2".as_bytes()), // Another overwrite in block 2
-    ];
-
-    // Apply overwrite operations
-    for (offset, data) in &overwrite_operations {
-        writer.seek(*offset as i64).await?;
-        writer.write(data).await?;
-
-        // Update expected content (this simulates the overwrite effect)
-        let end_pos = (*offset + data.len()).min(expected_content.len());
-        if *offset < expected_content.len() {
-            let copy_len = end_pos - offset;
-            expected_content[*offset..end_pos].copy_from_slice(&data[0..copy_len]);
-        }
-    }
-
     writer.complete().await?;
 
-    // Calculate expected checksum from final content (after all overwrites)
-    let expected_checksum = Utils::crc32(&expected_content) as u64;
-
-    // Read back and verify using existing read function
-    let (_actual_len, actual_checksum) = read(fs, path).await?;
-
-    // Verify checksums match after all overwrites
-    assert_eq!(
-        expected_checksum, actual_checksum,
-        "Checksums don't match after overwrite operations"
-    );
-
-    // Phase 3: Verify specific overwrite results using existing seek function
-    let mut reader = fs.open(path).await?;
-
-    // Test positions that should contain the final overwritten data
-    let verification_positions = vec![
-        // Verify final overwritten content
-        (0, "OVERWRITE_START_B0".as_bytes()),
-        (50, "FINAL_OVERWRITE_B0".as_bytes()),
-        (block_size + 100, "OVERWRITE_START_B1".as_bytes()),
-        (block_size + 150, "FINAL_OVERWRITE_B1".as_bytes()),
-        (block_size * 2 + 200, "OVERWRITE_START_B2".as_bytes()),
-        (block_size * 2 + 250, "FINAL_OVERWRITE_B2".as_bytes()),
-        (block_size - 20, "OVERWRITE_CROSS_01".as_bytes()),
-        (block_size * 2 - 25, "OVERWRITE_CROSS_12".as_bytes()),
-    ];
-
-    for (pos, expected_data) in verification_positions {
-        reader.seek(pos as i64).await?;
-        let mut verify_buf = vec![0u8; expected_data.len()];
-        let n = reader.read_full(&mut verify_buf).await?;
-        assert_eq!(n, expected_data.len());
-        assert_eq!(
-            &verify_buf[..n],
-            expected_data,
-            "Overwrite verification failed at position {} (block {})",
-            pos,
-            pos / block_size
-        );
-    }
-
-    reader.complete().await?;
+    // Check if data is equal。
+    let data = fs.read_string(writer.path()).await?;
+    assert_eq!(&expect_data, data.as_bytes());
 
     Ok(())
 }
