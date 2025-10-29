@@ -57,18 +57,6 @@ For more detailed information, please refer to:
 - **Monitoring and Metrics**: Built - in monitoring and performance metric collection.
 - **Web Interface**: Provides a web management interface for convenient system monitoring and management.
 
-## 🧩 Modular Architecture
-Curvine adopts a modular design and is mainly composed of the following core components：
-
-- **orpc**: A high-performance network communication framework that supports asynchronous RPC calls.
-- **curvine-common**: A shared library containing protocol definitions, error handling, and common utilities.
-- **curvine-server**: A server component that includes Master and Worker implementations.
-- **curvine-client**: A client library that provides APIs for interacting with the server.
-- **curvine-fuse**: A FUSE file system interface that allows Curvine to be mounted as a local file system.
-- **curvine-libsdk**: An SDK library that supports multi - language access.
-- **curvine-web**: A web management interface and API.
-- **curvine-tests**: A testing framework and performance benchmarking tool.
-
 ## 📦 System Requirements
 
 - Rust 1.86+

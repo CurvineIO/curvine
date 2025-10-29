@@ -54,19 +54,6 @@
 - **监控与指标**：内置监控与性能指标收集功能。
 - **Web 界面**：提供 Web 管理界面，便于系统监控与管理。
 
-## 🧩 模块化架构
-
-Curvine 采用模块化设计，主要由以下核心组件构成：
-
-- **orpc**: 一个支持异步 RPC 调用的高性能网络通信框架
-- **curvine-common**: 包含协议定义、错误处理和通用工具的共享库
-- **curvine-server**: 服务端组件，包含 Master 和 Worker 实现
-- **curvine-client**: 提供与服务器交互 API 的客户端库
-- **curvine-fuse**: FUSE 文件系统接口，支持将 Curvine 挂载为本地文件系统
-- **curvine-libsdk**: 支持多语言访问的 SDK 库
-- **curvine-web**: Web 管理界面和 API
-- **curvine-tests**: 测试框架与性能基准测试工具
-
 ## 📦 系统要求
 
 - Rust 1.80+
