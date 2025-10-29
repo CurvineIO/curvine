@@ -18,7 +18,7 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::Master;
 use curvine_common::state::MetricValue;
 use log::{debug, info, warn};
-use orpc::common::{Counter, CounterVec, Gauge, GaugeVec, Metrics as m, Metrics};
+use orpc::common::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m, Metrics}; 
 use orpc::sync::FastDashMap;
 use orpc::sys::SysUtils;
 use orpc::CommonResult;
@@ -50,10 +50,18 @@ pub struct MasterMetrics {
     pub(crate) replication_staging_number: Gauge,
     pub(crate) replication_inflight_number: Gauge,
     pub(crate) replication_failure_count: Counter,
+
+    
+    //pub(crate) fs_operation_duration_test:CounterVec,
+    pub(crate) fs_operation_duration: HistogramVec,
 }
 
 impl MasterMetrics {
     pub fn new() -> CommonResult<Self> {
+        let buckets = vec![  
+            10.0, 50.0, 100.0, 500.0, 1000.0,   
+            5000.0, 10000.0, 50000.0, 100000.0  
+        ];
         let wm = Self {
             files_total: m::new_gauge("files_total", "Total number of files")?,
             dir_total: m::new_gauge("dir_total", "Total number of directory")?,
@@ -98,6 +106,19 @@ impl MasterMetrics {
             replication_failure_count: m::new_counter(
                 "replication_failure_count",
                 "Total failure count",
+            )?,
+
+            // fs_operation_duration_test: m::new_counter_vec(
+            //     "fs_operation_duration_test",
+            //     "add_metrics_test",
+            //     &["method"],
+            // )?,
+
+            fs_operation_duration: m::new_histogram_vec_with_buckets(
+                "fs_operation_duration",
+                "File system operation duration",
+                &["operation"],
+                &buckets,
             )?,
         };
 

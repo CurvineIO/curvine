@@ -94,6 +94,13 @@ impl ClientMetrics {
                             0.0
                         }
                     }
+                    MetricType::Histogram => {
+                        if metric.has_histogram() {
+                            metric.get_histogram().get_sample_count() as f64
+                        } else {
+                            0.0
+                        }
+                    }
                 };
 
                 let incr_value = {

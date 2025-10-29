@@ -24,6 +24,7 @@ pub enum MetricType {
     #[default]
     Gauge = 1,
     Counter = 2,
+    Histogram = 3,
 }
 
 #[derive(Debug, Clone)]

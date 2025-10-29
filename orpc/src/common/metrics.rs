@@ -16,7 +16,7 @@ use once_cell::sync::Lazy;
 use prometheus::core::{
     AtomicI64, Collector, GenericCounter, GenericCounterVec, GenericGauge, GenericGaugeVec,
 };
-use prometheus::{default_registry, Encoder, Opts, Registry, TextEncoder};
+use prometheus::{default_registry, Encoder, HistogramOpts, Opts, Registry, TextEncoder};
 
 use crate::sync::FastDashMap;
 use crate::{err_box, CommonResult};
@@ -25,6 +25,8 @@ pub type Counter = GenericCounter<AtomicI64>;
 pub type CounterVec = GenericCounterVec<AtomicI64>;
 pub type Gauge = GenericGauge<AtomicI64>;
 pub type GaugeVec = GenericGaugeVec<AtomicI64>;
+pub type Histogram = prometheus::Histogram;
+pub type HistogramVec = prometheus::HistogramVec;
 
 static METRICS_MAP: Lazy<FastDashMap<String, Metrics>> = Lazy::new(FastDashMap::default);
 
@@ -34,6 +36,8 @@ pub enum Metrics {
     CounterVec(CounterVec),
     Gauge(Gauge),
     GaugeVec(GaugeVec),
+    Histogram(Histogram),
+    HistogramVec(HistogramVec),
 }
 
 impl Metrics {
@@ -43,6 +47,8 @@ impl Metrics {
             Metrics::CounterVec(v) => Box::new(v.clone()),
             Metrics::Gauge(v) => Box::new(v.clone()),
             Metrics::GaugeVec(v) => Box::new(v.clone()),
+            Metrics::Histogram(v) => Box::new(v.clone()),
+            Metrics::HistogramVec(v) => Box::new(v.clone()),
         }
     }
 
@@ -52,6 +58,8 @@ impl Metrics {
             Metrics::CounterVec(v) => &v.desc()[0].fq_name,
             Metrics::Gauge(v) => &v.desc()[0].fq_name,
             Metrics::GaugeVec(v) => &v.desc()[0].fq_name,
+            Metrics::Histogram(v) => &v.desc()[0].fq_name,
+            Metrics::HistogramVec(v) => &v.desc()[0].fq_name,
         }
     }
 
@@ -97,6 +105,52 @@ impl Metrics {
         Ok(g)
     }
 
+    pub fn new_histogram<T: Into<String>>(name: T, help: T) -> CommonResult<Histogram> {
+        let h = Histogram::with_opts(HistogramOpts::new(name, help))?;
+        Self::register(Self::Histogram(h.clone()))?;
+        Ok(h)
+    }
+
+    pub fn new_histogram_with_buckets<T: Into<String>>(
+        name: T,
+        help: T,
+        buckets: &[f64],
+    ) -> CommonResult<Histogram> {
+        let mut opts = HistogramOpts::new(name, help);
+        opts.buckets = buckets.to_vec();
+        let h = Histogram::with_opts(opts)?;
+        Self::register(Self::Histogram(h.clone()))?;
+        Ok(h)
+    }
+
+    pub fn new_histogram_vec<T: Into<String>>(
+        name: T,
+        help: T,
+        label_names: &[&str],  
+    ) -> CommonResult<HistogramVec> {  
+        let opts = HistogramOpts::new(name, help)  
+            .buckets(vec![  
+                10.0, 50.0, 100.0, 500.0, 1000.0,  
+                5000.0, 10000.0, 50000.0, 100000.0  
+            ]);  
+        let h = HistogramVec::new(opts, label_names)?;
+        Self::register(Self::HistogramVec(h.clone()))?;
+        Ok(h)
+    }
+
+    pub fn new_histogram_vec_with_buckets<T: Into<String>>(
+        name: T,
+        help: T,
+        label_names: &[&str],
+        buckets: &[f64],
+    ) -> CommonResult<HistogramVec> {
+        let mut opts = HistogramOpts::new(name, help);
+        opts.buckets = buckets.to_vec();
+        let h = HistogramVec::new(opts, label_names)?;
+        Self::register(Self::HistogramVec(h.clone()))?;
+        Ok(h)
+    }
+
     pub fn text_output() -> CommonResult<String> {
         let mut buffer = Vec::new();
         let encoder = TextEncoder::new();
@@ -119,6 +173,13 @@ impl Metrics {
         match self {
             Metrics::CounterVec(v) => Ok(v),
             _ => err_box!("Not CounterVec"),
+        }
+    }
+
+    pub fn try_into_histogram_vec(self) -> CommonResult<HistogramVec> {
+        match self {
+            Metrics::HistogramVec(v) => Ok(v),
+            _ => err_box!("Not HistogramVec"),
         }
     }
 }
