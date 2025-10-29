@@ -194,14 +194,24 @@ mod test {
         let counter_vec = Metrics::new_counter_vec("m2", "m2", &["l1"]).unwrap();
         let gauge = Metrics::new_gauge("g1", "g1").unwrap();
         let gauge_vec = Metrics::new_gauge_vec("g2", "g2", &["l2"]).unwrap();
+        let histogram = Metrics::new_histogram("h1", "h1").unwrap();
+        let histogram_vec = Metrics::new_histogram_vec("h2", "h2", &["l3"]).unwrap();
 
         counter.inc_by(100);
         counter_vec.with_label_values(&["v1"]).inc();
         gauge.set(1000);
         gauge_vec.with_label_values(&["v2"]).set(2000);
+        histogram.observe(1.5);
+        histogram_vec.with_label_values(&["v3"]).observe(2.5);
 
         assert_eq!(counter.get(), 100);
         assert_eq!(gauge.get(), 1000);
+        assert_eq!(histogram.get_sample_count(), 1);
+        assert_eq!(histogram.get_sample_sum(), 1.5);
+ 
+        let histogram_instance = histogram_vec.with_label_values(&["v3"]);
+        assert_eq!(histogram_instance.get_sample_count(), 1);
+        assert_eq!(histogram_instance.get_sample_sum(), 2.5);
 
         let output = Metrics::text_output().unwrap();
         println!("output = {}", output);
