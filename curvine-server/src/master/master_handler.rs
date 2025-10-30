@@ -485,15 +485,12 @@ impl MessageHandler for MasterHandler {
             .with_label_values(&[&code_label])
             .inc();
 
-        if matches!(
-            ctx.code,
-            RpcCode::Mkdir | RpcCode::CreateFile | RpcCode::Delete | RpcCode::Rename
-        ) {
+        if ctx.code != RpcCode::WorkerHeartbeat {
             self.metrics
-                .fs_operation_duration
+                .operation_duration
                 .with_label_values(&[&code_label])
                 .observe(used_us as f64);
-        }
+        };
 
         match response {
             Ok(v) => Ok(v),
