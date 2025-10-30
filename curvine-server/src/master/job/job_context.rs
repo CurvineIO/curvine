@@ -82,6 +82,7 @@ impl JobContext {
             ttl_action,
             mount_info: mnt.clone(),
             create_time: LocalTime::mills() as i64,
+            overwrite: job_conf.overwrite,
         };
 
         JobContext {

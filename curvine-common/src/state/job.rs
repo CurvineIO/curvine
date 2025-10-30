@@ -77,11 +77,13 @@ pub struct JobStatus {
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct LoadJobCommand {
     pub source_path: String,
+    pub target_path: Option<String>,
     pub replicas: Option<i32>,
     pub block_size: Option<i64>,
     pub storage_type: Option<StorageType>,
     pub ttl_ms: Option<i64>,
     pub ttl_action: Option<TtlAction>,
+    pub overwrite: Option<bool>,
 }
 
 impl LoadJobCommand {
@@ -93,11 +95,13 @@ impl LoadJobCommand {
 #[derive(Default)]
 pub struct LoadJobCommandBuilder {
     source_path: String,
+    target_path: Option<String>,
     replicas: Option<i32>,
     block_size: Option<i64>,
     storage_type: Option<StorageType>,
     ttl_ms: Option<i64>,
     ttl_action: Option<TtlAction>,
+    overwrite: Option<bool>,
 }
 
 impl LoadJobCommandBuilder {
@@ -106,6 +110,11 @@ impl LoadJobCommandBuilder {
             source_path: source_path.into(),
             ..Default::default()
         }
+    }
+
+    pub fn target_path(mut self, target_path: impl Into<String>) -> Self {
+        let _ = self.target_path.insert(target_path.into());
+        self
     }
 
     pub fn replicas(mut self, replicas: i32) -> Self {
@@ -133,14 +142,21 @@ impl LoadJobCommandBuilder {
         self
     }
 
+    pub fn overwrite(mut self, overwrite: bool) -> Self {
+        let _ = self.overwrite.insert(overwrite);
+        self
+    }
+
     pub fn build(self) -> LoadJobCommand {
         LoadJobCommand {
             source_path: self.source_path,
+            target_path: self.target_path,
             replicas: self.replicas,
             block_size: self.block_size,
             storage_type: self.storage_type,
             ttl_ms: self.ttl_ms,
             ttl_action: self.ttl_action,
+            overwrite: self.overwrite,
         }
     }
 }
@@ -157,6 +173,7 @@ pub struct LoadJobInfo {
     pub ttl_action: TtlAction,
     pub mount_info: MountInfo,
     pub create_time: i64,
+    pub overwrite: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

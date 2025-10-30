@@ -16,7 +16,6 @@ use crate::common::UfsFactory;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::fs::MasterFilesystem;
 use crate::master::{JobContext, JobStore, TaskDetail};
-use curvine_client::unified::UfsFileSystem;
 use curvine_common::conf::ClientConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
@@ -110,7 +109,16 @@ impl LoadJobRunner {
         mnt: MountInfo,
     ) -> FsResult<LoadJobResult> {
         let source_path = Path::from_str(&command.source_path)?;
-        let target_path = mnt.get_cv_path(&source_path)?;
+
+        let target_path = if let Some(ref target) = command.target_path {
+            Path::from_str(target)?
+        } else {
+            if source_path.is_cv() {
+                mnt.get_ufs_path(&source_path)?
+            } else {
+                mnt.get_cv_path(&source_path)?
+            }
+        };
 
         let job_id = Self::create_job_id(source_path.full_path());
         let result = LoadJobResult {
@@ -118,10 +126,13 @@ impl LoadJobRunner {
             target_path: target_path.clone_path(),
         };
 
-        let ufs = self.factory.get_ufs(&mnt)?;
-        let source_status = ufs.get_status(&source_path).await?;
+        let source_status = if source_path.is_cv() {
+            self.master_fs.file_status(source_path.path())?
+        } else {
+            let ufs = self.factory.get_ufs(&mnt)?;
+            ufs.get_status(&source_path).await?
+        };
 
-        // check job status
         if self.check_job_exists(&job_id, &source_status, &target_path) {
             info!(
                 "job {}, source_path {} already exists",
@@ -136,13 +147,13 @@ impl LoadJobRunner {
             &command,
             job_id.clone(),
             source_path.clone_uri(),
-            target_path.clone_path(),
+            target_path.clone_uri(),
             &mnt,
             &ClientConf::default(),
         );
 
         let res = self
-            .create_all_tasks(&mut job_context, source_status, &ufs, &mnt)
+            .create_all_tasks(&mut job_context, source_status, &mnt)
             .await;
 
         match res {
@@ -189,7 +200,6 @@ impl LoadJobRunner {
         &self,
         job: &mut JobContext,
         source_status: FileStatus,
-        ufs: &UfsFileSystem,
         mnt: &MountInfo,
     ) -> FsResult<i64> {
         job.update_state(JobTaskState::Pending, "Assigning workers");
@@ -199,10 +209,23 @@ impl LoadJobRunner {
         let mut stack = LinkedList::new();
         let mut task_index = 0;
         stack.push_back(source_status);
+
+        // Get target base path for direction detection
+        let target_base = Path::from_str(&job.info.target_path)?;
+
         while let Some(status) = stack.pop_front() {
             if status.is_dir {
+                // List directory based on path type
                 let dir_path = Path::from_str(status.path)?;
-                let childs = ufs.list_status(&dir_path).await?;
+                let childs = if dir_path.is_cv() {
+                    // Traverse Curvine directory
+                    self.master_fs.list_status(dir_path.path())?
+                } else {
+                    // Traverse UFS directory
+                    let ufs = self.factory.get_ufs(mnt)?;
+                    ufs.list_status(&dir_path).await?
+                };
+
                 for child in childs {
                     stack.push_back(child);
                 }
@@ -210,7 +233,22 @@ impl LoadJobRunner {
                 let worker = self.choose_worker(block_size)?;
 
                 let source_path = Path::from_str(status.path)?;
-                let target_path = mnt.get_cv_path(&source_path)?;
+
+                // Calculate target_path based on source and target types
+                let target_path = if source_path.is_cv() && !target_base.is_cv() {
+                    // Export: Curvine → UFS
+                    mnt.get_ufs_path(&source_path)?
+                } else if !source_path.is_cv() && target_base.is_cv() {
+                    // Import: UFS → Curvine
+                    mnt.get_cv_path(&source_path)?
+                } else {
+                    // Same type (Curvine→Curvine or UFS→UFS), not supported yet
+                    return err_box!(
+                        "Unsupported path combination: source={}, target={}",
+                        source_path.full_path(),
+                        target_base.full_path()
+                    );
+                };
 
                 let task_id = format!("{}_task_{}", job.info.job_id, task_index);
                 task_index += 1;
@@ -221,7 +259,7 @@ impl LoadJobRunner {
                     task_id: task_id.clone(),
                     worker: worker.clone(),
                     source_path: source_path.clone_uri(),
-                    target_path: target_path.clone_path(),
+                    target_path: target_path.clone_uri(),
                     create_time: LocalTime::mills() as i64,
                 };
                 job.add_task(task.clone());
