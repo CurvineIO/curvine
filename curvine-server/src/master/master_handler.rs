@@ -484,15 +484,13 @@ impl MessageHandler for MasterHandler {
             .rpc_request_count
             .with_label_values(&[&code_label])
             .inc();
-
-        // self.metrics
-        //     .fs_operation_duration_test
-        //     .with_label_values(&[&code_label])
-        //     .inc();
-        self.metrics
-            .fs_operation_duration
-            .with_label_values(&[&code_label])
-            .observe(used_us as f64);
+        
+        if matches!(ctx.code, RpcCode::Mkdir | RpcCode::CreateFile | RpcCode::Delete | RpcCode::Rename) {
+            self.metrics
+                .fs_operation_duration
+                .with_label_values(&[&code_label])
+                .observe(used_us as f64);
+        }
 
         match response {
             Ok(v) => Ok(v),

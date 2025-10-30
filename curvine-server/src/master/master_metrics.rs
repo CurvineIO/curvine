@@ -51,8 +51,6 @@ pub struct MasterMetrics {
     pub(crate) replication_inflight_number: Gauge,
     pub(crate) replication_failure_count: Counter,
 
-    
-    //pub(crate) fs_operation_duration_test:CounterVec,
     pub(crate) fs_operation_duration: HistogramVec,
 }
 
@@ -107,12 +105,6 @@ impl MasterMetrics {
                 "replication_failure_count",
                 "Total failure count",
             )?,
-
-            // fs_operation_duration_test: m::new_counter_vec(
-            //     "fs_operation_duration_test",
-            //     "add_metrics_test",
-            //     &["method"],
-            // )?,
 
             fs_operation_duration: m::new_histogram_vec_with_buckets(
                 "fs_operation_duration",
