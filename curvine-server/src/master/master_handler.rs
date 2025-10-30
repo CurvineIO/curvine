@@ -484,8 +484,11 @@ impl MessageHandler for MasterHandler {
             .rpc_request_count
             .with_label_values(&[&code_label])
             .inc();
-        
-        if matches!(ctx.code, RpcCode::Mkdir | RpcCode::CreateFile | RpcCode::Delete | RpcCode::Rename) {
+
+        if matches!(
+            ctx.code,
+            RpcCode::Mkdir | RpcCode::CreateFile | RpcCode::Delete | RpcCode::Rename
+        ) {
             self.metrics
                 .fs_operation_duration
                 .with_label_values(&[&code_label])

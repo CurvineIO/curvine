@@ -126,13 +126,11 @@ impl Metrics {
     pub fn new_histogram_vec<T: Into<String>>(
         name: T,
         help: T,
-        label_names: &[&str],  
-    ) -> CommonResult<HistogramVec> {  
-        let opts = HistogramOpts::new(name, help)  
-            .buckets(vec![  
-                10.0, 50.0, 100.0, 500.0, 1000.0,  
-                5000.0, 10000.0, 50000.0, 100000.0  
-            ]);  
+        label_names: &[&str],
+    ) -> CommonResult<HistogramVec> {
+        let opts = HistogramOpts::new(name, help).buckets(vec![
+            10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
+        ]);
         let h = HistogramVec::new(opts, label_names)?;
         Self::register(Self::HistogramVec(h.clone()))?;
         Ok(h)
@@ -208,7 +206,7 @@ mod test {
         assert_eq!(gauge.get(), 1000);
         assert_eq!(histogram.get_sample_count(), 1);
         assert_eq!(histogram.get_sample_sum(), 1.5);
- 
+
         let histogram_instance = histogram_vec.with_label_values(&["v3"]);
         assert_eq!(histogram_instance.get_sample_count(), 1);
         assert_eq!(histogram_instance.get_sample_sum(), 2.5);
