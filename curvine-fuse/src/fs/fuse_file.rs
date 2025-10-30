@@ -20,6 +20,7 @@ use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::FileStatus;
 use log::info;
+use orpc::common::Utils;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IoPhase {
@@ -55,7 +56,6 @@ impl FuseFile {
 
     pub async fn create(fs: UnifiedFileSystem, path: Path, flags: u32) -> FuseResult<Self> {
         let action = OpenAction::try_from(flags)?;
-
         let (writer, reader) = match action {
             OpenAction::ReadOnly => {
                 let reader = Self::create_reader(&fs, &path).await?;
@@ -127,24 +127,14 @@ impl FuseFile {
         flags: u32,
     ) -> FuseResult<FuseWriter> {
         let overwrite = FuseUtils::has_truncate(flags);
-        let _want_create = FuseUtils::has_create(flags);
-        let exists = fs.exists(path).await.unwrap_or(false);
+        let append = FuseUtils::has_append(flags);
 
-        let unified_writer = if exists {
-            // File already exists:
-            if overwrite {
-                // O_TRUNC semantics: allow overwrite/truncate
-                fs.create(path, true).await?
-            } else {
-                // No O_TRUNC: follow open(O_CREAT, ...) semantics -> open existing file, don't create again
-                // Use append to get writer, then implement writing from any offset via seek in upper layer write
-                fs.append(path).await?
-            }
+        let unified_writer = if append {
+            fs.append(path).await?
         } else {
-            // File does not exist:
-            // Only create when explicitly requested or O_TRUNC, otherwise should not reach here
             fs.create(path, overwrite).await?
         };
+
         Ok(FuseWriter::new(
             &fs.conf().fuse,
             fs.clone_runtime(),
@@ -207,14 +197,19 @@ impl FuseFile {
             );
         }
 
-        // Support random writes: perform seek operation to specified offset
-        if let Err(e) = writer.seek(off as i64).await {
-            return Err(e.into());
+        // When kernel flushes page cache to FUSE, the offset may differ from current position
+        // Always perform seek to the specified offset to ensure data correctness
+        if off as i64 != writer.pos() {
+            info!(
+                "Write position1 mismatch: requested offset={}, current position={}. Performing seek to requested offset.",
+                off,
+                writer.pos()
+            );
+            writer.seek(off as i64).await?;
         }
 
-        if let Err(e) = writer.write(op, reply).await {
-            return Err(e.into());
-        }
+        info!("write-{} {} off {}, cur pos {}, len {}", self.fh, self.path, off, writer.pos(), op.data.len());
+        writer.write(op, reply).await?;
 
         Ok(())
     }
@@ -254,6 +249,8 @@ impl FuseFile {
                 self.reader.get_or_insert(reader)
             }
         };
+        info!("read-{} {} off {}, {}", self.fh, self.path, op.arg.offset, op.arg.size);
+
         // Allow random read: just forward to reader
         reader.read(op, rep).await?;
         Ok(())

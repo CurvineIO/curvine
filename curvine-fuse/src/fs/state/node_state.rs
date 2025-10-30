@@ -26,7 +26,7 @@ use std::time::Duration;
 
 pub struct NodeState {
     node_map: RwLock<NodeMap>,
-    handle_map: HandleMap,
+    pub handle_map: HandleMap,
     conf: FuseConf,
 }
 

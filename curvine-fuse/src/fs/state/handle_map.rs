@@ -18,7 +18,7 @@ use orpc::sync::{AtomicCounter, FastDashMap};
 use orpc::sys::RawPtr;
 
 pub struct HandleMap {
-    files: FastDashMap<u64, RawPtr<FuseFile>>,
+    pub files: FastDashMap<u64, RawPtr<FuseFile>>,
     fh_creator: AtomicCounter,
 }
 

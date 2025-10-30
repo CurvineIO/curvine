@@ -102,7 +102,9 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                warn!("send_error unique {}: {}", self.unique, e);
+                if e.errno != libc::ENOENT {
+                    warn!("send_error unique {}: {}", self.unique, e);
+                }
                 self.send(e.errno, vec![]).await
             }
         }
@@ -118,7 +120,9 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                warn!("send_error unique {}: {}", self.unique, e);
+                if e.errno != libc::ENOENT {
+                    warn!("send_error unique {}: {}", self.unique, e);
+                }
                 self.send(e.errno, vec![]).await
             }
         }

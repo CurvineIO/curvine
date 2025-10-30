@@ -22,7 +22,7 @@ use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
 use curvine_common::state::*;
 use curvine_common::FsResult;
-use log::warn;
+use log::{info, warn};
 use orpc::sync::ArcRwLock;
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::sync::Arc;
@@ -408,6 +408,7 @@ impl MasterFilesystem {
         last: Option<CommitBlock>,
         client_name: T,
     ) -> FsResult<bool> {
+        info!("complete_file {} {}", path.as_ref(), len);
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 

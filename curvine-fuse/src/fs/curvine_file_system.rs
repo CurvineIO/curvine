@@ -26,7 +26,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{FileStatus, SetAttrOpts};
 use log::{debug, error, info};
-use orpc::common::ByteUnit;
+use orpc::common::{ByteUnit, Utils};
 use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
 use orpc::{sys, try_option};
@@ -865,7 +865,7 @@ impl fs::FileSystem for CurvineFileSystem {
             }
             Err(e) => {
                 error!("Backend set_attr failed for path {}: {}", path, e);
-                return err_fuse!(libc::EPERM, "Operation not permitted: {}", e);
+                return err_fuse!(libc::ENOENT, "Operation not permitted: {}", e);
             }
         }
 
@@ -1012,7 +1012,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let name = try_option!(op.name.to_str());
         let path = self.state.get_path_name(op.header.nodeid, name)?;
 
-        let _ = self.fs.mkdir(&path, false).await?;
+        let _ = self.fs.mkdir(&path, true).await?;
         // Apply requested mode and ownership to directory if provided
         if op.arg.mode != 0 {
             let owner = orpc::sys::get_username_by_uid(op.header.uid);
@@ -1063,6 +1063,11 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn read(&self, op: Read<'_>, rep: FuseResponse) -> FuseResult<()> {
+        for mut f in self.state.handle_map.files.iter_mut() {
+            info!("read for complete {}", f.path_str());
+            f.complete().await?;
+        }
+
         let file = self.state.get_file_check(op.arg.fh)?;
         file.as_mut().read(op, rep).await?;
         Ok(())
@@ -1075,8 +1080,7 @@ impl fs::FileSystem for CurvineFileSystem {
         // Check file access permissions before opening
         let _status = self.fs_get_status(&path).await?;
         info!(
-            "Open file: path={}, uid={}, gid={}, file_owner={}, file_group={}, file_mode={:o}",
-            path, op.header.uid, op.header.gid, _status.owner, _status.group, _status.mode
+            "Open file: unique={}, path={}", op.header.unique, path,
         );
 
         // Determine what permissions we need to check
@@ -1142,43 +1146,8 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_common(id, Some(name))?;
         let flags = op.arg.flags;
 
-        // If the file already exists:
-        // - With O_EXCL: return EEXIST
-        // - Without O_EXCL: open existing file and return handle (POSIX open semantics)
-        if self.fs.exists(&path).await.unwrap_or(false) {
-            // Even with O_EXCL, handle as "open existing file" for compatibility with tools like fio
-            let _want_excl = ((flags as i32) & libc::O_EXCL) != 0;
-
-            // Open existing file and return fuse_create_out
-            let status = self.fs_get_status(&path).await?;
-            let attr = self.lookup_status(id, Some(name), &status)?;
-
-            let file = FuseFile::create(self.fs.clone(), path.clone(), flags).await?;
-            let fh = self.state.add_file(file)?;
-
-            let open_flags = Self::fill_open_flags(&self.conf, flags);
-            let r = fuse_create_out(
-                fuse_entry_out {
-                    nodeid: attr.ino,
-                    generation: 0,
-                    entry_valid: self.conf.entry_ttl.as_secs(),
-                    attr_valid: self.conf.attr_ttl.as_secs(),
-                    entry_valid_nsec: self.conf.entry_ttl.subsec_nanos(),
-                    attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
-                    attr,
-                },
-                fuse_open_out {
-                    fh,
-                    open_flags,
-                    padding: 0,
-                },
-            );
-
-            return Ok(r);
-        }
-
         // Not exists: create a new file and then return handle & entry
-        let file = FuseFile::for_write(self.fs.clone(), path.clone(), flags).await?;
+        let file = FuseFile::create(self.fs.clone(), path.clone(), flags).await?;
         let status = file.status()?;
         let attr = self.lookup_status(id, Some(name), status)?;
 
@@ -1237,6 +1206,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn flush(&self, op: Flush<'_>) -> FuseResult<()> {
         if let Some(file) = self.state.get_file(op.arg.fh) {
+            //info!("flush unique={}, path={}", op.header.unique, file.status()?.path);
+
             file.as_mut().flush().await
         } else {
             let path = self.state.get_path(op.header.nodeid)?;
@@ -1247,6 +1218,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn release(&self, op: Release<'_>) -> FuseResult<()> {
         if let Some(file) = self.state.remove_file(op.arg.fh) {
+            //info!("release {}", file.status()?.path);
             file.as_mut().complete().await
         } else {
             let path = self.state.get_path(op.header.nodeid)?;
@@ -1262,6 +1234,7 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn unlink(&self, op: Unlink<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+        // let dist = Path::new(path.path().replace("/curvine", &format!("/{}", name)))?;
         self.fs.delete(&path, false).await?;
 
         Ok(())
@@ -1409,10 +1382,12 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn fsync(&self, op: FSync<'_>) -> FuseResult<()> {
+
         // Best-effort data durability for tools like mkfs on loop-backed files
         // 1) Try to flush the writer bound to this fh
-        if let Some(file) = self.state.get_file(op.arg.fh) {
-            file.as_mut().flush().await?; // Flush pending chunks to backend
+        if let Some(file) = self.state.remove_file(op.arg.fh) {
+            //info!("fsync {}", file.status()?.path);
+            file.as_mut().complete().await?; // Flush pending chunks to backend
             return Ok(());
         }
         // 2) If fh is unknown (some callers may fsync without cached fh), fall back to path-level no-op

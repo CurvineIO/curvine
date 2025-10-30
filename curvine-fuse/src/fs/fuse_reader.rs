@@ -19,11 +19,12 @@ use curvine_common::conf::FuseConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::Reader;
 use curvine_common::FsResult;
-use log::error;
+use log::{error, info};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
 use orpc::sync::ErrorMonitor;
 use std::sync::Arc;
+use clap::builder::TypedValueParser;
 
 enum ReadTask {
     Read(i64, usize, FuseResponse),
@@ -68,8 +69,16 @@ impl FuseReader {
     pub async fn read(&mut self, op: Read<'_>, rep: FuseResponse) -> FsResult<()> {
         let task = ReadTask::Read(op.arg.offset as i64, op.arg.size as usize, rep);
 
+        // Check for errors before sending to avoid using invalid channel
+        if let Some(error) = self.err_monitor.take_error() {
+            return Err(error);
+        }
+
         match self.sender.send(task).await {
-            Err(e) => Err(self.check_error(e.into())),
+            Err(e) => {
+                // Channel may be closed - check for underlying error
+                Err(self.check_error(e.into()))
+            },
             Ok(_) => Ok(()),
         }
     }
@@ -96,6 +105,11 @@ impl FuseReader {
             match task {
                 ReadTask::Read(off, len, reply) => {
                     let data = reader.fuse_read(off, len).await;
+                    let read_chunk: usize = match &data {
+                        Err(e) => 0,
+                        Ok(v) => v.iter().map(|x| x.len()).sum()
+                    };
+                    info!("read path {}, len {}, off {} chunk_len {}", reader.path(), len, off, read_chunk);
                     reply.send_data(data.map_err(|x| x.into())).await?;
                 }
 

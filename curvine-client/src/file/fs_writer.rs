@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::arch::x86_64::_bittestandreset;
 use crate::file::{FsContext, FsWriterBase, FsWriterBuffer};
 use bytes::BytesMut;
 use curvine_common::fs::{Path, Writer};
@@ -40,9 +41,10 @@ impl FsWriter {
         let pos = ternary!(append, status.len, 0);
 
         info!(
-            "Create writer, path={}, pos={}, block_size={}, chunk_size={}, chunk_number={}, replicas={}",
+            "Create writer, path={}, pos={}, len = {}, block_size={}, chunk_size={}, chunk_number={}, replicas={}",
             &status.path,
             pos,
+            status.len,
             ByteUnit::byte_to_string(status.block_size as u64),
             chunk_size,
             chunk_num,
@@ -121,6 +123,12 @@ impl Writer for FsWriter {
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 {
             return err_box!(format!("Cannot seek to negative position: {}", pos));
+        } else if pos > self.status().len {
+            return err_box!(
+                "Cannot seek to a position greater than the file length: {} > {}",
+                pos,
+                self.status().len
+            );
         }
 
         if self.append {

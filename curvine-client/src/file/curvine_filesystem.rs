@@ -197,7 +197,7 @@ impl CurvineFileSystem {
             .create(true)
             .overwrite(overwrite)
             .append(false)
-            .create_parent(false)
+            .create_parent(true)
             .build();
 
         let file_blocks = self
