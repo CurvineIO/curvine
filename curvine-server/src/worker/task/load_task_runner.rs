@@ -137,18 +137,8 @@ impl LoadTaskRunner {
         // Create reader (automatically selects filesystem based on scheme)
         let reader = self.open_unified(&source_path).await?;
 
-        // create cv writer
-        let target_path = Path::from_str(&info.target_path)?;
-        let opts = CreateFileOptsBuilder::new()
-            .create_parent(true)
-            .replicas(info.job.replicas)
-            .block_size(info.job.block_size)
-            .storage_type(info.job.storage_type)
-            .ttl_ms(info.job.ttl_ms)
-            .ttl_action(info.job.ttl_action)
-            .ufs_mtime(source_status.mtime)
-            .build();
-        let writer = self.fs.create_with_opts(&target_path, opts, true).await?;
+        // Create writer (automatically selects filesystem based on scheme)
+        let writer = self.create_unified(&target_path).await?;
 
         Ok((reader, writer))
     }
@@ -180,7 +170,6 @@ impl LoadTaskRunner {
             };
 
             let opts = CreateFileOptsBuilder::new()
-                .overwrite(true)
                 .create_parent(true)
                 .replicas(self.task.info.job.replicas)
                 .block_size(self.task.info.job.block_size)
@@ -190,19 +179,16 @@ impl LoadTaskRunner {
                 .ufs_mtime(source_mtime)
                 .build();
 
-            let writer = self.fs.create_with_opts(path, opts).await?;
+            let overwrite = self.task.info.job.overwrite.unwrap_or(false);
+            let writer = self.fs.create_with_opts(path, opts, overwrite).await?;
             Ok(UnifiedWriter::Cv(writer))
         } else {
-            // UFS path
             let ufs = self.factory.get_ufs(&self.task.info.job.mount_info)?;
             let overwrite = self.task.info.job.overwrite.unwrap_or(false);
 
-            // Check if file exists when overwrite=false
-            if !overwrite {
-                if ufs.exists(path).await? {
-                    warn!("UFS file already exists, skipping: {}", path.full_path());
-                    return err_box!("File exists and overwrite=false");
-                }
+            if !overwrite && ufs.exists(path).await? {
+                warn!("UFS file already exists, skipping: {}", path.full_path());
+                return err_box!("File exists and overwrite=false");
             }
 
             ufs.create(path, overwrite).await

@@ -211,21 +211,23 @@ impl InodeTtlChecker {
                     result.failed_cleanups = 1;
                 }
             },
-            TtlAction::Move | TtlAction::Ufs => match self.action_executor.free_inode(inode_id) {
-                Ok(()) => {
-                    info!(
-                        "Successfully executed MOVE/FREE action for inode {}",
-                        inode_id
-                    );
-                    result.successful_frees.push(inode_id);
-                    result.successful_cleanups = 1;
+            TtlAction::Persist | TtlAction::Evict | TtlAction::Flush => {
+                match self.action_executor.free_inode(inode_id) {
+                    Ok(()) => {
+                        info!(
+                            "Successfully executed {:?} action for inode {}",
+                            action, inode_id
+                        );
+                        result.successful_frees.push(inode_id);
+                        result.successful_cleanups = 1;
+                    }
+                    Err(e) => {
+                        error!("{:?} action failed for inode {}: {}", action, inode_id, e);
+                        result.failed_inodes.push(inode_id);
+                        result.failed_cleanups = 1;
+                    }
                 }
-                Err(e) => {
-                    error!("Free failed for inode {}: {}", inode_id, e);
-                    result.failed_inodes.push(inode_id);
-                    result.failed_cleanups = 1;
-                }
-            },
+            }
             TtlAction::None => {
                 warn!("No ttl action defined for inode {}, skipping", inode_id);
                 result.skipped_inodes = 1;
@@ -235,14 +237,12 @@ impl InodeTtlChecker {
         result
     }
 
-    /// Compute next retry timestamp with exponential backoff and ±10% jitter.
     fn compute_next_retry_ms(&self, current_time_ms: u64, inode_id: u64, retry_count: u32) -> u64 {
         let base = self.config.retry_interval_ms.max(1);
         let pow = retry_count.min(16); // cap to avoid overflow
         let mut backoff = base.saturating_mul(1u64 << pow);
         backoff = backoff.min(self.config.max_retry_duration_ms);
 
-        // deterministic jitter based on ids to avoid extra deps
         let basis = inode_id.rotate_left(pow) ^ current_time_ms;
         let jitter_pct: i64 = (basis % 21) as i64 - 10; // [-10, +10]
         let jitter_ms = ((backoff as i128 * jitter_pct as i128) / 100) as i64;

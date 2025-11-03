@@ -174,6 +174,14 @@ impl JobManager {
     ) -> FsResult<()> {
         self.jobs.update_progress(job_id, task_id, progress)
     }
+
+    pub fn jobs(&self) -> &JobStore {
+        &self.jobs
+    }
+
+    pub fn factory(&self) -> &Arc<UfsFactory> {
+        &self.factory
+    }
 }
 
 struct JobCleanupTask {

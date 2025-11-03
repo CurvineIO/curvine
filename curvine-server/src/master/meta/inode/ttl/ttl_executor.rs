@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
+use crate::master::job::JobManager;
 use crate::master::meta::inode::ttl_types::{TtlError, TtlResult};
-use crate::master::meta::inode::{Inode, InodeFile, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{Inode, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::InodeStore;
+use crate::master::mount::MountManager;
+use curvine_common::fs::{FileSystem, Path};
+use curvine_common::state::{LoadJobCommand, TtlAction};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 // TTL Executor Module
 //
@@ -38,11 +43,19 @@ use std::sync::Arc;
 pub struct InodeTtlExecutor {
     filesystem: MasterFilesystem,
     inode_store: InodeStore,
-    path_cache: Arc<std::sync::RwLock<HashMap<u64, String>>>,
+    path_cache: Arc<RwLock<HashMap<u64, String>>>,
+    mount_manager: Arc<MountManager>,
+    factory: Arc<UfsFactory>,
+    job_manager: Arc<JobManager>,
 }
 
 impl InodeTtlExecutor {
-    pub fn new(filesystem: MasterFilesystem) -> Self {
+    pub fn with_managers(
+        filesystem: MasterFilesystem,
+        mount_manager: Arc<MountManager>,
+        factory: Arc<UfsFactory>,
+        job_manager: Arc<JobManager>,
+    ) -> Self {
         let fs_dir = filesystem.fs_dir();
 
         let inode_store = {
@@ -53,7 +66,10 @@ impl InodeTtlExecutor {
         Self {
             filesystem,
             inode_store,
-            path_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            path_cache: Arc::new(RwLock::new(HashMap::new())),
+            mount_manager,
+            factory,
+            job_manager,
         }
     }
 
@@ -123,65 +139,6 @@ impl InodeTtlExecutor {
             .map_err(|e| TtlError::ServiceError(format!("Failed to get inode from store: {}", e)))
     }
 
-    fn execute_file_free(&self, inode_id: u64, path: &str, file: &InodeFile) -> TtlResult<()> {
-        info!(
-            "Executing file free operation: inode={}, size={} bytes",
-            inode_id, file.len
-        );
-
-        let storage_type = &file.storage_policy.storage_type;
-        debug!("File storage type: {:?}", storage_type);
-
-        {
-            self.perform_generic_free(inode_id, path, file)?;
-        }
-
-        Ok(())
-    }
-
-    fn perform_generic_free(&self, inode_id: u64, path: &str, file: &InodeFile) -> TtlResult<()> {
-        debug!("Performing generic free for inode {}", inode_id);
-        self.free_local_cache(inode_id, path)?;
-
-        if self.has_ufs_support() {
-            self.move_to_ufs_storage(inode_id, path, file)?;
-        }
-
-        self.update_file_free_status(inode_id, path)?;
-
-        Ok(())
-    }
-
-    fn free_local_cache(&self, inode_id: u64, path: &str) -> TtlResult<()> {
-        debug!("Freeing local cache for inode {}", inode_id);
-        debug!("Local cache freed for: {}", path);
-        //TODO
-        Ok(())
-    }
-
-    fn has_ufs_support(&self) -> bool {
-        false
-    }
-
-    fn move_to_ufs_storage(&self, inode_id: u64, path: &str, file: &InodeFile) -> TtlResult<()> {
-        debug!(
-            "Moving data to UFS storage: inode={}, size={}",
-            inode_id, file.len
-        );
-        // TODO
-        debug!("Data moved to UFS storage for: {}", path);
-        Ok(())
-    }
-
-    fn update_file_free_status(&self, inode_id: u64, path: &str) -> TtlResult<()> {
-        debug!("Updating file free status: inode={}", inode_id);
-
-        // TODO
-
-        debug!("File free status updated for: {}", path);
-        Ok(())
-    }
-
     pub fn delete_inode(&self, inode_id: u64) -> TtlResult<()> {
         debug!("Deleting inode: {}", inode_id);
         let path = self.get_inode_path(inode_id)?;
@@ -209,41 +166,255 @@ impl InodeTtlExecutor {
         info!("Freeing inode: {}", inode_id);
 
         let path = self.get_inode_path(inode_id)?;
+        let inode = self.get_inode_from_store(inode_id)?.ok_or_else(|| {
+            TtlError::ActionExecutionError(format!("Inode {} not found", inode_id))
+        })?;
 
-        if let Some(inode) = self.get_inode_from_store(inode_id)? {
-            match &inode {
-                InodeView::File(_, file) => {
+        match inode {
+            InodeView::File(_, file) => {
+                let action = file.storage_policy.ttl_action;
+                self.free(inode_id, &path, action, false)?;
+            }
+            InodeView::Dir(_, dir) => {
+                let action = dir.storage_policy.ttl_action;
+                self.free(inode_id, &path, action, true)?;
+            }
+            InodeView::FileEntry(..) => {
+                return Err(TtlError::ActionExecutionError(format!(
+                    "Cannot free empty file: {}",
+                    path
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn free(
+        &self,
+        inode_id: u64,
+        path: &str,
+        action: TtlAction,
+        is_directory: bool,
+    ) -> TtlResult<()> {
+        info!(
+            "Freeing {}: {}, action={:?}",
+            self.resource_type(is_directory),
+            path,
+            action
+        );
+
+        let cv_path = Path::from_str(path)
+            .map_err(|e| TtlError::ActionExecutionError(format!("Invalid path {}: {}", path, e)))?;
+
+        let mount_info = self
+            .mount_manager
+            .get_mount_info(&cv_path)
+            .map_err(|e| {
+                TtlError::ActionExecutionError(format!("Failed to get mount info: {}", e))
+            })?
+            .ok_or_else(|| {
+                TtlError::ActionExecutionError(format!("No mount point for path: {}", path))
+            })?;
+
+        let ufs_path = mount_info.get_ufs_path(&cv_path).map_err(|e| {
+            TtlError::ActionExecutionError(format!("Failed to get UFS path: {}", e))
+        })?;
+
+        let ufs_exists = self.check_ufs_exists(&mount_info, &ufs_path)?;
+
+        match (ufs_exists, action) {
+            (true, TtlAction::Persist | TtlAction::Evict) => {
+                info!(
+                    "UFS {} already exists, skipping job: {}",
+                    self.resource_type(is_directory),
+                    ufs_path.full_path()
+                );
+                self.handle_skip_job(inode_id, action, path, is_directory)?;
+            }
+            _ => {
+                info!(
+                    "Submitting export job for {}: {}",
+                    self.resource_type(is_directory),
+                    path
+                );
+                self.submit_export_job(
+                    inode_id,
+                    path,
+                    &ufs_path,
+                    action,
+                    is_directory,
+                    mount_info,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // Helper: Get resource type string (eliminates repetition)
+    #[inline]
+    fn resource_type(&self, is_directory: bool) -> &'static str {
+        if is_directory {
+            "directory"
+        } else {
+            "file"
+        }
+    }
+
+    fn check_ufs_exists(
+        &self,
+        mount_info: &curvine_common::state::MountInfo,
+        ufs_path: &Path,
+    ) -> TtlResult<bool> {
+        let handle = tokio::runtime::Handle::current();
+
+        let ufs_path_clone = ufs_path.clone();
+        let mount_info_clone = mount_info.clone();
+        let factory = self.factory.clone();
+
+        let exists = handle.block_on(async move {
+            let ufs = factory
+                .get_ufs(&mount_info_clone)
+                .map_err(|e| TtlError::ServiceError(format!("Failed to get UFS: {}", e)))?;
+
+            let result: Result<bool, TtlError> = match ufs.get_status(&ufs_path_clone).await {
+                Ok(_) => Ok(true),
+                Err(_) => Ok(false),
+            };
+            result
+        })?;
+
+        Ok(exists)
+    }
+
+    fn handle_skip_job(
+        &self,
+        _inode_id: u64,
+        action: TtlAction,
+        cv_path: &str,
+        is_directory: bool,
+    ) -> TtlResult<()> {
+        let resource_type = self.resource_type(is_directory);
+
+        match action {
+            TtlAction::Persist => {
+                info!(
+                    "Persist: UFS {} exists, keeping Curvine {}: {}",
+                    resource_type, resource_type, cv_path
+                );
+            }
+            TtlAction::Evict => {
+                info!(
+                    "Evict: UFS {} exists, deleting Curvine {}: {}",
+                    resource_type, resource_type, cv_path
+                );
+                self.filesystem.delete(cv_path, is_directory).map_err(|e| {
+                    TtlError::ActionExecutionError(format!("Failed to delete {}: {}", cv_path, e))
+                })?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn submit_export_job(
+        &self,
+        inode_id: u64,
+        cv_path: &str,
+        ufs_path: &Path,
+        action: TtlAction,
+        is_directory: bool,
+        _mount_info: curvine_common::state::MountInfo,
+    ) -> TtlResult<()> {
+        let command = LoadJobCommand {
+            source_path: cv_path.to_string(),
+            target_path: Some(ufs_path.full_path().to_string()),
+            overwrite: Some(matches!(action, TtlAction::Flush)),
+            replicas: None,
+            block_size: None,
+            storage_type: None,
+            ttl_ms: None,
+            ttl_action: None,
+        };
+
+        let job_result = self.job_manager.submit_load_job(command).map_err(|e| {
+            TtlError::ActionExecutionError(format!("Failed to submit export job: {}", e))
+        })?;
+
+        info!(
+            "Export job submitted for {}: job_id={}, inode={}, action={:?}",
+            self.resource_type(is_directory),
+            job_result.job_id,
+            inode_id,
+            action
+        );
+
+        self.register_export_callback(
+            job_result.job_id,
+            inode_id,
+            action,
+            cv_path.to_string(),
+            is_directory,
+        )?;
+
+        Ok(())
+    }
+
+    fn register_export_callback(
+        &self,
+        job_id: String,
+        inode_id: u64,
+        action: TtlAction,
+        cv_path: String,
+        is_directory: bool,
+    ) -> TtlResult<()> {
+        let filesystem = self.filesystem.clone();
+
+        self.job_manager.jobs().register_completion_callback(
+            job_id.clone(),
+            move |job_id_str, _old_state, new_state, job_ctx| {
+                if new_state == curvine_common::state::JobTaskState::Completed {
                     info!(
-                        "Executing Inode ttl free operation for file: inode={}, path={}",
-                        inode_id, path
+                        "Export job {} completed successfully for inode {}",
+                        job_id_str, inode_id
                     );
 
-                    self.execute_file_free(inode_id, &path, file)?;
+                    // Note: resource_type is captured from closure, but we can't call self here
+                    // So we compute it inline (consistent with other methods now using helper)
+                    let resource_type = if is_directory { "directory" } else { "file" };
 
-                    info!("Inode ttl free completed: {}", path);
-                    Ok(())
+                    match action {
+                        TtlAction::Persist => {
+                            info!(
+                                "Persist completed, keeping Curvine {}: {}",
+                                resource_type, cv_path
+                            );
+                        }
+                        TtlAction::Evict | TtlAction::Flush => {
+                            info!(
+                                "Evict/Flush completed, deleting Curvine {}: {}",
+                                resource_type, cv_path
+                            );
+                            // Use recursive=true for directories, false for files
+                            if let Err(e) = filesystem.delete(&cv_path, is_directory) {
+                                error!(
+                                    "Failed to delete Curvine {} after export: {}",
+                                    resource_type, e
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    warn!(
+                        "Export job {} failed: {}",
+                        job_id_str, job_ctx.progress.message
+                    );
                 }
-                InodeView::Dir(_, _) => {
-                    warn!("Cannot free directory: {}", path);
-                    Err(TtlError::ActionExecutionError(format!(
-                        "Cannot free directory: {}",
-                        path
-                    )))
-                }
-                InodeView::FileEntry(..) => {
-                    warn!("Cannot free empty file: {}", path);
-                    Err(TtlError::ActionExecutionError(format!(
-                        "Cannot free empty file: {}",
-                        path
-                    )))
-                }
-            }
-        } else {
-            warn!("Inode {} not found in store", inode_id);
-            Err(TtlError::ActionExecutionError(format!(
-                "Inode {} not found",
-                inode_id
-            )))
-        }
+            },
+        );
+
+        Ok(())
     }
 }
