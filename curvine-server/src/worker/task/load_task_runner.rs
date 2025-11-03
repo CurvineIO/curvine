@@ -183,16 +183,12 @@ impl LoadTaskRunner {
             let writer = self.fs.create_with_opts(path, opts).await?;
             Ok(UnifiedWriter::Cv(writer))
         } else {
-            // UFS path
             let ufs = self.factory.get_ufs(&self.task.info.job.mount_info)?;
             let overwrite = self.task.info.job.overwrite.unwrap_or(false);
 
-            // Check if file exists when overwrite=false
-            if !overwrite {
-                if ufs.exists(path).await? {
-                    warn!("UFS file already exists, skipping: {}", path.full_path());
-                    return err_box!("File exists and overwrite=false");
-                }
+            if !overwrite && ufs.exists(path).await? {
+                warn!("UFS file already exists, skipping: {}", path.full_path());
+                return err_box!("File exists and overwrite=false");
             }
 
             ufs.create(path, overwrite).await

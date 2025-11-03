@@ -52,7 +52,11 @@ pub struct MountCommand {
     #[arg(long, default_value = "0")]
     ttl_ms: String,
 
-    #[arg(long, default_value = "none")]
+    #[arg(
+        long,
+        default_value = "none",
+        help = "TTL expiration action when file expires:\n  none - No action\n  delete - Delete file\n  persist - Export to UFS (skip if exists), keep CV cache\n  evict - Export to UFS (skip if exists), delete CV cache\n  flush - Force export to UFS (overwrite), delete CV cache"
+    )]
     ttl_action: String,
 
     #[arg(long)]

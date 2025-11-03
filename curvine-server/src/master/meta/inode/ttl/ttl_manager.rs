@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
+use crate::master::job::JobManager;
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::inode::ttl::ttl_checker::InodeTtlChecker;
 use crate::master::meta::inode::ttl::ttl_executor::InodeTtlExecutor;
 use crate::master::meta::inode::ttl::ttl_types::{TtlCleanupConfig, TtlCleanupResult, TtlResult};
+use crate::master::mount::MountManager;
 use log::{debug, error};
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,8 +40,19 @@ pub struct InodeTtlManager {
 }
 
 impl InodeTtlManager {
-    pub fn new(filesystem: MasterFilesystem, bucket_list: Arc<TtlBucketList>) -> TtlResult<Self> {
-        let ttl_executor = InodeTtlExecutor::new(filesystem.clone());
+    pub fn new(
+        filesystem: MasterFilesystem,
+        bucket_list: Arc<TtlBucketList>,
+        mount_manager: Arc<MountManager>,
+        factory: Arc<UfsFactory>,
+        job_manager: Arc<JobManager>,
+    ) -> TtlResult<Self> {
+        let ttl_executor = InodeTtlExecutor::with_managers(
+            filesystem.clone(),
+            mount_manager,
+            factory,
+            job_manager,
+        );
 
         // Create cleanup configuration directly from master config
         let cleanup_config = TtlCleanupConfig {

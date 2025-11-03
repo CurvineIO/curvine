@@ -18,6 +18,7 @@ use once_cell::sync::OnceCell;
 
 use curvine_common::conf::ClusterConf;
 use curvine_web::server::{WebHandlerService, WebServer};
+use log::error;
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
@@ -213,6 +214,15 @@ impl Master {
 
         // step5: Start job manager
         self.job_manager.start();
+
+        // step6: Start TTL scheduler (requires mount_manager and job_manager)
+        if let Err(e) = self.actor.start_ttl_scheduler(
+            self.mount_manager.clone(),
+            self.job_manager.factory().clone(),
+            self.job_manager.clone(),
+        ) {
+            error!("Failed to start inode ttl scheduler: {}", e);
+        }
 
         rpc_status
     }

@@ -112,12 +112,10 @@ impl LoadJobRunner {
 
         let target_path = if let Some(ref target) = command.target_path {
             Path::from_str(target)?
+        } else if source_path.is_cv() {
+            mnt.get_ufs_path(&source_path)?
         } else {
-            if source_path.is_cv() {
-                mnt.get_ufs_path(&source_path)?
-            } else {
-                mnt.get_cv_path(&source_path)?
-            }
+            mnt.get_cv_path(&source_path)?
         };
 
         let job_id = Self::create_job_id(source_path.full_path());

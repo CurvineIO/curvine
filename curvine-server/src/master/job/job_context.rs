@@ -38,6 +38,7 @@ impl TaskDetail {
     }
 }
 
+#[derive(Clone)]
 pub struct JobContext {
     pub info: LoadJobInfo,
     pub state: StateCtl,
