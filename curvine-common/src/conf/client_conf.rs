@@ -297,13 +297,13 @@ impl Default for ClientConf {
             conn_retry_min_sleep_ms: 300,
             conn_retry_max_sleep_ms: 10 * 1000,
 
-            rpc_retry_max_duration_ms: 5 * 60 * 1000,
-            rpc_retry_min_sleep_ms: 300,
-            rpc_retry_max_sleep_ms: 30 * 1000,
+            rpc_retry_max_duration_ms: 40 * 1000, // 40s: optimized for fast master failover
+            rpc_retry_min_sleep_ms: 100,          // 100ms: faster retry
+            rpc_retry_max_sleep_ms: 2 * 1000,     // 2s: avoid long wait
 
             rpc_close_idle: true,
             conn_timeout_ms: 30 * 1000,
-            rpc_timeout_ms: 120 * 1000,
+            rpc_timeout_ms: 10 * 1000, // 10s: optimized for fast master failover (matches Raft election timeout)
             data_timeout_ms: 5 * 60 * 1000,
             master_conn_pool_size: 1,
 

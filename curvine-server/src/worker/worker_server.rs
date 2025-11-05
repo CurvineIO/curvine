@@ -210,6 +210,11 @@ impl Worker {
         self.rpc_server.service()
     }
 
+    // for test - get state controller to simulate server shutdown
+    pub fn new_state_ctl(&self) -> orpc::sync::StateCtl {
+        self.rpc_server.new_state_ctl()
+    }
+
     async fn start_s3_gateway(mut conf: ClusterConf, worker_rt: Arc<Runtime>) {
         let listen_addr = conf.s3_gateway.listen.clone();
         let region = conf.s3_gateway.region.clone();
