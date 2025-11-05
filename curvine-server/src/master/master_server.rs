@@ -245,6 +245,11 @@ impl Master {
         self.replication_manager.clone()
     }
 
+    // for test - get state controller to simulate server shutdown
+    pub fn new_state_ctl(&self) -> orpc::sync::StateCtl {
+        self.rpc_server.new_state_ctl()
+    }
+
     pub fn service(&self) -> &MasterService {
         self.rpc_server.service()
     }
