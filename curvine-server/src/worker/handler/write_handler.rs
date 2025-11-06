@@ -107,14 +107,17 @@ impl WriteHandler {
         // msg.header
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
-            if header.offset < 0 || header.offset >= context.len {
-                return err_box!(
-                    "Invalid seek offset: {}, block length: {}",
-                    header.offset,
-                    context.len
-                );
+            // Flush operation should not trigger seek or boundary check
+            if !header.flush {
+                if header.offset < 0 || header.offset >= context.len {
+                    return err_box!(
+                        "Invalid seek offset: {}, block length: {}",
+                        header.offset,
+                        context.len
+                    );
+                }
+                file.seek(header.offset)?;
             }
-            file.seek(header.offset)?;
         }
 
         // Write existing data blocks.
