@@ -186,6 +186,14 @@ while true ; do
   esac
 done
 
+# Set target directory based on PROFILE
+# TARGET_DIR is used for file paths (release or debug)
+if [ -z "$PROFILE" ]; then
+  TARGET_DIR="debug"
+else
+  TARGET_DIR="release"
+fi
+
 # Check if "all" is specified along with other packages
 for pkg in "${PACKAGES[@]}"; do
   if [ "$pkg" = "all" ] && [ ${#PACKAGES[@]} -gt 1 ]; then
@@ -383,10 +391,9 @@ else
     exit 1
   fi
 fi
-
 # Copy all built binaries
 for target in "${COPY_TARGETS[@]}"; do
-  cp -f "$FS_HOME"/target/${PROFILE#--}/${target} "$DIST_DIR"/lib
+  cp -f "$FS_HOME"/target/${TARGET_DIR}/${target} "$DIST_DIR"/lib
 done
 
 # Build optional non-rust packages
@@ -402,15 +409,15 @@ if should_build_package "java"; then
   mkdir -p "$FS_HOME"/curvine-libsdk/java/native
   
   # Handle java native library
-  if [ -e "$FS_HOME/target/${PROFILE#--}/curvine_libsdk.dll" ]; then
-    cp -f "$FS_HOME/target/${PROFILE#--}/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
-  elif [ -e "$FS_HOME/target/${PROFILE#--}/libcurvine_libsdk.so" ]; then
-    cp -f "$FS_HOME/target/${PROFILE#--}/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
+  if [ -e "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
+  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
   fi
 
   # Build java package
   cd "$FS_HOME"/curvine-libsdk/java
-  mvn protobuf:compile package -DskipTests -P${PROFILE#--}
+  mvn protobuf:compile package -DskipTests -P${TARGET_DIR}
   if [ $? -ne 0 ]; then
     echo "Java build failed. Exiting..."
     exit 1
