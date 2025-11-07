@@ -25,6 +25,7 @@ use orpc::sync::channel::AsyncSender;
 use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
 use orpc::{err_box, sys};
 use std::sync::Arc;
+use tokio::sync::watch;
 use tokio_util::bytes::BytesMut;
 
 /// FuseReceiver provides the following functionality:
@@ -96,7 +97,6 @@ impl<T: FileSystem> FuseReceiver<T> {
         }
 
         let read_len = self.pipe2.read_buf(&mut self.buf[..write_len]).await?;
-
         if write_len != read_len {
             return err_box!(
                 "Splice read and write lengths are inconsistent, write len {}, read len {}",
@@ -122,43 +122,55 @@ impl<T: FileSystem> FuseReceiver<T> {
         Ok(())
     }
 
-    pub async fn start(mut self) -> FuseResult<()> {
+    pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
+        info!("fuse receiver started");
         loop {
-            match self.receive().await {
-                Ok(buf) => {
-                    let req = FuseRequest::from_bytes(buf.freeze())?;
+            tokio::select! {
+                res = self.receive() => {
+                    match res {
+                        Ok(buf) => {
+                            let req = FuseRequest::from_bytes(buf.freeze())?;
 
-                    if self.debug {
-                        let operator = req.parse_operator()?;
-                        info!(
-                            "receive unique: {}, code: {:?}, op: {:?}",
-                            req.unique(),
-                            req.opcode(),
-                            operator
-                        );
-                    }
-
-                    if req.is_stream() {
-                        self.send_stream(req).await?;
-                    } else {
-                        let reply = self.new_replay(req.unique());
-                        let fs = self.fs.clone();
-
-                        self.rt.spawn(async move {
-                            if let Err(e) = Self::dispatch_meta(fs, req, reply).await {
-                                error!("Failed to dispatch meta request: {}", e);
+                            if self.debug {
+                                let operator = req.parse_operator()?;
+                                info!(
+                                    "receive unique: {}, code: {:?}, op: {:?}",
+                                    req.unique(),
+                                    req.opcode(),
+                                    operator
+                                );
                             }
-                        });
+
+                            if req.is_stream() {
+                                self.send_stream(req).await?;
+                            } else {
+                                let reply = self.new_replay(req.unique());
+                                let fs = self.fs.clone();
+
+                                self.rt.spawn(async move {
+                                    if let Err(e) = Self::dispatch_meta(fs, req, reply).await {
+                                        error!("Failed to dispatch meta request: {}", e);
+                                    }
+                                });
+                            }
+                        }
+
+                        Err(e) => match e.raw_error().raw_os_error() {
+                            Some(ENOENT) => continue,
+                            Some(EINTR) => continue,
+                            Some(EAGAIN) => continue,
+                            Some(ENODEV) => break,
+                            _ => return Err(e.into()),
+                        },
                     }
                 }
 
-                Err(e) => match e.raw_error().raw_os_error() {
-                    Some(ENOENT) => continue,
-                    Some(EINTR) => continue,
-                    Some(EAGAIN) => continue,
-                    Some(ENODEV) => break,
-                    _ => return Err(e.into()),
-                },
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("receiver observed shutdown broadcast; exiting receive loop");
+                        break;
+                    }
+                }
             }
         }
 

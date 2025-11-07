@@ -29,12 +29,14 @@ use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::CommonResult;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 pub struct FuseSession<T> {
     rt: Arc<Runtime>,
     fs: Arc<T>,
     mnts: Vec<FuseMnt>,
     channels: Vec<FuseChannel<T>>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl<T: FileSystem> FuseSession<T> {
@@ -51,6 +53,7 @@ impl<T: FileSystem> FuseSession<T> {
         }
 
         let fs = Arc::new(fs);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let mut channels = vec![];
         for mnt in &mut mnts {
             let channel = FuseChannel::new(fs.clone(), rt.clone(), mnt, &conf)?;
@@ -74,52 +77,118 @@ impl<T: FileSystem> FuseSession<T> {
             fs,
             mnts,
             channels,
+            shutdown_tx,
         };
         Ok(session)
     }
 
     pub async fn run(&mut self) -> CommonResult<()> {
+        info!("fuse session started running");
         let ctrl_c = tokio::signal::ctrl_c();
         let channels = std::mem::take(&mut self.channels);
-        let _mnts = std::mem::take(&mut self.mnts);
+        let mnts = std::mem::take(&mut self.mnts);
 
         #[cfg(target_os = "linux")]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            let mut unix_sig = signal(SignalKind::terminate()).unwrap();
+            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+            let mut sigint = signal(SignalKind::interrupt()).unwrap();
+            let mut sighup = signal(SignalKind::hangup()).unwrap();
+            let mut sigquit = signal(SignalKind::quit()).unwrap();
+
+            //check umount signal
+            {
+                let watch_fds: Vec<orpc::sys::RawIO> = mnts.iter().map(|m| m.fd).collect();
+                self.spawn_fd_watcher(&watch_fds);
+            }
 
             tokio::select! {
-                res = Self::run_all(self.rt.clone(), self.fs.clone(), channels) => {
+                res = Self::run_all(self.rt.clone(), self.fs.clone(), channels, self.shutdown_tx.subscribe()) => {
                     if let Err(err) = res {
                         error!("fatal error, cause = {:?}", err);
                     }
+                    info!("run_all finished; proceeding to unmount and exit");
                 }
 
                 _ = ctrl_c => {
-                    info!("Receive ctrl_c signal, shutting down fuse");
+                    info!("received Ctrl-C (SIGINT via terminal), shutting down fuse");
+                    let _ = self.shutdown_tx.send(true);
                 }
 
-                _ = unix_sig.recv()  => {
-                      info!("Received SIGTERM, shutting down fuse gracefully...");
+                _ = sigterm.recv()  => {
+                    info!("received SIGTERM, shutting down fuse gracefully...");
+                    let _ = self.shutdown_tx.send(true);
+                }
+
+                _ = sigint.recv()  => {
+                    info!("received SIGINT, shutting down fuse gracefully...");
+                    let _ = self.shutdown_tx.send(true);
+                }
+
+                _ = sighup.recv()  => {
+                    info!("received SIGHUP, shutting down fuse gracefully...");
+                    let _ = self.shutdown_tx.send(true);
+                }
+
+                _ = sigquit.recv()  => {
+                    info!("received SIGQUIT, shutting down fuse gracefully...");
+                    let _ = self.shutdown_tx.send(true);
                 }
             }
         }
 
+        info!("calling fs.unmount() and finishing fuse session");
         self.fs.unmount();
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_fd_watcher(&self, watch_fds: &[orpc::sys::RawIO]) {
+        // Spawn an independent watcher task to detect HUP/ERR on FUSE fd
+        let shutdown_tx = self.shutdown_tx.clone();
+        let watch_fds_cloned = watch_fds.to_owned();
+        self.rt.spawn(async move {
+            use libc::{poll, pollfd, POLLERR, POLLHUP};
+            use std::time::Duration;
+            let mut pfds: Vec<pollfd> = watch_fds_cloned
+                .iter()
+                .map(|fd| pollfd {
+                    fd: *fd,
+                    events: (POLLERR | POLLHUP) as i16,
+                    revents: 0,
+                })
+                .collect();
+            loop {
+                // Non-blocking poll; do not stall the runtime
+                let res = unsafe { poll(pfds.as_mut_ptr(), pfds.len() as u64, 0) };
+                if res > 0 {
+                    for p in &pfds {
+                        let revents = p.revents as i16;
+                        if (revents & ((POLLERR | POLLHUP) as i16)) != 0 {
+                            info!("fd_watcher detected HUP/ERR on FUSE fd; broadcasting shutdown");
+                            let _ = shutdown_tx.send(true);
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
     }
 
     async fn run_all(
         rt: Arc<Runtime>,
         fs: Arc<T>,
         channels: Vec<FuseChannel<T>>,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> CommonResult<()> {
         let mut handles = vec![];
 
         for channel in channels {
             for receiver in channel.receivers {
+                let mut shutdown_rx = shutdown_rx.clone();
                 let handle = rt.spawn(async move {
-                    if let Err(err) = receiver.start().await {
+                    if let Err(err) = receiver.start(shutdown_rx).await {
                         error!("failed to accept, cause = {:?}", err);
                     }
                 });

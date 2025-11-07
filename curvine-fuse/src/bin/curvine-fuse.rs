@@ -29,6 +29,11 @@ fn main() -> CommonResult<()> {
     let args = FuseArgs::parse();
     println!("fuse args {:?}", args);
 
+    // Ignore SIGPIPE to prevent unexpected termination when peer closes
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     let cluster_conf = args.get_conf()?;
     Logger::init(cluster_conf.fuse.log.clone());
     cluster_conf.print();
