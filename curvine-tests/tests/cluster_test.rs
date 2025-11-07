@@ -19,6 +19,7 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::FileBlocks;
 use curvine_server::test::MiniCluster;
+use curvine_tests::Testing;
 use orpc::common::Utils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{CommonError, CommonResult};
@@ -28,44 +29,58 @@ use std::sync::Arc;
 
 #[test]
 fn block_delete_test() -> CommonResult<()> {
-    let mut conf = ClusterConf::default();
-    conf.client.block_size = 64 * 1024;
-    conf.master.min_block_size = 64 * 1024;
-
-    let cluster = MiniCluster::with_num(&conf, 1, 1);
-    let conf = cluster.master_conf().clone();
-
-    cluster.start_cluster();
-
-    Utils::sleep(10000);
+    let testing = Testing::builder()
+        .workers(3)
+        .with_base_conf_path("../etc/curvine-cluster.toml")
+        .mutate_conf(|conf| {
+            conf.client.block_size = 64 * 1024;
+            conf.master.min_block_size = 64 * 1024;
+            print!("-----------------------------------------")
+        })
+        .build()?;
+    testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
 
     let rt = Arc::new(AsyncRuntime::single());
     let rt1 = rt.clone();
+    let fs = testing.get_fs(Some(rt1.clone()), Some(conf))?;
     let path = Path::from_str("/block_delete_test.log")?;
-    let file_blocks = rt.block_on(async move {
-        let fs = CurvineFileSystem::with_rt(conf, rt1)?;
+    rt.block_on(async move {
         let file_blocks = write(&fs, &path).await?;
+        log::info!("file_blocks {:?}", file_blocks);
 
-        fs.delete(&path, false).await?;
-        Ok::<FileBlocks, CommonError>(file_blocks)
+        fs.delete(&path, false).await.map_err(CommonError::from)?;
+        Utils::sleep(10000);
+
+        let exists = fs.exists(&path).await.map_err(CommonError::from)?;
+        assert!(!exists);
+        assert!(fs.get_status(&path).await.is_err());
+        assert!(fs.get_block_locations(&path).await.is_err());
+
+        // Verify each previously allocated block cannot be opened on any worker
+        for lc in file_blocks.block_locs {
+            for loc in lc.locs {
+                let bc = fs
+                    .fs_context()
+                    .block_client(&loc)
+                    .await
+                    .map_err(CommonError::from)?;
+                let res = bc
+                    .open_block(
+                        &fs.conf().client,
+                        &lc.block,
+                        0,
+                        lc.block.len,
+                        Utils::req_id(),
+                        0,
+                        false,
+                    )
+                    .await;
+                assert!(res.is_err());
+            }
+        }
+        Ok::<(), CommonError>(())
     })?;
-
-    // Wait for the block to be deleted asynchronously.
-    Utils::sleep(10000);
-
-    log::info!("file_blocks {:?}", file_blocks);
-    let fs = cluster.get_active_master_fs();
-    let sync_fs_dir = fs.fs_dir();
-    let fs_dir = sync_fs_dir.read();
-
-    for lc in file_blocks.block_locs {
-        // block id no longer exists.
-        assert!(!(fs_dir.block_exists(lc.block.id)?));
-
-        // locs have been deleted.
-        let block_locs = fs_dir.get_rocks_store().get_locations(lc.block.id)?;
-        assert!(block_locs.is_empty());
-    }
 
     Ok(())
 }
