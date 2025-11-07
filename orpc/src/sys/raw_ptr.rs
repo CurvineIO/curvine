@@ -75,6 +75,22 @@ impl<T> RawPtr<T> {
             self.ptr = self.ptr.add(offset);
         }
     }
+
+    pub fn replace(&self, value: T) -> T {
+        if self.owned {
+            unsafe { std::ptr::replace(self.ptr, value) }
+        } else {
+            panic!("Cannot replace a pointer that owns the value")
+        }
+    }
+
+    pub fn take(&self) -> T {
+        if self.owned {
+            unsafe { *Box::from_raw(self.ptr) }
+        } else {
+            panic!("Cannot take a pointer that owns the value")
+        }
+    }
 }
 
 impl<T> Clone for RawPtr<T> {
@@ -167,5 +183,33 @@ mod tests {
             let ptr = RawPtr::from_ref(&p);
             println!("{} {}", ptr.name, ptr.age)
         }
+    }
+
+    #[test]
+    fn ptr_replace() {
+        let p1 = Person {
+            name: "curvine".to_owned(),
+            age: 1,
+        };
+        let ptr = RawPtr::from_owned(p1);
+
+        println!("Before replace: {} {}", ptr.name, ptr.age);
+
+        let p2 = Person {
+            name: "oppo".to_owned(),
+            age: 2,
+        };
+        let old = ptr.replace(p2);
+
+        println!("After replace: {} {}", ptr.name, ptr.age);
+        println!("Old value: {} {}", old.name, old.age);
+
+        assert_eq!(ptr.name, "oppo");
+        assert_eq!(ptr.age, 2);
+        assert_eq!(old.name, "curvine");
+        assert_eq!(old.age, 1);
+
+        drop(old);
+        println!("Old value dropped");
     }
 }

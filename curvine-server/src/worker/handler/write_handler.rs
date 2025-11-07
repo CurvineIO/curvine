@@ -63,12 +63,13 @@ impl WriteHandler {
         };
 
         let log_msg = format!(
-            "Write {}-block start req_id: {}, path: {:?}, chunk_size: {}, block_size: {}",
+            "Write {}-block start req_id: {}, path: {:?}, chunk_size: {}, off: {}, block_size: {}",
             label,
             context.req_id,
             path,
             context.chunk_size,
-            ByteUnit::byte_to_string(context.block.len as u64)
+            context.off,
+            ByteUnit::byte_to_string(context.len as u64)
         );
 
         let response = BlockWriteResponse {
@@ -170,19 +171,10 @@ impl WriteHandler {
             };
         }
 
-        let block = match self.context.take() {
-            Some(v) => {
-                // Remote writing
-                Self::check_context(&v, msg)?;
-                v.block
-            }
-
-            None => {
-                // Local short-circuit write, block information is in the header.
-                let c = WriteContext::from_req(msg)?;
-                c.block
-            }
-        };
+        if let Some(context) = self.context.take() {
+            Self::check_context(&context, msg)?;
+        }
+        let context = WriteContext::from_req(msg)?;
 
         // flush and close the file.
         let file = self.file.take();
@@ -192,13 +184,15 @@ impl WriteHandler {
         }
 
         // Submit block.
-        self.commit_block(&block, commit || block.is_stream())?;
+        self.commit_block(&context.block, commit)?;
         self.is_commit = true;
 
         info!(
-            "write block end for req_id {}, is commit: {}",
+            "write block end for req_id {}, is commit: {}, off: {}, len: {}",
             msg.req_id(),
-            commit
+            commit,
+            context.off,
+            context.len
         );
 
         Ok(msg.success())

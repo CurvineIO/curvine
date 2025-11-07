@@ -162,11 +162,14 @@ impl Worker {
     }
 
     pub async fn start(self) -> ServerStateListener {
-        let worker_rt = self.rpc_server.clone_rt();
         let conf = CLUSTER_CONF.get().expect("Cluster conf not initialized");
         if conf.worker.enable_s3_gateway {
-            info!("Starting S3 gateway alongside worker");
-            Self::start_s3_gateway(conf.clone(), worker_rt).await;
+            #[cfg(target_os = "linux")]
+            {
+                info!("Starting S3 gateway alongside worker");
+                let worker_rt = self.rpc_server.clone_rt();
+                Self::start_s3_gateway(conf.clone(), worker_rt).await;
+            }
         }
 
         // step 3: Start rpc server
@@ -210,6 +213,7 @@ impl Worker {
         self.rpc_server.service()
     }
 
+    #[cfg(target_os = "linux")]
     async fn start_s3_gateway(mut conf: ClusterConf, worker_rt: Arc<Runtime>) {
         let listen_addr = conf.s3_gateway.listen.clone();
         let region = conf.s3_gateway.region.clone();

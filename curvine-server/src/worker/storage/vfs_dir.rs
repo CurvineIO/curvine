@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockMeta, BlockState};
-use crate::worker::storage::{DirState, StorageVersion, FINALIZED_DIR, RBW_DIR};
+use crate::worker::storage::{DirState, StorageVersion, ACTIVE_DIR, STAGING_DIR};
 use curvine_common::conf::WorkerDataDir;
 use curvine_common::state::{ExtendedBlock, StorageType};
 use log::*;
@@ -21,9 +21,8 @@ use orpc::common::{ByteUnit, FileUtils};
 use orpc::io::LocalFile;
 use orpc::sync::AtomicLong;
 use orpc::sys::FsStats;
-use orpc::{err_box, try_err, try_option, CommonResult};
+use orpc::{try_err, CommonResult};
 use std::fmt::{Debug, Formatter};
-use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -33,8 +32,8 @@ use std::sync::Arc;
 pub struct VfsDir {
     pub(crate) version: StorageVersion,
     pub(crate) stats: FsStats,
-    pub(crate) finalized_dir: PathBuf,
-    pub(crate) rbw_dir: PathBuf,
+    pub(crate) active_dir: PathBuf,
+    pub(crate) staging_dir: PathBuf,
     pub(crate) storage_type: StorageType,
     pub(crate) conf_capacity: i64,
     pub(crate) reserved_bytes: i64,
@@ -58,10 +57,10 @@ impl VfsDir {
         let stats = FsStats::new(&stg_dir);
 
         // Initialize the directory.
-        let finalized_dir = stats.path().join(FINALIZED_DIR);
-        let rbw_dir = stats.path().join(RBW_DIR);
-        FileUtils::create_dir(&finalized_dir, true)?;
-        FileUtils::create_dir(&rbw_dir, true)?;
+        let active_dir = stats.path().join(ACTIVE_DIR);
+        let staging_dir = stats.path().join(STAGING_DIR);
+        FileUtils::create_dir(&active_dir, true)?;
+        FileUtils::create_dir(&staging_dir, true)?;
 
         stats.check_dir()?;
 
@@ -77,8 +76,8 @@ impl VfsDir {
         let dir = Self {
             version,
             stats,
-            finalized_dir,
-            rbw_dir,
+            active_dir,
+            staging_dir,
             storage_type: conf.storage_type,
             conf_capacity: conf.capacity as i64,
             reserved_bytes: reserved_bytes as i64,
@@ -221,26 +220,9 @@ impl VfsDir {
         }
     }
 
-    pub fn open_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+    pub fn create_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let meta = BlockMeta::with_tmp(block, self);
         let file = meta.get_block_path()?;
-
-        if file.exists() {
-            return err_box!(
-                "Failed to create temporary file {:?}, because the file already exists",
-                file
-            );
-        }
-
-        // Create parent directory
-        let parent = try_option!(file.parent());
-        if !parent.exists() {
-            FileUtils::create_dir(parent, true)?;
-        } else if !parent.is_dir() {
-            return err_box!("Path {:?} not a dir", parent);
-        }
-
-        // Create a file.
         let _ = try_err!(File::create(file));
         Ok(meta)
     }
@@ -248,50 +230,24 @@ impl VfsDir {
     pub fn finalize_block(&self, meta: &BlockMeta) -> CommonResult<BlockMeta> {
         let tmp_file = meta.get_block_path()?;
         let file_size = try_err!(tmp_file.metadata()).len() as i64;
-
         let final_meta = BlockMeta::with_final(meta, file_size);
-        let final_file = final_meta.get_block_path()?;
-
-        FileUtils::rename(tmp_file, final_file)?;
         Ok(final_meta)
-    }
-
-    pub fn reopen_block(&self, block: &ExtendedBlock, meta: &BlockMeta) -> CommonResult<BlockMeta> {
-        let cur_file = meta.get_block_path()?;
-        let file_size = try_err!(cur_file.metadata()).len() as i64;
-        if file_size > block.len {
-            return err_box!(
-                "block file length is greater than block size, file size: {}, block size: {}",
-                file_size,
-                block.len
-            );
-        }
-
-        let new_meta = BlockMeta::new(meta.id, block.len, self);
-        let new_file = new_meta.get_block_path()?;
-
-        // rename file to rbw dir
-        if cur_file != new_file {
-            try_err!(fs::rename(cur_file, new_file))
-        }
-
-        Ok(new_meta)
     }
 
     // Scan all blocks in the directory
     pub fn scan_blocks(&self) -> CommonResult<Vec<BlockMeta>> {
-        let finalized_files = FileUtils::list_files(&self.finalized_dir, true)?;
-        let rbw_files = FileUtils::list_files(&self.rbw_dir, true)?;
+        let active_dir = FileUtils::list_files(&self.active_dir, true)?;
+        let staging_dir = FileUtils::list_files(&self.staging_dir, true)?;
 
         let mut vec = vec![];
-        for file in finalized_files {
+        for file in active_dir {
             if let Ok(v) = BlockMeta::from_file(&file, BlockState::Finalized, self) {
                 vec.push(v);
             }
         }
 
-        for file in rbw_files {
-            if let Ok(v) = BlockMeta::from_file(&file, BlockState::Writing, self) {
+        for file in staging_dir {
+            if let Ok(v) = BlockMeta::from_file(&file, BlockState::Recovering, self) {
                 vec.push(v);
             }
         }
@@ -367,7 +323,7 @@ mod test {
 
         // add tmp block
         let block = ExtendedBlock::with_size_str(1122, "10MB", StorageType::Mem)?;
-        let tmp = dir.open_block(&block)?;
+        let tmp = dir.create_block(&block)?;
         dir.reserve_space(false, block.len);
 
         let tmp_file = tmp.get_block_path()?;
@@ -386,16 +342,15 @@ mod test {
 
         // commit block
         let final1 = dir.finalize_block(&tmp)?;
-        let final_file = final1.get_block_path()?;
+        let file = final1.get_block_path()?;
         dir.release_space(false, block.len);
         dir.reserve_space(false, final1.len);
         println!(
             "final_file = {:?}, available = {}",
-            final_file,
+            file,
             ByteUnit::byte_to_string(dir.available() as u64)
         );
-        assert!(!tmp_file.exists());
-        assert!(final_file.exists());
+        assert!(file.exists());
         assert_eq!(dir.available(), 99 * ByteUnit::MB as i64);
 
         Ok(())

@@ -59,23 +59,12 @@ impl ReadHandler {
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let context = ReadContext::from_req(msg)?;
         let meta = self.store.get_block(context.block_id)?;
-        if !meta.is_final() {
-            return err_box!("Block {} not completed", meta.id);
-        }
 
         if context.off > meta.len {
             return err_box!(
                 "The length of the requested data exceeds the maximum length of the block file, \
             request off {}, file len {}",
                 context.off,
-                meta.len
-            );
-        }
-
-        if context.len != meta.len {
-            return err_box!(
-                "File length mismatch, request len {}, file len {}",
-                context.len,
                 meta.len
             );
         }
