@@ -50,6 +50,7 @@ pub enum FuseOperator<'a> {
     Link(Link<'a>),
     BatchForget(BatchForget<'a>),
     Rename(Rename<'a>),
+    Rename2(Rename2<'a>),
     Interrupt(Interrupt<'a>),
     ListXAttr(ListXAttr<'a>),
     FSync(FSync<'a>),
@@ -312,6 +313,15 @@ pub struct BatchForget<'a> {
 pub struct Rename<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_rename_in,
+    pub old_name: &'a OsStr,
+    pub new_name: &'a OsStr,
+}
+
+// Rename a file with flags (RENAME2).
+#[derive(Debug)]
+pub struct Rename2<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_rename2_in,
     pub old_name: &'a OsStr,
     pub new_name: &'a OsStr,
 }

@@ -75,7 +75,7 @@ pub struct fuse_init_out {
 }
 
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct fuse_attr {
     pub ino: u64,
     pub size: u64,

@@ -114,7 +114,7 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
 
 
     private void flushBuffer() throws IOException {
-        if (buffer[bufIndex].position() > 0) {
+        if (buffer != null && buffer[bufIndex].position() > 0) {
             libFs.write(nativeHandle, buffer[bufIndex]);
         }
     }

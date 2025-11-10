@@ -21,5 +21,5 @@ pub use self::node_state::NodeState;
 mod node_map;
 pub use self::node_map::NodeMap;
 
-mod handle_map;
-pub use self::handle_map::HandleMap;
+mod file_handle;
+pub use self::file_handle::FileHandle;

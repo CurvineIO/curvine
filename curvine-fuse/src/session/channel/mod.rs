@@ -12,31 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod fuse_receiver;
-
-pub use self::fuse_receiver::FuseReceiver;
-use crate::FuseUtils;
+use crate::fs::FileSystem;
+use crate::session::FuseMnt;
+use crate::{FuseResult, FuseUtils};
 use curvine_common::conf::FuseConf;
-use orpc::io::IOResult;
+use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncChannel;
-use orpc::sys::pipe::AsyncFd;
 use std::sync::Arc;
+
+mod fuse_receiver;
+pub use self::fuse_receiver::FuseReceiver;
 
 mod fuse_sender;
 pub use self::fuse_sender::FuseSender;
 
-pub struct FuseChannel {
-    pub sender: FuseSender,
-    pub receiver: FuseReceiver,
+pub struct FuseChannel<T> {
+    pub senders: Vec<FuseSender<T>>,
+    pub receivers: Vec<FuseReceiver<T>>,
 }
 
-impl FuseChannel {
-    pub fn new(fd_pair: (Arc<AsyncFd>, Arc<AsyncFd>), conf: &FuseConf) -> IOResult<Self> {
+impl<T: FileSystem> FuseChannel<T> {
+    pub fn new(fs: Arc<T>, rt: Arc<Runtime>, mnt: &FuseMnt, conf: &FuseConf) -> FuseResult<Self> {
         let buf_size = FuseUtils::get_fuse_buf_size();
-        let (tx, rx) = AsyncChannel::new(conf.fuse_channel_size).split();
-        let sender = FuseSender::new(fd_pair.0, rx, buf_size)?;
-        let receiver = FuseReceiver::new(fd_pair.1, tx, buf_size, conf.debug)?;
 
-        Ok(Self { sender, receiver })
+        let mut receivers = Vec::with_capacity(conf.mnt_per_task);
+        let mut senders = Vec::with_capacity(conf.mnt_per_task);
+        for _ in 0..conf.mnt_per_task {
+            let (tx, rx) = AsyncChannel::new(conf.fuse_channel_size).split();
+            let fd = mnt.create_async_task_fd(conf.clone_fd)?;
+
+            let sender =
+                FuseSender::new(fs.clone(), rt.clone(), fd.clone(), rx, buf_size, conf.debug)?;
+
+            let receiver = FuseReceiver::new(fs.clone(), rt.clone(), fd, tx, buf_size, conf.debug)?;
+
+            senders.push(sender);
+            receivers.push(receiver);
+        }
+
+        Ok(Self { senders, receivers })
     }
 }

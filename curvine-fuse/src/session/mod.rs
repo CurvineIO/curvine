@@ -35,3 +35,8 @@ pub use self::fuse_op_code::FuseOpCode;
 
 mod fuse_buf;
 pub use fuse_buf::FuseBuf;
+
+pub enum FuseTask {
+    Reply(ResponseData),
+    Request(FuseRequest),
+}

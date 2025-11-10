@@ -83,6 +83,8 @@ pub const FUSE_DO_READDIRPLUS: u32 = 1 << 13;
 
 pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
 
+pub const FUSE_DO_RENAME2: u32 = 1 << 11;
+
 pub const FUSE_MAX_NAME_LENGTH: usize = 255;
 
 pub const FUSE_UNKNOWN_INODES: u64 = 0xffffffff;

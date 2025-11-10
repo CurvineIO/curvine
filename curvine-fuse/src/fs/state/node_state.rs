@@ -12,32 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::state::{HandleMap, NodeAttr, NodeMap};
-use crate::fs::{CurvineFileSystem, FuseFile};
+use crate::fs::state::file_handle::FileHandle;
+use crate::fs::state::{NodeAttr, NodeMap};
+use crate::fs::CurvineFileSystem;
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult};
+use curvine_client::unified::{UnifiedFileSystem, UnifiedReader, UnifiedWriter};
 use curvine_common::conf::FuseConf;
-use curvine_common::fs::Path;
-use curvine_common::state::FileStatus;
-use log::warn;
+use curvine_common::fs::{FileSystem, Path};
+use curvine_common::state::{FileStatus, OpenFlags};
+use log::{info, warn};
+use orpc::common::FastHashMap;
+use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 pub struct NodeState {
     node_map: RwLock<NodeMap>,
-    handle_map: HandleMap,
+    handles: RwLockHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
+    fh_creator: AtomicCounter,
+    fs: UnifiedFileSystem,
     conf: FuseConf,
 }
 
 impl NodeState {
-    pub fn new(conf: &FuseConf) -> Self {
-        let node_map = NodeMap::new(conf);
+    pub fn new(fs: UnifiedFileSystem) -> Self {
+        let conf = fs.conf().fuse.clone();
+        let node_map = NodeMap::new(&conf);
 
         Self {
             node_map: RwLock::new(node_map),
-            handle_map: HandleMap::new(),
-            conf: conf.clone(),
+            handles: RwLockHashMap::default(),
+            fs,
+            fh_creator: AtomicCounter::new(0),
+            conf,
         }
     }
 
@@ -82,30 +92,11 @@ impl NodeState {
         self.node_read().get_check(id).map(|x| x.parent)
     }
 
-    pub fn add_file(&self, file: FuseFile) -> FuseResult<u64> {
-        self.handle_map.add(file)
+    pub fn next_fh(&self) -> u64 {
+        self.fh_creator.next()
     }
 
-    pub fn get_file(&self, fh: u64) -> Option<RawPtr<FuseFile>> {
-        self.handle_map.get(fh)
-    }
-
-    pub fn get_file_check(&self, fh: u64) -> FuseResult<RawPtr<FuseFile>> {
-        match self.handle_map.get(fh) {
-            None => err_fuse!(libc::EBADF, "FileHandle not initialized, fh {}", fh),
-            Some(v) => Ok(v),
-        }
-    }
-
-    pub fn remove_file(&self, fh: u64) -> Option<RawPtr<FuseFile>> {
-        self.handle_map.remove(fh)
-    }
-
-    pub fn next_handle(&self) -> u64 {
-        self.handle_map.next_id()
-    }
-
-    pub fn find_node<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> FuseResult<NodeAttr> {
+    pub fn find_node(&self, parent: u64, name: Option<&str>) -> FuseResult<NodeAttr> {
         self.node_write().find_node(parent, name).map(|x| x.clone())
     }
 
@@ -127,6 +118,7 @@ impl NodeState {
 
         let mut attr = CurvineFileSystem::status_to_attr(&self.conf, status)?;
         attr.ino = node.id;
+        node.attr = attr.clone();
 
         if self.conf.auto_cache
             && node.cache_valid
@@ -137,6 +129,14 @@ impl NodeState {
             node.size = attr.size;
         }
         Ok(attr)
+    }
+
+    pub fn get_attr<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> FuseResult<fuse_attr> {
+        let map = self.node_read();
+        match map.lookup_node(parent, name) {
+            Some(v) => Ok(v.attr.clone()),
+            None => err_fuse!(libc::ENOENT),
+        }
     }
 
     // Peer-to-peer implementation of fuse.c forget_node
@@ -175,23 +175,157 @@ impl NodeState {
 
         Ok(list)
     }
+
+    fn find_writer0(
+        map: &FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
+        ino: &u64,
+    ) -> Option<Arc<Mutex<UnifiedWriter>>> {
+        if let Some(h) = map.get(ino) {
+            for (_, handle) in h.iter() {
+                if let Some(writer) = &handle.writer {
+                    return Some(writer.clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn find_writer(&self, ino: &u64) -> Option<Arc<Mutex<UnifiedWriter>>> {
+        let map = self.handles.read();
+        Self::find_writer0(&map, ino)
+    }
+
+    pub async fn new_writer(
+        &self,
+        ino: u64,
+        path: &Path,
+        flags: OpenFlags,
+    ) -> FuseResult<Arc<Mutex<UnifiedWriter>>> {
+        let exists_writer = {
+            let lock = self.handles.read();
+            Self::find_writer0(&lock, &ino)
+        };
+
+        if let Some(writer) = exists_writer {
+            return Ok(writer);
+        }
+
+        let writer = if flags.append() {
+            self.fs.append(path).await?
+        } else {
+            self.fs.create(path, flags.overwrite()).await?
+        };
+        Ok(Arc::new(Mutex::new(writer)))
+    }
+
+    pub async fn new_reader(&self, path: &Path) -> FuseResult<UnifiedReader> {
+        let reader = self.fs.open(path).await?;
+        Ok(reader)
+    }
+
+    pub async fn new_handle(
+        &self,
+        ino: u64,
+        path: &Path,
+        flags: u32,
+    ) -> FuseResult<Arc<FileHandle>> {
+        let flags = OpenFlags::new(flags);
+        info!("flags {:?}", flags);
+        let (reader, writer) = match flags.access_mode() {
+            mode if mode == OpenFlags::RDONLY => {
+                let reader = self.new_reader(path).await?;
+                (Some(RawPtr::from_owned(reader)), None)
+            }
+
+            mode if mode == OpenFlags::WRONLY => {
+                let writer = self.new_writer(ino, path, flags).await?;
+                (None, Some(writer))
+            }
+
+            mode if mode == OpenFlags::RDWR => {
+                let writer = self.new_writer(ino, path, flags).await?;
+                let reader = self.new_reader(path).await.unwrap();
+                (Some(RawPtr::from_owned(reader)), Some(writer))
+            }
+            _ => {
+                return err_fuse!(
+                    libc::EINVAL,
+                    "Invalid access mode: {:?}",
+                    flags.access_mode()
+                );
+            }
+        };
+
+        let mut lock = self.handles.write();
+
+        // Check if writer already exists to prevent duplicate creation
+        let check_writer = if let Some(writer) = writer {
+            if let Some(exist_writer) = Self::find_writer0(&lock, &ino) {
+                Some(exist_writer)
+            } else {
+                Some(writer)
+            }
+        } else {
+            None
+        };
+
+        let handle = Arc::new(FileHandle::new(ino, self.next_fh(), reader, check_writer));
+        lock.entry(handle.ino)
+            .or_default()
+            .insert(handle.fh, handle.clone());
+
+        Ok(handle)
+    }
+
+    pub fn find_handle(&self, ino: u64, fh: u64) -> FuseResult<Arc<FileHandle>> {
+        let lock = self.handles.read();
+        if let Some(v) = lock.get(&ino) {
+            if let Some(handle) = v.get(&fh) {
+                Ok(handle.clone())
+            } else {
+                err_fuse!(libc::EBADF, "Ino {} fh {}  not found handle", ino, fh)
+            }
+        } else {
+            err_fuse!(libc::EBADF, "Ino {} fh {}  not found handle", ino, fh)
+        }
+    }
+
+    pub fn remove_handle(&self, ino: u64, fh: u64) -> Option<Arc<FileHandle>> {
+        let mut lock = self.handles.write();
+        if let Some(map) = lock.get_mut(&ino) {
+            let handle = map.remove(&fh);
+
+            if map.is_empty() {
+                lock.remove(&ino);
+            }
+
+            handle
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
     use crate::fs::state::NodeState;
     use crate::FUSE_ROOT_ID;
-    use curvine_common::conf::FuseConf;
+    use curvine_client::unified::UnifiedFileSystem;
+    use curvine_common::conf::{ClusterConf, FuseConf};
     use curvine_common::state::FileStatus;
+    use orpc::runtime::AsyncRuntime;
     use orpc::CommonResult;
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
     #[test]
     pub fn path() -> CommonResult<()> {
-        let mut conf = FuseConf::default();
-        conf.init()?;
-        let state = NodeState::new(&conf);
+        let mut conf = ClusterConf::default();
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
 
         let a = state.find_node(FUSE_ROOT_ID, Some("a"))?;
         println!("a = {:?}", a);
@@ -214,15 +348,18 @@ mod test {
 
     #[test]
     pub fn ttl() -> CommonResult<()> {
-        let mut conf = FuseConf {
-            node_cache_size: 2,
-            node_cache_timeout: "100ms".to_string(),
+        let mut conf = ClusterConf {
+            fuse: FuseConf {
+                node_cache_size: 2,
+                node_cache_timeout: "100ms".to_string(),
+                ..Default::default()
+            },
             ..Default::default()
         };
-        conf.init()?;
-        println!("{:#?}", conf);
+        conf.fuse.init()?;
 
-        let state = NodeState::new(&conf);
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
         let status_a = FileStatus::with_name(2, "a".to_string(), true);
         let status_b = FileStatus::with_name(3, "b".to_string(), true);
         let status_c = FileStatus::with_name(4, "c".to_string(), true);

@@ -12,42 +12,123 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::session::ResponseData;
+use crate::fs::operator::FuseOperator;
+use crate::fs::FileSystem;
+use crate::session::{FuseRequest, FuseTask, ResponseData};
+use crate::{err_fuse, FuseResult};
+use log::{info, warn};
 use orpc::io::IOResult;
+use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncReceiver;
 use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
 use orpc::{err_box, sys};
 use std::sync::Arc;
 
-pub struct FuseSender {
+/// FuseSender
+/// Reads data from queue and writes to fuse fd.
+/// 1. For metadata requests, write response directly
+/// 2. For read/write data requests, process then write response
+pub struct FuseSender<T> {
+    fs: Arc<T>,
+    rt: Arc<Runtime>,
     kernel_fd: Arc<AsyncFd>,
-    receiver: AsyncReceiver<ResponseData>,
+    receiver: AsyncReceiver<FuseTask>,
     pipe2: Pipe2,
+    debug: bool,
 }
 
-impl FuseSender {
+impl<T: FileSystem> FuseSender<T> {
     pub fn new(
+        fs: Arc<T>,
+        rt: Arc<Runtime>,
         kernel_fd: Arc<AsyncFd>,
-        receiver: AsyncReceiver<ResponseData>,
+        receiver: AsyncReceiver<FuseTask>,
         buf_size: usize,
+        debug: bool,
     ) -> IOResult<Self> {
         let pipe2 = Pipe2::new(PipeFd::new(buf_size, false, false)?)?;
         let fuse_rx = Self {
+            fs,
+            rt,
             kernel_fd,
             receiver,
             pipe2,
+            debug,
         };
 
         Ok(fuse_rx)
     }
 
-    // Get 1 response data
-    pub async fn recv(&mut self) -> Option<ResponseData> {
-        self.receiver.recv().await
+    pub fn rt(&self) -> &Runtime {
+        &self.rt
+    }
+
+    pub async fn start(mut self) -> FuseResult<()> {
+        while let Some(task) = self.receiver.recv().await {
+            match task {
+                FuseTask::Reply(reply) => {
+                    let id = reply.header.unique;
+                    if let Err(e) = self.send(reply).await {
+                        warn!("error send unique {}: {}", id, e);
+                    }
+                }
+
+                FuseTask::Request(req) => {
+                    let id = req.unique();
+                    if let Err(e) = self.process_stream(req).await {
+                        warn!("error stream unique {}: {}", id, e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn process_stream(&mut self, req: FuseRequest) -> FuseResult<()> {
+        let operator = req.parse_operator()?;
+
+        match operator {
+            FuseOperator::Read(op) => {
+                let res = self.fs.read(op).await;
+                self.splice(ResponseData::with_data(req.unique(), res))
+                    .await?;
+            }
+
+            FuseOperator::Write(op) => {
+                let res = self.fs.write(op).await;
+                self.splice(ResponseData::with_rep(req.unique(), res))
+                    .await?;
+            }
+
+            FuseOperator::Flush(op) => {
+                let res = self.fs.flush(op).await;
+                self.splice(ResponseData::with_rep(req.unique(), res))
+                    .await?;
+            }
+
+            FuseOperator::Release(op) => {
+                let res = self.fs.release(op).await;
+                self.splice(ResponseData::with_rep(req.unique(), res))
+                    .await?;
+            }
+
+            FuseOperator::FSync(op) => {
+                let res = self.fs.fsync(op).await;
+                self.splice(ResponseData::with_rep(req.unique(), res))
+                    .await?;
+            }
+
+            _ => return err_fuse!(libc::ENOSYS, "Unsupported operation {:?}", req.opcode()),
+        }
+
+        Ok(())
     }
 
     // Send response data to fuse.
     pub async fn send(&mut self, rep: ResponseData) -> IOResult<()> {
+        if self.debug {
+            info!("reply {:?}", rep.header);
+        }
         self.splice(rep).await
     }
 

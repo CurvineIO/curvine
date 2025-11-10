@@ -17,13 +17,14 @@ use curvine_common::conf::ClusterConf;
 use curvine_fuse::fs::CurvineFileSystem;
 use curvine_fuse::session::FuseSession;
 use orpc::common::Logger;
+use orpc::io::net::InetAddr;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;
 
 // fuse mount.
 // Debugging, after starting the cluster, execute the following naming, mount fuse
-// umount -f /curvine-fuse; cargo run --bin curvine-fuse -- --master-hostname localhost --master-rpc-port 8995 --mnt-path /curvine-fuse -d
+// umount -f /curvine-fuse; cargo run --bin curvine-fuse -- --conf /server/conf/curvine-cluster.toml
 fn main() -> CommonResult<()> {
     let args = FuseArgs::parse();
     println!("fuse args {:?}", args);
@@ -53,14 +54,6 @@ fn main() -> CommonResult<()> {
 // Mount command function parameters
 #[derive(Debug, Parser, Clone)]
 pub struct FuseArgs {
-    // Master hostname (optional)
-    #[arg(long, help = "Master hostname (optional)", default_value = "localhost")]
-    pub master_hostname: String,
-
-    // Master RPC port (optional)
-    #[arg(long, help = "Master RPC port (optional)", default_value = "8995")]
-    pub master_rpc_port: u16,
-
     // Mount the mount point, mount the file system to a directory of the machine.
     #[arg(long, default_value = "/curvine-fuse")]
     pub mnt_path: String,
@@ -85,10 +78,6 @@ pub struct FuseArgs {
         default_value = "conf/curvine-cluster.toml"
     )]
     pub(crate) conf: String,
-
-    // Master web port (optional)
-    #[arg(long, help = "Master web port (optional)")]
-    pub master_web_port: Option<u16>,
 
     // IO threads (optional)
     #[arg(long, help = "IO threads (optional)")]
@@ -151,6 +140,9 @@ pub struct FuseArgs {
     #[arg(long, help = "Node cache timeout (e.g., '1h', '30m') (optional)")]
     pub node_cache_timeout: Option<String>,
 
+    #[arg(long, help = "Master address (e.g., 'm1:8995,m2:8995'")]
+    pub master_addrs: Option<String>,
+
     // FUSE options
     #[arg(short, long)]
     pub(crate) options: Vec<String>,
@@ -170,20 +162,6 @@ impl FuseArgs {
                 Self::create_default_conf()
             }
         };
-
-        // Master configuration - only override if different from defaults
-        if self.master_hostname != "localhost" {
-            conf.master.hostname = self.master_hostname.clone();
-        }
-
-        if self.master_rpc_port != 8995 {
-            conf.master.rpc_port = self.master_rpc_port;
-        }
-
-        // Optional master web port - only override if specified
-        if let Some(web_port) = self.master_web_port {
-            conf.master.web_port = web_port;
-        }
 
         // FUSE configuration - override with command line values
         // These have default values from clap, so always override
@@ -261,20 +239,25 @@ impl FuseArgs {
             conf.fuse.node_cache_timeout = node_cache_timeout.clone();
         }
 
+        if let Some(master_addrs) = &self.master_addrs {
+            let mut vec = vec![];
+            for node in master_addrs.split(",") {
+                let tmp: Vec<&str> = node.split(":").collect();
+                if tmp.len() != 2 {
+                    return err_box!("wrong format master_addrs {}", master_addrs);
+                }
+                let hostname = tmp[0].to_string();
+                let port: u16 = tmp[1].parse()?;
+                vec.push(InetAddr::new(hostname, port));
+            }
+            conf.client.master_addrs = vec;
+        }
+
         // FUSE options - override if provided
         if !self.options.is_empty() {
             conf.fuse.fuse_opts = self.options.clone()
         } else {
             conf.fuse.fuse_opts = Self::default_mnt_opts();
-        }
-
-        // Validate configuration
-        if !conf.fuse.direct_io {
-            return err_box!("Currently only supports direct_io");
-        }
-
-        if conf.fuse.kernel_cache {
-            return err_box!("Kernel cache is not currently supported");
         }
 
         Ok(conf)

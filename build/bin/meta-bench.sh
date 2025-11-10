@@ -34,5 +34,5 @@ io.curvine.bench.NNBenchWithoutMR \
 -bytesToWrite 0 \
 -confDir ${CURVINE_HOME}/conf \
 -threads 10 \
--baseDir cv:///fs-meta \
+-baseDir cv://default/fs-meta \
 -numFiles 1000

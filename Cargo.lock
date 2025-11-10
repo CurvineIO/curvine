@@ -1343,6 +1343,7 @@ name = "curvine-fuse"
 version = "0.2.1-beta"
 dependencies = [
  "bindgen",
+ "bitflags 2.10.0",
  "clap",
  "curvine-client",
  "curvine-common",

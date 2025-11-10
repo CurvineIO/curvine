@@ -21,6 +21,12 @@ macro_rules! err_fuse {
         Err(err)
     });
 
+    ($errno:expr, $msg:expr) => ({
+        let msg = orpc::err_msg!("{}", $msg);
+        let err = $crate::FuseError::new($errno as i32, msg.into());
+        Err(err)
+    });
+
     ($errno:expr, $f:tt, $($arg:expr),+) => ({
         let msg = orpc::err_msg!($f, $($arg),+);
         let err = $crate::FuseError::new($errno as i32, msg.into());

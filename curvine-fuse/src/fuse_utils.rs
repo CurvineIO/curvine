@@ -89,6 +89,10 @@ impl FuseUtils {
         ((flags as i32) & libc::O_TRUNC) != 0
     }
 
+    pub fn has_append(flags: u32) -> bool {
+        ((flags as i32) & libc::O_APPEND) != 0
+    }
+
     pub fn has_create(flags: u32) -> bool {
         ((flags as i32) & libc::O_CREAT) != 0
     }

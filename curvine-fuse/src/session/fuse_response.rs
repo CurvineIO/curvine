@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use crate::raw::fuse_abi::fuse_out_header;
-use crate::{FuseResult, FuseUtils};
+use crate::session::FuseTask;
+use crate::{FuseError, FuseResult, FuseUtils};
 use crate::{FUSE_OUT_HEADER_LEN, FUSE_SUCCESS};
-use log::{error, info, warn};
+use log::debug;
 use orpc::io::IOResult;
 use orpc::sync::channel::AsyncSender;
 use orpc::sys::DataSlice;
@@ -34,6 +35,14 @@ impl ResponseData {
         Self { header, data }
     }
 
+    pub fn len(&self) -> u32 {
+        self.header.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn as_iovec(&self) -> IOResult<(usize, Vec<IoSlice<'_>>)> {
         let mut iovec: Vec<IoSlice<'_>> = Vec::with_capacity(self.data.len() + 1);
 
@@ -47,113 +56,107 @@ impl ResponseData {
         }
         Ok((self.header.len as usize, iovec))
     }
-}
 
-// Send fuse response to the mount point
-#[derive(Clone)]
-pub struct FuseResponse {
-    pub(crate) unique: u64,
-    pub(crate) sender: AsyncSender<ResponseData>,
-    pub(crate) debug: bool,
-}
-
-impl FuseResponse {
-    pub fn new(unique: u64, sender: AsyncSender<ResponseData>, debug: bool) -> Self {
-        Self {
-            unique,
-            sender,
-            debug,
-        }
-    }
-
-    pub fn unique(&self) -> u64 {
-        self.unique
-    }
-
-    async fn send(&self, errno: i32, data: Vec<DataSlice>) -> IOResult<isize> {
+    fn create(unique: u64, errno: i32, data: Vec<DataSlice>) -> Self {
         let data_len = data.iter().map(|x| x.len()).sum::<usize>();
 
         // The fuse error code is the negative number of the os error code.
         let header = fuse_out_header {
             len: (FUSE_OUT_HEADER_LEN + data_len) as u32,
             error: -errno,
-            unique: self.unique,
+            unique,
         };
 
-        let len = header.len;
-        self.sender.send(ResponseData::new(header, data)).await?;
-        Ok(len as isize)
+        Self::new(header, data)
     }
 
-    /// Build a response without data blocks.
-    pub async fn send_empty(&self) -> IOResult<isize> {
-        self.send(FUSE_SUCCESS, vec![]).await
+    pub fn with_empty(unique: u64, res: FuseResult<()>) -> Self {
+        let errno = match res {
+            Ok(_) => FUSE_SUCCESS,
+            Err(e) => e.errno,
+        };
+        Self::create(unique, errno, vec![])
     }
 
-    /// Send a data.
-    pub async fn send_rep<T: Debug>(&self, res: FuseResult<T>) -> IOResult<isize> {
+    pub fn with_rep<T: Debug, E: Into<FuseError>>(unique: u64, res: Result<T, E>) -> Self {
         match res {
             Ok(v) => {
-                if self.debug {
-                    info!("send_rep unique {}, res: {:?}", self.unique, v);
-                }
-                let data = DataSlice::Buffer(FuseUtils::struct_as_buf(&v));
-                self.send(FUSE_SUCCESS, vec![data]).await
+                let data = if size_of::<T>() == 0 {
+                    vec![]
+                } else {
+                    vec![DataSlice::buffer(FuseUtils::struct_as_buf(&v))]
+                };
+                Self::create(unique, FUSE_SUCCESS, data)
             }
 
             Err(e) => {
-                warn!("send_error unique {}: {}", self.unique, e);
-                self.send(e.errno, vec![]).await
+                let e = e.into();
+                debug!("send_error unique {}: {:?}", unique, e);
+                Self::create(unique, e.errno, vec![])
             }
         }
     }
 
-    pub async fn send_buf(&self, res: FuseResult<BytesMut>) -> IOResult<isize> {
+    pub fn with_buf(unique: u64, res: FuseResult<BytesMut>) -> Self {
         match res {
-            Ok(v) => {
-                if self.debug {
-                    info!("send_buf unique {}, data len: {}", self.unique, v.len());
-                }
-                self.send(FUSE_SUCCESS, vec![DataSlice::Buffer(v)]).await
-            }
-
+            Ok(v) => Self::create(unique, FUSE_SUCCESS, vec![DataSlice::Buffer(v)]),
             Err(e) => {
-                warn!("send_error unique {}: {}", self.unique, e);
-                self.send(e.errno, vec![]).await
+                debug!("send_error unique {}: {}", unique, e);
+                Self::create(unique, e.errno, vec![])
             }
         }
     }
 
-    pub async fn send_data(&self, res: FuseResult<Vec<DataSlice>>) -> IOResult<isize> {
+    pub fn with_data(unique: u64, res: FuseResult<Vec<DataSlice>>) -> Self {
         match res {
-            Ok(v) => {
-                if self.debug {
-                    let len = v.iter().map(|x| x.len()).sum::<usize>();
-                    info!("send_data unique {}, data len: {}", self.unique, len);
-                }
-                self.send(FUSE_SUCCESS, v).await
-            }
-
+            Ok(v) => Self::create(unique, FUSE_SUCCESS, v),
             Err(e) => {
-                warn!("send_error unique {}: {}", self.unique, e);
-                self.send(e.errno, vec![]).await
+                debug!("send_error unique {}: {}", unique, e);
+                Self::create(unique, e.errno, vec![])
             }
         }
     }
+}
 
-    // Requests that do not need to be responded to.
-    pub fn send_none<T: Debug>(&self, res: FuseResult<T>) -> IOResult<isize> {
-        match res {
-            Ok(v) => {
-                if self.debug {
-                    info!("send_none unique: {}, res: {:?}", self.unique, v);
-                }
-            }
+// Send fuse response to the mount point
+#[derive(Clone)]
+pub struct FuseResponse {
+    pub(crate) unique: u64,
+    pub(crate) sender: AsyncSender<FuseTask>,
+}
 
-            Err(e) => {
-                error!("Request({}) processing failed: {}", self.unique, e);
-            }
-        }
-        Ok(0)
+impl FuseResponse {
+    pub fn new(unique: u64, sender: AsyncSender<FuseTask>) -> Self {
+        Self { unique, sender }
+    }
+
+    pub fn unique(&self) -> u64 {
+        self.unique
+    }
+
+    pub async fn send_empty(&self, res: FuseResult<()>) -> IOResult<()> {
+        let data = ResponseData::with_empty(self.unique, res);
+        self.sender.send(FuseTask::Reply(data)).await
+    }
+
+    pub async fn send_rep<T: Debug, E: Into<FuseError>>(&self, res: Result<T, E>) -> IOResult<()> {
+        let data = ResponseData::with_rep(self.unique, res);
+        self.sender.send(FuseTask::Reply(data)).await
+    }
+
+    pub async fn send_buf(&self, res: FuseResult<BytesMut>) -> IOResult<()> {
+        let data = ResponseData::with_buf(self.unique, res);
+        self.sender.send(FuseTask::Reply(data)).await
+    }
+
+    pub async fn send_data(&self, res: FuseResult<Vec<DataSlice>>) -> IOResult<()> {
+        let data = ResponseData::with_data(self.unique, res);
+        self.sender.send(FuseTask::Reply(data)).await
+    }
+
+    pub fn send_none(&self, _: FuseResult<()>) -> IOResult<()> {
+        // let data = ResponseData::with_empty(self.unique, res);
+        // self.sender.send(FuseTask::Reply(data)).await
+        Ok(())
     }
 }

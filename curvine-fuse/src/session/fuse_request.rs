@@ -76,7 +76,10 @@ impl FuseRequest {
 
     // Determine whether it is a file data read and write operation
     pub fn is_stream(&self) -> bool {
-        self.opcode == FUSE_READ || self.opcode == FUSE_WRITE
+        matches!(
+            self.opcode,
+            FUSE_READ | FUSE_WRITE | FUSE_FLUSH | FUSE_RELEASE | FUSE_FSYNC
+        )
     }
 
     fn get_write_bytes(&self, size: usize) -> FuseResult<Bytes> {
@@ -90,6 +93,11 @@ impl FuseRequest {
             );
         }
         Ok(self.buf.slice(start..end))
+    }
+
+    pub fn get_header(&self) -> FuseResult<&fuse_in_header> {
+        let mut decoder = FuseDecoder::new(&self.buf);
+        decoder.get_struct()
     }
 
     pub fn parse_operator(&self) -> FuseResult<FuseOperator<'_>> {
@@ -253,6 +261,13 @@ impl FuseRequest {
             }
 
             FUSE_RENAME => FuseOperator::Rename(Rename {
+                header,
+                arg: decoder.get_struct()?,
+                old_name: decoder.get_os_str()?,
+                new_name: decoder.get_os_str()?,
+            }),
+
+            FUSE_RENAME2 => FuseOperator::Rename2(Rename2 {
                 header,
                 arg: decoder.get_struct()?,
                 old_name: decoder.get_os_str()?,

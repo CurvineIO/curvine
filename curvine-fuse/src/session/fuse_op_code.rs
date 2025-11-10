@@ -63,6 +63,8 @@ pub enum FuseOpCode {
     FUSE_BATCH_FORGET = 42,
     FUSE_FALLOCATE = 43,
     FUSE_READDIRPLUS = 44,
+    FUSE_RENAME2 = 45,
+    FUSE_LSEEK = 46,
 
     CUSE_INIT = 4096,
 }

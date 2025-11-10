@@ -26,6 +26,7 @@ once_cell = { workspace = true }
 mini-moka = { workspace = true }
 fxhash = { workspace = true }
 dashmap = { workspace = true }
+bitflags = { workspace = true }
 
 [features]
 default = ["fuse3"]

@@ -15,175 +15,145 @@
 use crate::fs::operator::*;
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
-use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
+use orpc::sys::DataSlice;
+use std::future::Future;
 use tokio_util::bytes::BytesMut;
 
-#[trait_variant::make(Send)]
 pub trait FileSystem: Send + Sync + 'static {
-    async fn init(&self, op: Init<'_>) -> FuseResult<fuse_init_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn init(&self, op: Init<'_>) -> impl Future<Output = FuseResult<fuse_init_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn lookup(&self, op: Lookup<'_>) -> FuseResult<fuse_entry_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn lookup(&self, op: Lookup<'_>) -> impl Future<Output = FuseResult<fuse_entry_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn get_xattr(&self, op: GetXAttr<'_>) -> FuseResult<BytesMut> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn get_xattr(&self, op: GetXAttr<'_>) -> impl Future<Output = FuseResult<BytesMut>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn list_xattr(&self, op: ListXAttr<'_>) -> FuseResult<BytesMut> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn list_xattr(&self, op: ListXAttr<'_>) -> impl Future<Output = FuseResult<BytesMut>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn set_xattr(&self, op: SetXAttr<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn set_xattr(&self, op: SetXAttr<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn remove_xattr(&self, op: RemoveXAttr<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn remove_xattr(&self, op: RemoveXAttr<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn get_attr(&self, op: GetAttr<'_>) -> FuseResult<fuse_attr_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn get_attr(&self, op: GetAttr<'_>) -> impl Future<Output = FuseResult<fuse_attr_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn set_attr(&self, op: SetAttr<'_>) -> FuseResult<fuse_attr_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn set_attr(&self, op: SetAttr<'_>) -> impl Future<Output = FuseResult<fuse_attr_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn access(&self, op: Access<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn access(&self, op: Access<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn open_dir(&self, op: OpenDir<'_>) -> FuseResult<fuse_open_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn open_dir(&self, op: OpenDir<'_>) -> impl Future<Output = FuseResult<fuse_open_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn stat_fs(&self, op: StatFs<'_>) -> FuseResult<fuse_kstatfs> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn stat_fs(&self, op: StatFs<'_>) -> impl Future<Output = FuseResult<fuse_kstatfs>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn mkdir(&self, op: MkDir<'_>) -> FuseResult<fuse_entry_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn mkdir(&self, op: MkDir<'_>) -> impl Future<Output = FuseResult<fuse_entry_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn fuse_allocate(&self, op: FAllocate<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn fuse_allocate(&self, op: FAllocate<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn release_dir(&self, op: ReleaseDir<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn release_dir(&self, op: ReleaseDir<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn read_dir(&self, op: ReadDir<'_>) -> FuseResult<FuseDirentList> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn read_dir(&self, op: ReadDir<'_>) -> impl Future<Output = FuseResult<FuseDirentList>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn read_dir_plus(&self, op: ReadDirPlus<'_>) -> FuseResult<FuseDirentList> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn read_dir_plus(
+        &self,
+        op: ReadDirPlus<'_>,
+    ) -> impl Future<Output = FuseResult<FuseDirentList>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn read(&self, op: Read<'_>, _rep: FuseResponse) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn read(&self, op: Read<'_>) -> impl Future<Output = FuseResult<Vec<DataSlice>>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn open(&self, op: Open<'_>) -> impl Future<Output = FuseResult<fuse_open_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn create(&self, op: Create<'_>) -> FuseResult<fuse_create_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn create(&self, op: Create<'_>) -> impl Future<Output = FuseResult<fuse_create_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn write(&self, op: Write<'_>, _rep: FuseResponse) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn write(&self, op: Write<'_>) -> impl Future<Output = FuseResult<fuse_write_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn flush(&self, op: Flush<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn flush(&self, op: Flush<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn release(&self, op: Release<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn release(&self, op: Release<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn mk_nod(&self, op: MkNod<'_>) -> FuseResult<fuse_entry_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn mk_nod(&self, op: MkNod<'_>) -> impl Future<Output = FuseResult<fuse_entry_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn forget(&self, op: Forget<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn forget(&self, op: Forget<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn batch_forget(&self, op: BatchForget<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn batch_forget(&self, op: BatchForget<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn unlink(&self, op: Unlink<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn unlink(&self, op: Unlink<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn link(&self, op: Link<'_>) -> FuseResult<fuse_entry_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn link(&self, op: Link<'_>) -> impl Future<Output = FuseResult<fuse_entry_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn rm_dir(&self, op: RmDir<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn rm_dir(&self, op: RmDir<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn rename(&self, op: Rename<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn rename(&self, op: Rename<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn interrupt(&self, op: Interrupt<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn interrupt(&self, op: Interrupt<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn fsync(&self, op: FSync<'_>) -> FuseResult<()> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn fsync(&self, op: FSync<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn symlink(&self, op: Symlink<'_>) -> FuseResult<fuse_entry_out> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn symlink(&self, op: Symlink<'_>) -> impl Future<Output = FuseResult<fuse_entry_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    async fn readlink(&self, op: Readlink<'_>) -> FuseResult<BytesMut> {
-        let msg = format!("{:?}", op);
-        async move { err_fuse!(libc::ENOSYS, "{}", msg) }
+    fn readlink(&self, op: Readlink<'_>) -> impl Future<Output = FuseResult<BytesMut>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
     fn unmount(&self) {}

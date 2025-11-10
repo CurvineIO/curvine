@@ -14,10 +14,9 @@
 
 use crate::fs::operator::*;
 use crate::fs::state::NodeState;
-use crate::fs::FuseFile;
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
-use crate::session::{FuseBuf, FuseResponse};
+use crate::session::FuseBuf;
 use crate::*;
 use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
@@ -28,7 +27,7 @@ use curvine_common::state::{FileStatus, SetAttrOpts};
 use log::{debug, error, info};
 use orpc::common::ByteUnit;
 use orpc::runtime::Runtime;
-use orpc::sys::FFIUtils;
+use orpc::sys::{DataSlice, FFIUtils};
 use orpc::{sys, try_option};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,8 +42,8 @@ pub struct CurvineFileSystem {
 impl CurvineFileSystem {
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
         let fuse_conf = conf.fuse.clone();
-        let state = NodeState::new(&fuse_conf);
         let fs = UnifiedFileSystem::with_rt(conf, rt)?;
+        let state = NodeState::new(fs.clone());
 
         let fuse_fs = Self {
             fs,
@@ -96,7 +95,7 @@ impl CurvineFileSystem {
         } else if let Ok(numeric_uid) = status.owner.parse::<u32>() {
             numeric_uid
         } else {
-            match orpc::sys::get_uid_by_name(&status.owner) {
+            match sys::get_uid_by_name(&status.owner) {
                 Some(uid) => uid,
                 None => {
                     return err_fuse!(
@@ -113,7 +112,7 @@ impl CurvineFileSystem {
         } else if let Ok(numeric_gid) = status.group.parse::<u32>() {
             numeric_gid
         } else {
-            match orpc::sys::get_gid_by_name(&status.group) {
+            match sys::get_gid_by_name(&status.group) {
                 Some(gid) => gid,
                 None => {
                     return err_fuse!(
@@ -234,16 +233,9 @@ impl CurvineFileSystem {
         plus: bool,
     ) -> FuseResult<FuseDirentList> {
         let path = self.state.get_path(header.nodeid)?;
-        let dir_status = self.fs_get_status(&path).await?;
 
         // Check directory read permission for reading directory contents
-        if !self.check_access_permissions(&dir_status, header.uid, header.gid, libc::R_OK as u32) {
-            return err_fuse!(
-                libc::EACCES,
-                "Permission denied to read directory: {}",
-                path
-            );
-        }
+        self.check_access_permissions(header, libc::R_OK as u32)?;
 
         let list = self.fs_list_status(header.nodeid, &path).await?;
 
@@ -265,39 +257,36 @@ impl CurvineFileSystem {
     }
 
     /// Check if the current user has the requested access permissions
-    fn check_access_permissions(
-        &self,
-        status: &FileStatus,
-        current_uid: u32,
-        current_gid: u32,
-        mask: u32,
-    ) -> bool {
+    fn check_access_permissions(&self, header: &fuse_in_header, mask: u32) -> FuseResult<()> {
         // Root (uid=0) bypasses permission checks
-        if current_uid == 0 {
-            return true;
+        if header.uid == 0 {
+            return Ok(());
         }
-        let file_uid = self.resolve_file_uid(&status.owner);
-        let file_gid = self.resolve_file_gid(&status.group);
-        let permission_bits = self.get_effective_permission_bits(
-            status.mode,
-            current_uid,
-            current_gid,
-            file_uid,
-            file_gid,
-        );
+        let attr = self.state.get_attr::<String>(header.nodeid, None)?;
+        let permission_bits = self
+            .get_effective_permission_bits(attr.mode, header.uid, header.gid, attr.uid, attr.gid);
 
         debug!(
             "Access check: file_uid={}, file_gid={}, current_uid={}, current_gid={}, mode={:o}, permission_bits={:o}, mask={:o}",
-            file_uid, file_gid, current_uid, current_gid, status.mode, permission_bits, mask
+            attr.uid, attr.gid, header.uid, header.gid, attr.mode, permission_bits, mask
         );
 
         let has_permission = self.check_permission_mask(permission_bits, mask);
         debug!("Final access result: {}", has_permission);
-        has_permission
+        if has_permission {
+            Ok(())
+        } else {
+            err_fuse!(
+                libc::EACCES,
+                "Permission denied to search ino: {}, op: {}",
+                header.nodeid,
+                header.opcode
+            )
+        }
     }
 
     /// Resolve file owner UID from string (supports both numeric and username)
-    fn resolve_file_uid(&self, owner: &str) -> u32 {
+    pub fn resolve_file_uid(&self, owner: &str) -> u32 {
         if owner.is_empty() {
             return self.conf.uid;
         }
@@ -308,7 +297,7 @@ impl CurvineFileSystem {
         }
 
         // If not numeric, try to lookup by username
-        match orpc::sys::get_uid_by_name(owner) {
+        match sys::get_uid_by_name(owner) {
             Some(uid) => uid,
             None => {
                 debug!(
@@ -321,7 +310,7 @@ impl CurvineFileSystem {
     }
 
     /// Resolve file group GID from string (supports both numeric and group name)
-    fn resolve_file_gid(&self, group: &str) -> u32 {
+    pub fn resolve_file_gid(&self, group: &str) -> u32 {
         if group.is_empty() {
             return self.conf.gid;
         }
@@ -538,30 +527,14 @@ impl fs::FileSystem for CurvineFileSystem {
             let parent = self.state.get_parent_id(id)?;
             (parent, None)
         } else {
-            (id, Some(name))
+            (id, Some(name.to_string()))
         };
 
-        // Check directory execute permission on parent before lookup (for path traversal)
-        {
-            let parent_path = self.state.get_path(parent)?;
-            let parent_status = self.fs_get_status(&parent_path).await?;
-            if !self.check_access_permissions(
-                &parent_status,
-                op.header.uid,
-                op.header.gid,
-                libc::X_OK as u32,
-            ) {
-                return err_fuse!(
-                    libc::EACCES,
-                    "Permission denied to search directory: {}",
-                    parent_path
-                );
-            }
-        }
+        self.check_access_permissions(op.header, libc::X_OK as u32)?;
 
         // Get the path.
-        let path = self.state.get_path_common(parent, name)?;
-        let res = self.lookup_path(parent, name, &path).await;
+        let path = self.state.get_path_common(parent, name.as_deref())?;
+        let res = self.lookup_path(parent, name.as_deref(), &path).await;
 
         let entry = match res {
             Ok(attr) => Self::create_entry_out(&self.conf, attr),
@@ -825,7 +798,7 @@ impl fs::FileSystem for CurvineFileSystem {
     //The chown, chmod, and truncate commands will access the interface.
     // @todo is not implemented at this time, and this interface will not cause inode to be familiar with.
     async fn set_attr(&self, op: SetAttr<'_>) -> FuseResult<fuse_attr_out> {
-        info!(
+        debug!(
             "Setting attr: path='{}', opts={:?}",
             op.header.nodeid, op.arg
         );
@@ -834,7 +807,7 @@ impl fs::FileSystem for CurvineFileSystem {
         // Convert setattr to opts with UID/GID numeric fallback
         let mut opts = match Self::fuse_setattr_to_opts(op.arg) {
             Ok(opts) => {
-                info!("Converted setattr opts: {:?}", opts);
+                debug!("Converted setattr opts: {:?}", opts);
                 opts
             }
             Err(e) => {
@@ -867,11 +840,11 @@ impl fs::FileSystem for CurvineFileSystem {
 
         match self.fs.set_attr(&path, opts).await {
             Ok(_) => {
-                info!("Backend set_attr succeeded for path: {}", path);
+                debug!("Backend set_attr succeeded for path: {}", path);
             }
             Err(e) => {
-                error!("Backend set_attr failed for path {}: {}", path, e);
-                return err_fuse!(libc::EPERM, "Operation not permitted: {}", e);
+                debug!("Backend set_attr failed for path {}: {}", path, e);
+                return err_fuse!(libc::ENOENT, "set_attr: {}", e);
             }
         }
 
@@ -889,51 +862,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     // This interface is not supported at present
     async fn access(&self, op: Access<'_>) -> FuseResult<()> {
-        let path = self.state.get_path(op.header.nodeid)?;
-
-        // Get file status to check permissions
-        let status = match self.fs.get_status(&path).await {
-            Ok(status) => status,
-            Err(e) => {
-                error!("Failed to get status for {}: {}", path, e);
-                return err_fuse!(libc::ENOENT, "File not found: {}", path);
-            }
-        };
-
-        // Check parent directory execute permission for path traversal
-        if let Ok(parent_id) = self.state.get_parent_id(op.header.nodeid) {
-            // Skip when parent_id is invalid (e.g., root has no parent). Inode 0 is invalid.
-            if parent_id != 0 {
-                let parent_path = self.state.get_path(parent_id)?;
-                let parent_status = self.fs_get_status(&parent_path).await?;
-                if !self.check_access_permissions(
-                    &parent_status,
-                    op.header.uid,
-                    op.header.gid,
-                    libc::X_OK as u32,
-                ) {
-                    return err_fuse!(
-                        libc::EACCES,
-                        "Permission denied to search directory: {}",
-                        parent_path
-                    );
-                }
-            }
-        }
-
-        // Get current user's UID and GID from the request header
-        let current_uid = op.header.uid;
-        let current_gid = op.header.gid;
-
-        // Get requested access mask
-        let mask = op.arg.mask;
-
-        // Check if user has the requested permissions on the node itself
-        if !self.check_access_permissions(&status, current_uid, current_gid, mask) {
-            return err_fuse!(libc::EACCES, "Permission denied for {}", path);
-        }
-
-        Ok(())
+        self.check_access_permissions(op.header, op.arg.mask)
     }
 
     // Open the directory.
@@ -941,44 +870,15 @@ impl fs::FileSystem for CurvineFileSystem {
         let action = OpenAction::try_from(op.arg.flags)?;
         let _ = self.state.get_node(op.header.nodeid)?;
 
-        // Check directory permissions based on open action
-        {
-            let dir_path = self.state.get_path(op.header.nodeid)?;
-            let dir_status = self.fs_get_status(&dir_path).await?;
+        // Determine required permission mask based on open flags
+        let required_mask = match action {
+            OpenAction::ReadOnly => libc::R_OK as u32,
+            OpenAction::WriteOnly => libc::W_OK as u32,
+            OpenAction::ReadWrite => (libc::R_OK | libc::W_OK) as u32,
+        };
+        self.check_access_permissions(op.header, required_mask)?;
 
-            info!(
-                "Open dir: path={}, uid={}, gid={}, file_owner={}, file_group={}, file_mode={:o}",
-                dir_path,
-                op.header.uid,
-                op.header.gid,
-                dir_status.owner,
-                dir_status.group,
-                dir_status.mode
-            );
-
-            // Determine required permission mask based on open flags
-            let required_mask = match action {
-                OpenAction::ReadOnly => libc::R_OK as u32,
-                OpenAction::WriteOnly => libc::W_OK as u32,
-                OpenAction::ReadWrite => (libc::R_OK | libc::W_OK) as u32,
-            };
-
-            // Use existing permission check function to verify access
-            if !self.check_access_permissions(
-                &dir_status,
-                op.header.uid,
-                op.header.gid,
-                required_mask,
-            ) {
-                return err_fuse!(
-                    libc::EACCES,
-                    "Permission denied to open directory: {}",
-                    dir_path
-                );
-            }
-        }
-
-        let fh = self.state.next_handle();
+        let fh = self.state.next_fh();
         let open_flags = Self::fill_open_flags(&self.conf, op.arg.flags);
         let attr = fuse_open_out {
             fh,
@@ -1068,64 +968,22 @@ impl fs::FileSystem for CurvineFileSystem {
         self.read_dir_common(op.header, op.arg, true).await
     }
 
-    async fn read(&self, op: Read<'_>, rep: FuseResponse) -> FuseResult<()> {
-        let file = self.state.get_file_check(op.arg.fh)?;
-        file.as_mut().read(op, rep).await?;
-        Ok(())
+    async fn read(&self, op: Read<'_>) -> FuseResult<Vec<DataSlice>> {
+        let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        handle.read(&self.state, op).await
     }
 
     async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
         let id = op.header.nodeid;
         let path = self.state.get_path(id)?;
 
-        // Check file access permissions before opening
-        let _status = self.fs_get_status(&path).await?;
-        info!(
-            "Open file: path={}, uid={}, gid={}, file_owner={}, file_group={}, file_mode={:o}",
-            path, op.header.uid, op.header.gid, _status.owner, _status.group, _status.mode
-        );
-
-        // Determine what permissions we need to check
-        #[cfg(target_os = "linux")]
-        {
-            let action = OpenAction::try_from(op.arg.flags)?;
-            let required_mask = match action {
-                OpenAction::ReadOnly => libc::R_OK as u32,
-                OpenAction::WriteOnly => libc::W_OK as u32,
-                OpenAction::ReadWrite => (libc::R_OK | libc::W_OK) as u32,
-            };
-
-            // Check if the current user has the required permissions
-            if !self.check_access_permissions(&_status, op.header.uid, op.header.gid, required_mask)
-            {
-                return err_fuse!(libc::EACCES, "Permission denied to open file: {}", path);
-            }
-        }
-
-        // Check parent directory execute permission for path traversal
-        if let Ok(parent_id) = self.state.get_parent_id(id) {
-            let parent_path = self.state.get_path(parent_id)?;
-            let parent_status = self.fs_get_status(&parent_path).await?;
-            if !self.check_access_permissions(
-                &parent_status,
-                op.header.uid,
-                op.header.gid,
-                libc::X_OK as u32,
-            ) {
-                return err_fuse!(
-                    libc::EACCES,
-                    "Permission denied to search directory: {}",
-                    parent_path
-                );
-            }
-        }
-
-        let file = FuseFile::create(self.fs.clone(), path.clone(), op.arg.flags).await?;
-        let fh = self.state.add_file(file)?;
-
+        let handle = self
+            .state
+            .new_handle(op.header.nodeid, &path, op.arg.flags)
+            .await?;
         let open_flags = Self::fill_open_flags(&self.conf, op.arg.flags);
         let entry = fuse_open_out {
-            fh,
+            fh: handle.fh,
             open_flags,
             padding: 0,
         };
@@ -1144,80 +1002,33 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::ENAMETOOLONG);
         }
 
-        // Resolve target path and flags first.
         let path = self.state.get_path_common(id, Some(name))?;
+
+        let node = self.state.find_node(id, Some(name))?;
         let flags = op.arg.flags;
-
-        // If the file already exists:
-        // - With O_EXCL: return EEXIST
-        // - Without O_EXCL: open existing file and return handle (POSIX open semantics)
-        if self.fs.exists(&path).await.unwrap_or(false) {
-            // Even with O_EXCL, handle as "open existing file" for compatibility with tools like fio
-            let _want_excl = ((flags as i32) & libc::O_EXCL) != 0;
-
-            // Open existing file and return fuse_create_out
-            let status = self.fs_get_status(&path).await?;
-            let attr = self.lookup_status(id, Some(name), &status)?;
-
-            let file = FuseFile::create(self.fs.clone(), path.clone(), flags).await?;
-            let fh = self.state.add_file(file)?;
-
-            let open_flags = Self::fill_open_flags(&self.conf, flags);
-            let r = fuse_create_out(
-                fuse_entry_out {
-                    nodeid: attr.ino,
-                    generation: 0,
-                    entry_valid: self.conf.entry_ttl.as_secs(),
-                    attr_valid: self.conf.attr_ttl.as_secs(),
-                    entry_valid_nsec: self.conf.entry_ttl.subsec_nanos(),
-                    attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
-                    attr,
-                },
-                fuse_open_out {
-                    fh,
-                    open_flags,
-                    padding: 0,
-                },
-            );
-
-            return Ok(r);
-        }
-
-        // Not exists: create a new file and then return handle & entry
-        let file = FuseFile::for_write(self.fs.clone(), path.clone(), flags).await?;
-        let status = file.status()?;
-        let attr = self.lookup_status(id, Some(name), status)?;
+        let handle = self.state.new_handle(node.id, &path, flags).await?;
 
         // Apply requested mode and ownership to the new file if provided
         if op.arg.mode != 0 {
-            let owner = orpc::sys::get_username_by_uid(op.header.uid);
-            let group = orpc::sys::get_groupname_by_gid(op.header.gid);
+            let owner = sys::get_username_by_uid(op.header.uid);
+            let group = sys::get_groupname_by_gid(op.header.gid);
 
             let opts = SetAttrOpts {
-                recursive: false,
-                replicas: None,
                 owner,
                 group,
                 // Apply umask: effective_mode = requested_mode & ~umask
                 mode: Some((op.arg.mode & 0o7777) & !op.arg.umask),
-                atime: None,
-                mtime: None,
-                ttl_ms: None,
-                ttl_action: None,
-                add_x_attr: HashMap::new(),
-                remove_x_attr: Vec::new(),
+                ..Default::default()
             };
-            // Ignore backend failures intentionally to follow common CREATE behavior
             let _ = self.fs.set_attr(&path, opts).await;
         }
 
-        // Cache file handle for the newly created file
-        let fh = self.state.add_file(file)?;
-
+        let status = handle.status().await?;
+        let attr = self.lookup_status(id, Some(name), &status)?;
         let open_flags = Self::fill_open_flags(&self.conf, flags);
         let r = fuse_create_out(
             fuse_entry_out {
-                nodeid: attr.ino,
+                nodeid: handle.ino,
                 generation: 0,
                 entry_valid: self.conf.entry_ttl.as_secs(),
                 attr_valid: self.conf.attr_ttl.as_secs(),
@@ -1226,7 +1037,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 attr,
             },
             fuse_open_out {
-                fh,
+                fh: handle.fh,
                 open_flags,
                 padding: 0,
             },
@@ -1235,28 +1046,27 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(r)
     }
 
-    async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
-        let file = self.state.get_file_check(op.arg.fh)?;
-        file.as_mut().write(op, reply).await?;
-        Ok(())
+    async fn write(&self, op: Write<'_>) -> FuseResult<fuse_write_out> {
+        let len = op.data.len();
+        let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        handle.write(op).await?;
+        let rep = fuse_write_out {
+            size: len as u32,
+            padding: 0,
+        };
+        Ok(rep)
     }
 
     async fn flush(&self, op: Flush<'_>) -> FuseResult<()> {
-        if let Some(file) = self.state.get_file(op.arg.fh) {
-            file.as_mut().flush().await
-        } else {
-            let path = self.state.get_path(op.header.nodeid)?;
-            error!("Failed to flush {}: Cannot find fh {}", path, op.arg.fh);
-            Ok(())
-        }
+        let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        handle.flush().await
     }
 
     async fn release(&self, op: Release<'_>) -> FuseResult<()> {
-        if let Some(file) = self.state.remove_file(op.arg.fh) {
-            file.as_mut().complete().await
+        let handle = self.state.remove_handle(op.header.nodeid, op.arg.fh);
+        if let Some(handle) = handle {
+            handle.complete().await
         } else {
-            let path = self.state.get_path(op.header.nodeid)?;
-            error!("Failed to release {}: Cannot find fh {}", path, op.arg.fh);
             Ok(())
         }
     }
@@ -1317,21 +1127,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let (old_path, new_path) =
             self.state
                 .get_path2(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
-
-        // If destination exists, remove it to emulate POSIX rename() replace semantics for files/symlinks
-        if (self.fs.get_status(&new_path).await).is_ok() {
-            // Try to delete the destination file, but don't fail if it doesn't exist
-            match self.fs.delete(&new_path, false).await {
-                Ok(_) => info!(
-                    "Successfully removed existing destination file: {}",
-                    new_path
-                ),
-                Err(e) => {
-                    // Log the error but continue - the file might have been deleted by another process
-                    info!("Destination file deletion result (non-critical): {}", e);
-                }
-            }
-        }
 
         // Perform the rename operation
         self.fs.rename(&old_path, &new_path).await?;
@@ -1415,14 +1210,7 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn fsync(&self, op: FSync<'_>) -> FuseResult<()> {
-        // Best-effort data durability for tools like mkfs on loop-backed files
-        // 1) Try to flush the writer bound to this fh
-        if let Some(file) = self.state.get_file(op.arg.fh) {
-            file.as_mut().flush().await?; // Flush pending chunks to backend
-            return Ok(());
-        }
-        // 2) If fh is unknown (some callers may fsync without cached fh), fall back to path-level no-op
-        //    We intentionally return success to comply with common FUSE behavior where fsync may be a no-op.
-        Ok(())
+        let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        handle.flush().await
     }
 }
