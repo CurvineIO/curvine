@@ -23,7 +23,7 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileStatus, MkdirOpts, MountInfo,
-    SetAttrOpts, WorkerAddress,
+    RenameFlags, SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -204,12 +204,22 @@ impl FsDir {
         Ok(del_res)
     }
 
-    pub fn rename(&mut self, src_inp: &InodePath, dst_inp: &InodePath) -> FsResult<bool> {
+    pub fn rename(
+        &mut self,
+        src_inp: &InodePath,
+        dst_inp: &InodePath,
+        flags: RenameFlags,
+    ) -> FsResult<Option<DeleteResult>> {
         let op_ms = LocalTime::mills();
-        self.unprotected_rename(src_inp, dst_inp, op_ms as i64)?;
-        self.journal_writer
-            .log_rename(op_ms, src_inp.path(), dst_inp.path(), op_ms as i64)?;
-        Ok(true)
+        let res = self.unprotected_rename(src_inp, dst_inp, op_ms as i64, flags)?;
+        self.journal_writer.log_rename(
+            op_ms,
+            src_inp.path(),
+            dst_inp.path(),
+            op_ms as i64,
+            flags,
+        )?;
+        Ok(res)
     }
 
     pub(crate) fn unprotected_rename(
@@ -217,35 +227,40 @@ impl FsDir {
         src_inp: &InodePath,
         dst_inp: &InodePath,
         mtime: i64,
-    ) -> FsResult<()> {
-        // Delete src_inp
+        flags: RenameFlags,
+    ) -> FsResult<Option<DeleteResult>> {
         let src_inode = match src_inp.get_last_inode() {
             None => return err_box!("File not exits: {}", src_inp.path()),
             Some(v) => v,
         };
-        assert!(!src_inode.as_ref().is_file_entry());
+        if flags.exchange_mode() {
+            return err_box!("Rename failed, because exchange mode is not supported");
+        }
 
         let mut src_parent = match src_inp.get_inode(-2) {
             None => return err_box!("Parent not exits: {}", src_inp.path()),
             Some(v) => v,
         };
 
-        // Get the target parent node that needs to be added
-        // 1. If dst last is a directory, then a new node is created under that directory.
-        // 2. If dst last does not exist, create a node in the parent directory.
-        let mut new_name = dst_inp.name().to_string();
-        let mut dst_parent = match dst_inp.get_last_inode() {
-            Some(v) => {
-                // /1.log -> /b is equivalent to /1.log /b/1.log
-                // b is an existing directory, indicating that you can move to this directory.
-                if v.is_dir() {
-                    new_name = src_inp.name().to_string();
-                    v
+        // If no_replace is true and target file exists, return error; otherwise delete target file first
+        let del_res = match dst_inp.get_last_inode() {
+            Some(v) if v.is_file() => {
+                if flags.no_replace() {
+                    return err_ext!(FsError::file_exists(dst_inp.path()));
                 } else {
-                    return err_box!("Rename failed, because dst {} is exists", dst_inp.path());
+                    Some(self.unprotected_delete(dst_inp, mtime)?)
                 }
             }
-            None => {
+            _ => None,
+        };
+
+        let mut new_name = dst_inp.name().to_string();
+        let mut dst_parent = match dst_inp.get_last_inode() {
+            Some(v) if v.is_dir() => {
+                new_name = src_inp.name().to_string();
+                v
+            }
+            _ => {
                 // /1.log -> /a/b b does not exist, think that b is the new inode name
                 match dst_inp.get_inode(-2) {
                     Some(v) => v,
@@ -277,7 +292,7 @@ impl FsDir {
         let _ = src_parent.delete_child(src_inode.id(), src_inode.name())?;
         let _ = dst_parent.add_child(new_inode)?;
 
-        Ok(())
+        Ok(del_res)
     }
 
     pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
@@ -387,64 +402,6 @@ impl FsDir {
         Ok(res)
     }
 
-    fn commit_block(
-        name: &str,
-        file: &mut InodeFile,
-        commit: Option<&CommitBlock>,
-    ) -> FsResult<()> {
-        let commit = match commit {
-            None => {
-                return Ok(());
-            }
-            Some(v) => v,
-        };
-
-        let last_block = match file.blocks.last_mut() {
-            None => {
-                log::error!(
-                    "[FsDir::commit_block] No blocks found in file={}, file_id={}",
-                    name,
-                    file.id
-                );
-                return err_box!(
-                    "Inode file {}({}) block status is abnormal, no blocks",
-                    file.id,
-                    name
-                );
-            }
-            Some(v) => v,
-        };
-
-        if last_block.id != commit.block_id {
-            log::error!(
-                "[FsDir::commit_block] Block ID mismatch: file={}, expected={}, actual={}",
-                name,
-                last_block.id,
-                commit.block_id
-            );
-            return err_box!("Inode file {}({}) block status is abnormal, expected last block id {}, actual submitted block id {}",
-                 file.id, name, last_block.id, commit.block_id);
-        }
-
-        if !last_block.is_writing() {
-            log::error!(
-                "[FsDir::commit_block] Block not in writing status: file={}, block_id={}",
-                name,
-                commit.block_id
-            );
-            return err_box!(
-                "Inode file {}({}), block {} not writing status",
-                file.id,
-                name,
-                commit.block_id
-            );
-        }
-
-        last_block.commit(commit);
-
-        Ok(())
-    }
-
     // Check the file block status. If it is a retry block, then return this block directly.
     pub fn analyze_block_state<'a>(
         file: &'a mut InodeFile,
@@ -472,10 +429,10 @@ impl FsDir {
         inp: &InodePath,
         commit_block: Option<CommitBlock>,
         choose_workers: &[WorkerAddress],
+        file_len: i64,
     ) -> FsResult<ExtendedBlock> {
         let op_ms = LocalTime::mills();
         let mut inode = try_option!(inp.get_last_inode());
-        let name = inp.name();
         let file = inode.as_file_mut()?;
 
         // Check whether it is a retry request.
@@ -491,8 +448,9 @@ impl FsDir {
 
         let new_block_id = file.next_block_id()?;
 
-        // commit block
-        Self::commit_block(name, file, commit_block.as_ref())?;
+        // flush file and commit block
+        let slice: &[CommitBlock] = commit_block.as_slice();
+        file.complete(file_len, slice, "", true)?;
 
         // create block.
         file.add_block(BlockMeta::with_pre(new_block_id, choose_workers));
@@ -516,27 +474,17 @@ impl FsDir {
         &mut self,
         inp: &InodePath,
         len: i64,
-        commit_block: Option<CommitBlock>,
+        commit_block: Vec<CommitBlock>,
+        client_name: impl AsRef<str>,
+        only_flush: bool,
     ) -> FsResult<bool> {
         let op_ms = LocalTime::mills();
         let mut inode = try_option!(inp.get_last_inode());
-        let name = inp.name();
         let file = inode.as_file_mut()?;
-        if file.is_complete() {
-            // The file has been completed, it is a duplicate request from the client service.
-            return Ok(false);
-        }
-
-        // commit block
-        Self::commit_block(name, file, commit_block.as_ref())?;
-
-        // Update file status.
-        file.mtime = LocalTime::mills() as i64;
-        file.features.complete_write();
-        file.len = len;
+        file.complete(len, &commit_block, client_name, only_flush)?;
 
         self.store
-            .apply_complete_file(inode.as_ref(), commit_block.as_ref())?;
+            .apply_complete_file(inode.as_ref(), &commit_block)?;
         self.journal_writer.log_complete_file(
             op_ms,
             inp.path(),
@@ -587,9 +535,6 @@ impl FsDir {
         };
 
         let file = inode.as_file_mut()?;
-        if !file.is_complete() {
-            return err_box!("Cannot append not complete file {}", inp.path());
-        }
         let _ = file.reopen(client_name);
         let status = inode.to_file_status(inp.path());
 

@@ -130,12 +130,11 @@ async fn create_file(fs: &CurvineFileSystem) -> CommonResult<()> {
     let path = Path::from_str(PATH)?;
     let opts = CreateFileOptsBuilder::with_conf(&fs.conf().client)
         .create_parent(true)
-        .overwrite(true)
         .x_attr("123".to_string(), "xxx".to_string().into_bytes())
         .ttl_ms(10000)
         .ttl_action(TtlAction::Delete)
         .build();
-    let writer = fs.create_with_opts(&path, opts).await?;
+    let writer = fs.create_with_opts(&path, opts, true).await?;
     let status = writer.status();
     info!("create file: {}, status: {:?}", path, status);
 
@@ -162,12 +161,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     }
 
     // 1. Create initial file and write content "initial"
-    let create_opts = CreateFileOptsBuilder::with_conf(&fs.conf().client)
-        .create_parent(true)
-        .overwrite(false) // First creation, no need to overwrite
-        .build();
-
-    let mut writer = fs.create_with_opts(&path, create_opts).await?;
+    let mut writer = fs.create(&path, true).await?;
     writer.write("initial".as_bytes()).await?;
     writer.complete().await?;
 
@@ -182,13 +176,8 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     );
 
     // 2. Use overwrite mode to rewrite file content to "overwritten_content"
-    let overwrite_opts = CreateFileOptsBuilder::with_conf(&fs.conf().client)
-        .create_parent(true)
-        .overwrite(true) // Enable overwrite
-        .build();
-
     println!("xx overwrite_inode_id");
-    let mut writer = fs.create_with_opts(&path, overwrite_opts.clone()).await?;
+    let mut writer = fs.create(&path, true).await?;
     writer.write("overwritten_content".as_bytes()).await?;
     println!("yy overwrite_inode_id");
     writer.complete().await?;
@@ -213,7 +202,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     );
 
     // 4. Overwrite again, write shorter content "short"
-    let mut writer = fs.create_with_opts(&path, overwrite_opts.clone()).await?;
+    let mut writer = fs.create(&path, true).await?;
     writer.write("short".as_bytes()).await?;
     writer.complete().await?;
 
@@ -234,7 +223,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     );
 
     // 6. Test overwrite to empty file
-    let mut writer = fs.create_with_opts(&path, overwrite_opts).await?;
+    let mut writer = fs.create(&path, true).await?;
     writer.complete().await?; // Don't write any content
 
     let empty_status = fs.get_status(&path).await?;
@@ -360,8 +349,8 @@ async fn add_block(fs: &CurvineFileSystem) -> CommonResult<()> {
     let client = fs.fs_client();
     let local_addr = client.client_addr().clone();
 
-    let _ = client.create(&path, true).await?;
-    let located = client.add_block(&path, None, &local_addr).await?;
+    let _ = client.create(&path, true, true).await?;
+    let located = client.add_block(&path, None, &local_addr, 0).await?;
     info!("add_block = {:?}", located);
     Ok(())
 }

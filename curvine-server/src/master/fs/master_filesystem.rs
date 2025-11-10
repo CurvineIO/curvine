@@ -135,7 +135,7 @@ impl MasterFilesystem {
         Ok(true)
     }
 
-    pub fn rename<T: AsRef<str>>(&self, src: T, dst: T) -> FsResult<bool> {
+    pub fn rename<T: AsRef<str>>(&self, src: T, dst: T, flags: RenameFlags) -> FsResult<bool> {
         let src = src.as_ref();
         let dst = dst.as_ref();
 
@@ -162,23 +162,27 @@ impl MasterFilesystem {
             }
         }
 
-        fs_dir.rename(&src_inp, &dst_inp)?;
+        if let Some(del_res) = fs_dir.rename(&src_inp, &dst_inp, flags)? {
+            let mut worker_manager = self.worker_manager.write();
+            worker_manager.remove_blocks(&del_res);
+        }
 
         Ok(true)
     }
 
     pub fn create<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
         let ctx = CreateFileOpts::with_create(create_parent);
-        self.create_with_opts(path, ctx)
+        self.create_with_opts(path, ctx, OpenFlags::new_create())
     }
 
     pub fn create_with_opts<T: AsRef<str>>(
         &self,
         path: T,
         opts: CreateFileOpts,
+        flags: OpenFlags,
     ) -> FsResult<FileStatus> {
-        if !opts.create() {
-            return err_box!("Flag error {}, cannot create file", opts.create_flag);
+        if !flags.create() {
+            return err_box!("Flag error {}, cannot create file", flags.value());
         }
         let path = path.as_ref();
 
@@ -218,7 +222,7 @@ impl MasterFilesystem {
         }
 
         // If the file already exists and overwrite is enabled, overwrite the file
-        let inp = if last_inode.is_some() && opts.overwrite() {
+        let inp = if last_inode.is_some() && flags.overwrite() {
             let clean_result = fs_dir.overwrite_file(&inp, opts)?;
             if !clean_result.blocks.is_empty() {
                 let mut worker_manager = self.worker_manager.write();
@@ -248,9 +252,9 @@ impl MasterFilesystem {
 
         let inode = match inp.get_last_inode() {
             None => {
-                return if opts.create() && flags.write() {
+                return if flags.create() && flags.write() {
                     drop(fs_dir);
-                    let status = self.create_with_opts(path, opts)?;
+                    let status = self.create_with_opts(path, opts, flags)?;
                     Ok(FileBlocks::new(status, vec![]))
                 } else {
                     err_ext!(FsError::file_not_found(inp.path()))
@@ -317,17 +321,10 @@ impl MasterFilesystem {
     }
 
     pub fn validate_add_block(
-        inp: &InodePath,
+        file: &InodeFile,
         client_addr: &ClientAddress,
         previous: Option<&CommitBlock>,
     ) -> FsResult<ValidateAddBlock> {
-        let inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => return err_box!("File {} not exists", inp.path()),
-        };
-
-        let file = inode.as_file_ref()?;
-
         if let Some(v) = previous {
             if v.block_len != file.block_size {
                 return err_box!(
@@ -338,33 +335,11 @@ impl MasterFilesystem {
             }
         }
 
-        match file.write_feature() {
-            None => {
-                return err_box!(
-                    "File is not open for writing, path {}, inode id {}",
-                    inp.path(),
-                    inode.id()
-                )
-            }
-
-            Some(v) if v.client_name != client_addr.client_name => {
-                return err_box!(
-                    "The client name written to file {} is incorrect, expected {}, actual {}",
-                    inp.path(),
-                    v.client_name,
-                    client_addr.client_name
-                )
-            }
-
-            _ => (),
-        }
-
         let res = ValidateAddBlock {
             replicas: file.replicas,
             block_size: file.block_size,
             storage_policy: file.storage_policy.clone(),
             client_host: client_addr.hostname.clone(),
-            file_inode: inode,
         };
 
         Ok(res)
@@ -377,12 +352,34 @@ impl MasterFilesystem {
         client_addr: ClientAddress,
         previous: Option<CommitBlock>,
         exclude_workers: Vec<u32>,
+        file_len: i64,
     ) -> FsResult<LocatedBlock> {
+        let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_box!("File {} not exists", inp.path()),
+        };
+        let file = inode.as_file_ref()?;
 
-        // Verify file status.
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-        let validate_block = Self::validate_add_block(&inp, &client_addr, previous.as_ref())?;
+        // File allows concurrent writes, 'previous' is the previous block,
+        // need to check if the next block has already been allocated。
+        // If it has been allocated, return that block
+        if let Some(next) = file.search_next_block(previous.as_ref().map(|x| x.block_id)) {
+            let locs = fs_dir.get_block_locations(next.id)?;
+            let extend_block = ExtendedBlock {
+                id: next.id,
+                len: next.len,
+                storage_type: file.storage_policy.storage_type,
+                file_type: file.file_type,
+            };
+
+            let wm = self.worker_manager.read();
+            return wm.create_locate_block(path, extend_block, &locs);
+        }
+
+        let validate_block = Self::validate_add_block(file, &client_addr, previous.as_ref())?;
 
         let wm = self.worker_manager.read();
 
@@ -392,7 +389,7 @@ impl MasterFilesystem {
         let choose_workers = wm.choose_worker(choose_ctx)?;
         drop(wm);
 
-        let block = fs_dir.acquire_new_block(&inp, previous, &choose_workers)?;
+        let block = fs_dir.acquire_new_block(&inp, previous, &choose_workers, file_len)?;
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -405,69 +402,28 @@ impl MasterFilesystem {
         &self,
         path: T,
         len: i64,
-        last: Option<CommitBlock>,
+        commit_blocks: Vec<CommitBlock>,
         client_name: T,
-    ) -> FsResult<bool> {
+        only_flush: bool,
+    ) -> FsResult<Option<FileBlocks>> {
+        let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+        let inp = Self::resolve_path(&fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
             None => return err_box!("File does not exist: {}", inp.path()),
             Some(v) => v,
         };
 
-        if !inode.is_file() {
-            return err_box!("INode is not a regular file: {}", inp.path());
+        let file = inode.as_file_ref()?;
+        fs_dir.complete_file(&inp, len, commit_blocks, client_name, only_flush)?;
+        if only_flush {
+            let locs = self.get_block_locs(path, &fs_dir, file)?;
+            let status = inode.to_file_status(path);
+            Ok(Some(FileBlocks::new(status, locs)))
+        } else {
+            Ok(None)
         }
-
-        //from store
-        let mut inode = fs_dir.store.get_inode(inode.id(), None)?;
-        let inode = match inode.as_mut() {
-            Some(inode_view) => inode_view,
-            None => {
-                return err_box!("File does not exist: {}", inp.path());
-            }
-        };
-
-        let file = inode.as_file_mut()?;
-        if file.is_complete() {
-            return Ok(false);
-        }
-
-        // Verify file length
-
-        let commit_len = file.commit_len(last.as_ref());
-
-        if commit_len != len {
-            log::error!(
-                "[MasterFilesystem::complete_file] File size mismatch! path={}, expected={}, submitted={}, difference={}",
-                path.as_ref(),
-                commit_len,
-                len,
-                len - commit_len
-            );
-
-            return err_box!(
-                "complete_file file size exception, expected {}, submitted {}",
-                commit_len,
-                len
-            );
-        }
-
-        // Verify file write status.
-        match &file.features.file_write {
-            Some(future) if future.client_name != client_name.as_ref() => {
-                return err_box!(
-                    "Client (={}) is not the lease owner (={})",
-                    client_name.as_ref(),
-                    future.client_name
-                )
-            }
-
-            _ => (),
-        }
-
-        fs_dir.complete_file(&inp, len, last)
     }
 
     fn get_block_locs(

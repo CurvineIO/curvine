@@ -55,22 +55,32 @@ impl FsClient {
         Ok(rep_header.flag)
     }
 
-    pub async fn create(&self, path: &Path, create_parent: bool) -> FsResult<FileStatus> {
+    pub async fn create(
+        &self,
+        path: &Path,
+        create_parent: bool,
+        overwrite: bool,
+    ) -> FsResult<FileStatus> {
         let opts = CreateFileOptsBuilder::new()
             .create_parent(create_parent)
             .build();
 
-        self.create_with_opts(path, opts).await
+        self.create_with_opts(path, opts, overwrite).await
     }
 
     pub async fn create_with_opts(
         &self,
         path: &Path,
         opts: CreateFileOpts,
+        overwrite: bool,
     ) -> FsResult<FileStatus> {
+        let flags = OpenFlags::new_write_only()
+            .set_create(true)
+            .set_overwrite(overwrite);
         let header = CreateFileRequest {
             path: path.encode(),
             opts: ProtoUtils::create_opts_to_pb(opts, self.context.clone_client_name()),
+            flags: flags.value(),
         };
 
         let rep_header: CreateFileResponse = self.rpc(RpcCode::CreateFile, header).await?;
@@ -134,6 +144,7 @@ impl FsClient {
         let header = RenameRequest {
             src: src.encode(),
             dst: dst.encode(),
+            flags: RenameFlags::empty().value(),
         };
 
         let rep_header: RenameResponse = self.rpc(RpcCode::Rename, header).await?;
@@ -190,6 +201,7 @@ impl FsClient {
         path: &Path,
         previous: Option<CommitBlock>,
         local_addr: &ClientAddress,
+        file_len: i64,
     ) -> FsResult<LocatedBlock> {
         let previous = previous.map(|v| ProtoUtils::commit_block_to_pb(v.clone()));
 
@@ -212,6 +224,7 @@ impl FsClient {
                 ip_addr: local_addr.ip_addr.to_owned(),
                 port: local_addr.port,
             },
+            file_len,
         };
 
         let rep_header = self.rpc(RpcCode::AddBlock, header).await?;
@@ -224,18 +237,24 @@ impl FsClient {
         &self,
         path: &Path,
         len: i64,
-        last: Option<CommitBlock>,
-    ) -> FsResult<()> {
-        let last = last.map(|v| ProtoUtils::commit_block_to_pb(v.clone()));
+        commit_blocks: impl IntoIterator<Item = CommitBlock>,
+        only_flush: bool,
+    ) -> FsResult<Option<FileBlocks>> {
+        let commit_blocks = commit_blocks
+            .into_iter()
+            .map(ProtoUtils::commit_block_to_pb)
+            .collect();
+
         let header = CompleteFileRequest {
             path: path.encode(),
             len,
             client_name: self.context().clone_client_name(),
-            last,
+            commit_blocks,
+            only_flush,
         };
 
-        let _: CompleteFileResponse = self.rpc(RpcCode::CompleteFile, header).await?;
-        Ok(())
+        let rep: CompleteFileResponse = self.rpc(RpcCode::CompleteFile, header).await?;
+        Ok(rep.file_blocks.map(ProtoUtils::file_blocks_from_pb))
     }
 
     pub async fn get_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {
