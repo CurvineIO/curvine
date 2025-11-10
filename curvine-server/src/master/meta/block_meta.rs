@@ -29,7 +29,6 @@ pub struct BlockMeta {
     pub(crate) id: i64,
     pub(crate) len: i64,
     pub(crate) replicas: u16,
-    pub(crate) state: BlockState,
     // The pre-assigned worker id is required when deleting.
     pub(crate) locs: Option<Vec<BlockLocation>>,
 }
@@ -40,7 +39,6 @@ impl BlockMeta {
             id,
             len,
             replicas: 1,
-            state: BlockState::Writing,
             locs: None,
         }
     }
@@ -55,7 +53,6 @@ impl BlockMeta {
             id,
             len: 0,
             replicas: 1,
-            state: BlockState::Writing,
             locs: Some(locs),
         }
     }
@@ -69,17 +66,8 @@ impl BlockMeta {
     }
 
     pub fn commit(&mut self, commit: &CommitBlock) {
-        self.state = BlockState::Committed;
-        self.len = commit.block_len;
+        self.len = self.len.max(commit.block_len);
         let _ = self.locs.take();
-    }
-
-    pub fn is_writing(&self) -> bool {
-        self.state == BlockState::Writing
-    }
-
-    pub fn is_committed(&self) -> bool {
-        self.state == BlockState::Committed
     }
 
     pub fn matching_block(a: Option<&BlockMeta>, b: Option<&CommitBlock>) -> bool {

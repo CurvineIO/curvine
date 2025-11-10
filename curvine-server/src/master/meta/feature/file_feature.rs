@@ -46,16 +46,28 @@ impl FileFeature {
         self.x_attr = map
     }
 
-    pub fn complete_write(&mut self) {
-        self.file_write = None;
+    pub fn complete_write(&mut self, client_name: impl AsRef<str>) {
+        match self.file_write {
+            None => (),
+            Some(ref mut f) => {
+                f.clients.remove(client_name.as_ref());
+                if f.clients.is_empty() {
+                    let _ = self.file_write.take();
+                }
+            }
+        }
     }
 
     pub fn set_writing(&mut self, client_name: String) {
-        let _ = self.file_write.replace(WriteFeature::new(client_name));
-    }
+        match &mut self.file_write {
+            Some(f) => {
+                f.clients.insert(client_name);
+            }
 
-    pub fn set_finalized(&mut self) {
-        let _ = self.file_write.take();
+            None => {
+                self.file_write = Some(WriteFeature::new(client_name));
+            }
+        }
     }
 
     pub fn all_attr(&self) -> &HashMap<String, Vec<u8>> {

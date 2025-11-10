@@ -57,9 +57,6 @@ pub use self::last_block_status::LastBlockStatus;
 mod worker_status;
 pub use self::worker_status::WorkerStatus;
 
-mod create_flag;
-pub use self::create_flag::*;
-
 mod mount;
 pub use self::mount::*;
 
@@ -77,3 +74,6 @@ pub use self::metrics::*;
 
 mod open_flags;
 pub use self::open_flags::*;
+
+mod rename_flags;
+pub use self::rename_flags::*;

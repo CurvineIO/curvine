@@ -23,7 +23,9 @@ use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
-use curvine_common::state::{CreateFileOpts, FileBlocks, FileStatus, HeartbeatStatus, OpenFlags};
+use curvine_common::state::{
+    CreateFileOpts, FileBlocks, FileStatus, HeartbeatStatus, OpenFlags, RenameFlags,
+};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
@@ -104,6 +106,7 @@ impl MasterHandler {
         req_id: i64,
         path: String,
         opts: CreateFileOpts,
+        flags: OpenFlags,
     ) -> FsResult<FileStatus> {
         if self.check_is_retry(req_id)? {
             // HDFS retries return the results of the last calculation
@@ -113,7 +116,7 @@ impl MasterHandler {
             return self.fs.file_status(&path);
         }
 
-        let res = self.fs.create_with_opts(&path, opts);
+        let res = self.fs.create_with_opts(&path, opts, flags);
         self.set_req_cache(req_id, res)
     }
 
@@ -122,7 +125,8 @@ impl MasterHandler {
         ctx.set_audit(Some(header.path.to_string()), None);
 
         let opts = ProtoUtils::create_opts_from_pb(header.opts);
-        let status = self.create_file0(ctx.msg.req_id(), header.path, opts)?;
+        let flags = OpenFlags::new(header.flags);
+        let status = self.create_file0(ctx.msg.req_id(), header.path, opts, flags)?;
 
         let rep_header = CreateFileResponse {
             file_status: ProtoUtils::file_status_to_pb(status),
@@ -202,8 +206,8 @@ impl MasterHandler {
         if self.check_is_retry(req_id)? {
             return Ok(true);
         }
-
-        let res = self.fs.rename(&header.src, &header.dst);
+        let flags = RenameFlags::new(header.flags);
+        let res = self.fs.rename(&header.src, &header.dst, flags);
         self.set_req_cache(req_id, res)
     }
 
@@ -239,7 +243,9 @@ impl MasterHandler {
         let client_addr = ProtoUtils::client_address_from_pb(req.client_address);
         let previous = req.previous.map(ProtoUtils::commit_block_from_pb);
 
-        let located_block = self.fs.add_block(path, client_addr, previous, vec![])?;
+        let located_block = self
+            .fs
+            .add_block(path, client_addr, previous, vec![], req.file_len)?;
         let rep_header = ProtoUtils::located_block_to_pb(located_block);
         ctx.response(rep_header)
     }
@@ -249,10 +255,22 @@ impl MasterHandler {
         let req: CompleteFileRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.path.to_string()), None);
 
-        let last = req.last.map(ProtoUtils::commit_block_from_pb);
-        self.fs
-            .complete_file(req.path, req.len, last, req.client_name)?;
-        let rep_header = CompleteFileResponse::default();
+        let commit_blocks = req
+            .commit_blocks
+            .into_iter()
+            .map(ProtoUtils::commit_block_from_pb)
+            .collect();
+        let file_blocks = self.fs.complete_file(
+            req.path,
+            req.len,
+            commit_blocks,
+            req.client_name,
+            req.only_flush,
+        )?;
+        let rep_header = CompleteFileResponse {
+            result: true,
+            file_blocks: file_blocks.map(ProtoUtils::file_blocks_to_pb),
+        };
         ctx.response(rep_header)
     }
 

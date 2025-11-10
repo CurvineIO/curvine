@@ -278,13 +278,10 @@ async fn write_test_file(
 ) -> CommonResult<FileBlocks> {
     let opts = CreateFileOptsBuilder::with_conf(&fs.fs_context().cluster_conf().client)
         .client_name(fs.fs_context().clone_client_name())
-        .create(true)
-        .overwrite(true)
-        .append(false)
         .replicas(2)
         .create_parent(true)
         .build();
-    let mut writer = fs.create_with_opts(path, opts).await?;
+    let mut writer = fs.create_with_opts(path, opts, true).await?;
     writer.write(data).await?;
     writer.complete().await?;
 

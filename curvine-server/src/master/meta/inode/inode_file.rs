@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::block_meta::BlockState;
 use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::state::{CommitBlock, CreateFileOpts, ExtendedBlock, FileType, StoragePolicy};
-use orpc::{err_box, ternary, CommonResult};
+use curvine_common::FsResult;
+use orpc::common::LocalTime;
+use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
@@ -146,11 +147,7 @@ impl InodeFile {
     }
 
     pub fn compute_len(&self) -> i64 {
-        let mut sum = 0;
-        for (i, x) in self.blocks.iter().enumerate() {
-            sum += ternary!(i == self.blocks.len() - 1 && !x.is_committed(), 0, x.len);
-        }
-        sum
+        self.blocks.iter().map(|x| x.len).sum()
     }
 
     pub fn commit_len(&self, last: Option<&CommitBlock>) -> i64 {
@@ -191,13 +188,8 @@ impl InodeFile {
     }
 
     pub fn reopen(&mut self, client_name: impl AsRef<str>) -> Option<ExtendedBlock> {
-        let _ = self
-            .features
-            .file_write
-            .insert(WriteFeature::new(client_name.as_ref().to_string()));
-
+        self.features.set_writing(client_name.as_ref().to_string());
         if let Some(last_block) = self.get_block_mut(-1) {
-            last_block.state = BlockState::Writing;
             let blk = ExtendedBlock {
                 id: last_block.id,
                 len: last_block.len,
@@ -267,6 +259,63 @@ impl InodeFile {
 
         // Reset file writing state for new write operation
         self.features.set_writing(opts.client_name);
+    }
+
+    pub fn search_block_mut(&mut self, block_id: i64) -> Option<&mut BlockMeta> {
+        let idx = self
+            .blocks
+            .binary_search_by_key(&block_id, |lb| lb.id)
+            .ok()?;
+        self.blocks.get_mut(idx)
+    }
+
+    pub fn search_block_mut_check(&mut self, block_id: i64) -> FsResult<&mut BlockMeta> {
+        match self.search_block_mut(block_id) {
+            Some(v) => Ok(v),
+            None => err_box!("Not found block, block_id = {}", block_id),
+        }
+    }
+
+    pub fn search_next_block(&self, previous: Option<i64>) -> Option<&BlockMeta> {
+        match previous {
+            None => self.blocks.first(),
+            Some(previous) => {
+                let idx = self
+                    .blocks
+                    .binary_search_by_key(&previous, |lb| lb.id)
+                    .ok()?;
+                self.blocks.get(idx + 1)
+            }
+        }
+    }
+
+    pub fn complete(
+        &mut self,
+        len: i64,
+        commit_blocks: &[CommitBlock],
+        client_name: impl AsRef<str>,
+        only_flush: bool,
+    ) -> FsResult<()> {
+        for block in commit_blocks {
+            let meta = self.search_block_mut_check(block.block_id)?;
+            meta.commit(block);
+        }
+
+        self.len = self.len.max(len);
+        let complete_len = self.compute_len();
+        if complete_len != self.len {
+            return err_box!(
+                "Complete len is not equal to file len, complete_len = {}, file_len = {}",
+                complete_len,
+                self.len
+            );
+        }
+
+        self.mtime = LocalTime::mills() as i64;
+        if !only_flush {
+            self.features.complete_write(client_name);
+        }
+        Ok(())
     }
 }
 

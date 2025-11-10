@@ -104,17 +104,15 @@ impl InodeStore {
                 InodeView::File(_, file) => {
                     deleted_files += 1;
                     for meta in &file.blocks {
-                        if meta.is_writing() {
+                        if let Some(locs) = &meta.locs {
                             // Uncommitted block.
-                            if let Some(locs) = &meta.locs {
-                                del_res.blocks.insert(meta.id, locs.clone());
-                            }
+                            del_res.blocks.insert(meta.id, locs.clone());
                         } else {
                             let locs = self.store.get_locations(meta.id)?;
                             if !locs.is_empty() {
                                 del_res.blocks.insert(meta.id, locs);
                             }
-                        };
+                        }
                     }
                 }
 
@@ -191,12 +189,12 @@ impl InodeStore {
     pub fn apply_complete_file(
         &self,
         file: &InodeView,
-        last: Option<&CommitBlock>,
+        commit_blocks: &[CommitBlock],
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(file)?;
-        if let Some(commit) = last {
+        for commit in commit_blocks {
             for item in &commit.locations {
                 batch.add_location(commit.block_id, item)?;
             }
