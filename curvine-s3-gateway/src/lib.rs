@@ -40,6 +40,7 @@
 pub mod auth;
 pub mod error;
 pub mod http;
+pub mod metrics_server;
 pub mod s3;
 pub mod utils;
 
@@ -52,6 +53,7 @@ use auth::{
 };
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
+use orpc::runtime::RpcRuntime;
 
 fn register_s3_handlers(
     router: axum::Router,
@@ -334,6 +336,12 @@ pub async fn start_gateway(
         listen,
         region
     );
+
+    rt.spawn(async move {
+        if let Err(e) = metrics_server::MetricsServer::start(9003).await {
+            tracing::error!("Failed to start metrics server: {}", e);
+        }
+    });
 
     let ufs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let ak_store = init_s3_authentication(&conf.s3_gateway, &ufs, rt.clone()).await?;

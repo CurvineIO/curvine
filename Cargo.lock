@@ -1341,10 +1341,12 @@ dependencies = [
 name = "curvine-fuse"
 version = "0.2.1-beta"
 dependencies = [
+ "axum 0.7.9",
  "bindgen",
  "clap",
  "curvine-client",
  "curvine-common",
+ "curvine-tracing-appender",
  "dashmap",
  "fxhash",
  "libc",
@@ -1361,6 +1363,8 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "trait-variant",
 ]
 

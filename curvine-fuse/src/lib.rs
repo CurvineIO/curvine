@@ -19,6 +19,7 @@ use once_cell::sync::Lazy;
 
 pub mod fs;
 pub mod macros;
+pub mod metrics_server;
 pub mod raw;
 pub mod session;
 
