@@ -39,10 +39,7 @@ pub struct ClientMetrics {
 impl ClientMetrics {
     pub const PREFIX: &'static str = "client";
 
-    pub fn new() -> CommonResult<Self> {
-        let buckets = vec![
-            10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
-        ];
+    pub fn new(buckets: &[f64]) -> CommonResult<Self> {
         let cm = Self {
             mount_cache_hits: m::new_counter_vec(
                 "client_mount_cache_hits",
@@ -75,7 +72,7 @@ impl ClientMetrics {
                 "client_metadata_operation_duration",
                 "metadata operation duration",
                 &["operation"],
-                &buckets,
+                buckets,
             )?,
             write_bytes: m::new_counter("client_write_bytes_total", "write bytes total")?,
             write_time_us: m::new_counter("client_write_time_us_total", "write time us total")?,

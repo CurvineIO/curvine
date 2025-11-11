@@ -1,11 +1,10 @@
 use axum::routing::get;
 use axum::Router;
-use curvine_client::ClientMetrics;
 use std::net::SocketAddr;
 
-pub struct MetricsServer;
+pub struct WebServer;
 
-impl MetricsServer {
+impl WebServer {
     pub async fn start(port: u16) -> orpc::CommonResult<()> {
         let app = Router::new()
             .route("/metrics", get(metrics_handler))
@@ -21,7 +20,5 @@ impl MetricsServer {
 }
 
 async fn metrics_handler() -> String {
-    ClientMetrics::new()
-        .and_then(|m| m.text_output())
-        .unwrap_or_else(|e| format!("Error: {}", e))
+    orpc::common::Metrics::text_output().unwrap_or_else(|e| format!("Error: {}", e))
 }

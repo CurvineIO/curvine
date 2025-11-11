@@ -40,9 +40,9 @@
 pub mod auth;
 pub mod error;
 pub mod http;
-pub mod metrics_server;
 pub mod s3;
 pub mod utils;
+pub mod web_server;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -338,7 +338,7 @@ pub async fn start_gateway(
     );
 
     rt.spawn(async move {
-        if let Err(e) = metrics_server::MetricsServer::start(9003).await {
+        if let Err(e) = web_server::WebServer::start(9003).await {
             tracing::error!("Failed to start metrics server: {}", e);
         }
     });

@@ -15,8 +15,8 @@
 use clap::Parser;
 use curvine_common::conf::ClusterConf;
 use curvine_fuse::fs::CurvineFileSystem;
-use curvine_fuse::metrics_server::MetricsServer;
 use curvine_fuse::session::FuseSession;
+use curvine_fuse::web_server::WebServer;
 use orpc::common::Logger;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{err_box, CommonResult};
@@ -42,7 +42,7 @@ fn main() -> CommonResult<()> {
     let fuse_rt = rt.clone();
 
     rt.spawn(async move {
-        if let Err(e) = MetricsServer::start(9002).await {
+        if let Err(e) = WebServer::start(9002).await {
             tracing::error!("Failed to start metrics server: {}", e);
         }
     });

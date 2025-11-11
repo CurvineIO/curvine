@@ -30,6 +30,8 @@ use orpc::runtime::Runtime;
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
 
+use crate::timed_operation;
+
 #[derive(Clone, Copy, PartialOrd, PartialEq, Debug)]
 enum CacheValidity {
     Valid,
@@ -232,35 +234,21 @@ impl UnifiedFileSystem {
 
 impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     async fn mkdir(&self, path: &Path, create_parent: bool) -> FsResult<bool> {
-        let timer = self
-            .metrics
-            .metadata_operation_duration
-            .with_label_values(&["mkdir"])
-            .start_timer();
-
-        let result = match self.get_mount(path).await? {
-            None => self.cv.mkdir(path, create_parent).await,
-            Some((ufs_path, mount)) => mount.ufs.mkdir(&ufs_path, create_parent).await,
-        };
-
-        timer.observe_duration();
-        result
+        timed_operation!(self, "mkdir", {
+            match self.get_mount(path).await? {
+                None => self.cv.mkdir(path, create_parent).await,
+                Some((ufs_path, mount)) => mount.ufs.mkdir(&ufs_path, create_parent).await,
+            }
+        })
     }
 
     async fn create(&self, path: &Path, overwrite: bool) -> FsResult<UnifiedWriter> {
-        let timer = self
-            .metrics
-            .metadata_operation_duration
-            .with_label_values(&["create"])
-            .start_timer();
-
-        let result = match self.get_mount(path).await? {
-            None => Ok(UnifiedWriter::Cv(self.cv.create(path, overwrite).await?)),
-            Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, overwrite).await,
-        };
-
-        timer.observe_duration();
-        result
+        timed_operation!(self, "create", {
+            match self.get_mount(path).await? {
+                None => Ok(UnifiedWriter::Cv(self.cv.create(path, overwrite).await?)),
+                Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, overwrite).await,
+            }
+        })
     }
 
     async fn append(&self, path: &Path) -> FsResult<UnifiedWriter> {
@@ -271,19 +259,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
-        let timer = self
-            .metrics
-            .metadata_operation_duration
-            .with_label_values(&["exists"])
-            .start_timer();
-
-        let result = match self.get_mount(path).await? {
-            None => self.cv.exists(path).await,
-            Some((ufs_path, mount)) => mount.ufs.exists(&ufs_path).await,
-        };
-
-        timer.observe_duration();
-        result
+        timed_operation!(self, "exists", {
+            match self.get_mount(path).await? {
+                None => self.cv.exists(path).await,
+                Some((ufs_path, mount)) => mount.ufs.exists(&ufs_path).await,
+            }
+        })
     }
 
     async fn open(&self, path: &Path) -> FsResult<UnifiedReader> {
@@ -354,143 +335,94 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
-        let timer = self
-            .metrics
-            .metadata_operation_duration
-            .with_label_values(&["rename"])
-            .start_timer();
+        timed_operation!(self, "rename", {
+            match self.get_mount(src).await? {
+                None => self.cv.rename(src, dst).await,
+                Some((src_ufs, mount)) => {
+                    let dst_ufs = mount.get_ufs_path(dst)?;
+                    let _ = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
 
-        let result = match self.get_mount(src).await? {
-            None => self.cv.rename(src, dst).await,
-            Some((src_ufs, mount)) => {
-                let dst_ufs = mount.get_ufs_path(dst)?;
-                let _ = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
+                    if self.cv.exists(src).await? {
+                        self.cv.delete(src, true).await?;
+                    }
 
-                if self.cv.exists(src).await? {
-                    self.cv.delete(src, true).await?;
+                    Ok(true)
                 }
-
-                Ok(true)
             }
-        };
-
-        timer.observe_duration();
-        result
+        })
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
-        let timer = self
-            .metrics
-            .metadata_operation_duration
-            .with_label_values(&["delete"])
-            .start_timer();
+        timed_operation!(self, "delete", {
+            match self.get_mount(path).await? {
+                None => self.cv.delete(path, recursive).await,
+                Some((ufs_path, mount)) => {
+                    // delete cache
+                    if self.cv.exists(path).await? {
+                        self.cv.delete(path, recursive).await?;
+                    }
 
-        let result = match self.get_mount(path).await? {
-            None => self.cv.delete(path, recursive).await,
-            Some((ufs_path, mount)) => {
-                // delete cache
-                if self.cv.exists(path).await? {
-                    self.cv.delete(path, recursive).await?;
+                    // delete ufs
+                    mount.ufs.delete(&ufs_path, recursive).await
                 }
-
-                // delete ufs
-                mount.ufs.delete(&ufs_path, recursive).await
             }
-        };
-
-        timer.observe_duration();
-        result
+        })
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
-        let timer = self
-            .metrics
-            .metadata_operation_duration
-            .with_label_values(&["get_status"])
-            .start_timer();
-
-        let result = match self.get_mount(path).await? {
-            None => self.cv.get_status(path).await,
-            Some((ufs_path, mount)) => {
-                if mount.info.cv_path == path.path() {
-                    return self.cv.get_status(path).await;
+        timed_operation!(self, "get_status", {
+            match self.get_mount(path).await? {
+                None => self.cv.get_status(path).await,
+                Some((ufs_path, mount)) => {
+                    if mount.info.cv_path == path.path() {
+                        return self.cv.get_status(path).await;
+                    }
+                    mount.ufs.get_status(&ufs_path).await
                 }
-                mount.ufs.get_status(&ufs_path).await
             }
-        };
-
-        timer.observe_duration();
-        result
+        })
     }
 
     async fn get_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
-        let timer = self
-            .metrics
-            .metadata_operation_duration
-            .with_label_values(&["get_status_bytes"])
-            .start_timer();
-
-        let result = match self.get_mount(path).await? {
-            None => self.cv.get_status_bytes(path).await,
-            Some((ufs_path, mount)) => {
-                if mount.info.cv_path == path.path() {
-                    return self.cv.get_status_bytes(path).await;
+        timed_operation!(self, "get_status_bytes", {
+            match self.get_mount(path).await? {
+                None => self.cv.get_status_bytes(path).await,
+                Some((ufs_path, mount)) => {
+                    if mount.info.cv_path == path.path() {
+                        return self.cv.get_status_bytes(path).await;
+                    }
+                    mount.ufs.get_status_bytes(&ufs_path).await
                 }
-                mount.ufs.get_status_bytes(&ufs_path).await
             }
-        };
-
-        timer.observe_duration();
-        result
+        })
     }
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
         tracing::info!("list_status");
         print!("list_status");
-        let timer = self
-            .metrics
-            .metadata_operation_duration
-            .with_label_values(&["list_status"])
-            .start_timer();
-
-        let result = match self.get_mount(path).await? {
-            None => self.cv.list_status(path).await,
-            Some((ufs_path, mount)) => mount.ufs.list_status(&ufs_path).await,
-        };
-
-        timer.observe_duration();
-        result
+        timed_operation!(self, "list_status", {
+            match self.get_mount(path).await? {
+                None => self.cv.list_status(path).await,
+                Some((ufs_path, mount)) => mount.ufs.list_status(&ufs_path).await,
+            }
+        })
     }
 
     async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
-        let timer = self
-            .metrics
-            .metadata_operation_duration
-            .with_label_values(&["list_status_bytes"])
-            .start_timer();
-
-        let result = match self.get_mount(path).await? {
-            None => self.cv.list_status_bytes(path).await,
-            Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
-        };
-
-        timer.observe_duration();
-        result
+        timed_operation!(self, "list_status_bytes", {
+            match self.get_mount(path).await? {
+                None => self.cv.list_status_bytes(path).await,
+                Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
+            }
+        })
     }
 
     async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
-        let timer = self
-            .metrics
-            .metadata_operation_duration
-            .with_label_values(&["set_attr"])
-            .start_timer();
-
-        let result = match self.get_mount(path).await? {
-            None => self.cv.set_attr(path, opts).await,
-            Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
-        };
-
-        timer.observe_duration();
-        result
+        timed_operation!(self, "set_attr", {
+            match self.get_mount(path).await? {
+                None => self.cv.set_attr(path, opts).await,
+                Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
+            }
+        })
     }
 }

@@ -19,7 +19,6 @@ use curvine_common::fs::Path;
 use curvine_common::state::FileBlocks;
 use curvine_common::FsResult;
 use log::error;
-use orpc::common::TimeSpent;
 use orpc::err_box;
 use orpc::runtime::RpcRuntime;
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
@@ -245,8 +244,6 @@ impl FsReaderBuffer {
             return Ok(DataSlice::Empty);
         }
 
-        let spend = TimeSpent::new();
-
         let reader = self.get_reader()?;
         let mut chunk = reader.read().await?;
 
@@ -263,11 +260,9 @@ impl FsReaderBuffer {
 
         self.pos += bytes.len() as i64;
 
-        let used_us = spend.used_us();
         FsContext::get_metrics()
             .read_bytes
             .inc_by(bytes.len() as i64);
-        FsContext::get_metrics().read_time_us.inc_by(used_us as i64);
 
         Ok(bytes)
     }
