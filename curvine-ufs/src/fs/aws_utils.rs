@@ -130,6 +130,15 @@ impl From<HashMap<String, u64>> for AwsCustomConfig {
 /// # return
 /// Returns the verification result, if all parameters are valid, returns Valid
 pub fn validate_s3_config(config: &HashMap<String, String>) -> S3ConfigValidationResult {
+    // Check required parameters
+    if !config.contains_key("s3.region_name") {
+        return S3ConfigValidationResult::MissingRequiredParam("s3.region_name".to_string());
+    }
+
+    if !config.contains_key("s3.bucket_name") {
+        return S3ConfigValidationResult::MissingRequiredParam("s3.bucket_name".to_string());
+    }
+
     // Check the endpoint url format (if present)
     if let Some(endpoint) = config.get("s3.endpoint_url") {
         if endpoint.is_empty() {

@@ -25,7 +25,7 @@ use std::io::Cursor;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use std::{env, panic, process, thread};
+use std::{env, fs, panic, process, thread};
 use uuid::Uuid;
 
 pub struct Utils;
@@ -146,7 +146,12 @@ impl Utils {
     // Returns a test file name.Located in the testing directory.
     pub fn test_file() -> String {
         let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
-        path.push(format!("../testing/test-{}", Self::rand_id()));
+        path.push("../testing");
+
+        // Ensure the testing directory exists
+        let _ = fs::create_dir_all(&path);
+
+        path.push(format!("test-{}", Self::rand_id()));
         format!("{}", path.display())
     }
 
@@ -154,6 +159,10 @@ impl Utils {
         let mut path = env::current_dir().unwrap_or(PathBuf::from("."));
         path.push("../testing");
         path.push(sub);
+
+        // Ensure the sub directory exists
+        let _ = fs::create_dir_all(&path);
+
         format!("{}", path.display())
     }
 

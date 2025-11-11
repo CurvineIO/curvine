@@ -36,8 +36,8 @@ fn get_raw_fd() {
 
     let writer = OpenOptions::new()
         .write(true)
-        .truncate(true)
         .create(true)
+        .truncate(true)
         .open(test_file_path)
         .unwrap_or_else(|e| {
             panic!("Failed to open file: {:?}, error: {}", test_file_path, e);
@@ -60,8 +60,8 @@ fn read_ahead() {
 
     let mut writer = OpenOptions::new()
         .write(true)
-        .truncate(true)
         .create(true)
+        .truncate(true)
         .open(test_file_path)
         .unwrap_or_else(|e| {
             panic!("Failed to open file: {:?}, error: {}", test_file_path, e);

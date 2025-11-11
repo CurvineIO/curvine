@@ -24,6 +24,7 @@ pub fn get_s3_test_config() -> HashMap<String, String> {
         "http://s3v2.dg-access-test.wanyol.com".to_string(),
     );
     config.insert("s3.region_name".to_string(), "cn-south-1".to_string());
+    config.insert("s3.bucket_name".to_string(), "test-bucket".to_string());
     config.insert(
         "s3.credentials.access".to_string(),
         "T6A4jOFA9TssTrn2K1A6pFDT-xwFiFQbfS2JxZ5D".to_string(),

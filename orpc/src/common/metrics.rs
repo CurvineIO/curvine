@@ -64,13 +64,26 @@ impl Metrics {
     }
 
     fn register(m: Metrics) -> CommonResult<()> {
-        if METRICS_MAP.contains_key(m.get_name()) {
+        let name = m.get_name().to_string();
+
+        if METRICS_MAP.contains_key(&name) {
             return Ok(());
         }
 
-        let res = METRICS_MAP.entry(m.get_name().to_string()).or_insert(m);
-        default_registry().register(res.boxed())?;
-        Ok(())
+        let res = METRICS_MAP.entry(name.clone()).or_insert(m);
+
+        // ignore already registered error as it can happen in concurrent test scenarios
+        match default_registry().register(res.boxed()) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                if err_msg.contains("Duplicate") || err_msg.contains("duplicate") {
+                    Ok(())
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
     }
 
     pub fn new_counter<T: Into<String>>(name: T, help: T) -> CommonResult<Counter> {

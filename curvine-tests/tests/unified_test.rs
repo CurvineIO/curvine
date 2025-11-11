@@ -35,6 +35,12 @@ fn run() -> CommonResult<()> {
     let path = Path::from_str("/s3/xuen-test/test.log")?;
     let s3_conf = testing.get_s3_conf();
 
+    // Skip test if S3 configuration is not available
+    if s3_conf.is_none() {
+        println!("Skipping unified_test as S3 configuration is not available");
+        return Ok(());
+    }
+
     rt.block_on(async {
         mount(&fs, s3_conf).await.unwrap();
         get_mount(&fs).await.unwrap();
@@ -69,8 +75,14 @@ async fn mount(fs: &UnifiedFileSystem, s3_conf: Option<HashMap<String, String>>)
 
     let ttl_ms = DurationUnit::from_str("1h")?.as_millis() as i64;
 
-    let opts = MountOptions::builder()
-        .set_properties(s3_conf.unwrap())
+    let mut opts_builder = MountOptions::builder();
+
+    // Set properties only if s3_conf is Some
+    if let Some(conf) = s3_conf {
+        opts_builder = opts_builder.set_properties(conf);
+    }
+
+    let opts = opts_builder
         .ttl_ms(ttl_ms)
         .ttl_action(TtlAction::Delete)
         .mount_type(MountType::Orch)

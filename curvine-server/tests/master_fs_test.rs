@@ -323,7 +323,7 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
 
 #[test]
 fn link() -> CommonResult<()> {
-    let fs = new_fs(true, "fs_test");
+    let fs = new_fs(true, "link_test");
     fs.mkdir("/a/b", true)?;
     fs.create("/a/b/file.log", true)?;
     fs.print_tree();
