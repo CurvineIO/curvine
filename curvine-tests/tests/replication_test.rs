@@ -67,7 +67,7 @@ fn test_block_replication_e2e() -> CommonResult<()> {
         .masters(2)
         .workers(3)
         .mutate_conf(|conf| {
-            conf.client.block_size = 64 * 1024;
+            conf.client.block_size_str = "64KB".to_string();
             conf.master.min_block_size = 64 * 1024;
             conf.master.min_replication = 1;
             conf.master.max_replication = 3;
@@ -195,7 +195,7 @@ fn test_replication_with_simulated_worker_failure() -> CommonResult<()> {
         .masters(2)
         .workers(4)
         .mutate_conf(|conf| {
-            conf.client.block_size = 32 * 1024; // 32KB blocks
+            conf.client.block_size_str = "32KB".to_string();
             conf.master.min_block_size = 32 * 1024;
             conf.master.min_replication = 1;
             conf.master.max_replication = 3;
@@ -278,13 +278,10 @@ async fn write_test_file(
 ) -> CommonResult<FileBlocks> {
     let opts = CreateFileOptsBuilder::with_conf(&fs.fs_context().cluster_conf().client)
         .client_name(fs.fs_context().clone_client_name())
-        .create(true)
-        .overwrite(true)
-        .append(false)
         .replicas(2)
         .create_parent(true)
         .build();
-    let mut writer = fs.create_with_opts(path, opts).await?;
+    let mut writer = fs.create_with_opts(path, opts, true).await?;
     writer.write(data).await?;
     writer.complete().await?;
 

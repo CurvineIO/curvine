@@ -40,9 +40,10 @@ impl FsWriter {
         let pos = ternary!(append, status.len, 0);
 
         info!(
-            "Create writer, path={}, pos={}, block_size={}, chunk_size={}, chunk_number={}, replicas={}",
+            "Create writer, path={}, pos={}, len = {}, block_size={}, chunk_size={}, chunk_number={}, replicas={}",
             &status.path,
             pos,
+            status.len,
             ByteUnit::byte_to_string(status.block_size as u64),
             chunk_size,
             chunk_num,

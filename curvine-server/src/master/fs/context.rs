@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::InodePtr;
 use curvine_common::state::StoragePolicy;
 
 // adBlock request verification result.
@@ -22,5 +21,4 @@ pub struct ValidateAddBlock {
     pub block_size: i64,
     pub storage_policy: StoragePolicy,
     pub client_host: String,
-    pub file_inode: InodePtr,
 }

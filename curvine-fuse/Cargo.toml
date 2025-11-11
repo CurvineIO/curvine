@@ -30,6 +30,7 @@ axum = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+bitflags = { workspace = true }
 
 [features]
 default = ["fuse3"]

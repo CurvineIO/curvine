@@ -15,7 +15,7 @@
 use crate::proto::BlockWriteRequest;
 use crate::state::{FileStatus, FileType, StorageType, WorkerAddress};
 use crate::FsResult;
-use orpc::common::ByteUnit;
+use orpc::common::{ByteUnit, FastHashMap};
 use orpc::{err_box, try_option, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, Range};
@@ -202,12 +202,12 @@ impl SearchFileBlocks {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct WriteFileBlocks {
     pub status: FileStatus,
     pub block_locs: Vec<LocatedBlock>,
     search_off: Vec<Range<i64>>,
-    pub last_commit: Option<CommitBlock>,
+    commit_blocks: FastHashMap<i64, CommitBlock>,
 }
 
 impl WriteFileBlocks {
@@ -220,14 +220,11 @@ impl WriteFileBlocks {
             search_off.push(Range { start, end: off });
         }
 
-        // file commit needs to submit the last block
-        let last_commit = file_blocks.block_locs.last().map(|x| x.into());
-
         Self {
             status: file_blocks.status,
             block_locs: file_blocks.block_locs,
             search_off,
-            last_commit,
+            commit_blocks: FastHashMap::default(),
         }
     }
 
@@ -248,18 +245,15 @@ impl WriteFileBlocks {
         }
     }
 
-    pub fn update_block(&mut self, commit: CommitBlock) -> FsResult<()> {
-        if let Some(v) = self.block_locs.last_mut() {
-            if v.id == commit.block_id {
-                v.block.len = commit.block_len;
-                let _ = self.last_commit.insert(commit);
-                Ok(())
-            } else {
-                Ok(())
-            }
-        } else {
-            err_box!("Not found last block")
-        }
+    pub fn add_commit(&mut self, commit: CommitBlock) {
+        self.commit_blocks.insert(commit.block_id, commit);
+    }
+
+    pub fn take_commit_blocks(&mut self) -> Vec<CommitBlock> {
+        let mut commits: Vec<_> = self.commit_blocks.drain().map(|(_, v)| v).collect();
+
+        commits.sort_by_key(|c| c.block_id);
+        commits
     }
 
     pub fn add_block(&mut self, mut lb: LocatedBlock) -> FsResult<()> {
@@ -288,9 +282,5 @@ impl WriteFileBlocks {
         self.search_off.push(Range { start, end });
 
         Ok(())
-    }
-
-    pub fn take_last_commit(&mut self) -> Option<CommitBlock> {
-        self.last_commit.take()
     }
 }

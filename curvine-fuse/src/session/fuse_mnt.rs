@@ -86,10 +86,10 @@ impl FuseMnt {
     }
 
     // Get 2 fds for asynchronous reading and writing data.
-    pub fn create_async_task_fd(&self, clone: bool) -> IOResult<(Arc<AsyncFd>, Arc<AsyncFd>)> {
+    pub fn create_async_task_fd(&self, clone: bool) -> IOResult<Arc<AsyncFd>> {
         let fd = self.crate_task_fd(clone)?;
         let fd = Arc::new(AsyncFd::new(fd)?);
-        Ok((fd.clone(), fd))
+        Ok(fd)
     }
 }
 

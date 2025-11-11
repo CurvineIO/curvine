@@ -42,6 +42,7 @@ message CreateFileOptsProto {
 message CreateFileRequest {
     required string path = 1;
     required CreateFileOptsProto opts = 2;
+    required uint32 flags = 3;
 }
 
 message CreateFileResponse {
@@ -51,7 +52,7 @@ message CreateFileResponse {
 message OpenFileRequest {
     required string path = 1;
     required CreateFileOptsProto opts = 2;
-    required int32 flags = 3;
+    required uint32 flags = 3;
 }
 
 message OpenFileResponse {
@@ -97,6 +98,7 @@ message ListStatusResponse {
 message RenameRequest {
     required string src = 1;
     required string dst = 2;
+    required uint32 flags = 3;
 }
 
 message RenameResponse {
@@ -110,6 +112,7 @@ message AddBlockRequest {
     repeated WorkerAddressProto exclude_workers = 3;
     required bool located = 4 [default = true];
     required ClientAddressProto client_address = 5;
+    required int64 file_len = 6;
 }
 
 message AddBlockResponse {
@@ -121,11 +124,13 @@ message CompleteFileRequest {
     required string path = 1;
     required int64 len = 2;
     required string client_name = 3;
-    optional CommitBlockProto last = 4;
+    repeated CommitBlockProto commit_blocks = 4;
+    required bool only_flush = 5 [default = false];
 }
 
 message CompleteFileResponse {
     required bool result = 1;
+    optional FileBlocksProto file_blocks = 2;
 }
 
 // Get the block of the file.
@@ -159,15 +164,6 @@ message GetMasterInfoResponse {
     repeated WorkerInfoProto blacklist_workers = 12;
     repeated WorkerInfoProto decommission_workers = 13;
     repeated WorkerInfoProto lost_workers = 14;
-}
-
-message AppendFileRequest {
-    required string path = 1;
-    required CreateFileOptsProto opts = 2;
-}
-
-message AppendFileResponse {
-    required FileBlocksProto status = 1;
 }
 
 message SetAttrOptsProto {

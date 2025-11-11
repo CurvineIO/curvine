@@ -127,11 +127,16 @@ impl FsWriterBase {
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        // Just flush the block writer in the current write state.
-        match &mut self.cur_writer {
-            None => Ok(()),
-            Some(writer) => writer.flush().await,
+        if let Some(writer) = &mut self.cur_writer {
+            writer.flush().await?;
+            self.file_blocks.add_commit(writer.to_commit_block());
         }
+
+        let commits_blocks = self.file_blocks.take_commit_blocks();
+        self.fs_client
+            .complete_file(&self.path, self.len, commits_blocks, true)
+            .await?;
+        Ok(())
     }
 
     // Write is completed, perform the following operations
@@ -139,17 +144,17 @@ impl FsWriterBase {
     pub async fn complete(&mut self) -> FsResult<()> {
         if let Some(mut writer) = self.cur_writer.take() {
             let commit_block = writer.complete().await?;
-            self.file_blocks.update_block(commit_block)?;
+            self.file_blocks.add_commit(commit_block);
         };
 
         for (_, mut writer) in self.all_writers.drain() {
             let commit_block = writer.complete().await?;
-            self.file_blocks.update_block(commit_block)?;
+            self.file_blocks.add_commit(commit_block);
         }
 
-        let last_commit = self.file_blocks.take_last_commit();
+        let commits_blocks = self.file_blocks.take_commit_blocks();
         self.fs_client
-            .complete_file(&self.path, self.len, last_commit)
+            .complete_file(&self.path, self.len, commits_blocks, false)
             .await?;
         Ok(())
     }
@@ -183,7 +188,12 @@ impl FsWriterBase {
                         // Apply for a new block
                         let lb = self
                             .fs_client
-                            .add_block(&self.path, commit_block, &self.fs_context.client_addr)
+                            .add_block(
+                                &self.path,
+                                commit_block,
+                                &self.fs_context.client_addr,
+                                self.len,
+                            )
                             .await?;
 
                         self.file_blocks.add_block(lb.clone())?;
@@ -230,7 +240,7 @@ impl FsWriterBase {
                 self.all_writers.insert(old.block_id(), old);
             } else {
                 let commit_block = old.complete().await?;
-                self.file_blocks.update_block(commit_block)?;
+                self.file_blocks.add_commit(commit_block);
             }
         }
 

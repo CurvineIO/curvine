@@ -19,7 +19,7 @@ use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
-use curvine_common::state::{CommitBlock, MountInfo, SetAttrOpts};
+use curvine_common::state::{CommitBlock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_common::FsResult;
 use log::info;
 use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
@@ -142,13 +142,13 @@ impl JournalWriter {
         op_ms: u64,
         path: P,
         file: &InodeFile,
-        commit_block: Option<CommitBlock>,
+        commit_blocks: Vec<CommitBlock>,
     ) -> FsResult<()> {
         let entry = CompleteFileEntry {
             op_ms,
             path: path.as_ref().to_string(),
             file: file.clone(),
-            commit_block,
+            commit_blocks,
         };
 
         self.send(JournalEntry::CompleteFile(entry))
@@ -169,12 +169,14 @@ impl JournalWriter {
         src: P,
         dst: P,
         mtime: i64,
+        flags: RenameFlags,
     ) -> FsResult<()> {
         let entry = RenameEntry {
             op_ms,
             src: src.as_ref().to_string(),
             dst: dst.as_ref().to_string(),
             mtime,
+            flags: flags.value(),
         };
 
         self.send(JournalEntry::Rename(entry))

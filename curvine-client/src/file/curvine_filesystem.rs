@@ -89,8 +89,16 @@ impl CurvineFileSystem {
         self.mkdir_with_opts(path, opts).await
     }
 
-    pub async fn create_with_opts(&self, path: &Path, opts: CreateFileOpts) -> FsResult<FsWriter> {
-        let status = self.fs_client.create_with_opts(path, opts).await?;
+    pub async fn create_with_opts(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        overwrite: bool,
+    ) -> FsResult<FsWriter> {
+        let status = self
+            .fs_client
+            .create_with_opts(path, opts, overwrite)
+            .await?;
         let file_blocks = FileBlocks::new(status, vec![]);
         let writer = FsWriter::create(self.fs_context.clone(), path.clone(), file_blocks);
         Ok(writer)
@@ -102,29 +110,14 @@ impl CurvineFileSystem {
     }
 
     pub async fn create(&self, path: &Path, overwrite: bool) -> FsResult<FsWriter> {
-        let opts = self
-            .create_opts_builder()
-            .create(true)
-            .overwrite(overwrite)
-            .append(false)
-            .create_parent(true)
-            .build();
-        self.create_with_opts(path, opts).await
+        let opts = self.create_opts_builder().create_parent(true).build();
+        self.create_with_opts(path, opts, overwrite).await
     }
 
     pub async fn append(&self, path: &Path) -> FsResult<FsWriter> {
-        let opts = self
-            .create_opts_builder()
-            .create(false)
-            .overwrite(false)
-            .append(true)
-            .create_parent(false)
-            .build();
-
-        let status = self
-            .fs_client
-            .open_with_opts(path, opts, OpenFlags::with_write())
-            .await?;
+        let opts = self.create_opts_builder().create_parent(false).build();
+        let flags = OpenFlags::new_append().set_create(true);
+        let status = self.fs_client.open_with_opts(path, opts, flags).await?;
         let writer = FsWriter::append(self.fs_context.clone(), path.clone(), status);
         Ok(writer)
     }
@@ -135,9 +128,6 @@ impl CurvineFileSystem {
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<FileBlocks> {
-        if flags.read_write() {
-            return err_box!("Cannot open {} for read and write.", path);
-        }
         self.fs_client.open_with_opts(path, opts, flags).await
     }
 
@@ -174,16 +164,10 @@ impl CurvineFileSystem {
     }
 
     pub async fn open_for_read(&self, path: &Path) -> FsResult<FsReader> {
-        let create_opts = self
-            .create_opts_builder()
-            .create(false)
-            .overwrite(false)
-            .append(false)
-            .create_parent(false)
-            .build();
+        let create_opts = self.create_opts_builder().build();
 
         let file_blocks = self
-            .open_with_opts(path, create_opts, OpenFlags::with_read())
+            .open_with_opts(path, create_opts, OpenFlags::new_read_only())
             .await?;
         Self::check_read_status(path, &file_blocks)?;
 
@@ -192,17 +176,12 @@ impl CurvineFileSystem {
     }
 
     pub async fn open_for_write(&self, path: &Path, overwrite: bool) -> FsResult<FsWriter> {
-        let create_opts = self
-            .create_opts_builder()
-            .create(true)
-            .overwrite(overwrite)
-            .append(false)
-            .create_parent(false)
-            .build();
+        let create_opts = self.create_opts_builder().create_parent(true).build();
 
-        let file_blocks = self
-            .open_with_opts(path, create_opts, OpenFlags::with_write())
-            .await?;
+        let flags = OpenFlags::new_write_only()
+            .set_create(true)
+            .set_overwrite(overwrite);
+        let file_blocks = self.open_with_opts(path, create_opts, flags).await?;
         let writer = FsWriter::create(self.fs_context.clone(), path.clone(), file_blocks);
         Ok(writer)
     }

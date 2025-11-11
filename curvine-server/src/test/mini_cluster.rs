@@ -256,6 +256,16 @@ impl MiniCluster {
         for item in list.iter_mut() {
             item.journal.journal_addrs = journal_addrs.clone();
             item.client.master_addrs = master_addrs.clone();
+            // Re-initialize configuration to ensure consistency
+            // This ensures that string-based configs (like block_size_str) are properly parsed
+            item.client
+                .init()
+                .expect("Failed to initialize client config");
+            item.master
+                .init()
+                .expect("Failed to initialize master config");
+            item.fuse.init().expect("Failed to initialize fuse config");
+            item.job.init().expect("Failed to initialize job config");
         }
 
         list
@@ -274,6 +284,23 @@ impl MiniCluster {
                 dirs.push(format!("{}/{}", item, index));
             }
             worker.worker.data_dir = dirs;
+
+            // Re-initialize configuration to ensure consistency
+            // This ensures that string-based configs (like block_size_str) are properly parsed
+            worker
+                .client
+                .init()
+                .expect("Failed to initialize client config");
+            worker
+                .master
+                .init()
+                .expect("Failed to initialize master config");
+            worker
+                .fuse
+                .init()
+                .expect("Failed to initialize fuse config");
+            worker.job.init().expect("Failed to initialize job config");
+
             worker_conf.push(worker)
         }
 

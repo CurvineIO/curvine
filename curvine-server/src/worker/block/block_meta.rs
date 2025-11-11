@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::worker::storage::{DirState, VfsDir, FINALIZED_DIR, RBW_DIR};
+use crate::worker::storage::{DirState, VfsDir, ACTIVE_DIR, STAGING_DIR};
 use curvine_common::state::{ExtendedBlock, StorageType};
 use once_cell::sync::Lazy;
 use orpc::common::{ByteUnit, FileUtils};
@@ -121,15 +121,6 @@ impl BlockMeta {
         }
     }
 
-    pub fn with_cow(finalized_meta: &BlockMeta, new_block_size: i64, dir: &VfsDir) -> Self {
-        Self {
-            id: finalized_meta.id,
-            len: new_block_size,
-            state: BlockState::Writing,
-            dir: dir.state.clone(),
-        }
-    }
-
     pub fn id(&self) -> i64 {
         self.id
     }
@@ -150,6 +141,10 @@ impl BlockMeta {
         self.state == BlockState::Finalized
     }
 
+    pub fn is_active(&self) -> bool {
+        matches!(self.state, BlockState::Finalized | BlockState::Writing)
+    }
+
     // Write some test data.
     pub fn write_test_data(&self, size: &str) -> CommonResult<()> {
         let bytes = ByteUnit::from_str(size)?.as_byte();
@@ -158,26 +153,22 @@ impl BlockMeta {
         Ok(())
     }
 
-    pub fn support_append(&self) -> bool {
-        self.state != BlockState::Recovering
-    }
-
     fn get_block_dir(&self) -> CommonResult<PathBuf> {
         let dir = match self.state {
-            BlockState::Finalized => {
+            BlockState::Finalized | BlockState::Writing => {
                 let d1 = (self.id >> 16) & 0x1F;
                 let d2 = (self.id >> 8) & 0x1F;
 
                 let mut path = PathBuf::from(&self.dir.base_path);
-                path.push(FINALIZED_DIR);
+                path.push(ACTIVE_DIR);
                 path.push(format!("b{}", d1));
                 path.push(format!("b{}", d2));
                 path
             }
 
-            BlockState::Writing | BlockState::Recovering => {
+            BlockState::Recovering => {
                 let mut path = PathBuf::from(&self.dir.base_path);
-                path.push(RBW_DIR);
+                path.push(STAGING_DIR);
                 path
             }
         };

@@ -454,7 +454,7 @@ impl ProtoUtils {
         client_name: impl Into<String>,
     ) -> CreateFileOptsProto {
         CreateFileOptsProto {
-            create_flag: opts.create_flag.value(),
+            create_flag: 0,
             create_parent: opts.create_parent,
             file_type: opts.file_type.into(),
             replicas: opts.replicas as i32,
@@ -468,7 +468,6 @@ impl ProtoUtils {
 
     pub fn create_opts_from_pb(opts: CreateFileOptsProto) -> CreateFileOpts {
         CreateFileOpts {
-            create_flag: CreateFlag::new(opts.create_flag),
             create_parent: opts.create_parent,
             file_type: FileType::from(opts.file_type),
             replicas: opts.replicas as u16,

@@ -60,7 +60,7 @@ pub struct CompleteFileEntry {
     pub(crate) op_ms: u64,
     pub(crate) path: String,
     pub(crate) file: InodeFile,
-    pub(crate) commit_block: Option<CommitBlock>,
+    pub(crate) commit_blocks: Vec<CommitBlock>,
 }
 
 // Rename
@@ -70,6 +70,7 @@ pub struct RenameEntry {
     pub(crate) src: String,
     pub(crate) dst: String,
     pub(crate) mtime: i64,
+    pub(crate) flags: u32,
 }
 // delete
 #[derive(Deserialize, Serialize, Debug, Clone)]

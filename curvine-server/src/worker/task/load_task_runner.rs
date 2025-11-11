@@ -142,7 +142,6 @@ impl LoadTaskRunner {
         // create cv writer
         let target_path = Path::from_str(&info.target_path)?;
         let opts = CreateFileOptsBuilder::new()
-            .overwrite(true)
             .create_parent(true)
             .replicas(info.job.replicas)
             .block_size(info.job.block_size)
@@ -151,7 +150,7 @@ impl LoadTaskRunner {
             .ttl_action(info.job.ttl_action)
             .ufs_mtime(source_status.mtime)
             .build();
-        let writer = self.fs.create_with_opts(&target_path, opts).await?;
+        let writer = self.fs.create_with_opts(&target_path, opts, true).await?;
 
         Ok((reader, writer))
     }

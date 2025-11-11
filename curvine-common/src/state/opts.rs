@@ -20,7 +20,6 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct CreateFileOpts {
-    pub create_flag: CreateFlag,
     pub create_parent: bool,
     pub replicas: u16,
     pub block_size: i64,
@@ -34,7 +33,6 @@ pub struct CreateFileOpts {
 impl CreateFileOpts {
     pub fn with_create(create_parent: bool) -> Self {
         Self {
-            create_flag: Default::default(),
             file_type: FileType::File,
             replicas: 1,
             block_size: ByteUnit::MB as i64 * 64,
@@ -44,24 +42,6 @@ impl CreateFileOpts {
             client_name: "".to_string(),
             mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
         }
-    }
-
-    pub fn with_append() -> Self {
-        let mut opts = Self::with_create(false);
-        opts.create_flag = CreateFlag::new(CreateFlag::APPEND);
-        opts
-    }
-
-    pub fn create(&self) -> bool {
-        self.create_flag.create()
-    }
-
-    pub fn overwrite(&self) -> bool {
-        self.create_flag.overwrite()
-    }
-
-    pub fn append(&self) -> bool {
-        self.create_flag.append()
     }
 
     pub fn dir_opts(&self) -> MkdirOpts {
@@ -76,7 +56,6 @@ impl CreateFileOpts {
 
 #[derive(Debug, Clone)]
 pub struct CreateFileOptsBuilder {
-    create_flag: CreateFlag,
     create_parent: bool,
     replicas: i32,
     block_size: i64,
@@ -96,7 +75,6 @@ impl Default for CreateFileOptsBuilder {
 impl CreateFileOptsBuilder {
     pub fn new() -> Self {
         Self {
-            create_flag: CreateFlag::default(),
             create_parent: false,
             replicas: 1,
             block_size: (64 * ByteUnit::MB) as i64,
@@ -110,7 +88,6 @@ impl CreateFileOptsBuilder {
 
     pub fn with_conf(conf: &ClientConf) -> Self {
         Self {
-            create_flag: CreateFlag::default(),
             create_parent: false,
             replicas: conf.replicas,
             block_size: conf.block_size,
@@ -125,38 +102,6 @@ impl CreateFileOptsBuilder {
             mode: conf.get_mode(),
             client_name: None,
         }
-    }
-
-    pub fn create_flags(mut self, create_flag: CreateFlag) -> Self {
-        self.create_flag = create_flag;
-        self
-    }
-
-    pub fn create(mut self, create: bool) -> Self {
-        if create {
-            self.create_flag = CreateFlag::new(self.create_flag.value() | CreateFlag::CRATE);
-        } else {
-            self.create_flag = CreateFlag::new(self.create_flag.value() & !CreateFlag::CRATE);
-        }
-        self
-    }
-
-    pub fn overwrite(mut self, overwrite: bool) -> Self {
-        if overwrite {
-            self.create_flag = CreateFlag::new(self.create_flag.value() | CreateFlag::OVERWRITE);
-        } else {
-            self.create_flag = CreateFlag::new(self.create_flag.value() & !CreateFlag::OVERWRITE);
-        }
-        self
-    }
-
-    pub fn append(mut self, append: bool) -> Self {
-        if append {
-            self.create_flag = CreateFlag::new(self.create_flag.value() | CreateFlag::APPEND);
-        } else {
-            self.create_flag = CreateFlag::new(self.create_flag.value() & !CreateFlag::APPEND);
-        }
-        self
     }
 
     pub fn create_parent(mut self, flag: bool) -> Self {
@@ -216,7 +161,6 @@ impl CreateFileOptsBuilder {
 
     pub fn build(self) -> CreateFileOpts {
         CreateFileOpts {
-            create_flag: self.create_flag,
             create_parent: self.create_parent,
             replicas: self.replicas as u16,
             block_size: self.block_size,
@@ -329,7 +273,7 @@ impl MkdirOptsBuilder {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SetAttrOpts {
     pub recursive: bool,
     pub replicas: Option<i32>,

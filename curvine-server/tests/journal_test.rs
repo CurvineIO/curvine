@@ -16,7 +16,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::fs::CurvineURI;
 use curvine_common::raft::{NodeId, RaftPeer};
 use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags, WorkerInfo,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
+    RenameFlags, WorkerInfo,
 };
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{JournalLoader, JournalSystem};
@@ -171,11 +172,10 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     fs_leader.mkdir("/journal_2/b", true)?;
 
     // Create a file.
-    let status =
-        fs_leader.create_with_opts("/journal/b/test.log", CreateFileOpts::with_create(true))?;
+    let status = fs_leader.create("/journal/b/test.log", true)?;
 
     // Assign block
-    let block = fs_leader.add_block(&status.path, address.clone(), None, vec![])?;
+    let block = fs_leader.add_block(&status.path, address.clone(), None, vec![], 0)?;
 
     // Complete the file.
     let commit = CommitBlock {
@@ -183,10 +183,14 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
         block_len: 10,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
     };
-    fs_leader.complete_file(&status.path, 10, Some(commit), &address.client_name)?;
+    fs_leader.complete_file(&status.path, 10, vec![commit], &address.client_name, false)?;
 
     // File renaming
-    fs_leader.rename("/journal/b/test.log", "/journal/a/test.log")?;
+    fs_leader.rename(
+        "/journal/b/test.log",
+        "/journal/a/test.log",
+        RenameFlags::empty(),
+    )?;
 
     // delete
     fs_leader.delete("/journal_2", true)?;
@@ -194,21 +198,25 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let path = "/journal/append.log";
     fs_leader.create(path, true)?;
 
-    let block = fs_leader.add_block(path, address.clone(), None, vec![])?;
+    let block = fs_leader.add_block(path, address.clone(), None, vec![], 0)?;
     let commit = CommitBlock {
         block_id: block.block.id,
         block_len: 10,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
     };
-    fs_leader.complete_file(path, 10, Some(commit), "")?;
+    fs_leader.complete_file(path, 10, vec![commit], "", false)?;
 
     let commit = CommitBlock {
         block_id: block.block.id,
         block_len: 13,
         locations: vec![BlockLocation::with_id(worker.worker_id())],
     };
-    fs_leader.open_file(path, CreateFileOpts::with_append(), OpenFlags::with_write())?;
-    fs_leader.complete_file(path, 13, Some(commit), "")?;
+    fs_leader.open_file(
+        path,
+        CreateFileOpts::with_create(true),
+        OpenFlags::new_create(),
+    )?;
+    fs_leader.complete_file(path, 13, vec![commit], "", false)?;
 
     Ok(())
 }

@@ -130,18 +130,6 @@ impl VfsDataset {
         }
         vec
     }
-
-    fn reopen_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        let meta = self.get_block_check(block.id)?;
-
-        let dir = self.find_dir(meta.dir_id())?;
-        let new_meta = dir.reopen_block(block, meta)?;
-        dir.release_space(meta.is_final(), meta.len);
-        dir.reserve_space(false, block.len);
-        self.block_map.insert(new_meta.id(), new_meta.clone());
-
-        Ok(new_meta)
-    }
 }
 
 impl Dataset for VfsDataset {
@@ -166,31 +154,37 @@ impl Dataset for VfsDataset {
     }
 
     fn open_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        if let Some(v) = self.block_map.get(&block.id) {
-            return match *v.state() {
-                // Allow reusing blocks already in Writing state
-                BlockState::Writing => Ok(v.clone()),
+        match self.block_map.get(&block.id) {
+            Some(meta) => {
+                if meta.is_active() {
+                    let dir = self.find_dir(meta.dir_id())?;
+                    // Create a new block meta, where block.len represents the block size
+                    let new_meta = BlockMeta::new(meta.id, block.len, dir);
 
-                BlockState::Finalized => self.reopen_block(block),
+                    dir.release_space(meta.is_final(), meta.len);
+                    dir.reserve_space(false, new_meta.len);
+                    self.block_map.insert(new_meta.id(), new_meta.clone());
 
-                // Recovering state does not allow operations
-                BlockState::Recovering => {
+                    Ok(new_meta)
+                } else {
                     err_box!(
-                        "Block {} is in recovering state and cannot be created in worker_id: {}",
+                        "Block {} is in recovering state and cannot be open in worker_id: {}",
                         block.id,
                         self.worker_id
                     )
                 }
-            };
+            }
+
+            None => {
+                let dir = self.dir_list.choose_dir(block)?;
+                let meta = dir.create_block(block)?;
+
+                self.block_map.insert(meta.id(), meta.clone());
+                dir.reserve_space(false, block.len);
+
+                Ok(meta)
+            }
         }
-
-        let dir = self.dir_list.choose_dir(block)?;
-        let meta = dir.open_block(block)?;
-
-        self.block_map.insert(meta.id(), meta.clone());
-        dir.reserve_space(false, block.len);
-
-        Ok(meta)
     }
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
@@ -206,25 +200,13 @@ impl Dataset for VfsDataset {
 
         let dir = self.find_dir(meta.dir_id())?;
         let final_meta = dir.finalize_block(meta)?;
-
-        let original_finalized_path = {
-            let original_meta = BlockMeta {
-                id: final_meta.id(),
-                len: final_meta.len(),
-                state: BlockState::Finalized,
-                dir: final_meta.dir.clone(),
-            };
-            original_meta.get_block_path().ok()
-        };
-
-        // If original finalized file exists, need to replace it
-        if let Some(original_path) = original_finalized_path {
-            let new_finalized_path = final_meta.get_block_path()?;
-
-            if original_path != new_finalized_path && original_path.exists() {
-                // Delete original finalized file
-                try_err!(fs::remove_file(&original_path));
-            }
+        if block.len != final_meta.len() {
+            return err_box!(
+                "Block {} length mismatch, expected: {}, actual: {}",
+                meta.id(),
+                block.len,
+                final_meta.len()
+            );
         }
 
         dir.release_space(false, meta.len);
@@ -283,19 +265,29 @@ mod test {
         let mut dataset = create_data_set(true, "sample");
         // println!("{:#?}", dataset.dir_list.dirs());
 
-        let block = ExtendedBlock::with_mem(11226688, "100B")?;
+        let mut block = ExtendedBlock::with_mem(11226688, "100B")?;
         let tmp_meta = dataset.open_block(&block)?;
         assert_eq!(dataset.available(), 400);
+        assert_eq!(
+            dataset.get_block_check(block.id)?.state,
+            BlockState::Writing
+        );
 
         // commit block
         tmp_meta.write_test_data("50B")?;
+        block.len = 50;
         let final_meta = dataset.finalize_block(&block)?;
         assert_eq!(dataset.available(), 450);
         assert!(final_meta.get_block_path()?.exists());
+        assert_eq!(
+            dataset.get_block_check(block.id)?.state,
+            BlockState::Finalized
+        );
 
         // abort block。
         let block = ExtendedBlock::with_mem(11226699, "100B")?;
         let tmp_meta1 = dataset.open_block(&block)?;
+        assert_eq!(dataset.available(), 350);
         assert_eq!(dataset.available(), 350);
         tmp_meta1.write_test_data("50B")?;
 
@@ -309,19 +301,34 @@ mod test {
     #[test]
     fn append() -> CommonResult<()> {
         let mut dataset = create_data_set(true, "append");
-        let block = ExtendedBlock::with_mem(11226688, "100B")?;
+        let mut block = ExtendedBlock::with_mem(11226688, "100B")?;
 
         let tmp_meta = dataset.open_block(&block)?;
         tmp_meta.write_test_data("50B")?;
+        block.len = 50;
         dataset.finalize_block(&block)?;
+        assert_eq!(
+            dataset.get_block_check(block.id)?.state,
+            BlockState::Finalized
+        );
 
         // append
-        let new_meta = dataset.reopen_block(&block)?;
+        block.len = 100;
+        let new_meta = dataset.open_block(&block)?;
         assert_eq!(dataset.available(), 400);
+        assert_eq!(
+            dataset.get_block_check(block.id)?.state,
+            BlockState::Writing
+        );
 
         new_meta.write_test_data("20B")?;
+        block.len = 70;
         dataset.finalize_block(&block)?;
         assert_eq!(dataset.available(), 430);
+        assert_eq!(
+            dataset.get_block_check(block.id)?.state,
+            BlockState::Finalized
+        );
 
         Ok(())
     }
@@ -334,10 +341,6 @@ mod test {
             let block = ExtendedBlock::with_mem(id, &size)?;
             let tmp_meta = dataset.open_block(&block)?;
             tmp_meta.write_test_data(&size)?;
-
-            if id != 11 {
-                let _ = dataset.finalize_block(&block)?;
-            }
         }
 
         drop(dataset);
@@ -346,12 +349,8 @@ mod test {
         println!("block_map {:?}", dataset.block_map);
 
         assert_eq!(11, dataset.block_map.len());
-        for (id, meta) in &dataset.block_map {
-            if id == &11 {
-                assert_eq!(meta.state, BlockState::Writing);
-            } else {
-                assert_eq!(meta.state, BlockState::Finalized);
-            }
+        for meta in dataset.block_map.values() {
+            assert_eq!(meta.state, BlockState::Finalized);
             assert_eq!(meta.len, meta.id);
         }
 

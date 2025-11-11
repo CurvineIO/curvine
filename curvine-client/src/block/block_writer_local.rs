@@ -52,7 +52,7 @@ impl BlockWriterLocal {
             .write_block(
                 &block,
                 pos,
-                len,
+                block_size,
                 req_id,
                 seq_id,
                 fs_context.write_chunk_size() as i32,

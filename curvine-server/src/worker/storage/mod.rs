@@ -35,8 +35,8 @@ pub use self::vfs_dataset::VfsDataset;
 
 pub type BlockDataset = VfsDataset;
 
-// The completed block save directory has been written.
-pub const FINALIZED_DIR: &str = "finalized";
+// Normal block directory.
+pub const ACTIVE_DIR: &str = "active";
 
-// The block in writing saves the directory.
-pub const RBW_DIR: &str = "rbw";
+// Temporary block directory, such as blocks triggered for recovery or replication status
+pub const STAGING_DIR: &str = "staging";

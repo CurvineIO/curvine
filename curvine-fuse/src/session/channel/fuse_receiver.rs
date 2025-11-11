@@ -12,29 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::session::{FuseResponse, ResponseData};
-use crate::FUSE_IN_HEADER_LEN;
+use crate::fs::operator::FuseOperator;
+use crate::fs::FileSystem;
+use crate::raw::fuse_abi::fuse_out_header;
+use crate::session::{FuseRequest, FuseResponse, FuseTask};
+use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
+use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
+use log::{error, info};
 use orpc::io::IOResult;
+use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::AsyncSender;
 use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
 use orpc::{err_box, sys};
 use std::sync::Arc;
 use tokio_util::bytes::BytesMut;
 
-// Read data from the fuse mount point.
-pub struct FuseReceiver {
+/// FuseReceiver provides the following functionality:
+/// 1. Receive data from fuse fd using splice
+/// 2. For metadata requests (mkdir, ls), spawn a task to execute
+/// 3. For file read/write requests, send task to queue
+pub struct FuseReceiver<T> {
     kernel_fd: Arc<AsyncFd>,
-    sender: AsyncSender<ResponseData>,
+    fs: Arc<T>,
+    rt: Arc<Runtime>,
+    sender: AsyncSender<FuseTask>,
     pipe2: Pipe2,
     buf: BytesMut,
     fuse_len: usize,
     debug: bool,
 }
 
-impl FuseReceiver {
+impl<T: FileSystem> FuseReceiver<T> {
     pub fn new(
+        fs: Arc<T>,
+        rt: Arc<Runtime>,
         kernel_fd: Arc<AsyncFd>,
-        sender: AsyncSender<ResponseData>,
+        sender: AsyncSender<FuseTask>,
         buf_size: usize,
         debug: bool,
     ) -> IOResult<Self> {
@@ -43,6 +56,8 @@ impl FuseReceiver {
 
         let client = Self {
             kernel_fd,
+            fs,
+            rt,
             sender,
             pipe2,
             buf,
@@ -56,10 +71,6 @@ impl FuseReceiver {
     // Read a data from fuse.
     pub async fn receive(&mut self) -> IOResult<BytesMut> {
         self.splice().await
-    }
-
-    pub fn new_reply(&self, unique: u64) -> FuseResponse {
-        FuseResponse::new(unique, self.sender.clone(), self.debug)
     }
 
     // Use libc::read to read data, test it, and there are multiple memory copies.
@@ -99,5 +110,135 @@ impl FuseReceiver {
 
         let req_buf = self.buf.split_to(read_len);
         Ok(req_buf)
+    }
+
+    pub fn new_replay(&self, unique: u64) -> FuseResponse {
+        FuseResponse::new(unique, self.sender.clone())
+    }
+
+    // TODO: Optimize
+    pub async fn send_stream(&self, req: FuseRequest) -> FuseResult<()> {
+        self.sender.send(FuseTask::Request(req)).await?;
+        Ok(())
+    }
+
+    pub async fn start(mut self) -> FuseResult<()> {
+        loop {
+            match self.receive().await {
+                Ok(buf) => {
+                    let req = FuseRequest::from_bytes(buf.freeze())?;
+
+                    if self.debug {
+                        let operator = req.parse_operator()?;
+                        info!(
+                            "receive unique: {}, code: {:?}, op: {:?}",
+                            req.unique(),
+                            req.opcode(),
+                            operator
+                        );
+                    }
+
+                    if req.is_stream() {
+                        self.send_stream(req).await?;
+                    } else {
+                        let reply = self.new_replay(req.unique());
+                        let fs = self.fs.clone();
+
+                        self.rt.spawn(async move {
+                            if let Err(e) = Self::dispatch_meta(fs, req, reply).await {
+                                error!("Failed to dispatch meta request: {}", e);
+                            }
+                        });
+                    }
+                }
+
+                Err(e) => match e.raw_error().raw_os_error() {
+                    Some(ENOENT) => continue,
+                    Some(EINTR) => continue,
+                    Some(EAGAIN) => continue,
+                    Some(ENODEV) => break,
+                    _ => return Err(e.into()),
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn dispatch_meta(fs: Arc<T>, req: FuseRequest, reply: FuseResponse) -> FuseResult<()> {
+        let operator = req.parse_operator()?;
+
+        let res = match operator {
+            FuseOperator::Init(op) => reply.send_rep(fs.init(op).await).await,
+
+            FuseOperator::StatFs(op) => reply.send_rep(fs.stat_fs(op).await).await,
+
+            FuseOperator::Access(op) => reply.send_rep(fs.access(op).await).await,
+
+            FuseOperator::Lookup(op) => reply.send_rep(fs.lookup(op).await).await,
+
+            FuseOperator::GetAttr(op) => reply.send_rep(fs.get_attr(op).await).await,
+
+            FuseOperator::SetAttr(op) => reply.send_rep(fs.set_attr(op).await).await,
+
+            FuseOperator::GetXAttr(op) => reply.send_buf(fs.get_xattr(op).await).await,
+
+            FuseOperator::SetXAttr(op) => reply.send_rep(fs.set_xattr(op).await).await,
+
+            FuseOperator::RemoveXAttr(op) => reply.send_rep(fs.remove_xattr(op).await).await,
+
+            FuseOperator::ListXAttr(op) => reply.send_buf(fs.list_xattr(op).await).await,
+
+            FuseOperator::OpenDir(op) => reply.send_rep(fs.open_dir(op).await).await,
+
+            FuseOperator::Mkdir(op) => reply.send_rep(fs.mkdir(op).await).await,
+
+            FuseOperator::FAllocate(op) => reply.send_rep(fs.fuse_allocate(op).await).await,
+
+            FuseOperator::ReleaseDir(op) => reply.send_rep(fs.release_dir(op).await).await,
+
+            FuseOperator::ReadDir(op) => {
+                let res = fs.read_dir(op).await.map(|x| x.take());
+                reply.send_buf(res).await
+            }
+
+            FuseOperator::ReadDirPlus(op) => {
+                let res = fs.read_dir_plus(op).await.map(|x| x.take());
+                reply.send_buf(res).await
+            }
+
+            FuseOperator::Forget(op) => reply.send_none(fs.forget(op).await),
+
+            FuseOperator::Open(op) => reply.send_rep(fs.open(op).await).await,
+
+            FuseOperator::MkNod(op) => reply.send_rep(fs.mk_nod(op).await).await,
+
+            FuseOperator::Create(op) => reply.send_rep(fs.create(op).await).await,
+
+            FuseOperator::Unlink(op) => reply.send_rep(fs.unlink(op).await).await,
+
+            FuseOperator::RmDir(op) => reply.send_rep(fs.rm_dir(op).await).await,
+
+            FuseOperator::Link(op) => reply.send_rep(fs.link(op).await).await,
+
+            FuseOperator::BatchForget(op) => reply.send_none(fs.batch_forget(op).await),
+
+            FuseOperator::Rename(op) => reply.send_rep(fs.rename(op).await).await,
+
+            FuseOperator::Interrupt(op) => reply.send_rep(fs.interrupt(op).await).await,
+
+            FuseOperator::Symlink(op) => reply.send_rep(fs.symlink(op).await).await,
+
+            FuseOperator::Readlink(op) => reply.send_buf(fs.readlink(op).await).await,
+
+            _ => {
+                let err: FuseResult<fuse_out_header> =
+                    err_fuse!(libc::ENOSYS, "Unsupported operation {:?}", req.opcode());
+                reply.send_rep(err).await
+            }
+        };
+
+        res?;
+        Ok(())
     }
 }

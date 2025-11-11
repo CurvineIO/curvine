@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::raw::fuse_abi::fuse_attr;
 use crate::FUSE_ROOT_ID;
 use std::time::Duration;
 
@@ -49,6 +50,8 @@ pub struct NodeAttr {
     pub is_hidden: bool,
 
     pub cache_valid: bool,
+
+    pub attr: fuse_attr,
 }
 
 impl NodeAttr {

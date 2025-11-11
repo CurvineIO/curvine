@@ -42,6 +42,7 @@ trait-variant = { workspace = true }
 
 anyhow = { workspace = true }
 tracing = { workspace = true }
+bitflags = { workspace = true }
 
 [features]
 default = []

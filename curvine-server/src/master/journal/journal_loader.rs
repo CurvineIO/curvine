@@ -22,6 +22,7 @@ use curvine_common::conf::JournalConf;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
 use curvine_common::raft::{RaftResult, RaftUtils};
+use curvine_common::state::RenameFlags;
 use curvine_common::utils::SerdeUtils;
 use log::{debug, error, info, warn};
 use orpc::common::FileUtils;
@@ -152,7 +153,7 @@ impl JournalLoader {
         // Update block location
         fs_dir
             .store
-            .apply_complete_file(inode.as_ref(), entry.commit_block.as_ref())?;
+            .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
 
         Ok(())
     }
@@ -161,7 +162,12 @@ impl JournalLoader {
         let mut fs_dir = self.fs_dir.write();
         let src_inp = InodePath::resolve(fs_dir.root_ptr(), entry.src, &fs_dir.store)?;
         let dst_inp = InodePath::resolve(fs_dir.root_ptr(), entry.dst, &fs_dir.store)?;
-        fs_dir.unprotected_rename(&src_inp, &dst_inp, entry.mtime)?;
+        fs_dir.unprotected_rename(
+            &src_inp,
+            &dst_inp,
+            entry.mtime,
+            RenameFlags::new(entry.flags),
+        )?;
 
         Ok(())
     }

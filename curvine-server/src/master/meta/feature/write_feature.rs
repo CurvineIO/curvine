@@ -14,16 +14,19 @@
 
 use orpc::common::Utils;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 // Tag file is being written
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteFeature {
-    pub(crate) client_name: String,
+    pub clients: HashSet<String>,
 }
 
 impl WriteFeature {
     pub fn new(client_name: String) -> Self {
-        Self { client_name }
+        let mut clients = HashSet::new();
+        clients.insert(client_name);
+        Self { clients }
     }
 }
 

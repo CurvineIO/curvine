@@ -79,12 +79,11 @@ async fn test_ttl_file_cleanup(fs: &FsClient, conf: &ClientConf) -> CommonResult
 
     let opts = CreateFileOptsBuilder::with_conf(conf)
         .create_parent(true)
-        .overwrite(true)
         .ttl_ms(ttl_ms)
         .ttl_action(TtlAction::Delete)
         .build();
     // Create file
-    let _file = fs.create_with_opts(&file_path, opts).await?;
+    let _file = fs.create_with_opts(&file_path, opts, true).await?;
     info!("Created file with TTL: {}", file_path);
 
     // Verify file exists
@@ -155,7 +154,6 @@ async fn test_ttl_cleanup_timing(fs: &FsClient, conf: &ClientConf) -> CommonResu
 
     let opts = CreateFileOptsBuilder::with_conf(conf)
         .create_parent(true)
-        .overwrite(true)
         .ttl_ms(ttl_ms)
         .ttl_action(TtlAction::Delete)
         .build();
@@ -164,7 +162,7 @@ async fn test_ttl_cleanup_timing(fs: &FsClient, conf: &ClientConf) -> CommonResu
     let start_time = SystemTime::now();
 
     // Create file
-    let _file = fs.create_with_opts(&file_path, opts).await?;
+    let _file = fs.create_with_opts(&file_path, opts, true).await?;
     info!("Created file with TTL: {}", file_path);
 
     // Verify file exists

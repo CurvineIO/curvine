@@ -16,7 +16,6 @@ curvine-common = { workspace = true }
 curvine-client = { workspace = true }
 curvine-ufs = { workspace = true }
 curvine-web = { workspace = true }
-curvine-s3-gateway = { workspace = true }
 prost = { workspace = true }
 prost-build = { workspace = true }
 bincode = { workspace = true }
@@ -45,3 +44,6 @@ chrono = { workspace = true }
 rand = { workspace = true }
 url = { workspace = true }
 parking_lot = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+curvine-s3-gateway = { workspace = true }

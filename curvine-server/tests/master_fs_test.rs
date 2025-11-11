@@ -17,10 +17,10 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
 };
-use curvine_common::state::SetAttrOptsBuilder;
 use curvine_common::state::{
-    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, CreateFlag, WorkerInfo,
+    BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, WorkerInfo,
 };
+use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
@@ -200,7 +200,7 @@ fn rename(fs: &MasterFilesystem) -> CommonResult<()> {
     assert!(fs.exists("/a")?);
 
     // Execute rename operation
-    fs.rename("/a/b/c", "/a/x")?;
+    fs.rename("/a/b/c", "/a/x", RenameFlags::empty())?;
 
     println!("=== After directory rename ===");
     fs.print_tree();
@@ -216,8 +216,7 @@ fn rename(fs: &MasterFilesystem) -> CommonResult<()> {
     assert!(fs.exists("/a/b")?);
 
     // Test file rename
-    let opts = CreateFileOpts::with_create(false);
-    fs.create_with_opts("/a.txt", opts.clone())?;
+    fs.create("/a.txt", true)?;
 
     println!("=== Before file rename ===");
     fs.print_tree();
@@ -226,7 +225,7 @@ fn rename(fs: &MasterFilesystem) -> CommonResult<()> {
     assert!(fs.exists("/a.txt")?);
 
     // Execute file rename operation
-    fs.rename("/a.txt", "/aaa.txt")?;
+    fs.rename("/a.txt", "/aaa.txt", RenameFlags::empty())?;
 
     println!("=== After file rename ===");
     fs.print_tree();
@@ -241,8 +240,7 @@ fn rename(fs: &MasterFilesystem) -> CommonResult<()> {
     // Create directory /a/b
     fs.mkdir("/a/b", true)?;
     // Create file /a/1.log
-    let opts = CreateFileOpts::with_create(false);
-    fs.create_with_opts("/a/1.log", opts.clone())?;
+    fs.create("/a/1.log", true)?;
 
     println!("=== Before file rename to directory ===");
     fs.print_tree();
@@ -253,7 +251,7 @@ fn rename(fs: &MasterFilesystem) -> CommonResult<()> {
 
     // Execute file rename to directory operation
     // Expected result: /a/1.log -> /a/b/1.log
-    fs.rename("/a/1.log", "/a/b")?;
+    fs.rename("/a/1.log", "/a/b", RenameFlags::empty())?;
 
     println!("=== After file rename to directory ===");
     fs.print_tree();
@@ -275,9 +273,8 @@ fn create_file(fs: &MasterFilesystem) -> CommonResult<()> {
     // Verify directory exists before file creation
     assert!(fs.exists("/test_dir/subdir")?);
 
-    let opts = CreateFileOpts::with_create(false);
-    fs.create_with_opts("/test_dir/subdir/file1.log", opts.clone())?;
-    fs.create_with_opts("/test_dir/subdir/file2.log", opts)?;
+    fs.create("/test_dir/subdir/file1.log", false)?;
+    fs.create("/test_dir/subdir/file2.log", false)?;
 
     // Verify files exist after creation
     assert!(fs.exists("/test_dir/subdir/file1.log")?);
@@ -289,9 +286,12 @@ fn create_file(fs: &MasterFilesystem) -> CommonResult<()> {
 
     // overwrite file
     let oldid = fs.file_status("/test_dir/subdir/file1.log")?.id;
-    let mut opts = CreateFileOpts::with_create(false);
-    opts.create_flag = CreateFlag::new(CreateFlag::CRATE | CreateFlag::OVERWRITE);
-    fs.create_with_opts("/test_dir/subdir/file1.log", opts.clone())?;
+    let opts = CreateFileOpts::with_create(false);
+    fs.create_with_opts(
+        "/test_dir/subdir/file1.log",
+        opts.clone(),
+        OpenFlags::new_create().set_overwrite(true),
+    )?;
     assert_eq!(oldid, fs.file_status("/test_dir/subdir/file1.log")?.id);
 
     fs.print_tree();
@@ -299,8 +299,7 @@ fn create_file(fs: &MasterFilesystem) -> CommonResult<()> {
 }
 
 fn get_file_info(fs: &MasterFilesystem) -> CommonResult<()> {
-    let opts = CreateFileOpts::with_create(true);
-    fs.create_with_opts("/a/b/xx.log", opts)?;
+    fs.create("/a/b/xx.log", true)?;
     fs.print_tree();
 
     let info = fs.file_status("/a/b/xx.log")?;
@@ -309,8 +308,7 @@ fn get_file_info(fs: &MasterFilesystem) -> CommonResult<()> {
 }
 
 fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
-    let opts = CreateFileOpts::with_create(true);
-    fs.create_with_opts("/a/1.log", opts)?;
+    fs.create("/a/1.log", true)?;
 
     fs.mkdir("/a/d1", true)?;
     fs.mkdir("/a/d2", true)?;
@@ -371,7 +369,7 @@ fn link() -> CommonResult<()> {
     assert_eq!(nlink_t, 2);
 
     //rename file2.log
-    fs.rename("/a/b/file2.log", "/a/b/file3.log")?;
+    fs.rename("/a/b/file2.log", "/a/b/file3.log", RenameFlags::empty())?;
     assert!(!fs.exists("/a/b/file2.log")?);
     assert!(fs.exists("/a/b/file3.log")?);
     fs.print_tree();
@@ -389,7 +387,7 @@ fn state(fs: &MasterFilesystem) -> CommonResult<()> {
     fs.create("/a/file/2.log", true)?;
 
     fs.create("/a/rename/old.log", true)?;
-    fs.rename("/a/rename/old.log", "/a/c/new.log")?;
+    fs.rename("/a/rename/old.log", "/a/c/new.log", RenameFlags::empty())?;
     fs.delete("/a/file/2.log", true)?;
 
     fs.print_tree();
@@ -409,6 +407,7 @@ fn state(fs: &MasterFilesystem) -> CommonResult<()> {
 fn create_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     let req = CreateFileRequest {
         path: "/create_file_retry.log".to_string(),
+        flags: OpenFlags::new_create().value(),
         ..Default::default()
     };
     let req_id = Utils::req_id();
@@ -439,11 +438,10 @@ fn create_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
 fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let path = "/add_block_retry.log";
     let addr = ClientAddress::default();
-    let opts = CreateFileOpts::with_create(false);
-    let status = fs.create_with_opts(path, opts).unwrap();
+    let status = fs.create(path, false).unwrap();
 
-    let b1 = fs.add_block(path, addr.clone(), None, vec![]).unwrap();
-    let b2 = fs.add_block(path, addr.clone(), None, vec![]).unwrap();
+    let b1 = fs.add_block(path, addr.clone(), None, vec![], 0).unwrap();
+    let b2 = fs.add_block(path, addr.clone(), None, vec![], 0).unwrap();
 
     assert_eq!(b1.block.id, b2.block.id);
 
@@ -461,10 +459,16 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     };
 
     let b1 = fs
-        .add_block(path, addr.clone(), Some(commit.clone()), vec![])
+        .add_block(
+            path,
+            addr.clone(),
+            Some(commit.clone()),
+            vec![],
+            status.block_size,
+        )
         .unwrap();
     let b2 = fs
-        .add_block(path, addr.clone(), Some(commit), vec![])
+        .add_block(path, addr.clone(), Some(commit), vec![], status.block_size)
         .unwrap();
     assert_eq!(b1.block.id, b2.block.id);
 
@@ -478,10 +482,9 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
 fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     let path = "/complete_file_retry.log";
     let addr = ClientAddress::default();
-    let opts = CreateFileOpts::with_create(false);
-    fs.create_with_opts(path, opts)?;
+    fs.create(path, false)?;
 
-    let b1 = fs.add_block(path, addr.clone(), None, vec![])?;
+    let b1 = fs.add_block(path, addr.clone(), None, vec![], 0)?;
 
     let commit = CommitBlock {
         block_id: b1.block.id,
@@ -492,11 +495,23 @@ fn complete_file_retry(fs: &MasterFilesystem) -> CommonResult<()> {
         }],
     };
 
-    let f1 = fs.complete_file(path, b1.block.len, Some(commit.clone()), &addr.client_name)?;
-    assert!(f1);
+    let f1 = fs.complete_file(
+        path,
+        b1.block.len,
+        vec![commit.clone()],
+        &addr.client_name,
+        false,
+    );
+    assert!(f1.is_ok());
 
-    let f2 = fs.complete_file(path, b1.block.len, Some(commit.clone()), &addr.client_name)?;
-    assert!(!f2);
+    let f2 = fs.complete_file(
+        path,
+        b1.block.len,
+        vec![commit.clone()],
+        &addr.client_name,
+        false,
+    );
+    assert!(f2.is_ok());
 
     let status = fs.file_status(path)?;
     println!("status = {:?}", status);
@@ -551,6 +566,7 @@ fn rename_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     let req = RenameRequest {
         src: "/rename_retry".to_string(),
         dst: "/rename_retry1".to_string(),
+        flags: RenameFlags::empty().value(),
     };
 
     let f1 = handler.rename0(id, req.clone())?;
