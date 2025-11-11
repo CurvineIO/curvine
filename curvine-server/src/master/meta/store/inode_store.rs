@@ -85,7 +85,7 @@ impl InodeStore {
         batch.write_inode(parent)?;
 
         let mut stack = LinkedList::new();
-        stack.push_back((parent.id(), del));
+        stack.push_back((parent.id(), del.clone()));
         let mut del_res = DeleteResult::new();
         let mut deleted_files = 0i64;
         let mut deleted_dirs = 0i64;
@@ -100,7 +100,7 @@ impl InodeStore {
                 log::warn!("Direct ttl removal failed for inode {}: {}", inode.id(), e);
             }
 
-            match inode {
+            match &inode {
                 InodeView::File(_, file) => {
                     deleted_files += 1;
                     for meta in &file.blocks {
@@ -122,12 +122,16 @@ impl InodeStore {
                         deleted_dirs += 1;
                     }
                     for item in dir.children_iter() {
-                        stack.push_back((inode.id(), item))
+                        stack.push_back((inode.id(), item.clone()))
                     }
                 }
 
-                InodeView::FileEntry(..) => {
-                    deleted_files += 1;
+                InodeView::FileEntry(name, id) => {
+                    let inode_opt = self.get_inode(*id, Some(name))?;
+                    if let Some(inode_view) = inode_opt {
+                        deleted_files += 1;
+                        stack.push_back((parent_id, inode_view));
+                    }
                 }
             }
         }
