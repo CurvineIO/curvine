@@ -158,7 +158,6 @@ impl ReadHandler {
                 self.io_slow_us,
                 file.path()
             );
-            self.metrics.read_slow_count.inc();
         }
         self.metrics.read_bytes.inc_by(region.len() as i64);
         self.metrics.read_time_us.inc_by(used as i64);

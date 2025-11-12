@@ -14,7 +14,7 @@
 
 use crate::worker::block::BlockStore;
 use crate::worker::storage::Dataset;
-use orpc::common::{Counter, CounterVec, Gauge, GaugeVec, Metrics as m, Metrics};
+use orpc::common::{Counter, CounterVec, Gauge, Metrics as m, Metrics};
 use orpc::sys::SysUtils;
 use orpc::CommonResult;
 use std::fmt::{Debug, Formatter};
@@ -25,18 +25,14 @@ pub struct WorkerMetrics {
     pub(crate) write_bytes: Counter,
     pub(crate) write_time_us: Counter,
     pub(crate) write_blocks: CounterVec,
-    pub(crate) write_slow_count: Counter,
 
     pub(crate) read_bytes: Counter,
     pub(crate) read_time_us: Counter,
     pub(crate) read_blocks: CounterVec,
-    pub(crate) read_slow_count: Counter,
 
     pub(crate) capacity: Gauge,
     pub(crate) available: Gauge,
     pub(crate) fs_used: Gauge,
-    pub(crate) storage_capacity: GaugeVec,
-    pub(crate) storage_available: GaugeVec,
     pub(crate) storage_failed: Gauge,
     pub(crate) num_blocks: Gauge,
 
@@ -51,26 +47,14 @@ impl WorkerMetrics {
             write_bytes: m::new_counter("write_bytes", "worker writes total bytes")?,
             write_time_us: m::new_counter("write_time_us", "Milliseconds spent writing")?,
             write_blocks: m::new_counter_vec("write_blocks", "write_blocks", &["type"])?,
-            write_slow_count: m::new_counter("write_slow_count", "Slow write times")?,
 
             read_bytes: m::new_counter("read_bytes", "worker read total bytes")?,
             read_time_us: m::new_counter("read_time_us", "Milliseconds spent read")?,
             read_blocks: m::new_counter_vec("read_blocks", "read_blocks", &["type"])?,
-            read_slow_count: m::new_counter("read_slow_count", "Slow read times")?,
 
             capacity: m::new_gauge("capacity", "Total storage capacity")?,
             available: m::new_gauge("available", "Total available space")?,
             fs_used: m::new_gauge("fs_used", "Space used by the file system")?,
-            storage_capacity: m::new_gauge_vec(
-                "storage_capacity",
-                "Dir storage capacity",
-                &["path"],
-            )?,
-            storage_available: m::new_gauge_vec(
-                "storage_available",
-                "Dir available space",
-                &["path"],
-            )?,
             storage_failed: m::new_gauge("storage_failed", "Abnormal storage number")?,
             num_blocks: m::new_gauge("num_blocks", "The total number of blocks")?,
 
@@ -93,14 +77,6 @@ impl WorkerMetrics {
             if item.is_failed() {
                 storage_failed += 1;
             }
-
-            self.storage_capacity
-                .with_label_values(&[item.path_str()])
-                .set(item.capacity());
-
-            self.storage_available
-                .with_label_values(&[item.path_str()])
-                .set(item.available());
         }
         self.storage_failed.set(storage_failed);
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
