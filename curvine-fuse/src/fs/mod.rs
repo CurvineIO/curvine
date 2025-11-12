@@ -24,3 +24,9 @@ pub use self::curvine_file_system::CurvineFileSystem;
 pub mod state;
 
 pub mod operator;
+
+mod fuse_reader;
+pub use self::fuse_reader::FuseReader;
+
+mod fuse_writer;
+pub use self::fuse_writer::FuseWriter;

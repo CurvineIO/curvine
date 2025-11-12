@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::operator::FuseOperator;
 use crate::fs::FileSystem;
-use crate::session::{FuseRequest, FuseTask, ResponseData};
-use crate::{err_fuse, FuseResult};
-use log::{info, warn};
+use crate::session::{FuseTask, ResponseData};
+use crate::FuseResult;
+use log::{error, info, warn};
 use orpc::io::IOResult;
 use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncReceiver;
@@ -29,7 +28,7 @@ use std::sync::Arc;
 /// 1. For metadata requests, write response directly
 /// 2. For read/write data requests, process then write response
 pub struct FuseSender<T> {
-    fs: Arc<T>,
+    pub fs: Arc<T>,
     rt: Arc<Runtime>,
     kernel_fd: Arc<AsyncFd>,
     receiver: AsyncReceiver<FuseTask>,
@@ -73,54 +72,11 @@ impl<T: FileSystem> FuseSender<T> {
                     }
                 }
 
-                FuseTask::Request(req) => {
-                    let id = req.unique();
-                    if let Err(e) = self.process_stream(req).await {
-                        warn!("error stream unique {}: {}", id, e);
-                    }
+                FuseTask::Request(_) => {
+                    error!("Not support")
                 }
             }
         }
-        Ok(())
-    }
-
-    pub async fn process_stream(&mut self, req: FuseRequest) -> FuseResult<()> {
-        let operator = req.parse_operator()?;
-
-        match operator {
-            FuseOperator::Read(op) => {
-                let res = self.fs.read(op).await;
-                self.splice(ResponseData::with_data(req.unique(), res))
-                    .await?;
-            }
-
-            FuseOperator::Write(op) => {
-                let res = self.fs.write(op).await;
-                self.splice(ResponseData::with_rep(req.unique(), res))
-                    .await?;
-            }
-
-            FuseOperator::Flush(op) => {
-                let res = self.fs.flush(op).await;
-                self.splice(ResponseData::with_rep(req.unique(), res))
-                    .await?;
-            }
-
-            FuseOperator::Release(op) => {
-                let res = self.fs.release(op).await;
-                self.splice(ResponseData::with_rep(req.unique(), res))
-                    .await?;
-            }
-
-            FuseOperator::FSync(op) => {
-                let res = self.fs.fsync(op).await;
-                self.splice(ResponseData::with_rep(req.unique(), res))
-                    .await?;
-            }
-
-            _ => return err_fuse!(libc::ENOSYS, "Unsupported operation {:?}", req.opcode()),
-        }
-
         Ok(())
     }
 

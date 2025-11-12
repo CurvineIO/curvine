@@ -16,7 +16,7 @@ use crate::fs::operator::*;
 use crate::fs::state::NodeState;
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
-use crate::session::FuseBuf;
+use crate::session::{FuseBuf, FuseResponse};
 use crate::*;
 use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
@@ -27,7 +27,7 @@ use curvine_common::state::{FileStatus, SetAttrOpts};
 use log::{debug, error, info};
 use orpc::common::ByteUnit;
 use orpc::runtime::Runtime;
-use orpc::sys::{DataSlice, FFIUtils};
+use orpc::sys::FFIUtils;
 use orpc::{sys, try_option};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -968,9 +968,9 @@ impl fs::FileSystem for CurvineFileSystem {
         self.read_dir_common(op.header, op.arg, true).await
     }
 
-    async fn read(&self, op: Read<'_>) -> FuseResult<Vec<DataSlice>> {
+    async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
-        handle.read(&self.state, op).await
+        handle.read(&self.state, op, reply).await
     }
 
     async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
@@ -1046,28 +1046,22 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(r)
     }
 
-    async fn write(&self, op: Write<'_>) -> FuseResult<fuse_write_out> {
-        let len = op.data.len();
+    async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
-        handle.write(op).await?;
-        let rep = fuse_write_out {
-            size: len as u32,
-            padding: 0,
-        };
-        Ok(rep)
+        handle.write(op, reply).await
     }
 
-    async fn flush(&self, op: Flush<'_>) -> FuseResult<()> {
+    async fn flush(&self, op: Flush<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
-        handle.flush().await
+        handle.flush(reply).await
     }
 
-    async fn release(&self, op: Release<'_>) -> FuseResult<()> {
+    async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.remove_handle(op.header.nodeid, op.arg.fh);
         if let Some(handle) = handle {
-            handle.complete().await
+            handle.complete(reply).await
         } else {
-            Ok(())
+            err_fuse!(libc::EIO)
         }
     }
 
@@ -1209,8 +1203,8 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(result.split_to(result.len() - 1))
     }
 
-    async fn fsync(&self, op: FSync<'_>) -> FuseResult<()> {
+    async fn fsync(&self, op: FSync<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
-        handle.flush().await
+        handle.flush(reply).await
     }
 }

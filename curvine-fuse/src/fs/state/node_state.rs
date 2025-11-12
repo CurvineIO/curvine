@@ -14,14 +14,14 @@
 
 use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::{NodeAttr, NodeMap};
-use crate::fs::CurvineFileSystem;
+use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult};
-use curvine_client::unified::{UnifiedFileSystem, UnifiedReader, UnifiedWriter};
+use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{FileStatus, OpenFlags};
-use log::{info, warn};
+use log::warn;
 use orpc::common::FastHashMap;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
@@ -179,7 +179,7 @@ impl NodeState {
     fn find_writer0(
         map: &FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
         ino: &u64,
-    ) -> Option<Arc<Mutex<UnifiedWriter>>> {
+    ) -> Option<Arc<Mutex<FuseWriter>>> {
         if let Some(h) = map.get(ino) {
             for (_, handle) in h.iter() {
                 if let Some(writer) = &handle.writer {
@@ -191,7 +191,7 @@ impl NodeState {
         None
     }
 
-    pub fn find_writer(&self, ino: &u64) -> Option<Arc<Mutex<UnifiedWriter>>> {
+    pub fn find_writer(&self, ino: &u64) -> Option<Arc<Mutex<FuseWriter>>> {
         let map = self.handles.read();
         Self::find_writer0(&map, ino)
     }
@@ -201,7 +201,7 @@ impl NodeState {
         ino: u64,
         path: &Path,
         flags: OpenFlags,
-    ) -> FuseResult<Arc<Mutex<UnifiedWriter>>> {
+    ) -> FuseResult<Arc<Mutex<FuseWriter>>> {
         let exists_writer = {
             let lock = self.handles.read();
             Self::find_writer0(&lock, &ino)
@@ -216,11 +216,13 @@ impl NodeState {
         } else {
             self.fs.create(path, flags.overwrite()).await?
         };
+        let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
         Ok(Arc::new(Mutex::new(writer)))
     }
 
-    pub async fn new_reader(&self, path: &Path) -> FuseResult<UnifiedReader> {
+    pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
         let reader = self.fs.open(path).await?;
+        let reader = FuseReader::new(&self.conf, self.fs.clone_runtime(), reader);
         Ok(reader)
     }
 
@@ -231,7 +233,6 @@ impl NodeState {
         flags: u32,
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
-        info!("flags {:?}", flags);
         let (reader, writer) = match flags.access_mode() {
             mode if mode == OpenFlags::RDONLY => {
                 let reader = self.new_reader(path).await?;
@@ -245,7 +246,7 @@ impl NodeState {
 
             mode if mode == OpenFlags::RDWR => {
                 let writer = self.new_writer(ino, path, flags).await?;
-                let reader = self.new_reader(path).await.unwrap();
+                let reader = self.new_reader(path).await?;
                 (Some(RawPtr::from_owned(reader)), Some(writer))
             }
             _ => {

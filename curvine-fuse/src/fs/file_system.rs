@@ -15,8 +15,8 @@
 use crate::fs::operator::*;
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
+use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
-use orpc::sys::DataSlice;
 use std::future::Future;
 use tokio_util::bytes::BytesMut;
 
@@ -88,7 +88,11 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    fn read(&self, op: Read<'_>) -> impl Future<Output = FuseResult<Vec<DataSlice>>> + Send {
+    fn read(
+        &self,
+        op: Read<'_>,
+        _reply: FuseResponse,
+    ) -> impl Future<Output = FuseResult<()>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
@@ -100,15 +104,27 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    fn write(&self, op: Write<'_>) -> impl Future<Output = FuseResult<fuse_write_out>> + Send {
+    fn write(
+        &self,
+        op: Write<'_>,
+        _reply: FuseResponse,
+    ) -> impl Future<Output = FuseResult<()>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    fn flush(&self, op: Flush<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+    fn flush(
+        &self,
+        op: Flush<'_>,
+        _reply: FuseResponse,
+    ) -> impl Future<Output = FuseResult<()>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    fn release(&self, op: Release<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+    fn release(
+        &self,
+        op: Release<'_>,
+        _reply: FuseResponse,
+    ) -> impl Future<Output = FuseResult<()>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
@@ -144,7 +160,11 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    fn fsync(&self, op: FSync<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+    fn fsync(
+        &self,
+        op: FSync<'_>,
+        _reply: FuseResponse,
+    ) -> impl Future<Output = FuseResult<()>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 

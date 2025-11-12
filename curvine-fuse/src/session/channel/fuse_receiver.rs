@@ -18,7 +18,7 @@ use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
-use log::{error, info};
+use log::{debug, error, info};
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::AsyncSender;
@@ -99,7 +99,7 @@ impl<T: FileSystem> FuseReceiver<T> {
         let read_len = self.pipe2.read_buf(&mut self.buf[..write_len]).await?;
         if write_len != read_len {
             return err_box!(
-                "Splice read and write lengths are inconsistent, write len {}, read len {}",
+                "splice read and write lengths are inconsistent, write len {}, read len {}",
                 write_len,
                 read_len
             );
@@ -113,17 +113,34 @@ impl<T: FileSystem> FuseReceiver<T> {
     }
 
     pub fn new_replay(&self, unique: u64) -> FuseResponse {
-        FuseResponse::new(unique, self.sender.clone())
+        FuseResponse::new(unique, self.sender.clone(), self.debug)
     }
 
-    // TODO: Optimize
     pub async fn send_stream(&self, req: FuseRequest) -> FuseResult<()> {
-        self.sender.send(FuseTask::Request(req)).await?;
+        let operator = req.parse_operator()?;
+        let rep = self.new_replay(req.unique());
+        let res = match operator {
+            FuseOperator::Read(op) => self.fs.read(op, rep).await,
+
+            FuseOperator::Write(op) => self.fs.write(op, rep).await,
+
+            FuseOperator::Flush(op) => self.fs.flush(op, rep).await,
+
+            FuseOperator::Release(op) => self.fs.release(op, rep).await,
+
+            FuseOperator::FSync(op) => self.fs.fsync(op, rep).await,
+
+            _ => err_fuse!(libc::ENOSYS, "unsupported operation {:?}", req.opcode()),
+        };
+
+        if res.is_err() {
+            self.new_replay(req.unique()).send_rep(res).await?;
+        }
         Ok(())
     }
 
     pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
-        info!("fuse receiver started");
+        debug!("fuse receiver started");
         loop {
             tokio::select! {
                 res = self.receive() => {
@@ -142,14 +159,16 @@ impl<T: FileSystem> FuseReceiver<T> {
                             }
 
                             if req.is_stream() {
-                                self.send_stream(req).await?;
+                                if let Err(e) = self.send_stream(req).await {
+                                    error!("failed to dispatch stream request: {}", e);
+                                }
                             } else {
                                 let reply = self.new_replay(req.unique());
                                 let fs = self.fs.clone();
 
                                 self.rt.spawn(async move {
                                     if let Err(e) = Self::dispatch_meta(fs, req, reply).await {
-                                        error!("Failed to dispatch meta request: {}", e);
+                                        error!("failed to dispatch meta request: {}", e);
                                     }
                                 });
                             }
@@ -245,7 +264,7 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             _ => {
                 let err: FuseResult<fuse_out_header> =
-                    err_fuse!(libc::ENOSYS, "Unsupported operation {:?}", req.opcode());
+                    err_fuse!(libc::ENOSYS, "unsupported operation {:?}", req.opcode());
                 reply.send_rep(err).await
             }
         };

@@ -14,11 +14,11 @@
 
 use crate::fs::operator::{Read, Write};
 use crate::fs::state::NodeState;
-use crate::{err_fuse, FuseResult, FUSE_SUCCESS};
-use curvine_client::unified::{UnifiedReader, UnifiedWriter};
-use curvine_common::fs::{Reader, Writer};
+use crate::fs::{FuseReader, FuseWriter};
+use crate::session::FuseResponse;
+use crate::{err_fuse, FuseError, FuseResult};
 use curvine_common::state::FileStatus;
-use orpc::sys::{DataSlice, RawPtr};
+use orpc::sys::RawPtr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -30,16 +30,16 @@ pub struct FileHandle {
     pub lock_owner: u64, // Owner ID of flock
     pub ofd_owner: u64,  // Owner ID of OFD lock
 
-    pub reader: Option<RawPtr<UnifiedReader>>,
-    pub writer: Option<Arc<Mutex<UnifiedWriter>>>, // Writer uses Arc for global sharing
+    pub reader: Option<RawPtr<FuseReader>>,
+    pub writer: Option<Arc<Mutex<FuseWriter>>>, // Writer uses Arc for global sharing
 }
 
 impl FileHandle {
     pub fn new(
         ino: u64,
         fh: u64,
-        reader: Option<RawPtr<UnifiedReader>>,
-        writer: Option<Arc<Mutex<UnifiedWriter>>>,
+        reader: Option<RawPtr<FuseReader>>,
+        writer: Option<Arc<Mutex<FuseWriter>>>,
     ) -> Self {
         Self {
             ino,
@@ -52,36 +52,38 @@ impl FileHandle {
         }
     }
 
-    pub async fn read(&self, state: &NodeState, op: Read<'_>) -> FuseResult<Vec<DataSlice>> {
+    pub async fn read(
+        &self,
+        state: &NodeState,
+        op: Read<'_>,
+        reply: FuseResponse,
+    ) -> FuseResult<()> {
         let reader = match &self.reader {
             Some(v) => v,
             None => return err_fuse!(libc::EIO),
         };
 
-        if !reader.has_remaining() {
+        if op.arg.offset as i64 >= reader.len() {
             if let Some(writer) = state.find_writer(&op.header.nodeid) {
                 {
-                    writer.lock().await.flush().await?;
+                    writer.lock().await.flush(None).await?;
                 }
                 // TODO: Optimize by adding refresh interface to refresh block list
                 let path = reader.path().clone();
-                reader.as_mut().complete().await?;
+                reader.as_mut().complete(None).await?;
                 let new_reader = state.new_reader(&path).await?;
                 reader.replace(new_reader);
             }
         }
 
-        let data = reader
-            .as_mut()
-            .fuse_read(op.arg.offset as i64, op.arg.size as usize)
-            .await?;
-
-        Ok(data)
+        reader.as_mut().read(op, reply).await?;
+        Ok(())
     }
 
-    pub async fn write(&self, op: Write<'_>) -> FuseResult<()> {
-        let off = op.arg.offset;
-        let len = op.data.len();
+    pub async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FuseResult<()> {
+        if op.data.is_empty() {
+            return Ok(());
+        }
 
         let lock = if let Some(lock) = &self.writer {
             lock
@@ -90,36 +92,26 @@ impl FileHandle {
         };
 
         let mut writer = lock.lock().await;
-
-        // Only skip true zero-length writes
-        if len == 0 {
-            return err_fuse!(
-                FUSE_SUCCESS,
-                "Skip zero-length write to file {} offset={} size={}",
-                writer.path(),
-                off,
-                len
-            );
-        }
-
-        writer.seek(off as i64).await?;
-        writer.fuse_write(DataSlice::bytes(op.data)).await?;
+        writer.write(op, reply).await?;
         Ok(())
     }
 
-    pub async fn flush(&self) -> FuseResult<()> {
+    pub async fn flush(&self, reply: FuseResponse) -> FuseResult<()> {
         if let Some(writer) = &self.writer {
-            writer.lock().await.flush().await?;
+            writer.lock().await.flush(Some(reply)).await?;
+        } else {
+            reply.send_rep(Ok::<(), FuseError>(())).await?;
         }
         Ok(())
     }
 
-    pub async fn complete(&self) -> FuseResult<()> {
+    pub async fn complete(&self, reply: FuseResponse) -> FuseResult<()> {
+        let mut reply = Some(reply);
         if let Some(writer) = &self.writer {
-            writer.lock().await.complete().await?;
+            writer.lock().await.complete(reply.take()).await?;
         }
         if let Some(reader) = &self.reader {
-            reader.as_mut().complete().await?;
+            reader.as_mut().complete(reply.take()).await?;
         }
         Ok(())
     }

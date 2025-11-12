@@ -19,7 +19,7 @@ use crate::raw::fuse_mount_pure;
 use crate::raw::fuse_umount_pure;
 use crate::{FuseUtils, RawSession, FUSE_CLONE_FD_MIN_VERSION, UNIX_KERNEL_VERSION};
 use curvine_common::conf::FuseConf;
-use log::{error, info};
+use log::{debug, error, info};
 use orpc::io::IOResult;
 use orpc::sys;
 use orpc::sys::pipe::{AsyncFd, BorrowedFd, OwnedFd};
@@ -58,7 +58,7 @@ impl FuseMnt {
         let clone_fd = if clone && *UNIX_KERNEL_VERSION >= FUSE_CLONE_FD_MIN_VERSION {
             match FuseUtils::fuse_clone_fd(self.fd) {
                 Ok(clone_fd) => {
-                    info!("Fuse clone fd, {} -> {}", self.fd, clone_fd);
+                    debug!("Fuse clone fd, {} -> {}", self.fd, clone_fd);
                     clone_fd
                 }
 
