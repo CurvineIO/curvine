@@ -35,6 +35,7 @@ pub struct WorkerMetrics {
     pub(crate) fs_used: Gauge,
     pub(crate) storage_failed: Gauge,
     pub(crate) num_blocks: Gauge,
+    pub(crate) store_total_disks: Gauge,
 
     pub(crate) used_memory_bytes: Gauge,
 }
@@ -57,6 +58,7 @@ impl WorkerMetrics {
             fs_used: m::new_gauge("fs_used", "Space used by the file system")?,
             storage_failed: m::new_gauge("storage_failed", "Abnormal storage number")?,
             num_blocks: m::new_gauge("num_blocks", "The total number of blocks")?,
+            store_total_disks: m::new_gauge("store_total_disks", "Total number of storage disks")?,
 
             used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
         };
@@ -80,6 +82,9 @@ impl WorkerMetrics {
         }
         self.storage_failed.set(storage_failed);
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
+
+        let total_disks = state.dir_iter().count();
+        self.store_total_disks.set(total_disks as i64);
 
         Metrics::text_output()
     }
