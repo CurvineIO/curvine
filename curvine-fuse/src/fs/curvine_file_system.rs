@@ -921,27 +921,19 @@ impl fs::FileSystem for CurvineFileSystem {
         let _ = self.fs.mkdir(&path, false).await?;
         // Apply requested mode and ownership to directory if provided
         if op.arg.mode != 0 {
-            let owner = orpc::sys::get_username_by_uid(op.header.uid);
-            let group = orpc::sys::get_groupname_by_gid(op.header.gid);
+            let owner = sys::get_username_by_uid(op.header.uid);
+            let group = sys::get_groupname_by_gid(op.header.gid);
 
-            let add_x_attr = HashMap::new();
             let opts = SetAttrOpts {
-                recursive: false,
-                replicas: None,
                 owner,
                 group,
                 // Apply umask: effective_mode = requested_mode & ~umask
                 mode: Some((op.arg.mode & 0o7777) & !op.arg.umask),
-                atime: None,
-                mtime: None,
-                ttl_ms: None,
-                ttl_action: None,
-                add_x_attr,
-                remove_x_attr: Vec::new(),
+                ..Default::default()
             };
-            // Ignore error intentionally if backend rejects, continue
-            let _ = self.fs.set_attr(&path, opts).await;
+            self.fs.set_attr(&path, opts).await?;
         }
+
         let entry = self
             .lookup_path(op.header.nodeid, Some(name), &path)
             .await?;
@@ -1020,11 +1012,10 @@ impl fs::FileSystem for CurvineFileSystem {
                 mode: Some((op.arg.mode & 0o7777) & !op.arg.umask),
                 ..Default::default()
             };
-            let _ = self.fs.set_attr(&path, opts).await;
+            self.fs.set_attr(&path, opts).await?;
         }
 
-        let status = handle.status().await?;
-        let attr = self.lookup_status(id, Some(name), &status)?;
+        let attr = self.lookup_path(id, Some(name), &path).await?;
         let open_flags = Self::fill_open_flags(&self.conf, flags);
         let r = fuse_create_out(
             fuse_entry_out {
