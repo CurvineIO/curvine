@@ -25,9 +25,6 @@ use orpc::CommonResult;
 use std::fmt::{Debug, Formatter};
 
 pub struct MasterMetrics {
-    pub(crate) files_total: Gauge,
-    pub(crate) dir_total: Gauge,
-
     pub(crate) rpc_request_count: CounterVec,
     pub(crate) rpc_request_time: CounterVec,
 
@@ -60,9 +57,6 @@ impl MasterMetrics {
             10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
         ];
         let wm = Self {
-            files_total: m::new_gauge("files_total", "Total number of files")?,
-            dir_total: m::new_gauge("dir_total", "Total number of directory")?,
-
             rpc_request_count: m::new_counter_vec(
                 "rpc_request_count",
                 "Numbers of rpc request",

@@ -82,8 +82,8 @@ async fn report(Extension(instance): Extension<Arc<MasterRouterHandler>>) -> Str
     let available = &report.get("available").unwrap();
     let capacity = &report.get("capacity").unwrap();
     let fs_used = &report.get("fs_used").unwrap();
-    let dir_total = &report.get("dir_total").unwrap();
-    let files_total = &report.get("files_total").unwrap();
+    let dir_total = &report.get("inode_dir_num").unwrap();
+    let files_total = &report.get("inode_file_num").unwrap();
     let live_workers = &report.get("live_workers").unwrap();
     let lost_workers = &report.get("lost_workers").unwrap();
 
