@@ -25,11 +25,11 @@ use orpc::CommonResult;
 use std::fmt::{Debug, Formatter};
 
 pub struct MasterMetrics {
-    pub(crate) rpc_request_count: CounterVec,
-    pub(crate) rpc_request_time: CounterVec,
+    pub(crate) rpc_request_total_count: Counter,
+    pub(crate) rpc_request_total_time: Counter,
 
-    pub(crate) capacity: Gauge,
-    pub(crate) available: Gauge,
+    pub(crate) cluster_capacity: Gauge,
+    pub(crate) cluster_available: Gauge,
     pub(crate) fs_used: Gauge,
 
     pub(crate) worker_num: GaugeVec,
@@ -57,19 +57,20 @@ impl MasterMetrics {
             10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
         ];
         let wm = Self {
-            rpc_request_count: m::new_counter_vec(
-                "rpc_request_count",
-                "Numbers of rpc request",
-                &["method"],
+            rpc_request_total_count: m::new_counter(
+                "rpc_request_total_count",
+                "Number of rpc request",
             )?,
-            rpc_request_time: m::new_counter_vec(
+            rpc_request_total_time: m::new_counter(
                 "rpc_request_time",
                 "Rpc request time duration(ms)",
-                &["method"],
             )?,
 
-            capacity: m::new_gauge("capacity", "Total storage capacity")?,
-            available: m::new_gauge("available", "Storage directory available space")?,
+            cluster_capacity: m::new_gauge("cluster_capacity", "Total storage capacity")?,
+            cluster_available: m::new_gauge(
+                "cluster_available",
+                "Storage directory available space",
+            )?,
             fs_used: m::new_gauge("fs_used", "Space used by the file system")?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
@@ -112,9 +113,8 @@ impl MasterMetrics {
 
     pub fn text_output(&self, fs: MasterFilesystem) -> CommonResult<String> {
         let master_info = fs.master_info()?;
-        self.capacity.set(master_info.capacity);
-        self.capacity.set(master_info.capacity);
-        self.available.set(master_info.available);
+        self.cluster_capacity.set(master_info.capacity);
+        self.cluster_available.set(master_info.available);
         self.fs_used.set(master_info.fs_used);
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
 

@@ -502,14 +502,8 @@ impl MessageHandler for MasterHandler {
         }
 
         let code_label = format!("{:?}", ctx.code);
-        self.metrics
-            .rpc_request_time
-            .with_label_values(&[&code_label])
-            .inc_by(used_us as i64);
-        self.metrics
-            .rpc_request_count
-            .with_label_values(&[&code_label])
-            .inc();
+        self.metrics.rpc_request_total_time.inc_by(used_us as i64);
+        self.metrics.rpc_request_total_count.inc();
 
         if ctx.code != RpcCode::WorkerHeartbeat {
             self.metrics
