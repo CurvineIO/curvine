@@ -45,6 +45,16 @@ mod s3_tests {
         Some(fs)
     }
 
+    // Check if S3 service is available by trying a simple operation
+    async fn check_s3_available(fs: &S3FileSystem) -> bool {
+        // Try to list the root path to verify S3 service is accessible
+        let test_path = match Path::new("s3://flink/") {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        fs.list_status(&test_path).await.is_ok()
+    }
+
     #[test]
     fn run_test() -> CommonResult<()> {
         let fs = match get_fs() {
@@ -56,6 +66,13 @@ mod s3_tests {
         };
 
         let rt = AsyncRuntime::single();
+        let service_available = rt.block_on(async { check_s3_available(&fs).await });
+
+        if !service_available {
+            println!("S3 service is not available, skip s3 test");
+            return Ok(());
+        }
+
         rt.block_on(async move {
             mkdir(&fs).await.unwrap();
             let write_ck = write(&fs).await.unwrap();
