@@ -1,7 +1,7 @@
+use clap::Subcommand;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{CurvineURI, FileSystem};
 use curvine_common::state::SetAttrOpts;
-use clap::Subcommand;
 use orpc::CommonResult;
 
 #[derive(Subcommand, Debug)]
@@ -20,10 +20,14 @@ pub enum ChmodCommand {
 impl ChmodCommand {
     pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
-            ChmodCommand::Chmod { mode, path, recursive } => {
+            ChmodCommand::Chmod {
+                mode,
+                path,
+                recursive,
+            } => {
                 let path = CurvineURI::new(path)?;
 
-                let mode = Self::parse_mode(mode)?;              
+                let mode = Self::parse_mode(mode)?;
                 if *recursive {
                     let opts = SetAttrOpts {
                         mode: Some(mode),
@@ -36,11 +40,11 @@ impl ChmodCommand {
                         mode: Some(mode),
                         ..Default::default()
                     };
-                    client.set_attr(&path, opts).await?;                    
+                    client.set_attr(&path, opts).await?;
                 }
                 println!("Changed permission of '{}' set to {:o}", path, mode);
-                
-                Ok(())  
+
+                Ok(())
             }
         }
     }
@@ -50,9 +54,13 @@ impl ChmodCommand {
         if mode_str.is_empty() {
             return Err("Mode string is empty".into());
         }
-        
+
         let s = mode_str.strip_prefix("0o").unwrap_or(mode_str);
-        let s = if s.len() == 4 && s.starts_with('0') { &s[1..] } else { s };
+        let s = if s.len() == 4 && s.starts_with('0') {
+            &s[1..]
+        } else {
+            s
+        };
 
         if let Ok(m) = u32::from_str_radix(s, 8) {
             return Ok(m);
@@ -88,5 +96,4 @@ impl ChmodCommand {
 
         Ok(mode)
     }
-
 }

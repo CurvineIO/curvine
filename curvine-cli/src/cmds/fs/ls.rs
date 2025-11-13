@@ -320,7 +320,26 @@ async fn print_file_entry(
     config: &PrintConfig,
 ) -> CommonResult<()> {
     let file_type = if file.is_dir { "d" } else { "-" };
-    let permissions = "rwxr-xr-x"; // Default permissions for now
+    let mut mode = file.mode & 0o777;
+    let mut permissions = String::new();
+    while mode > 0 {
+        if mode & 0o1 != 0 {
+            permissions.insert(0, 'x');
+        } else {
+            permissions.insert(0, '-');
+        }
+        if mode & 0o2 != 0 {
+            permissions.insert(0, 'w');
+        } else {
+            permissions.insert(0, '-');
+        }
+        if mode & 0o4 != 0 {
+            permissions.insert(0, 'r');
+        } else {
+            permissions.insert(0, '-');
+        }
+        mode >>= 3;
+    }
     let replicas = if file.is_dir {
         "-"
     } else {

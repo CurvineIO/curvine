@@ -838,7 +838,9 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        let attr = self.lookup_path::<String>(op.header.nodeid, None, &path).await?;
+        let attr = self
+            .lookup_path::<String>(op.header.nodeid, None, &path)
+            .await?;
 
         let attr = fuse_attr_out {
             attr_valid: self.conf.attr_ttl.as_secs(),

@@ -4,9 +4,9 @@ use orpc::CommonResult;
 use std::path::PathBuf;
 
 use crate::cmds::fs::{
-    blocks::BlocksCommand, cat::CatCommand, count::CountCommand, df::DfCommand, du::DuCommand,
-    get::GetCommand, ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand,
-    rm::RmCommand, stat::StatCommand, touch::TouchCommand, chmod::ChmodCommand,
+    blocks::BlocksCommand, cat::CatCommand, chmod::ChmodCommand, count::CountCommand,
+    df::DfCommand, du::DuCommand, get::GetCommand, ls::LsCommand, mkdir::MkdirCommand,
+    mv::MvCommand, put::PutCommand, rm::RmCommand, stat::StatCommand, touch::TouchCommand,
 };
 
 #[derive(Parser, Debug)]
@@ -312,7 +312,11 @@ impl FsCommand {
                 mv_cmd.execute(client).await
             }
 
-            FsSubCommand::Chmod { mode, path, recursive } => {
+            FsSubCommand::Chmod {
+                mode,
+                path,
+                recursive,
+            } => {
                 let chmod_cmd = ChmodCommand::Chmod {
                     mode: mode.clone(),
                     path: path.clone(),
