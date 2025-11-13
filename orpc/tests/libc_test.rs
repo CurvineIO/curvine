@@ -18,18 +18,16 @@ use bytes::BytesMut;
 use orpc::common::Utils;
 use orpc::sys;
 use orpc::sys::CacheManager;
-use std::fs::{create_dir_all, File, OpenOptions};
+use std::fs::{create_dir_all, remove_file, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 
 #[cfg(target_os = "linux")]
 #[test]
 fn get_raw_fd() {
-    let test_file = Utils::test_sub_dir("libc-read_ahead.log");
-    // Normalize the path to handle .. components
+    let test_file = Utils::test_file();
     let test_file_path = Path::new(&test_file);
     let parent = test_file_path.parent().unwrap();
-    // Ensure testing directory exists
     create_dir_all(parent).unwrap_or_else(|e| {
         panic!("Failed to create directory: {:?}, error: {}", parent, e);
     });
@@ -45,15 +43,15 @@ fn get_raw_fd() {
 
     let fd = sys::get_raw_io(&writer);
     println!("fd = {}", fd.unwrap());
+
+    remove_file(test_file_path).unwrap();
 }
 
 #[test]
 fn read_ahead() {
-    let test_file = Utils::test_sub_dir("libc-read_ahead.log");
-    // Normalize the path to handle .. components
+    let test_file = Utils::temp_file();
     let test_file_path = Path::new(&test_file);
     let parent = test_file_path.parent().unwrap();
-    // Ensure testing directory exists
     create_dir_all(parent).unwrap_or_else(|e| {
         panic!("Failed to create directory: {:?}, error: {}", parent, e);
     });
@@ -93,7 +91,9 @@ fn read_ahead() {
         cur_pos += chunk_size as u64;
     }
 
-    println!("cur_pos {}", cur_pos)
+    println!("cur_pos {}", cur_pos);
+
+    remove_file(test_file_path).unwrap();
 }
 
 #[cfg(target_os = "linux")]

@@ -45,6 +45,16 @@ mod s3_tests {
         Some(fs)
     }
 
+    // Check if S3 service is available by trying a simple operation
+    async fn check_s3_available(fs: &S3FileSystem) -> bool {
+        // Try to list the root path to verify S3 service is accessible
+        let test_path = match Path::new("s3://curvine-test/") {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        fs.list_status(&test_path).await.is_ok()
+    }
+
     #[test]
     fn run_test() -> CommonResult<()> {
         let fs = match get_fs() {
@@ -56,6 +66,13 @@ mod s3_tests {
         };
 
         let rt = AsyncRuntime::single();
+        let service_available = rt.block_on(async { check_s3_available(&fs).await });
+
+        if !service_available {
+            println!("S3 service is not available, skip s3 test");
+            return Ok(());
+        }
+
         rt.block_on(async move {
             mkdir(&fs).await.unwrap();
             let write_ck = write(&fs).await.unwrap();
@@ -71,23 +88,23 @@ mod s3_tests {
     }
 
     async fn mkdir(fs: &S3FileSystem) -> CommonResult<()> {
-        let path = "s3://flink/cv-fs-test/a".into();
+        let path = "s3://curvine-test/cv-fs-test/a".into();
         fs.mkdir(&path, true).await.unwrap();
 
-        let path = "s3://flink/cv-fs-test/b/c".into();
+        let path = "s3://curvine-test/cv-fs-test/b/c".into();
         fs.mkdir(&path, true).await.unwrap();
 
         Ok(())
     }
 
     async fn list_status(fs: &S3FileSystem) -> CommonResult<Vec<FileStatus>> {
-        let path = Path::new("s3://flink/cv-fs-test")?;
+        let path = Path::new("s3://curvine-test/cv-fs-test")?;
         let res = fs.list_status(&path).await.unwrap();
         Ok(res)
     }
 
     async fn write(fs: &S3FileSystem) -> CommonResult<u64> {
-        let path = Path::new("s3://flink/cv-fs-test/test.log")?;
+        let path = Path::new("s3://curvine-test/cv-fs-test/test.log")?;
         let mut writer = fs.create(&path, false).await.unwrap();
 
         let msg = Utils::rand_str(1024);
@@ -103,7 +120,7 @@ mod s3_tests {
     }
 
     async fn read(fs: &S3FileSystem) -> CommonResult<u64> {
-        let path = Path::new("s3://flink/cv-fs-test/test.log")?;
+        let path = Path::new("s3://curvine-test/cv-fs-test/test.log")?;
         let mut reader = fs.open(&path).await.unwrap();
         let mut buf = BytesMut::zeroed(1024);
         let mut checksum = 0;
