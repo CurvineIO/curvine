@@ -15,19 +15,33 @@
 #![allow(unused_imports)]
 
 use bytes::BytesMut;
+use orpc::common::Utils;
 use orpc::sys;
 use orpc::sys::CacheManager;
-use std::fs::{File, OpenOptions};
+use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::{Read, Write};
+use std::path::Path;
 
 #[cfg(target_os = "linux")]
 #[test]
 fn get_raw_fd() {
+    let test_file = Utils::test_sub_dir("libc-read_ahead.log");
+    // Normalize the path to handle .. components
+    let test_file_path = Path::new(&test_file);
+    let parent = test_file_path.parent().unwrap();
+    // Ensure testing directory exists
+    create_dir_all(parent).unwrap_or_else(|e| {
+        panic!("Failed to create directory: {:?}, error: {}", parent, e);
+    });
+
     let writer = OpenOptions::new()
         .write(true)
         .truncate(true)
-        .open("../testing/libc-read_ahead.log")
-        .unwrap();
+        .create(true)
+        .open(test_file_path)
+        .unwrap_or_else(|e| {
+            panic!("Failed to open file: {:?}, error: {}", test_file_path, e);
+        });
 
     let fd = sys::get_raw_io(&writer);
     println!("fd = {}", fd.unwrap());
@@ -35,11 +49,23 @@ fn get_raw_fd() {
 
 #[test]
 fn read_ahead() {
+    let test_file = Utils::test_sub_dir("libc-read_ahead.log");
+    // Normalize the path to handle .. components
+    let test_file_path = Path::new(&test_file);
+    let parent = test_file_path.parent().unwrap();
+    // Ensure testing directory exists
+    create_dir_all(parent).unwrap_or_else(|e| {
+        panic!("Failed to create directory: {:?}, error: {}", parent, e);
+    });
+
     let mut writer = OpenOptions::new()
         .write(true)
         .truncate(true)
-        .open("../testing/libc-read_ahead.log")
-        .unwrap();
+        .create(true)
+        .open(test_file_path)
+        .unwrap_or_else(|e| {
+            panic!("Failed to open file: {:?}, error: {}", test_file_path, e);
+        });
 
     for _ in 0..10000 {
         let s = "a".repeat(1024);
@@ -49,7 +75,7 @@ fn read_ahead() {
     drop(writer);
 
     let cache_manager = CacheManager::default();
-    let mut reader = File::open("../testing/libc-read_ahead.log").unwrap();
+    let mut reader = File::open(test_file_path).unwrap();
     let file_size = reader.metadata().unwrap().len();
     println!("file_size {}", file_size);
     let mut buf = BytesMut::zeroed(64 * 1024);
