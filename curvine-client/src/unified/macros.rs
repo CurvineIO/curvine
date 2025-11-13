@@ -152,6 +152,10 @@ macro_rules! impl_writer_for_enum {
 macro_rules! impl_reader_for_enum {
     ($enum_name:ident) => {
         impl ::curvine_common::fs::Reader for $enum_name {
+            fn status(&self) -> &::curvine_common::state::FileStatus {
+                match_variants!(self, status)
+            }
+
             fn path(&self) -> &::curvine_common::fs::Path {
                 match_variants!(self, path)
             }

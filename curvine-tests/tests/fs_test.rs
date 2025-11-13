@@ -112,12 +112,17 @@ async fn mkdir(fs: &CurvineFileSystem) -> CommonResult<()> {
         .x_attr("123".to_string(), "xxx".to_string().into_bytes())
         .ttl_ms(10000)
         .ttl_action(TtlAction::Delete)
+        .owner("user".to_string())
+        .group("group".to_string())
         .build();
     let flag = fs.mkdir_with_opts(&path, opts).await;
     assert!(flag.is_ok());
 
-    let status = fs.get_status(&path).await?;
+    let status = flag?;
     println!("dir status = {:?}", status);
+    assert_eq!(status.mode, 0o755);
+    assert_eq!(&status.owner, "user");
+    assert_eq!(&status.group, "group");
     assert_eq!(status.mode, 0o755);
     assert_eq!(status.storage_policy.ttl_ms, 10000);
     assert_eq!(status.storage_policy.ttl_action, TtlAction::Delete);
@@ -133,13 +138,16 @@ async fn create_file(fs: &CurvineFileSystem) -> CommonResult<()> {
         .x_attr("123".to_string(), "xxx".to_string().into_bytes())
         .ttl_ms(10000)
         .ttl_action(TtlAction::Delete)
+        .owner("user".to_string())
+        .group("group".to_string())
         .build();
     let writer = fs.create_with_opts(&path, opts, true).await?;
     let status = writer.status();
     info!("create file: {}, status: {:?}", path, status);
 
-    let status = fs.get_status(&path).await?;
     assert_eq!(status.mode, 0o755);
+    assert_eq!(&status.owner, "user");
+    assert_eq!(&status.group, "group");
     assert_eq!(status.storage_policy.ttl_ms, 10000);
     assert_eq!(status.storage_policy.ttl_action, TtlAction::Delete);
     assert_eq!(status.x_attr.get("123"), Some(&"xxx".as_bytes().to_vec()));
@@ -378,9 +386,8 @@ async fn set_attr_non_recursive(fs: &CurvineFileSystem) -> CommonResult<()> {
 
     // Non-recursive settings
     let path = Path::from_str("/fs_test/set_attr1")?;
-    fs.set_attr(&path, opts.clone()).await?;
+    let status = fs.set_attr(&path, opts.clone()).await?;
 
-    let status = fs.get_status(&path).await?;
     println!("non-recursive set_attr1 {:?}", status);
     assert_eq!(
         status.x_attr.get("attr1"),

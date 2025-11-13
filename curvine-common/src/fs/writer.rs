@@ -75,7 +75,13 @@ pub trait Writer {
     }
 
     fn async_write(&mut self, chunk: DataSlice) -> impl Future<Output = FsResult<()>> {
-        async move { self.fuse_write(chunk).await }
+        async move {
+            self.flush_chunk().await?;
+            let len = self.write_chunk(chunk).await?;
+            *self.pos_mut() += len;
+
+            Ok(())
+        }
     }
 
     fn blocking_write(&mut self, rt: &Runtime, chunk: DataSlice) -> FsResult<()> {
@@ -87,13 +93,10 @@ pub trait Writer {
         Ok(())
     }
 
-    fn fuse_write(&mut self, chunk: DataSlice) -> impl Future<Output = FsResult<()>> {
+    fn fuse_write(&mut self, pos: i64, chunk: DataSlice) -> impl Future<Output = FsResult<()>> {
         async move {
-            self.flush_chunk().await?;
-            let len = self.write_chunk(chunk).await?;
-            *self.pos_mut() += len;
-
-            Ok(())
+            self.seek(pos).await?;
+            self.async_write(chunk).await
         }
     }
 

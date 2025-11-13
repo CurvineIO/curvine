@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::fs::Path;
+use crate::state::FileStatus;
 use crate::FsResult;
 use orpc::err_box;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -21,6 +22,8 @@ use std::future::Future;
 use tokio_util::bytes::BytesMut;
 
 pub trait Reader {
+    fn status(&self) -> &FileStatus;
+
     fn path(&self) -> &Path;
 
     fn len(&self) -> i64;

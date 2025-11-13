@@ -145,8 +145,8 @@ fn mkdir(fs: &MasterFilesystem) -> CommonResult<()> {
     let _ = fs.mkdir("/a1", true)?;
     let _ = fs.mkdir("/a2", true)?;
 
-    let res2 = fs.mkdir("/a3/b/c", true)?;
-    assert!(res2);
+    let res2 = fs.mkdir("/a3/b/c", true);
+    assert!(res2.is_ok());
 
     // Verify directories exist after creation
     assert!(fs.exists("/a1")?);

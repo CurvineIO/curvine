@@ -21,8 +21,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    ConsistencyStrategy, FileStatus, LoadJobCommand, LoadJobResult, MasterInfo, MountInfo,
-    MountOptions, SetAttrOpts,
+    ConsistencyStrategy, CreateFileOpts, FileStatus, LoadJobCommand, LoadJobResult, MasterInfo,
+    MkdirOpts, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
 };
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -228,6 +228,59 @@ impl UnifiedFileSystem {
     pub fn disable_unified(&mut self) {
         self.enable_unified = false
     }
+
+    pub async fn open_with_opts(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<UnifiedWriter> {
+        match self.get_mount(path).await? {
+            None => {
+                let writer = self.cv.open_with_opts(path, opts, flags).await?;
+                Ok(UnifiedWriter::Cv(writer))
+            }
+
+            Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, flags.overwrite()).await,
+        }
+    }
+
+    pub async fn fuse_mkdir(&self, path: &Path, opts: MkdirOpts) -> FsResult<Option<FileStatus>> {
+        match self.get_mount(path).await? {
+            None => {
+                let status = self.cv.mkdir_with_opts(path, opts).await?;
+                Ok(Some(status))
+            }
+
+            Some((ufs_path, mount)) => {
+                let flag = mount.ufs.mkdir(&ufs_path, opts.create_parent).await?;
+                if !flag {
+                    err_ext!(FsError::file_exists(ufs_path.path()))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    pub async fn fuse_set_attr(
+        &self,
+        path: &Path,
+        opts: SetAttrOpts,
+    ) -> FsResult<Option<FileStatus>> {
+        match self.get_mount(path).await? {
+            None => {
+                let status = self.cv.set_attr(path, opts).await?;
+                Ok(Some(status))
+            }
+
+            Some(_) => {
+                // ufs currently does not support set attr, so it returns None.
+                // mount.ufs.set_attr(&ufs_path, opts).await?;
+                Ok(None)
+            }
+        }
+    }
 }
 
 impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
@@ -238,14 +291,9 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         }
     }
 
-    // In the UFS storage system, "create" only contains the semantics of "create".
-    // Curvine supports random writes, and "create" contains the semantics of both creating and opening existing files.
-    // To maintain API compatibility, the method name uses "create" to maintain compatibility.
     async fn create(&self, path: &Path, overwrite: bool) -> FsResult<UnifiedWriter> {
         match self.get_mount(path).await? {
-            None => Ok(UnifiedWriter::Cv(
-                self.cv.open_for_write(path, overwrite).await?,
-            )),
+            None => Ok(UnifiedWriter::Cv(self.cv.create(path, overwrite).await?)),
             Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, overwrite).await,
         }
     }
@@ -381,7 +429,10 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
         match self.get_mount(path).await? {
-            None => self.cv.set_attr(path, opts).await,
+            None => {
+                self.cv.set_attr(path, opts).await?;
+                Ok(())
+            }
             Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
         }
     }
