@@ -31,6 +31,8 @@ pub struct MasterMetrics {
     pub(crate) cluster_capacity: Gauge,
     pub(crate) cluster_available: Gauge,
     pub(crate) fs_used: Gauge,
+    pub(crate) blocks_total_num: Gauge,
+    pub(crate) blocks_size_avg: Gauge,
 
     pub(crate) worker_num: GaugeVec,
 
@@ -72,6 +74,8 @@ impl MasterMetrics {
                 "Storage directory available space",
             )?,
             fs_used: m::new_gauge("fs_used", "Space used by the file system")?,
+            blocks_total_num: m::new_gauge("blocks_total_num", "Total block number")?,
+            blocks_size_avg: m::new_gauge("blocks_size_avg", "Average block size")?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
             journal_queue_len: m::new_gauge("journal_queue_len", "Journal queue length")?,
@@ -116,7 +120,13 @@ impl MasterMetrics {
         self.cluster_capacity.set(master_info.capacity);
         self.cluster_available.set(master_info.available);
         self.fs_used.set(master_info.fs_used);
+        self.blocks_total_num.set(master_info.block_num);
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
+
+        if master_info.block_num > 0 {
+            let avg_size = master_info.fs_used / master_info.block_num;
+            self.blocks_size_avg.set(avg_size);
+        }
 
         self.worker_num
             .with_label_values(&["live"])
