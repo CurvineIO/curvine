@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::worker::block::{BlockStore, MasterClient};
+use crate::worker::storage::Dataset;
 use curvine_common::error::FsError;
 use curvine_common::state::{BlockReportInfo, HeartbeatStatus, WorkerCommand};
 use curvine_common::utils::ProtoUtils;
@@ -47,6 +48,11 @@ impl HeartbeatTask {
                     for block in c.blocks {
                         if report_blocks.contains_key(&block) {
                             continue;
+                        }
+
+                        {
+                            let state = store.write();
+                            state.increment_blocks_to_delete();
                         }
 
                         // Whether or not it is successfully deleted, it is marked as deleted

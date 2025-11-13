@@ -93,6 +93,7 @@ impl BlockStore {
             None => return err_box!("Not found block {}", id),
             Some(v) => v,
         };
+        state.decrement_blocks_to_delete();
         drop(state);
 
         // Delete the file.

@@ -33,6 +33,10 @@ pub trait Dataset {
 
     fn num_blocks(&self) -> usize;
 
+    fn num_blocks_to_delete(&self) -> usize;
+    fn increment_blocks_to_delete(&self);
+    fn decrement_blocks_to_delete(&self);
+
     fn available_str(&self) -> String {
         ByteUnit::byte_to_string(self.available() as u64)
     }

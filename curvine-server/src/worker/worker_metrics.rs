@@ -36,6 +36,7 @@ pub struct WorkerMetrics {
     pub(crate) storage_failed: Gauge,
     pub(crate) num_blocks: Gauge,
     pub(crate) store_total_disks: Gauge,
+    pub(crate) num_blocks_to_delete: Gauge,
 
     pub(crate) used_memory_bytes: Gauge,
 }
@@ -59,6 +60,10 @@ impl WorkerMetrics {
             storage_failed: m::new_gauge("storage_failed", "Abnormal storage number")?,
             num_blocks: m::new_gauge("num_blocks", "The total number of blocks")?,
             store_total_disks: m::new_gauge("store_total_disks", "Total number of storage disks")?,
+            num_blocks_to_delete: m::new_gauge(
+                "num_blocks_to_delete",
+                "Number of blocks pending deletion",
+            )?,
 
             used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
         };
@@ -73,6 +78,8 @@ impl WorkerMetrics {
         self.available.set(state.available());
         self.fs_used.set(state.fs_used());
         self.num_blocks.set(state.num_blocks() as i64);
+        self.num_blocks_to_delete
+            .set(state.num_blocks_to_delete() as i64);
 
         let mut storage_failed = 0;
         for item in state.dir_iter() {

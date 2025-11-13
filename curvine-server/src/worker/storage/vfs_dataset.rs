@@ -22,6 +22,7 @@ use orpc::common::{ByteUnit, FileUtils, LocalTime, TimeSpent};
 use orpc::{err_box, try_err, CommonResult};
 use std::collections::HashMap;
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct VfsDataset {
     cluster_id: String,
@@ -29,6 +30,7 @@ pub struct VfsDataset {
     ctime: u64,
     dir_list: DirList,
     pub(crate) block_map: HashMap<i64, BlockMeta>,
+    num_blocks_to_delete: AtomicUsize,
 }
 
 impl VfsDataset {
@@ -44,6 +46,7 @@ impl VfsDataset {
             ctime: LocalTime::mills(),
             dir_list,
             block_map: HashMap::new(),
+            num_blocks_to_delete: AtomicUsize::new(0),
         };
         ds.initialize();
         ds
@@ -147,6 +150,18 @@ impl Dataset for VfsDataset {
 
     fn num_blocks(&self) -> usize {
         self.block_map.len()
+    }
+
+    fn num_blocks_to_delete(&self) -> usize {
+        self.num_blocks_to_delete.load(Ordering::Relaxed)
+    }
+
+    fn increment_blocks_to_delete(&self) {
+        self.num_blocks_to_delete.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_blocks_to_delete(&self) {
+        self.num_blocks_to_delete.fetch_sub(1, Ordering::Relaxed);
     }
 
     fn get_block(&self, id: i64) -> Option<&BlockMeta> {
