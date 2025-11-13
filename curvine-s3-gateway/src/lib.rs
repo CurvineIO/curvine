@@ -338,7 +338,7 @@ pub async fn start_gateway(
     );
 
     rt.spawn(async move {
-        if let Err(e) = web_server::WebServer::start(9003).await {
+        if let Err(e) = web_server::WebServer::start(conf.s3_gateway.web_port).await {
             tracing::error!("Failed to start metrics server: {}", e);
         }
     });

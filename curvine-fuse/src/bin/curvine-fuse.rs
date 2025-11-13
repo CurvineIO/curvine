@@ -43,7 +43,7 @@ fn main() -> CommonResult<()> {
     let fuse_rt = rt.clone();
 
     rt.spawn(async move {
-        if let Err(e) = WebServer::start(9002).await {
+        if let Err(e) = WebServer::start(cluster_conf.fuse.web_port).await {
             tracing::error!("Failed to start metrics server: {}", e);
         }
     });
@@ -113,6 +113,10 @@ pub struct FuseArgs {
     // Cache settings
     #[arg(long, help = "Enable auto cache (optional)")]
     pub auto_cache: Option<bool>,
+
+    // Fuse web port (optional)
+    #[arg(long, help = "Web server port (optional)", default_value = "9002")]
+    pub web_port: u16,
 
     #[arg(long, help = "Enable direct IO (optional)")]
     pub direct_io: Option<bool>,
@@ -244,6 +248,10 @@ impl FuseArgs {
 
         if let Some(node_cache_timeout) = &self.node_cache_timeout {
             conf.fuse.node_cache_timeout = node_cache_timeout.clone();
+        }
+
+        if self.web_port != 9002 {
+            conf.fuse.web_port = self.web_port;
         }
 
         if let Some(master_addrs) = &self.master_addrs {
