@@ -216,16 +216,6 @@ impl CurvineFileSystem {
         Ok(attr)
     }
 
-    fn lookup_status<T: AsRef<str>>(
-        &self,
-        parent: u64,
-        name: Option<T>,
-        status: &FileStatus,
-    ) -> FuseResult<fuse_attr> {
-        let attr = self.state.do_lookup(parent, name, status)?;
-        Ok(attr)
-    }
-
     async fn read_dir_common(
         &self,
         header: &fuse_in_header,
@@ -848,8 +838,7 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        let status = self.fs_get_status(&path).await?;
-        let attr = self.lookup_status::<String>(op.header.nodeid, None, &status)?;
+        let attr = self.lookup_path::<String>(op.header.nodeid, None, &path).await?;
 
         let attr = fuse_attr_out {
             attr_valid: self.conf.attr_ttl.as_secs(),

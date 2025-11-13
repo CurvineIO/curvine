@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::cmds::fs::{
     blocks::BlocksCommand, cat::CatCommand, count::CountCommand, df::DfCommand, du::DuCommand,
     get::GetCommand, ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand,
-    rm::RmCommand, stat::StatCommand, touch::TouchCommand,
+    rm::RmCommand, stat::StatCommand, touch::TouchCommand, chmod::ChmodCommand,
 };
 
 #[derive(Parser, Debug)]
@@ -173,6 +173,16 @@ pub enum FsSubCommand {
         dst_path: String,
     },
 
+    /// chmod file or directory
+    Chmod {
+        #[clap(help = "Permissions to set (e.g., 755)")]
+        mode: String,
+        #[clap(help = "Path of the file/directory to modify")]
+        path: String,
+        #[clap(help = "Recursively apply permissions to all files and directories")]
+        recursive: bool,
+    },
+
     /// Get block location information for a file
     Blocks {
         #[clap(help = "Path to get block location information")]
@@ -300,6 +310,15 @@ impl FsCommand {
                     destination: dst_path.clone(),
                 };
                 mv_cmd.execute(client).await
+            }
+
+            FsSubCommand::Chmod { mode, path, recursive } => {
+                let chmod_cmd = ChmodCommand::Chmod {
+                    mode: mode.clone(),
+                    path: path.clone(),
+                    recursive: *recursive,
+                };
+                chmod_cmd.execute(client).await
             }
 
             FsSubCommand::Blocks { path, format } => {
