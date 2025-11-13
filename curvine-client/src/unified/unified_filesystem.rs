@@ -30,6 +30,8 @@ use orpc::runtime::Runtime;
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
 
+use crate::timed_operation;
+
 #[derive(Clone, Copy, PartialOrd, PartialEq, Debug)]
 enum CacheValidity {
     Valid,
@@ -232,22 +234,21 @@ impl UnifiedFileSystem {
 
 impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     async fn mkdir(&self, path: &Path, create_parent: bool) -> FsResult<bool> {
-        match self.get_mount(path).await? {
-            None => self.cv.mkdir(path, create_parent).await,
-            Some((ufs_path, mount)) => mount.ufs.mkdir(&ufs_path, create_parent).await,
-        }
+        timed_operation!(self, "mkdir", {
+            match self.get_mount(path).await? {
+                None => self.cv.mkdir(path, create_parent).await,
+                Some((ufs_path, mount)) => mount.ufs.mkdir(&ufs_path, create_parent).await,
+            }
+        })
     }
 
-    // In the UFS storage system, "create" only contains the semantics of "create".
-    // Curvine supports random writes, and "create" contains the semantics of both creating and opening existing files.
-    // To maintain API compatibility, the method name uses "create" to maintain compatibility.
     async fn create(&self, path: &Path, overwrite: bool) -> FsResult<UnifiedWriter> {
-        match self.get_mount(path).await? {
-            None => Ok(UnifiedWriter::Cv(
-                self.cv.open_for_write(path, overwrite).await?,
-            )),
-            Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, overwrite).await,
-        }
+        timed_operation!(self, "create", {
+            match self.get_mount(path).await? {
+                None => Ok(UnifiedWriter::Cv(self.cv.create(path, overwrite).await?)),
+                Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, overwrite).await,
+            }
+        })
     }
 
     async fn append(&self, path: &Path) -> FsResult<UnifiedWriter> {
@@ -258,13 +259,24 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
-        match self.get_mount(path).await? {
-            None => self.cv.exists(path).await,
-            Some((ufs_path, mount)) => mount.ufs.exists(&ufs_path).await,
-        }
+        timed_operation!(self, "exists", {
+            match self.get_mount(path).await? {
+                None => self.cv.exists(path).await,
+                Some((ufs_path, mount)) => mount.ufs.exists(&ufs_path).await,
+            }
+        })
     }
 
     async fn open(&self, path: &Path) -> FsResult<UnifiedReader> {
+        let path_parts: Vec<&str> = path.path().split('/').filter(|s| !s.is_empty()).collect();
+        let max_depth = path_parts.len().min(3);
+
+        let aggregated_path = ClientMetrics::aggregate_path(path.path(), max_depth);
+        self.metrics
+            .path_access_count
+            .with_label_values(&[&aggregated_path])
+            .inc();
+
         let (ufs_path, mount) = match self.get_mount(path).await? {
             None => return Ok(UnifiedReader::Cv(self.cv.open(path).await?)),
             Some(v) => v,
@@ -283,11 +295,23 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 .with_label_values(&[mount.mount_id()])
                 .inc();
 
+            let aggregated_path = ClientMetrics::aggregate_path(path.path(), max_depth);
+            self.metrics
+                .path_cache_hits
+                .with_label_values(&[&aggregated_path])
+                .inc();
+
             return Ok(UnifiedReader::Cv(self.cv.open(path).await?));
         } else {
             self.metrics
                 .mount_cache_misses
                 .with_label_values(&[mount.mount_id()])
+                .inc();
+
+            let aggregated_path = ClientMetrics::aggregate_path(path.path(), max_depth);
+            self.metrics
+                .path_cache_misses
+                .with_label_values(&[&aggregated_path])
                 .inc();
         }
 
@@ -311,78 +335,92 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
-        match self.get_mount(src).await? {
-            None => self.cv.rename(src, dst).await,
-            Some((src_ufs, mount)) => {
-                let dst_ufs = mount.get_ufs_path(dst)?;
-                let _ = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
+        timed_operation!(self, "rename", {
+            match self.get_mount(src).await? {
+                None => self.cv.rename(src, dst).await,
+                Some((src_ufs, mount)) => {
+                    let dst_ufs = mount.get_ufs_path(dst)?;
+                    let _ = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
 
-                if self.cv.exists(src).await? {
-                    self.cv.delete(src, true).await?;
+                    if self.cv.exists(src).await? {
+                        self.cv.delete(src, true).await?;
+                    }
+
+                    Ok(true)
                 }
-
-                Ok(true)
             }
-        }
+        })
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
-        match self.get_mount(path).await? {
-            None => self.cv.delete(path, recursive).await,
-            Some((ufs_path, mount)) => {
-                // delete cache
-                if self.cv.exists(path).await? {
-                    self.cv.delete(path, recursive).await?;
-                }
+        timed_operation!(self, "delete", {
+            match self.get_mount(path).await? {
+                None => self.cv.delete(path, recursive).await,
+                Some((ufs_path, mount)) => {
+                    // delete cache
+                    if self.cv.exists(path).await? {
+                        self.cv.delete(path, recursive).await?;
+                    }
 
-                // delete ufs
-                mount.ufs.delete(&ufs_path, recursive).await
+                    // delete ufs
+                    mount.ufs.delete(&ufs_path, recursive).await
+                }
             }
-        }
+        })
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
-        match self.get_mount(path).await? {
-            None => self.cv.get_status(path).await,
-            Some((ufs_path, mount)) => {
-                if mount.info.cv_path == path.path() {
-                    return self.cv.get_status(path).await;
+        timed_operation!(self, "get_status", {
+            match self.get_mount(path).await? {
+                None => self.cv.get_status(path).await,
+                Some((ufs_path, mount)) => {
+                    if mount.info.cv_path == path.path() {
+                        return self.cv.get_status(path).await;
+                    }
+                    mount.ufs.get_status(&ufs_path).await
                 }
-                mount.ufs.get_status(&ufs_path).await
             }
-        }
+        })
     }
 
     async fn get_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
-        match self.get_mount(path).await? {
-            None => self.cv.get_status_bytes(path).await,
-            Some((ufs_path, mount)) => {
-                if mount.info.cv_path == path.path() {
-                    return self.cv.get_status_bytes(path).await;
+        timed_operation!(self, "get_status_bytes", {
+            match self.get_mount(path).await? {
+                None => self.cv.get_status_bytes(path).await,
+                Some((ufs_path, mount)) => {
+                    if mount.info.cv_path == path.path() {
+                        return self.cv.get_status_bytes(path).await;
+                    }
+                    mount.ufs.get_status_bytes(&ufs_path).await
                 }
-                mount.ufs.get_status_bytes(&ufs_path).await
             }
-        }
+        })
     }
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
-        match self.get_mount(path).await? {
-            None => self.cv.list_status(path).await,
-            Some((ufs_path, mount)) => mount.ufs.list_status(&ufs_path).await,
-        }
+        timed_operation!(self, "list_status", {
+            match self.get_mount(path).await? {
+                None => self.cv.list_status(path).await,
+                Some((ufs_path, mount)) => mount.ufs.list_status(&ufs_path).await,
+            }
+        })
     }
 
     async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
-        match self.get_mount(path).await? {
-            None => self.cv.list_status_bytes(path).await,
-            Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
-        }
+        timed_operation!(self, "list_status_bytes", {
+            match self.get_mount(path).await? {
+                None => self.cv.list_status_bytes(path).await,
+                Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
+            }
+        })
     }
 
     async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
-        match self.get_mount(path).await? {
-            None => self.cv.set_attr(path, opts).await,
-            Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
-        }
+        timed_operation!(self, "set_attr", {
+            match self.get_mount(path).await? {
+                None => self.cv.set_attr(path, opts).await,
+                Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
+            }
+        })
     }
 }

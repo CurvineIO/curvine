@@ -18,7 +18,7 @@ use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileBlocks, FileStatus};
 use curvine_common::FsResult;
 use log::{info, warn};
-use orpc::common::ByteUnit;
+use orpc::common::{ByteUnit, TimeSpent};
 use orpc::sys::DataSlice;
 use orpc::{err_box, ternary};
 use std::sync::Arc;
@@ -98,7 +98,14 @@ impl Writer for FsWriter {
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
         let len = chunk.len();
+
+        let spend = TimeSpent::new();
         self.inner.write(chunk).await?;
+        let used = spend.used_us();
+
+        FsContext::get_metrics().write_bytes.inc_by(len as i64);
+        FsContext::get_metrics().write_time_us.inc_by(used as i64);
+
         Ok(len as i64)
     }
 
