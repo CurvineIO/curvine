@@ -82,7 +82,15 @@ impl InodeFile {
             replicas: opts.replicas,
 
             storage_policy: opts.storage_policy,
-            features: FileFeature::new(),
+            features: FileFeature {
+                x_attr: Default::default(),
+                file_write: None,
+                acl: AclFeature {
+                    mode: opts.mode,
+                    owner: opts.owner,
+                    group: opts.group,
+                },
+            },
 
             blocks: vec![],
             nlink: 1,

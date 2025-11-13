@@ -739,7 +739,7 @@ impl FsDir {
         self.store.get_mount_point(id)
     }
 
-    pub fn set_attr(&mut self, inp: InodePath, opts: SetAttrOpts) -> FsResult<()> {
+    pub fn set_attr(&mut self, inp: InodePath, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let op_ms = LocalTime::mills();
 
         let inode = match inp.get_last_inode() {
@@ -747,9 +747,9 @@ impl FsDir {
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
-        self.unprotected_set_attr(inode, opts.clone())?;
+        self.unprotected_set_attr(inode.clone(), opts.clone())?;
         self.journal_writer.log_set_attr(op_ms, &inp, opts)?;
-        Ok(())
+        Ok(inode.to_file_status(inp.path()))
     }
 
     pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {

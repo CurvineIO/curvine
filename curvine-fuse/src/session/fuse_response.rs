@@ -112,9 +112,7 @@ impl FuseResponse {
 
             Err(e) => {
                 let e = e.into();
-                if self.debug {
-                    warn!("send_rep unique {}: {:?}", self.unique, e);
-                }
+                warn!("send_rep unique {}: {:?}", self.unique, e);
                 ResponseData::create(self.unique, e.errno, vec![])
             }
         };
@@ -132,9 +130,7 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                if self.debug {
-                    warn!("send_buf unique {}: {}", self.unique, e);
-                }
+                warn!("send_buf unique {}: {}", self.unique, e);
                 ResponseData::create(self.unique, e.errno, vec![])
             }
         };
@@ -153,9 +149,7 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                if self.debug {
-                    warn!("send_data unique {}: {}", self.unique, e);
-                }
+                warn!("send_data unique {}: {}", self.unique, e);
                 ResponseData::create(self.unique, e.errno, vec![])
             }
         };

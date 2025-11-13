@@ -96,8 +96,11 @@ impl MasterHandler {
         ctx.set_audit(Some(header.path.to_string()), None);
 
         let opts = ProtoUtils::mkdir_opts_from_pb(header.opts);
-        let flag = self.fs.mkdir_with_opts(&header.path, opts)?;
-        let rep_header = MkdirResponse { flag };
+        let status = self.fs.mkdir_with_opts(&header.path, opts)?;
+        let rep_header = MkdirResponse {
+            status: ProtoUtils::file_status_to_pb(status),
+            ..Default::default()
+        };
         ctx.response(rep_header)
     }
 
@@ -386,9 +389,11 @@ impl MasterHandler {
 
         let header: SetAttrRequest = ctx.parse_header()?;
         let opts = ProtoUtils::set_attr_opts_from_pb(header.opts);
-        self.fs.set_attr(header.path, opts)?;
+        let status = self.fs.set_attr(header.path, opts)?;
 
-        ctx.response(SetAttrResponse::default())
+        ctx.response(SetAttrResponse {
+            status: ProtoUtils::file_status_to_pb(status),
+        })
     }
 
     fn symlink_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {

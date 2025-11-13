@@ -45,14 +45,14 @@ impl FsClient {
         self.context.clone()
     }
 
-    pub async fn mkdir(&self, path: &Path, opts: MkdirOpts) -> FsResult<bool> {
+    pub async fn mkdir(&self, path: &Path, opts: MkdirOpts) -> FsResult<FileStatus> {
         let header = MkdirRequest {
             path: path.encode(),
             opts: ProtoUtils::mkdir_opts_to_pb(opts),
         };
 
         let rep_header: MkdirResponse = self.rpc(RpcCode::Mkdir, header).await?;
-        Ok(rep_header.flag)
+        Ok(ProtoUtils::file_status_from_pb(rep_header.status))
     }
 
     pub async fn create(
@@ -344,13 +344,13 @@ impl FsClient {
         Ok(rep)
     }
 
-    pub async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
+    pub async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let req = SetAttrRequest {
             path: path.encode(),
             opts: ProtoUtils::set_attr_opts_to_pb(opts),
         };
-        let _: SetAttrResponse = self.rpc(RpcCode::SetAttr, req).await?;
-        Ok(())
+        let rep: SetAttrResponse = self.rpc(RpcCode::SetAttr, req).await?;
+        Ok(ProtoUtils::file_status_from_pb(rep.status))
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {

@@ -18,6 +18,7 @@ use aws_sdk_s3::Client;
 use aws_smithy_types::byte_stream::ByteStream;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use curvine_common::fs::{Path, Reader};
+use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
 use log::info;
 use orpc::common::ByteUnit;
@@ -38,6 +39,7 @@ pub struct S3Reader {
     len: i64,
     pos: i64,
     byte_stream: Option<ByteStream>,
+    status: FileStatus,
 }
 
 impl S3Reader {
@@ -72,6 +74,22 @@ impl S3Reader {
             Some(v) => v,
             None => return err_ufs!("S3 error: Missing content length"),
         };
+        let mtime = head_result
+            .last_modified
+            .map(|x| x.to_millis().unwrap_or(0))
+            .unwrap_or(0);
+
+        let status = FileStatus {
+            path: path.full_path().to_string(),
+            name: path.name().to_string(),
+            is_dir: false,
+            mtime,
+            is_complete: true,
+            len,
+            replicas: 1,
+            block_size: 4 * 1024 * 1024,
+            ..Default::default()
+        };
 
         info!(
             "Created S3Reader {}, len = {}",
@@ -88,6 +106,7 @@ impl S3Reader {
             len,
             pos: 0,
             byte_stream: None,
+            status,
         })
     }
 
@@ -125,6 +144,10 @@ impl S3Reader {
 }
 
 impl Reader for S3Reader {
+    fn status(&self) -> &FileStatus {
+        &self.status
+    }
+
     fn path(&self) -> &Path {
         &self.path
     }

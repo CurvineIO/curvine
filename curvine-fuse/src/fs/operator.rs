@@ -98,6 +98,14 @@ impl OpenAction {
     pub fn write(&self) -> bool {
         *self == Self::ReadWrite || *self == Self::WriteOnly
     }
+
+    pub fn acl_mask(&self) -> u32 {
+        match self {
+            OpenAction::ReadOnly => libc::R_OK as u32,
+            OpenAction::WriteOnly => libc::W_OK as u32,
+            OpenAction::ReadWrite => (libc::R_OK | libc::W_OK) as u32,
+        }
+    }
 }
 
 // View file and directory information. ls, ll command

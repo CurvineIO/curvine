@@ -18,6 +18,7 @@ use curvine_client::unified::UnifiedReader;
 use curvine_common::conf::FuseConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader};
+use curvine_common::state::FileStatus;
 use curvine_common::FsResult;
 use log::error;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -35,6 +36,7 @@ pub struct FuseReader {
     len: i64,
     sender: AsyncSender<ReadTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
+    status: FileStatus,
 }
 
 impl FuseReader {
@@ -43,6 +45,7 @@ impl FuseReader {
         let len = reader.len();
         let err_monitor = Arc::new(ErrorMonitor::new());
         let (sender, receiver) = AsyncChannel::new(conf.stream_channel_size).split();
+        let status = reader.status().clone();
 
         let monitor = err_monitor.clone();
         rt.spawn(async move {
@@ -62,6 +65,7 @@ impl FuseReader {
             len,
             sender,
             err_monitor,
+            status,
         }
     }
 
@@ -75,6 +79,10 @@ impl FuseReader {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub fn status(&self) -> &FileStatus {
+        &self.status
     }
 
     fn check_error(&self, e: FsError) -> FsError {

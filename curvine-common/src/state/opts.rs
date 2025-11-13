@@ -15,6 +15,7 @@
 use crate::conf::ClientConf;
 use crate::state::*;
 use orpc::common::ByteUnit;
+use orpc::sys;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -28,6 +29,8 @@ pub struct CreateFileOpts {
     pub storage_policy: StoragePolicy,
     pub mode: u32,
     pub client_name: String,
+    pub owner: String,
+    pub group: String,
 }
 
 impl CreateFileOpts {
@@ -41,6 +44,8 @@ impl CreateFileOpts {
             create_parent,
             client_name: "".to_string(),
             mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
+            owner: "".to_string(),
+            group: "".to_string(),
         }
     }
 
@@ -50,6 +55,8 @@ impl CreateFileOpts {
             x_attr: HashMap::default(),
             storage_policy: StoragePolicy::default(),
             mode: self.mode,
+            owner: self.owner.clone(),
+            group: self.group.clone(),
         }
     }
 }
@@ -64,6 +71,8 @@ pub struct CreateFileOptsBuilder {
     storage_policy: StoragePolicy,
     mode: u32,
     client_name: Option<String>,
+    pub owner: String,
+    pub group: String,
 }
 
 impl Default for CreateFileOptsBuilder {
@@ -83,6 +92,8 @@ impl CreateFileOptsBuilder {
             storage_policy: StoragePolicy::default(),
             mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
             client_name: None,
+            owner: "".to_string(),
+            group: "".to_string(),
         }
     }
 
@@ -101,6 +112,8 @@ impl CreateFileOptsBuilder {
             },
             mode: conf.get_mode(),
             client_name: None,
+            owner: "".to_string(),
+            group: "".to_string(),
         }
     }
 
@@ -159,6 +172,23 @@ impl CreateFileOptsBuilder {
         self
     }
 
+    pub fn owner(mut self, owner: String) -> Self {
+        self.owner = owner;
+        self
+    }
+
+    pub fn group(mut self, group: String) -> Self {
+        self.group = group;
+        self
+    }
+
+    pub fn acl(mut self, uid: u32, gid: u32, mode: u32) -> Self {
+        self.owner = sys::get_username_by_uid(uid).unwrap_or("".to_string());
+        self.group = sys::get_groupname_by_gid(gid).unwrap_or("".to_string());
+        self.mode = mode;
+        self
+    }
+
     pub fn build(self) -> CreateFileOpts {
         CreateFileOpts {
             create_parent: self.create_parent,
@@ -169,6 +199,8 @@ impl CreateFileOptsBuilder {
             storage_policy: self.storage_policy,
             mode: self.mode,
             client_name: self.client_name.unwrap_or_default(),
+            owner: self.owner,
+            group: self.group,
         }
     }
 }
@@ -179,6 +211,8 @@ pub struct MkdirOpts {
     pub x_attr: HashMap<String, Vec<u8>>,
     pub storage_policy: StoragePolicy,
     pub mode: u32,
+    pub owner: String,
+    pub group: String,
 }
 
 impl MkdirOpts {
@@ -188,6 +222,8 @@ impl MkdirOpts {
             x_attr: HashMap::default(),
             storage_policy: StoragePolicy::default(),
             mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
+            owner: "".to_string(),
+            group: "".to_string(),
         }
     }
 
@@ -197,6 +233,8 @@ impl MkdirOpts {
             x_attr: HashMap::default(),
             storage_policy: StoragePolicy::default(),
             mode: self.mode,
+            owner: self.owner.clone(),
+            group: self.group.clone(),
         }
     }
 }
@@ -206,6 +244,8 @@ pub struct MkdirOptsBuilder {
     x_attr: HashMap<String, Vec<u8>>,
     storage_policy: StoragePolicy,
     mode: u32,
+    pub owner: String,
+    pub group: String,
 }
 
 impl Default for MkdirOptsBuilder {
@@ -221,6 +261,8 @@ impl MkdirOptsBuilder {
             x_attr: HashMap::new(),
             storage_policy: StoragePolicy::default(),
             mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
+            owner: "".to_string(),
+            group: "".to_string(),
         }
     }
 
@@ -235,6 +277,8 @@ impl MkdirOptsBuilder {
                 ..Default::default()
             },
             mode: conf.get_mode(),
+            owner: "".to_string(),
+            group: "".to_string(),
         }
     }
 
@@ -263,12 +307,36 @@ impl MkdirOptsBuilder {
         self
     }
 
+    pub fn mode(mut self, mode: u32) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn owner(mut self, owner: String) -> Self {
+        self.owner = owner;
+        self
+    }
+
+    pub fn group(mut self, group: String) -> Self {
+        self.group = group;
+        self
+    }
+
+    pub fn acl(mut self, uid: u32, gid: u32, mode: u32) -> Self {
+        self.owner = sys::get_username_by_uid(uid).unwrap_or("".to_string());
+        self.group = sys::get_groupname_by_gid(gid).unwrap_or("".to_string());
+        self.mode = mode;
+        self
+    }
+
     pub fn build(self) -> MkdirOpts {
         MkdirOpts {
             create_parent: self.create_parent,
             x_attr: self.x_attr,
             storage_policy: self.storage_policy,
             mode: self.mode,
+            owner: self.owner,
+            group: self.group,
         }
     }
 }

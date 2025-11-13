@@ -463,6 +463,8 @@ impl ProtoUtils {
             storage_policy: ProtoUtils::storage_policy_to_pb(opts.storage_policy),
             client_name: client_name.into(),
             mode: opts.mode,
+            owner: opts.owner,
+            group: opts.group,
         }
     }
 
@@ -476,6 +478,8 @@ impl ProtoUtils {
             storage_policy: ProtoUtils::storage_policy_from_pb(opts.storage_policy),
             mode: opts.mode,
             client_name: opts.client_name,
+            owner: opts.owner,
+            group: opts.group,
         }
     }
 
@@ -485,6 +489,8 @@ impl ProtoUtils {
             x_attr: opts.x_attr,
             storage_policy: ProtoUtils::storage_policy_to_pb(opts.storage_policy),
             mode: opts.mode,
+            owner: opts.owner,
+            group: opts.group,
         }
     }
 
@@ -494,6 +500,8 @@ impl ProtoUtils {
             x_attr: opts.x_attr,
             storage_policy: ProtoUtils::storage_policy_from_pb(opts.storage_policy),
             mode: opts.mode,
+            owner: opts.owner,
+            group: opts.group,
         }
     }
 

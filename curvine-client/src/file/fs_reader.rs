@@ -14,7 +14,7 @@
 
 use crate::file::{FsContext, FsReaderBuffer};
 use curvine_common::fs::{Path, Reader};
-use curvine_common::state::FileBlocks;
+use curvine_common::state::{FileBlocks, FileStatus};
 use curvine_common::FsResult;
 use log::info;
 use orpc::common::ByteUnit;
@@ -30,6 +30,7 @@ pub struct FsReader {
     chunk_size: usize,
     pos: i64,
     len: i64,
+    status: FileStatus,
 }
 
 impl FsReader {
@@ -37,6 +38,8 @@ impl FsReader {
         let chunk_size = fs_context.read_chunk_size();
         let len = file_blocks.status.len;
         let conf = &fs_context.conf.client;
+        let status = file_blocks.status.clone();
+
         info!(
             "Create reader, path={}, len={}, blocks={}, chunk_size={}, chunk_number={}, read_parallel={}, slice_size={}, read_ahead={}-{}",
             &file_blocks.status.path,
@@ -57,12 +60,17 @@ impl FsReader {
             chunk_size,
             pos: 0,
             len,
+            status,
         };
         Ok(reader)
     }
 }
 
 impl Reader for FsReader {
+    fn status(&self) -> &FileStatus {
+        &self.status
+    }
+
     fn path(&self) -> &Path {
         self.inner.path()
     }

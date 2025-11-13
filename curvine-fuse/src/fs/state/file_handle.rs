@@ -32,6 +32,7 @@ pub struct FileHandle {
 
     pub reader: Option<RawPtr<FuseReader>>,
     pub writer: Option<Arc<Mutex<FuseWriter>>>, // Writer uses Arc for global sharing
+    pub status: FileStatus,
 }
 
 impl FileHandle {
@@ -40,6 +41,7 @@ impl FileHandle {
         fh: u64,
         reader: Option<RawPtr<FuseReader>>,
         writer: Option<Arc<Mutex<FuseWriter>>>,
+        status: FileStatus,
     ) -> Self {
         Self {
             ino,
@@ -49,6 +51,7 @@ impl FileHandle {
             ofd_owner: 0,
             reader,
             writer,
+            status,
         }
     }
 
@@ -116,11 +119,7 @@ impl FileHandle {
         Ok(())
     }
 
-    pub async fn status(&self) -> FuseResult<FileStatus> {
-        if let Some(writer) = &self.writer {
-            return Ok(writer.lock().await.status().clone());
-        } else {
-            err_fuse!(libc::EIO)
-        }
+    pub fn status(&self) -> &FileStatus {
+        &self.status
     }
 }

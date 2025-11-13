@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::err_ufs;
 use crate::OpendalConf;
+use crate::{err_ufs, UfsUtils};
 use bytes::BytesMut;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
@@ -23,7 +23,7 @@ use futures::StreamExt;
 use opendal::services::*;
 use opendal::{
     layers::{LoggingLayer, RetryLayer, TimeoutLayer},
-    Operator,
+    Metadata, Operator,
 };
 use orpc::sys::DataSlice;
 use std::collections::HashMap;
@@ -39,9 +39,14 @@ pub struct OpendalReader {
     chunk: DataSlice,
     chunk_size: usize,
     byte_stream: Option<opendal::FuturesBytesStream>,
+    status: FileStatus,
 }
 
 impl Reader for OpendalReader {
+    fn status(&self) -> &FileStatus {
+        &self.status
+    }
+
     fn path(&self) -> &Path {
         &self.path
     }
@@ -597,6 +602,36 @@ impl OpendalFileSystem {
             )
         })
     }
+
+    pub fn write_status(path: &Path) -> FileStatus {
+        FileStatus {
+            path: path.full_path().to_owned(),
+            name: path.name().to_owned(),
+            is_dir: false,
+            is_complete: false,
+            replicas: 1,
+            block_size: 4 * 1024 * 1024,
+            file_type: FileType::File,
+            ..Default::default()
+        }
+    }
+
+    pub fn read_status(path: &Path, metadata: Metadata) -> FileStatus {
+        FileStatus {
+            path: path.full_path().to_owned(),
+            name: path.name().to_owned(),
+            is_dir: metadata.is_dir(),
+            mtime: metadata
+                .last_modified()
+                .map(|t| t.timestamp_millis())
+                .unwrap_or(0),
+            is_complete: true,
+            len: metadata.content_length() as i64,
+            replicas: 1,
+            block_size: 4 * 1024 * 1024,
+            ..Default::default()
+        }
+    }
 }
 
 impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
@@ -620,19 +655,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         let object_path = self.get_object_path(path)?;
         // Debug: Creating file
 
-        let status = FileStatus {
-            path: path.full_path().to_owned(),
-            name: path.name().to_owned(),
-            is_dir: false,
-            mtime: 0,
-            is_complete: false,
-            len: 0,
-            replicas: 1,
-            block_size: 4 * 1024 * 1024,
-            file_type: FileType::File,
-            ..Default::default()
-        };
-
+        let status = Self::write_status(path);
         Ok(OpendalWriter {
             operator: self.operator.clone(),
             path: path.clone(),
@@ -671,16 +694,18 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             .stat(&object_path)
             .await
             .map_err(|e| FsError::common(format!("Failed to stat file: {}", e)))?;
+        let status = Self::read_status(path, metadata);
 
         Ok(OpendalReader {
             operator: self.operator.clone(),
             path: path.clone(),
             object_path,
-            length: metadata.content_length() as i64,
+            length: status.len,
             pos: 0,
             chunk: DataSlice::Empty,
             chunk_size: 8 * 1024 * 1024,
             byte_stream: None,
+            status,
         })
     }
 

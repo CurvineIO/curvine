@@ -57,7 +57,11 @@ impl InodeDir {
             atime: time,
             storage_policy: opts.storage_policy,
             features: DirFeature {
-                acl: AclFeature::with_mode(opts.mode),
+                acl: AclFeature {
+                    mode: opts.mode,
+                    owner: opts.owner,
+                    group: opts.group,
+                },
                 x_attr: opts.x_attr,
             },
             children: InodeChildren::new_map(),
