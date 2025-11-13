@@ -398,8 +398,6 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
-        tracing::info!("list_status");
-        print!("list_status");
         timed_operation!(self, "list_status", {
             match self.get_mount(path).await? {
                 None => self.cv.list_status(path).await,
