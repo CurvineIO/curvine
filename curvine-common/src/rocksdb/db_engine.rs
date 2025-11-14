@@ -288,6 +288,27 @@ impl DBEngine {
         format!("{}/ck-{}", self.conf.checkpoint_dir, id)
     }
 
+    pub fn get_rocksdb_memory(&self) -> CommonResult<Vec<(String, u64)>> {
+        let mut memory_info = Vec::with_capacity(4);
+
+        let properties = [
+            ("rocksdb.cur-size-all-mem-tables", "mem-tables"),
+            ("rocksdb.block-cache-usage", "block-cache"),
+            ("rocksdb.block-cache-pinned-usage", "block-cache-pinned"),
+            ("rocksdb.estimate-table-readers-mem", "table-readers"),
+        ];
+
+        for (property, name) in properties {
+            if let Some(value) = self.db.property_value(property)? {
+                if let Ok(size) = value.parse::<u64>() {
+                    memory_info.push((name.to_string(), size));
+                }
+            }
+        }
+
+        Ok(memory_info)
+    }
+
     pub fn conf(&self) -> &DBConf {
         &self.conf
     }

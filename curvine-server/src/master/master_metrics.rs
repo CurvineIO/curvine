@@ -41,6 +41,7 @@ pub struct MasterMetrics {
     pub(crate) journal_flush_time: Counter,
 
     pub(crate) used_memory_bytes: Gauge,
+    pub(crate) rocksdb_used_memory_bytes: GaugeVec,
 
     pub(crate) inode_dir_num: Gauge,
     pub(crate) inode_file_num: Gauge,
@@ -86,6 +87,11 @@ impl MasterMetrics {
             journal_flush_time: m::new_counter("journal_flush_time", "Log entry flush time")?,
 
             used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
+            rocksdb_used_memory_bytes: m::new_gauge_vec(
+                "rocksdb_used_memory_bytes",
+                "RocksDB memory usage in bytes",
+                &["tag"],
+            )?,
 
             inode_dir_num: m::new_gauge("inode_dir_num", "Total dir")?,
 
@@ -126,6 +132,15 @@ impl MasterMetrics {
         if master_info.block_num > 0 {
             let avg_size = master_info.fs_used / master_info.block_num;
             self.blocks_size_avg.set(avg_size);
+        }
+
+        let fs_dir = fs.fs_dir.read();
+        if let Ok(memory_info) = fs_dir.get_rocks_store().get_rocksdb_memory() {
+            for (component, size) in memory_info {
+                self.rocksdb_used_memory_bytes
+                    .with_label_values(&[&component])
+                    .set(size as i64);
+            }
         }
 
         self.worker_num

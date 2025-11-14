@@ -173,6 +173,10 @@ impl RocksInodeStore {
 
         Ok(vec)
     }
+
+    pub fn get_rocksdb_memory(&self) -> CommonResult<Vec<(String, u64)>> {
+        self.db.get_rocksdb_memory()
+    }
 }
 
 pub struct InodeChildrenIter<'a> {
