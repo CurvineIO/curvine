@@ -4,9 +4,10 @@ use orpc::CommonResult;
 use std::path::PathBuf;
 
 use crate::cmds::fs::{
-    blocks::BlocksCommand, cat::CatCommand, chmod::ChmodCommand, count::CountCommand,
-    df::DfCommand, du::DuCommand, get::GetCommand, ls::LsCommand, mkdir::MkdirCommand,
-    mv::MvCommand, put::PutCommand, rm::RmCommand, stat::StatCommand, touch::TouchCommand,
+    blocks::BlocksCommand, cat::CatCommand, chmod::ChmodCommand, chown::ChownCommand,
+    count::CountCommand, df::DfCommand, du::DuCommand, get::GetCommand, ls::LsCommand,
+    mkdir::MkdirCommand, mv::MvCommand, put::PutCommand, rm::RmCommand, stat::StatCommand,
+    touch::TouchCommand,
 };
 
 #[derive(Parser, Debug)]
@@ -183,6 +184,16 @@ pub enum FsSubCommand {
         recursive: bool,
     },
 
+    /// chown file or directory
+    Chown {
+        #[clap(help = "Owner/Group to set in format owner:group")]
+        owner_group: String,
+        #[clap(help = "Path of the file/directory to modify")]
+        path: String,
+        #[clap(help = "Recursively apply ownership to all files and directories")]
+        recursive: bool,
+    },
+
     /// Get block location information for a file
     Blocks {
         #[clap(help = "Path to get block location information")]
@@ -323,6 +334,19 @@ impl FsCommand {
                     recursive: *recursive,
                 };
                 chmod_cmd.execute(client).await
+            }
+
+            FsSubCommand::Chown {
+                owner_group,
+                path,
+                recursive,
+            } => {
+                let chown_cmd = ChownCommand::Chown {
+                    owner_group: owner_group.clone(),
+                    path: path.clone(),
+                    recursive: *recursive,
+                };
+                chown_cmd.execute(client).await
             }
 
             FsSubCommand::Blocks { path, format } => {

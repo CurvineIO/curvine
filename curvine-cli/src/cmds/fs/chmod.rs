@@ -6,7 +6,6 @@ use orpc::CommonResult;
 
 #[derive(Subcommand, Debug)]
 pub enum ChmodCommand {
-    /// Display file contents
     Chmod {
         #[clap(help = "Permissions to set (e.g., 755)")]
         mode: String,
