@@ -49,12 +49,12 @@ impl WorkerMetrics {
             store,
 
             write_bytes: m::new_counter("worker_write_bytes", "worker writes total bytes")?,
-            write_time_us: m::new_counter("worker_write_time_us", "Milliseconds spent writing")?,
+            write_time_us: m::new_counter("worker_write_time_us", "Microseconds spent writing")?,
             write_count: m::new_counter("write_count", "Number of writes")?,
             write_blocks: m::new_counter_vec("worker_write_blocks", "write_blocks", &["type"])?,
 
             read_bytes: m::new_counter("worker_read_bytes", "worker read total bytes")?,
-            read_time_us: m::new_counter("worker_read_time_us", "Milliseconds spent read")?,
+            read_time_us: m::new_counter("worker_read_time_us", "Microseconds spent read")?,
             read_count: m::new_counter("read_count", "Number of reads")?,
             read_blocks: m::new_counter_vec("worker_read_blocks", "read_blocks", &["type"])?,
 
