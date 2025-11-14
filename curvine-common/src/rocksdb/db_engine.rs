@@ -300,8 +300,11 @@ impl DBEngine {
 
         for (property, name) in properties {
             if let Some(value) = self.db.property_value(property)? {
-                if let Ok(size) = value.parse::<u64>() {
-                    memory_info.push((name.to_string(), size));
+                match value.parse::<u64>() {
+                    Ok(size) => memory_info.push((name.to_string(), size)),
+                    Err(e) => {
+                        log::error!("Failed to parse property value: {}", e);
+                    }
                 }
             }
         }
