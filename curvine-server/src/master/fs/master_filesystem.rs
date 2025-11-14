@@ -84,7 +84,7 @@ impl MasterFilesystem {
         fs_dir.print_tree();
     }
 
-    pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<bool> {
+    pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
@@ -94,7 +94,7 @@ impl MasterFilesystem {
         }
 
         if inp.is_full() {
-            return Ok(true);
+            return err_ext!(FsError::file_exists(inp.path()));
         }
 
         // Check whether the directory can be created recursively.
@@ -102,11 +102,13 @@ impl MasterFilesystem {
             Self::check_parent(&inp)?;
         }
 
-        let _ = fs_dir.mkdir(inp, opts)?;
-        Ok(true)
+        let inp = fs_dir.mkdir(inp, opts)?;
+        let last = try_option!(inp.get_last_inode());
+        let status = last.to_file_status(inp.path());
+        Ok(status)
     }
 
-    pub fn mkdir<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<bool> {
+    pub fn mkdir<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
         let opts = MkdirOpts::with_create(create_parent);
         self.mkdir_with_opts(path, opts)
     }
@@ -604,7 +606,7 @@ impl MasterFilesystem {
         fs_dir.delete_locations(worker_id)
     }
 
-    pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<()> {
+    pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         fs_dir.set_attr(inp, opts)

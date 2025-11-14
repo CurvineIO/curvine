@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::{FsClient, FsContext, FsReader, FsReaderBase, FsWriter};
+use crate::file::{FsClient, FsContext, FsReader, FsWriter};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
@@ -78,7 +78,7 @@ impl CurvineFileSystem {
         self.fs_context.rpc_conf()
     }
 
-    pub async fn mkdir_with_opts(&self, path: &Path, opts: MkdirOpts) -> FsResult<bool> {
+    pub async fn mkdir_with_opts(&self, path: &Path, opts: MkdirOpts) -> FsResult<FileStatus> {
         self.fs_client.mkdir(path, opts).await
     }
 
@@ -86,7 +86,16 @@ impl CurvineFileSystem {
         let opts = MkdirOptsBuilder::with_conf(&self.fs_context.conf.client)
             .create_parent(create_parent)
             .build();
-        self.mkdir_with_opts(path, opts).await
+        match self.mkdir_with_opts(path, opts).await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if matches!(e, FsError::FileAlreadyExists(_)) {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     pub async fn create_with_opts(
@@ -117,18 +126,7 @@ impl CurvineFileSystem {
     pub async fn append(&self, path: &Path) -> FsResult<FsWriter> {
         let opts = self.create_opts_builder().create_parent(false).build();
         let flags = OpenFlags::new_append().set_create(true);
-        let status = self.fs_client.open_with_opts(path, opts, flags).await?;
-        let writer = FsWriter::append(self.fs_context.clone(), path.clone(), status);
-        Ok(writer)
-    }
-
-    pub async fn open_with_opts(
-        &self,
-        path: &Path,
-        opts: CreateFileOpts,
-        flags: OpenFlags,
-    ) -> FsResult<FileBlocks> {
-        self.fs_client.open_with_opts(path, opts, flags).await
+        self.open_with_opts(path, opts, flags).await
     }
 
     pub async fn exists(&self, path: &Path) -> FsResult<bool> {
@@ -155,34 +153,27 @@ impl CurvineFileSystem {
         Ok(reader)
     }
 
-    pub async fn open_direct(&self, path: &Path) -> FsResult<FsReaderBase> {
-        let file_blocks = self.fs_client.get_block_locations(path).await?;
-        Self::check_read_status(path, &file_blocks)?;
-
-        let reader = FsReaderBase::new(path.clone(), self.fs_context.clone(), file_blocks);
-        Ok(reader)
-    }
-
-    pub async fn open_for_read(&self, path: &Path) -> FsResult<FsReader> {
-        let create_opts = self.create_opts_builder().build();
-
-        let file_blocks = self
-            .open_with_opts(path, create_opts, OpenFlags::new_read_only())
-            .await?;
-        Self::check_read_status(path, &file_blocks)?;
-
-        let reader = FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)?;
-        Ok(reader)
-    }
-
     pub async fn open_for_write(&self, path: &Path, overwrite: bool) -> FsResult<FsWriter> {
         let create_opts = self.create_opts_builder().create_parent(true).build();
-
         let flags = OpenFlags::new_write_only()
             .set_create(true)
             .set_overwrite(overwrite);
-        let file_blocks = self.open_with_opts(path, create_opts, flags).await?;
-        let writer = FsWriter::create(self.fs_context.clone(), path.clone(), file_blocks);
+        self.open_with_opts(path, create_opts, flags).await
+    }
+
+    pub async fn open_with_opts(
+        &self,
+        path: &Path,
+        opts: CreateFileOpts,
+        flags: OpenFlags,
+    ) -> FsResult<FsWriter> {
+        let file_block = self.fs_client.open_with_opts(path, opts, flags).await?;
+        let writer = FsWriter::new(
+            self.fs_context.clone(),
+            path.clone(),
+            file_block,
+            flags.append(),
+        );
         Ok(writer)
     }
 
@@ -266,7 +257,7 @@ impl CurvineFileSystem {
         Ok(())
     }
 
-    pub async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
+    pub async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<FileStatus> {
         self.fs_client.set_attr(path, opts).await
     }
 

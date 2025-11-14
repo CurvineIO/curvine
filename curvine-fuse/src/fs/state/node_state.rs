@@ -20,7 +20,7 @@ use crate::{err_fuse, FuseResult};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{FileStatus, OpenFlags};
+use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
 use log::warn;
 use orpc::common::FastHashMap;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
@@ -118,7 +118,6 @@ impl NodeState {
 
         let mut attr = CurvineFileSystem::status_to_attr(&self.conf, status)?;
         attr.ino = node.id;
-        node.attr = attr.clone();
 
         if self.conf.auto_cache
             && node.cache_valid
@@ -129,14 +128,6 @@ impl NodeState {
             node.size = attr.size;
         }
         Ok(attr)
-    }
-
-    pub fn get_attr<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> FuseResult<fuse_attr> {
-        let map = self.node_read();
-        match map.lookup_node(parent, name) {
-            Some(v) => Ok(v.attr.clone()),
-            None => err_fuse!(libc::ENOENT),
-        }
     }
 
     // Peer-to-peer implementation of fuse.c forget_node
@@ -201,6 +192,7 @@ impl NodeState {
         ino: u64,
         path: &Path,
         flags: OpenFlags,
+        opts: CreateFileOpts,
     ) -> FuseResult<Arc<Mutex<FuseWriter>>> {
         let exists_writer = {
             let lock = self.handles.read();
@@ -211,11 +203,7 @@ impl NodeState {
             return Ok(writer);
         }
 
-        let writer = if flags.append() {
-            self.fs.append(path).await?
-        } else {
-            self.fs.create(path, flags.overwrite()).await?
-        };
+        let writer = self.fs.open_with_opts(path, opts, flags).await?;
         let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
         Ok(Arc::new(Mutex::new(writer)))
     }
@@ -231,6 +219,7 @@ impl NodeState {
         ino: u64,
         path: &Path,
         flags: u32,
+        opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
         let (reader, writer) = match flags.access_mode() {
@@ -240,12 +229,12 @@ impl NodeState {
             }
 
             mode if mode == OpenFlags::WRONLY => {
-                let writer = self.new_writer(ino, path, flags).await?;
+                let writer = self.new_writer(ino, path, flags, opts).await?;
                 (None, Some(writer))
             }
 
             mode if mode == OpenFlags::RDWR => {
-                let writer = self.new_writer(ino, path, flags).await?;
+                let writer = self.new_writer(ino, path, flags, opts).await?;
                 let reader = self.new_reader(path).await?;
                 (Some(RawPtr::from_owned(reader)), Some(writer))
             }
@@ -256,6 +245,15 @@ impl NodeState {
                     flags.access_mode()
                 );
             }
+        };
+
+        let status = if let Some(writer) = &writer {
+            let lock = writer.lock().await;
+            lock.status().clone()
+        } else if let Some(reader) = &reader {
+            reader.status().clone()
+        } else {
+            return err_fuse!(libc::EINVAL, "Invalid flags: {:?}", flags);
         };
 
         let mut lock = self.handles.write();
@@ -271,7 +269,13 @@ impl NodeState {
             None
         };
 
-        let handle = Arc::new(FileHandle::new(ino, self.next_fh(), reader, check_writer));
+        let handle = Arc::new(FileHandle::new(
+            ino,
+            self.next_fh(),
+            reader,
+            check_writer,
+            status,
+        ));
         lock.entry(handle.ino)
             .or_default()
             .insert(handle.fh, handle.clone());

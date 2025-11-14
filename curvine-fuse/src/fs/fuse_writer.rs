@@ -117,10 +117,8 @@ impl FuseWriter {
             match task {
                 WriteTask::Write(off, data, reply) => {
                     let res: FsResult<fuse_write_out> = {
-                        writer.seek(off).await?;
-
                         let len = data.len();
-                        writer.fuse_write(DataSlice::Bytes(data)).await?;
+                        writer.fuse_write(off, DataSlice::Bytes(data)).await?;
 
                         Ok(fuse_write_out {
                             size: len as u32,
