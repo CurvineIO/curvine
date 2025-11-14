@@ -147,6 +147,7 @@ impl WriteHandler {
             }
             self.metrics.write_bytes.inc_by(msg.data_len() as i64);
             self.metrics.write_time_us.inc_by(used as i64);
+            self.metrics.write_count.inc();
         }
 
         Ok(msg.success())
