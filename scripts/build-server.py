@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response
 import subprocess
 import threading
 import os
@@ -6,6 +6,8 @@ import json
 import glob
 import sys
 import argparse
+import shutil
+import re
 from datetime import datetime
 
 app = Flask(__name__)
@@ -24,9 +26,27 @@ dailytest_status = {
     'report_url': ''
 }
 
+# Coverage test status storage
+coverage_status = {
+    'status': 'idle',  # idle, testing, completed, failed
+    'message': '',
+    'test_dir': '',
+    'report_url': ''
+}
+
+# Regression test status storage
+regression_status = {
+    'status': 'idle',  # idle, testing, completed, failed
+    'message': '',
+    'test_dir': '',
+    'report_url': ''
+}
+
 # Create lock objects
 build_lock = threading.Lock()
 dailytest_lock = threading.Lock()
+coverage_lock = threading.Lock()
+regression_lock = threading.Lock()
 
 # Project path (global)
 PROJECT_PATH = None
@@ -69,18 +89,336 @@ def run_build_script(date, commit):
             build_status['status'] = 'failed'
             build_status['message'] = f'An error occurred: {str(e)}'
 
+def run_coverage_test(project_path, test_dir=None, update_status=None):
+    """Run coverage test using cargo llvm-cov and integrate results
+    
+    Args:
+        project_path: Path to the project root
+        test_dir: Test directory to store results (if None, creates new timestamped dir)
+        update_status: Status dict to update (if None, uses coverage_status)
+    """
+    status = update_status if update_status else coverage_status
+    
+    try:
+        print("Starting coverage test...")
+        if status:
+            status['message'] = 'Running coverage test...'
+        
+        # Change to project directory
+        original_cwd = os.getcwd()
+        os.chdir(project_path)
+        
+        # If test_dir is not provided, try to use latest test directory or create a new timestamped directory
+        if test_dir is None:
+            # Try to find the latest test directory first
+            latest_dir = find_latest_test_dir()
+            if latest_dir:
+                test_dir = latest_dir
+                print(f"Using latest test directory: {test_dir}")
+            else:
+                # Create a new timestamped directory (same format as unit tests)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                test_dir = os.path.join(TEST_RESULTS_DIR, timestamp)
+                os.makedirs(test_dir, exist_ok=True)
+                print(f"Created new test directory: {test_dir}")
+        
+        try:
+            # Check if cargo llvm-cov is available
+            check_process = subprocess.Popen(
+                ['cargo', 'llvm-cov', '--version'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            check_process.wait()
+            if check_process.returncode != 0:
+                error_msg = "cargo llvm-cov is not installed. Please install it with: cargo install cargo-llvm-cov"
+                print(f"Error: {error_msg}")
+                if status:
+                    status['status'] = 'failed'
+                    status['message'] = error_msg
+                return False
+            
+            # Run coverage test with JSON output for parsing
+            print("Running coverage test with JSON output...")
+            coverage_json_log = os.path.join(test_dir, 'coverage.json.log')
+            coverage_process = subprocess.Popen(
+                ['cargo', 'llvm-cov', 'test', '--workspace', '--json'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            
+            stdout, stderr = coverage_process.communicate()
+            
+            # Print stderr for debugging
+            if stderr:
+                print(f"Coverage test stderr: {stderr}")
+            
+            # Save coverage JSON output
+            with open(coverage_json_log, 'w', encoding='utf-8') as f:
+                f.write(stdout)
+                if stderr:
+                    f.write("\n\n=== STDERR ===\n")
+                    f.write(stderr)
+            
+            if coverage_process.returncode != 0:
+                error_msg = f"Coverage test failed with return code {coverage_process.returncode}. Check {coverage_json_log} for details."
+                print(f"Error: {error_msg}")
+                if status:
+                    status['status'] = 'failed'
+                    status['message'] = error_msg
+                return False
+            
+            # Parse coverage data from JSON
+            coverage_data = None
+            try:
+                if not stdout.strip():
+                    print("Warning: Coverage test produced no output")
+                    if status:
+                        status['status'] = 'failed'
+                        status['message'] = 'Coverage test produced no output'
+                    return False
+                
+                coverage_json = json.loads(stdout)
+                coverage_type = coverage_json.get('type', 'unknown')
+                print(f"Parsed coverage JSON, type: {coverage_type}")
+                
+                # Support both 'llvm-cov' and 'llvm.coverage.json.export' types
+                if coverage_type in ('llvm-cov', 'llvm.coverage.json.export'):
+                    data = coverage_json.get('data', [])
+                    if not data:
+                        print("Warning: Coverage JSON has no data")
+                        if status:
+                            status['status'] = 'failed'
+                            status['message'] = 'Coverage JSON has no data'
+                        return False
+                    
+                    totals = data[0].get('totals', {})
+                    lines_info = totals.get('lines', {})
+                    functions_info = totals.get('functions', {})
+                    regions_info = totals.get('regions', {})
+                    
+                    # For llvm.coverage.json.export, lines already has 'covered' and 'count'
+                    # For llvm-cov, we need to calculate from 'count' and 'uncovered_count'
+                    if coverage_type == 'llvm.coverage.json.export':
+                        lines_covered = lines_info.get('covered', 0)
+                        lines_total = lines_info.get('count', 0)
+                        functions_covered = functions_info.get('covered', 0)
+                        functions_total = functions_info.get('count', 0)
+                        regions_covered = regions_info.get('covered', 0)
+                        regions_total = regions_info.get('count', 0)
+                    else:
+                        # llvm-cov format
+                        lines_covered = lines_info.get('count', 0)
+                        lines_total = lines_info.get('count', 0) + lines_info.get('uncovered_count', 0)
+                        functions_covered = functions_info.get('count', 0)
+                        functions_total = functions_info.get('count', 0) + functions_info.get('uncovered_count', 0)
+                        regions_covered = regions_info.get('count', 0)
+                        regions_total = regions_info.get('count', 0) + regions_info.get('uncovered_count', 0)
+                    
+                    coverage_data = {
+                        'lines': {
+                            'covered': lines_covered,
+                            'total': lines_total,
+                            'percent': lines_info.get('percent', 0.0)
+                        },
+                        'functions': {
+                            'covered': functions_covered,
+                            'total': functions_total,
+                            'percent': functions_info.get('percent', 0.0)
+                        },
+                        'regions': {
+                            'covered': regions_covered,
+                            'total': regions_total,
+                            'percent': regions_info.get('percent', 0.0)
+                        }
+                    }
+                    print(f"Parsed coverage data successfully")
+            except json.JSONDecodeError as e:
+                error_msg = f"Failed to parse coverage JSON: {e}. Output: {stdout[:500]}"
+                print(f"Error: {error_msg}")
+                if status:
+                    status['status'] = 'failed'
+                    status['message'] = error_msg
+                return False
+            except (KeyError, IndexError) as e:
+                error_msg = f"Failed to extract coverage data from JSON: {e}"
+                print(f"Error: {error_msg}")
+                if status:
+                    status['status'] = 'failed'
+                    status['message'] = error_msg
+                return False
+            
+            # Generate HTML coverage report
+            print("Generating HTML coverage report...")
+            html_process = subprocess.Popen(
+                ['cargo', 'llvm-cov', 'test', '--workspace', '--html'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            html_stdout, html_stderr = html_process.communicate()
+            
+            if html_process.returncode != 0:
+                print(f"Warning: HTML report generation failed: {html_stderr}")
+            
+            # Copy HTML coverage report to test directory
+            coverage_html_source = os.path.join(project_path, 'target', 'llvm-cov', 'html')
+            coverage_html_dest = os.path.join(test_dir, 'coverage')
+            
+            if os.path.exists(coverage_html_source):
+                if os.path.exists(coverage_html_dest):
+                    shutil.rmtree(coverage_html_dest)
+                shutil.copytree(coverage_html_source, coverage_html_dest)
+                print(f"Coverage HTML report copied to: {coverage_html_dest}")
+            else:
+                print(f"Warning: Coverage HTML report not found at: {coverage_html_source}")
+            
+            # Update or create test_summary.json with coverage data
+            summary_file = os.path.join(test_dir, 'test_summary.json')
+            if coverage_data:
+                # Load existing summary if it exists, otherwise create new
+                if os.path.exists(summary_file):
+                    with open(summary_file, 'r', encoding='utf-8') as f:
+                        summary = json.load(f)
+                else:
+                    summary = {
+                        'timestamp': datetime.now().isoformat(),
+                        'total_tests': 0,
+                        'passed_tests': 0,
+                        'failed_tests': 0,
+                        'success_rate': 0,
+                        'packages': [],
+                        'test_cases': []
+                    }
+                
+                summary['coverage'] = coverage_data
+                summary['coverage_report_url'] = f"/coverage/{os.path.basename(test_dir)}/index.html"
+                
+                with open(summary_file, 'w', encoding='utf-8') as f:
+                    json.dump(summary, f, indent=2, ensure_ascii=False)
+                
+                print(f"Coverage data added to test_summary.json")
+                print(f"  Lines: {coverage_data['lines']['covered']}/{coverage_data['lines']['total']} ({coverage_data['lines']['percent']:.2f}%)")
+                print(f"  Functions: {coverage_data['functions']['covered']}/{coverage_data['functions']['total']} ({coverage_data['functions']['percent']:.2f}%)")
+                print(f"  Regions: {coverage_data['regions']['covered']}/{coverage_data['regions']['total']} ({coverage_data['regions']['percent']:.2f}%)")
+            
+            if status:
+                status['status'] = 'completed'
+                status['message'] = 'Coverage test completed successfully.'
+                status['test_dir'] = test_dir
+                status['report_url'] = f"/result?date={os.path.basename(test_dir)}"
+            
+            return True
+            
+        finally:
+            os.chdir(original_cwd)
+            
+    except Exception as e:
+        error_msg = f"Error running coverage test: {e}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+        if status:
+            status['status'] = 'failed'
+            status['message'] = error_msg
+        return False
+
+def find_latest_test_dir():
+    """Find the latest test directory"""
+    if not os.path.exists(TEST_RESULTS_DIR):
+        return None
+    
+    test_dirs = []
+    for item in os.listdir(TEST_RESULTS_DIR):
+        item_path = os.path.join(TEST_RESULTS_DIR, item)
+        if os.path.isdir(item_path):
+            # Check if it's a timestamp directory (YYYYMMDD_HHMMSS)
+            if re.match(r'^\d{8}_\d{6}$', item):
+                test_dirs.append((item, os.path.getmtime(item_path)))
+    
+    if not test_dirs:
+        return None
+    
+    # Sort by modification time, get latest
+    test_dirs.sort(key=lambda x: x[1], reverse=True)
+    return os.path.join(TEST_RESULTS_DIR, test_dirs[0][0])
+
+def run_regression_test_independent(project_path):
+    """Run regression test independently in a thread"""
+    global regression_status
+    with regression_lock:
+        regression_status['status'] = 'testing'
+        regression_status['message'] = 'Starting regression test...'
+        regression_status['test_dir'] = ''
+        regression_status['report_url'] = ''
+        
+        try:
+            # Auto-detect script path
+            script_path = find_script_path()
+            if not script_path:
+                regression_status['status'] = 'failed'
+                regression_status['message'] = 'Cannot find daily_regression_test.sh script'
+                return
+            
+            # Check if script exists
+            if not os.path.exists(script_path):
+                regression_status['status'] = 'failed'
+                regression_status['message'] = f'Test script not found: {script_path}'
+                return
+            
+            print(f"Using script path: {script_path}")
+
+            process = subprocess.Popen(
+                [script_path, project_path, TEST_RESULTS_DIR],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+
+            # Stream output in real time
+            for line in process.stdout:
+                print(line, end='')  # Print to console
+
+            # Wait for process to finish
+            process.wait()
+
+            # Find the latest test directory
+            latest_test_dir = find_latest_test_dir()
+            if latest_test_dir:
+                regression_status['test_dir'] = latest_test_dir
+
+            if process.returncode == 0:
+                regression_status['status'] = 'completed'
+                regression_status['message'] = 'Regression test completed successfully.'
+                # Generate report URL
+                if regression_status['test_dir']:
+                    regression_status['report_url'] = f"http://localhost:5002/result?date={regression_status['test_dir'].split('/')[-1]}"
+            else:
+                regression_status['status'] = 'failed'
+                # Print error output
+                stderr_output = process.stderr.read()
+                regression_status['message'] = f'Regression test failed. Error: {stderr_output}'
+        except Exception as e:
+            regression_status['status'] = 'failed'
+            regression_status['message'] = f'An error occurred: {str(e)}'
+
 def run_dailytest_script():
+    """Run both regression test and coverage test in sequence"""
     global dailytest_status
     with dailytest_lock:  # Ensure only one test instance at a time
         dailytest_status['status'] = 'testing'
-        dailytest_status['message'] = 'Starting daily regression test...'
+        dailytest_status['message'] = 'Starting daily test (regression + coverage)...'
         dailytest_status['test_dir'] = ''
         dailytest_status['report_url'] = ''
 
         try:
-            # Use Popen to run daily test script and stream logs
-            # Pass project path and results directory as arguments
             project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
+            
+            # Step 1: Run regression test
+            dailytest_status['message'] = 'Running regression test...'
+            print("Step 1: Running regression test...")
             
             # Auto-detect script path
             script_path = find_script_path()
@@ -111,17 +449,36 @@ def run_dailytest_script():
             # Wait for process to finish
             process.wait()
 
-            if process.returncode == 0:
-                dailytest_status['status'] = 'completed'
-                dailytest_status['message'] = 'Daily regression test completed successfully.'
-                # Generate report URL
-                if dailytest_status['test_dir']:
-                    dailytest_status['report_url'] = f"http://localhost:5002/result?date={dailytest_status['test_dir'].split('/')[-1]}"
-            else:
+            # Find the latest test directory
+            latest_test_dir = find_latest_test_dir()
+            if latest_test_dir:
+                dailytest_status['test_dir'] = latest_test_dir
+
+            if process.returncode != 0:
                 dailytest_status['status'] = 'failed'
-                # Print error output
                 stderr_output = process.stderr.read()
-                dailytest_status['message'] = f'Daily regression test failed. Error: {stderr_output}'
+                dailytest_status['message'] = f'Regression test failed. Error: {stderr_output}'
+                return
+            
+            # Step 2: Run coverage test after regression test completes successfully
+            dailytest_status['message'] = 'Regression test completed successfully. Running coverage test...'
+            print("Step 2: Running coverage test...")
+            
+            if latest_test_dir:
+                coverage_success = run_coverage_test(project_path, latest_test_dir, update_status=dailytest_status)
+                if coverage_success:
+                    dailytest_status['status'] = 'completed'
+                    dailytest_status['message'] = 'Daily test (regression + coverage) completed successfully.'
+                else:
+                    dailytest_status['status'] = 'completed'
+                    dailytest_status['message'] = 'Regression test completed, but coverage test had issues.'
+            else:
+                dailytest_status['status'] = 'completed'
+                dailytest_status['message'] = 'Regression test completed, but could not find test directory for coverage test.'
+            
+            # Generate report URL
+            if dailytest_status['test_dir']:
+                dailytest_status['report_url'] = f"http://localhost:5002/result?date={dailytest_status['test_dir'].split('/')[-1]}"
 
         except Exception as e:
             dailytest_status['status'] = 'failed'
@@ -153,7 +510,7 @@ def status():
 
 @app.route('/dailytest', methods=['POST'])
 def dailytest():
-    """Start daily regression test"""
+    """Start daily test (regression + coverage in sequence)"""
     # Check current test status
     if dailytest_status['status'] == 'testing':
         return jsonify({
@@ -161,14 +518,71 @@ def dailytest():
             'current_status': dailytest_status
         }), 409
 
-    # Start a new thread to run daily test script
+    # Start a new thread to run daily test script (regression + coverage)
     threading.Thread(target=run_dailytest_script).start()
-    return jsonify({'message': 'Daily regression test started.'}), 202
+    return jsonify({'message': 'Daily test (regression + coverage) started.'}), 202
 
 @app.route('/dailytest/status', methods=['GET'])
 def get_dailytest_status():
-    """Get daily test status"""
+    """Get daily test status (regression + coverage)"""
     return jsonify(dailytest_status)
+
+@app.route('/regression/run', methods=['POST'])
+def run_regression():
+    """Run regression test independently"""
+    # Check current regression test status
+    if regression_status['status'] == 'testing':
+        return jsonify({
+            'error': 'A regression test is already in progress.',
+            'current_status': regression_status
+        }), 409
+    
+    # Start a new thread to run regression test
+    project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
+    threading.Thread(target=run_regression_test_independent, args=(project_path,)).start()
+    return jsonify({'message': 'Regression test started.'}), 202
+
+@app.route('/regression/status', methods=['GET'])
+def get_regression_status():
+    """Get regression test status"""
+    return jsonify(regression_status)
+
+@app.route('/coverage/run', methods=['POST'])
+def run_coverage():
+    """Run coverage test independently"""
+    # Check current coverage test status
+    if coverage_status['status'] == 'testing':
+        return jsonify({
+            'error': 'A coverage test is already in progress.',
+            'current_status': coverage_status
+        }), 409
+    
+    # Start a new thread to run coverage test
+    project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
+    threading.Thread(target=run_coverage_test_independent, args=(project_path,)).start()
+    return jsonify({'message': 'Coverage test started.'}), 202
+
+def run_coverage_test_independent(project_path):
+    """Run coverage test independently in a thread"""
+    global coverage_status
+    with coverage_lock:
+        coverage_status['status'] = 'testing'
+        coverage_status['message'] = 'Starting coverage test...'
+        coverage_status['test_dir'] = ''
+        coverage_status['report_url'] = ''
+        
+        try:
+            success = run_coverage_test(project_path, test_dir=None, update_status=coverage_status)
+            if not success:
+                coverage_status['status'] = 'failed'
+        except Exception as e:
+            coverage_status['status'] = 'failed'
+            coverage_status['message'] = f'An error occurred: {str(e)}'
+
+@app.route('/coverage/status', methods=['GET'])
+def get_coverage_status():
+    """Get coverage test status"""
+    return jsonify(coverage_status)
 
 def get_available_test_dates():
     """List available test dates"""
@@ -200,16 +614,102 @@ def get_available_test_dates():
 
 def get_test_result_summary(date_folder):
     """Get test result summary for a given date"""
-    summary_file = os.path.join(TEST_RESULTS_DIR, date_folder, "test_summary.json")
-    if not os.path.exists(summary_file):
-        return None
+    test_dir = os.path.join(TEST_RESULTS_DIR, date_folder)
+    summary_file = os.path.join(test_dir, "test_summary.json")
+    coverage_json_log = os.path.join(test_dir, "coverage.json.log")
     
-    try:
-        with open(summary_file, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Error reading summary file: {e}")
-        return None
+    # Try to load existing summary file
+    summary = None
+    if os.path.exists(summary_file):
+        try:
+            with open(summary_file, 'r', encoding='utf-8') as f:
+                summary = json.load(f)
+        except Exception as e:
+            print(f"Error reading summary file: {e}")
+            summary = None
+    
+    # If summary doesn't exist but coverage.json.log exists, parse it
+    if summary is None and os.path.exists(coverage_json_log):
+        try:
+            print(f"Parsing coverage data from {coverage_json_log}")
+            with open(coverage_json_log, 'r', encoding='utf-8') as f:
+                content = f.read()
+                # Extract JSON part (before STDERR if present)
+                json_content = content.split('\n\n=== STDERR ===\n')[0].strip()
+                if json_content:
+                    coverage_json = json.loads(json_content)
+                    
+                    # Support both 'llvm-cov' and 'llvm.coverage.json.export' types
+                    coverage_type = coverage_json.get('type', '')
+                    if coverage_type in ('llvm-cov', 'llvm.coverage.json.export'):
+                        data = coverage_json.get('data', [])
+                        if data:
+                            totals = data[0].get('totals', {})
+                            lines_info = totals.get('lines', {})
+                            functions_info = totals.get('functions', {})
+                            regions_info = totals.get('regions', {})
+                            
+                            # For llvm.coverage.json.export, lines already has 'covered' and 'count'
+                            # For llvm-cov, we need to calculate from 'count' and 'uncovered_count'
+                            if coverage_type == 'llvm.coverage.json.export':
+                                lines_covered = lines_info.get('covered', 0)
+                                lines_total = lines_info.get('count', 0)
+                                functions_covered = functions_info.get('covered', 0)
+                                functions_total = functions_info.get('count', 0)
+                                regions_covered = regions_info.get('covered', 0)
+                                regions_total = regions_info.get('count', 0)
+                            else:
+                                # llvm-cov format
+                                lines_covered = lines_info.get('count', 0)
+                                lines_total = lines_info.get('count', 0) + lines_info.get('uncovered_count', 0)
+                                functions_covered = functions_info.get('count', 0)
+                                functions_total = functions_info.get('count', 0) + functions_info.get('uncovered_count', 0)
+                                regions_covered = regions_info.get('count', 0)
+                                regions_total = regions_info.get('count', 0) + regions_info.get('uncovered_count', 0)
+                            
+                            coverage_data = {
+                                'lines': {
+                                    'covered': lines_covered,
+                                    'total': lines_total,
+                                    'percent': lines_info.get('percent', 0.0)
+                                },
+                                'functions': {
+                                    'covered': functions_covered,
+                                    'total': functions_total,
+                                    'percent': functions_info.get('percent', 0.0)
+                                },
+                                'regions': {
+                                    'covered': regions_covered,
+                                    'total': regions_total,
+                                    'percent': regions_info.get('percent', 0.0)
+                                }
+                            }
+                            
+                            # Create summary with coverage data
+                            summary = {
+                                'timestamp': datetime.now().isoformat(),
+                                'total_tests': 0,
+                                'passed_tests': 0,
+                                'failed_tests': 0,
+                                'success_rate': 0,
+                                'packages': [],
+                                'test_cases': [],
+                                'coverage': coverage_data,
+                                'coverage_report_url': f"/coverage/{date_folder}/index.html"
+                            }
+                            
+                            # Check if coverage HTML report exists
+                            coverage_html_dir = os.path.join(test_dir, 'coverage')
+                            if not os.path.exists(coverage_html_dir):
+                                summary['coverage_report_url'] = None
+                            
+                            print(f"Successfully parsed coverage data from coverage.json.log")
+        except Exception as e:
+            print(f"Error parsing coverage.json.log: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    return summary
 
 @app.route('/result', methods=['GET'])
 def result():
@@ -355,6 +855,15 @@ def result():
             .passed { color: #27ae60; }
             .failed { color: #e74c3c; }
             .success-rate { color: #f39c12; }
+            .coverage { color: #9b59b6; }
+            .coverage-section { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
+            .coverage-title { font-size: 1.3em; font-weight: bold; color: #2c3e50; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #9b59b6; }
+            .coverage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 20px; }
+            .coverage-card { background: #f8f9fa; padding: 20px; border-radius: 8px; text-align: center; }
+            .coverage-card h4 { color: #666; margin-bottom: 10px; font-size: 0.9em; }
+            .coverage-card .number { font-size: 1.5em; font-weight: bold; color: #9b59b6; }
+            .coverage-link { display: inline-block; margin-top: 15px; padding: 10px 20px; background: #9b59b6; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
+            .coverage-link:hover { background: #7d3c98; }
             .package-section { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
             .package-title { font-size: 1.3em; font-weight: bold; color: #2c3e50; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #3498db; }
             .test-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
@@ -395,13 +904,50 @@ def result():
             </div>
 
             {% if test_summary %}
+            {% if total_tests > 0 or packages|length > 0 or test_cases|length > 0 %}
             <div class="summary">
                 <div class="summary-card"><h3>Total Tests</h3><div class="number total">{{ total_tests }}</div></div>
                 <div class="summary-card"><h3>Passed</h3><div class="number passed">{{ passed_tests }}</div></div>
                 <div class="summary-card"><h3>Failed</h3><div class="number failed">{{ failed_tests }}</div></div>
                 <div class="summary-card"><h3>Success Rate</h3><div class="number success-rate">{{ success_rate }}%</div></div>
             </div>
+            {% endif %}
 
+            {% if test_summary.coverage %}
+            <div class="coverage-section">
+                <div class="coverage-title">📊 Code Coverage Report</div>
+                <div class="coverage-grid">
+                    <div class="coverage-card">
+                        <h4>Lines Coverage</h4>
+                        <div class="number">{{ "%.2f"|format(test_summary.coverage.lines.percent) }}%</div>
+                        <div style="font-size: 0.9em; color: #666; margin-top: 5px;">
+                            {{ test_summary.coverage.lines.covered }}/{{ test_summary.coverage.lines.total }}
+                        </div>
+                    </div>
+                    <div class="coverage-card">
+                        <h4>Functions Coverage</h4>
+                        <div class="number">{{ "%.2f"|format(test_summary.coverage.functions.percent) }}%</div>
+                        <div style="font-size: 0.9em; color: #666; margin-top: 5px;">
+                            {{ test_summary.coverage.functions.covered }}/{{ test_summary.coverage.functions.total }}
+                        </div>
+                    </div>
+                    <div class="coverage-card">
+                        <h4>Regions Coverage</h4>
+                        <div class="number">{{ "%.2f"|format(test_summary.coverage.regions.percent) }}%</div>
+                        <div style="font-size: 0.9em; color: #666; margin-top: 5px;">
+                            {{ test_summary.coverage.regions.covered }}/{{ test_summary.coverage.regions.total }}
+                        </div>
+                    </div>
+                </div>
+                {% if test_summary.coverage_report_url %}
+                <div style="text-align: center;">
+                    <a href="{{ test_summary.coverage_report_url }}" class="coverage-link" target="_blank">View Detailed Coverage Report →</a>
+                </div>
+                {% endif %}
+            </div>
+            {% endif %}
+
+            {% if packages|length > 0 %}
             {% for pkg in packages %}
             <div class="package-section">
                 <div class="package-title">📦 Package: {{ pkg.name }} (Total: {{ pkg.total }}, Passed: {{ pkg.passed }}, Failed: {{ pkg.failed }}, Success Rate: {{ pkg.success_rate }}%)</div>
@@ -442,6 +988,7 @@ def result():
                 {% endfor %}
             </div>
             {% endfor %}
+            {% endif %}
 
             {% else %}
             <div class="package-section">No test results for the selected date</div>
@@ -661,6 +1208,66 @@ def view_log(date, log_file):
                                 log_content=log_content,
                                 available_logs=available_logs,
                                 current_log=current_log)
+
+@app.route('/coverage/<date>/', defaults={'file_path': ''}, methods=['GET'])
+@app.route('/coverage/<date>/<path:file_path>', methods=['GET'])
+def view_coverage(date, file_path):
+    """Serve coverage HTML report files"""
+    # Validate date directory
+    base_dir = os.path.join(TEST_RESULTS_DIR, date, 'coverage')
+    if not os.path.exists(base_dir):
+        return jsonify({'error': 'Coverage report not found for this date'}), 404
+    
+    # If no file path specified, redirect to index.html
+    if not file_path:
+        file_path = 'index.html'
+    
+    # Join file path
+    file_full_path = os.path.join(base_dir, file_path)
+    
+    # Security check: ensure the file is within the coverage directory
+    if not os.path.abspath(file_full_path).startswith(os.path.abspath(base_dir)):
+        return jsonify({'error': 'Invalid file path'}), 403
+    
+    if not os.path.exists(file_full_path):
+        return jsonify({'error': 'File not found'}), 404
+    
+    # Determine content type
+    content_type = 'text/html'
+    if file_path.endswith('.css'):
+        content_type = 'text/css'
+    elif file_path.endswith('.js'):
+        content_type = 'application/javascript'
+    elif file_path.endswith('.png'):
+        content_type = 'image/png'
+    elif file_path.endswith('.svg'):
+        content_type = 'image/svg+xml'
+    elif file_path.endswith('.json'):
+        content_type = 'application/json'
+    
+    # Read and return file
+    try:
+        if file_path.endswith(('.png', '.svg', '.ico')):
+            # Binary files
+            with open(file_full_path, 'rb') as f:
+                return Response(f.read(), mimetype=content_type)
+        else:
+            # Text files
+            with open(file_full_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                # Fix relative paths in HTML to work with our routing
+                if file_path.endswith('.html'):
+                    # Replace relative paths with absolute paths (only if they don't start with / or http)
+                    # Fix href attributes (support both single and double quotes)
+                    # Match href='...' where content doesn't start with / or http
+                    content = re.sub(r"href='(?![/h])([^']*)'", rf"href='/coverage/{date}/\1'", content)
+                    content = re.sub(r'href="(?![/h])([^"]*)"', rf'href="/coverage/{date}/\1"', content)
+                    # Fix src attributes (support both single and double quotes)
+                    content = re.sub(r"src='(?![/h])([^']*)'", rf"src='/coverage/{date}/\1'", content)
+                    content = re.sub(r'src="(?![/h])([^"]*)"', rf'src="/coverage/{date}/\1"', content)
+                return Response(content, mimetype=content_type)
+    except Exception as e:
+        return jsonify({'error': f'Failed to read file: {str(e)}'}), 500
 
 def parse_arguments():
     """Parse command-line arguments"""

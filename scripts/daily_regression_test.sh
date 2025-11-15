@@ -116,7 +116,7 @@ run_package_tests() {
     
     # Run all tests in the package
     log_info "Running all tests in package $package"
-    cd "$PROJECT_ROOT" && cargo test --package "$package" --all-targets -- --nocapture > "$log_file" 2>&1
+    cd "$PROJECT_ROOT" && cargo test --package "$package" --all-targets --all-features -- --nocapture > "$log_file" 2>&1
     local exit_code=$?
     
     # Parse test results
@@ -228,69 +228,230 @@ discover_all_tests() {
     # Temporarily disable set -e to avoid exiting on single package failure
     set +e
 
-    # Use cargo metadata to get all package names (limit to curvine-*)
-    cd "$PROJECT_ROOT"
-    local packages=$(cargo metadata --format-version=1 | jq -r '.packages[] | select(.name | startswith("curvine-")) | .name')
-    if [ -z "$packages" ]; then
-        log_warning "No packages found via cargo metadata, trying directory listing..."
-        packages=$(find "$PROJECT_ROOT" -name "Cargo.toml" -not -path "*/target/*" -not -path "*/\.*" | xargs dirname | xargs basename | grep "^curvine-")
-    fi
-    if [ -z "$packages" ]; then
-        log_error "No packages discovered; cannot list tests."
-        set -e
-        return 1
-    fi
-
     # Clean up old discovered_tests.txt
     : > "$TEST_DIR/discovered_tests.txt"
 
-    declare -A discovered_tests
+    # Use workspace-wide listing to avoid per-package feature/compile skew
+    cd "$PROJECT_ROOT"
+    local test_list_file="$TEST_DIR/workspace_tests_list.txt"
+    cargo test --workspace -- --list --format=terse > "$test_list_file" 2>&1
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        log_warning "Failed to list tests for workspace (exit $exit_code)."
+    fi
 
-    for package in $packages; do
-        log_info "Listing tests for package: $package"
-        local test_list_file="$TEST_DIR/${package}_tests_list.txt"
-        cargo test --package "$package" -- --list > "$test_list_file" 2>&1
-        local exit_code=$?
-        if [ $exit_code -ne 0 ]; then
-            log_warning "Failed to list tests for package $package (exit $exit_code). Skipping."
+    # Parse unique test names
+    # Format: test_name: test (test_name can contain "::")
+    declare -A discovered_set
+    while IFS= read -r line; do
+        if [ -z "$line" ]; then
             continue
         fi
-
-        # Current test file (for integration tests tests/<file>.rs)
-        local current_test_file="lib"
-
-        while IFS= read -r line; do
-            # Record the current test file name being listed (integration tests)
-            if [[ "$line" =~ Running[[:space:]]+tests/([^[:space:]]+)\ \(target/debug/deps/ ]]; then
-                current_test_file="${BASH_REMATCH[1]}"
-                # Remove .rs suffix
-                current_test_file="${current_test_file%.rs}"
-                continue
+        # Match pattern: "anything: test" where "anything" can contain "::"
+        # Remove leading/trailing whitespace first
+        line=$(echo "$line" | xargs)
+        if [[ "$line" =~ ^(.+):[[:space:]]*test[[:space:]]*$ ]]; then
+            local test_name="${BASH_REMATCH[1]}"
+            test_name=$(echo "$test_name" | xargs)
+            if [ -n "$test_name" ]; then
+                discovered_set["$test_name"]=1
             fi
+        fi
+    done < "$test_list_file"
 
-            # Match test case lines (tolerate leading/trailing spaces)
-            if [[ "$line" =~ ^[[:space:]]*([^:]+):[[:space:]]*test[[:space:]]*$ ]]; then
-                local test_name="${BASH_REMATCH[1]}"
-                if [ -n "$test_name" ]; then
-                    local test_file="$current_test_file"
-                    local test_case="$test_name"
-                    # If unit test form (module::case), keep module path
-                    if [[ "$test_name" =~ ^(.+)::([^:]+)$ ]]; then
-                        test_file="${BASH_REMATCH[1]}"
-                        test_case="${BASH_REMATCH[2]}"
-                    fi
-                    discovered_tests["$package::$test_file::$test_case"]=1
+    # Build mapping: prefer precise mapping by target
+    local mapping_file="$TEST_DIR/test_name_to_package.txt"
+    : > "$mapping_file"
+    # Build auxiliary mapping: test_name -> package (from per-package aggregate listing)
+    local mapping_pkg_all="$TEST_DIR/test_name_in_package.txt"
+    : > "$mapping_pkg_all"
+    local packages=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[].name' | sort -u)
+    if [ -z "$packages" ]; then
+        packages=$(cargo metadata --format-version=1 2>/dev/null | jq -r '.workspace_members as $m | .packages[] | select(.id as $id | $m | index($id)) | .name' | sort -u)
+    fi
+    for package in $packages; do
+        log_info "Mapping tests for package: $package"
+        # Aggregate list for package -> used for fallback mapping
+        local pkg_all_list="$TEST_DIR/${package}_all_tests_list.txt"
+        cargo test --package "$package" -- --list --format=terse > "$pkg_all_list" 2>&1 || true
+        while IFS= read -r line; do
+            line=$(echo "$line" | xargs)
+            if [[ "$line" =~ ^(.+):[[:space:]]*test[[:space:]]*$ ]]; then
+                local tn="${BASH_REMATCH[1]}"
+                tn=$(echo "$tn" | xargs)
+                if [ -n "$tn" ]; then
+                    echo "$tn|$package" >> "$mapping_pkg_all"
                 fi
             fi
-        done < "$test_list_file"
+        done < "$pkg_all_list"
+        # Get test targets for integration tests
+        local test_targets=$(cargo metadata --format-version=1 | jq -r --arg pkg "$package" '.packages[] | select(.name==$pkg) | .targets[] | select(.kind | index("test")) | .name')
+        for tgt in $test_targets; do
+            local tgt_list_file="$TEST_DIR/${package}_${tgt}_tests_list.txt"
+            cargo test --package "$package" --test "$tgt" -- --list --format=terse > "$tgt_list_file" 2>&1 || true
+            while IFS= read -r line; do
+                line=$(echo "$line" | xargs)
+                if [[ "$line" =~ ^(.+):[[:space:]]*test[[:space:]]*$ ]]; then
+                    local tc="${BASH_REMATCH[1]}"
+                    tc=$(echo "$tc" | xargs)
+                    if [ -n "$tc" ]; then
+                        echo "$package|$tgt|$tc" >> "$mapping_file"
+                    fi
+                fi
+            done < "$tgt_list_file"
+        done
+        # Map library unit tests if present
+        local has_lib=$(cargo metadata --format-version=1 | jq -r --arg pkg "$package" '.packages[] | select(.name==$pkg) | .targets[] | select(.kind | index("lib")) | .name' | head -n 1)
+        if [ -n "$has_lib" ]; then
+            local lib_list_file="$TEST_DIR/${package}_lib_tests_list.txt"
+            cargo test --package "$package" --lib -- --list --format=terse > "$lib_list_file" 2>&1 || true
+            while IFS= read -r line; do
+                line=$(echo "$line" | xargs)
+                if [[ "$line" =~ ^(.+):[[:space:]]*test[[:space:]]*$ ]]; then
+                    local tn="${BASH_REMATCH[1]}"
+                    tn=$(echo "$tn" | xargs)
+                    if [ -n "$tn" ]; then
+                        local tf="lib"
+                        local tc="$tn"
+                        if [[ "$tn" == *"::"* ]]; then
+                            tf="${tn%::*}"
+                            tc="${tn##*::}"
+                        fi
+                        echo "$package|$tf|$tc" >> "$mapping_file"
+                    fi
+                fi
+            done < "$lib_list_file"
+        fi
     done
 
-    # Output discovered test cases
-    log_info "Discovered ${#discovered_tests[@]} test cases:"
-    for test_key in "${!discovered_tests[@]}"; do
-        echo "$test_key" >> "$TEST_DIR/discovered_tests.txt"
-        log_info "  $test_key"
+    # Output discovered test cases with package prefix if mapping available
+    local out_count=0
+    local skipped_no_pkg=0
+    # Always iterate workspace-discovered names to ensure full coverage
+    declare -A emitted
+    for name in "${!discovered_set[@]}"; do
+        local pkg=""
+        local tf=""
+        local tc=""
+        
+        # First, try to find package from per-package aggregate mapping (most reliable)
+        pkg=$(grep "^$name|" "$mapping_pkg_all" 2>/dev/null | head -n 1 | awk -F'|' '{print $2}' || true)
+        
+        # If package found, try to find precise mapping from target-based mapping_file
+        if [ -n "$pkg" ]; then
+            # Try exact match first (for integration tests where testcase is just the function name)
+            # Format: package|testfile|testcase
+            local mapped_line=$(grep -E "^${pkg}\|[^|]+\|${name}$" "$mapping_file" 2>/dev/null | head -n 1 || true)
+            
+            # If no exact match, try to match by testcase (last part of name)
+            if [ -z "$mapped_line" ] && [[ "$name" == *"::"* ]]; then
+                local testcase="${name##*::}"
+                mapped_line=$(grep -E "^${pkg}\|[^|]+\|${testcase}$" "$mapping_file" 2>/dev/null | head -n 1 || true)
+            fi
+            
+            # If still no match, try to match by full name as testcase (for unit tests in lib)
+            if [ -z "$mapped_line" ]; then
+                mapped_line=$(grep -E "^${pkg}\|lib\|${name}$" "$mapping_file" 2>/dev/null | head -n 1 || true)
+            fi
+            
+            if [ -n "$mapped_line" ]; then
+                pkg="${mapped_line%%|*}"
+                local rest="${mapped_line#*|}"
+                tf="${rest%%|*}"
+                tc="${rest##*|}"
+            fi
+        fi
+        
+        # If still no package found, try to infer from test name's module path
+        if [ -z "$pkg" ] && [[ "$name" == *"::"* ]]; then
+            # Extract first module segment and try to match with package names
+            local first_module="${name%%::*}"
+            # Try exact match first
+            pkg=$(echo "$packages" | grep -x "$first_module" | head -n 1 || true)
+            # If no exact match, try case-insensitive match
+            if [ -z "$pkg" ]; then
+                pkg=$(echo "$packages" | grep -i "^$first_module" | head -n 1 || true)
+            fi
+        fi
+        
+        # If package still not found, search all package test lists to find which package contains this test
+        if [ -z "$pkg" ]; then
+            for pkg_candidate in $packages; do
+                local pkg_all_list="$TEST_DIR/${pkg_candidate}_all_tests_list.txt"
+                if [ -f "$pkg_all_list" ] && grep -qE "^${name}:[[:space:]]*test[[:space:]]*$" "$pkg_all_list" 2>/dev/null; then
+                    pkg="$pkg_candidate"
+                    break
+                fi
+            done
+        fi
+        
+        # Derive tf/tc from name if not already set
+        if [ -z "$tf" ] || [ -z "$tc" ]; then
+            if [[ "$name" == *"::"* ]]; then
+                # For unit tests: module::path::test_function
+                # Extract test_file (all but last segment) and test_case (last segment)
+                # Find the last occurrence of "::"
+                local reversed=$(echo "$name" | rev)
+                local reversed_after="${reversed#*::}"
+                if [ "$reversed" != "$reversed_after" ]; then
+                    # Found "::", extract test_case (last part after "::")
+                    tc=$(echo "$reversed_after" | rev)
+                    # Extract test_file (everything before last "::")
+                    local reversed_before="${reversed%"$reversed_after"}"
+                    tf=$(echo "$reversed_before" | rev | sed 's/::$//')
+                else
+                    tf="lib"
+                    tc="$name"
+                fi
+            else
+                # For integration tests: just test_function
+                tf="lib"
+                tc="$name"
+            fi
+            
+            # If name has no module path and package is known, try to find which test target contains it
+            if [ "$tf" = "lib" ] && [ -n "$pkg" ]; then
+                local test_targets=$(cargo metadata --format-version=1 | jq -r --arg p "$pkg" '.packages[] | select(.name==$p) | .targets[] | select(.kind | index("test")) | .name' 2>/dev/null || true)
+                local matching_targets=0
+                local first_matching_target=""
+                for tgt in $test_targets; do
+                    local tgt_list_file="$TEST_DIR/${pkg}_${tgt}_tests_list.txt"
+                    if [ -f "$tgt_list_file" ] && grep -qE "^${name}:[[:space:]]*test[[:space:]]*$" "$tgt_list_file" 2>/dev/null; then
+                        ((matching_targets++))
+                        if [ -z "$first_matching_target" ]; then
+                            first_matching_target="$tgt"
+                        fi
+                    fi
+                done
+                # If exactly one target contains this test, use it as TestFile
+                if [ "$matching_targets" = "1" ] && [ -n "$first_matching_target" ]; then
+                    tf="$first_matching_target"
+                elif [ "$matching_targets" -gt 1 ] && [ -n "$first_matching_target" ]; then
+                    # If multiple targets, prefer the one that matches the test name pattern
+                    # For integration tests, the test file name usually matches
+                    tf="$first_matching_target"
+                fi
+            fi
+        fi
+        
+        # Guard: require package; if missing, skip
+        if [ -z "$pkg" ]; then
+            ((skipped_no_pkg++))
+            log_warning "Could not map test to package: $name"
+            continue
+        fi
+        
+        local key="$pkg::$tf::$tc"
+        if [ -z "${emitted[$key]}" ]; then
+            echo "$key" >> "$TEST_DIR/discovered_tests.txt"
+            emitted["$key"]=1
+            ((out_count++))
+        fi
     done
+    log_info "Discovered $out_count test cases (workspace, package-qualified)"
+    if [ "$skipped_no_pkg" -gt 0 ]; then
+        log_warning "Skipped $skipped_no_pkg test cases due to missing package mapping"
+    fi
 
     # Restore set -e
     set -e
@@ -311,21 +472,45 @@ run_single_test_case() {
     
     # Create test result directory
     mkdir -p "$TEST_DIR/logs/$package"
-    local log_file="$TEST_DIR/logs/$package/${test_file//::/_}_${test_case}.log"
+    local safe_test_file="${test_file//::/_}"
+    local safe_test_case="${test_case//::/_}"
+    local log_file="$TEST_DIR/logs/$package/${safe_test_file}_${safe_test_case}.log"
     
-    # Build full test name (for unit tests)
-    local full_test_name="$test_case"
-    if [ "$test_file" != "lib" ]; then
+    # Build full test name and determine test type
+    local full_test_name=""
+    local is_integration_test=false
+    local is_unit_test=false
+    
+    # Check if test_file is an integration test file (no "::" in name)
+    if [ "$test_file" != "lib" ] && [[ "$test_file" != *"::"* ]]; then
+        # Integration test: test_file is the test target name (e.g., "block_test")
+        is_integration_test=true
+        full_test_name="$test_case"
+    elif [ "$test_file" = "lib" ]; then
+        # Unit test in lib: test_case might be full path or just function name
+        is_unit_test=true
+        full_test_name="$test_case"
+    else
+        # Unit test with module path: test_file is module path, test_case is function name
+        is_unit_test=true
         full_test_name="$test_file::$test_case"
     fi
     
-    # For integration tests (tests/<test_file>.rs) use --test; unit tests use package-level filter
-    if [ "$test_file" != "lib" ]; then
-        # Integration tests
-        cd "$PROJECT_ROOT" && cargo test --package "$package" --test "$test_file" -- "$test_case" --exact --nocapture > "$log_file" 2>&1
+    # Run the test
+    cd "$PROJECT_ROOT"
+    if [ "$is_integration_test" = true ]; then
+        # For integration tests, use --test flag with exact match
+        # Use --exact to ensure only the specified test case runs
+        log_info "Running integration test: cargo test --package $package --test $test_file -- $test_case --exact"
+        cargo test --package "$package" --test "$test_file" -- "$test_case" --exact --nocapture > "$log_file" 2>&1
+    elif [ "$is_unit_test" = true ]; then
+        # For unit tests, use --lib flag to only run lib tests, not integration tests
+        log_info "Running unit test: cargo test --package $package --lib -- $full_test_name --exact"
+        cargo test --package "$package" --lib -- "$full_test_name" --exact --nocapture > "$log_file" 2>&1
     else
-        # Unit/library tests
-        cd "$PROJECT_ROOT" && cargo test --package "$package" -- "$full_test_name" --exact --nocapture > "$log_file" 2>&1
+        # Fallback: use package-level filter (should not reach here)
+        log_info "Running test: cargo test --package $package --all-features -- $full_test_name --exact"
+        cargo test --package "$package" --all-features -- "$full_test_name" --exact --nocapture > "$log_file" 2>&1
     fi
     local exit_code=$?
     
@@ -333,6 +518,28 @@ run_single_test_case() {
     set -e
     
     # Return result
+    if [ $exit_code -eq 0 ]; then
+        echo "PASSED:$log_file"
+        return 0
+    else
+        echo "FAILED:$log_file"
+        return 1
+    fi
+}
+
+# Run single test by full name in workspace scope
+run_single_test_name() {
+    local package="$1"
+    local full_test_name="$2"
+    local safe_name="${full_test_name//::/_}"
+    local log_dir="$TEST_DIR/logs/${package:-workspace}"
+    mkdir -p "$log_dir"
+    local log_file="$log_dir/${safe_name}.log"
+    log_info "Running test by name (workspace): $full_test_name"
+    set +e
+    cd "$PROJECT_ROOT" && cargo test --workspace -- "$full_test_name" --exact --nocapture > "$log_file" 2>&1
+    local exit_code=$?
+    set -e
     if [ $exit_code -eq 0 ]; then
         echo "PASSED:$log_file"
         return 0
@@ -364,30 +571,84 @@ run_tests_individually() {
     local total_tests=0
     local passed_tests=0
     local failed_tests=0
+    # Use single workspace bucket for stats
     declare -A package_stats
     declare -a detailed_results
     
     # Disable set -e during individual runs to avoid exit on single failure
     set +e
     
+    # Prepare package name set to detect legacy lines like package::mod::case
+    cd "$PROJECT_ROOT"
+    local packages=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[].name' | tr '\n' ' ')
+    
     # Run test cases one by one
+    # Format: package::testfile::testcase
     while IFS= read -r test_key; do
         if [ -z "$test_key" ]; then
             continue
         fi
         
-        # Safely parse package, test_file, test_case (split by "::")
-        local package="${test_key%%::*}"
-        local rest="${test_key#*::}"
-        local test_file="${rest%%::*}"
-        local test_case="${rest#*::}"
+        # Parse package::testfile::testcase format
+        local package=""
+        local test_file=""
+        local test_case=""
         
-        if [ -z "$package" ] || [ -z "$test_case" ]; then
-            log_warning "Skipping invalid test: $test_key"
-            continue
+        # Count number of "::" separators
+        local sep_count=$(echo "$test_key" | grep -o "::" | wc -l)
+        
+        if [ "$sep_count" -ge 2 ]; then
+            # Format: package::testfile::testcase
+            package="${test_key%%::*}"
+            local rest="${test_key#*::}"
+            # Find the last "::" to split test_file and test_case
+            # Use ## to get the longest match (last occurrence)
+            test_case="${rest##*::}"
+            # Extract test_file (everything before last "::")
+            local test_file_with_sep="${rest%"::$test_case"}"
+            if [ "$test_file_with_sep" != "$rest" ]; then
+                test_file="$test_file_with_sep"
+            else
+                # Fallback: no "::" found in rest (shouldn't happen with sep_count >= 2)
+                test_file="lib"
+                test_case="$rest"
+            fi
+        elif [ "$sep_count" -eq 1 ]; then
+            # Legacy format: testfile::testcase (try to infer package)
+            local first_seg="${test_key%%::*}"
+            local second_seg="${test_key##*::}"
+            # Try to find package by checking if first_seg matches a package name
+            if [[ " $packages " == *" $first_seg "* ]]; then
+                package="$first_seg"
+                test_file="lib"
+                test_case="$second_seg"
+                full_test_name="$test_case"
+            else
+                # Assume it's testfile::testcase, need to find package
+                test_file="$first_seg"
+                test_case="$second_seg"
+                full_test_name="$test_key"
+                # Try to find package by searching test files
+                for pkg_candidate in $packages; do
+                    local test_targets=$(cargo metadata --format-version=1 | jq -r --arg p "$pkg_candidate" '.packages[] | select(.name==$p) | .targets[] | select(.kind | index("test")) | .name' 2>/dev/null || true)
+                    if echo "$test_targets" | grep -q "^${test_file}$"; then
+                        package="$pkg_candidate"
+                        break
+                    fi
+                done
+                if [ -z "$package" ]; then
+                    package="workspace"
+                fi
+            fi
+        else
+            # No separators: just test case name
+            test_case="$test_key"
+            test_file="lib"
+            full_test_name="$test_key"
+            package="workspace"
         fi
         
-        # Run single test case and capture function output last line (PASSED/FAILED)
+        # Use run_single_test_case for proper package-scoped execution
         local result=$(run_single_test_case "$package" "$test_file" "$test_case" | tail -n 1)
         local status="${result%%:*}"
         local log_file="${result##*:}"
@@ -396,30 +657,31 @@ run_tests_individually() {
         ((total_tests++))
         
         # Initialize package statistics
-        if [ -z "${package_stats[$package]}" ]; then
-            package_stats["$package"]="0:0:0"
+        local pkg_key="$package"
+        if [ -z "${package_stats[$pkg_key]}" ]; then
+            package_stats["$pkg_key"]="0:0:0"
         fi
         
         # Parse current package statistics
-        IFS=':' read -r pkg_total pkg_passed pkg_failed <<< "${package_stats[$package]}"
+        IFS=':' read -r pkg_total pkg_passed pkg_failed <<< "${package_stats[$pkg_key]}"
         ((pkg_total++))
         
         if [ "$status" = "PASSED" ]; then
             ((passed_tests++))
             ((pkg_passed++))
-            log_success "✓ $package::$test_file::$test_case"
+            log_success "✓ $full_test_name"
         else
             ((failed_tests++))
             ((pkg_failed++))
-            log_error "✗ $package::$test_file::$test_case"
+            log_error "✗ $full_test_name"
         fi
         
         # Update package statistics
-        package_stats["$package"]="$pkg_total:$pkg_passed:$pkg_failed"
+        package_stats["$pkg_key"]="$pkg_total:$pkg_passed:$pkg_failed"
         
         # Add to detailed results using safe separator '|'
         local rel_log_path="${log_file#$TEST_DIR/}"
-        detailed_results+=("$package|$test_file|$test_case|$status|$rel_log_path")
+        detailed_results+=("$pkg_key|$test_file|$test_case|$status|$rel_log_path")
         
     done < "$TEST_DIR/discovered_tests.txt"
     
@@ -443,7 +705,7 @@ run_tests_individually() {
     "packages": [
 EOF
     
-    # Add package statistics
+    # Add package statistics (workspace bucket)
     local first=true
     for package in "${!package_stats[@]}"; do
         IFS=':' read -r pkg_total pkg_passed pkg_failed <<< "${package_stats[$package]}"
@@ -568,8 +830,8 @@ run_tests() {
         log_info "Running all tests in package $package..."
         local log_file="$package_dir/all_tests.log"
         
-        # Use cargo test to run all tests in the package, adding --all-targets to ensure running all types of tests
-        if cargo test --package "$package" --all-targets -- --nocapture > "$log_file" 2>&1; then
+        # Use cargo test to run all tests in the package, include all targets and all features
+        if cargo test --package "$package" --all-targets --all-features -- --nocapture > "$log_file" 2>&1; then
             local test_count=$(grep -c "test result:" "$log_file" || echo 0)
             if [ "$test_count" -gt 0 ]; then
                 # Extract test results
