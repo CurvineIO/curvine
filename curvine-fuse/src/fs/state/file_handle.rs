@@ -99,17 +99,16 @@ impl FileHandle {
         Ok(())
     }
 
-    pub async fn flush(&self, reply: FuseResponse) -> FuseResult<()> {
+    pub async fn flush(&self, reply: Option<FuseResponse>) -> FuseResult<()> {
         if let Some(writer) = &self.writer {
-            writer.lock().await.flush(Some(reply)).await?;
-        } else {
+            writer.lock().await.flush(reply).await?;
+        } else if let Some(reply) = reply {
             reply.send_rep(Ok::<(), FuseError>(())).await?;
         }
         Ok(())
     }
 
-    pub async fn complete(&self, reply: FuseResponse) -> FuseResult<()> {
-        let mut reply = Some(reply);
+    pub async fn complete(&self, mut reply: Option<FuseResponse>) -> FuseResult<()> {
         if let Some(writer) = &self.writer {
             writer.lock().await.complete(reply.take()).await?;
         }

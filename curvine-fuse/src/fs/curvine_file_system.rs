@@ -23,7 +23,9 @@ use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{CreateFileOptsBuilder, FileStatus, MkdirOptsBuilder, SetAttrOpts};
+use curvine_common::state::{
+    CreateFileOptsBuilder, FileStatus, MkdirOptsBuilder, OpenFlags, SetAttrOpts,
+};
 use log::{debug, error, info};
 use orpc::common::ByteUnit;
 use orpc::runtime::Runtime;
@@ -922,6 +924,10 @@ impl fs::FileSystem for CurvineFileSystem {
     // Create a directory.
     async fn mkdir(&self, op: MkDir<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
+        if name.len() > FUSE_MAX_NAME_LENGTH {
+            return err_fuse!(libc::ENAMETOOLONG);
+        }
+
         let path = self.state.get_path_name(op.header.nodeid, name)?;
 
         let mut opts = MkdirOptsBuilder::with_conf(&self.fs.conf().client);
@@ -1048,13 +1054,13 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn flush(&self, op: Flush<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
-        handle.flush(reply).await
+        handle.flush(Some(reply)).await
     }
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.remove_handle(op.header.nodeid, op.arg.fh);
         if let Some(handle) = handle {
-            handle.complete(reply).await
+            handle.complete(Some(reply)).await
         } else {
             err_fuse!(libc::EIO)
         }
@@ -1200,6 +1206,68 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn fsync(&self, op: FSync<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
-        handle.flush(reply).await
+        handle.flush(Some(reply)).await
+    }
+
+    /// Create a file system node (mknod system call)
+    ///
+    /// This function handles the creation of file system nodes:
+    /// - For regular files: delegates to `create()` and immediately closes the handle
+    /// - For directories: delegates to `mkdir()`
+    /// - For other types (devices, fifos, etc.): returns EPERM error
+    ///
+    /// # Arguments
+    /// * `op` - MkNod operation containing:
+    ///   - `mode`: file type and permissions
+    ///   - `umask`: file creation mask
+    ///   - `name`: name of the node to create
+    ///
+    /// # Returns
+    /// * `Ok(fuse_entry_out)` - Entry information for the created node
+    /// * `Err(FuseError)` - Error if creation fails or unsupported type
+    async fn mk_nod(&self, op: MkNod<'_>) -> FuseResult<fuse_entry_out> {
+        if FuseUtils::s_isreg(op.arg.mode) {
+            let create_in = fuse_create_in {
+                flags: OpenFlags::new_create().value(),
+                mode: op.arg.mode,
+                umask: op.arg.umask,
+                padding: op.arg.padding,
+            };
+            let op = Create {
+                header: op.header,
+                arg: &create_in,
+                name: op.name,
+            };
+            let res = self.create(op).await?;
+            let handle = self.state.remove_handle(res.0.nodeid, res.1.fh);
+            if let Some(handle) = handle {
+                handle.complete(None).await?;
+            } else {
+                return err_fuse!(libc::EIO);
+            }
+            let out = fuse_entry_out {
+                nodeid: res.0.nodeid,
+                generation: res.0.generation,
+                entry_valid: res.0.entry_valid,
+                attr_valid: res.0.attr_valid,
+                entry_valid_nsec: res.0.entry_valid_nsec,
+                attr_valid_nsec: res.0.attr_valid_nsec,
+                attr: res.0.attr,
+            };
+            Ok(out)
+        } else if FuseUtils::is_dir(op.arg.mode) {
+            let mkdir_in = fuse_mkdir_in {
+                mode: op.arg.mode,
+                umask: op.arg.umask,
+            };
+            let op = MkDir {
+                header: op.header,
+                arg: &mkdir_in,
+                name: op.name,
+            };
+            self.mkdir(op).await
+        } else {
+            err_fuse!(libc::EPERM)
+        }
     }
 }
