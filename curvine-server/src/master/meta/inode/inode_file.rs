@@ -230,11 +230,6 @@ impl InodeFile {
         )
     }
 
-    // Increment link count
-    pub fn increment_nlink(&mut self) {
-        self.nlink += 1;
-    }
-
     // Decrement link count
     pub fn decrement_nlink(&mut self) -> u32 {
         if self.nlink > 0 {
@@ -346,6 +341,10 @@ impl Inode for InodeFile {
 
     fn atime(&self) -> i64 {
         self.atime
+    }
+
+    fn nlink(&self) -> u32 {
+        self.nlink
     }
 }
 

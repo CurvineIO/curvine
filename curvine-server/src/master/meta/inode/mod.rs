@@ -61,4 +61,7 @@ pub trait Inode {
 
     // Access time
     fn atime(&self) -> i64;
+
+    // nlink
+    fn nlink(&self) -> u32;
 }

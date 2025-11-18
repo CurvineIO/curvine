@@ -876,8 +876,8 @@ impl FsDir {
 
         // If we have the original inode in memory, increment its nlink count
         if let Some(ref mut inode_ptr) = original_inode_ptr {
-            if let File(_, ref mut file) = inode_ptr.as_mut() {
-                file.increment_nlink();
+            if let File(_, _) = inode_ptr.as_mut() {
+                inode_ptr.incr_nlink();
             }
         }
 

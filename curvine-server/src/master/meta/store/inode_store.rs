@@ -280,8 +280,8 @@ impl InodeStore {
     fn increment_inode_nlink(&self, inode_id: i64) -> CommonResult<()> {
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {
-                InodeView::File(_, file) => {
-                    file.increment_nlink();
+                InodeView::File(_, _) => {
+                    inode_view.incr_nlink();
                     let mut batch = self.store.new_batch();
                     batch.write_inode(&inode_view)?;
                     batch.commit()?;

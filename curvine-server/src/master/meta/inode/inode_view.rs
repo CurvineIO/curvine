@@ -179,6 +179,14 @@ impl InodeView {
         }
     }
 
+    pub fn incr_nlink(&mut self) {
+        match self {
+            File(_, f) => f.nlink += 1,
+            Dir(_, d) => d.nlink += 1,
+            FileEntry(..) => (),
+        }
+    }
+
     pub fn set_parent_id(&mut self, parent_id: i64) {
         match self {
             File(_, f) => f.parent_id = parent_id,
@@ -298,7 +306,7 @@ impl InodeView {
     pub fn nlink(&self) -> u32 {
         match self {
             File(_, f) => f.nlink(),
-            Dir(_, _) => 1,
+            Dir(_, d) => d.nlink(),
             FileEntry(_, _) => {
                 panic!("FileEntry does not support nlink")
             }

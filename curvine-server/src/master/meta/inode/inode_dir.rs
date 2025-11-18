@@ -28,6 +28,7 @@ pub struct InodeDir {
     pub(crate) parent_id: i64,
     pub(crate) mtime: i64,
     pub(crate) atime: i64,
+    pub(crate) nlink: u32,
     pub(crate) storage_policy: StoragePolicy,
 
     pub(crate) features: DirFeature,
@@ -43,6 +44,7 @@ impl InodeDir {
             parent_id: EMPTY_PARENT_ID,
             mtime: time,
             atime: time,
+            nlink: 2,
             storage_policy: Default::default(),
             features: Default::default(),
             children: InodeChildren::new_map(),
@@ -55,6 +57,7 @@ impl InodeDir {
             parent_id: EMPTY_PARENT_ID,
             mtime: time,
             atime: time,
+            nlink: 2,
             storage_policy: opts.storage_policy,
             features: DirFeature {
                 acl: AclFeature {
@@ -133,6 +136,10 @@ impl Inode for InodeDir {
 
     fn is_dir(&self) -> bool {
         true
+    }
+
+    fn nlink(&self) -> u32 {
+        self.nlink
     }
 
     fn mtime(&self) -> i64 {
