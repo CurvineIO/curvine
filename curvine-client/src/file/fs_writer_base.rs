@@ -170,7 +170,11 @@ impl FsWriterBase {
                     // Multiple seek operations will automatically cache block writer, so need to check block writer cache.
                     Some((off, lb)) => {
                         let writer = match self.all_writers.remove(&lb.id) {
-                            Some(v) => v,
+                            Some(mut v) => {
+                                // Writer from cache may have a different position, seek to correct offset
+                                v.seek(off).await?;
+                                v
+                            }
                             None => {
                                 BlockWriter::new(self.fs_context.clone(), lb.clone(), off).await?
                             }

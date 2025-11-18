@@ -82,7 +82,7 @@ impl UnifiedFileSystem {
     }
 
     // Check if the path is a mount point, if so, return the mount point information
-    async fn get_mount(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
+    pub async fn get_mount(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
         if !path.is_cv() {
             return err_box!("path is not curvine path");
         }
@@ -182,11 +182,17 @@ impl UnifiedFileSystem {
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {
-        self.cv.symlink(target, link, force).await
+        match self.get_mount(link).await? {
+            None => self.cv.symlink(target, link, force).await,
+            Some(_) => err_ext!(FsError::unsupported("symlink")),
+        }
     }
 
     pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
-        self.cv.link(src_path, dst_path).await
+        match self.get_mount(src_path).await? {
+            None => self.cv.link(src_path, dst_path).await,
+            Some(_) => err_ext!(FsError::unsupported("link")),
+        }
     }
 
     async fn get_cache_validity(

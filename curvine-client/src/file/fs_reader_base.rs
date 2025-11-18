@@ -118,15 +118,16 @@ impl FsReaderBase {
             return err_box!("seek position {} can not exceed file len {}", pos, self.len);
         }
 
+        let (block_off, loc) = self.file_blocks.get_read_block(pos)?;
         if let Some(reader) = &mut self.cur_reader {
-            let to_skip = pos - self.pos;
-            if to_skip <= reader.remaining() && to_skip >= -reader.pos() {
-                // Move backwards and the new position is within the current block.
-                reader.seek(reader.pos() + to_skip)?;
+            // Check if the target position is in the current block
+            if reader.block_id() == loc.block.id {
+                // Within the same block, seek to the correct block offset
+                reader.seek(block_off)?;
             } else {
                 self.close_reader_times = self.close_reader_times.saturating_add(1);
                 self.update_reader(None).await?;
-            };
+            }
         }
 
         self.pos = pos;

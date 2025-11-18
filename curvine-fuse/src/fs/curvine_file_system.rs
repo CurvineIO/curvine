@@ -99,13 +99,7 @@ impl CurvineFileSystem {
         } else {
             match sys::get_uid_by_name(&status.owner) {
                 Some(uid) => uid,
-                None => {
-                    return err_fuse!(
-                        libc::EINVAL,
-                        "Cannot resolve username '{}' to UID",
-                        status.owner
-                    );
-                }
+                None => conf.uid,
             }
         };
 
@@ -116,13 +110,7 @@ impl CurvineFileSystem {
         } else {
             match sys::get_gid_by_name(&status.group) {
                 Some(gid) => gid,
-                None => {
-                    return err_fuse!(
-                        libc::EINVAL,
-                        "Cannot resolve username '{}' to GID",
-                        status.group
-                    );
-                }
+                None => conf.uid,
             }
         };
 

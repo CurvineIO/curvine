@@ -116,15 +116,14 @@ impl FuseWriter {
         while let Some(task) = req_receiver.recv().await {
             match task {
                 WriteTask::Write(off, data, reply) => {
-                    let res: FsResult<fuse_write_out> = {
-                        let len = data.len();
-                        writer.fuse_write(off, DataSlice::Bytes(data)).await?;
-
-                        Ok(fuse_write_out {
+                    let len = data.len();
+                    let res: FsResult<fuse_write_out> = writer
+                        .fuse_write(off, DataSlice::Bytes(data))
+                        .await
+                        .map(|_| fuse_write_out {
                             size: len as u32,
                             padding: 0,
-                        })
-                    };
+                        });
                     reply.send_rep(res).await?;
                 }
 
