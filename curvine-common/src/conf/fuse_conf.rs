@@ -65,6 +65,8 @@ pub struct FuseConf {
 
     pub auto_cache: bool,
 
+    pub web_port: u16,
+
     // Whether to fill the fuse node id when traversing the directory.
     // When executing list_status, if the node id is not filled, the node id returned to the kernel is in curvine and does not exist in the node cache.
     // file attr has cache time. During the cache time, look up will not be executed. If you access this file, an error will be reported (node ​​does not exist)
@@ -274,6 +276,7 @@ impl Default for FuseConf {
             ac_attr_timeout_set: FuseConf::TTR_TIMEOUT,
             remember: false,
             auto_cache: false,
+            web_port: 9002,
 
             max_background: 256,
             congestion_threshold: 192,
