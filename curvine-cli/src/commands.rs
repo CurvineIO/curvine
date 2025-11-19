@@ -47,6 +47,10 @@ pub enum Commands {
     #[command(name = "node")]
     Node(NodeCommand),
 
+    /// Kubernetes deployment commands
+    #[command(name = "k8s")]
+    K8s(K8sCommand),
+
     /// show cli version
     #[command(name = "version")]
     Version,

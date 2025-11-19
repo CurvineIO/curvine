@@ -1,0 +1,25 @@
+# Build artifacts
+target/
+build/dist/
+*.log
+
+# Node modules (will be installed fresh in container)
+node_modules/
+**/node_modules/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Temporary files
+*.tmp
+.DS_Store
+
+# Test artifacts
+coverage/

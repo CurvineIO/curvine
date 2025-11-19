@@ -52,7 +52,7 @@ fn main() -> CommonResult<()> {
     let load_client = JobMasterClient::new(fs_client.clone());
 
     rt.block_on(async move {
-        let result = match args.command {
+        match args.command {
             Commands::Fs(cmd) => cmd.execute(curvine_fs).await,
             Commands::Report(cmd) => cmd.execute(curvine_fs).await,
             Commands::Load(cmd) => cmd.execute(load_client).await,
@@ -61,16 +61,17 @@ fn main() -> CommonResult<()> {
             Commands::Mount(cmd) => cmd.execute(fs_client).await,
             Commands::UnMount(cmd) => cmd.execute(fs_client).await,
             Commands::Node(cmd) => cmd.execute(fs_client, conf.clone()).await,
+            Commands::K8s(cmd) => match cmd.execute(conf.clone()).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            },
             Commands::Version => {
                 println!("Curvine version: {}", version::GIT_VERSION);
                 Ok(())
             }
-        };
-
-        if let Err(e) = &result {
-            eprintln!("Error: {}", e);
         }
-
-        result
     })
 }

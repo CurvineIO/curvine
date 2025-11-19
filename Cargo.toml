@@ -20,7 +20,8 @@ members = [
     "curvine-web",
     "curvine-ufs",
     "curvine-cli",
-    "curvine-s3-gateway"
+    "curvine-s3-gateway",
+    "curvine-kube"
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ curvine-tests = { path = "curvine-tests" }
 curvine-fuse = { path = "curvine-fuse" }
 curvine-web = { path = "curvine-web" }
 curvine-s3-gateway = { path = "curvine-s3-gateway" }
+curvine-kube = { path = "curvine-kube" }
 
 # The most important library start
 

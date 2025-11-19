@@ -1,0 +1,276 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+# Curvine Cluster K8s Configuration Example
+# This file contains ALL supported Kubernetes configuration parameters with their DEFAULT values
+# Both static (in config file) and dynamic (via -D flags) parameters are documented
+
+# ============================================================================
+# Client Configuration
+# ============================================================================
+[client]
+master_addrs = ["localhost:8995"]
+hostname = "localhost"
+io_threads = 16
+worker_threads = 16
+replicas = 1
+block_size = "128MB"
+write_chunk_size = "128KB"
+write_chunk_num = 8
+read_chunk_size = "128KB"
+read_chunk_num = 8
+conn_timeout_ms = 30000
+rpc_timeout_ms = 120000
+data_timeout_ms = 300000
+master_conn_pool_size = 1
+
+# ============================================================================
+# Kubernetes Configuration
+# ============================================================================
+[client.kubernetes]
+# Basic Settings
+namespace = "default"                           # Default: "default" - Kubernetes namespace
+cluster_id = "curvine-cluster"                  # Default: None - Cluster identifier (max 45 chars, lowercase alphanumeric and hyphens)
+# config_file = "~/.kube/config"                # Default: None (uses KUBECONFIG env or ~/.kube/config)
+# context = ""                                  # Default: None (uses current context)
+cluster_domain = "cluster.local"                # Default: "cluster.local" - Cluster domain for service discovery
+                                                # Dynamic: -Dkubernetes.cluster.domain=custom.local
+
+# Image Configuration
+# container_image = "docker.io/curvine:latest"  # Default: None (uses master/worker specific images)
+                                                # Dynamic: -Dkubernetes.container.image=xxx (applies to both master and worker)
+image_pull_policy = "IfNotPresent"              # Default: "IfNotPresent" - Values: Always | IfNotPresent | Never
+                                                # Dynamic: -Dkubernetes.image.pull-policy=Always
+image_pull_secrets = []                         # Default: [] - List of image pull secret names
+hostnetwork_enabled = false                     # Default: false - Enable host network for all pods
+
+# ============================================================================
+# Master (JobManager) Configuration
+# ============================================================================
+[client.kubernetes.master]
+# Basic Settings
+replicas = 3                                    # Default: 3 - Must be odd: 1, 3, 5, 7 (for Raft consensus)
+                                                # Dynamic: -Dkubernetes.master.replicas=5
+image = "docker.io/curvine:latest"              # Default: "docker.io/curvine:latest" - Master container image
+                                                # Dynamic: -Dkubernetes.master.image=docker.io/curvine:v1.0
+
+# Pod Template (Advanced)
+# pod_template = "/path/to/master-pod.yaml"     # Default: None - Optional: Custom Pod template file
+                                                # Dynamic: -Dkubernetes.master.pod-template=/path/to/template.yaml
+
+# Lifecycle
+graceful_shutdown = true                        # Default: true - Enable graceful shutdown
+
+# Resource Limits (Optional - defaults applied via dynamic config if not specified)
+# Default: CPU=1.0 (1000m), Memory=2Gi, Requests=Limits
+# cpu = 1.0                                     # Default: None (1.0 via dynamic config)
+# cpu_limit_factor = 1.0                        # Default: None - CPU limit = cpu * cpu_limit_factor
+# memory_limit_factor = 1.0                     # Default: None - Memory limit = memory * memory_limit_factor
+                                                # Dynamic: -Dkubernetes.master.cpu=2.0 (CPU in cores, e.g., 2.0 = 2000m)
+                                                # Dynamic: -Dkubernetes.master.memory=4Gi (e.g., 4Gi, 2048Mi)
+
+# Node Scheduling (Optional)
+# node_selector = { "node-type" = "master" }    # Default: None - Node selector labels
+                                                # Dynamic: -Dkubernetes.master.node-selector=key1=value1,key2=value2
+
+# Labels and Annotations (Optional)
+# labels = { "app" = "curvine", "tier" = "master" }
+                                                # Default: None - Pod labels
+                                                # Dynamic: -Dkubernetes.master.labels=key1=value1,key2=value2
+# annotations = { "prometheus.io/scrape" = "true" }
+                                                # Default: None - Pod annotations
+                                                # Dynamic: -Dkubernetes.master.annotations=key1=value1,key2=value2
+
+# Service Account (Optional)
+# service_account = "curvine-master"            # Default: None (uses "default") - Kubernetes ServiceAccount name
+                                                # Dynamic: -Dkubernetes.master.service-account=my-sa
+
+# Tolerations (Optional)
+# tolerations = [
+#   { "key" = "node-role", "operator" = "Equal", "value" = "master", "effect" = "NoSchedule" }
+# ]                                             # Default: None - Pod tolerations
+
+# DNS and Priority (Optional)
+# dns_policy = "ClusterFirst"                   # Default: None - DNS policy: ClusterFirst | Default | ClusterFirstWithHostNet | None
+                                                # Dynamic: -Dkubernetes.pod.dns-policy=ClusterFirst
+# priority_class = "high-priority"              # Default: None - PriorityClass name
+                                                # Dynamic: -Dkubernetes.master.priority-class=high-priority
+                                                # Dynamic: -Dkubernetes.pod.priority-class=xxx (applies to both master and worker)
+
+# Environment Variables (Optional)
+# Note: Use dynamic config for custom env vars
+# Dynamic: -Dkubernetes.master.env.VAR_NAME=value
+
+# ============================================================================
+# Worker (TaskManager) Configuration
+# ============================================================================
+[client.kubernetes.worker]
+# Basic Settings
+replicas = 3                                    # Default: 3 - Number of worker replicas
+                                                # Dynamic: -Dkubernetes.worker.replicas=10
+image = "docker.io/curvine:latest"              # Default: "docker.io/curvine:latest" - Worker container image
+                                                # Dynamic: -Dkubernetes.worker.image=docker.io/curvine:v1.0
+
+# Pod Template (Advanced)
+# pod_template = "/path/to/worker-pod.yaml"     # Default: None - Optional: Custom Pod template file
+                                                # Dynamic: -Dkubernetes.worker.pod-template=/path/to/template.yaml
+
+# Deployment Type
+use_statefulset = true                          # Default: true - Use StatefulSet (true) or Deployment (false)
+
+# Storage
+# storage_class = "standard"                    # Default: None - StorageClass for worker data volumes
+                                                # Dynamic: -Dkubernetes.worker.storage-class=fast-ssd
+
+# Lifecycle
+graceful_shutdown = true                        # Default: true - Enable graceful shutdown
+host_network = false                            # Default: false - Use host network
+init_container = false                          # Default: false - Enable init container
+
+# Resource Limits (Optional - defaults applied via dynamic config if not specified)
+# Default: CPU=0.5 (500m), Memory=1Gi, Requests=Limits
+# cpu = 0.5                                     # Default: None (0.5 via dynamic config)
+# cpu_limit_factor = 1.0                        # Default: None - CPU limit = cpu * cpu_limit_factor
+# memory_limit_factor = 1.0                     # Default: None - Memory limit = memory * memory_limit_factor
+                                                # Dynamic: -Dkubernetes.worker.cpu=1.0 (CPU in cores)
+                                                # Dynamic: -Dkubernetes.worker.memory=2Gi
+
+# Node Scheduling (Optional)
+# node_selector = { "node-type" = "worker" }    # Default: None - Node selector labels
+                                                # Dynamic: -Dkubernetes.worker.node-selector=key1=value1,key2=value2
+# anti_affinity = true                          # Note: This is handled in curvine-kube, not in this config
+
+# Labels and Annotations (Optional)
+# labels = { "app" = "curvine", "tier" = "worker" }
+                                                # Default: None - Pod labels
+                                                # Dynamic: -Dkubernetes.worker.labels=key1=value1,key2=value2
+# annotations = { "prometheus.io/scrape" = "true" }
+                                                # Default: None - Pod annotations
+                                                # Dynamic: -Dkubernetes.worker.annotations=key1=value1,key2=value2
+
+# Service Account (Optional)
+# service_account = "curvine-worker"            # Default: None (uses "default") - Kubernetes ServiceAccount name
+                                                # Dynamic: -Dkubernetes.worker.service-account=my-sa
+
+# Tolerations (Optional)
+# tolerations = [
+#   { "key" = "node-role", "operator" = "Equal", "value" = "worker", "effect" = "NoSchedule" }
+# ]                                             # Default: None - Pod tolerations
+
+# DNS and Priority (Optional)
+# dns_policy = "ClusterFirst"                   # Default: None - DNS policy
+                                                # Dynamic: -Dkubernetes.pod.dns-policy=ClusterFirst
+# priority_class = "normal-priority"            # Default: None - PriorityClass name
+                                                # Dynamic: -Dkubernetes.worker.priority-class=normal-priority
+
+# Environment Variables (Optional)
+# Note: Use dynamic config for custom env vars
+# Dynamic: -Dkubernetes.worker.env.VAR_NAME=value
+
+# ============================================================================
+# Storage Configuration
+# ============================================================================
+[client.kubernetes.storage]
+storage_class = "standard"                      # Default: "" (empty) - StorageClass for master metadata and journal
+                                                # Dynamic: -Dkubernetes.storage.class=fast-ssd
+size = "10Gi"                                   # Default: "10Gi" - Storage size for PVCs
+                                                # Dynamic: -Dkubernetes.storage.size=200Gi
+
+# Note: Storage configuration cannot be updated after deployment (K8s limitation)
+
+# ============================================================================
+# Service Configuration
+# ============================================================================
+[client.kubernetes.service]
+service_type = "ClusterIP"                      # Default: "ClusterIP" - Values: ClusterIP | NodePort | LoadBalancer
+                                                # Dynamic: -Dkubernetes.service.type=NodePort
+
+# Service Type Settings
+# node_port_address_type = "InternalIP"         # Default: "InternalIP" - Values: InternalIP | ExternalIP
+
+# Labels and Annotations (Optional)
+# labels = { "app" = "curvine" }                # Default: None - Service labels
+annotations = {}                                # Default: {} - Service annotations
+                                                # Dynamic: -Dkubernetes.service.annotations=key1=value1,key2=value2
+
+# Advanced Service Settings (Optional)
+# session_affinity = "ClientIP"                 # Default: None - Session affinity: None | ClientIP
+external_ips = []                               # Default: [] - External IPs for the service
+                                                # Dynamic: -Dkubernetes.service.external-ips=1.2.3.4,5.6.7.8
+# load_balancer_source_ranges = []              # Default: [] - LoadBalancer source IP ranges
+
+# ============================================================================
+# Master Server Configuration
+# ============================================================================
+[master]
+rpc_host = "0.0.0.0"
+rpc_port = 8995
+web_port = 9000
+meta_dir = "/opt/curvine/data/meta"             # Metadata directory (absolute or relative to /app/curvine)
+
+# ============================================================================
+# Journal Configuration
+# ============================================================================
+[journal]
+rpc_port = 8996
+journal_dir = "/opt/curvine/data/journal"       # Journal directory (absolute or relative to /app/curvine)
+
+# ============================================================================
+# Worker Server Configuration
+# ============================================================================
+[worker]
+rpc_host = "0.0.0.0"
+rpc_port = 8997
+web_port = 9001
+worker_data_dir = "[SSD:100GB]/data/cache"      # Worker data directory with tier specification
+
+# ============================================================================
+# Dynamic Configuration Examples (Command Line)
+# ============================================================================
+# All parameters marked with "Dynamic:" above can be overridden via -D flags:
+#
+# Deploy with custom configuration:
+#   cv k8s deploy -c my-cluster \
+#     -Dkubernetes.master.replicas=5 \
+#     -Dkubernetes.worker.replicas=10 \
+#     -Dkubernetes.master.cpu=2.0 \
+#     -Dkubernetes.master.memory=4Gi \
+#     -Dkubernetes.worker.cpu=1.0 \
+#     -Dkubernetes.worker.memory=2Gi \
+#     -Dkubernetes.cluster.domain=my-domain.local \
+#     -Dkubernetes.service.type=NodePort
+#
+# Update cluster:
+#   cv k8s update -c my-cluster \
+#     -Dkubernetes.worker.replicas=20 \
+#     -Dkubernetes.master.image=docker.io/curvine:v2.0 \
+#     -Dkubernetes.worker.image=docker.io/curvine:v2.0
+#
+# Advanced scheduling:
+#   cv k8s deploy -c my-cluster \
+#     -Dkubernetes.master.node-selector=node-type=master,zone=us-east-1a \
+#     -Dkubernetes.worker.node-selector=node-type=worker,zone=us-east-1b \
+#     -Dkubernetes.master.labels=app=curvine,tier=master \
+#     -Dkubernetes.master.annotations=prometheus.io/scrape=true
+#
+# Custom environment variables:
+#   cv k8s deploy -c my-cluster \
+#     -Dkubernetes.master.env.JAVA_OPTS=-Xmx4g \
+#     -Dkubernetes.worker.env.CACHE_SIZE=10GB
+#
+# Advanced service configuration:
+#   cv k8s deploy -c my-cluster \
+#     -Dkubernetes.service.type=LoadBalancer \
+#     -Dkubernetes.service.external-ips=10.0.0.1,10.0.0.2 \
+#     -Dkubernetes.service.annotations=service.beta.kubernetes.io/aws-load-balancer-type=nlb

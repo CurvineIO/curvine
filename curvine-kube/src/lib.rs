@@ -12,22 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod fs;
-pub mod k8s;
-mod load;
-mod load_cancel;
-mod load_status;
-mod mount;
-mod node;
-mod report;
-mod umount;
+pub mod builder;
+pub mod client;
+pub mod config;
+pub mod constants;
+pub mod descriptor;
+pub mod dynamic_config;
+pub mod error;
+pub mod pod_template;
+pub mod pod_template_utils;
+pub mod validator;
 
-pub use fs::FsCommand;
-pub use k8s::K8sCommand;
-pub use load::LoadCommand;
-pub use load_cancel::CancelLoadCommand;
-pub use load_status::LoadStatusCommand;
-pub use mount::MountCommand;
-pub use node::NodeCommand;
-pub use report::ReportCommand;
-pub use umount::UnMountCommand;
+pub use config::{
+    KubernetesConfig, MasterConfig, ServiceConfig, ServiceType, StorageConfig, WorkerConfig,
+};
+pub use descriptor::{ClusterInfo, CurvineClusterDescriptor};
+pub use error::KubeError;
+
+#[doc(hidden)]
+pub use builder::{
+    ConfigMapBuilder, HeadlessServiceBuilder, MasterBuilder, ServiceBuilder, WorkerBuilder,
+};
+#[doc(hidden)]
+pub use config::KubernetesConfigBuilder;

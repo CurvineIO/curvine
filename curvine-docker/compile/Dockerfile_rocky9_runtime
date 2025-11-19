@@ -1,0 +1,72 @@
+#
+# Copyright 2025 OPPO.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Runtime image for Curvine cluster deployment
+# This Dockerfile is used for building from pre-compiled binaries
+
+# Use the official Rocky Linux 9 image as a base
+FROM rockylinux:9
+
+# Add metadata labels
+ARG REPO_URL=https://github.com/curvineio/curvine
+LABEL org.opencontainers.image.source="${REPO_URL}"
+LABEL org.opencontainers.image.description="Curvine Native Kubernetes Runtime Image"
+
+# Install runtime dependencies
+RUN dnf install -y \
+    java-1.8.0-openjdk-devel \
+    procps \
+    net-tools \
+    fuse3 \
+    libfuse3-3 \
+    nc \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf/*
+
+# Set environment variables
+ENV APP_HOME=/app
+ENV CURVINE_HOME=${APP_HOME}/curvine
+WORKDIR $APP_HOME
+
+# Copy build artifacts from dist directory
+ADD dist $APP_HOME/curvine
+
+# Make all binaries executable
+RUN chmod +x $APP_HOME/curvine/bin/* 2>/dev/null || true && \
+    chmod +x $APP_HOME/curvine/lib/* 2>/dev/null || true
+
+# Copy entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Create necessary directories
+RUN mkdir -p $APP_HOME/curvine/data/{meta,journal} && \
+    mkdir -p $APP_HOME/curvine/logs
+
+# Expose ports
+# 8995: Master RPC
+# 8996: Master Journal/Raft
+# 8997: Worker RPC
+# 9000: Master Web UI
+# 9001: Worker Web UI / Master Web1
+EXPOSE 8995 8996 8997 9000 9001
+
+# Set entrypoint
+ENTRYPOINT ["/entrypoint.sh"]
+
+# Default command (can be overridden)
+CMD ["all", "start"]
+

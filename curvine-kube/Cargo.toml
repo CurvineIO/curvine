@@ -1,0 +1,23 @@
+[package]
+name = "curvine-kube"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+curvine-common = { workspace = true }
+orpc = { workspace = true }
+kube = { version = "2.0.1", default-features = false, features = ["runtime", "client", "openssl-tls"] }
+k8s-openapi = { version = "0.26.0", default-features = false, features = ["latest"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_yaml = "0.9"
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+futures = "0.3"
+tracing = { workspace = true }
+backon = "0.5"
+async-trait = { workspace = true }
+toml = { workspace = true }
+

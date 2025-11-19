@@ -19,6 +19,7 @@ use orpc::common::{ByteUnit, DurationUnit, Utils};
 use orpc::io::net::InetAddr;
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +168,176 @@ pub struct ClientConf {
     pub metric_report_interval_str: String,
 
     pub close_timeout_secs: u64,
+
+    /// Kubernetes deployment configuration
+    pub kubernetes: Option<KubernetesConf>,
+}
+
+/// Kubernetes deployment configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KubernetesConf {
+    pub namespace: String,
+    pub cluster_id: Option<String>,
+    pub config_file: Option<String>,
+    pub context: Option<String>,
+    pub master: KubernetesMasterConf,
+    pub worker: KubernetesWorkerConf,
+    pub storage: Option<KubernetesStorageConf>,
+    pub service: KubernetesServiceConf,
+    pub container_image: Option<String>,
+    pub image_pull_policy: String,
+    pub image_pull_secrets: Vec<String>,
+    pub hostnetwork_enabled: bool,
+}
+
+/// Kubernetes Master component configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KubernetesMasterConf {
+    pub replicas: u32,
+    pub image: String,
+    pub pod_template: Option<String>,
+    pub node_selector: Option<HashMap<String, String>>,
+    pub labels: Option<HashMap<String, String>>,
+    pub annotations: Option<HashMap<String, String>>,
+    pub service_account: Option<String>,
+    pub cpu: Option<f64>,
+    pub cpu_limit_factor: Option<f64>,
+    pub memory_limit_factor: Option<f64>,
+    pub tolerations: Option<Vec<HashMap<String, String>>>,
+    pub graceful_shutdown: bool,
+}
+
+/// Kubernetes Worker component configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KubernetesWorkerConf {
+    pub replicas: u32,
+    pub image: String,
+    pub pod_template: Option<String>,
+    pub node_selector: Option<HashMap<String, String>>,
+    pub labels: Option<HashMap<String, String>>,
+    pub annotations: Option<HashMap<String, String>>,
+    pub service_account: Option<String>,
+    pub cpu: Option<f64>,
+    pub cpu_limit_factor: Option<f64>,
+    pub memory_limit_factor: Option<f64>,
+    pub tolerations: Option<Vec<HashMap<String, String>>>,
+    pub use_statefulset: bool,
+    pub storage_class: Option<String>,
+    pub graceful_shutdown: bool,
+    pub host_network: bool,
+    pub init_container: bool,
+}
+
+/// Kubernetes Storage configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KubernetesStorageConf {
+    pub storage_class: String,
+    pub master_storage_class: Option<String>,
+    pub worker_storage_class: Option<String>,
+    pub master_size: Option<String>,
+    pub worker_size: Option<String>,
+}
+
+/// Kubernetes Service configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KubernetesServiceConf {
+    pub service_type: String,
+    pub node_port_address_type: Option<String>,
+    pub annotations: HashMap<String, String>,
+    pub labels: Option<HashMap<String, String>>,
+    pub session_affinity: Option<String>,
+    pub external_ips: Vec<String>,
+}
+
+impl Default for KubernetesConf {
+    fn default() -> Self {
+        Self {
+            namespace: "default".to_string(),
+            cluster_id: None,
+            config_file: None,
+            context: None,
+            master: KubernetesMasterConf::default(),
+            worker: KubernetesWorkerConf::default(),
+            storage: None,
+            service: KubernetesServiceConf::default(),
+            container_image: None,
+            image_pull_policy: "IfNotPresent".to_string(),
+            image_pull_secrets: Vec::new(),
+            hostnetwork_enabled: false,
+        }
+    }
+}
+
+impl Default for KubernetesMasterConf {
+    fn default() -> Self {
+        Self {
+            replicas: 3,
+            image: "docker.io/curvine:latest".to_string(),
+            pod_template: None,
+            node_selector: None,
+            labels: None,
+            annotations: None,
+            service_account: None,
+            cpu: None,
+            cpu_limit_factor: None,
+            memory_limit_factor: None,
+            tolerations: None,
+            graceful_shutdown: true,
+        }
+    }
+}
+
+impl Default for KubernetesWorkerConf {
+    fn default() -> Self {
+        Self {
+            replicas: 3,
+            image: "docker.io/curvine:latest".to_string(),
+            pod_template: None,
+            node_selector: None,
+            labels: None,
+            annotations: None,
+            service_account: None,
+            cpu: None,
+            cpu_limit_factor: None,
+            memory_limit_factor: None,
+            tolerations: None,
+            use_statefulset: true,
+            storage_class: None,
+            graceful_shutdown: true,
+            host_network: false,
+            init_container: false,
+        }
+    }
+}
+
+impl Default for KubernetesStorageConf {
+    fn default() -> Self {
+        Self {
+            storage_class: "".to_string(),
+            master_storage_class: None,
+            worker_storage_class: None,
+            master_size: Some("10Gi".to_string()),
+            worker_size: Some("20Gi".to_string()),
+        }
+    }
+}
+
+impl Default for KubernetesServiceConf {
+    fn default() -> Self {
+        Self {
+            service_type: "ClusterIP".to_string(),
+            node_port_address_type: Some("InternalIP".to_string()),
+            annotations: HashMap::new(),
+            labels: None,
+            session_affinity: None,
+            external_ips: Vec::new(),
+        }
+    }
 }
 
 impl ClientConf {
@@ -328,6 +499,7 @@ impl Default for ClientConf {
             metric_report_interval: Default::default(),
             metric_report_interval_str: Self::DEFAULT_METRIC_REPORT_INTERVAL_STR.to_string(),
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
+            kubernetes: None,
         };
 
         conf.init().unwrap();

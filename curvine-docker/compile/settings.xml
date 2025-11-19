@@ -24,5 +24,50 @@
             <url>https://maven.aliyun.com/repository/public</url>
             <mirrorOf>central</mirrorOf>
         </mirror>
+        <mirror>
+            <id>tunamaven</id>
+            <name>Tsinghua University public repositories</name>
+            <url>https://mirrors.tuna.tsinghua.edu.cn/maven2/</url>
+            <mirrorOf>central</mirrorOf>
+        </mirror>
+        <mirror>
+            <id>backup-maven</id>
+            <name>Central Repository</name>
+            <url>https://repo1.maven.org/maven2</url>
+            <mirrorOf>*</mirrorOf>
+        </mirror>
     </mirrors>
+    
+    <profiles>
+        <profile>
+            <id>default</id>
+            <activation>
+                <activeByDefault>true</activeByDefault>
+            </activation>
+            <repositories>
+                <repository>
+                    <id>central</id>
+                    <url>https://repo1.maven.org/maven2</url>
+                    <releases>
+                        <enabled>true</enabled>
+                    </releases>
+                    <snapshots>
+                        <enabled>true</enabled>
+                    </snapshots>
+                </repository>
+            </repositories>
+            <pluginRepositories>
+                <pluginRepository>
+                    <id>central</id>
+                    <url>https://repo1.maven.org/maven2</url>
+                    <releases>
+                        <enabled>true</enabled>
+                    </releases>
+                    <snapshots>
+                        <enabled>true</enabled>
+                    </snapshots>
+                </pluginRepository>
+            </pluginRepositories>
+        </profile>
+    </profiles>
 </settings>

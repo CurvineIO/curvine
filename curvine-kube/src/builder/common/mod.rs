@@ -12,22 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod fs;
-pub mod k8s;
-mod load;
-mod load_cancel;
-mod load_status;
-mod mount;
-mod node;
-mod report;
-mod umount;
+pub mod env_builder;
+pub mod lifecycle_builder;
 
-pub use fs::FsCommand;
-pub use k8s::K8sCommand;
-pub use load::LoadCommand;
-pub use load_cancel::CancelLoadCommand;
-pub use load_status::LoadStatusCommand;
-pub use mount::MountCommand;
-pub use node::NodeCommand;
-pub use report::ReportCommand;
-pub use umount::UnMountCommand;
+pub use env_builder::EnvironmentBuilder;
+pub use lifecycle_builder::LifecycleBuilder;
