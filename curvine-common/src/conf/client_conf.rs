@@ -167,6 +167,8 @@ pub struct ClientConf {
     pub metric_report_interval_str: String,
 
     pub close_timeout_secs: u64,
+
+    pub metadata_operation_buckets: Vec<f64>,
 }
 
 impl ClientConf {
@@ -328,6 +330,10 @@ impl Default for ClientConf {
             metric_report_interval: Default::default(),
             metric_report_interval_str: Self::DEFAULT_METRIC_REPORT_INTERVAL_STR.to_string(),
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
+
+            metadata_operation_buckets: vec![
+                10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
+            ],
         };
 
         conf.init().unwrap();

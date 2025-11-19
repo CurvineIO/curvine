@@ -62,7 +62,8 @@ impl FsContext {
             port: 0,
         };
 
-        CLIENT_METRICS.get_or_init(|| ClientMetrics::new().unwrap());
+        CLIENT_METRICS
+            .get_or_init(|| ClientMetrics::new(&conf.client.metadata_operation_buckets).unwrap());
 
         let connector = ClusterConnector::with_rt(conf.client_rpc_conf(), rt.clone());
         for node in conf.master_nodes() {

@@ -281,3 +281,18 @@ macro_rules! impl_filesystem_for_enum {
         }
     };
 }
+
+#[macro_export]
+macro_rules! timed_operation {
+    ($self:expr, $operation_name:expr, $body:expr) => {{
+        let start = std::time::Instant::now();
+        let result = $body;
+        let duration_us = start.elapsed().as_micros() as f64;
+        $self
+            .metrics
+            .metadata_operation_duration
+            .with_label_values(&[$operation_name])
+            .observe(duration_us);
+        result
+    }};
+}

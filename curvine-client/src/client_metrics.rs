@@ -15,7 +15,7 @@
 use crate::file::FsContext;
 use curvine_common::state::{MetricType, MetricValue};
 use orpc::common::Metrics;
-use orpc::common::{CounterVec, Metrics as m};
+use orpc::common::{CounterVec, HistogramVec, Metrics as m};
 use orpc::sync::FastDashMap;
 use orpc::CommonResult;
 use std::collections::HashMap;
@@ -25,12 +25,14 @@ pub struct ClientMetrics {
     pub mount_cache_hits: CounterVec,
     pub mount_cache_misses: CounterVec,
     pub last_value_map: FastDashMap<String, f64>,
+
+    pub metadata_operation_duration: HistogramVec,
 }
 
 impl ClientMetrics {
     pub const PREFIX: &'static str = "client";
 
-    pub fn new() -> CommonResult<Self> {
+    pub fn new(buckets: &[f64]) -> CommonResult<Self> {
         let cm = Self {
             mount_cache_hits: m::new_counter_vec(
                 "client_mount_cache_hits",
@@ -44,6 +46,13 @@ impl ClientMetrics {
             )?,
 
             last_value_map: FastDashMap::default(),
+
+            metadata_operation_duration: m::new_histogram_vec_with_buckets(
+                "client_metadata_operation_duration",
+                "metadata operation duration",
+                &["operation"],
+                buckets,
+            )?,
         };
 
         Ok(cm)
@@ -104,7 +113,8 @@ impl ClientMetrics {
                 };
 
                 let incr_value = {
-                    let mut last_value = cm.last_value_map.entry(name.clone()).or_insert(0.0);
+                    let key = format!("{}:{:?}", name, tags);
+                    let mut last_value = cm.last_value_map.entry(key).or_insert(0.0);
                     let incr_value = value - *last_value;
                     *last_value = value;
                     incr_value
