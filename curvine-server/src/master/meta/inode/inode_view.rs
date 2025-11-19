@@ -187,6 +187,22 @@ impl InodeView {
         }
     }
 
+    pub fn dec_nlink(&mut self) {
+        match self {
+            File(_, f) => {
+                if f.nlink > 0 {
+                    f.nlink -= 1
+                }
+            }
+            Dir(_, d) => {
+                if d.nlink > 0 {
+                    d.nlink -= 1
+                }
+            }
+            FileEntry(..) => (),
+        }
+    }
+
     pub fn set_parent_id(&mut self, parent_id: i64) {
         match self {
             File(_, f) => f.parent_id = parent_id,

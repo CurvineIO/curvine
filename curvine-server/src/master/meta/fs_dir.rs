@@ -194,6 +194,7 @@ impl FsDir {
                     .apply_unlink_file_entry(parent.as_ref(), child, *inode_id)?
             }
             Dir(_, _) => {
+                parent.dec_nlink();
                 // Directories are always deleted
                 self.store.apply_delete(parent.as_ref(), child)?
             }
@@ -339,6 +340,9 @@ impl FsDir {
 
         // Update the parent directory for the last modification time.
         parent.update_mtime(child.mtime());
+        if child.is_dir() {
+            parent.incr_nlink();
+        }
 
         let added = parent.add_child(child)?;
         self.store.apply_add(parent.as_ref(), added.as_ref())?;
