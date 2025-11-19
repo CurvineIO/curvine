@@ -28,10 +28,10 @@ pub struct MasterMetrics {
     pub(crate) rpc_request_total_count: Counter,
     pub(crate) rpc_request_total_time: Counter,
 
-    pub(crate) cluster_capacity: Gauge,
-    pub(crate) cluster_available: Gauge,
+    pub(crate) capacity: Gauge,
+    pub(crate) available: Gauge,
     pub(crate) fs_used: Gauge,
-    pub(crate) blocks_total_num: Gauge,
+    pub(crate) block_num: Gauge,
     pub(crate) blocks_size_avg: Gauge,
 
     pub(crate) worker_num: GaugeVec,
@@ -69,13 +69,10 @@ impl MasterMetrics {
                 "Rpc request time duration(ms)",
             )?,
 
-            cluster_capacity: m::new_gauge("cluster_capacity", "Total storage capacity")?,
-            cluster_available: m::new_gauge(
-                "cluster_available",
-                "Storage directory available space",
-            )?,
+            capacity: m::new_gauge("capacity", "Total storage capacity")?,
+            available: m::new_gauge("available", "Storage directory available space")?,
             fs_used: m::new_gauge("fs_used", "Space used by the file system")?,
-            blocks_total_num: m::new_gauge("blocks_total_num", "Total block number")?,
+            block_num: m::new_gauge("num_blocks", "Total block number")?,
             blocks_size_avg: m::new_gauge("blocks_size_avg", "Average block size")?,
             worker_num: m::new_gauge_vec("worker_num", "The number of lived workers", &["tag"])?,
 
@@ -123,10 +120,10 @@ impl MasterMetrics {
 
     pub fn text_output(&self, fs: MasterFilesystem) -> CommonResult<String> {
         let master_info = fs.master_info()?;
-        self.cluster_capacity.set(master_info.capacity);
-        self.cluster_available.set(master_info.available);
+        self.capacity.set(master_info.capacity);
+        self.available.set(master_info.available);
         self.fs_used.set(master_info.fs_used);
-        self.blocks_total_num.set(master_info.block_num);
+        self.block_num.set(master_info.block_num);
         self.used_memory_bytes.set(SysUtils::used_memory() as i64);
 
         if master_info.block_num > 0 {
