@@ -15,7 +15,7 @@
 use crate::file::FsContext;
 use curvine_common::state::{MetricType, MetricValue};
 use orpc::common::Metrics;
-use orpc::common::{CounterVec, HistogramVec, Metrics as m};
+use orpc::common::{Counter, CounterVec, HistogramVec, Metrics as m};
 use orpc::sync::FastDashMap;
 use orpc::CommonResult;
 use std::collections::HashMap;
@@ -27,6 +27,10 @@ pub struct ClientMetrics {
     pub last_value_map: FastDashMap<String, f64>,
 
     pub metadata_operation_duration: HistogramVec,
+    pub write_bytes: Counter,
+    pub write_time_us: Counter,
+    pub read_bytes: Counter,
+    pub read_time_us: Counter,
 }
 
 impl ClientMetrics {
@@ -53,6 +57,10 @@ impl ClientMetrics {
                 &["operation"],
                 buckets,
             )?,
+            write_bytes: m::new_counter("client_write_bytes", "write bytes total")?,
+            write_time_us: m::new_counter("client_write_time_us", "write time us total")?,
+            read_bytes: m::new_counter("client_read_bytes", "read bytes total")?,
+            read_time_us: m::new_counter("client_read_time_us", "read time us total")?,
         };
 
         Ok(cm)

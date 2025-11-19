@@ -17,7 +17,7 @@ use curvine_common::fs::{Path, Reader};
 use curvine_common::state::{FileBlocks, FileStatus};
 use curvine_common::FsResult;
 use log::info;
-use orpc::common::ByteUnit;
+use orpc::common::{ByteUnit, TimeSpent};
 use orpc::err_box;
 use orpc::sys::DataSlice;
 use std::sync::Arc;
@@ -96,7 +96,12 @@ impl Reader for FsReader {
     }
 
     async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
-        self.inner.read().await
+        let spend = TimeSpent::new();
+        let result = self.inner.read().await;
+        let used_us = spend.used_us();
+        FsContext::get_metrics().read_time_us.inc_by(used_us as i64);
+
+        result
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
