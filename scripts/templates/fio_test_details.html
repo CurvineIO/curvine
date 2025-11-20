@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FIO Test Results - {{ date }}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; text-align: center; }
+        .header h1 { font-size: 2.2em; margin-bottom: 10px; }
+        .back-link { display: inline-block; margin-top: 15px; padding: 10px 20px; background: rgba(255,255,255,0.2); color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
+        .back-link:hover { background: rgba(255,255,255,0.3); }
+        .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .summary-card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }
+        .summary-card h3 { color: #666; margin-bottom: 10px; }
+        .summary-card .number { font-size: 1.8em; font-weight: bold; }
+        .total { color: #3498db; }
+        .passed { color: #27ae60; }
+        .failed { color: #e74c3c; }
+        .test-config { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
+        .test-config-title { font-size: 1.2em; font-weight: bold; color: #2c3e50; margin-bottom: 10px; }
+        .test-group-section { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
+        .test-group-title { font-size: 1.3em; font-weight: bold; color: #2c3e50; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #3498db; }
+        .test-item { padding: 8px 12px; margin: 5px 0; border-left: 4px solid #ddd; background: #fafafa; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+        .test-item.pass { border-left-color: #27ae60; }
+        .test-item.fail { border-left-color: #e74c3c; }
+        .test-item-name { font-weight: 500; color: #2c3e50; flex: 1; }
+        .test-item-status { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; font-weight: bold; min-width: 70px; text-align: center; }
+        .test-item-status.pass { background: #d4edda; color: #155724; }
+        .test-item-status.fail { background: #f8d7da; color: #721c24; }
+        .test-item-command { font-size: 0.85em; color: #666; margin-top: 5px; font-family: monospace; width: 100%; }
+        .test-item-error { font-size: 0.85em; color: #e74c3c; margin-top: 5px; width: 100%; }
+        .test-item-details { width: 100%; margin-top: 5px; }
+        .footer { text-align: center; margin-top: 40px; padding: 20px; color: #666; border-top: 1px solid #e0e0e0; }
+        .filter-controls { margin: 20px 0; text-align: center; }
+        .filter-btn { padding: 10px 20px; margin: 0 5px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 0.9em; font-weight: bold; }
+        .filter-btn:hover { background: #5568d3; }
+        .test-item-hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⚡ FIO Performance Test Results</h1>
+            <div>Test Date: {{ date }}</div>
+            <a href="/result?date={{ date }}" class="back-link">← Back to Test Results</a>
+        </div>
+        
+        <div class="filter-controls">
+            <button id="filter-failed-btn" class="filter-btn">Show Failed Only</button>
+            <button id="show-all-btn" class="filter-btn" style="display:none;">Show All</button>
+        </div>
+        
+        <div class="summary">
+            <div class="summary-card"><h3>Total Tests</h3><div class="number total">{{ fio_results.summary.total_tests }}</div></div>
+            <div class="summary-card"><h3>Passed</h3><div class="number passed">{{ fio_results.summary.passed }}</div></div>
+            <div class="summary-card"><h3>Failed</h3><div class="number failed">{{ fio_results.summary.failed }}</div></div>
+        </div>
+        
+        {% if fio_results.test_config %}
+        <div class="test-config">
+            <div class="test-config-title">Test Configuration</div>
+            <div>
+                <strong>Size:</strong> {{ fio_results.test_config.fio_size }}<br>
+                <strong>Runtime:</strong> {{ fio_results.test_config.fio_runtime }}<br>
+                <strong>Jobs:</strong> {{ fio_results.test_config.fio_numjobs }}<br>
+                <strong>Verify:</strong> {{ 'Enabled' if fio_results.test_config.fio_verify == '1' else 'Disabled' }}
+            </div>
+        </div>
+        {% endif %}
+        
+        {% if fio_tests_by_group %}
+        {% for test_group, group_tests in fio_tests_by_group.items() %}
+        <div class="test-group-section">
+            <div class="test-group-title">{{ test_group }}</div>
+            {% for test in group_tests %}
+            <div class="test-item {% if test.status == 'PASS' %}pass test-item-passed{% else %}fail test-item-failed{% endif %}">
+                <div style="flex: 1;">
+                    <span class="test-item-name">{{ test.name }}</span>
+                    {% if test.command %}
+                    <div class="test-item-details">
+                        <div class="test-item-command">Command: {{ test.command }}</div>
+                    </div>
+                    {% endif %}
+                    {% if test.status == 'FAIL' and test.error %}
+                    <div class="test-item-details">
+                        <div class="test-item-error">Error: {{ test.error }}</div>
+                    </div>
+                    {% endif %}
+                </div>
+                <span class="test-item-status {% if test.status == 'PASS' %}pass{% else %}fail{% endif %}">{{ test.status }}</span>
+            </div>
+            {% endfor %}
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="test-group-section">
+            <p>No test results available</p>
+        </div>
+        {% endif %}
+        
+        <div class="footer">
+            <p>Report generated at: {{ current_time }}</p>
+            <p>Curvine FIO Test Results Viewer</p>
+        </div>
+    </div>
+    <script>
+        let showFailedOnly = false;
+        const filterFailedBtn = document.getElementById('filter-failed-btn');
+        const showAllBtn = document.getElementById('show-all-btn');
+        const testItems = document.querySelectorAll('.test-item');
+        const testGroupSections = document.querySelectorAll('.test-group-section');
+        
+        filterFailedBtn.addEventListener('click', function() {
+            showFailedOnly = true;
+            filterFailedBtn.style.display = 'none';
+            showAllBtn.style.display = 'inline-block';
+            
+            // Hide passed test items
+            testItems.forEach(item => {
+                if (item.classList.contains('test-item-passed')) {
+                    item.style.display = 'none';
+                } else {
+                    item.style.display = '';
+                }
+            });
+            
+            // Hide test group sections that have no failed tests
+            testGroupSections.forEach(groupSection => {
+                const itemsInGroup = groupSection.querySelectorAll('.test-item');
+                const hasFailed = Array.from(itemsInGroup).some(item => 
+                    item.classList.contains('test-item-failed') && item.style.display !== 'none'
+                );
+                if (!hasFailed) {
+                    groupSection.style.display = 'none';
+                } else {
+                    groupSection.style.display = '';
+                }
+            });
+        });
+        
+        showAllBtn.addEventListener('click', function() {
+            showFailedOnly = false;
+            filterFailedBtn.style.display = 'inline-block';
+            showAllBtn.style.display = 'none';
+            
+            // Show all test items
+            testItems.forEach(item => {
+                item.style.display = '';
+            });
+            
+            // Show all test group sections
+            testGroupSections.forEach(groupSection => {
+                groupSection.style.display = '';
+            });
+        });
+    </script>
+</body>
+</html>
+

@@ -133,15 +133,22 @@ impl WebHandlerService for TestWebService {
     }
 }
 
-// #[tokio::test]
-// async fn test() {
 #[test]
 fn test() {
     use std::thread;
+    use std::time::Duration;
+
     let service = TestWebService {};
     let mut conf = ServerConf::with_hostname("127.0.0.1", 9000);
     conf.name = "test".to_string();
     let web = WebServer::new(conf, service);
-    web.block_on_start();
-    thread::sleep(std::time::Duration::from_secs(30));
+
+    // Start server in background instead of blocking
+    web.start();
+
+    // Wait a short time for server to start
+    thread::sleep(Duration::from_millis(500));
+
+    // Test completes - server continues running in background but test doesn't block
+    // The server will be cleaned up when the runtime shuts down
 }

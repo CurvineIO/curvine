@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LTP Test Results - {{ date }}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; text-align: center; }
+        .header h1 { font-size: 2.2em; margin-bottom: 10px; }
+        .back-link { display: inline-block; margin-top: 15px; padding: 10px 20px; background: rgba(255,255,255,0.2); color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
+        .back-link:hover { background: rgba(255,255,255,0.3); }
+        .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .summary-card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }
+        .summary-card h3 { color: #666; margin-bottom: 10px; }
+        .summary-card .number { font-size: 1.8em; font-weight: bold; }
+        .total { color: #3498db; }
+        .passed { color: #27ae60; }
+        .failed { color: #e74c3c; }
+        .success-rate { color: #f39c12; }
+        .test-suite-section { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
+        .test-suite-title { font-size: 1.3em; font-weight: bold; color: #2c3e50; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #3498db; }
+        .test-suite-info { margin-bottom: 15px; padding: 10px; background: #f8f9fa; border-radius: 5px; }
+        .test-group-section { margin-top: 20px; margin-bottom: 20px; }
+        .test-group-title { font-weight: bold; color: #2c3e50; margin-bottom: 10px; padding: 10px; background: #f8f9fa; border-radius: 5px; }
+        .test-item { padding: 8px 12px; margin: 5px 0; border-left: 4px solid #ddd; background: #fafafa; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
+        .test-item.pass { border-left-color: #27ae60; }
+        .test-item.fail { border-left-color: #e74c3c; }
+        .test-item-name { font-weight: 500; color: #2c3e50; flex: 1; }
+        .test-item-status { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; font-weight: bold; min-width: 70px; text-align: center; }
+        .test-item-status.pass { background: #d4edda; color: #155724; }
+        .test-item-status.fail { background: #f8d7da; color: #721c24; }
+        .log-link { color: #007bff; text-decoration: none; font-size: 0.9em; }
+        .log-link:hover { text-decoration: underline; }
+        .footer { text-align: center; margin-top: 40px; padding: 20px; color: #666; border-top: 1px solid #e0e0e0; }
+        .filter-controls { margin: 20px 0; text-align: center; }
+        .filter-btn { padding: 10px 20px; margin: 0 5px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 0.9em; font-weight: bold; }
+        .filter-btn:hover { background: #5568d3; }
+        .test-item-hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🧪 LTP Regression Test Results</h1>
+            <div>Test Date: {{ date }}</div>
+            <a href="/result?date={{ date }}" class="back-link">← Back to Test Results</a>
+        </div>
+        
+        <div class="filter-controls">
+            <button id="filter-failed-btn" class="filter-btn">Show Failed Only</button>
+            <button id="show-all-btn" class="filter-btn" style="display:none;">Show All</button>
+        </div>
+        
+        <div class="summary">
+            <div class="summary-card"><h3>Total Tests</h3><div class="number total">{{ ltp_test.total_tests }}</div></div>
+            <div class="summary-card"><h3>Passed</h3><div class="number passed">{{ ltp_test.passed_tests }}</div></div>
+            <div class="summary-card"><h3>Failed</h3><div class="number failed">{{ ltp_test.failed_tests }}</div></div>
+            <div class="summary-card"><h3>Success Rate</h3><div class="number success-rate">{{ "%.2f"|format(ltp_test.success_rate) }}%</div></div>
+        </div>
+        
+        {% if ltp_test.test_suites %}
+        <div class="test-suite-info">
+            <strong>Test Suites:</strong> {{ ltp_test.test_suites|join(', ') }}
+        </div>
+        {% endif %}
+        
+        {% if ltp_test.test_results %}
+        {% for result in ltp_test.test_results %}
+        <div class="test-suite-section">
+            <div class="test-suite-title">
+                Test Suite: {{ result.suite }}
+                <span style="font-size: 0.8em; font-weight: normal; color: #666;">
+                    (Status: {{ result.status }}, Passed: {{ result.passed_count }}, Failed: {{ result.failed_count }}, Total: {{ result.total_count }})
+                </span>
+            </div>
+            {% if result.test_cases %}
+            <div class="test-group-section">
+                <div class="test-group-title">Test Cases</div>
+                {% for test_case in result.test_cases %}
+                <div class="test-item {% if test_case.status == 'PASSED' %}pass test-item-passed{% else %}fail test-item-failed{% endif %}">
+                    <span class="test-item-name">{{ test_case.name }}</span>
+                    <span class="test-item-status {% if test_case.status == 'PASSED' %}pass{% else %}fail{% endif %}">{{ test_case.status }}</span>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% if result.log_file %}
+            <div style="margin-top: 15px;">
+                <a href="/logs/{{ date }}/{{ result.log_file }}?referrer=/ltp-test-details/{{ date }}" class="log-link" target="_blank">View Log File: {{ result.log_file }}</a>
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="test-suite-section">
+            <p>No test results available</p>
+        </div>
+        {% endif %}
+        
+        <div class="footer">
+            <p>Report generated at: {{ current_time }}</p>
+            <p>Curvine LTP Test Results Viewer</p>
+        </div>
+    </div>
+    <script>
+        let showFailedOnly = false;
+        const filterFailedBtn = document.getElementById('filter-failed-btn');
+        const showAllBtn = document.getElementById('show-all-btn');
+        const testItems = document.querySelectorAll('.test-item');
+        const testSuiteSections = document.querySelectorAll('.test-suite-section');
+        
+        filterFailedBtn.addEventListener('click', function() {
+            showFailedOnly = true;
+            filterFailedBtn.style.display = 'none';
+            showAllBtn.style.display = 'inline-block';
+            
+            // Hide passed test items
+            testItems.forEach(item => {
+                if (item.classList.contains('test-item-passed')) {
+                    item.style.display = 'none';
+                } else {
+                    item.style.display = '';
+                }
+            });
+            
+            // Hide test suite sections that have no failed tests
+            testSuiteSections.forEach(suiteSection => {
+                const itemsInSuite = suiteSection.querySelectorAll('.test-item');
+                const hasFailed = Array.from(itemsInSuite).some(item => 
+                    item.classList.contains('test-item-failed') && item.style.display !== 'none'
+                );
+                if (!hasFailed) {
+                    suiteSection.style.display = 'none';
+                } else {
+                    suiteSection.style.display = '';
+                }
+            });
+        });
+        
+        showAllBtn.addEventListener('click', function() {
+            showFailedOnly = false;
+            filterFailedBtn.style.display = 'inline-block';
+            showAllBtn.style.display = 'none';
+            
+            // Show all test items
+            testItems.forEach(item => {
+                item.style.display = '';
+            });
+            
+            // Show all test suite sections
+            testSuiteSections.forEach(suiteSection => {
+                suiteSection.style.display = '';
+            });
+        });
+    </script>
+</body>
+</html>
+

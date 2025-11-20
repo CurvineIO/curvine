@@ -25,16 +25,14 @@
 
 set -e
 
+# Load shared colors and logging helpers
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/colors.sh"
+
 # Default configuration
 TEST_DIR="/curvine-fuse/fuse-test"
 CLEANUP="1"  # Cleanup test files by default
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+JSON_OUTPUT=""  # JSON output file path (empty = disabled)
 
 # Test results tracking
 TOTAL_TESTS=0
@@ -42,6 +40,10 @@ PASSED_TESTS=0
 FAILED_TESTS=0
 FAILED_TEST_LIST=()
 FAILED_CMD_LIST=()
+
+# JSON test results tracking
+JSON_TEST_RESULTS=()
+CURRENT_TEST_GROUP=""
 
 # Print functions
 print_help() {
@@ -63,6 +65,7 @@ OPTIONS:
     -t, --test-dir PATH       Test directory path (default: /curvine-fuse/fuse-test)
         --cleanup <0|1>       Cleanup test files after completion (default: 1)
                               0=keep files, 1=cleanup files
+        --json-output PATH    Output test results to JSON file (for regression testing)
     -h, --help                Show this help message
 
 EXAMPLES:
@@ -74,36 +77,11 @@ EXAMPLES:
     
     # Keep test files for inspection (do not cleanup)
     $0 --cleanup 0
+    
+    # Output results to JSON file for regression testing
+    $0 --json-output /tmp/fuse-test-results.json
 
 EOF
-}
-
-print_header() {
-    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BLUE}  $1${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}\n"
-}
-
-print_test() {
-    echo -e "${YELLOW}► Testing: $1${NC}"
-}
-
-print_success() {
-    echo -e "${GREEN}✓ $1${NC}"
-    PASSED_TESTS=$((PASSED_TESTS + 1))
-}
-
-print_fail() {
-    echo -e "${RED}✗ $1${NC}"
-    FAILED_TESTS=$((FAILED_TESTS + 1))
-}
-
-print_info() {
-    echo -e "${BLUE}ℹ $1${NC}"
-}
-
-print_command() {
-    echo -e "${BLUE}$ $1${NC}"
 }
 
 # Error handling
@@ -112,14 +90,22 @@ handle_error() {
     # Record failed test
     FAILED_TEST_LIST+=("$1")
     # Record failed command if provided (remove newlines for display)
+    local cleaned_cmd=""
     if [ -n "$2" ] && [ "$2" != "fatal" ]; then
-        local cleaned_cmd=$(echo "$2" | tr '\n' ' ' | tr -s ' ')
+        cleaned_cmd=$(echo "$2" | tr '\n' ' ' | tr -s ' ')
         FAILED_CMD_LIST+=("$cleaned_cmd")
     elif [ -n "$3" ]; then
-        local cleaned_cmd=$(echo "$3" | tr '\n' ' ' | tr -s ' ')
+        cleaned_cmd=$(echo "$3" | tr '\n' ' ' | tr -s ' ')
         FAILED_CMD_LIST+=("$cleaned_cmd")
     else
         FAILED_CMD_LIST+=("")
+    fi
+    
+    # Record test result for JSON output
+    if [ -n "$JSON_OUTPUT" ]; then
+        local test_name="${LAST_TEST_NAME:-$1}"
+        local test_cmd="${cleaned_cmd:-${LAST_TEST_CMD:-}}"
+        JSON_TEST_RESULTS+=("FAIL|$CURRENT_TEST_GROUP|$test_name|$test_cmd|$1")
     fi
     
     if [ "$2" == "fatal" ] || [ "$3" == "fatal" ]; then
@@ -150,7 +136,19 @@ check_prerequisites() {
         exit 1
     fi
     
-    print_info "Test directory parent is accessible: $parent_dir"
+    # Check if parent directory is a mount point (curvine-fuse should be mounted)
+    if command -v mountpoint >/dev/null 2>&1; then
+        if ! mountpoint -q "$parent_dir" 2>/dev/null; then
+            print_fail "Parent directory $parent_dir is not a mount point. Curvine cluster may not be started."
+            echo "  Please ensure Curvine cluster is running and $parent_dir is mounted"
+            echo "  If running via build-server.py, cluster should be prepared automatically"
+            exit 1
+        fi
+        print_info "Mount point $parent_dir is properly mounted"
+    else
+        print_info "mountpoint command not found, skipping mount point check"
+        print_info "Test directory parent is accessible: $parent_dir"
+    fi
     
     # Check for required commands
     local missing_commands=()
@@ -186,7 +184,8 @@ init_test_env() {
 
 # Test 1: Basic file operations
 test_basic_operations() {
-    print_header "Test 1: Basic File Operations"
+    CURRENT_TEST_GROUP="Test 1: Basic File Operations"
+    print_header "$CURRENT_TEST_GROUP"
 
     # Test touch
     print_test "Creating empty file with touch"
@@ -243,7 +242,8 @@ test_basic_operations() {
 
 # Test 2: Directory operations
 test_directory_operations() {
-    print_header "Test 2: Directory Operations"
+    CURRENT_TEST_GROUP="Test 2: Directory Operations"
+    print_header "$CURRENT_TEST_GROUP"
 
     # Test mkdir
     print_test "Creating directory"
@@ -282,7 +282,8 @@ test_directory_operations() {
 
 # Test 3: Copy and move operations
 test_copy_move() {
-    print_header "Test 3: Copy and Move Operations"
+    CURRENT_TEST_GROUP="Test 3: Copy and Move Operations"
+    print_header "$CURRENT_TEST_GROUP"
 
     # Test cp
     print_test "Copying file"
@@ -317,7 +318,8 @@ test_copy_move() {
 
 # Test 4: Large file operations
 test_large_files() {
-    print_header "Test 4: Large File Operations"
+    CURRENT_TEST_GROUP="Test 4: Large File Operations"
+    print_header "$CURRENT_TEST_GROUP"
 
     print_test "Creating 100MB file"
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
@@ -338,7 +340,8 @@ test_large_files() {
 
 # Test 5: Vi editor test
 test_vi_editor() {
-    print_header "Test 5: Vi Editor Test"
+    CURRENT_TEST_GROUP="Test 5: Vi Editor Test"
+    print_header "$CURRENT_TEST_GROUP"
 
     local test_file="$TEST_DIR/vi_test.txt"
     local test_content="Line 1: Original content"
@@ -384,7 +387,8 @@ test_vi_editor() {
 
 # Test 6: Symbolic links
 test_symlinks() {
-    print_header "Test 6: Symbolic Link Operations"
+    CURRENT_TEST_GROUP="Test 6: Symbolic Link Operations"
+    print_header "$CURRENT_TEST_GROUP"
 
     print_test "Creating symbolic link"
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
@@ -413,7 +417,8 @@ test_symlinks() {
 
 # Test 7: Hard links
 test_hardlinks() {
-    print_header "Test 7: Hard Link Operations"
+    CURRENT_TEST_GROUP="Test 7: Hard Link Operations"
+    print_header "$CURRENT_TEST_GROUP"
 
     local original_file="$TEST_DIR/hardlink_original.txt"
     local hard_link="$TEST_DIR/hardlink_copy"
@@ -514,7 +519,8 @@ test_hardlinks() {
 
 # Test 8: File permissions
 test_permissions() {
-    print_header "Test 8: File Permission Operations"
+    CURRENT_TEST_GROUP="Test 8: File Permission Operations"
+    print_header "$CURRENT_TEST_GROUP"
 
     local perm_file="$TEST_DIR/perm_test.txt"
     echo "test" > "$perm_file"
@@ -631,9 +637,10 @@ test_permissions() {
     fi
 }
 
-# Test 8: Delete operations
+# Test 9: Delete operations
 test_delete_operations() {
-    print_header "Test 8: Delete Operations"
+    CURRENT_TEST_GROUP="Test 9: Delete Operations"
+    print_header "$CURRENT_TEST_GROUP"
 
     print_test "Deleting file"
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
@@ -682,6 +689,80 @@ test_delete_operations() {
     fi
 }
 
+# Escape JSON string
+json_escape() {
+    local str="$1"
+    # Escape special JSON characters
+    # Order matters: escape backslash first, then other characters
+    str=$(printf '%s' "$str" | sed 's/\\/\\\\/g')
+    str=$(printf '%s' "$str" | sed 's/"/\\"/g')
+    str=$(printf '%s' "$str" | sed 's/\t/\\t/g')
+    str=$(printf '%s' "$str" | sed 's/\r/\\r/g')
+    # Replace newlines with \n
+    str=$(printf '%s' "$str" | sed ':a;N;$!ba;s/\n/\\n/g')
+    printf '%s' "$str"
+}
+
+# Generate JSON report
+generate_json_report() {
+    if [ -z "$JSON_OUTPUT" ]; then
+        return
+    fi
+    
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%S")
+    local test_suite="fuse-test"
+    
+    # Create JSON file
+    {
+        echo "{"
+        echo "  \"test_suite\": \"$test_suite\","
+        echo "  \"timestamp\": \"$timestamp\","
+        echo "  \"test_config\": {"
+        echo "    \"test_dir\": \"$(json_escape "$TEST_DIR")\","
+        echo "    \"cleanup\": \"$CLEANUP\""
+        echo "  },"
+        echo "  \"summary\": {"
+        echo "    \"total_tests\": $TOTAL_TESTS,"
+        echo "    \"passed\": $PASSED_TESTS,"
+        echo "    \"failed\": $FAILED_TESTS"
+        echo "  },"
+        echo "  \"tests\": ["
+        
+        # Output test results
+        local first=true
+        for result in "${JSON_TEST_RESULTS[@]}"; do
+            IFS='|' read -r status test_group test_name test_cmd error_msg <<< "$result"
+            
+            if [ "$first" = true ]; then
+                first=false
+            else
+                echo ","
+            fi
+            
+            echo -n "    {"
+            echo -n "\"name\": \"$(json_escape "$test_name")\","
+            echo -n "\"status\": \"$status\","
+            echo -n "\"test_group\": \"$(json_escape "$test_group")\""
+            
+            if [ -n "$test_cmd" ]; then
+                echo -n ",\"command\": \"$(json_escape "$test_cmd")\""
+            fi
+            
+            if [ "$status" = "FAIL" ] && [ -n "$error_msg" ]; then
+                echo -n ",\"error\": \"$(json_escape "$error_msg")\""
+            fi
+            
+            echo -n "}"
+        done
+        
+        echo ""
+        echo "  ]"
+        echo "}"
+    } > "$JSON_OUTPUT"
+    
+    print_info "JSON report saved to: $JSON_OUTPUT"
+}
+
 # Print final report
 print_report() {
     print_header "Test Summary"
@@ -692,7 +773,6 @@ print_report() {
 
     if [ $FAILED_TESTS -eq 0 ]; then
         echo -e "\n${GREEN}✓ All tests passed!${NC}\n"
-        return 0
     else
         echo -e "\n${RED}✗ Some tests failed!${NC}\n"
 
@@ -707,7 +787,16 @@ print_report() {
             done
             echo ""
         fi
+    fi
+    
+    # Generate JSON report if requested
+    if [ -n "$JSON_OUTPUT" ]; then
+        generate_json_report
+    fi
 
+    if [ $FAILED_TESTS -eq 0 ]; then
+        return 0
+    else
         return 1
     fi
 }
@@ -723,6 +812,10 @@ main() {
                 ;;
             --cleanup)
                 CLEANUP="$2"
+                shift 2
+                ;;
+            --json-output)
+                JSON_OUTPUT="$2"
                 shift 2
                 ;;
             -h|--help)
@@ -741,6 +834,9 @@ main() {
     
     echo "Test Directory: $TEST_DIR"
     echo "Cleanup Files:  $([ "$CLEANUP" = "1" ] && echo "Enabled" || echo "Disabled")"
+    if [ -n "$JSON_OUTPUT" ]; then
+        echo "JSON Output:    $JSON_OUTPUT"
+    fi
 
     # Run tests
     check_prerequisites

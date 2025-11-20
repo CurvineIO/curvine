@@ -25,6 +25,10 @@
 
 set -e
 
+# Load shared colors and logging helpers
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/colors.sh"
+
 # Default configuration
 TEST_DIR="/curvine-fuse/fio-test"
 FIO_SIZE="500m"
@@ -32,13 +36,7 @@ FIO_RUNTIME="30s"
 FIO_NUMJOBS="1"
 FIO_VERIFY="1"  # Enable data verification by default
 FIO_CLEANUP="1"  # Cleanup test files by default
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+JSON_OUTPUT=""  # JSON output file path (empty = disabled)
 
 # Test results tracking
 TOTAL_TESTS=0
@@ -46,6 +44,10 @@ PASSED_TESTS=0
 FAILED_TESTS=0
 FAILED_TEST_LIST=()
 FAILED_CMD_LIST=()
+
+# JSON test results tracking
+JSON_TEST_RESULTS=()
+CURRENT_TEST_GROUP=""
 
 # Print functions
 print_help() {
@@ -65,6 +67,7 @@ OPTIONS:
                               0=disable, 1=enable CRC32C verification
         --cleanup <0|1>       Cleanup test files after completion (default: 1)
                               0=keep files, 1=cleanup files
+        --json-output PATH    Output test results to JSON file (for regression testing)
     -h, --help                Show this help message
 
 EXAMPLES:
@@ -82,36 +85,11 @@ EXAMPLES:
     
     # Keep test files for inspection (do not cleanup)
     $0 --cleanup 0 --size 500M
+    
+    # Output results to JSON file for regression testing
+    $0 --json-output /tmp/fio-test-results.json --size 1G
 
 EOF
-}
-
-print_header() {
-    echo -e "\n${BLUE}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BLUE}  $1${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}\n"
-}
-
-print_test() {
-    echo -e "${YELLOW}► Testing: $1${NC}"
-}
-
-print_success() {
-    echo -e "${GREEN}✓ $1${NC}"
-    PASSED_TESTS=$((PASSED_TESTS + 1))
-}
-
-print_fail() {
-    echo -e "${RED}✗ $1${NC}"
-    FAILED_TESTS=$((FAILED_TESTS + 1))
-}
-
-print_info() {
-    echo -e "${BLUE}ℹ $1${NC}"
-}
-
-print_command() {
-    echo -e "${BLUE}$ $1${NC}"
 }
 
 # Error handling
@@ -120,14 +98,22 @@ handle_error() {
     # Record failed test
     FAILED_TEST_LIST+=("$1")
     # Record failed command if provided (remove newlines for display)
+    local cleaned_cmd=""
     if [ -n "$2" ] && [ "$2" != "fatal" ]; then
-        local cleaned_cmd=$(echo "$2" | tr '\n' ' ' | tr -s ' ')
+        cleaned_cmd=$(echo "$2" | tr '\n' ' ' | tr -s ' ')
         FAILED_CMD_LIST+=("$cleaned_cmd")
     elif [ -n "$3" ]; then
-        local cleaned_cmd=$(echo "$3" | tr '\n' ' ' | tr -s ' ')
+        cleaned_cmd=$(echo "$3" | tr '\n' ' ' | tr -s ' ')
         FAILED_CMD_LIST+=("$cleaned_cmd")
     else
         FAILED_CMD_LIST+=("")
+    fi
+    
+    # Record test result for JSON output
+    if [ -n "$JSON_OUTPUT" ]; then
+        local test_name="${LAST_TEST_NAME:-$1}"
+        local test_cmd="${cleaned_cmd:-${LAST_TEST_CMD:-}}"
+        JSON_TEST_RESULTS+=("FAIL|$CURRENT_TEST_GROUP|$test_name|$test_cmd|$1")
     fi
     
     if [ "$2" == "fatal" ] || [ "$3" == "fatal" ]; then
@@ -158,7 +144,19 @@ check_prerequisites() {
         exit 1
     fi
     
-    print_info "Test directory parent is accessible: $parent_dir"
+    # Check if parent directory is a mount point (curvine-fuse should be mounted)
+    if command -v mountpoint >/dev/null 2>&1; then
+        if ! mountpoint -q "$parent_dir" 2>/dev/null; then
+            print_fail "Parent directory $parent_dir is not a mount point. Curvine cluster may not be started."
+            echo "  Please ensure Curvine cluster is running and $parent_dir is mounted"
+            echo "  If running via build-server.py, cluster should be prepared automatically"
+            exit 1
+        fi
+        print_info "Mount point $parent_dir is properly mounted"
+    else
+        print_info "mountpoint command not found, skipping mount point check"
+        print_info "Test directory parent is accessible: $parent_dir"
+    fi
     
     # Check for fio
     if ! command -v fio &> /dev/null; then
@@ -215,7 +213,8 @@ get_verify_msg() {
 
 # Test 1: FIO Sequential Read/Write
 test_fio_sequential() {
-    print_header "Test 1: FIO Sequential Read/Write Performance"
+    CURRENT_TEST_GROUP="Test 1: FIO Sequential Read/Write Performance"
+    print_header "$CURRENT_TEST_GROUP"
     
     local fio_dir="$TEST_DIR/fio_seq"
     mkdir -p "$fio_dir"
@@ -272,7 +271,8 @@ test_fio_sequential() {
 
 # Test 2: FIO Random Read/Write
 test_fio_random() {
-    print_header "Test 2: FIO Random Read/Write Performance"
+    CURRENT_TEST_GROUP="Test 2: FIO Random Read/Write Performance"
+    print_header "$CURRENT_TEST_GROUP"
     
     local fio_dir="$TEST_DIR/fio_rand"
     mkdir -p "$fio_dir"
@@ -377,6 +377,84 @@ test_fio_random() {
     fi
 }
 
+# Escape JSON string
+json_escape() {
+    local str="$1"
+    # Escape special JSON characters
+    # Order matters: escape backslash first, then other characters
+    str=$(printf '%s' "$str" | sed 's/\\/\\\\/g')
+    str=$(printf '%s' "$str" | sed 's/"/\\"/g')
+    str=$(printf '%s' "$str" | sed 's/\t/\\t/g')
+    str=$(printf '%s' "$str" | sed 's/\r/\\r/g')
+    # Replace newlines with \n
+    str=$(printf '%s' "$str" | sed ':a;N;$!ba;s/\n/\\n/g')
+    printf '%s' "$str"
+}
+
+# Generate JSON report
+generate_json_report() {
+    if [ -z "$JSON_OUTPUT" ]; then
+        return
+    fi
+    
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%S")
+    local test_suite="fio-test"
+    
+    # Create JSON file
+    {
+        echo "{"
+        echo "  \"test_suite\": \"$test_suite\","
+        echo "  \"timestamp\": \"$timestamp\","
+        echo "  \"test_config\": {"
+        echo "    \"test_dir\": \"$(json_escape "$TEST_DIR")\","
+        echo "    \"fio_size\": \"$FIO_SIZE\","
+        echo "    \"fio_runtime\": \"$FIO_RUNTIME\","
+        echo "    \"fio_numjobs\": \"$FIO_NUMJOBS\","
+        echo "    \"fio_verify\": \"$FIO_VERIFY\","
+        echo "    \"cleanup\": \"$FIO_CLEANUP\""
+        echo "  },"
+        echo "  \"summary\": {"
+        echo "    \"total_tests\": $TOTAL_TESTS,"
+        echo "    \"passed\": $PASSED_TESTS,"
+        echo "    \"failed\": $FAILED_TESTS"
+        echo "  },"
+        echo "  \"tests\": ["
+        
+        # Output test results
+        local first=true
+        for result in "${JSON_TEST_RESULTS[@]}"; do
+            IFS='|' read -r status test_group test_name test_cmd error_msg <<< "$result"
+            
+            if [ "$first" = true ]; then
+                first=false
+            else
+                echo ","
+            fi
+            
+            echo -n "    {"
+            echo -n "\"name\": \"$(json_escape "$test_name")\","
+            echo -n "\"status\": \"$status\","
+            echo -n "\"test_group\": \"$(json_escape "$test_group")\""
+            
+            if [ -n "$test_cmd" ]; then
+                echo -n ",\"command\": \"$(json_escape "$test_cmd")\""
+            fi
+            
+            if [ "$status" = "FAIL" ] && [ -n "$error_msg" ]; then
+                echo -n ",\"error\": \"$(json_escape "$error_msg")\""
+            fi
+            
+            echo -n "}"
+        done
+        
+        echo ""
+        echo "  ]"
+        echo "}"
+    } > "$JSON_OUTPUT"
+    
+    print_info "JSON report saved to: $JSON_OUTPUT"
+}
+
 # Print final report
 print_report() {
     print_header "Test Summary"
@@ -387,7 +465,6 @@ print_report() {
     
     if [ $FAILED_TESTS -eq 0 ]; then
         echo -e "\n${GREEN}✓ All tests passed!${NC}\n"
-        return 0
     else
         echo -e "\n${RED}✗ Some tests failed!${NC}\n"
         
@@ -402,7 +479,16 @@ print_report() {
             done
             echo ""
         fi
-        
+    fi
+    
+    # Generate JSON report if requested
+    if [ -n "$JSON_OUTPUT" ]; then
+        generate_json_report
+    fi
+    
+    if [ $FAILED_TESTS -eq 0 ]; then
+        return 0
+    else
         return 1
     fi
 }
@@ -436,6 +522,10 @@ main() {
                 FIO_CLEANUP="$2"
                 shift 2
                 ;;
+            --json-output)
+                JSON_OUTPUT="$2"
+                shift 2
+                ;;
             -h|--help)
                 print_help
                 exit 0
@@ -456,6 +546,9 @@ main() {
     echo "FIO Jobs:       $FIO_NUMJOBS"
     echo "Data Verify:    $([ "$FIO_VERIFY" = "1" ] && echo "Enabled (CRC32C)" || echo "Disabled")"
     echo "Cleanup Files:  $([ "$FIO_CLEANUP" = "1" ] && echo "Enabled" || echo "Disabled")"
+    if [ -n "$JSON_OUTPUT" ]; then
+        echo "JSON Output:    $JSON_OUTPUT"
+    fi
     
     # Run tests
     check_prerequisites

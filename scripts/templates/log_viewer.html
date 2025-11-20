@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test Log - {{ current_log.display_name if current_log else log_file }}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Consolas', 'Monaco', 'Courier New', monospace; background: #1e1e1e; color: #d4d4d4; }
+        .header { background: #2d2d30; padding: 15px 20px; border-bottom: 1px solid #3e3e42; }
+        .header h1 { color: #ffffff; font-size: 1.5em; margin-bottom: 10px; }
+        .log-selector { display: flex; align-items: center; gap: 15px; }
+        .log-selector label { color: #cccccc; font-weight: bold; }
+        .log-selector select { 
+            background: #3c3c3c; 
+            color: #ffffff; 
+            border: 1px solid #555; 
+            padding: 8px 12px; 
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .log-selector select:focus { outline: none; border-color: #007acc; }
+        .back-btn { 
+            background: #007acc; 
+            color: white; 
+            border: none; 
+            padding: 8px 16px; 
+            border-radius: 4px; 
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+        }
+        .back-btn:hover { background: #005a9e; }
+        .log-content { 
+            padding: 20px; 
+            white-space: pre-wrap; 
+            word-wrap: break-word; 
+            line-height: 1.4;
+            font-size: 13px;
+            max-height: calc(100vh - 120px);
+            overflow-y: auto;
+        }
+        .log-line { margin-bottom: 2px; }
+        .log-info { color: #569cd6; }
+        .log-error { color: #f44747; }
+        .log-warning { color: #ffcc02; }
+        .log-success { color: #4ec9b0; }
+        .timestamp { color: #808080; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📋 Test Log Viewer</h1>
+        <div class="log-selector">
+            <label for="log-select">Select Log File:</label>
+            <select id="log-select" onchange="switchLog()">
+                {% for log in available_logs %}
+                <option value="{{ log.filename }}" {% if log.filename == log_file %}selected{% endif %}>
+                    {{ log.display_name }}
+                </option>
+                {% endfor %}
+            </select>
+            <a href="{{ referrer_url }}" class="back-btn">← Back to Test Results</a>
+        </div>
+    </div>
+    <div class="log-content" id="log-content">{{ log_content }}</div>
+    
+    <script>
+        function switchLog() {
+            const selectedLog = document.getElementById('log-select').value;
+            const referrer = '{{ referrer_url }}';
+            window.location.href = '/logs/{{ date }}/' + selectedLog + (referrer ? '?referrer=' + encodeURIComponent(referrer) : '');
+        }
+        
+        // Highlight log lines
+        function highlightLogLines() {
+            const content = document.getElementById('log-content');
+            const lines = content.innerHTML.split('\n');
+            let highlightedLines = [];
+            
+            for (let line of lines) {
+                let highlightedLine = line;
+                
+                // Highlight different log levels
+                if (line.includes('ERROR')) {
+                    highlightedLine = '<span class="log-error">' + line + '</span>';
+                } else if (line.includes('WARN')) {
+                    highlightedLine = '<span class="log-warning">' + line + '</span>';
+                } else if (line.includes('INFO')) {
+                    highlightedLine = '<span class="log-info">' + line + '</span>';
+                } else if (line.includes('SUCCESS')) {
+                    highlightedLine = '<span class="log-success">' + line + '</span>';
+                }
+                
+                // Highlight timestamps
+                highlightedLine = highlightedLine.replace(
+                    /(\d{2}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\.\d{3})/g,
+                    '<span class="timestamp">$1</span>'
+                );
+                
+                highlightedLines.push(highlightedLine);
+            }
+            
+            content.innerHTML = highlightedLines.join('\n');
+        }
+        
+        // Page load after highlighting logs
+        document.addEventListener('DOMContentLoaded', highlightLogLines);
+    </script>
+</body>
+</html>
+

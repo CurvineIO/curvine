@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Unit Test Results - {{ date }}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; text-align: center; }
+        .header h1 { font-size: 2.2em; margin-bottom: 10px; }
+        .back-link { display: inline-block; margin-top: 15px; padding: 10px 20px; background: rgba(255,255,255,0.2); color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
+        .back-link:hover { background: rgba(255,255,255,0.3); }
+        .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .summary-card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }
+        .summary-card h3 { color: #666; margin-bottom: 10px; }
+        .summary-card .number { font-size: 1.8em; font-weight: bold; }
+        .total { color: #3498db; }
+        .passed { color: #27ae60; }
+        .failed { color: #e74c3c; }
+        .success-rate { color: #f39c12; }
+        .package-section { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
+        .package-title { font-size: 1.3em; font-weight: bold; color: #2c3e50; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #3498db; }
+        .test-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; table-layout: fixed; }
+        .test-table th, .test-table td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .test-table th { background-color: #f8f9fa; font-weight: bold; color: #495057; }
+        .status-passed { background: #d4edda; color: #155724; padding: 3px 6px; border-radius: 4px; font-weight: bold; }
+        .status-failed { background: #f8d7da; color: #721c24; padding: 3px 6px; border-radius: 4px; font-weight: bold; }
+        .log-link { color: #007bff; text-decoration: none; font-size: 0.9em; }
+        .log-link:hover { text-decoration: underline; }
+        .file-block { margin: 18px 0; padding: 14px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa; }
+        .file-block-title { font-weight: 600; color: #2c3e50; margin-bottom: 8px; }
+        .footer { text-align: center; margin-top: 40px; padding: 20px; color: #666; border-top: 1px solid #e0e0e0; }
+        .filter-controls { margin: 20px 0; text-align: center; }
+        .filter-btn { padding: 10px 20px; margin: 0 5px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 0.9em; font-weight: bold; }
+        .filter-btn:hover { background: #5568d3; }
+        .test-row-hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🧪 Unit Test Results</h1>
+            <div>Test Date: {{ date }}</div>
+            <a href="/result?date={{ date }}" class="back-link">← Back to Test Results</a>
+        </div>
+        
+        <div class="filter-controls">
+            <button id="filter-failed-btn" class="filter-btn">Show Failed Only</button>
+            <button id="show-all-btn" class="filter-btn" style="display:none;">Show All</button>
+        </div>
+        
+        <div class="summary">
+            <div class="summary-card"><h3>Total Tests</h3><div class="number total">{{ total_tests }}</div></div>
+            <div class="summary-card"><h3>Passed</h3><div class="number passed">{{ passed_tests }}</div></div>
+            <div class="summary-card"><h3>Failed</h3><div class="number failed">{{ failed_tests }}</div></div>
+            <div class="summary-card"><h3>Success Rate</h3><div class="number success-rate">{{ success_rate }}%</div></div>
+        </div>
+        
+        {% if packages|length > 0 %}
+        {% for pkg in packages %}
+        <div class="package-section">
+            <div class="package-title">📦 Package: {{ pkg.name }} (Total: {{ pkg.total }}, Passed: {{ pkg.passed }}, Failed: {{ pkg.failed }}, Success Rate: {{ pkg.success_rate }}%)</div>
+            {% for test_file, file_cases in cases_by_package_file.get(pkg.name, {}).items() %}
+            <div class="file-block">
+                <div class="file-block-title">{{ test_file }}</div>
+                <table class="test-table">
+                    <colgroup>
+                        <col style="width: 20%">
+                        <col style="width: 50%">
+                        <col style="width: 15%">
+                        <col style="width: 15%">
+                    </colgroup>
+                    <thead>
+                        <tr>
+                            <th>TestFile</th>
+                            <th>TestCase</th>
+                            <th>Result</th>
+                            <th>Log</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for c in file_cases %}
+                        <tr class="test-row {% if c.status == 'PASSED' %}test-row-passed{% else %}test-row-failed{% endif %}">
+                            <td>{{ test_file }}</td>
+                            <td>{{ c.test_case }}</td>
+                            <td>
+                                <span class="{% if c.status == 'PASSED' %}status-passed{% else %}status-failed{% endif %}">{{ 'PASS' if c.status == 'PASSED' else 'FAIL' }}</span>
+                            </td>
+                            <td>
+                                <a class="log-link" href="/logs/{{ date }}/{{ c.log }}?referrer=/unit-tests/{{ date }}" target="_blank">View Log</a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endfor %}
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="package-section">No unit test results available</div>
+        {% endif %}
+        
+        <div class="footer">
+            <p>Report generated at: {{ current_time }}</p>
+            <p>Curvine Unit Test Results Viewer</p>
+        </div>
+    </div>
+    <script>
+        let showFailedOnly = false;
+        const filterFailedBtn = document.getElementById('filter-failed-btn');
+        const showAllBtn = document.getElementById('show-all-btn');
+        const testRows = document.querySelectorAll('.test-row');
+        const fileBlocks = document.querySelectorAll('.file-block');
+        const packageSections = document.querySelectorAll('.package-section');
+        
+        filterFailedBtn.addEventListener('click', function() {
+            showFailedOnly = true;
+            filterFailedBtn.style.display = 'none';
+            showAllBtn.style.display = 'inline-block';
+            
+            // Hide passed test rows
+            testRows.forEach(row => {
+                if (row.classList.contains('test-row-passed')) {
+                    row.style.display = 'none';
+                } else {
+                    row.style.display = '';
+                }
+            });
+            
+            // Hide file blocks that have no failed tests
+            fileBlocks.forEach(fileBlock => {
+                const rowsInBlock = fileBlock.querySelectorAll('.test-row');
+                const hasFailed = Array.from(rowsInBlock).some(row => 
+                    row.classList.contains('test-row-failed') && row.style.display !== 'none'
+                );
+                if (!hasFailed) {
+                    fileBlock.style.display = 'none';
+                } else {
+                    fileBlock.style.display = '';
+                }
+            });
+            
+            // Hide package sections that have no failed tests
+            packageSections.forEach(packageSection => {
+                const fileBlocksInPackage = packageSection.querySelectorAll('.file-block');
+                const hasVisibleFileBlock = Array.from(fileBlocksInPackage).some(fileBlock => 
+                    fileBlock.style.display !== 'none'
+                );
+                if (!hasVisibleFileBlock) {
+                    packageSection.style.display = 'none';
+                } else {
+                    packageSection.style.display = '';
+                }
+            });
+        });
+        
+        showAllBtn.addEventListener('click', function() {
+            showFailedOnly = false;
+            filterFailedBtn.style.display = 'inline-block';
+            showAllBtn.style.display = 'none';
+            
+            // Show all test rows
+            testRows.forEach(row => {
+                row.style.display = '';
+            });
+            
+            // Show all file blocks
+            fileBlocks.forEach(fileBlock => {
+                fileBlock.style.display = '';
+            });
+            
+            // Show all package sections
+            packageSections.forEach(packageSection => {
+                packageSection.style.display = '';
+            });
+        });
+    </script>
+</body>
+</html>
+
