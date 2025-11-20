@@ -480,6 +480,14 @@ impl Writer for S3Writer {
 
         Ok(())
     }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if self.pos != pos {
+            err_box!("not support random write")
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for S3Writer {

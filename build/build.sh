@@ -131,7 +131,7 @@ DIST_ZIP=curvine-${CURVINE_VERSION}-${ARCH_NAME}-${OS_VERSION}.zip
 # Process command parameters
 PROFILE="--release"
 declare -a PACKAGES=("all")  # Default to build all packages
-declare -a UFS_TYPES=("s3")  # Default UFS type
+declare -a UFS_TYPES=("opendal-s3")  # Default UFS type
 declare -a EXTRA_FEATURES=()  # Extra features to add
 CRATE_ZIP=""
 

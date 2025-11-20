@@ -63,6 +63,7 @@ opendal-cos = ["opendal", "opendal/services-cos"]      # Tencent Cloud COS
 opendal-azblob = ["opendal", "opendal/services-azblob"] # Azure Blob Storage
 opendal-gcs = ["opendal", "opendal/services-gcs"]      # Google Cloud Storage
 opendal-hdfs = ["opendal", "opendal/services-hdfs", "jni"]  
-opendal-webhdfs = ["opendal", "opendal/services-webhdfs"]         
-         
+opendal-webhdfs = ["opendal", "opendal/services-webhdfs"]
+opendal-hdfs-native = ["opendal", "opendal/services-hdfs-native"]
+
 jni = ["dep:jni"]  # JNI support (now local to curvine-ufs)

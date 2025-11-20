@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::err_ufs;
 use crate::OpendalConf;
-use crate::{err_ufs, UfsUtils};
 use bytes::BytesMut;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
@@ -26,8 +26,11 @@ use opendal::{
     Metadata, Operator,
 };
 use orpc::sys::DataSlice;
+use orpc::{err_box, err_ext};
 use std::collections::HashMap;
 use std::time::Duration;
+
+pub const HDFS_SCHEMA: &str = "hdfs";
 
 /// OpenDAL Reader implementation
 pub struct OpendalReader {
@@ -246,6 +249,14 @@ impl Writer for OpendalWriter {
     async fn cancel(&mut self) -> FsResult<()> {
         self.writer = None;
         Ok(())
+    }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if self.pos != pos {
+            err_box!("not support random write")
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -493,6 +504,9 @@ impl OpendalFileSystem {
                 Self::add_stability_layers(base_op, &conf)?
             }
 
+            #[cfg(feature = "opendal-hdfs-native")]
+            "hdfs" => Self::create_hdfs_native_operator(&bucket_or_container, &conf)?,
+
             _ => {
                 return Err(FsError::unsupported(format!(
                     "Unsupported scheme: {}",
@@ -506,6 +520,73 @@ impl OpendalFileSystem {
             scheme: scheme.to_string(),
             bucket_or_container,
         })
+    }
+
+    /// Create HDFS Native operator (Rust native implementation, no JVM required)
+    ///
+    /// Note: HdfsNative uses system-level Kerberos configuration via environment variables.
+    /// Supported configurations:
+    /// - hdfs.namenode: NameNode address (required)
+    /// - hdfs.root: Root path (default: "/")
+    /// - hdfs.kerberos.krb5_conf: Path to krb5.conf file
+    /// - hdfs.kerberos.ccache: Path to Kerberos ticket cache
+    /// - hdfs.kerberos.keytab: Path to keytab file
+    #[cfg(feature = "opendal-hdfs-native")]
+    fn create_hdfs_native_operator(
+        bucket_or_container: &str,
+        conf: &HashMap<String, String>,
+    ) -> FsResult<Operator> {
+        let namenode = if let Some(namenode_config) = conf.get("hdfs.namenode") {
+            namenode_config.clone()
+        } else {
+            format!("hdfs://{}", bucket_or_container)
+        };
+
+        let root_path = conf.get("hdfs.root").map(|s| s.as_str()).unwrap_or("/");
+
+        // Set HADOOP_USER_NAME environment variable for HDFS authentication
+        // HdfsNative reads this environment variable to determine the user
+        let hdfs_user = conf
+            .get("hdfs.user")
+            .cloned()
+            .or_else(|| std::env::var("HADOOP_USER_NAME").ok())
+            .or_else(|| std::env::var("USER").ok());
+
+        if let Some(user) = hdfs_user {
+            std::env::set_var("HADOOP_USER_NAME", &user);
+            log::debug!("Set HADOOP_USER_NAME to: {}", user);
+        }
+
+        // Configure Kerberos environment if needed
+        // HdfsNative relies on system-level Kerberos configuration:
+        // 1. Set KRB5_CONFIG environment variable (krb5.conf path)
+        // 2. Set KRB5CCNAME environment variable (ticket cache path) or use kinit
+        // 3. Optionally set KRB5_KTNAME (keytab file path)
+
+        if let Some(krb5_conf) = conf.get("hdfs.kerberos.krb5_conf") {
+            std::env::set_var("KRB5_CONFIG", krb5_conf);
+        }
+
+        if let Some(ccache) = conf.get("hdfs.kerberos.ccache") {
+            std::env::set_var("KRB5CCNAME", ccache);
+        } else if let Ok(ccache) = std::env::var("KRB5CCNAME") {
+            // Use existing KRB5CCNAME from environment
+            log::debug!("Using Kerberos ticket cache from KRB5CCNAME: {}", ccache);
+        }
+
+        if let Some(keytab) = conf.get("hdfs.kerberos.keytab") {
+            std::env::set_var("KRB5_KTNAME", keytab);
+        }
+
+        let mut builder = HdfsNative::default();
+        builder = builder.name_node(&namenode);
+        builder = builder.root(root_path);
+
+        let base_op = Operator::new(builder)
+            .map_err(|e| FsError::common(format!("Failed to create HDFS Native operator: {}", e)))?
+            .finish();
+
+        Self::add_stability_layers(base_op, conf)
     }
 
     fn get_object_path(&self, path: &Path) -> FsResult<String> {
@@ -533,15 +614,12 @@ impl OpendalFileSystem {
             self.bucket_or_container,
             entry.path()
         );
-        let entry_path = Path::from_str(&raw_path)
-            .ok()?
-            .normalize_uri()
-            .unwrap_or(raw_path.clone());
+        let entry_path = Path::from_str(&raw_path).ok()?;
 
         let metadata = entry.metadata();
 
         // Critical: Skip self-references to prevent infinite recursion
-        if metadata.is_dir() && entry_path == parent_normalized {
+        if metadata.is_dir() && entry_path.full_path() == parent_normalized {
             log::warn!(
                 "Filtered self-reference: '{}' points to parent '{}'",
                 entry_path,
@@ -550,49 +628,10 @@ impl OpendalFileSystem {
             return None;
         }
 
-        // Get metadata with HDFS stat optimization
-        let (mtime, content_length) =
-            if self.scheme == "hdfs" && metadata.is_dir() && metadata.last_modified().is_none() {
-                self.get_hdfs_metadata(&entry)
-                    .await
-                    .unwrap_or((946684800000, metadata.content_length() as i64))
-            } else {
-                (
-                    metadata
-                        .last_modified()
-                        .map(|t| t.timestamp_millis())
-                        .unwrap_or(946684800000),
-                    metadata.content_length() as i64,
-                )
-            };
-
-        // Clean directory names (remove trailing slash)
-        let name = entry.name();
-        let cleaned_name = if metadata.is_dir() && name.ends_with('/') {
-            &name[..name.len() - 1]
-        } else {
-            name
-        };
-
-        Some(FileStatus {
-            path: entry_path,
-            name: cleaned_name.to_owned(),
-            is_dir: metadata.is_dir(),
-            file_type: if metadata.is_dir() {
-                FileType::Dir
-            } else {
-                FileType::File
-            },
-            mtime,
-            len: content_length,
-            is_complete: true,
-            replicas: 1,
-            block_size: 4 * 1024 * 1024,
-            ..Default::default()
-        })
+        Some(Self::read_status(&entry_path, metadata))
     }
 
-    async fn get_hdfs_metadata(&self, entry: &opendal::Entry) -> Option<(i64, i64)> {
+    pub async fn get_hdfs_metadata(&self, entry: &opendal::Entry) -> Option<(i64, i64)> {
         self.operator.stat(entry.path()).await.ok().map(|stat| {
             (
                 stat.last_modified()
@@ -616,17 +655,25 @@ impl OpendalFileSystem {
         }
     }
 
-    pub fn read_status(path: &Path, metadata: Metadata) -> FileStatus {
+    pub fn read_status(path: &Path, metadata: &Metadata) -> FileStatus {
+        let mtime = metadata
+            .last_modified()
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(0);
+        let len = metadata.content_length() as i64;
+
         FileStatus {
             path: path.full_path().to_owned(),
             name: path.name().to_owned(),
             is_dir: metadata.is_dir(),
-            mtime: metadata
-                .last_modified()
-                .map(|t| t.timestamp_millis())
-                .unwrap_or(0),
+            file_type: if metadata.is_dir() {
+                FileType::Dir
+            } else {
+                FileType::File
+            },
+            mtime,
+            len,
             is_complete: true,
-            len: metadata.content_length() as i64,
             replicas: 1,
             block_size: 4 * 1024 * 1024,
             ..Default::default()
@@ -694,7 +741,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             .stat(&object_path)
             .await
             .map_err(|e| FsError::common(format!("Failed to stat file: {}", e)))?;
-        let status = Self::read_status(path, metadata);
+        let status = Self::read_status(path, &metadata);
 
         Ok(OpendalReader {
             operator: self.operator.clone(),
@@ -746,37 +793,19 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             Err(e) => {
                 // Map backend NotFound to FsError::FileNotFound so FUSE can return ENOENT
                 if e.kind() == opendal::ErrorKind::NotFound {
-                    return Err(FsError::file_not_found(path.full_path()));
+                    return err_ext!(FsError::file_not_found(path.full_path()));
                 }
-                return Err(FsError::common(format!("Failed to stat: {}", e)));
+                return err_box!(format!("failed to stat: {}", e));
             }
         };
 
-        Ok(FileStatus {
-            path: path.full_path().to_owned(),
-            name: path.name().to_owned(),
-            is_dir: metadata.is_dir(),
-            mtime: metadata
-                .last_modified()
-                .map(|t| t.timestamp_millis())
-                .unwrap_or(946684800000),
-            is_complete: true,
-            len: metadata.content_length() as i64,
-            replicas: 1,
-            block_size: 4 * 1024 * 1024,
-            file_type: if metadata.is_dir() {
-                FileType::Dir
-            } else {
-                FileType::File
-            },
-            ..Default::default()
-        })
+        Ok(Self::read_status(path, &metadata))
     }
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
         // Build object path with HDFS trailing slash (needed for proper directory listing)
         let mut object_path = self.get_object_path(path)?;
-        if self.scheme == "hdfs" && !object_path.ends_with('/') && !object_path.is_empty() {
+        if self.scheme == HDFS_SCHEMA && !object_path.ends_with('/') && !object_path.is_empty() {
             object_path.push('/');
         }
 
@@ -793,6 +822,10 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
 
         let mut statuses = Vec::new();
         for entry in list_result {
+            if self.scheme == HDFS_SCHEMA && entry.path() == object_path {
+                continue;
+            }
+
             if let Some(status) = self.process_entry(entry, &parent_normalized).await {
                 statuses.push(status);
             }

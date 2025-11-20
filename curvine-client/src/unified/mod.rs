@@ -19,7 +19,7 @@ use crate::{impl_reader_for_enum, impl_writer_for_enum};
 use curvine_common::fs::Path;
 use curvine_common::state::MountInfo;
 use curvine_common::FsResult;
-use curvine_ufs::err_ufs;
+use orpc::err_box;
 use std::collections::HashMap;
 
 #[cfg(feature = "s3")]
@@ -94,9 +94,9 @@ impl UfsFileSystem {
                 Ok(UfsFileSystem::OpenDAL(fs))
             }
 
-            Some(scheme) => err_ufs!("Unsupported scheme: {}", scheme),
+            Some(scheme) => err_box!("unsupported scheme: {}", scheme),
 
-            None => err_ufs!("Missing scheme"),
+            None => err_box!("missing scheme"),
         }
     }
 
