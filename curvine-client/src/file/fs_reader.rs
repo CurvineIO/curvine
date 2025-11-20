@@ -96,12 +96,9 @@ impl Reader for FsReader {
     }
 
     async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
-        let spend = TimeSpent::new();
-        let result = self.inner.read().await;
-        let used_us = spend.used_us();
-        FsContext::get_metrics().read_time_us.inc_by(used_us as i64);
-
-        result
+        let _timer =
+            TimeSpent::timer_counter(Arc::new(FsContext::get_metrics().read_time_us.clone()));
+        self.inner.read().await
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {

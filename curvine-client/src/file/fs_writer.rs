@@ -98,14 +98,10 @@ impl Writer for FsWriter {
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
         let len = chunk.len();
-
-        let spend = TimeSpent::new();
+        let _timer =
+            TimeSpent::timer_counter(Arc::new(FsContext::get_metrics().write_time_us.clone()));
         self.inner.write(chunk).await?;
-        let used = spend.used_us();
-
         FsContext::get_metrics().write_bytes.inc_by(len as i64);
-        FsContext::get_metrics().write_time_us.inc_by(used as i64);
-
         Ok(len as i64)
     }
 

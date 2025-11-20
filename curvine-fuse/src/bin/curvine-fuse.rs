@@ -119,10 +119,6 @@ pub struct FuseArgs {
     #[arg(long, help = "Enable auto cache (optional)")]
     pub auto_cache: Option<bool>,
 
-    // Fuse web port (optional)
-    #[arg(long, help = "Web server port (optional)", default_value = "9002")]
-    pub web_port: u16,
-
     #[arg(long, help = "Enable direct IO (optional)")]
     pub direct_io: Option<bool>,
 
@@ -155,6 +151,10 @@ pub struct FuseArgs {
 
     #[arg(long, help = "Node cache timeout (e.g., '1h', '30m') (optional)")]
     pub node_cache_timeout: Option<String>,
+
+    // Fuse web port
+    #[arg(long, help = "Web server port (optional)")]
+    pub web_port: Option<u16>,
 
     #[arg(long, help = "Master address (e.g., 'm1:8995,m2:8995'")]
     pub master_addrs: Option<String>,
@@ -255,8 +255,8 @@ impl FuseArgs {
             conf.fuse.node_cache_timeout = node_cache_timeout.clone();
         }
 
-        if self.web_port != 9002 {
-            conf.fuse.web_port = self.web_port;
+        if let Some(web_port) = self.web_port {
+            conf.fuse.web_port = web_port;
         }
 
         if let Some(master_addrs) = &self.master_addrs {

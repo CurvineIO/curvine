@@ -26,11 +26,10 @@ use curvine_common::state::{
 };
 use curvine_common::FsResult;
 use log::{info, warn};
+use orpc::common::TimeSpent;
 use orpc::runtime::Runtime;
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
-
-use crate::timed_operation;
 
 #[derive(Clone, Copy, PartialOrd, PartialEq, Debug)]
 enum CacheValidity {
@@ -287,21 +286,25 @@ impl UnifiedFileSystem {
 
 impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     async fn mkdir(&self, path: &Path, create_parent: bool) -> FsResult<bool> {
-        timed_operation!(self, "mkdir", {
-            match self.get_mount(path).await? {
-                None => self.cv.mkdir(path, create_parent).await,
-                Some((ufs_path, mount)) => mount.ufs.mkdir(&ufs_path, create_parent).await,
-            }
-        })
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["mkdir".to_string()],
+        );
+        match self.get_mount(path).await? {
+            None => self.cv.mkdir(path, create_parent).await,
+            Some((ufs_path, mount)) => mount.ufs.mkdir(&ufs_path, create_parent).await,
+        }
     }
 
     async fn create(&self, path: &Path, overwrite: bool) -> FsResult<UnifiedWriter> {
-        timed_operation!(self, "create", {
-            match self.get_mount(path).await? {
-                None => Ok(UnifiedWriter::Cv(self.cv.create(path, overwrite).await?)),
-                Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, overwrite).await,
-            }
-        })
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["create".to_string()],
+        );
+        match self.get_mount(path).await? {
+            None => Ok(UnifiedWriter::Cv(self.cv.create(path, overwrite).await?)),
+            Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, overwrite).await,
+        }
     }
 
     async fn append(&self, path: &Path) -> FsResult<UnifiedWriter> {
@@ -312,12 +315,14 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
-        timed_operation!(self, "exists", {
-            match self.get_mount(path).await? {
-                None => self.cv.exists(path).await,
-                Some((ufs_path, mount)) => mount.ufs.exists(&ufs_path).await,
-            }
-        })
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["exists".to_string()],
+        );
+        match self.get_mount(path).await? {
+            None => self.cv.exists(path).await,
+            Some((ufs_path, mount)) => mount.ufs.exists(&ufs_path).await,
+        }
     }
 
     async fn open(&self, path: &Path) -> FsResult<UnifiedReader> {
@@ -367,95 +372,108 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
-        timed_operation!(self, "rename", {
-            match self.get_mount(src).await? {
-                None => self.cv.rename(src, dst).await,
-                Some((src_ufs, mount)) => {
-                    let dst_ufs = mount.get_ufs_path(dst)?;
-                    let _ = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["rename".to_string()],
+        );
+        match self.get_mount(src).await? {
+            None => self.cv.rename(src, dst).await,
+            Some((src_ufs, mount)) => {
+                let dst_ufs = mount.get_ufs_path(dst)?;
+                let _ = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
 
-                    if self.cv.exists(src).await? {
-                        self.cv.delete(src, true).await?;
-                    }
-
-                    Ok(true)
+                if self.cv.exists(src).await? {
+                    self.cv.delete(src, true).await?;
                 }
+                Ok(true)
             }
-        })
+        }
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
-        timed_operation!(self, "delete", {
-            match self.get_mount(path).await? {
-                None => self.cv.delete(path, recursive).await,
-                Some((ufs_path, mount)) => {
-                    // delete cache
-                    if self.cv.exists(path).await? {
-                        self.cv.delete(path, recursive).await?;
-                    }
-
-                    // delete ufs
-                    mount.ufs.delete(&ufs_path, recursive).await
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["delete".to_string()],
+        );
+        match self.get_mount(path).await? {
+            None => self.cv.delete(path, recursive).await,
+            Some((ufs_path, mount)) => {
+                // delete cache
+                if self.cv.exists(path).await? {
+                    self.cv.delete(path, recursive).await?;
                 }
+
+                // delete ufs
+                mount.ufs.delete(&ufs_path, recursive).await
             }
-        })
+        }
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
-        timed_operation!(self, "get_status", {
-            match self.get_mount(path).await? {
-                None => self.cv.get_status(path).await,
-                Some((ufs_path, mount)) => {
-                    if mount.info.cv_path == path.path() {
-                        return self.cv.get_status(path).await;
-                    }
-                    mount.ufs.get_status(&ufs_path).await
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["get_status".to_string()],
+        );
+        match self.get_mount(path).await? {
+            None => self.cv.get_status(path).await,
+            Some((ufs_path, mount)) => {
+                if mount.info.cv_path == path.path() {
+                    return self.cv.get_status(path).await;
                 }
+                mount.ufs.get_status(&ufs_path).await
             }
-        })
+        }
     }
 
     async fn get_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
-        timed_operation!(self, "get_status_bytes", {
-            match self.get_mount(path).await? {
-                None => self.cv.get_status_bytes(path).await,
-                Some((ufs_path, mount)) => {
-                    if mount.info.cv_path == path.path() {
-                        return self.cv.get_status_bytes(path).await;
-                    }
-                    mount.ufs.get_status_bytes(&ufs_path).await
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["get_status_bytes".to_string()],
+        );
+        match self.get_mount(path).await? {
+            None => self.cv.get_status_bytes(path).await,
+            Some((ufs_path, mount)) => {
+                if mount.info.cv_path == path.path() {
+                    return self.cv.get_status_bytes(path).await;
                 }
+                mount.ufs.get_status_bytes(&ufs_path).await
             }
-        })
+        }
     }
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
-        timed_operation!(self, "list_status", {
-            match self.get_mount(path).await? {
-                None => self.cv.list_status(path).await,
-                Some((ufs_path, mount)) => mount.ufs.list_status(&ufs_path).await,
-            }
-        })
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["list_status".to_string()],
+        );
+        match self.get_mount(path).await? {
+            None => self.cv.list_status(path).await,
+            Some((ufs_path, mount)) => mount.ufs.list_status(&ufs_path).await,
+        }
     }
 
     async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
-        timed_operation!(self, "list_status_bytes", {
-            match self.get_mount(path).await? {
-                None => self.cv.list_status_bytes(path).await,
-                Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
-            }
-        })
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["list_status_bytes".to_string()],
+        );
+        match self.get_mount(path).await? {
+            None => self.cv.list_status_bytes(path).await,
+            Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
+        }
     }
 
     async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
-        timed_operation!(self, "set_attr", {
-            match self.get_mount(path).await? {
-                None => {
-                    self.cv.set_attr(path, opts).await?;
-                    Ok(())
-                }
-                Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["set_attr".to_string()],
+        );
+        match self.get_mount(path).await? {
+            None => {
+                self.cv.set_attr(path, opts).await?;
+                Ok(())
             }
-        })
+            Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
+        }
     }
 }
