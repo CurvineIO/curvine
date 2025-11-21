@@ -215,7 +215,6 @@ impl Writer for OpendalWriter {
                 bytes::Bytes::copy_from_slice(slice)
             }
         };
-
         let len = data.len() as i64;
 
         let writer = self.writer.as_mut().unwrap();
@@ -701,8 +700,27 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     async fn create(&self, path: &Path, _overwrite: bool) -> FsResult<OpendalWriter> {
         let object_path = self.get_object_path(path)?;
         // Debug: Creating file
+        let exist = self.exists(path).await?;
+        if exist && !_overwrite {
+            return Err(FsError::common(format!(
+                "File already exists: {}",
+                path.full_path()
+            )));
+        }
+
+        self.operator
+            .write(&object_path, opendal::Buffer::new())
+            .await
+            .map_err(|e| {
+                FsError::common(format!(
+                    "Failed to create empty file {}: {}",
+                    path.full_path(),
+                    e
+                ))
+            })?;
 
         let status = Self::write_status(path);
+
         Ok(OpendalWriter {
             operator: self.operator.clone(),
             path: path.clone(),
