@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Curvine Test Results</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; text-align: center; }
+        .header h1 { font-size: 2.2em; margin-bottom: 10px; }
+        .date-selector { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .date-selector h3 { margin-bottom: 15px; color: #2c3e50; }
+        .date-dropdown { display: flex; align-items: center; gap: 15px; }
+        .date-dropdown label { color: #2c3e50; font-weight: bold; font-size: 16px; }
+        .date-dropdown select { flex: 1; padding: 10px 15px; border: 2px solid #ddd; border-radius: 8px; font-size: 16px; background: white; color: #2c3e50; cursor: pointer; transition: border-color 0.3s; }
+        .date-dropdown select:hover { border-color: #667eea; }
+        .date-dropdown select:focus { outline: none; border-color: #667eea; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1); }
+        .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .summary-card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; }
+        .summary-card h3 { color: #666; margin-bottom: 10px; }
+        .summary-card .number { font-size: 1.8em; font-weight: bold; }
+        .total { color: #3498db; }
+        .passed { color: #27ae60; }
+        .failed { color: #e74c3c; }
+        .success-rate { color: #f39c12; }
+        .coverage { color: #9b59b6; }
+        .coverage-section { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
+        .coverage-title { font-size: 1.3em; font-weight: bold; color: #2c3e50; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #9b59b6; }
+        .coverage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        .coverage-card { background: #f8f9fa; padding: 20px; border-radius: 8px; text-align: center; }
+        .coverage-card h4 { color: #666; margin-bottom: 10px; font-size: 0.9em; }
+        .coverage-card .number { font-size: 1.5em; font-weight: bold; color: #9b59b6; }
+        .coverage-link { display: inline-block; margin-top: 15px; padding: 10px 20px; background: #9b59b6; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
+        .coverage-link:hover { background: #7d3c98; }
+        .package-section { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
+        .package-title { font-size: 1.3em; font-weight: bold; color: #2c3e50; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #3498db; }
+        .test-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+        .test-table th, .test-table td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        .test-table th { background-color: #f8f9fa; font-weight: bold; color: #495057; }
+        .file-group { background: #eef; font-weight: bold; color: #2c3e50; }
+        .status-passed { background: #d4edda; color: #155724; padding: 3px 6px; border-radius: 4px; font-weight: bold; }
+        .status-failed { background: #f8d7da; color: #721c24; padding: 3px 6px; border-radius: 4px; font-weight: bold; }
+        .log-link { color: #007bff; text-decoration: none; font-size: 0.9em; }
+        .log-link:hover { text-decoration: underline; }
+        .footer { text-align: center; margin-top: 40px; padding: 20px; color: #666; border-top: 1px solid #e0e0e0; }
+        .file-block { margin: 18px 0; padding: 14px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa; }
+        .file-block-title { font-weight: 600; color: #2c3e50; margin-bottom: 8px; }
+        .test-table { table-layout: fixed; }
+        .test-table th, .test-table td { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .fuse-fio-section { background: white; border-radius: 10px; padding: 25px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
+        .fuse-fio-title { font-size: 1.3em; font-weight: bold; color: #2c3e50; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #3498db; cursor: pointer; display: flex; align-items: center; justify-content: space-between; }
+        .fuse-fio-title:hover { color: #667eea; }
+        .fuse-fio-title .toggle-icon { font-size: 0.8em; transition: transform 0.3s; }
+        .fuse-fio-title.collapsed .toggle-icon { transform: rotate(-90deg); }
+        .fuse-fio-content { display: block; }
+        .fuse-fio-content.collapsed { display: none; }
+        .fuse-fio-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .fuse-fio-summary-card { background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; }
+        .fuse-fio-summary-card h4 { color: #666; margin-bottom: 8px; font-size: 0.9em; }
+        .fuse-fio-summary-card .number { font-size: 1.3em; font-weight: bold; }
+        .test-group-section { margin-top: 20px; margin-bottom: 20px; }
+        .test-group-title { font-weight: bold; color: #2c3e50; margin-bottom: 10px; padding: 10px; background: #f8f9fa; border-radius: 5px; }
+        .test-item { padding: 8px 12px; margin: 5px 0; border-left: 4px solid #ddd; background: #fafafa; border-radius: 4px; }
+        .test-item.pass { border-left-color: #27ae60; }
+        .test-item.fail { border-left-color: #e74c3c; }
+        .test-item-name { font-weight: 500; color: #2c3e50; }
+        .test-item-status { display: inline-block; margin-left: 10px; padding: 2px 8px; border-radius: 3px; font-size: 0.85em; font-weight: bold; }
+        .test-item-status.pass { background: #d4edda; color: #155724; }
+        .test-item-status.fail { background: #f8d7da; color: #721c24; }
+        .test-item-command { font-size: 0.85em; color: #666; margin-top: 5px; font-family: monospace; }
+        .test-item-error { font-size: 0.85em; color: #e74c3c; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🧪 Curvine Test Results</h1>
+            <div id="current-date">Selected: {{ current_date }}</div>
+        </div>
+
+        <div class="date-selector">
+            <h3>📅 Select Test Date</h3>
+            <div class="date-dropdown">
+                <label for="date-select">Test Date:</label>
+                <select id="date-select" onchange="loadTestResult(this.value)">
+                    {% for date_info in available_dates %}
+                    <option value="{{ date_info.folder }}" {% if date_info.folder == selected_date %}selected{% endif %}>
+                        {{ date_info.datetime }} ({{ date_info.folder }})
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+
+        {% if test_summary %}
+        {% if total_tests > 0 or packages|length > 0 or test_cases|length > 0 %}
+        <div class="coverage-section">
+            <div class="coverage-title">🧪 Unit Test Results</div>
+            <div class="coverage-grid">
+                <div class="coverage-card">
+                    <h4>Total Tests</h4>
+                    <div class="number" style="color: #3498db;">{{ total_tests }}</div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Passed</h4>
+                    <div class="number" style="color: #27ae60;">{{ passed_tests }}</div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Failed</h4>
+                    <div class="number" style="color: #e74c3c;">{{ failed_tests }}</div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Success Rate</h4>
+                    <div class="number" style="color: #f39c12;">{{ success_rate }}%</div>
+                </div>
+            </div>
+            {% if packages|length > 0 %}
+            <div style="text-align: center;">
+                <a href="/unit-tests/{{ selected_date }}" class="coverage-link" target="_blank">View Detailed Unit Test Results →</a>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        {% if test_summary.coverage %}
+        <div class="coverage-section">
+            <div class="coverage-title">📊 Code Coverage Report</div>
+            <div class="coverage-grid">
+                <div class="coverage-card">
+                    <h4>Lines Coverage</h4>
+                    <div class="number">{{ "%.2f"|format(test_summary.coverage.lines.percent) }}%</div>
+                    <div style="font-size: 0.9em; color: #666; margin-top: 5px;">
+                        {{ test_summary.coverage.lines.covered }}/{{ test_summary.coverage.lines.total }}
+                    </div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Functions Coverage</h4>
+                    <div class="number">{{ "%.2f"|format(test_summary.coverage.functions.percent) }}%</div>
+                    <div style="font-size: 0.9em; color: #666; margin-top: 5px;">
+                        {{ test_summary.coverage.functions.covered }}/{{ test_summary.coverage.functions.total }}
+                    </div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Regions Coverage</h4>
+                    <div class="number">{{ "%.2f"|format(test_summary.coverage.regions.percent) }}%</div>
+                    <div style="font-size: 0.9em; color: #666; margin-top: 5px;">
+                        {{ test_summary.coverage.regions.covered }}/{{ test_summary.coverage.regions.total }}
+                    </div>
+                </div>
+            </div>
+            {% if test_summary.coverage_report_url %}
+            <div style="text-align: center;">
+                <a href="{{ test_summary.coverage_report_url }}" class="coverage-link" target="_blank">View Detailed Coverage Report →</a>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        {% if ltp_test %}
+        <div class="coverage-section">
+            <div class="coverage-title">🧪 LTP Regression Test Results</div>
+            <div class="coverage-grid">
+                <div class="coverage-card">
+                    <h4>Total Tests</h4>
+                    <div class="number" style="color: #3498db;">{{ ltp_test.total_tests }}</div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Passed</h4>
+                    <div class="number" style="color: #27ae60;">{{ ltp_test.passed_tests }}</div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Failed</h4>
+                    <div class="number" style="color: #e74c3c;">{{ ltp_test.failed_tests }}</div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Success Rate</h4>
+                    <div class="number" style="color: #f39c12;">{{ "%.2f"|format(ltp_test.success_rate) }}%</div>
+                </div>
+            </div>
+            {% if ltp_test.test_suites %}
+            <div style="text-align: center;">
+                <a href="/ltp-test-details/{{ selected_date }}" class="coverage-link" target="_blank">View Detailed LTP Test Results →</a>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+        {% endif %}
+
+        {% if fuse_results %}
+        <div class="coverage-section">
+            <div class="coverage-title">🔧 FUSE Filesystem Test Results</div>
+            <div class="coverage-grid">
+                <div class="coverage-card">
+                    <h4>Total Tests</h4>
+                    <div class="number" style="color: #3498db;">{{ fuse_results.summary.total_tests }}</div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Passed</h4>
+                    <div class="number" style="color: #27ae60;">{{ fuse_results.summary.passed }}</div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Failed</h4>
+                    <div class="number" style="color: #e74c3c;">{{ fuse_results.summary.failed }}</div>
+                </div>
+            </div>
+            {% if fuse_results.summary.total_tests > 0 %}
+            <div style="text-align: center;">
+                <a href="/fuse-test-details/{{ selected_date }}" class="coverage-link" target="_blank">View Detailed FUSE Test Results →</a>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        {% if fio_results %}
+        <div class="coverage-section">
+            <div class="coverage-title">⚡ FIO Performance Test Results</div>
+            <div class="coverage-grid">
+                <div class="coverage-card">
+                    <h4>Total Tests</h4>
+                    <div class="number" style="color: #3498db;">{{ fio_results.summary.total_tests }}</div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Passed</h4>
+                    <div class="number" style="color: #27ae60;">{{ fio_results.summary.passed }}</div>
+                </div>
+                <div class="coverage-card">
+                    <h4>Failed</h4>
+                    <div class="number" style="color: #e74c3c;">{{ fio_results.summary.failed }}</div>
+                </div>
+            </div>
+            {% if fio_results.summary.total_tests > 0 %}
+            <div style="text-align: center;">
+                <a href="/fio-test-details/{{ selected_date }}" class="coverage-link" target="_blank">View Detailed FIO Test Results →</a>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        {% if not test_summary and not fuse_results and not fio_results and not ltp_test %}
+        <div class="package-section">No test results for the selected date</div>
+        {% endif %}
+
+        <div class="footer">
+            <p>Report generated at: {{ current_time }}</p>
+            <p>Curvine Test Results Viewer</p>
+        </div>
+    </div>
+
+    <script>
+        function loadTestResult(date) { window.location.href = '/result?date=' + date; }
+        function toggleSection(sectionId) {
+            const content = document.getElementById(sectionId);
+            const title = content.previousElementSibling;
+            if (content.classList.contains('collapsed')) {
+                content.classList.remove('collapsed');
+                title.classList.remove('collapsed');
+            } else {
+                content.classList.add('collapsed');
+                title.classList.add('collapsed');
+            }
+        }
+        setTimeout(function() { location.reload(); }, 30000);
+    </script>
+</body>
+</html>
+

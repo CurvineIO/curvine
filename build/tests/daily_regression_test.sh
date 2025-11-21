@@ -95,7 +95,7 @@ run_all_tests() {
     
     # Run all tests with --all-targets to include all types of tests
     log_info "Running 'cargo test' for all packages with all targets..."
-    cd "$PROJECT_ROOT" && cargo test --all-targets -- --nocapture > "$all_tests_log" 2>&1
+    cd "$PROJECT_ROOT" && cargo test --all-targets -- --nocapture 2>&1 | tee "$all_tests_log"
     
     log_success "All tests completed. See $all_tests_log for details"
     return 0
@@ -116,8 +116,8 @@ run_package_tests() {
     
     # Run all tests in the package
     log_info "Running all tests in package $package"
-    cd "$PROJECT_ROOT" && cargo test --package "$package" --all-targets --all-features -- --nocapture > "$log_file" 2>&1
-    local exit_code=$?
+    cd "$PROJECT_ROOT" && cargo test --package "$package" --all-targets --all-features -- --nocapture 2>&1 | tee "$log_file"
+    local exit_code=${PIPESTATUS[0]}
     
     # Parse test results
     if [ $exit_code -eq 0 ]; then
@@ -465,8 +465,6 @@ run_single_test_case() {
     local test_file="$2"
     local test_case="$3"
     
-    log_info "Running test case: $package::$test_file::$test_case"
-    
     # Temporarily disable set -e to continue on test failures
     set +e
     
@@ -496,23 +494,22 @@ run_single_test_case() {
         full_test_name="$test_file::$test_case"
     fi
     
-    # Run the test
+    # Run the test (output is captured to log_file and displayed)
     cd "$PROJECT_ROOT"
     if [ "$is_integration_test" = true ]; then
         # For integration tests, use --test flag with exact match
         # Use --exact to ensure only the specified test case runs
-        log_info "Running integration test: cargo test --package $package --test $test_file -- $test_case --exact"
-        cargo test --package "$package" --test "$test_file" -- "$test_case" --exact --nocapture > "$log_file" 2>&1
+        cargo test --package "$package" --test "$test_file" -- "$test_case" --exact --nocapture 2>&1 | tee "$log_file"
+        local exit_code=${PIPESTATUS[0]}
     elif [ "$is_unit_test" = true ]; then
         # For unit tests, use --lib flag to only run lib tests, not integration tests
-        log_info "Running unit test: cargo test --package $package --lib -- $full_test_name --exact"
-        cargo test --package "$package" --lib -- "$full_test_name" --exact --nocapture > "$log_file" 2>&1
+        cargo test --package "$package" --lib -- "$full_test_name" --exact --nocapture 2>&1 | tee "$log_file"
+        local exit_code=${PIPESTATUS[0]}
     else
         # Fallback: use package-level filter (should not reach here)
-        log_info "Running test: cargo test --package $package --all-features -- $full_test_name --exact"
-        cargo test --package "$package" --all-features -- "$full_test_name" --exact --nocapture > "$log_file" 2>&1
+        cargo test --package "$package" --all-features -- "$full_test_name" --exact --nocapture 2>&1 | tee "$log_file"
+        local exit_code=${PIPESTATUS[0]}
     fi
-    local exit_code=$?
     
     # Re-enable set -e
     set -e
@@ -537,8 +534,8 @@ run_single_test_name() {
     local log_file="$log_dir/${safe_name}.log"
     log_info "Running test by name (workspace): $full_test_name"
     set +e
-    cd "$PROJECT_ROOT" && cargo test --workspace -- "$full_test_name" --exact --nocapture > "$log_file" 2>&1
-    local exit_code=$?
+    cd "$PROJECT_ROOT" && cargo test --workspace -- "$full_test_name" --exact --nocapture 2>&1 | tee "$log_file"
+    local exit_code=${PIPESTATUS[0]}
     set -e
     if [ $exit_code -eq 0 ]; then
         echo "PASSED:$log_file"
@@ -648,6 +645,22 @@ run_tests_individually() {
             package="workspace"
         fi
         
+        # Build full test name for display
+        local full_test_name=""
+        if [ "$test_file" != "lib" ] && [[ "$test_file" != *"::"* ]]; then
+            # Integration test: test_file is the test target name
+            full_test_name="$package::$test_file::$test_case"
+        elif [ "$test_file" = "lib" ]; then
+            # Unit test in lib
+            full_test_name="$package::lib::$test_case"
+        else
+            # Unit test with module path
+            full_test_name="$package::$test_file::$test_case"
+        fi
+        
+        # Display test name before running
+        log_info "Running test: $full_test_name"
+        
         # Use run_single_test_case for proper package-scoped execution
         local result=$(run_single_test_case "$package" "$test_file" "$test_case" | tail -n 1)
         local status="${result%%:*}"
@@ -666,14 +679,15 @@ run_tests_individually() {
         IFS=':' read -r pkg_total pkg_passed pkg_failed <<< "${package_stats[$pkg_key]}"
         ((pkg_total++))
         
+        # Display test result with test name
         if [ "$status" = "PASSED" ]; then
             ((passed_tests++))
             ((pkg_passed++))
-            log_success "✓ $full_test_name"
+            log_success "✓ PASSED: $full_test_name"
         else
             ((failed_tests++))
             ((pkg_failed++))
-            log_error "✗ $full_test_name"
+            log_error "✗ FAILED: $full_test_name"
         fi
         
         # Update package statistics
@@ -762,8 +776,8 @@ run_specific_test() {
     
     # Run specific test
     log_info "Running test: $package/$test_file::$test_case"
-    cd "$PROJECT_ROOT" && cargo test --package "$package" --test "$test_file" -- "$test_case" --exact --show-output > "$log_file" 2>&1
-    local exit_code=$?
+    cd "$PROJECT_ROOT" && cargo test --package "$package" --test "$test_file" -- "$test_case" --exact --show-output 2>&1 | tee "$log_file"
+    local exit_code=${PIPESTATUS[0]}
     
     # Parse test result
     if [ $exit_code -eq 0 ]; then
@@ -831,7 +845,9 @@ run_tests() {
         local log_file="$package_dir/all_tests.log"
         
         # Use cargo test to run all tests in the package, include all targets and all features
-        if cargo test --package "$package" --all-targets --all-features -- --nocapture > "$log_file" 2>&1; then
+        cargo test --package "$package" --all-targets --all-features -- --nocapture 2>&1 | tee "$log_file"
+        local test_exit_code=${PIPESTATUS[0]}
+        if [ $test_exit_code -eq 0 ]; then
             local test_count=$(grep -c "test result:" "$log_file" || echo 0)
             if [ "$test_count" -gt 0 ]; then
                 # Extract test results
