@@ -1,5 +1,5 @@
 # Build stage
-FROM rockylinux:9 AS builder
+FROM ubuntu:24.04 AS builder
 
 # Add metadata labels
 ARG REPO_URL=https://github.com/curvineio/curvine
@@ -8,32 +8,38 @@ LABEL org.opencontainers.image.description="Curvine Native Kubernetes Runtime Im
 
 # This Dockerfile is specifically for source code compilation
 
+# Set non-interactive mode for apt to avoid prompts during install
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Use Alibaba Cloud mirror for faster package downloads in China
+RUN mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.backup 2>/dev/null || true && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble main restricted universe multiverse' > /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-updates main restricted universe multiverse' >> /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-backports main restricted universe multiverse' >> /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-security main restricted universe multiverse' >> /etc/apt/sources.list && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # 1. Install the basic toolchain and dependencies
-# Note: curl-minimal is already installed in base image, conflicts with curl
-# Note: ca-certificates is already installed in base image
-RUN dnf install -y \
+RUN apt-get update && apt-get install -y --fix-missing \
     fuse3 \
-    fuse3-devel \
+    libfuse3-dev \
     clang \
     llvm \
-    llvm-devel \
+    llvm-dev \
     git \
     wget \
+    curl \
     zip \
     unzip \
-    openssl-devel \
+    nodejs \
+    npm \
+    openjdk-8-jdk \
+    libssl-dev \
     pkg-config \
+    ca-certificates \
     rsync \
-    && dnf clean all
-
-# 1.1. Install latest Node.js from NodeSource repository
-RUN curl -sL https://rpm.nodesource.com/setup_current.x | bash - && \
-    dnf install -y nodejs && \
-    dnf clean all
-
-# 1.2. Install Java 8 JDK
-RUN dnf install -y java-1.8.0-openjdk-devel && \
-    dnf clean all
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 # 2. Install the Rust toolchain
 RUN export PATH="/root/.cargo/bin:${PATH}" && \
@@ -141,13 +147,27 @@ RUN mkdir -p /build-output && \
     echo "  conf/: $(ls -1 /build-output/conf 2>/dev/null | wc -l) files"
 
 # Runtime stage
-FROM rockylinux:9
+FROM ubuntu:24.04
 
-RUN dnf install -y \
+# Set non-interactive mode for apt
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Use Alibaba Cloud mirror for faster package downloads in China
+RUN mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.backup 2>/dev/null || true && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble main restricted universe multiverse' > /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-updates main restricted universe multiverse' >> /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-backports main restricted universe multiverse' >> /etc/apt/sources.list && \
+    echo 'deb http://mirrors.aliyun.com/ubuntu/ noble-security main restricted universe multiverse' >> /etc/apt/sources.list && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install runtime dependencies (minimal set)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     fuse3 \
-    java-1.8.0-openjdk-headless \
-    && dnf clean all \
-    && rm -rf /var/cache/dnf/*
+    libfuse3-3 \
+    openjdk-8-jre-headless \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/*
 
 # Create curvine directories
 RUN mkdir -p /app/curvine \
@@ -160,7 +180,7 @@ RUN mkdir -p /app/curvine/bin /app/curvine/lib /app/curvine/conf
 # Copy from builder stage when building from source
 COPY --from=builder /build-output/ /app/curvine/
 
-# Copy entrypoint script
+# Copy entrypoint script (use compile-specific entrypoint)
 COPY entrypoint.sh /entrypoint.sh
 
 # Make all binaries and scripts executable
@@ -190,3 +210,4 @@ EXPOSE 8995 8996 8997 9000 9001
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["master", "start"]
+
