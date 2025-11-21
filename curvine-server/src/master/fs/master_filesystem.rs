@@ -94,6 +94,14 @@ impl MasterFilesystem {
         }
 
         if inp.is_full() {
+            if opts.create_parent {
+                if let Some(last_inode) = inp.get_last_inode() {
+                    if last_inode.is_dir() {
+                        let status = last_inode.to_file_status(inp.path());
+                        return Ok(status);
+                    }
+                }
+            }
             return err_ext!(FsError::file_exists(inp.path()));
         }
 
