@@ -1,4 +1,4 @@
-.PHONY: help check-env format build cargo docker-build docker-build-img docker-build-cached all dist dist-only
+.PHONY: help check-env format build cargo docker-build docker-build-compile docker-compile all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -29,9 +29,9 @@ help:
 	@echo "  make format                      - Format code using pre-commit hooks"
 	@echo ""
 	@echo "Docker:"
-	@echo "  make docker-build                - Build using Docker compilation image"
-	@echo "  make docker-build-cached         - Build using cached Docker compilation image"
-	@echo "  make docker-build-img            - Build compilation Docker image (interactive)"
+	@echo "  make docker-build                - Build runtime Docker image from source (compile + package)"
+	@echo "  make docker-build-compile         - Build compilation Docker image (interactive)"
+	@echo "  make docker-compile               - Compile code in Docker container (output to local build/dist)"
 	@echo ""
 	@echo "CSI (Container Storage Interface):"
 	@echo "  make csi-build                   - Build curvine-csi Go binary"
@@ -80,29 +80,32 @@ build: check-env
 cargo:
 	cargo $(ARGS)
 
-# 5. Build through docker compilation image
+# 5. Build runtime Docker image from source (compile + package into image)
 docker-build:
-	docker run --rm --entrypoint="" -v $(PWD):/workspace -w /workspace curvine/curvine-compile:latest bash -c "make all"
+	@echo "Building runtime Docker image from source..."
+	@bash curvine-docker/deploy/build-image.sh
 
-docker-build-cached:
-	docker run --rm --entrypoint="" -v $(PWD):/workspace -w /workspace curvine/curvine-compile:build-cached bash -c "make all"
-
-# 6. Build compilation image under curvine-docker
-docker-build-img:
-	@echo "Please select the system type to build:"
+# 6. Build compilation Docker image (interactive)
+docker-build-compile:
+	@echo "Please select the system type to build compilation image:"
 	@echo "1) Rocky Linux 9"
 	@echo "2) Ubuntu 22.04"
 	@read -p "Enter your choice (1 or 2): " choice; \
 	case $$choice in \
 		1) \
 			echo "Building Rocky Linux 9 compilation image..."; \
-			docker build -t curvine-build -f curvine-docker/compile/Dockerfile_rocky9 curvine-docker/compile ;; \
+			docker build -t curvine/curvine-compile:latest -f curvine-docker/compile/Dockerfile_rocky9 curvine-docker/compile ;; \
 		2) \
 			echo "Building Ubuntu 22.04 compilation image..."; \
-			docker build -t curvine-build -f curvine-docker/compile/Dockerfile_ubuntu22 curvine-docker/compile ;; \
+			docker build -t curvine/curvine-compile:latest -f curvine-docker/compile/Dockerfile_ubuntu22 curvine-docker/compile ;; \
 		*) \
 			echo "Invalid option!" ;; \
 	esac
+
+# 7. Compile code in Docker container (output to local build/dist)
+docker-compile:
+	@echo "Compiling code in Docker container..."
+	docker run --rm --entrypoint="" -v $(PWD):/workspace -w /workspace curvine/curvine-compile:build-cached bash -c "make all"
 
 # 8. CSI (Container Storage Interface) targets - delegate to curvine-csi/Makefile
 .PHONY: csi-build csi-run csi-fmt csi-vet csi-docker-build csi-docker-push csi-docker csi-docker-fast
