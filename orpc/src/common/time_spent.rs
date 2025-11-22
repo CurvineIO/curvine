@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use crate::common::LocalTime;
+use crate::common::{Counter, HistogramVec};
 
 pub struct TimeSpent(u128);
 
@@ -47,5 +50,66 @@ impl TimeSpent {
 impl Default for TimeSpent {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl TimeSpent {
+    pub fn timer_counter(metric: Arc<Counter>) -> MetricTimer {
+        MetricTimer::new(metric)
+    }
+
+    pub fn timer_counter_vec(
+        metric: Arc<HistogramVec>,
+        label_values: Vec<String>,
+    ) -> MetricTimerVec {
+        MetricTimerVec::new(metric, label_values)
+    }
+}
+
+// RAII guard for Counter metrics
+pub struct MetricTimer {
+    start: u128,
+    metric: Arc<Counter>,
+}
+
+impl MetricTimer {
+    pub fn new(metric: Arc<Counter>) -> Self {
+        Self {
+            start: LocalTime::nanos(),
+            metric,
+        }
+    }
+}
+
+impl Drop for MetricTimer {
+    fn drop(&mut self) {
+        let used_us = (LocalTime::nanos() - self.start) / 1000;
+        self.metric.inc_by(used_us as i64);
+    }
+}
+
+pub struct MetricTimerVec {
+    start: u128,
+    metric: Arc<HistogramVec>,
+    label_values: Vec<String>,
+}
+
+impl MetricTimerVec {
+    pub fn new(metric: Arc<HistogramVec>, label_values: Vec<String>) -> Self {
+        Self {
+            start: LocalTime::nanos(),
+            metric,
+            label_values,
+        }
+    }
+}
+
+impl Drop for MetricTimerVec {
+    fn drop(&mut self) {
+        let used_us = (LocalTime::nanos() - self.start) / 1000;
+        let values: Vec<&str> = self.label_values.iter().map(|s| s.as_str()).collect();
+        self.metric
+            .with_label_values(&values)
+            .observe(used_us as f64);
     }
 }

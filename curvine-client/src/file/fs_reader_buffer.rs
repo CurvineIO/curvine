@@ -259,6 +259,11 @@ impl FsReaderBuffer {
         };
 
         self.pos += bytes.len() as i64;
+
+        FsContext::get_metrics()
+            .read_bytes
+            .inc_by(bytes.len() as i64);
+
         Ok(bytes)
     }
 

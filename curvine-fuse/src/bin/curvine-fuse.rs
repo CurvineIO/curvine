@@ -16,6 +16,7 @@ use clap::Parser;
 use curvine_common::conf::ClusterConf;
 use curvine_fuse::fs::CurvineFileSystem;
 use curvine_fuse::session::FuseSession;
+use curvine_fuse::web_server::WebServer;
 use orpc::common::Logger;
 use orpc::io::net::InetAddr;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -45,6 +46,12 @@ fn main() -> CommonResult<()> {
     ));
 
     let fuse_rt = rt.clone();
+
+    rt.spawn(async move {
+        if let Err(e) = WebServer::start(cluster_conf.fuse.web_port).await {
+            tracing::error!("Failed to start metrics server: {}", e);
+        }
+    });
 
     rt.block_on(async move {
         let fs = CurvineFileSystem::new(cluster_conf, fuse_rt.clone()).unwrap();
@@ -145,6 +152,10 @@ pub struct FuseArgs {
     #[arg(long, help = "Node cache timeout (e.g., '1h', '30m') (optional)")]
     pub node_cache_timeout: Option<String>,
 
+    // Fuse web port
+    #[arg(long, help = "Web server port (optional)")]
+    pub web_port: Option<u16>,
+
     #[arg(long, help = "Master address (e.g., 'm1:8995,m2:8995'")]
     pub master_addrs: Option<String>,
 
@@ -242,6 +253,10 @@ impl FuseArgs {
 
         if let Some(node_cache_timeout) = &self.node_cache_timeout {
             conf.fuse.node_cache_timeout = node_cache_timeout.clone();
+        }
+
+        if let Some(web_port) = self.web_port {
+            conf.fuse.web_port = web_port;
         }
 
         if let Some(master_addrs) = &self.master_addrs {
