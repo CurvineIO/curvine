@@ -174,6 +174,7 @@ impl FsDir {
 
         // Handle different types of nodes
         parent.update_mtime(mtime);
+
         let del_res = match child {
             File(_, file) => {
                 if file.nlink() > 1 {

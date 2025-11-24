@@ -21,7 +21,7 @@ use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
-use log::warn;
+use log::{debug, warn};
 use orpc::common::FastHashMap;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
@@ -116,6 +116,7 @@ impl NodeState {
             Err(e) => return err_fuse!(libc::ENOMEM, "{}", e),
         };
 
+        let node_id = node.id;
         let mut attr = CurvineFileSystem::status_to_attr(&self.conf, status)?;
         attr.ino = node.id;
 
@@ -127,6 +128,8 @@ impl NodeState {
             node.mtime = Duration::from_millis(attr.mtime);
             node.size = attr.size;
         }
+
+        attr.ino = node_id;
         Ok(attr)
     }
 
@@ -157,11 +160,61 @@ impl NodeState {
             .rename_node(old_id, old_name, new_id, new_name)
     }
 
+    // Register a hard link node with specified inode ID
+    pub fn link_node<T: AsRef<str>>(&self, parent: u64, name: T, ino: u64) -> FuseResult<()> {
+        self.node_write().link_node(parent, name, ino)
+    }
+
+    // Register backend inode mapping
+    pub fn register_linked_inode(&self, backend_ino: i64, fuse_ino: u64) {
+        self.node_write()
+            .register_linked_inode(backend_ino, fuse_ino)
+    }
+
+    // Lookup backend inode to find existing FUSE inode (for hard link detection)
+    pub fn lookup_link_inode(&self, backend_ino: i64) -> Option<u64> {
+        self.node_read().lookup_link_inode(backend_ino)
+    }
+
+    // Remove a single name mapping (parent,name) from the node map for unlink
+    pub fn unlink_name<T: AsRef<str>>(&self, parent: u64, name: T) {
+        self.node_write().remove_name(parent, name);
+    }
+
     pub fn fill_ino(&self, parent: u64, mut list: Vec<FileStatus>) -> FuseResult<Vec<FileStatus>> {
         let mut map = self.node_write();
         for status in list.iter_mut() {
-            let attr = map.find_node(parent, Some(&status.name))?;
-            status.id = attr.id as i64
+            if status.name == "." || status.name == ".." {
+                continue;
+            }
+
+            if status.exists_links() {
+                let backend_ino = status.id;
+
+                if let Some(link_fuse_ino) = map.lookup_link_inode(backend_ino) {
+                    if let Err(e) = map.link_node(parent, &status.name, link_fuse_ino) {
+                        debug!(
+                            "fill_ino: link_node failed (may already exist): name={}, fuse_ino={}, err={}",
+                            status.name, link_fuse_ino, e
+                        );
+                    }
+                    status.id = link_fuse_ino as i64;
+                } else {
+                    let node_id = {
+                        let node = map.find_node(parent, Some(&status.name))?;
+                        node.id
+                    };
+                    map.register_linked_inode(backend_ino, node_id);
+                    status.id = node_id as i64;
+                    debug!(
+                        "fill_ino: first occurrence, register mapping backend_ino={} -> fuse_ino={}, name={}, nlink={}",
+                        backend_ino, node_id, status.name, status.nlink
+                    );
+                }
+            } else {
+                let node = map.find_node(parent, Some(&status.name))?;
+                status.id = node.id as i64;
+            }
         }
 
         Ok(list)
