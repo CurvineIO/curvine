@@ -1,0 +1,88 @@
+# Bare-metal environment configuration
+# Using hostPath for local disk access
+
+cluster:
+  id: "curvine-baremetal"
+
+image:
+  repository: docker.io/curvine/curvine
+  tag: "v1.0.0"
+  pullPolicy: IfNotPresent
+
+# 3 masters using hostPath
+master:
+  replicas: 3
+  
+  storage:
+    meta:
+      enabled: true
+      storageClass: ""  # Empty means use hostPath
+      size: "20Gi"
+      hostPath: "/mnt/curvine/master/meta"  # Local disk path
+      mountPath: "/opt/curvine/data/meta"
+    
+    journal:
+      enabled: true
+      storageClass: ""
+      size: "100Gi"
+      hostPath: "/mnt/curvine/master/journal"
+      mountPath: "/opt/curvine/data/journal"
+  
+  resources:
+    requests:
+      cpu: "2000m"
+      memory: "4Gi"
+    limits:
+      cpu: "4000m"
+      memory: "8Gi"
+  
+  # Pin to specific nodes
+  nodeSelector:
+    curvine-role: "master"
+
+# 5 workers using local NVMe disks
+worker:
+  replicas: 5
+  
+  hostNetwork: true  # Use host network for better performance
+  dnsPolicy: "ClusterFirstWithHostNet"
+  privileged: true
+  
+  storage:
+    dataDirs:
+      - name: "data1"
+        type: "SSD"
+        enabled: true
+        size: "500Gi"
+        storageClass: ""
+        hostPath: "/mnt/nvme0n1/curvine"  # Local NVMe disk
+        mountPath: "/data/data1"
+      
+      - name: "data2"
+        type: "SSD"
+        enabled: true
+        size: "500Gi"
+        storageClass: ""
+        hostPath: "/mnt/nvme1n1/curvine"  # Second NVMe disk
+        mountPath: "/data/data2"
+  
+  resources:
+    requests:
+      cpu: "4000m"
+      memory: "8Gi"
+    limits:
+      cpu: "8000m"
+      memory: "16Gi"
+  
+  # Pin to specific worker nodes
+  nodeSelector:
+    curvine-role: "worker"
+  
+  # Required anti-affinity to spread across nodes
+  antiAffinity:
+    enabled: true
+    type: "required"
+
+config:
+  log:
+    level: "INFO"

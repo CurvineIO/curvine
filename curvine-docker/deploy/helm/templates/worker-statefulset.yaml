@@ -1,0 +1,176 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "curvine.workerFullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curvine.workerLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "curvine.workerFullname" . }}
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "curvine.workerSelectorLabels" . | nindent 6 }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "curvine.workerSelectorLabels" . | nindent 8 }}
+        {{- with .Values.worker.labels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Trigger pod restart when ConfigMap changes
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.worker.annotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "curvine.serviceAccountName" . }}
+      {{- include "curvine.imagePullSecrets" . | nindent 6 }}
+      {{- if .Values.worker.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: {{ .Values.worker.dnsPolicy }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "curvine.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /entrypoint.sh
+          args:
+            - worker
+            - start
+          env:
+            - name: APP_HOME
+              value: {{ include "curvine.appHome" . | quote }}
+            - name: CURVINE_HOME
+              value: {{ include "curvine.home" . | quote }}
+            - name: CURVINE_CONF_FILE
+              value: {{ include "curvine.configFile" . | quote }}
+            - name: ORPC_BIND_HOSTNAME
+              value: "0.0.0.0"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_CLUSTER_DOMAIN
+              value: {{ .Values.global.clusterDomain | quote }}
+            - name: CURVINE_MASTER_HOSTNAME
+              value: "{{ include "curvine.masterFullname" . }}-0.{{ include "curvine.masterServiceName" . }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }}"
+            - name: CURVINE_WORKER_HOSTNAME
+              value: "$(POD_NAME).{{ include "curvine.workerFullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }}"
+            {{- with .Values.worker.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: rpc
+              containerPort: {{ .Values.worker.rpcPort }}
+              protocol: TCP
+            - name: web
+              containerPort: {{ .Values.worker.webPort }}
+              protocol: TCP
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.worker.rpcPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.worker.rpcPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{- if .Values.worker.privileged }}
+          securityContext:
+            privileged: true
+          {{- end }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: {{ include "curvine.configFile" . }}
+              subPath: curvine-cluster.toml
+              readOnly: true
+            {{- range .Values.worker.storage.dataDirs }}
+            {{- if .enabled }}
+            - name: {{ .name }}
+              mountPath: {{ include "curvine.absPath" (dict "path" .mountPath) }}
+            {{- end }}
+            {{- end }}
+            - name: logs
+              mountPath: {{ .Values.config.log.logDir }}
+            {{- with .Values.worker.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "curvine.fullname" . }}-config
+        - name: logs
+          emptyDir: {}
+        {{- range .Values.worker.storage.dataDirs }}
+        {{- if .enabled }}
+        {{- if .hostPath }}
+        - name: {{ .name }}
+          hostPath:
+            path: {{ .hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- end }}
+        {{- end }}
+        {{- with .Values.worker.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- include "curvine.workerAntiAffinity" . | nindent 8 }}
+        {{- with .Values.worker.affinity }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- $hasDataDirs := false }}
+  {{- range .Values.worker.storage.dataDirs }}
+  {{- if and .enabled (not .hostPath) }}
+  {{- $hasDataDirs = true }}
+  {{- end }}
+  {{- end }}
+  {{- if $hasDataDirs }}
+  volumeClaimTemplates:
+    {{- range .Values.worker.storage.dataDirs }}
+    {{- if and .enabled (not .hostPath) }}
+    - metadata:
+        name: {{ .name }}
+        labels:
+          {{- include "curvine.workerLabels" $ | nindent 10 }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .storageClass }}
+        storageClassName: {{ .storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .size }}
+    {{- end }}
+    {{- end }}
+  {{- end }}

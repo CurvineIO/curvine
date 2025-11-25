@@ -1,0 +1,176 @@
+{{- include "curvine.validateMasterReplicasOnUpgrade" . }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "curvine.masterFullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curvine.masterLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "curvine.masterServiceName" . }}
+  replicas: {{ .Values.master.replicas }}
+  selector:
+    matchLabels:
+      {{- include "curvine.masterSelectorLabels" . | nindent 6 }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "curvine.masterSelectorLabels" . | nindent 8 }}
+        {{- with .Values.master.labels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Trigger pod restart when ConfigMap changes
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.master.annotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "curvine.serviceAccountName" . }}
+      {{- include "curvine.imagePullSecrets" . | nindent 6 }}
+      setHostnameAsFQDN: true
+      containers:
+        - name: master
+          image: {{ include "curvine.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /entrypoint.sh
+          args:
+            - master
+            - start
+          env:
+            - name: APP_HOME
+              value: {{ include "curvine.appHome" . | quote }}
+            - name: CURVINE_HOME
+              value: {{ include "curvine.home" . | quote }}
+            - name: CURVINE_CONF_FILE
+              value: {{ include "curvine.configFile" . | quote }}
+            - name: ORPC_BIND_HOSTNAME
+              value: "0.0.0.0"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_CLUSTER_DOMAIN
+              value: {{ .Values.global.clusterDomain | quote }}
+            - name: CURVINE_MASTER_HOSTNAME
+              value: "$(POD_NAME).{{ include "curvine.masterServiceName" . }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }}"
+            {{- with .Values.master.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: rpc
+              containerPort: {{ .Values.master.rpcPort }}
+              protocol: TCP
+            - name: journal
+              containerPort: {{ .Values.master.journalPort }}
+              protocol: TCP
+            - name: web
+              containerPort: {{ .Values.master.webPort }}
+              protocol: TCP
+            - name: web1
+              containerPort: {{ .Values.master.web1Port }}
+              protocol: TCP
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.master.rpcPort }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.master.rpcPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.master.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: {{ include "curvine.configFile" . }}
+              subPath: curvine-cluster.toml
+              readOnly: true
+            - name: meta
+              mountPath: {{ include "curvine.absPath" (dict "path" .Values.master.storage.meta.mountPath) }}
+            - name: journal
+              mountPath: {{ include "curvine.absPath" (dict "path" .Values.master.storage.journal.mountPath) }}
+            - name: logs
+              mountPath: {{ .Values.config.log.logDir }}
+            {{- with .Values.master.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "curvine.fullname" . }}-config
+        - name: logs
+          emptyDir: {}
+        {{- if .Values.master.storage.meta.hostPath }}
+        - name: meta
+          hostPath:
+            path: {{ .Values.master.storage.meta.hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if .Values.master.storage.journal.hostPath }}
+        - name: journal
+          hostPath:
+            path: {{ .Values.master.storage.journal.hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- with .Values.master.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.master.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.master.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.master.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if and (not .Values.master.storage.meta.hostPath) (not .Values.master.storage.journal.hostPath) }}
+  volumeClaimTemplates:
+    - metadata:
+        name: meta
+        labels:
+          {{- include "curvine.masterLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.master.storage.meta.storageClass }}
+        storageClassName: {{ .Values.master.storage.meta.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.master.storage.meta.size }}
+    - metadata:
+        name: journal
+        labels:
+          {{- include "curvine.masterLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.master.storage.journal.storageClass }}
+        storageClassName: {{ .Values.master.storage.journal.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.master.storage.journal.size }}
+  {{- end }}

@@ -1,0 +1,18 @@
+apiVersion: v2
+name: curvine
+description: A Helm chart for deploying Curvine distributed multi-level cache system cluster on Kubernetes
+type: application
+version: 0.2.0
+appVersion: "0.2.0"
+keywords:
+  - curvine
+  - multi-level cache system
+  - master-worker
+  - raft
+home: https://github.com/CurvineIO/curvine
+sources:
+  - https://github.com/CurvineIO/curvine
+maintainers:
+  - name: Curvine Team
+    email: curvine@example.com
+icon: https://curvineio.github.io/img/curvine_logo.png

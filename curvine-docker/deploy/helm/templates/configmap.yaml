@@ -1,0 +1,99 @@
+{{- include "curvine.validateMasterReplicas" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "curvine.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curvine.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config
+data:
+  curvine-cluster.toml: |
+    cluster_id = "{{ .Values.cluster.id }}"
+    format_master = {{ .Values.cluster.formatMaster | default false }}
+    format_worker = {{ .Values.cluster.formatWorker | default false }}
+
+    {{- $metaDir := .Values.config.master.metaDir }}
+    {{- $metaMount := .Values.master.storage.meta.mountPath }}
+    {{- if or (eq $metaDir "") (eq $metaDir nil) }}
+    {{- $metaDir = printf "%s/db" (trimSuffix "/" $metaMount) }}
+    {{- end }}
+    {{- $metaDir = include "curvine.absPath" (dict "path" $metaDir) }}
+    {{- $metaMountAbs := include "curvine.absPath" (dict "path" $metaMount) }}
+    {{- if eq $metaDir $metaMountAbs }}
+    {{- $metaDir = printf "%s/db" (trimSuffix "/" $metaDir) }}
+    {{- end }}
+
+    {{- $journalDir := .Values.config.journal.journalDir }}
+    {{- $journalMount := .Values.master.storage.journal.mountPath }}
+    {{- if or (eq $journalDir "") (eq $journalDir nil) }}
+    {{- $journalDir = printf "%s/db" (trimSuffix "/" $journalMount) }}
+    {{- end }}
+    {{- $journalDir = include "curvine.absPath" (dict "path" $journalDir) }}
+    {{- $journalMountAbs := include "curvine.absPath" (dict "path" $journalMount) }}
+    {{- if eq $journalDir $journalMountAbs }}
+    {{- $journalDir = printf "%s/db" (trimSuffix "/" $journalDir) }}
+    {{- end }}
+
+    [master]
+    rpc_host = "0.0.0.0"
+    meta_dir = "{{ $metaDir }}"
+    rpc_port = {{ .Values.master.rpcPort }}
+    web_port = {{ .Values.master.webPort }}
+    web1_port = {{ .Values.master.web1Port }}
+    {{- if .Values.configOverrides.master }}
+    {{- range $key, $value := .Values.configOverrides.master }}
+    {{ $key }} = {{ toJson $value }}
+    {{- end }}
+    {{- end }}
+
+    [journal]
+    enable = {{ .Values.config.journal.enable }}
+    rpc_port = {{ .Values.master.journalPort }}
+    journal_dir = "{{ $journalDir }}"
+    {{- if .Values.configOverrides.journal }}
+    {{- range $key, $value := .Values.configOverrides.journal }}
+    {{ $key }} = {{ toJson $value }}
+    {{- end }}
+    {{- end }}
+
+    {{- range $i := until (int .Values.master.replicas) }}
+    [[journal.journal_addrs]]
+    id = {{ add $i 1 }}
+    hostname = "{{ include "curvine.masterFullname" $ }}-{{ $i }}.{{ include "curvine.masterServiceName" $ }}.{{ $.Release.Namespace }}.svc.{{ $.Values.global.clusterDomain }}"
+    port = {{ $.Values.master.journalPort }}
+    {{- end }}
+
+    [worker]
+    rpc_host = "0.0.0.0"
+    rpc_port = {{ .Values.worker.rpcPort }}
+    web_port = {{ .Values.worker.webPort }}
+    data_dir = {{ include "curvine.workerDataDirs" . | trim }}
+    {{- if .Values.configOverrides.worker }}
+    {{- range $key, $value := .Values.configOverrides.worker }}
+    {{ $key }} = {{ toJson $value }}
+    {{- end }}
+    {{- end }}
+
+    [client]
+    block_size_str = "{{ .Values.config.client.blockSizeStr }}"
+    {{- if .Values.configOverrides.client }}
+    {{- range $key, $value := .Values.configOverrides.client }}
+    {{ $key }} = {{ toJson $value }}
+    {{- end }}
+    {{- end }}
+
+    {{- range $i := until (int .Values.master.replicas) }}
+    [[client.master_addrs]]
+    hostname = "{{ include "curvine.masterFullname" $ }}-{{ $i }}.{{ include "curvine.masterServiceName" $ }}.{{ $.Release.Namespace }}.svc.{{ $.Values.global.clusterDomain }}"
+    port = {{ $.Values.master.rpcPort }}
+    {{- end }}
+
+    [log]
+    level = "{{ .Values.config.log.level }}"
+    log_dir = "{{ .Values.config.log.logDir }}"
+    {{- if .Values.configOverrides.log }}
+    {{- range $key, $value := .Values.configOverrides.log }}
+    {{ $key }} = {{ toJson $value }}
+    {{- end }}
+    {{- end }}

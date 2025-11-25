@@ -1,0 +1,233 @@
+# Global configuration
+global:
+  clusterDomain: "cluster.local"
+
+# Cluster configuration
+cluster:
+  id: "curvine"
+  formatMaster: false
+  formatWorker: false
+  formatJournal: false
+
+# Image configuration
+image:
+  repository: docker.io/curvine
+  tag: "latest"
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Master node configuration
+master:
+  # Number of master replicas (must be odd: 1, 3, 5, 7...)
+  replicas: 3
+  
+  # Master RPC port
+  rpcPort: 8995
+  
+  # Journal/Raft port
+  journalPort: 8996
+  
+  # Web UI port
+  webPort: 9000
+  
+  # Additional web port
+  web1Port: 9001
+  
+  # Storage configuration for master nodes
+  storage:
+    meta:
+      enabled: true
+      storageClass: ""  # Empty means use default StorageClass
+      size: "10Gi"
+      hostPath: ""  # Use hostPath if storageClass is empty
+      mountPath: "/opt/curvine/data/meta"
+    
+    journal:
+      enabled: true
+      storageClass: ""
+      size: "50Gi"
+      hostPath: ""
+      mountPath: "/opt/curvine/data/journal"
+  
+  # Resource requests and limits
+  resources:
+    requests:
+      cpu: "1000m"
+      memory: "2Gi"
+    limits:
+      cpu: "2000m"
+      memory: "4Gi"
+  
+  # Node selector
+  nodeSelector: {}
+  
+  # Tolerations
+  tolerations: []
+  
+  # Affinity
+  affinity: {}
+  
+  # Additional labels
+  labels: {}
+  
+  # Additional annotations
+  annotations: {}
+  
+  # Additional environment variables
+  extraEnv: []
+  
+  # Additional volumes
+  extraVolumes: []
+  
+  # Additional volume mounts
+  extraVolumeMounts: []
+
+# Worker node configuration
+worker:
+  # Number of worker replicas
+  replicas: 3
+  
+  # Worker RPC port
+  rpcPort: 8997
+  
+  # Worker Web UI port
+  webPort: 9001
+  
+  # Use host network for workers
+  hostNetwork: false
+  
+  # DNS policy (ClusterFirstWithHostNet when hostNetwork is true)
+  dnsPolicy: "ClusterFirst"
+  
+  # Enable privileged mode for FUSE
+  privileged: true
+  
+  # Storage configuration for worker nodes
+  storage:
+    dataDirs:
+      - name: "data1"
+        type: "SSD"
+        enabled: true
+        size: "10Gi"
+        storageClass: ""  # Empty means use default StorageClass
+        hostPath: ""  # Use hostPath if storageClass is empty
+        mountPath: "/data/data1"
+      
+      # Additional data directories can be added here
+      # - name: "data2"
+      #   type: "HDD"
+      #   enabled: true
+      #   size: "500Gi"
+      #   storageClass: ""
+      #   hostPath: "/mnt/hdd1"
+      #   mountPath: "/data/data2"
+  
+  # Resource requests and limits
+  resources:
+    requests:
+      cpu: "2000m"
+      memory: "4Gi"
+    limits:
+      cpu: "4000m"
+      memory: "8Gi"
+  
+  # Node selector
+  nodeSelector: {}
+  
+  # Tolerations
+  tolerations: []
+  
+  # Pod anti-affinity to spread workers across nodes
+  antiAffinity:
+    enabled: true
+    # requiredDuringSchedulingIgnoredDuringExecution or preferredDuringSchedulingIgnoredDuringExecution
+    type: "preferred"
+  
+  # Additional labels
+  labels: {}
+  
+  # Additional annotations
+  annotations: {}
+  
+  # Additional environment variables
+  extraEnv: []
+  
+  # Additional volumes
+  extraVolumes: []
+  
+  # Additional volume mounts
+  extraVolumeMounts: []
+
+# Service configuration
+service:
+  master:
+    # Headless service type (always ClusterIP: None)
+    type: ClusterIP
+    annotations: {}
+  
+  # Optional: External service for master access
+  masterExternal:
+    enabled: false
+    type: ClusterIP
+    annotations: {}
+    # For NodePort or LoadBalancer
+    nodePort: {}
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+
+# Service Account configuration
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# RBAC configuration
+rbac:
+  create: true
+
+# Curvine cluster configuration
+config:
+  # Master configuration
+  master:
+    metaDir: "/opt/curvine/data/meta"
+  
+  # Journal configuration
+  journal:
+    enable: true
+    journalDir: "/opt/curvine/data/journal"
+  
+  # Worker configuration
+  worker:
+    # data_dir will be generated from worker.storage.dataDirs
+    # Format: [TYPE:SIZE]PATH
+    # Example: [SSD:100GB]/data/data1
+  
+  # Client configuration
+  client:
+    blockSizeStr: "64MB"
+  
+  # Log configuration
+  log:
+    level: "INFO"
+    logDir: "/opt/curvine/logs"
+
+# Configuration overrides by section
+# These allow you to override specific configuration items in each section
+# Examples:
+#   configOverrides:
+#     master:
+#       rpc_timeout: "30s"
+#     journal:
+#       enable: false
+#     worker:
+#       max_connections: "1000"
+#     client:
+#       block_size_str: "128MB"
+#     log:
+#       level: "DEBUG"
+configOverrides:
+  master: {}
+  journal: {}
+  worker: {}
+  client: {}
+  log: {}

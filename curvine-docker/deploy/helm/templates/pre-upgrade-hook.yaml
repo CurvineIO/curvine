@@ -1,0 +1,57 @@
+{{- if .Release.IsUpgrade }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "curvine.fullname" . }}-pre-upgrade-check
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curvine.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pre-upgrade-check
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        {{- include "curvine.labels" . | nindent 8 }}
+        app.kubernetes.io/component: pre-upgrade-check
+    spec:
+      serviceAccountName: {{ include "curvine.serviceAccountName" . }}
+      restartPolicy: Never
+      automountServiceAccountToken: true
+      containers:
+      - name: pre-upgrade-check
+        image: bitnami/kubectl:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          
+          # Get current master replicas from the existing StatefulSet
+          # kubectl automatically uses the Service Account token mounted in the Pod
+          CURRENT_REPLICAS=$(kubectl get statefulset {{ include "curvine.masterFullname" . }} \
+            -n {{ .Release.Namespace }} \
+            -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
+          
+          # Get new master replicas from the upgrade values
+          NEW_REPLICAS={{ .Values.master.replicas }}
+          
+          echo "Current Master Replicas: $CURRENT_REPLICAS"
+          echo "New Master Replicas: $NEW_REPLICAS"
+          
+          # Check if master replicas are being changed
+          if [ "$CURRENT_REPLICAS" != "0" ] && [ "$CURRENT_REPLICAS" != "$NEW_REPLICAS" ]; then
+            echo "ERROR: Master replicas cannot be changed during upgrade!"
+            echo "Current: $CURRENT_REPLICAS, Requested: $NEW_REPLICAS"
+            echo "To change master replicas, you must delete and redeploy the cluster."
+            exit 1
+          fi
+          
+          echo "Pre-upgrade check passed: Master replicas are not being changed"
+          exit 0
+{{- end }}

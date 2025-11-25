@@ -1,0 +1,100 @@
+# Production environment configuration
+# High availability and performance
+
+cluster:
+  id: "curvine-prod"
+
+image:
+  repository: docker.io/curvine/curvine
+  tag: "v1.0.0"
+  pullPolicy: Always
+  pullSecrets: []
+
+# 5 masters for high availability
+master:
+  replicas: 5
+  
+  storage:
+    meta:
+      enabled: true
+      storageClass: "fast-ssd"  # Use high-performance storage class
+      size: "50Gi"
+      mountPath: "/opt/curvine/data/meta"
+    
+    journal:
+      enabled: true
+      storageClass: "fast-ssd"
+      size: "200Gi"
+      mountPath: "/opt/curvine/data/journal"
+  
+  # Production-grade resources
+  resources:
+    requests:
+      cpu: "2000m"
+      memory: "4Gi"
+    limits:
+      cpu: "4000m"
+      memory: "8Gi"
+  
+  # Node selector for dedicated master nodes
+  nodeSelector:
+    node-role.kubernetes.io/master: "true"
+  
+  # Tolerate master taints
+  tolerations:
+    - key: "node-role.kubernetes.io/master"
+      operator: "Exists"
+      effect: "NoSchedule"
+  
+  labels:
+    tier: "control-plane"
+    env: "production"
+
+# 10 workers for production workload
+worker:
+  replicas: 10
+  
+  hostNetwork: false
+  privileged: true
+  
+  storage:
+    dataDirs:
+      - name: "data1"
+        type: "SSD"
+        enabled: true
+        size: "500Gi"
+        storageClass: "fast-ssd"
+        mountPath: "/data/data1"
+      
+      - name: "data2"
+        type: "HDD"
+        enabled: true
+        size: "2Ti"
+        storageClass: "standard-hdd"
+        mountPath: "/data/data2"
+  
+  # Production-grade resources
+  resources:
+    requests:
+      cpu: "4000m"
+      memory: "8Gi"
+    limits:
+      cpu: "8000m"
+      memory: "16Gi"
+  
+  # Node selector for dedicated worker nodes
+  nodeSelector:
+    node-role.kubernetes.io/worker: "true"
+  
+  # Strong anti-affinity for high availability
+  antiAffinity:
+    enabled: true
+    type: "required"
+  
+  labels:
+    tier: "data-plane"
+    env: "production"
+
+config:
+  log:
+    level: "INFO"

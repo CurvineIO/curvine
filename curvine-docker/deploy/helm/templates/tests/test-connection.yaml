@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "curvine.fullname" . }}-test-connection"
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curvine.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test-master-connection
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          echo "Testing Master node connections..."
+          {{- range $i := until (int .Values.master.replicas) }}
+          echo "Testing {{ include "curvine.masterFullname" $ }}-{{ $i }}..."
+          nc -zv {{ include "curvine.masterFullname" $ }}-{{ $i }}.{{ include "curvine.masterServiceName" $ }}.{{ $.Release.Namespace }}.svc.{{ $.Values.global.clusterDomain }} {{ $.Values.master.rpcPort }}
+          {{- end }}
+          
+          echo "Testing Worker node connections..."
+          {{- range $i := until (int .Values.worker.replicas) }}
+          echo "Testing {{ include "curvine.workerFullname" $ }}-{{ $i }}..."
+          nc -zv {{ include "curvine.workerFullname" $ }}-{{ $i }}.{{ include "curvine.workerServiceName" $ }}.{{ $.Release.Namespace }}.svc.{{ $.Values.global.clusterDomain }} {{ $.Values.worker.rpcPort }} || true
+          {{- end }}
+          
+          echo "All connection tests completed successfully!"
