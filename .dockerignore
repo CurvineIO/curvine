@@ -1,0 +1,33 @@
+# Version control
+.git
+.github
+
+# Build artifacts
+target/
+build/dist/
+*.tar.gz
+
+# Dependency caches
+node_modules/
+.npm/
+.cargo/registry/
+.cargo/git/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+*.log
+.DS_Store
+tmp/
+.tmp/
+
+# Docker build context
+build-context/
+
+# Test artifacts
+*.profraw
+*.profdata

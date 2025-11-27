@@ -63,7 +63,8 @@ RUN cd /app && \
     rm -f *.tar.gz
 
 # 5. Copy and apply build configurations
-COPY compile/ /build-config/
+COPY curvine-docker/deploy/settings.xml /build-config/settings.xml
+COPY curvine-docker/deploy/config /build-config/config
 RUN mkdir -p /app/maven/conf && \
     cp /build-config/settings.xml /app/maven/conf/settings.xml && \
     mkdir -p /root/.cargo && \
@@ -73,7 +74,7 @@ RUN mkdir -p /app/maven/conf && \
 ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
 
 # Copy and build source code if building from source
-COPY workspace/ /workspace/
+COPY . /workspace/
 WORKDIR /workspace
 
 # 6. Pre-install WebUI dependencies and fix vue-cli-service module resolution
@@ -181,7 +182,7 @@ RUN mkdir -p /app/curvine/bin /app/curvine/lib /app/curvine/conf
 COPY --from=builder /build-output/ /app/curvine/
 
 # Copy entrypoint script (use compile-specific entrypoint)
-COPY entrypoint.sh /entrypoint.sh
+COPY curvine-docker/deploy/entrypoint.sh /entrypoint.sh
 
 # Make all binaries and scripts executable
 RUN find /app/curvine -type f -name "*.sh" -exec chmod +x {} \; \
