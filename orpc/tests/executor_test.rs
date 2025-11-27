@@ -21,7 +21,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 
 #[test]
-fn single() -> CommonResult<()> {
+fn test_single_thread_executor_spawn_blocking() -> CommonResult<()> {
     Logger::default();
 
     let executor = Arc::new(SingleExecutor::new("test", 10));
@@ -49,7 +49,7 @@ fn single() -> CommonResult<()> {
 }
 
 #[test]
-fn group() {
+fn test_group_executor_fixed_thread_allocation_for_thread_safety() {
     let executor = Arc::new(GroupExecutor::new("test", 2, 10));
 
     let data = 0;

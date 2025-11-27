@@ -48,7 +48,7 @@ fn get_raw_fd() {
 }
 
 #[test]
-fn read_ahead() {
+fn test_cache_manager_read_ahead_optimization() {
     let test_file = Utils::temp_file();
     let test_file_path = Path::new(&test_file);
     let parent = test_file_path.parent().unwrap();
@@ -98,7 +98,7 @@ fn read_ahead() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn tmpfs_test() {
+fn test_tmpfs_filesystem_detection_on_linux() {
     assert!(sys::is_tmpfs("/run").unwrap());
     assert!(!sys::is_tmpfs("/").unwrap());
 }

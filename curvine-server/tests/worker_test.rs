@@ -43,7 +43,7 @@ fn start_worker() -> ClusterConf {
 }
 
 #[test]
-fn create_block() -> CommonResult<()> {
+fn test_worker_block_write_and_read_with_checksum_validation() -> CommonResult<()> {
     let conf = start_worker();
 
     let block_id = Utils::req_id().abs();

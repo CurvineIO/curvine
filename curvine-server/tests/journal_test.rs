@@ -33,7 +33,7 @@ use std::time::Duration;
 
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
 #[test]
-fn check_journal_state() -> CommonResult<()> {
+fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult<()> {
     Master::init_test_metrics();
 
     let mut conf = ClusterConf {
@@ -80,7 +80,7 @@ fn check_journal_state() -> CommonResult<()> {
 
 // Start 2 masters at the same time to check the correctness of log playback.
 #[test]
-fn check_raft_state() -> CommonResult<()> {
+fn test_raft_consensus_and_state_synchronization_between_two_masters() -> CommonResult<()> {
     Logger::default();
     Master::init_test_metrics();
 
@@ -259,7 +259,7 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
 
 // Test snapshot restart
 #[test]
-fn test_restart() -> CommonResult<()> {
+fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
     Logger::default();
     Master::init_test_metrics();
     let mut conf = ClusterConf::default();

@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 // Test local short-circuit read and write
 #[test]
-fn local() -> CommonResult<()> {
+fn test_local_short_circuit_file_read_write() -> CommonResult<()> {
     let testing = Testing::default();
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
@@ -39,7 +39,7 @@ fn local() -> CommonResult<()> {
 }
 
 #[test]
-fn remote() -> CommonResult<()> {
+fn test_remote_network_file_read_write() -> CommonResult<()> {
     let testing = Testing::default();
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
@@ -48,7 +48,7 @@ fn remote() -> CommonResult<()> {
 }
 
 #[test]
-fn remote_parallel_1() -> CommonResult<()> {
+fn test_remote_file_operations_with_single_chunk_parallelism() -> CommonResult<()> {
     let testing = Testing::default();
 
     let mut conf = testing.get_active_cluster_conf()?;
@@ -66,7 +66,7 @@ fn remote_parallel_1() -> CommonResult<()> {
 }
 
 #[test]
-fn remote_parallel_4() -> CommonResult<()> {
+fn test_remote_file_operations_with_four_chunk_parallelism() -> CommonResult<()> {
     let testing = Testing::default();
 
     let mut conf = testing.get_active_cluster_conf()?;
@@ -84,7 +84,7 @@ fn remote_parallel_4() -> CommonResult<()> {
 }
 
 #[test]
-fn remote_parallel_4_cache() -> CommonResult<()> {
+fn test_remote_file_operations_with_parallelism_and_caching() -> CommonResult<()> {
     let testing = Testing::default();
 
     let mut conf = testing.get_active_cluster_conf()?;
@@ -102,7 +102,7 @@ fn remote_parallel_4_cache() -> CommonResult<()> {
 }
 
 #[test]
-fn replicas_3() -> CommonResult<()> {
+fn test_file_replication_with_three_replicas() -> CommonResult<()> {
     let testing = Testing::default();
 
     let mut conf = testing.get_active_cluster_conf()?;
@@ -134,7 +134,7 @@ fn replicas_3() -> CommonResult<()> {
 }
 
 #[test]
-fn append_local() -> CommonResult<()> {
+fn test_local_file_append_operation() -> CommonResult<()> {
     let testing = Testing::default();
 
     let mut conf = testing.get_active_cluster_conf()?;
@@ -145,7 +145,7 @@ fn append_local() -> CommonResult<()> {
 }
 
 #[test]
-fn append_remote() -> CommonResult<()> {
+fn test_remote_file_append_operation() -> CommonResult<()> {
     let testing = Testing::default();
 
     let mut conf = testing.get_active_cluster_conf().unwrap();
@@ -301,7 +301,7 @@ async fn seek(fs: &CurvineFileSystem, path: &Path) -> CommonResult<()> {
 }
 
 #[test]
-fn random_write_local() -> CommonResult<()> {
+fn test_local_random_position_file_write() -> CommonResult<()> {
     let testing = Testing::default();
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
@@ -309,7 +309,7 @@ fn random_write_local() -> CommonResult<()> {
 }
 
 #[test]
-fn random_write_remote() -> CommonResult<()> {
+fn test_remote_random_position_file_write() -> CommonResult<()> {
     let testing = Testing::default();
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;
@@ -317,7 +317,7 @@ fn random_write_remote() -> CommonResult<()> {
 }
 
 #[test]
-fn random_write_local_replicas() -> CommonResult<()> {
+fn test_local_random_write_with_replication() -> CommonResult<()> {
     let testing = Testing::default();
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = true;
@@ -326,7 +326,7 @@ fn random_write_local_replicas() -> CommonResult<()> {
 }
 
 #[test]
-fn random_write_remote_replicas() -> CommonResult<()> {
+fn test_remote_random_write_with_replication() -> CommonResult<()> {
     let testing = Testing::default();
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.short_circuit = false;

@@ -18,7 +18,7 @@ use orpc::CommonResult;
 
 // Rocksdb database core function test
 #[test]
-fn rocks_api_test() {
+fn test_rocksdb_scan_and_range_operations() {
     let conf = DBConf::new("../testing/rocks_api_test")
         .add_cf("scan1")
         .add_cf("scan2");
@@ -30,7 +30,7 @@ fn rocks_api_test() {
 }
 
 #[test]
-fn test_restore() -> CommonResult<()> {
+fn test_rocksdb_checkpoint_and_restore_functionality() -> CommonResult<()> {
     FileUtils::delete_path("../testing/test_restore", true)?;
 
     let conf = DBConf::new("../testing/test_restore/db1");
@@ -105,7 +105,7 @@ fn scan_test2(db: &DBEngine, cf: &str) -> CommonResult<()> {
 }
 
 #[test]
-fn delete_range() -> CommonResult<()> {
+fn test_rocksdb_prefix_delete_range_operation() -> CommonResult<()> {
     let conf = DBConf::new("../testing/delete_range").add_cf("cf");
 
     let db = DBEngine::new(conf, true)?;

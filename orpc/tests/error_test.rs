@@ -89,7 +89,7 @@ fn fun2() -> Result<i32, MyError> {
 }
 
 #[test]
-fn error_ext() {
+fn test_error_context_propagation_through_call_stack() {
     match fun1() {
         Ok(_) => println!("ok"),
         Err(e) => println!("xxx {}", e),
@@ -97,7 +97,7 @@ fn error_ext() {
 }
 
 #[test]
-fn err_ext_io() -> CommonResult<()> {
+fn test_error_io_encoding_decoding_and_type_matching() -> CommonResult<()> {
     let error = std::io::Error::new(ErrorKind::AlreadyExists, "already_exists");
     let error = MyError::io(error);
     println!("io error: {}", error);
@@ -118,7 +118,7 @@ fn err_ext_io() -> CommonResult<()> {
 }
 
 #[test]
-fn err_ext_data() -> CommonResult<()> {
+fn test_error_with_data_encoding_decoding_and_retrieval() -> CommonResult<()> {
     let error1 = MyError::not_leader(100);
     let bytes = error1.encode();
 

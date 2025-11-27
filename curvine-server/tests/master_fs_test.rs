@@ -93,7 +93,7 @@ fn new_handler() -> MasterHandler {
 }
 
 #[test]
-fn fs_test() -> CommonResult<()> {
+fn test_master_filesystem_core_operations() -> CommonResult<()> {
     let fs = new_fs(true, "fs_test");
 
     mkdir(&fs)?;
@@ -108,7 +108,7 @@ fn fs_test() -> CommonResult<()> {
 }
 
 #[test]
-fn retry_test() -> CommonResult<()> {
+fn test_rpc_retry_cache_for_idempotent_operations() -> CommonResult<()> {
     let mut handler = new_handler();
     let fs = handler.clone_fs();
 
@@ -122,7 +122,7 @@ fn retry_test() -> CommonResult<()> {
 }
 
 #[test]
-fn restore() -> CommonResult<()> {
+fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
     let fs = new_fs(true, "restore");
     fs.mkdir("/a", false)?;
     fs.mkdir("/x1/x2/x3", true)?;
@@ -322,7 +322,7 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
 }
 
 #[test]
-fn link() -> CommonResult<()> {
+fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
     let fs = new_fs(true, "link_test");
     fs.mkdir("/a/b", true)?;
     fs.create("/a/b/file.log", true)?;

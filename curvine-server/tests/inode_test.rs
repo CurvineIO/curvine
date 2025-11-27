@@ -19,7 +19,7 @@ use curvine_server::master::meta::store::RocksInodeStore;
 use orpc::CommonResult;
 
 #[test]
-fn inode_dir() {
+fn test_inode_dir_add_children_and_sort_alphabetically() {
     let mut root = InodeDir::new(0, 0);
     println!("{:?}", root);
     root.add_file_child("aa1", InodeFile::new(1, 0)).unwrap();
@@ -39,7 +39,7 @@ fn inode_dir() {
 }
 
 #[test]
-fn inode_path() {
+fn test_inode_path_components_parsing() {
     let p1 = "/a/b/c";
     let vec = InodeView::path_components(p1).unwrap();
     assert_eq!(vec.len(), 4);
@@ -48,7 +48,7 @@ fn inode_path() {
 }
 
 #[test]
-fn inodes_store() -> CommonResult<()> {
+fn test_rocks_inode_store_add_delete_child_and_iterator() -> CommonResult<()> {
     let conf = DBConf::default();
     let db = RocksInodeStore::new(conf, true)?;
 
@@ -92,7 +92,7 @@ fn inodes_store() -> CommonResult<()> {
 }
 
 #[test]
-fn block_store() -> CommonResult<()> {
+fn test_rocks_block_store_add_delete_location_operations() -> CommonResult<()> {
     let conf = DBConf::default();
     let db = RocksInodeStore::new(conf, true)?;
 
@@ -128,7 +128,7 @@ fn block_store() -> CommonResult<()> {
 }
 
 #[test]
-fn blocks_locations_delete_worker_test() -> CommonResult<()> {
+fn test_delete_all_block_locations_for_specific_worker() -> CommonResult<()> {
     let conf = DBConf::default();
     let db = RocksInodeStore::new(conf, true)?;
 
