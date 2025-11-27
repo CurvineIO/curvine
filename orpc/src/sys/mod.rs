@@ -71,3 +71,5 @@ pub const PIPE_BUF: usize = 4096;
 
 #[cfg(target_os = "linux")]
 pub const PIPE_BUF: usize = libc::PIPE_BUF;
+
+pub const ST_BLOCK_SIZE: u64 = 512;

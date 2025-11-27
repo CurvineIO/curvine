@@ -103,11 +103,11 @@ impl LocalFile {
     pub fn read_region(&mut self, enable_send_file: bool, len: i32) -> IOResult<DataSlice> {
         let chunk = (len as i64).min(self.len - self.pos);
         if chunk <= 0 {
-            let err_msg = format!(
+            return err_box!(
                 "offset exceeds file length, length={}, offset={}",
-                self.len, self.pos
+                self.len,
+                self.pos
             );
-            return Err(err_msg.as_str().into());
         }
 
         let region = DataSlice::from_file(self, enable_send_file, Some(self.pos), chunk as i32)?;
@@ -259,6 +259,22 @@ impl LocalFile {
         let str = try_err!(toml::ser::to_string(value));
         Self::write_string(path, &str, false)?;
         Ok(())
+    }
+
+    pub fn resize(&mut self, truncate: bool, off: i64, len: i64, mode: i32) -> IOResult<()> {
+        if truncate {
+            sys::ftruncate(&self.inner, len)?;
+        } else {
+            sys::fallocate(&self.inner, off, len, mode)?;
+        }
+
+        self.len = self.inner.metadata()?.len() as i64;
+        Ok(())
+    }
+
+    pub fn actual_size(&self) -> IOResult<u64> {
+        let meta = self.inner.metadata()?;
+        sys::file_actual_size(meta)
     }
 }
 

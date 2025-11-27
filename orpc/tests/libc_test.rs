@@ -15,7 +15,8 @@
 #![allow(unused_imports)]
 
 use bytes::BytesMut;
-use orpc::common::Utils;
+use orpc::common::{FileUtils, Utils};
+use orpc::io::{IOResult, LocalFile};
 use orpc::sys;
 use orpc::sys::CacheManager;
 use std::fs::{create_dir_all, remove_file, File, OpenOptions};
@@ -101,4 +102,170 @@ fn read_ahead() {
 fn tmpfs_test() {
     assert!(sys::is_tmpfs("/run").unwrap());
     assert!(!sys::is_tmpfs("/").unwrap());
+}
+
+#[test]
+fn resize_truncate_extend_with_hole() {
+    // Test case 1: truncate extends file size, creating holes (sparse file)
+    let test_file = Utils::test_file();
+
+    // Create file and write some data
+    let mut file = LocalFile::with_write(&test_file, true).unwrap();
+    file.write_all(b"hello world").unwrap();
+    file.flush().unwrap();
+
+    let initial_len = file.len();
+    let initial_actual = file.actual_size().unwrap();
+    println!(
+        "Initial: len={}, actual_size={}",
+        initial_len, initial_actual
+    );
+
+    // Use truncate to extend to larger size (creates holes)
+    let new_len = 1024 * 1024; // 1MB
+    file.resize(true, 0, new_len, 0).unwrap();
+
+    let final_len = file.len();
+    let final_actual = file.actual_size().unwrap();
+    println!(
+        "After truncate extend: len={}, actual_size={}",
+        final_len, final_actual
+    );
+
+    // Verify: logical size should increase, but actual size should be small (holes created)
+    assert_eq!(
+        final_len, new_len,
+        "Logical size should be extended to {}",
+        new_len
+    );
+    assert!(
+        final_actual < final_len as u64,
+        "Actual size should be less than logical size (sparse file)"
+    );
+    assert!(
+        final_actual <= initial_actual + 4096,
+        "Actual size should be close to initial size (hole created)"
+    );
+
+    // Verify file content is still preserved
+    let mut file = LocalFile::with_read(&test_file, 0).unwrap();
+    let mut buf = vec![0u8; 11];
+    file.read_all(&mut buf).unwrap();
+    assert_eq!(buf, b"hello world", "Original content should be preserved");
+
+    remove_file(test_file).unwrap();
+}
+
+#[test]
+fn resize_truncate_shrink() {
+    // Test case 2: truncate shrinks file size
+    let test_file = Utils::test_file();
+
+    // Create file and write data
+    let mut file = LocalFile::with_write(&test_file, true).unwrap();
+    let data = "x".repeat(10240); // 10KB
+    file.write_all(data.as_bytes()).unwrap();
+    file.flush().unwrap();
+
+    let initial_len = file.len();
+    let initial_actual = file.actual_size().unwrap();
+    println!(
+        "Initial: len={}, actual_size={}",
+        initial_len, initial_actual
+    );
+
+    // Use truncate to shrink file
+    let new_len = 1024; // 1KB
+    file.resize(true, 0, new_len, 0).unwrap();
+
+    let final_len = file.len();
+    let final_actual = file.actual_size().unwrap();
+    println!(
+        "After truncate shrink: len={}, actual_size={}",
+        final_len, final_actual
+    );
+
+    // Verify: both logical size and actual size should decrease
+    assert_eq!(
+        final_len, new_len,
+        "Logical size should be shrunk to {}",
+        new_len
+    );
+    assert!(
+        final_actual <= final_len as u64,
+        "Actual size should be <= logical size"
+    );
+    assert!(
+        final_actual < initial_actual,
+        "Actual size should be reduced"
+    );
+
+    // Verify file content is truncated
+    let mut file = LocalFile::with_read(&test_file, 0).unwrap();
+    let mut buf = vec![0u8; new_len as usize];
+    file.read_all(&mut buf).unwrap();
+    assert_eq!(
+        buf.len(),
+        new_len as usize,
+        "File should be truncated to {} bytes",
+        new_len
+    );
+
+    remove_file(test_file).unwrap();
+}
+
+#[test]
+fn resize_allocate_preallocate() {
+    // Test case 3: allocate pre-allocates file space, both logical and actual size change
+    let test_file = Utils::test_file();
+
+    // Create file and write some data
+    let mut file = LocalFile::with_write(&test_file, true).unwrap();
+    file.write_all(b"hello").unwrap();
+    file.flush().unwrap();
+
+    let initial_len = file.len();
+    let initial_actual = file.actual_size().unwrap();
+    println!(
+        "Initial: len={}, actual_size={}",
+        initial_len, initial_actual
+    );
+
+    // Use fallocate to pre-allocate space (DEFAULT mode = 0)
+    // fallocate allocates space in the range from offset to offset+len
+    // Default mode changes file size to max(current_size, offset+len)
+    let allocate_off = 0;
+    let allocate_len = 1024 * 1024; // 1MB
+    file.resize(false, allocate_off, allocate_len, 0).unwrap();
+
+    let final_len = file.len();
+    let final_actual = file.actual_size().unwrap();
+    println!(
+        "After fallocate: len={}, actual_size={}",
+        final_len, final_actual
+    );
+
+    // Verify: logical size should equal allocate_off + allocate_len (fallocate default mode extends file size)
+    assert_eq!(
+        final_len,
+        allocate_off + allocate_len,
+        "Logical size should be extended to offset + len"
+    );
+    // Verify: actual size should equal or close to logical size (space is pre-allocated)
+    assert!(
+        final_actual >= allocate_len as u64,
+        "Actual size should be >= allocated size (space pre-allocated)"
+    );
+    assert!(
+        final_actual >= initial_actual,
+        "Actual size should be increased"
+    );
+
+    // Verify file content is still preserved
+    let mut file = LocalFile::with_read(&test_file, 0).unwrap();
+    let mut buf = vec![0u8; 5];
+    file.read_all(&mut buf).unwrap();
+    assert_eq!(buf, b"hello", "Original content should be preserved");
+
+    remove_file(test_file).unwrap();
 }
