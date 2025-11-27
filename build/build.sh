@@ -92,7 +92,6 @@ print_help() {
   echo
   echo "  -u, --ufs TYPE        UFS storage type (can be specified multiple times, default: opendal-s3)"
   echo "                        Available types:"
-  echo "                          - s3: AWS S3 native SDK"
   echo "                          - opendal-s3: OpenDAL S3"
   echo "                          - opendal-oss: OpenDAL OSS"
   echo "                          - opendal-azblob: OpenDAL Azure Blob"
@@ -320,10 +319,6 @@ if [ ${#RUST_BUILD_ARGS[@]} -gt 0 ]; then
   if [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-client " ]]; then
     for ufs in "${UFS_TYPES[@]}"; do
       case $ufs in
-        s3)
-          # Use s3 feature for AWS SDK implementation
-          FEATURES+=("curvine-client/s3")
-          ;;
         *)
           FEATURES+=("curvine-client/$ufs")
           ;;
@@ -335,10 +330,6 @@ else
   FEATURES+=("curvine-fuse/$FUSE_VERSION")  # FUSE check already done above
   for ufs in "${UFS_TYPES[@]}"; do
     case $ufs in
-      s3)
-        # Use s3-native feature for AWS SDK implementation
-        FEATURES+=("curvine-client/s3")
-        ;;
       *)
         FEATURES+=("curvine-client/$ufs")
         ;;

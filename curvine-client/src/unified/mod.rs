@@ -22,9 +22,6 @@ use curvine_common::FsResult;
 use orpc::err_box;
 use std::collections::HashMap;
 
-#[cfg(feature = "s3")]
-use curvine_ufs::s3::*;
-
 #[cfg(feature = "opendal")]
 use curvine_ufs::opendal::*;
 
@@ -43,9 +40,6 @@ pub use self::mount_cache::*;
 pub enum UnifiedWriter {
     Cv(FsWriter),
 
-    #[cfg(feature = "s3")]
-    S3(S3Writer),
-
     #[cfg(feature = "opendal")]
     OpenDAL(OpendalWriter),
 }
@@ -55,9 +49,6 @@ impl_writer_for_enum!(UnifiedWriter);
 pub enum UnifiedReader {
     Cv(FsReader),
 
-    #[cfg(feature = "s3")]
-    S3(S3Reader),
-
     #[cfg(feature = "opendal")]
     OpenDAL(OpendalReader),
 }
@@ -66,9 +57,6 @@ impl_reader_for_enum!(UnifiedReader);
 
 #[derive(Clone)]
 pub enum UfsFileSystem {
-    #[cfg(feature = "s3")]
-    S3(S3FileSystem),
-
     #[cfg(feature = "opendal")]
     OpenDAL(OpendalFileSystem),
 }
@@ -76,12 +64,6 @@ pub enum UfsFileSystem {
 impl UfsFileSystem {
     pub fn new(path: &Path, conf: HashMap<String, String>) -> FsResult<Self> {
         match path.scheme() {
-            #[cfg(feature = "s3")]
-            Some(S3_SCHEME) => {
-                let fs = S3FileSystem::new(conf)?;
-                Ok(UfsFileSystem::S3(fs))
-            }
-
             #[cfg(feature = "opendal")]
             Some(scheme)
                 if [

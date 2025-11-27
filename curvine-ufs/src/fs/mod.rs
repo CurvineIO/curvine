@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "s3")]
-pub mod aws_utils;
-
 mod buffer_transfer;
 pub use crate::fs::buffer_transfer::*;
 

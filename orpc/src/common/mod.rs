@@ -19,7 +19,7 @@ mod speed_counter;
 pub use self::speed_counter::SpeedCounter;
 
 mod time_spent;
-pub use self::time_spent::TimeSpent;
+pub use self::time_spent::{MetricTimer, TimeSpent};
 
 pub mod file_utils;
 pub use self::file_utils::FileUtils;

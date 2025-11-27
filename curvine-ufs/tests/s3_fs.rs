@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "s3")]
+#[cfg(feature = "opendal")]
 mod s3_tests {
     use bytes::BytesMut;
 
     use curvine_common::fs::{FileSystem, Path, Reader, Writer};
     use curvine_common::state::FileStatus;
-    use curvine_ufs::s3::S3FileSystem;
+    use curvine_ufs::opendal::OpendalFileSystem;
     use orpc::common::{FileUtils, Utils};
     use orpc::runtime::{AsyncRuntime, RpcRuntime};
     use orpc::CommonResult;
@@ -39,14 +39,18 @@ mod s3_tests {
         Some(FileUtils::read_toml_as_map(&path).unwrap())
     }
 
-    fn get_fs() -> Option<S3FileSystem> {
+    fn get_fs() -> Option<OpendalFileSystem> {
         let conf = get_s3_conf()?;
-        let fs = S3FileSystem::new(conf).unwrap();
+        let path = match Path::new("s3://curvine-test/") {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
+        let fs = OpendalFileSystem::new(&path, conf).unwrap();
         Some(fs)
     }
 
     // Check if S3 service is available by trying a simple operation
-    async fn check_s3_available(fs: &S3FileSystem) -> bool {
+    async fn check_s3_available(fs: &OpendalFileSystem) -> bool {
         // Try to list the root path to verify S3 service is accessible
         let test_path = match Path::new("s3://curvine-test/") {
             Ok(p) => p,
@@ -87,7 +91,7 @@ mod s3_tests {
         Ok(())
     }
 
-    async fn mkdir(fs: &S3FileSystem) -> CommonResult<()> {
+    async fn mkdir(fs: &OpendalFileSystem) -> CommonResult<()> {
         let path = "s3://curvine-test/cv-fs-test/a".into();
         fs.mkdir(&path, true).await.unwrap();
 
@@ -97,13 +101,13 @@ mod s3_tests {
         Ok(())
     }
 
-    async fn list_status(fs: &S3FileSystem) -> CommonResult<Vec<FileStatus>> {
+    async fn list_status(fs: &OpendalFileSystem) -> CommonResult<Vec<FileStatus>> {
         let path = Path::new("s3://curvine-test/cv-fs-test")?;
         let res = fs.list_status(&path).await.unwrap();
         Ok(res)
     }
 
-    async fn write(fs: &S3FileSystem) -> CommonResult<u64> {
+    async fn write(fs: &OpendalFileSystem) -> CommonResult<u64> {
         let path = Path::new("s3://curvine-test/cv-fs-test/test.log")?;
         let mut writer = fs.create(&path, false).await.unwrap();
 
@@ -119,7 +123,7 @@ mod s3_tests {
         Ok(checksum)
     }
 
-    async fn read(fs: &S3FileSystem) -> CommonResult<u64> {
+    async fn read(fs: &OpendalFileSystem) -> CommonResult<u64> {
         let path = Path::new("s3://curvine-test/cv-fs-test/test.log")?;
         let mut reader = fs.open(&path).await.unwrap();
         let mut buf = BytesMut::zeroed(1024);
