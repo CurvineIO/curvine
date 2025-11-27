@@ -5,6 +5,8 @@ set -e
 # Configuration
 IMAGE_NAME="curvine"
 IMAGE_TAG="latest"
+DOCKERFILE_NAME=""
+PLATFORM_NAME=""
 
 # Color output functions
 print_info() {
@@ -25,6 +27,12 @@ print_error() {
 
 # Interactive platform selection
 select_platform() {
+    # If DOCKERFILE_NAME is already set (non-interactive mode), skip selection
+    if [ -n "$DOCKERFILE_NAME" ]; then
+        print_info "Using platform: $PLATFORM_NAME"
+        return 0
+    fi
+    
     echo "==========================================="
     echo "    Curvine Native K8s Image Builder"
     echo "==========================================="
@@ -75,6 +83,7 @@ build_image() {
     PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
     
     print_info "Project root directory: $PROJECT_ROOT"
+    print_info "Using Dockerfile: $DOCKERFILE_NAME"
     
     # Validate Dockerfile exists
     if [ ! -f "$SCRIPT_DIR/$DOCKERFILE_NAME" ]; then
@@ -82,94 +91,25 @@ build_image() {
         exit 1
     fi
     
-    # Create build context
-    BUILD_DIR=$(mktemp -d -t curvine-build-XXXXXX)
-    if [ ! -d "$BUILD_DIR" ]; then
-        print_error "Failed to create temporary build directory"
-        exit 1
-    fi
-    print_info "Creating build context: $BUILD_DIR"
-    
-    # Copy Dockerfile
-    cp "$SCRIPT_DIR/$DOCKERFILE_NAME" "$BUILD_DIR/Dockerfile"
-    print_info "Using $DOCKERFILE_NAME"
-    
-    # Copy entrypoint script
-    if [ -f "$SCRIPT_DIR/entrypoint.sh" ]; then
-        cp "$SCRIPT_DIR/entrypoint.sh" "$BUILD_DIR/"
-        print_info "Copied entrypoint.sh"
-    else
-        print_error "entrypoint.sh not found at $SCRIPT_DIR/entrypoint.sh"
-        rm -rf "$BUILD_DIR"
-        exit 1
+    # Validate .dockerignore exists
+    if [ ! -f "$PROJECT_ROOT/.dockerignore" ]; then
+        print_warning ".dockerignore not found, build context may be large"
     fi
     
-    # Copy build config files (settings.xml and config) for Dockerfile build stage
-    # Dockerfile expects these files in a 'compile' directory (COPY compile/ /build-config/)
-    mkdir -p "$BUILD_DIR/compile"
-    
-    if [ -f "$SCRIPT_DIR/settings.xml" ]; then
-        cp "$SCRIPT_DIR/settings.xml" "$BUILD_DIR/compile/"
-        print_info "Copied settings.xml"
-    else
-        print_error "settings.xml not found at $SCRIPT_DIR/settings.xml"
-        rm -rf "$BUILD_DIR"
-        exit 1
-    fi
-    
-    if [ -f "$SCRIPT_DIR/config" ]; then
-        cp "$SCRIPT_DIR/config" "$BUILD_DIR/compile/"
-        print_info "Copied config"
-    else
-        print_error "config not found at $SCRIPT_DIR/config"
-        rm -rf "$BUILD_DIR"
-        exit 1
-    fi
-    
-    # Copy source code
-    print_info "Copying Curvine project source code..."
-    mkdir -p "$BUILD_DIR/workspace"
-    
-    # Copy curvine directories
-    for dir in curvine-cli curvine-client curvine-common curvine-server curvine-libsdk curvine-tests curvine-fuse curvine-web curvine-ufs curvine-s3-gateway curvine-kube orpc; do
-        if [ -d "$PROJECT_ROOT/$dir" ]; then
-            print_info "Copying $dir..."
-            cp -r "$PROJECT_ROOT/$dir" "$BUILD_DIR/workspace/"
-        fi
-    done
-    
-    # Copy root-level build files
-    cp "$PROJECT_ROOT/Cargo.toml" "$BUILD_DIR/workspace/" 2>/dev/null || true
-    cp "$PROJECT_ROOT/Cargo.lock" "$BUILD_DIR/workspace/" 2>/dev/null || true
-    cp "$PROJECT_ROOT/Makefile" "$BUILD_DIR/workspace/" 2>/dev/null || true
-    cp "$PROJECT_ROOT/rust-toolchain.toml" "$BUILD_DIR/workspace/" 2>/dev/null || true
-    cp "$PROJECT_ROOT/rustfmt.toml" "$BUILD_DIR/workspace/" 2>/dev/null || true
-    cp "$PROJECT_ROOT/clippy.toml" "$BUILD_DIR/workspace/" 2>/dev/null || true
-
-    # Copy build directory if exists
-    if [ -d "$PROJECT_ROOT/build" ]; then
-        print_info "Copying build directory..."
-        cp -r "$PROJECT_ROOT/build" "$BUILD_DIR/workspace/"
-    fi
-
-    # Copy etc directory if exists
-    if [ -d "$PROJECT_ROOT/etc" ]; then
-        cp -r "$PROJECT_ROOT/etc" "$BUILD_DIR/workspace/"
-    fi
-    
-    # Build Docker image
+    # Build Docker image directly from project root
     print_info "Building Docker image: $IMAGE_NAME:$IMAGE_TAG"
     print_warning "Note: Source build requires longer time, please be patient..."
     
-    # Build with increased shared memory (for RocksDB compilation)
-    if ! docker build --shm-size=2g -t "$IMAGE_NAME:$IMAGE_TAG" "$BUILD_DIR"; then
+    # Build with project root as context
+    # .dockerignore will filter out unnecessary files
+    if ! docker build \
+        --shm-size=2g \
+        -f "$SCRIPT_DIR/$DOCKERFILE_NAME" \
+        -t "$IMAGE_NAME:$IMAGE_TAG" \
+        "$PROJECT_ROOT"; then
         print_error "Docker build failed"
-        rm -rf "$BUILD_DIR"
         exit 1
     fi
-    
-    # Clean up
-    rm -rf "$BUILD_DIR"
     
     print_success "Build completed!"
     print_info "Note: This build uses your local source code"
@@ -209,24 +149,67 @@ main() {
     echo ""
 }
 
-# Check for help flag
-if [[ "$1" == "-h" || "$1" == "--help" ]]; then
-    echo "Curvine Native K8s Docker Build Tool"
-    echo ""
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo "Options:"
-    echo "  -h, --help     Show this help message"
-    echo ""
-    echo "Build platforms:"
-    echo "  1. Ubuntu 24.04"
-    echo "  2. Rocky Linux 9"
-    echo ""
-    echo "Examples:"
-    echo "  $0                    # Interactive platform selection"
-    echo ""
-    exit 0
-fi
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Curvine Native K8s Docker Build Tool"
+                echo ""
+                echo "Usage: $0 [OPTIONS]"
+                echo ""
+                echo "Options:"
+                echo "  -h, --help          Show this help message"
+                echo "  -p, --platform      Specify platform: ubuntu24 or rocky9"
+                echo "  -t, --tag           Specify image tag (default: latest)"
+                echo "  -n, --name          Specify image name (default: curvine)"
+                echo ""
+                echo "Build platforms:"
+                echo "  ubuntu24   - Ubuntu 24.04"
+                echo "  rocky9     - Rocky Linux 9"
+                echo ""
+                echo "Examples:"
+                echo "  $0                                    # Interactive platform selection"
+                echo "  $0 --platform rocky9                  # Non-interactive build with Rocky9"
+                echo "  $0 -p ubuntu24 -t v1.0.0              # Build Ubuntu24 with custom tag"
+                echo "  $0 -p rocky9 -n myapp -t latest       # Build with custom name and tag"
+                echo ""
+                exit 0
+                ;;
+            -p|--platform)
+                case "$2" in
+                    ubuntu24)
+                        DOCKERFILE_NAME="Dockerfile_ubuntu24"
+                        PLATFORM_NAME="Ubuntu 24.04"
+                        ;;
+                    rocky9)
+                        DOCKERFILE_NAME="Dockerfile_rocky9"
+                        PLATFORM_NAME="Rocky Linux 9"
+                        ;;
+                    *)
+                        print_error "Invalid platform: $2. Use 'ubuntu24' or 'rocky9'"
+                        exit 1
+                        ;;
+                esac
+                shift 2
+                ;;
+            -t|--tag)
+                IMAGE_TAG="$2"
+                shift 2
+                ;;
+            -n|--name)
+                IMAGE_NAME="$2"
+                shift 2
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                echo "Use -h or --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+}
 
-# Run main function
+# Parse arguments and run main function
+parse_args "$@"
 main

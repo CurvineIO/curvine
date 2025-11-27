@@ -1,4 +1,4 @@
-name: Build Docker Image
+name: Build Compile Docker Image
 
 on:
   workflow_dispatch:
