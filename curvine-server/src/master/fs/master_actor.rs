@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::UfsFactory;
 use crate::master::fs::heartbeat_checker::HeartbeatChecker;
 use crate::master::fs::master_filesystem::MasterFilesystem;
+use crate::master::job::JobManager;
 use crate::master::meta::inode::ttl::ttl_manager::InodeTtlManager;
 use crate::master::meta::inode::ttl::ttl_scheduler::TtlHeartbeatChecker;
 use crate::master::meta::inode::ttl_scheduler::TtlHeartbeatConfig;
+use crate::master::mount::MountManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
 use curvine_common::executor::ScheduledExecutor;
-use log::{error, info};
+use log::info;
 use orpc::runtime::GroupExecutor;
 use orpc::CommonResult;
 use std::sync::Arc;
@@ -56,13 +59,14 @@ impl MasterActor {
             self.replication_manager.clone(),
         )
         .unwrap();
-
-        if let Err(e) = self.start_ttl_scheduler() {
-            error!("Failed to start inode ttl scheduler: {}", e);
-        }
     }
 
-    pub fn start_ttl_scheduler(&mut self) -> CommonResult<()> {
+    pub fn start_ttl_scheduler(
+        &mut self,
+        mount_manager: Arc<MountManager>,
+        factory: Arc<UfsFactory>,
+        job_manager: Arc<JobManager>,
+    ) -> CommonResult<()> {
         info!("Starting inode ttl scheduler.");
 
         let ttl_bucket_list = {
@@ -71,10 +75,15 @@ impl MasterActor {
             fs_dir.get_ttl_bucket_list()
         };
 
-        let ttl_manager = InodeTtlManager::new(self.fs.clone(), ttl_bucket_list)?;
+        let ttl_manager = InodeTtlManager::new(
+            self.fs.clone(),
+            ttl_bucket_list,
+            mount_manager,
+            factory,
+            job_manager,
+        )?;
         let ttl_manager_arc = Arc::new(ttl_manager);
 
-        // TTL manager is ready for use immediately after creation
         self.start_ttl_heartbeat_checker(ttl_manager_arc)?;
 
         info!("Inode ttl scheduler started successfully.");
