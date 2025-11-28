@@ -234,18 +234,20 @@ impl NodeState {
             }
 
             mode if mode == OpenFlags::RDWR => {
-                if let Some((ufs_path, _)) = self.fs.get_mount(path).await? {
-                    return err_fuse!(
-                        libc::ENOSYS,
-                        "ufs {} -> {} doesn't support read-write mode for file opening",
+                let writer = self.new_writer(ino, path, flags, opts).await?;
+                let reader = if let Some((ufs_path, _)) = self.fs.get_mount(path).await? {
+                    warn!(
+                        "ufs {} -> {} does not support read-write mode for file opening, reader will be None",
                         path,
                         ufs_path
                     );
-                }
+                    None
+                } else {
+                    let reader = self.new_reader(path).await?;
+                    Some(RawPtr::from_owned(reader))
+                };
 
-                let writer = self.new_writer(ino, path, flags, opts).await?;
-                let reader = self.new_reader(path).await?;
-                (Some(RawPtr::from_owned(reader)), Some(writer))
+                (reader, Some(writer))
             }
             _ => {
                 return err_fuse!(
