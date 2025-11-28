@@ -16,11 +16,13 @@
 
 use crate::err_box;
 use crate::handler::RpcFrame;
-use crate::io::IOResult;
+use crate::io::{IOResult, LocalFile};
 use crate::sys::*;
 use crate::{err_io, err_msg, try_err, try_option};
+use fs2::FileExt;
 use std::ffi::{CStr, CString};
 use std::fs;
+use std::fs::Metadata;
 use std::io::IoSlice;
 use std::path::Path;
 
@@ -609,5 +611,81 @@ pub fn get_groupname_by_gid(gid: u32) -> Option<String> {
     #[cfg(not(target_os = "linux"))]
     {
         None
+    }
+}
+
+/// pub unsafe extern "C" fn ftruncate64(
+//     fd: c_int,
+//     length: off64_t,
+// ) -> c_int
+pub fn ftruncate(file: &fs::File, len: i64) -> IOResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            let fd = get_raw_io(file)?;
+            let result = libc::ftruncate64(fd, len as libc::off64_t);
+
+            err_io!(result)?;
+            Ok(())
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        file.set_len(len as u64)?;
+        Ok(())
+    }
+}
+
+/// pub unsafe extern "C" fn fallocate64(
+//     fd: c_int,
+//     mode: c_int,
+//     offset: off64_t,
+//     len: off64_t,
+// ) -> c_int
+pub fn fallocate(file: &fs::File, off: i64, len: i64, mode: i32) -> IOResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            let fd = get_raw_io(file)?;
+            let result = libc::fallocate64(fd, mode, off as libc::off64_t, len as libc::off64_t);
+
+            err_io!(result)?;
+            Ok(())
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        file.allocate(len as u64)?;
+        Ok(())
+    }
+}
+
+/// Get the actual size of the file
+/// - If there are no holes in the file, returns the logical file size
+/// - If there are holes, returns the actual disk space occupied
+pub fn file_actual_size(metadata: Metadata) -> IOResult<u64> {
+    // 4k
+    // 1G
+    let logical_size = metadata.len();
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::linux::fs::MetadataExt;
+        let actual_size = metadata.st_blocks() * ST_BLOCK_SIZE;
+
+        // If actual size is less than logical size, the file has holes
+        // 1g > 4k
+        if actual_size < logical_size {
+            Ok(actual_size)
+        } else {
+            Ok(logical_size)
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(logical_size)
     }
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::LocalTime;
+use crate::common::{FileUtils, LocalTime};
 use crate::runtime::Runtime;
 use crate::CommonResult;
 use md5::{Digest, Md5};
@@ -149,7 +149,7 @@ impl Utils {
         path.push("../testing");
 
         // Ensure the testing directory exists
-        let _ = fs::create_dir_all(&path);
+        let _ = FileUtils::create_parent_dir(&path, true);
 
         path.push(format!("test-{}", Self::rand_id()));
         format!("{}", path.display())
