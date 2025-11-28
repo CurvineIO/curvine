@@ -18,9 +18,6 @@ macro_rules! match_variants {
         match $self {
             Self::Cv(v) => v.$method($($arg),*),
 
-            #[cfg(feature = "s3")]
-            Self::S3(v) => v.$method($($arg),*),
-
             #[cfg(feature = "opendal")]
             Self::OpenDAL(v) => v.$method($($arg),*),
         }
@@ -33,9 +30,6 @@ macro_rules! match_variants_async {
         match $self {
             Self::Cv(v) => v.$method($($arg),*).await,
 
-            #[cfg(feature = "s3")]
-            Self::S3(v) => v.$method($($arg),*).await,
-
             #[cfg(feature = "opendal")]
             Self::OpenDAL(v) => v.$method($($arg),*).await,
         }
@@ -46,9 +40,6 @@ macro_rules! match_variants_async {
 macro_rules! match_fs_variants {
     ($self:expr, $method:ident $(, $arg:expr)*) => {
         match $self {
-            #[cfg(feature = "s3")]
-            Self::S3(inner) => inner.$method($($arg),*),
-
             #[cfg(feature = "opendal")]
             Self::OpenDAL(inner) => inner.$method($($arg),*),
         }
@@ -59,9 +50,6 @@ macro_rules! match_fs_variants {
 macro_rules! match_fs_variants_async {
     ($self:expr, $method:ident $(, $arg:expr)*) => {
         match $self {
-            #[cfg(feature = "s3")]
-            Self::S3(inner) => inner.$method($($arg),*).await,
-
             #[cfg(feature = "opendal")]
             Self::OpenDAL(inner) => inner.$method($($arg),*).await,
         }
@@ -72,9 +60,6 @@ macro_rules! match_fs_variants_async {
 macro_rules! match_fs_variants_writer {
     ($self:expr, $method:ident $(, $arg:expr)*) => {
         match $self {
-            #[cfg(feature = "s3")]
-            Self::S3(inner) => Ok($crate::unified::UnifiedWriter::S3(inner.$method($($arg),*).await?)),
-
             #[cfg(feature = "opendal")]
             Self::OpenDAL(inner) => Ok($crate::unified::UnifiedWriter::OpenDAL(inner.$method($($arg),*).await?)),
         }
@@ -85,9 +70,6 @@ macro_rules! match_fs_variants_writer {
 macro_rules! match_fs_variants_reader {
     ($self:expr, $method:ident $(, $arg:expr)*) => {
         match $self {
-            #[cfg(feature = "s3")]
-            Self::S3(inner) => Ok($crate::unified::UnifiedReader::S3(inner.$method($($arg),*).await?)),
-
             #[cfg(feature = "opendal")]
             Self::OpenDAL(inner) => Ok($crate::unified::UnifiedReader::OpenDAL(inner.$method($($arg),*).await?)),
         }

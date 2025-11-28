@@ -18,10 +18,6 @@ pub mod fs;
 #[cfg(feature = "jni")]
 pub mod jni;
 
-// Native S3 implementation
-#[cfg(feature = "s3")]
-pub mod s3;
-
 // OpenDAL implementations
 #[cfg(feature = "opendal")]
 pub mod opendal;
