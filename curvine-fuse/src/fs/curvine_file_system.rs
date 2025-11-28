@@ -24,9 +24,10 @@ use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    CreateFileOptsBuilder, FileStatus, MkdirOptsBuilder, OpenFlags, SetAttrOpts,
+    CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileStatus, MkdirOptsBuilder, OpenFlags,
+    SetAttrOpts,
 };
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use orpc::common::ByteUnit;
 use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
@@ -485,6 +486,36 @@ impl CurvineFileSystem {
             remove_x_attr: Vec::new(),
         })
     }
+
+    async fn fs_resize(
+        &self,
+        path: &Path,
+        ino: u64,
+        fh: u64,
+        opts: FileAllocOpts,
+    ) -> FuseResult<()> {
+        if let Some((ufs_path, _)) = self.fs.get_mount(path).await? {
+            warn!(
+                "ufs {} -> {} does not support resize, will ignore",
+                path, ufs_path
+            );
+            return Ok(());
+        }
+
+        opts.validate()?;
+        if fh != 0 {
+            let handle = self.state.find_handle(ino, fh)?;
+            if let Some(writer) = &handle.writer {
+                writer.lock().await.resize(opts).await?;
+            } else {
+                return err_fuse!(libc::EACCES);
+            }
+        } else {
+            self.fs.resize(path, opts).await?;
+        };
+
+        Ok(())
+    }
 }
 
 impl fs::FileSystem for CurvineFileSystem {
@@ -827,10 +858,21 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        let status = match self.fs_set_attr(&path, opts).await? {
+        let mut status = match self.fs_set_attr(&path, opts).await? {
             Some(v) => v,
             None => self.fs_get_status(&path).await?,
         };
+
+        // Handle file size change (truncate/resize)
+        if (op.arg.valid & FATTR_SIZE) != 0 {
+            let expect_len = op.arg.size as i64;
+            if expect_len != status.len {
+                let resize_opts = FileAllocOpts::with_truncate(expect_len);
+                self.fs_resize(&path, op.header.nodeid, op.arg.fh, resize_opts)
+                    .await?;
+                status.len = expect_len;
+            }
+        }
 
         let attr = Self::status_to_attr(&self.conf, &status)?;
         let attr = fuse_attr_out {
@@ -940,10 +982,19 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(Self::create_entry_out(&self.conf, entry))
     }
 
-    // The kernel requests to allocate space.Not currently implemented, and in distributed systems, it is not necessary.
-    async fn fuse_allocate(&self, op: FAllocate<'_>) -> FuseResult<()> {
-        let _ = self.state.get_path(op.header.nodeid)?;
-        Ok(())
+    async fn allocate(&self, op: FAllocate<'_>) -> FuseResult<()> {
+        let path = self.state.get_path(op.header.nodeid)?;
+
+        let opts = FileAllocOpts {
+            truncate: false,
+            off: op.arg.offset as i64,
+            len: op.arg.length as i64,
+            mode: FileAllocMode::from_bits_truncate(op.arg.mode as i32),
+        };
+
+        opts.validate()?;
+        self.fs_resize(&path, op.header.nodeid, op.arg.fh, opts)
+            .await
     }
 
     // Release the directory, curvine does not need to implement this interface
