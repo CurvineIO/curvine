@@ -77,3 +77,6 @@ pub use self::open_flags::*;
 
 mod rename_flags;
 pub use self::rename_flags::*;
+
+mod file_alloc;
+pub use self::file_alloc::*;

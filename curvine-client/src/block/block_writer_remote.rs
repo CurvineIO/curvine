@@ -26,7 +26,6 @@ pub struct BlockWriterRemote {
     worker_address: WorkerAddress,
     client: BlockClient,
     pos: i64,
-    len: i64,
     seq_id: i32,
     req_id: i64,
     pending_header: Option<DataHeaderProto>,
@@ -43,7 +42,6 @@ impl BlockWriterRemote {
         let req_id = Utils::req_id();
         let seq_id = 0;
         let block_size = fs_context.block_size();
-        let len = block.len;
 
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
@@ -58,11 +56,11 @@ impl BlockWriterRemote {
             )
             .await?;
 
-        if block_size != write_context.len {
+        if block_size != write_context.block_size {
             return err_box!(
                 "Abnormal block size, expected length {}, actual length {}",
                 block_size,
-                write_context.len
+                write_context.block_size
             );
         }
 
@@ -70,7 +68,6 @@ impl BlockWriterRemote {
             block,
             client,
             pos,
-            len,
             seq_id,
             req_id,
             worker_address,
@@ -98,8 +95,8 @@ impl BlockWriterRemote {
             .await?;
 
         self.pos += len;
-        if self.pos > self.len {
-            self.len = self.pos;
+        if self.pos > self.block.len {
+            self.block.len = self.pos;
         }
         Ok(())
     }
@@ -121,7 +118,7 @@ impl BlockWriterRemote {
             .write_commit(
                 &self.block,
                 self.pos,
-                self.len,
+                self.block_size,
                 self.req_id,
                 next_seq_id,
                 false,
@@ -136,7 +133,7 @@ impl BlockWriterRemote {
             .write_commit(
                 &self.block,
                 self.pos,
-                self.len,
+                self.block_size,
                 self.req_id,
                 next_seq_id,
                 true,
@@ -158,7 +155,7 @@ impl BlockWriterRemote {
     }
 
     pub fn len(&self) -> i64 {
-        self.len
+        self.block.len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -168,10 +165,12 @@ impl BlockWriterRemote {
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 {
             return err_box!("Cannot seek to negative position: {}", pos);
-        }
-
-        if pos >= self.len {
-            return err_box!("Seek position {} exceeds block capacity {}", pos, self.len);
+        } else if pos > self.block_size {
+            return err_box!(
+                "Seek position {} exceeds block capacity {}",
+                pos,
+                self.block_size
+            );
         }
 
         // Set new position and pending header

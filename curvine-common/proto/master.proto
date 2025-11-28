@@ -113,11 +113,12 @@ message RenameResponse {
 // Apply for allocation of blocks.
 message AddBlockRequest {
     required string path = 1;
-    optional CommitBlockProto previous = 2;
-    repeated WorkerAddressProto exclude_workers = 3;
+    repeated CommitBlockProto commit_blocks = 2;
+    repeated uint32 exclude_workers = 3;
     required bool located = 4 [default = true];
     required ClientAddressProto client_address = 5;
     required int64 file_len = 6;
+    optional ExtendedBlockProto last_block = 7;
 }
 
 message AddBlockResponse {
@@ -232,4 +233,24 @@ message MetricsReportRequest {
 
 message MetricsReportResponse {
 
+}
+
+message FileResizeRequest {
+    required string path = 1;
+    required FileAllocOptsProto opts = 2;
+}
+
+message FileResizeResponse {
+    required FileBlocksProto file_blocks = 1;
+}
+
+message AssignWorkerRequest {
+    required string path = 1;
+    required ExtendedBlockProto block = 2;
+    repeated uint32 exclude_workers = 3;
+    required ClientAddressProto client_address = 4;
+}
+
+message AssignWorkerResponse {
+    required LocatedBlockProto block = 1;
 }

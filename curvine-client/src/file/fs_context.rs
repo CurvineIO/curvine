@@ -16,7 +16,9 @@ use crate::block::BlockClient;
 use crate::file::CurvineFileSystem;
 use crate::ClientMetrics;
 use curvine_common::conf::ClusterConf;
+use curvine_common::proto::ClientAddressProto;
 use curvine_common::state::{ClientAddress, WorkerAddress};
+use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use fxhash::FxHasher;
 use log::warn;
@@ -166,13 +168,21 @@ impl FsContext {
         self.failed_workers.contains_key(&addr.worker_id)
     }
 
-    pub fn get_failed_workers(&self) -> Vec<WorkerAddress> {
+    pub fn get_failed_workers(&self) -> Vec<u32> {
         let mut res = vec![];
         for item in self.failed_workers.iter() {
-            res.push(item.1.clone());
+            res.push(item.1.worker_id);
         }
 
         res
+    }
+
+    pub fn client_addr_pb(&self) -> ClientAddressProto {
+        ProtoUtils::client_address_to_pb(self.client_addr.clone())
+    }
+
+    pub fn exclude_workers(&self) -> Vec<u32> {
+        self.failed_workers.iter().map(|x| x.1.worker_id).collect()
     }
 
     pub fn start_metrics_report_task(fs: CurvineFileSystem) {

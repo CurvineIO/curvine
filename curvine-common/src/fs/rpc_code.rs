@@ -39,6 +39,8 @@ pub enum RpcCode {
     SetAttr = 15,
     Symlink = 16,
     Link = 17,
+    ResizeFile = 18,
+    AssignWorker = 19,
 
     // manager interface.
     Mount = 30,

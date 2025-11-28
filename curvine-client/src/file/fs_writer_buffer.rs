@@ -16,9 +16,10 @@ use crate::file::fs_writer_buffer::WriterAdapter::{Base, Buffer};
 use crate::file::FsWriterBase;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
-use curvine_common::state::FileStatus;
+use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus};
 use curvine_common::FsResult;
 use log::error;
+use orpc::io::IOError;
 use orpc::runtime::RpcRuntime;
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
 use orpc::sync::ErrorMonitor;
@@ -30,6 +31,7 @@ enum WriterTask {
     Flush(CallSender<i8>),
     Complete((bool, CallSender<i8>)),
     Seek((i64, CallSender<i8>)),
+    Resize((FileAllocOpts, CallSender<FileBlocks>)),
 }
 
 enum SelectTask {
@@ -44,65 +46,59 @@ struct BufferChannel {
 }
 
 impl BufferChannel {
-    fn check_error(&self, e: FsError) -> FsError {
-        self.err_monitor.take_error().unwrap_or(e)
+    fn check_error(&self, e: impl Into<FsError>) -> FsError {
+        self.err_monitor.take_error().unwrap_or(e.into())
     }
 
     async fn write(&mut self, data: DataSlice) -> FsResult<()> {
-        match self.chunk_sender.send(data).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(self.check_error(e.into())),
-        }
+        self.chunk_sender
+            .send(data)
+            .await
+            .map_err(|e| self.check_error(e))
     }
 
     async fn complete(&mut self) -> FsResult<()> {
-        let res: FsResult<()> = {
+        let fun = async {
             let (tx, rx) = CallChannel::channel();
             self.task_sender
                 .send(WriterTask::Complete((false, tx)))
                 .await?;
             rx.receive().await?;
-            Ok(())
+            Ok::<(), IOError>(())
         };
-
-        match res {
-            Err(e) => Err(self.check_error(e)),
-            Ok(_) => Ok(()),
-        }
+        fun.await.map_err(|e| self.check_error(e))
     }
 
     async fn flush(&mut self) -> FsResult<()> {
-        let res: FsResult<()> = {
+        let fun = async {
             let (tx, rx) = CallChannel::channel();
             self.task_sender.send(WriterTask::Flush(tx)).await?;
             rx.receive().await?;
-            Ok(())
+            Ok::<(), IOError>(())
         };
-
-        match res {
-            Err(e) => Err(self.check_error(e)),
-            Ok(_) => Ok(()),
-        }
+        fun.await.map_err(|e| self.check_error(e))
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        let res: FsResult<()> = {
+        let fun = async {
             let (tx, rx) = CallChannel::channel();
-
-            if let Err(e) = self.task_sender.send(WriterTask::Seek((pos, tx))).await {
-                return Err(e.into());
-            }
-
-            if let Err(e) = rx.receive().await {
-                return Err(e.into());
-            }
-            Ok(())
+            self.task_sender.send(WriterTask::Seek((pos, tx))).await?;
+            rx.receive().await?;
+            Ok::<(), IOError>(())
         };
+        fun.await.map_err(|e| self.check_error(e))
+    }
 
-        match res {
-            Err(e) => Err(self.check_error(e)),
-            Ok(_) => Ok(()),
-        }
+    async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        let fun = async {
+            let (tx, rx) = CallChannel::channel();
+            self.task_sender
+                .send(WriterTask::Resize((opts, tx)))
+                .await?;
+            rx.receive().await?;
+            Ok::<(), IOError>(())
+        };
+        fun.await.map_err(|e| self.check_error(e))
     }
 }
 
@@ -137,6 +133,13 @@ impl WriterAdapter {
         match self {
             Base(w) => w.seek(pos).await,
             Buffer(w) => w.seek(pos).await,
+        }
+    }
+
+    async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        match self {
+            Base(w) => w.resize(opts).await,
+            Buffer(w) => w.resize(opts).await,
         }
     }
 }
@@ -234,6 +237,10 @@ impl FsWriterBuffer {
         Ok(())
     }
 
+    pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        self.writer.resize(opts).await
+    }
+
     async fn write_future(
         mut chunk_receiver: AsyncReceiver<DataSlice>,
         mut task_receiver: AsyncReceiver<WriterTask>,
@@ -282,6 +289,18 @@ impl FsWriterBuffer {
                         writer.seek(pos).await?;
 
                         if let Err(e) = tx.send(1) {
+                            return Err(e.into());
+                        }
+                    }
+
+                    WriterTask::Resize((opts, tx)) => {
+                        while let Some(chunk) = chunk_receiver.try_recv()? {
+                            writer.write(chunk).await?
+                        }
+
+                        writer.resize(opts).await?;
+
+                        if let Err(e) = tx.send(writer.file_blocks()) {
                             return Err(e.into());
                         }
                     }

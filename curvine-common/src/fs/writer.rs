@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::fs::Path;
-use crate::state::FileStatus;
+use crate::state::{FileAllocOpts, FileStatus};
 use crate::FsResult;
 use orpc::err_box;
 use orpc::runtime::RpcRuntime;
@@ -108,6 +108,10 @@ pub trait Writer {
 
     // Random write seek support
     fn seek(&mut self, _pos: i64) -> impl Future<Output = FsResult<()>> {
+        async move { err_box!("Not support") }
+    }
+
+    fn resize(&mut self, _opts: FileAllocOpts) -> impl Future<Output = FsResult<()>> {
         async move { err_box!("Not support") }
     }
 }

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::block_reader::ReaderAdapter::{Local, Remote};
-use crate::block::{BlockReaderLocal, BlockReaderRemote};
+use crate::block::block_reader::ReaderAdapter::{Hole, Local, Remote};
+use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
 use crate::file::FsContext;
 use curvine_common::state::{ClientAddress, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
@@ -27,6 +27,7 @@ use std::sync::Arc;
 enum ReaderAdapter {
     Local(BlockReaderLocal),
     Remote(BlockReaderRemote),
+    Hole(BlockReaderHole),
 }
 
 impl ReaderAdapter {
@@ -34,6 +35,7 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.read().await,
             Remote(r) => r.read().await,
+            Hole(r) => r.read(),
         }
     }
 
@@ -41,6 +43,7 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.blocking_read(),
             Remote(r) => rt.block_on(r.read()),
+            Hole(r) => r.read(),
         }
     }
 
@@ -48,6 +51,7 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.complete().await,
             Remote(r) => r.complete().await,
+            Hole(r) => r.complete(),
         }
     }
 
@@ -55,6 +59,7 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.remaining(),
             Remote(r) => r.remaining(),
+            Hole(r) => r.remaining(),
         }
     }
 
@@ -62,6 +67,7 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.seek(pos),
             Remote(r) => r.seek(pos),
+            Hole(r) => r.seek(pos),
         }
     }
 
@@ -69,6 +75,7 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.pos(),
             Remote(r) => r.pos(),
+            Hole(r) => r.pos(),
         }
     }
 
@@ -76,6 +83,7 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.len(),
             Remote(r) => r.len(),
+            Hole(r) => r.len(),
         }
     }
 
@@ -83,6 +91,7 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.block_id(),
             Remote(r) => r.block_id(),
+            Hole(r) => r.block_id(),
         }
     }
 
@@ -90,6 +99,7 @@ impl ReaderAdapter {
         match self {
             Local(r) => r.worker_address(),
             Remote(r) => r.worker_address(),
+            Hole(r) => r.worker_address(),
         }
     }
 }
@@ -137,7 +147,7 @@ impl BlockReader {
         local_addr: &ClientAddress,
     ) -> FsResult<Vec<WorkerAddress>> {
         if locs.is_empty() {
-            return err_box!("There is no available worker");
+            return Ok(vec![]);
         }
 
         Utils::shuffle(&mut locs);
@@ -160,6 +170,11 @@ impl BlockReader {
         off: i64,
         len: i64,
     ) -> FsResult<ReaderAdapter> {
+        if locs.is_empty() && block.alloc_opts.is_some() {
+            let reader = BlockReaderHole::new(fs_context.clone(), block.clone(), off, len)?;
+            return Ok(Hole(reader));
+        }
+
         let short_circuit = fs_context.conf.client.short_circuit;
         for loc in locs {
             if fs_context.is_failed_worker(loc) {
