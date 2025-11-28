@@ -36,6 +36,19 @@ master_addrs = [
     { hostname = "cv-master-2.svc.cluster.local", port = 8995 }
 ]
 
+# RPC timeout optimization for fast master failover
+# RPC timeout: 120s → 10s (Raft election takes 10-15s)
+rpc_timeout_ms = 10000
+
+# Total retry duration: 300s → 40s (10s × 3 nodes + retry intervals)
+rpc_retry_max_duration_ms = 40000
+
+# Minimum retry sleep: 300ms → 100ms (faster retry)
+rpc_retry_min_sleep_ms = 100
+
+# Maximum retry sleep: 30s → 2s (avoid long wait)
+rpc_retry_max_sleep_ms = 2000
+
 [fuse]
 debug = false
 
