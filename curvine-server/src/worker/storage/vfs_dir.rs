@@ -21,7 +21,7 @@ use orpc::common::{ByteUnit, FileUtils};
 use orpc::io::LocalFile;
 use orpc::sync::AtomicLong;
 use orpc::sys::FsStats;
-use orpc::{try_err, CommonResult};
+use orpc::{sys, try_err, CommonResult};
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -229,8 +229,8 @@ impl VfsDir {
 
     pub fn finalize_block(&self, meta: &BlockMeta) -> CommonResult<BlockMeta> {
         let tmp_file = meta.get_block_path()?;
-        let file_size = try_err!(tmp_file.metadata()).len() as i64;
-        let final_meta = BlockMeta::with_final(meta, file_size);
+        let file_size = sys::file_actual_size(tmp_file.metadata()?)?;
+        let final_meta = BlockMeta::with_final(meta, file_size as i64);
         Ok(final_meta)
     }
 

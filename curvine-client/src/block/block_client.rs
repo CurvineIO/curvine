@@ -22,6 +22,7 @@ use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse, DataHeaderProto,
 };
 use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::client::RpcClient;
 use orpc::message::{Builder, Message, RequestStatus};
@@ -57,18 +58,16 @@ impl BlockClient {
         &self,
         blk: &ExtendedBlock,
         off: i64,
-        len: i64,
+        block_size: i64,
         req_id: i64,
         seq_id: i32,
         chunk_size: i32,
         short_circuit: bool,
     ) -> FsResult<CreateBlockContext> {
         let header = BlockWriteRequest {
-            id: blk.id,
+            block: ProtoUtils::extend_block_to_pb(blk.clone()),
             off,
-            len,
-            file_type: blk.file_type.into(),
-            storage_type: blk.storage_type.into(),
+            block_size,
             short_circuit,
             client_name: self.client_name.to_string(),
             chunk_size,
@@ -88,7 +87,7 @@ impl BlockClient {
         let context = CreateBlockContext {
             id: rep_header.id,
             off: rep_header.off,
-            len: rep_header.len,
+            block_size: rep_header.block_size,
             storage_type: StorageType::from(rep_header.storage_type),
             path: rep_header.path,
         };
@@ -142,17 +141,15 @@ impl BlockClient {
         &self,
         block: &ExtendedBlock,
         off: i64,
-        len: i64,
+        block_size: i64,
         req_id: i64,
         seq_id: i32,
         cancel: bool,
     ) -> FsResult<()> {
         let header = BlockWriteRequest {
-            id: block.id,
+            block: ProtoUtils::extend_block_to_pb(block.clone()),
             off,
-            len,
-            file_type: block.file_type.into(),
-            storage_type: block.storage_type.into(),
+            block_size,
             client_name: self.client_name.to_string(),
             ..Default::default()
         };

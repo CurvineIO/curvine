@@ -125,7 +125,7 @@ impl JournalWriter {
         op_ms: u64,
         path: P,
         file: &InodeFile,
-        commit_block: Option<CommitBlock>,
+        commit_block: Vec<CommitBlock>,
     ) -> FsResult<()> {
         let entry = AddBlockEntry {
             op_ms,

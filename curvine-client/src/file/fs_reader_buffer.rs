@@ -50,54 +50,43 @@ struct BufferChannel {
 }
 
 impl BufferChannel {
-    fn check_error(&self, e: FsError) -> FsError {
-        match self.err_monitor.take_error() {
-            Some(e) => e,
-            None => e,
-        }
+    fn check_error(&self, e: impl Into<FsError>) -> FsError {
+        self.err_monitor.take_error().unwrap_or(e.into())
     }
 
     async fn read(&mut self) -> FsResult<FileChunk> {
-        match self.chunk_receiver.recv_check().await {
-            Ok(v) => Ok(v),
-            Err(e) => Err(self.check_error(e.into())),
-        }
+        self.chunk_receiver
+            .recv_check()
+            .await
+            .map_err(|e| self.check_error(e))
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        let res: FsResult<()> = {
+        let fun = async {
             // Notify seek and seek will pause data reading.
             let (tx, rx) = CallChannel::channel();
             self.task_sender.send(ReadTask::Seek(pos, tx)).await?;
             rx.receive().await?;
 
             // Clear the buffer data.
-            while (self.chunk_receiver.try_recv()?).is_some() {}
+            while self.chunk_receiver.try_recv()?.is_some() {}
 
             // Restart the read task.
             self.task_sender.send(ReadTask::Start).await?;
-            Ok(())
+            Ok::<(), FsError>(())
         };
-
-        match res {
-            Err(e) => Err(self.check_error(e)),
-            Ok(_) => Ok(()),
-        }
+        fun.await.map_err(|e| self.check_error(e))
     }
 
     async fn complete(&mut self) -> FsResult<()> {
-        let res: FsResult<()> = {
+        let fun = async {
             // Send a stop command and wait for the command to complete
             let (tx, rx) = CallChannel::channel();
             self.task_sender.send(ReadTask::Stop(tx)).await?;
             rx.receive().await?;
-            Ok(())
+            Ok::<(), FsError>(())
         };
-
-        match res {
-            Err(e) => Err(self.check_error(e)),
-            Ok(_) => Ok(()),
-        }
+        fun.await.map_err(|e| self.check_error(e))
     }
 }
 

@@ -21,8 +21,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileStatus, LoadJobCommand, LoadJobResult, MasterInfo,
-    MkdirOpts, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
+    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileStatus, LoadJobCommand, LoadJobResult,
+    MasterInfo, MkdirOpts, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
 };
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -193,6 +193,13 @@ impl UnifiedFileSystem {
         match self.get_mount(src_path).await? {
             None => self.cv.link(src_path, dst_path).await,
             Some(_) => err_ext!(FsError::unsupported("link")),
+        }
+    }
+
+    pub async fn resize(&self, path: &Path, opts: FileAllocOpts) -> FsResult<()> {
+        match self.get_mount(path).await? {
+            None => self.cv.resize(path, opts).await,
+            Some(_) => err_ext!(FsError::unsupported("resize")),
         }
     }
 

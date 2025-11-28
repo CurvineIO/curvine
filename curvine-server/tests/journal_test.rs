@@ -162,7 +162,6 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
 
 fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let address = ClientAddress::default();
-
     /************* Master node execution log **************/
     // Create a directory
     fs_leader.mkdir("/journal/a", true)?;
@@ -175,7 +174,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let status = fs_leader.create("/journal/b/test.log", true)?;
 
     // Assign block
-    let block = fs_leader.add_block(&status.path, address.clone(), None, vec![], 0)?;
+    let block = fs_leader.add_block(&status.path, address.clone(), vec![], vec![], 0, None)?;
 
     // Complete the file.
     let commit = CommitBlock {
@@ -198,7 +197,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let path = "/journal/append.log";
     fs_leader.create(path, true)?;
 
-    let block = fs_leader.add_block(path, address.clone(), None, vec![], 0)?;
+    let block = fs_leader.add_block(path, address.clone(), vec![], vec![], 0, None)?;
     let commit = CommitBlock {
         block_id: block.block.id,
         block_len: 10,

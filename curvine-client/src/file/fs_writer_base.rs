@@ -15,7 +15,7 @@
 use crate::block::BlockWriter;
 use crate::file::{FsClient, FsContext};
 use curvine_common::fs::Path;
-use curvine_common::state::{FileBlocks, FileStatus, WriteFileBlocks};
+use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus, WriteFileBlocks};
 use curvine_common::FsResult;
 use orpc::common::FastHashMap;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -78,9 +78,20 @@ impl FsWriterBase {
         &self.fs_context
     }
 
+    pub fn file_blocks(&self) -> FileBlocks {
+        FileBlocks::new(
+            self.file_blocks.status.clone(),
+            self.file_blocks.block_locs.clone(),
+        )
+    }
+
     pub async fn write(&mut self, mut chunk: DataSlice) -> FsResult<()> {
         if chunk.is_empty() {
             return Ok(());
+        }
+
+        if self.pos > self.len {
+            self.resize(FileAllocOpts::with_truncate(self.pos)).await?;
         }
 
         let mut remaining = chunk.len();
@@ -108,6 +119,10 @@ impl FsWriterBase {
             return Ok(());
         }
 
+        if self.pos > self.len {
+            rt.block_on(self.resize(FileAllocOpts::with_truncate(self.pos)))?;
+        }
+
         let mut remaining = chunk.len();
         while remaining > 0 {
             let cur_writer = rt.block_on(self.get_writer())?;
@@ -129,7 +144,12 @@ impl FsWriterBase {
     pub async fn flush(&mut self) -> FsResult<()> {
         if let Some(writer) = &mut self.cur_writer {
             writer.flush().await?;
-            self.file_blocks.add_commit(writer.to_commit_block());
+            self.file_blocks.add_commit(writer.to_commit_block())?;
+        }
+
+        for (_, writer) in self.all_writers.iter_mut() {
+            writer.flush().await?;
+            self.file_blocks.add_commit(writer.to_commit_block())?;
         }
 
         let commits_blocks = self.file_blocks.take_commit_blocks();
@@ -142,21 +162,24 @@ impl FsWriterBase {
     // Write is completed, perform the following operations
     // 1. Submit the last block.
     pub async fn complete(&mut self) -> FsResult<()> {
-        if let Some(mut writer) = self.cur_writer.take() {
-            let commit_block = writer.complete().await?;
-            self.file_blocks.add_commit(commit_block);
+        self.complete0(false).await?;
+        Ok(())
+    }
+
+    async fn complete0(&mut self, only_flush: bool) -> FsResult<Option<FileBlocks>> {
+        if let Some(writer) = self.cur_writer.take() {
+            self.all_writers.insert(writer.block_id(), writer);
         };
 
         for (_, mut writer) in self.all_writers.drain() {
             let commit_block = writer.complete().await?;
-            self.file_blocks.add_commit(commit_block);
+            self.file_blocks.add_commit(commit_block)?;
         }
 
         let commits_blocks = self.file_blocks.take_commit_blocks();
         self.fs_client
-            .complete_file(&self.path, self.len, commits_blocks, false)
-            .await?;
-        Ok(())
+            .complete_file(&self.path, self.len, commits_blocks, only_flush)
+            .await
     }
 
     async fn get_writer(&mut self) -> FsResult<&mut BlockWriter> {
@@ -175,36 +198,41 @@ impl FsWriterBase {
                                 v.seek(off).await?;
                                 v
                             }
+
                             None => {
-                                BlockWriter::new(self.fs_context.clone(), lb.clone(), off).await?
+                                let lb = if lb.should_assign() {
+                                    let assign_lb = self
+                                        .fs_client
+                                        .assign_worker(&self.path, lb.block.clone())
+                                        .await?;
+
+                                    self.file_blocks.update_locate(&assign_lb)?;
+                                    assign_lb
+                                } else {
+                                    lb
+                                };
+                                BlockWriter::new(self.fs_context.clone(), lb, off).await?
                             }
                         };
+
                         self.update_writer(Some(writer)).await?;
                     }
 
                     None => {
-                        // step2: Need to apply for a new block.
-                        let commit_block = match self.cur_writer.take() {
-                            Some(mut v) => Some(v.complete().await?),
-                            _ => None,
-                        };
+                        self.update_writer(None).await?;
 
                         // Apply for a new block
+                        let commit_blocks = self.file_blocks.take_commit_blocks();
+                        let last_block = self.file_blocks.last_block();
                         let lb = self
                             .fs_client
-                            .add_block(
-                                &self.path,
-                                commit_block,
-                                &self.fs_context.client_addr,
-                                self.len,
-                            )
+                            .add_block(&self.path, commit_blocks, self.len, last_block)
                             .await?;
-
                         self.file_blocks.add_block(lb.clone())?;
 
                         let writer =
                             BlockWriter::new(self.fs_context.clone(), lb.clone(), 0).await?;
-                        let _ = self.cur_writer.insert(writer);
+                        self.cur_writer.replace(writer);
                     }
                 };
             }
@@ -218,6 +246,9 @@ impl FsWriterBase {
         if pos < 0 {
             return err_box!("Cannot seek to negative position: {}", pos);
         } else if pos == self.pos() {
+            return Ok(());
+        } else if pos > self.len {
+            self.pos = pos;
             return Ok(());
         }
 
@@ -244,9 +275,62 @@ impl FsWriterBase {
                 self.all_writers.insert(old.block_id(), old);
             } else {
                 let commit_block = old.complete().await?;
-                self.file_blocks.add_commit(commit_block);
+                self.file_blocks.add_commit(commit_block)?;
             }
         }
+
+        Ok(())
+    }
+
+    /// Resize the file to the specified length.
+    ///
+    /// This method coordinates the resize operation between client and master:
+    /// 1. Submit all pending blocks before resize to ensure data consistency
+    /// 2. Request master to resize the file metadata
+    /// 3. Handle blocks that need reassignment due to resize
+    /// 4. Update local writer state with new file blocks
+    ///
+    /// # Arguments
+    /// * `opts` - File allocation options containing the target length and allocation mode
+    ///
+    /// # Returns
+    /// * `FsResult<()>` - Success if resize completed, error otherwise
+    ///
+    /// # Note
+    /// If a block with written data needs reassignment (has workers but new alloc_opts),
+    /// it will be committed before reassignment. At most one such block exists.
+    pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        opts.validate()?;
+        let len = opts.len;
+
+        // Step 1: Submit all blocks before resize
+        self.complete0(true).await?;
+
+        // Step 2: Execute resize operation
+        let file_blocks = self.fs_client.resize(&self.path, opts).await?;
+        let mut file_blocks = WriteFileBlocks::new(file_blocks);
+        if file_blocks.len() != len {
+            return err_box!(
+                "Cannot resize file: {}, expect len {}, actual len {}",
+                self.path,
+                len,
+                file_blocks.len()
+            );
+        }
+
+        // Step 3: If a block with written data triggers reassignment, request worker to reassign the block.
+        // At most one such block exists.
+        for lb in &mut file_blocks.block_locs {
+            if lb.should_resize() {
+                let mut writer = BlockWriter::new(self.fs_context.clone(), lb.clone(), 0).await?;
+                let commit_block = writer.complete().await?;
+                self.file_blocks.add_commit(commit_block)?;
+            }
+        }
+
+        // Step 4: Reset writer state
+        self.len = len;
+        self.file_blocks = file_blocks;
 
         Ok(())
     }

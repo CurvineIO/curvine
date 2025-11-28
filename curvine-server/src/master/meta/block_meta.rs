@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::state::{BlockLocation, CommitBlock, WorkerAddress};
+use curvine_common::state::{BlockLocation, CommitBlock, FileAllocOpts, WorkerAddress};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
@@ -31,6 +31,7 @@ pub struct BlockMeta {
     pub(crate) replicas: u16,
     // The pre-assigned worker id is required when deleting.
     pub(crate) locs: Option<Vec<BlockLocation>>,
+    pub(crate) alloc_opts: Option<FileAllocOpts>,
 }
 
 impl BlockMeta {
@@ -40,6 +41,7 @@ impl BlockMeta {
             len,
             replicas: 1,
             locs: None,
+            alloc_opts: None,
         }
     }
 
@@ -54,6 +56,17 @@ impl BlockMeta {
             len: 0,
             replicas: 1,
             locs: Some(locs),
+            alloc_opts: None,
+        }
+    }
+
+    pub fn with_alloc(id: i64, alloc_opts: FileAllocOpts) -> Self {
+        Self {
+            id,
+            len: alloc_opts.len,
+            replicas: 0,
+            locs: None,
+            alloc_opts: Some(alloc_opts),
         }
     }
 
@@ -68,8 +81,21 @@ impl BlockMeta {
     pub fn commit(&mut self, commit: &CommitBlock) {
         self.len = self.len.max(commit.block_len);
         let _ = self.locs.take();
+        let _ = self.alloc_opts.take();
     }
 
+    pub fn assign_worker(&mut self, workers: &[WorkerAddress]) -> bool {
+        if self.alloc_opts.is_none() || self.locs.is_some() {
+            false
+        } else {
+            let locs = workers
+                .iter()
+                .map(|x| BlockLocation::with_id(x.worker_id))
+                .collect();
+            self.locs = Some(locs);
+            true
+        }
+    }
     pub fn matching_block(a: Option<&BlockMeta>, b: Option<&CommitBlock>) -> bool {
         let id_a = a.map(|x| x.id);
         let id_b = b.map(|x| x.block_id);

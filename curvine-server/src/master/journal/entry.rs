@@ -51,7 +51,7 @@ pub struct AddBlockEntry {
     pub(crate) op_ms: u64,
     pub(crate) path: String,
     pub(crate) blocks: Vec<BlockMeta>,
-    pub(crate) commit_block: Option<CommitBlock>,
+    pub(crate) commit_block: Vec<CommitBlock>,
 }
 
 // File writing is completed.

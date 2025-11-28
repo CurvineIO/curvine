@@ -126,6 +126,13 @@ macro_rules! impl_writer_for_enum {
             async fn seek(&mut self, pos: i64) -> ::curvine_common::FsResult<()> {
                 match_variants_async!(self, seek, pos)
             }
+
+            async fn resize(
+                &mut self,
+                opts: ::curvine_common::state::FileAllocOpts,
+            ) -> ::curvine_common::FsResult<()> {
+                match_variants_async!(self, resize, opts)
+            }
         }
     };
 }
