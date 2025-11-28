@@ -19,7 +19,7 @@ use curvine_client::unified::UnifiedWriter;
 use curvine_common::conf::FuseConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::FileStatus;
+use curvine_common::state::{FileAllocOpts, FileStatus};
 use curvine_common::FsResult;
 use log::error;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -33,6 +33,7 @@ enum WriteTask {
     Write(i64, Bytes, FuseResponse),
     Flush(CallSender<i8>, Option<FuseResponse>),
     Complete(CallSender<i8>, Option<FuseResponse>),
+    Resize(CallSender<i8>, FileAllocOpts),
 }
 
 pub struct FuseWriter {
@@ -90,23 +91,33 @@ impl FuseWriter {
     }
 
     pub async fn flush(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
-        let res: FsResult<()> = {
+        let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(WriteTask::Flush(rx, reply)).await?;
             tx.receive().await?;
-            Ok(())
+            Ok::<(), FsError>(())
         };
-        res.map_err(|e| self.check_error(e))
+        fun.await.map_err(|e| self.check_error(e))
     }
 
     pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
-        let res: FsResult<()> = {
+        let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(WriteTask::Complete(rx, reply)).await?;
             tx.receive().await?;
-            Ok(())
+            Ok::<(), FsError>(())
         };
-        res.map_err(|e| self.check_error(e))
+        fun.await.map_err(|e| self.check_error(e))
+    }
+
+    pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        let fun = async {
+            let (rx, tx) = CallChannel::channel();
+            self.sender.send(WriteTask::Resize(rx, opts)).await?;
+            tx.receive().await?;
+            Ok::<(), FsError>(())
+        };
+        fun.await.map_err(|e| self.check_error(e))
     }
 
     async fn writer_future(
@@ -140,6 +151,11 @@ impl FuseWriter {
                     if let Some(reply) = reply {
                         reply.send_rep(res).await?;
                     }
+                    tx.send(1)?;
+                }
+
+                WriteTask::Resize(tx, opts) => {
+                    writer.resize(opts).await?;
                     tx.send(1)?;
                 }
             }

@@ -103,13 +103,13 @@ impl FuseReader {
     }
 
     pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
-        let res: FsResult<()> = {
+        let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(ReadTask::Complete(rx, reply)).await?;
             tx.receive().await?;
-            Ok(())
+            Ok::<(), FsError>(())
         };
-        res.map_err(|e| self.check_error(e))
+        fun.await.map_err(|e| self.check_error(e))
     }
 
     async fn read_future(

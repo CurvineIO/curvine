@@ -69,7 +69,7 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    fn fuse_allocate(&self, op: FAllocate<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+    fn allocate(&self, op: FAllocate<'_>) -> impl Future<Output = FuseResult<()>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
