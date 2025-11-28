@@ -234,14 +234,13 @@ impl Writer for OpendalWriter {
     async fn complete(&mut self) -> FsResult<()> {
         self.flush().await?;
 
-        if let Some(writer) = self.writer.as_mut() {
+        if let Some(mut writer) = self.writer.take() {
             writer
                 .close()
                 .await
                 .map_err(|e| FsError::common(format!("Failed to close writer: {}", e)))?;
         }
 
-        self.writer = None;
         Ok(())
     }
 
@@ -697,30 +696,27 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         Ok(true)
     }
 
+    /// OpenDal only supports overwrite, so the overwrite parameter is ignored here.
     async fn create(&self, path: &Path, _overwrite: bool) -> FsResult<OpendalWriter> {
         let object_path = self.get_object_path(path)?;
-        // Debug: Creating file
+
         let exist = self.exists(path).await?;
-        if exist && !_overwrite {
-            return Err(FsError::common(format!(
-                "File already exists: {}",
-                path.full_path()
-            )));
+        if !exist {
+            // If no data is written to OpenDal, no file will be created.
+            // This does not conform to POSIX semantics, so an empty file is created.
+            self.operator
+                .write(&object_path, opendal::Buffer::new())
+                .await
+                .map_err(|e| {
+                    FsError::common(format!(
+                        "Failed to create empty file {}: {}",
+                        path.full_path(),
+                        e
+                    ))
+                })?;
         }
 
-        self.operator
-            .write(&object_path, opendal::Buffer::new())
-            .await
-            .map_err(|e| {
-                FsError::common(format!(
-                    "Failed to create empty file {}: {}",
-                    path.full_path(),
-                    e
-                ))
-            })?;
-
         let status = Self::write_status(path);
-
         Ok(OpendalWriter {
             operator: self.operator.clone(),
             path: path.clone(),
