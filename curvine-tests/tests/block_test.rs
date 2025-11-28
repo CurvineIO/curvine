@@ -21,11 +21,12 @@ use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::fs::Reader;
 use curvine_common::fs::Writer;
+use curvine_common::state::{FileAllocMode, FileAllocOpts};
 use curvine_tests::Testing;
 use log::info;
 use orpc::common::{LocalTime, Utils};
 use orpc::runtime::RpcRuntime;
-use orpc::{CommonError, CommonResult};
+use orpc::{err_box, CommonError, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 // Test local short-circuit read and write
@@ -408,4 +409,467 @@ async fn test_random_write(
     assert_eq!(&expect_data, data.as_bytes());
 
     Ok(())
+}
+#[test]
+fn resize_truncate_extend() -> CommonResult<()> {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.block_size = 1024 * 1024; // 1MB
+    resize_test(testing, conf, "truncate_extend")
+}
+
+#[test]
+fn resize_truncate_shrink() -> CommonResult<()> {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.block_size = 1024 * 1024; // 1MB
+    resize_test(testing, conf, "truncate_shrink")
+}
+
+#[test]
+fn resize_allocate() -> CommonResult<()> {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.short_circuit = false;
+    conf.client.block_size = 1024 * 1024; // 1MB
+    resize_test(testing, conf, "allocate")
+}
+
+fn resize_test(testing: Testing, conf: ClusterConf, test_type: &str) -> CommonResult<()> {
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    let block_size = fs.conf().client.block_size;
+
+    rt.block_on(async move {
+        let path = Path::from_str(format!("/resize_test_{}.data", test_type))?;
+
+        // Create initial file with some data
+        let initial_data = b"Hello, World!";
+        let mut writer = fs.create(&path, true).await?;
+        writer.write(initial_data).await?;
+        writer.complete().await?;
+
+        let initial_status = fs.get_status(&path).await?;
+        let initial_len = initial_status.len;
+        println!("Initial file len: {}", initial_len);
+
+        match test_type {
+            "truncate_extend" => {
+                // Test 1: truncate extends file size, creating holes
+                // Test multiple resize operations, focusing on block_size boundaries
+                let test_cases = vec![
+                    // Extend to exactly 1 block boundary
+                    (block_size, "exactly 1 block"),
+                    // Extend to 1.5 blocks
+                    (block_size + block_size / 2, "1.5 blocks"),
+                    // Extend to exactly 2 blocks
+                    (block_size * 2, "exactly 2 blocks"),
+                    // Extend to 2.5 blocks
+                    (block_size * 2 + block_size / 2, "2.5 blocks"),
+                    // Extend to exactly 3 blocks
+                    (block_size * 3, "exactly 3 blocks"),
+                ];
+
+                for (target_len, description) in test_cases {
+                    println!(
+                        "Testing truncate extend to {} ({})",
+                        target_len, description
+                    );
+                    let opts = FileAllocOpts::with_truncate(target_len);
+                    let file_blocks = test_resize(&fs, &path, opts).await?;
+
+                    // Verify file size matches target
+                    assert_eq!(
+                        file_blocks.status.len, target_len,
+                        "File size should be {} after truncate extend",
+                        target_len
+                    );
+
+                    // Verify block count matches expected
+                    let expected_blocks = (target_len + block_size - 1) / block_size;
+                    assert_eq!(
+                        file_blocks.block_locs.len() as i64,
+                        expected_blocks,
+                        "Block count should be {} for size {}",
+                        expected_blocks,
+                        target_len
+                    );
+
+                    // Verify file content is preserved
+                    let mut reader = fs.open(&path).await?;
+                    let mut buf = vec![0u8; initial_data.len()];
+                    reader.read_full(&mut buf).await?;
+                    assert_eq!(
+                        &buf[..initial_data.len()],
+                        initial_data,
+                        "Initial data should be preserved after truncate extend"
+                    );
+                }
+            }
+            "truncate_shrink" => {
+                // Test 2: truncate shrinks file size
+                // First extend file to 3 blocks
+                let extend_len = block_size * 3;
+                let extend_opts = FileAllocOpts::with_truncate(extend_len);
+                let _ = test_resize(&fs, &path, extend_opts).await?;
+
+                // Write data across blocks
+                let mut writer = fs.open_for_write(&path, false).await?;
+                let test_data = b"X".repeat(extend_len as usize);
+                writer.seek(0).await?;
+                writer.write(&test_data).await?;
+                writer.complete().await?;
+
+                // Test multiple shrink operations, focusing on block_size boundaries
+                let test_cases = vec![
+                    // Shrink to 2.5 blocks
+                    (block_size * 2 + block_size / 2, "2.5 blocks"),
+                    // Shrink to exactly 2 blocks
+                    (block_size * 2, "exactly 2 blocks"),
+                    // Shrink to 1.5 blocks
+                    (block_size + block_size / 2, "1.5 blocks"),
+                    // Shrink to exactly 1 block
+                    (block_size, "exactly 1 block"),
+                    // Shrink to half block
+                    (block_size / 2, "half block"),
+                    // Shrink to small size
+                    (100, "small size"),
+                ];
+
+                for (target_len, description) in test_cases {
+                    println!(
+                        "Testing truncate shrink to {} ({})",
+                        target_len, description
+                    );
+                    let opts = FileAllocOpts::with_truncate(target_len);
+                    let file_blocks = test_resize(&fs, &path, opts).await?;
+
+                    // Verify file size matches target
+                    assert_eq!(
+                        file_blocks.status.len, target_len,
+                        "File size should be {} after truncate shrink",
+                        target_len
+                    );
+
+                    // Verify block count matches expected
+                    let expected_blocks = if target_len == 0 {
+                        0
+                    } else {
+                        (target_len + block_size - 1) / block_size
+                    };
+                    assert_eq!(
+                        file_blocks.block_locs.len() as i64,
+                        expected_blocks,
+                        "Block count should be {} for size {}",
+                        expected_blocks,
+                        target_len
+                    );
+
+                    // Verify file content is truncated correctly
+                    let mut reader = fs.open(&path).await?;
+                    let mut buf = vec![0u8; target_len as usize];
+                    let read_len = reader.read_full(&mut buf).await?;
+                    assert_eq!(
+                        read_len, target_len as usize,
+                        "Read length should match file size"
+                    );
+                }
+            }
+            "allocate" => {
+                // Test 3: allocate pre-allocates space
+                // Test multiple allocate operations, focusing on block_size boundaries
+                let test_cases = vec![
+                    // Allocate exactly 1 block
+                    (
+                        block_size,
+                        FileAllocMode::DEFAULT,
+                        "exactly 1 block, DEFAULT mode",
+                    ),
+                    // Allocate 1.5 blocks
+                    (
+                        block_size + block_size / 2,
+                        FileAllocMode::DEFAULT,
+                        "1.5 blocks, DEFAULT mode",
+                    ),
+                    // Allocate exactly 2 blocks
+                    (
+                        block_size * 2,
+                        FileAllocMode::DEFAULT,
+                        "exactly 2 blocks, DEFAULT mode",
+                    ),
+                    // Allocate with ZERO_RANGE mode
+                    (
+                        block_size * 2 + block_size / 2,
+                        FileAllocMode::ZERO_RANGE,
+                        "2.5 blocks, ZERO_RANGE mode",
+                    ),
+                    // Allocate exactly 3 blocks
+                    (
+                        block_size * 3,
+                        FileAllocMode::DEFAULT,
+                        "exactly 3 blocks, DEFAULT mode",
+                    ),
+                ];
+
+                for (target_len, mode, description) in test_cases {
+                    println!("Testing allocate to {} ({})", target_len, description);
+                    let opts = FileAllocOpts::with_alloc(target_len, mode);
+                    let file_blocks = test_resize(&fs, &path, opts).await?;
+
+                    // Verify file size matches target (fallocate extends file size)
+                    assert_eq!(
+                        file_blocks.status.len, target_len,
+                        "File size should be {} after allocate",
+                        target_len
+                    );
+
+                    // Verify block count matches expected
+                    let expected_blocks = (target_len + block_size - 1) / block_size;
+                    assert_eq!(
+                        file_blocks.block_locs.len() as i64,
+                        expected_blocks,
+                        "Block count should be {} for size {}",
+                        expected_blocks,
+                        target_len
+                    );
+
+                    // Verify file content is preserved
+                    let mut reader = fs.open(&path).await?;
+                    let mut buf = vec![0u8; initial_data.len()];
+                    reader.read_full(&mut buf).await?;
+                    assert_eq!(
+                        &buf[..initial_data.len()],
+                        initial_data,
+                        "Initial data should be preserved after allocate"
+                    );
+                }
+            }
+            _ => {
+                return err_box!("Unknown test type: {}", test_type);
+            }
+        }
+
+        Ok::<(), FsError>(())
+    })
+    .unwrap();
+
+    Ok(())
+}
+
+/// Unified method to test resize operation
+/// Verifies the returned FileBlocks data matches expectations
+async fn test_resize(
+    fs: &CurvineFileSystem,
+    path: &Path,
+    opts: FileAllocOpts,
+) -> CommonResult<curvine_common::state::FileBlocks> {
+    let block_size = fs.conf().client.block_size;
+    fs.resize(path, opts.clone()).await?;
+    let file_blocks = fs.get_block_locations(path).await?;
+    assert_eq!(
+        file_blocks.status.len, opts.len,
+        "FileBlocks.status.len should match opts.len"
+    );
+
+    if opts.len == 0 {
+        assert_eq!(
+            file_blocks.block_locs.len(),
+            0,
+            "Empty file should have no blocks"
+        );
+    } else {
+        // Calculate expected block count
+        let expected_blocks = (opts.len + block_size - 1) / block_size;
+        assert_eq!(
+            file_blocks.block_locs.len() as i64,
+            expected_blocks,
+            "Block count should match expected for size {}",
+            opts.len
+        );
+
+        // Verify block lengths sum up correctly
+        let mut total_len = 0i64;
+        for (idx, block) in file_blocks.block_locs.iter().enumerate() {
+            let is_last = idx == file_blocks.block_locs.len() - 1;
+            let expected_block_len = if is_last {
+                // Last block may be partial
+                opts.len - total_len
+            } else {
+                block_size
+            };
+
+            assert_eq!(
+                block.block.len, expected_block_len,
+                "Block {} length should be {}",
+                idx, expected_block_len
+            );
+
+            total_len += block.block.len;
+        }
+
+        assert_eq!(
+            total_len, opts.len,
+            "Sum of block lengths should equal file size"
+        );
+    }
+
+    Ok(file_blocks)
+}
+
+#[test]
+fn resize_file_read_write() {
+    let testing = Testing::default();
+    let mut conf = testing.get_active_cluster_conf().unwrap();
+    conf.client.short_circuit = false;
+    conf.client.replicas = 1;
+    conf.client.block_size = 1024; // 1KB
+
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf)).unwrap();
+    let block_size = fs.conf().client.block_size;
+
+    rt.block_on(async {
+        let path = Path::from_str("/resize_file_read_write.data").unwrap();
+
+        let mut writer = fs.create(&path, true).await.unwrap();
+
+        let write_positions = vec![
+            (0, b"A", 100, "start of file"),
+            (
+                block_size - 100,
+                b"C",
+                100,
+                "just before block_size boundary",
+            ),
+            (block_size, b"B", 100, "block_size boundary"),
+            (block_size * 2, b"E", 100, "2 * block_size boundary"),
+            (
+                block_size + 100,
+                b"D",
+                100,
+                "just after block_size boundary",
+            ),
+            (
+                block_size * 2 + block_size / 2,
+                b"F",
+                100,
+                "middle of third block",
+            ),
+            (block_size * 3, b"G", 100, "3 * block_size boundary"),
+            (
+                block_size * 3 + block_size - 100,
+                b"H",
+                100,
+                "end of last block (must be allocated)",
+            ),
+        ];
+
+        let max_pos = write_positions
+            .iter()
+            .map(|(pos, _, len, _)| pos + *len as i64)
+            .max()
+            .unwrap_or(0);
+
+        for (pos, pattern, len, description) in &write_positions {
+            writer.seek(*pos).await.expect(description);
+            let data = pattern.repeat(*len);
+            writer.write(&data).await.expect(description);
+            writer.flush().await.expect(description);
+            println!("Wrote {} bytes at position {} ({})", len, pos, description);
+        }
+
+        writer.complete().await.unwrap();
+
+        let file_status = fs.get_status(&path).await.unwrap();
+        println!(
+            "File size: {}, max write position: {}",
+            file_status.len, max_pos
+        );
+        assert!(
+            file_status.len >= max_pos,
+            "File size should be at least {} (max write position), but got {}",
+            max_pos,
+            file_status.len
+        );
+
+        let mut reader = fs.open(&path).await.unwrap();
+        let read_buf_size = 100;
+
+        for (pos, pattern, len, description) in &write_positions {
+            reader.seek(*pos).await.unwrap();
+            let mut buf = vec![0u8; *len];
+            let read_len = reader.read_full(&mut buf).await.unwrap();
+
+            assert_eq!(
+                read_len, *len,
+                "Should read {} bytes at position {} ({}), but only read {}",
+                len, pos, description, read_len
+            );
+
+            let pattern_byte = pattern[0];
+            assert!(
+                buf[..read_len].iter().all(|&b| b == pattern_byte),
+                "Data at position {} ({}) should be all '{}' (0x{:02x}), but got: {:?}",
+                pos,
+                description,
+                pattern_byte as char,
+                pattern_byte,
+                &buf[..read_len.min(20)]
+            );
+            println!(
+                "Verified data at position {} ({}): all {} bytes are '{}'",
+                pos, description, len, pattern_byte as char
+            );
+        }
+
+        let hole_positions = vec![
+            (200, "middle of first block (after A, before C)"),
+            (block_size / 2, "middle of first block"),
+            (block_size - 200, "before C in first block"),
+            (block_size + block_size / 2, "middle of second block"),
+            (block_size + 300, "after D in second block"),
+            (
+                block_size * 2 + block_size / 4,
+                "quarter of third block (before F)",
+            ),
+            (
+                block_size * 2 + block_size / 2 + 200,
+                "after F in third block",
+            ),
+            (
+                block_size * 3 + block_size / 2,
+                "middle of fourth block (between G and H)",
+            ),
+            (block_size * 3 + 200, "after G in fourth block"),
+        ];
+
+        for (pos, description) in &hole_positions {
+            reader.seek(*pos).await.unwrap();
+
+            let mut buf = vec![0u8; read_buf_size];
+            let read_len = reader.read_full(&mut buf).await.unwrap();
+
+            if read_len == 0 {
+                println!(
+                    "Skipped hole verification at position {} ({}): no data to read",
+                    pos, description
+                );
+                continue;
+            }
+
+            assert!(
+                buf[..read_len].iter().all(|&b| b == 0),
+                "Hole at position {} ({}) should be all zeros, but got: {:?}",
+                pos,
+                description,
+                &buf[..read_len.min(20)]
+            );
+            println!(
+                "Verified hole at position {} ({}): all {} bytes are zero",
+                pos, description, read_len
+            );
+        }
+    });
 }

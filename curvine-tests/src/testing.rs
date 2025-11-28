@@ -235,7 +235,7 @@ impl TestingBuilder {
         conf.master.meta_dir = format!("{}/meta", base_path);
         conf.journal.journal_dir = format!("{}/journal", base_path);
         conf.worker.data_dir = vec![format!("{}/data", base_path)];
-        conf.master.min_block_size = 1024;
+        conf.master.min_block_size = 1;
         conf.journal.raft_tick_interval_ms = 100;
         let s3_conf_path = self
             .s3_conf_path
