@@ -35,3 +35,6 @@ pub use self::block_reader_local::BlockReaderLocal;
 
 mod block_reader_remote;
 pub use self::block_reader_remote::BlockReaderRemote;
+
+mod block_reader_hole;
+pub use self::block_reader_hole::BlockReaderHole;

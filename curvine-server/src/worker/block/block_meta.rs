@@ -17,7 +17,7 @@ use curvine_common::state::{ExtendedBlock, StorageType};
 use once_cell::sync::Lazy;
 use orpc::common::{ByteUnit, FileUtils};
 use orpc::io::{IOResult, LocalFile};
-use orpc::{err_box, try_err, CommonResult};
+use orpc::{err_box, sys, try_err, CommonResult};
 use regex::Regex;
 use std::fmt::Formatter;
 use std::path::{Path, PathBuf};
@@ -64,6 +64,7 @@ pub struct BlockMeta {
     pub(crate) len: i64,
     pub(crate) state: BlockState,
     pub(crate) dir: Arc<DirState>,
+    pub(crate) actual_len: i64,
 }
 
 impl BlockMeta {
@@ -73,25 +74,36 @@ impl BlockMeta {
             len: block_size,
             state: BlockState::Writing,
             dir: dir.state.clone(),
+            actual_len: block_size,
         }
+    }
+
+    fn get_len<P: AsRef<Path>>(path: P) -> CommonResult<(i64, i64)> {
+        let path = path.as_ref();
+        let metadata = path.metadata()?;
+        let len = metadata.len() as i64;
+        let actual_len = sys::file_actual_size(metadata)? as i64;
+
+        Ok((len, actual_len))
     }
 
     pub fn from_file(file: &str, state: BlockState, dir: &VfsDir) -> CommonResult<Self> {
         let path = Path::new(file);
-        let len = path.metadata()?.len();
         let filename = match FileUtils::filename(path) {
             None => return err_box!("Not found filename {}", file),
             Some(v) => v,
         };
 
+        let (len, actual_len) = Self::get_len(path)?;
         match BlockState::check_file(&filename) {
             None => err_box!("Not a block file {}", file),
             Some(id) => {
                 let meta = Self {
                     id,
-                    len: len as i64,
+                    len,
                     state,
                     dir: dir.state.clone(),
+                    actual_len,
                 };
 
                 Ok(meta)
@@ -103,13 +115,19 @@ impl BlockMeta {
         Self::new(block.id, block.len, dir)
     }
 
-    pub fn with_final(meta: &BlockMeta, file_size: i64) -> Self {
-        Self {
+    pub fn with_final(meta: &BlockMeta) -> CommonResult<Self> {
+        let path = meta.get_block_path()?;
+        let (len, actual_len) = Self::get_len(&path)?;
+
+        let meta = Self {
             id: meta.id,
-            len: file_size,
+            len,
             state: BlockState::Finalized,
             dir: meta.dir.clone(),
-        }
+            actual_len,
+        };
+
+        Ok(meta)
     }
 
     pub fn with_id(id: i64) -> Self {
@@ -118,6 +136,7 @@ impl BlockMeta {
             len: 0,
             state: BlockState::Finalized,
             dir: Arc::new(DirState::default()),
+            actual_len: 0,
         }
     }
 

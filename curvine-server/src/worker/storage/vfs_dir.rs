@@ -228,9 +228,7 @@ impl VfsDir {
     }
 
     pub fn finalize_block(&self, meta: &BlockMeta) -> CommonResult<BlockMeta> {
-        let tmp_file = meta.get_block_path()?;
-        let file_size = try_err!(tmp_file.metadata()).len() as i64;
-        let final_meta = BlockMeta::with_final(meta, file_size);
+        let final_meta = BlockMeta::with_final(meta)?;
         Ok(final_meta)
     }
 

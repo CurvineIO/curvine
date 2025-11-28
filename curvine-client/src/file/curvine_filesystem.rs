@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::{FsClient, FsContext, FsReader, FsWriter};
+use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOpts, CreateFileOptsBuilder, FileBlocks, FileStatus, MasterInfo, MkdirOpts,
-    MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags, SetAttrOpts,
+    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, MasterInfo,
+    MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags, SetAttrOpts,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
@@ -275,6 +275,23 @@ impl CurvineFileSystem {
 
     pub async fn get_mount_info_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         self.fs_client.get_mount_info_bytes(path).await
+    }
+
+    pub async fn resize(&self, path: &Path, opts: FileAllocOpts) -> FsResult<()> {
+        let create_opts = self.create_opts_builder().create_parent(true).build();
+        let flags = OpenFlags::new_write_only()
+            .set_create(true)
+            .set_overwrite(false);
+        let file_blocks = self
+            .fs_client
+            .open_with_opts(path, create_opts, flags)
+            .await?;
+
+        let mut writer = FsWriterBase::new(self.fs_context.clone(), path.clone(), file_blocks, 0);
+        writer.resize(opts).await?;
+        writer.complete().await?;
+
+        Ok(())
     }
 
     pub fn clone_runtime(&self) -> Arc<Runtime> {

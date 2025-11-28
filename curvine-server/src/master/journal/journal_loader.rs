@@ -137,7 +137,7 @@ impl JournalLoader {
         let _ = mem::replace(&mut file.blocks, entry.blocks);
         fs_dir
             .store
-            .apply_new_block(inode.as_ref(), entry.commit_block.as_ref())?;
+            .apply_new_block(inode.as_ref(), &entry.commit_block)?;
 
         Ok(())
     }

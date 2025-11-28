@@ -244,11 +244,20 @@ impl MasterHandler {
 
         let path = req.path;
         let client_addr = ProtoUtils::client_address_from_pb(req.client_address);
-        let previous = req.previous.map(ProtoUtils::commit_block_from_pb);
+        let commit_blocks = req
+            .commit_blocks
+            .into_iter()
+            .map(ProtoUtils::commit_block_from_pb)
+            .collect();
 
-        let located_block = self
-            .fs
-            .add_block(path, client_addr, previous, vec![], req.file_len)?;
+        let located_block = self.fs.add_block(
+            path,
+            client_addr,
+            commit_blocks,
+            req.exclude_workers,
+            req.file_len,
+            req.last_block.map(ProtoUtils::extend_block_from_pb),
+        )?;
         let rep_header = ProtoUtils::located_block_to_pb(located_block);
         ctx.response(rep_header)
     }
@@ -437,6 +446,36 @@ impl MasterHandler {
 
         ctx.response(LinkResponse::default())
     }
+
+    pub fn resize_file(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: FileResizeRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+
+        let file_blocks = self.fs.resize(
+            &header.path,
+            ProtoUtils::file_alloc_opts_from_pb(header.opts),
+        )?;
+        let rep_header = FileResizeResponse {
+            file_blocks: ProtoUtils::file_blocks_to_pb(file_blocks),
+        };
+        ctx.response(rep_header)
+    }
+
+    pub fn assign_worker(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: AssignWorkerRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+
+        let block = self.fs.assign_worker(
+            &header.path,
+            ProtoUtils::extend_block_from_pb(header.block),
+            ProtoUtils::client_address_from_pb(header.client_address),
+            header.exclude_workers,
+        )?;
+        let rep_header = AssignWorkerResponse {
+            block: ProtoUtils::located_block_to_pb(block),
+        };
+        ctx.response(rep_header)
+    }
 }
 
 impl MessageHandler for MasterHandler {
@@ -469,6 +508,8 @@ impl MessageHandler for MasterHandler {
             RpcCode::SetAttr => self.set_attr_retry_check(ctx),
             RpcCode::Symlink => self.symlink_retry_check(ctx),
             RpcCode::Link => self.link_retry_check(ctx),
+            RpcCode::ResizeFile => self.resize_file(ctx),
+            RpcCode::AssignWorker => self.assign_worker(ctx),
 
             RpcCode::Mount => self.mount(ctx),
             RpcCode::UnMount => self.umount(ctx),

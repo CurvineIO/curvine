@@ -14,6 +14,7 @@
 
 use curvine_common::proto::{BlockReadRequest, BlockWriteRequest};
 use curvine_common::state::ExtendedBlock;
+use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::message::Message;
 
@@ -24,27 +25,20 @@ pub struct WriteContext {
     pub chunk_size: i32,
     pub short_circuit: bool,
     pub off: i64,
-    pub len: i64,
+    pub block_size: i64,
 }
 
 impl WriteContext {
     pub fn from_req(msg: &Message) -> FsResult<Self> {
         let req: BlockWriteRequest = msg.parse_header()?;
 
-        // Fix: Distinguish between true append mode and random write mode
-        // In the modified client logic:
-        // - Sequential write (append): off = block.len (actual data length), len = block_capacity
-        // - Random write: off = any position, len = block_capacity
-        // Therefore, only when off == block.len (actual data length) is it true append mode
-        let block = ExtendedBlock::from_req(&req);
-
         let context = Self {
-            block,
+            block: ProtoUtils::extend_block_from_pb(req.block),
             req_id: msg.req_id(),
             chunk_size: req.chunk_size,
             short_circuit: req.short_circuit,
             off: req.off,
-            len: req.len,
+            block_size: req.block_size,
         };
 
         Ok(context)

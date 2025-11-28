@@ -15,7 +15,7 @@
 use crate::file::{FsContext, FsWriterBase, FsWriterBuffer};
 use bytes::BytesMut;
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileBlocks, FileStatus};
+use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus};
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
@@ -144,6 +144,11 @@ impl Writer for FsWriter {
         // Update current position
         self.pos = pos;
         Ok(())
+    }
+
+    async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        self.flush_chunk().await?;
+        self.inner.resize(opts).await
     }
 }
 

@@ -91,12 +91,22 @@ impl ProtoUtils {
         }
     }
 
+    pub fn client_address_to_pb(addr: ClientAddress) -> ClientAddressProto {
+        ClientAddressProto {
+            client_name: addr.client_name,
+            hostname: addr.hostname,
+            ip_addr: addr.ip_addr,
+            port: addr.port,
+        }
+    }
+
     pub fn extend_block_from_pb(block: ExtendedBlockProto) -> ExtendedBlock {
         ExtendedBlock {
             id: block.id,
             len: block.block_size,
             storage_type: StorageType::from(block.storage_type),
             file_type: FileType::from(block.file_type),
+            alloc_opts: block.alloc_opts.map(Self::file_alloc_opts_from_pb),
         }
     }
 
@@ -106,6 +116,7 @@ impl ProtoUtils {
             block_size: block.len,
             storage_type: block.storage_type.into(),
             file_type: block.file_type.into(),
+            alloc_opts: block.alloc_opts.map(Self::file_alloc_opts_to_pb),
         }
     }
 
@@ -609,5 +620,23 @@ impl ProtoUtils {
                 tags: metric.tags,
             })
             .collect()
+    }
+
+    pub fn file_alloc_opts_to_pb(opts: FileAllocOpts) -> FileAllocOptsProto {
+        FileAllocOptsProto {
+            truncate: opts.truncate,
+            off: opts.off,
+            len: opts.len,
+            mode: opts.mode.bits(),
+        }
+    }
+
+    pub fn file_alloc_opts_from_pb(opts: FileAllocOptsProto) -> FileAllocOpts {
+        FileAllocOpts {
+            truncate: opts.truncate,
+            off: opts.off,
+            len: opts.len,
+            mode: FileAllocMode::from_bits_truncate(opts.mode),
+        }
     }
 }

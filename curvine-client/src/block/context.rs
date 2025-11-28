@@ -18,7 +18,7 @@ use curvine_common::state::StorageType;
 pub struct CreateBlockContext {
     pub id: i64,
     pub off: i64,
-    pub len: i64,
+    pub block_size: i64,
     pub path: Option<String>,
     pub storage_type: StorageType,
 }

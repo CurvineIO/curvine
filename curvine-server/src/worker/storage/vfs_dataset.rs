@@ -176,7 +176,7 @@ impl Dataset for VfsDataset {
                     // Create a new block meta, where block.len represents the block size
                     let new_meta = BlockMeta::new(meta.id, block.len, dir);
 
-                    dir.release_space(meta.is_final(), meta.len);
+                    dir.release_space(meta.is_final(), meta.actual_len);
                     dir.reserve_space(false, new_meta.len);
                     self.block_map.insert(new_meta.id(), new_meta.clone());
 
@@ -224,8 +224,8 @@ impl Dataset for VfsDataset {
             );
         }
 
-        dir.release_space(false, meta.len);
-        dir.reserve_space(true, final_meta.len);
+        dir.release_space(false, meta.actual_len);
+        dir.reserve_space(true, final_meta.actual_len);
         self.block_map.insert(final_meta.id(), final_meta.clone());
 
         Ok(final_meta)
@@ -240,7 +240,7 @@ impl Dataset for VfsDataset {
         let dir = self.find_dir(meta.dir_id())?;
         let file = meta.get_block_path()?;
         try_err!(fs::remove_file(file));
-        dir.release_space(meta.is_final(), meta.len);
+        dir.release_space(meta.is_final(), meta.actual_len);
         Ok(())
     }
 
