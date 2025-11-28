@@ -76,4 +76,9 @@ impl FileStatus {
         self.storage_policy.ttl_action == TtlAction::Delete
             && LocalTime::mills() as i64 > self.atime + self.storage_policy.ttl_ms
     }
+
+    // Check if this file has hard links (nlink > 1 and is a regular file)
+    pub fn exists_links(&self) -> bool {
+        !self.is_dir && self.nlink > 1 && self.id > 0
+    }
 }
