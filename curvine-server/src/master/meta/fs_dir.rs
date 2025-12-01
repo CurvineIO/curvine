@@ -19,6 +19,7 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
+use crate::master::quota::eviction::evictor::Evictor;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
@@ -39,6 +40,7 @@ pub struct FsDir {
     pub(crate) inode_id: InodeId,
     pub(crate) store: InodeStore,
     pub(crate) journal_writer: JournalWriter,
+    pub(crate) evictor: Arc<dyn Evictor>,
 }
 
 impl FsDir {
@@ -46,6 +48,7 @@ impl FsDir {
         conf: &ClusterConf,
         journal_writer: JournalWriter,
         ttl_bucket_list: Arc<TtlBucketList>,
+        evictor: Arc<dyn Evictor>,
     ) -> FsResult<Self> {
         let db_conf = conf.meta_rocks_conf();
 
@@ -58,6 +61,7 @@ impl FsDir {
             inode_id: InodeId::new(),
             store: state,
             journal_writer,
+            evictor,
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
 
@@ -488,6 +492,8 @@ impl FsDir {
         let file = inode.as_file_mut()?;
         file.complete(len, &commit_block, client_name, only_flush)?;
 
+        self.evictor.on_access(file.id());
+
         self.store
             .apply_complete_file(inode.as_ref(), &commit_block)?;
         self.journal_writer.log_complete_file(
@@ -496,6 +502,7 @@ impl FsDir {
             inode.as_file_ref()?,
             commit_block,
         )?;
+
         Ok(true)
     }
 
@@ -504,6 +511,7 @@ impl FsDir {
         file: &InodeFile,
     ) -> FsResult<HashMap<i64, Vec<BlockLocation>>> {
         let locs = self.store.get_file_locations(file)?;
+        self.evictor.on_access(file.id());
         Ok(locs)
     }
 

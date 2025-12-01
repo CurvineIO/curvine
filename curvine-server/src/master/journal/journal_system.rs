@@ -16,7 +16,12 @@ use crate::master::fs::{MasterFilesystem, WorkerManager};
 use crate::master::journal::{JournalLoader, JournalWriter};
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::FsDir;
-use crate::master::{MasterMonitor, MetaRaftJournal, MountManager, SyncFsDir, SyncWorkerManager};
+use crate::master::quota::eviction::evictor::LRUEvictor;
+use crate::master::quota::eviction::types::EvictionPolicy;
+use crate::master::quota::eviction::EvictionConf;
+use crate::master::{
+    MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncFsDir, SyncWorkerManager,
+};
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
@@ -39,6 +44,7 @@ pub struct JournalSystem {
     raft_journal: MetaRaftJournal,
     master_monitor: MasterMonitor,
     mount_manager: Arc<MountManager>,
+    quota_manager: Arc<QuotaManager>,
 }
 
 impl JournalSystem {
@@ -49,6 +55,7 @@ impl JournalSystem {
         raft_journal: MetaRaftJournal,
         master_monitor: MasterMonitor,
         mount_manager: Arc<MountManager>,
+        quota_manager: Arc<QuotaManager>,
     ) -> Self {
         Self {
             rt,
@@ -57,6 +64,7 @@ impl JournalSystem {
             raft_journal,
             master_monitor,
             mount_manager,
+            quota_manager,
         }
     }
 
@@ -88,7 +96,20 @@ impl JournalSystem {
         // Create TTL bucket list early with configuration
         let ttl_bucket_list = Arc::new(TtlBucketList::new(conf.master.ttl_bucket_interval_ms()));
 
-        let fs_dir = SyncFsDir::new(FsDir::new(conf, journal_writer, ttl_bucket_list)?);
+        let eviction_conf = EvictionConf::from_conf(conf);
+        let evictor = match eviction_conf.policy {
+            EvictionPolicy::Lru | EvictionPolicy::Lfu | EvictionPolicy::Arc => {
+                Arc::new(LRUEvictor::new(eviction_conf.clone()))
+            }
+        };
+
+        let fs_dir = SyncFsDir::new(FsDir::new(
+            conf,
+            journal_writer,
+            ttl_bucket_list,
+            evictor.clone(),
+        )?);
+
         let fs = MasterFilesystem::new(
             conf,
             fs_dir.clone(),
@@ -97,6 +118,9 @@ impl JournalSystem {
         );
 
         let mount_manager = Arc::new(MountManager::new(fs.clone()));
+
+        let quota_manager =
+            QuotaManager::new(eviction_conf, fs.clone(), evictor.clone(), rt.clone());
 
         let raft_journal = MetaRaftJournal::new(
             rt.clone(),
@@ -113,6 +137,7 @@ impl JournalSystem {
             raft_journal,
             master_monitor,
             mount_manager,
+            quota_manager,
         );
 
         Ok(js)
@@ -147,6 +172,10 @@ impl JournalSystem {
 
     pub fn mount_manager(&self) -> Arc<MountManager> {
         self.mount_manager.clone()
+    }
+
+    pub fn quota_manager(&self) -> Arc<QuotaManager> {
+        self.quota_manager.clone()
     }
 
     // Create a snapshot manually, dedicated for testing.

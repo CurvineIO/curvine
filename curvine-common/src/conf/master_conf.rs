@@ -107,6 +107,16 @@ pub struct MasterConf {
     pub ttl_retry_interval: String,
     #[serde(skip)]
     pub ttl_retry_interval_unit: DurationUnit,
+
+    // Eviction configuration
+    pub enable_quota_eviction: bool,
+    pub quota_eviction_mode: String,
+    pub quota_eviction_policy: String,
+    pub quota_eviction_high_rate: f64,
+    pub quota_eviction_low_rate: f64,
+    pub quota_eviction_scan_page: i32,
+    pub quota_eviction_dry_run: bool,
+    pub quota_eviction_capacity: usize,
 }
 
 impl MasterConf {
@@ -252,6 +262,16 @@ impl Default for MasterConf {
 
             ttl_retry_interval: "1s".to_string(),
             ttl_retry_interval_unit: Default::default(),
+
+            // Eviction configuration defaults
+            enable_quota_eviction: false,
+            quota_eviction_mode: "free".to_string(),
+            quota_eviction_policy: "lru".to_string(),
+            quota_eviction_high_rate: 0.8,
+            quota_eviction_low_rate: 0.6,
+            quota_eviction_scan_page: 2,
+            quota_eviction_dry_run: false,
+            quota_eviction_capacity: 5_000_000, // Default: 5 million entries (~250MB)
         };
 
         conf.init().unwrap();

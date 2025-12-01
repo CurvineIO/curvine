@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::MasterFilesystem;
+use crate::master::quota::QuotaManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
 use curvine_common::error::FsError;
@@ -30,6 +31,7 @@ pub struct HeartbeatChecker {
     worker_blacklist_ms: u64,
     worker_lost_ms: u64,
     replication_manager: Arc<MasterReplicationManager>,
+    quota_manager: Arc<QuotaManager>,
 }
 
 impl HeartbeatChecker {
@@ -38,6 +40,7 @@ impl HeartbeatChecker {
         monitor: MasterMonitor,
         executor: Arc<GroupExecutor>,
         replication_manager: Arc<MasterReplicationManager>,
+        quota_manager: Arc<QuotaManager>,
     ) -> Self {
         let worker_blacklist_ms = fs.conf.worker_blacklist_interval_ms();
         let worker_lost_ms = fs.conf.worker_lost_interval_ms();
@@ -48,6 +51,7 @@ impl HeartbeatChecker {
             worker_blacklist_ms,
             worker_lost_ms,
             replication_manager,
+            quota_manager,
         }
     }
 }
@@ -60,49 +64,55 @@ impl LoopTask for HeartbeatChecker {
             return Ok(());
         }
 
-        let mut wm = self.fs.worker_manager.write();
-        let workers = wm.get_last_heartbeat();
-        let now = LocalTime::mills();
+        {
+            let mut wm = self.fs.worker_manager.write();
+            let workers = wm.get_last_heartbeat();
+            let now = LocalTime::mills();
 
-        for (id, last_update) in workers {
-            if now > last_update + self.worker_blacklist_ms {
-                // Worker blacklist timeout
-                let worker = wm.add_blacklist_worker(id);
-                warn!(
-                    "Worker {:?} has no heartbeat for more than {} ms and will be blacklisted",
-                    worker, self.worker_blacklist_ms
-                );
-            }
-
-            if now > last_update + self.worker_lost_ms {
-                // Heartbeat timeout
-                let removed = wm.remove_expired_worker(id);
-                warn!(
-                    "Worker {:?} has no heartbeat for more than {} ms and will be removed",
-                    removed, self.worker_lost_ms
-                );
-                // Asynchronously delete all block location data.
-                let fs = self.fs.clone();
-                let rm = self.replication_manager.clone();
-                let res = self.executor.spawn(move || {
-                    let spend = TimeSpent::new();
-                    let block_ids = try_log!(fs.delete_locations(id), vec![]);
-                    let block_num = block_ids.len();
-                    if let Err(e) = rm.report_under_replicated_blocks(id, block_ids) {
-                        error!(
-                            "Errors on reporting under-replicated {} blocks. err: {:?}",
-                            block_num, e
-                        );
-                    }
-                    info!(
-                        "Delete worker {} all locations used {} ms",
-                        id,
-                        spend.used_ms()
+            for (id, last_update) in workers {
+                if now > last_update + self.worker_blacklist_ms {
+                    // Worker blacklist timeout
+                    let worker = wm.add_blacklist_worker(id);
+                    warn!(
+                        "Worker {:?} has no heartbeat for more than {} ms and will be blacklisted",
+                        worker, self.worker_blacklist_ms
                     );
-                });
-                let _ = try_log!(res);
+                }
+
+                if now > last_update + self.worker_lost_ms {
+                    // Heartbeat timeout
+                    let removed = wm.remove_expired_worker(id);
+                    warn!(
+                        "Worker {:?} has no heartbeat for more than {} ms and will be removed",
+                        removed, self.worker_lost_ms
+                    );
+                    // Asynchronously delete all block location data.
+                    let fs = self.fs.clone();
+                    let rm = self.replication_manager.clone();
+                    let res = self.executor.spawn(move || {
+                        let spend = TimeSpent::new();
+                        let block_ids = try_log!(fs.delete_locations(id), vec![]);
+                        let block_num = block_ids.len();
+                        if let Err(e) = rm.report_under_replicated_blocks(id, block_ids) {
+                            error!(
+                                "Errors on reporting under-replicated {} blocks. err: {:?}",
+                                block_num, e
+                            );
+                        }
+                        info!(
+                            "Delete worker {} all locations used {} ms",
+                            id,
+                            spend.used_ms()
+                        );
+                    });
+                    let _ = try_log!(res);
+                }
             }
         }
+
+        if let Ok(info) = self.fs.master_info() {
+            self.quota_manager.detector(Some(info));
+        };
 
         Ok(())
     }

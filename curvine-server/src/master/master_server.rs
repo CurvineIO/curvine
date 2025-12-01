@@ -140,6 +140,7 @@ impl Master {
         let fs = journal_system.fs();
         let worker_manager = journal_system.worker_manager();
         let mount_manager = journal_system.mount_manager();
+        let quota_manager = journal_system.quota_manager();
 
         let rt = Arc::new(conf.master_server_conf().create_runtime());
 
@@ -150,6 +151,7 @@ impl Master {
             journal_system.master_monitor(),
             conf.master.new_executor(),
             &replication_manager,
+            quota_manager,
         );
 
         let job_manager = Arc::new(JobManager::from_cluster_conf(
