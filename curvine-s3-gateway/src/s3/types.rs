@@ -155,7 +155,6 @@ impl ChunkProcessor {
 pub struct StreamReader;
 
 impl StreamReader {
-    /// Read next chunk from input stream
     pub async fn read_next_chunk(
         body: &mut (dyn PollRead + Unpin + Send),
     ) -> Result<Option<Vec<u8>>, String> {
@@ -166,7 +165,7 @@ impl StreamReader {
 
         match chunk_result {
             Some(data) if !data.is_empty() => Ok(Some(data)),
-            Some(_) | None => Ok(None), // Empty chunk or end of stream
+            Some(_) | None => Ok(None),
         }
     }
 }
@@ -193,6 +192,31 @@ pub struct PutOperation;
 
 impl PutOperation {
     pub async fn execute(
+        context: PutContext,
+        body: &mut crate::utils::io::PollReaderEnum,
+    ) -> Result<(), String> {
+        context.log_start();
+
+        let mut writer = context.create_writer().await?;
+        let mut stats = UploadStats::new();
+
+        loop {
+            let chunk = match body.poll_read().await? {
+                Some(data) => data,
+                None => break,
+            };
+
+            ChunkProcessor::process_chunk(&chunk, &mut stats)?;
+            WriterHelper::write_chunk(&mut writer, &chunk).await?;
+        }
+
+        WriterHelper::complete_write(&mut writer).await?;
+        context.log_completion(&stats);
+
+        Ok(())
+    }
+
+    pub async fn execute_dyn(
         context: PutContext,
         body: &mut (dyn PollRead + Unpin + Send),
     ) -> Result<(), String> {
