@@ -31,18 +31,12 @@ use serde::{Deserialize, Serialize};
     Hash,
 )]
 pub enum TtlAction {
-    /// No action is performed.
     #[default]
     None = 0,
-
-    /// Try moving to slow storage such as disk
-    Move = 1,
-
-    /// Move to the underlying storage after expiration
-    Ufs = 2,
-
-    /// Delete after expiration
-    Delete = 3,
+    Delete = 1,
+    Persist = 2,
+    Evict = 3,
+    Flush = 4,
 }
 
 impl TryFrom<&str> for TtlAction {
@@ -51,10 +45,10 @@ impl TryFrom<&str> for TtlAction {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let action = match value.to_uppercase().as_str() {
             "NONE" => TtlAction::None,
-            "MOVE" => TtlAction::Move,
-            "UFS" => TtlAction::Ufs,
             "DELETE" => TtlAction::Delete,
-
+            "PERSIST" => TtlAction::Persist,
+            "EVICT" => TtlAction::Evict,
+            "FLUSH" => TtlAction::Flush,
             _ => return err_box!("invalid ttl action: {}", value),
         };
 

@@ -347,4 +347,74 @@ mod tests {
             "s3://spark/a/b/c/dt=2025/1.csv"
         );
     }
+
+    #[test]
+    fn test_bidirectional_path_conversion() {
+        // Mount config: s3://flink/user → /mnt/s3
+        let info = MountInfo {
+            ufs_path: "s3://flink/user".to_string(),
+            cv_path: "/mnt/s3".to_string(),
+            ..Default::default()
+        };
+
+        // Test 1: UFS → CV (Import) - root level file
+        let ufs_path = Path::from_str("s3://flink/user/batch_add_path_migrate_task.py").unwrap();
+        let cv_result = info.get_cv_path(&ufs_path).unwrap();
+        assert_eq!(
+            cv_result.full_path(),
+            "/mnt/s3/batch_add_path_migrate_task.py"
+        );
+
+        // Test 2: CV → UFS (Export) - root level file
+        let cv_path = Path::from_str("/mnt/s3/batch_add_path_migrate_task.py").unwrap();
+        let ufs_result = info.get_ufs_path(&cv_path).unwrap();
+        assert_eq!(
+            ufs_result.full_path(),
+            "s3://flink/user/batch_add_path_migrate_task.py"
+        );
+
+        // Test 3: UFS → CV (Import) - nested directory
+        let ufs_nested = Path::from_str("s3://flink/user/dir1/dir2/file.txt").unwrap();
+        let cv_nested = info.get_cv_path(&ufs_nested).unwrap();
+        assert_eq!(cv_nested.full_path(), "/mnt/s3/dir1/dir2/file.txt");
+
+        // Test 4: CV → UFS (Export) - nested directory
+        let cv_nested = Path::from_str("/mnt/s3/dir1/dir2/file.txt").unwrap();
+        let ufs_nested = info.get_ufs_path(&cv_nested).unwrap();
+        assert_eq!(ufs_nested.full_path(), "s3://flink/user/dir1/dir2/file.txt");
+
+        // Test 5: UFS → CV (Import) - special characters in path
+        let ufs_special =
+            Path::from_str("s3://flink/user/test_data/dt=2025-01-30/part-00000.parquet").unwrap();
+        let cv_special = info.get_cv_path(&ufs_special).unwrap();
+        assert_eq!(
+            cv_special.full_path(),
+            "/mnt/s3/test_data/dt=2025-01-30/part-00000.parquet"
+        );
+
+        // Test 6: CV → UFS (Export) - special characters in path
+        let cv_special =
+            Path::from_str("/mnt/s3/test_data/dt=2025-01-30/part-00000.parquet").unwrap();
+        let ufs_special = info.get_ufs_path(&cv_special).unwrap();
+        assert_eq!(
+            ufs_special.full_path(),
+            "s3://flink/user/test_data/dt=2025-01-30/part-00000.parquet"
+        );
+
+        // Test 7: Verify is_cv() detection
+        assert!(cv_path.is_cv());
+        assert!(!ufs_path.is_cv());
+
+        // Test 8: Round-trip conversion (UFS → CV → UFS)
+        let original_ufs = Path::from_str("s3://flink/user/data/test.csv").unwrap();
+        let to_cv = info.get_cv_path(&original_ufs).unwrap();
+        let back_to_ufs = info.get_ufs_path(&to_cv).unwrap();
+        assert_eq!(original_ufs.full_path(), back_to_ufs.full_path());
+
+        // Test 9: Round-trip conversion (CV → UFS → CV)
+        let original_cv = Path::from_str("/mnt/s3/data/test.csv").unwrap();
+        let to_ufs = info.get_ufs_path(&original_cv).unwrap();
+        let back_to_cv = info.get_cv_path(&to_ufs).unwrap();
+        assert_eq!(original_cv.full_path(), back_to_cv.full_path());
+    }
 }
