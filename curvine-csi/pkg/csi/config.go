@@ -33,19 +33,19 @@ type Config struct {
 	// CommandTimeout command execution timeout (seconds)
 	CommandTimeout int `json:"commandTimeout"`
 
-	// ConfigFile configuration file path
-	ConfigFile string `json:"configFile"`
+	// KubernetesNamespace namespace for storing mount state Secret
+	KubernetesNamespace string `json:"kubernetesNamespace"`
 }
 
 // DefaultConfig returns default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		CurvineCliPath: "/opt/curvine/bin/cv",
-		FuseBinaryPath: "/opt/curvine/bin/curvine-fuse",
-		RetryCount:     3,
-		RetryInterval:  2,
-		CommandTimeout: 30,
-		ConfigFile:     "/opt/curvine/conf/curvine-cluster.toml",
+		CurvineCliPath:      "/opt/curvine/curvine-cli",
+		FuseBinaryPath:      "/opt/curvine/curvine-fuse",
+		RetryCount:          3,
+		RetryInterval:       2,
+		CommandTimeout:      30,
+		KubernetesNamespace: "curvine-system",
 	}
 }
 
@@ -80,33 +80,8 @@ func LoadConfig(configPath string) (*Config, error) {
 
 // loadFromEnv loads configuration from environment variables
 func loadFromEnv(config *Config) *Config {
-	if path := os.Getenv("CURVINE_CLI_PATH"); path != "" {
-		config.CurvineCliPath = path
-	}
-
-	if path := os.Getenv("CURVINE_FUSE_PATH"); path != "" {
-		config.FuseBinaryPath = path
-	}
-
-	if retryCount := os.Getenv("CURVINE_RETRY_COUNT"); retryCount != "" {
-		var count int
-		if _, err := fmt.Sscanf(retryCount, "%d", &count); err == nil && count > 0 {
-			config.RetryCount = count
-		}
-	}
-
-	if retryInterval := os.Getenv("CURVINE_RETRY_INTERVAL"); retryInterval != "" {
-		var interval int
-		if _, err := fmt.Sscanf(retryInterval, "%d", &interval); err == nil && interval > 0 {
-			config.RetryInterval = interval
-		}
-	}
-
-	if commandTimeout := os.Getenv("CURVINE_COMMAND_TIMEOUT"); commandTimeout != "" {
-		var timeout int
-		if _, err := fmt.Sscanf(commandTimeout, "%d", &timeout); err == nil && timeout > 0 {
-			config.CommandTimeout = timeout
-		}
+	if namespace := os.Getenv("KUBERNETES_NAMESPACE"); namespace != "" {
+		config.KubernetesNamespace = namespace
 	}
 
 	return config

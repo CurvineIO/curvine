@@ -21,14 +21,11 @@ spec:
       tolerations:
         - key: CriticalAddonsOnly
           operator: Exists
-      #nodeSelector:
-      #  curvine-master: 'true'
-
       containers:
         - name: csi-plugin
-          image: curvine/curvine-csi:latest
+          image: curvineio/curvine-csi:latest
           imagePullPolicy: Always
-          command: ["/opt/curvine/bin/csi"]
+          command: ["/opt/curvine/csi"]
           args:
             - --endpoint=$(CSI_ENDPOINT)
             - --nodeid=$(NODE_NAME)
@@ -39,6 +36,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           livenessProbe:
             failureThreshold: 5
             httpGet:
@@ -59,9 +60,6 @@ spec:
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
-            - mountPath: /opt/curvine/conf
-              name: curvine-config
-              readOnly: true
         - args:
             - --csi-address=$(ADDRESS)
             - --timeout=60s
@@ -101,7 +99,3 @@ spec:
       volumes:
         - emptyDir: {}
           name: socket-dir
-        - name: curvine-config
-          configMap:
-            name: curvine-config
-            defaultMode: 0755

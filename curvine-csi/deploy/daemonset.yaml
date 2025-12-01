@@ -22,9 +22,9 @@ spec:
 
       containers:
         - name: csi-plugin
-          image: curvine/curvine-csi:latest
+          image: curvineio/curvine-csi:latest
           imagePullPolicy: Always
-          command: ["/opt/curvine/bin/csi"]
+          command: ["/opt/curvine/csi"]
           args:
             - --endpoint=$(CSI_ENDPOINT)
             - --nodeid=$(NODE_NAME)
@@ -35,6 +35,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           lifecycle:
             preStop:
               exec:
@@ -64,17 +68,12 @@ spec:
               name: kubelet-dir
             - mountPath: /registration
               name: registration-dir
-            - mountPath: /opt/curvine/conf
-              name: curvine-config
-              readOnly: true
         - name: node-driver-registrar
           args:
             - --csi-address=$(ADDRESS)
             - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
             - --v=5
           env:
-            - name: CURVINE_CONF_FILE
-              value: /opt/curvine/conf/curvine-cluster.toml
             - name: ADDRESS
               value: /csi/csi.sock
             - name: DRIVER_REG_SOCK_PATH
@@ -111,7 +110,3 @@ spec:
             path: /var/lib/kubelet/plugins_registry/
             type: Directory
           name: registration-dir
-        - name: curvine-config
-          configMap:
-            name: curvine-config
-            defaultMode: 0755
