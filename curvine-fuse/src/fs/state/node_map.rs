@@ -16,7 +16,7 @@ use crate::fs::state::NodeAttr;
 use crate::{err_fuse, FuseResult, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, FUSE_UNKNOWN_INO};
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::Path;
-use log::info;
+use log::{debug, info};
 use orpc::common::{FastHashMap, LocalTime};
 use orpc::sync::AtomicCounter;
 use std::collections::VecDeque;
@@ -27,6 +27,8 @@ use std::time::Duration;
 pub struct NodeMap {
     nodes: FastHashMap<u64, NodeAttr>,
     names: FastHashMap<String, u64>,
+    // record curvine inode ID to FUSE inode ID for hard link detection when fuse restart
+    linked_inode_map: FastHashMap<i64, u64>,
     id_creator: AtomicCounter,
     remember: bool,
     cache_ttl: u64,
@@ -40,6 +42,7 @@ impl NodeMap {
         Self {
             nodes,
             names: FastHashMap::default(),
+            linked_inode_map: FastHashMap::default(),
             remember: conf.remember,
             id_creator: AtomicCounter::new(FUSE_ROOT_ID),
             cache_ttl: conf.node_cache_ttl.as_millis() as u64,
@@ -148,6 +151,65 @@ impl NodeMap {
         ino
     }
 
+    // Add a hard link node with specified inode ID
+    pub fn link_node<T: AsRef<str>>(&mut self, parent: u64, name: T, ino: u64) -> FuseResult<()> {
+        let name = name.as_ref();
+        let key = Self::name_key(parent, name);
+
+        // Check if the name already exists
+        if self.names.contains_key(&key) {
+            return err_fuse!(
+                libc::EEXIST,
+                "Name already exists: parent={}, name={}",
+                parent,
+                name
+            );
+        }
+
+        // Check if the target inode exists
+        if !self.nodes.contains_key(&ino) {
+            return err_fuse!(libc::ENOENT, "Target inode {} does not exist", ino);
+        }
+
+        // Add the name mapping to the existing inode
+        self.names.insert(key, ino);
+
+        // Increment the lookup count of the target node
+        if let Some(node) = self.nodes.get_mut(&ino) {
+            node.inc_lookup();
+        }
+
+        // Update parent references
+        if let Some(p) = self.get_mut(parent) {
+            p.ref_ctr += 1;
+        }
+
+        debug!(
+            "link_node: parent={}, name={}, ino={}, registered hard link in node map",
+            parent, name, ino
+        );
+
+        Ok(())
+    }
+
+    // Register curvine inode mapping when creating a new node
+    // This helps detect whether a file exists links after FUSE restart
+    pub fn register_linked_inode(&mut self, curvine_ino: i64, fuse_ino: u64) {
+        if curvine_ino > 0 {
+            self.linked_inode_map.insert(curvine_ino, fuse_ino);
+            debug!(
+                "register_linked_inode: curvine_ino={}, fuse_ino={}",
+                curvine_ino, fuse_ino
+            );
+        }
+    }
+
+    // Check if a curvine inode is already mapped (indicates a hard link)
+    // Returns the FUSE inode ID if found
+    pub fn lookup_link_inode(&self, curvine_ino: i64) -> Option<u64> {
+        self.linked_inode_map.get(&curvine_ino).copied()
+    }
+
     // is a peer implementation of the fuse.h try_get_path function.
     pub fn try_get_path<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> FuseResult<Path> {
         let mut buf = VecDeque::new();
@@ -197,10 +259,19 @@ impl NodeMap {
             None => return Ok(()),
         };
 
-        let name_key = Self::name_key(node.parent, &node.name);
         if node.ref_ctr <= 1 && node.n_lookup <= n_lookup {
+            // Remove the node itself
             self.nodes.remove(&id);
-            self.names.remove(&name_key);
+
+            // Remove all name mappings that point to this inode to avoid stale entries
+            let keys_to_remove: Vec<String> = self
+                .names
+                .iter()
+                .filter_map(|(k, v)| if *v == id { Some(k.clone()) } else { None })
+                .collect();
+            for k in keys_to_remove {
+                self.names.remove(&k);
+            }
         } else {
             node.n_lookup = node.n_lookup.saturating_sub(n_lookup);
             node.ref_ctr = node.ref_ctr.checked_sub(1).unwrap_or(0);
@@ -266,6 +337,89 @@ impl NodeMap {
     fn delete_node(&mut self, node: &NodeAttr) {
         self.names.remove(&Self::name_key(node.parent, &node.name));
         self.nodes.remove(&node.id);
+    }
+
+    // Remove a single name mapping (parent,name) without deleting the inode itself.
+    // Used for unlink operations where only the directory entry is removed.
+    // If the removed name is the primary name in the node, update it to another valid name.
+    pub fn remove_name<T: AsRef<str>>(&mut self, parent: u64, name: T) {
+        let name_str = name.as_ref();
+        let key = Self::name_key(parent, name_str);
+
+        // Get the nodeid before removing
+        if let Some(nodeid) = self.names.get(&key).copied() {
+            // Remove the name mapping
+            self.names.remove(&key);
+
+            info!(
+                "remove_name: removed mapping (parent={}, name='{}') -> nodeid={}",
+                parent, name_str, nodeid
+            );
+
+            // Check if this was the primary name in the node
+            let needs_update = self
+                .nodes
+                .get(&nodeid)
+                .map(|node| node.name == name_str && node.parent == parent)
+                .unwrap_or(false);
+
+            if needs_update {
+                info!(
+                    "remove_name: '{}' was primary name for nodeid={}, finding alternative",
+                    name_str, nodeid
+                );
+
+                // Find another valid name for this nodeid
+                let mut new_parent_name = None;
+                for (other_key, &other_nid) in self.names.iter() {
+                    if other_nid == nodeid {
+                        // Parse the key to extract parent and name
+                        if let Some((new_parent, new_name)) = Self::parse_name_key(other_key) {
+                            new_parent_name = Some((new_parent, new_name));
+                            break;
+                        }
+                    }
+                }
+
+                // Update the node with the new parent and name
+                if let Some((new_parent, new_name)) = new_parent_name {
+                    if let Some(node) = self.nodes.get_mut(&nodeid) {
+                        node.parent = new_parent;
+                        node.name = new_name.clone();
+                        info!("remove_name: updated nodeid={} to use alternative name='{}' in parent={}", 
+                              nodeid, new_name, new_parent);
+                    }
+                } else {
+                    info!(
+                        "remove_name: no alternative name found for nodeid={}, keeping stale name",
+                        nodeid
+                    );
+                }
+            }
+        } else {
+            info!(
+                "remove_name: no mapping found for (parent={}, name='{}')",
+                parent, name_str
+            );
+        }
+    }
+
+    // Helper function to parse a name key back into (parent_id, name)
+    fn parse_name_key(key: &str) -> Option<(u64, String)> {
+        // The key format is "{parent_id}{name}"
+        // We need to find where the parent_id ends and name begins
+
+        // Try to parse increasing prefixes as parent_id
+        for i in 1..=key.len() {
+            if let Ok(parent_id) = key[..i].parse::<u64>() {
+                // Check if there's a name part after the parent_id
+                if i < key.len() {
+                    let name = key[i..].to_string();
+                    return Some((parent_id, name));
+                }
+            }
+        }
+        None
     }
 
     pub fn clean_cache(&mut self) {

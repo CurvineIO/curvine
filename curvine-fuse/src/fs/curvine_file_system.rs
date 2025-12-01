@@ -1061,7 +1061,14 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn unlink(&self, op: Unlink<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+
         self.fs.delete(&path, false).await?;
+        self.state.unlink_name(op.header.nodeid, name);
+
+        debug!(
+            "unlink: removed name mapping for parent={}, name={}",
+            op.header.nodeid, name
+        );
 
         Ok(())
     }
@@ -1074,6 +1081,11 @@ impl fs::FileSystem for CurvineFileSystem {
         let src_path = self.state.get_path(oldnodeid)?;
         let src_status = self.fs_get_status(&src_path).await?;
 
+        debug!(
+            "link: src_path={}, des_path={}, oldnodeid={}, parent={}",
+            src_path, des_path, oldnodeid, op.header.nodeid
+        );
+
         if self.fs.exists(&des_path).await? {
             return err_fuse!(libc::EEXIST, "File already exists: {}", des_path);
         }
@@ -1083,13 +1095,12 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         self.fs.link(&src_path, &des_path).await?;
-
-        let entry = self
+        self.state.link_node(op.header.nodeid, name, oldnodeid)?;
+        let attr = self
             .lookup_path(op.header.nodeid, Some(name), &des_path)
             .await?;
-        //entry.ino = oldnodeid;
-        let result = Self::create_entry_out(&self.conf, entry);
 
+        let result = Self::create_entry_out(&self.conf, attr);
         Ok(result)
     }
 
