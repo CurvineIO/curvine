@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: curvine-statefulset
+  namespace: curvine-system
+spec:
+  serviceName: curvine-service
+  replicas: 3
+  selector:
+    matchLabels:
+      app: curvine-stateful
+  template:
+    metadata:
+      labels:
+        app: curvine-stateful
+    spec:
+      containers:
+        - name: web-server
+          image: nginx:stable-alpine
+          ports:
+            - containerPort: 80
+              name: http
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/nginx/html
+          command: ["/bin/sh"]
+          args:
+            - -c
+            - |
+              POD_NAME=$(hostname)
+              echo "Pod: $POD_NAME" > /usr/share/nginx/html/index.html
+              echo "Timestamp: $(date)" >> /usr/share/nginx/html/index.html
+              echo "PVC: data-$POD_NAME" >> /usr/share/nginx/html/index.html
+              exec nginx -g 'daemon off;'
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: curvine-sc
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: curvine-service
+  namespace: curvine-system
+spec:
+  clusterIP: None
+  selector:
+    app: curvine-stateful
+  ports:
+    - port: 80
+      name: http
+

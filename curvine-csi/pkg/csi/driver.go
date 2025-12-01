@@ -41,31 +41,24 @@ type Driver struct {
 
 	srv      *grpc.Server
 	endpoint string
-	config   *Config
 }
 
 // NewDriver creates a new driver
-func NewDriver(endpoint string, nodeID string, configPath string) *Driver {
+func NewDriver(endpoint string, nodeID string) *Driver {
 	// Generate request ID for log tracking
 	requestID := generateRequestID()
 	klog.Infof("RequestID: %s, Initializing driver: %v version %v commit %v date %v",
 		requestID, DriverName, driverVersion, gitCommit, buildDate)
 
-	// Load configuration
-	config, err := LoadConfig(configPath)
+	nodeSvc, err := newNodeService(nodeID)
 	if err != nil {
-		klog.Warningf("RequestID: %s, Failed to load config from %s: %v, using default config",
-			requestID, configPath, err)
-		config = DefaultConfig()
+		klog.Fatalf("Failed to create node service: %v", err)
 	}
-
-	klog.Infof("RequestID: %s, Driver config: %+v", requestID, config)
 
 	return &Driver{
 		endpoint:          endpoint,
-		config:            config,
-		controllerService: newControllerService(config),
-		nodeService:       newNodeService(nodeID, config),
+		controllerService: newControllerService(),
+		nodeService:       nodeSvc,
 	}
 }
 
@@ -225,6 +218,15 @@ func (d *Driver) Run() error {
 
 	klog.Infof("RequestID: %s, Listening for connections on address: %#v", requestID, listener.Addr())
 	return d.srv.Serve(listener)
+}
+
+// Stop stops the driver gracefully
+func (d *Driver) Stop() {
+	klog.Infof("Stopping driver...")
+	if d.srv != nil {
+		d.srv.GracefulStop()
+	}
+	klog.Infof("Driver stopped")
 }
 
 func ParseEndpoint(endpoint string) (string, string, error) {

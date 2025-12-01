@@ -118,6 +118,37 @@ curvine-csi:
 	@echo "Building curvine-csi Docker image..."
 	docker build --build-arg GOPROXY=https://goproxy.cn,direct -t curvine-csi:latest -f curvine-csi/Dockerfile .
 
+# Tag and push curvine-csi image to private registry
+.PHONY: curvine-csi-push
+curvine-csi-push: curvine-csi
+	@echo "Tagging and pushing curvine-csi image to private registry..."
+	docker tag curvine-csi:latest curvineio/curvine-csi:latest
+	docker push curvineio/curvine-csi:latest
+	@echo "✓ Image pushed successfully: curvineio/curvine-csi:latest"
+
+# Quick iteration build for CSI development (only rebuilds CSI binary)
+# Prerequisite: curvine-csi:latest must exist (run 'make curvine-csi' first)
+.PHONY: curvine-csi-quick
+curvine-csi-quick:
+	@echo "Quick building curvine-csi (CSI binary only)..."
+	@if ! docker image inspect curvine-csi:latest >/dev/null 2>&1; then \
+		echo "Error: Base image curvine-csi:latest not found. Please run 'make curvine-csi' first."; \
+		exit 1; \
+	fi
+	@echo "Building CSI binary locally..."
+	@cd curvine-csi && GOPROXY=https://goproxy.cn,direct go build -o csi-binary main.go || exit 1
+	@echo "Building Docker image with new CSI binary..."
+	docker build -t curvine-csi:latest -f curvine-csi/Dockerfile.quick .
+	@rm -f curvine-csi/csi-binary
+
+# Quick iteration build and push
+.PHONY: curvine-csi-quick-push
+curvine-csi-quick-push: curvine-csi-quick
+	@echo "Tagging and pushing quick-built curvine-csi image to private registry..."
+	docker tag curvine-csi:latest curvineio/curvine-csi:latest
+	docker push curvineio/curvine-csi:latest
+	@echo "✓ Quick-built image pushed successfully: curvineio/curvine-csi:latest"
+
 # 7. HDFS-specific builds
 .PHONY: build-hdfs build-webhdfs setup-hdfs
 
