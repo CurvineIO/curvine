@@ -5,6 +5,17 @@
 
 set -e
 
+# Parse command line arguments
+SKIP_JAVA_SDK=0
+for arg in "$@"; do
+    case $arg in
+        --skip-java-sdk)
+            SKIP_JAVA_SDK=1
+            shift
+            ;;
+    esac
+done
+
 # Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -136,17 +147,22 @@ else
     print_status "FAIL" "Protobuf compiler (protoc) not found. Please install Protobuf version 3.0.0 or later" "PROTOBUF"
 fi
 
-# Check Maven (version 3.8 or later)
-echo -e "${BLUE}Checking Maven...${NC}"
-if command -v mvn >/dev/null 2>&1; then
-    MAVEN_VERSION=$(mvn --version | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-    if version_compare "$MAVEN_VERSION" "3.8.0"; then
-        print_status "OK" "Maven $MAVEN_VERSION (>= 3.8.0 required)"
+# Check Maven (version 3.8 or later) - skip if --skip-java-sdk is set
+if [ $SKIP_JAVA_SDK -eq 0 ]; then
+    echo -e "${BLUE}Checking Maven...${NC}"
+    if command -v mvn >/dev/null 2>&1; then
+        MAVEN_VERSION=$(mvn --version | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        if version_compare "$MAVEN_VERSION" "3.8.0"; then
+            print_status "OK" "Maven $MAVEN_VERSION (>= 3.8.0 required)"
+        else
+            print_status "FAIL" "Maven $MAVEN_VERSION found, but version 3.8.0 or later is required" "MAVEN"
+        fi
     else
-        print_status "FAIL" "Maven $MAVEN_VERSION found, but version 3.8.0 or later is required" "MAVEN"
+        print_status "FAIL" "Maven not found. Please install Maven version 3.8.0 or later" "MAVEN"
     fi
 else
-    print_status "FAIL" "Maven not found. Please install Maven version 3.8.0 or later" "MAVEN"
+    echo -e "${BLUE}Checking Maven...${NC}"
+    print_status "OK" "Maven check skipped (--skip-java-sdk enabled)"
 fi
 
 # Check LLVM (version 12 or later)
@@ -221,27 +237,32 @@ else
     print_status "WARN" "FUSE development package not found. FUSE module will be skipped during compilation"
 fi
 
-# Check JDK (version 1.8 or later)
-echo -e "${BLUE}Checking JDK...${NC}"
-if command -v javac >/dev/null 2>&1; then
-    JAVA_VERSION=$(javac -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-    if [ -z "$JAVA_VERSION" ]; then
-        # Handle newer Java versions (9+) that use different versioning
-        JAVA_VERSION=$(javac -version 2>&1 | grep -oE '[0-9]+' | head -n1)
-        if [ -n "$JAVA_VERSION" ] && [ "$JAVA_VERSION" -ge 8 ]; then
-            print_status "OK" "JDK $JAVA_VERSION (>= 1.8.0 required)"
+# Check JDK (version 1.8 or later) - skip if --skip-java-sdk is set
+if [ $SKIP_JAVA_SDK -eq 0 ]; then
+    echo -e "${BLUE}Checking JDK...${NC}"
+    if command -v javac >/dev/null 2>&1; then
+        JAVA_VERSION=$(javac -version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        if [ -z "$JAVA_VERSION" ]; then
+            # Handle newer Java versions (9+) that use different versioning
+            JAVA_VERSION=$(javac -version 2>&1 | grep -oE '[0-9]+' | head -n1)
+            if [ -n "$JAVA_VERSION" ] && [ "$JAVA_VERSION" -ge 8 ]; then
+                print_status "OK" "JDK $JAVA_VERSION (>= 1.8.0 required)"
+            else
+                print_status "FAIL" "JDK version could not be determined or is too old" "JDK"
+            fi
         else
-            print_status "FAIL" "JDK version could not be determined or is too old" "JDK"
+            if version_compare "$JAVA_VERSION" "1.8.0"; then
+                print_status "OK" "JDK $JAVA_VERSION (>= 1.8.0 required)"
+            else
+                print_status "FAIL" "JDK $JAVA_VERSION found, but version 1.8.0 or later is required" "JDK"
+            fi
         fi
     else
-        if version_compare "$JAVA_VERSION" "1.8.0"; then
-            print_status "OK" "JDK $JAVA_VERSION (>= 1.8.0 required)"
-        else
-            print_status "FAIL" "JDK $JAVA_VERSION found, but version 1.8.0 or later is required" "JDK"
-        fi
+        print_status "FAIL" "JDK not found. Please install JDK version 1.8.0 or later" "JDK"
     fi
 else
-    print_status "FAIL" "JDK not found. Please install JDK version 1.8.0 or later" "JDK"
+    echo -e "${BLUE}Checking JDK...${NC}"
+    print_status "OK" "JDK check skipped (--skip-java-sdk enabled)"
 fi
 
 # Check npm (version 9 or later)
