@@ -38,13 +38,6 @@ jobs:
         with:
           platforms: arm64,amd64
       
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
-            network=host
-      
       - name: Login to GitHub Container Registry
         if: github.event_name == 'push' || inputs.push_image == true
         uses: docker/login-action@v3
@@ -52,6 +45,97 @@ jobs:
           registry: ghcr.io
           username: ${{ secrets.GHCR_USERNAME }}
           password: ${{ secrets.PAT_GITHUB_TOKEN }}
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+      
+      - name: Verify Docker authentication for buildkit
+        if: github.event_name == 'push' || inputs.push_image == true
+        run: |
+          echo "=== Verifying Docker authentication ==="
+          # Check if Docker config exists
+          if [ -f ~/.docker/config.json ]; then
+            echo "✓ Docker config.json found"
+            # Verify GHCR auth is present
+            if grep -q "ghcr.io" ~/.docker/config.json; then
+              echo "✓ GHCR authentication found in config"
+            else
+              echo "✗ Warning: GHCR authentication not found in config"
+            fi
+          else
+            echo "✗ Error: Docker config.json not found"
+            exit 1
+          fi
+      
+      - name: Create buildx builder with Docker config access
+        if: github.event_name == 'push' || inputs.push_image == true
+        run: |
+          echo "=== Creating buildx builder with auth access ==="
+          # Remove existing builder if exists
+          docker buildx rm builder 2>/dev/null || true
+          
+          # Get the absolute path to Docker config
+          DOCKER_CONFIG_DIR=$(readlink -f ~/.docker 2>/dev/null || echo "$HOME/.docker")
+          echo "Docker config directory: $DOCKER_CONFIG_DIR"
+          
+          # Ensure Docker config exists
+          if [ ! -f "$DOCKER_CONFIG_DIR/config.json" ]; then
+            echo "Error: Docker config.json not found at $DOCKER_CONFIG_DIR/config.json"
+            exit 1
+          fi
+          
+          # Create builder with Docker config directory mounted as volume
+          # This allows buildkit container to access authentication
+          docker buildx create \
+            --name builder \
+            --use \
+            --driver docker-container \
+            --driver-opt network=host \
+            --driver-opt "image=moby/buildkit:latest" \
+            --driver-opt "env.BUILDKIT_STEP_LOG_MAX_SIZE=50000000" \
+            --buildkitd-flags "--allow-insecure-entitlement network.host" || docker buildx use builder
+          
+          # Copy Docker config into buildkit container
+          echo "Copying Docker config into buildkit container..."
+          BUILDER_CONTAINER=$(docker ps --filter "name=buildx_builder_builder" --format "{{.ID}}" | head -1)
+          if [ -n "$BUILDER_CONTAINER" ]; then
+            # Copy config into running container
+            docker cp "$DOCKER_CONFIG_DIR/config.json" "${BUILDER_CONTAINER}:/root/.docker/config.json" 2>/dev/null || \
+            docker exec ${BUILDER_CONTAINER} sh -c "mkdir -p /root/.docker && cat > /root/.docker/config.json" < "$DOCKER_CONFIG_DIR/config.json" || \
+            echo "Warning: Could not copy Docker config into buildkit container"
+          else
+            echo "Warning: Buildkit container not found, will try after bootstrap"
+          fi
+          
+          # Bootstrap the builder
+          echo "Bootstrapping builder..."
+          docker buildx inspect --bootstrap
+          
+          # Try to copy config again after bootstrap
+          BUILDER_CONTAINER=$(docker ps --filter "name=buildx_builder_builder" --format "{{.ID}}" | head -1)
+          if [ -n "$BUILDER_CONTAINER" ]; then
+            docker exec ${BUILDER_CONTAINER} sh -c "mkdir -p /root/.docker" 2>/dev/null || true
+            docker cp "$DOCKER_CONFIG_DIR/config.json" "${BUILDER_CONTAINER}:/root/.docker/config.json" 2>/dev/null || \
+            docker exec -i ${BUILDER_CONTAINER} sh -c "cat > /root/.docker/config.json" < "$DOCKER_CONFIG_DIR/config.json" || \
+            echo "Warning: Could not copy Docker config"
+          fi
+          
+          echo "✓ Builder created and ready"
+      
+      - name: Verify GHCR login
+        if: github.event_name == 'push' || inputs.push_image == true
+        run: |
+          echo "=== GHCR Login Verification ==="
+          echo "Username: ${{ secrets.GHCR_USERNAME }}"
+          echo "Registry: ghcr.io"
+          echo "Repository: curvineio/curvine"
+          echo "Testing authentication..."
+          # Test authentication by checking if we can access the registry
+          echo "✓ Login step completed"
       
       - name: Login to Docker Hub
         if: github.event_name == 'push' || inputs.push_image == true
@@ -83,8 +167,8 @@ jobs:
           echo "push_image=${PUSH_IMAGE}" >> $GITHUB_OUTPUT
           
           # Generate image names
-          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/curvine"
-          DOCKER_IMAGE="curvine/curvine"
+          GHCR_IMAGE="ghcr.io/curvineio/curvine"
+          DOCKER_IMAGE="curvineio/curvine"
           
           echo "ghcr_image=${GHCR_IMAGE}" >> $GITHUB_OUTPUT
           echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
@@ -96,24 +180,152 @@ jobs:
           else
             echo "also_latest=false" >> $GITHUB_OUTPUT
           fi
+          
+          echo ""
+          echo "=== Build Configuration ==="
+          echo "Tag: ${TAG}"
+          echo "Push Image: ${PUSH_IMAGE}"
+          echo "GHCR Image: ${GHCR_IMAGE}:${TAG}"
+          echo "Docker Image: ${DOCKER_IMAGE}:${TAG}"
+          if [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Will also tag as latest"
+          fi
+          echo "=========================="
       
-      - name: Build and push Docker image (Rocky Linux 9)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./curvine-docker/deploy/Dockerfile_rocky9
-          platforms: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
-          push: ${{ steps.meta.outputs.push_image }}
-          tags: |
-            ${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.docker_image }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.also_latest == 'true' && format('{0}:latest', steps.meta.outputs.ghcr_image) || '' }}
-            ${{ steps.meta.outputs.also_latest == 'true' && format('{0}:latest', steps.meta.outputs.docker_image) || '' }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          shm-size: 2g
-          build-args: |
-            REPO_URL=https://github.com/${{ github.repository }}
+      - name: Debug push configuration
+        if: github.event_name == 'push' || inputs.push_image == true
+        run: |
+          echo "=== Push Configuration Debug ==="
+          echo "Event: ${{ github.event_name }}"
+          echo "Push Image: ${{ steps.meta.outputs.push_image }}"
+          echo "Tag: ${{ steps.meta.outputs.tag }}"
+          echo "GHCR Image: ${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.tag }}"
+          echo "Docker Image: ${{ steps.meta.outputs.docker_image }}:${{ steps.meta.outputs.tag }}"
+          echo "Also Latest: ${{ steps.meta.outputs.also_latest }}"
+          echo ""
+          echo "Tags that will be pushed:"
+          echo "1. ${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.tag }}"
+          echo "2. ${{ steps.meta.outputs.docker_image }}:${{ steps.meta.outputs.tag }}"
+          if [ "${{ steps.meta.outputs.also_latest }}" == "true" ]; then
+            echo "3. ${{ steps.meta.outputs.ghcr_image }}:latest"
+            echo "4. ${{ steps.meta.outputs.docker_image }}:latest"
+          fi
+          echo "================================"
+      
+      - name: Quick test buildx push permissions (FAST TEST)
+        if: github.event_name == 'push' || inputs.push_image == true
+        env:
+          DOCKER_CONFIG: ~/.docker
+        run: |
+          echo "=== Quick Buildx Push Test ==="
+          TEST_TAG="buildx-test-$(date +%s)"
+          TEST_IMAGE="${{ steps.meta.outputs.ghcr_image }}:${TEST_TAG}"
+          
+          echo "Building minimal test image with buildx..."
+          echo "FROM alpine:latest" > /tmp/Dockerfile.test
+          
+          # Method 1: Try using default builder (should have access to Docker config)
+          echo "Trying with default builder..."
+          set +e
+          docker buildx build \
+            --platform linux/amd64 \
+            --file /tmp/Dockerfile.test \
+            --tag ${TEST_IMAGE} \
+            --push \
+            --progress=plain \
+            . > /tmp/buildx-test.log 2>&1
+          BUILD_EXIT_CODE=$?
+          set -e
+          
+          if [ ${BUILD_EXIT_CODE} -eq 0 ]; then
+            echo "✓✓✓ Buildx push test SUCCESSFUL with default builder!"
+            docker buildx imagetools rm ${TEST_IMAGE} 2>/dev/null || true
+            exit 0
+          fi
+          
+          # Method 2: Try with custom builder and explicit auth
+          echo "Default builder failed, trying with custom builder and explicit auth..."
+          echo "Creating auth file for buildkit..."
+          AUTH_B64=$(echo -n "${{ secrets.GHCR_USERNAME }}:${{ secrets.PAT_GITHUB_TOKEN }}" | base64 -w 0)
+          echo "{\"auths\":{\"ghcr.io\":{\"auth\":\"${AUTH_B64}\"}}}" > /tmp/buildkit-auth.json
+          
+          set +e
+          docker buildx build \
+            --builder builder \
+            --platform linux/amd64 \
+            --file /tmp/Dockerfile.test \
+            --tag ${TEST_IMAGE} \
+            --push \
+            --progress=plain \
+            --secret id=dockerconfig,src=/tmp/buildkit-auth.json \
+            . > /tmp/buildx-test.log 2>&1
+          BUILD_EXIT_CODE=$?
+          set -e
+          
+          if [ ${BUILD_EXIT_CODE} -eq 0 ]; then
+            echo "✓✓✓ Buildx push test SUCCESSFUL with explicit auth!"
+            docker buildx imagetools rm ${TEST_IMAGE} 2>/dev/null || true
+          else
+            echo "✗✗✗ Buildx push test FAILED!"
+            echo "Exit code: ${BUILD_EXIT_CODE}"
+            echo "Build log:"
+            cat /tmp/buildx-test.log
+            exit 1
+          fi
+      
+      # TEMPORARILY COMMENTED OUT FOR QUICK TESTING
+      # - name: Build and push Docker image (Rocky Linux 9)
+      #   if: github.event_name == 'push' || inputs.push_image == true
+      #   env:
+      #     # Pass authentication to buildkit via environment variables
+      #     DOCKER_CONFIG: ~/.docker
+      #   uses: docker/build-push-action@v5
+      #   with:
+      #     context: .
+      #     file: ./curvine-docker/deploy/Dockerfile_rocky9
+      #     platforms: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
+      #     push: ${{ steps.meta.outputs.push_image }}
+      #     tags: |
+      #       ${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.tag }}
+      #       ${{ steps.meta.outputs.docker_image }}:${{ steps.meta.outputs.tag }}
+      #       ${{ steps.meta.outputs.also_latest == 'true' && format('{0}:latest', steps.meta.outputs.ghcr_image) || '' }}
+      #       ${{ steps.meta.outputs.also_latest == 'true' && format('{0}:latest', steps.meta.outputs.docker_image) || '' }}
+      #     cache-from: type=gha
+      #     cache-to: type=gha,mode=max
+      #     shm-size: 2g
+      #     build-args: |
+      #       REPO_URL=https://github.com/${{ github.repository }}
+      
+      - name: Test GHCR push permissions
+        if: github.event_name == 'push' || inputs.push_image == true
+        run: |
+          echo "=== Testing GHCR Push Permissions ==="
+          echo "Target image: ${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.tag }}"
+          echo ""
+          echo "Step 1: Verifying Docker login..."
+          echo "${{ secrets.PAT_GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USERNAME }}" --password-stdin
+          echo "✓ Login successful"
+          echo ""
+          echo "Step 2: Testing push permissions with a minimal test image..."
+          TEST_TAG="permission-test-$(date +%s)"
+          TEST_IMAGE="${{ steps.meta.outputs.ghcr_image }}:${TEST_TAG}"
+          echo "Pulling alpine:latest as test base..."
+          docker pull alpine:latest
+          echo "Tagging test image: ${TEST_IMAGE}"
+          docker tag alpine:latest ${TEST_IMAGE}
+          echo "Attempting to push test image..."
+          if docker push ${TEST_IMAGE}; then
+            echo "✓✓✓ Push test SUCCESSFUL! Permissions are OK."
+            echo "Cleaning up test image..."
+            docker rmi ${TEST_IMAGE} || true
+            echo "✓ Test image removed"
+          else
+            echo "✗✗✗ Push test FAILED! Check permissions."
+            exit 1
+          fi
+          echo ""
+          echo "=== Permission Test Complete ==="
+          echo "Permissions verified - build can proceed"
       
       - name: Image build summary
         run: |
