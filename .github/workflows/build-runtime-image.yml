@@ -46,7 +46,7 @@ jobs:
             network=host
       
       - name: Login to GitHub Container Registry
-        if: github.event_name == 'push' || inputs.push_image == true
+        # Always login to pull base image, even if not pushing
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -83,7 +83,7 @@ jobs:
           echo "push_image=${PUSH_IMAGE}" >> $GITHUB_OUTPUT
           
           # Generate image names
-          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/curvine"
+          GHCR_IMAGE="ghcr.io/curvineio/curvine"
           DOCKER_IMAGE="curvine/curvine"
           
           echo "ghcr_image=${GHCR_IMAGE}" >> $GITHUB_OUTPUT
