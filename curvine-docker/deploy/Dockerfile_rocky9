@@ -6,11 +6,6 @@ ARG REPO_URL=https://github.com/curvineio/curvine
 LABEL org.opencontainers.image.source="${REPO_URL}"
 LABEL org.opencontainers.image.description="Curvine Native Kubernetes Runtime Image"
 
-# This Dockerfile is specifically for source code compilation
-
-# 1. Install the basic toolchain and dependencies
-# Note: curl-minimal is already installed in base image, conflicts with curl
-# Note: ca-certificates is already installed in base image
 RUN dnf install -y \
     fuse3 \
     fuse3-devel \
@@ -49,23 +44,13 @@ RUN mkdir -p /app/protoc && cd /app/protoc && \
     chmod +x bin/protoc && \
     rm -f *.zip
 
-# 4. Install Maven
-RUN cd /app && \
-    curl -k -LO https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz && \
-    tar -xzf apache-maven-3.9.11-bin.tar.gz && \
-    mv apache-maven-3.9.11 maven && \
-    rm -f *.tar.gz
-
-# 5. Copy and apply build configurations
-COPY curvine-docker/deploy/settings.xml /build-config/settings.xml
+# 4. Copy and apply build configurations
 COPY curvine-docker/deploy/config /build-config/config
-RUN mkdir -p /app/maven/conf && \
-    cp /build-config/settings.xml /app/maven/conf/settings.xml && \
-    mkdir -p /root/.cargo && \
+RUN mkdir -p /root/.cargo && \
     cp /build-config/config /root/.cargo/config.toml
 
 # Set environment variables for build
-ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
+ENV PATH="/root/.cargo/bin:/app/protoc/bin:${PATH}"
 
 # Copy and build source code if building from source
 COPY . /workspace/
@@ -99,12 +84,12 @@ RUN echo "Building Curvine from source..." && \
     mkdir -p /workspace/tmp && \
     export TMPDIR=/workspace/tmp && \
     echo "Using TMPDIR=$TMPDIR for compilation temporary files" && \
-    echo "Running 'make all' with retry mechanism..." && \
-    # Build with retry mechanism for Maven failures
+    echo "Running 'make all --skip-java-sdk' with retry mechanism..." && \
+    # Build with retry mechanism
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all; then \
-            echo "✓ Build succeeded with 'make all'" && \
+        if make all ARGS='--skip-java-sdk'; then \
+            echo "✓ Build succeeded with 'make all --skip-java-sdk'" && \
             break; \
         else \
             echo "✗ Build attempt $attempt failed" && \
@@ -146,7 +131,6 @@ FROM rockylinux:9
 
 RUN dnf install -y \
     fuse3 \
-    java-1.8.0-openjdk-headless \
     && dnf clean all \
     && rm -rf /var/cache/dnf/*
 
