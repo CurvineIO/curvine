@@ -153,6 +153,7 @@ RUN mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sou
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fuse3 \
     libfuse3-3 \
+    procps \
     openjdk-8-jre-headless \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \

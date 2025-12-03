@@ -131,6 +131,7 @@ FROM rockylinux:9
 
 RUN dnf install -y \
     fuse3 \
+    procps-ng \
     && dnf clean all \
     && rm -rf /var/cache/dnf/*
 
