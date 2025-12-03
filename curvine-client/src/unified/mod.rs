@@ -14,7 +14,6 @@
 
 use crate::file::{FsReader, FsWriter};
 use crate::impl_filesystem_for_enum;
-use crate::*;
 use crate::{impl_reader_for_enum, impl_writer_for_enum};
 use curvine_common::fs::Path;
 use curvine_common::state::MountInfo;
@@ -41,24 +40,45 @@ pub enum UnifiedWriter {
     Cv(FsWriter),
 
     #[cfg(feature = "opendal")]
-    OpenDAL(OpendalWriter),
+    Opendal(OpendalWriter),
 }
 
-impl_writer_for_enum!(UnifiedWriter);
+impl_writer_for_enum! {
+    enum UnifiedWriter {
+        Cv(FsWriter),
+
+        #[cfg(feature = "opendal")]
+        Opendal(OpendalWriter),
+    }
+}
 
 pub enum UnifiedReader {
     Cv(FsReader),
 
     #[cfg(feature = "opendal")]
-    OpenDAL(OpendalReader),
+    Opendal(OpendalReader),
 }
 
-impl_reader_for_enum!(UnifiedReader);
+impl_reader_for_enum! {
+    enum UnifiedReader {
+        Cv(FsReader),
+
+        #[cfg(feature = "opendal")]
+        Opendal(OpendalReader),
+    }
+}
 
 #[derive(Clone)]
 pub enum UfsFileSystem {
     #[cfg(feature = "opendal")]
-    OpenDAL(OpendalFileSystem),
+    Opendal(OpendalFileSystem),
+}
+
+impl_filesystem_for_enum! {
+    enum UfsFileSystem {
+        #[cfg(feature = "opendal")]
+        Opendal(OpendalFileSystem),
+    }
 }
 
 impl UfsFileSystem {
@@ -73,7 +93,7 @@ impl UfsFileSystem {
             {
                 // JVM initialization for HDFS is handled in OpendalFileSystem::new
                 let fs = OpendalFileSystem::new(path, conf)?;
-                Ok(UfsFileSystem::OpenDAL(fs))
+                Ok(UfsFileSystem::Opendal(fs))
             }
 
             Some(scheme) => err_box!("unsupported scheme: {}", scheme),
@@ -87,4 +107,3 @@ impl UfsFileSystem {
         Self::new(&path, mnt.properties.clone())
     }
 }
-impl_filesystem_for_enum!(UfsFileSystem);

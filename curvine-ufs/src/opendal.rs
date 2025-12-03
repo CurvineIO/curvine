@@ -75,6 +75,10 @@ impl Reader for OpendalReader {
     }
 
     async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
+        if !self.has_remaining() {
+            return Ok(DataSlice::Empty);
+        }
+
         // Initialize stream if needed
         if self.byte_stream.is_none() {
             let reader = self

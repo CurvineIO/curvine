@@ -13,125 +13,129 @@
 // limitations under the License.
 
 #[macro_export]
-macro_rules! match_variants {
-    ($self:expr, $method:ident $(, $arg:expr)*) => {
-        match $self {
-            Self::Cv(v) => v.$method($($arg),*),
-
-            #[cfg(feature = "opendal")]
-            Self::OpenDAL(v) => v.$method($($arg),*),
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! match_variants_async {
-    ($self:expr, $method:ident $(, $arg:expr)*) => {
-        match $self {
-            Self::Cv(v) => v.$method($($arg),*).await,
-
-            #[cfg(feature = "opendal")]
-            Self::OpenDAL(v) => v.$method($($arg),*).await,
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! match_fs_variants {
-    ($self:expr, $method:ident $(, $arg:expr)*) => {
-        match $self {
-            #[cfg(feature = "opendal")]
-            Self::OpenDAL(inner) => inner.$method($($arg),*),
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! match_fs_variants_async {
-    ($self:expr, $method:ident $(, $arg:expr)*) => {
-        match $self {
-            #[cfg(feature = "opendal")]
-            Self::OpenDAL(inner) => inner.$method($($arg),*).await,
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! match_fs_variants_writer {
-    ($self:expr, $method:ident $(, $arg:expr)*) => {
-        match $self {
-            #[cfg(feature = "opendal")]
-            Self::OpenDAL(inner) => Ok($crate::unified::UnifiedWriter::OpenDAL(inner.$method($($arg),*).await?)),
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! match_fs_variants_reader {
-    ($self:expr, $method:ident $(, $arg:expr)*) => {
-        match $self {
-            #[cfg(feature = "opendal")]
-            Self::OpenDAL(inner) => Ok($crate::unified::UnifiedReader::OpenDAL(inner.$method($($arg),*).await?)),
-        }
-    };
-}
-
-#[macro_export]
 macro_rules! impl_writer_for_enum {
-    ($enum_name:ident) => {
+    // Accept enum definition and extract variants
+    (
+        enum $enum_name:ident {
+            $(
+                $(#[$cfg:meta])*
+                $variant:ident($type:ty)
+            ),+ $(,)?
+        }
+    ) => {
         impl ::curvine_common::fs::Writer for $enum_name {
             fn status(&self) -> &::curvine_common::state::FileStatus {
-                match_variants!(self, status)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.status(),
+                    )+
+                }
             }
 
             fn path(&self) -> &::curvine_common::fs::Path {
-                match_variants!(self, path)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.path(),
+                    )+
+                }
             }
 
             fn pos(&self) -> i64 {
-                match_variants!(self, pos)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.pos(),
+                    )+
+                }
             }
 
             fn pos_mut(&mut self) -> &mut i64 {
-                match_variants!(self, pos_mut)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.pos_mut(),
+                    )+
+                }
             }
 
             fn chunk_mut(&mut self) -> &mut ::bytes::BytesMut {
-                match_variants!(self, chunk_mut)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.chunk_mut(),
+                    )+
+                }
             }
 
             fn chunk_size(&self) -> usize {
-                match_variants!(self, chunk_size)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.chunk_size(),
+                    )+
+                }
             }
 
             async fn write_chunk(
                 &mut self,
                 chunk: ::orpc::sys::DataSlice,
             ) -> ::curvine_common::FsResult<i64> {
-                match_variants_async!(self, write_chunk, chunk)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.write_chunk(chunk).await,
+                    )+
+                }
             }
 
             async fn flush(&mut self) -> ::curvine_common::FsResult<()> {
-                match_variants_async!(self, flush)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.flush().await,
+                    )+
+                }
             }
 
             async fn complete(&mut self) -> ::curvine_common::FsResult<()> {
-                match_variants_async!(self, complete)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.complete().await,
+                    )+
+                }
             }
 
             async fn cancel(&mut self) -> ::curvine_common::FsResult<()> {
-                match_variants_async!(self, cancel)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.cancel().await,
+                    )+
+                }
             }
 
             async fn seek(&mut self, pos: i64) -> ::curvine_common::FsResult<()> {
-                match_variants_async!(self, seek, pos)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.seek(pos).await,
+                    )+
+                }
             }
 
             async fn resize(
                 &mut self,
                 opts: ::curvine_common::state::FileAllocOpts,
             ) -> ::curvine_common::FsResult<()> {
-                match_variants_async!(self, resize, opts)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.resize(opts).await,
+                    )+
+                }
             }
         }
     };
@@ -139,46 +143,181 @@ macro_rules! impl_writer_for_enum {
 
 #[macro_export]
 macro_rules! impl_reader_for_enum {
-    ($enum_name:ident) => {
+    // Accept enum definition and extract variants
+    (
+        enum $enum_name:ident {
+            $(
+                $(#[$cfg:meta])*
+                $variant:ident($type:ty)
+            ),+ $(,)?
+        }
+    ) => {
+        #[allow(refining_impl_trait)]
         impl ::curvine_common::fs::Reader for $enum_name {
             fn status(&self) -> &::curvine_common::state::FileStatus {
-                match_variants!(self, status)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.status(),
+                    )+
+                }
             }
 
             fn path(&self) -> &::curvine_common::fs::Path {
-                match_variants!(self, path)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.path(),
+                    )+
+                }
             }
 
             fn len(&self) -> i64 {
-                match_variants!(self, len)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.len(),
+                    )+
+                }
             }
 
             fn chunk_mut(&mut self) -> &mut ::orpc::sys::DataSlice {
-                match_variants!(self, chunk_mut)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.chunk_mut(),
+                    )+
+                }
             }
 
             fn chunk_size(&self) -> usize {
-                match_variants!(self, chunk_size)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.chunk_size(),
+                    )+
+                }
             }
 
             fn pos(&self) -> i64 {
-                match_variants!(self, pos)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.pos(),
+                    )+
+                }
             }
 
             fn pos_mut(&mut self) -> &mut i64 {
-                match_variants!(self, pos_mut)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.pos_mut(),
+                    )+
+                }
             }
 
             async fn read_chunk0(&mut self) -> ::curvine_common::FsResult<::orpc::sys::DataSlice> {
-                match_variants_async!(self, read_chunk0)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.read_chunk0().await,
+                    )+
+                }
             }
 
             async fn seek(&mut self, pos: i64) -> ::curvine_common::FsResult<()> {
-                match_variants_async!(self, seek, pos)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.seek(pos).await,
+                    )+
+                }
             }
 
             async fn complete(&mut self) -> ::curvine_common::FsResult<()> {
-                match_variants_async!(self, complete)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.complete().await,
+                    )+
+                }
+            }
+
+            // Forward default methods explicitly to ensure they work correctly
+            fn async_read(&mut self, len: Option<usize>) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<::orpc::sys::DataSlice>> + Send {
+                async move {
+                    match self {
+                        $(
+                            $(#[$cfg])*
+                            Self::$variant(v) => v.async_read(len).await,
+                        )+
+                    }
+                }
+            }
+
+            fn read_chunk(&mut self, len: Option<usize>) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<::orpc::sys::DataSlice>> + Send {
+                async move {
+                    match self {
+                        $(
+                            $(#[$cfg])*
+                            Self::$variant(v) => v.read_chunk(len).await,
+                        )+
+                    }
+                }
+            }
+
+            fn read(&mut self, buf: &mut [u8]) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<usize>> + Send {
+                async move {
+                    match self {
+                        $(
+                            $(#[$cfg])*
+                            Self::$variant(v) => v.read(buf).await,
+                        )+
+                    }
+                }
+            }
+
+            fn blocking_read(&mut self, rt: &::orpc::runtime::Runtime) -> ::curvine_common::FsResult<::orpc::sys::DataSlice> {
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(v) => v.blocking_read(rt),
+                    )+
+                }
+            }
+
+            fn fuse_read(&mut self, pos: i64, len: usize) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<Vec<::orpc::sys::DataSlice>>> + Send {
+                async move {
+                    match self {
+                        $(
+                            $(#[$cfg])*
+                            Self::$variant(v) => v.fuse_read(pos, len).await,
+                        )+
+                    }
+                }
+            }
+
+            fn read_full(&mut self, buf: &mut [u8]) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<usize>> + Send {
+                async move {
+                    match self {
+                        $(
+                            $(#[$cfg])*
+                            Self::$variant(v) => v.read_full(buf).await,
+                        )+
+                    }
+                }
+            }
+
+            fn read_as_string(&mut self) -> impl ::std::future::Future<Output = ::curvine_common::FsResult<String>> + Send {
+                async move {
+                    match self {
+                        $(
+                            $(#[$cfg])*
+                            Self::$variant(v) => v.read_as_string().await,
+                        )+
+                    }
+                }
             }
         }
     };
@@ -186,7 +325,15 @@ macro_rules! impl_reader_for_enum {
 
 #[macro_export]
 macro_rules! impl_filesystem_for_enum {
-    ($enum_name:ident) => {
+    // Accept enum definition and extract variants
+    (
+        enum $enum_name:ident {
+            $(
+                $(#[$cfg:meta])*
+                $variant:ident($type:ty)
+            ),+ $(,)?
+        }
+    ) => {
         impl
             ::curvine_common::fs::FileSystem<
                 $crate::unified::UnifiedWriter,
@@ -198,7 +345,12 @@ macro_rules! impl_filesystem_for_enum {
                 path: &::curvine_common::fs::Path,
                 create_parent: bool,
             ) -> ::curvine_common::FsResult<bool> {
-                match_fs_variants_async!(self, mkdir, path, create_parent)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.mkdir(path, create_parent).await,
+                    )+
+                }
             }
 
             async fn create(
@@ -206,28 +358,57 @@ macro_rules! impl_filesystem_for_enum {
                 path: &::curvine_common::fs::Path,
                 overwrite: bool,
             ) -> ::curvine_common::FsResult<$crate::unified::UnifiedWriter> {
-                match_fs_variants_writer!(self, create, path, overwrite)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => {
+                            let writer = inner.create(path, overwrite).await?;
+                            Ok($crate::unified::UnifiedWriter::$variant(writer))
+                        }
+                    )+
+                }
             }
 
             async fn append(
                 &self,
                 path: &::curvine_common::fs::Path,
             ) -> ::curvine_common::FsResult<$crate::unified::UnifiedWriter> {
-                match_fs_variants_writer!(self, append, path)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => {
+                            let writer = inner.append(path).await?;
+                            Ok($crate::unified::UnifiedWriter::$variant(writer))
+                        }
+                    )+
+                }
             }
 
             async fn exists(
                 &self,
                 path: &::curvine_common::fs::Path,
             ) -> ::curvine_common::FsResult<bool> {
-                match_fs_variants_async!(self, exists, path)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.exists(path).await,
+                    )+
+                }
             }
 
             async fn open(
                 &self,
                 path: &::curvine_common::fs::Path,
             ) -> ::curvine_common::FsResult<$crate::unified::UnifiedReader> {
-                match_fs_variants_reader!(self, open, path)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => {
+                            let reader = inner.open(path).await?;
+                            Ok($crate::unified::UnifiedReader::$variant(reader))
+                        }
+                    )+
+                }
             }
 
             async fn rename(
@@ -235,7 +416,12 @@ macro_rules! impl_filesystem_for_enum {
                 src: &::curvine_common::fs::Path,
                 dst: &::curvine_common::fs::Path,
             ) -> ::curvine_common::FsResult<bool> {
-                match_fs_variants_async!(self, rename, src, dst)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.rename(src, dst).await,
+                    )+
+                }
             }
 
             async fn delete(
@@ -243,21 +429,36 @@ macro_rules! impl_filesystem_for_enum {
                 path: &::curvine_common::fs::Path,
                 recursive: bool,
             ) -> ::curvine_common::FsResult<()> {
-                match_fs_variants_async!(self, delete, path, recursive)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.delete(path, recursive).await,
+                    )+
+                }
             }
 
             async fn get_status(
                 &self,
                 path: &::curvine_common::fs::Path,
             ) -> ::curvine_common::FsResult<::curvine_common::state::FileStatus> {
-                match_fs_variants_async!(self, get_status, path)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.get_status(path).await,
+                    )+
+                }
             }
 
             async fn list_status(
                 &self,
                 path: &::curvine_common::fs::Path,
             ) -> ::curvine_common::FsResult<Vec<::curvine_common::state::FileStatus>> {
-                match_fs_variants_async!(self, list_status, path)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.list_status(path).await,
+                    )+
+                }
             }
 
             async fn set_attr(
@@ -265,7 +466,12 @@ macro_rules! impl_filesystem_for_enum {
                 path: &::curvine_common::fs::Path,
                 opts: ::curvine_common::state::SetAttrOpts,
             ) -> ::curvine_common::FsResult<()> {
-                match_fs_variants_async!(self, set_attr, path, opts)
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.set_attr(path, opts).await,
+                    )+
+                }
             }
         }
     };
