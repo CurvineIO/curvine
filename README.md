@@ -48,13 +48,14 @@ For more detailed information, please refer to:
 
 ## 🚀 Core Features
 
-- **High-performance RPC Framework**: An asynchronous communication framework based on Tokio, supporting high-concurrency request processing.
-- **Distributed Architecture**: A Master - Worker architecture design that supports horizontal scaling.
-- **Multi-level Cache**: Supports multi - level cache strategies for memory, SSD, and HDD.
-- **FUSE Interface**: Provides a FUSE file system interface for seamless integration into existing systems.
-- **Underlying Storage Integration**: Supports integration with multiple underlying storage systems.
-- **Raft Consensus**: Uses the Raft algorithm to ensure data consistency and high availability.
-- **Monitoring and Metrics**: Built - in monitoring and performance metric collection.
+- **Multi-Cloud Support**: Curvine is compatible with object storage services from multiple cloud providers as its underlying storage layer, enabling transparent data migration across different vendors' object storage platforms.
+- **Cloud-Native**: Curvine supports CSI-based cloud-native integration with Kubernetes, enabling deployment and management of Curvine clusters via Helm charts.
+- **Multi-tir Cache**: Supports multi-tir cache strategies for memory, SSD, and HDD.
+- **POSIX Semantic Support**: Curvine delivers comprehensive POSIX semantic compatibility, implementing a high-performance FUSE layer to facilitate the manipulation of distributed cached data as if it were local disk storage.
+- **Compatibility with S3 and HDFS Protocols**: The system supports both S3 and HDFS read/write interfaces, facilitating seamless integration with artificial intelligence and big data technology ecosystems.
+- **High Performance**: Curvine employs "zero-copy" techniques multiple times throughout its data read/write pipeline and leverages asynchronous operations. Additionally, its core engine is built with Rust, ensuring optimal performance is achieved.
+- **Raft Consensus**: Uses the Raft algorithm to ensure the master's data consistency and high availability.
+- **Monitoring and Metrics**: Curvine features a comprehensive built-in observability metrics system, facilitating detailed monitoring of the performance of each component.
 - **Web Interface**: Provides a web management interface for convenient system monitoring and management.
 
 ## 📦 System Requirements
