@@ -138,7 +138,7 @@ CRATE_ZIP=""
 SKIP_JAVA_SDK=0  # Flag to skip Java SDK compilation
 
 # Parse command line arguments
-TEMP=$(getopt -o p:u:f:dzhv --long package:,ufs:,features:,debug,zip,skip-java,help -n "$0" -- "$@")
+TEMP=$(getopt -o p:u:f:dzhv --long package:,ufs:,features:,debug,zip,skip-java-sdk,help -n "$0" -- "$@")
 if [ $? != 0 ] ; then print_help ; exit 1 ; fi
 
 eval set -- "$TEMP"
