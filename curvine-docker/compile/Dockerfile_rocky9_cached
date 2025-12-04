@@ -16,11 +16,14 @@ RUN dnf install -y \
     wget \
     zip \
     unzip \
-    nodejs \
-    npm \
     java-1.8.0-openjdk-devel \
     openssl-devel \
     && dnf clean all
+
+# 1.1. Install latest Node.js from NodeSource repository (ensures npm >= 9.0.0)
+RUN curl -sL https://rpm.nodesource.com/setup_current.x | bash - && \
+    dnf install -y nodejs && \
+    dnf clean all
 
 # 2. Install the Rust toolchain
 # uncomment the following two lines if you met network problem
@@ -35,12 +38,21 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
     cargo install --force cargo-cache && \
     echo "Rust toolchain and components installed successfully"
 
-# 3. Install protoc
-RUN mkdir -p /app/protoc && cd /app/protoc && \
-    curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip && \
-    unzip protoc-27.2-linux-x86_64.zip && \
+# 3. Install protoc with multi-arch support
+RUN PROTOC_VERSION=27.2 && \
+    ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+        x86_64) PROTOC_ARCH="x86_64" ;; \
+        aarch64) PROTOC_ARCH="aarch_64" ;; \
+        *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Installing protoc ${PROTOC_VERSION} for ${PROTOC_ARCH}..." && \
+    mkdir -p /app/protoc && cd /app/protoc && \
+    curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" && \
+    unzip "protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" && \
     chmod +x bin/protoc && \
-    rm -f *.zip
+    rm -f *.zip && \
+    echo "✓ protoc installed successfully for ${ARCH}"
 ENV PATH="/app/protoc/bin:${PATH}"
 
 # 4. Install Maven
@@ -116,8 +128,12 @@ RUN rm -rf \
 
 WORKDIR /workspace
 
-# Ensure environment is properly set up
-RUN rustc --version && cargo --version && protoc --version && mvn --version
+# Ensure environment is properly set up and verify npm version
+RUN rustc --version && cargo --version && protoc --version && mvn --version && node --version && \
+    npm --version && \
+    npm install -g npm@latest && \
+    echo "npm version after upgrade:" && \
+    npm --version
 
 # Use ENTRYPOINT to ensure environment is loaded
 ENTRYPOINT ["/bin/bash", "-c"]
