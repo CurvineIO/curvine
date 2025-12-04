@@ -55,8 +55,7 @@ where
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
-        let key_arc = Arc::new(key.clone());
-        self.items.contains_key(&key_arc)
+        self.items.contains_key(key)
     }
 
     pub fn remove(&mut self, key: K) -> bool {
