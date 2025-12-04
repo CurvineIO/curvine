@@ -113,9 +113,10 @@ docker-compile:
 # 8. CSI (Container Storage Interface) target
 .PHONY: curvine-csi
 
-# Build curvine-csi Docker image
+# Build curvine-csi Docker image (optimized with pre-cached builder)
 curvine-csi:
-	@echo "Building curvine-csi Docker image..."
+	@echo "Building curvine-csi Docker image (using cached builder)..."
+	@echo "Required components: csi, curvine-cli, curvine-fuse"
 	docker build --build-arg GOPROXY=https://goproxy.cn,direct -t curvine-csi:latest -f curvine-csi/Dockerfile .
 
 # 7. HDFS-specific builds

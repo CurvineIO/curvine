@@ -3,30 +3,30 @@
 
 # Global settings
 global:
-  namespace: default
+  namespace: curvine-system
 
 # Image settings
 image:
-  repository: curvine/curvine-csi
+  repository: ghcr.io/curvineio/curvine-csi
   tag: latest
   pullPolicy: Always
 
 # CSI Driver settings
 csiDriver:
   name: curvine
-  attachRequired: true
+  attachRequired: false
   podInfoOnMount: false
 
 # Controller settings
 controller:
-  name: curvine-controller
+  name: curvine-csi-controller
   replicas: 1
   priorityClassName: system-cluster-critical
 
   # Controller container settings
   container:
     name: csi-plugin
-    command: ["/opt/curvine/bin/csi"]
+    command: ["/opt/curvine/csi"]
     args:
       - --endpoint=$(CSI_ENDPOINT)
       - --nodeid=$(NODE_NAME)
@@ -91,7 +91,7 @@ node:
   # Node container settings
   container:
     name: csi-plugin
-    command: ["/opt/curvine/bin/csi"]
+    command: ["/opt/curvine/csi"]
     args:
       - --endpoint=$(CSI_ENDPOINT)
       - --nodeid=$(NODE_NAME)
@@ -136,7 +136,6 @@ node:
       env:
         ADDRESS: /csi/csi.sock
         DRIVER_REG_SOCK_PATH: /var/lib/kubelet/csi-plugins/csi.curvine.io/csi.sock
-        CURVINE_CONF_FILE: /opt/curvine/conf/curvine-cluster.toml
 
     livenessProbe:
       image: registry.k8s.io/sig-storage/livenessprobe:v2.11.0

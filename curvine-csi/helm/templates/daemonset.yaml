@@ -39,6 +39,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           lifecycle:
             preStop:
               exec:
@@ -68,9 +72,6 @@ spec:
               name: kubelet-dir
             - mountPath: /registration
               name: registration-dir
-            - mountPath: /opt/curvine/conf
-              name: curvine-config
-              readOnly: true
         - name: node-driver-registrar
           image: {{ .Values.node.sidecars.nodeDriverRegistrar.image }}
           args:
@@ -78,8 +79,6 @@ spec:
             - {{ . }}
             {{- end }}
           env:
-            - name: CURVINE_CONF_FILE
-              value: {{ .Values.node.sidecars.nodeDriverRegistrar.env.CURVINE_CONF_FILE }}
             - name: ADDRESS
               value: {{ .Values.node.sidecars.nodeDriverRegistrar.env.ADDRESS }}
             - name: DRIVER_REG_SOCK_PATH
@@ -116,7 +115,3 @@ spec:
             path: {{ .Values.node.hostPaths.registrationDir.path }}
             type: {{ .Values.node.hostPaths.registrationDir.type }}
           name: registration-dir
-        - name: curvine-config
-          configMap:
-            name: {{ .Values.configMap.name }}
-            defaultMode: {{ .Values.configMap.defaultMode }}
