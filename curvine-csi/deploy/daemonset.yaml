@@ -22,7 +22,7 @@ spec:
 
       containers:
         - name: csi-plugin
-          image: curvineio/curvine-csi:latest
+          image: ghcr.io/curvineio/curvine-csi:latest
           imagePullPolicy: Always
           command: ["/opt/curvine/csi"]
           args:

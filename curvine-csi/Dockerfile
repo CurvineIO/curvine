@@ -1,132 +1,63 @@
-FROM ubuntu:24.04 AS builder
+# Use pre-cached compilation image as builder
+FROM ghcr.io/curvineio/curvine-compile:build-cached AS builder
 
 ARG GOPROXY
+ARG TARGETARCH
+ARG TARGETOS
 
-# Set non-interactive mode for apt to avoid prompts during install
-ENV DEBIAN_FRONTEND=noninteractive
+# Install Go toolchain (build-cached image doesn't include Go)
+# Support multi-architecture: amd64 and arm64
+RUN GO_VERSION=1.23.4 && \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) GO_ARCH="amd64" ;; \
+        arm64) GO_ARCH="arm64" ;; \
+        *) GO_ARCH="amd64" ;; \
+    esac && \
+    echo "Installing Go ${GO_VERSION} for ${GO_ARCH}..." && \
+    wget -O go.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" && \
+    tar -C /usr/local -xzf go.tar.gz && \
+    rm go.tar.gz && \
+    echo "✓ Go ${GO_VERSION} installed successfully"
 
-# Use Tsinghua mirror for faster package downloads
-RUN sed -i 's/archive.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    sed -i 's/security.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    apt-get update && apt-get install -y --fix-missing \
-    fuse3 \
-    libfuse3-dev \
-    clang \
-    llvm \
-    llvm-dev \
-    git \
-    wget \
-    curl \
-    tar \
-    zip \
-    unzip \
-    nodejs \
-    npm \
-    openjdk-8-jdk \
-    libssl-dev \
-    pkg-config \
-    build-essential \
-    ca-certificates \
-    rsync \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Go toolchain
-RUN wget -O go1.23.linux-amd64.tar.gz https://go.dev/dl/go1.23.4.linux-amd64.tar.gz && \
-    tar -C /usr/local -xzf go1.23.linux-amd64.tar.gz && \
-    rm go1.23.linux-amd64.tar.gz
-
-ENV PATH=/usr/local/go/bin:$PATH
+# Set environment variables for build tools
+ENV PATH="/root/.cargo/bin:/usr/local/go/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
 ENV GOPATH=/go
 ENV GOROOT=/usr/local/go
-ENV GOPROXY=${GOPROXY:-https://proxy.golang.org}
-
-#ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
-#ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
-#ENV RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
-#ENV RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
-# Install Rust toolchain
-# Use HTTP/1.1 to avoid HTTP/2 protocol errors and add retry mechanism
-RUN export PATH="/root/.cargo/bin:${PATH}" && \
-    for i in 1 2 3; do \
-        curl --http1.1 --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh && \
-        sh /tmp/rustup-init.sh -y --default-toolchain stable && \
-        break || (echo "Attempt $i failed, retrying..." && sleep 5); \
-    done && \
-    . $HOME/.cargo/env && \
-    rustup default stable && \
-    rustup component add rustfmt clippy && \
-    rm -f /tmp/rustup-init.sh
-
-# Install protoc
-RUN mkdir -p /app/protoc && cd /app/protoc && \
-    curl -k -LO https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip && \
-    unzip protoc-27.2-linux-x86_64.zip && \
-    chmod +x bin/protoc && \
-    rm -f *.zip
-
-# Install Maven
-RUN cd /app && \
-    curl -k -LO https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz && \
-    tar -xzf apache-maven-3.9.11-bin.tar.gz && \
-    mv apache-maven-3.9.11 maven && \
-    rm -f *.tar.gz
-
-# Set environment variables for build
-ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
+ENV GOPROXY=${GOPROXY:-https://goproxy.cn,direct}
 
 WORKDIR /workspace
 
 # Copy entire Curvine source code
 COPY . /workspace/
 
-# Pre-install WebUI dependencies and fix vue-cli-service module resolution
-RUN if [ -d "/workspace/curvine-web/webui" ]; then \
-        echo "Pre-installing WebUI dependencies..."; \
-        cd /workspace/curvine-web/webui && \
-        npm install --legacy-peer-deps && \
-        echo "npm install completed" && \
-        ln -s @vue/cli-service/package.json node_modules/package.json && \
-        echo "Created symlink: node_modules/package.json -> @vue/cli-service/package.json"; \
-    fi
-
-# Patch build.sh to use direct vue-cli-service.js call
-RUN if [ -f "/workspace/build/build.sh" ]; then \
-        echo "Patching build.sh to fix vue-cli-service wrapper script issue..."; \
-        sed -i 's/npm run build/node node_modules\/@vue\/cli-service\/bin\/vue-cli-service.js build/g' /workspace/build/build.sh; \
-    fi
-
-# Build Curvine from source
-RUN echo "Building Curvine from source..." && \
+# Build only required components: cli and fuse
+# Skip WebUI and other unnecessary components
+# Docker buildx uses QEMU for native compilation on each platform
+RUN echo "Building curvine-cli and curvine-fuse..." && \
+    echo "Target platform: ${TARGETOS:-linux}/${TARGETARCH:-amd64}" && \
     export CURVINE_HOME=/workspace && \
     mkdir -p /workspace/tmp && \
     export TMPDIR=/workspace/tmp && \
     echo "Using TMPDIR=$TMPDIR for compilation temporary files" && \
-    echo "Running 'make all' with retry mechanism..." && \
-    for attempt in 1 2 3; do \
-        echo "Build attempt $attempt..." && \
-        if make all; then \
-            echo "✓ Build succeeded with 'make all'" && \
-            break; \
-        else \
-            echo "✗ Build attempt $attempt failed" && \
-            if [ $attempt -eq 3 ]; then \
-                echo "✗ All build attempts failed" && \
-                exit 1; \
-            fi && \
-            echo "Retrying... (attempt $((attempt + 1))/3)" && \
-            sleep 10; \
-        fi; \
-    done && \
+    echo "Running 'make build ARGS=\"-p cli -p fuse\"'..." && \
+    make build ARGS="-p cli -p fuse" && \
     if [ ! -d "/workspace/build/dist" ]; then \
         echo "✗ ERROR: /workspace/build/dist not found after build" && \
         exit 1; \
     fi && \
+    echo "✓ Build succeeded for cli and fuse components" && \
     rm -rf /workspace/tmp
 
 # Build CSI binary
+# Docker buildx sets TARGETARCH automatically (amd64, arm64, etc.)
+# CGO_ENABLED=0 for static binary without C dependencies
 RUN cd /workspace/curvine-csi && \
-    go build -o bin/csi main.go
+    echo "Building CSI for ${TARGETOS:-linux}/${TARGETARCH:-amd64}..." && \
+    CGO_ENABLED=0 \
+    GOOS=${TARGETOS:-linux} \
+    GOARCH=${TARGETARCH:-amd64} \
+    go build -o bin/csi main.go && \
+    echo "✓ CSI binary built successfully"
 
 # Create output directory and copy build artifacts
 RUN mkdir -p /build-output && \
@@ -138,19 +69,15 @@ RUN mkdir -p /build-output && \
     echo "  lib/: $(ls -1 /build-output/lib 2>/dev/null | wc -l) files" && \
     echo "  conf/: $(ls -1 /build-output/conf 2>/dev/null | wc -l) files"
 
-FROM ubuntu:24.04
+FROM rockylinux:9
 
-# Set non-interactive mode for apt
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN sed -i 's/archive.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    sed -i 's/security.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    apt-get update && apt-get install -y --no-install-recommends \
+# Install runtime dependencies
+RUN dnf install -y \
     fuse3 \
-    libfuse3-3 \
+    fuse3-libs \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
 
 # Create curvine directories
 RUN mkdir -p /opt/curvine
