@@ -16,7 +16,9 @@ use crate::util::*;
 use clap::Parser;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{ConsistencyStrategy, MountOptions, MountType, StorageType, TtlAction};
+use curvine_common::state::{
+    ConsistencyStrategy, MountOptions, MountType, StorageType, TtlAction, WriteType,
+};
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
@@ -44,12 +46,12 @@ pub struct MountCommand {
     #[arg(long, default_value = "always")]
     consistency_strategy: String,
 
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "7d")]
     ttl_ms: String,
 
     #[arg(
         long,
-        default_value = "none",
+        default_value = "delete",
         help = "TTL expiration action when file expires:\n  none - No action\n  delete - Delete file\n  persist - Export to UFS (skip if exists), keep CV cache\n  evict - Export to UFS (skip if exists), delete CV cache\n  flush - Force export to UFS (overwrite), delete CV cache"
     )]
     ttl_action: String,
@@ -62,6 +64,13 @@ pub struct MountCommand {
 
     #[arg(short, long)]
     storage_type: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "async_through",
+        help = "Write type: cache, through, async_through, cache_through"
+    )]
+    write_type: String,
 
     #[arg(long, default_value_t = false)]
     check: bool,
@@ -250,6 +259,9 @@ impl MountCommand {
         if let Some(storage_type) = self.storage_type.as_ref() {
             opts = opts.storage_type(StorageType::try_from(storage_type.as_str())?);
         }
+
+        let write_type = WriteType::try_from(self.write_type.as_str())?;
+        opts = opts.write_type(write_type);
 
         Ok(opts.build())
     }
