@@ -441,6 +441,7 @@ impl ProtoUtils {
             ttl_action: opts.ttl_action.map(|v| v as i32),
             add_x_attr: opts.add_x_attr,
             remove_x_attr: opts.remove_x_attr,
+            ufs_mtime: opts.ufs_mtime,
         }
     }
 
@@ -457,6 +458,7 @@ impl ProtoUtils {
             ttl_action: opts.ttl_action.map(TtlAction::from),
             add_x_attr: opts.add_x_attr,
             remove_x_attr: opts.remove_x_attr,
+            ufs_mtime: opts.ufs_mtime,
         }
     }
 

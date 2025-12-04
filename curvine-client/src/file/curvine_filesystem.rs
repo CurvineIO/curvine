@@ -113,7 +113,7 @@ impl CurvineFileSystem {
         Ok(writer)
     }
 
-    fn create_opts_builder(&self) -> CreateFileOptsBuilder {
+    pub fn create_opts_builder(&self) -> CreateFileOptsBuilder {
         CreateFileOptsBuilder::with_conf(&self.fs_context.conf.client)
             .client_name(self.fs_context.clone_client_name())
     }
@@ -236,14 +236,11 @@ impl CurvineFileSystem {
             return err_box!("mount path can not be root");
         }
 
-        if !opts.update
-            && opts.mount_type == MountType::Cst
-            && ufs_path.authority_path() != cv_path.path()
-        {
+        if !opts.update && opts.mount_type == MountType::Cst && ufs_path.path() != cv_path.path() {
             return err_box!(
                 "for Cst mount type, the ufs path and the cv path must be identical. \
                      current ufs path: {},  current cv path: {}",
-                ufs_path.authority_path(),
+                ufs_path.path(),
                 cv_path.path()
             );
         }
