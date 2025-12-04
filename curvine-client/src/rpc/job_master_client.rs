@@ -25,7 +25,7 @@ use curvine_common::state::{
 use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
 
-use crate::file::FsClient;
+use crate::file::{FsClient, FsContext};
 
 /// Job master client
 #[derive(Clone)]
@@ -36,6 +36,11 @@ pub struct JobMasterClient {
 impl JobMasterClient {
     pub fn new(client: Arc<FsClient>) -> Self {
         Self { client }
+    }
+
+    pub fn with_context(context: &Arc<FsContext>) -> Self {
+        let client = Arc::new(FsClient::new(context.clone()));
+        Self::new(client)
     }
 
     pub async fn submit_load(&self, path: impl AsRef<str>) -> FsResult<LoadJobResult> {

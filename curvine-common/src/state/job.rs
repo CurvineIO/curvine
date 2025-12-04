@@ -14,6 +14,7 @@
 
 use crate::state::{MountInfo, StorageType, TtlAction, WorkerAddress};
 use num_enum::{FromPrimitive, IntoPrimitive};
+use orpc::common::ByteUnit;
 use serde::{Deserialize, Serialize};
 
 #[derive(
@@ -74,6 +75,13 @@ pub struct JobStatus {
     pub progress: JobTaskProgress,
 }
 
+impl JobStatus {
+    /// Returns a formatted progress string with percentage and byte counts
+    pub fn progress_string(&self, show_bar: bool) -> String {
+        self.progress.progress_string(show_bar)
+    }
+}
+
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct LoadJobCommand {
     pub source_path: String,
@@ -88,7 +96,7 @@ pub struct LoadJobCommand {
 
 impl LoadJobCommand {
     pub fn builder(source_path: impl Into<String>) -> LoadJobCommandBuilder {
-        LoadJobCommandBuilder::new(source_path)
+        LoadJobCommandBuilder::new(source_path).overwrite(true)
     }
 }
 
@@ -203,6 +211,53 @@ impl Default for JobTaskProgress {
             loaded_size: 0,
             update_time: 0,
             message: String::new(),
+        }
+    }
+}
+
+impl JobTaskProgress {
+    /// Returns a formatted progress string with percentage and byte counts
+    /// Format: "[████████░░░░░░░░░░] 45.2% (123.4 MB / 273.0 MB)"
+    /// If show_bar is false, format: "45.2% (123.4 MB / 273.0 MB)"
+    pub fn progress_string(&self, show_bar: bool) -> String {
+        let loaded = self.loaded_size.max(0) as u64;
+        let total = self.total_size.max(0) as u64;
+
+        let percentage = if total == 0 {
+            0.0
+        } else {
+            (loaded as f64 / total as f64 * 100.0).min(100.0)
+        };
+
+        if show_bar {
+            if total == 0 {
+                return format!(
+                    "[{}] 0.0% ({} / {})",
+                    "░".repeat(20),
+                    ByteUnit::byte_to_string(loaded),
+                    ByteUnit::byte_to_string(total)
+                );
+            }
+
+            let filled = (percentage / 100.0 * 20.0) as usize;
+            let empty = 20 - filled.min(20);
+
+            let progress_bar = format!("{}{}", "█".repeat(filled.min(20)), "░".repeat(empty));
+
+            format!(
+                "[{}] {:.1}% ({} / {})",
+                progress_bar,
+                percentage,
+                ByteUnit::byte_to_string(loaded),
+                ByteUnit::byte_to_string(total)
+            )
+        } else {
+            format!(
+                "{:.1}% ({} / {})",
+                percentage,
+                ByteUnit::byte_to_string(loaded),
+                ByteUnit::byte_to_string(total)
+            )
         }
     }
 }
