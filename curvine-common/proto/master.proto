@@ -184,6 +184,7 @@ message SetAttrOptsProto {
     optional TtlActionProto ttl_action = 9;
     map<string, bytes> add_x_attr = 10;
     repeated string remove_x_attr = 11;
+    optional int64 ufs_mtime = 12;
 }
 
 message SetAttrRequest {

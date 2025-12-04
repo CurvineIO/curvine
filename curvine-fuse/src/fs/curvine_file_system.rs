@@ -473,17 +473,12 @@ impl CurvineFileSystem {
         }
 
         Ok(SetAttrOpts {
-            recursive: false,
-            replicas: None,
             owner,
             group,
             mode,
             atime,
             mtime,
-            ttl_ms: None,
-            ttl_action: None,
-            add_x_attr: HashMap::new(),
-            remove_x_attr: Vec::new(),
+            ..Default::default()
         })
     }
 

@@ -331,6 +331,12 @@ impl From<tokio::sync::oneshot::error::RecvError> for FsError {
     }
 }
 
+impl From<Elapsed> for FsError {
+    fn from(value: Elapsed) -> Self {
+        Self::Timeout(ErrorImpl::with_source(value))
+    }
+}
+
 impl ErrorExt for FsError {
     fn ctx(self, ctx: impl Into<String>) -> Self {
         match self {

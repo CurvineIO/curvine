@@ -158,6 +158,10 @@ impl MasterHandler {
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<FileBlocks> {
+        if flags.read_only() {
+            return self.fs.get_block_locations(&path);
+        }
+
         if self.check_is_retry(req_id)? {
             return self.fs.get_block_locations(&path);
         }

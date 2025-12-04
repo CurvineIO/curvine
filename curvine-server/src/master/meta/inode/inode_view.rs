@@ -378,6 +378,10 @@ impl InodeView {
         for key in opts.remove_x_attr {
             let _ = self.x_attr_mut().remove(&key);
         }
+
+        if let Some(ufs_mtime) = opts.ufs_mtime {
+            self.storage_policy_mut().ufs_mtime = ufs_mtime;
+        }
     }
 
     pub fn to_file_status(&self, path: &str) -> FileStatus {
