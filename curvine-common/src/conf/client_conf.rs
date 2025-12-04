@@ -169,6 +169,27 @@ pub struct ClientConf {
     pub close_timeout_secs: u64,
 
     pub metadata_operation_buckets: Vec<f64>,
+
+    // Minimum interval for checking if ufs sync task is complete / checking if curvine file data has updates
+    #[serde(skip)]
+    pub sync_check_interval_min: Duration,
+    #[serde(alias = "sync_check_interval_min")]
+    pub sync_check_interval_min_str: String,
+
+    // Maximum interval for checking if ufs sync task is complete / checking if curvine file data has updates
+    #[serde(skip)]
+    pub sync_check_interval_max: Duration,
+    #[serde(alias = "sync_check_interval_max")]
+    pub sync_check_interval_max_str: String,
+
+    // Maximum timeout for waiting for sync job to complete
+    #[serde(skip)]
+    pub max_sync_wait_timeout: Duration,
+    #[serde(alias = "max_sync_wait_timeout")]
+    pub max_sync_wait_timeout_str: String,
+
+    // Number of sync_check_interval cycles before logging
+    pub sync_check_log_tick: u32,
 }
 
 impl ClientConf {
@@ -217,6 +238,14 @@ impl ClientConf {
 
         self.metric_report_interval =
             DurationUnit::from_str(&self.metric_report_interval_str)?.as_duration();
+
+        self.sync_check_interval_min =
+            DurationUnit::from_str(&self.sync_check_interval_min_str)?.as_duration();
+        self.sync_check_interval_max =
+            DurationUnit::from_str(&self.sync_check_interval_max_str)?.as_duration();
+
+        self.max_sync_wait_timeout =
+            DurationUnit::from_str(&self.max_sync_wait_timeout_str)?.as_duration();
 
         Ok(())
     }
@@ -322,7 +351,7 @@ impl Default for ClientConf {
             enable_rust_read_ufs: true,
 
             mount_update_ttl: Default::default(),
-            mount_update_ttl_str: "10m".to_string(),
+            mount_update_ttl_str: "10s".to_string(),
 
             umask: Self::DEFAULT_FILE_SYSTEM_UMASK,
 
@@ -334,6 +363,17 @@ impl Default for ClientConf {
             metadata_operation_buckets: vec![
                 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
             ],
+
+            sync_check_interval_min: Default::default(),
+            sync_check_interval_min_str: "100ms".to_string(),
+
+            sync_check_interval_max: Default::default(),
+            sync_check_interval_max_str: "1s".to_string(),
+
+            max_sync_wait_timeout: Default::default(),
+            max_sync_wait_timeout_str: "5m".to_string(),
+
+            sync_check_log_tick: 3,
         };
 
         conf.init().unwrap();

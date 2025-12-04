@@ -121,7 +121,7 @@ impl LoadJobRunner {
         let job_id = Self::create_job_id(source_path.full_path());
         let result = LoadJobResult {
             job_id: job_id.clone(),
-            target_path: target_path.clone_path(),
+            target_path: target_path.clone_uri(),
         };
 
         let source_status = if source_path.is_cv() {

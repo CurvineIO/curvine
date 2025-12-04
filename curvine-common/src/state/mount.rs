@@ -14,7 +14,7 @@
 
 use crate::conf::ClientConf;
 use crate::fs::Path;
-use crate::state::{StorageType, TtlAction};
+use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StorageType, TtlAction};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use orpc::{err_box, CommonError, CommonResult};
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,7 @@ pub struct MountInfo {
     pub block_size: Option<i64>,
     pub replicas: Option<i32>,
     pub mount_type: MountType,
+    pub write_type: WriteType,
 }
 
 impl MountInfo {
@@ -142,6 +143,17 @@ impl MountInfo {
             self.get_cv_path(path)
         }
     }
+
+    pub fn get_create_opts(&self, conf: &ClientConf) -> CreateFileOpts {
+        CreateFileOptsBuilder::new()
+            .create_parent(true)
+            .replicas(self.replicas.unwrap_or(conf.replicas))
+            .block_size(self.block_size.unwrap_or(conf.block_size))
+            .storage_type(self.storage_type.unwrap_or(conf.storage_type))
+            .ttl_ms(self.ttl_ms)
+            .ttl_action(self.ttl_action)
+            .build()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +168,7 @@ pub struct MountOptions {
     pub replicas: Option<i32>,
     pub mount_type: MountType,
     pub remove_properties: Vec<String>,
+    pub write_type: WriteType,
 }
 
 impl MountOptions {
@@ -179,6 +192,7 @@ impl MountOptions {
             block_size: self.block_size,
             replicas: self.replicas,
             mount_type: self.mount_type,
+            write_type: self.write_type,
         }
     }
 }
@@ -195,11 +209,15 @@ pub struct MountOptionsBuilder {
     replicas: Option<i32>,
     mount_type: MountType,
     remove_properties: Vec<String>,
+    write_type: WriteType,
 }
 
 impl MountOptionsBuilder {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            write_type: WriteType::Through,
+            ..Default::default()
+        }
     }
 
     pub fn with_conf(conf: &ClientConf, update: bool) -> Self {
@@ -266,6 +284,11 @@ impl MountOptionsBuilder {
         self
     }
 
+    pub fn write_type(mut self, write_type: WriteType) -> Self {
+        self.write_type = write_type;
+        self
+    }
+
     pub fn build(self) -> MountOptions {
         MountOptions {
             update: self.update,
@@ -278,7 +301,55 @@ impl MountOptionsBuilder {
             replicas: self.replicas,
             mount_type: self.mount_type,
             remove_properties: self.remove_properties,
+            write_type: self.write_type,
         }
+    }
+}
+
+/// Write type for cache write operations, corresponding to Alluxio write types:
+/// - Cache (MUST_CACHE): Write data only to cache, not to the underlying storage.
+///   This mode provides the fastest write performance but data may be lost if cache is evicted.
+/// - Through (THROUGH): Write data directly to the underlying storage (UFS), bypassing cache.
+///   This mode ensures data persistence but may be slower than cache writes.
+/// - AsyncThrough (ASYNC_THROUGH): Write data to cache first, then asynchronously write to underlying storage (UFS).
+///   This mode balances performance and durability.
+/// - CacheThrough (CACHE_THROUGH): Write data synchronously to both cache and underlying storage (UFS).
+///   This mode provides the best durability guarantee but may be slower.
+#[repr(i32)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    FromPrimitive,
+    IntoPrimitive,
+    Default,
+    Deserialize,
+    Serialize,
+)]
+pub enum WriteType {
+    #[default]
+    Cache = 0,
+    Through = 1,
+    AsyncThrough = 2,
+    CacheThrough = 3,
+}
+
+impl TryFrom<&str> for WriteType {
+    type Error = CommonError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let typ = match value {
+            "cache" => WriteType::Cache,
+            "through" => WriteType::Through,
+            "async_through" => WriteType::AsyncThrough,
+            "cache_through" => WriteType::CacheThrough,
+            _ => return err_box!("invalid write type: {}", value),
+        };
+
+        Ok(typ)
     }
 }
 

@@ -24,6 +24,7 @@ message MountInfoProto {
     optional int64 block_size = 9;
     optional int32 replicas = 10;
     required MountTypeProto mount_type = 11;
+    required WriteTypeProto write_type = 12;
 }
 
 message MountOptionsProto {
@@ -37,6 +38,7 @@ message MountOptionsProto {
     optional int32 replicas = 8;
     required MountTypeProto mount_type = 9;
     repeated string remove_properties = 10;
+    required WriteTypeProto write_type = 11;
 }
 
 enum ConsistencyStrategyProto {

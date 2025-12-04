@@ -531,6 +531,7 @@ impl ProtoUtils {
             block_size: info.block_size,
             replicas: info.replicas,
             mount_type: info.mount_type.into(),
+            write_type: info.write_type.into(),
         }
     }
 
@@ -547,6 +548,7 @@ impl ProtoUtils {
             block_size: info.block_size,
             replicas: info.replicas,
             mount_type: info.mount_type.into(),
+            write_type: WriteType::from(info.write_type),
         }
     }
 
@@ -562,6 +564,7 @@ impl ProtoUtils {
             replicas: opts.replicas,
             mount_type: opts.mount_type.into(),
             remove_properties: opts.remove_properties,
+            write_type: opts.write_type.into(),
         }
     }
 
@@ -577,6 +580,7 @@ impl ProtoUtils {
             replicas: opts.replicas,
             mount_type: MountType::from(opts.mount_type),
             remove_properties: opts.remove_properties,
+            write_type: opts.write_type.into(),
         }
     }
 
