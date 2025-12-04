@@ -16,6 +16,7 @@ use crate::conf::ClientConf;
 use crate::fs::Path;
 use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StorageType, TtlAction};
 use num_enum::{FromPrimitive, IntoPrimitive};
+use orpc::common::DurationUnit;
 use orpc::{err_box, CommonError, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -215,7 +216,9 @@ pub struct MountOptionsBuilder {
 impl MountOptionsBuilder {
     pub fn new() -> Self {
         Self {
-            write_type: WriteType::Through,
+            write_type: WriteType::CacheThrough,
+            ttl_ms: Some(7 * DurationUnit::DAY as i64),
+            ttl_action: Some(TtlAction::Delete),
             ..Default::default()
         }
     }
