@@ -422,6 +422,10 @@ impl ErrorExt for FsError {
     fn should_retry(&self) -> bool {
         self.retry_master()
     }
+
+    fn should_continue(&self) -> bool {
+        matches!(self, FsError::NotLeaderMaster(_))
+    }
 }
 
 #[cfg(test)]
