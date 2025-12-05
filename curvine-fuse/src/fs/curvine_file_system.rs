@@ -1146,7 +1146,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         self.fs.link(&src_path, &des_path).await?;
-        self.state.link_node(op.header.nodeid, name, oldnodeid)?;
+        // self.state.link_node(op.header.nodeid, name, oldnodeid)?;
         let attr = self
             .lookup_path(op.header.nodeid, Some(name), &des_path)
             .await?;
