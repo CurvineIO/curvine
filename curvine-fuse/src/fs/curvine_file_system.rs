@@ -1114,7 +1114,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
 
         self.fs.delete(&path, false).await?;
-        self.state.unlink_name(op.header.nodeid, name);
+        // self.state.unlink_name(op.header.nodeid, name);
 
         debug!(
             "unlink: removed name mapping for parent={}, name={}",
@@ -1146,7 +1146,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         self.fs.link(&src_path, &des_path).await?;
-        self.state.link_node(op.header.nodeid, name, oldnodeid)?;
+        // self.state.link_node(op.header.nodeid, name, oldnodeid)?;
         let attr = self
             .lookup_path(op.header.nodeid, Some(name), &des_path)
             .await?;
