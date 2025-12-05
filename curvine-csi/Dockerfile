@@ -1,53 +1,99 @@
-FROM ubuntu:24.04 AS builder
+# Use pre-cached compilation image as builder
+FROM ghcr.io/curvineio/curvine-compile:build-cached AS builder
 
 ARG GOPROXY
+ARG TARGETARCH
+ARG TARGETOS
 
-RUN sed -i 's/archive.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    sed -i 's/security.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    apt-get update && apt-get install -y \
-    wget \
-    tar \
-    build-essential \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Install Go toolchain (build-cached image doesn't include Go)
+# Support multi-architecture: amd64 and arm64
+RUN GO_VERSION=1.23.4 && \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) GO_ARCH="amd64" ;; \
+        arm64) GO_ARCH="arm64" ;; \
+        *) GO_ARCH="amd64" ;; \
+    esac && \
+    echo "Installing Go ${GO_VERSION} for ${GO_ARCH}..." && \
+    wget -O go.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" && \
+    tar -C /usr/local -xzf go.tar.gz && \
+    rm go.tar.gz && \
+    echo "✓ Go ${GO_VERSION} installed successfully"
 
-RUN wget -O go1.23.linux-amd64.tar.gz https://go.dev/dl/go1.23.4.linux-amd64.tar.gz && \
-    tar -C /usr/local -xzf go1.23.linux-amd64.tar.gz && \
-    rm go1.23.linux-amd64.tar.gz
-
-ENV PATH=/usr/local/go/bin:$PATH
+# Set environment variables for build tools
+ENV PATH="/root/.cargo/bin:/usr/local/go/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
 ENV GOPATH=/go
 ENV GOROOT=/usr/local/go
-ENV GOPROXY=${GOPROXY:-https://proxy.golang.org}
+ENV GOPROXY=${GOPROXY:-https://goproxy.cn,direct}
 
 WORKDIR /workspace
 
-COPY curvine-csi/ ./curvine-csi/
+# Copy entire Curvine source code
+COPY . /workspace/
 
-RUN cd curvine-csi && \
-    go build -o bin/csi main.go
+# Build only required components: cli and fuse
+# Skip WebUI and other unnecessary components
+# Docker buildx uses QEMU for native compilation on each platform
+RUN echo "Building curvine-cli and curvine-fuse..." && \
+    echo "Target platform: ${TARGETOS:-linux}/${TARGETARCH:-amd64}" && \
+    export CURVINE_HOME=/workspace && \
+    mkdir -p /workspace/tmp && \
+    export TMPDIR=/workspace/tmp && \
+    echo "Using TMPDIR=$TMPDIR for compilation temporary files" && \
+    echo "Running 'make build ARGS=\"-p cli -p fuse\"'..." && \
+    make build ARGS="-p cli -p fuse" && \
+    if [ ! -d "/workspace/build/dist" ]; then \
+        echo "✗ ERROR: /workspace/build/dist not found after build" && \
+        exit 1; \
+    fi && \
+    echo "✓ Build succeeded for cli and fuse components" && \
+    rm -rf /workspace/tmp
 
-FROM ubuntu:24.04
+# Build CSI binary
+# Docker buildx sets TARGETARCH automatically (amd64, arm64, etc.)
+# CGO_ENABLED=0 for static binary without C dependencies
+RUN cd /workspace/curvine-csi && \
+    echo "Building CSI for ${TARGETOS:-linux}/${TARGETARCH:-amd64}..." && \
+    CGO_ENABLED=0 \
+    GOOS=${TARGETOS:-linux} \
+    GOARCH=${TARGETARCH:-amd64} \
+    go build -o bin/csi main.go && \
+    echo "✓ CSI binary built successfully"
 
-RUN sed -i 's/archive.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    sed -i 's/security.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    apt-get update && apt-get install -y \
+# Create output directory and copy build artifacts
+RUN mkdir -p /build-output && \
+    echo "Copying build/dist contents to /build-output..." && \
+    cp -r /workspace/build/dist/* /build-output/ && \
+    cp /workspace/curvine-csi/bin/csi /build-output/bin/ && \
+    echo "Build output summary:" && \
+    echo "  bin/: $(ls -1 /build-output/bin 2>/dev/null | wc -l) files" && \
+    echo "  lib/: $(ls -1 /build-output/lib 2>/dev/null | wc -l) files" && \
+    echo "  conf/: $(ls -1 /build-output/conf 2>/dev/null | wc -l) files"
+
+FROM rockylinux:9
+
+# Install runtime dependencies
+RUN dnf install -y \
     fuse3 \
-    libfuse3-3 \
+    fuse3-libs \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
 
-RUN mkdir -p /opt/curvine/bin /opt/curvine/conf
+# Create curvine directories
+RUN mkdir -p /opt/curvine
 
-COPY build/dist/bin/* /opt/curvine/bin/
-COPY build/dist/conf/* /opt/curvine/conf/
-COPY build/dist/lib/curvine-fuse /opt/curvine/bin/
+# Copy only required binaries from builder stage
+COPY --from=builder /build-output/lib/curvine-cli /opt/curvine/
+COPY --from=builder /build-output/lib/curvine-fuse /opt/curvine/
+COPY --from=builder /build-output/bin/csi /opt/curvine/
 
-COPY --from=builder /workspace/curvine-csi/bin/csi /opt/curvine/bin/
+# Make binaries executable
+RUN chmod +x /opt/curvine/curvine-cli && \
+    chmod +x /opt/curvine/curvine-fuse && \
+    chmod +x /opt/curvine/csi
 
-RUN chmod u+x /opt/curvine/bin/csi && \
-    chmod u+x /opt/curvine/bin/cv && \
-    chmod u+x /opt/curvine/bin/curvine-fuse
+# Set environment variables
+ENV CURVINE_HOME=/opt/curvine
+ENV PATH=$PATH:$CURVINE_HOME
 
 WORKDIR /opt/curvine

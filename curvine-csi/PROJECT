@@ -3,5 +3,5 @@ version:
   stage: 0
   goversion: ""
 name: ""
-repo: github.com/curvineio/curvine-csi
+repo: github.com/curvineio/curvine
 goversion: "1.18"

@@ -39,6 +39,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           livenessProbe:
             failureThreshold: {{ .Values.controller.container.livenessProbe.failureThreshold }}
             httpGet:
@@ -56,9 +60,6 @@ spec:
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
-            - mountPath: /opt/curvine/conf
-              name: curvine-config
-              readOnly: true
         - name: csi-provisioner
           image: {{ .Values.controller.sidecars.provisioner.image }}
           args:
@@ -100,7 +101,3 @@ spec:
       volumes:
         - emptyDir: {}
           name: socket-dir
-        - name: curvine-config
-          configMap:
-            name: {{ .Values.configMap.name }}
-            defaultMode: {{ .Values.configMap.defaultMode }}
