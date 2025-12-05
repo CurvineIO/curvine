@@ -14,14 +14,12 @@
 
 use crate::util::*;
 use clap::Parser;
-use curvine_client::file::FsClient;
-use curvine_client::unified::UfsFileSystem;
+use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{ConsistencyStrategy, MountOptions, MountType, StorageType, TtlAction};
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 pub struct MountCommand {
@@ -35,9 +33,6 @@ pub struct MountCommand {
 
     #[arg(short, long)]
     config: Vec<String>,
-
-    #[arg(long, default_value = "${CURVINE_CONF_FILE}")]
-    conf: String,
 
     /// Update the mount point config if it already exists
     #[arg(long, default_value_t = false)]
@@ -73,10 +68,10 @@ pub struct MountCommand {
 }
 
 impl MountCommand {
-    pub async fn execute(&self, client: Arc<FsClient>) -> CommonResult<()> {
+    pub async fn execute(&self, fs: UnifiedFileSystem) -> CommonResult<()> {
         // If no path argument is given, all mount points are listed.
         if self.ufs_path.trim().is_empty() && self.cv_path.trim().is_empty() {
-            let rep = handle_rpc_result(client.get_mount_table()).await;
+            let rep = handle_rpc_result(fs.fs_client().get_mount_table()).await;
             if self.check {
                 if rep.mount_table.is_empty() {
                     println!("Mount Table: (empty)");
@@ -211,8 +206,8 @@ impl MountCommand {
             }
         }
 
-        let rep = handle_rpc_result(client.mount(&ufs_path, &cv_path, mnt_opts)).await;
-        println!("{}", rep);
+        handle_rpc_result(fs.mount(&ufs_path, &cv_path, mnt_opts)).await;
+        println!("│ ✅️ mount success.");
         Ok(())
     }
 

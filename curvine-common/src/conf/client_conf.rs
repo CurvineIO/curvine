@@ -322,7 +322,7 @@ impl Default for ClientConf {
             enable_rust_read_ufs: true,
 
             mount_update_ttl: Default::default(),
-            mount_update_ttl_str: "10m".to_string(),
+            mount_update_ttl_str: "10s".to_string(),
 
             umask: Self::DEFAULT_FILE_SYSTEM_UMASK,
 

@@ -63,10 +63,7 @@ impl CurvineArgs {
 
         let mut conf = if let Some(path) = conf_path {
             match ClusterConf::from(&path) {
-                Ok(c) => {
-                    println!("Loaded configuration from {}", path);
-                    c
-                }
+                Ok(c) => c,
                 Err(e) => {
                     eprintln!("Warning: Failed to load config file '{}': {}", path, e);
                     eprintln!("Using default configuration");
@@ -123,7 +120,7 @@ fn main() -> CommonResult<()> {
             Commands::Load(cmd) => cmd.execute(load_client).await,
             Commands::LoadStatus(cmd) => cmd.execute(load_client).await,
             Commands::CancelLoad(cmd) => cmd.execute(load_client).await,
-            Commands::Mount(cmd) => cmd.execute(fs_client).await,
+            Commands::Mount(cmd) => cmd.execute(curvine_fs).await,
             Commands::UnMount(cmd) => cmd.execute(fs_client).await,
             Commands::Node(cmd) => cmd.execute(fs_client, conf.clone()).await,
             Commands::Version => {

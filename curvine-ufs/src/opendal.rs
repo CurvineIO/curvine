@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::err_ufs;
 use crate::OpendalConf;
+use crate::{err_ufs, FOLDER_SUFFIX};
 use bytes::BytesMut;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
@@ -26,7 +26,7 @@ use opendal::{
     Metadata, Operator,
 };
 use orpc::sys::DataSlice;
-use orpc::{err_box, err_ext};
+use orpc::{err_box, err_ext, try_option_mut};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -221,7 +221,7 @@ impl Writer for OpendalWriter {
         };
         let len = data.len() as i64;
 
-        let writer = self.writer.as_mut().unwrap();
+        let writer = try_option_mut!(self.writer);
         writer
             .write(data)
             .await
@@ -592,56 +592,22 @@ impl OpendalFileSystem {
     }
 
     fn get_object_path(&self, path: &Path) -> FsResult<String> {
-        if path.is_root() {
-            Ok("/".to_string())
+        match path.path().strip_prefix('/') {
+            Some(v) => Ok(v.to_string()),
+            None => err_box!("path {} invalid", path),
+        }
+    }
+
+    fn get_dir_path(&self, path: &Path) -> FsResult<String> {
+        let object_path = self.get_object_path(path)?;
+        let dir_path = if object_path.is_empty() {
+            "/".to_string()
+        } else if object_path.ends_with(FOLDER_SUFFIX) {
+            object_path.to_string()
         } else {
-            let full_path = path.path();
-            let trimmed = full_path.trim_start_matches('/');
-            if trimmed.is_empty() {
-                Ok("/".to_string())
-            } else {
-                Ok(trimmed.to_string())
-            }
-        }
-    }
-
-    async fn process_entry(
-        &self,
-        entry: opendal::Entry,
-        parent_normalized: &str,
-    ) -> Option<FileStatus> {
-        let raw_path = format!(
-            "{}://{}/{}",
-            self.scheme,
-            self.bucket_or_container,
-            entry.path()
-        );
-        let entry_path = Path::from_str(&raw_path).ok()?;
-
-        let metadata = entry.metadata();
-
-        // Critical: Skip self-references to prevent infinite recursion
-        if metadata.is_dir() && entry_path.full_path() == parent_normalized {
-            log::warn!(
-                "Filtered self-reference: '{}' points to parent '{}'",
-                entry_path,
-                parent_normalized
-            );
-            return None;
-        }
-
-        Some(Self::read_status(&entry_path, metadata))
-    }
-
-    pub async fn get_hdfs_metadata(&self, entry: &opendal::Entry) -> Option<(i64, i64)> {
-        self.operator.stat(entry.path()).await.ok().map(|stat| {
-            (
-                stat.last_modified()
-                    .map(|t| t.timestamp_millis())
-                    .unwrap_or(946684800000),
-                stat.content_length() as i64,
-            )
-        })
+            format!("{}{}", object_path, FOLDER_SUFFIX)
+        };
+        Ok(dir_path)
     }
 
     pub fn write_status(path: &Path) -> FileStatus {
@@ -681,16 +647,39 @@ impl OpendalFileSystem {
             ..Default::default()
         }
     }
+
+    async fn get_object_status(&self, object_path: &str) -> FsResult<Option<Metadata>> {
+        match self.operator.stat(object_path).await {
+            Ok(m) => Ok(Some(m)),
+            Err(e) => {
+                if e.kind() == opendal::ErrorKind::NotFound {
+                    Ok(None)
+                } else {
+                    err_box!(format!("failed to stat: {}", e))
+                }
+            }
+        }
+    }
+
+    pub async fn get_file_status(&self, path: &Path) -> FsResult<Option<FileStatus>> {
+        let object_path = self.get_object_path(path)?;
+        let mut metadata = self.get_object_status(&object_path).await?;
+        if metadata.is_none() {
+            // If the path is a directory, we need to check if it exists.
+            // If it does not exist, we need to create it.
+            let dir_path = self.get_dir_path(path)?;
+            metadata = self.get_object_status(&dir_path).await?;
+        }
+
+        Ok(metadata.map(|m| Self::read_status(path, &m)))
+    }
 }
 
 impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
+    // Creates a directory; the directory must end with "/".
+    // OpenDal always creates directories recursively.
     async fn mkdir(&self, path: &Path, _create_parent: bool) -> FsResult<bool> {
-        let mut object_path = self.get_object_path(path)?;
-        // Ensure directory paths end with '/' for WebHDFS
-        if !object_path.ends_with('/') && !object_path.is_empty() {
-            object_path.push('/');
-        }
-        // Debug: Creating directory
+        let object_path = self.get_dir_path(path)?;
 
         self.operator
             .create_dir(&object_path)
@@ -704,7 +693,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     async fn create(&self, path: &Path, _overwrite: bool) -> FsResult<OpendalWriter> {
         let object_path = self.get_object_path(path)?;
 
-        let exist = self.exists(path).await?;
+        let exist = self.get_object_status(&object_path).await?.is_some();
         if !exist {
             // If no data is written to OpenDal, no file will be created.
             // This does not conform to POSIX semantics, so an empty file is created.
@@ -743,11 +732,9 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     }
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
-        let object_path = self.get_object_path(path)?;
-        match self.operator.stat(&object_path).await {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(FsError::common(format!("Failed to check existence: {}", e))),
+        match self.get_file_status(path).await? {
+            Some(_) => Ok(true),
+            None => Ok(false),
         }
     }
 
@@ -778,12 +765,34 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         let src_path = self.get_object_path(src)?;
         let dst_path = self.get_object_path(dst)?;
 
-        self.operator
-            .rename(&src_path, &dst_path)
-            .await
-            .map_err(|e| FsError::common(format!("Failed to rename: {}", e)))?;
+        // Try direct rename first
+        match self.operator.rename(&src_path, &dst_path).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
+                // For services that don't support rename (like S3), use copy + delete
+                // Read source file
+                let data = self.operator.read(&src_path).await.map_err(|e| {
+                    FsError::common(format!("failed to read source file for rename: {}", e))
+                })?;
 
-        Ok(true)
+                // Write to destination
+                self.operator.write(&dst_path, data).await.map_err(|e| {
+                    FsError::common(format!(
+                        "failed to write destination file for rename: {}",
+                        e
+                    ))
+                })?;
+
+                // Delete source file
+                self.operator.delete(&src_path).await.map_err(|e| {
+                    FsError::common(format!("failed to delete source file after rename: {}", e))
+                })?;
+
+                Ok(true)
+            }
+
+            Err(e) => Err(FsError::common(format!("failed to rename: {}", e))),
+        }
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
@@ -804,49 +813,38 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     }
 
     async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
-        let object_path = self.get_object_path(path)?;
-
-        let metadata = match self.operator.stat(&object_path).await {
-            Ok(m) => m,
-            Err(e) => {
-                // Map backend NotFound to FsError::FileNotFound so FUSE can return ENOENT
-                if e.kind() == opendal::ErrorKind::NotFound {
-                    return err_ext!(FsError::file_not_found(path.full_path()));
-                }
-                return err_box!(format!("failed to stat: {}", e));
-            }
-        };
-
-        Ok(Self::read_status(path, &metadata))
+        match self.get_file_status(path).await? {
+            Some(v) => Ok(v),
+            None => err_ext!(FsError::file_not_found(path.full_path())),
+        }
     }
 
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
-        // Build object path with HDFS trailing slash (needed for proper directory listing)
-        let mut object_path = self.get_object_path(path)?;
-        if self.scheme == HDFS_SCHEMA && !object_path.ends_with('/') && !object_path.is_empty() {
-            object_path.push('/');
-        }
+        let dir_path = self.get_dir_path(path)?;
 
         let list_result = self
             .operator
-            .list(&object_path)
+            .list(&dir_path)
             .await
             .map_err(|e| FsError::common(format!("Failed to list directory: {}", e)))?;
 
-        // Get parent path for self-reference filtering
-        let parent_normalized = path
-            .normalize_uri()
-            .unwrap_or_else(|| path.full_path().to_string());
-
         let mut statuses = Vec::new();
         for entry in list_result {
-            if self.scheme == HDFS_SCHEMA && entry.path() == object_path {
+            let raw_path = format!(
+                "{}://{}/{}",
+                self.scheme,
+                self.bucket_or_container,
+                entry.path().trim_end_matches('/')
+            );
+            let entry_path = Path::from_str(&raw_path)?;
+
+            if entry_path.path() == path.path() {
                 continue;
             }
 
-            if let Some(status) = self.process_entry(entry, &parent_normalized).await {
-                statuses.push(status);
-            }
+            let metadata = entry.metadata();
+            let status = Self::read_status(&entry_path, metadata);
+            statuses.push(status);
         }
 
         Ok(statuses)
