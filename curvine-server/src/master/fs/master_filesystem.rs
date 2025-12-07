@@ -15,9 +15,9 @@
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
+use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
-use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
@@ -307,13 +307,14 @@ impl MasterFilesystem {
     pub fn is_glob_pattern(path: &str) -> bool {
         path.contains(|c| matches!(c, '*' | '?' | '[' | '{' | '\\'))
     }
-    
+
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
         let fs_dir = self.fs_dir.read();
         if Self::is_glob_pattern(&path.as_ref()) {
-            let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;  // FIXED: paths
+            let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?; // FIXED: paths
             let mut all_statuses = Vec::new();
-            for path in &paths {  // FIXED: path (singular)
+            for path in &paths {
+                // FIXED: path (singular)
                 let statuses = fs_dir.list_status(path)?;
                 all_statuses.extend(statuses);
             }
@@ -322,7 +323,6 @@ impl MasterFilesystem {
             let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
             fs_dir.list_status(&inp)
         }
-        
     }
 
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
