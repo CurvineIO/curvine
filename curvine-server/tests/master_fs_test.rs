@@ -318,11 +318,17 @@ fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
     sorted_list_1.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Verify first file: /a/1.log
-    assert_eq!(sorted_list_1[0].path, "/a/b1.log", "First file path mismatch");
+    assert_eq!(
+        sorted_list_1[0].path, "/a/b1.log",
+        "First file path mismatch"
+    );
     assert_eq!(sorted_list_1[0].name, "b1.log", "First file name mismatch");
 
-    // Verify second file: /a/2.log  
-    assert_eq!(sorted_list_1[1].path, "/a/b2.log", "Second file path mismatch");
+    // Verify second file: /a/2.log
+    assert_eq!(
+        sorted_list_1[1].path, "/a/b2.log",
+        "Second file path mismatch"
+    );
     assert_eq!(sorted_list_1[1].name, "b2.log", "Second file name mismatch");
 
     // test 2
@@ -335,7 +341,10 @@ fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
     sorted_list_2.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Verify second file: /a/c2.txt
-    assert_eq!(sorted_list_2[0].path, "/a/c2.txt", "Second file path mismatch");
+    assert_eq!(
+        sorted_list_2[0].path, "/a/c2.txt",
+        "Second file path mismatch"
+    );
     assert_eq!(sorted_list_2[0].name, "c2.txt", "Second file name mismatch");
 
     // test 3
@@ -348,10 +357,16 @@ fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
     sorted_list_3.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Verify second file: /a/b1.txt
-    assert_eq!(sorted_list_3[0].path, "/a/b1.log", "Second file path mismatch");
+    assert_eq!(
+        sorted_list_3[0].path, "/a/b1.log",
+        "Second file path mismatch"
+    );
     assert_eq!(sorted_list_3[0].name, "b1.log", "Second file name mismatch");
 
-    assert_eq!(sorted_list_3[3].path, "/a/c2.txt", "Second file path mismatch");
+    assert_eq!(
+        sorted_list_3[3].path, "/a/c2.txt",
+        "Second file path mismatch"
+    );
     assert_eq!(sorted_list_3[3].name, "c2.txt", "Second file name mismatch");
 
     Ok(())
@@ -369,7 +384,6 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
 
     // list status with glob pattern
 
-
     // println!("find 1.log");
     // let list = fs.list_status("/a/1.log")?;
     // println!("list = {:#?}", list);
@@ -377,7 +391,6 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
     // println!("find files in /a/");
     // let list = fs.list_status("/a")?;
     // println!("list = {:#?}", list);
-
 
     // println!("find /a/1.log");
     // let list1 = fs.list_status("/a/1.log")?;
