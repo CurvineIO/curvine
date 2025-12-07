@@ -112,11 +112,11 @@ fn retry_test() -> CommonResult<()> {
     let mut handler = new_handler();
     let fs = handler.clone_fs();
 
-    // create_file_retry(&mut handler).unwrap();
-    // add_block_retry(&fs).unwrap();
-    // complete_file_retry(&fs).unwrap();
-    // delete_file_retry(&mut handler).unwrap();
-    // rename_retry(&mut handler).unwrap();
+    create_file_retry(&mut handler).unwrap();
+    add_block_retry(&fs).unwrap();
+    complete_file_retry(&fs).unwrap();
+    delete_file_retry(&mut handler).unwrap();
+    rename_retry(&mut handler).unwrap();
 
     Ok(())
 }
