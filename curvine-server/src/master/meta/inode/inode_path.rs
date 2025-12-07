@@ -114,7 +114,7 @@ impl InodePath {
         
         while let Some((curr_index, curr_node)) = queue.pop_front() {
             // Copy current path prefix 0..curr_index from global state
-            let mut path_prefix: Vec<InodePtr> = path_state[0..curr_index].to_vec();
+            // let mut path_prefix: Vec<InodePtr> = path_state[0..curr_index].to_vec();
             
             // Resolve current node
             let resolved_node = match &curr_node.as_ref() {
@@ -127,16 +127,16 @@ impl InodePath {
                 _ => curr_node,
             };
             
-            path_prefix.push(resolved_node.clone());  // Add current
+            path_state[curr_index] = resolved_node.clone(); // Add current
             
             if curr_index == components_length - 1 {
                 // Complete path - produce result
-                let components_result: Vec<String> = path_prefix.iter()
+                let components_result: Vec<String> = path_state.iter()
                     .map(|node| node.as_ref().name().to_string()).collect();
                 let path_str = components_result.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("/");
                 results.push(Self {
                     path: path_str, name: components_result.last().cloned().unwrap_or_default(),
-                    components: components_result, inodes: path_prefix,
+                    components: components_result, inodes: path_state.clone(),
                 });
                 continue;
             }
