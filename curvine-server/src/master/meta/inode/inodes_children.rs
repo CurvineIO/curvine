@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::master::meta::inode::{InodePtr, InodeView};
+use glob::Pattern;
 use orpc::{err_box, CommonResult};
 use std::collections::btree_map::{Entry, Values};
 use std::collections::BTreeMap;
 use std::slice::Iter;
 use std::vec;
-use glob::Pattern;
 
 #[derive(Debug, Clone)]
 pub enum InodeChildren {
@@ -41,18 +41,23 @@ impl InodeChildren {
     }
 
     /// Search children by glob pattern (e.g., "*.txt", "dir*", "**/*.log")
-    fn search_by_glob<'a>(list: &'a [Box<InodeView>], pattern_str: &'a str) -> CommonResult<Vec<&'a InodeView>> {
+    fn search_by_glob<'a>(
+        list: &'a [Box<InodeView>],
+        pattern_str: &'a str,
+    ) -> CommonResult<Vec<&'a InodeView>> {
         println!("jump in search_by_glob");
         let pattern = match Pattern::new(pattern_str) {
             Ok(p) => p,
-            Err(e) => return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Invalid glob pattern '{}': {}", pattern_str, e)
-            ))),
+            Err(e) => {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Invalid glob pattern '{}': {}", pattern_str, e),
+                )))
+            }
         };
-        
+
         let mut matches: Vec<&'a InodeView> = Vec::new();
-        
+
         for child in list {
             if pattern.matches(child.name()) {
                 matches.push(child.as_ref());
@@ -61,7 +66,6 @@ impl InodeChildren {
         println!("matches: {:?}", matches);
         Ok(matches)
     }
-
 
     /// Get children matching glob pattern (e.g., "*.txt", "dir*")
     pub fn get_child_by_glob_pattern<'a>(&'a self, pattern: &'a str) -> Option<Vec<&'a InodeView>> {
@@ -92,18 +96,14 @@ impl InodeChildren {
         }
     }
 
-
-    
     pub fn get_child_ptr_by_glob_pattern(&self, pattern: &str) -> Option<Vec<InodePtr>> {
-        self.get_child_by_glob_pattern(pattern)
-            .map(|children| {
-                children.iter()
-                    .map(|child_ref| InodePtr::from_ref(*child_ref))  // Deref &&InodeView -> &InodeView
-                    .collect()
+        self.get_child_by_glob_pattern(pattern).map(|children| {
+            children
+                .iter()
+                .map(|child_ref| InodePtr::from_ref(*child_ref)) // Deref &&InodeView -> &InodeView
+                .collect()
         })
     }
-
-
 
     pub fn get_child(&self, name: &str) -> Option<&InodeView> {
         match self {
