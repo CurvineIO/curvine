@@ -1462,6 +1462,7 @@ dependencies = [
  "curvine-web",
  "dashmap",
  "futures",
+ "glob",
  "indexmap 2.11.0",
  "linked-hash-map",
  "log",

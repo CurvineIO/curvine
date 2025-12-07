@@ -111,6 +111,7 @@ impl FileUtils {
     // contains_parent is true, and the returned path protects the parent directory name, otherwise it will not be included.
     pub fn list_files<P: AsRef<Path>>(path: P, contains_parent: bool) -> CommonResult<Vec<String>> {
         let path = Path::new(path.as_ref());
+        println!("path: {:?}", path);
         if !path.exists() {
             return err_box!("Dir {} not exits", path.display());
         }
@@ -221,6 +222,15 @@ mod tests {
     #[test]
     fn list_files_test() -> CommonResult<()> {
         let list = FileUtils::list_files("../curvine-client/", false)?;
+        for item in list {
+            println!("{}", item);
+        }
+
+        Ok(())
+    }
+    #[test]
+    fn list_files_test_with_wildcard() -> CommonResult<()> {
+        let list = FileUtils::list_files("../curvine-client/src/file/*.rs", false)?;
         for item in list {
             println!("{}", item);
         }

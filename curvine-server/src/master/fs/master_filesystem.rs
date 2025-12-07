@@ -17,6 +17,8 @@ use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
+use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
+
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
@@ -301,14 +303,34 @@ impl MasterFilesystem {
         Ok(inp.get_last_inode().is_some())
     }
 
+    /// Check if string contains glob pattern characters
+    pub fn is_glob_pattern(path: &str) -> bool {
+        path.contains(|c| matches!(c, '*' | '?' | '[' | '{' | '\\'))
+    }
+    
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
         let fs_dir = self.fs_dir.read();
-        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
-        fs_dir.list_status(&inp)
+        if Self::is_glob_pattern(&path.as_ref()) {
+            let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;  // FIXED: paths
+            let mut all_statuses = Vec::new();
+            for path in &paths {  // FIXED: path (singular)
+                let statuses = fs_dir.list_status(path)?;
+                all_statuses.extend(statuses);
+            }
+            Ok(all_statuses)
+        } else {
+            let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+            fs_dir.list_status(&inp)
+        }
+        
     }
 
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
+    }
+
+    fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
+        InodePath::resolve_for_glob_pattern_v1(fs_dir.root_ptr(), path, &fs_dir.store)
     }
 
     pub fn check_path_length(&self, path: &str) -> CommonResult<()> {
@@ -424,7 +446,6 @@ impl MasterFilesystem {
             None => return err_box!("File does not exist: {}", inp.path()),
             Some(v) => v,
         };
-
         let file = inode.as_file_ref()?;
         fs_dir.complete_file(&inp, len, commit_blocks, client_name, only_flush)?;
         if only_flush {

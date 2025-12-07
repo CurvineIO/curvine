@@ -86,6 +86,10 @@ impl InodeDir {
         self.children.get_child_ptr(name)
     }
 
+    pub fn get_child_ptr_by_glob_pattern(&mut self, name: &str) -> Option<Vec<InodePtr>> {
+        self.children.get_child_ptr_by_glob_pattern(name)
+    }
+
     pub fn update_mtime(&mut self, time: i64) {
         if time > self.mtime {
             self.mtime = time

@@ -15,8 +15,13 @@
 use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePtr, PATH_SEPARATOR};
 use crate::master::meta::store::InodeStore;
+use axum::extract::path;
 use orpc::{err_box, try_option, CommonResult};
 use std::fmt;
+use std::collections::VecDeque;
+use std::cell::RefCell;
+
+
 
 #[derive(Clone)]
 pub struct InodePath {
@@ -33,8 +38,8 @@ impl InodePath {
         store: &InodeStore,
     ) -> CommonResult<Self> {
         let components = InodeView::path_components(path.as_ref())?;
-
         let name = try_option!(components.last());
+
         if name.is_empty() {
             return err_box!("Path {} is invalid", path.as_ref());
         }
@@ -42,6 +47,8 @@ impl InodePath {
         let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
         let mut cur_inode = root;
         let mut index = 0;
+        
+
 
         while index < components.len() {
             //make sure resolved_inode is not a FileEntry
@@ -49,10 +56,14 @@ impl InodePath {
             let resolved_inode = match cur_inode.as_ref() {
                 FileEntry(name, id) => {
                     // If it is a FileEntry, load the complete object from store
-                    match store.get_inode(*id, Some(name))? {
-                        Some(full_inode) => InodePtr::from_owned(full_inode),
+                    let tt = match store.get_inode(*id, Some(name))? {
+                        Some(full_inode) => {
+                            InodePtr::from_owned(full_inode)
+                        },
                         None => return err_box!("Failed to load inode {} from store", id),
-                    }
+                    };
+                    tt
+                    
                 }
                 _ => cur_inode.clone(),
             };
@@ -92,6 +103,170 @@ impl InodePath {
         Ok(inode_path)
     }
 
+
+    pub fn is_glob_pattern(path: &str) -> bool {
+        path.contains(|c| matches!(c, '*' | '?' | '[' | '{' | '\\'))
+    }
+
+    /// Resolve all paths matching glob pattern using BFS queue traversal
+    pub fn resolve_for_glob_pattern_v1(
+        root: InodePtr,
+        pattern: &str,
+        store: &InodeStore,
+    ) -> CommonResult<Vec<Self>> {
+        let components = InodeView::path_components(pattern)?;
+        // let components_clone: Vec<String> = components.clone();
+        let components_length = components.len();
+        let mut results = Vec::new();
+        let mut queue: VecDeque<(usize, Vec<InodePtr>)> = VecDeque::new(); 
+        
+        // Start with root as initial path
+        // let root_path: InodePath = Self::resolve(root.clone(), "", store)?;
+        // let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
+        let initial_node = root.clone();
+        // let mut initial_path_inodes = Vec::with_capacity(components_length);
+
+        let mut initial_path_inodes = vec![initial_node.clone()];
+        initial_path_inodes.resize(components_length, initial_node);  
+
+        queue.push_back((0, initial_path_inodes)); // Start with root
+        while let Some((curr_index, mut path_inodes)) = queue.pop_front() {
+            let mut index: usize = curr_index.clone();
+            let mut curr_node = path_inodes[index].clone();
+            let mut is_consist_of_glob_pattern = false;
+            
+            while index<components_length {
+                let resolved_inode = match &curr_node.as_ref() {
+                    FileEntry(name, id) => {
+                        // If it is a FileEntry, load the complete object from store
+                        let tt= match store.get_inode(*id, Some(name))? {
+                            Some(full_inode) => {
+                                let t2 = InodePtr::from_owned(full_inode.clone());
+                                t2
+                            },
+                            None => return err_box!("Failed to load inode {} from store", id),
+                        };
+                        tt
+                    }
+                    _ => curr_node.clone(),
+                };
+
+                path_inodes[index] = resolved_inode;
+
+
+                if index<components_length-1 {
+                    index += 1;
+                    let child_name: Option<&str> = components.get(index).map(|s| s.as_str());
+                    match curr_node.as_mut() {
+                        Dir(_, d) => {
+                            if let Some(child_name_str) = child_name {
+                                if Self::is_glob_pattern(child_name_str) {
+                                    is_consist_of_glob_pattern = true;
+                                    if let Some(children) = d.get_child_ptr_by_glob_pattern(child_name_str) {
+                                        for child_ptr in children.iter() {
+                                            let mut new_path = path_inodes.clone();
+                                            // new_path.push(child_ptr.clone());
+                                            new_path[index] = child_ptr.clone();
+                                            queue.push_back((index, new_path));
+                                        }
+                                    }
+                                    break; // Stop building this path, continue BFS
+                                } else if let Some(child) = d.get_child_ptr(child_name_str) {
+                                    curr_node = child;
+                                    // path_inodes.push(curr_node.clone());
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        File(_, _) | FileEntry(_, _) => {
+                            break;
+                        }
+                    }
+                }
+                
+                if is_consist_of_glob_pattern == false && index == components_length - 1 {
+                
+                    // Path complete - build result
+                    let components_result: Vec<String> = path_inodes.iter()
+                        .map(|node| node.as_ref().name().to_string())
+                        .collect();
+                    
+                    let components_str = components_result
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<&str>>()
+                        .join("/");
+                    
+                    let inode_path = Self {
+                        path: components_str,
+                        name: components_result.last().cloned().unwrap_or_default(),
+                        components: components_result,
+                        inodes: path_inodes, // Move owned vector
+                    };
+                    
+                    results.push(inode_path);
+                    break;
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Resolve all paths matching glob pattern using BFS queue traversal
+    pub fn resolve_for_glob_pattern(
+        root: InodePtr,
+        pattern: &str,
+        store: &InodeStore,
+    ) -> CommonResult<Vec<Self>> {
+        let mut results = Vec::new();
+        let mut queue: VecDeque<InodePath> = VecDeque::new();
+        
+        // Start with root as initial path
+        let root_path = Self::resolve(root.clone(), "", store)?;
+        queue.push_back(root_path);
+        while let Some(mut current_path) = queue.pop_front() {
+            // Get current directory inode - convert Result to Option
+            // Clone inode first to own the data
+            let last_inode = match current_path.get_last_inode() {
+                Some(inode) => inode,
+                None => continue,
+            };
+            
+            // Now safe to convert to dir - owns the InodePtr
+            let dir_inode = match last_inode.as_dir_ref() {
+                Ok(dir) => dir.clone(),
+                Err(_) => continue,
+            };
+            
+            // Get children matching glob pattern
+            if let Some(matching_children) = dir_inode.clone().get_child_ptr_by_glob_pattern(pattern) {
+                for child in matching_children {
+                    let child_name = child.name();
+                    let child_path_str = current_path.child_path(child_name);
+                    
+                    // Try to resolve full path for matching child
+                    match Self::resolve(root.clone(), &child_path_str, store) {
+                        Ok(child_path) => {
+                            results.push(child_path.clone());
+                            // If child is directory, enqueue for further traversal
+                            if child.is_dir() {
+                                queue.push_back(child_path);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to resolve {}: {}", child_path_str, e);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+ 
     pub fn is_root(&self) -> bool {
         self.components.len() <= 1
     }
@@ -179,7 +354,7 @@ impl InodePath {
 
     /// Get the inode that already exists in the path
     /// If it is a positive number, it indicates the start position; if it is a negative number, it indicates the start from the end.
-    pub fn get_inode(&self, pos: i32) -> Option<InodePtr> {
+    pub fn get_inode(&self, pos: i32) -> Option<InodePtr> {        
         let pos = if pos < 0 {
             (self.components.len() as i32 + pos) as usize
         } else {
