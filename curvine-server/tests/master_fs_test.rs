@@ -310,7 +310,6 @@ fn get_file_info(fs: &MasterFilesystem) -> CommonResult<()> {
 fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
     // test 1
     let list_1 = fs.list_status("/*/*.log")?;
-    println!("list_1: {:?}", list_1);
     assert_eq!(list_1.len(), 2, "Should find exactly 2 log files");
 
     // Sort for consistent ordering (if order not guaranteed)
@@ -333,7 +332,6 @@ fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
 
     // test 2
     let list_2 = fs.list_status("/a/[ac]2.*")?;
-    println!("list_2: {:?}", list_2);
     assert_eq!(list_2.len(), 1, "Should find exactly 1 log files");
 
     // Sort for consistent ordering (if order not guaranteed)
@@ -349,7 +347,6 @@ fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
 
     // test 3
     let list_3 = fs.list_status("/a/*")?;
-    println!("list_3: {:?}", list_3);
     assert_eq!(list_3.len(), 4, "Should find exactly 1 log files");
 
     // Sort for consistent ordering (if order not guaranteed)
