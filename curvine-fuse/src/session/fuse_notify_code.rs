@@ -12,34 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod fuse_response;
-pub use self::fuse_response::FuseResponse;
-pub use self::fuse_response::ResponseData;
+use num_enum::{FromPrimitive, IntoPrimitive};
 
-mod fuse_session;
-pub use fuse_session::FuseSession;
-
-mod fuse_request;
-pub use self::fuse_request::FuseRequest;
-
-mod fuse_decoder;
-pub use self::fuse_decoder::FuseDecoder;
-
-pub mod channel;
-
-mod fuse_mnt;
-pub use self::fuse_mnt::*;
-
-mod fuse_op_code;
-pub use self::fuse_op_code::FuseOpCode;
-
-mod fuse_buf;
-pub use fuse_buf::FuseBuf;
-
-mod fuse_notify_code;
-pub use self::fuse_notify_code::FuseNotifyCode;
-
-pub enum FuseTask {
-    Reply(ResponseData),
-    Request(FuseRequest),
+#[repr(i32)]
+#[derive(Debug, FromPrimitive, IntoPrimitive, Copy, Clone, PartialEq, Eq, Hash)]
+#[allow(non_camel_case_types)]
+pub enum FuseNotifyCode {
+    #[num_enum(default)]
+    FUSE_NOTIFY_UNKNOWN = 0,
+    FUSE_NOTIFY_POLL = 1,
+    FUSE_NOTIFY_INVAL_INODE = 2,
+    FUSE_NOTIFY_INVAL_ENTRY = 3,
+    FUSE_NOTIFY_STORE = 4,
+    FUSE_NOTIFY_RETRIEVE = 5,
+    FUSE_NOTIFY_DELETE = 6,
+    FUSE_NOTIFY_RESEND = 7,
+    FUSE_NOTIFY_INC_EPOCH = 8,
+    FUSE_NOTIFY_CODE_MAX = 9,
 }

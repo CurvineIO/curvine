@@ -61,8 +61,7 @@ impl CurvineFileSystem {
         let mut flags = v;
         if conf.direct_io {
             flags |= FUSE_FOPEN_DIRECT_IO;
-        }
-        if conf.kernel_cache {
+        } else {
             flags |= FUSE_FOPEN_KEEP_CACHE;
         }
         if conf.cache_readdir {
@@ -528,7 +527,10 @@ impl fs::FileSystem for CurvineFileSystem {
             | FUSE_ASYNC_READ
             | FUSE_ASYNC_DIO
             | FUSE_SPLICE_MOVE
-            | FUSE_SPLICE_WRITE;
+            | FUSE_SPLICE_WRITE
+            | FUSE_SPLICE_READ
+            | FUSE_READDIRPLUS_AUTO;
+
         let max_write = FuseUtils::get_fuse_buf_size() - FUSE_BUFFER_HEADER_SIZE;
         let page_size = sys::get_pagesize()?;
         let max_pages = if op.arg.flags & FUSE_MAX_PAGES != 0 {
@@ -538,11 +540,18 @@ impl fs::FileSystem for CurvineFileSystem {
             0
         };
 
+        out_flags |= op.arg.flags;
+        if self.conf.write_back_cache {
+            out_flags |= FUSE_WRITEBACK_CACHE;
+        } else {
+            out_flags &= !FUSE_WRITEBACK_CACHE;
+        }
+
         let out = fuse_init_out {
             major: op.arg.major,
             minor: op.arg.minor,
             max_readahead: op.arg.max_readahead,
-            flags: op.arg.flags | out_flags,
+            flags: out_flags,
             max_background: self.conf.max_background,
             congestion_threshold: self.conf.congestion_threshold,
             max_write: max_write as u32,
@@ -598,24 +607,34 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(entry)
     }
 
-    // getfattr /curvine-fuse/x.log -n id
-    // Query the inode id of node in curvine system, and it is useful to troubleshoot problems.
-    // Output:
-    // # file: curvine-fuse/x.log
-    // id="1057"
     async fn get_xattr(&self, op: GetXAttr<'_>) -> FuseResult<BytesMut> {
         let name = try_option!(op.name.to_str());
-        let path = self.state.get_path(op.header.nodeid)?;
 
+        // Handle system extended attributes FIRST, before any path resolution
+        // This avoids unnecessary operations and provides fastest response
+        // Kernel may still query these even if FUSE_POSIX_ACL is disabled in init response
+        // Kernel requested POSIX_ACL support (kernel_requested_POSIX_ACL: 1048576)
+        // but we disabled it in our response, yet kernel still queries ACL attributes
+        match name {
+            "security.capability"
+            | "security.selinux"
+            | "system.posix_acl_access"
+            | "system.posix_acl_default" => {
+                // Silently ignore system extended attributes without logging
+                // Return ENODATA error to indicate the attribute doesn't exist
+                // This is the correct FUSE protocol response for non-existent attributes
+                // Empty error message to avoid any logging overhead
+                return err_fuse!(libc::ENODATA, "not support get_xattr {}", name);
+            }
+            _ => {
+                // Continue with normal processing for other attributes
+            }
+        }
+
+        let path = self.state.get_path(op.header.nodeid)?;
         debug!("Getting xattr: path='{}' name='{}'", path, name);
 
-        let status = match self.fs.get_status(&path).await {
-            Ok(status) => status,
-            Err(e) => {
-                error!("Failed to get status for {}: {}", path, e);
-                return err_fuse!(libc::ENOENT, "File not found: {}", path);
-            }
-        };
+        let status = self.fs_get_status(&path).await?;
 
         let mut buf = FuseBuf::default();
         match name {
@@ -626,24 +645,6 @@ impl fs::FileSystem for CurvineFileSystem {
                 } else {
                     buf.add_slice(value.as_bytes());
                 }
-            }
-            "security.capability" => {
-                debug!("Querying file capabilities for: {}", path);
-                // Return ENODATA silently to avoid ERROR logs
-                let err = FuseError::new(libc::ENODATA, "No capabilities set".into());
-                return Err(err);
-            }
-            "security.selinux" => {
-                debug!("Querying SELinux context for: {}", path);
-                // Return ENODATA silently to avoid ERROR logs
-                let err = FuseError::new(libc::ENODATA, "No SELinux context set".into());
-                return Err(err);
-            }
-            "system.posix_acl_access" | "system.posix_acl_default" => {
-                debug!("Querying POSIX ACL for: {}", path);
-                // Return ENODATA silently to avoid ERROR logs
-                let err = FuseError::new(libc::ENODATA, "POSIX ACLs not supported".into());
-                return Err(err);
             }
             _ => {
                 // For other xattr names, try to get from file's xattr
@@ -678,7 +679,7 @@ impl fs::FileSystem for CurvineFileSystem {
         // Get the xattr value from the request
         let value_slice: &[u8] = op.value;
 
-        info!(
+        debug!(
             "Setting xattr: path='{}' name='{}' value='{}'",
             path,
             name,
@@ -710,28 +711,21 @@ impl fs::FileSystem for CurvineFileSystem {
         let name = try_option!(op.name.to_str());
         let path = self.state.get_path(op.header.nodeid)?;
 
-        info!("Removing xattr: path='{}' name='{}'", path, name);
+        debug!("Removing xattr: path='{}' name='{}'", path, name);
 
         // Handle system extended attributes silently to avoid ERROR logs
+        // Return success for system attributes without forwarding to backend
         match name {
-            "security.capability" => {
-                debug!("Removing file capabilities for: {}", path);
-                // Return success silently to avoid ERROR logs
+            "security.capability"
+            | "security.selinux"
+            | "system.posix_acl_access"
+            | "system.posix_acl_default" => {
+                // Silently ignore system extended attributes removal
+                // Return success to avoid ERROR logs
                 return Ok(());
             }
-            "security.selinux" => {
-                debug!("Removing SELinux context for: {}", path);
-                // Return success silently to avoid ERROR logs
-                return Ok(());
-            }
-            "system.posix_acl_access" | "system.posix_acl_default" => {
-                debug!("Removing POSIX ACL for: {}", path);
-                // Return success silently to avoid ERROR logs
-                return Ok(());
-            }
-            _ => {
-                // Handle user-defined attributes and other attributes
-            }
+
+            _ => (),
         }
 
         // Create SetAttrOpts with the xattr to remove
@@ -750,13 +744,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         debug!("Listing xattrs: path='{}' size={}", path, op.arg.size);
 
-        let status = match self.fs.get_status(&path).await {
-            Ok(status) => status,
-            Err(e) => {
-                error!("Failed to get status for {}: {}", path, e);
-                return err_fuse!(libc::ENOENT, "File not found: {}", path);
-            }
-        };
+        let status = self.fs_get_status(&path).await?;
 
         // Build the list of xattr names
         let mut xattr_names = Vec::new();
@@ -1011,7 +999,7 @@ impl fs::FileSystem for CurvineFileSystem {
         handle.read(&self.state, op, reply).await
     }
 
-    async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
+    async fn open(&self, op: Open<'_>, reply: &FuseResponse) -> FuseResult<fuse_open_out> {
         let path = self.state.get_path(op.header.nodeid)?;
         let opts = CreateFileOptsBuilder::with_conf(&self.fs.conf().client);
         let handle = self
@@ -1023,7 +1011,23 @@ impl fs::FileSystem for CurvineFileSystem {
         let action = OpenAction::try_from(op.arg.flags)?;
         self.check_access_permissions(handle.status(), op.header, action.acl_mask())?;
 
-        let open_flags = Self::fill_open_flags(&self.conf, op.arg.flags);
+        let mut open_flags = op.arg.flags;
+        if self.conf.direct_io {
+            open_flags |= FUSE_FOPEN_DIRECT_IO;
+        } else {
+            let keep_cache = self
+                .state
+                .should_keep_cache(op.header.nodeid, handle.status())?;
+            if keep_cache {
+                open_flags |= FUSE_FOPEN_KEEP_CACHE;
+            } else {
+                let flag = reply.send_inode_out(handle.ino, -1, 0).await?;
+                if !flag {
+                    open_flags |= FUSE_FOPEN_DIRECT_IO;
+                }
+            }
+        }
+
         let entry = fuse_open_out {
             fh: handle.fh,
             open_flags,
@@ -1060,7 +1064,6 @@ impl fs::FileSystem for CurvineFileSystem {
             .await?;
 
         let attr = self.lookup_status(id, Some(name), handle.status())?;
-        let open_flags = Self::fill_open_flags(&self.conf, flags);
         let r = fuse_create_out(
             fuse_entry_out {
                 nodeid: handle.ino,
@@ -1073,7 +1076,7 @@ impl fs::FileSystem for CurvineFileSystem {
             },
             fuse_open_out {
                 fh: handle.fh,
-                open_flags,
+                open_flags: op.arg.flags,
                 padding: 0,
             },
         );

@@ -63,8 +63,6 @@ pub struct FuseConf {
 
     pub gid: u32,
 
-    pub auto_cache: bool,
-
     pub web_port: u16,
 
     // Whether to fill the fuse node id when traversing the directory.
@@ -118,7 +116,7 @@ pub struct FuseConf {
     // File and directory related options
     pub direct_io: bool,
 
-    pub kernel_cache: bool,
+    pub write_back_cache: bool,
 
     pub cache_readdir: bool,
 
@@ -225,22 +223,20 @@ impl FuseConf {
     }
 
     pub fn set_fuse_opts(&self, mount_options: &mut String) {
-        self.fuse_opts.iter().for_each(|opt| {
-            match opt.as_str() {
-                "default_permissions" => {
-                    mount_options.push_str(",default_permissions");
-                }
-                // "auto_unmount" => {
-                //     mount_options.push_str(",auto_unmount");
-                // },
-                "allow_other" => {
-                    mount_options.push_str(",allow_other");
-                }
-                "allow_root" => {
-                    mount_options.push_str(",allow_root");
-                }
-                _ => {}
+        self.fuse_opts.iter().for_each(|opt| match opt.as_str() {
+            "default_permissions" => {
+                mount_options.push_str(",default_permissions");
             }
+            "allow_other" => {
+                mount_options.push_str(",allow_other");
+            }
+            "allow_root" => {
+                mount_options.push_str(",allow_root");
+            }
+            "async" => {
+                mount_options.push_str(",async");
+            }
+            _ => {}
         });
     }
 
@@ -275,7 +271,6 @@ impl Default for FuseConf {
             ac_attr_timeout: FuseConf::TTR_TIMEOUT,
             ac_attr_timeout_set: FuseConf::TTR_TIMEOUT,
             remember: false,
-            auto_cache: false,
             web_port: 9002,
 
             max_background: 256,
@@ -284,8 +279,8 @@ impl Default for FuseConf {
             node_cache_size: 200000,
             node_cache_timeout: "1h".to_string(),
 
-            direct_io: true,
-            kernel_cache: false,
+            direct_io: false,
+            write_back_cache: false,
             cache_readdir: false,
             non_seekable: false,
 

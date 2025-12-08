@@ -26,7 +26,6 @@ use orpc::common::FastHashMap;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Duration;
 use tokio::sync::Mutex;
 
 pub struct NodeState {
@@ -61,6 +60,20 @@ impl NodeState {
 
     pub fn get_node(&self, id: u64) -> FuseResult<NodeAttr> {
         self.node_read().get_check(id).cloned()
+    }
+
+    pub fn should_keep_cache(&self, id: u64, status: &FileStatus) -> FuseResult<bool> {
+        let mut lock = self.node_write();
+        let attr = lock.get_mut_check(id)?;
+
+        let is_first_access = !attr.cache_valid;
+        let is_changed = status.mtime != attr.mtime || status.len != attr.len;
+
+        attr.cache_valid = true;
+        attr.mtime = status.mtime;
+        attr.len = status.len;
+
+        Ok(is_first_access || !is_changed)
     }
 
     pub fn get_path_common<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> FuseResult<Path> {
@@ -118,15 +131,6 @@ impl NodeState {
 
         let mut attr = CurvineFileSystem::status_to_attr(&self.conf, status)?;
         attr.ino = node.id;
-
-        if self.conf.auto_cache
-            && node.cache_valid
-            && (node.mtime.as_millis() as u64 != attr.mtime || attr.size != node.size)
-        {
-            node.cache_valid = false;
-            node.mtime = Duration::from_millis(attr.mtime);
-            node.size = attr.size;
-        }
 
         Ok(attr)
     }
@@ -273,6 +277,15 @@ impl NodeState {
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
+
+        // Before creating reader, flush any active writer to ensure reader gets correct file length
+        // This is critical for applications like git clone that read files while they're being written
+        if flags.read() {
+            if let Some(existing_writer) = self.find_writer(&ino) {
+                existing_writer.lock().await.flush(None).await?;
+            }
+        }
+
         let (reader, writer) = match flags.access_mode() {
             mode if mode == OpenFlags::RDONLY => {
                 let reader = self.new_reader(path).await?;

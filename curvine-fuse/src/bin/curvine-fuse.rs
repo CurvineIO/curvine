@@ -115,15 +115,8 @@ pub struct FuseArgs {
     #[arg(long, help = "Stream channel size (optional)")]
     pub stream_channel_size: Option<usize>,
 
-    // Cache settings
-    #[arg(long, help = "Enable auto cache (optional)")]
-    pub auto_cache: Option<bool>,
-
     #[arg(long, help = "Enable direct IO (optional)")]
     pub direct_io: Option<bool>,
-
-    #[arg(long, help = "Enable kernel cache (optional)")]
-    pub kernel_cache: Option<bool>,
 
     #[arg(long, help = "Cache readdir results (optional)")]
     pub cache_readdir: Option<bool>,
@@ -211,16 +204,8 @@ impl FuseArgs {
             conf.fuse.stream_channel_size = stream_channel_size;
         }
 
-        if let Some(auto_cache) = self.auto_cache {
-            conf.fuse.auto_cache = auto_cache;
-        }
-
         if let Some(direct_io) = self.direct_io {
             conf.fuse.direct_io = direct_io;
-        }
-
-        if let Some(kernel_cache) = self.kernel_cache {
-            conf.fuse.kernel_cache = kernel_cache;
         }
 
         if let Some(cache_readdir) = self.cache_readdir {

@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::raw::fuse_abi::fuse_out_header;
-use crate::session::FuseTask;
+#![allow(unused)]
+
+use crate::raw::fuse_abi::{fuse_notify_inval_inode_out, fuse_out_header};
+use crate::session::{FuseNotifyCode, FuseOpCode, FuseTask};
 use crate::{FuseError, FuseResult, FuseUtils};
-use crate::{FUSE_OUT_HEADER_LEN, FUSE_SUCCESS};
+use crate::{FUSE_NOTIFY_UNIQUE, FUSE_OUT_HEADER_LEN, FUSE_SUCCESS};
 use log::{info, warn};
 use orpc::io::IOResult;
 use orpc::sync::channel::AsyncSender;
 use orpc::sys::DataSlice;
+use orpc::ternary;
 use std::fmt::Debug;
 use std::io::IoSlice;
 use std::vec;
@@ -57,13 +60,14 @@ impl ResponseData {
         Ok((self.header.len as usize, iovec))
     }
 
-    fn create(unique: u64, errno: i32, data: Vec<DataSlice>) -> Self {
+    fn create(unique: u64, error: i32, data: Vec<DataSlice>) -> Self {
         let data_len = data.iter().map(|x| x.len()).sum::<usize>();
+        let error = ternary!(unique == FUSE_NOTIFY_UNIQUE, error, -error);
 
         // The fuse error code is the negative number of the os error code.
         let header = fuse_out_header {
             len: (FUSE_OUT_HEADER_LEN + data_len) as u32,
-            error: -errno,
+            error,
             unique,
         };
 
@@ -112,12 +116,34 @@ impl FuseResponse {
 
             Err(e) => {
                 let e = e.into();
-                warn!("send_rep unique {}: {:?}", self.unique, e);
+                if self.debug || e.errno != libc::ENOENT {
+                    warn!("send_rep unique {}: {:?}", self.unique, e);
+                }
                 ResponseData::create(self.unique, e.errno, vec![])
             }
         };
 
         self.sender.send(FuseTask::Reply(data)).await
+    }
+
+    pub async fn send_notify<T: Debug>(&self, code: FuseNotifyCode, res: T) -> IOResult<bool> {
+        if self.debug {
+            info!("send_notify code {:?}, res: {:?}", code, res);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let data = vec![DataSlice::buffer(FuseUtils::struct_as_buf(&res))];
+            let data = ResponseData::create(FUSE_NOTIFY_UNIQUE, code.into(), data);
+
+            self.sender.send(FuseTask::Reply(data)).await?;
+            Ok(true)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(false)
+        }
     }
 
     pub async fn send_buf(&self, res: FuseResult<BytesMut>) -> IOResult<()> {
@@ -130,7 +156,9 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                warn!("send_buf unique {}: {}", self.unique, e);
+                if self.debug || e.errno != libc::ENOENT {
+                    warn!("send_buf unique {}: {}", self.unique, e);
+                }
                 ResponseData::create(self.unique, e.errno, vec![])
             }
         };
@@ -149,7 +177,9 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                warn!("send_data unique {}: {}", self.unique, e);
+                if self.debug || e.errno != libc::ENOENT {
+                    warn!("send_data unique {}: {}", self.unique, e);
+                }
                 ResponseData::create(self.unique, e.errno, vec![])
             }
         };
@@ -159,5 +189,12 @@ impl FuseResponse {
 
     pub fn send_none(&self, _: FuseResult<()>) -> IOResult<()> {
         Ok(())
+    }
+
+    // notify kernel cache invalidation
+    pub async fn send_inode_out(&self, ino: u64, off: i64, len: i64) -> IOResult<bool> {
+        let arg = fuse_notify_inval_inode_out { ino, off, len };
+        self.send_notify(FuseNotifyCode::FUSE_NOTIFY_INVAL_INODE, arg)
+            .await
     }
 }

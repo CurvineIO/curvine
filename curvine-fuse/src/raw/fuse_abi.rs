@@ -367,3 +367,19 @@ pub struct fuse_rename2_in {
     pub flags: u32,
     pub padding: u32,
 }
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_notify_inval_inode_out {
+    pub ino: u64,
+    pub off: i64,
+    pub len: i64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_notify_inval_entry_out {
+    pub parent: u64,
+    pub namelen: u32,
+    pub flags: u32,
+}

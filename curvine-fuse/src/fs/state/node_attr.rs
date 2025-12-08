@@ -42,9 +42,9 @@ pub struct NodeAttr {
     pub stat_updated: Duration,
 
     // Inode modification time in the file system.
-    pub mtime: Duration,
+    pub mtime: i64,
 
-    pub size: u64,
+    pub len: i64,
 
     pub is_hidden: bool,
 

@@ -138,6 +138,8 @@ fn fuse_mount_sys(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
     );
     conf.set_fuse_opts(&mut mount_options);
     flags |= options_to_flag(mount_options.as_str());
+    info!("sys-mount options: {}; flags: 0x{:x}", mount_options, flags);
+
     // Default name is "/dev/fuse", then use the subtype, and lastly prefer the name
     let c_source = CString::new("curvinefs").unwrap();
     let c_mountpoint = CString::new(mnt.to_str().unwrap()).unwrap();

@@ -34,6 +34,7 @@ TEST_DIR="/curvine-fuse/fio-test"
 FIO_SIZE="500m"
 FIO_RUNTIME="30s"
 FIO_NUMJOBS="1"
+FIO_DIRECT="1"  # Disable direct I/O by default (use page cache)
 FIO_VERIFY="1"  # Enable data verification by default
 FIO_CLEANUP="1"  # Cleanup test files by default
 JSON_OUTPUT=""  # JSON output file path (empty = disabled)
@@ -63,6 +64,8 @@ OPTIONS:
         --runtime TIME        FIO test runtime (default: 30s)
                               Examples: 30s, 1m, 2m
         --numjobs NUM         Number of FIO parallel jobs (default: 1)
+        --direct <0|1>        Enable direct I/O (default: 1)
+                              0=disable (use page cache), 1=enable (bypasses page cache)
         --verify <0|1>        Enable data verification (default: 1)
                               0=disable, 1=enable CRC32C verification
         --cleanup <0|1>       Cleanup test files after completion (default: 1)
@@ -83,6 +86,9 @@ EXAMPLES:
     # Disable data verification for faster performance testing
     $0 --verify 0 --size 1G --runtime 30s
     
+    # Disable direct I/O to test with page cache
+    $0 --direct 0 --size 1G --runtime 30s
+
     # Keep test files for inspection (do not cleanup)
     $0 --cleanup 0 --size 500M
     
@@ -226,7 +232,7 @@ test_fio_sequential() {
         --name=seq_write \
         --directory=$fio_dir \
         --ioengine=libaio \
-        --direct=1 \
+        --direct=$FIO_DIRECT \
         --bs=256k \
         --size=$FIO_SIZE \
         --numjobs=$FIO_NUMJOBS \
@@ -251,7 +257,7 @@ test_fio_sequential() {
         --name=seq_write \
         --directory=$fio_dir \
         --ioengine=libaio \
-        --direct=1 \
+        --direct=$FIO_DIRECT \
         --bs=256k \
         --size=$FIO_SIZE \
         --numjobs=$FIO_NUMJOBS \
@@ -285,7 +291,7 @@ test_fio_random() {
         --name=rand_write \
         --directory=$fio_dir \
         --ioengine=libaio \
-        --direct=1 \
+        --direct=$FIO_DIRECT \
         --bs=256k \
         --size=$FIO_SIZE \
         --numjobs=$FIO_NUMJOBS \
@@ -311,7 +317,7 @@ test_fio_random() {
         --name=rand_write \
         --directory=$fio_dir \
         --ioengine=libaio \
-        --direct=1 \
+        --direct=$FIO_DIRECT \
         --bs=256k \
         --size=$FIO_SIZE \
         --numjobs=$FIO_NUMJOBS \
@@ -337,7 +343,7 @@ test_fio_random() {
         --name=rand_rw \
         --directory=$fio_dir \
         --ioengine=libaio \
-        --direct=1 \
+        --direct=$FIO_DIRECT \
         --bs=256k \
         --size=$FIO_SIZE \
         --numjobs=$FIO_NUMJOBS \
@@ -493,6 +499,10 @@ main() {
                 FIO_NUMJOBS="$2"
                 shift 2
                 ;;
+            --direct)
+                FIO_DIRECT="$2"
+                shift 2
+                ;;
             --verify)
                 FIO_VERIFY="$2"
                 shift 2
@@ -523,6 +533,7 @@ main() {
     echo "FIO Size:       $FIO_SIZE"
     echo "FIO Runtime:    $FIO_RUNTIME"
     echo "FIO Jobs:       $FIO_NUMJOBS"
+    echo "FIO Direct I/O: $([ "$FIO_DIRECT" = "1" ] && echo "Enabled" || echo "Disabled")"
     echo "Data Verify:    $([ "$FIO_VERIFY" = "1" ] && echo "Enabled (CRC32C)" || echo "Disabled")"
     echo "Cleanup Files:  $([ "$FIO_CLEANUP" = "1" ] && echo "Enabled" || echo "Disabled")"
     if [ -n "$JSON_OUTPUT" ]; then

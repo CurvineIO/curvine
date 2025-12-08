@@ -78,11 +78,17 @@ pub const FUSE_SPLICE_WRITE: u32 = 1 << 7;
 
 pub const FUSE_SPLICE_MOVE: u32 = 1 << 8;
 
+pub const FUSE_SPLICE_READ: u32 = 1 << 9;
+
 pub const FUSE_ASYNC_DIO: u32 = 1 << 15;
 
 pub const FUSE_DO_READDIRPLUS: u32 = 1 << 13;
 
 pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
+
+pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
+
+pub const FUSE_POSIX_ACL: u32 = 1 << 20;
 
 pub const FUSE_DO_RENAME2: u32 = 1 << 11;
 
@@ -140,5 +146,7 @@ pub const FATTR_MTIME_NOW: u32 = 1 << 8;
 
 // The minimum version of the clone fd feature can be used.
 pub const FUSE_CLONE_FD_MIN_VERSION: f32 = 4.2f32;
+
+pub const FUSE_NOTIFY_UNIQUE: u64 = 0;
 
 pub static UNIX_KERNEL_VERSION: Lazy<f32> = Lazy::new(FuseUtils::get_kernel_version);

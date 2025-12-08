@@ -96,7 +96,11 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    fn open(&self, op: Open<'_>) -> impl Future<Output = FuseResult<fuse_open_out>> + Send {
+    fn open(
+        &self,
+        op: Open<'_>,
+        _reply: &FuseResponse,
+    ) -> impl Future<Output = FuseResult<fuse_open_out>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
