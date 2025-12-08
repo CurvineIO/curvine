@@ -28,6 +28,9 @@ use log::warn;
 use orpc::sync::ArcRwLock;
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::sync::Arc;
+use glob::Pattern;
+use crate::master::meta::is_glob_pattern;
+
 
 #[derive(Clone)]
 pub struct MasterFilesystem {
@@ -303,18 +306,12 @@ impl MasterFilesystem {
         Ok(inp.get_last_inode().is_some())
     }
 
-    /// Check if string contains glob pattern characters
-    pub fn is_glob_pattern(path: &str) -> bool {
-        path.contains(|c| matches!(c, '*' | '?' | '[' | '{' | '\\'))
-    }
-
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
         let fs_dir = self.fs_dir.read();
-        if Self::is_glob_pattern(&path.as_ref()) {
-            let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?; // FIXED: paths
+        if is_glob_pattern(&path.as_ref()) {
+            let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
             let mut all_statuses = Vec::new();
             for path in &paths {
-                // FIXED: path (singular)
                 let statuses = fs_dir.list_status(path)?;
                 all_statuses.extend(statuses);
             }

@@ -45,7 +45,6 @@ impl InodeChildren {
         list: &'a [Box<InodeView>],
         pattern_str: &'a str,
     ) -> CommonResult<Vec<&'a InodeView>> {
-        println!("jump in search_by_glob");
         let pattern = match Pattern::new(pattern_str) {
             Ok(p) => p,
             Err(e) => {
@@ -63,34 +62,26 @@ impl InodeChildren {
                 matches.push(child.as_ref());
             }
         }
-        println!("matches: {:?}", matches);
         Ok(matches)
     }
 
     /// Get children matching glob pattern (e.g., "*.txt", "dir*")
     pub fn get_child_by_glob_pattern<'a>(&'a self, pattern: &'a str) -> Option<Vec<&'a InodeView>> {
-        println!("jump in get_child_by_glob_pattern: {:?}", self);
         match self {
             InodeChildren::List(list) => {
-                println!("is list");
                 Self::search_by_glob(list, pattern).ok()
             }
             InodeChildren::Map(map) => {
-                println!("is map");
                 let glob_pattern = match Pattern::new(pattern) {
                     Ok(p) => p,
                     Err(_) => return None,
                 };
                 let mut matches: Vec<&'a InodeView> = Vec::new();
                 for child in map.values() {
-                    print!("child in map: {:?}", child);
-                    print!("child name in map: {:?}", child.name());
                     if glob_pattern.matches(child.name()) {
-                        println!("matche!!!!, child = {:?}", child.name());
                         matches.push(child.as_ref());
                     }
                 }
-                println!("get_child_by_glob_pattern: {:?}", matches);
                 Some(matches)
             }
         }
@@ -156,9 +147,7 @@ impl InodeChildren {
         // Assert that it should not be FileEntry
         match self {
             InodeChildren::List(list) => {
-                println!("list: {:?}", list);
                 let index = Self::search_by_name(list, inode.name());
-                println!("index: {:?}", index);
                 match index {
                     Err(v) => {
                         list.insert(v, inode);

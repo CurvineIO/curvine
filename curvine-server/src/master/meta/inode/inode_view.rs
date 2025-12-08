@@ -491,6 +491,10 @@ impl InodeView {
 
         res
     }
+    fn has_metachars(s: &str) -> bool {
+        s.contains('*') || s.contains('?') || s.contains('[') || s.contains(']')
+    }
+
 }
 
 impl Clone for InodeView {

@@ -15,11 +15,41 @@
 use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePtr, PATH_SEPARATOR};
 use crate::master::meta::store::InodeStore;
-use axum::extract::path;
 use orpc::{err_box, try_option, CommonResult};
-use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
+use std::hash::{Hash, Hasher};
 use std::fmt;
+use crate::master::meta::glob_utils::is_glob_pattern;
+
+#[derive(Clone)]
+pub struct HashableInodePtr(pub InodePtr);  // Wraps your RawPtr<InodeView>
+
+impl PartialEq for HashableInodePtr {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.0.as_ptr(), other.0.as_ptr())
+    }
+}
+
+impl Eq for HashableInodePtr {}
+
+impl Hash for HashableInodePtr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.as_ptr().hash(state);
+    }
+}
+
+impl std::ops::Deref for HashableInodePtr {
+    type Target = InodePtr;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<InodePtr> for HashableInodePtr {
+    fn from(ptr: InodePtr) -> Self {
+        HashableInodePtr(ptr)
+    }
+}
 
 #[derive(Clone)]
 pub struct InodePath {
@@ -96,26 +126,20 @@ impl InodePath {
         Ok(inode_path)
     }
 
-    pub fn is_glob_pattern(path: &str) -> bool {
-        path.contains(|c| matches!(c, '*' | '?' | '[' | '{' | '\\'))
-    }
-
     /// Resolve all paths matching glob pattern using BFS queue traversal
     pub fn resolve_for_glob_pattern_v1(root: InodePtr, pattern: &str, store: &InodeStore) -> CommonResult<Vec<Self>> {
         let components = InodeView::path_components(pattern)?;
         let components_length = components.len();
         let mut results = Vec::new();
         let mut queue: VecDeque<(usize, InodePtr)> = VecDeque::new();  // Just index + node!
-        
-        // Global path state - shared across all queue entries
-        let mut path_state: Vec<InodePtr> = vec![root.clone(); components_length];
+        let root_hashable = HashableInodePtr::from(root.clone());
+        // Parent map: hash node -> (index, parent) for path reconstruction
+        let mut parent_map: HashMap<HashableInodePtr, (usize, Option<InodePtr>)> = HashMap::new();
+        parent_map.insert(root_hashable, (0, None)); // Root has no parent
         
         queue.push_back((0, root));  // Start BFS
         
-        while let Some((curr_index, curr_node)) = queue.pop_front() {
-            // Copy current path prefix 0..curr_index from global state
-            // let mut path_prefix: Vec<InodePtr> = path_state[0..curr_index].to_vec();
-            
+        while let Some((curr_index, curr_node)) = queue.pop_front() {            
             // Resolve current node
             let resolved_node = match &curr_node.as_ref() {
                 FileEntry(name, id) => {
@@ -126,17 +150,33 @@ impl InodePath {
                 }
                 _ => curr_node,
             };
-            
-            path_state[curr_index] = resolved_node.clone(); // Add current
-            
+                        
             if curr_index == components_length - 1 {
-                // Complete path - produce result
-                let components_result: Vec<String> = path_state.iter()
+                // Reconstruct path
+                let mut path_inodes = Vec::new();
+                let mut current = resolved_node;
+                let mut idx = curr_index;
+                
+                while idx != 0 {
+                    path_inodes.push(current.clone());
+                    if let Some((parent_idx, parent)) = parent_map.get(&HashableInodePtr(current.clone())) {
+                        current = parent.clone().unwrap();
+                        idx = *parent_idx - 1;
+                    } else {
+                        break;
+                    }
+                }
+                path_inodes.reverse();
+                
+                let components_result: Vec<String> = path_inodes.iter()
                     .map(|node| node.as_ref().name().to_string()).collect();
                 let path_str = components_result.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("/");
+                
                 results.push(Self {
-                    path: path_str, name: components_result.last().cloned().unwrap_or_default(),
-                    components: components_result, inodes: path_state.clone(),
+                    path: path_str,
+                    name: components_result.last().cloned().unwrap_or_default(),
+                    components: components_result,
+                    inodes: path_inodes,
                 });
                 continue;
             }
@@ -145,13 +185,18 @@ impl InodePath {
             if let Dir(_, d) = resolved_node.as_mut() {
                 let next_name = components.get(curr_index + 1).map(|s| s.as_str());
                 if let Some(child_name_str) = next_name {
-                    if Self::is_glob_pattern(child_name_str) {
+                    if is_glob_pattern(child_name_str) {
                         if let Some(children) = d.get_child_ptr_by_glob_pattern(child_name_str) {
                             for child_ptr in children.iter() {
-                                queue.push_back((curr_index + 1, child_ptr.clone()));  // Minimal clone!
+                                let child = child_ptr.clone();
+                                let child_hashable = HashableInodePtr(child.clone());
+                                parent_map.insert(child_hashable, (curr_index + 1, Some(resolved_node.clone())));
+                                queue.push_back((curr_index + 1, child));
                             }
                         }
                     } else if let Some(child) = d.get_child_ptr(child_name_str) {
+                        let child_hashable = HashableInodePtr(child.clone());
+                        parent_map.insert(child_hashable, (curr_index + 1, Some(resolved_node.clone())));
                         queue.push_back((curr_index + 1, child));
                     }
                 }
