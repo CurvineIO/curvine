@@ -8,13 +8,15 @@ pub enum DfCommand {
     Df {
         #[clap(short, long, help = "Show human-readable sizes")]
         human_readable: bool,
+        #[clap(long, action = clap::ArgAction::Help, help = "Print help")]
+        help: Option<bool>,
     },
 }
 
 impl DfCommand {
     pub async fn execute(&self, client: UnifiedFileSystem) -> CommonResult<()> {
         match self {
-            DfCommand::Df { human_readable } => {
+            DfCommand::Df { human_readable, .. } => {
                 // Get master info from the filesystem
                 match client.get_master_info().await {
                     Ok(master_info) => {
