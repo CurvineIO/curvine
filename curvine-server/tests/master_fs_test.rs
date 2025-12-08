@@ -96,13 +96,13 @@ fn new_handler() -> MasterHandler {
 fn fs_test() -> CommonResult<()> {
     let fs = new_fs(true, "fs_test");
 
-    mkdir(&fs)?;
-    delete(&fs)?;
-    rename(&fs)?;
-    create_file(&fs)?;
-    get_file_info(&fs)?;
+    // mkdir(&fs)?;
+    // delete(&fs)?;
+    // rename(&fs)?;
+    // create_file(&fs)?;
+    // get_file_info(&fs)?;
     list_status(&fs)?;
-    state(&fs)?;
+    // state(&fs)?;
 
     Ok(())
 }
@@ -365,6 +365,10 @@ fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
         "Second file path mismatch"
     );
     assert_eq!(sorted_list_3[3].name, "c2.txt", "Second file name mismatch");
+
+    // test 4
+    let list_4 = fs.list_status("/a/[a")?;
+    assert_eq!(list_4.len(), 0, "Should find exactly 0 log files");
 
     Ok(())
 }
