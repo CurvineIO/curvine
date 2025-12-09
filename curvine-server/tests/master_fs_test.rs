@@ -311,7 +311,7 @@ fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
     // test 1
     let list_1 = fs.list_status("/*/*.log")?;
     assert_eq!(list_1.len(), 2, "Should find exactly 2 log files");
-
+    println!("list_1: {:?}", list_1);
     // Sort for consistent ordering (if order not guaranteed)
     let mut sorted_list_1 = list_1.clone();
     sorted_list_1.sort_by(|a, b| a.name.cmp(&b.name));
