@@ -19,7 +19,7 @@ use orpc::{err_box, try_option, CommonResult};
 use std::collections::{VecDeque, HashMap};
 use std::hash::{Hash, Hasher};
 use std::fmt;
-use crate::master::meta::glob_utils::is_glob_pattern;
+use crate::master::meta::glob_utils::parse_glob_pattern;
 
 #[derive(Clone)]
 pub struct HashableInodePtr(pub InodePtr);  // Wraps your RawPtr<InodeView>
@@ -82,11 +82,10 @@ impl InodePath {
             let resolved_inode = match cur_inode.as_ref() {
                 FileEntry(name, id) => {
                     // If it is a FileEntry, load the complete object from store
-                    let tt = match store.get_inode(*id, Some(name))? {
+                    match store.get_inode(*id, Some(name))? {
                         Some(full_inode) => InodePtr::from_owned(full_inode),
                         None => return err_box!("Failed to load inode {} from store", id),
-                    };
-                    tt
+                    }
                 }
                 _ => cur_inode.clone(),
             };
@@ -127,7 +126,7 @@ impl InodePath {
     }
 
     /// Resolve all paths matching glob pattern using BFS queue traversal
-    pub fn resolve_for_glob_pattern_v1(root: InodePtr, pattern: &str, store: &InodeStore) -> CommonResult<Vec<Self>> {
+    pub fn resolve_for_glob_pattern(root: InodePtr, pattern: &str, store: &InodeStore) -> CommonResult<Vec<Self>> {
         let components = InodeView::path_components(pattern)?;
         let components_length = components.len();
         let mut results = Vec::new();
@@ -185,8 +184,9 @@ impl InodePath {
             if let Dir(_, d) = resolved_node.as_mut() {
                 let next_name = components.get(curr_index + 1).map(|s| s.as_str());
                 if let Some(child_name_str) = next_name {
-                    if is_glob_pattern(child_name_str) {
-                        if let Some(children) = d.get_child_ptr_by_glob_pattern(child_name_str) {
+                    let (is_glob_pattern, glob_pattern) = parse_glob_pattern(child_name_str);
+                    if is_glob_pattern {
+                        if let Some(children) = d.get_child_ptr_by_glob_pattern(&glob_pattern.unwrap()) {
                             for child_ptr in children.iter() {
                                 let child = child_ptr.clone();
                                 let child_hashable = HashableInodePtr(child.clone());
@@ -205,59 +205,7 @@ impl InodePath {
         Ok(results)
     }
 
-    /// Resolve all paths matching glob pattern using BFS queue traversal
-    pub fn resolve_for_glob_pattern(
-        root: InodePtr,
-        pattern: &str,
-        store: &InodeStore,
-    ) -> CommonResult<Vec<Self>> {
-        let mut results = Vec::new();
-        let mut queue: VecDeque<InodePath> = VecDeque::new();
-
-        // Start with root as initial path
-        let root_path = Self::resolve(root.clone(), "", store)?;
-        queue.push_back(root_path);
-        while let Some(mut current_path) = queue.pop_front() {
-            // Get current directory inode - convert Result to Option
-            // Clone inode first to own the data
-            let last_inode = match current_path.get_last_inode() {
-                Some(inode) => inode,
-                None => continue,
-            };
-
-            // Now safe to convert to dir - owns the InodePtr
-            let dir_inode = match last_inode.as_dir_ref() {
-                Ok(dir) => dir.clone(),
-                Err(_) => continue,
-            };
-
-            // Get children matching glob pattern
-            if let Some(matching_children) =
-                dir_inode.clone().get_child_ptr_by_glob_pattern(pattern)
-            {
-                for child in matching_children {
-                    let child_name = child.name();
-                    let child_path_str = current_path.child_path(child_name);
-
-                    // Try to resolve full path for matching child
-                    match Self::resolve(root.clone(), &child_path_str, store) {
-                        Ok(child_path) => {
-                            results.push(child_path.clone());
-                            // If child is directory, enqueue for further traversal
-                            if child.is_dir() {
-                                queue.push_back(child_path);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to resolve {}: {}", child_path_str, e);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(results)
-    }
+    
 
     pub fn is_root(&self) -> bool {
         self.components.len() <= 1

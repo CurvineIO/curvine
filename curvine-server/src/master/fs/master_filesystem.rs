@@ -28,8 +28,7 @@ use log::warn;
 use orpc::sync::ArcRwLock;
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::sync::Arc;
-use glob::Pattern;
-use crate::master::meta::is_glob_pattern;
+use crate::master::meta::parse_glob_pattern;
 
 
 #[derive(Clone)]
@@ -308,7 +307,8 @@ impl MasterFilesystem {
 
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
         let fs_dir = self.fs_dir.read();
-        if is_glob_pattern(&path.as_ref()) {
+        let (is_glob_pattern, _) = parse_glob_pattern(&path.as_ref());
+        if is_glob_pattern {
             let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
             let mut all_statuses = Vec::new();
             for path in &paths {
@@ -327,7 +327,7 @@ impl MasterFilesystem {
     }
 
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
-        InodePath::resolve_for_glob_pattern_v1(fs_dir.root_ptr(), path, &fs_dir.store)
+        InodePath::resolve_for_glob_pattern(fs_dir.root_ptr(), path, &fs_dir.store)
     }
 
     pub fn check_path_length(&self, path: &str) -> CommonResult<()> {

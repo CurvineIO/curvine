@@ -30,4 +30,4 @@ mod block_meta;
 pub use block_meta::BlockMeta;
 
 mod glob_utils;
-pub use glob_utils::is_glob_pattern;
+pub use glob_utils::*;
