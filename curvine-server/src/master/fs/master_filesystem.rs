@@ -20,6 +20,7 @@ use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR
 use crate::master::meta::FsDir;
 
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
+use axum::http::status;
 use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
 use curvine_common::state::*;
@@ -308,13 +309,19 @@ impl MasterFilesystem {
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
         let fs_dir = self.fs_dir.read();
         let (is_glob_pattern, _) = parse_glob_pattern(&path.as_ref());
+        println!("path.as_ref(): {:?}", path.as_ref());
+        println!("is_glob_pattern: {:?}", is_glob_pattern);
         if is_glob_pattern {
             let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
+            println!("paths: {:?}", paths);
             let mut all_statuses = Vec::new();
             for path in &paths {
+                println!("path: {:?}", path);
                 let statuses = fs_dir.list_status(path)?;
+                println!("statuses: {:?}", statuses);
                 all_statuses.extend(statuses);
             }
+            println!("all_statuses: {:?}", all_statuses);
             Ok(all_statuses)
         } else {
             let inp = Self::resolve_path(&fs_dir, path.as_ref())?;

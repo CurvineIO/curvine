@@ -1,0 +1,98 @@
+🚀 Starting 100 runs of: cargo test --package curvine-server --test journal_test -- check_raft_state --exact --nocapture
+📅 Started at: Sun Nov 30 09:02:44 +07 2025
+----------------------------------------
+🔄 Run 1/100
+
+running 1 test
+25/11/30 09:02:45.143 INFO db_engine.rs:224 Delete(format) exists db path "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-1/journal"    
+25/11/30 09:02:45.155 INFO db_engine.rs:41 Create rocksdb success, format: true, conf: DBConf { base_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-1/journal", data_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-1/journal/data", checkpoint_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-1/journal/checkpoint", family_list: ["default", "default", "meta"], disable_wal: false, compression_type: None, db_write_buffer_size: 0, write_buffer_size: 67108864 }    
+25/11/30 09:02:45.155 INFO ttl_bucket.rs:123 Creating TTL bucket list with sorted storage, interval duration: 3600000ms    
+25/11/30 09:02:45.156 INFO db_engine.rs:224 Delete(format) exists db path "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-1/meta"    
+25/11/30 09:02:45.174 INFO db_engine.rs:41 Create rocksdb success, format: true, conf: DBConf { base_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-1/meta", data_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-1/meta/data", checkpoint_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-1/meta/checkpoint", family_list: ["default", "inodes", "edges", "block", "location", "mountpoints"], disable_wal: true, compression_type: None, db_write_buffer_size: 0, write_buffer_size: 67108864 }    
+25/11/30 09:02:45.175 INFO db_engine.rs:224 Delete(format) exists db path "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-2/journal"    
+25/11/30 09:02:45.185 INFO db_engine.rs:41 Create rocksdb success, format: true, conf: DBConf { base_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-2/journal", data_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-2/journal/data", checkpoint_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-2/journal/checkpoint", family_list: ["default", "default", "meta"], disable_wal: false, compression_type: None, db_write_buffer_size: 0, write_buffer_size: 67108864 }    
+25/11/30 09:02:45.185 INFO ttl_bucket.rs:123 Creating TTL bucket list with sorted storage, interval duration: 3600000ms    
+25/11/30 09:02:45.186 INFO db_engine.rs:224 Delete(format) exists db path "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-2/meta"    
+25/11/30 09:02:45.204 INFO db_engine.rs:41 Create rocksdb success, format: true, conf: DBConf { base_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-2/meta", data_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-2/meta/data", checkpoint_dir: "/Users/mac/warehouse/OSS/curvine/curvine-server/../testing/raft-2/meta/checkpoint", family_list: ["default", "inodes", "edges", "block", "location", "mountpoints"], disable_wal: true, compression_type: None, db_write_buffer_size: 0, write_buffer_size: 67108864 }    
+25/11/30 09:02:45.204 INFO raft_node.rs:245 install snapshot end, cost 0 ms    
+25/11/30 09:02:45.205 INFO raft.rs:2668 switched to configuration, raft_id: 64761, config: Configuration { voters: Configuration { incoming: Configuration { voters: {64761, 64762} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }    
+25/11/30 09:02:45.205 INFO raft.rs:1132 became follower at term 0, raft_id: 64761, term: 0    
+25/11/30 09:02:45.205 INFO raft.rs:393 newRaft, raft_id: 64761, peers: Configuration { incoming: Configuration { voters: {64761, 64762} }, outgoing: Configuration { voters: {} } }, last term: 0, last index: 0, applied: 0, commit: 0, term: 0    
+25/11/30 09:02:45.205 INFO raw_node.rs:315 RawNode created with id 64761., raft_id: 64761, id: 64761    
+25/11/30 09:02:45.206 INFO rpc_server.rs:143 Rpc server [curvine-journal] start successfully, bind address: localhost:64761, hostname: localhost, thread_name: raft-rpc, io threads: 8, worker threads: 8    
+25/11/30 09:02:45.206 INFO raft_node.rs:245 install snapshot end, cost 0 ms    
+25/11/30 09:02:45.207 INFO raft.rs:2668 switched to configuration, raft_id: 64762, config: Configuration { voters: Configuration { incoming: Configuration { voters: {64761, 64762} }, outgoing: Configuration { voters: {} } }, learners: {}, learners_next: {}, auto_leave: false }    
+25/11/30 09:02:45.207 INFO raft.rs:1132 became follower at term 0, raft_id: 64762, term: 0    
+25/11/30 09:02:45.207 INFO raft.rs:393 newRaft, raft_id: 64762, peers: Configuration { incoming: Configuration { voters: {64761, 64762} }, outgoing: Configuration { voters: {} } }, last term: 0, last index: 0, applied: 0, commit: 0, term: 0    
+25/11/30 09:02:45.207 INFO raw_node.rs:315 RawNode created with id 64762., raft_id: 64762, id: 64762    
+25/11/30 09:02:45.207 INFO rpc_server.rs:143 Rpc server [curvine-journal] start successfully, bind address: localhost:64762, hostname: localhost, thread_name: raft-rpc, io threads: 8, worker threads: 8    
+25/11/30 09:02:47.246 INFO raft.rs:1562 starting a new election, raft_id: 64762, term: 0    
+25/11/30 09:02:47.247 INFO raft.rs:1182 became pre-candidate at term 0, raft_id: 64762, term: 0    
+25/11/30 09:02:47.247 INFO raft.rs:1311 broadcasting vote request, raft_id: 64762, to: [64761], log_index: 0, log_term: 0, term: 0, type: MsgRequestPreVote    
+25/11/30 09:02:47.247 INFO raft_node.rs:457 Raft soft state change, node id 64762, current leader 0    
+25/11/30 09:02:47.249 INFO raft.rs:1577 [logterm: 0, index: 0, vote: 0] cast vote for 64762 [logterm: 0, index: 0] at term 0, raft_id: 64761, msg type: MsgRequestPreVote, term: 0, msg_index: 0, msg_term: 0, from: 64762, vote: 0, log_index: 0, log_term: 0    
+25/11/30 09:02:47.354 INFO raft.rs:2224 received votes response, raft_id: 64762, term: 0, type: MsgRequestPreVoteResponse, approvals: 2, rejections: 0, from: 64761, vote: true    
+25/11/30 09:02:47.355 INFO raft.rs:1156 became candidate at term 1, raft_id: 64762, term: 1    
+25/11/30 09:02:47.355 INFO raft.rs:1311 broadcasting vote request, raft_id: 64762, to: [64761], log_index: 0, log_term: 0, term: 1, type: MsgRequestVote    
+25/11/30 09:02:47.456 INFO raft_node.rs:457 Raft soft state change, node id 64762, current leader 0    
+25/11/30 09:02:47.457 INFO raft.rs:1376 received a message with higher term from 64762, raft_id: 64761, msg type: MsgRequestVote, message_term: 1, term: 0, from: 64762    
+25/11/30 09:02:47.458 INFO raft.rs:1132 became follower at term 1, raft_id: 64761, term: 1    
+25/11/30 09:02:47.458 INFO raft.rs:1577 [logterm: 0, index: 0, vote: 0] cast vote for 64762 [logterm: 0, index: 0] at term 1, raft_id: 64761, msg type: MsgRequestVote, term: 1, msg_index: 0, msg_term: 0, from: 64762, vote: 0, log_index: 0, log_term: 0    
+25/11/30 09:02:47.561 INFO raft.rs:2224 received votes response, raft_id: 64762, term: 1, type: MsgRequestVoteResponse, approvals: 2, rejections: 0, from: 64761, vote: true    
+25/11/30 09:02:47.561 INFO raft.rs:1240 became leader at term 1, raft_id: 64762, term: 1    
+25/11/30 09:02:47.664 INFO raft_node.rs:457 Raft soft state change, node id 64762, current leader 64762    
+25/11/30 09:02:47.682 INFO journal_test.rs:140 state 1 Exit    
+25/11/30 09:02:47.682 INFO journal_test.rs:141 state 2 Active    
+inp: InodePath { path: "/journal/b/test.log", name: "test.log", components: ["", "journal", "b", "test.log"], inodes: [0x11df126c0, 0x11ea1ed90, 0x11ea19ec0, 0x11ea1a2b0], store: "<InodeStore>" }
+inode: 0x11ea1a2b0
+complete_file: 1764468167683
+commit_blocks: [CommitBlock { block_id: 16944988160, block_len: 10, locations: [BlockLocation { worker_id: 100, storage_type: Disk }] }]
+inp: InodePath { path: "/journal/append.log", name: "append.log", components: ["", "journal", "append.log"], inodes: [0x11df126c0, 0x11ea1ed90, 0x11ea2a8a0], store: "<InodeStore>" }
+inode: 0x11ea2a8a0
+complete_file: 1764468167683
+commit_blocks: [CommitBlock { block_id: 16961765376, block_len: 10, locations: [BlockLocation { worker_id: 100, storage_type: Disk }] }]
+inp: InodePath { path: "/journal/append.log", name: "append.log", components: ["", "journal", "append.log"], inodes: [0x11df126c0, 0x11ea1ed90, 0x11ea2a8a0], store: "<InodeStore>" }
+inode: 0x11ea2a8a0
+complete_file: 1764468167683
+commit_blocks: [CommitBlock { block_id: 16961765376, block_len: 13, locations: [BlockLocation { worker_id: 100, storage_type: Disk }] }]
+25/11/30 09:02:47.684 INFO mount_table.rs:106 add mount: MountInfo { cv_path: "/x/y/z", ufs_path: "oss://cluster1/", mount_id: 50006031, properties: {"k1": "v1"}, ttl_ms: 0, ttl_action: None, consistency_strategy: None, storage_type: None, block_size: None, replicas: None, mount_type: Cst }    
+25/11/30 09:02:47.684 INFO mount_table.rs:106 add mount: MountInfo { cv_path: "/x/z/y", ufs_path: "hdfs://cluster1/", mount_id: 2937248522, properties: {}, ttl_ms: 0, ttl_action: None, consistency_strategy: None, storage_type: None, block_size: None, replicas: None, mount_type: Cst }    
+25/11/30 09:02:47.767 INFO raft_node.rs:457 Raft soft state change, node id 64761, current leader 64762    
+25/11/30 09:02:55.172 INFO mount_table.rs:106 add mount: MountInfo { cv_path: "/x/y/z", ufs_path: "oss://cluster1/", mount_id: 50006031, properties: {"k1": "v1"}, ttl_ms: 0, ttl_action: None, consistency_strategy: None, storage_type: None, block_size: None, replicas: None, mount_type: Cst }    
+25/11/30 09:02:55.406 INFO rpc_server.rs:125 Receive ctrl_c signal, shutting down curvine-journal    
+25/11/30 09:02:55.406 INFO rpc_server.rs:125 Receive ctrl_c signal, shutting down curvine-journal    
+25/11/30 09:02:55.407 INFO rpc_server.rs:137 The server has stopped    
+25/11/30 09:02:55.407 INFO rpc_server.rs:137 The server has stopped    
+25/11/30 09:02:56.222 INFO mount_table.rs:106 add mount: MountInfo { cv_path: "/x/z/y", ufs_path: "hdfs://cluster1/", mount_id: 2937248522, properties: {}, ttl_ms: 0, ttl_action: None, consistency_strategy: None, storage_type: None, block_size: None, replicas: None, mount_type: Cst }    
+.
+├── journal
+│   ├── a
+│   │   └── test.log
+│   ├── append.log
+│   └── b
+├── journal_1
+│   ├── a
+│   └── b
+└── x
+    ├── y
+    │   └── z
+    └── z
+        └── y
+.
+├── journal
+│   ├── a
+│   │   └── test.log
+│   ├── append.log
+│   └── b
+├── journal_1
+│   ├── a
+│   └── b
+└── x
+    ├── y
+    │   └── z
+    └── z
+        └── y
+test check_raft_state ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 32.55s
+

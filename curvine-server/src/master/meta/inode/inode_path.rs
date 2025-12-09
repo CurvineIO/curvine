@@ -185,6 +185,7 @@ impl InodePath {
                 let next_name = components.get(curr_index + 1).map(|s| s.as_str());
                 if let Some(child_name_str) = next_name {
                     let (is_glob_pattern, glob_pattern) = parse_glob_pattern(child_name_str);
+                    println!("is_glob_pattern: {:?}, glob_pattern: {:?}", is_glob_pattern, glob_pattern);
                     if is_glob_pattern {
                         if let Some(children) = d.get_child_ptr_by_glob_pattern(&glob_pattern.unwrap()) {
                             for child_ptr in children.iter() {
@@ -202,6 +203,7 @@ impl InodePath {
                 }
             }
         }
+        println!("results: {:?}", results);
         Ok(results)
     }
 
