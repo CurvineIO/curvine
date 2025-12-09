@@ -626,7 +626,7 @@ impl OpendalFileSystem {
     pub fn read_status(path: &Path, metadata: &Metadata) -> FileStatus {
         let mtime = metadata
             .last_modified()
-            .map(|t| t.timestamp_millis())
+            .map(|t| t.into_inner().as_millisecond())
             .unwrap_or(0);
         let len = metadata.content_length() as i64;
 

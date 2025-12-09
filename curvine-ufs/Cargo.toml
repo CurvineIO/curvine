@@ -14,7 +14,7 @@ futures = { workspace = true }
 log = { workspace = true }
 fastrand = { workspace = true }
 
-opendal = { version = "0.54", default-features = false, optional = true }
+opendal = { version = "0.55", optional = true }
 
 # JNI support for HDFS (moved from curvine-common)
 jni = { version = "0.21.1", features = ["invocation"], optional = true }
