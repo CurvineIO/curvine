@@ -129,7 +129,12 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 	// Build FUSE command
 	fuseBinaryPath := "/opt/curvine/curvine-fuse"
 	args := []string{fuseBinaryPath}
-	args = append(args, "-d") // Debug mode
+
+	// Add debug flag if FUSE_DEBUG_ENABLED is set
+	if debugEnabled := os.Getenv("FUSE_DEBUG_ENABLED"); debugEnabled == "true" || debugEnabled == "1" {
+		args = append(args, "-d")
+		klog.Infof("FUSE debug mode enabled for %s", key)
+	}
 
 	// Add master-addrs
 	if masterAddrs != "" {
