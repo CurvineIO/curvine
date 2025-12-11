@@ -49,6 +49,14 @@
             <a href="/result?date={{ date }}" class="back-link">← Back to Test Results</a>
         </div>
         
+        {% if ltp_test.status == 'skipped' %}
+        <div style="text-align: center; padding: 40px; color: #f39c12;">
+            <h2>LTP Test Skipped</h2>
+            {% if ltp_test.reason %}
+            <p style="margin-top: 20px; font-size: 1.1em;">{{ ltp_test.reason }}</p>
+            {% endif %}
+        </div>
+        {% elif ltp_test.total_tests is defined %}
         <div class="filter-controls">
             <button id="filter-failed-btn" class="filter-btn">Show Failed Only</button>
             <button id="show-all-btn" class="filter-btn" style="display:none;">Show All</button>
@@ -97,6 +105,11 @@
         {% else %}
         <div class="test-suite-section">
             <p>No test results available</p>
+        </div>
+        {% endif %}
+        {% else %}
+        <div style="text-align: center; padding: 40px; color: #95a5a6;">
+            <p>No test data available</p>
         </div>
         {% endif %}
         
