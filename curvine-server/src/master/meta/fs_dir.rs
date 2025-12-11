@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use crate::master::fs::DeleteResult;
 use crate::master::journal::{JournalEntry, JournalWriter};
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
@@ -34,7 +33,6 @@ use std::collections::{HashMap, LinkedList};
 use std::mem;
 use std::sync::Arc;
 
-
 /// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
     pub(crate) root_dir: InodeView,
@@ -42,7 +40,6 @@ pub struct FsDir {
     pub(crate) store: InodeStore,
     pub(crate) journal_writer: JournalWriter,
 }
-
 
 impl FsDir {
     pub fn new(
@@ -52,11 +49,9 @@ impl FsDir {
     ) -> FsResult<Self> {
         let db_conf = conf.meta_rocks_conf();
 
-
         let store = RocksInodeStore::new(db_conf, conf.format_master)?;
         let state = InodeStore::new(store, ttl_bucket_list);
         let (last_inode_id, root_dir) = state.create_tree()?;
-
 
         let fs_dir = Self {
             root_dir,
@@ -66,10 +61,8 @@ impl FsDir {
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
 
-
         Ok(fs_dir)
     }
-
 
     pub fn inode_store(&self) -> InodeStore {
         self.store.clone()
@@ -79,38 +72,31 @@ impl FsDir {
         Dir(ROOT_INODE_NAME.to_string(), InodeDir::new(ROOT_INODE_ID, 0))
     }
 
-
     pub fn root_ptr(&self) -> InodePtr {
         InodePtr::from_ref(&self.root_dir)
     }
 
-
     pub fn root_dir(&self) -> &InodeView {
         &self.root_dir
     }
-
 
     fn next_inode_id(&self) -> FsResult<i64> {
         let id = self.inode_id.next()?;
         Ok(id)
     }
 
-
     pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
         self.store.get_ttl_bucket_list()
     }
-
 
     pub fn mkdir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         // Create parent directory
         inp = self.create_parent_dir(inp, opts.parent_opts())?;
 
-
         // Create the final directory.
         inp = self.create_single_dir(inp, opts)?;
         Ok(inp)
     }
-
 
     // Create the first subdirectory that does not exist.
     // 1. If all directories on the path already exist, skip and return successful.
@@ -118,50 +104,39 @@ impl FsDir {
     fn create_single_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         let op_ms = LocalTime::mills();
 
-
         if inp.is_full() || inp.is_root() {
             return Ok(inp);
         }
 
-
         let pos = inp.existing_len() - 1;
         let name = inp.get_component(pos + 1)?.to_string();
 
-
         let dir = InodeDir::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
 
-
         inp = self.add_last_inode(inp, Dir(name.clone(), dir.clone()))?;
-
 
         let parent_path = inp.get_valid_parent_path();
         self.journal_writer.log_mkdir(op_ms, &parent_path, &dir)?;
 
-
         Ok(inp)
     }
-
 
     // Create all previous directories that may be missing on the path.
     fn create_parent_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         let mut index = inp.existing_len();
-
 
         // The parent directory already exists and does not need to be created.
         if inp.is_full() || index + 1 >= inp.len() {
             return Ok(inp);
         }
 
-
         while index <= inp.len() - 2 {
             inp = self.create_single_dir(inp, opts.clone())?;
             index += 1;
         }
 
-
         Ok(inp)
     }
-
 
     // Delete files or directories
     pub fn delete(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
@@ -170,7 +145,6 @@ impl FsDir {
             return err_box!("Path not exists: {}", inp.path());
         }
 
-
         if !inp.is_empty_dir() && !recursive {
             return err_box!("{} is non empty", inp.path());
         }
@@ -178,10 +152,8 @@ impl FsDir {
         self.journal_writer
             .log_delete(op_ms, inp.path(), op_ms as i64)?;
 
-
         Ok(del_res)
     }
-
 
     pub(crate) fn unprotected_delete(
         &mut self,
@@ -193,14 +165,12 @@ impl FsDir {
             None => return err_box!("Path not exists: {}", inp.path()),
         };
 
-
         let mut parent = match inp.get_inode(-2) {
             Some(v) => v,
             None => return err_box!("Abnormal data status"),
         };
         let child = target.as_ref();
         let child_name = inp.name();
-
 
         // Handle different types of nodes
         parent.update_mtime(mtime);
@@ -230,12 +200,10 @@ impl FsDir {
             }
         };
 
-
         // After deletion occurs, the target address cannot be used.
         let _ = parent.delete_child(child.id(), child_name)?;
         Ok(del_res)
     }
-
 
     pub fn rename(
         &mut self,
@@ -255,7 +223,6 @@ impl FsDir {
         Ok(res)
     }
 
-
     pub(crate) fn unprotected_rename(
         &mut self,
         src_inp: &InodePath,
@@ -271,12 +238,10 @@ impl FsDir {
             return err_box!("Rename failed, because exchange mode is not supported");
         }
 
-
         let mut src_parent = match src_inp.get_inode(-2) {
             None => return err_box!("Parent not exits: {}", src_inp.path()),
             Some(v) => v,
         };
-
 
         // If no_replace is true and target file exists, return error; otherwise delete target file first
         let del_res = match dst_inp.get_last_inode() {
@@ -289,7 +254,6 @@ impl FsDir {
             }
             _ => None,
         };
-
 
         let mut new_name = dst_inp.name().to_string();
         let mut dst_parent = match dst_inp.get_last_inode() {
@@ -306,17 +270,14 @@ impl FsDir {
             }
         };
 
-
         // Modify the time and name of the rename node.
         let mut new_inode = src_inode.as_ref().clone();
         new_inode.update_mtime(mtime);
         new_inode.change_name(new_name);
 
-
         // Update the parent directory for the last modification time.
         src_parent.update_mtime(mtime);
         dst_parent.update_mtime(mtime);
-
 
         // Update state.
         self.store.apply_rename(
@@ -326,17 +287,14 @@ impl FsDir {
             &new_inode,
         )?;
 
-
         // Update memory status.
         // step 1: Delete the original node.
         // step 2: Add a new node.
         let _ = src_parent.delete_child(src_inode.id(), src_inode.name())?;
         let _ = dst_parent.add_child(new_inode)?;
 
-
         Ok(del_res)
     }
-
 
     pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
         let op_ms = LocalTime::mills();
@@ -344,21 +302,17 @@ impl FsDir {
             return err_ext!(FsError::file_exists(inp.path()));
         }
 
-
         // Create a directory that does not exist.
         inp = self.create_parent_dir(inp, opts.dir_opts())?;
         let name = inp.name().to_string();
-
 
         // Create an inode file node.
         let file = InodeFile::with_opts(self.inode_id.next()?, LocalTime::mills() as i64, opts);
         inp = self.add_last_inode(inp, File(name, file))?;
         self.journal_writer.log_create_file(op_ms, &inp)?;
 
-
         Ok(inp)
     }
-
 
     pub(crate) fn add_last_inode(
         &mut self,
@@ -369,9 +323,7 @@ impl FsDir {
             return Ok(inp);
         }
 
-
         let pos = inp.existing_len() as i32;
-
 
         // parent must be an existing directory.
         let mut parent = match inp.get_inode(pos - 1) {
@@ -383,10 +335,8 @@ impl FsDir {
                 }
             }
 
-
             None => return err_box!("Parent path not exists: {}", inp.get_parent_path()),
         };
-
 
         // Update the parent directory for the last modification time.
         parent.update_mtime(child.mtime());
@@ -394,15 +344,12 @@ impl FsDir {
             parent.incr_nlink();
         }
 
-
         let added = parent.add_child(child)?;
         self.store.apply_add(parent.as_ref(), added.as_ref())?;
         inp.append(added)?;
 
-
         Ok(inp)
     }
-
 
     pub fn file_status(&self, inp: &InodePath) -> FsResult<FileStatus> {
         let inode = match inp.get_last_inode() {
@@ -411,7 +358,6 @@ impl FsDir {
         };
         assert!(!inode.is_file_entry());
 
-
         let status = match inode.as_ref() {
             File(..) | Dir(..) => inode.to_file_status(inp.path()),
             FileEntry(..) => {
@@ -419,12 +365,9 @@ impl FsDir {
             }
         };
 
-
         Ok(status)
     }
 
-
-    
     pub fn list_status(&self, inp: &InodePath) -> FsResult<Vec<FileStatus>> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -432,11 +375,9 @@ impl FsDir {
         };
         assert!(!inode.is_file_entry()); // removed because we want to list FileEntry as well
 
-
         let mut res = Vec::with_capacity(1.max(inode.child_len()));
         match inode.as_ref() {
             File(_, _) => res.push(inode.to_file_status(inp.path())),
-
 
             Dir(_, d) => {
                 for item in d.children_iter() {
@@ -453,7 +394,6 @@ impl FsDir {
                 }
             }
 
-
             FileEntry(name, id) => {
                 let inode_opt = self.store.get_inode(*id, Some(name))?;
                 match inode_opt {
@@ -463,10 +403,8 @@ impl FsDir {
             }
         }
 
-
         Ok(res)
     }
-
 
     // Check the file block status. If it is a retry block, then return this block directly.
     pub fn analyze_block_state<'a>(
@@ -477,7 +415,6 @@ impl FsDir {
         if BlockMeta::matching_block(last_block, commit) {
             return Ok(None);
         }
-
 
         let penultimate = file.get_block(-2);
         if BlockMeta::matching_block(penultimate, commit) {
@@ -491,7 +428,6 @@ impl FsDir {
         }
     }
 
-
     pub fn acquire_new_block(
         &mut self,
         inp: &InodePath,
@@ -502,7 +438,6 @@ impl FsDir {
         let op_ms = LocalTime::mills();
         let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
-
 
         // Check whether it is a retry request.
         let retry_block = Self::analyze_block_state(file, commit_block.as_ref())?;
@@ -515,18 +450,14 @@ impl FsDir {
             });
         }
 
-
         let new_block_id = file.next_block_id()?;
-
 
         // flush file and commit block
         let slice: &[CommitBlock] = commit_block.as_slice();
         file.complete(file_len, slice, "", true)?;
 
-
         // create block.
         file.add_block(BlockMeta::with_pre(new_block_id, choose_workers));
-
 
         let block = ExtendedBlock {
             id: new_block_id,
@@ -535,7 +466,6 @@ impl FsDir {
             file_type: file.file_type,
         };
 
-
         // state add block.
         self.store
             .apply_new_block(inode.as_ref(), commit_block.as_ref())?;
@@ -543,7 +473,6 @@ impl FsDir {
             .log_add_block(op_ms, inp.path(), inode.as_file_ref()?, commit_block)?;
         Ok(block)
     }
-
 
     pub fn complete_file(
         &mut self,
@@ -558,7 +487,6 @@ impl FsDir {
         let file = inode.as_file_mut()?;
         file.complete(len, &commit_block, client_name, only_flush)?;
 
-
         self.store
             .apply_complete_file(inode.as_ref(), &commit_block)?;
         self.journal_writer.log_complete_file(
@@ -570,7 +498,6 @@ impl FsDir {
         Ok(true)
     }
 
-
     pub fn get_file_locations(
         &self,
         file: &InodeFile,
@@ -579,17 +506,14 @@ impl FsDir {
         Ok(locs)
     }
 
-
     pub fn add_block_location(&self, block_id: i64, location: BlockLocation) -> FsResult<()> {
         self.store.add_block_location(block_id, location)?;
         Ok(())
     }
 
-
     pub fn get_block_locations(&self, block_id: i64) -> FsResult<Vec<BlockLocation>> {
         Ok(self.store.get_block_locations(block_id)?)
     }
-
 
     pub fn reopen_file(
         &mut self,
@@ -603,7 +527,6 @@ impl FsDir {
         };
         assert!(!inode_ptr.is_file_entry());
 
-
         let mut inode = match inode_ptr.as_ref() {
             File(..) => inode_ptr.as_ref().clone(),
             Dir(..) => {
@@ -615,20 +538,16 @@ impl FsDir {
             }
         };
 
-
         let file = inode.as_file_mut()?;
         let _ = file.reopen(client_name);
         let status = inode.to_file_status(inp.path());
-
 
         self.store.apply_reopen_file(&inode)?;
         self.journal_writer
             .log_reopen_file(op_ms, inp.path(), inode.as_file_ref()?)?;
 
-
         Ok(status)
     }
-
 
     // Determine whether the current block has been deleted.
     //Judge whether the block's inode exists. Block will only be deleted if the inode is deleted. All this judgment is not problematic.
@@ -651,7 +570,6 @@ impl FsDir {
         }
     }
 
-
     /// Overwrite a file by cleaning all blocks and updating metadata.
     /// If file doesn't exist, create a new one.
     /// Returns DeleteResult containing blocks that need to be removed from workers.
@@ -663,13 +581,11 @@ impl FsDir {
         let op_ms = LocalTime::mills();
         let mut delete_result = DeleteResult::new();
 
-
         match inp.get_last_inode() {
             Some(inode) => {
                 if !inode.is_file() {
                     return err_box!("Path is not a file: {}", inp.path());
                 }
-
 
                 let file = inode.as_mut().as_file_mut()?;
                 for block_meta in &file.blocks {
@@ -679,7 +595,6 @@ impl FsDir {
                 }
                 file.overwrite(opts, op_ms as i64);
 
-
                 self.store.apply_overwrite_file(inode.as_ref())?;
             }
             None => {
@@ -687,19 +602,15 @@ impl FsDir {
             }
         }
 
-
         // Log the operation
         self.journal_writer.log_overwrite_file(op_ms, inp)?;
-
 
         Ok(delete_result)
     }
 
-
     pub fn print_tree(&self) {
         self.root_dir.print_tree()
     }
-
 
     pub fn sum_hash(&self) -> u128 {
         let mut tree_hash = self.root_dir.sum_hash();
@@ -710,11 +621,9 @@ impl FsDir {
         tree_hash
     }
 
-
     pub fn last_inode_id(&self) -> i64 {
         self.inode_id.current()
     }
-
 
     pub fn update_last_inode_id(&self, new_value: i64) -> CommonResult<()> {
         if new_value > self.last_inode_id() {
@@ -724,39 +633,32 @@ impl FsDir {
         }
     }
 
-
     // Read data from rocksdb to build a directory tree
     pub fn create_tree(&self) -> CommonResult<InodeView> {
         self.store.create_tree().map(|x| x.1)
     }
 
-
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
         self.store.create_checkpoint(id)
     }
-
 
     pub fn restore<T: AsRef<str>>(&mut self, path: T) -> CommonResult<()> {
         let mut spend = TimeSpent::new();
         let path = path.as_ref();
 
-
         // Set to other values ​​first to facilitate memory recycling.
         self.root_dir = Self::create_root();
-
 
         // Reset rocksdb
         self.store.restore(path)?;
         let time1 = spend.used_ms();
         spend.reset();
 
-
         // Update the directory tree
         let (last_inode_id, root_dir) = self.store.create_tree()?;
         self.root_dir = root_dir;
         self.update_last_inode_id(last_inode_id)?;
         let time2 = spend.used_ms();
-
 
         info!(
             "Restore from {}, restore rocksdb used {} ms, \
@@ -767,16 +669,13 @@ impl FsDir {
         Ok(())
     }
 
-
     pub fn get_checkpoint_path(&self, id: u64) -> String {
         self.store.get_checkpoint_path(id)
     }
 
-
     pub fn get_file_counts(&self) -> (i64, i64) {
         self.store.get_file_counts()
     }
-
 
     pub fn block_report(&mut self, blocks: Vec<(bool, i64, BlockLocation)>) -> FsResult<()> {
         let mut batch = self.store.new_batch();
@@ -788,49 +687,40 @@ impl FsDir {
             }
         }
 
-
         batch.commit()?;
         Ok(())
     }
 
-
     pub fn get_rocks_store(&self) -> &RocksInodeStore {
         &self.store.store
     }
-
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
         let block_ids = self.store.store.delete_locations(worker_id)?;
         Ok(block_ids)
     }
 
-
     // for testing
     pub fn take_entries(&self) -> Vec<JournalEntry> {
         self.journal_writer.take_entries()
     }
-
 
     pub fn store_mount(&mut self, info: MountInfo, send_log: bool) -> FsResult<()> {
         // Create parent directory
         let op_ms = LocalTime::mills();
         self.store.store.add_mountpoint(info.mount_id, &info)?;
 
-
         if send_log {
             self.journal_writer.log_mount(op_ms, info)?;
         }
 
-
         Ok(())
     }
-
 
     pub fn unprotected_store_mount(&mut self, info: MountInfo) -> FsResult<()> {
         self.store.store.add_mountpoint(info.mount_id, &info)?;
         Ok(())
     }
-
 
     pub fn unmount(&mut self, id: u32) -> FsResult<()> {
         // Create parent directory
@@ -840,38 +730,31 @@ impl FsDir {
         Ok(())
     }
 
-
     pub fn unprotected_unmount(&mut self, id: u32) -> FsResult<()> {
         self.store.store.remove_mountpoint(id)?;
         Ok(())
     }
 
-
     pub fn get_mount_table(&self) -> CommonResult<Vec<MountInfo>> {
         self.store.get_mount_table()
     }
-
 
     pub fn get_mount_point(&self, id: u32) -> CommonResult<Option<MountInfo>> {
         self.store.get_mount_point(id)
     }
 
-
     pub fn set_attr(&mut self, inp: InodePath, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let op_ms = LocalTime::mills();
-
 
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
-
         self.unprotected_set_attr(inode.clone(), opts.clone())?;
         self.journal_writer.log_set_attr(op_ms, &inp, opts)?;
         Ok(inode.to_file_status(inp.path()))
     }
-
 
     pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {
         let child_opts = opts.child_opts();
@@ -879,11 +762,9 @@ impl FsDir {
         let parent_inode_id = inode.id();
         let mut change_inodes: Vec<InodePtr> = vec![];
 
-
         // set current inode
         inode.as_mut().set_attr(opts);
         change_inodes.push(inode.clone());
-
 
         // recursive set child inode
         if recursive {
@@ -894,7 +775,6 @@ impl FsDir {
                     cur_inode.as_mut().set_attr(child_opts.clone());
                     change_inodes.push(cur_inode.clone());
                 }
-
 
                 //children may be FileEntry, so we need to load complete data from store
                 for child in cur_inode.children() {
@@ -916,11 +796,9 @@ impl FsDir {
             }
         }
 
-
         self.store.apply_set_attr(change_inodes)?;
         Ok(())
     }
-
 
     pub fn symlink(
         &mut self,
@@ -931,16 +809,13 @@ impl FsDir {
     ) -> FsResult<()> {
         let op_ms = LocalTime::mills();
 
-
         let new_inode = InodeFile::with_link(self.inode_id.next()?, op_ms as i64, target, mode);
-
 
         let link = self.unprotected_symlink(link, new_inode.clone(), force)?;
         self.journal_writer
             .log_symlink(op_ms, link.path(), new_inode, force)?;
         Ok(())
     }
-
 
     pub fn unprotected_symlink(
         &mut self,
@@ -954,7 +829,6 @@ impl FsDir {
             None => return err_box!("Directory does not exist"),
         };
 
-
         let old_inode = if let Some(v) = link.get_last_inode() {
             if !v.is_link() || (v.is_link() && !force) {
                 return err_ext!(FsError::file_exists(link.path()));
@@ -964,7 +838,6 @@ impl FsDir {
         } else {
             None
         };
-
 
         let name = link.name().to_string();
         parent.update_mtime(new_inode.mtime);
@@ -980,17 +853,14 @@ impl FsDir {
             }
         };
 
-
         self.store
             .apply_symlink(parent.as_ref(), new_inode_ptr.as_ref())?;
         Ok(link)
     }
 
-
     // Create a link to an existing file
     pub fn link(&mut self, src_path: InodePath, dst_path: InodePath) -> FsResult<()> {
         let op_ms = LocalTime::mills();
-
 
         // Get the original inode ID and update nlink in memory if it's a direct File
         let (original_inode_id, mut original_inode_ptr) = match src_path.get_last_inode() {
@@ -1008,7 +878,6 @@ impl FsDir {
             None => return err_ext!(FsError::file_not_found(src_path.path())),
         };
 
-
         // If we have the original inode in memory, increment its nlink count
         if let Some(ref mut inode_ptr) = original_inode_ptr {
             if let File(_, _) = inode_ptr.as_mut() {
@@ -1016,20 +885,16 @@ impl FsDir {
             }
         }
 
-
         // Create the link
         let dst_path_str = dst_path.path().to_string();
         self.unprotected_link(dst_path, original_inode_id, op_ms)?;
-
 
         // Log the operation
         self.journal_writer
             .log_link(op_ms, src_path.path(), &dst_path_str)?;
 
-
         Ok(())
     }
-
 
     pub fn unprotected_link(
         &mut self,
@@ -1042,10 +907,8 @@ impl FsDir {
             return err_ext!(FsError::file_exists(new_path.path()));
         }
 
-
         // Create parent directory if needed
         new_path = self.create_parent_dir(new_path, MkdirOpts::with_create(true))?;
-
 
         // Get the parent directory
         let mut parent = match new_path.get_inode(-2) {
@@ -1053,22 +916,18 @@ impl FsDir {
             None => return err_box!("Parent directory does not exist"),
         };
 
-
         // Create a FileEntry that points to the original inode
         let name = new_path.name().to_string();
         let file_entry = FileEntry(name.clone(), original_inode_id);
-
 
         // Update parent directory
         parent.update_mtime(op_ms as i64);
         let added = parent.add_child(file_entry)?;
         new_path.append(added.clone())?;
 
-
         // Apply changes to storage - this creates an edge pointing to the original inode
         self.store
             .apply_link(parent.as_ref(), added.as_ref(), original_inode_id)?;
-
 
         Ok(new_path)
     }
