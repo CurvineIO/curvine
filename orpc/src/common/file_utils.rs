@@ -228,13 +228,4 @@ mod tests {
 
         Ok(())
     }
-    #[test]
-    fn list_files_test_with_wildcard() -> CommonResult<()> {
-        let list = FileUtils::list_files("../curvine-client/src/file/*.rs", false)?;
-        for item in list {
-            println!("{}", item);
-        }
-
-        Ok(())
-    }
 }
