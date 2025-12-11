@@ -56,7 +56,10 @@ impl InodeChildren {
     }
 
     /// Get children matching glob pattern (e.g., "*.txt", "dir*")
-    pub fn get_child_by_glob_pattern<'a>(&'a self, glob_pattern: &'a Pattern) -> Option<Vec<&'a InodeView>> {
+    pub fn get_child_by_glob_pattern<'a>(
+        &'a self,
+        glob_pattern: &'a Pattern,
+    ) -> Option<Vec<&'a InodeView>> {
         match self {
             InodeChildren::List(list) => {
                 let mut matches: Vec<&'a InodeView> = Vec::new();
@@ -80,12 +83,13 @@ impl InodeChildren {
     }
 
     pub fn get_child_ptr_by_glob_pattern(&self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
-        self.get_child_by_glob_pattern(glob_pattern).map(|children| {
-            children
-                .iter()
-                .map(|child_ref| InodePtr::from_ref(*child_ref)) // Deref &&InodeView -> &InodeView
-                .collect()
-        })
+        self.get_child_by_glob_pattern(glob_pattern)
+            .map(|children| {
+                children
+                    .iter()
+                    .map(|child_ref| InodePtr::from_ref(*child_ref)) // Deref &&InodeView -> &InodeView
+                    .collect()
+            })
     }
 
     pub fn get_child(&self, name: &str) -> Option<&InodeView> {

@@ -87,7 +87,10 @@ impl InodeDir {
         self.children.get_child_ptr(name)
     }
 
-    pub fn get_child_ptr_by_glob_pattern(&mut self, glob_pattern: &Pattern) -> Option<Vec<InodePtr>> {
+    pub fn get_child_ptr_by_glob_pattern(
+        &mut self,
+        glob_pattern: &Pattern,
+    ) -> Option<Vec<InodePtr>> {
         self.children.get_child_ptr_by_glob_pattern(glob_pattern)
     }
 
