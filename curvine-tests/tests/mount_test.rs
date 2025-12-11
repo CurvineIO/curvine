@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 // Test the load function of curvine-client
 #[test]
-fn mount_test() -> CommonResult<()> {
+fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
     Logger::default();
     // Create a test cluster configuration
     let testing = Testing::builder().default().build()?;

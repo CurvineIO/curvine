@@ -51,11 +51,49 @@ impl WriteHandler {
         }
     }
 
+    pub fn resize(file: &mut LocalFile, ctx: &WriteContext) -> FsResult<()> {
+        let opts = if let Some(opts) = &ctx.block.alloc_opts {
+            opts
+        } else {
+            return Ok(());
+        };
+        opts.validate()?;
+
+        if opts.len > ctx.block_size {
+            return err_box!(
+                "Invalid resize operation: allocation size {} > block size {}",
+                opts.len,
+                ctx.block_size
+            );
+        }
+        if opts.len == 0 {
+            return Ok(());
+        }
+
+        file.resize(opts.truncate, opts.off, opts.len, opts.mode.bits())?;
+        Ok(())
+    }
+
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let context = WriteContext::from_req(msg)?;
-        let meta = self.store.open_block(&context.block)?;
+        if context.off > context.block_size {
+            return err_box!(
+                "Invalid write offset: {}, block size: {}",
+                context.off,
+                context.block_size
+            );
+        }
 
-        let file = meta.create_writer(context.off, false)?;
+        let open_block = ExtendedBlock {
+            len: context.block_size,
+            ..context.block.clone()
+        };
+
+        let meta = self.store.open_block(&open_block)?;
+        let mut file = meta.create_writer(context.off, false)?;
+        // check file resize
+        Self::resize(&mut file, &context)?;
+
         let (label, path, file) = if context.short_circuit {
             ("local", file.path().to_string(), None)
         } else {
@@ -69,14 +107,14 @@ impl WriteHandler {
             path,
             context.chunk_size,
             context.off,
-            ByteUnit::byte_to_string(context.len as u64)
+            ByteUnit::byte_to_string(context.block_size as u64)
         );
 
         let response = BlockWriteResponse {
             id: meta.id,
             path: ternary!(context.short_circuit, Some(path), None),
             off: context.off,
-            len: context.len,
+            block_size: context.block_size,
             storage_type: meta.storage_type().into(),
         };
 
@@ -110,11 +148,11 @@ impl WriteHandler {
             let header: DataHeaderProto = msg.parse_header()?;
             // Flush operation should not trigger seek or boundary check
             if !header.flush {
-                if header.offset < 0 || header.offset >= context.len {
+                if header.offset < 0 || header.offset >= context.block_size {
                     return err_box!(
                         "Invalid seek offset: {}, block length: {}",
                         header.offset,
-                        context.len
+                        context.block_size
                     );
                 }
                 file.seek(header.offset)?;
@@ -124,12 +162,12 @@ impl WriteHandler {
         // Write existing data blocks.
         let data_len = msg.data_len() as i64;
         if data_len > 0 {
-            if file.pos() + data_len > context.len {
+            if file.pos() + data_len > context.block_size {
                 return err_box!(
                     "Write range [{}, {}) exceeds block size {}",
                     file.pos(),
                     file.pos() + data_len,
-                    context.len
+                    context.block_size
                 );
             }
 
@@ -183,6 +221,14 @@ impl WriteHandler {
             drop(file);
         }
 
+        if context.block.len > context.block_size {
+            return err_box!(
+                "Invalid write offset: {}, block size: {}",
+                context.off,
+                context.block_size
+            );
+        }
+
         // Submit block.
         self.commit_block(&context.block, commit)?;
         self.is_commit = true;
@@ -192,7 +238,7 @@ impl WriteHandler {
             msg.req_id(),
             commit,
             context.off,
-            context.len
+            context.block.len
         );
 
         Ok(msg.success())

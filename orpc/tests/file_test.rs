@@ -26,7 +26,7 @@ use orpc::test::file::file_handler::{FileService, RpcCode};
 use orpc::CommonResult;
 
 #[test]
-fn dir_location() {
+fn test_distributed_file_location_and_creation() {
     let dirs = vec![
         String::from("../testing/orpc-1"),
         String::from("../testing/orpc-2"),
@@ -42,7 +42,7 @@ fn dir_location() {
 }
 
 #[test]
-fn file_server() -> CommonResult<()> {
+fn test_rpc_file_server_write_read_with_checksum_validation() -> CommonResult<()> {
     let conf = ServerConf::default();
     let dirs = vec![
         String::from("../testing/orpc-d1"),

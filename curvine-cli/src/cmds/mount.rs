@@ -14,14 +14,14 @@
 
 use crate::util::*;
 use clap::Parser;
-use curvine_client::file::FsClient;
-use curvine_client::unified::UfsFileSystem;
+use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{ConsistencyStrategy, MountOptions, MountType, StorageType, TtlAction};
+use curvine_common::state::{
+    ConsistencyStrategy, MountOptions, MountType, StorageType, TtlAction, WriteType,
+};
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 pub struct MountCommand {
@@ -36,9 +36,6 @@ pub struct MountCommand {
     #[arg(short, long)]
     config: Vec<String>,
 
-    #[arg(long, default_value = "${CURVINE_CONF_FILE}")]
-    conf: String,
-
     /// Update the mount point config if it already exists
     #[arg(long, default_value_t = false)]
     update: bool,
@@ -49,10 +46,14 @@ pub struct MountCommand {
     #[arg(long, default_value = "always")]
     consistency_strategy: String,
 
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "7d")]
     ttl_ms: String,
 
-    #[arg(long, default_value = "none")]
+    #[arg(
+        long,
+        default_value = "delete",
+        help = "TTL expiration action when file expires:\n  none - No action\n  delete - Delete file\n  persist - Export to UFS (skip if exists), keep CV cache\n  evict - Export to UFS (skip if exists), delete CV cache\n  flush - Force export to UFS (overwrite), delete CV cache"
+    )]
     ttl_action: String,
 
     #[arg(long)]
@@ -64,15 +65,22 @@ pub struct MountCommand {
     #[arg(short, long)]
     storage_type: Option<String>,
 
+    #[arg(
+        long,
+        default_value = "async_through",
+        help = "Write type: cache, through, async_through, cache_through"
+    )]
+    write_type: String,
+
     #[arg(long, default_value_t = false)]
     check: bool,
 }
 
 impl MountCommand {
-    pub async fn execute(&self, client: Arc<FsClient>) -> CommonResult<()> {
+    pub async fn execute(&self, fs: UnifiedFileSystem) -> CommonResult<()> {
         // If no path argument is given, all mount points are listed.
         if self.ufs_path.trim().is_empty() && self.cv_path.trim().is_empty() {
-            let rep = handle_rpc_result(client.get_mount_table()).await;
+            let rep = handle_rpc_result(fs.fs_client().get_mount_table()).await;
             if self.check {
                 if rep.mount_table.is_empty() {
                     println!("Mount Table: (empty)");
@@ -207,8 +215,8 @@ impl MountCommand {
             }
         }
 
-        let rep = handle_rpc_result(client.mount(&ufs_path, &cv_path, mnt_opts)).await;
-        println!("{}", rep);
+        handle_rpc_result(fs.mount(&ufs_path, &cv_path, mnt_opts)).await;
+        println!("│ ✅️ mount success.");
         Ok(())
     }
 
@@ -251,6 +259,9 @@ impl MountCommand {
         if let Some(storage_type) = self.storage_type.as_ref() {
             opts = opts.storage_type(StorageType::try_from(storage_type.as_str())?);
         }
+
+        let write_type = WriteType::try_from(self.write_type.as_str())?;
+        opts = opts.write_type(write_type);
 
         Ok(opts.build())
     }

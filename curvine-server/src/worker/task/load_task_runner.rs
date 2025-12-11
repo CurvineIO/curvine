@@ -14,11 +14,11 @@
 
 use crate::common::UfsFactory;
 use crate::worker::task::TaskContext;
-use curvine_client::file::{CurvineFileSystem, FsWriter};
+use curvine_client::file::CurvineFileSystem;
 use curvine_client::rpc::JobMasterClient;
-use curvine_client::unified::UnifiedReader;
+use curvine_client::unified::{CacheSyncReader, UfsFileSystem, UnifiedReader, UnifiedWriter};
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{CreateFileOptsBuilder, JobTaskState};
+use curvine_common::state::{CreateFileOptsBuilder, JobTaskState, SetAttrOptsBuilder};
 use curvine_common::FsResult;
 use log::{error, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
@@ -51,6 +51,10 @@ impl LoadTaskRunner {
             progress_interval_ms,
             task_timeout_ms,
         }
+    }
+
+    pub fn get_ufs(&self) -> FsResult<UfsFileSystem> {
+        self.factory.get_ufs(&self.task.info.job.mount_info)
     }
 
     pub async fn run(&self) {
@@ -115,13 +119,29 @@ impl LoadTaskRunner {
 
         writer.complete().await?;
         reader.complete().await?;
+
+        // cv -> ufs
+        let ufs_mtime = if reader.path().is_cv() && !writer.path().is_cv() {
+            let ufs_status = self.get_ufs()?.get_status(writer.path()).await?;
+
+            let attr_opts = SetAttrOptsBuilder::new()
+                .ufs_mtime(ufs_status.mtime)
+                .build();
+
+            self.fs.set_attr(reader.path(), attr_opts).await?;
+            ufs_status.mtime
+        } else {
+            reader.status().storage_policy.ufs_mtime
+        };
+
         self.update_progress(writer.pos(), reader.len()).await;
 
         info!(
-            "task {} completed, source_path {}, target_path {}, copy bytes {}, read cost {} ms, task cost {} ms",
+            "task {} completed, source_path {}, target_path {}, ufs_mtime:{}, copy bytes {}, read cost {} ms, task cost {} ms",
             self.task.info.task_id,
             self.task.info.source_path,
             self.task.info.target_path,
+            ufs_mtime,
             writer.pos(),
             read_cost_ms,
             total_cost_ms,
@@ -130,29 +150,69 @@ impl LoadTaskRunner {
         Ok(())
     }
 
-    async fn create_stream(&self) -> FsResult<(UnifiedReader, FsWriter)> {
-        let info = &self.task.info;
+    async fn create_stream(&self) -> FsResult<(UnifiedReader, UnifiedWriter)> {
+        let source_path = Path::from_str(&self.task.info.source_path)?;
+        let target_path = Path::from_str(&self.task.info.target_path)?;
 
-        // create ufs reader
-        let source_path = Path::from_str(&info.source_path)?;
-        let ufs = self.factory.get_ufs(&self.task.info.job.mount_info)?;
-        let reader = ufs.open(&source_path).await?;
-        let source_status = ufs.get_status(&source_path).await?;
+        // Create reader (automatically selects filesystem based on scheme)
+        let reader = self.open_unified(&source_path).await?;
 
-        // create cv writer
-        let target_path = Path::from_str(&info.target_path)?;
-        let opts = CreateFileOptsBuilder::new()
-            .create_parent(true)
-            .replicas(info.job.replicas)
-            .block_size(info.job.block_size)
-            .storage_type(info.job.storage_type)
-            .ttl_ms(info.job.ttl_ms)
-            .ttl_action(info.job.ttl_action)
-            .ufs_mtime(source_status.mtime)
-            .build();
-        let writer = self.fs.create_with_opts(&target_path, opts, true).await?;
+        // Create writer (automatically selects filesystem based on scheme)
+        let writer = self.create_unified(&target_path).await?;
 
         Ok((reader, writer))
+    }
+
+    async fn open_unified(&self, path: &Path) -> FsResult<UnifiedReader> {
+        if path.is_cv() {
+            // Curvine path
+            let reader = CacheSyncReader::new(&self.fs, path).await?;
+            Ok(UnifiedReader::CacheSync(reader))
+        } else {
+            // UFS path
+            let ufs = self.get_ufs()?;
+            ufs.open(path).await
+        }
+    }
+
+    async fn create_unified(&self, path: &Path) -> FsResult<UnifiedWriter> {
+        if path.is_cv() {
+            // Curvine path - get source mtime for UFS→Curvine import
+            let source_path = Path::from_str(&self.task.info.source_path)?;
+            let source_mtime = if !source_path.is_cv() {
+                // Import from UFS, get source mtime
+                let ufs = self.get_ufs()?;
+                let source_status = ufs.get_status(&source_path).await?;
+                source_status.mtime
+            } else {
+                // Curvine→Curvine (not supported yet), use 0
+                0
+            };
+
+            let opts = CreateFileOptsBuilder::new()
+                .create_parent(true)
+                .replicas(self.task.info.job.replicas)
+                .block_size(self.task.info.job.block_size)
+                .storage_type(self.task.info.job.storage_type)
+                .ttl_ms(self.task.info.job.ttl_ms)
+                .ttl_action(self.task.info.job.ttl_action)
+                .ufs_mtime(source_mtime)
+                .build();
+
+            let overwrite = self.task.info.job.overwrite.unwrap_or(false);
+            let writer = self.fs.create_with_opts(path, opts, overwrite).await?;
+            Ok(UnifiedWriter::Cv(writer))
+        } else {
+            let ufs = self.get_ufs()?;
+            let overwrite = self.task.info.job.overwrite.unwrap_or(false);
+
+            if !overwrite && ufs.exists(path).await? {
+                warn!("UFS file already exists, skipping: {}", path.full_path());
+                return err_box!("File exists and overwrite=false");
+            }
+
+            ufs.create(path, overwrite).await
+        }
     }
 
     pub async fn update_progress(&self, loaded_size: i64, total_size: i64) {

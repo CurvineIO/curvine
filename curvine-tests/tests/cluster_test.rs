@@ -28,7 +28,7 @@ use std::sync::Arc;
 // Cluster functional unit test.
 
 #[test]
-fn block_delete_test() -> CommonResult<()> {
+fn test_block_deletion_and_cleanup_verification() -> CommonResult<()> {
     let testing = Testing::builder()
         .workers(3)
         .with_base_conf_path("../etc/curvine-cluster.toml")

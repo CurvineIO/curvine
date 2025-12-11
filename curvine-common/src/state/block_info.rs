@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::BlockWriteRequest;
-use crate::state::{FileStatus, FileType, StorageType, WorkerAddress};
+use crate::state::{FileAllocOpts, FileStatus, FileType, StorageType, WorkerAddress};
 use crate::FsResult;
 use orpc::common::{ByteUnit, FastHashMap};
-use orpc::{err_box, try_option, CommonResult};
+use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, Range};
 
@@ -69,6 +68,7 @@ pub struct ExtendedBlock {
     pub len: i64,
     pub storage_type: StorageType,
     pub file_type: FileType,
+    pub alloc_opts: Option<FileAllocOpts>,
 }
 
 impl ExtendedBlock {
@@ -78,6 +78,23 @@ impl ExtendedBlock {
             len,
             storage_type,
             file_type,
+            alloc_opts: None,
+        }
+    }
+
+    pub fn with_alloc(
+        id: i64,
+        len: i64,
+        storage_type: StorageType,
+        file_type: FileType,
+        alloc_opts: Option<FileAllocOpts>,
+    ) -> Self {
+        Self {
+            id,
+            len,
+            storage_type,
+            file_type,
+            alloc_opts,
         }
     }
 
@@ -98,15 +115,6 @@ impl ExtendedBlock {
         Self::with_size_str(id, size, StorageType::Ssd)
     }
 
-    pub fn from_req(req: &BlockWriteRequest) -> Self {
-        Self::new(
-            req.id,
-            req.len,
-            StorageType::from(req.storage_type),
-            FileType::from(req.file_type),
-        )
-    }
-
     pub fn size_string(&self) -> String {
         ByteUnit::byte_to_string(self.len as u64)
     }
@@ -120,6 +128,20 @@ impl ExtendedBlock {
 pub struct LocatedBlock {
     pub block: ExtendedBlock,
     pub locs: Vec<WorkerAddress>,
+}
+
+impl LocatedBlock {
+    pub fn new(block: ExtendedBlock, locs: Vec<WorkerAddress>) -> Self {
+        Self { block, locs }
+    }
+
+    pub fn should_resize(&self) -> bool {
+        !self.locs.is_empty() && self.block.alloc_opts.is_some()
+    }
+
+    pub fn should_assign(&self) -> bool {
+        self.locs.is_empty()
+    }
 }
 
 impl Deref for LocatedBlock {
@@ -228,6 +250,14 @@ impl WriteFileBlocks {
         }
     }
 
+    pub fn len(&self) -> i64 {
+        self.status.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.status.len == 0
+    }
+
     pub fn get_block(&self, file_pos: i64) -> Option<(i64, LocatedBlock)> {
         let index = self.search_off.partition_point(|x| x.end <= file_pos);
         if let Some(lc) = self.block_locs.get(index) {
@@ -245,42 +275,58 @@ impl WriteFileBlocks {
         }
     }
 
-    pub fn add_commit(&mut self, commit: CommitBlock) {
+    pub fn add_commit(&mut self, commit: CommitBlock) -> FsResult<()> {
+        if let Some(lb) = self.search_block_mut(commit.block_id) {
+            lb.block.len = commit.block_len;
+        } else {
+            return err_box!("Not found block {}", commit.block_id);
+        }
+
         self.commit_blocks.insert(commit.block_id, commit);
+        Ok(())
     }
 
     pub fn take_commit_blocks(&mut self) -> Vec<CommitBlock> {
-        let mut commits: Vec<_> = self.commit_blocks.drain().map(|(_, v)| v).collect();
-
-        commits.sort_by_key(|c| c.block_id);
-        commits
+        self.commit_blocks.drain().map(|(_, v)| v).collect()
     }
 
-    pub fn add_block(&mut self, mut lb: LocatedBlock) -> FsResult<()> {
-        if let Some(v) = self.block_locs.last_mut() {
-            if v.id == lb.id {
-                v.block.len = self.status.block_size;
-
-                let last_search = try_option!(self.search_off.last_mut());
-                last_search.end = last_search.start + self.status.block_size;
-
-                return Ok(());
-            } else if v.id > lb.id {
+    pub fn add_block(&mut self, lb: LocatedBlock) -> FsResult<()> {
+        if let Some(v) = self.block_locs.last() {
+            if v.id >= lb.id {
                 return err_box!(
                     "Cannot add block: existing block id {} does not match new block id {}",
                     v.id,
                     lb.id
                 );
             }
-        };
-
-        lb.block.len = self.status.block_size;
-        self.block_locs.push(lb);
+        }
 
         let start = self.search_off.last().map(|x| x.end).unwrap_or(0);
         let end = start + self.status.block_size;
         self.search_off.push(Range { start, end });
 
+        self.block_locs.push(lb);
         Ok(())
+    }
+
+    fn search_block_mut(&mut self, block_id: i64) -> Option<&mut LocatedBlock> {
+        let idx = self
+            .block_locs
+            .binary_search_by_key(&block_id, |lb| lb.id)
+            .ok()?;
+        self.block_locs.get_mut(idx)
+    }
+
+    pub fn update_locate(&mut self, block: &LocatedBlock) -> FsResult<()> {
+        if let Some(v) = self.search_block_mut(block.id) {
+            *v = block.clone();
+            Ok(())
+        } else {
+            err_box!("Cannot update block: block id {} not found", block.id)
+        }
+    }
+
+    pub fn last_block(&self) -> Option<ExtendedBlock> {
+        self.block_locs.last().map(|x| x.block.clone())
     }
 }

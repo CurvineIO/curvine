@@ -17,6 +17,8 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
 };
+use curvine_common::state::{ExtendedBlock, FileType, StorageType};
+use curvine_common::utils::ProtoUtils;
 use curvine_server::worker::Worker;
 use orpc::common::Utils;
 use orpc::io::net::NetUtils;
@@ -43,7 +45,7 @@ fn start_worker() -> ClusterConf {
 }
 
 #[test]
-fn create_block() -> CommonResult<()> {
+fn test_worker_block_write_and_read_with_checksum_validation() -> CommonResult<()> {
     let conf = start_worker();
 
     let block_id = Utils::req_id().abs();
@@ -55,11 +57,15 @@ fn create_block() -> CommonResult<()> {
 }
 
 fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
+    let block_size = (CHUNK_SIZE * LOOP_NUM) as i64;
+    let block = ExtendedBlock::new(id, block_size, StorageType::Disk, FileType::File);
     let request = BlockWriteRequest {
-        id,
+        block: ProtoUtils::extend_block_to_pb(block),
         off: 0,
-        len: (CHUNK_SIZE * LOOP_NUM) as i64,
-        ..Default::default()
+        block_size,
+        short_circuit: false,
+        client_name: "test".to_string(),
+        chunk_size: CHUNK_SIZE,
     };
 
     let req_id = Utils::req_id();

@@ -14,29 +14,7 @@ futures = { workspace = true }
 log = { workspace = true }
 fastrand = { workspace = true }
 
-aws-config = { version = "1.8.5", default-features = false, features = [
-    "behavior-version-latest",
-    "rt-tokio",
-    "rustls",
-], optional = true }
-
-aws-sdk-s3 = { version = "1.103.0", default-features = false, features = [
-    "behavior-version-latest",
-    "rt-tokio",
-    "rustls",
-], optional = true }
-
-aws-smithy-types = { version = "1.3.2", default-features = false, features = [
-    "hyper-0-14-x"
-], optional = true }
-
-aws-credential-types = { version = "1.2.5", default-features = false, features = [
-    "hardcoded-credentials",
-], optional = true}
-
-aws-types = { version = "1.3.8", optional = true}
-
-opendal = { version = "0.54", default-features = false, optional = true }
+opendal = { version = "0.55", optional = true }
 
 # JNI support for HDFS (moved from curvine-common)
 jni = { version = "0.21.1", features = ["invocation"], optional = true }
@@ -46,15 +24,6 @@ tracing = { workspace = true }
 
 [features]
 # Storage backend implementations
-## AWS native implementation using AWS SDK
-s3 = [
-    "dep:aws-config",
-    "dep:aws-sdk-s3",
-    "dep:aws-smithy-types",
-    "dep:aws-credential-types",
-    "dep:aws-types"
-]
-
 ## OpenDAL implementations for various storage services
 opendal = ["dep:opendal"]
 opendal-s3 = ["opendal", "opendal/services-s3"]        # Amazon S3

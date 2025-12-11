@@ -372,14 +372,42 @@ impl MasterFilesystem {
         Ok(res)
     }
 
+    pub fn choose_worker(
+        &self,
+        inp: &InodePath,
+        client_addr: ClientAddress,
+        exclude_workers: Vec<u32>,
+    ) -> FsResult<Vec<WorkerAddress>> {
+        let wm = self.worker_manager.read();
+
+        let mut inode = try_option!(inp.get_last_inode());
+        let file = inode.as_file_mut()?;
+        let validate_block = Self::validate_add_block(file, &client_addr, None)?;
+
+        let choose_ctx = ChooseContext::with_block(validate_block, exclude_workers);
+        Ok(wm.choose_worker(choose_ctx)?)
+    }
+
+    pub fn create_locate_block(
+        &self,
+        path: impl AsRef<str>,
+        block: ExtendedBlock,
+        locs: &[BlockLocation],
+    ) -> FsResult<LocatedBlock> {
+        self.worker_manager
+            .read()
+            .create_locate_block(path, block, locs)
+    }
+
     /// Document application to allocate a new block.
     pub fn add_block<T: AsRef<str>>(
         &self,
         path: T,
         client_addr: ClientAddress,
-        previous: Option<CommitBlock>,
+        commit_blocks: Vec<CommitBlock>,
         exclude_workers: Vec<u32>,
         file_len: i64,
+        last_block: Option<ExtendedBlock>,
     ) -> FsResult<LocatedBlock> {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
@@ -393,30 +421,21 @@ impl MasterFilesystem {
         // File allows concurrent writes, 'previous' is the previous block,
         // need to check if the next block has already been allocated。
         // If it has been allocated, return that block
-        if let Some(next) = file.search_next_block(previous.as_ref().map(|x| x.block_id)) {
+        if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
             let locs = fs_dir.get_block_locations(next.id)?;
             let extend_block = ExtendedBlock {
                 id: next.id,
                 len: next.len,
                 storage_type: file.storage_policy.storage_type,
                 file_type: file.file_type,
+                alloc_opts: next.alloc_opts.clone(),
             };
 
-            let wm = self.worker_manager.read();
-            return wm.create_locate_block(path, extend_block, &locs);
+            return self.create_locate_block(path, extend_block, &locs);
         }
 
-        let validate_block = Self::validate_add_block(file, &client_addr, previous.as_ref())?;
-
-        let wm = self.worker_manager.read();
-
-        let choose_ctx = ChooseContext::with_block(validate_block, exclude_workers);
-
-        // Select worker.
-        let choose_workers = wm.choose_worker(choose_ctx)?;
-        drop(wm);
-
-        let block = fs_dir.acquire_new_block(&inp, previous, &choose_workers, file_len)?;
+        let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
+        let block = fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
         let located = LocatedBlock {
             block,
             locs: choose_workers,
@@ -452,6 +471,18 @@ impl MasterFilesystem {
         }
     }
 
+    pub fn get_file_blocks(
+        &self,
+        path: &str,
+        fs_dir: &FsDir,
+        inp: &InodePath,
+    ) -> FsResult<FileBlocks> {
+        let inode = try_option!(inp.get_last_inode(), "File {} not exits", path);
+        let file = inode.as_file_ref()?;
+        let blocks = self.get_block_locs(path, fs_dir, file)?;
+        Ok(FileBlocks::new(inode.to_file_status(path), blocks))
+    }
+
     fn get_block_locs(
         &self,
         path: &str,
@@ -477,6 +508,7 @@ impl MasterFilesystem {
                 len: meta.len,
                 storage_type: file.storage_policy.storage_type,
                 file_type: file.file_type,
+                alloc_opts: meta.alloc_opts.clone(),
             };
 
             let lc = try_option!(
@@ -654,6 +686,39 @@ impl MasterFilesystem {
         let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
         let dst_path = Self::resolve_path(&fs_dir, dst_path.as_ref())?;
         fs_dir.link(src_path, dst_path)
+    }
+
+    pub fn resize<T: AsRef<str>>(&self, path: T, opts: FileAllocOpts) -> FsResult<FileBlocks> {
+        opts.validate()?;
+
+        let path = path.as_ref();
+        let mut fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+
+        let del_res = fs_dir.resize(&inp, opts)?;
+        self.worker_manager.write().remove_blocks(&del_res);
+
+        self.get_file_blocks(path, &fs_dir, &inp)
+    }
+
+    pub fn assign_worker<T: AsRef<str>>(
+        &self,
+        path: T,
+        block: ExtendedBlock,
+        client_addr: ClientAddress,
+        exclude_workers: Vec<u32>,
+    ) -> FsResult<LocatedBlock> {
+        let path = path.as_ref();
+        let mut fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+
+        let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
+        let block = fs_dir.assign_worker(inp, block.id, &choose_workers)?;
+
+        Ok(LocatedBlock {
+            block,
+            locs: choose_workers,
+        })
     }
 }
 

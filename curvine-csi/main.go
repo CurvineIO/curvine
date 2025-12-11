@@ -25,10 +25,9 @@ import (
 )
 
 var (
-	endpoint   = flag.String("endpoint", "unix://tmp/csi.sock", "CSI Endpoint")
-	version    = flag.Bool("version", false, "Print the version and exit.")
-	nodeID     = flag.String("nodeid", "", "Node ID")
-	configPath = flag.String("config", "", "Path to config file")
+	endpoint = flag.String("endpoint", "unix://tmp/csi.sock", "CSI Endpoint")
+	version  = flag.Bool("version", false, "Print the version and exit.")
+	nodeID   = flag.String("nodeid", "", "Node ID")
 )
 
 func main() {
@@ -45,7 +44,7 @@ func main() {
 		klog.Fatalln("nodeID must be provided")
 	}
 
-	drv := csi.NewDriver(*endpoint, *nodeID, *configPath)
+	drv := csi.NewDriver(*endpoint, *nodeID)
 	if err := drv.Run(); err != nil {
 		klog.Fatalln(err)
 	}

@@ -15,7 +15,6 @@
 use crate::fs::Path;
 use crate::state::FileStatus;
 use crate::FsResult;
-use orpc::err_box;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use std::future::Future;
@@ -52,10 +51,6 @@ pub trait Reader {
 
     fn read_chunk(&mut self, len: Option<usize>) -> impl Future<Output = FsResult<DataSlice>> {
         async move {
-            if !self.has_remaining() {
-                return Ok(DataSlice::Empty);
-            }
-
             if self.chunk_mut().is_empty() {
                 *self.chunk_mut() = self.read_chunk0().await?;
             }
@@ -65,7 +60,7 @@ pub trait Reader {
                 Some(v) => v.min(self.chunk_mut().len()),
             };
             if read_len == 0 {
-                return err_box!("Abnormal status: chunk is empty");
+                return Ok(DataSlice::empty());
             }
 
             let chunk = self.chunk_mut().split_to(read_len);

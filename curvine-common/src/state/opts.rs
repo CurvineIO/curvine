@@ -356,6 +356,7 @@ pub struct SetAttrOpts {
     pub ttl_action: Option<TtlAction>,
     pub add_x_attr: HashMap<String, Vec<u8>>,
     pub remove_x_attr: Vec<String>,
+    pub ufs_mtime: Option<i64>,
 }
 
 impl SetAttrOpts {
@@ -373,6 +374,7 @@ impl SetAttrOpts {
             ttl_action: None,
             add_x_attr: HashMap::default(),
             remove_x_attr: vec![],
+            ufs_mtime: None,
         }
     }
 }
@@ -389,6 +391,7 @@ pub struct SetAttrOptsBuilder {
     ttl_action: Option<TtlAction>,
     add_x_attr: HashMap<String, Vec<u8>>,
     remove_x_attr: Vec<String>,
+    ufs_mtime: Option<i64>,
 }
 
 impl Default for SetAttrOptsBuilder {
@@ -411,6 +414,7 @@ impl SetAttrOptsBuilder {
             ttl_action: None,
             add_x_attr: HashMap::new(),
             remove_x_attr: vec![],
+            ufs_mtime: None,
         }
     }
 
@@ -469,6 +473,11 @@ impl SetAttrOptsBuilder {
         self
     }
 
+    pub fn ufs_mtime(mut self, mtime: i64) -> Self {
+        let _ = self.ufs_mtime.insert(mtime);
+        self
+    }
+
     pub fn build(self) -> SetAttrOpts {
         SetAttrOpts {
             recursive: self.recursive,
@@ -482,6 +491,7 @@ impl SetAttrOptsBuilder {
             ttl_action: self.ttl_action,
             add_x_attr: self.add_x_attr,
             remove_x_attr: self.remove_x_attr,
+            ufs_mtime: self.ufs_mtime,
         }
     }
 }

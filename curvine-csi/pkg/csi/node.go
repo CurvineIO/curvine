@@ -43,17 +43,40 @@ var (
 )
 
 type nodeService struct {
-	nodeID string
-	config *Config
+	nodeID      string
+	fuseManager *FuseManager
+	mountState  *MountState
+	k8sClient   *K8sClient
 }
 
 var _ csi.NodeServer = &nodeService{}
 
-func newNodeService(nodeID string, config *Config) *nodeService {
-	return &nodeService{
-		nodeID: nodeID,
-		config: config,
+func newNodeService(nodeID string) (*nodeService, error) {
+	// Initialize Kubernetes client
+	kubernetesNamespace := os.Getenv("KUBERNETES_NAMESPACE")
+	if kubernetesNamespace == "" {
+		kubernetesNamespace = "curvine-system"
 	}
+	k8sClient, err := NewK8sClient(kubernetesNamespace, nodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create k8s client: %v", err)
+	}
+
+	// Initialize mount state
+	mountState, err := NewMountState(k8sClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create mount state: %v", err)
+	}
+
+	// Initialize FUSE manager
+	fuseManager := NewFuseManager(mountState)
+
+	return &nodeService{
+		nodeID:      nodeID,
+		fuseManager: fuseManager,
+		mountState:  mountState,
+		k8sClient:   k8sClient,
+	}, nil
 }
 
 // Two ways use curvine
@@ -61,44 +84,157 @@ func newNodeService(nodeID string, config *Config) *nodeService {
 // 2. curvine path -> pod target path
 // NodeStageVolume is called by the CO when a workload that wants to use the specified volume is placed (scheduled) on a node.
 func (n *nodeService) NodeStageVolume(ctx context.Context, request *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	klog.Infof("NodeStageVolume, request: %v", request)
+	requestID := generateRequestID()
+	klog.Infof("RequestID: %s, NodeStageVolume called with request: %+v", requestID, request)
 
-	stageingPath := request.GetStagingTargetPath()
-	// Check if staging path exists
-	if _, err := os.Stat(stageingPath); err == nil {
-		klog.Infof("NodeStageVolume, staging path already exists: %v", request.GetStagingTargetPath())
-		return &csi.NodeStageVolumeResponse{}, nil
+	volumeID := request.GetVolumeId()
+	if len(volumeID) == 0 {
+		klog.Errorf("RequestID: %s, Volume ID not provided in NodeStageVolume request", requestID)
+		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
-	// Generate request ID for log tracking
-	requestID := generateRequestID()
-	klog.Infof("RequestID: %s, Creating staging directory at: %s", requestID, stageingPath)
+	// Get VolumeContext and PublishContext
+	volumeContext := request.GetVolumeContext()
+	if volumeContext == nil {
+		volumeContext = make(map[string]string)
+	}
+
+	publishContext := request.GetPublishContext()
+	if publishContext == nil {
+		publishContext = make(map[string]string)
+	}
+
+	// Get required parameters
+	masterAddrs := volumeContext["master-addrs"]
+	if masterAddrs == "" {
+		masterAddrs = publishContext["master-addrs"]
+	}
+	if masterAddrs == "" {
+		klog.Errorf("RequestID: %s, master-addrs not found in volume context or publish context", requestID)
+		return nil, status.Error(codes.InvalidArgument, "master-addrs parameter is required")
+	}
+
+	// Generate cluster-id from master-addrs
+	clusterID := GenerateClusterID(masterAddrs)
+
+	// Generate mnt-path based on cluster-id only
+	// All PVs in same cluster share one FUSE process that mounts root path
+	mntPath := fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/curvine/%s/fuse-mount", clusterID)
+	klog.Infof("RequestID: %s, Generated mnt-path: %s (cluster-id: %s, master-addrs: %s)",
+		requestID, mntPath, clusterID, masterAddrs)
+
+	// Collect FUSE parameters from VolumeContext or PublishContext
+	fuseParams := make(map[string]string)
+	fuseParamKeys := []string{
+		"io-threads", "worker-threads", "mnt-per-task", "clone-fd",
+		"fuse-channel-size", "stream-channel-size", "auto-cache",
+		"direct-io", "kernel-cache", "cache-readdir", "entry-timeout",
+		"attr-timeout", "negative-timeout", "max-background",
+		"congestion-threshold", "node-cache-size", "node-cache-timeout",
+		"master-hostname", "master-rpc-port", "master-web-port", "mnt-number",
+	}
+	for _, key := range fuseParamKeys {
+		// Try VolumeContext first, then PublishContext
+		if value, ok := volumeContext[key]; ok && value != "" {
+			fuseParams[key] = value
+		} else if value, ok := publishContext[key]; ok && value != "" {
+			fuseParams[key] = value
+		}
+	}
+
+	// Check if shared mount point already exists
+	mountInfo, exists := n.mountState.GetMount(mntPath, clusterID)
+	if exists && mountInfo.FusePID > 0 {
+		// Verify process is still running
+		if proc, procExists := n.fuseManager.GetFuseProcess(mntPath, clusterID); procExists {
+			klog.Infof("RequestID: %s, Shared FUSE mount point already exists for %s@%s (PID: %d)",
+				requestID, mntPath, clusterID, proc.PID)
+			return &csi.NodeStageVolumeResponse{}, nil
+		}
+	}
+
+	// Start FUSE process for shared mount point
+	// Always mount root path "/" of curvine filesystem
+	fsPathToMount := "/"
+	klog.Infof("RequestID: %s, Starting FUSE process for cluster: %s, mounting curvine root path: %s to: %s",
+		requestID, clusterID, fsPathToMount, mntPath)
+	if err := n.fuseManager.StartFuseProcess(ctx, mntPath, clusterID, masterAddrs, fsPathToMount, fuseParams); err != nil {
+		klog.Errorf("RequestID: %s, Failed to start FUSE process: %v", requestID, err)
+		return nil, status.Errorf(codes.Internal, "Failed to start FUSE process: %v", err)
+	}
 
 	// Create staging directory
-	if err := os.MkdirAll(stageingPath, 0750); err != nil {
-		klog.Errorf("RequestID: %s, Failed to create staging directory at %s: %v", requestID, stageingPath, err)
-		return nil, status.Errorf(codes.Internal, "Failed to create staging directory at %s: %v", stageingPath, err)
+	stagingPath := request.GetStagingTargetPath()
+	if err := os.MkdirAll(stagingPath, 0750); err != nil {
+		klog.Errorf("RequestID: %s, Failed to create staging directory at %s: %v", requestID, stagingPath, err)
+		return nil, status.Errorf(codes.Internal, "Failed to create staging directory at %s: %v", stagingPath, err)
 	}
-	klog.Infof("RequestID: %s, Successfully created staging directory at: %s", requestID, stageingPath)
 
-	//TODO use curvine-fuse mount to staging dir
+	klog.Infof("RequestID: %s, Successfully staged volume: %s", requestID, volumeID)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
 // NodeUnstageVolume is called by the CO when a workload that was using the specified volume is being moved to a different node.
 func (n *nodeService) NodeUnstageVolume(ctx context.Context, request *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	// Generate request ID for log tracking
 	requestID := generateRequestID()
 	klog.Infof("RequestID: %s, NodeUnstageVolume called with request: %+v", requestID, request)
-	return &csi.NodeUnstageVolumeResponse{}, nil
 
-	//umount staging dir
+	volumeID := request.GetVolumeId()
+	if len(volumeID) == 0 {
+		klog.Errorf("RequestID: %s, Volume ID not provided in NodeUnstageVolume request", requestID)
+		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
+	}
+
+	// Try to parse VolumeHandle to get cluster-id
+	components, parseErr := ParseVolumeHandle(volumeID)
+	var clusterID string
+
+	if parseErr == nil {
+		clusterID = components.ClusterID
+	} else {
+		// Non-structured volumeHandle: generate cluster-id from volumeContext
+		// (This should not happen for NodeUnstageVolume as volume should have been staged first)
+		klog.Warningf("RequestID: %s, Failed to parse volumeHandle, cannot determine cluster-id: %v", requestID, parseErr)
+		return &csi.NodeUnstageVolumeResponse{}, nil
+	}
+
+	// Get mnt-path from mount state by cluster-id
+	mountInfo, exists := n.mountState.GetMountByClusterID(clusterID)
+	if !exists {
+		klog.Warningf("RequestID: %s, Mount info not found for cluster-id %s, skipping cleanup", requestID, components.ClusterID)
+		return &csi.NodeUnstageVolumeResponse{}, nil
+	}
+
+	mntPath := mountInfo.MntPath
+	if mntPath == "" {
+		klog.Warningf("RequestID: %s, mnt-path not found in mount state, skipping cleanup", requestID)
+		return &csi.NodeUnstageVolumeResponse{}, nil
+	}
+
+	// Remove volume from mount state
+	if err := n.mountState.RemoveVolume(mntPath, clusterID, volumeID); err != nil {
+		klog.Warningf("RequestID: %s, Failed to remove volume from mount state: %v", requestID, err)
+	}
+
+	// Check reference count
+	mountInfo, exists = n.mountState.GetMount(mntPath, clusterID)
+	if exists && mountInfo.RefCount == 0 {
+		// No more volumes using this mount, stop FUSE process
+		klog.Infof("RequestID: %s, No more volumes using mount point %s@%s, stopping FUSE process",
+			requestID, mntPath, clusterID)
+		if err := n.fuseManager.StopFuseProcess(mntPath, clusterID); err != nil {
+			klog.Warningf("RequestID: %s, Failed to stop FUSE process: %v", requestID, err)
+		}
+	}
+
+	klog.Infof("RequestID: %s, Successfully unstaged volume: %s", requestID, volumeID)
+	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
 // NodePublishVolume mounts the volume on the node.
 func (n *nodeService) NodePublishVolume(ctx context.Context, request *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	// Generate request ID for log tracking
 	requestID := generateRequestID()
+	klog.Infof("RequestID: %s, NodePublishVolume called with request: %+v", requestID, request)
 
 	volumeID := request.GetVolumeId()
 	if len(volumeID) == 0 {
@@ -107,7 +243,8 @@ func (n *nodeService) NodePublishVolume(ctx context.Context, request *csi.NodePu
 	}
 
 	// Validate basic request parameters
-	if len(request.GetTargetPath()) == 0 {
+	targetPath := request.GetTargetPath()
+	if len(targetPath) == 0 {
 		klog.Errorf("RequestID: %s, Target path not provided for volume ID: %s", requestID, volumeID)
 		return nil, status.Error(codes.InvalidArgument, "Target path not provided")
 	}
@@ -123,78 +260,147 @@ func (n *nodeService) NodePublishVolume(ctx context.Context, request *csi.NodePu
 		return nil, status.Error(codes.InvalidArgument, "Volume capability not supported")
 	}
 
-	// Build fuse command with all parameters
-	cmd := buildFuseCommand(n.config.FuseBinaryPath, n.config.ConfigFile, request, requestID)
-
-	// Create log file for output redirection
-	logFilePath := "/tmp/curvine-fuse.log"
-	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		klog.Errorf("RequestID: %s, Failed to create log file %s: %v", requestID, logFilePath, err)
-		return nil, status.Errorf(codes.Internal, "Failed to create log file: %v", err)
+	// Get VolumeContext and PublishContext
+	volumeContext := request.GetVolumeContext()
+	if volumeContext == nil {
+		volumeContext = make(map[string]string)
 	}
-	defer logFile.Close()
 
-	// Redirect stdout and stderr to log file
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
+	publishContext := request.GetPublishContext()
+	if publishContext == nil {
+		publishContext = make(map[string]string)
+	}
 
-	// Use nohup to start command, prevent hang signal interference
-	nohupCmd := exec.Command("nohup", append([]string{cmd.Path}, cmd.Args[1:]...)...)
-	nohupCmd.Stdout = logFile
-	nohupCmd.Stderr = logFile
+	// Get required parameters
+	masterAddrs := volumeContext["master-addrs"]
+	if masterAddrs == "" {
+		masterAddrs = publishContext["master-addrs"]
+	}
+	if masterAddrs == "" {
+		klog.Errorf("RequestID: %s, master-addrs not found in volume context or publish context", requestID)
+		return nil, status.Error(codes.InvalidArgument, "master-addrs parameter is required")
+	}
 
-	// Start command
-	klog.Infof("RequestID: %s, Starting nohup command: %s %v", requestID, nohupCmd.Path, nohupCmd.Args)
-	err = nohupCmd.Start()
+	// Get curvine-path
+	curvinePath := volumeContext["curvine-path"]
+	if curvinePath == "" {
+		curvinePath = publishContext["curvine-path"]
+	}
+	if curvinePath == "" {
+		klog.Errorf("RequestID: %s, curvine-path not found in volume context or publish context", requestID)
+		return nil, status.Error(codes.InvalidArgument, "curvine-path parameter is required")
+	}
 
-	// Record PID for subsequent management
-	klog.Infof("RequestID: %s, Started curvine-fuse with PID %d", requestID, nohupCmd.Process.Pid)
+	// Generate cluster-id and mnt-path (same as NodeStageVolume)
+	clusterID := GenerateClusterID(masterAddrs)
+	mntPath := fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/curvine/%s/fuse-mount", clusterID)
 
-	// Asynchronously wait for process to end to catch abnormal exit
-	go func() {
-		state, err := nohupCmd.Process.Wait()
-		if err != nil {
-			klog.Errorf("RequestID: %s, Error waiting for nohup process: %v", requestID, err)
-			return
+	// Ensure shared mount point is ready (call NodeStageVolume logic if needed)
+	klog.Infof("RequestID: %s, Checking mount state for mntPath: %s, clusterID: %s, curvine-path: %s",
+		requestID, mntPath, clusterID, curvinePath)
+	mountInfo, exists := n.mountState.GetMount(mntPath, clusterID)
+	if !exists || mountInfo.FusePID == 0 {
+		klog.Infof("RequestID: %s, Mount state not found or FUSE PID is 0, need to stage volume", requestID)
+		// Need to stage the volume first
+		// Merge volumeContext into publishContext for NodeStageVolume
+		mergedPublishContext := make(map[string]string)
+		for k, v := range publishContext {
+			mergedPublishContext[k] = v
 		}
-
-		// Check if process exited normally
-		if !state.Success() {
-			// Read log file content
-			logContent := "Failed fetch nohup log"
-			if logBytes, readErr := os.ReadFile(logFilePath); readErr == nil {
-				logContent = string(logBytes)
+		for k, v := range volumeContext {
+			if _, exists := mergedPublishContext[k]; !exists {
+				mergedPublishContext[k] = v
 			}
+		}
+		stageReq := &csi.NodeStageVolumeRequest{
+			VolumeId:          volumeID,
+			StagingTargetPath: mntPath,
+			PublishContext:    mergedPublishContext,
+			VolumeContext:     volumeContext,
+		}
+		klog.Infof("RequestID: %s, Calling NodeStageVolume from NodePublishVolume", requestID)
+		if _, err := n.NodeStageVolume(ctx, stageReq); err != nil {
+			klog.Errorf("RequestID: %s, Failed to stage volume: %v", requestID, err)
+			return nil, status.Errorf(codes.Internal, "Failed to stage volume: %v", err)
+		}
+		klog.Infof("RequestID: %s, NodeStageVolume completed successfully", requestID)
+	} else {
+		klog.Infof("RequestID: %s, Mount state exists, FUSE PID: %d", requestID, mountInfo.FusePID)
+	}
 
-			exitCode := state.ExitCode()
-			klog.Errorf("RequestID: %s, curvine-fuse process exited unexpectedly with code %d. Log content: %s",
-				requestID, exitCode, logContent)
+	// Calculate host sub-path: mnt-path + curvine-path
+	// FUSE mounts curvine root "/" to mnt-path, so curvine-path is accessible at mnt-path + curvine-path
+	// For example: mnt-path="/xyz", curvine-path="/pvc-abc" → hostSubPath="/xyz/pvc-abc"
+	// Need to strip leading "/" from curvine-path to avoid double slash
+	curvineSubPath := strings.TrimPrefix(curvinePath, "/")
+	hostSubPath := mntPath
+	if curvineSubPath != "" {
+		hostSubPath = mntPath + "/" + curvineSubPath
+	}
+	klog.Infof("RequestID: %s, Calculated host sub-path: %s (mnt-path: %s, curvine-path: %s)",
+		requestID, hostSubPath, mntPath, curvinePath)
 
-			// Check if mount point still exists
-			cmd := exec.Command("mountpoint", "-q", request.GetTargetPath())
-			if err := cmd.Run(); err != nil {
-				klog.Errorf("RequestID: %s, Mount point %s is no longer valid after process exit", requestID, request.GetTargetPath())
-			}
+	// Check if sub-path exists (should be created by Controller in remote storage)
+	klog.Infof("RequestID: %s, Checking if sub-path exists: %s", requestID, hostSubPath)
+	if _, err := os.Stat(hostSubPath); os.IsNotExist(err) {
+		// Sub-path not found - Controller may have failed to create it, or FUSE hasn't synced yet
+		klog.Warningf("RequestID: %s, Sub-path %s not found in FUSE mount point. "+
+			"This may indicate Controller CreateVolume failed. "+
+			"Attempting to create through FUSE as fallback...", requestID, hostSubPath)
+
+		// Try to create through FUSE (will create in remote storage)
+		if err := os.MkdirAll(hostSubPath, 0750); err != nil {
+			klog.Errorf("RequestID: %s, Failed to create sub-path %s through FUSE: %v",
+				requestID, hostSubPath, err)
+			return nil, status.Errorf(codes.Internal,
+				"Sub-path not found and failed to create through FUSE: %v. "+
+					"Please check if Controller CreateVolume succeeded.", err)
+		}
+		klog.Infof("RequestID: %s, Sub-path created through FUSE (fallback): %s", requestID, hostSubPath)
+	} else if err != nil {
+		// Other error (permission, etc.)
+		klog.Errorf("RequestID: %s, Failed to stat sub-path %s: %v", requestID, hostSubPath, err)
+		return nil, status.Errorf(codes.Internal, "Failed to access sub-path: %v", err)
+	} else {
+		// Sub-path exists (created by Controller as expected)
+		klog.Infof("RequestID: %s, Sub-path already exists (created by Controller): %s",
+			requestID, hostSubPath)
+	}
+
+	// Ensure target path exists
+	klog.Infof("RequestID: %s, Creating target path: %s", requestID, targetPath)
+	if err := os.MkdirAll(targetPath, 0750); err != nil {
+		klog.Errorf("RequestID: %s, Failed to create target path %s: %v", requestID, targetPath, err)
+		return nil, status.Errorf(codes.Internal, "Failed to create target path: %v", err)
+	}
+	klog.Infof("RequestID: %s, Target path created successfully", requestID)
+
+	// Bind mount sub-path to target path
+	klog.Infof("RequestID: %s, Bind mounting %s to %s", requestID, hostSubPath, targetPath)
+	cmd := exec.Command("mount", "--bind", hostSubPath, targetPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		klog.Errorf("RequestID: %s, Failed to bind mount %s to %s: %v, output: %s",
+			requestID, hostSubPath, targetPath, err, string(output))
+		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
+	}
+
+	// Add volume to mount state and increment reference count (async to avoid blocking)
+	klog.Infof("RequestID: %s, Updating mount state for volume", requestID)
+	go func() {
+		if err := n.mountState.AddVolume(mntPath, clusterID, volumeID); err != nil {
+			klog.Warningf("RequestID: %s, Failed to update mount state: %v", requestID, err)
+		} else {
+			klog.Infof("RequestID: %s, Mount state updated successfully", requestID)
 		}
 	}()
 
-	// Check if mount was successful
-	if err != nil {
-		klog.Errorf("RequestID: %s, Failed to mount volume %s at %s: %v",
-			requestID, volumeID, request.GetTargetPath(), err)
-		return nil, status.Errorf(codes.Internal, "Failed to mount volume %s at %s: %v",
-			volumeID, request.GetTargetPath(), err)
-	}
-
-	klog.Infof("RequestID: %s, Successfully mounted volume %s at %s", requestID, volumeID, request.GetTargetPath())
-
+	klog.Infof("RequestID: %s, Successfully published volume %s at %s", requestID, volumeID, targetPath)
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
 // NodeUnpublishVolume unmount the volume from the target path
 func (n *nodeService) NodeUnpublishVolume(ctx context.Context, request *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	// Generate request ID for log tracking
 	requestID := generateRequestID()
 	klog.Infof("RequestID: %s, NodeUnpublishVolume called with request: %+v", requestID, request)
 
@@ -210,57 +416,62 @@ func (n *nodeService) NodeUnpublishVolume(ctx context.Context, request *csi.Node
 		return nil, status.Error(codes.InvalidArgument, "Target path not provided")
 	}
 
-	// Find log file associated with this volume
-	logFilePath := fmt.Sprintf("/tmp/curvine-fuse-%s.log", volumeID)
+	// Check if target path exists and is a mount point before unmounting
+	if _, err := os.Stat(target); os.IsNotExist(err) {
+		klog.Infof("RequestID: %s, Target path %s does not exist, treating as already unmounted", requestID, target)
+		// Path doesn't exist, consider it already unmounted
+	} else {
+		// Check if it's a mount point
+		cmdCheck := exec.Command("mountpoint", "-q", target)
+		if err := cmdCheck.Run(); err != nil {
+			// Not a mount point, treat as success
+			klog.Infof("RequestID: %s, Target path %s is not a mount point, treating as already unmounted", requestID, target)
+		} else {
+			// It is a mount point, proceed with unmount
+			klog.Infof("RequestID: %s, Unmounting volume %s from %s", requestID, volumeID, target)
+			cmd := exec.Command("umount", target)
 
-	// Use system umount command to unmount volume
-	klog.Infof("RequestID: %s, Unmounting volume %s from %s", requestID, volumeID, target)
-	cmd := exec.Command("umount", target)
+			// Execute command with retry and timeout
+			retryCount := 3
+			retryInterval := 2 * time.Second
+			commandTimeout := 30 * time.Second
+			output, err := ExecuteWithRetry(
+				cmd,
+				retryCount,
+				retryInterval,
+				commandTimeout,
+				[]string{"not mounted", "no mount point specified", "not found"},
+			)
 
-	// Execute command with retry and timeout
-	output, err := ExecuteWithRetry(
-		cmd,
-		n.config.RetryCount,
-		time.Duration(n.config.RetryInterval)*time.Second,
-		time.Duration(n.config.CommandTimeout)*time.Second,
-		[]string{"not mounted"},
-	)
-
-	// Try to find and terminate related curvine-fuse processes
-	// Use ps and grep to find processes related to mount point
-	findCmd := exec.Command("sh", "-c", fmt.Sprintf("ps aux | grep '%s' | grep -v grep | awk '{print $2}'", target))
-	findOutput, findErr := findCmd.CombinedOutput()
-	if findErr == nil && len(findOutput) > 0 {
-		// Found processes, try to terminate them
-		pids := strings.Split(strings.TrimSpace(string(findOutput)), "\n")
-		for _, pid := range pids {
-			if pid == "" {
-				continue
+			if err != nil {
+				klog.Errorf("RequestID: %s, Failed to unmount volume %s from %s: %v, output: %s",
+					requestID, volumeID, target, err, string(output))
+				return nil, status.Errorf(codes.Internal, "Failed to unmount volume %s from %s: %v, output: %s",
+					volumeID, target, err, string(output))
 			}
-			klog.Infof("RequestID: %s, Attempting to terminate curvine-fuse process with PID %s", requestID, pid)
-			killCmd := exec.Command("kill", pid)
-			killCmd.Run() // Ignore error because process may have already terminated
 		}
 	}
 
-	if err != nil {
-		klog.Errorf("RequestID: %s, Failed to unmount volume %s from %s: %v, output: %s",
-			requestID, volumeID, target, err, string(output))
-		return nil, status.Errorf(codes.Internal, "Failed to unmount volume %s from %s: %v, output: %s",
-			volumeID, target, err, string(output))
-	}
-
-	klog.Infof("RequestID: %s, Successfully unmounted volume %s from %s", requestID, volumeID, target)
-
-	// Clean up log file
-	if _, err := os.Stat(logFilePath); err == nil {
-		klog.Infof("RequestID: %s, Removing log file: %s", requestID, logFilePath)
-		if err := os.Remove(logFilePath); err != nil {
-			klog.Warningf("RequestID: %s, Failed to remove log file %s: %v", requestID, logFilePath, err)
-			// Don't return error because unmount was successful
+	// Update mount state: remove volume and decrement reference count
+	// Iterate through all mounts to find which one contains this volume
+	klog.Infof("RequestID: %s, Looking for volume %s in mount state", requestID, volumeID)
+	allMounts := n.mountState.GetAllMounts()
+	for _, mountInfo := range allMounts {
+		// Check if this volume is in the mount's volume list
+		for _, volID := range mountInfo.Volumes {
+			if volID == volumeID {
+				// Found the mount, remove volume from it
+				klog.Infof("RequestID: %s, Found volume in mount %s@%s, removing",
+					requestID, mountInfo.MntPath, mountInfo.ClusterID)
+				if err := n.mountState.RemoveVolume(mountInfo.MntPath, mountInfo.ClusterID, volumeID); err != nil {
+					klog.Warningf("RequestID: %s, Failed to update mount state: %v", requestID, err)
+				}
+				break
+			}
 		}
 	}
 
+	klog.Infof("RequestID: %s, Successfully unpublished volume %s from %s", requestID, volumeID, target)
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -345,48 +556,6 @@ func isValidVolumeCapabilities(volCaps []*csi.VolumeCapability) bool {
 	return foundAll
 }
 
-func buildFuseCommand(fuseBinaryPath, configFile string, request *csi.NodePublishVolumeRequest, requestID string) *exec.Cmd {
-
-	volumeID := request.GetVolumeId()
-	target := request.GetTargetPath()
-	publishContext := request.GetPublishContext()
-	volumeContext := request.GetVolumeContext()
-
-	// Determine curvinePath
-	curvinePath := getCurvinePath(publishContext, volumeContext, volumeID, requestID)
-
-	// Build mount options
-	mountOptions := buildMountOptions(request, requestID)
-
-	// Log mount information
-	klog.Infof("RequestID: %s, Mounting volume %s to %s with curvinePath: %s, options: %s",
-		requestID, volumeID, target, curvinePath, mountOptions)
-
-	// Start building command arguments
-	args := []string{fuseBinaryPath}
-
-	// Add debug flag by default
-	args = append(args, "-d")
-
-	// Handle config file
-	args = appendConfigFile(args, publishContext, configFile, requestID)
-
-	// Add required paths
-	args = append(args, "--fs-path", curvinePath, "--mnt-path", target)
-
-	// Add fuse parameters from publishContext
-	args = appendFuseParameters(args, publishContext, requestID)
-
-	// Add mount options
-	if mountOptions != "" {
-		parts := strings.Fields(mountOptions)
-		args = append(args, parts...)
-	}
-
-	klog.Infof("RequestID: %s, Final fuse command: %v", requestID, args)
-	return exec.Command(args[0], args[1:]...)
-}
-
 // getCurvinePath determines the curvine filesystem path to mount
 func getCurvinePath(publishContext, volumeContext map[string]string, volumeID, requestID string) string {
 	// First try to get curvinePath from publishContext
@@ -434,26 +603,6 @@ func buildMountOptions(request *csi.NodePublishVolumeRequest, requestID string) 
 	return ""
 }
 
-// appendConfigFile adds config file argument if available
-func appendConfigFile(args []string, publishContext map[string]string, defaultConfigFile, requestID string) []string {
-	// Check for config file from publishContext first
-	if configFromContext := publishContext["conf"]; configFromContext != "" {
-		args = append(args, "-c", configFromContext)
-		klog.Infof("RequestID: %s, Using config file from publishContext: %s", requestID, configFromContext)
-		return args
-	}
-
-	// Use default config file if provided
-	if defaultConfigFile != "" {
-		args = append(args, "-c", defaultConfigFile)
-		klog.Infof("RequestID: %s, Using default config file: %s", requestID, defaultConfigFile)
-		return args
-	}
-
-	klog.Infof("RequestID: %s, No config file specified, using curvine-fuse defaults", requestID)
-	return args
-}
-
 // appendFuseParameters adds all supported fuse parameters from publishContext
 func appendFuseParameters(args []string, publishContext map[string]string, requestID string) []string {
 	// Define supported fuse parameters and their types
@@ -484,7 +633,7 @@ func appendFuseParameters(args []string, publishContext map[string]string, reque
 	// Process parameters from publishContext
 	for key, value := range publishContext {
 		// Skip parameters that are handled elsewhere
-		if key == "curvinePath" || key == "conf" {
+		if key == "curvinePath" {
 			continue
 		}
 

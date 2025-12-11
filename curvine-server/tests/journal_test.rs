@@ -33,7 +33,7 @@ use std::time::Duration;
 
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
 #[test]
-fn check_journal_state() -> CommonResult<()> {
+fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult<()> {
     Master::init_test_metrics();
 
     let mut conf = ClusterConf {
@@ -80,7 +80,7 @@ fn check_journal_state() -> CommonResult<()> {
 
 // Start 2 masters at the same time to check the correctness of log playback.
 #[test]
-fn check_raft_state() -> CommonResult<()> {
+fn test_raft_consensus_and_state_synchronization_between_two_masters() -> CommonResult<()> {
     Logger::default();
     Master::init_test_metrics();
 
@@ -162,7 +162,6 @@ fn check_raft_state() -> CommonResult<()> {
 
 fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let address = ClientAddress::default();
-
     /************* Master node execution log **************/
     // Create a directory
     fs_leader.mkdir("/journal/a", true)?;
@@ -175,7 +174,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let status = fs_leader.create("/journal/b/test.log", true)?;
 
     // Assign block
-    let block = fs_leader.add_block(&status.path, address.clone(), None, vec![], 0)?;
+    let block = fs_leader.add_block(&status.path, address.clone(), vec![], vec![], 0, None)?;
 
     // Complete the file.
     let commit = CommitBlock {
@@ -198,7 +197,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     let path = "/journal/append.log";
     fs_leader.create(path, true)?;
 
-    let block = fs_leader.add_block(path, address.clone(), None, vec![], 0)?;
+    let block = fs_leader.add_block(path, address.clone(), vec![], vec![], 0, None)?;
     let commit = CommitBlock {
         block_id: block.block.id,
         block_len: 10,
@@ -259,7 +258,7 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
 
 // Test snapshot restart
 #[test]
-fn test_restart() -> CommonResult<()> {
+fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
     Logger::default();
     Master::init_test_metrics();
     let mut conf = ClusterConf::default();

@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: curvine-shared-pvc
+  namespace: curvine-system
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: curvine-sc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: curvine-test-deployment
+  namespace: curvine-system
+  labels:
+    app: curvine-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: curvine-test
+  template:
+    metadata:
+      labels:
+        app: curvine-test
+    spec:
+      containers:
+        - name: web-server
+          image: nginx:stable-alpine
+          ports:
+            - containerPort: 80
+              name: http
+          volumeMounts:
+            - mountPath: "/usr/share/nginx/html"
+              name: curvine-storage
+          command: ["/bin/sh"]
+          args:
+            - -c
+            - |
+              echo "Pod: $(hostname)" > /usr/share/nginx/html/index.html
+              echo "Timestamp: $(date)" >> /usr/share/nginx/html/index.html
+              exec nginx -g 'daemon off;'
+      volumes:
+        - name: curvine-storage
+          persistentVolumeClaim:
+            claimName: curvine-shared-pvc
+

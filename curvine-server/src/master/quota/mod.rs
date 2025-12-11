@@ -12,4 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod s3;
+mod quota_manager;
+pub use quota_manager::QuotaManager;
+
+pub mod eviction;

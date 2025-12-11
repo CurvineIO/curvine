@@ -92,7 +92,6 @@ print_help() {
   echo
   echo "  -u, --ufs TYPE        UFS storage type (can be specified multiple times, default: opendal-s3)"
   echo "                        Available types:"
-  echo "                          - s3: AWS S3 native SDK"
   echo "                          - opendal-s3: OpenDAL S3"
   echo "                          - opendal-oss: OpenDAL OSS"
   echo "                          - opendal-azblob: OpenDAL Azure Blob"
@@ -101,6 +100,7 @@ print_help() {
   echo "  -d, --debug           Build in debug mode (default: release mode)"
   echo "  -f, --features LIST   Comma-separated list of extra features to enable"
   echo "  -z, --zip             Create zip archive"
+  echo "  --skip-java-sdk           Skip Java SDK compilation (useful for Docker builds)"
   echo "  -h, --help            Show this help message"
   echo
   echo "Examples:"
@@ -110,6 +110,7 @@ print_help() {
   echo "  $0 --package all --ufs opendal-s3 -z   # Build all packages with OpenDAL S3 and create zip"
   echo "  $0 --features opendal-hdfs,opendal-webhdfs  # Build with HDFS support"
   echo "  $0 --features jni --package client     # Build client with JNI support"
+  echo "  $0 --skip-java-sdk                         # Build all packages except Java SDK"
 }
 
 # Create a version file.
@@ -134,9 +135,10 @@ declare -a PACKAGES=("all")  # Default to build all packages
 declare -a UFS_TYPES=("opendal-s3")  # Default UFS type
 declare -a EXTRA_FEATURES=()  # Extra features to add
 CRATE_ZIP=""
+SKIP_JAVA_SDK=0  # Flag to skip Java SDK compilation
 
 # Parse command line arguments
-TEMP=$(getopt -o p:u:f:dzhv --long package:,ufs:,features:,debug,zip,help -n "$0" -- "$@")
+TEMP=$(getopt -o p:u:f:dzhv --long package:,ufs:,features:,debug,zip,skip-java-sdk,help -n "$0" -- "$@")
 if [ $? != 0 ] ; then print_help ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -169,6 +171,10 @@ while true ; do
       ;;
     -z|--zip)
       CRATE_ZIP="zip"
+      shift
+      ;;
+    --skip-java-sdk)
+      SKIP_JAVA_SDK=1
       shift
       ;;
     -h|--help)
@@ -276,7 +282,7 @@ if should_build_package "fuse" && [ -n "$FUSE_VERSION" ]; then
   COPY_TARGETS+=("curvine-fuse")
 fi
 
-if should_build_package "java"; then
+if should_build_package "java" && [ $SKIP_JAVA_SDK -eq 0 ]; then
   RUST_BUILD_ARGS+=("-p" "curvine-libsdk")
 fi
 
@@ -320,10 +326,6 @@ if [ ${#RUST_BUILD_ARGS[@]} -gt 0 ]; then
   if [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-client " ]]; then
     for ufs in "${UFS_TYPES[@]}"; do
       case $ufs in
-        s3)
-          # Use s3 feature for AWS SDK implementation
-          FEATURES+=("curvine-client/s3")
-          ;;
         *)
           FEATURES+=("curvine-client/$ufs")
           ;;
@@ -335,10 +337,6 @@ else
   FEATURES+=("curvine-fuse/$FUSE_VERSION")  # FUSE check already done above
   for ufs in "${UFS_TYPES[@]}"; do
     case $ufs in
-      s3)
-        # Use s3-native feature for AWS SDK implementation
-        FEATURES+=("curvine-client/s3")
-        ;;
       *)
         FEATURES+=("curvine-client/$ufs")
         ;;
@@ -411,7 +409,7 @@ if should_build_package "web"; then
   mv "$FS_HOME"/curvine-web/webui/dist "$DIST_DIR"/webui
 fi
 
-if should_build_package "java"; then
+if should_build_package "java" && [ $SKIP_JAVA_SDK -eq 0 ]; then
   mkdir -p "$FS_HOME"/curvine-libsdk/java/native
   
   # Handle java native library

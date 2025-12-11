@@ -224,7 +224,7 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::Mkdir(op) => reply.send_rep(fs.mkdir(op).await).await,
 
-            FuseOperator::FAllocate(op) => reply.send_rep(fs.fuse_allocate(op).await).await,
+            FuseOperator::FAllocate(op) => reply.send_rep(fs.allocate(op).await).await,
 
             FuseOperator::ReleaseDir(op) => reply.send_rep(fs.release_dir(op).await).await,
 

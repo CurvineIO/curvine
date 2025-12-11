@@ -199,32 +199,23 @@ impl FsClient {
     pub async fn add_block(
         &self,
         path: &Path,
-        previous: Option<CommitBlock>,
-        local_addr: &ClientAddress,
+        commit_blocks: Vec<CommitBlock>,
         file_len: i64,
+        last_block: Option<ExtendedBlock>,
     ) -> FsResult<LocatedBlock> {
-        let previous = previous.map(|v| ProtoUtils::commit_block_to_pb(v.clone()));
-
-        let exclude_workers = {
-            self.context()
-                .failed_workers
-                .iter()
-                .map(|x| ProtoUtils::worker_address_to_pb(&x.1))
-                .collect()
-        };
+        let commit_blocks = commit_blocks
+            .into_iter()
+            .map(|v| ProtoUtils::commit_block_to_pb(v.clone()))
+            .collect();
 
         let header = AddBlockRequest {
             path: path.encode(),
-            previous,
-            exclude_workers,
+            commit_blocks,
+            exclude_workers: self.context.exclude_workers(),
             located: true,
-            client_address: ClientAddressProto {
-                client_name: local_addr.client_name.to_owned(),
-                hostname: local_addr.hostname.to_owned(),
-                ip_addr: local_addr.ip_addr.to_owned(),
-                port: local_addr.port,
-            },
+            client_address: self.context.client_addr_pb(),
             file_len,
+            last_block: last_block.map(ProtoUtils::extend_block_to_pb),
         };
 
         let rep_header = self.rpc(RpcCode::AddBlock, header).await?;
@@ -385,6 +376,28 @@ impl FsClient {
         };
         let _: LinkResponse = self.rpc(RpcCode::Link, req).await?;
         Ok(())
+    }
+
+    pub async fn resize(&self, path: &Path, alloc_opts: FileAllocOpts) -> FsResult<FileBlocks> {
+        let req = FileResizeRequest {
+            path: path.encode(),
+            opts: ProtoUtils::file_alloc_opts_to_pb(alloc_opts),
+        };
+
+        let rep: FileResizeResponse = self.rpc(RpcCode::ResizeFile, req).await?;
+        Ok(ProtoUtils::file_blocks_from_pb(rep.file_blocks))
+    }
+
+    pub async fn assign_worker(&self, path: &Path, block: ExtendedBlock) -> FsResult<LocatedBlock> {
+        let req = AssignWorkerRequest {
+            path: path.encode(),
+            block: ProtoUtils::extend_block_to_pb(block),
+            exclude_workers: self.context.exclude_workers(),
+            client_address: self.context.client_addr_pb(),
+        };
+
+        let rep: AssignWorkerResponse = self.rpc(RpcCode::AssignWorker, req).await?;
+        Ok(ProtoUtils::located_block_from_pb(rep.block))
     }
 
     pub async fn rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>

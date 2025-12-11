@@ -12,12 +12,7 @@ use crate::cmds::fs::{
 
 #[derive(Parser, Debug)]
 pub struct FsCommand {
-    #[clap(
-        short = 'c',
-        long,
-        global = true,
-        help = "Query only Curvine cached data"
-    )]
+    #[clap(long, global = true, help = "Query only Curvine cached data")]
     pub cache_only: bool,
 
     #[clap(subcommand)]
@@ -111,9 +106,12 @@ pub enum FsSubCommand {
     },
 
     /// Show disk usage statistics
+    #[command(disable_help_flag = true)]
     Df {
         #[clap(short, long, help = "Show human-readable sizes")]
         human_readable: bool,
+        #[clap(long, action = clap::ArgAction::Help, help = "Print help")]
+        help: Option<bool>,
     },
 
     /// Create an empty file or update timestamp
@@ -123,6 +121,7 @@ pub enum FsSubCommand {
     },
 
     /// Calculate directory space usage
+    #[command(disable_help_flag = true)]
     Du {
         #[clap(help = "Path of the directory to calculate")]
         path: String,
@@ -132,6 +131,9 @@ pub enum FsSubCommand {
 
         #[clap(short, long, help = "Display the names of columns as a header line")]
         verbose: bool,
+
+        #[clap(long, action = clap::ArgAction::Help, help = "Print help")]
+        help: Option<bool>,
     },
 
     /// Get file to local
@@ -264,9 +266,10 @@ impl FsCommand {
                 cat_cmd.execute(client).await
             }
 
-            FsSubCommand::Df { human_readable } => {
+            FsSubCommand::Df { human_readable, .. } => {
                 let df_cmd = DfCommand::Df {
                     human_readable: *human_readable,
+                    help: None,
                 };
                 df_cmd.execute(client).await
             }
@@ -280,11 +283,13 @@ impl FsCommand {
                 path,
                 human_readable,
                 verbose,
+                ..
             } => {
                 let du_cmd = DuCommand::Du {
                     path: path.clone(),
                     human_readable: *human_readable,
                     verbose: *verbose,
+                    help: None,
                 };
                 du_cmd.execute(client).await
             }

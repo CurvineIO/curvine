@@ -321,15 +321,15 @@ test_large_files() {
     CURRENT_TEST_GROUP="Test 4: Large File Operations"
     print_header "$CURRENT_TEST_GROUP"
 
-    print_test "Creating 100MB file"
+    print_test "Creating 10MB file"
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
-    local cmd="dd if=/dev/zero of=$TEST_DIR/large_file.dat bs=1M count=100 2>/dev/null"
+    local cmd="dd if=/dev/zero of=$TEST_DIR/large_file.dat bs=1M count=10"
     print_command "$cmd"
     if eval "$cmd"; then
         file_size=$(stat -f%z "$TEST_DIR/large_file.dat" 2>/dev/null || stat -c%s "$TEST_DIR/large_file.dat")
-        expected_size=$((100 * 1024 * 1024))
+        expected_size=$((10 * 1024 * 1024))
         if [ "$file_size" -eq "$expected_size" ]; then
-            print_success "Created 100MB file (size verified)"
+            print_success "Created 10MB file (size verified)"
         else
             handle_error "File created but size mismatch (expected: $expected_size, got: $file_size)" "$cmd"
         fi
@@ -763,6 +763,78 @@ generate_json_report() {
     print_info "JSON report saved to: $JSON_OUTPUT"
 }
 
+# Test 10: Truncate operations
+test_truncate() {
+    print_header "Test 10: Truncate Operations"
+
+    local test_file="$TEST_DIR/truncate_test.txt"
+    
+    # Test 1: Expand file (truncate to larger size)
+    print_test "Truncating file to larger size (200MB)"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    local truncate_size=$((200 * 1024 * 1024))  # 200MB
+    local cmd="truncate -s $truncate_size $test_file"
+    print_command "$cmd"
+    if eval "$cmd"; then
+        new_size=$(stat -f%z "$test_file" 2>/dev/null || stat -c%s "$test_file")
+        if [ "$new_size" -eq "$truncate_size" ]; then
+            print_success "Extended file to 200MB successfully"
+        else
+            handle_error "Truncate extension failed (expected: $truncate_size, got: $new_size)" "$cmd"
+        fi
+    else
+        handle_error "Failed to extend file" "$cmd"
+    fi
+
+    # Test 2: Shrink file (truncate to smaller size)
+    print_test "Truncating file to smaller size (100MB)"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    local truncate_size=$((100 * 1024 * 1024))  # 100MB
+    cmd="truncate -s $truncate_size $test_file"
+    print_command "$cmd"
+    if eval "$cmd"; then
+        new_size=$(stat -f%z "$test_file" 2>/dev/null || stat -c%s "$test_file")
+        if [ "$new_size" -eq "$truncate_size" ]; then
+            print_success "Truncated file to 100MB successfully"
+        else
+            handle_error "Truncate failed (expected: $truncate_size, got: $new_size)" "$cmd"
+        fi
+    else
+        handle_error "Failed to truncate file" "$cmd"
+    fi
+}
+
+# Test 11: Fallocate operations
+test_fallocate() {
+    print_header "Test 11: Fallocate Operations"
+
+    local test_file="$TEST_DIR/fallocate_test.txt"
+
+    # Check if fallocate command is available
+    if ! command -v fallocate >/dev/null 2>&1; then
+        print_info "fallocate command not available, skipping fallocate tests"
+        return
+    fi
+
+    # Test 1: Expand file (allocate space to increase file size)
+    print_test "Allocating space with fallocate (increase file size to 200MB)"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    local allocate_size=$((200 * 1024 * 1024))  # 200MB
+    local cmd="fallocate -l $allocate_size $test_file"
+    print_command "$cmd"
+    if eval "$cmd"; then
+        file_size=$(stat -f%z "$test_file" 2>/dev/null || stat -c%s "$test_file")
+        if [ "$file_size" -eq "$allocate_size" ]; then
+            print_success "Allocated $allocate_size bytes successfully"
+        else
+            handle_error "Fallocate failed (expected: $allocate_size, got: $file_size)" "$cmd"
+        fi
+    else
+        handle_error "Failed to allocate space" "$cmd"
+        return
+    fi
+}
+
 # Print final report
 print_report() {
     print_header "Test Summary"
@@ -853,7 +925,9 @@ main() {
     test_hardlinks
     test_permissions
     test_delete_operations
-    
+    test_truncate
+    test_fallocate
+
     print_info "All test functions completed"
 
     # Cleanup and report

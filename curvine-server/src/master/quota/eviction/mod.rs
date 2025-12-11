@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "s3")]
-mod test_utils;
-#[cfg(feature = "s3")]
-mod validation_tests;
+pub mod evictor;
+pub mod types;
+
+pub use types::{EvictPlan, EvictionConf, EvictionMode, EvictionPolicy};

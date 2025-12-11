@@ -6,8 +6,6 @@ ARG REPO_URL=https://github.com/curvineio/curvine
 LABEL org.opencontainers.image.source="${REPO_URL}"
 LABEL org.opencontainers.image.description="Curvine Native Kubernetes Runtime Image"
 
-# This Dockerfile is specifically for source code compilation
-
 # Set non-interactive mode for apt to avoid prompts during install
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -55,25 +53,16 @@ RUN mkdir -p /app/protoc && cd /app/protoc && \
     chmod +x bin/protoc && \
     rm -f *.zip
 
-# 4. Install Maven
-RUN cd /app && \
-    curl -k -LO https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz && \
-    tar -xzf apache-maven-3.9.11-bin.tar.gz && \
-    mv apache-maven-3.9.11 maven && \
-    rm -f *.tar.gz
-
-# 5. Copy and apply build configurations
-COPY compile/ /build-config/
-RUN mkdir -p /app/maven/conf && \
-    cp /build-config/settings.xml /app/maven/conf/settings.xml && \
-    mkdir -p /root/.cargo && \
+# 4. Copy and apply build configurations
+COPY curvine-docker/deploy/config /build-config/config
+RUN mkdir -p /root/.cargo && \
     cp /build-config/config /root/.cargo/config.toml
 
 # Set environment variables for build
-ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
+ENV PATH="/root/.cargo/bin:/app/protoc/bin:${PATH}"
 
 # Copy and build source code if building from source
-COPY workspace/ /workspace/
+COPY . /workspace/
 WORKDIR /workspace
 
 # 6. Pre-install WebUI dependencies and fix vue-cli-service module resolution
@@ -104,12 +93,12 @@ RUN echo "Building Curvine from source..." && \
     mkdir -p /workspace/tmp && \
     export TMPDIR=/workspace/tmp && \
     echo "Using TMPDIR=$TMPDIR for compilation temporary files" && \
-    echo "Running 'make all' with retry mechanism..." && \
-    # Build with retry mechanism for Maven failures
+    echo "Running 'make all --skip-java-sdk' with retry mechanism..." && \
+    # Build with retry mechanism
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all; then \
-            echo "✓ Build succeeded with 'make all'" && \
+        if make all ARGS='--skip-java-sdk'; then \
+            echo "✓ Build succeeded with 'make all --skip-java-sdk'" && \
             break; \
         else \
             echo "✗ Build attempt $attempt failed" && \
@@ -164,6 +153,7 @@ RUN mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sou
 RUN apt-get update && apt-get install -y --no-install-recommends \
     fuse3 \
     libfuse3-3 \
+    procps \
     openjdk-8-jre-headless \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
@@ -181,7 +171,7 @@ RUN mkdir -p /app/curvine/bin /app/curvine/lib /app/curvine/conf
 COPY --from=builder /build-output/ /app/curvine/
 
 # Copy entrypoint script (use compile-specific entrypoint)
-COPY entrypoint.sh /entrypoint.sh
+COPY curvine-docker/deploy/entrypoint.sh /entrypoint.sh
 
 # Make all binaries and scripts executable
 RUN find /app/curvine -type f -name "*.sh" -exec chmod +x {} \; \

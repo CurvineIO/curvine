@@ -28,25 +28,10 @@ ACTION_TYPE=${2:-start}
 echo "SERVER_TYPE: $SERVER_TYPE, ACTION_TYPE: $ACTION_TYPE"
 
 set_hosts() {
-  local POD_IP_VALUE=${POD_IP:-}
-  local POD_NAMESPACE_VALUE=${POD_NAMESPACE:-}
-  local POD_CLUSTER_DOMAIN_VALUE=${POD_CLUSTER_DOMAIN:-}
-  local HOSTNAME_VALUE=${HOSTNAME:-$(hostname)}
-
-  if [[ $(grep -c "$HOSTNAME_VALUE" /etc/hosts) = '0' ]]; then
-    echo "$POD_IP_VALUE $HOSTNAME_VALUE" >> /etc/hosts
-  fi
-
-  echo "POD_IP: ${POD_IP_VALUE}"
-  echo "POD_NAMESPACE: ${POD_NAMESPACE_VALUE}"
-  echo "POD_CLUSTER_DOMAIN: ${POD_CLUSTER_DOMAIN_VALUE}"
-  if [[ -z "$POD_IP_VALUE" || -z "$POD_NAMESPACE_VALUE" || -z "$POD_CLUSTER_DOMAIN_VALUE" ]]; then
-    echo "missing env, POD_IP: $POD_IP_VALUE, POD_NAMESPACE: $POD_NAMESPACE_VALUE, POD_CLUSTER_DOMAIN: $POD_CLUSTER_DOMAIN_VALUE"
-    return 0
-  fi
-  local name="${POD_IP_VALUE//./-}.${POD_NAMESPACE_VALUE//_/-}.pod.${POD_CLUSTER_DOMAIN_VALUE}"
-  sed -i "s/${POD_IP_VALUE}/${POD_IP_VALUE} ${name}/g" /etc/hosts
-  echo 'export PS1="[\u@\H \W]\$ "' >>/etc/bashrc
+  # Print pod info for debugging (Kubernetes CoreDNS handles DNS resolution, no need to modify /etc/hosts)
+  echo "POD_IP: ${POD_IP:-}"
+  echo "POD_NAMESPACE: ${POD_NAMESPACE:-}"
+  echo "POD_CLUSTER_DOMAIN: ${POD_CLUSTER_DOMAIN:-}"
 }
 
 # Container-specific service management logic

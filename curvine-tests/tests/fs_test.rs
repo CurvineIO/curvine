@@ -29,7 +29,7 @@ use std::sync::Arc;
 const PATH: &str = "/fs_test/a.log";
 
 #[test]
-fn fs_test() -> FsResult<()> {
+fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     let rt = Arc::new(AsyncRuntime::single());
 
     let testing = Testing::builder().default().build()?;
@@ -355,10 +355,9 @@ async fn list_files(fs: &CurvineFileSystem) -> CommonResult<()> {
 async fn add_block(fs: &CurvineFileSystem) -> CommonResult<()> {
     let path = Path::from_str("/fs_test/add-block.lg")?;
     let client = fs.fs_client();
-    let local_addr = client.client_addr().clone();
 
     let _ = client.create(&path, true, true).await?;
-    let located = client.add_block(&path, None, &local_addr, 0).await?;
+    let located = client.add_block(&path, vec![], 0, None).await?;
     info!("add_block = {:?}", located);
     Ok(())
 }

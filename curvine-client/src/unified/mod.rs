@@ -14,16 +14,12 @@
 
 use crate::file::{FsReader, FsWriter};
 use crate::impl_filesystem_for_enum;
-use crate::*;
 use crate::{impl_reader_for_enum, impl_writer_for_enum};
 use curvine_common::fs::Path;
 use curvine_common::state::MountInfo;
 use curvine_common::FsResult;
 use orpc::err_box;
 use std::collections::HashMap;
-
-#[cfg(feature = "s3")]
-use curvine_ufs::s3::*;
 
 #[cfg(feature = "opendal")]
 use curvine_ufs::opendal::*;
@@ -39,49 +35,70 @@ pub use self::unified_filesystem::UnifiedFileSystem;
 mod mount_cache;
 pub use self::mount_cache::*;
 
+mod cache_sync_writer;
+pub use self::cache_sync_writer::CacheSyncWriter;
+
+mod cache_sync_reader;
+pub use self::cache_sync_reader::CacheSyncReader;
+
 #[allow(clippy::large_enum_variant)]
 pub enum UnifiedWriter {
     Cv(FsWriter),
 
-    #[cfg(feature = "s3")]
-    S3(S3Writer),
+    CacheSync(CacheSyncWriter),
 
     #[cfg(feature = "opendal")]
-    OpenDAL(OpendalWriter),
+    Opendal(OpendalWriter),
 }
 
-impl_writer_for_enum!(UnifiedWriter);
+impl_writer_for_enum! {
+    enum UnifiedWriter {
+        Cv(FsWriter),
 
+        CacheSync(CacheSyncWriter),
+
+        #[cfg(feature = "opendal")]
+        Opendal(OpendalWriter),
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
 pub enum UnifiedReader {
     Cv(FsReader),
 
-    #[cfg(feature = "s3")]
-    S3(S3Reader),
+    CacheSync(CacheSyncReader),
 
     #[cfg(feature = "opendal")]
-    OpenDAL(OpendalReader),
+    Opendal(OpendalReader),
 }
 
-impl_reader_for_enum!(UnifiedReader);
+impl_reader_for_enum! {
+    enum UnifiedReader {
+        Cv(FsReader),
+
+        CacheSync(CacheSyncReader),
+
+        #[cfg(feature = "opendal")]
+        Opendal(OpendalReader),
+    }
+}
 
 #[derive(Clone)]
 pub enum UfsFileSystem {
-    #[cfg(feature = "s3")]
-    S3(S3FileSystem),
-
     #[cfg(feature = "opendal")]
-    OpenDAL(OpendalFileSystem),
+    Opendal(OpendalFileSystem),
+}
+
+impl_filesystem_for_enum! {
+    enum UfsFileSystem {
+        #[cfg(feature = "opendal")]
+        Opendal(OpendalFileSystem),
+    }
 }
 
 impl UfsFileSystem {
     pub fn new(path: &Path, conf: HashMap<String, String>) -> FsResult<Self> {
         match path.scheme() {
-            #[cfg(feature = "s3")]
-            Some(S3_SCHEME) => {
-                let fs = S3FileSystem::new(conf)?;
-                Ok(UfsFileSystem::S3(fs))
-            }
-
             #[cfg(feature = "opendal")]
             Some(scheme)
                 if [
@@ -91,7 +108,7 @@ impl UfsFileSystem {
             {
                 // JVM initialization for HDFS is handled in OpendalFileSystem::new
                 let fs = OpendalFileSystem::new(path, conf)?;
-                Ok(UfsFileSystem::OpenDAL(fs))
+                Ok(UfsFileSystem::Opendal(fs))
             }
 
             Some(scheme) => err_box!("unsupported scheme: {}", scheme),
@@ -105,4 +122,3 @@ impl UfsFileSystem {
         Self::new(&path, mnt.properties.clone())
     }
 }
-impl_filesystem_for_enum!(UfsFileSystem);

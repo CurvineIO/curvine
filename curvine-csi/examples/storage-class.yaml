@@ -7,5 +7,23 @@ reclaimPolicy: Delete
 volumeBindingMode: Immediate
 allowVolumeExpansion: true
 parameters:
-  curvinePath: "/"
-  type: "DirectoryOrCreate" #"DirectoryOrCreate" or "Directory"
+  # Required: Curvine cluster connection information
+  master-addrs: "m0:8995,m1:8995,m2:8995"  # Master node addresses, format: host:port,host:port
+  
+  # Required: Filesystem path prefix for dynamic PV
+  # Each dynamic PV will create: fs-path + pv-name
+  # Example: fs-path="/" → creates "/pvc-xxx"
+  #          fs-path="/test-data" → creates "/test-data/pvc-xxx"
+  fs-path: "/test-data"
+  
+  # Optional: Path creation strategy
+  path-type: "DirectoryOrCreate"  # "DirectoryOrCreate" or "Directory" (default: "Directory")
+  
+  # Optional: FUSE parameters
+  # io-threads: "4"
+  # worker-threads: "8"
+  
+# How it works:
+# - Each PV gets curvine-path = fs-path + pv-name
+# - FUSE mounts curvine-path directly to local mount point
+# - PVs with same master-addrs + curvine-path share FUSE process

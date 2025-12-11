@@ -14,7 +14,7 @@
 
 #[cfg(target_os = "linux")]
 #[test]
-fn tmpfs_test() {
+fn test_tmpfs_filesystem_detection() {
     use orpc::sys;
     assert!(sys::is_tmpfs("/run").unwrap());
     assert!(!sys::is_tmpfs("/").unwrap());

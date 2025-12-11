@@ -16,7 +16,7 @@ use orpc::message::{RequestStatus, ResponseStatus, Status};
 use orpc::sys::RawPtr;
 
 #[test]
-fn status() {
+fn test_rpc_status_encoding_and_decoding() {
     let status = Status(RequestStatus::Running, ResponseStatus::Error);
     let code = status.encode();
 
@@ -38,7 +38,7 @@ impl Point {
 }
 
 #[tokio::test]
-async fn box_ptr() {
+async fn test_raw_ptr_cross_thread_sharing() {
     let p = Point(1, 1);
     let my_box = RawPtr::from_ref(&p);
 

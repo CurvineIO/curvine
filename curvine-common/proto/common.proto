@@ -22,6 +22,13 @@ enum TtlActionProto {
     TTL_ACTION_PROTO_DELETE = 3;
 }
 
+enum WriteTypeProto {
+    WRITE_TYPE_PROTO_CACHE = 0;
+    WRITE_TYPE_PROTO_THROUGH = 1;
+    WRITE_TYPE_PROTO_ASYNC_THROUGH = 2;
+    WRITE_TYPE_PROTO_CACHE_THROUGH = 3;
+}
+
 // Define file type
 enum FileTypeProto {
     FILE_TYPE_PROTO_DIR = 0;
@@ -88,6 +95,7 @@ message ExtendedBlockProto {
     required int64 block_size = 2;
     required StorageTypeProto storage_type = 3;
     required FileTypeProto file_type = 4;
+    optional FileAllocOptsProto alloc_opts = 5;
 }
 
 message LocatedBlockProto {
@@ -149,4 +157,11 @@ message WorkerInfoProto {
     required uint64 last_update = 6;
     map<string, StorageInfoProto> storage_map = 7;
     required int64 reserved_bytes = 8 [default = 0];
+}
+
+message FileAllocOptsProto {
+    required bool truncate = 1;
+    required int64 off = 2;
+    required int64 len = 3;
+    required int32 mode = 4;
 }

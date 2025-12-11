@@ -176,12 +176,12 @@ impl InodeStore {
     pub fn apply_new_block(
         &self,
         file: &InodeView,
-        previous: Option<&CommitBlock>,
+        commit_blocks: &[CommitBlock],
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(file)?;
-        if let Some(commit) = previous {
+        for commit in commit_blocks {
             for item in &commit.locations {
                 batch.add_location(commit.block_id, item)?;
             }
@@ -530,5 +530,9 @@ impl InodeStore {
 
     pub fn get_file_counts(&self) -> (i64, i64) {
         self.fs_stats.counts()
+    }
+
+    pub fn get_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
+        self.store.get_locations(block_id)
     }
 }

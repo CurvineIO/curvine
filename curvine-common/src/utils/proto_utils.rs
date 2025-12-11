@@ -91,12 +91,22 @@ impl ProtoUtils {
         }
     }
 
+    pub fn client_address_to_pb(addr: ClientAddress) -> ClientAddressProto {
+        ClientAddressProto {
+            client_name: addr.client_name,
+            hostname: addr.hostname,
+            ip_addr: addr.ip_addr,
+            port: addr.port,
+        }
+    }
+
     pub fn extend_block_from_pb(block: ExtendedBlockProto) -> ExtendedBlock {
         ExtendedBlock {
             id: block.id,
             len: block.block_size,
             storage_type: StorageType::from(block.storage_type),
             file_type: FileType::from(block.file_type),
+            alloc_opts: block.alloc_opts.map(Self::file_alloc_opts_from_pb),
         }
     }
 
@@ -106,6 +116,7 @@ impl ProtoUtils {
             block_size: block.len,
             storage_type: block.storage_type.into(),
             file_type: block.file_type.into(),
+            alloc_opts: block.alloc_opts.map(Self::file_alloc_opts_to_pb),
         }
     }
 
@@ -430,6 +441,7 @@ impl ProtoUtils {
             ttl_action: opts.ttl_action.map(|v| v as i32),
             add_x_attr: opts.add_x_attr,
             remove_x_attr: opts.remove_x_attr,
+            ufs_mtime: opts.ufs_mtime,
         }
     }
 
@@ -446,6 +458,7 @@ impl ProtoUtils {
             ttl_action: opts.ttl_action.map(TtlAction::from),
             add_x_attr: opts.add_x_attr,
             remove_x_attr: opts.remove_x_attr,
+            ufs_mtime: opts.ufs_mtime,
         }
     }
 
@@ -518,6 +531,7 @@ impl ProtoUtils {
             block_size: info.block_size,
             replicas: info.replicas,
             mount_type: info.mount_type.into(),
+            write_type: info.write_type.into(),
         }
     }
 
@@ -534,6 +548,7 @@ impl ProtoUtils {
             block_size: info.block_size,
             replicas: info.replicas,
             mount_type: info.mount_type.into(),
+            write_type: WriteType::from(info.write_type),
         }
     }
 
@@ -549,6 +564,7 @@ impl ProtoUtils {
             replicas: opts.replicas,
             mount_type: opts.mount_type.into(),
             remove_properties: opts.remove_properties,
+            write_type: opts.write_type.into(),
         }
     }
 
@@ -564,6 +580,7 @@ impl ProtoUtils {
             replicas: opts.replicas,
             mount_type: MountType::from(opts.mount_type),
             remove_properties: opts.remove_properties,
+            write_type: opts.write_type.into(),
         }
     }
 
@@ -609,5 +626,23 @@ impl ProtoUtils {
                 tags: metric.tags,
             })
             .collect()
+    }
+
+    pub fn file_alloc_opts_to_pb(opts: FileAllocOpts) -> FileAllocOptsProto {
+        FileAllocOptsProto {
+            truncate: opts.truncate,
+            off: opts.off,
+            len: opts.len,
+            mode: opts.mode.bits(),
+        }
+    }
+
+    pub fn file_alloc_opts_from_pb(opts: FileAllocOptsProto) -> FileAllocOpts {
+        FileAllocOpts {
+            truncate: opts.truncate,
+            off: opts.off,
+            len: opts.len,
+            mode: FileAllocMode::from_bits_truncate(opts.mode),
+        }
     }
 }

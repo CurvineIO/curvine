@@ -128,6 +128,8 @@ pub const FATTR_UID: u32 = 1 << 1;
 
 pub const FATTR_GID: u32 = 1 << 2;
 
+pub const FATTR_SIZE: u32 = 1 << 3;
+
 pub const FATTR_ATIME: u32 = 1 << 4;
 
 pub const FATTR_MTIME: u32 = 1 << 5;

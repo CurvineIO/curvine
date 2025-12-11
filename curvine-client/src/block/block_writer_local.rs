@@ -32,7 +32,6 @@ pub struct BlockWriterLocal {
     block_size: i64,
     seq_id: i32,
     req_id: i64,
-    len: i64,
 }
 
 impl BlockWriterLocal {
@@ -46,7 +45,6 @@ impl BlockWriterLocal {
         let seq_id = 0;
 
         let block_size = fs_context.block_size();
-        let len = block.len;
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
             .write_block(
@@ -72,7 +70,6 @@ impl BlockWriterLocal {
             block_size,
             seq_id,
             req_id,
-            len,
         };
 
         Ok(writer)
@@ -92,8 +89,8 @@ impl BlockWriterLocal {
             })
             .await??;
 
-        if self.pos() > self.len {
-            self.len = self.pos();
+        if self.pos() > self.block.len {
+            self.block.len = self.pos();
         }
         Ok(())
     }
@@ -101,8 +98,8 @@ impl BlockWriterLocal {
     // Block write data.
     pub fn blocking_write(&mut self, chunk: DataSlice) -> FsResult<()> {
         self.file.as_mut().write_all(chunk.as_slice())?;
-        if self.pos() > self.len {
-            self.len = self.pos();
+        if self.pos() > self.block.len {
+            self.block.len = self.pos();
         }
         Ok(())
     }
@@ -125,7 +122,7 @@ impl BlockWriterLocal {
             .write_commit(
                 &self.block,
                 self.pos(),
-                self.len,
+                self.block_size,
                 self.req_id,
                 next_seq_id,
                 false,
@@ -140,7 +137,7 @@ impl BlockWriterLocal {
             .write_commit(
                 &self.block,
                 self.pos(),
-                self.len,
+                self.block_size,
                 self.req_id,
                 next_seq_id,
                 true,
@@ -157,7 +154,7 @@ impl BlockWriterLocal {
     }
 
     pub fn len(&self) -> i64 {
-        self.len
+        self.block.len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -172,7 +169,11 @@ impl BlockWriterLocal {
         if pos < 0 {
             return err_box!("Cannot seek to negative position: {}", pos);
         } else if pos > self.block_size {
-            return err_box!("Seek position {} exceeds block capacity {}", pos, self.len);
+            return err_box!(
+                "Seek position {} exceeds block capacity {}",
+                pos,
+                self.block_size
+            );
         }
 
         let file = self.file.clone();

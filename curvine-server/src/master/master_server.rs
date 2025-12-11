@@ -18,6 +18,7 @@ use once_cell::sync::OnceCell;
 
 use curvine_common::conf::ClusterConf;
 use curvine_web::server::{WebHandlerService, WebServer};
+use log::error;
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
@@ -139,6 +140,7 @@ impl Master {
         let fs = journal_system.fs();
         let worker_manager = journal_system.worker_manager();
         let mount_manager = journal_system.mount_manager();
+        let quota_manager = journal_system.quota_manager();
 
         let rt = Arc::new(conf.master_server_conf().create_runtime());
 
@@ -149,6 +151,7 @@ impl Master {
             journal_system.master_monitor(),
             conf.master.new_executor(),
             &replication_manager,
+            quota_manager,
         );
 
         let job_manager = Arc::new(JobManager::from_cluster_conf(
@@ -213,6 +216,15 @@ impl Master {
 
         // step5: Start job manager
         self.job_manager.start();
+
+        // step6: Start TTL scheduler (requires mount_manager and job_manager)
+        if let Err(e) = self.actor.start_ttl_scheduler(
+            self.mount_manager.clone(),
+            self.job_manager.factory().clone(),
+            self.job_manager.clone(),
+        ) {
+            error!("Failed to start inode ttl scheduler: {}", e);
+        }
 
         rpc_status
     }

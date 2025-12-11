@@ -73,11 +73,13 @@ impl Path {
     pub fn authority_path(&self) -> &str {
         let full_path = self.full_path();
 
-        if let Some(scheme_end) = full_path.find("://") {
+        let auth_path = if let Some(scheme_end) = full_path.find("://") {
             let start_index = scheme_end + 2;
-            return &full_path[start_index..];
-        }
-        full_path
+            &full_path[start_index..]
+        } else {
+            full_path
+        };
+        auth_path.trim_end_matches("/")
     }
 
     pub fn name(&self) -> &str {

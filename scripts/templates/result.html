@@ -161,6 +161,14 @@
         {% if ltp_test %}
         <div class="coverage-section">
             <div class="coverage-title">🧪 LTP Regression Test Results</div>
+            {% if ltp_test.status == 'skipped' %}
+            <div style="text-align: center; padding: 20px; color: #f39c12;">
+                <p><strong>Status:</strong> Skipped</p>
+                {% if ltp_test.reason %}
+                <p><strong>Reason:</strong> {{ ltp_test.reason }}</p>
+                {% endif %}
+            </div>
+            {% elif ltp_test.total_tests is defined %}
             <div class="coverage-grid">
                 <div class="coverage-card">
                     <h4>Total Tests</h4>
@@ -182,6 +190,11 @@
             {% if ltp_test.test_suites %}
             <div style="text-align: center;">
                 <a href="/ltp-test-details/{{ selected_date }}" class="coverage-link" target="_blank">View Detailed LTP Test Results →</a>
+            </div>
+            {% endif %}
+            {% else %}
+            <div style="text-align: center; padding: 20px; color: #95a5a6;">
+                <p>No test data available</p>
             </div>
             {% endif %}
         </div>

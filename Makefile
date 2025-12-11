@@ -1,4 +1,4 @@
-.PHONY: help check-env format build cargo docker-build docker-build-compile docker-compile all dist dist-only
+.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -26,7 +26,8 @@ help:
 	@echo "  make all                         - Same as 'make build'"
 	@echo "  make dist                        - Build and create distribution package (tar.gz)"
 	@echo "  make dist-only                   - Create distribution package without building"
-	@echo "  make format                      - Format code using pre-commit hooks"
+	@echo "  make format                      - Format Rust code using pre-commit hooks"
+	@echo "  make format-csi                  - Format curvine-csi Go code"
 	@echo ""
 	@echo "Docker:"
 	@echo "  make docker-build                - Build runtime Docker image from source (compile + package)"
@@ -34,14 +35,7 @@ help:
 	@echo "  make docker-compile               - Compile code in Docker container (output to local build/dist)"
 	@echo ""
 	@echo "CSI (Container Storage Interface):"
-	@echo "  make csi-build                   - Build curvine-csi Go binary"
-	@echo "  make csi-run                     - Run curvine-csi from source"
-	@echo "  make csi-docker-build            - Build curvine-csi Docker image"
-	@echo "  make csi-docker-push             - Push curvine-csi Docker image"
-	@echo "  make csi-docker                  - Build and push curvine-csi Docker image"
-	@echo "  make csi-docker-fast             - Build curvine-csi Docker image quickly (no push)"
-	@echo "  make csi-fmt                     - Format curvine-csi Go code"
-	@echo "  make csi-vet                     - Run go vet on curvine-csi code"
+	@echo "  make curvine-csi                 - Build curvine-csi Docker image"
 	@echo ""
 	@echo "Other:"
 	@echo "  make cargo ARGS='<args>'         - Run arbitrary cargo commands"
@@ -57,20 +51,29 @@ help:
 	@echo "  make build ARGS='-p server -p client'       - Build only server and client components"
 	@echo "  make build ARGS='-p object'                  - Build S3 object gateway"
 	@echo "  make build ARGS='--package core --ufs s3'   - Build core packages with S3 native SDK"
+	@echo "  make build ARGS='--skip-java-sdk'               - Build all packages except Java SDK"
 	@echo "  make build-hdfs                             - Build with HDFS support (native + WebHDFS)"
 	@echo "  make build-webhdfs                          - Build with WebHDFS support only"
 	@echo "  make dist                                   - Build and create distribution package"
 	@echo "  RELEASE_VERSION=v1.0.0 make dist           - Build and package with specific version"
 	@echo "  make cargo ARGS='test --verbose'            - Run cargo test with verbose output"
-	@echo "  make csi-docker-fast                        - Build curvine-csi Docker image quickly"
+	@echo "  make curvine-csi                            - Build curvine-csi Docker image"
 
 # 1. Check build environment dependencies
 check-env:
-	$(SHELL_CMD) build/check-env.sh
+	@if echo "$(ARGS)" | grep -q -- '--skip-java-sdk'; then \
+		$(SHELL_CMD) build/check-env.sh --skip-java-sdk; \
+	else \
+		$(SHELL_CMD) build/check-env.sh; \
+	fi
 
 # 2. Format the project
 format:
 	$(SHELL_CMD) build/pre-commit.sh
+
+# 2.1. Format curvine-csi Go code
+format-csi:
+	$(SHELL_CMD) build/format-csi.sh
 
 # 3. Build and package the project (depends on environment check and format)
 build: check-env
@@ -107,49 +110,44 @@ docker-compile:
 	@echo "Compiling code in Docker container..."
 	docker run --rm --entrypoint="" -v $(PWD):/workspace -w /workspace curvine/curvine-compile:build-cached bash -c "make all"
 
-# 8. CSI (Container Storage Interface) targets - delegate to curvine-csi/Makefile
-.PHONY: csi-build csi-run csi-fmt csi-vet csi-docker-build csi-docker-push csi-docker csi-docker-fast
+# 8. CSI (Container Storage Interface) target
+.PHONY: curvine-csi
 
-# Build curvine-csi Go binary
-csi-build:
-	@echo "Building curvine-csi..."
-	cd curvine-csi && go fmt ./... && go vet ./... && go build -o bin/csi main.go
-
-# Run curvine-csi from source
-csi-run:
-	@echo "Running curvine-csi..."
-	cd curvine-csi && go fmt ./... && go vet ./... && go run ./main.go
-
-# Format curvine-csi Go code
-csi-fmt:
-	@echo "Formatting curvine-csi Go code..."
-	cd curvine-csi && go fmt ./...
-
-# Run go vet on curvine-csi code
-csi-vet:
-	@echo "Running go vet on curvine-csi code..."
-	cd curvine-csi && go vet ./...
-
-# Build curvine-csi Docker image (from root context)
-csi-docker-build:
+# Build curvine-csi Docker image
+curvine-csi:
 	@echo "Building curvine-csi Docker image..."
 	docker build --build-arg GOPROXY=https://goproxy.cn,direct -t curvine-csi:latest -f curvine-csi/Dockerfile .
 
-# Push curvine-csi Docker image
-csi-docker-push:
-	@echo "Pushing curvine-csi Docker image..."
-	docker push curvine-csi:latest
+# Tag and push curvine-csi image to private registry
+.PHONY: curvine-csi-push
+curvine-csi-push: curvine-csi
+	@echo "Tagging and pushing curvine-csi image to private registry..."
+	docker tag curvine-csi:latest curvineio/curvine-csi:latest
+	docker push curvineio/curvine-csi:latest
+	@echo "✓ Image pushed successfully: curvineio/curvine-csi:latest"
 
-# Build and push curvine-csi Docker image
-csi-docker:
-	@echo "Building and pushing curvine-csi Docker image..."
-	docker build --build-arg GOPROXY=https://goproxy.cn,direct -t curvine-csi:latest -f curvine-csi/Dockerfile .
-	docker push curvine-csi:latest
+# Quick iteration build for CSI development (only rebuilds CSI binary)
+# Prerequisite: curvine-csi:latest must exist (run 'make curvine-csi' first)
+.PHONY: curvine-csi-quick
+curvine-csi-quick:
+	@echo "Quick building curvine-csi (CSI binary only)..."
+	@if ! docker image inspect curvine-csi:latest >/dev/null 2>&1; then \
+		echo "Error: Base image curvine-csi:latest not found. Please run 'make curvine-csi' first."; \
+		exit 1; \
+	fi
+	@echo "Building CSI binary locally..."
+	@cd curvine-csi && GOPROXY=https://goproxy.cn,direct go build -o csi-binary main.go || exit 1
+	@echo "Building Docker image with new CSI binary..."
+	docker build -t curvine-csi:latest -f curvine-csi/Dockerfile.quick .
+	@rm -f curvine-csi/csi-binary
 
-# Build curvine-csi Docker image quickly (no push)
-csi-docker-fast:
-	@echo "Building curvine-csi Docker image (fast)..."
-	docker build --build-arg GOPROXY=https://goproxy.cn,direct -t curvine-csi:latest -f curvine-csi/Dockerfile .
+# Quick iteration build and push
+.PHONY: curvine-csi-quick-push
+curvine-csi-quick-push: curvine-csi-quick
+	@echo "Tagging and pushing quick-built curvine-csi image to private registry..."
+	docker tag curvine-csi:latest curvineio/curvine-csi:latest
+	docker push curvineio/curvine-csi:latest
+	@echo "✓ Quick-built image pushed successfully: curvineio/curvine-csi:latest"
 
 # 7. HDFS-specific builds
 .PHONY: build-hdfs build-webhdfs setup-hdfs

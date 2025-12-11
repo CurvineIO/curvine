@@ -18,7 +18,7 @@ use orpc::io::LocalFile;
 use orpc::CommonResult;
 
 #[test]
-fn snapshot_file_rw_test() -> CommonResult<()> {
+fn test_raft_snapshot_file_read_write_with_checksum_validation() -> CommonResult<()> {
     let (file, checksum) = create_file()?;
 
     let mut reader = FileReader::from_file(&file, 0, 1024)?;

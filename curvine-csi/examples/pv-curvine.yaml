@@ -9,11 +9,36 @@ spec:
   capacity:
     storage: 10Gi
   accessModes:
-    - ReadWriteOnce
-  persistentVolumeReclaimPolicy: Delete
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
   csi:
     driver: curvine
-    volumeHandle: curvine-volume-1
+    # For static PV, volumeHandle can be any unique string
+    volumeHandle: "my-existing-volume"
     volumeAttributes:
-      curvinePath: "/"
-      type: "Directory"
+      # Required: Curvine cluster master addresses
+      master-addrs: "m0:8995,m1:8995,m2:8995"
+      # Required: Complete path in curvine filesystem to mount
+      # This path will be mounted directly by FUSE
+      curvine-path: "/my-existing-data"
+      # Optional: Path creation strategy
+      # "Directory" - path must exist (recommended for existing data)
+      # "DirectoryOrCreate" - create if not exist
+      path-type: "Directory"
+      # Optional: FUSE parameters
+      # io-threads: "4"
+      # worker-threads: "8"
+      
+# Static PV Configuration Notes:
+# - volumeHandle: Any unique string (e.g., "my-volume-1")
+# - curvine-path: Complete path in curvine filesystem to mount
+# - FUSE mounts curvine-path directly to local mount point
+# - Recommended: Use "Retain" policy to prevent accidental deletion
+# 
+# Sharing FUSE Process:
+# - Multiple PVs with same master-addrs + curvine-path will share one FUSE process
+# - Different curvine-path will have independent FUSE process
+# 
+# Example:
+# PV1 (curvine-path="/shared") + PV2 (curvine-path="/shared") → Share FUSE
+# PV3 (curvine-path="/data") → Independent FUSE

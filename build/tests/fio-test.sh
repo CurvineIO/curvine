@@ -277,27 +277,6 @@ test_fio_random() {
     local fio_dir="$TEST_DIR/fio_rand"
     mkdir -p "$fio_dir"
     
-    # Prepare files with sequential write once (Curvine doesn't support sparse files)
-    print_info "Preparing: Creating files with sequential write for all random tests..."
-    local prep_verify_opt=$(get_write_verify_opt)
-    local prep_cmd="fio \
-        --name=rand_write \
-        --directory=$fio_dir \
-        --ioengine=libaio \
-        --direct=1 \
-        --bs=256k \
-        --size=$FIO_SIZE \
-        --numjobs=$FIO_NUMJOBS \
-        --rw=write \
-        $prep_verify_opt \
-        --group_reporting \
-        --time_based=0"
-    if ! eval "$prep_cmd"; then
-        handle_error "Failed to prepare files for random tests" "$prep_cmd"
-        return
-    fi
-    echo ""
-    
     # Test 1: Random Write
     print_test "FIO Random Write Test (256KB blocks)"
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
@@ -314,7 +293,7 @@ test_fio_random() {
         $verify_opt \
         --group_reporting \
         --runtime=$FIO_RUNTIME \
-        --time_based"
+        --time_based=0"
     print_command "$cmd"
     echo ""  # Add newline for better readability
     if eval "$cmd"; then
@@ -355,7 +334,7 @@ test_fio_random() {
     verify_opt=$(get_write_verify_opt)
     local verify_msg=$(get_verify_msg)
     cmd="fio \
-        --name=rand_write \
+        --name=rand_rw \
         --directory=$fio_dir \
         --ioengine=libaio \
         --direct=1 \
@@ -367,7 +346,7 @@ test_fio_random() {
         $verify_opt \
         --group_reporting \
         --runtime=$FIO_RUNTIME \
-        --time_based"
+        --time_based=0"
     print_command "$cmd"
     echo ""  # Add newline for better readability
     if eval "$cmd"; then

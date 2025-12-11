@@ -15,6 +15,9 @@ pub enum DuCommand {
 
         #[clap(short, long, help = "Display the names of columns as a header line")]
         verbose: bool,
+
+        #[clap(long, action = clap::ArgAction::Help, help = "Print help")]
+        help: Option<bool>,
     },
 }
 
@@ -25,6 +28,7 @@ impl DuCommand {
                 path,
                 human_readable,
                 verbose,
+                ..
             } => {
                 let path = CurvineURI::new(path)?;
 

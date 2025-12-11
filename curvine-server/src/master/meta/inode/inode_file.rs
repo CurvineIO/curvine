@@ -15,7 +15,9 @@
 use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::{BlockMeta, InodeId};
-use curvine_common::state::{CommitBlock, CreateFileOpts, ExtendedBlock, FileType, StoragePolicy};
+use curvine_common::state::{
+    CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileType, StoragePolicy,
+};
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
 use orpc::{err_box, CommonResult};
@@ -201,6 +203,7 @@ impl InodeFile {
             let blk = ExtendedBlock {
                 id: last_block.id,
                 len: last_block.len,
+                alloc_opts: last_block.alloc_opts.clone(),
                 storage_type: self.storage_policy.storage_type,
                 file_type: self.file_type,
             };
@@ -319,6 +322,148 @@ impl InodeFile {
             self.features.complete_write(client_name);
         }
         Ok(())
+    }
+
+    /// Search for block by file position
+    /// Returns the block reference if found
+    pub fn search_block_mut_by_pos(&mut self, file_pos: i64) -> Option<&mut BlockMeta> {
+        if file_pos < 0 {
+            return None;
+        }
+
+        let mut current = 0i64;
+        for block in &mut self.blocks {
+            let block_end = current + block.len;
+            if file_pos >= current && file_pos < block_end {
+                return Some(block);
+            }
+            current = block_end;
+        }
+        None
+    }
+
+    pub fn last_block_start_off(&self) -> i64 {
+        if self.blocks.is_empty() {
+            return 0;
+        }
+        self.blocks[..self.blocks.len() - 1]
+            .iter()
+            .map(|block| block.len)
+            .sum()
+    }
+
+    /// Resize the file to the specified length.
+    ///
+    /// This method handles three cases:
+    /// - If the new length equals the current length, no operation is needed
+    /// - If the new length is smaller, truncate the file (remove excess blocks)
+    /// - If the new length is larger, extend the file (allocate new blocks)
+    ///
+    /// # Arguments
+    /// * `opts` - File allocation options containing the target length
+    ///
+    /// # Returns
+    /// * `Vec<BlockMeta>` - Blocks that were removed during truncation (empty if extended or unchanged)
+    pub fn resize(&mut self, opts: FileAllocOpts) -> FsResult<Vec<BlockMeta>> {
+        if self.len == opts.len {
+            Ok(vec![])
+        } else if opts.len < self.len {
+            let del_blocks = self.truncate(opts);
+            Ok(del_blocks)
+        } else {
+            self.extend(opts)?;
+            Ok(vec![])
+        }
+    }
+
+    /// Extend the file to the specified length by allocating new blocks or extending existing ones.
+    ///
+    /// This method processes blocks from the last block's start position to the target length.
+    /// For each block boundary:
+    /// - If a block exists at the position, extend its length
+    /// - If no block exists, create a new allocated block
+    ///
+    /// # Arguments
+    /// * `opts` - File allocation options containing the target length
+    fn extend(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        let expect_len = opts.len;
+        let block_size = self.block_size;
+        let mut start = self.last_block_start_off();
+
+        // Start from the last block's start position, process each block until expect_len
+        while start < expect_len {
+            let resize_len = block_size.min(expect_len - start);
+            let block_opts = opts.clone_with_len(resize_len);
+
+            if let Some(block) = self.search_block_mut_by_pos(start) {
+                // Found existing block, extend its length
+                block.len = resize_len;
+                block.alloc_opts.replace(block_opts);
+            } else {
+                // No block found, create new block
+                let new_block_id = self.next_block_id()?;
+                self.add_block(BlockMeta::with_alloc(new_block_id, block_opts));
+            }
+            start += block_size;
+        }
+
+        self.len = expect_len;
+        Ok(())
+    }
+
+    /// Truncate the file to the specified length by removing blocks beyond the target length.
+    ///
+    /// This method handles three cases:
+    /// - If a block starts beyond the target length, remove it and all subsequent blocks
+    /// - If a block spans the target length, truncate it and remove subsequent blocks
+    /// - If a block ends before the target length, keep it unchanged
+    ///
+    /// # Arguments
+    /// * `opts` - File allocation options containing the target length
+    ///
+    /// # Returns
+    /// * `Vec<BlockMeta>` - Blocks that were removed during truncation
+    fn truncate(&mut self, opts: FileAllocOpts) -> Vec<BlockMeta> {
+        let expect_len = opts.len;
+        let mut remove_start = None;
+
+        let mut start = 0;
+        for (idx, block) in self.blocks.iter_mut().enumerate() {
+            let end = start + block.len;
+
+            if start >= expect_len {
+                // Current block's start position exceeds expect_len, delete all blocks starting from current block
+                remove_start.replace(idx);
+                break;
+            } else if end > expect_len {
+                // Current block spans expect_len, needs truncation
+                let new_len = expect_len - start;
+                if new_len > 0 {
+                    // Truncate current block, keep first new_len bytes
+                    block.len = new_len;
+                    block.alloc_opts.replace(opts.clone_with_len(new_len));
+                    remove_start.replace(idx + 1); // Delete subsequent blocks
+                } else {
+                    // new_len == 0, delete current block and subsequent blocks
+                    remove_start.replace(idx);
+                }
+                break;
+            }
+            // end <= expect_len, keep current block, continue processing next
+
+            start = end;
+        }
+
+        let mut del_blocks = vec![];
+        if let Some(start_idx) = remove_start {
+            // start_idx may equal blocks.len(), drain won't panic, just returns empty iterator
+            for block in self.blocks.drain(start_idx..) {
+                del_blocks.push(block);
+            }
+        }
+
+        self.len = expect_len;
+        del_blocks
     }
 }
 

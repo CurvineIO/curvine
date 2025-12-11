@@ -14,15 +14,15 @@
 
 use crate::file::{CurvineFileSystem, FsClient, FsContext};
 use crate::rpc::JobMasterClient;
-use crate::unified::{MountCache, MountValue, UnifiedReader, UnifiedWriter};
+use crate::unified::{CacheSyncWriter, MountCache, MountValue, UnifiedReader, UnifiedWriter};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileStatus, LoadJobCommand, LoadJobResult, MasterInfo,
-    MkdirOpts, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
+    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileStatus, LoadJobCommand, LoadJobResult,
+    MasterInfo, MkdirOpts, MountInfo, MountOptions, OpenFlags, SetAttrOpts, WriteType,
 };
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -74,8 +74,12 @@ impl UnifiedFileSystem {
         self.cv.conf()
     }
 
-    pub fn cv(&self) -> CurvineFileSystem {
-        self.cv.clone()
+    pub fn cv(&self) -> &CurvineFileSystem {
+        &self.cv
+    }
+
+    pub fn fs_context(&self) -> &Arc<FsContext> {
+        &self.cv.fs_context
     }
 
     pub fn fs_client(&self) -> Arc<FsClient> {
@@ -196,6 +200,13 @@ impl UnifiedFileSystem {
         }
     }
 
+    pub async fn resize(&self, path: &Path, opts: FileAllocOpts) -> FsResult<()> {
+        match self.get_mount(path).await? {
+            None => self.cv.resize(path, opts).await,
+            Some(_) => err_ext!(FsError::unsupported("resize")),
+        }
+    }
+
     async fn get_cache_validity(
         &self,
         cv_path: &Path,
@@ -206,6 +217,9 @@ impl UnifiedFileSystem {
             Some(v) => v,
             None => return Ok(CacheValidity::Invalid),
         };
+        if cv_status.is_cv_only() {
+            return Ok(CacheValidity::Valid);
+        }
 
         if mount.info.consistency_strategy == ConsistencyStrategy::None {
             Ok(CacheValidity::Valid)
@@ -248,7 +262,23 @@ impl UnifiedFileSystem {
                 Ok(UnifiedWriter::Cv(writer))
             }
 
-            Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, flags.overwrite()).await,
+            Some((ufs_path, mount)) => match mount.info.write_type {
+                WriteType::Cache => {
+                    let opts = mount.info.get_create_opts(&self.conf().client);
+                    let writer = self.cv.open_with_opts(path, opts, flags).await?;
+                    Ok(UnifiedWriter::Cv(writer))
+                }
+
+                WriteType::Through => {
+                    let writer = mount.ufs.create(&ufs_path, flags.overwrite()).await?;
+                    Ok(writer)
+                }
+
+                _ => {
+                    let writer = CacheSyncWriter::new(self, path, &mount, flags).await?;
+                    Ok(UnifiedWriter::CacheSync(writer))
+                }
+            },
         }
     }
 
@@ -307,10 +337,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
             vec!["create".to_string()],
         );
-        match self.get_mount(path).await? {
-            None => Ok(UnifiedWriter::Cv(self.cv.create(path, overwrite).await?)),
-            Some((ufs_path, mount)) => mount.ufs.create(&ufs_path, overwrite).await,
-        }
+
+        let flags = OpenFlags::new_write_only()
+            .set_create(true)
+            .set_overwrite(overwrite);
+        let opts = self.cv.create_opts_builder().build();
+        self.open_with_opts(path, opts, flags).await
     }
 
     async fn append(&self, path: &Path) -> FsResult<UnifiedWriter> {
@@ -342,7 +374,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         // Read data from the curvine cache
         if read_cache.is_valid() {
             info!(
-                "Read from Curvine(cache), ufs path {}, cv path: {}",
+                "read from Curvine(cache), ufs path {}, cv path: {}",
                 ufs_path, path
             );
             self.metrics
@@ -360,9 +392,9 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
         if mount.info.auto_cache() {
             match self.async_cache(&ufs_path).await {
-                Err(e) => warn!("Submit async cache error for {}: {}", ufs_path, e),
+                Err(e) => warn!("submit async cache error for {}: {}", ufs_path, e),
                 Ok(res) => info!(
-                    "Submit async cache successfully for {}, job id {}, target_path {}",
+                    "submit async cache successfully for {}, job id {}, target_path {}",
                     ufs_path, res.job_id, res.target_path
                 ),
             }
@@ -370,7 +402,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
         // Reading from ufs
         if self.enable_read_ufs {
-            info!("Read from ufs, ufs path {}, cv path: {}", ufs_path, path);
+            info!("read from ufs, ufs path {}, cv path: {}", ufs_path, path);
             mount.ufs.open(&ufs_path).await
         } else {
             err_ext!(FsError::unsupported_ufs_read(path.path()))

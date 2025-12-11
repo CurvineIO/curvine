@@ -24,9 +24,10 @@ use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    CreateFileOptsBuilder, FileStatus, MkdirOptsBuilder, OpenFlags, SetAttrOpts,
+    CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileStatus, MkdirOptsBuilder, OpenFlags,
+    SetAttrOpts,
 };
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use orpc::common::ByteUnit;
 use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
@@ -472,18 +473,43 @@ impl CurvineFileSystem {
         }
 
         Ok(SetAttrOpts {
-            recursive: false,
-            replicas: None,
             owner,
             group,
             mode,
             atime,
             mtime,
-            ttl_ms: None,
-            ttl_action: None,
-            add_x_attr: HashMap::new(),
-            remove_x_attr: Vec::new(),
+            ..Default::default()
         })
+    }
+
+    async fn fs_resize(
+        &self,
+        path: &Path,
+        ino: u64,
+        fh: u64,
+        opts: FileAllocOpts,
+    ) -> FuseResult<()> {
+        if let Some((ufs_path, _)) = self.fs.get_mount(path).await? {
+            warn!(
+                "ufs {} -> {} does not support resize, will ignore",
+                path, ufs_path
+            );
+            return Ok(());
+        }
+
+        opts.validate()?;
+        if fh != 0 {
+            let handle = self.state.find_handle(ino, fh)?;
+            if let Some(writer) = &handle.writer {
+                writer.lock().await.resize(opts).await?;
+            } else {
+                return err_fuse!(libc::EACCES);
+            }
+        } else {
+            self.fs.resize(path, opts).await?;
+        };
+
+        Ok(())
     }
 }
 
@@ -827,10 +853,21 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        let status = match self.fs_set_attr(&path, opts).await? {
+        let mut status = match self.fs_set_attr(&path, opts).await? {
             Some(v) => v,
             None => self.fs_get_status(&path).await?,
         };
+
+        // Handle file size change (truncate/resize)
+        if (op.arg.valid & FATTR_SIZE) != 0 {
+            let expect_len = op.arg.size as i64;
+            if expect_len != status.len {
+                let resize_opts = FileAllocOpts::with_truncate(expect_len);
+                self.fs_resize(&path, op.header.nodeid, op.arg.fh, resize_opts)
+                    .await?;
+                status.len = expect_len;
+            }
+        }
 
         let attr = Self::status_to_attr(&self.conf, &status)?;
         let attr = fuse_attr_out {
@@ -940,10 +977,19 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(Self::create_entry_out(&self.conf, entry))
     }
 
-    // The kernel requests to allocate space.Not currently implemented, and in distributed systems, it is not necessary.
-    async fn fuse_allocate(&self, op: FAllocate<'_>) -> FuseResult<()> {
-        let _ = self.state.get_path(op.header.nodeid)?;
-        Ok(())
+    async fn allocate(&self, op: FAllocate<'_>) -> FuseResult<()> {
+        let path = self.state.get_path(op.header.nodeid)?;
+
+        let opts = FileAllocOpts {
+            truncate: false,
+            off: op.arg.offset as i64,
+            len: op.arg.length as i64,
+            mode: FileAllocMode::from_bits_truncate(op.arg.mode as i32),
+        };
+
+        opts.validate()?;
+        self.fs_resize(&path, op.header.nodeid, op.arg.fh, opts)
+            .await
     }
 
     // Release the directory, curvine does not need to implement this interface
@@ -1061,7 +1107,14 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn unlink(&self, op: Unlink<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+
         self.fs.delete(&path, false).await?;
+        // self.state.unlink_name(op.header.nodeid, name);
+
+        debug!(
+            "unlink: removed name mapping for parent={}, name={}",
+            op.header.nodeid, name
+        );
 
         Ok(())
     }
@@ -1074,6 +1127,11 @@ impl fs::FileSystem for CurvineFileSystem {
         let src_path = self.state.get_path(oldnodeid)?;
         let src_status = self.fs_get_status(&src_path).await?;
 
+        debug!(
+            "link: src_path={}, des_path={}, oldnodeid={}, parent={}",
+            src_path, des_path, oldnodeid, op.header.nodeid
+        );
+
         if self.fs.exists(&des_path).await? {
             return err_fuse!(libc::EEXIST, "File already exists: {}", des_path);
         }
@@ -1083,13 +1141,12 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         self.fs.link(&src_path, &des_path).await?;
-
-        let entry = self
+        // self.state.link_node(op.header.nodeid, name, oldnodeid)?;
+        let attr = self
             .lookup_path(op.header.nodeid, Some(name), &des_path)
             .await?;
-        //entry.ino = oldnodeid;
-        let result = Self::create_entry_out(&self.conf, entry);
 
+        let result = Self::create_entry_out(&self.conf, attr);
         Ok(result)
     }
 

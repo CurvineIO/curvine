@@ -19,11 +19,12 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
+use crate::master::quota::eviction::evictor::Evictor;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
-    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileStatus, MkdirOpts, MountInfo,
-    RenameFlags, SetAttrOpts, WorkerAddress,
+    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileStatus,
+    MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -39,6 +40,7 @@ pub struct FsDir {
     pub(crate) inode_id: InodeId,
     pub(crate) store: InodeStore,
     pub(crate) journal_writer: JournalWriter,
+    pub(crate) evictor: Arc<dyn Evictor>,
 }
 
 impl FsDir {
@@ -46,6 +48,7 @@ impl FsDir {
         conf: &ClusterConf,
         journal_writer: JournalWriter,
         ttl_bucket_list: Arc<TtlBucketList>,
+        evictor: Arc<dyn Evictor>,
     ) -> FsResult<Self> {
         let db_conf = conf.meta_rocks_conf();
 
@@ -58,6 +61,7 @@ impl FsDir {
             inode_id: InodeId::new(),
             store: state,
             journal_writer,
+            evictor,
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
 
@@ -174,6 +178,7 @@ impl FsDir {
 
         // Handle different types of nodes
         parent.update_mtime(mtime);
+
         let del_res = match child {
             File(_, file) => {
                 if file.nlink() > 1 {
@@ -406,32 +411,10 @@ impl FsDir {
         Ok(res)
     }
 
-    // Check the file block status. If it is a retry block, then return this block directly.
-    pub fn analyze_block_state<'a>(
-        file: &'a mut InodeFile,
-        commit: Option<&CommitBlock>,
-    ) -> FsResult<Option<&'a BlockMeta>> {
-        let last_block = file.get_block(-1);
-        if BlockMeta::matching_block(last_block, commit) {
-            return Ok(None);
-        }
-
-        let penultimate = file.get_block(-2);
-        if BlockMeta::matching_block(penultimate, commit) {
-            if last_block.is_none() {
-                err_box!("Abnormal block status")
-            } else {
-                Ok(last_block)
-            }
-        } else {
-            Ok(None)
-        }
-    }
-
     pub fn acquire_new_block(
         &mut self,
         inp: &InodePath,
-        commit_block: Option<CommitBlock>,
+        commit_blocks: Vec<CommitBlock>,
         choose_workers: &[WorkerAddress],
         file_len: i64,
     ) -> FsResult<ExtendedBlock> {
@@ -439,22 +422,10 @@ impl FsDir {
         let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
 
-        // Check whether it is a retry request.
-        let retry_block = Self::analyze_block_state(file, commit_block.as_ref())?;
-        if let Some(b) = retry_block {
-            return Ok(ExtendedBlock {
-                id: b.id,
-                len: b.len,
-                storage_type: file.storage_policy.storage_type,
-                file_type: file.file_type,
-            });
-        }
-
         let new_block_id = file.next_block_id()?;
 
         // flush file and commit block
-        let slice: &[CommitBlock] = commit_block.as_slice();
-        file.complete(file_len, slice, "", true)?;
+        file.complete(file_len, &commit_blocks, "", true)?;
 
         // create block.
         file.add_block(BlockMeta::with_pre(new_block_id, choose_workers));
@@ -464,13 +435,17 @@ impl FsDir {
             len: 0,
             storage_type: file.storage_policy.storage_type,
             file_type: file.file_type,
+            alloc_opts: None,
         };
 
         // state add block.
-        self.store
-            .apply_new_block(inode.as_ref(), commit_block.as_ref())?;
-        self.journal_writer
-            .log_add_block(op_ms, inp.path(), inode.as_file_ref()?, commit_block)?;
+        self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
+        self.journal_writer.log_add_block(
+            op_ms,
+            inp.path(),
+            inode.as_file_ref()?,
+            commit_blocks,
+        )?;
         Ok(block)
     }
 
@@ -487,6 +462,8 @@ impl FsDir {
         let file = inode.as_file_mut()?;
         file.complete(len, &commit_block, client_name, only_flush)?;
 
+        self.evictor.on_access(file.id());
+
         self.store
             .apply_complete_file(inode.as_ref(), &commit_block)?;
         self.journal_writer.log_complete_file(
@@ -495,6 +472,7 @@ impl FsDir {
             inode.as_file_ref()?,
             commit_block,
         )?;
+
         Ok(true)
     }
 
@@ -503,6 +481,7 @@ impl FsDir {
         file: &InodeFile,
     ) -> FsResult<HashMap<i64, Vec<BlockLocation>>> {
         let locs = self.store.get_file_locations(file)?;
+        self.evictor.on_access(file.id());
         Ok(locs)
     }
 
@@ -930,5 +909,92 @@ impl FsDir {
             .apply_link(parent.as_ref(), added.as_ref(), original_inode_id)?;
 
         Ok(new_path)
+    }
+
+    /// Resize a file to the specified length.
+    ///
+    /// This method changes the file size by either extending or truncating it.
+    /// - If the new size is larger than the current size, new blocks are allocated.
+    /// - If the new size is smaller, blocks beyond the new size are marked for deletion.
+    ///
+    /// # Arguments
+    /// * `inp` - The inode path of the file to resize
+    /// * `opts` - File allocation options containing the target length and allocation mode
+    ///
+    /// # Returns
+    /// * `DeleteResult` - Contains blocks that need to be deleted from workers
+    ///
+    /// # Process
+    /// 1. Resize the file metadata (extend or truncate blocks)
+    /// 2. Complete the file operation to update metadata state
+    /// 3. Collect locations of blocks to be deleted
+    /// 4. Persist changes to store and write journal entry
+    pub fn resize(&mut self, inp: &InodePath, opts: FileAllocOpts) -> FsResult<DeleteResult> {
+        let op_ms = LocalTime::mills();
+
+        let mut inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+        let file = inode.as_file_mut()?;
+
+        if file.len == opts.len {
+            return Ok(DeleteResult::new());
+        }
+        let del_blocks = file.resize(opts.clone())?;
+        info!("resize file {} success, opts: {:?}", inp.path(), opts);
+
+        file.complete(file.len, &[], "", true)?;
+        let mut del_res = DeleteResult::new();
+        for meta in del_blocks {
+            let locs = self.get_locations(&meta)?;
+            if !locs.is_empty() {
+                del_res.blocks.insert(meta.id, locs);
+            }
+        }
+
+        self.store.apply_complete_file(inode.as_ref(), &[])?;
+        self.journal_writer
+            .log_complete_file(op_ms, inp.path(), inode.as_file_ref()?, vec![])?;
+
+        Ok(del_res)
+    }
+
+    pub fn assign_worker(
+        &mut self,
+        inp: InodePath,
+        block_id: i64,
+        workers: &[WorkerAddress],
+    ) -> FsResult<ExtendedBlock> {
+        let op_ms = LocalTime::mills();
+
+        let mut inode = try_option!(inp.get_last_inode());
+        let file = inode.as_file_mut()?;
+
+        let block = file.search_block_mut_check(block_id)?;
+        let res = block.assign_worker(workers);
+        let block = ExtendedBlock {
+            id: block.id,
+            len: block.len,
+            alloc_opts: block.alloc_opts.clone(),
+            storage_type: file.storage_policy.storage_type,
+            file_type: file.file_type,
+        };
+
+        if res {
+            self.store.apply_new_block(inode.as_ref(), &[])?;
+            self.journal_writer
+                .log_add_block(op_ms, inp.path(), inode.as_file_ref()?, vec![])?;
+        }
+
+        Ok(block)
+    }
+
+    pub fn get_locations(&self, meta: &BlockMeta) -> CommonResult<Vec<BlockLocation>> {
+        if let Some(locs) = &meta.locs {
+            Ok(locs.clone())
+        } else {
+            self.store.get_locations(meta.id)
+        }
     }
 }
