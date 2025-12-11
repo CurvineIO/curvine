@@ -96,13 +96,13 @@ fn new_handler() -> MasterHandler {
 fn fs_test() -> CommonResult<()> {
     let fs = new_fs(true, "fs_test");
 
-    // mkdir(&fs)?;
-    // delete(&fs)?;
-    // rename(&fs)?;
-    // create_file(&fs)?;
-    // get_file_info(&fs)?;
+    mkdir(&fs)?;
+    delete(&fs)?;
+    rename(&fs)?;
+    create_file(&fs)?;
+    get_file_info(&fs)?;
     list_status(&fs)?;
-    // state(&fs)?;
+    state(&fs)?;
 
     Ok(())
 }
@@ -313,69 +313,57 @@ fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
         .list_status("/*/*.log")
         .expect("list_1 failed to get status");
     assert_eq!(list_1.len(), 2, "Should find exactly 2 log files");
-    println!("list_1 = {:#?}", list_1);
+
     // Sort for consistent ordering (if order not guaranteed)
     let mut sorted_list_1 = list_1.clone();
     sorted_list_1.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Verify first file: /a/1.log
-    assert_eq!(
-        sorted_list_1[0].path, "/a/b1.log",
-        "First file path mismatch"
-    );
-    assert_eq!(sorted_list_1[0].name, "b1.log", "First file name mismatch");
+    assert_eq!(sorted_list_1[0].path, "/a/b1.log", "file path mismatch");
+    assert_eq!(sorted_list_1[0].name, "b1.log", "file name mismatch");
 
     // Verify second file: /a/2.log
-    assert_eq!(
-        sorted_list_1[1].path, "/a/b2.log",
-        "Second file path mismatch"
-    );
-    assert_eq!(sorted_list_1[1].name, "b2.log", "Second file name mismatch");
+    assert_eq!(sorted_list_1[1].path, "/a/b2.log", "file path mismatch");
+    assert_eq!(sorted_list_1[1].name, "b2.log", "file name mismatch");
 
     // test 2
     let list_2 = fs
         .list_status("/a/[ac]2.*")
         .expect("list_2 failed to get status");
     assert_eq!(list_2.len(), 1, "Should find exactly 1 log files");
-    println!("list_2 = {:#?}", list_2);
+
     // Sort for consistent ordering (if order not guaranteed)
     let mut sorted_list_2 = list_2.clone();
     sorted_list_2.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Verify second file: /a/c2.txt
-    assert_eq!(
-        sorted_list_2[0].path, "/a/c2.txt",
-        "Second file path mismatch"
-    );
-    assert_eq!(sorted_list_2[0].name, "c2.txt", "Second file name mismatch");
+    assert_eq!(sorted_list_2[0].path, "/a/c2.txt", "file path mismatch");
+    assert_eq!(sorted_list_2[0].name, "c2.txt", "file name mismatch");
 
     // test 3
     let list_3 = fs.list_status("/a/*").expect("list_2 failed to get status");
-    println!("list_3 = {:#?}", list_3);
-    assert_eq!(list_3.len(), 4, "Should find exactly 1 log files");
+    assert_eq!(list_3.len(), 6, "Should find exactly 6 log files");
     // Sort for consistent ordering (if order not guaranteed)
     let mut sorted_list_3 = list_3.clone();
     sorted_list_3.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Verify second file: /a/b1.txt
-    assert_eq!(
-        sorted_list_3[0].path, "/a/b1.log",
-        "Second file path mismatch"
-    );
-    assert_eq!(sorted_list_3[0].name, "b1.log", "Second file name mismatch");
+    // Verify second file: /a/b/xx.log
 
-    assert_eq!(
-        sorted_list_3[3].path, "/a/c2.txt",
-        "Second file path mismatch"
-    );
-    assert_eq!(sorted_list_3[3].name, "c2.txt", "Second file name mismatch");
+    assert_eq!(sorted_list_3[0].path, "/a/b/1.log", "file path mismatch");
+
+    // Verify second file: /a/b2.txt
+    assert_eq!(sorted_list_3[2].path, "/a/b2.log", "file path mismatch");
+    assert_eq!(sorted_list_3[2].name, "b2.log", "file name mismatch");
+
+    // Verify second file: /a/b/xx.log
+    assert_eq!(sorted_list_3[5].path, "/a/b/xx.log", "file path mismatch");
+    assert_eq!(sorted_list_3[5].name, "xx.log", "file name mismatch");
 
     // test 4
     assert!(fs.list_status("/a/[a").is_err());
 
-    println!("before list_5");
     let list_5 = fs.list_status("/*").expect("list_5 failed to get status");
-    println!("list_5 = {:#?}", list_5);
+    assert_eq!(list_5.len(), 11, "should find exactly 11 log files");
 
     Ok(())
 }

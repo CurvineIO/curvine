@@ -15,12 +15,10 @@
 use crate::master::meta::glob_utils::parse_glob_pattern;
 use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
 use crate::master::meta::inode::{
-    inode_file, InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_ID,
+    InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::meta::store::InodeStore;
-use crate::master::FsDir;
 use orpc::{err_box, try_option, CommonResult};
-use rocksdb::statistics::NameParseError;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -216,7 +214,6 @@ impl InodePath {
 
     /// Resolve all paths matching glob pattern using BFS queue traversal
     pub fn resolve_for_glob_pattern(
-        fs_dir: &FsDir,
         root: InodePtr,
         pattern: &str,
         store: &InodeStore,
