@@ -378,7 +378,6 @@ impl FsDir {
             Some(v) => v,
             None => return err_box!("File {} not exists", inp.path()),
         };
-        assert!(!inode.is_file_entry()); // removed because we want to list FileEntry as well
 
         let mut res = Vec::with_capacity(1.max(inode.child_len()));
         match inode.as_ref() {
