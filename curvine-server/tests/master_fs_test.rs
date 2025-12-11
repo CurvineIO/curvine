@@ -367,6 +367,21 @@ fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
 
     Ok(())
 }
+
+fn list_status_without_glob(fs: &MasterFilesystem) -> CommonResult<()> {
+    // Verify directories exist after creation
+    assert!(fs.exists("/a1")?);
+    assert!(fs.exists("/a2")?);
+    assert!(fs.exists("/a3")?);
+    assert!(fs.exists("/a3/b")?);
+    assert!(fs.exists("/a3/b/c")?);
+
+    let list = fs.list_status("/")?;
+    assert_eq!(list.len(), 6);
+
+    Ok(())
+}
+
 fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
     fs.create("/a/b1.log", true)?;
     fs.create("/a/b2.log", true)?;
@@ -375,42 +390,18 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
 
     fs.mkdir("/a/d1", true)?;
     fs.mkdir("/a/d2", true)?;
-    // fs.mkdir("/a/d1/d3.txt", true)?;
-    // fs.mkdir("/a/d2/d4.txt", true)?;
 
-    // list_status without glob pattern
+    assert!(fs.mkdir("/a/b", false).is_err());
 
-    // list status with glob pattern
+    fs.mkdir("/a1", true)?;
+    fs.mkdir("/a2", true)?;
 
-    // println!("find 1.log");
-    // let list = fs.list_status("/a/1.log")?;
-    // println!("list = {:#?}", list);
+    assert!(fs.mkdir("/a3/b/c", true).is_ok());
 
-    // println!("find files in /a/");
-    // let list = fs.list_status("/a")?;
-    // println!("list = {:#?}", list);
-
-    // println!("find /a/1.log");
-    // let list1 = fs.list_status("/a/1.log")?;
-    // println!("list1 = {:#?}", list1);
-
-    // println!("find /a/2.log");
-    // let list2 = fs.list_status("/a/2.log")?;
-    // println!("list2 = {:#?}", list1);
-
-    // println!("find /a/*.log");
-    // let list1 = fs.list_status("/a/*.log")?;
-    // println!("list1 = {:#?}", list1);
-
-    // println!("find /a/*");
-    // let list2 = fs.list_status("/*/*.log")?;
-    // println!("list2 = {:#?}", list2);
-    // for item in list2.iter() {
-    //     println!("item: {:?}, {:?}", item.path, item.name)
-    // }
     fs.print_tree();
 
     let _ = list_status_with_glob(fs);
+    let _ = list_status_without_glob(fs);
     Ok(())
 }
 
