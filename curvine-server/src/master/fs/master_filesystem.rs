@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
@@ -19,8 +20,8 @@ use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
 
+
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
-use axum::http::status;
 use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
 use curvine_common::state::*;
@@ -32,6 +33,7 @@ use std::sync::Arc;
 use crate::master::meta::parse_glob_pattern;
 
 
+
 #[derive(Clone)]
 pub struct MasterFilesystem {
     pub fs_dir: SyncFsDir,
@@ -39,6 +41,7 @@ pub struct MasterFilesystem {
     pub master_monitor: MasterMonitor,
     pub conf: Arc<MasterConf>,
 }
+
 
 impl MasterFilesystem {
     pub fn new(
@@ -55,6 +58,7 @@ impl MasterFilesystem {
         }
     }
 
+
     pub fn with_js(conf: &ClusterConf, js: &JournalSystem) -> Self {
         Self {
             fs_dir: js.fs().fs_dir.clone(),
@@ -63,6 +67,7 @@ impl MasterFilesystem {
             conf: Arc::new(conf.master.clone()),
         }
     }
+
 
     pub fn check_parent(path: &InodePath) -> FsResult<()> {
         // The root directory must exist.All /a does not require verification
@@ -84,19 +89,23 @@ impl MasterFilesystem {
         }
     }
 
+
     pub fn print_tree(&self) {
         let fs_dir = self.fs_dir.read();
         fs_dir.print_tree();
     }
 
+
     pub fn mkdir_with_opts<T: AsRef<str>>(&self, path: T, opts: MkdirOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+
 
         // Creation of root directory is not allowed
         if inp.is_root() {
             return err_box!("Not allowed to create existing root path: {}", inp.path());
         }
+
 
         if inp.is_full() {
             if opts.create_parent {
@@ -110,10 +119,12 @@ impl MasterFilesystem {
             return err_ext!(FsError::file_exists(inp.path()));
         }
 
+
         // Check whether the directory can be created recursively.
         if !opts.create_parent {
             Self::check_parent(&inp)?;
         }
+
 
         let inp = fs_dir.mkdir(inp, opts)?;
         let last = try_option!(inp.get_last_inode());
@@ -121,50 +132,63 @@ impl MasterFilesystem {
         Ok(status)
     }
 
+
     pub fn mkdir<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
         let opts = MkdirOpts::with_create(create_parent);
         self.mkdir_with_opts(path, opts)
     }
 
+
     pub fn delete<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<bool> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+
 
         if !inp.is_empty_dir() && !recursive {
             return err_box!("{} is non empty", inp.path());
         }
 
+
         if inp.is_root() {
             return err_box!("The root is not allowed to be deleted");
         }
+
 
         if inp.is_empty() || inp.get_last_inode().is_none() {
             return err_box!("Failed to remove {} because it does not exist", inp.path());
         }
 
+
         let delete_result = fs_dir.delete(&inp, recursive)?;
+
 
         let mut worker_manager = self.worker_manager.write();
         worker_manager.remove_blocks(&delete_result);
 
+
         Ok(true)
     }
+
 
     pub fn rename<T: AsRef<str>>(&self, src: T, dst: T, flags: RenameFlags) -> FsResult<bool> {
         let src = src.as_ref();
         let dst = dst.as_ref();
 
+
         let mut fs_dir = self.fs_dir.write();
         let src_inp = Self::resolve_path(&fs_dir, src)?;
         let dst_inp = Self::resolve_path(&fs_dir, dst)?;
+
 
         if src_inp.is_root() {
             return err_box!("Cannot rename root path");
         }
 
+
         if src == dst {
             return Ok(false);
         }
+
 
         // dst cannot be in the src directory, /a/b -> /a/b/c is not allowed operations.
         if let Some(rest) = dst.strip_prefix(src) {
@@ -177,18 +201,22 @@ impl MasterFilesystem {
             }
         }
 
+
         if let Some(del_res) = fs_dir.rename(&src_inp, &dst_inp, flags)? {
             let mut worker_manager = self.worker_manager.write();
             worker_manager.remove_blocks(&del_res);
         }
 
+
         Ok(true)
     }
+
 
     pub fn create<T: AsRef<str>>(&self, path: T, create_parent: bool) -> FsResult<FileStatus> {
         let ctx = CreateFileOpts::with_create(create_parent);
         self.create_with_opts(path, ctx, OpenFlags::new_create().set_overwrite(true))
     }
+
 
     pub fn create_with_opts<T: AsRef<str>>(
         &self,
@@ -201,8 +229,10 @@ impl MasterFilesystem {
         }
         let path = path.as_ref();
 
+
         // Check the path length
         self.check_path_length(path)?;
+
 
         if opts.replicas < self.conf.min_replication || opts.replicas >= self.conf.max_replication {
             return err_box!(
@@ -213,6 +243,7 @@ impl MasterFilesystem {
             );
         }
 
+
         if opts.block_size < self.conf.min_block_size || opts.block_size >= self.conf.max_block_size
         {
             return err_box!(
@@ -222,8 +253,10 @@ impl MasterFilesystem {
             );
         }
 
+
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
+
 
         let last_inode = inp.get_last_inode();
         if let Some(inode) = &last_inode {
@@ -232,9 +265,11 @@ impl MasterFilesystem {
             }
         }
 
+
         if !opts.create_parent {
             Self::check_parent(&inp)?;
         }
+
 
         // If the file already exists and overwrite is enabled, overwrite the file
         let inp = if last_inode.is_some() && flags.overwrite() {
@@ -249,10 +284,13 @@ impl MasterFilesystem {
             fs_dir.create_file(inp, opts)?
         };
 
+
         let status = fs_dir.file_status(&inp)?;
+
 
         Ok(status)
     }
+
 
     pub fn open_file<T: AsRef<str>>(
         &self,
@@ -262,8 +300,10 @@ impl MasterFilesystem {
     ) -> FsResult<FileBlocks> {
         let path = path.as_ref();
 
+
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
+
 
         let inode = match inp.get_last_inode() {
             None => {
@@ -278,11 +318,13 @@ impl MasterFilesystem {
             Some(inode) => inode,
         };
 
+
         let status = if flags.write() {
             fs_dir.reopen_file(&inp, opts.client_name)?
         } else {
             fs_dir.file_status(&inp)?
         };
+
 
         let file = inode.as_file_ref()?;
         let blocks = if !file.blocks.is_empty() {
@@ -293,6 +335,7 @@ impl MasterFilesystem {
         Ok(FileBlocks::new(status, blocks))
     }
 
+
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
@@ -300,28 +343,24 @@ impl MasterFilesystem {
         Ok(status)
     }
 
+
     pub fn exists<T: AsRef<str>>(&self, path: T) -> FsResult<bool> {
         let fs_dir = self.fs_dir.read();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         Ok(inp.get_last_inode().is_some())
     }
 
+
     pub fn list_status<T: AsRef<str>>(&self, path: T) -> FsResult<Vec<FileStatus>> {
         let fs_dir = self.fs_dir.read();
         let (is_glob_pattern, _) = parse_glob_pattern(&path.as_ref());
-        println!("path.as_ref(): {:?}", path.as_ref());
-        println!("is_glob_pattern: {:?}", is_glob_pattern);
         if is_glob_pattern {
             let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
-            println!("paths: {:?}", paths);
             let mut all_statuses = Vec::new();
             for path in &paths {
-                println!("path: {:?}", path);
                 let statuses = fs_dir.list_status(path)?;
-                println!("statuses: {:?}", statuses);
                 all_statuses.extend(statuses);
             }
-            println!("all_statuses: {:?}", all_statuses);
             Ok(all_statuses)
         } else {
             let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
@@ -329,13 +368,16 @@ impl MasterFilesystem {
         }
     }
 
+
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
     }
 
+
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
-        InodePath::resolve_for_glob_pattern(fs_dir.root_ptr(), path, &fs_dir.store)
+        InodePath::resolve_for_glob_pattern(fs_dir, fs_dir.root_ptr(), path, &fs_dir.store)
     }
+
 
     pub fn check_path_length(&self, path: &str) -> CommonResult<()> {
         if path.len() > self.conf.max_path_len {
@@ -345,6 +387,7 @@ impl MasterFilesystem {
             );
         }
 
+
         let depth = path.split(PATH_SEPARATOR).count();
         if depth > self.conf.max_path_depth {
             return err_box!(
@@ -353,8 +396,10 @@ impl MasterFilesystem {
             );
         }
 
+
         Ok(())
     }
+
 
     pub fn validate_add_block(
         file: &InodeFile,
@@ -371,6 +416,7 @@ impl MasterFilesystem {
             }
         }
 
+
         let res = ValidateAddBlock {
             replicas: file.replicas,
             block_size: file.block_size,
@@ -378,8 +424,10 @@ impl MasterFilesystem {
             client_host: client_addr.hostname.clone(),
         };
 
+
         Ok(res)
     }
+
 
     /// Document application to allocate a new block.
     pub fn add_block<T: AsRef<str>>(
@@ -399,6 +447,7 @@ impl MasterFilesystem {
         };
         let file = inode.as_file_ref()?;
 
+
         // File allows concurrent writes, 'previous' is the previous block,
         // need to check if the next block has already been allocated。
         // If it has been allocated, return that block
@@ -411,19 +460,25 @@ impl MasterFilesystem {
                 file_type: file.file_type,
             };
 
+
             let wm = self.worker_manager.read();
             return wm.create_locate_block(path, extend_block, &locs);
         }
 
+
         let validate_block = Self::validate_add_block(file, &client_addr, previous.as_ref())?;
+
 
         let wm = self.worker_manager.read();
 
+
         let choose_ctx = ChooseContext::with_block(validate_block, exclude_workers);
+
 
         // Select worker.
         let choose_workers = wm.choose_worker(choose_ctx)?;
         drop(wm);
+
 
         let block = fs_dir.acquire_new_block(&inp, previous, &choose_workers, file_len)?;
         let located = LocatedBlock {
@@ -431,8 +486,10 @@ impl MasterFilesystem {
             locs: choose_workers,
         };
 
+
         Ok(located)
     }
+
 
     pub fn complete_file<T: AsRef<str>>(
         &self,
@@ -445,6 +502,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
+
 
         let inode = match inp.get_last_inode() {
             None => return err_box!("File does not exist: {}", inp.path()),
@@ -461,6 +519,7 @@ impl MasterFilesystem {
         }
     }
 
+
     fn get_block_locs(
         &self,
         path: &str,
@@ -470,6 +529,7 @@ impl MasterFilesystem {
         let wm = self.worker_manager.read();
         let file_locs = fs_dir.get_file_locations(file)?;
         let mut block_locs = Vec::with_capacity(file_locs.len());
+
 
         for (index, meta) in file.blocks.iter().enumerate() {
             if index + 1 < file.blocks.len() && meta.len != file.block_size {
@@ -481,12 +541,14 @@ impl MasterFilesystem {
                 );
             }
 
+
             let extend_block = ExtendedBlock {
                 id: meta.id,
                 len: meta.len,
                 storage_type: file.storage_policy.storage_type,
                 file_type: file.file_type,
             };
+
 
             let lc = try_option!(
                 file_locs.get(&meta.id),
@@ -498,13 +560,16 @@ impl MasterFilesystem {
             block_locs.push(lb);
         }
 
+
         Ok(block_locs)
     }
+
 
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
         let fs_dir = self.fs_dir.read();
         let path = path.as_ref();
         let inp = Self::resolve_path(&fs_dir, path)?;
+
 
         let inode = try_option!(inp.get_last_inode(), "File {} not exits", path);
         let file = inode.as_file_ref()?;
@@ -514,8 +579,10 @@ impl MasterFilesystem {
             block_locs,
         };
 
+
         Ok(locate_blocks)
     }
+
 
     pub fn master_info(&self) -> FsResult<MasterInfo> {
         let metrics = Master::get_metrics();
@@ -525,13 +592,16 @@ impl MasterFilesystem {
             ..Default::default()
         };
 
+
         let wm = self.worker_manager.read();
+
 
         // Requests can only reach active master
         info.active_master = wm.conf.master_addr().to_string();
         for peer in &wm.conf.journal.journal_addrs {
             info.journal_nodes.push(peer.to_string())
         }
+
 
         for (_, worker) in wm.worker_map.workers() {
             info.capacity += worker.capacity;
@@ -541,6 +611,7 @@ impl MasterFilesystem {
             info.reserved_bytes += worker.reserved_bytes;
             info.block_num += worker.block_num;
 
+
             match worker.status {
                 WorkerStatus::Live => info.live_workers.push(worker.clone()),
                 WorkerStatus::Blacklist => info.blacklist_workers.push(worker.clone()),
@@ -549,16 +620,20 @@ impl MasterFilesystem {
             }
         }
 
+
         for (_, worker) in wm.worker_map.lost_workers() {
             info.lost_workers.push(worker.clone());
         }
 
+
         Ok(info)
     }
+
 
     pub fn fs_dir(&self) -> ArcRwLock<FsDir> {
         self.fs_dir.clone()
     }
+
 
     // Add a test worker and unit tests will use it.
     pub fn add_test_worker(&self, worker: WorkerInfo) {
@@ -566,20 +641,24 @@ impl MasterFilesystem {
         wm.add_test_worker(worker);
     }
 
+
     pub fn sum_hash(&self) -> u128 {
         let fs_dir = self.fs_dir.read();
         fs_dir.sum_hash()
     }
+
 
     pub fn last_inode_id(&self) -> i64 {
         let fs_dir = self.fs_dir.read();
         fs_dir.last_inode_id()
     }
 
+
     pub fn get_file_counts(&self) -> (i64, i64) {
         let fs_dir = self.fs_dir.read();
         fs_dir.get_file_counts()
     }
+
 
     // Create a directory number based on rocksdb data for testing.
     pub fn create_tree(&self) -> CommonResult<InodeView> {
@@ -587,10 +666,12 @@ impl MasterFilesystem {
         fs_dir.create_tree()
     }
 
+
     fn block_exists(&self, id: i64) -> FsResult<bool> {
         let fs_dir = self.fs_dir.read();
         fs_dir.block_exists(id)
     }
+
 
     /// Process block reports
     pub fn block_report(&self, list: BlockReportList) -> FsResult<()> {
@@ -598,6 +679,7 @@ impl MasterFilesystem {
         if list.blocks.is_empty() {
             return Ok(());
         }
+
 
         //(Whether to increase, block id, block location)
         let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
@@ -614,6 +696,7 @@ impl MasterFilesystem {
                         }
                     };
 
+
                     if exists {
                         batch.push((true, item.id, loc));
                     } else {
@@ -621,6 +704,7 @@ impl MasterFilesystem {
                         wm.remove_block(list.worker_id, item.id);
                     }
                 }
+
 
                 BlockReportStatus::Deleted => {
                     batch.push((false, item.id, loc));
@@ -630,20 +714,24 @@ impl MasterFilesystem {
         }
         drop(wm);
 
+
         let mut fs_dir = self.fs_dir.write();
         fs_dir.block_report(batch)
     }
+
 
     pub fn delete_locations(&self, worker_id: u32) -> FsResult<Vec<i64>> {
         let fs_dir = self.fs_dir.write();
         fs_dir.delete_locations(worker_id)
     }
 
+
     pub fn set_attr<T: AsRef<str>>(&self, path: T, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
         fs_dir.set_attr(inp, opts)
     }
+
 
     pub fn symlink<T: AsRef<str>>(
         &self,
@@ -658,6 +746,7 @@ impl MasterFilesystem {
         fs_dir.symlink(target, link, force, mode)
     }
 
+
     pub fn link<T: AsRef<str>>(&self, src_path: T, dst_path: T) -> FsResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let src_path = Self::resolve_path(&fs_dir, src_path.as_ref())?;
@@ -665,6 +754,7 @@ impl MasterFilesystem {
         fs_dir.link(src_path, dst_path)
     }
 }
+
 
 impl Default for MasterFilesystem {
     fn default() -> Self {
