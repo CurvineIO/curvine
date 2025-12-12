@@ -40,21 +40,6 @@ impl InodeChildren {
         list.binary_search_by(|f| f.name().cmp(name))
     }
 
-    /// Search children by glob pattern (e.g., "*.txt", "dir*", "**/*.log")
-    pub fn search_by_glob<'a>(
-        list: &'a [Box<InodeView>],
-        glob_pattern: &'a Pattern,
-    ) -> CommonResult<Vec<&'a InodeView>> {
-        let mut matches: Vec<&'a InodeView> = Vec::new();
-
-        for child in list {
-            if glob_pattern.matches(child.name()) {
-                matches.push(child.as_ref());
-            }
-        }
-        Ok(matches)
-    }
-
     /// Get children matching glob pattern (e.g., "*.txt", "dir*")
     pub fn get_child_by_glob_pattern<'a>(
         &'a self,

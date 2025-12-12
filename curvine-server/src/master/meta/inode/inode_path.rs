@@ -21,37 +21,6 @@ use crate::master::meta::store::InodeStore;
 use orpc::{err_box, try_option, CommonResult};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::hash::{Hash, Hasher};
-
-#[derive(Clone, Debug)]
-pub struct HashableInodePtr(pub InodePtr); // Wraps your RawPtr<InodeView>
-
-impl PartialEq for HashableInodePtr {
-    fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.0.as_ptr(), other.0.as_ptr())
-    }
-}
-
-impl Eq for HashableInodePtr {}
-
-impl Hash for HashableInodePtr {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.as_ptr().hash(state);
-    }
-}
-
-impl std::ops::Deref for HashableInodePtr {
-    type Target = InodePtr;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl From<InodePtr> for HashableInodePtr {
-    fn from(ptr: InodePtr) -> Self {
-        HashableInodePtr(ptr)
-    }
-}
 
 #[derive(Clone)]
 pub struct InodePath {
@@ -191,13 +160,13 @@ impl InodePath {
             .collect::<Vec<_>>()
             .join("/");
 
-        assert_eq!(
-            path_inodes_rebuild.len(),
-            components_length as usize,
-            "Path length mismatch: {} vs {}",
-            path_inodes_rebuild.len(),
-            components_length
-        );
+        if path_inodes_rebuild.len() != components_length as usize {
+            return err_box!(
+                "Path length mismatch during inode rebuild: {} vs {}",
+                path_inodes_rebuild.len(),
+                components_length
+            );
+        }
 
         Ok(Self {
             path: path_str,

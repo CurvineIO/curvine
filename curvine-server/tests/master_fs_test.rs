@@ -511,7 +511,6 @@ fn create_file_retry(handler: &mut MasterHandler) -> CommonResult<()> {
         OperationStatus::Success
     );
     let is_retry = handler.check_is_retry(req_id)?;
-    println!("is_retry: {:?}", is_retry);
     assert!(is_retry);
 
     // Retry request is normal
