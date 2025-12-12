@@ -22,7 +22,7 @@ use super::ListObjectVersionsResult;
 use super::ObjectVersion;
 use super::PutObjectHandler;
 use super::PutObjectOption;
-use crate::s3::error::Error;
+use crate::s3::error_code::Error;
 use crate::s3::s3_api::HeadHandler;
 use crate::s3::s3_api::HeadObjectResult;
 use crate::utils::s3_utils::{
@@ -35,9 +35,10 @@ use curvine_common::state::FileType;
 use curvine_common::FsResult;
 use orpc::runtime::AsyncRuntime;
 use std::fs;
-use tokio::io::AsyncWriteExt;
 use tracing;
 use uuid;
+
+#[derive(Clone)]
 pub struct S3Handlers {
     pub fs: UnifiedFileSystem,
     pub region: String,
@@ -75,6 +76,68 @@ impl S3Handlers {
             put_temp_dir,
             rt,
             get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024),
+        }
+    }
+
+    #[inline]
+    pub async fn handle_list_buckets(
+        &self,
+        _opt: &crate::s3::s3_api::ListBucketsOption,
+    ) -> Result<Vec<crate::s3::s3_api::Bucket>, String> {
+        let mut buckets = vec![];
+        let root = Path::from_str("/").map_err(|e| e.to_string())?;
+        let list = self
+            .fs
+            .list_status(&root)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        for st in list {
+            if st.is_dir {
+                let creation_date = if st.mtime > 0 {
+                    chrono::DateTime::from_timestamp(st.mtime / 1000, 0)
+                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                        .unwrap_or_else(|| {
+                            chrono::Utc::now()
+                                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                                .to_string()
+                        })
+                } else {
+                    chrono::Utc::now()
+                        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                        .to_string()
+                };
+
+                buckets.push(crate::s3::s3_api::Bucket {
+                    name: st.name,
+                    creation_date,
+                    bucket_region: self.region.clone(),
+                });
+            }
+        }
+        Ok(buckets)
+    }
+
+    #[inline]
+    pub async fn handle_get_bucket_location(
+        &self,
+        _loc: Option<&str>,
+    ) -> Result<Option<&'static str>, ()> {
+        match self.region.as_str() {
+            "us-east-1" => Ok(Some("us-east-1")),
+            "us-west-1" => Ok(Some("us-west-1")),
+            "us-west-2" => Ok(Some("us-west-2")),
+            "eu-west-1" => Ok(Some("eu-west-1")),
+            "eu-central-1" => Ok(Some("eu-central-1")),
+            "ap-southeast-1" => Ok(Some("ap-southeast-1")),
+            "ap-northeast-1" => Ok(Some("ap-northeast-1")),
+            _ => {
+                tracing::warn!(
+                    "Unsupported region '{}', defaulting to us-east-1",
+                    self.region
+                );
+                Ok(Some("us-east-1"))
+            }
         }
     }
 
@@ -133,68 +196,75 @@ impl S3Handlers {
     }
 }
 
-#[async_trait::async_trait]
 impl HeadHandler for S3Handlers {
-    async fn lookup(&self, bucket: &str, object: &str) -> Result<Option<HeadObjectResult>, Error> {
-        tracing::info!("HEAD request for s3://{}/{}", bucket, object);
+    fn lookup(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> impl std::future::Future<Output = Result<Option<HeadObjectResult>, Error>> + Send {
+        let bucket = bucket.to_string();
+        let object = object.to_string();
+        let this = self.clone();
 
-        let path = match self.cv_object_path(bucket, object) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to convert S3 path s3://{}/{}: {}",
-                    bucket,
-                    object,
-                    e
-                );
-                return Ok(None);
-            }
-        };
+        async move {
+            tracing::info!("HEAD request for s3://{}/{}", bucket, object);
 
-        let fs = self.fs.clone();
-        let object_name = object.to_string();
+            let path = match this.cv_object_path(&bucket, &object) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to convert S3 path s3://{}/{}: {}",
+                        bucket,
+                        object,
+                        e
+                    );
+                    return Ok(None);
+                }
+            };
 
-        let res = fs.get_status(&path).await;
+            let fs = this.fs.clone();
+            let object_name = object.clone();
 
-        match res {
-            Ok(st) if st.file_type == FileType::File => {
-                tracing::debug!("Found file at path: {}, size: {}", path, st.len);
+            let res = fs.get_status(&path).await;
 
-                let head = file_status_to_head_object_result(&st, &object_name);
+            match res {
+                Ok(st) if st.file_type == FileType::File => {
+                    tracing::debug!("Found file at path: {}, size: {}", path, st.len);
 
-                Ok(Some(head))
-            }
-            Ok(st) => {
-                tracing::debug!("Path exists but is not a file: {:?}", st.file_type);
-                Ok(None)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to get status for path {}: {}", path, e);
-                Ok(None)
+                    let head = file_status_to_head_object_result(&st, &object_name);
+
+                    Ok(Some(head))
+                }
+                Ok(st) => {
+                    tracing::debug!("Path exists but is not a file: {:?}", st.file_type);
+                    Ok(None)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get status for path {}: {}", path, e);
+                    Ok(None)
+                }
             }
         }
     }
 }
 
-#[async_trait::async_trait]
 impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
     fn handle<'a>(
         &'a self,
         bucket: &str,
         object: &str,
-        _opt: crate::s3::s3_api::GetObjectOption,
-        out: tokio::sync::Mutex<
-            std::pin::Pin<Box<dyn 'a + Send + crate::utils::io::PollWrite + Unpin>>,
-        >,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>> {
+        opt: crate::s3::s3_api::GetObjectOption,
+        out: &'a mut (dyn crate::utils::io::PollWrite + Unpin + Send),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         let fs = self.fs.clone();
         let path = self.cv_object_path(bucket, object);
         let bucket = bucket.to_string();
         let object = object.to_string();
+        let chunk_size = self.get_chunk_size_bytes;
 
         Box::pin(async move {
-            if let Some(start) = _opt.range_start {
-                if let Some(end) = _opt.range_end {
+            if let Some(start) = opt.range_start {
+                if let Some(end) = opt.range_end {
                     tracing::info!(
                         "GET object s3://{}/{} with range: bytes={}-{}",
                         bucket,
@@ -229,7 +299,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                 e.to_string()
             })?;
 
-            let (seek_pos, bytes_to_read) = if let Some(range_end) = _opt.range_end {
+            let (seek_pos, bytes_to_read) = if let Some(range_end) = opt.range_end {
                 if range_end > u64::MAX / 2 {
                     let suffix_len = u64::MAX - range_end;
                     let file_size = reader.remaining().max(0) as u64;
@@ -245,7 +315,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                         (Some(start_pos), Some(suffix_len))
                     }
                 } else {
-                    let start = _opt.range_start.unwrap_or(0);
+                    let start = opt.range_start.unwrap_or(0);
                     let bytes = range_end - start + 1;
                     tracing::debug!(
                         "Normal range request: seeking to {} for {} bytes",
@@ -254,7 +324,7 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                     );
                     (Some(start), Some(bytes))
                 }
-            } else if let Some(start) = _opt.range_start {
+            } else if let Some(start) = opt.range_start {
                 tracing::debug!("Open-ended range request: seeking to {}", start);
                 (Some(start), None)
             } else {
@@ -268,36 +338,20 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                 })?;
             }
 
-            let remaining_bytes = bytes_to_read;
-
-            log::debug!(
-                "GetObject: range_bytes={:?}, reader.remaining()={}",
-                remaining_bytes,
-                reader.remaining()
-            );
-
-            let target_read = if let Some(range_bytes) = remaining_bytes {
-                range_bytes
-            } else {
-                reader.remaining().max(0) as u64
-            };
-
+            let target_read = bytes_to_read.unwrap_or(reader.remaining().max(0) as u64);
             log::debug!("GetObject: will read {target_read} bytes directly");
 
-            // Dynamic chunk size based on file size for optimal performance
             let chunk_size = if target_read <= 64 * 1024 {
-                std::cmp::min(self.get_chunk_size_bytes, target_read as usize).max(4 * 1024)
+                std::cmp::min(chunk_size, target_read as usize).max(4 * 1024)
             } else if target_read <= 1024 * 1024 {
-                std::cmp::min(self.get_chunk_size_bytes, 256 * 1024)
+                std::cmp::min(chunk_size, 256 * 1024)
             } else {
-                self.get_chunk_size_bytes
+                chunk_size
             };
 
             let mut total_read = 0u64;
             let mut remaining_to_read = target_read;
-            let mut guard = out.lock().await;
 
-            // Simple streaming loop without complex prefetching
             while remaining_to_read > 0 {
                 let read_size = std::cmp::min(chunk_size, remaining_to_read as usize);
                 let mut buffer = vec![0u8; read_size];
@@ -308,29 +362,19 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
                     .map_err(|e| e.to_string())?;
 
                 if bytes_read == 0 {
-                    break; // End of file
+                    break;
                 }
 
                 buffer.truncate(bytes_read);
 
-                guard.poll_write_vec(buffer).await.map_err(|e| {
+                out.poll_write_vec(buffer).await.map_err(|e| {
                     tracing::error!("Failed to write chunk to output: {}", e);
                     e.to_string()
                 })?;
 
                 total_read += bytes_read as u64;
                 remaining_to_read -= bytes_read as u64;
-
-                if total_read % (chunk_size as u64 * 16) == 0 {
-                    log::trace!(
-                        "GetObject: streamed {} KB (total: {} KB)",
-                        bytes_read / 1024,
-                        total_read / 1024
-                    );
-                }
             }
-
-            drop(guard);
 
             log::debug!(
                 "GetObject: streaming completed, total bytes: {}",
@@ -352,203 +396,208 @@ impl crate::s3::s3_api::GetObjectHandler for S3Handlers {
     }
 }
 
-#[async_trait::async_trait]
 impl PutObjectHandler for S3Handlers {
-    async fn handle(
+    fn handle(
         &self,
-        _opt: &PutObjectOption,
-        bucket: &str,
-        object: &str,
-        body: &mut (dyn crate::utils::io::PollRead + Unpin + Send),
-    ) -> Result<(), String> {
+        _opt: PutObjectOption,
+        bucket: String,
+        object: String,
+        mut body: crate::utils::io::PollReaderEnum,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         let context = PutContext::new(
             self.fs.clone(),
             self.rt.clone(),
-            bucket.to_string(),
-            object.to_string(),
-            self.cv_object_path(bucket, object),
+            bucket.clone(),
+            object.clone(),
+            self.cv_object_path(&bucket, &object),
         );
 
-        PutOperation::execute(context, body).await
+        async move { PutOperation::execute(context, &mut body).await }
     }
 }
 
-#[async_trait::async_trait]
 impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
-    async fn handle(
+    fn handle(
         &self,
         _opt: &crate::s3::s3_api::DeleteObjectOption,
         object: &str,
-    ) -> Result<(), String> {
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         let fs = self.fs.clone();
         let object = object.to_string();
-        let path = Path::from_str(format!("/{object}"));
 
-        let path = path.map_err(|e| e.to_string())?;
-        match fs.delete(&path, false).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("No such file")
-                    || msg.contains("not exists")
-                    || msg.contains("not found")
-                {
-                    Ok(())
-                } else {
-                    Err(msg)
+        async move {
+            let path = Path::from_str(format!("/{object}")).map_err(|e| e.to_string())?;
+            match fs.delete(&path, false).await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("No such file")
+                        || msg.contains("not exists")
+                        || msg.contains("not found")
+                    {
+                        Ok(())
+                    } else {
+                        Err(msg)
+                    }
                 }
             }
         }
     }
 }
 
-#[async_trait::async_trait]
 impl crate::s3::s3_api::CreateBucketHandler for S3Handlers {
-    async fn handle(
+    fn handle(
         &self,
         _opt: &crate::s3::s3_api::CreateBucketOption,
         bucket: &str,
-    ) -> Result<(), String> {
-        let fs = self.fs.clone();
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let this = self.clone();
         let bucket = bucket.to_string();
-        let path = self.cv_bucket_path(&bucket);
 
-        let path = path.map_err(|e| e.to_string())?;
+        async move {
+            let fs = this.fs.clone();
+            let path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
 
-        if fs.get_status(&path).await.is_ok() {
-            return Err("BucketAlreadyExists".to_string());
+            if fs.get_status(&path).await.is_ok() {
+                return Err("BucketAlreadyExists".to_string());
+            }
+
+            fs.mkdir(&path, true).await.map_err(|e| e.to_string())?;
+            Ok(())
         }
-
-        fs.mkdir(&path, true).await.map_err(|e| e.to_string())?;
-        Ok(())
     }
 }
 
-#[async_trait::async_trait]
 impl crate::s3::s3_api::DeleteBucketHandler for S3Handlers {
-    async fn handle(
+    fn handle(
         &self,
         _opt: &crate::s3::s3_api::DeleteBucketOption,
         bucket: &str,
-    ) -> Result<(), String> {
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         let fs = self.fs.clone();
         let bucket = bucket.to_string();
         let path = self.cv_bucket_path(&bucket);
 
-        let path = path.map_err(|e| e.to_string())?;
-        fs.delete(&path, false).await.map_err(|e| e.to_string())
+        async move {
+            let path = path.map_err(|e| e.to_string())?;
+            fs.delete(&path, false).await.map_err(|e| e.to_string())
+        }
     }
 }
 
-#[async_trait::async_trait]
 impl crate::s3::s3_api::ListBucketHandler for S3Handlers {
-    async fn handle(
+    fn handle(
         &self,
-        _opt: &crate::s3::s3_api::ListBucketsOption,
-    ) -> Result<Vec<crate::s3::s3_api::Bucket>, String> {
-        let mut buckets = vec![];
-        let root = Path::from_str("/").map_err(|e| e.to_string())?;
-        let list = self
-            .fs
-            .list_status(&root)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        for st in list {
-            if st.is_dir {
-                let creation_date = if st.mtime > 0 {
-                    chrono::DateTime::from_timestamp(st.mtime / 1000, 0)
-                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
-                        .unwrap_or_else(|| {
-                            chrono::Utc::now()
-                                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                                .to_string()
-                        })
-                } else {
-                    chrono::Utc::now()
-                        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                        .to_string()
-                };
-
-                buckets.push(crate::s3::s3_api::Bucket {
-                    name: st.name,
-                    creation_date,
-                    bucket_region: self.region.clone(),
-                });
-            }
-        }
-        Ok(buckets)
+        opt: &crate::s3::s3_api::ListBucketsOption,
+    ) -> impl std::future::Future<Output = Result<Vec<crate::s3::s3_api::Bucket>, String>> + Send
+    {
+        self.handle_list_buckets(opt)
     }
 }
 
-#[async_trait::async_trait]
 impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
-    async fn handle(&self, _loc: Option<&str>) -> Result<Option<&'static str>, ()> {
-        match self.region.as_str() {
-            "us-east-1" => Ok(Some("us-east-1")),
-            "us-west-1" => Ok(Some("us-west-1")),
-            "us-west-2" => Ok(Some("us-west-2")),
-            "eu-west-1" => Ok(Some("eu-west-1")),
-            "eu-central-1" => Ok(Some("eu-central-1")),
-            "ap-southeast-1" => Ok(Some("ap-southeast-1")),
-            "ap-northeast-1" => Ok(Some("ap-northeast-1")),
-            _ => {
-                tracing::warn!(
-                    "Unsupported region '{}', defaulting to us-east-1",
-                    self.region
-                );
-                Ok(Some("us-east-1"))
-            }
-        }
+    fn handle(
+        &self,
+        loc: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<Option<&'static str>, ()>> + Send {
+        self.handle_get_bucket_location(loc)
     }
 }
 
 #[async_trait::async_trait]
 impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
-    fn handle_create_session<'a>(
-        &'a self,
-        _bucket: &'a str,
-        _key: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>> {
-        Box::pin(async move {
-            let upload_id = uuid::Uuid::new_v4().to_string();
-            Ok(upload_id)
-        })
+    async fn handle_create_session(&self, _bucket: String, _key: String) -> Result<String, ()> {
+        let upload_id = uuid::Uuid::new_v4().to_string();
+        Ok(upload_id)
     }
 
-    fn handle_upload_part<'a>(
-        &'a self,
-        _bucket: &'a str,
-        _key: &'a str,
-        upload_id: &'a str,
+    async fn handle_upload_part(
+        &self,
+        _bucket: String,
+        _key: String,
+        upload_id: String,
         part_number: u32,
-        body: &'a mut (dyn tokio::io::AsyncRead + Unpin + Send),
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>> {
-        Box::pin(async move {
-            use bytes::BytesMut;
-            use tokio::io::AsyncReadExt;
+        mut body: crate::utils::io::AsyncReadEnum,
+    ) -> Result<String, ()> {
+        use bytes::BytesMut;
+        use tokio::io::AsyncWriteExt;
 
-            let dir = format!("{}/{}", self.put_temp_dir, upload_id);
-            let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = format!("{}/{}", self.put_temp_dir, upload_id);
+        let _ = tokio::fs::create_dir_all(&dir).await;
 
-            let path = format!("{dir}/{part_number}");
-            let mut file = match tokio::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&path)
-                .await
-            {
+        let path = format!("{dir}/{part_number}");
+        let mut file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .await
+        {
+            Ok(f) => f,
+            Err(_) => return Err(()),
+        };
+
+        let mut hasher = md5::Context::new();
+        let mut total_data = BytesMut::new();
+
+        let mut temp_buf = vec![0u8; 1024 * 1024]; // 1MB buffer
+        loop {
+            let n = match body.read(&mut temp_buf).await {
+                Ok(n) => n,
+                Err(_) => return Err(()),
+            };
+            if n == 0 {
+                break;
+            }
+
+            let actual_data = &temp_buf[..n];
+            hasher.consume(actual_data);
+            total_data.extend_from_slice(actual_data);
+        }
+
+        if file.write_all(&total_data).await.is_err() {
+            return Err(());
+        }
+
+        let digest = hasher.compute();
+        Ok(format!("\"{digest:x}\""))
+    }
+
+    async fn handle_complete(
+        &self,
+        bucket: String,
+        key: String,
+        upload_id: String,
+        data: Vec<(String, u32)>,
+        _opts: crate::s3::s3_api::MultiUploadObjectCompleteOption,
+    ) -> Result<String, ()> {
+        use tokio::io::AsyncReadExt;
+
+        let final_path = match self.cv_object_path(&bucket, &key) {
+            Ok(p) => p,
+            Err(_) => return Err(()),
+        };
+
+        let mut writer = match self.fs.create(&final_path, true).await {
+            Ok(w) => w,
+            Err(_) => return Err(()),
+        };
+
+        let dir = format!("{}/{}", self.put_temp_dir, upload_id);
+
+        let mut part_list = data;
+        part_list.sort_by_key(|(_, n)| *n);
+
+        for (_, num) in part_list {
+            let path = format!("{dir}/{num}");
+            let mut file = match tokio::fs::OpenOptions::new().read(true).open(&path).await {
                 Ok(f) => f,
                 Err(_) => return Err(()),
             };
 
-            let mut hasher = md5::Context::new();
-            let mut total_data = BytesMut::new();
-
-            let mut temp_buf = vec![0u8; 1024 * 1024]; // 1MB buffer
+            let mut buf = [0u8; 1024 * 1024]; // 1MB buffer
             loop {
-                let n = match body.read(&mut temp_buf).await {
+                let n = match file.read(&mut buf).await {
                     Ok(n) => n,
                     Err(_) => return Err(()),
                 };
@@ -556,244 +605,199 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
                     break;
                 }
 
-                let actual_data = &temp_buf[..n];
-                hasher.consume(actual_data);
-                total_data.extend_from_slice(actual_data);
-            }
-
-            if file.write_all(&total_data).await.is_err() {
-                return Err(());
-            }
-
-            let digest = hasher.compute();
-            Ok(format!("\"{digest:x}\""))
-        })
-    }
-
-    fn handle_complete<'a>(
-        &'a self,
-        bucket: &'a str,
-        key: &'a str,
-        upload_id: &'a str,
-        data: &'a [(&'a str, u32)],
-        _opts: crate::s3::s3_api::MultiUploadObjectCompleteOption,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>> {
-        let fs = self.fs.clone();
-        let bucket = bucket.to_string();
-        let key = key.to_string();
-        let path_res = self.cv_object_path(&bucket, &key);
-
-        Box::pin(async move {
-            use tokio::io::AsyncReadExt;
-
-            let final_path = match path_res {
-                Ok(p) => p,
-                Err(_) => return Err(()),
-            };
-
-            let mut writer = match fs.create(&final_path, true).await {
-                Ok(w) => w,
-                Err(_) => return Err(()),
-            };
-
-            let put_temp_dir = self.put_temp_dir.clone();
-            let dir = format!("{put_temp_dir}/{upload_id}");
-
-            let mut part_list = data.to_vec();
-            part_list.sort_by_key(|(_, n)| *n);
-
-            for (_, num) in part_list {
-                let path = format!("{dir}/{num}");
-                let mut file = match tokio::fs::OpenOptions::new().read(true).open(&path).await {
-                    Ok(f) => f,
-                    Err(_) => return Err(()),
-                };
-
-                let mut buf = [0u8; 1024 * 1024]; // 1MB buffer
-                loop {
-                    let n = match file.read(&mut buf).await {
-                        Ok(n) => n,
-                        Err(_) => return Err(()),
-                    };
-                    if n == 0 {
-                        break;
-                    }
-
-                    if writer.write(&buf[..n]).await.is_err() {
-                        return Err(());
-                    }
+                if writer.write(&buf[..n]).await.is_err() {
+                    return Err(());
                 }
             }
+        }
 
-            if writer.complete().await.is_err() {
-                return Err(());
-            }
+        if writer.complete().await.is_err() {
+            return Err(());
+        }
 
-            let _ = tokio::fs::remove_dir_all(&dir).await;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
 
-            Ok("etag-not-computed".to_string())
-        })
+        Ok("etag-not-computed".to_string())
     }
 
-    fn handle_abort<'a>(
-        &'a self,
-        _bucket: &'a str,
-        _key: &'a str,
-        upload_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), ()>>>> {
-        Box::pin(async move {
-            let dir = format!("/tmp/curvine-multipart/{}", upload_id);
-            let _ = tokio::fs::remove_dir_all(&dir).await;
-            Ok(())
-        })
+    async fn handle_abort(
+        &self,
+        _bucket: String,
+        _key: String,
+        upload_id: String,
+    ) -> Result<(), ()> {
+        let dir = format!("{}/{}", self.put_temp_dir, upload_id);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        Ok(())
     }
 }
 
-#[async_trait::async_trait]
 impl ListObjectHandler for S3Handlers {
-    async fn handle(
+    fn handle(
         &self,
         opt: &ListObjectOption,
         bucket: &str,
-    ) -> Result<Vec<ListObjectContent>, String> {
-        let bkt_path = self.cv_bucket_path(bucket).map_err(|e| e.to_string())?;
+    ) -> impl std::future::Future<Output = Result<Vec<ListObjectContent>, String>> + Send {
+        let this = self.clone();
+        let opt = opt.clone();
+        let bucket = bucket.to_string();
 
-        let list_path = if let Some(prefix) = &opt.prefix {
-            let prefix_path = prefix.trim_end_matches('/');
-            if prefix_path.is_empty() {
-                bkt_path.clone()
-            } else {
-                Path::from_str(format!("{}/{}", bkt_path, prefix_path).as_str())
-                    .map_err(|e| e.to_string())?
-            }
-        } else {
-            bkt_path.clone()
-        };
+        async move {
+            let bkt_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
 
-        let list = self
-            .fs
-            .list_status(&list_path)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let mut contents = Vec::new();
-
-        for st in list {
-            let full_path = st.path.clone();
-            let bucket_root = bkt_path.to_string();
-
-            let key = if full_path.starts_with(&bucket_root) {
-                let relative_path = full_path.strip_prefix(&bucket_root).unwrap_or(&full_path);
-                relative_path.trim_start_matches('/').to_string()
-            } else {
-                let list_path_str = list_path.to_string();
-                if list_path_str.starts_with(&bucket_root) {
-                    let relative_dir = list_path_str.strip_prefix(&bucket_root).unwrap_or("");
-                    let relative_dir = relative_dir.trim_start_matches('/');
-                    if relative_dir.is_empty() {
-                        st.name.clone()
+            // S3 prefix semantics: prefix is for filtering, not path construction
+            // Only treat prefix as directory path if it ends with '/'
+            let (list_path, prefix_dir) = if let Some(prefix) = &opt.prefix {
+                if prefix.ends_with('/') {
+                    // Prefix is a directory path (e.g., "folder/")
+                    let dir_path = prefix.trim_end_matches('/');
+                    if dir_path.is_empty() {
+                        (bkt_path.clone(), String::new())
                     } else {
-                        format!("{}/{}", relative_dir, st.name)
+                        let full_path =
+                            Path::from_str(format!("{}/{}", bkt_path, dir_path).as_str())
+                                .map_err(|e| e.to_string())?;
+                        (full_path, dir_path.to_string())
+                    }
+                } else if prefix.contains('/') {
+                    // Prefix contains directory component (e.g., "folder/file")
+                    // List the parent directory and filter by full prefix
+                    let last_slash = prefix.rfind('/').unwrap();
+                    let dir_part = &prefix[..last_slash];
+                    if dir_part.is_empty() {
+                        (bkt_path.clone(), String::new())
+                    } else {
+                        let full_path =
+                            Path::from_str(format!("{}/{}", bkt_path, dir_part).as_str())
+                                .map_err(|e| e.to_string())?;
+                        (full_path, dir_part.to_string())
                     }
                 } else {
-                    st.name.clone()
+                    // Prefix is just a filename prefix (e.g., "small")
+                    // List bucket root and filter by prefix
+                    (bkt_path.clone(), String::new())
                 }
+            } else {
+                (bkt_path.clone(), String::new())
             };
 
-            if let Some(pref) = &opt.prefix {
-                if !key.starts_with(pref) {
-                    continue;
+            let list = this
+                .fs
+                .list_status(&list_path)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let mut contents = Vec::new();
+
+            for st in list {
+                // Build the S3 key from file status
+                let key = if prefix_dir.is_empty() {
+                    st.name.clone()
+                } else {
+                    format!("{}/{}", prefix_dir, st.name)
+                };
+
+                // Apply prefix filter
+                if let Some(pref) = &opt.prefix {
+                    if !key.starts_with(pref) {
+                        continue;
+                    }
                 }
+
+                contents.push(file_status_to_list_object_content(&st, key));
             }
 
-            contents.push(file_status_to_list_object_content(&st, key));
+            Ok(contents)
         }
-
-        Ok(contents)
     }
 }
 
-#[async_trait::async_trait]
 impl ListObjectVersionsHandler for S3Handlers {
-    async fn handle(
+    fn handle(
         &self,
         opt: &ListObjectVersionsOption,
         bucket: &str,
-    ) -> Result<ListObjectVersionsResult, String> {
-        tracing::info!("ListObjectVersions request for bucket: {}", bucket);
+    ) -> impl std::future::Future<Output = Result<ListObjectVersionsResult, String>> + Send {
+        let this = self.clone();
+        let opt = opt.clone();
+        let bucket = bucket.to_string();
 
-        let bkt_path = self.cv_bucket_path(bucket).map_err(|e| e.to_string())?;
+        async move {
+            tracing::info!("ListObjectVersions request for bucket: {}", bucket);
 
-        let list = self
-            .fs
-            .list_status(&bkt_path)
-            .await
-            .map_err(|e| e.to_string())?;
+            let bkt_path = this.cv_bucket_path(&bucket).map_err(|e| e.to_string())?;
 
-        let mut versions = Vec::new();
+            let list = this
+                .fs
+                .list_status(&bkt_path)
+                .await
+                .map_err(|e| e.to_string())?;
 
-        for st in list {
-            if st.is_dir {
-                continue;
+            let mut versions = Vec::new();
+
+            for st in list {
+                if st.is_dir {
+                    continue;
+                }
+
+                let key = st.name.clone();
+
+                if let Some(prefix) = &opt.prefix {
+                    if !key.starts_with(prefix) {
+                        continue;
+                    }
+                }
+
+                let version_id = format!("{}-{}", st.mtime, st.len);
+
+                let version = ObjectVersion {
+                    key: key.clone(),
+                    version_id,
+                    is_latest: true,
+                    last_modified: crate::utils::s3_utils::format_s3_timestamp(st.mtime)
+                        .unwrap_or_else(|| {
+                            chrono::Utc::now()
+                                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                                .to_string()
+                        }),
+                    etag: crate::utils::s3_utils::generate_etag(&st),
+                    size: st.len as u64,
+                    storage_class: Some(crate::utils::s3_utils::map_storage_class(
+                        &st.storage_policy.storage_type,
+                    )),
+                    owner: Some(crate::utils::s3_utils::create_owner_info(&st)),
+                };
+
+                versions.push(version);
             }
 
-            let key = st.name.clone();
-
-            if let Some(prefix) = &opt.prefix {
-                if !key.starts_with(prefix) {
-                    continue;
+            if let Some(max_keys) = opt.max_keys {
+                if max_keys > 0 && versions.len() > max_keys as usize {
+                    versions.truncate(max_keys as usize);
                 }
             }
 
-            let version_id = format!("{}-{}", st.mtime, st.len);
-
-            let version = ObjectVersion {
-                key: key.clone(),
-                version_id,
-                is_latest: true,
-                last_modified: crate::utils::s3_utils::format_s3_timestamp(st.mtime)
-                    .unwrap_or_else(|| {
-                        chrono::Utc::now()
-                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                            .to_string()
-                    }),
-                etag: crate::utils::s3_utils::generate_etag(&st),
-                size: st.len as u64,
-                storage_class: Some(crate::utils::s3_utils::map_storage_class(
-                    &st.storage_policy.storage_type,
-                )),
-                owner: Some(crate::utils::s3_utils::create_owner_info(&st)),
+            let result = ListObjectVersionsResult {
+                xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
+                name: bucket.to_string(),
+                prefix: opt.prefix.clone(),
+                key_marker: opt.key_marker.clone(),
+                version_id_marker: opt.version_id_marker.clone(),
+                next_key_marker: None,
+                next_version_id_marker: None,
+                max_keys: opt.max_keys.map(|k| k as u32),
+                is_truncated: false,
+                versions,
+                delete_markers: Vec::new(),
             };
 
-            versions.push(version);
+            tracing::info!(
+                "ListObjectVersions completed for bucket: {}, found {} versions",
+                bucket,
+                result.versions.len()
+            );
+
+            Ok(result)
         }
-
-        if let Some(max_keys) = opt.max_keys {
-            if max_keys > 0 && versions.len() > max_keys as usize {
-                versions.truncate(max_keys as usize);
-            }
-        }
-
-        let result = ListObjectVersionsResult {
-            xmlns: "http://s3.amazonaws.com/doc/2006-03-01/".to_string(),
-            name: bucket.to_string(),
-            prefix: opt.prefix.clone(),
-            key_marker: opt.key_marker.clone(),
-            version_id_marker: opt.version_id_marker.clone(),
-            next_key_marker: None,
-            next_version_id_marker: None,
-            max_keys: opt.max_keys.map(|k| k as u32),
-            is_truncated: false,
-            versions,
-            delete_markers: Vec::new(),
-        };
-
-        tracing::info!(
-            "ListObjectVersions completed for bucket: {}, found {} versions",
-            bucket,
-            result.versions.len()
-        );
-
-        Ok(result)
     }
 }

@@ -31,16 +31,139 @@ pub struct BaseKv<K: PartialOrd, V> {
 
 pub mod io {
     use std::ops::{Deref, DerefMut};
+    use tokio::io::AsyncReadExt;
 
+    pub enum PollReaderEnum {
+        Body(crate::http::axum::BodyReader),
+        File(tokio::fs::File),
+        InMemory(InMemoryPollReader),
+        BufCursor(tokio::io::BufReader<std::io::Cursor<Vec<u8>>>),
+    }
+
+    impl PollReaderEnum {
+        #[inline]
+        pub async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+            match self {
+                PollReaderEnum::Body(r) => r.poll_read_impl().await,
+                PollReaderEnum::File(f) => {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    match f.read(&mut buf).await {
+                        Ok(0) => Ok(None),
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Ok(Some(buf))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                PollReaderEnum::InMemory(r) => r.poll_read_impl().await,
+                PollReaderEnum::BufCursor(r) => {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    match r.read(&mut buf).await {
+                        Ok(0) => Ok(None),
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Ok(Some(buf))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+            }
+        }
+    }
+
+    pub struct InMemoryPollReader {
+        pub data: Vec<u8>,
+        pub offset: usize,
+    }
+
+    impl InMemoryPollReader {
+        pub fn new(data: Vec<u8>) -> Self {
+            Self { data, offset: 0 }
+        }
+
+        #[inline]
+        pub async fn poll_read_impl(&mut self) -> Result<Option<Vec<u8>>, String> {
+            if self.offset >= self.data.len() {
+                return Ok(None);
+            }
+            let chunk_size = std::cmp::min(64 * 1024, self.data.len() - self.offset);
+            let chunk = self.data[self.offset..self.offset + chunk_size].to_vec();
+            self.offset += chunk_size;
+            Ok(Some(chunk))
+        }
+    }
+
+    pub enum PollWriterEnum<'a> {
+        VecBuf(&'a mut Vec<u8>),
+    }
+
+    impl<'a> PollWriterEnum<'a> {
+        #[inline]
+        pub async fn poll_write(&mut self, buff: &[u8]) -> Result<usize, std::io::Error> {
+            match self {
+                PollWriterEnum::VecBuf(v) => {
+                    v.extend_from_slice(buff);
+                    Ok(buff.len())
+                }
+            }
+        }
+
+        #[inline]
+        pub async fn poll_write_vec(&mut self, vec: Vec<u8>) -> Result<usize, std::io::Error> {
+            self.poll_write(&vec).await
+        }
+    }
+
+    pub enum AsyncReadEnum {
+        File(tokio::fs::File),
+        BufCursor(tokio::io::BufReader<std::io::Cursor<Vec<u8>>>),
+    }
+
+    impl AsyncReadEnum {
+        #[inline]
+        pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            use tokio::io::AsyncReadExt;
+            match self {
+                AsyncReadEnum::File(f) => f.read(buf).await,
+                AsyncReadEnum::BufCursor(r) => r.read(buf).await,
+            }
+        }
+
+        #[inline]
+        pub async fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+            use tokio::io::AsyncReadExt;
+            match self {
+                AsyncReadEnum::File(f) => f.read_to_end(buf).await,
+                AsyncReadEnum::BufCursor(r) => r.read_to_end(buf).await,
+            }
+        }
+    }
+
+    /// Legacy trait for async reading - uses async_trait for object safety
+    ///
+    /// **Prefer `PollReaderEnum` for new code** - provides zero-allocation dispatch.
+    /// This trait is kept for backward compatibility with `dyn PollRead` usage.
+    ///
+    /// The reason we still use async_trait here is to maintain compatibility with
+    /// `dyn PollRead` usage in some places, which requires object safety.
+    /// async_trait provides this object safety by generating a vtable at compile time.
     #[async_trait::async_trait]
-    pub trait PollRead {
+    pub trait PollRead: Send {
         async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String>;
     }
-    #[async_trait::async_trait]
-    pub trait PollWrite {
-        async fn poll_write(&mut self, buff: &[u8]) -> Result<usize, std::io::Error>;
 
-        /// Optional: write Vec<u8> directly to avoid copy (default implementation falls back to slice)
+    /// Legacy trait for async writing - uses async_trait for object safety
+    ///
+    /// **Prefer `PollWriterEnum` for new code** - provides zero-allocation dispatch.
+    /// This trait is kept for backward compatibility with `dyn PollWrite` usage.
+    ///
+    /// The reason we still use async_trait here is to maintain compatibility with
+    /// `dyn PollWrite` usage in some places, which requires object safety.
+    /// async_trait provides this object safety by generating a vtable at compile time.
+    #[async_trait::async_trait]
+    pub trait PollWrite: Send {
+        async fn poll_write(&mut self, buff: &[u8]) -> Result<usize, std::io::Error>;
         async fn poll_write_vec(&mut self, vec: Vec<u8>) -> Result<usize, std::io::Error> {
             self.poll_write(&vec).await
         }

@@ -12,75 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! # S3 API Trait Definitions and Data Structures
-//!
-//! This module defines the core S3 API traits and data structures that provide
-//! complete AWS S3 compatibility for the Curvine Object Gateway. It serves as
-//! the contract between HTTP handlers and storage backend implementations.
-//!
-//! ## API Coverage
-//!
-//! The module implements all major S3 operations:
-//! - **Object Operations**: PUT, GET, HEAD, DELETE with range support
-//! - **Bucket Operations**: CREATE, DELETE, LIST with location support  
-//! - **Multipart Upload**: Complete lifecycle from initiation to completion
-//! - **Listing Operations**: LIST objects and buckets with filtering
-//!
-//! ## Design Principles
-//!
-//! - **Full S3 Compatibility**: All structures match AWS S3 API specifications
-//! - **Async First**: All operations return futures for high-concurrency handling
-//! - **Type Safety**: Strong typing prevents common integration errors
-//! - **Extensibility**: Trait-based design allows pluggable implementations
-//!
-//! ## Response Format Compatibility
-//!
-//! All response structures are designed for direct XML serialization,
-//! maintaining full compatibility with S3 clients including:
-//! - AWS CLI and SDKs
-//! - MinIO client libraries
-//! - Third-party S3 tools
-//! - Custom S3 applications
-
-pub use crate::s3::error::Error;
+pub use crate::s3::error_code::Error;
 use std::{
-    collections::HashMap,
     fmt::{Debug, Display},
     io::Write,
     str::FromStr,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub enum ArchiveStatus {
-    #[serde(rename = "ARCHIVE_ACCESS")]
-    ArchiveAccess,
-    #[serde(rename = "DEEP_ARCHIVE_ACCESS")]
-    DeepArchiveAccess,
-}
+pub use crate::s3::dto::ArchiveStatus;
 
-impl std::str::FromStr for ArchiveStatus {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "ARCHIVE_ACCESS" => Ok(ArchiveStatus::ArchiveAccess),
-            "DEEP_ARCHIVE_ACCESS" => Ok(ArchiveStatus::DeepArchiveAccess),
-            _ => Err(Error::Other(format!("Invalid ArchiveStatus value: {}", s))),
-        }
-    }
-}
-
-impl std::fmt::Display for ArchiveStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ArchiveStatus::ArchiveAccess => write!(f, "ARCHIVE_ACCESS"),
-            ArchiveStatus::DeepArchiveAccess => write!(f, "DEEP_ARCHIVE_ACCESS"),
-        }
-    }
-}
-
+pub use crate::s3::dto::{DateTime, DEFAULT_OWNER_ID};
 static OWNER_ID: &str = DEFAULT_OWNER_ID;
-pub type DateTime = chrono::DateTime<chrono::Utc>;
 
 pub trait VRequest: crate::auth::sig_v4::VHeader {
     fn method(&self) -> String;
@@ -88,12 +30,13 @@ pub trait VRequest: crate::auth::sig_v4::VHeader {
     fn get_query(&self, k: &str) -> Option<String>;
     fn all_query(&self, cb: impl FnMut(&str, &str) -> bool);
 }
-#[async_trait::async_trait]
 pub trait BodyWriter {
     type BodyWriter<'a>: crate::utils::io::PollWrite + Send + Unpin
     where
         Self: 'a;
-    async fn get_body_writer(&mut self) -> Result<Self::BodyWriter<'_>, String>;
+    fn get_body_writer(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Self::BodyWriter<'_>, String>> + Send;
 }
 pub trait BodyReader {
     type BodyReader: crate::utils::io::PollRead + Send;
@@ -119,132 +62,31 @@ pub trait VResponse: crate::auth::sig_v4::VHeader + BodyWriter {
     fn send_header(&mut self);
 }
 
-#[derive(Default, Debug, Serialize)]
-pub struct HeadObjectResult {
-    #[serde(rename = "AcceptRanges")]
-    pub accept_ranges: Option<String>,
-    #[serde(rename = "ArchiveStatus")]
-    pub archive_status: Option<ArchiveStatus>,
-    #[serde(rename = "BucketKeyEnabled")]
-    pub bucket_key_enabled: Option<bool>,
-    #[serde(rename = "CacheControl")]
-    pub cache_control: Option<String>,
-    #[serde(rename = "ChecksumCRC32")]
-    pub checksum_crc32: Option<String>,
-    #[serde(rename = "ChecksumCRC32C")]
-    pub checksum_crc32c: Option<String>,
-    #[serde(rename = "ChecksumCRC64")]
-    pub checksum_crc64: Option<String>,
-    #[serde(rename = "ChecksumSHA1")]
-    pub checksum_sha1: Option<String>,
-    #[serde(rename = "ChecksumSHA256")]
-    pub checksum_sha256: Option<String>,
-    #[serde(rename = "ChecksumType")]
-    pub checksum_type: Option<String>,
-    #[serde(rename = "ContentDisposition")]
-    pub content_disposition: Option<String>,
-    #[serde(rename = "ContentEncoding")]
-    pub content_encoding: Option<String>,
-    #[serde(rename = "ContentLanguage")]
-    pub content_language: Option<String>,
-    #[serde(rename = "ContentLength")]
-    pub content_length: Option<usize>,
-    #[serde(rename = "ContentRange")]
-    pub content_range: Option<String>,
-    #[serde(rename = "ContentType")]
-    pub content_type: Option<String>,
-    #[serde(rename = "DeleteMarker")]
-    pub delete_marker: Option<bool>,
-    #[serde(rename = "ETag")]
-    pub etag: Option<String>,
-    #[serde(rename = "Expiration")]
-    pub expiration: Option<String>,
-    #[serde(rename = "Expires")]
-    pub expires: Option<String>,
-    #[serde(rename = "ExpiresString")]
-    pub expires_string: Option<String>,
-    #[serde(rename = "LastModified")]
-    pub last_modified: Option<String>,
-    #[serde(rename = "Metadata")]
-    pub metadata: Option<HashMap<String, String>>,
-    #[serde(rename = "MissingMeta")]
-    pub missing_meta: Option<i32>,
-    #[serde(rename = "ObjectLockLegalHoldStatus")]
-    pub object_lock_legal_hold_status: Option<String>,
-    #[serde(rename = "ObjectLockMode")]
-    pub object_lock_mode: Option<String>,
-    #[serde(rename = "ObjectLockRetainUntilDate")]
-    pub object_lock_retain_until_date: Option<String>,
-    #[serde(rename = "PartsCount")]
-    pub parts_count: Option<i32>,
-    #[serde(rename = "ReplicationStatus")]
-    pub replication_status: Option<String>,
-    #[serde(rename = "RequestCharged")]
-    pub request_charged: Option<String>,
-    #[serde(rename = "Restore")]
-    pub restore: Option<String>,
-    #[serde(rename = "SSECustomerAlgorithm")]
-    pub sse_customer_algorithm: Option<String>,
-    #[serde(rename = "SSECustomerKeyMD5")]
-    pub sse_customer_key_md5: Option<String>,
-    #[serde(rename = "SSEKMSKeyId")]
-    pub sse_kms_key_id: Option<String>,
-    #[serde(rename = "ServerSideEncryption")]
-    pub server_side_encryption: Option<String>,
-    #[serde(rename = "StorageClass")]
-    pub storage_class: Option<String>,
-    #[serde(rename = "VersionId")]
-    pub version_id: Option<String>,
-    #[serde(rename = "WebsiteRedirectLocation")]
-    pub website_redirect_location: Option<String>,
+pub use crate::s3::dto::HeadObjectResult;
+
+pub trait HeadHandler: Send + Sync {
+    fn lookup(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> impl std::future::Future<Output = Result<Option<HeadObjectResult>, Error>> + Send;
 }
 
-/// Core trait for object metadata retrieval operations
-///
-/// This trait provides the fundamental capability to retrieve object metadata
-/// without transferring the object content itself. It serves as the foundation
-/// for both HEAD requests and as a prerequisite for GET operations.
-///
-/// ## Purpose
-/// - **Metadata Lookup**: Retrieve object size, modification time, ETag, and custom metadata
-/// - **Existence Check**: Determine if an object exists without downloading it
-/// - **Performance**: Efficient metadata access for large objects
-/// - **Foundation**: Required by GetObjectHandler for content operations
-///
-/// ## Implementation Notes
-/// - Should return `None` if object doesn't exist (not an error)
-/// - Must populate all available metadata fields accurately
-/// - Should be optimized for fast metadata access
-#[async_trait::async_trait]
-pub trait HeadHandler {
-    /// Retrieve object metadata without content transfer
-    ///
-    /// ## Parameters
-    /// - `bucket`: S3 bucket name containing the object
-    /// - `object`: Object key/path within the bucket
-    ///
-    /// ## Returns
-    /// - `Ok(Some(HeadObjectResult))`: Object exists with metadata
-    /// - `Ok(None)`: Object does not exist
-    /// - `Err(Error)`: Backend error during lookup
-    async fn lookup(&self, bucket: &str, object: &str) -> Result<Option<HeadObjectResult>, Error>;
-}
-#[derive(Default)]
-pub struct GetObjectOption {
-    pub range_start: Option<u64>,
-    pub range_end: Option<u64>,
-}
+pub use crate::s3::dto::GetObjectOption;
 
+/// GET Object handler trait
+///
+/// Note: This trait uses Box<dyn Future> because the output writer has a borrowed
+/// lifetime that cannot be expressed with impl Future in stable Rust.
+/// The Box allocation here is unavoidable due to lifetime constraints.
 pub trait GetObjectHandler: HeadHandler {
     fn handle<'a>(
         &'a self,
         bucket: &str,
         object: &str,
         opt: GetObjectOption,
-        out: tokio::sync::Mutex<
-            std::pin::Pin<Box<dyn 'a + Send + crate::utils::io::PollWrite + Unpin>>,
-        >,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), String>>>>;
+        out: &'a mut (dyn crate::utils::io::PollWrite + Unpin + Send),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 extern crate serde;
@@ -252,91 +94,12 @@ use serde::Serialize;
 use sha1::Digest;
 use tokio::io::AsyncSeekExt;
 
-use crate::utils::consts::*;
 use crate::utils::io::{PollRead, PollWrite};
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-#[serde(rename = "ListBucketResult")]
-pub struct ListObjectResult {
-    #[serde(
-        rename = "xmlns",
-        default = "s3_namespace",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub xmlns: String,
-
-    #[serde(rename = "Name")]
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_keys: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delimiter: Option<String>,
-    pub is_truncated: bool,
-    #[serde(default)]
-    pub contents: Vec<ListObjectContent>,
-    #[serde(default)]
-    pub common_prefixes: Vec<CommonPrefix>,
-}
+pub use crate::s3::dto::{Bucket, Buckets, CommonPrefix, ListAllMyBucketsResult, Owner};
+pub use crate::s3::dto::{ListObjectContent, ListObjectResult};
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct ListObjectContent {
-    pub key: String,
-    pub last_modified: Option<String>,
-    pub etag: Option<String>,
-    pub size: u64,
-    pub storage_class: Option<String>,
-    pub owner: Option<Owner>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename = "ListAllMyBucketsResult")]
-#[serde(rename_all = "PascalCase")]
-pub struct ListAllMyBucketsResult {
-    #[serde(
-        rename = "xmlns",
-        default = "s3_namespace",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub xmlns: String,
-
-    pub owner: Owner,
-
-    pub buckets: Buckets,
-}
-#[derive(Debug, Serialize)]
-pub struct Buckets {
-    #[serde(rename = "Bucket")]
-    pub bucket: Vec<Bucket>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct Bucket {
-    pub name: String,
-    pub creation_date: String,
-    pub bucket_region: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct Owner {
-    pub id: String,
-    pub display_name: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct CommonPrefix {
-    pub prefix: String,
-}
-
-#[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ListObjectOption {
     pub bucket: String,
@@ -372,80 +135,18 @@ pub struct ListObjectOption {
     pub start_after: Option<String>,
 }
 
-#[async_trait::async_trait]
-pub trait ListObjectHandler {
-    async fn handle(
+/// OPTIMIZED: No async_trait - zero Box allocation
+pub trait ListObjectHandler: Send + Sync {
+    fn handle(
         &self,
         opt: &ListObjectOption,
         bucket: &str,
-    ) -> Result<Vec<ListObjectContent>, String>;
+    ) -> impl std::future::Future<Output = Result<Vec<ListObjectContent>, String>> + Send;
 }
 
-/// List Object Versions API structures and handler
-#[derive(Debug, Serialize)]
-#[serde(rename = "ListVersionsResult")]
-pub struct ListObjectVersionsResult {
-    #[serde(
-        rename = "xmlns",
-        default = "s3_namespace",
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub xmlns: String,
+pub use crate::s3::dto::{DeleteMarker, ListObjectVersionsResult, ObjectVersion};
 
-    #[serde(rename = "Name")]
-    pub name: String,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_marker: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version_id_marker: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_key_marker: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_version_id_marker: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_keys: Option<u32>,
-
-    pub is_truncated: bool,
-
-    #[serde(rename = "Version", default)]
-    pub versions: Vec<ObjectVersion>,
-
-    #[serde(rename = "DeleteMarker", default)]
-    pub delete_markers: Vec<DeleteMarker>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct ObjectVersion {
-    pub key: String,
-    pub version_id: String,
-    pub is_latest: bool,
-    pub last_modified: String,
-    pub etag: String,
-    pub size: u64,
-    pub storage_class: Option<String>,
-    pub owner: Option<Owner>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct DeleteMarker {
-    pub key: String,
-    pub version_id: String,
-    pub is_latest: bool,
-    pub last_modified: String,
-    pub owner: Option<Owner>,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ListObjectVersionsOption {
     pub bucket: String,
 
@@ -457,13 +158,13 @@ pub struct ListObjectVersionsOption {
     pub version_id_marker: Option<String>,
 }
 
-#[async_trait::async_trait]
-pub trait ListObjectVersionsHandler {
-    async fn handle(
+/// OPTIMIZED: No async_trait - zero Box allocation
+pub trait ListObjectVersionsHandler: Send + Sync {
+    fn handle(
         &self,
         opt: &ListObjectVersionsOption,
         bucket: &str,
-    ) -> Result<ListObjectVersionsResult, String>;
+    ) -> impl std::future::Future<Output = Result<ListObjectVersionsResult, String>> + Send;
 }
 
 pub fn handle_head_object<T: VRequest, F: VResponse, E: HeadHandler>(
@@ -497,10 +198,11 @@ pub fn handle_head_object<T: VRequest, F: VResponse, E: HeadHandler>(
 /// - `404 Not Found`: Object does not exist
 /// - `405 Method Not Allowed`: Non-GET request
 /// - `416 Range Not Satisfiable`: Invalid range specification
-pub async fn handle_get_object<T: VRequest, F: VResponse>(
+/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+pub async fn handle_get_object<T: VRequest, F: VResponse, H: GetObjectHandler + Send + Sync>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn GetObjectHandler + Send + Sync>,
+    handler: &H,
 ) {
     if req.method() != "GET" {
         resp.set_status(405);
@@ -530,19 +232,14 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
             .and_then(|v| v.parse::<u64>().ok()),
     };
 
-    // Try parse HTTP Range header: bytes=start-end, bytes=start-, bytes=-suffix
     if let Some(rh) = req.get_header("range") {
         if let Some(bytes) = rh.strip_prefix("bytes=") {
             if let Some(suffix_str) = bytes.strip_prefix('-') {
-                // Handle suffix-byte-range-spec: bytes=-N (last N bytes)
                 if let Ok(suffix_len) = suffix_str.parse::<u64>() {
-                    // We'll need to calculate the actual range after we know the file size
-                    // For now, we mark this as a special case
                     opt.range_start = None;
-                    opt.range_end = Some(u64::MAX - suffix_len); // Use special encoding
+                    opt.range_end = Some(u64::MAX - suffix_len);
                 }
             } else {
-                // Handle normal range: bytes=start-end or bytes=start-
                 let mut it = bytes.splitn(2, '-');
                 let s = it.next().unwrap_or("");
                 let e = it.next().unwrap_or("");
@@ -583,25 +280,20 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         }
     };
 
-    //send header info to client
     let total_len = head.content_length.unwrap_or(0) as u64;
 
-    // Default: full content
     let mut status = 200u16;
     let mut resp_len = total_len;
     let header_last_modified = head.last_modified.clone();
     let header_etag = head.etag.clone();
     let header_ct = head.content_type.clone();
 
-    // If range requested, validate and compute
     if opt.range_start.is_some() || opt.range_end.is_some() {
         let (start, end) = if let Some(range_end) = opt.range_end {
             if range_end > u64::MAX / 2 {
-                // This is a suffix-byte-range-spec (bytes=-N)
                 let suffix_len = u64::MAX - range_end;
 
-                // Add reasonable limit: maximum 1GB suffix range
-                const MAX_SUFFIX_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
+                const MAX_SUFFIX_SIZE: u64 = 1024 * 1024 * 1024;
                 if suffix_len > MAX_SUFFIX_SIZE {
                     tracing::warn!(
                         "Suffix range size {} exceeds maximum allowed {}",
@@ -615,14 +307,11 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
                 }
 
                 if suffix_len > total_len {
-                    // If suffix length is larger than file, return entire file
                     (0, total_len.saturating_sub(1))
                 } else {
-                    // Return last N bytes
                     (total_len - suffix_len, total_len.saturating_sub(1))
                 }
             } else {
-                // Normal range processing
                 let start = opt.range_start.unwrap_or(0);
                 if start >= total_len {
                     resp.set_status(416);
@@ -640,7 +329,6 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
                 (start, end)
             }
         } else {
-            // range_start only (bytes=N-)
             let start = opt.range_start.unwrap_or(0);
             if start >= total_len {
                 resp.set_status(416);
@@ -655,7 +343,6 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         resp.set_header("content-range", &format!("bytes {start}-{end}/{total_len}"));
     }
 
-    // Apply headers
     resp.set_header("content-length", resp_len.to_string().as_str());
     if let Some(v) = header_etag {
         resp.set_header("etag", &v)
@@ -669,11 +356,8 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         resp.set_header("last-modified", &v)
     }
 
-    // Set custom metadata as x-amz-meta-* headers
     if let Some(metadata) = head.metadata {
         for (key, value) in metadata {
-            // If key already starts with x-amz-meta-, use as-is
-            // Otherwise, add the x-amz-meta- prefix
             let header_name = if key.starts_with("x-amz-meta-") {
                 key.to_string()
             } else {
@@ -683,29 +367,20 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
         }
     }
 
-    // Keep-alive and Content-Length help avoid chunked encoding and extra handshakes
     resp.set_header("connection", "keep-alive");
     resp.set_status(status);
     resp.send_header();
 
-    let ret = {
-        match resp.get_body_writer().await {
-            Ok(body) => {
-                let ret = handler
-                    .handle(bucket, object, opt, tokio::sync::Mutex::new(Box::pin(body)))
-                    .await;
-                if let Err(err) = ret {
-                    Err(err)
-                } else {
-                    Ok(())
-                }
+    let body_result = resp.get_body_writer().await;
+    match body_result {
+        Ok(mut body) => {
+            if let Err(err) = handler.handle(bucket, object, opt, &mut body).await {
+                log::error!("body handle error {err}");
             }
-            Err(err) => Err(err),
         }
-    };
-    if let Err(err) = ret {
-        log::error!("body handle error {err}");
-        resp.set_status(500);
+        Err(err) => {
+            log::error!("get body writer error {err}");
+        }
     }
 }
 
@@ -733,16 +408,19 @@ pub async fn handle_get_object<T: VRequest, F: VResponse>(
 /// - `404 Not Found`: Bucket does not exist
 /// - `405 Method Not Allowed`: Non-GET request
 /// - `500 Internal Server Error`: Backend listing error
-pub async fn handle_get_list_object_versions<T: VRequest, F: VResponse>(
+/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+pub async fn handle_get_list_object_versions<
+    T: VRequest,
+    F: VResponse,
+    H: ListObjectVersionsHandler + Send + Sync,
+>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn ListObjectVersionsHandler + Send + Sync>,
+    handler: &H,
 ) {
-    // Parse bucket name from URL path
     let url_path = req.url_path();
     let bucket_name = url_path.trim_start_matches('/');
 
-    // Parse query parameters
     let opt = ListObjectVersionsOption {
         bucket: bucket_name.to_string(),
         delimiter: req.get_query("delimiter"),
@@ -753,14 +431,11 @@ pub async fn handle_get_list_object_versions<T: VRequest, F: VResponse>(
         version_id_marker: req.get_query("version-id-marker"),
     };
 
-    // Execute handler
     match handler.handle(&opt, bucket_name).await {
         Ok(result) => {
-            // Set response headers
             resp.set_header("content-type", "application/xml");
             resp.set_status(200);
 
-            // Serialize to XML
             match quick_xml::se::to_string(&result) {
                 Ok(xml) => {
                     if let Ok(mut writer) = resp.get_body_writer().await {
@@ -780,10 +455,14 @@ pub async fn handle_get_list_object_versions<T: VRequest, F: VResponse>(
     }
 }
 
-pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
+pub async fn handle_get_list_object<
+    T: VRequest,
+    F: VResponse,
+    H: ListObjectHandler + Send + Sync,
+>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn ListObjectHandler + Send + Sync>,
+    handler: &H,
 ) {
     if req.method() != "GET" {
         resp.set_status(405);
@@ -812,7 +491,7 @@ pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
         max_keys: req
             .get_query("max-keys")
             .and_then(|v| v.parse::<i32>().ok()),
-        optional_object_attributes: None, //todo: support option_object_attributes on v2
+        optional_object_attributes: None,
         request_payer: req.get_header("x-amz-request-layer"),
         start_after: req.get_query("start-after"),
         encoding_type: req.get_query("encoding-type"),
@@ -887,15 +566,17 @@ pub async fn handle_get_list_object<T: VRequest, F: VResponse>(
     }
 }
 
-#[async_trait::async_trait]
-pub trait ListBucketHandler {
-    async fn handle(&self, opt: &ListBucketsOption) -> Result<Vec<Bucket>, String>;
+pub trait ListBucketHandler: Send + Sync {
+    fn handle(
+        &self,
+        opt: &ListBucketsOption,
+    ) -> impl std::future::Future<Output = Result<Vec<Bucket>, String>> + Send;
 }
-#[async_trait::async_trait]
-pub trait GetBucketLocationHandler {
-    async fn handle(&self, _loc: Option<&str>) -> Result<Option<&'static str>, ()> {
-        Ok(Some("us-west-1"))
-    }
+pub trait GetBucketLocationHandler: Send + Sync {
+    fn handle(
+        &self,
+        loc: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<Option<&'static str>, ()>> + Send;
 }
 #[derive(Debug)]
 pub struct ListBucketsOption {
@@ -933,10 +614,15 @@ pub struct ListBucketsOption {
 /// - `403 Forbidden`: Access denied to bucket listing
 /// - `405 Method Not Allowed`: Non-GET request
 /// - `500 Internal Server Error`: Backend listing error
-pub async fn handle_get_list_buckets<T: VRequest, F: VResponse>(
+/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+pub async fn handle_get_list_buckets<
+    T: VRequest,
+    F: VResponse,
+    H: ListBucketHandler + Send + Sync,
+>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn ListBucketHandler + Send + Sync>,
+    handler: &H,
 ) {
     if req.method() != "GET" {
         resp.set_status(405);
@@ -988,131 +674,18 @@ pub async fn handle_get_list_buckets<T: VRequest, F: VResponse>(
         }
     }
 }
-#[derive(Default)]
-pub struct PutObjectOption {
-    // pub acl: ObjectCannedACL,
-    pub cache_control: Option<String>,
-    pub checksum_algorithm: Option<ChecksumAlgorithm>,
-    pub checksum_crc32: Option<String>,
-    pub checksum_crc32c: Option<String>,
-    pub checksum_crc64nvme: Option<String>,
-    pub checksum_sha1: Option<String>,
-    pub checksum_sha256: Option<String>,
-    pub content_disposition: Option<String>,
-    pub content_encoding: Option<String>,
-    pub content_language: Option<String>,
-    pub content_length: Option<i64>,
-    pub content_md5: Option<String>,
-    pub content_type: Option<String>,
-    pub expected_bucket_owner: Option<String>,
-    pub expires: Option<DateTime>,
-    pub grant_full_control: Option<String>,
-    pub grant_read: Option<String>,
-    pub if_match: Option<String>,
-    pub if_none_match: Option<String>,
-    // pub metadata: Option<HashMap<String, String>>,
-    pub object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
-    pub object_lock_mode: Option<ObjectLockMode>,
-    pub object_lock_retain_until_date: Option<DateTime>,
-    pub request_payer: Option<RequestPayer>,
-    pub storage_class: Option<String>,
-    // pub tagging: Option<String>,
-    // pub website_redirect_location: Option<String>,
-    pub write_offset_bytes: Option<i64>,
-}
 
-impl PutObjectOption {
-    pub fn invalid(&self) -> bool {
-        if self.content_length.is_none() || self.content_md5.is_none() {
-            return false;
-        }
-        true
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub enum ChecksumAlgorithm {
-    Crc32,
-    Crc32c,
-    Sha1,
-    Sha256,
-    Crc64nvme,
-}
-
-impl std::str::FromStr for ChecksumAlgorithm {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "CRC32" => Ok(ChecksumAlgorithm::Crc32),
-            "CRC32C" => Ok(ChecksumAlgorithm::Crc32c),
-            "SHA1" => Ok(ChecksumAlgorithm::Sha1),
-            "SHA256" => Ok(ChecksumAlgorithm::Sha256),
-            "CRC64NVME" => Ok(ChecksumAlgorithm::Crc64nvme),
-            _ => orpc::err_box!("Invalid checksum algorithm: {}", s),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum RequestPayer {
-    Requester,
-}
-
-impl std::str::FromStr for RequestPayer {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "requester" => Ok(RequestPayer::Requester),
-            _ => Err(Error::Other(format!("Invalid RequestPayer value: {}", s))),
-        }
-    }
-}
-#[derive(Debug)]
-pub enum ObjectLockMode {
-    Governance,
-    Compliance,
-}
-impl std::str::FromStr for ObjectLockMode {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "GOVERNANCE" => Ok(ObjectLockMode::Governance),
-            "COMPLIANCE" => Ok(ObjectLockMode::Compliance),
-            _ => Err(Error::Other(format!("Invalid ObjectLockMode value: {}", s))),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum ObjectLockLegalHoldStatus {
-    On,
-    Off,
-}
-
-impl std::str::FromStr for ObjectLockLegalHoldStatus {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "ON" => Ok(ObjectLockLegalHoldStatus::On),
-            "OFF" => Ok(ObjectLockLegalHoldStatus::Off),
-            _ => Err(Error::Other(format!(
-                "Invalid ObjectLockLegalHoldStatus value: {}",
-                s
-            ))),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-pub trait PutObjectHandler {
-    async fn handle(
+pub use crate::s3::dto::{
+    ChecksumAlgorithm, ObjectLockLegalHoldStatus, ObjectLockMode, PutObjectOption, RequestPayer,
+};
+pub trait PutObjectHandler: Send + Sync {
+    fn handle(
         &self,
-        opt: &PutObjectOption,
-        bucket: &str,
-        object: &str,
-        body: &mut (dyn crate::utils::io::PollRead + Unpin + Send),
-    ) -> Result<(), String>;
+        opt: PutObjectOption,
+        bucket: String,
+        object: String,
+        body: crate::utils::io::PollReaderEnum,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
 /// Parse bucket and object names from URL path for PUT operations
@@ -1158,11 +731,15 @@ fn parse_put_object_path(url_path: &str) -> Result<(&str, &str), ()> {
 /// - `403 Forbidden`: Authentication failure
 /// - `405 Method Not Allowed`: Non-PUT request
 /// - `500 Internal Server Error`: Storage backend error
-pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
+pub async fn handle_put_object<
+    T: VRequest + BodyReader,
+    F: VResponse,
+    H: PutObjectHandler + Send + Sync,
+>(
     mut v4head: crate::auth::sig_v4::V4Head,
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn PutObjectHandler + Send + Sync>,
+    handler: &H,
 ) {
     if req.method() != "PUT" {
         resp.set_status(405);
@@ -1170,7 +747,6 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         return;
     }
 
-    // Parse bucket and object from URL path
     let url_path = req.url_path();
     let (bucket, object) = match parse_put_object_path(&url_path) {
         Ok((bucket, object)) => (bucket, object),
@@ -1210,7 +786,6 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
         grant_read: req.get_header("x-amz-grant-read"),
         if_match: req.get_header("if-match"),
         if_none_match: req.get_header("if-none-match"),
-        // metadata: todo!(),
         object_lock_legal_hold_status: req
             .get_header("x-amz-object-lock-legal-hold-status")
             .and_then(|v| ObjectLockLegalHoldStatus::from_str(&v).ok()),
@@ -1229,14 +804,11 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
             .get_header("x-amz-request-payer")
             .and_then(|v| RequestPayer::from_str(&v).ok()),
         storage_class: req.get_header("x-amz-storage-class"),
-        // tagging: todo!(),
-        // website_redirect_location: todo!(),
         write_offset_bytes: req
             .get_header("x-amz-write-offset-bytes")
             .and_then(|v| v.parse::<i64>().ok()),
     };
 
-    //todo:parse from body,then derive into handle
     enum ContentSha256 {
         Hash(String),
         Streaming,
@@ -1244,7 +816,6 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
     }
 
     let content_sha256 = req.get_header("x-amz-content-sha256").map_or_else(
-        // Default to UNSIGNED-PAYLOAD for requests without x-amz-content-sha256 (e.g., V2 requests)
         || Some(ContentSha256::Unsigned),
         |content_sha256| {
             if content_sha256.as_str() == "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" {
@@ -1289,11 +860,12 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
             if content_length <= 10 << 20 {
                 match read_body_to_vec(r, &cs, content_length).await {
                     Ok(vec) => {
-                        let mut reader = InMemoryPollReader {
-                            data: vec,
-                            offset: 0,
-                        };
-                        handler.handle(&opt, bucket, object, &mut reader).await
+                        let reader = crate::utils::io::PollReaderEnum::InMemory(
+                            crate::utils::io::InMemoryPollReader::new(vec),
+                        );
+                        handler
+                            .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
+                            .await
                     }
                     Err(err) => {
                         use crate::error::BodyParseError;
@@ -1348,7 +920,10 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
                                 resp.send_header();
                                 return;
                             }
-                            handler.handle(&opt, bucket, object, &mut fd).await
+                            let reader = crate::utils::io::PollReaderEnum::File(fd);
+                            handler
+                                .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
+                                .await
                         }
                         Err(err) => match err {
                             ParseBodyError::HashMismatch => {
@@ -1433,8 +1008,11 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
                 .open(file_name.as_str())
                 .await
             {
-                Ok(mut fd) => {
-                    let ret = handler.handle(&opt, bucket, object, &mut fd).await;
+                Ok(fd) => {
+                    let reader = crate::utils::io::PollReaderEnum::File(fd);
+                    let ret = handler
+                        .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
+                        .await;
                     orpc::try_log!(tokio::fs::remove_file(file_name.as_str()).await, ());
                     ret
                 }
@@ -1503,8 +1081,11 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
                 .open(file_name.as_str())
                 .await
             {
-                Ok(mut fd) => {
-                    let ret = handler.handle(&opt, bucket, object, &mut fd).await;
+                Ok(fd) => {
+                    let reader = crate::utils::io::PollReaderEnum::File(fd);
+                    let ret = handler
+                        .handle(opt.clone(), bucket.to_string(), object.to_string(), reader)
+                        .await;
                     let _ = tokio::fs::remove_file(file_name.as_str()).await;
                     ret
                 }
@@ -1533,9 +1114,13 @@ pub async fn handle_put_object<T: VRequest + BodyReader, F: VResponse>(
 }
 pub struct DeleteObjectOption {}
 
-#[async_trait::async_trait]
-pub trait DeleteObjectHandler {
-    async fn handle(&self, opt: &DeleteObjectOption, object: &str) -> Result<(), String>;
+/// OPTIMIZED: No async_trait - zero Box allocation
+pub trait DeleteObjectHandler: Send + Sync {
+    fn handle(
+        &self,
+        opt: &DeleteObjectOption,
+        object: &str,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
 // ===== DeleteObjects (Batch) =====
@@ -1573,10 +1158,15 @@ struct DeletedEntry {
 }
 
 /// Handle S3 DeleteObjects (POST ?delete) batch deletion
-pub async fn handle_post_delete_objects<T: VRequestPlus, F: VResponse>(
+/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+pub async fn handle_post_delete_objects<
+    T: VRequestPlus,
+    F: VResponse,
+    H: DeleteObjectHandler + Send + Sync,
+>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn DeleteObjectHandler + Send + Sync>,
+    handler: &H,
 ) {
     // Parse bucket name from URL path
     let url_path = req.url_path();
@@ -1674,10 +1264,15 @@ pub async fn handle_post_delete_objects<T: VRequestPlus, F: VResponse>(
 ///
 /// ## S3 Behavior Note
 /// S3 returns 204 even if the object doesn't exist, for security reasons
-pub async fn handle_delete_object<T: VRequest, F: VResponse>(
+/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+pub async fn handle_delete_object<
+    T: VRequest,
+    F: VResponse,
+    H: DeleteObjectHandler + Send + Sync,
+>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn DeleteObjectHandler + Send + Sync>,
+    handler: &H,
 ) {
     let opt = DeleteObjectOption {};
     let url_path = req.url_path();
@@ -1692,45 +1287,46 @@ pub struct MultiUploadObjectCompleteOption {
     pub if_match: Option<String>,
     pub if_none_match: Option<String>,
 }
-pub trait MultiUploadObjectHandler {
-    fn handle_create_session<'a>(
-        &'a self,
-        bucket: &'a str,
-        key: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>>;
 
-    ///return etag
-    fn handle_upload_part<'a>(
-        &'a self,
-        bucket: &'a str,
-        key: &'a str,
-        upload_id: &'a str,
+/// Multipart upload handler - uses async_trait for stack safety
+///
+/// Deep async call chains require heap-allocated futures to prevent stack overflow.
+/// This is a necessary trade-off: async_trait boxes futures, but prevents crashes.
+/// AsyncReadEnum still provides zero-allocation for body reading.
+#[async_trait::async_trait]
+pub trait MultiUploadObjectHandler: Send + Sync {
+    async fn handle_create_session(&self, bucket: String, key: String) -> Result<String, ()>;
+
+    async fn handle_upload_part(
+        &self,
+        bucket: String,
+        key: String,
+        upload_id: String,
         part_number: u32,
-        body: &'a mut (dyn tokio::io::AsyncRead + Unpin + Send),
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>>;
+        body: crate::utils::io::AsyncReadEnum,
+    ) -> Result<String, ()>;
 
-    fn handle_complete<'a>(
-        &'a self,
-        bucket: &'a str,
-        key: &'a str,
-        upload_id: &'a str,
-        //(etag,part number)
-        data: &'a [(&'a str, u32)],
+    async fn handle_complete(
+        &self,
+        bucket: String,
+        key: String,
+        upload_id: String,
+        data: Vec<(String, u32)>,
         opts: MultiUploadObjectCompleteOption,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<String, ()>>>>;
+    ) -> Result<String, ()>;
 
-    fn handle_abort<'a>(
-        &'a self,
-        bucket: &'a str,
-        key: &'a str,
-        upload_id: &'a str,
-    ) -> std::pin::Pin<Box<dyn 'a + Send + std::future::Future<Output = Result<(), ()>>>>;
+    async fn handle_abort(&self, bucket: String, key: String, upload_id: String) -> Result<(), ()>;
 }
 
-pub async fn handle_multipart_create_session<T: VRequest, F: VResponse>(
+/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+pub async fn handle_multipart_create_session<
+    T: VRequest,
+    F: VResponse,
+    H: MultiUploadObjectHandler + Send + Sync,
+>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn MultiUploadObjectHandler + Send + Sync>,
+    handler: &H,
 ) {
     let raw_path = req.url_path();
     let raw = raw_path
@@ -1745,7 +1341,10 @@ pub async fn handle_multipart_create_session<T: VRequest, F: VResponse>(
 
     let bucket = raw[0];
     let key = raw[1];
-    match handler.handle_create_session(bucket, key).await {
+    match handler
+        .handle_create_session(bucket.to_string(), key.to_string())
+        .await
+    {
         Ok(upload_id) => {
             #[derive(Debug, serde::Serialize)]
             #[serde(rename_all = "PascalCase")]
@@ -1794,10 +1393,15 @@ pub async fn handle_multipart_create_session<T: VRequest, F: VResponse>(
     }
 }
 
-pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker, F: VResponse>(
+/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+pub async fn handle_multipart_upload_part<
+    T: VRequest + BodyReader + HeaderTaker,
+    F: VResponse,
+    H: MultiUploadObjectHandler + Send + Sync,
+>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn MultiUploadObjectHandler + Send + Sync>,
+    handler: &H,
 ) {
     let upload_id = req.get_query("uploadId");
     let part_number = req.get_query("partNumber");
@@ -1857,20 +1461,28 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
     };
 
     let ret = match body {
-        StreamType::File(mut file) => {
+        StreamType::File(file) => {
+            let body = crate::utils::io::AsyncReadEnum::File(file);
             handler
-                .handle_upload_part(raw[0], raw[1], upload_id.as_str(), part_number, &mut file)
+                .handle_upload_part(
+                    raw[0].to_string(),
+                    raw[1].to_string(),
+                    upload_id.clone(),
+                    part_number,
+                    body,
+                )
                 .await
         }
 
-        StreamType::Buff(mut buf_reader) => {
+        StreamType::Buff(buf_reader) => {
+            let body = crate::utils::io::AsyncReadEnum::BufCursor(buf_reader);
             handler
                 .handle_upload_part(
-                    raw[0],
-                    raw[1],
-                    upload_id.as_str(),
+                    raw[0].to_string(),
+                    raw[1].to_string(),
+                    upload_id.clone(),
                     part_number,
-                    &mut buf_reader,
+                    body,
                 )
                 .await
         }
@@ -1888,10 +1500,14 @@ pub async fn handle_multipart_upload_part<T: VRequest + BodyReader + HeaderTaker
     }
 }
 
-pub async fn handle_multipart_complete_session<T: VRequestPlus, F: VResponse>(
+pub async fn handle_multipart_complete_session<
+    T: VRequestPlus,
+    F: VResponse,
+    H: MultiUploadObjectHandler + Send + Sync,
+>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn MultiUploadObjectHandler + Send + Sync>,
+    handler: &H,
 ) {
     let raw_path = req.url_path();
     let raw = raw_path
@@ -1933,14 +1549,14 @@ pub async fn handle_multipart_complete_session<T: VRequestPlus, F: VResponse>(
                         let data = upload_request
                             .parts
                             .iter()
-                            .map(|data| (data.etag.as_str(), data.part_number))
-                            .collect::<Vec<(&str, u32)>>();
+                            .map(|data| (data.etag.clone(), data.part_number))
+                            .collect::<Vec<(String, u32)>>();
                         match handler
                             .handle_complete(
-                                bucket,
-                                key,
-                                &upload_id,
-                                &data,
+                                bucket.to_string(),
+                                key.to_string(),
+                                upload_id.clone(),
+                                data,
                                 MultiUploadObjectCompleteOption {
                                     if_match: None,
                                     if_none_match: None,
@@ -2018,10 +1634,15 @@ pub async fn handle_multipart_complete_session<T: VRequestPlus, F: VResponse>(
     }
 }
 
-pub async fn handle_multipart_abort_session<T: VRequest, F: VResponse>(
+/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+pub async fn handle_multipart_abort_session<
+    T: VRequest,
+    F: VResponse,
+    H: MultiUploadObjectHandler + Send + Sync,
+>(
     _req: T,
     _resp: &mut F,
-    _handler: &std::sync::Arc<dyn MultiUploadObjectHandler + Send + Sync>,
+    _handler: &H,
 ) {
     todo!()
 }
@@ -2249,9 +1870,13 @@ impl Display for BucketLocationConstraint {
     }
 }
 
-#[async_trait::async_trait]
-pub trait CreateBucketHandler {
-    async fn handle(&self, opt: &CreateBucketOption, bucket: &str) -> Result<(), String>;
+/// OPTIMIZED: No async_trait - zero Box allocation
+pub trait CreateBucketHandler: Send + Sync {
+    fn handle(
+        &self,
+        opt: &CreateBucketOption,
+        bucket: &str,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
 /// Handle S3 CREATE Bucket requests with region and configuration support
@@ -2277,10 +1902,15 @@ pub trait CreateBucketHandler {
 /// - `409 Conflict`: Bucket already exists
 /// - `405 Method Not Allowed`: Non-PUT request
 /// - `500 Internal Server Error`: Backend creation error
-pub async fn handle_create_bucket<T: VRequest, F: VResponse>(
+/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+pub async fn handle_create_bucket<
+    T: VRequest,
+    F: VResponse,
+    H: CreateBucketHandler + Send + Sync,
+>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn CreateBucketHandler + Send + Sync>,
+    handler: &H,
 ) {
     if req.method() != "PUT" {
         resp.set_status(405);
@@ -2324,9 +1954,13 @@ pub struct DeleteBucketOption {
     pub expected_owner: Option<String>,
 }
 
-#[async_trait::async_trait]
-pub trait DeleteBucketHandler {
-    async fn handle(&self, opt: &DeleteBucketOption, bucket: &str) -> Result<(), String>;
+/// OPTIMIZED: No async_trait - zero Box allocation
+pub trait DeleteBucketHandler: Send + Sync {
+    fn handle(
+        &self,
+        opt: &DeleteBucketOption,
+        bucket: &str,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }
 
 /// Handle S3 DELETE Bucket requests with safety validation
@@ -2352,10 +1986,15 @@ pub trait DeleteBucketHandler {
 /// - `409 Conflict`: Bucket is not empty
 /// - `405 Method Not Allowed`: Non-DELETE request
 /// - `500 Internal Server Error`: Backend deletion error
-pub async fn handle_delete_bucket<T: VRequest, F: VResponse>(
+/// - OPTIMIZED: Generic handler parameter eliminates async_trait Box allocation
+pub async fn handle_delete_bucket<
+    T: VRequest,
+    F: VResponse,
+    H: DeleteBucketHandler + Send + Sync,
+>(
     req: T,
     resp: &mut F,
-    handler: &std::sync::Arc<dyn DeleteBucketHandler + Send + Sync>,
+    handler: &H,
 ) {
     if req.method() != "DELETE" {
         resp.set_status(405);
@@ -2535,26 +2174,6 @@ impl crate::utils::io::PollRead for tokio::fs::File {
         }
     }
 }
-struct InMemoryPollReader {
-    data: Vec<u8>,
-    offset: usize,
-}
-
-#[async_trait::async_trait]
-impl crate::utils::io::PollRead for InMemoryPollReader {
-    async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
-        if self.offset >= self.data.len() {
-            return Ok(None);
-        }
-        let remaining = self.data.len() - self.offset;
-        // read up to 64KB per poll
-        let to_read = remaining.min(64 * 1024);
-        let chunk = self.data[self.offset..self.offset + to_read].to_vec();
-        self.offset += to_read;
-        Ok(Some(chunk))
-    }
-}
-
 // Helper: read entire body into Vec<u8> and verify sha256
 /// Core body reading and validation logic
 ///

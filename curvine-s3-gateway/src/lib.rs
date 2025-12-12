@@ -55,51 +55,16 @@ use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 use orpc::runtime::RpcRuntime;
 
+/// Register S3 handlers with concrete type - zero dynamic dispatch overhead
+///
+/// OPTIMIZATION: Previously registered 11 trait objects (Arc<dyn Trait>),
+/// each causing Box allocation on every async method call.
+/// Now we register a single concrete type, eliminating all dynamic dispatch.
 fn register_s3_handlers(
     router: axum::Router,
     handlers: Arc<s3::handlers::S3Handlers>,
 ) -> axum::Router {
-    router
-        .layer(axum::Extension(
-            handlers.clone() as Arc<dyn crate::s3::s3_api::PutObjectHandler + Send + Sync>
-        ))
-        .layer(axum::Extension(
-            handlers.clone() as Arc<dyn crate::s3::s3_api::HeadHandler + Send + Sync>
-        ))
-        .layer(axum::Extension(
-            handlers.clone() as Arc<dyn crate::s3::s3_api::ListBucketHandler + Send + Sync>
-        ))
-        .layer(axum::Extension(handlers.clone()
-            as Arc<
-                dyn crate::s3::s3_api::CreateBucketHandler + Send + Sync,
-            >))
-        .layer(axum::Extension(handlers.clone()
-            as Arc<
-                dyn crate::s3::s3_api::DeleteBucketHandler + Send + Sync,
-            >))
-        .layer(axum::Extension(handlers.clone()
-            as Arc<
-                dyn crate::s3::s3_api::DeleteObjectHandler + Send + Sync,
-            >))
-        .layer(axum::Extension(
-            handlers.clone() as Arc<dyn crate::s3::s3_api::GetObjectHandler + Send + Sync>
-        ))
-        .layer(axum::Extension(handlers.clone()
-            as Arc<
-                dyn crate::s3::s3_api::GetBucketLocationHandler + Send + Sync,
-            >))
-        .layer(axum::Extension(handlers.clone()
-            as Arc<
-                dyn crate::s3::s3_api::MultiUploadObjectHandler + Send + Sync,
-            >))
-        .layer(axum::Extension(
-            handlers.clone() as Arc<dyn crate::s3::s3_api::ListObjectHandler + Send + Sync>
-        ))
-        .layer(axum::Extension(handlers.clone()
-            as Arc<
-                dyn crate::s3::s3_api::ListObjectVersionsHandler + Send + Sync,
-            >))
-        .layer(axum::Extension(handlers))
+    router.layer(axum::Extension(handlers))
 }
 
 async fn init_s3_authentication(

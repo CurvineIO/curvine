@@ -140,17 +140,18 @@ impl VRequestPlus for Request {
         })
     }
 }
-pub struct BodyReader(body::BodyDataStream);
+pub struct BodyReader(pub(crate) body::BodyDataStream);
 
-#[async_trait::async_trait]
-impl crate::utils::io::PollRead for BodyReader {
-    async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+impl BodyReader {
+    /// Direct implementation - used by both trait impl and enum dispatch
+    /// This avoids async_trait boxing when called directly
+    #[inline]
+    pub async fn poll_read_impl(&mut self) -> Result<Option<Vec<u8>>, String> {
         let data = self.0.next().await;
         match data {
             Some(ret) => match ret {
                 Ok(ret) => {
                     let vec_data = ret.to_vec();
-                    // Reduce noisy logs in hot path
                     Ok(Some(vec_data))
                 }
                 Err(err) => Err(err.to_string()),
@@ -160,6 +161,13 @@ impl crate::utils::io::PollRead for BodyReader {
                 Ok(None)
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::utils::io::PollRead for BodyReader {
+    async fn poll_read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        self.poll_read_impl().await
     }
 }
 
@@ -274,15 +282,18 @@ impl<'b> crate::utils::io::PollWrite for BodyWriter<'b> {
     }
 }
 
-#[async_trait::async_trait]
+/// OPTIMIZED: No async_trait - zero allocation
 impl crate::s3::s3_api::BodyWriter for Response {
     type BodyWriter<'a>
         = BodyWriter<'a>
     where
         Self: 'a;
 
-    async fn get_body_writer(&mut self) -> Result<Self::BodyWriter<'_>, String> {
-        Ok(BodyWriter(&mut self.body))
+    fn get_body_writer(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Self::BodyWriter<'_>, String>> + Send {
+        let writer = BodyWriter(&mut self.body);
+        async move { Ok(writer) }
     }
 }
 
