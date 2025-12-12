@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod evictor;
+pub mod lfu;
 pub mod types;
 
 pub use types::{EvictPlan, EvictionConf, EvictionMode, EvictionPolicy};
