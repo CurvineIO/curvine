@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::master::meta::inode::InodeView;
+use crate::master::meta::LockMeta;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
-use curvine_common::state::{BlockLocation, MountInfo};
+use curvine_common::state::{BlockLocation, FileLock, MountInfo};
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use rocksdb::{DBIteratorWithThreadMode, WriteBatchWithTransaction, DB};
@@ -28,7 +29,10 @@ impl RocksInodeStore {
     pub const CF_EDGES: &'static str = "edges";
     pub const CF_BLOCK: &'static str = "block";
     pub const CF_LOCATION: &'static str = "location";
-    pub const CF_MOUNTPOINT: &'static str = "mountpoints";
+    pub const CF_COMMON: &'static str = "common";
+
+    pub const PREFIX_MOUNT: u8 = 0x01;
+    pub const PREFIX_LOCK: u8 = 0x02;
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
@@ -36,7 +40,7 @@ impl RocksInodeStore {
             .add_cf(Self::CF_EDGES)
             .add_cf(Self::CF_BLOCK)
             .add_cf(Self::CF_LOCATION)
-            .add_cf(Self::CF_MOUNTPOINT);
+            .add_cf(Self::CF_COMMON);
         let db = DBEngine::new(conf, format)?;
         Ok(Self { db })
     }
@@ -137,20 +141,20 @@ impl RocksInodeStore {
     }
 
     pub fn add_mountpoint(&self, id: u32, entry: &MountInfo) -> CommonResult<()> {
-        let key = RocksUtils::u32_to_bytes(id);
+        let key = RocksUtils::u8_u32_to_bytes(Self::PREFIX_MOUNT, id);
         let value = Serde::serialize(entry).unwrap();
-        self.db.put_cf(RocksInodeStore::CF_MOUNTPOINT, key, value)
+        self.db.put_cf(Self::CF_COMMON, key, value)
     }
 
     pub fn remove_mountpoint(&self, id: u32) -> CommonResult<()> {
-        let key = RocksUtils::u32_to_bytes(id);
-        self.db.delete_cf(RocksInodeStore::CF_MOUNTPOINT, key)
+        let key = RocksUtils::u8_u32_to_bytes(Self::PREFIX_MOUNT, id);
+        self.db.delete_cf(Self::CF_COMMON, key)
     }
 
     pub fn get_mount_info(&self, id: u32) -> CommonResult<Option<MountInfo>> {
-        let bytes = self
-            .db
-            .get_cf(Self::CF_MOUNTPOINT, RocksUtils::u32_to_bytes(id))?;
+        let key = RocksUtils::u8_u32_to_bytes(Self::PREFIX_MOUNT, id);
+
+        let bytes = self.db.get_cf(Self::CF_COMMON, key)?;
 
         match bytes {
             None => Ok(None),
@@ -163,7 +167,7 @@ impl RocksInodeStore {
     }
 
     pub fn get_mount_table(&self) -> CommonResult<Vec<MountInfo>> {
-        let iter = self.db.scan(Self::CF_MOUNTPOINT)?;
+        let iter = self.db.prefix_scan(Self::CF_COMMON, [Self::PREFIX_MOUNT])?;
         let mut vec = Vec::with_capacity(8);
         for item in iter {
             let bytes = item?;
@@ -172,6 +176,28 @@ impl RocksInodeStore {
         }
 
         Ok(vec)
+    }
+
+    pub fn get_locks(&self, id: i64) -> CommonResult<LockMeta> {
+        let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_LOCK, id);
+        let bytes = self.db.get_cf(Self::CF_COMMON, key)?;
+
+        if let Some(bytes) = bytes {
+            let locks: Vec<FileLock> = Serde::deserialize(&bytes)?;
+            Ok(LockMeta::with_vec(locks))
+        } else {
+            Ok(LockMeta::default())
+        }
+    }
+
+    pub fn set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
+        let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_LOCK, id);
+        if lock.is_empty() {
+            self.db.delete_cf(RocksInodeStore::CF_COMMON, key)
+        } else {
+            let value = Serde::serialize(&lock)?;
+            self.db.put_cf(RocksInodeStore::CF_COMMON, key, value)
+        }
     }
 
     pub fn get_rocksdb_memory(&self) -> CommonResult<Vec<(String, u64)>> {
