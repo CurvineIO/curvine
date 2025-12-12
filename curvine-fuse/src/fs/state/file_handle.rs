@@ -17,22 +17,26 @@ use crate::fs::state::NodeState;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseError, FuseResult};
-use curvine_common::state::FileStatus;
+use curvine_common::state::{FileStatus, LockFlags};
 use orpc::sys::RawPtr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+#[derive(Debug, Default)]
+struct HandleLock {
+    flock_owner_id: Option<u64>,
+    plock_owner_id: Option<u64>,
+}
 
 pub struct FileHandle {
     pub ino: u64,
     pub fh: u64,
 
-    pub locks: u8,       // Lock status flags
-    pub lock_owner: u64, // Owner ID of flock
-    pub ofd_owner: u64,  // Owner ID of OFD lock
-
     pub reader: Option<RawPtr<FuseReader>>,
     pub writer: Option<Arc<Mutex<FuseWriter>>>, // Writer uses Arc for global sharing
     pub status: FileStatus,
+
+    fh_locks: std::sync::Mutex<HandleLock>,
 }
 
 impl FileHandle {
@@ -46,12 +50,10 @@ impl FileHandle {
         Self {
             ino,
             fh,
-            locks: 0,
-            lock_owner: 0,
-            ofd_owner: 0,
             reader,
             writer,
             status,
+            fh_locks: std::sync::Mutex::new(HandleLock::default()),
         }
     }
 
@@ -120,5 +122,31 @@ impl FileHandle {
 
     pub fn status(&self) -> &FileStatus {
         &self.status
+    }
+
+    // Add lock, only save the owner_id of the first lock
+    pub fn add_lock(&self, lock_flags: LockFlags, owner_id: u64) {
+        let mut fh_locks = self.fh_locks.lock().unwrap();
+
+        match lock_flags {
+            LockFlags::Plock => {
+                fh_locks.plock_owner_id.get_or_insert(owner_id);
+            }
+
+            LockFlags::Flock => {
+                fh_locks.flock_owner_id.get_or_insert(owner_id);
+            }
+        }
+    }
+
+    // Remove lock, return owner_id
+    pub fn remove_lock(&self, typ: LockFlags) -> Option<u64> {
+        let mut fh_locks = self.fh_locks.lock().unwrap();
+
+        match typ {
+            LockFlags::Plock => fh_locks.plock_owner_id.take(),
+
+            LockFlags::Flock => fh_locks.flock_owner_id.take(),
+        }
     }
 }

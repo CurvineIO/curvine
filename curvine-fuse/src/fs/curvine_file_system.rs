@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::fs::operator::*;
-use crate::fs::state::NodeState;
+use crate::fs::state::{FileHandle, NodeState};
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
 use crate::session::{FuseBuf, FuseResponse};
@@ -24,14 +24,14 @@ use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileStatus, MkdirOptsBuilder, OpenFlags,
-    SetAttrOpts,
+    CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileLock, FileStatus, LockFlags, LockType,
+    MkdirOptsBuilder, OpenFlags, SetAttrOpts,
 };
 use log::{debug, error, info, warn};
-use orpc::common::ByteUnit;
+use orpc::common::{ByteUnit, TimeSpent};
 use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
-use orpc::{sys, try_option};
+use orpc::{sys, ternary, try_option};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::bytes::BytesMut;
@@ -159,6 +159,43 @@ impl CurvineFileSystem {
 
     fn new_dot_status(name: &str) -> FileStatus {
         FileStatus::with_name(FUSE_UNKNOWN_INO as i64, name.to_string(), true)
+    }
+
+    fn to_file_lock(&self, arg: &fuse_lk_in) -> FileLock {
+        let client_id = self.fs.cv().fs_context().clone_client_name();
+        FileLock {
+            client_id,
+            owner_id: arg.owner,
+            pid: arg.lk.pid,
+            lock_type: LockType::from(arg.lk.typ as u8),
+            lock_flags: LockFlags::from(arg.lk_flags as u8),
+            start: arg.lk.start,
+            end: arg.lk.end,
+            ..Default::default()
+        }
+    }
+
+    async fn fs_unlock(&self, handler: &FileHandle, flags: LockFlags) -> FuseResult<()> {
+        if let Some(owner_id) = handler.remove_lock(flags) {
+            let client_id = self.fs.cv().fs_context().clone_client_name();
+            let path = Path::from_str(&handler.status.path)?;
+
+            let mut lock = FileLock {
+                client_id,
+                owner_id,
+                lock_type: LockType::UnLock,
+                lock_flags: flags,
+                ..Default::default()
+            };
+            if flags == LockFlags::Plock {
+                lock.start = 0;
+                lock.end = u64::MAX;
+            }
+
+            self.fs.set_lock(&path, lock).await?;
+        }
+
+        Ok(())
     }
 
     async fn fs_list_status(&self, parent: u64, path: &Path) -> FuseResult<Vec<FileStatus>> {
@@ -1091,15 +1128,18 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn flush(&self, op: Flush<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+        self.fs_unlock(&handle, LockFlags::Plock).await?;
         handle.flush(Some(reply)).await
     }
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.remove_handle(op.header.nodeid, op.arg.fh);
         if let Some(handle) = handle {
+            self.fs_unlock(&handle, LockFlags::Flock).await?;
+            self.fs_unlock(&handle, LockFlags::Plock).await?;
             handle.complete(Some(reply)).await
         } else {
-            err_fuse!(libc::EIO)
+            err_fuse!(libc::EBADF)
         }
     }
 
@@ -1316,6 +1356,76 @@ impl fs::FileSystem for CurvineFileSystem {
             self.mkdir(op).await
         } else {
             err_fuse!(libc::EPERM)
+        }
+    }
+
+    async fn get_lk(&self, op: GetLk<'_>) -> FuseResult<fuse_lk_out> {
+        let path = self.state.get_path(op.header.nodeid)?;
+        let lock = self.to_file_lock(op.arg);
+        let client_id = lock.client_id.clone();
+
+        let conflict = self.fs.get_lock(&path, lock).await?;
+        let lk = match conflict {
+            Some(lk) => fuse_file_lock {
+                start: lk.start,
+                end: lk.end,
+                typ: lk.lock_type as u32,
+                pid: ternary!(client_id == lk.client_id, lk.pid, 0),
+            },
+
+            None => fuse_file_lock {
+                typ: LockType::UnLock as u32,
+                ..Default::default()
+            },
+        };
+
+        Ok(fuse_lk_out { lk })
+    }
+
+    async fn set_lk(&self, op: SetLk<'_>) -> FuseResult<()> {
+        let path = self.state.get_path(op.header.nodeid)?;
+        let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+
+        let lock = self.to_file_lock(op.arg);
+        let (flag, owner_id) = (lock.lock_flags, lock.owner_id);
+
+        let conflict = self.fs.set_lock(&path, lock).await?;
+        if conflict.is_none() {
+            handle.add_lock(flag, owner_id);
+            Ok(())
+        } else {
+            err_fuse!(libc::EAGAIN)
+        }
+    }
+
+    async fn set_lkw(&self, op: SetLkW<'_>) -> FuseResult<()> {
+        let path = self.state.get_path(op.header.nodeid)?;
+        let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
+
+        let conf = &self.fs.conf().client;
+        let check_interval_min = conf.sync_check_interval_min;
+        let check_interval_max = conf.sync_check_interval_max;
+        let log_ticks = conf.sync_check_log_tick;
+
+        let mut ticks = 0;
+        let time = TimeSpent::new();
+
+        let lock = self.to_file_lock(op.arg);
+        // @todo needs to implement interruption.
+        loop {
+            let conflict = self.fs.set_lock(&path, lock.clone()).await?;
+            if conflict.is_none() {
+                handle.add_lock(lock.lock_flags, lock.owner_id);
+                return Ok(());
+            }
+
+            ticks += 1;
+            let sleep_time = check_interval_max.min(check_interval_min * ticks);
+            tokio::time::sleep(sleep_time).await;
+
+            if ticks % log_ticks == 0 {
+                info!("waiting lock for {}, elapsed: {} ms", path, time.used_ms());
+            }
         }
     }
 }

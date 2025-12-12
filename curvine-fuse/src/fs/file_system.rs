@@ -181,4 +181,16 @@ pub trait FileSystem: Send + Sync + 'static {
     }
 
     fn unmount(&self) {}
+
+    fn get_lk(&self, op: GetLk<'_>) -> impl Future<Output = FuseResult<fuse_lk_out>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
+    }
+
+    fn set_lk(&self, op: SetLk<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
+    }
+
+    fn set_lkw(&self, op: SetLkW<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
+    }
 }
