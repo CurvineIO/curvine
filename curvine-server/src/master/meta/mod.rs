@@ -27,4 +27,7 @@ pub use self::inode_id::InodeId;
 pub mod store;
 
 mod block_meta;
-pub use block_meta::BlockMeta;
+pub use self::block_meta::BlockMeta;
+
+mod lock_meta;
+pub use self::lock_meta::LockMeta;
