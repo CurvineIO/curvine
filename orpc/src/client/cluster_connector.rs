@@ -21,6 +21,7 @@ use crate::message::{Message, MessageBuilder, RefMessage};
 use crate::runtime::Runtime;
 use crate::sync::FastDashMap;
 use crate::{err_box, err_msg, CommonError};
+use futures::future::select_ok;
 use log::warn;
 use prost::Message as PMessage;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -183,7 +184,6 @@ impl ClusterConnector {
         }
     }
 
-    // Send a retry request to the specified node.
     pub async fn retry_rpc<E>(&self, id: u64, msg: Message) -> Result<Message, E>
     where
         E: ErrorExt + From<IOError> + From<CommonError>,
@@ -227,9 +227,9 @@ impl ClusterConnector {
         let mut last_error: Option<E> = None;
         let msg = msg.into_arc();
 
-        // Send a request to the current leader node.
+        // Step 1: Try current leader first (fast path)
         if let Some(id) = self.leader_id() {
-            match self.timeout_rpc(id, msg.clone()).await {
+            match self.timeout_rpc::<E>(id, msg.clone()).await {
                 Ok(v) => return Ok(v),
 
                 Err((retry, e)) => {
@@ -242,43 +242,77 @@ impl ClusterConnector {
                             self.get_addr_string(id),
                             e
                         );
+
+                        // Optimization: If NotLeaderMaster error, trigger concurrent RPC
+                        if self.is_not_leader_master(&e) {
+                            warn!(
+                                "Rpc({}) detected NotLeaderMaster, starting concurrent polling...",
+                                msg.req_id()
+                            );
+                            if let crate::message::BoxMessage::Arc(arc_msg) = msg.clone() {
+                                match self.concurrent_rpc::<E>(arc_msg).await {
+                                    Ok((node_id, response)) => {
+                                        warn!(
+                                            "Rpc({}) succeeded via concurrent polling on node {}",
+                                            msg.req_id(),
+                                            self.get_addr_string(node_id)
+                                        );
+                                        self.change_leader(node_id);
+                                        return Ok(response);
+                                    }
+                                    Err(_) => {
+                                        warn!(
+                                            "Rpc({}) concurrent polling failed, falling back to sequential polling",
+                                            msg.req_id()
+                                        );
+                                        // Fallback to sequential polling
+                                    }
+                                }
+                            }
+                        }
+
                         let _ = last_error.insert(e);
                     }
                 }
             }
         }
 
-        // Poll to send requests to all nodes until timeout.
-        // If the client returns that the current node is not the leader, we still perform polling and retry.
-        // At this time, the server may be performing the master selection operation, and it is not advisable to fail directly to return.
+        // Step 2: Sequential polling with immediate switching (fallback)
+        // Optimization: Only wait between rounds, not between nodes in the same round
         let mut policy = self.retry_builder.build();
         let node_list = self.node_list(false);
-        let mut index = 0;
+        let mut node_iter = node_list.iter().copied().cycle();
+
         while policy.attempt().await {
-            let id = node_list[index];
-            index = (index + 1) % node_list.len();
+            // In each round, try all nodes immediately without waiting
+            for _ in 0..node_list.len() {
+                let id = node_iter.next().expect("cycle iterator never ends");
 
-            match self.timeout_rpc(id, msg.clone()).await {
-                Ok(v) => {
-                    self.change_leader(id);
-                    return Ok(v);
-                }
-
-                Err((retry, e)) => {
-                    if !retry {
+                match self.timeout_rpc::<E>(id, msg.clone()).await {
+                    Ok(v) => {
                         self.change_leader(id);
-                        return Err(e);
-                    } else {
-                        warn!(
-                            "Rpc({}) call failed to active master {}: {}",
-                            msg.req_id(),
-                            self.get_addr_string(id),
-                            e
-                        );
-                        let _ = last_error.insert(e);
+                        return Ok(v);
+                    }
+
+                    Err((retry, e)) => {
+                        if !retry {
+                            self.change_leader(id);
+                            return Err(e);
+                        } else {
+                            warn!(
+                                "Rpc({}) failed at {}, switching to next node: {}",
+                                msg.req_id(),
+                                self.get_addr_string(id),
+                                e
+                            );
+                            let _ = last_error.insert(e);
+                            // Continue immediately to next node in the same round (no wait)
+                            // Node1 failed → immediately → Node2 failed → immediately → Node3
+                        }
                     }
                 }
             }
+            // Only after traversing all nodes, wait for the next round (100ms-2s)
         }
 
         let err = err_msg!(
@@ -287,6 +321,47 @@ impl ClusterConnector {
             last_error
         );
         Err(IOError::create(err).into())
+    }
+
+    fn is_not_leader_master<E: ErrorExt>(&self, e: &E) -> bool {
+        e.should_retry() && e.should_continue()
+    }
+
+    /// Concurrently send RPC requests to all known master nodes
+    /// Returns the first successful response along with the node ID
+    /// Uses futures::select_ok to race all futures and get the first successful response
+    async fn concurrent_rpc<E>(&self, msg: Arc<Message>) -> Result<(u64, Message), E>
+    where
+        E: ErrorExt + From<IOError> + From<CommonError>,
+    {
+        let node_list = self.node_list(false);
+
+        // Create futures for all nodes
+        let futures: Vec<_> = node_list
+            .iter()
+            .map(|&id| {
+                let msg_clone = msg.clone();
+                let connector = self;
+                Box::pin(async move {
+                    use crate::message::BoxMessage;
+                    let box_msg = BoxMessage::Arc(msg_clone);
+                    connector
+                        .timeout_rpc::<E>(id, box_msg)
+                        .await
+                        .map(|response| (id, response))
+                })
+            })
+            .collect();
+
+        // Use select_ok to race all futures and get the first successful response
+        match select_ok(futures).await {
+            Ok((result, _remaining)) => Ok(result),
+            Err(_) => {
+                // All requests failed, convert the last error
+                // Since select_ok doesn't give us the error details, we'll return a generic error
+                Err(IOError::create(err_msg!("All concurrent RPC requests failed")).into())
+            }
+        }
     }
 
     pub async fn proto_rpc<T, R, E>(&self, code: impl Into<i8>, header: T) -> Result<R, E>
