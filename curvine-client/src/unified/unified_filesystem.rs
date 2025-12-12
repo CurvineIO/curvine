@@ -21,8 +21,9 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileStatus, LoadJobCommand, LoadJobResult,
-    MasterInfo, MkdirOpts, MountInfo, MountOptions, OpenFlags, SetAttrOpts, WriteType,
+    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, LoadJobCommand,
+    LoadJobResult, MasterInfo, MkdirOpts, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
+    WriteType,
 };
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -316,6 +317,20 @@ impl UnifiedFileSystem {
                 // mount.ufs.set_attr(&ufs_path, opts).await?;
                 Ok(None)
             }
+        }
+    }
+
+    pub async fn get_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
+        match self.get_mount(path).await? {
+            None => self.cv.get_lock(path, lock).await,
+            Some(_) => err_ext!(FsError::unsupported("get_lock")),
+        }
+    }
+
+    pub async fn set_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
+        match self.get_mount(path).await? {
+            None => self.cv.set_lock(path, lock).await,
+            Some(_) => err_ext!(FsError::unsupported("set_lock")),
         }
     }
 }

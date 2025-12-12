@@ -19,6 +19,7 @@ use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
     CreateFileOptsBuilder, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
 };
+use curvine_common::state::{FileLock, LockFlags, LockType};
 use curvine_common::FsResult;
 use curvine_tests::Testing;
 use log::info;
@@ -622,4 +623,298 @@ async fn test_metrics(fs: &CurvineFileSystem) -> FsResult<()> {
     fs.fs_client()
         .metrics_report(ClientMetrics::encode().unwrap())
         .await
+}
+
+#[test]
+fn set_lock() {
+    let testing = Testing::default();
+    let fs = testing.get_fs(None, None).unwrap();
+
+    fs.clone_runtime().block_on(async move {
+        let file_path = Path::from_str("/lock_test/test_file.txt").unwrap();
+        let mut writer = fs.create(&file_path, true).await.unwrap();
+        writer.complete().await.unwrap();
+
+        info!("=== Testing POSIX locks (Plock) ===");
+
+        // 1. Client1 acquires read lock
+        let plock_read = FileLock {
+            client_id: "client1".to_string(),
+            owner_id: 100,
+            pid: 1001,
+            acquire_time: 0,
+            lock_type: LockType::ReadLock,
+            lock_flags: LockFlags::Plock,
+            start: 0,
+            end: 100,
+        };
+
+        let conflict = fs.set_lock(&file_path, plock_read.clone()).await.unwrap();
+        assert!(
+            conflict.is_none(),
+            "First read lock should not have conflict"
+        );
+        info!("✓ POSIX read lock set successfully");
+
+        // 2. Client2 acquires read lock on same region, should not conflict
+        let plock_read2 = FileLock {
+            client_id: "client2".to_string(),
+            owner_id: 200,
+            lock_type: LockType::ReadLock,
+            lock_flags: LockFlags::Plock,
+            start: 50,
+            end: 150,
+            ..Default::default()
+        };
+
+        let conflict = fs.set_lock(&file_path, plock_read2).await.unwrap();
+        assert!(
+            conflict.is_none(),
+            "Multiple read locks should not conflict"
+        );
+        info!("✓ POSIX multiple read locks can coexist");
+
+        // 3. Client3 tries write lock on overlapping region, should conflict
+        let plock_write = FileLock {
+            client_id: "client3".to_string(),
+            owner_id: 300,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 50,
+            end: 150,
+            ..Default::default()
+        };
+
+        let conflict = fs.set_lock(&file_path, plock_write).await.unwrap();
+        assert!(
+            conflict.is_some(),
+            "Write lock should conflict with existing read locks"
+        );
+        info!("✓ POSIX write lock conflicts correctly with read locks");
+
+        // 4. Client4 acquires write lock on non-overlapping region, should succeed
+        let plock_write_non_overlap = FileLock {
+            client_id: "client4".to_string(),
+            owner_id: 400,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 200,
+            end: 300,
+            ..Default::default()
+        };
+
+        let conflict = fs
+            .set_lock(&file_path, plock_write_non_overlap)
+            .await
+            .unwrap();
+        assert!(
+            conflict.is_none(),
+            "Write lock on non-overlapping region should not conflict"
+        );
+        info!("✓ POSIX write lock on non-overlapping region succeeds");
+
+        // 5. Unlock client1
+        let unlock1 = FileLock {
+            client_id: "client1".to_string(),
+            owner_id: 100,
+            lock_type: LockType::UnLock,
+            lock_flags: LockFlags::Plock,
+            start: 0,
+            end: 100,
+            ..Default::default()
+        };
+
+        let conflict = fs.set_lock(&file_path, unlock1).await.unwrap();
+        assert!(conflict.is_none(), "Unlock should not have conflict");
+        info!("✓ POSIX unlock successful");
+
+        info!("=== Testing BSD locks (Flock) ===");
+
+        // 6. Client5 acquires BSD read lock
+        let flock_read = FileLock {
+            client_id: "client5".to_string(),
+            owner_id: 500,
+            lock_type: LockType::ReadLock,
+            lock_flags: LockFlags::Flock,
+            start: 0,
+            end: 0,
+            ..Default::default()
+        };
+
+        let conflict = fs.set_lock(&file_path, flock_read).await.unwrap();
+        assert!(
+            conflict.is_none(),
+            "BSD read lock should be set successfully"
+        );
+        info!("✓ BSD read lock set successfully");
+
+        // 7. Client6 acquires BSD read lock, should not conflict
+        let flock_read2 = FileLock {
+            client_id: "client6".to_string(),
+            owner_id: 600,
+            lock_type: LockType::ReadLock,
+            lock_flags: LockFlags::Flock,
+            start: 0,
+            end: 0,
+            ..Default::default()
+        };
+
+        let conflict = fs.set_lock(&file_path, flock_read2).await.unwrap();
+        assert!(
+            conflict.is_none(),
+            "BSD multiple read locks should not conflict"
+        );
+        info!("✓ BSD multiple read locks can coexist");
+
+        // 8. Client7 tries BSD write lock, should conflict
+        let flock_write = FileLock {
+            client_id: "client7".to_string(),
+            owner_id: 700,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Flock,
+            start: 0,
+            end: 0,
+            ..Default::default()
+        };
+
+        let conflict = fs.set_lock(&file_path, flock_write).await.unwrap();
+        assert!(
+            conflict.is_some(),
+            "BSD write lock should conflict with existing read locks"
+        );
+        info!("✓ BSD write lock conflicts correctly with read locks");
+
+        // 9. Verify POSIX and BSD locks are independent
+        info!("✓ POSIX and BSD locks work independently on the same file");
+
+        // Cleanup
+        info!("=== set_lock test completed ===");
+    })
+}
+
+#[test]
+fn get_lock() {
+    let testing = Testing::default();
+    let fs = testing.get_fs(None, None).unwrap();
+
+    fs.clone_runtime().block_on(async move {
+        let file_path = Path::from_str("/lock_test_get/test_file.txt").unwrap();
+        let mut writer = fs.create(&file_path, true).await.unwrap();
+        writer.complete().await.unwrap();
+
+        info!("=== Testing get_lock - POSIX locks ===");
+
+        // 1. Client1 acquires POSIX write lock
+        let plock_write = FileLock {
+            client_id: "client1".to_string(),
+            owner_id: 100,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 0,
+            end: 100,
+            ..Default::default()
+        };
+
+        fs.set_lock(&file_path, plock_write.clone()).await.unwrap();
+        info!("✓ Set POSIX write lock");
+
+        // 2. Client2 queries lock on overlapping region
+        let query_lock = FileLock {
+            client_id: "client2".to_string(),
+            owner_id: 200,
+            lock_type: LockType::ReadLock,
+            lock_flags: LockFlags::Plock,
+            start: 50,
+            end: 150,
+            ..Default::default()
+        };
+
+        let conflict = fs.get_lock(&file_path, query_lock.clone()).await.unwrap();
+        assert!(conflict.is_some(), "Should detect conflicting write lock");
+        let conflict = conflict.unwrap();
+        assert_eq!(conflict.client_id, "client1");
+        assert_eq!(conflict.owner_id, 100);
+        assert_eq!(conflict.lock_type, LockType::WriteLock);
+        info!("✓ get_lock correctly returns conflicting POSIX write lock");
+
+        // 3. Query non-overlapping region
+        let query_non_overlap = FileLock {
+            client_id: "client2".to_string(),
+            owner_id: 200,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 200,
+            end: 300,
+            ..Default::default()
+        };
+
+        let conflict = fs.get_lock(&file_path, query_non_overlap).await.unwrap();
+        assert!(
+            conflict.is_none(),
+            "Non-overlapping region should have no conflict"
+        );
+        info!("✓ get_lock correctly identifies non-overlapping regions");
+
+        info!("=== Testing get_lock - BSD locks ===");
+
+        // 4. Client3 acquires BSD write lock
+        let flock_write = FileLock {
+            client_id: "client3".to_string(),
+            owner_id: 300,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Flock,
+            start: 0,
+            end: 0,
+            ..Default::default()
+        };
+
+        fs.set_lock(&file_path, flock_write).await.unwrap();
+        info!("✓ Set BSD write lock");
+
+        // 5. Client4 queries BSD lock
+        let query_flock = FileLock {
+            client_id: "client4".to_string(),
+            owner_id: 400,
+            lock_type: LockType::ReadLock,
+            lock_flags: LockFlags::Flock,
+            start: 0,
+            end: 0,
+            ..Default::default()
+        };
+
+        let conflict = fs.get_lock(&file_path, query_flock).await.unwrap();
+        assert!(
+            conflict.is_some(),
+            "Should detect conflicting BSD write lock"
+        );
+        let conflict = conflict.unwrap();
+        assert_eq!(conflict.client_id, "client3");
+        assert_eq!(conflict.lock_type, LockType::WriteLock);
+        info!("✓ get_lock correctly returns conflicting BSD write lock");
+
+        // 6. Verify POSIX query doesn't conflict with BSD locks
+        let query_plock_different_flag = FileLock {
+            client_id: "client5".to_string(),
+            owner_id: 500,
+            lock_type: LockType::WriteLock,
+            lock_flags: LockFlags::Plock,
+            start: 0,
+            end: 100,
+            ..Default::default()
+        };
+
+        let conflict = fs
+            .get_lock(&file_path, query_plock_different_flag)
+            .await
+            .unwrap();
+        // Should return client1's POSIX lock, not client3's BSD lock
+        assert!(conflict.is_some());
+        let conflict = conflict.unwrap();
+        assert_eq!(conflict.lock_flags, LockFlags::Plock);
+        assert_eq!(conflict.client_id, "client1");
+        info!("✓ POSIX and BSD locks are independent");
+
+        // Cleanup
+        info!("=== get_lock test completed ===");
+    })
 }

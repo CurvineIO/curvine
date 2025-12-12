@@ -19,8 +19,9 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileStatus, MasterInfo,
-    MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags, SetAttrOpts,
+    CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
+    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags,
+    SetAttrOpts,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
@@ -292,6 +293,14 @@ impl CurvineFileSystem {
         writer.complete().await?;
 
         Ok(())
+    }
+
+    pub async fn get_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
+        self.fs_client.get_lock(path, lock).await
+    }
+
+    pub async fn set_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
+        self.fs_client.set_lock(path, lock).await
     }
 
     pub fn clone_runtime(&self) -> Arc<Runtime> {
