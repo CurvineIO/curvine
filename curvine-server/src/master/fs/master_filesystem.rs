@@ -720,6 +720,25 @@ impl MasterFilesystem {
             locs: choose_workers,
         })
     }
+
+    pub fn get_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
+        let path = path.as_ref();
+
+        let fs_dir = self.fs_dir.read();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+        let expire_ms = self.conf.lock_expire_time_ms();
+
+        fs_dir.get_lock(inp, &lock, expire_ms)
+    }
+
+    pub fn set_lock<T: AsRef<str>>(&self, path: T, lock: FileLock) -> FsResult<Option<FileLock>> {
+        let path = path.as_ref();
+
+        let fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+
+        fs_dir.set_lock(inp, lock, self.conf.lock_expire_time_ms())
+    }
 }
 
 impl Default for MasterFilesystem {

@@ -117,6 +117,16 @@ pub struct MasterConf {
     pub quota_eviction_scan_page: i32,
     pub quota_eviction_dry_run: bool,
     pub quota_eviction_capacity: usize,
+
+    // File lock configuration
+    // Lock expiration time (applies to both POSIX and BSD locks)
+    // If a lock is held longer than this duration, it will be considered stale and can be removed
+    // This prevents locks from being held indefinitely if a process crashes
+    // Default: 5 minutes - longer than typical distributed lock timeout
+    // to accommodate file operations that may take time
+    pub lock_expire_time: String,
+    #[serde(skip)]
+    pub lock_expire_time_unit: DurationUnit,
 }
 
 impl MasterConf {
@@ -135,6 +145,9 @@ impl MasterConf {
         self.ttl_bucket_interval_unit = DurationUnit::from_str(&self.ttl_bucket_interval)?;
         self.ttl_max_retry_duration_unit = DurationUnit::from_str(&self.ttl_max_retry_duration)?;
         self.ttl_retry_interval_unit = DurationUnit::from_str(&self.ttl_retry_interval)?;
+
+        // Initialize lock expiration time
+        self.lock_expire_time_unit = DurationUnit::from_str(&self.lock_expire_time)?;
 
         if self.heartbeat_interval_unit > self.worker_blacklist_interval_unit {
             return err_box!("Worker_blacklist_interval must be greater than heartbeat_interval");
@@ -177,6 +190,10 @@ impl MasterConf {
 
     pub fn ttl_retry_interval_ms(&self) -> u64 {
         self.ttl_retry_interval_unit.as_millis()
+    }
+
+    pub fn lock_expire_time_ms(&self) -> u64 {
+        self.lock_expire_time_unit.as_millis()
     }
 
     pub fn io_timeout_ms(&self) -> u64 {
@@ -272,6 +289,9 @@ impl Default for MasterConf {
             quota_eviction_scan_page: 2,
             quota_eviction_dry_run: false,
             quota_eviction_capacity: 5_000_000, // Default: 5 million entries (~250MB)
+
+            lock_expire_time: "5m".to_string(),
+            lock_expire_time_unit: Default::default(),
         };
 
         conf.init().unwrap();

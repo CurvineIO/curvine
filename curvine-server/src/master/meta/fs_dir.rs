@@ -23,7 +23,7 @@ use crate::master::quota::eviction::evictor::Evictor;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
-    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileStatus,
+    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
     MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
@@ -995,5 +995,44 @@ impl FsDir {
         } else {
             self.store.get_locations(meta.id)
         }
+    }
+
+    pub fn get_lock(
+        &self,
+        inp: InodePath,
+        lock: &FileLock,
+        expire_ms: u64,
+    ) -> FsResult<Option<FileLock>> {
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        let mut meta = self.store.get_locks(inode.id())?;
+        let conflict = meta.check_conflict(lock, expire_ms);
+        Ok(conflict)
+    }
+
+    pub fn set_lock(
+        &self,
+        inp: InodePath,
+        lock: FileLock,
+        expire_ms: u64,
+    ) -> FsResult<Option<FileLock>> {
+        let op_ms = LocalTime::mills();
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        let mut meta = self.store.get_locks(inode.id())?;
+        let conflict = meta.set_lock(lock, expire_ms);
+
+        let locks = meta.to_vec();
+        self.store.apply_set_locks(inode.id(), &locks)?;
+        self.journal_writer
+            .log_set_locks(op_ms, inode.id(), locks)?;
+
+        Ok(conflict)
     }
 }

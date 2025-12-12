@@ -480,6 +480,35 @@ impl MasterHandler {
         };
         ctx.response(rep_header)
     }
+
+    pub fn get_lock(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: GetLockRequest = ctx.parse_header()?;
+        let lock = ProtoUtils::file_lock_from_pb(header.lock);
+        ctx.set_audit(Some(header.path.to_string()), None);
+
+        let conflict = self.fs.get_lock(header.path, lock)?;
+        let rep_header = GetLockResponse {
+            conflict: conflict.map(ProtoUtils::file_lock_to_pb),
+        };
+        ctx.response(rep_header)
+    }
+
+    pub fn set_lock(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: SetLockRequest = ctx.parse_header()?;
+        let lock = ProtoUtils::file_lock_from_pb(header.lock);
+
+        let audit = format!(
+            "{}[{:?}-{:?}]",
+            header.path, lock.lock_flags, lock.lock_type
+        );
+        ctx.set_audit(Some(audit), None);
+
+        let conflict = self.fs.set_lock(header.path, lock)?;
+        let rep_header = SetLockResponse {
+            conflict: conflict.map(ProtoUtils::file_lock_to_pb),
+        };
+        ctx.response(rep_header)
+    }
 }
 
 impl MessageHandler for MasterHandler {
@@ -514,6 +543,8 @@ impl MessageHandler for MasterHandler {
             RpcCode::Link => self.link_retry_check(ctx),
             RpcCode::ResizeFile => self.resize_file(ctx),
             RpcCode::AssignWorker => self.assign_worker(ctx),
+            RpcCode::GetLock => self.get_lock(ctx),
+            RpcCode::SetLock => self.set_lock(ctx),
 
             RpcCode::Mount => self.mount(ctx),
             RpcCode::UnMount => self.umount(ctx),

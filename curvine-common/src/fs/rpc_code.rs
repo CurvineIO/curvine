@@ -41,6 +41,9 @@ pub enum RpcCode {
     Link = 17,
     ResizeFile = 18,
     AssignWorker = 19,
+    GetLock = 20,
+    SetLock = 21,
+    ListLock = 22,
 
     // manager interface.
     Mount = 30,

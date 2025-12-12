@@ -19,7 +19,7 @@ use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
-use curvine_common::state::{CommitBlock, MountInfo, RenameFlags, SetAttrOpts};
+use curvine_common::state::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_common::FsResult;
 use log::info;
 use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
@@ -237,6 +237,11 @@ impl JournalWriter {
             dst_path: dst_path.as_ref().to_string(),
         };
         self.send(JournalEntry::Link(entry))
+    }
+
+    pub fn log_set_locks(&self, op_ms: u64, ino: i64, locks: Vec<FileLock>) -> FsResult<()> {
+        let entry = SetLocksEntry { op_ms, ino, locks };
+        self.send(JournalEntry::SetLocks(entry))
     }
 
     // for testing
