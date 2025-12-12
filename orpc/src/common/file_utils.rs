@@ -111,7 +111,6 @@ impl FileUtils {
     // contains_parent is true, and the returned path protects the parent directory name, otherwise it will not be included.
     pub fn list_files<P: AsRef<Path>>(path: P, contains_parent: bool) -> CommonResult<Vec<String>> {
         let path = Path::new(path.as_ref());
-        println!("path: {:?}", path);
         if !path.exists() {
             return err_box!("Dir {} not exits", path.display());
         }
