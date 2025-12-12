@@ -96,6 +96,7 @@ print_help() {
   echo "                          - opendal-oss: OpenDAL OSS"
   echo "                          - opendal-azblob: OpenDAL Azure Blob"
   echo "                          - opendal-gcs: OpenDAL GCS"
+  echo "                          - oss-hdfs: OSS-HDFS (JindoSDK)"
   echo
   echo "  -d, --debug           Build in debug mode (default: release mode)"
   echo "  -f, --features LIST   Comma-separated list of extra features to enable"
@@ -109,6 +110,7 @@ print_help() {
   echo "  $0 -p web --package fuse --debug       # Build web and fuse in debug mode"
   echo "  $0 --package all --ufs opendal-s3 -z   # Build all packages with OpenDAL S3 and create zip"
   echo "  $0 --features opendal-hdfs,opendal-webhdfs  # Build with HDFS support"
+  echo "  $0 --ufs oss-hdfs                          # Build with OSS-HDFS support"
   echo "  $0 --features jni --package client     # Build client with JNI support"
   echo "  $0 --skip-java-sdk                         # Build all packages except Java SDK"
 }
@@ -326,6 +328,11 @@ if [ ${#RUST_BUILD_ARGS[@]} -gt 0 ]; then
   if [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-client " ]]; then
     for ufs in "${UFS_TYPES[@]}"; do
       case $ufs in
+        oss-hdfs)
+          # OSS-HDFS uses JindoSDK, needs both curvine-ufs and curvine-client features
+          FEATURES+=("curvine-ufs/oss-hdfs")
+          FEATURES+=("curvine-client/oss-hdfs")
+          ;;
         *)
           FEATURES+=("curvine-client/$ufs")
           ;;
@@ -337,6 +344,11 @@ else
   FEATURES+=("curvine-fuse/$FUSE_VERSION")  # FUSE check already done above
   for ufs in "${UFS_TYPES[@]}"; do
     case $ufs in
+      oss-hdfs)
+        # OSS-HDFS uses JindoSDK, needs both curvine-ufs and curvine-client features
+        FEATURES+=("curvine-ufs/oss-hdfs")
+        FEATURES+=("curvine-client/oss-hdfs")
+        ;;
       *)
         FEATURES+=("curvine-client/$ufs")
         ;;
@@ -362,6 +374,11 @@ if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
         # COS features need to be added to the correct packages
         FEATURES+=("curvine-ufs/opendal-cos")
         FEATURES+=("curvine-client/opendal-cos")
+        ;;
+      oss-hdfs)
+        # OSS-HDFS features need to be added to the correct packages
+        FEATURES+=("curvine-ufs/oss-hdfs")
+        FEATURES+=("curvine-client/oss-hdfs")
         ;;
       jni)
         # JNI features need to be added to curvine-ufs and curvine-server

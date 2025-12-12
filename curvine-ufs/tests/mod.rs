@@ -12,35 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod fs;
+#[cfg(feature = "opendal-s3")]
+pub mod s3_fs;
 
-// JNI support for HDFS operations (moved from curvine-common)
-#[cfg(feature = "jni")]
-pub mod jni;
-
-// OpenDAL implementations
-#[cfg(feature = "opendal")]
-pub mod opendal;
-
-// OSS-HDFS implementation using JindoSDK C++ library via FFI
 #[cfg(feature = "oss-hdfs")]
 pub mod oss_hdfs;
-
-mod ufs_utils;
-pub use self::ufs_utils::UfsUtils;
-
-mod conf;
-pub use self::conf::*;
-
-pub const FOLDER_SUFFIX: &str = "/";
-
-#[macro_export]
-macro_rules! err_ufs {
-    ($e:expr) => ({
-        Err(orpc::err_msg!($e).into())
-    });
-
-    ($f:tt, $($arg:expr),+) => ({
-        orpc::err_box!(format!($f, $($arg),+))
-    });
-}
