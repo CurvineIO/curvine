@@ -80,3 +80,6 @@ pub use self::rename_flags::*;
 
 mod file_alloc;
 pub use self::file_alloc::*;
+
+mod file_lock;
+pub use self::file_lock::*;
