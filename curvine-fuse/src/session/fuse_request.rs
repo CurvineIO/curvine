@@ -74,6 +74,10 @@ impl FuseRequest {
         self.opcode
     }
 
+    pub fn is_interrupt(&self) -> bool {
+        matches!(self.opcode, FUSE_SETLKW)
+    }
+
     // Determine whether it is a file data read and write operation
     pub fn is_stream(&self) -> bool {
         matches!(

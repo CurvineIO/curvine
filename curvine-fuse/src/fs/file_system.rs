@@ -160,8 +160,8 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    fn interrupt(&self, op: Interrupt<'_>) -> impl Future<Output = FuseResult<()>> + Send {
-        async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
+    fn interrupt(&self, _op: Interrupt<'_>) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { Ok(()) }
     }
 
     fn fsync(

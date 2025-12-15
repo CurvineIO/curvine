@@ -22,10 +22,11 @@ use log::{debug, error, info};
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::AsyncSender;
+use orpc::sync::FastDashMap;
 use orpc::sys::pipe::{AsyncFd, Pipe2, PipeFd};
 use orpc::{err_box, sys};
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio_util::bytes::BytesMut;
 
 /// FuseReceiver provides the following functionality:
@@ -41,6 +42,7 @@ pub struct FuseReceiver<T> {
     buf: BytesMut,
     fuse_len: usize,
     debug: bool,
+    pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
 }
 
 impl<T: FileSystem> FuseReceiver<T> {
@@ -51,6 +53,7 @@ impl<T: FileSystem> FuseReceiver<T> {
         sender: AsyncSender<FuseTask>,
         buf_size: usize,
         debug: bool,
+        pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
     ) -> IOResult<Self> {
         let pipe2 = Pipe2::new(PipeFd::new(buf_size, false, false)?)?;
         let buf = BytesMut::zeroed(buf_size);
@@ -64,6 +67,7 @@ impl<T: FileSystem> FuseReceiver<T> {
             buf,
             fuse_len: buf_size,
             debug,
+            pending_requests,
         };
 
         Ok(client)
@@ -165,9 +169,10 @@ impl<T: FileSystem> FuseReceiver<T> {
                             } else {
                                 let reply = self.new_replay(req.unique());
                                 let fs = self.fs.clone();
+                                let pending_requests = self.pending_requests.clone();
 
                                 self.rt.spawn(async move {
-                                    if let Err(e) = Self::dispatch_meta(fs, req, reply).await {
+                                    if let Err(e) = Self::dispatch_meta_interrupt(fs, pending_requests, req, reply).await {
                                         error!("failed to dispatch meta request: {}", e);
                                     }
                                 });
@@ -196,7 +201,41 @@ impl<T: FileSystem> FuseReceiver<T> {
         Ok(())
     }
 
-    async fn dispatch_meta(fs: Arc<T>, req: FuseRequest, reply: FuseResponse) -> FuseResult<()> {
+    pub async fn dispatch_meta_interrupt(
+        fs: Arc<T>,
+        pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
+        req: FuseRequest,
+        reply: FuseResponse,
+    ) -> FuseResult<()> {
+        if !req.is_interrupt() {
+            return Self::dispatch_meta(&pending_requests, &fs, &req, &reply).await;
+        }
+
+        let notify = Arc::new(Notify::new());
+        pending_requests.insert(req.unique(), notify.clone());
+
+        let res = tokio::select! {
+            result = Self::dispatch_meta(&pending_requests, &fs, &req, &reply) => {
+                pending_requests.remove(&req.unique());
+                result
+            }
+
+            _ = notify.notified() => {
+                pending_requests.remove(&req.unique());
+                let err: FuseResult<()> = err_fuse!(EINTR, "operation interrupted");
+                reply.send_rep(err).await.map_err(|x| x.into())
+            }
+        };
+
+        res
+    }
+
+    pub async fn dispatch_meta(
+        pending_requests: &FastDashMap<u64, Arc<Notify>>,
+        fs: &T,
+        req: &FuseRequest,
+        reply: &FuseResponse,
+    ) -> FuseResult<()> {
         let operator = req.parse_operator()?;
 
         let res = match operator {
@@ -240,7 +279,7 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::Forget(op) => reply.send_none(fs.forget(op).await),
 
-            FuseOperator::Open(op) => reply.send_rep(fs.open(op, &reply).await).await,
+            FuseOperator::Open(op) => reply.send_rep(fs.open(op, reply).await).await,
 
             FuseOperator::MkNod(op) => reply.send_rep(fs.mk_nod(op).await).await,
 
@@ -256,7 +295,15 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::Rename(op) => reply.send_rep(fs.rename(op).await).await,
 
-            FuseOperator::Interrupt(op) => reply.send_rep(fs.interrupt(op).await).await,
+            FuseOperator::Interrupt(op) => {
+                let res = if let Some(notify) = pending_requests.get(&op.arg.unique) {
+                    notify.notify_one();
+                    Ok(())
+                } else {
+                    fs.interrupt(op).await
+                };
+                reply.send_rep(res).await
+            }
 
             FuseOperator::Symlink(op) => reply.send_rep(fs.symlink(op).await).await,
 

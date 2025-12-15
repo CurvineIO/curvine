@@ -1411,7 +1411,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let time = TimeSpent::new();
 
         let lock = self.to_file_lock(op.arg);
-        // @todo needs to implement interruption.
         loop {
             let conflict = self.fs.set_lock(&path, lock.clone()).await?;
             if conflict.is_none() {
