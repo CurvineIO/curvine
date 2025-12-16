@@ -1,79 +1,18 @@
-FROM ubuntu:24.04 AS builder
+# Build stage - Use pre-built compile image with all toolchains
+FROM ghcr.io/curvineio/curvine-compile:ubuntu24.04 AS builder
 
 ARG GOPROXY
 
-# Set non-interactive mode for apt to avoid prompts during install
-ENV DEBIAN_FRONTEND=noninteractive
+# Override ENTRYPOINT to ensure RUN commands execute correctly
+# The compile image has ENTRYPOINT ["/bin/bash", "-c"] which can interfere with RUN
+ENTRYPOINT []
 
-# Use Tsinghua mirror for faster package downloads
-RUN sed -i 's/archive.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    sed -i 's/security.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list && \
-    apt-get update && apt-get install -y --fix-missing \
-    fuse3 \
-    libfuse3-dev \
-    clang \
-    llvm \
-    llvm-dev \
-    git \
-    wget \
-    curl \
-    tar \
-    zip \
-    unzip \
-    nodejs \
-    npm \
-    openjdk-8-jdk \
-    libssl-dev \
-    pkg-config \
-    build-essential \
-    ca-certificates \
-    rsync \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Go toolchain
-RUN wget -O go1.23.linux-amd64.tar.gz https://go.dev/dl/go1.23.4.linux-amd64.tar.gz && \
-    tar -C /usr/local -xzf go1.23.linux-amd64.tar.gz && \
-    rm go1.23.linux-amd64.tar.gz
-
-ENV PATH=/usr/local/go/bin:$PATH
-ENV GOPATH=/go
-ENV GOROOT=/usr/local/go
+# Set GOPROXY environment variable (Go is already installed in compile image)
 ENV GOPROXY=${GOPROXY:-https://proxy.golang.org}
 
-#ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
-#ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
-#ENV RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
-#ENV RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
-# Install Rust toolchain
-# Use HTTP/1.1 to avoid HTTP/2 protocol errors and add retry mechanism
-RUN export PATH="/root/.cargo/bin:${PATH}" && \
-    for i in 1 2 3; do \
-        curl --http1.1 --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh && \
-        sh /tmp/rustup-init.sh -y --default-toolchain stable && \
-        break || (echo "Attempt $i failed, retrying..." && sleep 5); \
-    done && \
-    . $HOME/.cargo/env && \
-    rustup default stable && \
-    rustup component add rustfmt clippy && \
-    rm -f /tmp/rustup-init.sh
-
-# Install protoc
-RUN mkdir -p /app/protoc && cd /app/protoc && \
-    curl -k -LO https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip && \
-    unzip protoc-27.2-linux-x86_64.zip && \
-    chmod +x bin/protoc && \
-    rm -f *.zip
-
-# Install Maven
-RUN cd /app && \
-    curl -k -LO https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz && \
-    tar -xzf apache-maven-3.9.11-bin.tar.gz && \
-    mv apache-maven-3.9.11 maven && \
-    rm -f *.tar.gz
-
-# Set environment variables for build
-ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
+# Ensure environment variables are set (from compile image)
+# Go toolchain is already included: PATH="/usr/local/go/bin:...", GOPATH=/go, GOROOT=/usr/local/go
+ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:/usr/local/go/bin:${PATH}"
 
 WORKDIR /workspace
 

@@ -83,7 +83,7 @@ jobs:
           echo "push_image=${PUSH_IMAGE}" >> $GITHUB_OUTPUT
           
           # Generate image names
-          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/curvine"
+          GHCR_IMAGE="ghcr.io/curvineio/curvine"
           DOCKER_IMAGE="curvine/curvine"
           
           echo "ghcr_image=${GHCR_IMAGE}" >> $GITHUB_OUTPUT

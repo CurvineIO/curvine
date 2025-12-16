@@ -10,6 +10,7 @@ RUN dnf install -y \
     gcc \
     gcc-c++ \
     make \
+    pkg-config \
     fuse3 \
     fuse3-devel \
     clang \
@@ -24,9 +25,12 @@ RUN dnf install -y \
     zlib-devel \
     && dnf clean all
 
-# 1.1. Install latest Node.js from NodeSource repository (ensures npm >= 9.0.0)
-RUN curl -sL https://rpm.nodesource.com/setup_current.x | bash - && \
-    dnf install -y nodejs && \
+# 1.1. Install Node.js 22 LTS from NodeSource repository (ensures npm >= 9.0.0 and compatibility)
+RUN curl -sL https://rpm.nodesource.com/setup_22.x | bash - && \
+    dnf clean all && \
+    dnf module reset -y nodejs 2>/dev/null || true && \
+    dnf module disable -y nodejs 2>/dev/null || true && \
+    dnf install -y --nobest nodejs && \
     dnf clean all
 
 # 2. Install the Rust toolchain
