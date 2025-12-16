@@ -769,19 +769,12 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         match self.operator.rename(&src_path, &dst_path).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
-                // For services that don't support rename (like S3), use copy + delete
-                // Read source file
-                let data = self.operator.read(&src_path).await.map_err(|e| {
-                    FsError::common(format!("failed to read source file for rename: {}", e))
-                })?;
-
-                // Write to destination
-                self.operator.write(&dst_path, data).await.map_err(|e| {
-                    FsError::common(format!(
-                        "failed to write destination file for rename: {}",
-                        e
-                    ))
-                })?;
+                self.operator
+                    .copy(&src_path, &dst_path)
+                    .await
+                    .map_err(|e| {
+                        FsError::common(format!("failed to copy source file for rename: {}", e))
+                    })?;
 
                 // Delete source file
                 self.operator.delete(&src_path).await.map_err(|e| {
