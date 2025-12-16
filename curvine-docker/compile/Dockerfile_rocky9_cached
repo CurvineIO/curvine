@@ -7,6 +7,9 @@ LABEL org.opencontainers.image.source="${REPO_URL}"
 
 # 1. Install the basic toolchain and dependencies
 RUN dnf install -y \
+    gcc \
+    gcc-c++ \
+    make \
     fuse3 \
     fuse3-devel \
     clang \
@@ -18,6 +21,7 @@ RUN dnf install -y \
     unzip \
     java-1.8.0-openjdk-devel \
     openssl-devel \
+    zlib-devel \
     && dnf clean all
 
 # 1.1. Install latest Node.js from NodeSource repository (ensures npm >= 9.0.0)

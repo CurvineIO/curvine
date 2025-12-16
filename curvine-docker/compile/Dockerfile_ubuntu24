@@ -1,5 +1,5 @@
-# Use the official Ubuntu 22.04 image as a base
-FROM ubuntu:22.04
+# Use the official Ubuntu 24.04 image as a base
+FROM ubuntu:24.04
 
 # Add metadata labels
 ARG REPO_URL=https://github.com/curvineio/curvine
@@ -104,3 +104,4 @@ RUN rustc --version && cargo --version && protoc --version && mvn --version && n
 # Use ENTRYPOINT to ensure environment is loaded
 ENTRYPOINT ["/bin/bash", "-c"]
 CMD ["bash"]
+
