@@ -14,14 +14,14 @@
 
 package io.curvine;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
+
+import javax.annotation.Nonnull;
+
 import org.apache.hadoop.fs.FSExceptionMessages;
 import org.apache.hadoop.fs.FSInputStream;
 import org.apache.hadoop.fs.FileSystem;
-
-import javax.annotation.Nonnull;
-import java.io.EOFException;
-import java.io.IOException;
-import java.nio.ByteBuffer;
 
 public class CurvineInputStream extends FSInputStream {
     private long nativeHandle;
@@ -34,7 +34,7 @@ public class CurvineInputStream extends FSInputStream {
     private final long[] tmp = new long[] {0, 0};
     private ByteBuffer buffer;
 
-    private FileSystem.Statistics statistics;
+    private final FileSystem.Statistics statistics;
 
     public CurvineInputStream(CurvineFsMount libFs, long nativeHandle, long fileSize, FileSystem.Statistics statistics) {
         this.libFs = libFs;
@@ -45,7 +45,7 @@ public class CurvineInputStream extends FSInputStream {
 
     private void checkClosed() throws IOException {
         if (closed) {
-            throw new EOFException("stream has been closed!");
+            throw new IOException("Stream has been closed");
         }
     }
 
@@ -132,10 +132,22 @@ public class CurvineInputStream extends FSInputStream {
             return;
         }
 
-        long toSkip = pos - targetPos;
-        if (buffer != null && toSkip >= 0 && toSkip <= buffer.remaining()) {
-            buffer.position((int) (buffer.position() + toSkip));
-        } else {
+        // Check if we can reuse buffer data (only for backward seek within buffer)
+        // buffer contains data from (pos - buffer.position()) to (pos - buffer.position() + buffer.limit())
+        if (buffer != null && targetPos < pos) {
+            // Backward seek: check if targetPos is within the already-read portion of buffer
+            int alreadyRead = buffer.position();
+            long bufferStartPos = pos - alreadyRead;
+            if (targetPos >= bufferStartPos) {
+                // targetPos is within the buffer's already-read data, rewind buffer
+                int newBufferPos = (int) (targetPos - bufferStartPos);
+                buffer.position(newBufferPos);
+                pos = targetPos;
+                return;
+            }
+        }
+        // Forward seek or targetPos not in buffer: discard buffer and seek natively
+        if (targetPos != pos) {
             // Discard buffer data.
             buffer = null;
             libFs.seek(nativeHandle, targetPos);
@@ -166,6 +178,8 @@ public class CurvineInputStream extends FSInputStream {
 
     @Override
     public int available() {
-        return (int) (fileSize - pos);
+        long remaining = fileSize - pos;
+        // Avoid overflow: return Integer.MAX_VALUE if remaining exceeds int range
+        return remaining > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) remaining;
     }
 }

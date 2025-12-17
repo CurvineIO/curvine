@@ -14,13 +14,13 @@
 
 package io.curvine;
 
-import io.curvine.exception.CurvineException;
-import org.apache.hadoop.fs.Syncable;
-
-import javax.annotation.Nonnull;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+
+import javax.annotation.Nonnull;
+
+import org.apache.hadoop.fs.Syncable;
 
 public class CurvineOutputStream extends OutputStream implements Syncable {
     private long nativeHandle;
@@ -54,7 +54,7 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
 
     private void checkClosed() throws IOException {
         if (closed) {
-            throw new CurvineException("stream has been closed!");
+            throw new IOException("Stream has been closed");
         }
     }
 
@@ -116,6 +116,8 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
     private void flushBuffer() throws IOException {
         if (buffer != null && buffer[bufIndex].position() > 0) {
             libFs.write(nativeHandle, buffer[bufIndex]);
+            // Clear buffer after writing to prevent duplicate writes
+            buffer[bufIndex].clear();
         }
     }
 
@@ -152,7 +154,9 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
 
     @Override
     public void hsync() throws IOException {
-        // pass
+        // HDFS protocol requires hsync() to guarantee data durability
+        // Flush all buffered data to ensure persistence
+        flush();
     }
 
     private static ByteBuffer[] createBufferArray(int chunkSize, int chunkNum) {

@@ -109,10 +109,10 @@ public class CurvineNative {
             return "unknown";
         }
 
-        BufferedReader reader;
-        try {
-            reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8));
-            String line = null;
+        // Use try-with-resources to ensure BufferedReader is properly closed
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
+            String line;
             String id = null;
             String version = null;
             while ((line = reader.readLine()) != null) {

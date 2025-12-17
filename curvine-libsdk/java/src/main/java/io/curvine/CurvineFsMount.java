@@ -14,12 +14,12 @@
 
 package io.curvine;
 
-import io.curvine.exception.CurvineException;
-import sun.nio.ch.DirectBuffer;
-
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Optional;
+
+import io.curvine.exception.CurvineException;
+import sun.nio.ch.DirectBuffer;
 
 public class CurvineFsMount {
     private final long nativeHandle;
@@ -38,13 +38,13 @@ public class CurvineFsMount {
 
     public void checkError(long errno, String msg) throws IOException {
         if (errno < SUCCESS) {
-            throw new CurvineException((int) errno, msg);
+            throw CurvineException.create((int) errno, msg);
         }
     }
 
     public void checkError(long errno) throws IOException {
         if (errno < SUCCESS) {
-            throw new CurvineException((int) errno, "lib error");
+            throw CurvineException.create((int) errno, "lib error");
         }
     }
 
