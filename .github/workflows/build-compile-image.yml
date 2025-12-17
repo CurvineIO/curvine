@@ -8,11 +8,6 @@ on:
         required: false
         default: false
         type: boolean
-      use_cache:
-        description: 'Whether to build image with dependency cache'
-        required: false
-        default: false
-        type: boolean
       platforms:
         description: 'Target platforms (comma-separated)'
         required: false
@@ -24,14 +19,62 @@ permissions:
   packages: write
 
 jobs:
-  # Build for each architecture on native runners
-  build-arch:
+  # Build for each build type and architecture on native runners
+  build-image:
     strategy:
       matrix:
         include:
-          - arch: amd64
+          # Rocky Linux 9 (standard)
+          - build_type: rocky9
+            dockerfile: Dockerfile_rocky9
+            context: ./curvine-docker/compile
+            tag: rocky9
+            arch: amd64
             runner: ubuntu-latest
-          - arch: arm64
+          - build_type: rocky9
+            dockerfile: Dockerfile_rocky9
+            context: ./curvine-docker/compile
+            tag: rocky9
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          # Rocky Linux 9 (cached)
+          - build_type: rocky9_cached
+            dockerfile: Dockerfile_rocky9_cached
+            context: .
+            tag: rocky9_cached
+            arch: amd64
+            runner: ubuntu-latest
+          - build_type: rocky9_cached
+            dockerfile: Dockerfile_rocky9_cached
+            context: .
+            tag: rocky9_cached
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          # Ubuntu 22.04
+          - build_type: ubuntu22.04
+            dockerfile: Dockerfile_ubuntu22
+            context: ./curvine-docker/compile
+            tag: ubuntu22.04
+            arch: amd64
+            runner: ubuntu-latest
+          - build_type: ubuntu22.04
+            dockerfile: Dockerfile_ubuntu22
+            context: ./curvine-docker/compile
+            tag: ubuntu22.04
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          # Ubuntu 24.04
+          - build_type: ubuntu24.04
+            dockerfile: Dockerfile_ubuntu24
+            context: ./curvine-docker/compile
+            tag: ubuntu24.04
+            arch: amd64
+            runner: ubuntu-latest
+          - build_type: ubuntu24.04
+            dockerfile: Dockerfile_ubuntu24
+            context: ./curvine-docker/compile
+            tag: ubuntu24.04
+            arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
@@ -56,55 +99,40 @@ jobs:
           username: curvine
           password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
       
-      - name: Determine image tag suffix
-        id: tag
-        run: |
-          if [ "${{ inputs.use_cache }}" == "true" ]; then
-            echo "suffix=build-cached" >> $GITHUB_OUTPUT
-          else
-            echo "suffix=latest" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Build and push compile image for ${{ matrix.arch }} (standard)
-        if: inputs.use_cache == false
+      - name: Build and push compile image for ${{ matrix.build_type }} (${{ matrix.arch }})
         uses: docker/build-push-action@v5
         with:
-          context: ./curvine-docker/compile
-          file: ./curvine-docker/compile/Dockerfile_rocky9
+          context: ${{ matrix.context }}
+          file: ./curvine-docker/compile/${{ matrix.dockerfile }}
           platforms: linux/${{ matrix.arch }}
           push: ${{ inputs.push_image }}
           tags: |
-            ghcr.io/curvineio/curvine-compile:latest-${{ matrix.arch }}
-            curvine/curvine-compile:latest-${{ matrix.arch }}
-          cache-from: type=gha,scope=compile-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=compile-${{ matrix.arch }}
+            ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
+            curvine/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=compile-${{ matrix.build_type }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=compile-${{ matrix.build_type }}-${{ matrix.arch }}
       
-      - name: Build and push compile image for ${{ matrix.arch }} (with cache)
-        if: inputs.use_cache == true
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./curvine-docker/compile/Dockerfile_rocky9_cached
-          platforms: linux/${{ matrix.arch }}
-          push: ${{ inputs.push_image }}
-          tags: |
-            ghcr.io/curvineio/curvine-compile:build-cached-${{ matrix.arch }}
-            curvine/curvine-compile:build-cached-${{ matrix.arch }}
-          cache-from: type=gha,scope=compile-cached-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=compile-cached-${{ matrix.arch }}
-      
-      - name: Build summary for ${{ matrix.arch }}
+      - name: Build summary for ${{ matrix.build_type }} (${{ matrix.arch }})
         run: |
-          echo "✅ Built compile image for ${{ matrix.arch }} architecture" >> $GITHUB_STEP_SUMMARY
-          TAG_SUFFIX="${{ steps.tag.outputs.suffix }}"
-          echo "Image: ghcr.io/curvineio/curvine-compile:${TAG_SUFFIX}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Built compile image for ${{ matrix.build_type }} (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
+          echo "Image: ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
 
-  # Create multi-arch manifest
+  # Create multi-arch manifests for each build type
   create-manifest:
-    needs: build-arch
+    needs: build-image
     runs-on: ubuntu-latest
     if: inputs.push_image == true
+    strategy:
+      matrix:
+        include:
+          - tag: rocky9
+          - tag: rocky9_cached
+          - tag: ubuntu22.04
+          - tag: ubuntu24.04
     steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -118,52 +146,32 @@ jobs:
           username: curvine
           password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
       
-      - name: Create and push multi-arch manifest (standard)
-        if: inputs.use_cache == false
+      - name: Create and push multi-arch manifest for ${{ matrix.tag }}
         run: |
           # Create manifest for GHCR
-          docker buildx imagetools create -t ghcr.io/curvineio/curvine-compile:latest \
-            ghcr.io/curvineio/curvine-compile:latest-amd64 \
-            ghcr.io/curvineio/curvine-compile:latest-arm64
+          docker buildx imagetools create -t ghcr.io/curvineio/curvine-compile:${{ matrix.tag }} \
+            ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-amd64 \
+            ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-arm64
           
           # Create manifest for Docker Hub
-          docker buildx imagetools create -t curvine/curvine-compile:latest \
-            curvine/curvine-compile:latest-amd64 \
-            curvine/curvine-compile:latest-arm64
+          docker buildx imagetools create -t curvine/curvine-compile:${{ matrix.tag }} \
+            curvine/curvine-compile:${{ matrix.tag }}-amd64 \
+            curvine/curvine-compile:${{ matrix.tag }}-arm64
       
-      - name: Create and push multi-arch manifest (with cache)
-        if: inputs.use_cache == true
+      - name: Manifest creation summary for ${{ matrix.tag }}
         run: |
-          # Create manifest for GHCR
-          docker buildx imagetools create -t ghcr.io/curvineio/curvine-compile:build-cached \
-            ghcr.io/curvineio/curvine-compile:build-cached-amd64 \
-            ghcr.io/curvineio/curvine-compile:build-cached-arm64
-          
-          # Create manifest for Docker Hub
-          docker buildx imagetools create -t curvine/curvine-compile:build-cached \
-            curvine/curvine-compile:build-cached-amd64 \
-            curvine/curvine-compile:build-cached-arm64
-      
-      - name: Manifest creation summary
-        run: |
-          echo "### Multi-arch Manifest Created 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "### Multi-arch Manifest Created for ${{ matrix.tag }} 🎉" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${{ matrix.tag }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Combined architectures:** amd64, arm64" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ inputs.use_cache }}" == "true" ]; then
-            echo "**Manifests created:**" >> $GITHUB_STEP_SUMMARY
-            echo "- \`ghcr.io/curvineio/curvine-compile:build-cached\`" >> $GITHUB_STEP_SUMMARY
-            echo "- \`curvine/curvine-compile:build-cached\`" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "**Manifests created:**" >> $GITHUB_STEP_SUMMARY
-            echo "- \`ghcr.io/curvineio/curvine-compile:latest\`" >> $GITHUB_STEP_SUMMARY
-            echo "- \`curvine/curvine-compile:latest\`" >> $GITHUB_STEP_SUMMARY
-          fi
-
+          echo "**Manifests created:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`curvine/curvine-compile:${{ matrix.tag }}\`" >> $GITHUB_STEP_SUMMARY
 
   # Final summary
   summary:
-    needs: [build-arch, create-manifest]
+    needs: [build-image, create-manifest]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -171,43 +179,33 @@ jobs:
         run: |
           echo "### Compile Image Build Summary 🚀" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Platform:** Rocky Linux 9" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Types:** rocky9, rocky9_cached, ubuntu22.04, ubuntu24.04" >> $GITHUB_STEP_SUMMARY
           echo "**Architectures:** amd64 (native), arm64 (native)" >> $GITHUB_STEP_SUMMARY
-          echo "**Build Type:** ${{ inputs.use_cache == true && 'build-cached' || 'latest' }}" >> $GITHUB_STEP_SUMMARY
           echo "**Build Strategy:** Native runners for each architecture" >> $GITHUB_STEP_SUMMARY
           echo "**Trigger:** workflow_dispatch" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ inputs.push_image }}" == "true" ]; then
             echo "**Multi-arch images pushed to:**" >> $GITHUB_STEP_SUMMARY
-            if [ "${{ inputs.use_cache }}" == "true" ]; then
-              echo "- \`ghcr.io/curvineio/curvine-compile:build-cached\`" >> $GITHUB_STEP_SUMMARY
-              echo "- \`curvine/curvine-compile:build-cached\`" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "- \`ghcr.io/curvineio/curvine-compile:latest\`" >> $GITHUB_STEP_SUMMARY
-              echo "- \`curvine/curvine-compile:latest\`" >> $GITHUB_STEP_SUMMARY
-            fi
-            
+            echo "- \`ghcr.io/curvineio/curvine-compile:rocky9\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`ghcr.io/curvineio/curvine-compile:rocky9_cached\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`ghcr.io/curvineio/curvine-compile:ubuntu22.04\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`ghcr.io/curvineio/curvine-compile:ubuntu24.04\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Pull commands:**" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-            if [ "${{ inputs.use_cache }}" == "true" ]; then
-              echo "docker pull ghcr.io/curvineio/curvine-compile:build-cached" >> $GITHUB_STEP_SUMMARY
-              echo "# or from Docker Hub" >> $GITHUB_STEP_SUMMARY
-              echo "docker pull curvine/curvine-compile:build-cached" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "docker pull ghcr.io/curvineio/curvine-compile:latest" >> $GITHUB_STEP_SUMMARY
-              echo "# or from Docker Hub" >> $GITHUB_STEP_SUMMARY
-              echo "docker pull curvine/curvine-compile:latest" >> $GITHUB_STEP_SUMMARY
-            fi
+            echo "# Rocky Linux 9 (standard)" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ghcr.io/curvineio/curvine-compile:rocky9" >> $GITHUB_STEP_SUMMARY
+            echo "# Rocky Linux 9 (cached)" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ghcr.io/curvineio/curvine-compile:rocky9_cached" >> $GITHUB_STEP_SUMMARY
+            echo "# Ubuntu 22.04" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ghcr.io/curvineio/curvine-compile:ubuntu22.04" >> $GITHUB_STEP_SUMMARY
+            echo "# Ubuntu 24.04" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ghcr.io/curvineio/curvine-compile:ubuntu24.04" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "# Verify multi-arch" >> $GITHUB_STEP_SUMMARY
-            if [ "${{ inputs.use_cache }}" == "true" ]; then
-              echo "docker buildx imagetools inspect ghcr.io/curvineio/curvine-compile:build-cached" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "docker buildx imagetools inspect ghcr.io/curvineio/curvine-compile:latest" >> $GITHUB_STEP_SUMMARY
-            fi
+            echo "docker buildx imagetools inspect ghcr.io/curvineio/curvine-compile:rocky9" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           else
-            echo "**Note:** Image was built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY
+            echo "**Note:** Images were built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY
           fi

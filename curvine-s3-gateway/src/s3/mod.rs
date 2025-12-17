@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod error;
+pub mod dto;
+pub mod error_code;
 pub mod handlers;
 pub mod s3_api;
 pub mod types;
-pub use error::*;
+
+pub use error_code::{s3_error, Error, S3Error as S3ApiError, S3ErrorCode};
 pub use s3_api::*;

@@ -725,10 +725,37 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     async fn append(&self, path: &Path) -> FsResult<OpendalWriter> {
         // OpenDAL doesn't support append for most backends
         // For now, return an error
-        Err(FsError::unsupported(format!(
-            "Append operation not supported for {}",
-            path.full_path()
-        )))
+        let object_path = self.get_object_path(path)?;
+        let status = self.get_file_status(path).await?;
+
+        match status {
+            None => err_ext!(FsError::file_not_found(path.full_path())),
+            Some(s) => {
+                if s.len < 8 * 1024 * 1024 {
+                    let chunk = self.operator.read(&object_path).await.map_err(|e| {
+                        FsError::common(format!(
+                            "Failed to read existing file {} for append: {}",
+                            path.full_path(),
+                            e
+                        ))
+                    })?;
+                    return Ok(OpendalWriter {
+                        operator: self.operator.clone(),
+                        path: path.clone(),
+                        object_path,
+                        pos: s.len,
+                        status: s,
+                        chunk: BytesMut::from(chunk.to_vec().as_slice()),
+                        chunk_size: 8 * 1024 * 1024,
+                        writer: None,
+                    });
+                }
+                err_ext!(FsError::unsupported(format!(
+                    "Append operation is not supported for file {}",
+                    path.full_path()
+                )))
+            }
+        }
     }
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
@@ -769,19 +796,12 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         match self.operator.rename(&src_path, &dst_path).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
-                // For services that don't support rename (like S3), use copy + delete
-                // Read source file
-                let data = self.operator.read(&src_path).await.map_err(|e| {
-                    FsError::common(format!("failed to read source file for rename: {}", e))
-                })?;
-
-                // Write to destination
-                self.operator.write(&dst_path, data).await.map_err(|e| {
-                    FsError::common(format!(
-                        "failed to write destination file for rename: {}",
-                        e
-                    ))
-                })?;
+                self.operator
+                    .copy(&src_path, &dst_path)
+                    .await
+                    .map_err(|e| {
+                        FsError::common(format!("failed to copy source file for rename: {}", e))
+                    })?;
 
                 // Delete source file
                 self.operator.delete(&src_path).await.map_err(|e| {

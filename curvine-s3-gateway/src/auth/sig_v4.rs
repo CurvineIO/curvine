@@ -25,7 +25,7 @@ pub trait VHeader {
     fn rng_header(&self, cb: impl FnMut(&str, &str) -> bool);
 }
 
-use crate::s3::error::Error;
+use crate::s3::error_code::Error;
 use crate::utils::consts::*;
 use crate::utils::GenericResult;
 #[derive(Debug)]
