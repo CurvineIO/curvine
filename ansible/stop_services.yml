@@ -1,0 +1,66 @@
+---
+# 停止Curvine集群服务
+# 使用方法: ansible-playbook stop_services.yml
+
+- name: Stop Curvine Worker Services
+  hosts: worker
+  gather_facts: no
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  tasks:
+    - name: Stop curvine-fuse service on worker nodes
+      systemd:
+        name: curvine-fuse
+        state: stopped
+      ignore_errors: yes
+
+    - name: Stop curvine-worker service on worker nodes
+      systemd:
+        name: curvine-worker
+        state: stopped
+      ignore_errors: yes
+
+    - name: Display worker node stop status
+      debug:
+        msg: "Worker节点 {{ inventory_hostname }} 服务已停止"
+
+- name: Stop Curvine Master Services
+  hosts: master
+  gather_facts: no
+  serial: 1
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  tasks:
+    - name: Stop curvine-fuse service on master nodes
+      systemd:
+        name: curvine-fuse
+        state: stopped
+      ignore_errors: yes
+
+    - name: Stop curvine-worker service on master nodes
+      systemd:
+        name: curvine-worker
+        state: stopped
+      ignore_errors: yes
+
+    - name: Stop curvine-master service
+      systemd:
+        name: curvine-master
+        state: stopped
+      ignore_errors: yes
+
+    - name: Display master node stop status
+      debug:
+        msg: "Master节点 {{ inventory_hostname }} 服务已停止"
+
+- name: Display stop completion message
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Success message
+      debug:
+        msg: |
+          ========================================
+          Curvine集群所有服务已停止！
+          ========================================
+

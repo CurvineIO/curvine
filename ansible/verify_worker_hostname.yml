@@ -1,0 +1,114 @@
+---
+# 验证Worker节点的CURVINE_WORKER_HOSTNAME环境变量设置
+# 使用方法: ansible-playbook verify_worker_hostname.yml
+
+- name: Verify CURVINE_WORKER_HOSTNAME for Worker Nodes
+  hosts: worker
+  gather_facts: no
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  tasks:
+    - name: Get CURVINE_WORKER_HOSTNAME from /etc/profile
+      shell: grep 'CURVINE_WORKER_HOSTNAME' /etc/profile | grep -v '^#' | tail -1 | sed 's/.*CURVINE_WORKER_HOSTNAME=//'
+      register: profile_hostname
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Get CURVINE_WORKER_HOSTNAME from curvine-worker.service
+      shell: grep 'CURVINE_WORKER_HOSTNAME' /etc/systemd/system/curvine-worker.service | sed 's/.*CURVINE_WORKER_HOSTNAME=//' | tr -d '"'
+      register: service_hostname
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Get expected IP (from hosts.ini)
+      set_fact:
+        expected_ip: "{{ inventory_hostname }}"
+
+    - name: Check profile setting
+      set_fact:
+        profile_correct: "{{ profile_hostname.stdout == expected_ip }}"
+
+    - name: Check service setting
+      set_fact:
+        service_correct: "{{ service_hostname.stdout == expected_ip }}"
+
+    - name: Display verification result
+      debug:
+        msg: |
+          ========================================
+          Worker节点: {{ inventory_hostname }}
+          ----------------------------------------
+          预期IP (hosts.ini): {{ expected_ip }}
+          
+          /etc/profile设置:
+            值: {{ profile_hostname.stdout | default('未设置') }}
+            状态: {{ '✓ 正确' if profile_correct else '✗ 错误' }}
+          
+          systemd服务设置:
+            值: {{ service_hostname.stdout | default('未设置') }}
+            状态: {{ '✓ 正确' if service_correct else '✗ 错误' }}
+          
+          总体状态: {{ '✓ 通过验证' if (profile_correct and service_correct) else '✗ 验证失败' }}
+          ========================================
+
+    - name: Collect verification results
+      set_fact:
+        verification_result:
+          hostname: "{{ inventory_hostname }}"
+          expected_ip: "{{ expected_ip }}"
+          profile_value: "{{ profile_hostname.stdout | default('未设置') }}"
+          profile_correct: "{{ profile_correct }}"
+          service_value: "{{ service_hostname.stdout | default('未设置') }}"
+          service_correct: "{{ service_correct }}"
+          overall_status: "{{ 'PASS' if (profile_correct and service_correct) else 'FAIL' }}"
+
+    - name: Add to global results
+      set_fact:
+        all_results: "{{ all_results | default([]) + [verification_result] }}"
+      delegate_to: localhost
+      delegate_facts: true
+
+- name: Display Summary
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Count results
+      set_fact:
+        total_workers: "{{ all_results | length }}"
+        passed_workers: "{{ all_results | selectattr('overall_status', 'equalto', 'PASS') | list | length }}"
+        failed_workers: "{{ all_results | selectattr('overall_status', 'equalto', 'FAIL') | list | length }}"
+      when: all_results is defined
+
+    - name: Display failed workers
+      debug:
+        msg: |
+          ⚠️ 以下Worker节点验证失败:
+          {% for result in all_results | selectattr('overall_status', 'equalto', 'FAIL') %}
+          - {{ result.hostname }}:
+            预期: {{ result.expected_ip }}
+            /etc/profile: {{ result.profile_value }} ({{ '✓' if result.profile_correct else '✗' }})
+            systemd服务: {{ result.service_value }} ({{ '✓' if result.service_correct else '✗' }})
+          {% endfor %}
+      when: 
+        - all_results is defined
+        - failed_workers | int > 0
+
+    - name: Display summary
+      debug:
+        msg: |
+          ========================================
+          验证摘要
+          ========================================
+          总Worker节点数: {{ total_workers | default(0) }}
+          通过验证: {{ passed_workers | default(0) }}
+          验证失败: {{ failed_workers | default(0) }}
+          
+          {% if failed_workers | default(0) | int > 0 %}
+          ⚠️ 有节点验证失败，请运行以下命令修复:
+          ansible-playbook setup_worker_hostname.yml
+          {% else %}
+          ✓ 所有Worker节点的CURVINE_WORKER_HOSTNAME环境变量设置正确！
+          {% endif %}
+          ========================================
+      when: all_results is defined
+

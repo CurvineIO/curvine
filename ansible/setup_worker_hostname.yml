@@ -1,0 +1,156 @@
+---
+# 设置Worker节点的CURVINE_WORKER_HOSTNAME环境变量
+# 使用方法: ansible-playbook setup_worker_hostname.yml
+
+- name: Setup CURVINE_WORKER_HOSTNAME for Worker Nodes
+  hosts: worker
+  gather_facts: no
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  tasks:
+    - name: Get current CURVINE_WORKER_HOSTNAME value
+      shell: grep 'CURVINE_WORKER_HOSTNAME' /etc/profile | grep -v '^#' | tail -1 | sed 's/.*CURVINE_WORKER_HOSTNAME=//'
+      register: current_worker_hostname
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display current worker hostname status
+      debug:
+        msg: |
+          ========================================
+          Worker节点: {{ inventory_hostname }}
+          当前CURVINE_WORKER_HOSTNAME: {{ current_worker_hostname.stdout | default('未设置') }}
+          应该设置为: {{ inventory_hostname }}
+          状态: {{ '✓ 正确' if current_worker_hostname.stdout == inventory_hostname else '⚠️ 需要修复' }}
+          ========================================
+
+    - name: Remove old CURVINE_WORKER_HOSTNAME setting if incorrect
+      lineinfile:
+        path: /etc/profile
+        regexp: '.*CURVINE_WORKER_HOSTNAME.*'
+        state: absent
+      when: current_worker_hostname.stdout != inventory_hostname
+
+    - name: Add correct CURVINE_WORKER_HOSTNAME setting
+      lineinfile:
+        path: /etc/profile
+        line: "export CURVINE_WORKER_HOSTNAME={{ inventory_hostname }}"
+        state: present
+        create: yes
+        backup: yes
+      when: current_worker_hostname.stdout != inventory_hostname
+
+    - name: Update curvine-worker systemd service with CURVINE_WORKER_HOSTNAME
+      block:
+        - name: Check if curvine-worker service file exists
+          stat:
+            path: /etc/systemd/system/curvine-worker.service
+          register: worker_service_file
+
+        - name: Update curvine-worker service file
+          lineinfile:
+            path: /etc/systemd/system/curvine-worker.service
+            regexp: '^Environment="CURVINE_WORKER_HOSTNAME=.*'
+            line: 'Environment="CURVINE_WORKER_HOSTNAME={{ inventory_hostname }}"'
+            insertafter: '^Environment="CURVINE_MASTER_HOSTNAME=.*'
+            state: present
+          when: worker_service_file.stat.exists
+
+        - name: Check if line was added or just insert it
+          shell: grep 'CURVINE_WORKER_HOSTNAME' /etc/systemd/system/curvine-worker.service
+          register: service_has_hostname
+          ignore_errors: yes
+          when: worker_service_file.stat.exists
+
+        - name: Add CURVINE_WORKER_HOSTNAME to service if not present
+          lineinfile:
+            path: /etc/systemd/system/curvine-worker.service
+            line: '  Environment="CURVINE_WORKER_HOSTNAME={{ inventory_hostname }}"'
+            insertafter: '.*CURVINE_MASTER_HOSTNAME.*'
+            state: present
+          when: 
+            - worker_service_file.stat.exists
+            - service_has_hostname.rc != 0
+
+    - name: Update curvine-fuse systemd service with CURVINE_WORKER_HOSTNAME
+      block:
+        - name: Check if curvine-fuse service file exists
+          stat:
+            path: /etc/systemd/system/curvine-fuse.service
+          register: fuse_service_file
+
+        - name: Update curvine-fuse service file
+          lineinfile:
+            path: /etc/systemd/system/curvine-fuse.service
+            regexp: '^Environment="CURVINE_WORKER_HOSTNAME=.*'
+            line: 'Environment="CURVINE_WORKER_HOSTNAME={{ inventory_hostname }}"'
+            insertafter: '^Environment="CURVINE_MASTER_HOSTNAME=.*'
+            state: present
+          when: fuse_service_file.stat.exists
+
+        - name: Check if line was added to fuse service
+          shell: grep 'CURVINE_WORKER_HOSTNAME' /etc/systemd/system/curvine-fuse.service
+          register: fuse_has_hostname
+          ignore_errors: yes
+          when: fuse_service_file.stat.exists
+
+        - name: Add CURVINE_WORKER_HOSTNAME to fuse service if not present
+          lineinfile:
+            path: /etc/systemd/system/curvine-fuse.service
+            line: '  Environment="CURVINE_WORKER_HOSTNAME={{ inventory_hostname }}"'
+            insertafter: '.*CURVINE_MASTER_HOSTNAME.*'
+            state: present
+          when: 
+            - fuse_service_file.stat.exists
+            - fuse_has_hostname.rc != 0
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      when: current_worker_hostname.stdout != inventory_hostname
+
+    - name: Source /etc/profile
+      shell: source /etc/profile
+      args:
+        executable: /bin/bash
+      when: current_worker_hostname.stdout != inventory_hostname
+
+    - name: Verify new setting
+      shell: grep 'CURVINE_WORKER_HOSTNAME' /etc/profile | grep -v '^#' | tail -1
+      register: verify_setting
+      changed_when: false
+
+    - name: Display final status
+      debug:
+        msg: |
+          ========================================
+          Worker节点: {{ inventory_hostname }}
+          {{ '✓ 环境变量已正确设置' if verify_setting.stdout is search(inventory_hostname) else '⚠️ 设置可能失败' }}
+          当前设置: {{ verify_setting.stdout }}
+          ========================================
+
+- name: Summary
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Display completion message
+      debug:
+        msg: |
+          ========================================
+          CURVINE_WORKER_HOSTNAME 设置完成！
+          
+          所有Worker节点的/etc/profile已更新
+          每个Worker的CURVINE_WORKER_HOSTNAME已设置为其在hosts.ini中的IP地址
+          
+          注意：
+          1. 新的终端会话会自动加载此环境变量
+          2. systemd服务已更新并重新加载
+          3. 如需立即生效，请重启worker服务
+          
+          验证设置：
+          ansible worker -m shell -a "grep CURVINE_WORKER_HOSTNAME /etc/profile"
+          
+          重启worker服务：
+          ansible-playbook restart_services.yml
+          ========================================
+

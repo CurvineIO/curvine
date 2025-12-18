@@ -1,0 +1,152 @@
+---
+# 重启Curvine集群服务
+# 使用方法: ansible-playbook restart_services.yml
+
+- name: Check and Fix Environment Variables
+  hosts: all
+  gather_facts: yes
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  tasks:
+    - name: Get current CURVINE_MASTER_HOSTNAME value
+      shell: grep 'CURVINE_MASTER_HOSTNAME' /etc/profile | grep -v '^#' | tail -1 | sed 's/.*CURVINE_MASTER_HOSTNAME=//'
+      register: current_hostname
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Get node IP for master nodes
+      set_fact:
+        node_ip: "{{ ansible_eth0.ipv4.address if ansible_eth0 is defined else (ansible_bond0.ipv4.address if ansible_bond0 is defined else ansible_default_ipv4.address) }}"
+      when: "'master' in group_names"
+
+    - name: Check master node environment
+      debug:
+        msg: |
+          Master节点 {{ inventory_hostname }}:
+          当前值: {{ current_hostname.stdout | default('未设置') }}
+          应该是: {{ node_ip }}
+          状态: {{ '✓ 正确' if current_hostname.stdout == node_ip else '✗ 需要修复' }}
+      when: "'master' in group_names"
+
+    - name: Fix master node environment if incorrect
+      block:
+        - name: Remove old CURVINE_MASTER_HOSTNAME
+          lineinfile:
+            path: /etc/profile
+            regexp: '.*CURVINE_MASTER_HOSTNAME.*'
+            state: absent
+
+        - name: Add correct CURVINE_MASTER_HOSTNAME
+          lineinfile:
+            path: /etc/profile
+            line: "export CURVINE_MASTER_HOSTNAME={{ node_ip }}"
+            state: present
+
+        - name: Source profile
+          shell: source /etc/profile
+          args:
+            executable: /bin/bash
+      when: 
+        - "'master' in group_names"
+        - current_hostname.stdout != node_ip
+
+    - name: Check worker node environment
+      debug:
+        msg: |
+          Worker节点 {{ inventory_hostname }}:
+          当前值: {{ current_hostname.stdout | default('未设置') }}
+          应该是: localhost
+          状态: {{ '✓ 正确' if current_hostname.stdout == 'localhost' else '✗ 需要修复' }}
+      when: "'worker' in group_names"
+
+    - name: Fix worker node environment if incorrect
+      block:
+        - name: Remove old CURVINE_MASTER_HOSTNAME
+          lineinfile:
+            path: /etc/profile
+            regexp: '.*CURVINE_MASTER_HOSTNAME.*'
+            state: absent
+
+        - name: Add correct CURVINE_MASTER_HOSTNAME
+          lineinfile:
+            path: /etc/profile
+            line: "export CURVINE_MASTER_HOSTNAME=localhost"
+            state: present
+
+        - name: Source profile
+          shell: source /etc/profile
+          args:
+            executable: /bin/bash
+      when: 
+        - "'worker' in group_names"
+        - current_hostname.stdout != 'localhost'
+
+- name: Restart Worker Services First
+  hosts: worker
+  gather_facts: no
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  tasks:
+    - name: Restart curvine-fuse service on worker nodes
+      systemd:
+        name: curvine-fuse
+        state: restarted
+      ignore_errors: yes
+
+    - name: Restart curvine-worker service on worker nodes
+      systemd:
+        name: curvine-worker
+        state: restarted
+      ignore_errors: yes
+
+    - name: Display worker node restart status
+      debug:
+        msg: "Worker节点 {{ inventory_hostname }} 服务已重启"
+
+- name: Restart Master Services
+  hosts: master
+  gather_facts: no
+  serial: 1
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  tasks:
+    - name: Restart curvine-fuse service on master nodes
+      systemd:
+        name: curvine-fuse
+        state: restarted
+      ignore_errors: yes
+
+    - name: Restart curvine-worker service on master nodes
+      systemd:
+        name: curvine-worker
+        state: restarted
+      ignore_errors: yes
+
+    - name: Restart curvine-master service
+      systemd:
+        name: curvine-master
+        state: restarted
+      ignore_errors: yes
+
+    - name: Wait for services to stabilize
+      wait_for:
+        timeout: 10
+
+    - name: Display master node restart status
+      debug:
+        msg: "Master节点 {{ inventory_hostname }} 服务已重启"
+
+- name: Display restart completion message
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Success message
+      debug:
+        msg: |
+          ========================================
+          Curvine集群所有服务已重启！
+          
+          查看服务状态请运行：
+          ansible-playbook status_services.yml
+          ========================================
+

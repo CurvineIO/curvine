@@ -1,0 +1,532 @@
+---
+# Curvine集群部署和服务化
+# 使用方法: ansible-playbook deploy_curvine.yml
+
+- name: Deploy Curvine Cluster
+  hosts: all
+  gather_facts: yes
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  vars:
+    curvine_install_dir: /root/dist
+    curvine_config_file: "{{ curvine_install_dir }}/conf/curvine-cluster.toml"
+    master_dist_file: /root/dist.tar.gz
+    worker_dist_file: /root/dist1.tar.gz
+    # 数据目录配置，可以修改为实际的目录列表
+    data_dirs:
+      - "[SSD]/data/data"
+    
+  tasks:
+    - name: Get bond0 IP address
+      set_fact:
+        bond0_ip: "{{ ansible_facts['bond0']['ipv4']['address'] }}"
+      when: 
+        - "'master' in group_names"
+        - "'bond0' in ansible_facts"
+      ignore_errors: yes
+
+    - name: Get eth0 IP address if bond0 not found
+      set_fact:
+        bond0_ip: "{{ ansible_facts['eth0']['ipv4']['address'] }}"
+      when: 
+        - "'master' in group_names"
+        - "bond0_ip is not defined"
+        - "'eth0' in ansible_facts"
+      ignore_errors: yes
+
+    - name: Use default IP if bond0 and eth0 not found
+      set_fact:
+        bond0_ip: "{{ ansible_default_ipv4.address }}"
+      when: bond0_ip is not defined and 'master' in group_names
+
+    - name: Display detected IP for master nodes
+      debug:
+        msg: "Master节点IP: {{ bond0_ip }} (来源: {{ 'bond0' if 'bond0' in ansible_facts else ('eth0' if 'eth0' in ansible_facts else '默认网卡') }})"
+      when: "'master' in group_names"
+
+# ============= Master节点配置 =============
+- name: Configure Master Nodes
+  hosts: master
+  gather_facts: no
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  vars:
+    curvine_install_dir: /root/dist
+    curvine_config_file: "{{ curvine_install_dir }}/conf/curvine-cluster.toml"
+    master_dist_file: /root/dist.tar.gz
+    data_dirs:
+      - "[SSD]/data/data"
+  
+  tasks:
+    - name: Check if environment variable already exists in /etc/profile
+      shell: grep "CURVINE_MASTER_HOSTNAME" /etc/profile
+      register: env_exists
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Add CURVINE_MASTER_HOSTNAME to /etc/profile for master nodes
+      lineinfile:
+        path: /etc/profile
+        line: "export CURVINE_MASTER_HOSTNAME={{ bond0_ip }}"
+        state: present
+        create: yes
+        backup: yes
+      when: env_exists.rc != 0
+
+    - name: Source /etc/profile
+      shell: source /etc/profile
+      args:
+        executable: /bin/bash
+
+    - name: Check if installation directory already exists
+      stat:
+        path: "{{ curvine_install_dir }}"
+      register: install_dir_check
+
+    - name: Display installation status
+      debug:
+        msg: "安装目录{{ '已存在' if install_dir_check.stat.exists else '不存在' }}，{{ '跳过' if install_dir_check.stat.exists else '开始' }}拷贝和解压"
+
+    - name: Check if dist.tar.gz exists on control node
+      delegate_to: localhost
+      stat:
+        path: "{{ master_dist_file }}"
+      register: master_dist_stat
+      run_once: true
+      when: not install_dir_check.stat.exists
+
+    - name: Fail if dist.tar.gz not found
+      fail:
+        msg: "文件 {{ master_dist_file }} 在控制节点上不存在，请先准备好安装包"
+      when: 
+        - not install_dir_check.stat.exists
+        - not master_dist_stat.stat.exists
+      run_once: true
+
+    - name: Create installation directory
+      file:
+        path: "{{ curvine_install_dir }}"
+        state: directory
+        mode: '0755'
+      when: not install_dir_check.stat.exists
+
+    - name: Copy dist.tar.gz to master nodes
+      copy:
+        src: "{{ master_dist_file }}"
+        dest: /root/dist.tar.gz
+        mode: '0644'
+      when: not install_dir_check.stat.exists
+
+    - name: Extract dist.tar.gz
+      unarchive:
+        src: /root/dist.tar.gz
+        dest: /root/
+        remote_src: yes
+      when: not install_dir_check.stat.exists
+
+    - name: Make scripts executable
+      file:
+        path: "{{ curvine_install_dir }}/bin"
+        mode: '0755'
+        recurse: yes
+      when: curvine_install_dir is defined
+
+    - name: Update data_dir in curvine-cluster.toml
+      block:
+        - name: Read current config file
+          slurp:
+            src: "{{ curvine_config_file }}"
+          register: config_content
+
+        - name: Backup original config
+          copy:
+            content: "{{ config_content['content'] | b64decode }}"
+            dest: "{{ curvine_config_file }}.backup"
+            backup: yes
+
+        - name: Update data_dir configuration
+          replace:
+            path: "{{ curvine_config_file }}"
+            regexp: '^(\s*)data_dir\s*=\s*\[.*?\]'
+            replace: 'data_dir = {{ data_dirs | to_json }}'
+            backup: yes
+      when: 
+        - data_dirs is defined
+        - not install_dir_check.stat.exists
+
+    - name: Create curvine-master systemd service
+      copy:
+        dest: /etc/systemd/system/curvine-master.service
+        content: |
+          [Unit]
+          Description=Curvine Master Service
+          After=network.target
+          
+          [Service]
+          Type=forking
+          User=root
+          Group=root
+          WorkingDirectory={{ curvine_install_dir }}
+          Environment="CURVINE_MASTER_HOSTNAME={{ bond0_ip }}"
+          ExecStart={{ curvine_install_dir }}/bin/curvine-master.sh start
+          ExecStop={{ curvine_install_dir }}/bin/curvine-master.sh stop
+          ExecReload={{ curvine_install_dir }}/bin/curvine-master.sh restart
+          Restart=on-failure
+          RestartSec=10
+          LimitNOFILE=65536
+          
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Create curvine-worker systemd service for master nodes
+      copy:
+        dest: /etc/systemd/system/curvine-worker.service
+        content: |
+          [Unit]
+          Description=Curvine Worker Service
+          After=network.target curvine-master.service
+          Wants=curvine-master.service
+          
+          [Service]
+          Type=forking
+          User=root
+          Group=root
+          WorkingDirectory={{ curvine_install_dir }}
+          Environment="CURVINE_MASTER_HOSTNAME={{ bond0_ip }}"
+          ExecStart={{ curvine_install_dir }}/bin/curvine-worker.sh start
+          ExecStop={{ curvine_install_dir }}/bin/curvine-worker.sh stop
+          ExecReload={{ curvine_install_dir }}/bin/curvine-worker.sh restart
+          Restart=on-failure
+          RestartSec=10
+          LimitNOFILE=65536
+          
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Create curvine-fuse systemd service for master nodes
+      copy:
+        dest: /etc/systemd/system/curvine-fuse.service
+        content: |
+          [Unit]
+          Description=Curvine FUSE Service
+          After=network.target curvine-worker.service
+          Wants=curvine-worker.service
+          
+          [Service]
+          Type=forking
+          User=root
+          Group=root
+          WorkingDirectory={{ curvine_install_dir }}
+          Environment="CURVINE_MASTER_HOSTNAME={{ bond0_ip }}"
+          ExecStart={{ curvine_install_dir }}/bin/curvine-fuse.sh start
+          ExecStop={{ curvine_install_dir }}/bin/curvine-fuse.sh stop
+          ExecReload={{ curvine_install_dir }}/bin/curvine-fuse.sh restart
+          Restart=on-failure
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable curvine services on master nodes
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+      loop:
+        - curvine-master
+        - curvine-worker
+        - curvine-fuse
+
+    - name: Display master node deployment status
+      debug:
+        msg: "Master节点 {{ inventory_hostname }} 部署完成，服务已配置但未启动"
+
+# ============= Worker节点配置 =============
+- name: Configure Worker Nodes
+  hosts: worker
+  gather_facts: no
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  vars:
+    curvine_install_dir: /root/dist
+    curvine_config_file: "{{ curvine_install_dir }}/conf/curvine-cluster.toml"
+    worker_dist_file: /root/dist1.tar.gz
+    data_dirs:
+      - "[SSD]/data/data"
+  
+  tasks:
+    - name: Check if CURVINE_MASTER_HOSTNAME already exists in /etc/profile
+      shell: grep "CURVINE_MASTER_HOSTNAME" /etc/profile
+      register: env_exists
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Add CURVINE_MASTER_HOSTNAME to /etc/profile for worker nodes
+      lineinfile:
+        path: /etc/profile
+        line: "export CURVINE_MASTER_HOSTNAME=localhost"
+        state: present
+        create: yes
+        backup: yes
+      when: env_exists.rc != 0
+
+    - name: Check if CURVINE_WORKER_HOSTNAME already exists in /etc/profile
+      shell: grep "CURVINE_WORKER_HOSTNAME" /etc/profile
+      register: worker_hostname_exists
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Add CURVINE_WORKER_HOSTNAME to /etc/profile for worker nodes
+      lineinfile:
+        path: /etc/profile
+        line: "export CURVINE_WORKER_HOSTNAME={{ inventory_hostname }}"
+        state: present
+        create: yes
+        backup: yes
+      when: worker_hostname_exists.rc != 0
+
+    - name: Display worker hostname setting
+      debug:
+        msg: "Worker节点 {{ inventory_hostname }} 已设置 CURVINE_WORKER_HOSTNAME={{ inventory_hostname }}"
+
+    - name: Source /etc/profile
+      shell: source /etc/profile
+      args:
+        executable: /bin/bash
+
+    - name: Check if installation directory already exists
+      stat:
+        path: "{{ curvine_install_dir }}"
+      register: worker_install_dir_check
+
+    - name: Display installation status
+      debug:
+        msg: "安装目录{{ '已存在' if worker_install_dir_check.stat.exists else '不存在' }}，{{ '跳过' if worker_install_dir_check.stat.exists else '开始' }}拷贝和解压"
+
+    - name: Check if dist1.tar.gz exists on control node
+      delegate_to: localhost
+      stat:
+        path: "{{ worker_dist_file }}"
+      register: worker_dist_stat
+      run_once: true
+      when: not worker_install_dir_check.stat.exists
+
+    - name: Fail if dist1.tar.gz not found
+      fail:
+        msg: "文件 {{ worker_dist_file }} 在控制节点上不存在，请先准备好安装包"
+      when: 
+        - not worker_install_dir_check.stat.exists
+        - not worker_dist_stat.stat.exists
+      run_once: true
+
+    - name: Create installation directory
+      file:
+        path: "{{ curvine_install_dir }}"
+        state: directory
+        mode: '0755'
+      when: not worker_install_dir_check.stat.exists
+
+    - name: Copy dist1.tar.gz to worker nodes
+      copy:
+        src: "{{ worker_dist_file }}"
+        dest: /root/dist1.tar.gz
+        mode: '0644'
+      when: not worker_install_dir_check.stat.exists
+
+    - name: Extract dist1.tar.gz directly to /root/dist/
+      unarchive:
+        src: /root/dist1.tar.gz
+        dest: "{{ curvine_install_dir }}/"
+        remote_src: yes
+        extra_opts:
+          - --strip-components=1
+      when: not worker_install_dir_check.stat.exists
+
+    - name: Check if dist directory exists after extraction
+      stat:
+        path: "{{ curvine_install_dir }}"
+      register: dist_final_check
+
+    - name: Display final installation status
+      debug:
+        msg: "安装目录 {{ curvine_install_dir }} {{ '存在' if dist_final_check.stat.exists else '不存在' }}"
+
+    - name: Verify bin directory structure
+      shell: ls -la {{ curvine_install_dir }}/
+      register: dist_structure
+      when: dist_final_check.stat.exists
+
+    - name: Display dist structure
+      debug:
+        msg: "{{ curvine_install_dir }} 目录结构: {{ dist_structure.stdout_lines }}"
+      when: 
+        - dist_final_check.stat.exists
+        - dist_structure is defined
+
+    - name: Check if bin directory was extracted
+      stat:
+        path: "{{ curvine_install_dir }}/bin"
+      register: bin_dir_check
+
+    - name: Display bin directory check result
+      debug:
+        msg: "Worker节点bin目录{{ '存在' if bin_dir_check.stat.exists else '不存在' }}: {{ curvine_install_dir }}/bin"
+
+    - name: Make scripts executable
+      file:
+        path: "{{ curvine_install_dir }}/bin"
+        mode: '0755'
+        recurse: yes
+      when: bin_dir_check.stat.exists
+
+    - name: Make lib executables
+      file:
+        path: "{{ curvine_install_dir }}/lib"
+        mode: '0755'
+        recurse: yes
+      when: bin_dir_check.stat.exists
+
+    - name: Check critical files
+      stat:
+        path: "{{ item }}"
+      register: critical_files
+      loop:
+        - "{{ curvine_install_dir }}/bin/curvine-worker.sh"
+        - "{{ curvine_install_dir }}/bin/curvine-fuse.sh"
+        - "{{ curvine_install_dir }}/lib/curvine-server"
+
+    - name: Display critical files status
+      debug:
+        msg: "{{ item.item }}: {{ '存在' if item.stat.exists else '不存在' }}"
+      loop: "{{ critical_files.results }}"
+
+    - name: Check if config file exists on worker nodes
+      stat:
+        path: "{{ curvine_config_file }}"
+      register: worker_config_stat
+
+    - name: Display config file status for worker nodes
+      debug:
+        msg: "Worker节点配置文件{{ '存在' if worker_config_stat.stat.exists else '不存在' }}: {{ curvine_config_file }}"
+
+    - name: Update data_dir in curvine-cluster.toml
+      block:
+        - name: Read current config file
+          slurp:
+            src: "{{ curvine_config_file }}"
+          register: config_content
+
+        - name: Backup original config
+          copy:
+            content: "{{ config_content['content'] | b64decode }}"
+            dest: "{{ curvine_config_file }}.backup"
+            backup: yes
+
+        - name: Update data_dir configuration
+          replace:
+            path: "{{ curvine_config_file }}"
+            regexp: '^(\s*)data_dir\s*=\s*\[.*?\]'
+            replace: 'data_dir = {{ data_dirs | to_json }}'
+            backup: yes
+      when: 
+        - data_dirs is defined
+        - worker_config_stat.stat.exists
+        - not worker_install_dir_check.stat.exists
+
+    - name: Create curvine-worker systemd service for worker nodes
+      copy:
+        dest: /etc/systemd/system/curvine-worker.service
+        content: |
+          [Unit]
+          Description=Curvine Worker Service
+          After=network.target
+          
+          [Service]
+          Type=forking
+          User=root
+          Group=root
+          WorkingDirectory={{ curvine_install_dir }}
+          Environment="CURVINE_MASTER_HOSTNAME=localhost"
+          Environment="CURVINE_WORKER_HOSTNAME={{ inventory_hostname }}"
+          ExecStart={{ curvine_install_dir }}/bin/curvine-worker.sh start
+          ExecStop={{ curvine_install_dir }}/bin/curvine-worker.sh stop
+          ExecReload={{ curvine_install_dir }}/bin/curvine-worker.sh restart
+          Restart=on-failure
+          RestartSec=10
+          LimitNOFILE=65536
+          
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Create curvine-fuse systemd service for worker nodes
+      copy:
+        dest: /etc/systemd/system/curvine-fuse.service
+        content: |
+          [Unit]
+          Description=Curvine FUSE Service
+          After=network.target curvine-worker.service
+          Wants=curvine-worker.service
+          
+          [Service]
+          Type=forking
+          User=root
+          Group=root
+          WorkingDirectory={{ curvine_install_dir }}
+          Environment="CURVINE_MASTER_HOSTNAME=localhost"
+          Environment="CURVINE_WORKER_HOSTNAME={{ inventory_hostname }}"
+          ExecStart={{ curvine_install_dir }}/bin/curvine-fuse.sh start
+          ExecStop={{ curvine_install_dir }}/bin/curvine-fuse.sh stop
+          ExecReload={{ curvine_install_dir }}/bin/curvine-fuse.sh restart
+          Restart=on-failure
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable curvine services on worker nodes
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+      loop:
+        - curvine-worker
+        - curvine-fuse
+
+    - name: Display worker node deployment status
+      debug:
+        msg: "Worker节点 {{ inventory_hostname }} 部署完成，服务已配置但未启动"
+
+# ============= 部署总结 =============
+- name: Deployment Summary
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Display deployment completion message
+      debug:
+        msg: |
+          ========================================
+          Curvine集群部署完成！
+          
+          所有服务已经配置并启用，但尚未启动。
+          
+          启动服务请使用：
+          ansible-playbook start_services.yml
+          
+          查看服务状态：
+          ansible-playbook status_services.yml
+          
+          停止服务：
+          ansible-playbook stop_services.yml
+          ========================================
+
