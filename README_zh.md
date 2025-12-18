@@ -216,21 +216,23 @@ Curvine 使用 TOML 格式的配置文件。示例配置位于 conf/curvine-clus
 - 集群配置（节点数量、副本因子）
 - 性能调优参数
 ## 🏗️ 大型集群批量自动部署
-优势简介：
-1.自动部署master服务、worker服务、fuse服务在对应功能的节点上
-2.自动探测您GPU集群每一台GPU服务器的未使用的NVME盘和已经使用的NVME盘
-3.自动格式化未使用磁盘并挂载到您指定的路径
-4.自动添加指定的路径及所有其他NVME磁盘挂载点到config文件（系统盘除外）
-5.服务化master服务、worker服务、fuse服务，能使用systemctl 管理
-6.可以多次重复部署和修复部署、添加部分配置部署，自动批量管理服务启动、重启、停止
-7.可以根据您要求自动添加环境变量并生效
-8.可以自动检查您配置要求错误的地方并更正
-部署指南：
+优势简介：<br>
+1.自动部署master服务、worker服务、fuse服务在对应功能的节点上<br>
+2.自动探测您GPU集群每一台GPU服务器的未使用的NVME盘和已经使用的NVME盘<br>
+3.自动格式化未使用磁盘并挂载到您指定的路径<br>
+4.自动添加指定的路径及所有其他NVME磁盘挂载点到config文件（系统盘除外）<br>
+5.服务化master服务、worker服务、fuse服务，能使用systemctl 管理<br>
+6.可以多次重复部署和修复部署、添加部分配置部署，自动批量管理服务启动、重启、停止<br>
+7.可以根据您要求自动添加环境变量并生效<br>
+8.可以自动检查您配置要求错误的地方并更正<br>
+部署指南：<br>
+```bash
 apt install ansible
 vi host.ini (配置您master节点的ip列表 和worker 节点的IP列表，注意：master 节点启动的是三个服务全启动，worker节点是启动worker服务和fuse服务)
 cd ansible
 chmod 777 *
 ./deploy_all.sh
+```
 
 
 
