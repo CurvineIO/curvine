@@ -179,6 +179,31 @@ Curvine uses TOML - formatted configuration files. An example configuration is l
 - Storage policies (cache size, storage type)
 - Cluster configuration (number of nodes, replication factor)
 - Performance tuning parameters
+## 🏗️ cluster auto deploy
+Introduction of Advantages
+Automated Component Deployment: Automatically deploys Master, Worker, and Fuse services onto their respective functional nodes.<br>
+
+Smart Disk Detection: Automatically detects both used and unused NVMe drives across every GPU server within your cluster.<br>
+
+Automated Storage Initialization: Automatically formats unused disks and mounts them to your specified paths.<br>
+
+Dynamic Configuration Management: Automatically adds specified paths and all other NVMe mount points (excluding the system partition) to the configuration file.<br>
+
+Service-Oriented Management: Integrates Master, Worker, and Fuse services with systemd, allowing management via standard systemctl commands.<br>
+
+Flexible Lifecycle Management: Supports idempotent deployments (repeated runs), deployment repairs, and incremental configuration updates. Provides automated batch management for service start, restart, and stop operations.<br>
+
+Environment Automation: Automatically injects and activates required environment variables based on your specifications.<br>
+
+Self-Correction Logic: Automatically detects configuration errors and applies corrections to ensure deployment integrity.<br>
+```bash
+apt install ansible
+vi host.ini (config your master node ip address list 和worker ip address list，note：master node will start all three service，worker node only start worker service and fuse service )
+cd ansible
+chmod 777 *
+./deploy_all.sh
+```
+
 
 ## 🏗️ Architecture Design
 
