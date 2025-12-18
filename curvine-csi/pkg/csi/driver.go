@@ -35,9 +35,14 @@ const (
 	DriverName = "curvine"
 )
 
+// NodeServer interface for node service implementations
+type NodeServer interface {
+	csi.NodeServer
+}
+
 type Driver struct {
 	*controllerService
-	*nodeService
+	nodeServer NodeServer
 
 	srv      *grpc.Server
 	endpoint string
@@ -50,56 +55,79 @@ func NewDriver(endpoint string, nodeID string) *Driver {
 	klog.Infof("RequestID: %s, Initializing driver: %v version %v commit %v date %v",
 		requestID, DriverName, driverVersion, gitCommit, buildDate)
 
-	nodeSvc, err := newNodeService(nodeID)
-	if err != nil {
-		klog.Fatalf("Failed to create node service: %v", err)
+	// Check mount mode via environment variable
+	// Options: "embedded" (FUSE in CSI container) or "standalone" (independent standalone pod)
+	// Default: "standalone" for better lifecycle management
+	mountMode := os.Getenv("MOUNT_MODE")
+	if mountMode == "" {
+		mountMode = "standalone" // default to standalone mode
+	}
+
+	var nodeServer NodeServer
+	var err error
+
+	switch mountMode {
+	case "standalone":
+		klog.Infof("RequestID: %s, Using standalone mode for FUSE management", requestID)
+		nodeServer, err = newNodeServiceStandalone(nodeID)
+		if err != nil {
+			klog.Fatalf("Failed to create standalone node service: %v", err)
+		}
+	case "embedded":
+		klog.Infof("RequestID: %s, Using embedded mode (FUSE in CSI container)", requestID)
+		nodeServer, err = newNodeService(nodeID)
+		if err != nil {
+			klog.Fatalf("Failed to create node service: %v", err)
+		}
+	default:
+		klog.Fatalf("Invalid MOUNT_MODE: %s (expected: embedded or standalone)", mountMode)
 	}
 
 	return &Driver{
 		endpoint:          endpoint,
 		controllerService: newControllerService(),
-		nodeService:       nodeSvc,
+		nodeServer:        nodeServer,
 	}
 }
 
-// NodeStageVolume is a proxy method that delegates to the embedded nodeService
+// NodeStageVolume is a proxy method that delegates to the nodeServer
 func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	return d.nodeService.NodeStageVolume(ctx, req)
+	return d.nodeServer.NodeStageVolume(ctx, req)
 }
 
-// NodeUnstageVolume is a proxy method that delegates to the embedded nodeService
+// NodeUnstageVolume is a proxy method that delegates to the nodeServer
 func (d *Driver) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	return d.nodeService.NodeUnstageVolume(ctx, req)
+	return d.nodeServer.NodeUnstageVolume(ctx, req)
 }
 
-// NodePublishVolume is a proxy method that delegates to the embedded nodeService
+// NodePublishVolume is a proxy method that delegates to the nodeServer
 func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	return d.nodeService.NodePublishVolume(ctx, req)
+	return d.nodeServer.NodePublishVolume(ctx, req)
 }
 
-// NodeUnpublishVolume is a proxy method that delegates to the embedded nodeService
+// NodeUnpublishVolume is a proxy method that delegates to the nodeServer
 func (d *Driver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	return d.nodeService.NodeUnpublishVolume(ctx, req)
+	return d.nodeServer.NodeUnpublishVolume(ctx, req)
 }
 
-// NodeGetVolumeStats is a proxy method that delegates to the embedded nodeService
+// NodeGetVolumeStats is a proxy method that delegates to the nodeServer
 func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
-	return d.nodeService.NodeGetVolumeStats(ctx, req)
+	return d.nodeServer.NodeGetVolumeStats(ctx, req)
 }
 
-// NodeExpandVolume is a proxy method that delegates to the embedded nodeService
+// NodeExpandVolume is a proxy method that delegates to the nodeServer
 func (d *Driver) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
-	return d.nodeService.NodeExpandVolume(ctx, req)
+	return d.nodeServer.NodeExpandVolume(ctx, req)
 }
 
-// NodeGetCapabilities is a proxy method that delegates to the embedded nodeService
+// NodeGetCapabilities is a proxy method that delegates to the nodeServer
 func (d *Driver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	return d.nodeService.NodeGetCapabilities(ctx, req)
+	return d.nodeServer.NodeGetCapabilities(ctx, req)
 }
 
-// NodeGetInfo is a proxy method that delegates to the embedded nodeService
+// NodeGetInfo is a proxy method that delegates to the nodeServer
 func (d *Driver) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	return d.nodeService.NodeGetInfo(ctx, req)
+	return d.nodeServer.NodeGetInfo(ctx, req)
 }
 
 // CreateVolume is a proxy method that delegates to the embedded controllerService
