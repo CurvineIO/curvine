@@ -1,0 +1,356 @@
+name: Build Java SDK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., 0.1.0), defaults to 0.1.0 if empty'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build native libraries for each OS and architecture
+  # NOTE: alinux3 uses amzn2 compiled .so for glibc compatibility
+  # Rocky 9 requires glibc 2.33/2.34, but StarRocks alinux3 image only has glibc 2.32
+  # Amazon Linux 2 (glibc 2.26) is forward compatible with glibc 2.32
+  build-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rocky Linux 9 - x86_64
+          - os: rocky9
+            arch: x86
+            runner: ubuntu-latest
+            image: ghcr.io/curvineio/curvine-compile:rocky9
+            also_alinux3: false
+          # Rocky Linux 9 - aarch64
+          - os: rocky9
+            arch: aarch
+            runner: ubuntu-24.04-arm
+            image: ghcr.io/curvineio/curvine-compile:rocky9
+            also_alinux3: false
+          # Ubuntu 22.04 - x86_64
+          - os: ubuntu22
+            arch: x86
+            runner: ubuntu-latest
+            image: ghcr.io/curvineio/curvine-compile:ubuntu22.04
+            also_alinux3: false
+          # Ubuntu 22.04 - aarch64
+          - os: ubuntu22
+            arch: aarch
+            runner: ubuntu-24.04-arm
+            image: ghcr.io/curvineio/curvine-compile:ubuntu22.04
+            also_alinux3: false
+          # Ubuntu 24.04 - x86_64
+          - os: ubuntu24
+            arch: x86
+            runner: ubuntu-latest
+            image: ghcr.io/curvineio/curvine-compile:ubuntu24.04
+            also_alinux3: false
+          # Ubuntu 24.04 - aarch64
+          - os: ubuntu24
+            arch: aarch
+            runner: ubuntu-24.04-arm
+            image: ghcr.io/curvineio/curvine-compile:ubuntu24.04
+            also_alinux3: false
+          # Amazon Linux 2 - x86_64 (also creates alinux3 for glibc 2.32 compatibility)
+          - os: amzn2
+            arch: x86
+            runner: ubuntu-latest
+            image: ghcr.io/curvineio/curvine-compile:amzn2
+            also_alinux3: true
+          # Amazon Linux 2 - aarch64 (also creates alinux3 for glibc 2.32 compatibility)
+          - os: amzn2
+            arch: aarch
+            runner: ubuntu-24.04-arm
+            image: ghcr.io/curvineio/curvine-compile:amzn2
+            also_alinux3: true
+
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        run: |
+          export PATH="/root/.cargo/bin:$PATH"
+          unset RUSTUP_UPDATE_ROOT
+          unset RUSTUP_DIST_SERVER
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "curvine-java-sdk-${{ matrix.os }}-${{ matrix.arch }}"
+          cache-all-crates: false
+          cache-targets: false
+
+      - name: Build native library
+        run: |
+          echo "Building native library for ${{ matrix.os }} ${{ matrix.arch }}_64"
+          cargo build --release -p curvine-libsdk --jobs 2
+          
+          # Create output directory
+          mkdir -p native-output
+          
+          # Copy the built library with proper naming
+          cp target/release/libcurvine_libsdk.so \
+             native-output/libcurvine_libsdk_${{ matrix.os }}_${{ matrix.arch }}_64.so
+          
+          # Also copy for alinux3 if amzn2 (glibc 2.26 forward compatible with glibc 2.32)
+          # NOTE: Rocky 9 requires glibc 2.33/2.34, but StarRocks alinux3 image only has glibc 2.32
+          # Amazon Linux 2 (glibc 2.26) is the best choice for alinux3 compatibility
+          if [ "${{ matrix.also_alinux3 }}" = "true" ]; then
+            echo "Creating alinux3 compatible .so from amzn2 build (glibc 2.26 -> 2.32)"
+            cp target/release/libcurvine_libsdk.so \
+               native-output/libcurvine_libsdk_alinux3_${{ matrix.arch }}_64.so
+          fi
+          
+          ls -la native-output/
+
+      - name: Upload native library artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.os }}-${{ matrix.arch }}
+          path: native-output/*.so
+          retention-days: 7
+
+  # Package all native libraries into JAR
+  package-jar:
+    needs: build-native
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/curvineio/curvine-compile:rocky9
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all native library artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: native-artifacts
+          pattern: native-*
+          merge-multiple: true
+
+      - name: Prepare native libraries
+        run: |
+          echo "Downloaded native libraries:"
+          ls -la native-artifacts/
+          
+          # Copy all .so files to java native directory
+          mkdir -p curvine-libsdk/java/native
+          cp native-artifacts/*.so curvine-libsdk/java/native/
+          
+          echo "Native libraries in java/native:"
+          ls -la curvine-libsdk/java/native/
+
+      - name: Set version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION="${{ inputs.version || '0.1.0' }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Build JAR with Maven
+        run: |
+          cd curvine-libsdk/java
+          
+          # Update version in pom.xml if needed
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s/<version>0.1.0<\/version>/<version>${VERSION}<\/version>/" pom.xml
+          
+          # Generate protobuf code and package
+          mvn protobuf:compile package -DskipTests -B
+          
+          echo "Built JAR files:"
+          ls -la target/*.jar
+
+      - name: Upload JAR artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: curvine-hadoop-jars
+          path: |
+            curvine-libsdk/java/target/curvine-hadoop-*.jar
+          retention-days: 30
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+  # Publish to GitHub Release and GitHub Packages
+  publish:
+    needs: package-jar
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download JAR artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: curvine-hadoop-jars
+          path: jars
+
+      - name: List JAR files
+        run: |
+          echo "JAR files to publish:"
+          ls -la jars/
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: jars/*.jar
+          generate_release_notes: false
+          append_body: true
+          body: |
+            
+            ## Java SDK
+            
+            ### JAR Downloads
+            - **curvine-hadoop-${{ needs.package-jar.outputs.version }}.jar** - Base JAR
+            - **curvine-hadoop-${{ needs.package-jar.outputs.version }}-client.jar** - Client JAR (with shaded protobuf, recommended for big data environments)
+            - **curvine-hadoop-${{ needs.package-jar.outputs.version }}-shade.jar** - Fully shaded JAR
+            
+            ### Supported Platforms
+            | OS | x86_64 | aarch64 |
+            |----|--------|---------|
+            | Rocky Linux 9 | ✅ | ✅ |
+            | Alibaba Cloud Linux 3 | ✅ | ✅ |
+            | Ubuntu 22.04 | ✅ | ✅ |
+            | Ubuntu 24.04 | ✅ | ✅ |
+            | Amazon Linux 2 | ✅ | ✅ |
+            
+            ### Usage
+            ```xml
+            <dependency>
+                <groupId>io.curvine</groupId>
+                <artifactId>curvine-hadoop</artifactId>
+                <version>${{ needs.package-jar.outputs.version }}</version>
+                <classifier>client</classifier>
+            </dependency>
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up JDK for Maven
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+
+      - name: Publish to GitHub Packages
+        run: |
+          cd curvine-libsdk/java
+          
+          # Download all native libraries again for the publish
+          mkdir -p native
+          
+          # We need to rebuild with the native libs for publishing
+          # First download the artifacts
+          echo "Downloading native artifacts for publishing..."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download native artifacts for publish
+        uses: actions/download-artifact@v4
+        with:
+          path: native-artifacts
+          pattern: native-*
+          merge-multiple: true
+
+      - name: Publish JAR to GitHub Packages
+        run: |
+          # Copy native libraries
+          mkdir -p curvine-libsdk/java/native
+          cp native-artifacts/*.so curvine-libsdk/java/native/
+          
+          cd curvine-libsdk/java
+          
+          # Update version
+          VERSION="${{ needs.package-jar.outputs.version }}"
+          sed -i "s/<version>0.1.0<\/version>/<version>${VERSION}<\/version>/" pom.xml
+          
+          # Add distribution management for GitHub Packages
+          sed -i '/<\/project>/i \
+            <distributionManagement>\
+              <repository>\
+                <id>github</id>\
+                <name>GitHub CurvineIO Apache Maven Packages</name>\
+                <url>https://maven.pkg.github.com/CurvineIO/curvine</url>\
+              </repository>\
+            </distributionManagement>' pom.xml
+          
+          # Create settings.xml for GitHub Packages authentication
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << EOF
+          <settings>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>\${env.GITHUB_ACTOR}</username>
+                <password>\${env.GITHUB_TOKEN}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+          
+          # Build and deploy
+          mvn protobuf:compile deploy -DskipTests -B
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+
+  # Build summary
+  summary:
+    needs: [build-native, package-jar, publish]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Build summary
+        run: |
+          echo "### Java SDK Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ needs.package-jar.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Native Libraries Built:**" >> $GITHUB_STEP_SUMMARY
+          echo "| OS | x86_64 | aarch64 |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Rocky Linux 9 | ✅ | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Alibaba Cloud Linux 3 | ✅ | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ubuntu 22.04 | ✅ | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ubuntu 24.04 | ✅ | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Amazon Linux 2 | ✅ | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "**Published to:**" >> $GITHUB_STEP_SUMMARY
+            echo "- GitHub Release" >> $GITHUB_STEP_SUMMARY
+            echo "- GitHub Packages (Maven)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Note:** Manual trigger - artifacts uploaded but not published to release" >> $GITHUB_STEP_SUMMARY
+          fi
+
