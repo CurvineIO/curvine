@@ -397,6 +397,50 @@ impl NodeState {
             None
         }
     }
+
+    pub fn has_open_handles(&self, ino: u64) -> bool {
+        let lock = self.handles.read();
+        if let Some(map) = lock.get(&ino) {
+            !map.is_empty()
+        } else {
+            false
+        }
+    }
+
+    pub fn should_delete_now<T: AsRef<str>>(
+        &self,
+        parent: u64,
+        name: Option<T>,
+    ) -> FuseResult<bool> {
+        let name = name.as_ref();
+
+        let mut map = self.node_write();
+        let id = match map.lookup_node(parent, name) {
+            Some(v) => v.id,
+            None => return err_fuse!(libc::ENOENT, "node {} not found", parent),
+        };
+
+        let delete = if self.has_open_handles(id) {
+            map.mark_pending_delete(id);
+            let path = map.get_path_common(id, name)?;
+            info!(
+                "unlink {}: file has open handles (ino={}), marking for delayed deletion",
+                path, id
+            );
+            false
+        } else {
+            true
+        };
+        Ok(delete)
+    }
+
+    pub fn remove_pending_delete(&self, ino: u64) -> bool {
+        self.node_write().remove_pending_delete(ino)
+    }
+
+    pub fn is_pending_delete(&self, ino: u64) -> bool {
+        self.node_read().is_pending_delete(ino)
+    }
 }
 
 #[cfg(test)]

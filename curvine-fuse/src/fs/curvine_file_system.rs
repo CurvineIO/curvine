@@ -1089,6 +1089,10 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::ENAMETOOLONG);
         }
 
+        if self.state.is_pending_delete(id) {
+            return err_fuse!(libc::ETXTBSY, "file has been deleted or unlinked");
+        }
+
         let path = self.state.get_path_common(id, Some(name))?;
         let node = self.state.find_node(id, Some(name))?;
         let flags = op.arg.flags;
@@ -1137,14 +1141,28 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
-        let handle = self.state.remove_handle(op.header.nodeid, op.arg.fh);
-        if let Some(handle) = handle {
-            self.fs_unlock(&handle, LockFlags::Flock).await?;
-            self.fs_unlock(&handle, LockFlags::Plock).await?;
-            handle.complete(Some(reply)).await
-        } else {
-            err_fuse!(libc::EBADF)
+        let ino = op.header.nodeid;
+        let handle = match self.state.remove_handle(ino, op.arg.fh) {
+            Some(handle) => handle,
+            None => return err_fuse!(libc::EBADF),
+        };
+
+        self.fs_unlock(&handle, LockFlags::Flock).await?;
+        self.fs_unlock(&handle, LockFlags::Plock).await?;
+        let complete_result = handle.complete(Some(reply)).await;
+
+        if !self.state.has_open_handles(ino) && self.state.remove_pending_delete(ino) {
+            let path = Path::from_str(&handle.status.path)?;
+            info!(
+                "release ino={}: no more open handles, executing delayed deletion of {}",
+                ino, path
+            );
+            if let Err(e) = self.fs.delete(&path, false).await {
+                warn!("failed to delete {} after last handle closed: {}", path, e);
+            }
         }
+
+        complete_result
     }
 
     async fn forget(&self, op: Forget<'_>) -> FuseResult<()> {
@@ -1153,10 +1171,13 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn unlink(&self, op: Unlink<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+        let parent_ino = op.header.nodeid;
 
-        self.fs.delete(&path, false).await?;
-        self.state.unlink_node(op.header.nodeid, Some(name))?;
+        if self.state.should_delete_now(parent_ino, Some(name))? {
+            let path = self.state.get_path_common(parent_ino, Some(name))?;
+            self.fs.delete(&path, false).await?;
+        }
+        self.state.unlink_node(parent_ino, Some(name))?;
         Ok(())
     }
 

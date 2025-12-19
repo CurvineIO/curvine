@@ -17,7 +17,7 @@ use crate::{err_fuse, FuseResult, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, FUSE_UNKNOW
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::Path;
 use log::{debug, error, info};
-use orpc::common::{FastHashMap, LocalTime};
+use orpc::common::{FastHashMap, FastHashSet, LocalTime};
 use orpc::sync::AtomicCounter;
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -29,6 +29,7 @@ pub struct NodeMap {
     names: FastHashMap<String, u64>,
     // record curvine inode ID to FUSE inode ID for hard link detection when fuse restart
     linked_inode_map: FastHashMap<i64, u64>,
+    pending_deletes: FastHashSet<u64>,
     id_creator: AtomicCounter,
     cache_ttl: u64,
     last_clean: u64,
@@ -42,6 +43,7 @@ impl NodeMap {
             nodes,
             names: FastHashMap::default(),
             linked_inode_map: FastHashMap::default(),
+            pending_deletes: FastHashSet::default(),
             id_creator: AtomicCounter::new(FUSE_ROOT_ID),
             cache_ttl: conf.node_cache_ttl.as_millis() as u64,
             last_clean: LocalTime::mills(),
@@ -454,5 +456,17 @@ impl NodeMap {
                 return id;
             }
         }
+    }
+
+    pub fn mark_pending_delete(&mut self, ino: u64) {
+        self.pending_deletes.insert(ino);
+    }
+
+    pub fn remove_pending_delete(&mut self, ino: u64) -> bool {
+        self.pending_deletes.remove(&ino)
+    }
+
+    pub fn is_pending_delete(&self, ino: u64) -> bool {
+        self.pending_deletes.contains(&ino)
     }
 }

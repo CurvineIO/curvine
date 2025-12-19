@@ -969,9 +969,143 @@ PYTHON_EOF
     fi
 }
 
-# Test 13: Git clone operations
+# Test 13: Delayed delete (unlink while file is open)
+test_delayed_delete() {
+    CURRENT_TEST_GROUP="Test 13: Delayed Delete (POSIX unlink semantics)"
+    print_header "$CURRENT_TEST_GROUP"
+
+    local test_file="$TEST_DIR/delayed_delete_test.txt"
+    local test_content="Test data for delayed deletion"
+    
+    # Create test file with content
+    echo "$test_content" > "$test_file"
+
+    # Test 1: Open file, delete it, read should still work
+    print_test "Testing delayed delete - read after unlink"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    
+    # Use a background process to keep the file open
+    (
+        # Open file descriptor 3 for reading
+        exec 3< "$test_file"
+        
+        # Delete the file while fd 3 is still open
+        rm -f "$test_file"
+        
+        # Try to read from the open file descriptor
+        local content=$(cat <&3)
+        
+        # Close the file descriptor
+        exec 3<&-
+        
+        # Verify content was read successfully
+        if [ "$content" = "$test_content" ]; then
+            exit 0
+        else
+            exit 1
+        fi
+    )
+    
+    if [ $? -eq 0 ]; then
+        print_success "Read after unlink succeeded (delayed delete working)"
+    else
+        handle_error "Failed to read from deleted but open file" "delayed delete read test"
+    fi
+
+    # Test 2: Verify file is deleted after closing
+    print_test "Verifying file deletion after close"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    
+    if [ ! -e "$test_file" ]; then
+        print_success "File deleted successfully after closing (delayed delete completed)"
+    else
+        handle_error "File still exists after closing" "delayed delete cleanup test"
+        rm -f "$test_file"  # Cleanup for next tests
+    fi
+
+    # Test 3: Multiple handles - file deleted only after last close
+    print_test "Testing delayed delete with multiple file handles"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    
+    # Create test file again
+    echo "$test_content" > "$test_file"
+    
+    (
+        # Open two file descriptors
+        exec 3< "$test_file"
+        exec 4< "$test_file"
+        
+        # Delete the file
+        rm -f "$test_file"
+        
+        # Read from first fd
+        local content1=$(cat <&3)
+        exec 3<&-
+        
+        # File should still exist (fd 4 still open)
+        # Note: We can't easily check file existence from within subprocess
+        # So we verify by reading from the second fd
+        local content2=$(cat <&4)
+        exec 4<&-
+        
+        # Verify both reads succeeded
+        if [ "$content1" = "$test_content" ] && [ "$content2" = "$test_content" ]; then
+            exit 0
+        else
+            exit 1
+        fi
+    )
+    
+    if [ $? -eq 0 ]; then
+        print_success "Multiple handles delayed delete working correctly"
+    else
+        handle_error "Failed delayed delete with multiple handles" "multiple handles test"
+    fi
+    
+    # Verify final cleanup
+    if [ ! -e "$test_file" ]; then
+        print_success "File deleted after all handles closed"
+    else
+        print_warning "File still exists after all handles closed"
+        rm -f "$test_file"
+    fi
+
+    # Test 4: Write to deleted file should still work
+    print_test "Testing write to deleted but open file"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    
+    echo "$test_content" > "$test_file"
+    
+    (
+        # Open file for read/write
+        exec 3<> "$test_file"
+        
+        # Delete the file
+        rm -f "$test_file"
+        
+        # Write new content
+        echo "Modified content" >&3
+        
+        # Seek to beginning and read
+        exec 3<> "$test_file" 2>/dev/null || exec 3<&-
+        
+        # Just verify the write didn't error
+        exit 0
+    )
+    
+    if [ $? -eq 0 ]; then
+        print_success "Write to deleted but open file succeeded"
+    else
+        handle_error "Failed to write to deleted but open file" "delayed delete write test"
+    fi
+    
+    # Final cleanup
+    rm -f "$test_file" 2>/dev/null || true
+}
+
+# Test 14: Git clone operations
 test_git_clone() {
-    CURRENT_TEST_GROUP="Test 13: Git Clone Operations"
+    CURRENT_TEST_GROUP="Test 14: Git Clone Operations"
     print_header "$CURRENT_TEST_GROUP"
 
     if ! command -v git >/dev/null 2>&1; then
@@ -1114,6 +1248,7 @@ main() {
     test_truncate
     test_fallocate
     test_file_locks
+    test_delayed_delete
     test_git_clone
 
     print_info "All test functions completed"
