@@ -63,10 +63,17 @@ impl<'a> FuseDecoder<'a> {
         Ok(bytes)
     }
 
-    pub fn get_struct_slice<T>(&mut self, count: usize) -> FuseResult<&'a [T]> {
-        let slice = self.get_slice(count * size_of::<T>())?;
-        let structs = unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const T, count) };
-        Ok(structs)
+    pub fn get_struct_vec<T>(&mut self, count: usize) -> FuseResult<Vec<&'a T>> {
+        if count == 0 {
+            return Ok(vec![]);
+        }
+
+        let mut res = Vec::with_capacity(count);
+        for _ in 0..count {
+            let item: &'a T = self.get_struct()?;
+            res.push(item);
+        }
+        Ok(res)
     }
 
     pub fn get_os_str(&mut self) -> FuseResult<&'a OsStr> {

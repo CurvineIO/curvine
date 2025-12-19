@@ -316,7 +316,7 @@ pub struct RmDir<'a> {
 pub struct BatchForget<'a> {
     pub header: &'a fuse_in_header,
     pub arg: &'a fuse_batch_forget_in,
-    pub nodes: &'a [fuse_forget_one],
+    pub nodes: Vec<&'a fuse_forget_one>,
 }
 
 // Rename a file.

@@ -1209,7 +1209,7 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn batch_forget(&self, op: BatchForget<'_>) -> FuseResult<()> {
-        self.state.batch_forget_node(op.nodes)
+        self.state.batch_forget_node(&op.nodes)
     }
 
     // Create a symbolic link

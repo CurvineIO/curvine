@@ -152,7 +152,7 @@ impl NodeState {
         self.node_write().forget_node(id, n_lookup)
     }
 
-    pub fn batch_forget_node(&self, nodes: &[fuse_forget_one]) -> FuseResult<()> {
+    pub fn batch_forget_node(&self, nodes: &[&fuse_forget_one]) -> FuseResult<()> {
         let mut state = self.node_write();
         for node in nodes {
             if let Err(e) = state.forget_node(node.nodeid, node.nlookup) {

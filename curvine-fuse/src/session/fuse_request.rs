@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::fs::operator::*;
-use crate::raw::fuse_abi::{fuse_in_header, fuse_write_in};
+use crate::raw::fuse_abi::{fuse_batch_forget_in, fuse_forget_one, fuse_in_header, fuse_write_in};
 use crate::session::fuse_decoder::FuseDecoder;
 use crate::session::FuseOpCode::{self, *};
 use crate::FuseResult;
@@ -256,12 +256,9 @@ impl FuseRequest {
             }),
 
             FUSE_BATCH_FORGET => {
-                let arg = decoder.get_struct()?;
-                FuseOperator::BatchForget(BatchForget {
-                    header,
-                    arg,
-                    nodes: &[],
-                })
+                let arg: &fuse_batch_forget_in = decoder.get_struct()?;
+                let nodes = decoder.get_struct_vec::<fuse_forget_one>(arg.count as usize)?;
+                FuseOperator::BatchForget(BatchForget { header, arg, nodes })
             }
 
             FUSE_RENAME => FuseOperator::Rename(Rename {
