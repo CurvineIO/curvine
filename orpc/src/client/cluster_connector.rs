@@ -21,7 +21,8 @@ use crate::message::{Message, MessageBuilder, RefMessage};
 use crate::runtime::Runtime;
 use crate::sync::FastDashMap;
 use crate::{err_box, err_msg, CommonError};
-use log::warn;
+use futures::future::select_all;
+use log::{debug, warn};
 use prost::Message as PMessage;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -200,7 +201,7 @@ impl ClusterConnector {
                         return Err(e);
                     } else {
                         warn!(
-                            "Rpc({}) call failed to node {}: {}",
+                            "rpc({}) call failed to node {}: {}",
                             msg.req_id(),
                             self.get_addr_string(id),
                             e
@@ -232,18 +233,18 @@ impl ClusterConnector {
             match self.timeout_rpc(id, msg.clone()).await {
                 Ok(v) => return Ok(v),
 
-                Err((retry, e)) => {
-                    if !retry {
-                        return Err(e);
-                    } else {
-                        warn!(
-                            "Rpc({}) call failed to leader {}: {}",
-                            msg.req_id(),
-                            self.get_addr_string(id),
-                            e
-                        );
-                        let _ = last_error.insert(e);
-                    }
+                Err((false, e)) => {
+                    return Err(e);
+                }
+
+                Err((true, e)) => {
+                    warn!(
+                        "rpc({}) call failed to leader {}: {}",
+                        msg.req_id(),
+                        self.get_addr_string(id),
+                        e
+                    );
+                    last_error.replace(e);
                 }
             }
         }
@@ -251,38 +252,70 @@ impl ClusterConnector {
         // Poll to send requests to all nodes until timeout.
         // If the client returns that the current node is not the leader, we still perform polling and retry.
         // At this time, the server may be performing the master selection operation, and it is not advisable to fail directly to return.
+        self.change_leader(Self::DEFAULT_LEADER_ID);
         let mut policy = self.retry_builder.build();
         let node_list = self.node_list(false);
-        let mut index = 0;
-        while policy.attempt().await {
-            let id = node_list[index];
-            index = (index + 1) % node_list.len();
+        if node_list.is_empty() {
+            let err = err_msg!("no nodes available in cluster");
+            return Err(IOError::create(err).into());
+        }
 
-            match self.timeout_rpc(id, msg.clone()).await {
-                Ok(v) => {
-                    self.change_leader(id);
-                    return Ok(v);
+        while policy.attempt().await {
+            let mut futures: Vec<_> = node_list
+                .iter()
+                .map(|&id| {
+                    let msg = msg.clone();
+                    Box::pin(async move {
+                        let res = self.timeout_rpc::<E>(id, msg).await;
+                        (id, res)
+                    })
+                })
+                .collect();
+
+            let mut failed_msgs = vec![];
+            loop {
+                if futures.is_empty() {
+                    break;
                 }
 
-                Err((retry, e)) => {
-                    if !retry {
+                let ((id, res), _index, remaining) = select_all(futures).await;
+                match res {
+                    Ok(v) => {
+                        self.change_leader(id);
+                        return Ok(v);
+                    }
+
+                    Err((false, e)) => {
                         self.change_leader(id);
                         return Err(e);
-                    } else {
-                        warn!(
-                            "Rpc({}) call failed to active master {}: {}",
+                    }
+
+                    Err((true, e)) => {
+                        futures = remaining;
+
+                        let error_msg = format!(
+                            "rpc({}) node {} is unavailable: {}",
                             msg.req_id(),
                             self.get_addr_string(id),
                             e
                         );
-                        let _ = last_error.insert(e);
+                        failed_msgs.push(error_msg);
+                        last_error.replace(e);
                     }
+                }
+            }
+
+            if !failed_msgs.is_empty() {
+                if self.leader_id().is_some() {
+                    debug!("{}", failed_msgs.join("; "));
+                } else {
+                    warn!("{}", failed_msgs.join("; "));
                 }
             }
         }
 
         let err = err_msg!(
-            "Failed to determine after {} attempts: {:?}",
+            "failed to determine after {} attempts: {:?}",
             policy.count(),
             last_error
         );

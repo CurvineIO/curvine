@@ -324,18 +324,18 @@ impl Default for ClientConf {
             auto_cache_ttl: "7d".to_string(),
             default_cache_ttl: Some("7d".to_string()),
 
-            conn_retry_max_duration_ms: 2 * 60 * 1000,
-            conn_retry_min_sleep_ms: 300,
-            conn_retry_max_sleep_ms: 10 * 1000,
+            conn_retry_max_duration_ms: 60 * 1000,
+            conn_retry_min_sleep_ms: 100,
+            conn_retry_max_sleep_ms: 2 * 1000,
 
-            rpc_retry_max_duration_ms: 5 * 60 * 1000,
-            rpc_retry_min_sleep_ms: 300,
-            rpc_retry_max_sleep_ms: 30 * 1000,
+            rpc_retry_max_duration_ms: 120 * 1000,
+            rpc_retry_min_sleep_ms: 100,
+            rpc_retry_max_sleep_ms: 10 * 1000,
 
             rpc_close_idle: true,
             conn_timeout_ms: 30 * 1000,
             rpc_timeout_ms: 120 * 1000,
-            data_timeout_ms: 5 * 60 * 1000,
+            data_timeout_ms: 120 * 1000,
             master_conn_pool_size: 1,
 
             enable_read_ahead: true,

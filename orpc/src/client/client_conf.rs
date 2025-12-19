@@ -89,17 +89,17 @@ impl Default for ClientConf {
             close_idle: false,
             message_size: 16,
 
-            conn_retry_max_duration_ms: 2 * 60 * 1000,
-            conn_retry_min_sleep_ms: 300,
-            conn_retry_max_sleep_ms: 10 * 1000,
+            conn_retry_max_duration_ms: 60 * 1000,
+            conn_retry_min_sleep_ms: 100,
+            conn_retry_max_sleep_ms: 2 * 1000,
 
-            io_retry_max_duration_ms: 5 * 60 * 1000,
-            io_retry_min_sleep_ms: 300,
-            io_retry_max_sleep_ms: 30 * 1000,
+            io_retry_max_duration_ms: 120 * 1000,
+            io_retry_min_sleep_ms: 100,
+            io_retry_max_sleep_ms: 10 * 1000,
 
             conn_timeout_ms: 30 * 1000,
             rpc_timeout_ms: 2 * 60 * 1000,
-            data_timeout_ms: 5 * 60 * 1000,
+            data_timeout_ms: 2 * 60 * 1000,
 
             conn_size: 1,
 
