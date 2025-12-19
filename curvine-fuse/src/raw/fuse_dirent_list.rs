@@ -43,7 +43,7 @@ impl FuseDirentList {
         let name = FFIUtils::get_os_bytes(&status.name);
 
         let header = fuse_dirent {
-            ino: status.id as u64,
+            ino: entry.attr.ino,
             off,
             namelen: name.len() as u32,
             typ,
@@ -54,11 +54,12 @@ impl FuseDirentList {
     pub fn add_plus(&mut self, off: u64, status: &FileStatus, entry: fuse_entry_out) -> bool {
         let typ = entry.attr.mode >> 12;
         let name = FFIUtils::get_os_bytes(&status.name);
+        let ino = entry.attr.ino;
 
         let header = fuse_direntplus {
             entry_out: entry,
             dirent: fuse_dirent {
-                ino: status.id as u64,
+                ino,
                 off,
                 namelen: name.len() as u32,
                 typ,

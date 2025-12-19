@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use crate::fs::state::NodeAttr;
+use crate::fs::CurvineFileSystem;
+use crate::raw::fuse_abi::fuse_attr;
 use crate::{err_fuse, FuseResult, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, FUSE_UNKNOWN_INO};
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::Path;
-use log::{debug, error, info};
+use curvine_common::state::FileStatus;
+use log::{error, info};
 use orpc::common::{FastHashMap, FastHashSet, LocalTime};
 use orpc::sync::AtomicCounter;
 use std::collections::VecDeque;
@@ -33,6 +36,7 @@ pub struct NodeMap {
     id_creator: AtomicCounter,
     cache_ttl: u64,
     last_clean: u64,
+    conf: FuseConf,
 }
 
 impl NodeMap {
@@ -47,6 +51,7 @@ impl NodeMap {
             id_creator: AtomicCounter::new(FUSE_ROOT_ID),
             cache_ttl: conf.node_cache_ttl.as_millis() as u64,
             last_clean: LocalTime::mills(),
+            conf: conf.clone(),
         }
     }
 
@@ -110,6 +115,27 @@ impl NodeMap {
         }
     }
 
+    pub fn do_lookup<T: AsRef<str>>(
+        &mut self,
+        parent: u64,
+        name: Option<T>,
+        status: &FileStatus,
+    ) -> FuseResult<fuse_attr> {
+        let ino = match self.find_node(parent, name) {
+            Ok(v) => v.id,
+            Err(e) => return err_fuse!(libc::ENOMEM, "{}", e),
+        };
+
+        let mut attr = CurvineFileSystem::status_to_attr(&self.conf, status)?;
+        attr.ino = if status.exists_links() {
+            self.find_link_inode(status.id, ino)
+        } else {
+            ino
+        };
+
+        Ok(attr)
+    }
+
     // fuse.c find_node function peer implementation
     // Query a node, and if the node does not exist, one will be automatically created.
     pub fn find_node<T: AsRef<str>>(
@@ -145,63 +171,10 @@ impl NodeMap {
         Ok(node)
     }
 
-    // Add a hard link node with specified inode ID
-    pub fn link_node<T: AsRef<str>>(&mut self, parent: u64, name: T, ino: u64) -> FuseResult<()> {
-        let name = name.as_ref();
-        let key = Self::name_key(parent, name);
-
-        // Check if the name already exists
-        if self.names.contains_key(&key) {
-            return err_fuse!(
-                libc::EEXIST,
-                "Name already exists: parent={}, name={}",
-                parent,
-                name
-            );
-        }
-
-        // Check if the target inode exists
-        if !self.nodes.contains_key(&ino) {
-            return err_fuse!(libc::ENOENT, "Target inode {} does not exist", ino);
-        }
-
-        // Add the name mapping to the existing inode
-        self.names.insert(key, ino);
-
-        // Increment the lookup count of the target node
-        if let Some(node) = self.nodes.get_mut(&ino) {
-            node.add_lookup(1);
-        }
-
-        // Update parent references
-        if let Some(p) = self.get_mut(parent) {
-            p.ref_ctr += 1;
-        }
-
-        debug!(
-            "link_node: parent={}, name={}, ino={}, registered hard link in node map",
-            parent, name, ino
-        );
-
-        Ok(())
-    }
-
-    // Register curvine inode mapping when creating a new node
-    // This helps detect whether a file exists links after FUSE restart
-    pub fn register_linked_inode(&mut self, curvine_ino: i64, fuse_ino: u64) {
-        if curvine_ino > 0 {
-            self.linked_inode_map.insert(curvine_ino, fuse_ino);
-            debug!(
-                "register_linked_inode: curvine_ino={}, fuse_ino={}",
-                curvine_ino, fuse_ino
-            );
-        }
-    }
-
     // Check if a curvine inode is already mapped (indicates a hard link)
     // Returns the FUSE inode ID if found
-    pub fn lookup_link_inode(&self, curvine_ino: i64) -> Option<u64> {
-        self.linked_inode_map.get(&curvine_ino).copied()
+    pub fn find_link_inode(&mut self, curvine_ino: i64, fuse_ino: u64) -> u64 {
+        *self.linked_inode_map.entry(curvine_ino).or_insert(fuse_ino)
     }
 
     // is a peer implementation of the fuse.h try_get_path function.

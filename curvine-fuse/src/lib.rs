@@ -56,7 +56,7 @@ pub const FS_ROOT_ID: i64 = 1000;
 
 pub const FUSE_PATH_SEPARATOR: &str = "/";
 
-pub const FUSE_BLOCK_SIZE: u64 = 512;
+pub const FUSE_BLOCK_SIZE: u64 = 65536;
 
 pub const FUSE_KERNEL_VERSION: u32 = 7;
 
