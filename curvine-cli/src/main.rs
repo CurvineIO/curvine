@@ -22,7 +22,7 @@ use curvine_client::rpc::JobMasterClient;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::version;
-use orpc::common::Utils;
+use orpc::common::{Logger, Utils};
 use orpc::io::net::InetAddr;
 use orpc::runtime::RpcRuntime;
 use orpc::{err_box, CommonResult};
@@ -108,6 +108,8 @@ fn main() -> CommonResult<()> {
     Utils::set_panic_exit_hook();
 
     let conf = args.get_conf()?;
+    Logger::init(conf.cli.log.clone());
+
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let curvine_fs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let fs_client = curvine_fs.fs_client();

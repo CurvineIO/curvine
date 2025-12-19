@@ -69,3 +69,6 @@ put_max_memory_buffer = 16777216
 # GET Performance Optimization Settings
 # GET read/write chunk size in MB (default: 1.0, options: 0.5/1/2)
 get_chunk_size_mb = 1.0
+
+[cli]
+log = { level = "warn", log_dir = "stdout", file_name = "cli.log" }
