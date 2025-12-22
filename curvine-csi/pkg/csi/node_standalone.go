@@ -13,10 +13,16 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog"
 )
 
@@ -25,6 +31,8 @@ type nodeServiceStandalone struct {
 	nodeID            string
 	standaloneManager StandaloneMountManager
 	k8sClient         *K8sClient
+	pvInformer        cache.SharedIndexInformer
+	stopCh            chan struct{}
 }
 
 var _ csi.NodeServer = &nodeServiceStandalone{}
@@ -63,11 +71,23 @@ func newNodeServiceStandalone(nodeID string) (*nodeServiceStandalone, error) {
 		klog.Warningf("Failed to recover Standalone state: %v", err)
 	}
 
-	return &nodeServiceStandalone{
+	// Create node service
+	nodeService := &nodeServiceStandalone{
 		nodeID:            nodeID,
 		standaloneManager: standaloneManager,
 		k8sClient:         k8sClient,
-	}, nil
+		stopCh:            make(chan struct{}),
+	}
+
+	// Start PV watcher for automatic cleanup
+	if err := nodeService.startPVWatcher(); err != nil {
+		klog.Warningf("Failed to start PV watcher: %v (cleanup may be delayed)", err)
+	}
+
+	// Start garbage collector for orphaned Standalone pods
+	nodeService.startGarbageCollector()
+
+	return nodeService, nil
 }
 
 // NodeStageVolume stages the volume
@@ -112,13 +132,25 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 		Namespace:   n.k8sClient.namespace,
 	}
 
-	hostMountPath, err := n.standaloneManager.EnsureStandalone(ctx, opts)
-	if err != nil {
-		klog.Errorf("RequestID: %s, Failed to ensure Standalone: %v", requestID, err)
-		return nil, status.Errorf(codes.Internal, "Failed to ensure Standalone: %v", err)
+	hostMountPath, ensureErr := n.standaloneManager.EnsureStandalone(ctx, opts)
+
+	// Add volume reference immediately, even if EnsureStandalone failed
+	// This ensures the Standalone Pod can be cleaned up when PV is deleted
+	// Note: AddVolumeRef will auto-create state entry if not exists
+	if refErr := n.standaloneManager.AddVolumeRef(ctx, clusterID, volumeID); refErr != nil {
+		klog.Errorf("RequestID: %s, Failed to add volume ref: %v", requestID, refErr)
+		// If AddVolumeRef fails, return error immediately
+		return nil, status.Errorf(codes.Internal, "Failed to add volume ref: %v", refErr)
 	}
 
-	klog.Infof("RequestID: %s, Standalone ready, hostMountPath: %s", requestID, hostMountPath)
+	// Now check if EnsureStandalone succeeded
+	if ensureErr != nil {
+		klog.Errorf("RequestID: %s, Failed to ensure Standalone (volume ref added for cleanup): %v", requestID, ensureErr)
+		// Return error but volume ref is already added, so NodeUnstageVolume can clean up
+		return nil, status.Errorf(codes.Internal, "Failed to ensure Standalone: %v", ensureErr)
+	}
+
+	klog.Infof("RequestID: %s, Standalone ready, hostMountPath: %s, volume ref added", requestID, hostMountPath)
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -139,9 +171,21 @@ func (n *nodeServiceStandalone) NodeUnstageVolume(ctx context.Context, request *
 		components, err := ParseVolumeHandle(volumeID)
 		if err != nil {
 			klog.Warningf("RequestID: %s, Failed to parse volumeHandle: %v", requestID, err)
+		} else {
+			clusterID = components.ClusterID
+		}
+	}
+
+	// For static PVs, volumeID may not contain clusterID, search by volumeID
+	if clusterID == "" || clusterID == volumeID {
+		foundClusterID, found := n.standaloneManager.FindClusterIDByVolumeID(volumeID)
+		if found {
+			klog.Infof("RequestID: %s, Found clusterID %s for volumeID %s via state lookup", requestID, foundClusterID, volumeID)
+			clusterID = foundClusterID
+		} else {
+			klog.Warningf("RequestID: %s, Cannot find clusterID for volumeID %s", requestID, volumeID)
 			return &csi.NodeUnstageVolumeResponse{}, nil
 		}
-		clusterID = components.ClusterID
 	}
 
 	// Remove volume reference
@@ -264,10 +308,8 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 		return nil, status.Errorf(codes.Internal, "Failed to bind mount: %v", err)
 	}
 
-	// Add volume reference
-	if err := n.standaloneManager.AddVolumeRef(ctx, clusterID, volumeID); err != nil {
-		klog.Warningf("RequestID: %s, Failed to add volume ref: %v", requestID, err)
-	}
+	// Note: Volume reference was already added in NodeStageVolume
+	// No need to add it again here
 
 	klog.Infof("RequestID: %s, Successfully published volume %s at %s", requestID, volumeID, targetPath)
 	return &csi.NodePublishVolumeResponse{}, nil
@@ -324,6 +366,15 @@ func (n *nodeServiceStandalone) NodeUnpublishVolume(ctx context.Context, request
 		}
 	}
 
+	// For static PVs, volumeID may not contain clusterID, search by volumeID
+	if clusterID == "" || clusterID == volumeID {
+		foundClusterID, found := n.standaloneManager.FindClusterIDByVolumeID(volumeID)
+		if found {
+			klog.Infof("RequestID: %s, Found clusterID %s for volumeID %s via state lookup", requestID, foundClusterID, volumeID)
+			clusterID = foundClusterID
+		}
+	}
+
 	if clusterID != "" {
 		shouldDelete, err := n.standaloneManager.RemoveVolumeRef(ctx, clusterID, volumeID)
 		if err != nil {
@@ -371,4 +422,216 @@ func (n *nodeServiceStandalone) NodeGetCapabilities(ctx context.Context, request
 // NodeGetInfo gets the node info
 func (n *nodeServiceStandalone) NodeGetInfo(ctx context.Context, request *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	return &csi.NodeGetInfoResponse{NodeId: n.nodeID}, nil
+}
+
+// startPVWatcher starts watching PV deletion events for automatic cleanup
+func (n *nodeServiceStandalone) startPVWatcher() error {
+	klog.Info("Starting PV watcher for Standalone pod cleanup")
+
+	// Create informer factory with field selector to only watch PVs on this node
+	// Note: We can't filter by node in PV list, so we filter in the event handler
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(
+		n.k8sClient.clientset,
+		30*time.Second, // Resync period
+	)
+
+	// Create PV informer
+	n.pvInformer = informerFactory.Core().V1().PersistentVolumes().Informer()
+
+	// Add event handler for PV deletion
+	n.pvInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: func(obj interface{}) {
+			pv, ok := obj.(*corev1.PersistentVolume)
+			if !ok {
+				// Handle DeletedFinalStateUnknown
+				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					klog.Warningf("Failed to decode deleted PV object")
+					return
+				}
+				pv, ok = tombstone.Obj.(*corev1.PersistentVolume)
+				if !ok {
+					klog.Warningf("Tombstone contained object that is not a PV")
+					return
+				}
+			}
+
+			// Only handle PVs for this CSI driver
+			if pv.Spec.CSI != nil && pv.Spec.CSI.Driver == DriverName {
+				n.handlePVDeletion(pv)
+			}
+		},
+	})
+
+	// Start informer
+	go n.pvInformer.Run(n.stopCh)
+
+	// Wait for cache sync
+	if !cache.WaitForCacheSync(n.stopCh, n.pvInformer.HasSynced) {
+		return fmt.Errorf("failed to sync PV informer cache")
+	}
+
+	klog.Info("PV watcher started successfully")
+	return nil
+}
+
+// handlePVDeletion handles PV deletion events by cleaning up associated Standalone pods
+func (n *nodeServiceStandalone) handlePVDeletion(pv *corev1.PersistentVolume) {
+	klog.Infof("PV %s deleted, checking for Standalone cleanup", pv.Name)
+
+	// Extract volumeID from PV
+	if pv.Spec.CSI == nil {
+		klog.V(4).Infof("PV %s is not a CSI volume, skipping", pv.Name)
+		return
+	}
+
+	volumeID := pv.Spec.CSI.VolumeHandle
+	if volumeID == "" {
+		klog.Warningf("PV %s has empty volumeHandle", pv.Name)
+		return
+	}
+
+	// Try to extract clusterID from volumeID
+	clusterID := ExtractClusterIDFromVolumeID(volumeID)
+	if clusterID == "" {
+		// Try to find clusterID from state
+		foundClusterID, found := n.standaloneManager.FindClusterIDByVolumeID(volumeID)
+		if !found {
+			klog.V(4).Infof("No Standalone found for volumeID %s", volumeID)
+			return
+		}
+		clusterID = foundClusterID
+	}
+
+	klog.Infof("Found clusterID %s for deleted PV %s (volumeID: %s)", clusterID, pv.Name, volumeID)
+
+	// Remove volume reference
+	ctx := context.Background()
+	shouldDelete, err := n.standaloneManager.RemoveVolumeRef(ctx, clusterID, volumeID)
+	if err != nil {
+		klog.Warningf("Failed to remove volume ref for PV %s: %v", pv.Name, err)
+		return
+	}
+
+	// Delete Standalone if no more references
+	if shouldDelete {
+		klog.Infof("No more volume refs for cluster %s, deleting Standalone", clusterID)
+		if err := n.standaloneManager.DeleteStandalone(ctx, clusterID); err != nil {
+			klog.Warningf("Failed to delete Standalone for cluster %s: %v", clusterID, err)
+		} else {
+			klog.Infof("Successfully deleted Standalone for cluster %s", clusterID)
+		}
+	} else {
+		klog.Infof("Standalone for cluster %s still has volume references, not deleting", clusterID)
+	}
+}
+
+// startGarbageCollector starts a periodic garbage collector for orphaned Standalone pods
+// This serves as a fallback mechanism in case PV watch events are missed
+func (n *nodeServiceStandalone) startGarbageCollector() {
+	klog.Info("Starting garbage collector for orphaned Standalone pods")
+
+	go func() {
+		// Initial cleanup after startup
+		time.Sleep(2 * time.Minute)
+		n.cleanupOrphanedStandalonePods()
+
+		// Periodic cleanup every 10 minutes
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				n.cleanupOrphanedStandalonePods()
+			case <-n.stopCh:
+				klog.Info("Garbage collector stopped")
+				return
+			}
+		}
+	}()
+
+	klog.Info("Garbage collector started (interval: 10 minutes)")
+}
+
+// cleanupOrphanedStandalonePods cleans up Standalone pods that have no corresponding PVs
+func (n *nodeServiceStandalone) cleanupOrphanedStandalonePods() {
+	klog.Info("Running garbage collection for orphaned Standalone pods")
+	ctx := context.Background()
+
+	// Get all Standalone pods on this node
+	listOptions := metav1.ListOptions{
+		LabelSelector: "app=curvine-standalone",
+		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", n.nodeID).String(),
+	}
+
+	pods, err := n.k8sClient.clientset.CoreV1().Pods(n.k8sClient.namespace).List(ctx, listOptions)
+	if err != nil {
+		klog.Warningf("Failed to list Standalone pods: %v", err)
+		return
+	}
+
+	klog.Infof("Found %d Standalone pods on node %s", len(pods.Items), n.nodeID)
+
+	// Get all PVs to check which ones still exist
+	pvList, err := n.k8sClient.clientset.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		klog.Warningf("Failed to list PVs: %v", err)
+		return
+	}
+
+	// Build a map of existing volumeIDs
+	existingVolumeIDs := make(map[string]bool)
+	for _, pv := range pvList.Items {
+		if pv.Spec.CSI != nil && pv.Spec.CSI.Driver == DriverName {
+			existingVolumeIDs[pv.Spec.CSI.VolumeHandle] = true
+		}
+	}
+
+	// Check each Standalone pod
+	for _, pod := range pods.Items {
+		// Extract clusterID from pod name
+		// Pod name format: curvine-standalone-<clusterID>-<nodeHash>
+		parts := strings.Split(pod.Name, "-")
+		if len(parts) < 4 {
+			klog.V(4).Infof("Skipping pod %s: unexpected name format", pod.Name)
+			continue
+		}
+		clusterID := parts[2]
+
+		// Get volumes for this cluster from state
+		state := n.standaloneManager.GetState()
+		entry, exists := state.Mounts[clusterID]
+		if !exists || len(entry.Volumes) == 0 {
+			klog.Infof("Standalone pod %s has no volume references, deleting", pod.Name)
+			if err := n.standaloneManager.DeleteStandalone(ctx, clusterID); err != nil {
+				klog.Warningf("Failed to delete orphaned Standalone %s: %v", pod.Name, err)
+			}
+			continue
+		}
+
+		// Check if any of the volumes still exist
+		hasExistingVolume := false
+		for _, volumeID := range entry.Volumes {
+			if existingVolumeIDs[volumeID] {
+				hasExistingVolume = true
+				break
+			}
+		}
+
+		if !hasExistingVolume {
+			klog.Infof("Standalone pod %s has no existing PVs, deleting", pod.Name)
+			if err := n.standaloneManager.DeleteStandalone(ctx, clusterID); err != nil {
+				klog.Warningf("Failed to delete orphaned Standalone %s: %v", pod.Name, err)
+			}
+		}
+	}
+
+	klog.Info("Garbage collection completed")
+}
+
+// Stop stops the PV watcher and garbage collector
+func (n *nodeServiceStandalone) Stop() {
+	klog.Info("Stopping PV watcher and garbage collector")
+	close(n.stopCh)
 }
