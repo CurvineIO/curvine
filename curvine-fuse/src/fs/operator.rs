@@ -56,6 +56,9 @@ pub enum FuseOperator<'a> {
     FSync(FSync<'a>),
     Symlink(Symlink<'a>),
     Readlink(Readlink<'a>),
+    GetLk(GetLk<'a>),
+    SetLk(SetLk<'a>),
+    SetLkW(SetLkW<'a>),
 }
 
 #[repr(i8)]
@@ -370,4 +373,22 @@ pub struct Symlink<'a> {
 #[derive(Debug)]
 pub struct Readlink<'a> {
     pub header: &'a fuse_in_header,
+}
+
+#[derive(Debug)]
+pub struct GetLk<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_lk_in,
+}
+
+#[derive(Debug)]
+pub struct SetLk<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_lk_in,
+}
+
+#[derive(Debug)]
+pub struct SetLkW<'a> {
+    pub header: &'a fuse_in_header,
+    pub arg: &'a fuse_lk_in,
 }

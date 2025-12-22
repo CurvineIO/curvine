@@ -133,6 +133,20 @@ impl RocksUtils {
         v
     }
 
+    pub fn u8_i64_to_bytes(id1: u8, id2: i64) -> [u8; 9] {
+        let mut v = [0; 9];
+        v[0] = id1;
+        BigEndian::write_i64(&mut v[1..9], id2);
+        v
+    }
+
+    pub fn u8_u32_to_bytes(id1: u8, id2: u32) -> [u8; 5] {
+        let mut v = [0; 5];
+        v[0] = id1;
+        BigEndian::write_u32(&mut v[1..5], id2);
+        v
+    }
+
     pub fn u64_u64_from_bytes(bytes: &[u8]) -> CommonResult<(u64, u64)> {
         if bytes.len() < 16 {
             err_box!("Byte array has less than 16 bytes")

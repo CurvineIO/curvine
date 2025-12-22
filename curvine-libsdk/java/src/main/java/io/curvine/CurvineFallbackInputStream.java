@@ -14,14 +14,13 @@
 
 package io.curvine;
 
-import org.apache.hadoop.fs.*;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import javax.annotation.Nonnull;
 import java.io.EOFException;
 import java.io.IOException;
 import java.util.function.Supplier;
+import javax.annotation.Nonnull;
+import org.apache.hadoop.fs.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class CurvineFallbackInputStream extends FSInputStream {
     public static final Logger LOGGER = LoggerFactory.getLogger(CurvineFallbackInputStream.class);
@@ -125,6 +124,7 @@ public class CurvineFallbackInputStream extends FSInputStream {
 
     @Override
     public long getPos() throws IOException {
+        checkClosed();
         if (ufsInputStream != null) {
             return ufsInputStream.getPos();
         } else {

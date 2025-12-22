@@ -645,4 +645,30 @@ impl ProtoUtils {
             mode: FileAllocMode::from_bits_truncate(opts.mode),
         }
     }
+
+    pub fn file_lock_to_pb(lock: FileLock) -> FileLockProto {
+        FileLockProto {
+            client_id: lock.client_id,
+            owner_id: lock.owner_id,
+            pid: lock.pid,
+            acquire_time: lock.acquire_time,
+            lock_type: lock.lock_type as i32,
+            lock_flags: lock.lock_flags as i32,
+            start: lock.start,
+            end: lock.end,
+        }
+    }
+
+    pub fn file_lock_from_pb(lock: FileLockProto) -> FileLock {
+        FileLock {
+            client_id: lock.client_id,
+            owner_id: lock.owner_id,
+            pid: lock.pid,
+            acquire_time: lock.acquire_time,
+            lock_type: LockType::from(lock.lock_type as u8),
+            lock_flags: LockFlags::from(lock.lock_flags as u8),
+            start: lock.start,
+            end: lock.end,
+        }
+    }
 }

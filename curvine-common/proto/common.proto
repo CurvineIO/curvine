@@ -165,3 +165,28 @@ message FileAllocOptsProto {
     required int64 len = 3;
     required int32 mode = 4;
 }
+
+// Define lock type
+enum LockTypeProto {
+    LOCK_TYPE_PROTO_READ = 0;
+    LOCK_TYPE_PROTO_WRITE = 1;
+    LOCK_TYPE_PROTO_UNLOCK = 2;
+}
+
+// Define lock flags
+enum LockFlagsProto {
+    LOCK_FLAGS_PROTO_PLOCK = 0; // POSIX lock (fcntl)
+    LOCK_FLAGS_PROTO_FLOCK = 1; // BSD lock (flock)
+}
+
+// File lock information
+message FileLockProto {
+    required string client_id = 1;
+    required uint64 owner_id = 2;
+    required uint32 pid = 3;
+    required uint64 acquire_time = 4;
+    required LockTypeProto lock_type = 5 [default = LOCK_TYPE_PROTO_READ];
+    required LockFlagsProto lock_flags = 6 [default = LOCK_FLAGS_PROTO_PLOCK];
+    required uint64 start = 7;
+    required uint64 end = 8;
+}

@@ -76,35 +76,12 @@ impl ClusterConf {
         let str = try_err!(read_to_string(path.as_ref()));
         let mut conf = try_err!(toml::from_str::<Self>(&str));
 
-        // Check the environment variable configuration.
-        if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
-            conf.master.hostname = v.to_owned();
-            let hostname_exists = conf
-                .journal
-                .journal_addrs
-                .iter()
-                .any(|peer| peer.hostname == v);
-
-            if !hostname_exists {
-                return err_box!(
-                    "Hostname '{}' from {} is not found in journal_addrs. Available hostnames: [{}]",
-                    v,
-                    Self::ENV_MASTER_HOSTNAME,
-                    conf.journal.journal_addrs
-                        .iter()
-                        .map(|peer| peer.hostname.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-
-            conf.journal.hostname = v;
-        }
-
+        // Apply worker hostname from environment variable (used by worker process)
         if let Ok(v) = env::var(Self::ENV_WORKER_HOSTNAME) {
             conf.worker.hostname = v;
         }
 
+        // Apply client hostname from environment variable
         if let Ok(v) = env::var(Self::ENV_CLIENT_HOSTNAME) {
             conf.client.hostname = v;
         }
@@ -115,6 +92,33 @@ impl ClusterConf {
         conf.job.init()?;
 
         Ok(conf)
+    }
+
+    pub fn apply_master_hostname_env(&mut self) -> CommonResult<()> {
+        if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
+            self.master.hostname = v.to_owned();
+            let hostname_exists = self
+                .journal
+                .journal_addrs
+                .iter()
+                .any(|peer| peer.hostname == v);
+
+            if !hostname_exists {
+                return err_box!(
+                    "Hostname '{}' from {} is not found in journal_addrs. Available hostnames: [{}]",
+                    v,
+                    Self::ENV_MASTER_HOSTNAME,
+                    self.journal.journal_addrs
+                        .iter()
+                        .map(|peer| peer.hostname.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+
+            self.journal.hostname = v;
+        }
+        Ok(())
     }
 
     // Master service starts configuration.

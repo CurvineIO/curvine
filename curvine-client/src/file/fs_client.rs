@@ -400,6 +400,24 @@ impl FsClient {
         Ok(ProtoUtils::located_block_from_pb(rep.block))
     }
 
+    pub async fn get_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
+        let req = GetLockRequest {
+            path: path.encode(),
+            lock: ProtoUtils::file_lock_to_pb(lock),
+        };
+        let rep: GetLockResponse = self.rpc(RpcCode::GetLock, req).await?;
+        Ok(rep.conflict.map(ProtoUtils::file_lock_from_pb))
+    }
+
+    pub async fn set_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
+        let req = SetLockRequest {
+            path: path.encode(),
+            lock: ProtoUtils::file_lock_to_pb(lock),
+        };
+        let rep: SetLockResponse = self.rpc(RpcCode::SetLock, req).await?;
+        Ok(rep.conflict.map(ProtoUtils::file_lock_from_pb))
+    }
+
     pub async fn rpc<T, R>(&self, code: RpcCode, header: T) -> FsResult<R>
     where
         T: PMessage + Default,

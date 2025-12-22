@@ -56,7 +56,7 @@ public class CurvineFilesystemProvider implements Closeable {
     private NodeCache nodeCache;
     private final AtomicBoolean enabled;
 
-    private CurvineFileSystem fs;
+    private volatile CurvineFileSystem fs;
 
     public CurvineFilesystemProvider(Configuration conf) {
         zkServer = conf.get(ZK_SERVER, "");
@@ -129,12 +129,17 @@ public class CurvineFilesystemProvider implements Closeable {
             return null;
         }
 
+        // Double-checked locking to avoid race condition when creating CurvineFileSystem
         if (fs == null) {
-            try {
-                fs = createCurvineFileSystem();
-            } catch (Exception e) {
-                enabled.set(false);
-                LOGGER.warn("createCurvineFileSystem", e);
+            synchronized (this) {
+                if (fs == null) {
+                    try {
+                        fs = createCurvineFileSystem();
+                    } catch (Exception e) {
+                        enabled.set(false);
+                        LOGGER.warn("createCurvineFileSystem", e);
+                    }
+                }
             }
         }
         return fs;

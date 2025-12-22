@@ -30,12 +30,13 @@ fn main() -> CommonResult<()> {
     );
 
     let service = args.get_service()?;
-    let conf = args.get_conf()?;
+    let mut conf = args.get_conf()?;
 
     Utils::set_panic_exit_hook();
 
     match service {
         ServiceType::Master => {
+            conf.apply_master_hostname_env()?;
             let master = Master::with_conf(conf)?;
             master.block_on_start();
         }

@@ -383,3 +383,28 @@ pub struct fuse_notify_inval_entry_out {
     pub namelen: u32,
     pub flags: u32,
 }
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_file_lock {
+    pub start: u64,
+    pub end: u64,
+    pub typ: u32,
+    pub pid: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_lk_in {
+    pub fh: u64,
+    pub owner: u64,
+    pub lk: fuse_file_lock,
+    pub lk_flags: u32,
+    pub padding: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_lk_out {
+    pub lk: fuse_file_lock,
+}

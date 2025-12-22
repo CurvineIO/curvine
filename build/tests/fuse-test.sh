@@ -835,6 +835,192 @@ test_fallocate() {
     fi
 }
 
+# Test 12: File locks (POSIX and BSD locks)
+test_file_locks() {
+    CURRENT_TEST_GROUP="Test 12: File Locks"
+    print_header "$CURRENT_TEST_GROUP"
+
+    local test_file="$TEST_DIR/lock_test.txt"
+    
+    # Create test file
+    echo "test data" > "$test_file"
+
+    # Check if flock command is available
+    if ! command -v flock >/dev/null 2>&1; then
+        print_info "flock command not available, skipping file lock tests"
+        return
+    fi
+
+    # Test 1: BSD lock (flock) - exclusive lock
+    print_test "Acquiring BSD exclusive lock (flock)"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    local cmd="flock -n $test_file -c 'echo locked'"
+    print_command "$cmd"
+    if eval "$cmd" > /dev/null 2>&1; then
+        print_success "Acquired BSD exclusive lock successfully"
+    else
+        handle_error "Failed to acquire BSD exclusive lock" "$cmd"
+    fi
+
+    # Test 2: BSD lock (flock) - shared lock
+    print_test "Acquiring BSD shared lock (flock -s)"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    cmd="flock -sn $test_file -c 'echo shared locked'"
+    print_command "$cmd"
+    if eval "$cmd"; then
+        print_success "Acquired BSD shared lock successfully"
+    else
+        handle_error "Failed to acquire BSD shared lock" "$cmd"
+    fi
+
+    # Test 3: BSD lock conflict detection
+    print_test "Testing BSD lock conflict detection"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    (
+        exec 200<"$test_file"
+        flock -n 200 || exit 1
+        (
+            exec 201<"$test_file"
+            if flock -n 201; then
+                exit 1
+            else
+                exit 0
+            fi
+        ) &
+        local conflict_pid=$!
+        sleep 0.1
+        wait $conflict_pid
+        local conflict_result=$?
+        flock -u 200
+        exit $conflict_result
+    )
+    if [ $? -eq 0 ]; then
+        print_success "BSD lock conflict detected correctly"
+    else
+        handle_error "BSD lock conflict detection failed" "flock conflict test"
+    fi
+
+    # Test 4: POSIX lock (fcntl) - using Python if available
+    if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+        print_test "Testing POSIX lock (fcntl) with Python"
+        TOTAL_TESTS=$((TOTAL_TESTS + 1))
+        local python_cmd=""
+        if command -v python3 >/dev/null 2>&1; then
+            python_cmd="python3"
+        else
+            python_cmd="python"
+        fi
+
+        local lock_script_file=$(mktemp)
+        cat > "$lock_script_file" << 'PYTHON_EOF'
+import fcntl
+import sys
+import time
+
+file_path = sys.argv[1]
+try:
+    with open(file_path, 'r+') as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        print("POSIX exclusive lock acquired")
+        time.sleep(0.1)
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        print("POSIX lock released")
+        sys.exit(0)
+except IOError as e:
+    if e.errno == 11:
+        print("POSIX lock conflict detected")
+        sys.exit(0)
+    else:
+        print("Error: {}".format(e))
+        sys.exit(1)
+PYTHON_EOF
+
+        cmd="$python_cmd $lock_script_file $test_file"
+        print_command "$cmd"
+        local python_result=0
+        eval "$cmd" || python_result=$?
+        rm -f "$lock_script_file"
+
+        if [ $python_result -eq 0 ]; then
+            print_success "POSIX lock test completed"
+        else
+            handle_error "POSIX lock test failed" "$cmd"
+        fi
+    else
+        print_info "Python not available, skipping POSIX lock tests"
+    fi
+
+    # Test 5: Multiple shared locks compatibility
+    print_test "Testing multiple shared locks compatibility"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    (
+        exec 200<"$test_file"
+        exec 201<"$test_file"
+        if flock -sn 200 && flock -sn 201; then
+            exit 0
+        else
+            exit 1
+        fi
+    )
+    if [ $? -eq 0 ]; then
+        print_success "Multiple shared locks acquired successfully"
+    else
+        handle_error "Multiple shared locks test failed" "flock shared locks test"
+    fi
+}
+
+# Test 13: Git clone operations
+test_git_clone() {
+    CURRENT_TEST_GROUP="Test 13: Git Clone Operations"
+    print_header "$CURRENT_TEST_GROUP"
+
+    if ! command -v git >/dev/null 2>&1; then
+        print_info "git command not available, skipping git clone tests"
+        return
+    fi
+
+    local clone_dir="$TEST_DIR/curvine-repo"
+    local repo_url="https://github.com/CurvineIO/curvine.git"
+
+    if [ -d "$clone_dir" ]; then
+        print_info "Removing existing clone directory: $clone_dir"
+        rm -rf "$clone_dir"
+    fi
+
+    print_test "Cloning repository: $repo_url"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    local cmd="git clone $repo_url $clone_dir"
+    print_command "$cmd"
+
+    if eval "$cmd"; then
+        if [ -d "$clone_dir/.git" ]; then
+            print_success "Repository cloned successfully"
+
+            print_test "Checking git status of cloned repository"
+            TOTAL_TESTS=$((TOTAL_TESTS + 1))
+            cmd="cd $clone_dir && git status"
+            print_command "$cmd"
+            if eval "$cmd" > /dev/null 2>&1; then
+                local status_output=$(cd "$clone_dir" && git status 2>&1)
+                print_success "Git status command executed successfully"
+                print_info "Git status output:"
+                echo "$status_output" | sed 's/^/  /'
+            else
+                handle_error "Failed to execute git status" "$cmd"
+            fi
+        else
+            handle_error "Clone directory exists but .git directory not found" "$cmd"
+        fi
+    else
+        handle_error "Failed to clone repository" "$cmd"
+    fi
+
+    if [ "$CLEANUP" = "1" ] && [ -d "$clone_dir" ]; then
+        print_info "Cleaning up cloned repository"
+        rm -rf "$clone_dir"
+    fi
+}
+
 # Print final report
 print_report() {
     print_header "Test Summary"
@@ -927,6 +1113,8 @@ main() {
     test_delete_operations
     test_truncate
     test_fallocate
+    test_file_locks
+    test_git_clone
 
     print_info "All test functions completed"
 

@@ -76,6 +76,19 @@ jobs:
             tag: ubuntu24.04
             arch: arm64
             runner: ubuntu-24.04-arm
+          # Amazon Linux 2
+          - build_type: amzn2
+            dockerfile: Dockerfile_amzn2
+            context: ./curvine-docker/compile
+            tag: amzn2
+            arch: amd64
+            runner: ubuntu-latest
+          - build_type: amzn2
+            dockerfile: Dockerfile_amzn2
+            context: ./curvine-docker/compile
+            tag: amzn2
+            arch: arm64
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
@@ -129,6 +142,7 @@ jobs:
           - tag: rocky9_cached
           - tag: ubuntu22.04
           - tag: ubuntu24.04
+          - tag: amzn2
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -179,7 +193,7 @@ jobs:
         run: |
           echo "### Compile Image Build Summary 🚀" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Build Types:** rocky9, rocky9_cached, ubuntu22.04, ubuntu24.04" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Types:** rocky9, rocky9_cached, ubuntu22.04, ubuntu24.04, amzn2" >> $GITHUB_STEP_SUMMARY
           echo "**Architectures:** amd64 (native), arm64 (native)" >> $GITHUB_STEP_SUMMARY
           echo "**Build Strategy:** Native runners for each architecture" >> $GITHUB_STEP_SUMMARY
           echo "**Trigger:** workflow_dispatch" >> $GITHUB_STEP_SUMMARY
@@ -191,6 +205,7 @@ jobs:
             echo "- \`ghcr.io/curvineio/curvine-compile:rocky9_cached\`" >> $GITHUB_STEP_SUMMARY
             echo "- \`ghcr.io/curvineio/curvine-compile:ubuntu22.04\`" >> $GITHUB_STEP_SUMMARY
             echo "- \`ghcr.io/curvineio/curvine-compile:ubuntu24.04\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`ghcr.io/curvineio/curvine-compile:amzn2\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Pull commands:**" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
@@ -202,6 +217,8 @@ jobs:
             echo "docker pull ghcr.io/curvineio/curvine-compile:ubuntu22.04" >> $GITHUB_STEP_SUMMARY
             echo "# Ubuntu 24.04" >> $GITHUB_STEP_SUMMARY
             echo "docker pull ghcr.io/curvineio/curvine-compile:ubuntu24.04" >> $GITHUB_STEP_SUMMARY
+            echo "# Amazon Linux 2" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ghcr.io/curvineio/curvine-compile:amzn2" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "# Verify multi-arch" >> $GITHUB_STEP_SUMMARY
             echo "docker buildx imagetools inspect ghcr.io/curvineio/curvine-compile:rocky9" >> $GITHUB_STEP_SUMMARY

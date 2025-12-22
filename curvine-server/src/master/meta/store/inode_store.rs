@@ -16,9 +16,9 @@ use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::inode::{InodeFile, InodePtr, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
-use crate::master::meta::{FileSystemStats, FsDir};
+use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
-use curvine_common::state::{BlockLocation, CommitBlock, MountInfo};
+use curvine_common::state::{BlockLocation, CommitBlock, FileLock, MountInfo};
 use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
@@ -534,5 +534,13 @@ impl InodeStore {
 
     pub fn get_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
         self.store.get_locations(block_id)
+    }
+
+    pub fn get_locks(&self, id: i64) -> CommonResult<LockMeta> {
+        self.store.get_locks(id)
+    }
+
+    pub fn apply_set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
+        self.store.set_locks(id, lock)
     }
 }

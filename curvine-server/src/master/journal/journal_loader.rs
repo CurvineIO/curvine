@@ -79,7 +79,10 @@ impl JournalLoader {
             JournalEntry::SetAttr(e) => self.set_attr(e),
 
             JournalEntry::Symlink(e) => self.symlink(e),
+
             JournalEntry::Link(e) => self.link(e),
+
+            JournalEntry::SetLocks(e) => self.set_locks(e),
         }
     }
 
@@ -222,6 +225,11 @@ impl JournalLoader {
 
         fs_dir.unprotected_link(new_path, original_inode_id, entry.op_ms)?;
         Ok(())
+    }
+
+    pub fn set_locks(&self, entry: SetLocksEntry) -> CommonResult<()> {
+        let fs_dir = self.fs_dir.write();
+        fs_dir.store.apply_set_locks(entry.ino, &entry.locks)
     }
 
     // Clean up expired checkpoints.

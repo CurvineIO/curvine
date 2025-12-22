@@ -14,7 +14,7 @@
 
 use crate::master::meta::inode::{InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
-use curvine_common::state::{CommitBlock, MountInfo, SetAttrOpts};
+use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -119,6 +119,13 @@ pub struct LinkEntry {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct SetLocksEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) ino: i64,
+    pub(crate) locks: Vec<FileLock>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
@@ -133,6 +140,7 @@ pub enum JournalEntry {
     SetAttr(SetAttrEntry),
     Symlink(SymlinkEntry),
     Link(LinkEntry),
+    SetLocks(SetLocksEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

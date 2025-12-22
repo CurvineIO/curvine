@@ -289,6 +289,21 @@ impl FuseRequest {
                 arg: decoder.get_struct()?,
             }),
 
+            FUSE_GETLK => FuseOperator::GetLk(GetLk {
+                header,
+                arg: decoder.get_struct()?,
+            }),
+
+            FUSE_SETLK => FuseOperator::SetLk(SetLk {
+                header,
+                arg: decoder.get_struct()?,
+            }),
+
+            FUSE_SETLKW => FuseOperator::SetLkW(SetLkW {
+                header,
+                arg: decoder.get_struct()?,
+            }),
+
             _ => FuseOperator::Notimplemented,
         };
 

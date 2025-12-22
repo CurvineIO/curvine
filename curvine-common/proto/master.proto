@@ -255,3 +255,25 @@ message AssignWorkerRequest {
 message AssignWorkerResponse {
     required LocatedBlockProto block = 1;
 }
+
+// GetLock request
+message GetLockRequest {
+    required string path = 1;
+    required FileLockProto lock = 2;
+}
+
+// GetLock response
+message GetLockResponse {
+    optional FileLockProto conflict = 1;
+}
+
+// SetLock request
+message SetLockRequest {
+    required string path = 1;
+    required FileLockProto lock = 2;
+}
+
+// SetLock response
+message SetLockResponse {
+    optional FileLockProto conflict = 1;
+}

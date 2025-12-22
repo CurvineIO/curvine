@@ -262,6 +262,12 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::Readlink(op) => reply.send_buf(fs.readlink(op).await).await,
 
+            FuseOperator::GetLk(op) => reply.send_rep(fs.get_lk(op).await).await,
+
+            FuseOperator::SetLk(op) => reply.send_rep(fs.set_lk(op).await).await,
+
+            FuseOperator::SetLkW(op) => reply.send_rep(fs.set_lkw(op).await).await,
+
             _ => {
                 let err: FuseResult<fuse_out_header> =
                     err_fuse!(libc::ENOSYS, "unsupported operation {:?}", req.opcode());
