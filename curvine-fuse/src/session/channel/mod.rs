@@ -18,6 +18,7 @@ use crate::{FuseResult, FuseUtils};
 use curvine_common::conf::FuseConf;
 use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncChannel;
+use orpc::sync::FastDashMap;
 use std::sync::Arc;
 
 mod fuse_receiver;
@@ -37,6 +38,7 @@ impl<T: FileSystem> FuseChannel<T> {
 
         let mut receivers = Vec::with_capacity(conf.mnt_per_task);
         let mut senders = Vec::with_capacity(conf.mnt_per_task);
+        let pending_requests = Arc::new(FastDashMap::default());
         for _ in 0..conf.mnt_per_task {
             let (tx, rx) = AsyncChannel::new(conf.fuse_channel_size).split();
             let fd = mnt.create_async_task_fd(conf.clone_fd)?;
@@ -44,7 +46,15 @@ impl<T: FileSystem> FuseChannel<T> {
             let sender =
                 FuseSender::new(fs.clone(), rt.clone(), fd.clone(), rx, buf_size, conf.debug)?;
 
-            let receiver = FuseReceiver::new(fs.clone(), rt.clone(), fd, tx, buf_size, conf.debug)?;
+            let receiver = FuseReceiver::new(
+                fs.clone(),
+                rt.clone(),
+                fd,
+                tx,
+                buf_size,
+                conf.debug,
+                pending_requests.clone(),
+            )?;
 
             senders.push(sender);
             receivers.push(receiver);

@@ -32,3 +32,8 @@ yarn.lock
 .scala-build/
 .bloop/
 .memory-bank
+
+curvine-libsdk/java/target/
+.staging/
+.summary/
+.claude/

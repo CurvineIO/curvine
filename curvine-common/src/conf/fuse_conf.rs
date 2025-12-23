@@ -277,7 +277,7 @@ impl Default for FuseConf {
             congestion_threshold: 192,
 
             node_cache_size: 200000,
-            node_cache_timeout: "1h".to_string(),
+            node_cache_timeout: "24h".to_string(),
 
             direct_io: false,
             write_back_cache: false,

@@ -30,7 +30,7 @@ pub struct NodeAttr {
     pub generation: u64,
 
     // Number of references, application layer
-    pub ref_ctr: i32,
+    pub ref_ctr: u32,
 
     // lookup times.Kernel layer.
     pub n_lookup: u64,
@@ -45,8 +45,6 @@ pub struct NodeAttr {
     pub mtime: i64,
 
     pub len: i64,
-
-    pub is_hidden: bool,
 
     pub cache_valid: bool,
 }
@@ -64,14 +62,31 @@ impl NodeAttr {
         }
     }
 
-    pub fn inc_lookup(&mut self) {
-        if self.n_lookup == 0 {
-            self.ref_ctr += 1;
-        }
-        self.n_lookup += 1;
-    }
-
     pub fn is_root(&self) -> bool {
         self.id == FUSE_ROOT_ID
+    }
+
+    pub fn add_lookup(&mut self, v: u64) -> u64 {
+        self.n_lookup = self.n_lookup.saturating_add(v);
+        self.n_lookup
+    }
+
+    pub fn sub_lookup(&mut self, v: u64) -> u64 {
+        self.n_lookup = self.n_lookup.saturating_sub(v);
+        self.n_lookup
+    }
+
+    pub fn add_ref(&mut self, v: u32) -> u32 {
+        self.ref_ctr = self.ref_ctr.saturating_add(v);
+        self.ref_ctr
+    }
+
+    pub fn sub_ref(&mut self, v: u32) -> u32 {
+        self.ref_ctr = self.ref_ctr.saturating_sub(v);
+        self.ref_ctr
+    }
+
+    pub fn should_unref(&self) -> bool {
+        self.n_lookup == 0 && self.ref_ctr == 0 && !self.is_root()
     }
 }

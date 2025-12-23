@@ -198,18 +198,12 @@ impl CurvineFileSystem {
         Ok(())
     }
 
-    async fn fs_list_status(&self, parent: u64, path: &Path) -> FuseResult<Vec<FileStatus>> {
-        let mut res = vec![];
+    async fn fs_list_status(&self, path: &Path) -> FuseResult<Vec<FileStatus>> {
+        let list = self.fs.list_status(path).await?;
+
+        let mut res = Vec::with_capacity(list.len() + 2);
         res.push(Self::new_dot_status(FUSE_CURRENT_DIR));
         res.push(Self::new_dot_status(FUSE_PARENT_DIR));
-
-        let list = self.fs.list_status(path).await?;
-        let list = if self.conf.read_dir_fill_ino {
-            self.state.fill_ino(parent, list)?
-        } else {
-            list
-        };
-
         for status in list {
             res.push(status);
         }
@@ -279,12 +273,19 @@ impl CurvineFileSystem {
         // Check directory read permission for reading directory contents
         self.check_access_permissions(&dir_status, header, libc::R_OK as u32)?;
 
-        let list = self.fs_list_status(header.nodeid, &path).await?;
+        let list = self.fs_list_status(&path).await?;
 
         let start_index = arg.offset as usize;
+        let mut map = self.state.node_write();
         let mut res = FuseDirentList::new(arg);
         for (index, status) in list.iter().enumerate().skip(start_index) {
-            let attr = Self::status_to_attr(&self.conf, status)?;
+            let mut attr = Self::status_to_attr(&self.conf, status)?;
+
+            if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
+                let node = map.find_node(header.nodeid, Some(&status.name))?;
+                attr.ino = node.id;
+            }
+
             let entry = Self::create_entry_out(&self.conf, attr);
 
             if plus {
@@ -821,15 +822,16 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn get_attr(&self, op: GetAttr<'_>) -> FuseResult<fuse_attr_out> {
         let path = self.state.get_path(op.header.nodeid)?;
 
-        let attr = self
-            .lookup_path::<String>(op.header.nodeid, None, &path)
-            .await?;
+        let status = self.fs_get_status(&path).await?;
+
+        let mut fuse_attr = Self::status_to_attr(&self.conf, &status)?;
+        fuse_attr.ino = op.header.nodeid; // Use FUSE inode, not backend inode
 
         let attr = fuse_attr_out {
             attr_valid: self.conf.attr_ttl.as_secs(),
             attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
             dummy: 0,
-            attr,
+            attr: fuse_attr,
         };
         Ok(attr)
     }
@@ -894,7 +896,9 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        let attr = Self::status_to_attr(&self.conf, &status)?;
+        let mut attr = Self::status_to_attr(&self.conf, &status)?;
+        attr.ino = op.header.nodeid;
+
         let attr = fuse_attr_out {
             attr_valid: self.conf.attr_ttl.as_secs(),
             attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
@@ -1152,13 +1156,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
 
         self.fs.delete(&path, false).await?;
-        // self.state.unlink_name(op.header.nodeid, name);
-
-        debug!(
-            "unlink: removed name mapping for parent={}, name={}",
-            op.header.nodeid, name
-        );
-
+        self.state.unlink_node(op.header.nodeid, Some(name))?;
         Ok(())
     }
 
@@ -1168,23 +1166,13 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let des_path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         let src_path = self.state.get_path(oldnodeid)?;
-        let src_status = self.fs_get_status(&src_path).await?;
 
         debug!(
             "link: src_path={}, des_path={}, oldnodeid={}, parent={}",
             src_path, des_path, oldnodeid, op.header.nodeid
         );
 
-        if self.fs.exists(&des_path).await? {
-            return err_fuse!(libc::EEXIST, "File already exists: {}", des_path);
-        }
-
-        if src_status.is_dir {
-            return err_fuse!(libc::EPERM, "Cannot create link to directory: {}", src_path);
-        }
-
         self.fs.link(&src_path, &des_path).await?;
-        // self.state.link_node(op.header.nodeid, name, oldnodeid)?;
         let attr = self
             .lookup_path(op.header.nodeid, Some(name), &des_path)
             .await?;
@@ -1197,6 +1185,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let name = try_option!(op.name.to_str());
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         self.fs.delete(&path, false).await?;
+        self.state.unlink_node(op.header.nodeid, Some(name))?;
         Ok(())
     }
 
@@ -1211,24 +1200,16 @@ impl fs::FileSystem for CurvineFileSystem {
             self.state
                 .get_path2(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
 
-        // Perform the rename operation
         self.fs.rename(&old_path, &new_path).await?;
 
-        // Update FUSE state after successful backend rename
         self.state
             .rename_node(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
 
-        info!("Successfully renamed {} to {}", old_path, new_path);
-        Ok(())
-    }
-
-    // interrupt request, curvine each future has a timeout time and will not block for a long time, so this interface is not required.
-    async fn interrupt(&self, _: Interrupt<'_>) -> FuseResult<()> {
         Ok(())
     }
 
     async fn batch_forget(&self, op: BatchForget<'_>) -> FuseResult<()> {
-        self.state.batch_forget_node(op.nodes)
+        self.state.batch_forget_node(&op.nodes)
     }
 
     // Create a symbolic link
@@ -1236,7 +1217,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let linkname = try_option!(op.linkname.to_str());
         let target = try_option!(op.target.to_str());
         let id = op.header.nodeid;
-        info!("symlink: linkname={:?}, target={:?}", linkname, target);
+        debug!("symlink: linkname={:?}, target={:?}", linkname, target);
 
         if linkname.len() > FUSE_MAX_NAME_LENGTH {
             return err_fuse!(libc::ENAMETOOLONG);
@@ -1411,7 +1392,6 @@ impl fs::FileSystem for CurvineFileSystem {
         let time = TimeSpent::new();
 
         let lock = self.to_file_lock(op.arg);
-        // @todo needs to implement interruption.
         loop {
             let conflict = self.fs.set_lock(&path, lock.clone()).await?;
             if conflict.is_none() {

@@ -21,7 +21,7 @@ use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
-use log::{debug, warn};
+use log::{info, warn};
 use orpc::common::FastHashMap;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
@@ -135,15 +135,27 @@ impl NodeState {
         Ok(attr)
     }
 
-    // Peer-to-peer implementation of fuse.c forget_node
-    pub fn forget_node(&self, id: u64, n_lookup: u64) -> FuseResult<()> {
-        self.node_write().unref_node(id, n_lookup)
+    pub fn unlink_node<T: AsRef<str>>(&self, id: u64, name: Option<T>) -> FuseResult<()> {
+        let mut map = self.node_write();
+        let node = if let Some(node) = map.lookup_node_mut(id, name) {
+            node.sub_lookup(1);
+            node.clone()
+        } else {
+            return Ok(());
+        };
+
+        map.delete_name(&node)
     }
 
-    pub fn batch_forget_node(&self, nodes: &[fuse_forget_one]) -> FuseResult<()> {
+    // Peer-to-peer implementation of fuse.c forget_node
+    pub fn forget_node(&self, id: u64, n_lookup: u64) -> FuseResult<()> {
+        self.node_write().forget_node(id, n_lookup)
+    }
+
+    pub fn batch_forget_node(&self, nodes: &[&fuse_forget_one]) -> FuseResult<()> {
         let mut state = self.node_write();
         for node in nodes {
-            if let Err(e) = state.unref_node(node.nodeid, node.nlookup) {
+            if let Err(e) = state.forget_node(node.nodeid, node.nlookup) {
                 warn!("batch_forget {:?}: {}", node, e);
             }
         }
@@ -195,7 +207,7 @@ impl NodeState {
 
                 if let Some(link_fuse_ino) = map.lookup_link_inode(backend_ino) {
                     if let Err(e) = map.link_node(parent, &status.name, link_fuse_ino) {
-                        debug!(
+                        info!(
                             "fill_ino: link_node failed (may already exist): name={}, fuse_ino={}, err={}",
                             status.name, link_fuse_ino, e
                         );
@@ -208,7 +220,7 @@ impl NodeState {
                     };
                     map.register_linked_inode(backend_ino, node_id);
                     status.id = node_id as i64;
-                    debug!(
+                    info!(
                         "fill_ino: first occurrence, register mapping backend_ino={} -> fuse_ino={}, name={}, nlink={}",
                         backend_ino, node_id, status.name, status.nlink
                     );

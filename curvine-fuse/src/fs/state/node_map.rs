@@ -16,7 +16,7 @@ use crate::fs::state::NodeAttr;
 use crate::{err_fuse, FuseResult, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, FUSE_UNKNOWN_INO};
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::Path;
-use log::{debug, info};
+use log::{debug, error, info};
 use orpc::common::{FastHashMap, LocalTime};
 use orpc::sync::AtomicCounter;
 use std::collections::VecDeque;
@@ -30,7 +30,6 @@ pub struct NodeMap {
     // record curvine inode ID to FUSE inode ID for hard link detection when fuse restart
     linked_inode_map: FastHashMap<i64, u64>,
     id_creator: AtomicCounter,
-    remember: bool,
     cache_ttl: u64,
     last_clean: u64,
 }
@@ -43,7 +42,6 @@ impl NodeMap {
             nodes,
             names: FastHashMap::default(),
             linked_inode_map: FastHashMap::default(),
-            remember: conf.remember,
             id_creator: AtomicCounter::new(FUSE_ROOT_ID),
             cache_ttl: conf.node_cache_ttl.as_millis() as u64,
             last_clean: LocalTime::mills(),
@@ -51,7 +49,7 @@ impl NodeMap {
     }
 
     fn name_key<T: AsRef<str>>(id: u64, name: T) -> String {
-        format!("{}{}", id, name.as_ref())
+        format!("{}\0{}", id, name.as_ref())
     }
 
     pub fn get(&self, id: u64) -> Option<&NodeAttr> {
@@ -119,36 +117,30 @@ impl NodeMap {
     ) -> FuseResult<&mut NodeAttr> {
         self.clean_cache();
 
-        let id = match self.lookup_node(parent, name.as_ref()) {
+        let ino = match self.lookup_node(parent, name.as_ref()) {
             Some(v) => v.id,
-            None => self.add_node(parent, name),
+
+            None => {
+                let ino = self.next_id();
+                let node = NodeAttr::new(ino, name, parent);
+
+                if let Some(p) = self.get_mut(parent) {
+                    p.add_ref(1);
+                }
+
+                let key = Self::name_key(node.parent, &node.name);
+                self.names.insert(key, ino);
+                self.nodes.insert(ino, node);
+
+                ino
+            }
         };
 
-        let node = self.get_mut_check(id)?;
+        let node = self.get_mut_check(ino)?;
+        node.add_lookup(1);
         node.stat_updated = Duration::from_millis(LocalTime::mills());
+
         Ok(node)
-    }
-
-    // Add a new node and return the id of the new node.
-    fn add_node<T: AsRef<str>>(&mut self, parent: u64, name: Option<T>) -> u64 {
-        let ino = self.next_id();
-        let mut node = NodeAttr::new(ino, name, parent);
-
-        if self.remember {
-            node.inc_lookup();
-        }
-
-        // Update parent references.
-        if let Some(p) = self.get_mut(parent) {
-            p.ref_ctr += 1;
-        }
-        node.inc_lookup();
-
-        let key = Self::name_key(node.parent, &node.name);
-        self.names.insert(key, ino);
-        self.nodes.insert(ino, node);
-
-        ino
     }
 
     // Add a hard link node with specified inode ID
@@ -176,7 +168,7 @@ impl NodeMap {
 
         // Increment the lookup count of the target node
         if let Some(node) = self.nodes.get_mut(&ino) {
-            node.inc_lookup();
+            node.add_lookup(1);
         }
 
         // Update parent references
@@ -253,29 +245,52 @@ impl NodeMap {
         s
     }
 
-    pub fn unref_node(&mut self, id: u64, n_lookup: u64) -> FuseResult<()> {
+    pub fn delete_node(&mut self, node: &NodeAttr) -> FuseResult<()> {
+        self.delete_name(node)?;
+        self.nodes.remove(&node.id);
+
+        Ok(())
+    }
+
+    pub fn delete_name(&mut self, node: &NodeAttr) -> FuseResult<()> {
+        if let Some(parent) = self.get_mut(node.parent).cloned() {
+            self.unref_node(parent.id)?;
+        }
+
+        self.names.remove(&Self::name_key(node.parent, &node.name));
+        Ok(())
+    }
+
+    pub fn unref_node(&mut self, id: u64) -> FuseResult<()> {
+        if id == FUSE_ROOT_ID {
+            return Ok(());
+        }
+
         let node = match self.get_mut(id) {
-            Some(v) => v,
             None => return Ok(()),
+            Some(v) => {
+                v.sub_ref(1);
+                v.clone()
+            }
         };
 
-        if node.ref_ctr <= 1 && node.n_lookup <= n_lookup {
-            // Remove the node itself
-            self.nodes.remove(&id);
-
-            // Remove all name mappings that point to this inode to avoid stale entries
-            let keys_to_remove: Vec<String> = self
-                .names
-                .iter()
-                .filter_map(|(k, v)| if *v == id { Some(k.clone()) } else { None })
-                .collect();
-            for k in keys_to_remove {
-                self.names.remove(&k);
-            }
-        } else {
-            node.n_lookup = node.n_lookup.saturating_sub(n_lookup);
-            node.ref_ctr = node.ref_ctr.checked_sub(1).unwrap_or(0);
+        if node.ref_ctr == 0 && node.n_lookup == 0 {
+            self.delete_node(&node)?;
         }
+
+        Ok(())
+    }
+
+    pub fn forget_node(&mut self, id: u64, n_lookup: u64) -> FuseResult<()> {
+        let node = match self.get_mut(id) {
+            None => return Ok(()),
+            Some(v) => v,
+        };
+
+        let cur_lookup = node.sub_lookup(n_lookup);
+        if cur_lookup == 0 {
+            self.unref_node(id)?;
+        };
 
         Ok(())
     }
@@ -289,54 +304,32 @@ impl NodeMap {
     ) -> FuseResult<()> {
         let (old_name, new_name) = (old_name.as_ref(), new_name.as_ref());
 
-        // If destination node exists, remove it first to support replace semantics
-        let existing_node = self.lookup_node(new_id, Some(new_name)).cloned();
-        if existing_node.is_some() {
-            info!(
-                "Removing existing destination node for rename: parent={}, name={}",
-                new_id, new_name
-            );
-        }
+        let old_node = match self.lookup_node_mut(old_id, Some(old_name)) {
+            None => return err_fuse!(libc::ENOENT, "inode {} {} not exists", old_id, old_name),
 
-        let old_node = match self.lookup_node(old_id, Some(old_name)) {
-            None => {
-                return err_fuse!(
-                    libc::ENOENT,
-                    "src parent: {}, name: {} not exists",
-                    old_id,
-                    old_name
-                );
+            Some(v) => {
+                v.sub_lookup(1);
+                v.clone()
             }
-
-            Some(v) => v.clone(),
         };
+        self.delete_name(&old_node)?;
 
-        // Remove existing destination node if it exists
-        if let Some(node) = existing_node {
-            self.delete_node(&node);
+        if let Some(exists_node) = self.lookup_node(new_id, Some(new_name)).cloned() {
+            self.delete_name(&exists_node)?;
         }
 
-        // Remove the old node from names mapping but keep the inode
-        let old_name_key = Self::name_key(old_node.parent, &old_node.name);
-        self.names.remove(&old_name_key);
+        let mut new_node = old_node;
+        new_node.parent = new_id;
+        new_node.name = new_name.to_string();
 
-        // Update the old node with new parent and name, then re-add it
-        let mut updated_node = old_node;
-        updated_node.parent = new_id;
-        updated_node.name = new_name.to_string();
-
-        // Add the updated node back with new path mapping
-        let new_name_key = Self::name_key(updated_node.parent, &updated_node.name);
-        self.names.insert(new_name_key, updated_node.id);
-        self.nodes.insert(updated_node.id, updated_node);
+        if let Some(parent) = self.get_mut(new_id) {
+            parent.add_ref(1);
+        }
+        self.names
+            .insert(Self::name_key(new_node.parent, &new_node.name), new_node.id);
+        self.nodes.insert(new_node.id, new_node);
 
         Ok(())
-    }
-
-    // Delete the node.
-    fn delete_node(&mut self, node: &NodeAttr) {
-        self.names.remove(&Self::name_key(node.parent, &node.name));
-        self.nodes.remove(&node.id);
     }
 
     // Remove a single name mapping (parent,name) without deleting the inode itself.
@@ -432,13 +425,15 @@ impl NodeMap {
             .nodes
             .iter()
             .filter(|x| {
-                !x.1.is_root() && x.1.stat_updated.as_millis() as u64 + self.cache_ttl <= now
+                x.1.should_unref() && x.1.stat_updated.as_millis() as u64 + self.cache_ttl <= now
             })
-            .map(|x| x.1.clone())
+            .map(|x| x.1.id)
             .collect();
 
         for node in &expired_nodes {
-            self.delete_node(node);
+            if let Err(e) = self.unref_node(*node) {
+                error!("clean_cache: unref_node failed: {}", e);
+            }
         }
 
         self.last_clean = now;

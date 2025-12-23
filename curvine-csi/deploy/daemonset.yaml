@@ -17,12 +17,10 @@ spec:
         - operator: Exists
       priorityClassName: system-node-critical
       dnsPolicy: ClusterFirstWithHostNet
-      #nodeSelector:
-      #  curvine-fuse: 'true'
 
       containers:
         - name: csi-plugin
-          image: curvineio/curvine-csi:latest
+          image: ghcr.io/curvineio/curvine-csi:latest
           imagePullPolicy: Always
           command: ["/opt/curvine/csi"]
           args:
@@ -39,13 +37,25 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Mount mode configuration
+            # - "standalone": FUSE runs in independent standalone pod (default, recommended)
+            # - "embedded": FUSE runs in CSI container (legacy mode)
+            - name: MOUNT_MODE
+              value: "standalone"
+            # Standalone pod image (defaults to same CSI image)
+            - name: STANDALONE_IMAGE
+              value: "ghcr.io/curvineio/curvine-csi:latest"
+            # Standalone pod ServiceAccount (required for standalone mode)
+            # Must match the ServiceAccount name used by CSI node pods
+            - name: STANDALONE_SERVICE_ACCOUNT
+              value: "curvine-csi-node-sa"
           lifecycle:
             preStop:
               exec:
                 command:
                   - /bin/sh
                   - -c
-                  - rm /csi/csi.sock
+                  - rm -f /csi/csi.sock
           livenessProbe:
             failureThreshold: 5
             httpGet:
@@ -58,8 +68,6 @@ spec:
             - containerPort: 9909
               name: healthz
               protocol: TCP
-          securityContext:
-            privileged: true
           volumeMounts:
             - mountPath: /csi
               name: plugin-dir
@@ -68,6 +76,7 @@ spec:
               name: kubelet-dir
             - mountPath: /registration
               name: registration-dir
+
         - name: node-driver-registrar
           args:
             - --csi-address=$(ADDRESS)
@@ -77,36 +86,67 @@ spec:
             - name: ADDRESS
               value: /csi/csi.sock
             - name: DRIVER_REG_SOCK_PATH
-              value: /var/lib/kubelet/csi-plugins/csi.curvine.io/csi.sock
-          image: quay.io/k8scsi/csi-node-driver-registrar:v2.1.0
+              value: /var/lib/kubelet/plugins/curvine/csi.sock
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.5.1
+          imagePullPolicy: IfNotPresent
           volumeMounts:
             - mountPath: /csi
               name: plugin-dir
             - mountPath: /registration
               name: registration-dir
+
         - name: liveness-probe
           args:
-            - --csi-address=$(ADDRESS)
-            - --health-port=$(HEALTH_PORT)
-          env:
-            - name: ADDRESS
-              value: /csi/csi.sock
-            - name: HEALTH_PORT
-              value: "9909"
-          image: registry.k8s.io/sig-storage/livenessprobe:v2.11.0
+            - --csi-address=/csi/csi.sock
+            - --health-port=9909
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.8.0
+          imagePullPolicy: IfNotPresent
           volumeMounts:
             - mountPath: /csi
               name: plugin-dir
+
       volumes:
         - hostPath:
-            path: /var/lib/kubelet/csi-plugins/csi.curvine.io/
+            path: /var/lib/kubelet/plugins/curvine
             type: DirectoryOrCreate
           name: plugin-dir
         - hostPath:
             path: /var/lib/kubelet
-            type: DirectoryOrCreate
+            type: Directory
           name: kubelet-dir
         - hostPath:
-            path: /var/lib/kubelet/plugins_registry/
+            path: /var/lib/kubelet/plugins_registry
             type: Directory
           name: registration-dir
+---
+# RBAC for Standalone pod management
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: curvine-csi-standalone-role
+rules:
+  # Pod management for standalone pods
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  # ConfigMap for state persistence
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "delete", "get", "list", "update", "watch"]
+  # Events for debugging
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: curvine-csi-standalone-binding  # Keep name for backward compatibility
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: curvine-csi-standalone-role
+subjects:
+  - kind: ServiceAccount
+    name: curvine-csi-node-sa
+    namespace: curvine-system
