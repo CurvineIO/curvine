@@ -23,6 +23,7 @@ pub type GenericResult<T> = Result<T, String>;
 pub mod consts;
 pub mod s3_utils;
 pub mod temp_file_manager;
+pub mod temp_storage;
 #[derive(Debug)]
 pub struct BaseKv<K: PartialOrd, V> {
     pub key: K,

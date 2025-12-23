@@ -302,18 +302,39 @@ pub async fn start_gateway(
         region
     );
 
+    // Clone web_port before moving conf into spawn
+    let web_port = conf.s3_gateway.web_port;
     rt.spawn(async move {
-        if let Err(e) = web_server::WebServer::start(conf.s3_gateway.web_port).await {
+        if let Err(e) = web_server::WebServer::start(web_port).await {
             tracing::error!("Failed to start metrics server: {}", e);
         }
     });
 
     let ufs = UnifiedFileSystem::with_rt(conf.clone(), rt.clone())?;
     let ak_store = init_s3_authentication(&conf.s3_gateway, &ufs, rt.clone()).await?;
+
+    // Create temp storage using factory pattern
+    // - enable_s3_gateway=true: Use Curvine DFS for distributed multipart upload support
+    // - enable_s3_gateway=false: Use local filesystem for standalone deployment
+    let temp_storage = Arc::new(utils::temp_storage::TempStorageEnum::create(
+        conf.worker.enable_s3_gateway,
+        conf.s3_gateway.put_temp_dir.clone(),
+        "/.s3temp".to_string(),
+        conf.s3_gateway.put_memory_buffer_threshold,
+        conf.s3_gateway.put_max_memory_buffer,
+        Some(ufs.clone()),
+    ));
+
+    tracing::info!(
+        "S3 Gateway temp storage configured: type={}, dir={}",
+        temp_storage.storage_type(),
+        temp_storage.config().temp_dir
+    );
+
     let handlers = Arc::new(s3::handlers::S3Handlers::new(
         ufs,
         region.clone(),
-        conf.s3_gateway.put_temp_dir.clone(),
+        temp_storage,
         rt.clone(),
         conf.s3_gateway.get_chunk_size_mb,
     ));

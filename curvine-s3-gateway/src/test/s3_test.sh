@@ -19,7 +19,7 @@
 
 set -e  # Exit on any error
 
-ENDPOINT="http://localhost:9900"
+ENDPOINT="${ENDPOINT:-http://localhost:9900}"
 TEST_BUCKET="comprehensive-test-$(date +%s)"
 TEST_DIR="/tmp/curvine-comprehensive-test"
 

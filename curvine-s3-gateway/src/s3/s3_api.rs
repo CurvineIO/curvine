@@ -686,6 +686,9 @@ pub trait PutObjectHandler: Send + Sync {
         object: String,
         body: crate::utils::io::PollReaderEnum,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+
+    /// Get the temporary directory path for storing temporary files during PUT operations
+    fn get_temp_dir(&self) -> String;
 }
 
 /// Parse bucket and object names from URL path for PUT operations
@@ -904,12 +907,17 @@ pub async fn handle_put_object<
                     }
                 }
             } else {
+                let temp_dir = handler.get_temp_dir();
+                // Ensure temp directory exists (for local filesystem only)
+                if !temp_dir.starts_with("/system") {
+                    let _ = tokio::fs::create_dir_all(&temp_dir).await;
+                }
                 match tokio::fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)
                     .read(true)
                     .mode(0o644)
-                    .open(format!("/tmp/curvine-temp/{}", cs))
+                    .open(format!("{}/{}", temp_dir, cs))
                     .await
                 {
                     Ok(mut fd) => match parse_body(r, &mut fd, &cs, content_length).await {
@@ -962,8 +970,13 @@ pub async fn handle_put_object<
             }
         }
         ContentSha256::Streaming => {
+            let temp_dir = handler.get_temp_dir();
+            // Ensure temp directory exists (for local filesystem only)
+            if !temp_dir.starts_with("/system") {
+                let _ = tokio::fs::create_dir_all(&temp_dir).await;
+            }
             let file_name = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let file_name = format!("/tmp/curvine-temp/{}", file_name);
+            let file_name = format!("{}/{}", temp_dir, file_name);
             let ret = match tokio::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
@@ -1027,8 +1040,13 @@ pub async fn handle_put_object<
         }
         ContentSha256::Unsigned => {
             // No hash verification; stream body into a temp file, then pass to handler
+            let temp_dir = handler.get_temp_dir();
+            // Ensure temp directory exists (for local filesystem only)
+            if !temp_dir.starts_with("/system") {
+                let _ = tokio::fs::create_dir_all(&temp_dir).await;
+            }
             let file_name = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let file_name = format!("/tmp/curvine-temp/{}", file_name);
+            let file_name = format!("{}/{}", temp_dir, file_name);
             let ret = match tokio::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
