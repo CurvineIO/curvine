@@ -1110,9 +1110,109 @@ test_delayed_delete() {
     rm -f "$test_file" 2>/dev/null || true
 }
 
-# Test 14: Git clone operations
+# Test 14: High-frequency Python write test
+test_python_high_frequency_write() {
+    CURRENT_TEST_GROUP="Test 14: Python High-Frequency Write"
+    print_header "$CURRENT_TEST_GROUP"
+
+    if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+        print_info "Python not available, skipping high-frequency write test"
+        return
+    fi
+
+    local python_cmd=$(command -v python3 2>/dev/null || command -v python)
+    local test_file="$TEST_DIR/python-high-freq.txt"
+    local iterations=2000
+    
+    # Clean up any existing test file
+    rm -f "$test_file" 2>/dev/null || true
+
+    print_test "Python high-frequency write and verify ($iterations iterations)"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+    local start_time=$(date +%s)
+    
+    TEST_FILE="$test_file" ITERATIONS="$iterations" $python_cmd << 'PYTHON_SCRIPT'
+import os
+import sys
+
+test_file = os.environ.get('TEST_FILE')
+iterations = int(os.environ.get('ITERATIONS', '2000'))
+
+try:
+    # Create parent directory if needed
+    os.makedirs(os.path.dirname(test_file), exist_ok=True)
+    
+    # High-frequency write test
+    print(f"Writing {iterations} times...", file=sys.stderr)
+    for i in range(iterations):
+        with open(test_file, "a") as f:
+            f.write(f"{i}\n")
+        
+        # Progress indicator every 500 iterations
+        if (i + 1) % 500 == 0:
+            print(f"  Progress: {i + 1}/{iterations}", file=sys.stderr)
+    
+    print("Write completed, verifying data...", file=sys.stderr)
+    
+    # Verify data immediately
+    with open(test_file, 'r') as f:
+        lines = f.readlines()
+    
+    # Check line count
+    if len(lines) != iterations:
+        print(f"ERROR: Line count mismatch - expected {iterations}, got {len(lines)}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Verify each line contains the correct number
+    errors = 0
+    for i, line in enumerate(lines):
+        expected = f"{i}\n"
+        if line != expected:
+            if errors < 10:  # Only show first 10 errors
+                print(f"ERROR: Line {i} mismatch - expected '{expected.strip()}', got '{line.strip()}'", file=sys.stderr)
+            errors += 1
+    
+    if errors > 0:
+        print(f"ERROR: Total {errors} line(s) with incorrect data", file=sys.stderr)
+        sys.exit(1)
+    
+    # Success
+    print(f"SUCCESS: All {iterations} lines verified correctly", file=sys.stderr)
+    print("VERIFICATION_SUCCESS")
+    sys.exit(0)
+    
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+PYTHON_SCRIPT
+
+    local result=$?
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+
+    if [ $result -eq 0 ]; then
+        print_success "Write and verify completed successfully in ${elapsed}s"
+        
+        # Get file size info
+        if [ -f "$test_file" ]; then
+            local file_size=$(stat -f%z "$test_file" 2>/dev/null || stat -c%s "$test_file" 2>/dev/null || echo "unknown")
+            local line_count=$(wc -l < "$test_file" 2>/dev/null)
+            print_info "File size: $file_size bytes, Lines: $line_count"
+        fi
+    else
+        handle_error "Python high-frequency write test failed" "python write and verify"
+    fi
+
+    # Cleanup
+    rm -f "$test_file" 2>/dev/null || true
+}
+
+# Test 15: Git clone operations
 test_git_clone() {
-    CURRENT_TEST_GROUP="Test 14: Git Clone Operations"
+    CURRENT_TEST_GROUP="Test 15: Git Clone Operations"
     print_header "$CURRENT_TEST_GROUP"
 
     if ! command -v git >/dev/null 2>&1; then
@@ -1154,11 +1254,6 @@ test_git_clone() {
         fi
     else
         handle_error "Failed to clone repository" "$cmd"
-    fi
-
-    if [ "$CLEANUP" = "1" ] && [ -d "$clone_dir" ]; then
-        print_info "Cleaning up cloned repository"
-        rm -rf "$clone_dir"
     fi
 }
 
@@ -1256,6 +1351,7 @@ main() {
     test_fallocate
     test_file_locks
     test_delayed_delete
+    test_python_high_frequency_write
     test_git_clone
 
     print_info "All test functions completed"

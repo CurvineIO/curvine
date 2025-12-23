@@ -20,6 +20,7 @@ use log::info;
 use orpc::sys::DataSlice;
 use std::time::Duration;
 use tokio::time;
+use tokio::time::timeout;
 
 pub struct CacheSyncReader {
     fs: CurvineFileSystem,
@@ -27,6 +28,7 @@ pub struct CacheSyncReader {
     check_interval_min: Duration,
     check_interval_max: Duration,
     log_ticks: u32,
+    max_wait: Duration,
 }
 
 impl CacheSyncReader {
@@ -39,6 +41,7 @@ impl CacheSyncReader {
             check_interval_min: conf.sync_check_interval_min,
             check_interval_max: conf.sync_check_interval_max,
             log_ticks: conf.sync_check_log_tick,
+            max_wait: conf.max_sync_wait_timeout,
         })
     }
 
@@ -110,7 +113,7 @@ impl Reader for CacheSyncReader {
     }
 
     async fn read_chunk0(&mut self) -> FsResult<DataSlice> {
-        self.read_check_complete().await
+        timeout(self.max_wait, self.read_check_complete()).await?
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {

@@ -17,7 +17,7 @@ use bytes::BytesMut;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus};
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{debug, info};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::sys::DataSlice;
 use orpc::{err_box, ternary};
@@ -128,7 +128,7 @@ impl Writer for FsWriter {
         }
 
         if self.append {
-            warn!(
+            debug!(
                 "Seek operation in append mode is ineffective,\
              data will still be written in append mode"
             );
