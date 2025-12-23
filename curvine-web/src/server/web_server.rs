@@ -72,6 +72,10 @@ where
         }
     }
 
+    pub fn rt(&self) -> Arc<Runtime> {
+        self.rt.clone()
+    }
+
     pub fn block_on_start(&self) {
         self.rt.block_on(async {
             if let Err(e) = self.run().await {

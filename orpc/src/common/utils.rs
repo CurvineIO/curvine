@@ -178,12 +178,12 @@ impl Utils {
         }
 
         panic::set_hook(Box::new(|panic_info| {
-            let message = match panic_info.payload().downcast_ref::<&str>() {
-                Some(s) => *s,
-                None => match panic_info.payload().downcast_ref::<String>() {
-                    Some(s) => s.as_str(),
-                    None => "Box<Any>",
-                },
+            let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+                *s
+            } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+                s.as_str()
+            } else {
+                "Box<Any>"
             };
 
             let (file, line) = match panic_info.location() {

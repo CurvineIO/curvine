@@ -196,14 +196,14 @@ impl Master {
         Self::new(conf)
     }
 
-    pub async fn start(mut self) -> ServerStateListener {
+    pub async fn start(mut self) -> CommonResult<ServerStateListener> {
         // step 1: Start journal_system, raft server and raft node will be started internally
-        let mut listener = self.journal_system.start().await.unwrap();
-        listener.wait_role().await.unwrap();
+        let mut listener = self.journal_system.start().await?;
+        listener.wait_role().await?;
 
         // step 2: Start rpc server
         let mut rpc_status = self.rpc_server.start();
-        rpc_status.wait_running().await.unwrap();
+        rpc_status.wait_running().await?;
 
         // step3: Start the web server
         self.web_server.start();
@@ -226,13 +226,17 @@ impl Master {
             error!("Failed to start inode ttl scheduler: {}", e);
         }
 
-        rpc_status
+        Ok(rpc_status)
     }
 
     pub fn block_on_start(self) {
         let rt = self.rpc_server.clone_rt();
+        // Keep the journal runtime alive to prevent it from being dropped in the async context.
+        let _journal_rt = self.journal_system.rt();
+        // Keep the web server runtime alive to prevent it from being dropped in the async context.
+        let _web_rt = self.web_server.rt();
         rt.block_on(async move {
-            let mut status = self.start().await;
+            let mut status = self.start().await.unwrap();
             status.wait_stop().await.unwrap();
         });
     }

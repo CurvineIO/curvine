@@ -158,6 +158,10 @@ impl JournalSystem {
         self.fs.clone()
     }
 
+    pub fn rt(&self) -> Arc<Runtime> {
+        self.rt.clone()
+    }
+
     pub fn worker_manager(&self) -> SyncWorkerManager {
         self.worker_manager.clone()
     }

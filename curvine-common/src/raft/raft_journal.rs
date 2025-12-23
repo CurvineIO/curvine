@@ -82,8 +82,7 @@ where
             sender,
             &self.logger,
         )
-        .await
-        .unwrap();
+        .await?;
 
         Self::start(server, node).await
     }
