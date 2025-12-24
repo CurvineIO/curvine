@@ -128,7 +128,7 @@ impl MasterFilesystem {
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
         if !inp.is_empty_dir() && !recursive {
-            return err_box!("{} is non empty", inp.path());
+            return err_ext!(FsError::dir_not_empty(inp.path()));
         }
 
         if inp.is_root() {
