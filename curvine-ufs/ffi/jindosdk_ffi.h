@@ -65,6 +65,20 @@ typedef struct {
     int64_t file_size;
 } JindoContentSummary;
 
+// =========================
+// Async callback signatures
+// =========================
+// NOTE: For async APIs below, `err` is a UTF-8 C string (may be NULL). The pointer is only
+// guaranteed to be valid for the duration of the callback invocation (Rust must copy it).
+typedef void (*JindoStatusCallback)(JindoStatus status, const char* err, void* userdata);
+typedef void (*JindoBoolResultCallback)(JindoStatus status, bool value, const char* err, void* userdata);
+typedef void (*JindoFileInfoResultCallback)(JindoStatus status, JindoFileInfo* info, const char* err, void* userdata);
+typedef void (*JindoListResultCallback)(JindoStatus status, JindoListResult* result, const char* err, void* userdata);
+typedef void (*JindoContentSummaryResultCallback)(JindoStatus status, const JindoContentSummary* summary, const char* err, void* userdata);
+typedef void (*JindoI64ResultCallback)(JindoStatus status, int64_t value, const char* err, void* userdata);
+typedef void (*JindoOpenWriterCallback)(JindoStatus status, JindoWriterHandle writer, const char* err, void* userdata);
+typedef void (*JindoOpenReaderCallback)(JindoStatus status, JindoReaderHandle reader, const char* err, void* userdata);
+
 // Config functions
 JindoConfigHandle jindo_config_new(void);
 void jindo_config_set_string(JindoConfigHandle config, const char* key, const char* value);
@@ -81,56 +95,47 @@ JindoStatus jindo_filesystem_init(
 );
 void jindo_filesystem_free(JindoFileSystemHandle fs);
 
-// Directory operations
-JindoStatus jindo_filesystem_mkdir(JindoFileSystemHandle fs, const char* path, bool recursive);
-JindoStatus jindo_filesystem_rename(JindoFileSystemHandle fs, const char* oldpath, const char* newpath);
-JindoStatus jindo_filesystem_remove(JindoFileSystemHandle fs, const char* path, bool recursive);
-JindoStatus jindo_filesystem_exists(JindoFileSystemHandle fs, const char* path, bool* exists);
+// Async directory/meta operations (sync APIs removed; async only)
+JindoStatus jindo_filesystem_mkdir_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoStatusCallback cb, void* userdata);
+JindoStatus jindo_filesystem_rename_async(JindoFileSystemHandle fs, const char* oldpath, const char* newpath, JindoStatusCallback cb, void* userdata);
+JindoStatus jindo_filesystem_remove_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoStatusCallback cb, void* userdata);
+JindoStatus jindo_filesystem_exists_async(JindoFileSystemHandle fs, const char* path, JindoBoolResultCallback cb, void* userdata);
 
-// File info operations
-JindoStatus jindo_filesystem_get_file_info(JindoFileSystemHandle fs, const char* path, JindoFileInfo* info);
+// Async file info / list / summary (sync APIs removed; async only)
+JindoStatus jindo_filesystem_get_file_info_async(JindoFileSystemHandle fs, const char* path, JindoFileInfoResultCallback cb, void* userdata);
+JindoStatus jindo_filesystem_list_dir_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoListResultCallback cb, void* userdata);
+JindoStatus jindo_filesystem_get_content_summary_async(JindoFileSystemHandle fs, const char* path, bool recursive, JindoContentSummaryResultCallback cb, void* userdata);
 void jindo_file_info_free(JindoFileInfo* info);
-
-JindoStatus jindo_filesystem_list_dir(
-    JindoFileSystemHandle fs,
-    const char* path,
-    bool recursive,
-    JindoListResult* result
-);
 void jindo_list_result_free(JindoListResult* result);
 
-JindoStatus jindo_filesystem_get_content_summary(
-    JindoFileSystemHandle fs,
-    const char* path,
-    bool recursive,
-    JindoContentSummary* summary
-);
-
 // OSS-HDFS specific operations
-JindoStatus jindo_filesystem_set_permission(JindoFileSystemHandle fs, const char* path, int16_t perm);
-JindoStatus jindo_filesystem_set_owner(JindoFileSystemHandle fs, const char* path, const char* user, const char* group);
+JindoStatus jindo_filesystem_set_permission_async(JindoFileSystemHandle fs, const char* path, int16_t perm, JindoStatusCallback cb, void* userdata);
+JindoStatus jindo_filesystem_set_owner_async(JindoFileSystemHandle fs, const char* path, const char* user, const char* group, JindoStatusCallback cb, void* userdata);
 
-// Writer functions
-JindoStatus jindo_filesystem_open_writer(JindoFileSystemHandle fs, const char* path, JindoWriterHandle* writer);
-JindoStatus jindo_filesystem_open_writer_append(JindoFileSystemHandle fs, const char* path, JindoWriterHandle* writer);
-JindoStatus jindo_writer_write(JindoWriterHandle writer, const uint8_t* data, size_t len);
-JindoStatus jindo_writer_flush(JindoWriterHandle writer);
-JindoStatus jindo_writer_tell(JindoWriterHandle writer, int64_t* offset);
-JindoStatus jindo_writer_close(JindoWriterHandle writer);
+// Writer functions (async only)
+JindoStatus jindo_filesystem_open_writer_async(JindoFileSystemHandle fs, const char* path, JindoOpenWriterCallback cb, void* userdata);
+JindoStatus jindo_filesystem_open_writer_append_async(JindoFileSystemHandle fs, const char* path, JindoOpenWriterCallback cb, void* userdata);
+JindoStatus jindo_writer_write_async(JindoWriterHandle writer, const uint8_t* data, size_t len, JindoI64ResultCallback cb, void* userdata);
+JindoStatus jindo_writer_flush_async(JindoWriterHandle writer, JindoStatusCallback cb, void* userdata);
+JindoStatus jindo_writer_tell_async(JindoWriterHandle writer, JindoI64ResultCallback cb, void* userdata);
+JindoStatus jindo_writer_close_async(JindoWriterHandle writer, JindoStatusCallback cb, void* userdata);
 void jindo_writer_free(JindoWriterHandle writer);
 
-// Reader functions
-JindoStatus jindo_filesystem_open_reader(JindoFileSystemHandle fs, const char* path, JindoReaderHandle* reader);
-JindoStatus jindo_reader_read(JindoReaderHandle reader, size_t n, uint8_t* scratch, size_t* actual_read);
-JindoStatus jindo_reader_pread(JindoReaderHandle reader, int64_t offset, size_t n, uint8_t* scratch, size_t* actual_read);
-JindoStatus jindo_reader_seek(JindoReaderHandle reader, int64_t offset);
-JindoStatus jindo_reader_tell(JindoReaderHandle reader, int64_t* offset);
-JindoStatus jindo_reader_get_file_length(JindoReaderHandle reader, int64_t* length);
-JindoStatus jindo_reader_close(JindoReaderHandle reader);
+// Reader functions (async only)
+JindoStatus jindo_filesystem_open_reader_async(JindoFileSystemHandle fs, const char* path, JindoOpenReaderCallback cb, void* userdata);
+JindoStatus jindo_reader_read_async(JindoReaderHandle reader, size_t n, uint8_t* scratch, JindoI64ResultCallback cb, void* userdata);
+JindoStatus jindo_reader_pread_async(JindoReaderHandle reader, int64_t offset, size_t n, uint8_t* scratch, JindoI64ResultCallback cb, void* userdata);
+JindoStatus jindo_reader_seek_async(JindoReaderHandle reader, int64_t offset, JindoStatusCallback cb, void* userdata);
+JindoStatus jindo_reader_tell_async(JindoReaderHandle reader, JindoI64ResultCallback cb, void* userdata);
+JindoStatus jindo_reader_get_file_length_async(JindoReaderHandle reader, JindoI64ResultCallback cb, void* userdata);
+JindoStatus jindo_reader_close_async(JindoReaderHandle reader, JindoStatusCallback cb, void* userdata);
 void jindo_reader_free(JindoReaderHandle reader);
 
 // Error handling
 const char* jindo_get_last_error(void);
+
+// Generic heap free helper (frees pointers allocated by this shim with malloc).
+void jindo_free(void* p);
 
 #ifdef __cplusplus
 }

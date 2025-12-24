@@ -22,9 +22,9 @@ pub mod jni;
 #[cfg(feature = "opendal")]
 pub mod opendal;
 
-// OSS-HDFS implementation using JindoSDK C++ library via FFI
-#[cfg(feature = "oss-hdfs")]
-pub mod oss_hdfs;
+// OSS implementation using JindoSDK C++ library via FFI
+#[cfg(feature = "oss")]
+pub mod oss;
 
 mod ufs_utils;
 pub use self::ufs_utils::UfsUtils;

@@ -15,5 +15,5 @@
 #[cfg(feature = "opendal-s3")]
 pub mod s3_fs;
 
-#[cfg(feature = "oss-hdfs")]
-pub mod oss_hdfs;
+#[cfg(feature = "oss")]
+pub mod oss;

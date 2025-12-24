@@ -3,6 +3,11 @@ name = "curvine-tests"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Enable OSS backend specific tests / code paths (Jindo-based).
+# This is used by `#[cfg(feature = "oss")]` in integration tests.
+oss = ["curvine-ufs/oss"]
+
 [dependencies]
 orpc = { workspace = true }
 curvine-common = { workspace = true }

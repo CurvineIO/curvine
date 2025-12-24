@@ -40,5 +40,5 @@ opendal-hdfs-native = ["opendal", "opendal/services-hdfs-native"]
 
 jni = ["dep:jni"]  # JNI support (now local to curvine-ufs)
 
-## OSS-HDFS implementation using JindoSDK C++ library
-oss-hdfs = []
+## OSS implementation using JindoSDK C++ library (async-only)
+oss = []

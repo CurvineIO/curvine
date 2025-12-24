@@ -24,8 +24,8 @@ use std::collections::HashMap;
 #[cfg(feature = "opendal")]
 use curvine_ufs::opendal::*;
 
-#[cfg(feature = "oss-hdfs")]
-use curvine_ufs::oss_hdfs::*;
+#[cfg(feature = "oss")]
+use curvine_ufs::oss::*;
 
 // Storage schemes
 pub const S3_SCHEME: &str = "s3";
@@ -53,7 +53,7 @@ pub enum UnifiedWriter {
     #[cfg(feature = "opendal")]
     Opendal(OpendalWriter),
 
-    #[cfg(feature = "oss-hdfs")]
+    #[cfg(feature = "oss")]
     OssHdfs(OssHdfsWriter),
 }
 
@@ -66,7 +66,7 @@ impl_writer_for_enum! {
         #[cfg(feature = "opendal")]
         Opendal(OpendalWriter),
 
-        #[cfg(feature = "oss-hdfs")]
+        #[cfg(feature = "oss")]
         OssHdfs(OssHdfsWriter),
     }
 }
@@ -80,7 +80,7 @@ pub enum UnifiedReader {
     #[cfg(feature = "opendal")]
     Opendal(OpendalReader),
 
-    #[cfg(feature = "oss-hdfs")]
+    #[cfg(feature = "oss")]
     OssHdfs(OssHdfsReader),
 }
 
@@ -93,7 +93,7 @@ impl_reader_for_enum! {
         #[cfg(feature = "opendal")]
         Opendal(OpendalReader),
 
-        #[cfg(feature = "oss-hdfs")]
+        #[cfg(feature = "oss")]
         OssHdfs(OssHdfsReader),
     }
 }
@@ -103,7 +103,7 @@ pub enum UfsFileSystem {
     #[cfg(feature = "opendal")]
     Opendal(OpendalFileSystem),
 
-    #[cfg(feature = "oss-hdfs")]
+    #[cfg(feature = "oss")]
     OssHdfs(OssHdfsFileSystem),
 }
 
@@ -112,7 +112,7 @@ impl_filesystem_for_enum! {
         #[cfg(feature = "opendal")]
         Opendal(OpendalFileSystem),
 
-        #[cfg(feature = "oss-hdfs")]
+        #[cfg(feature = "oss")]
         OssHdfs(OssHdfsFileSystem),
     }
 }
@@ -120,8 +120,8 @@ impl_filesystem_for_enum! {
 impl UfsFileSystem {
     pub fn new(path: &Path, conf: HashMap<String, String>) -> FsResult<Self> {
         match path.scheme() {
-            // OSS-HDFS has priority when both features are enabled
-            #[cfg(feature = "oss-hdfs")]
+            // Jindo OSS backend (async-only)
+            #[cfg(feature = "oss")]
             Some("oss") => {
                 let fs = OssHdfsFileSystem::new(path, conf)?;
                 Ok(UfsFileSystem::OssHdfs(fs))
