@@ -32,7 +32,7 @@ pub struct RawClient {
 
 impl RawClient {
     pub async fn new(addr: &InetAddr, conf: &ClientConf) -> IOResult<Self> {
-        let stream = Self::conn_retry(addr, conf).await?;
+        let stream = Self::conn(addr, conf).await?;
         let sock_ref = SockRef::from(&stream);
         // @todo Whether to set the network timeout time, follow-up research.
         sock_ref.set_nodelay(true)?;

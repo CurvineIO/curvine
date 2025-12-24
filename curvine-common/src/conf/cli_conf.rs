@@ -12,8 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod evictor;
-pub mod lfu;
-pub mod types;
+use orpc::common::LogConf;
+use serde::{Deserialize, Serialize};
 
-pub use types::{EvictPlan, EvictionConf, EvictionMode, EvictionPolicy};
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CliConf {
+    pub log: LogConf,
+}
+
+impl Default for CliConf {
+    fn default() -> Self {
+        CliConf {
+            log: LogConf {
+                level: "warn".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+}

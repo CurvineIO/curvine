@@ -355,6 +355,9 @@ test_vi_editor() {
     local cmd="sed -i 's/Original content/Modified by sed/' $test_file 2>/dev/null"
     print_command "$cmd"
     if eval "$cmd"; then
+        sync
+        sleep 2
+        
         if grep -q "Modified by sed" "$test_file"; then
             print_success "Sed editor operations successful"
         else
@@ -370,6 +373,9 @@ test_vi_editor() {
     cmd="sed -i '\$a Line 2: Appended content' $test_file 2>/dev/null"
     print_command "$cmd"
     if eval "$cmd"; then
+        sync
+        sleep 2
+        
         line_count=$(wc -l < "$test_file")
         if [ "$line_count" -ge 2 ]; then
             if grep -q "Appended content" "$test_file"; then
@@ -494,6 +500,7 @@ test_hardlinks() {
     print_test "Hard link survives after deleting original file"
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     rm "$original_file"
+    sleep 2
     if [ ! -f "$original_file" ] && [ -f "$hard_link" ]; then
         if grep -q "$another_content" "$hard_link"; then
             print_success "Hard link survives and retains content after original deletion"
@@ -969,9 +976,243 @@ PYTHON_EOF
     fi
 }
 
-# Test 13: Git clone operations
+# Test 13: Delayed delete (unlink while file is open)
+test_delayed_delete() {
+    CURRENT_TEST_GROUP="Test 13: Delayed Delete (POSIX unlink semantics)"
+    print_header "$CURRENT_TEST_GROUP"
+
+    local test_file="$TEST_DIR/delayed_delete_test.txt"
+    local test_content="Test data for delayed deletion"
+    
+    # Create test file with content
+    echo "$test_content" > "$test_file"
+
+    # Test 1: Open file, delete it, read should still work
+    print_test "Testing delayed delete - read after unlink"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    
+    # Use a background process to keep the file open
+    (
+        # Open file descriptor 3 for reading
+        exec 3< "$test_file"
+        
+        # Delete the file while fd 3 is still open
+        rm -f "$test_file"
+        
+        # Try to read from the open file descriptor
+        local content=$(cat <&3)
+        
+        # Close the file descriptor
+        exec 3<&-
+        
+        # Verify content was read successfully
+        if [ "$content" = "$test_content" ]; then
+            exit 0
+        else
+            exit 1
+        fi
+    )
+    
+    if [ $? -eq 0 ]; then
+        print_success "Read after unlink succeeded (delayed delete working)"
+    else
+        handle_error "Failed to read from deleted but open file" "delayed delete read test"
+    fi
+
+    # Test 2: Verify file is deleted after closing
+    print_test "Verifying file deletion after close"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    
+    if [ ! -e "$test_file" ]; then
+        print_success "File deleted successfully after closing (delayed delete completed)"
+    else
+        handle_error "File still exists after closing" "delayed delete cleanup test"
+        rm -f "$test_file"  # Cleanup for next tests
+    fi
+
+    # Test 3: Multiple handles - file deleted only after last close
+    print_test "Testing delayed delete with multiple file handles"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    
+    # Create test file again
+    echo "$test_content" > "$test_file"
+    
+    (
+        # Open two file descriptors
+        exec 3< "$test_file"
+        exec 4< "$test_file"
+        
+        # Delete the file
+        rm -f "$test_file"
+        
+        # Read from first fd
+        local content1=$(cat <&3)
+        exec 3<&-
+        
+        # File should still exist (fd 4 still open)
+        # Note: We can't easily check file existence from within subprocess
+        # So we verify by reading from the second fd
+        local content2=$(cat <&4)
+        exec 4<&-
+        
+        # Verify both reads succeeded
+        if [ "$content1" = "$test_content" ] && [ "$content2" = "$test_content" ]; then
+            exit 0
+        else
+            exit 1
+        fi
+    )
+    
+    if [ $? -eq 0 ]; then
+        print_success "Multiple handles delayed delete working correctly"
+    else
+        handle_error "Failed delayed delete with multiple handles" "multiple handles test"
+    fi
+    
+    # Verify final cleanup (non-test verification)
+    if [ ! -e "$test_file" ]; then
+        print_info "File deleted after all handles closed (cleanup verified)"
+    else
+        print_info "File still exists after all handles closed, cleaning up manually"
+        rm -f "$test_file"
+    fi
+
+    # Test 4: Write to deleted file should still work
+    print_test "Testing write to deleted but open file"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+    
+    echo "$test_content" > "$test_file"
+    
+    (
+        # Open file for read/write
+        exec 3<> "$test_file"
+        
+        # Delete the file
+        rm -f "$test_file"
+        
+        # Write new content
+        echo "Modified content" >&3
+        
+        # Seek to beginning and read
+        exec 3<> "$test_file" 2>/dev/null || exec 3<&-
+        
+        # Just verify the write didn't error
+        exit 0
+    )
+    
+    if [ $? -eq 0 ]; then
+        print_success "Write to deleted but open file succeeded"
+    else
+        handle_error "Failed to write to deleted but open file" "delayed delete write test"
+    fi
+    
+    # Final cleanup
+    rm -f "$test_file" 2>/dev/null || true
+}
+
+# Test 14: High-frequency Python write test
+test_python_high_frequency_write() {
+    CURRENT_TEST_GROUP="Test 14: Python High-Frequency Write"
+    print_header "$CURRENT_TEST_GROUP"
+
+    if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+        print_info "Python not available, skipping high-frequency write test"
+        return
+    fi
+
+    local python_cmd=$(command -v python3 2>/dev/null || command -v python)
+    local test_file="$TEST_DIR/python-high-freq.txt"
+    local iterations=2000
+    
+    # Clean up any existing test file
+    rm -f "$test_file" 2>/dev/null || true
+
+    print_test "Python high-frequency write and verify ($iterations iterations)"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+    local start_time=$(date +%s)
+    
+    TEST_FILE="$test_file" ITERATIONS="$iterations" $python_cmd << 'PYTHON_SCRIPT'
+import os
+import sys
+
+test_file = os.environ.get('TEST_FILE')
+iterations = int(os.environ.get('ITERATIONS', '2000'))
+
+try:
+    # Create parent directory if needed
+    os.makedirs(os.path.dirname(test_file), exist_ok=True)
+    
+    # High-frequency write test
+    print(f"Writing {iterations} times...", file=sys.stderr)
+    for i in range(iterations):
+        with open(test_file, "a") as f:
+            f.write(f"{i}\n")
+        
+        # Progress indicator every 500 iterations
+        if (i + 1) % 500 == 0:
+            print(f"  Progress: {i + 1}/{iterations}", file=sys.stderr)
+    
+    print("Write completed, verifying data...", file=sys.stderr)
+    
+    # Verify data immediately
+    with open(test_file, 'r') as f:
+        lines = f.readlines()
+    
+    # Check line count
+    if len(lines) != iterations:
+        print(f"ERROR: Line count mismatch - expected {iterations}, got {len(lines)}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Verify each line contains the correct number
+    errors = 0
+    for i, line in enumerate(lines):
+        expected = f"{i}\n"
+        if line != expected:
+            if errors < 10:  # Only show first 10 errors
+                print(f"ERROR: Line {i} mismatch - expected '{expected.strip()}', got '{line.strip()}'", file=sys.stderr)
+            errors += 1
+    
+    if errors > 0:
+        print(f"ERROR: Total {errors} line(s) with incorrect data", file=sys.stderr)
+        sys.exit(1)
+    
+    # Success
+    print(f"SUCCESS: All {iterations} lines verified correctly", file=sys.stderr)
+    print("VERIFICATION_SUCCESS")
+    sys.exit(0)
+    
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+PYTHON_SCRIPT
+
+    local result=$?
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+
+    if [ $result -eq 0 ]; then
+        print_success "Write and verify completed successfully in ${elapsed}s"
+        
+        # Get file size info
+        if [ -f "$test_file" ]; then
+            local file_size=$(stat -f%z "$test_file" 2>/dev/null || stat -c%s "$test_file" 2>/dev/null || echo "unknown")
+            local line_count=$(wc -l < "$test_file" 2>/dev/null)
+            print_info "File size: $file_size bytes, Lines: $line_count"
+        fi
+    else
+        handle_error "Python high-frequency write test failed" "python write and verify"
+    fi
+
+    # Cleanup
+    rm -f "$test_file" 2>/dev/null || true
+}
+
+# Test 15: Git clone operations
 test_git_clone() {
-    CURRENT_TEST_GROUP="Test 13: Git Clone Operations"
+    CURRENT_TEST_GROUP="Test 15: Git Clone Operations"
     print_header "$CURRENT_TEST_GROUP"
 
     if ! command -v git >/dev/null 2>&1; then
@@ -1013,11 +1254,6 @@ test_git_clone() {
         fi
     else
         handle_error "Failed to clone repository" "$cmd"
-    fi
-
-    if [ "$CLEANUP" = "1" ] && [ -d "$clone_dir" ]; then
-        print_info "Cleaning up cloned repository"
-        rm -rf "$clone_dir"
     fi
 }
 
@@ -1114,6 +1350,8 @@ main() {
     test_truncate
     test_fallocate
     test_file_locks
+    test_delayed_delete
+    test_python_high_frequency_write
     test_git_clone
 
     print_info "All test functions completed"

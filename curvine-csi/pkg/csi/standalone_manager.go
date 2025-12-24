@@ -19,6 +19,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -63,6 +64,18 @@ const (
 
 	// EnvStandaloneServiceAccount is the environment variable for Standalone pod ServiceAccount
 	EnvStandaloneServiceAccount = "STANDALONE_SERVICE_ACCOUNT"
+
+	// EnvStandaloneCPURequest is the environment variable for Standalone CPU request
+	EnvStandaloneCPURequest = "STANDALONE_CPU_REQUEST"
+
+	// EnvStandaloneCPULimit is the environment variable for Standalone CPU limit
+	EnvStandaloneCPULimit = "STANDALONE_CPU_LIMIT"
+
+	// EnvStandaloneMemoryRequest is the environment variable for Standalone Memory request
+	EnvStandaloneMemoryRequest = "STANDALONE_MEMORY_REQUEST"
+
+	// EnvStandaloneMemoryLimit is the environment variable for Standalone Memory limit
+	EnvStandaloneMemoryLimit = "STANDALONE_MEMORY_LIMIT"
 )
 
 // StandaloneOptions contains options for creating a Standalone
@@ -132,6 +145,12 @@ type StandaloneMountManager interface {
 
 	// GetHostMountPath returns the host mount path for a cluster
 	GetHostMountPath(clusterID string) string
+
+	// FindClusterIDByVolumeID finds the clusterID that contains the given volumeID
+	FindClusterIDByVolumeID(volumeID string) (string, bool)
+
+	// GetState returns a copy of the current state (for garbage collection)
+	GetState() *StandaloneState
 }
 
 // standaloneManagerImpl implements StandaloneMountManager
@@ -354,6 +373,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 		Spec: corev1.PodSpec{
 			HostNetwork:                   true,
 			HostPID:                       true,
+			DNSPolicy:                     corev1.DNSClusterFirstWithHostNet, // Use cluster DNS first, then host DNS
 			NodeName:                      m.nodeName,
 			RestartPolicy:                 corev1.RestartPolicyAlways,
 			ServiceAccountName:            m.serviceAccountName,
@@ -373,6 +393,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 					SecurityContext: &corev1.SecurityContext{
 						Privileged: &privileged,
 					},
+					Resources: buildResourceRequirements(),
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:             "fuse-mount",
@@ -474,6 +495,58 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 			},
 		},
 	}
+}
+
+// buildResourceRequirements builds resource requirements from environment variables
+func buildResourceRequirements() corev1.ResourceRequirements {
+	resources := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{},
+		Limits:   corev1.ResourceList{},
+	}
+
+	// Parse CPU request
+	if cpuRequest := os.Getenv(EnvStandaloneCPURequest); cpuRequest != "" {
+		if quantity, err := resource.ParseQuantity(cpuRequest); err == nil {
+			resources.Requests[corev1.ResourceCPU] = quantity
+		} else {
+			klog.Warningf("Failed to parse CPU request %s: %v", cpuRequest, err)
+		}
+	}
+
+	// Parse CPU limit
+	if cpuLimit := os.Getenv(EnvStandaloneCPULimit); cpuLimit != "" {
+		if quantity, err := resource.ParseQuantity(cpuLimit); err == nil {
+			resources.Limits[corev1.ResourceCPU] = quantity
+		} else {
+			klog.Warningf("Failed to parse CPU limit %s: %v", cpuLimit, err)
+		}
+	}
+
+	// Parse Memory request
+	if memRequest := os.Getenv(EnvStandaloneMemoryRequest); memRequest != "" {
+		if quantity, err := resource.ParseQuantity(memRequest); err == nil {
+			resources.Requests[corev1.ResourceMemory] = quantity
+		} else {
+			klog.Warningf("Failed to parse Memory request %s: %v", memRequest, err)
+		}
+	}
+
+	// Parse Memory limit
+	if memLimit := os.Getenv(EnvStandaloneMemoryLimit); memLimit != "" {
+		if quantity, err := resource.ParseQuantity(memLimit); err == nil {
+			resources.Limits[corev1.ResourceMemory] = quantity
+		} else {
+			klog.Warningf("Failed to parse Memory limit %s: %v", memLimit, err)
+		}
+	}
+
+	// Log the configured resources
+	if len(resources.Requests) > 0 || len(resources.Limits) > 0 {
+		klog.V(4).Infof("Standalone Pod resources configured: requests=%v, limits=%v",
+			resources.Requests, resources.Limits)
+	}
+
+	return resources
 }
 
 // mountPropagationBidirectionalPtr returns a pointer to Bidirectional mount propagation
@@ -736,9 +809,57 @@ func (m *standaloneMountManagerImpl) saveStateLocked(ctx context.Context) error 
 // Helper to extract cluster ID from volume ID
 // Volume ID format: clusterID@fsPath@pvcName
 func ExtractClusterIDFromVolumeID(volumeID string) string {
+	// VolumeID format: clusterID@volumeName
+	// For static PVs, volumeID is just the volume name without "@"
+	if !strings.Contains(volumeID, "@") {
+		return "" // No clusterID in volumeID, caller should use FindClusterIDByVolumeID
+	}
 	parts := strings.Split(volumeID, "@")
-	if len(parts) >= 1 {
+	if len(parts) >= 2 {
 		return parts[0]
 	}
 	return ""
+}
+
+// FindClusterIDByVolumeID finds the clusterID that contains the given volumeID
+// This is needed for static PVs where volumeID doesn't contain clusterID information
+func (m *standaloneMountManagerImpl) FindClusterIDByVolumeID(volumeID string) (string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for clusterID, entry := range m.state.Mounts {
+		for _, v := range entry.Volumes {
+			if v == volumeID {
+				klog.V(4).Infof("Found clusterID %s for volumeID %s", clusterID, volumeID)
+				return clusterID, true
+			}
+		}
+	}
+	klog.V(4).Infof("No clusterID found for volumeID %s", volumeID)
+	return "", false
+}
+
+// GetState returns a copy of the current state for garbage collection
+func (m *standaloneMountManagerImpl) GetState() *StandaloneState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Create a deep copy of the state
+	stateCopy := &StandaloneState{
+		Mounts: make(map[string]*StandaloneStateEntry),
+	}
+
+	for clusterID, entry := range m.state.Mounts {
+		volumesCopy := make([]string, len(entry.Volumes))
+		copy(volumesCopy, entry.Volumes)
+
+		stateCopy.Mounts[clusterID] = &StandaloneStateEntry{
+			PodName:   entry.PodName,
+			RefCount:  entry.RefCount,
+			Volumes:   volumesCopy,
+			CreatedAt: entry.CreatedAt,
+		}
+	}
+
+	return stateCopy
 }

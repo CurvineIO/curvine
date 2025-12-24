@@ -45,14 +45,14 @@ public class FilesystemConf {
     public String ttl_action = "none";
 
     // Set up the customer service retry policy
-    public long conn_retry_max_duration_ms = 2 * 60 * 1000;
-    public long conn_retry_min_sleep_ms = 300;
-    public long conn_retry_max_sleep_ms = 10 * 1000;
+    public long conn_retry_max_duration_ms = 60 * 1000;
+    public long conn_retry_min_sleep_ms = 100;
+    public long conn_retry_max_sleep_ms = 2 * 1000;
 
     // rpc requests retry policy.
-    public long rpc_retry_max_duration_ms = 5 * 60 * 1000;
-    public long rpc_retry_min_sleep_ms = 300;
-    public long rpc_retry_max_sleep_ms = 30 * 1000;
+    public long rpc_retry_max_duration_ms = 120 * 1000;
+    public long rpc_retry_min_sleep_ms = 100;
+    public long rpc_retry_max_sleep_ms = 10 * 1000;
 
     // Whether to close the idle rpc connection.
     public boolean rpc_close_idle = true;
@@ -60,7 +60,7 @@ public class FilesystemConf {
     //Configuration of timeout for a request.
     public long conn_timeout_ms = 30 * 1000;
     public long rpc_timeout_ms = 120 * 1000;
-    public long data_timeout_ms = 5 * 60 * 1000;
+    public long data_timeout_ms = 120 * 1000;
 
     // Number of fs master connections.
     public int master_conn_pool_size = 1;

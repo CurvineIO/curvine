@@ -43,6 +43,9 @@ pub use self::ufs_conf::UfsConfBuilder;
 mod job_conf;
 pub use self::job_conf::JobConf;
 
+mod cli_conf;
+pub use self::cli_conf::CliConf;
+
 #[cfg(test)]
 mod tests {
     use crate::conf::{ClusterConf, WorkerDataDir};

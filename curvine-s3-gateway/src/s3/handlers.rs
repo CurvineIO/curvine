@@ -28,13 +28,14 @@ use crate::s3::s3_api::HeadObjectResult;
 use crate::utils::s3_utils::{
     file_status_to_head_object_result, file_status_to_list_object_content,
 };
+use crate::utils::temp_storage::TempStorageEnum;
 use chrono;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::FileType;
 use curvine_common::FsResult;
 use orpc::runtime::AsyncRuntime;
-use std::fs;
+use std::sync::Arc;
 use tracing;
 use uuid;
 
@@ -42,7 +43,7 @@ use uuid;
 pub struct S3Handlers {
     pub fs: UnifiedFileSystem,
     pub region: String,
-    pub put_temp_dir: String,
+    pub temp_storage: Arc<TempStorageEnum>,
     pub rt: std::sync::Arc<AsyncRuntime>,
     pub get_chunk_size_bytes: usize,
 }
@@ -51,29 +52,24 @@ impl S3Handlers {
     pub fn new(
         fs: UnifiedFileSystem,
         region: String,
-        put_temp_dir: String,
+        temp_storage: Arc<TempStorageEnum>,
         rt: std::sync::Arc<AsyncRuntime>,
         get_chunk_size_mb: f32,
     ) -> Self {
         let get_chunk_size_bytes = (get_chunk_size_mb * 1024.0 * 1024.0) as usize;
 
-        let put_temp_path = std::path::Path::new(&put_temp_dir);
-        if !put_temp_path.exists() {
-            tracing::debug!("Creating put_temp_dir: {}", put_temp_dir);
-            if let Err(e) = fs::create_dir_all(put_temp_path) {
-                tracing::error!("Failed to create put_temp_dir {}: {}", put_temp_dir, e);
-            }
-        }
-
         tracing::debug!(
-            "Creating new S3Handlers with region: {}, put_temp_dir: {}, GET optimizations: chunk_size={}MB",
-            region, put_temp_dir, get_chunk_size_mb
+            "Creating new S3Handlers with region: {}, temp_storage: {} ({}), GET optimizations: chunk_size={}MB",
+            region,
+            temp_storage.config().temp_dir,
+            temp_storage.storage_type(),
+            get_chunk_size_mb
         );
 
         Self {
             fs,
             region,
-            put_temp_dir,
+            temp_storage,
             rt,
             get_chunk_size_bytes: get_chunk_size_bytes.clamp(512 * 1024, 4 * 1024 * 1024),
         }
@@ -414,6 +410,10 @@ impl PutObjectHandler for S3Handlers {
 
         async move { PutOperation::execute(context, &mut body).await }
     }
+
+    fn get_temp_dir(&self) -> String {
+        self.temp_storage.config().temp_dir.clone()
+    }
 }
 
 impl crate::s3::s3_api::DeleteObjectHandler for S3Handlers {
@@ -508,6 +508,18 @@ impl crate::s3::s3_api::GetBucketLocationHandler for S3Handlers {
 impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
     async fn handle_create_session(&self, _bucket: String, _key: String) -> Result<String, ()> {
         let upload_id = uuid::Uuid::new_v4().to_string();
+
+        // Pre-create the upload session directory
+        if let Err(e) = self.temp_storage.create_dir(&upload_id).await {
+            tracing::error!("Failed to create upload session directory: {}", e);
+            return Err(());
+        }
+
+        tracing::debug!(
+            "Created multipart upload session: {} (storage: {})",
+            upload_id,
+            self.temp_storage.storage_type()
+        );
         Ok(upload_id)
     }
 
@@ -519,48 +531,32 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         part_number: u32,
         mut body: crate::utils::io::AsyncReadEnum,
     ) -> Result<String, ()> {
-        use bytes::BytesMut;
-        use tokio::io::AsyncWriteExt;
-
-        let dir = format!("{}/{}", self.put_temp_dir, upload_id);
-        let _ = tokio::fs::create_dir_all(&dir).await;
-
-        let path = format!("{dir}/{part_number}");
-        let mut file = match tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
+        // Use streaming write to avoid loading entire part into memory
+        // This is critical for large parts (S3 allows up to 5GB per part)
+        match self
+            .temp_storage
+            .write_part_stream(&upload_id, part_number, &mut body)
             .await
         {
-            Ok(f) => f,
-            Err(_) => return Err(()),
-        };
-
-        let mut hasher = md5::Context::new();
-        let mut total_data = BytesMut::new();
-
-        let mut temp_buf = vec![0u8; 1024 * 1024]; // 1MB buffer
-        loop {
-            let n = match body.read(&mut temp_buf).await {
-                Ok(n) => n,
-                Err(_) => return Err(()),
-            };
-            if n == 0 {
-                break;
+            Ok(etag) => {
+                tracing::debug!(
+                    "Uploaded part {} for upload_id {} (storage: {})",
+                    part_number,
+                    upload_id,
+                    self.temp_storage.storage_type()
+                );
+                Ok(etag)
             }
-
-            let actual_data = &temp_buf[..n];
-            hasher.consume(actual_data);
-            total_data.extend_from_slice(actual_data);
+            Err(e) => {
+                tracing::error!(
+                    "Failed to write part {} for upload_id {}: {}",
+                    part_number,
+                    upload_id,
+                    e
+                );
+                Err(())
+            }
         }
-
-        if file.write_all(&total_data).await.is_err() {
-            return Err(());
-        }
-
-        let digest = hasher.compute();
-        Ok(format!("\"{digest:x}\""))
     }
 
     async fn handle_complete(
@@ -571,51 +567,68 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         data: Vec<(String, u32)>,
         _opts: crate::s3::s3_api::MultiUploadObjectCompleteOption,
     ) -> Result<String, ()> {
-        use tokio::io::AsyncReadExt;
-
         let final_path = match self.cv_object_path(&bucket, &key) {
             Ok(p) => p,
-            Err(_) => return Err(()),
+            Err(e) => {
+                tracing::error!("Invalid object path: {}", e);
+                return Err(());
+            }
         };
 
         let mut writer = match self.fs.create(&final_path, true).await {
             Ok(w) => w,
-            Err(_) => return Err(()),
+            Err(e) => {
+                tracing::error!("Failed to create final file: {}", e);
+                return Err(());
+            }
         };
 
-        let dir = format!("{}/{}", self.put_temp_dir, upload_id);
-
+        // Sort parts by part number
         let mut part_list = data;
         part_list.sort_by_key(|(_, n)| *n);
 
-        for (_, num) in part_list {
-            let path = format!("{dir}/{num}");
-            let mut file = match tokio::fs::OpenOptions::new().read(true).open(&path).await {
-                Ok(f) => f,
-                Err(_) => return Err(()),
-            };
-
-            let mut buf = [0u8; 1024 * 1024]; // 1MB buffer
-            loop {
-                let n = match file.read(&mut buf).await {
-                    Ok(n) => n,
-                    Err(_) => return Err(()),
-                };
-                if n == 0 {
-                    break;
-                }
-
-                if writer.write(&buf[..n]).await.is_err() {
-                    return Err(());
-                }
+        // Stream each part directly to final file (memory-efficient)
+        // This avoids loading entire parts into memory
+        for (_, part_num) in part_list {
+            if let Err(e) = self
+                .temp_storage
+                .read_part_stream(&upload_id, part_num, &mut writer)
+                .await
+            {
+                tracing::error!(
+                    "Failed to stream part {} for upload_id {}: {}",
+                    part_num,
+                    upload_id,
+                    e
+                );
+                // Cleanup on failure
+                let _ = self.temp_storage.cleanup(&upload_id).await;
+                return Err(());
             }
         }
 
-        if writer.complete().await.is_err() {
+        if let Err(e) = writer.complete().await {
+            tracing::error!("Failed to complete final file write: {}", e);
+            // Cleanup on failure
+            let _ = self.temp_storage.cleanup(&upload_id).await;
             return Err(());
         }
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        // Cleanup temp files after successful completion
+        if let Err(e) = self.temp_storage.cleanup(&upload_id).await {
+            tracing::warn!(
+                "Failed to cleanup temp files for upload_id {}: {}",
+                upload_id,
+                e
+            );
+        }
+
+        tracing::info!(
+            "Completed multipart upload for s3://{}/{} (upload_id: {})",
+            bucket,
+            key,
+            upload_id
+        );
 
         Ok("etag-not-computed".to_string())
     }
@@ -626,8 +639,16 @@ impl crate::s3::s3_api::MultiUploadObjectHandler for S3Handlers {
         _key: String,
         upload_id: String,
     ) -> Result<(), ()> {
-        let dir = format!("{}/{}", self.put_temp_dir, upload_id);
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        // Cleanup temp files on abort
+        if let Err(e) = self.temp_storage.cleanup(&upload_id).await {
+            tracing::warn!(
+                "Failed to cleanup temp files on abort for upload_id {}: {}",
+                upload_id,
+                e
+            );
+        }
+
+        tracing::debug!("Aborted multipart upload: {}", upload_id);
         Ok(())
     }
 }

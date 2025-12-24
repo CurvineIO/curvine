@@ -116,7 +116,7 @@ impl BufferClient {
             let req_id = env.msg.req_id();
             if env.is_canceled() {
                 // The callback has been cancelled, and the next request is executed.
-                warn!(
+                info!(
                     "Request({},{}) has been canceled",
                     req_id,
                     client_state.conn_info()
@@ -146,7 +146,7 @@ impl BufferClient {
                             e
                         );
                         if let Err(e) = cb.send(error) {
-                            warn!(
+                            info!(
                                 "Request({},{}) callback execute fail: {:?}",
                                 req_id,
                                 client_state.conn_info(),
@@ -208,7 +208,7 @@ impl BufferClient {
                 Some(cb) => {
                     // The callback notification failed, which may be because the caller has been destroyed, and the response_future only prints the log and the task does not end.
                     if let Err(e) = cb.send(Ok(msg)) {
-                        error!(
+                        info!(
                             "Request({},{}) callback execute fail: {:?}",
                             req_id,
                             client_state.conn_info(),
@@ -231,7 +231,7 @@ impl BufferClient {
             let error: IOResult<Message> =
                 err_box!("Connection {} closed", client_state.conn_info());
             if let Err(e) = cb.send(error) {
-                error!(
+                info!(
                     "Request({},{}) callback execute fail: {:?}",
                     id,
                     client_state.conn_info(),

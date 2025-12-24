@@ -2,7 +2,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: curvine-pvc
-  namespace: curvine-system
+  namespace: curvine
 spec:
   storageClassName: curvine-sc
   accessModes:

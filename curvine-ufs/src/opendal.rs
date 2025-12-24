@@ -662,13 +662,26 @@ impl OpendalFileSystem {
     }
 
     pub async fn get_file_status(&self, path: &Path) -> FsResult<Option<FileStatus>> {
-        let object_path = self.get_object_path(path)?;
-        let mut metadata = self.get_object_status(&object_path).await?;
+        let path_str = path.full_path();
+
+        let likely_dir = if path_str.ends_with('/') {
+            true
+        } else {
+            let name = path.name();
+            let has_extension = name.contains('.') && !name.starts_with('.');
+            !has_extension
+        };
+
+        let (first_path, second_path) = if likely_dir {
+            (self.get_dir_path(path)?, self.get_object_path(path)?)
+        } else {
+            (self.get_object_path(path)?, self.get_dir_path(path)?)
+        };
+
+        let mut metadata = self.get_object_status(&first_path).await?;
+
         if metadata.is_none() {
-            // If the path is a directory, we need to check if it exists.
-            // If it does not exist, we need to create it.
-            let dir_path = self.get_dir_path(path)?;
-            metadata = self.get_object_status(&dir_path).await?;
+            metadata = self.get_object_status(&second_path).await?;
         }
 
         Ok(metadata.map(|m| Self::read_status(path, &m)))

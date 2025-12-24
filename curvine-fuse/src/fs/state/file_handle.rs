@@ -112,7 +112,11 @@ impl FileHandle {
 
     pub async fn complete(&self, mut reply: Option<FuseResponse>) -> FuseResult<()> {
         if let Some(writer) = &self.writer {
-            writer.lock().await.complete(reply.take()).await?;
+            if Arc::strong_count(writer) <= 1 {
+                writer.lock().await.complete(reply.take()).await?;
+            } else {
+                writer.lock().await.flush(reply.take()).await?;
+            }
         }
         if let Some(reader) = &self.reader {
             reader.as_mut().complete(reply.take()).await?;

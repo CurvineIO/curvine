@@ -79,7 +79,7 @@ impl CurvineFileSystem {
     }
 
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
-        let blocks = (status.len as f64 / FUSE_BLOCK_SIZE as f64).ceil() as u64;
+        let blocks = ((status.len + 511) / 512) as u64;
 
         let ctime_sec = if status.atime > 0 {
             (status.atime / 1000) as u64
@@ -279,13 +279,11 @@ impl CurvineFileSystem {
         let mut map = self.state.node_write();
         let mut res = FuseDirentList::new(arg);
         for (index, status) in list.iter().enumerate().skip(start_index) {
-            let mut attr = Self::status_to_attr(&self.conf, status)?;
-
-            if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
-                let node = map.find_node(header.nodeid, Some(&status.name))?;
-                attr.ino = node.id;
-            }
-
+            let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
+                map.do_lookup(header.nodeid, Some(&status.name), status)?
+            } else {
+                Self::status_to_attr(&self.conf, status)?
+            };
             let entry = Self::create_entry_out(&self.conf, attr);
 
             if plus {
@@ -662,7 +660,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 // Return ENODATA error to indicate the attribute doesn't exist
                 // This is the correct FUSE protocol response for non-existent attributes
                 // Empty error message to avoid any logging overhead
-                return err_fuse!(libc::ENODATA, "not support get_xattr {}", name);
+                return err_fuse!(libc::EOPNOTSUPP, "not support get_xattr {}", name);
             }
             _ => {
                 // Continue with normal processing for other attributes
@@ -724,10 +722,17 @@ impl fs::FileSystem for CurvineFileSystem {
             String::from_utf8_lossy(value_slice)
         );
 
-        // Accept the SELinux labels in the FUSE layer. Add a guard in set_xattr so the driver simply ACKs the write instead of forwarding it.
-        if name == "security.selinux" {
-            debug!("Ignoring SELinux label on {}", path);
-            return Ok(());
+        // Handle system extended attributes - return EOPNOTSUPP for unsupported attributes
+        match name {
+            "security.capability"
+            | "security.selinux"
+            | "system.posix_acl_access"
+            | "system.posix_acl_default" => {
+                return err_fuse!(libc::EOPNOTSUPP, "not support set_xattr {}", name);
+            }
+            _ => {
+                // Continue with normal processing for other attributes
+            }
         }
 
         // Create SetAttrOpts with the xattr to add
@@ -1089,6 +1094,10 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::ENAMETOOLONG);
         }
 
+        if self.state.is_pending_delete(id) {
+            return err_fuse!(libc::ETXTBSY, "file has been deleted or unlinked");
+        }
+
         let path = self.state.get_path_common(id, Some(name))?;
         let node = self.state.find_node(id, Some(name))?;
         let flags = op.arg.flags;
@@ -1137,14 +1146,28 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
-        let handle = self.state.remove_handle(op.header.nodeid, op.arg.fh);
-        if let Some(handle) = handle {
-            self.fs_unlock(&handle, LockFlags::Flock).await?;
-            self.fs_unlock(&handle, LockFlags::Plock).await?;
-            handle.complete(Some(reply)).await
-        } else {
-            err_fuse!(libc::EBADF)
+        let ino = op.header.nodeid;
+        let handle = match self.state.remove_handle(ino, op.arg.fh) {
+            Some(handle) => handle,
+            None => return err_fuse!(libc::EBADF),
+        };
+
+        self.fs_unlock(&handle, LockFlags::Flock).await?;
+        self.fs_unlock(&handle, LockFlags::Plock).await?;
+        let complete_result = handle.complete(Some(reply)).await;
+
+        if !self.state.has_open_handles(ino) && self.state.remove_pending_delete(ino) {
+            let path = Path::from_str(&handle.status.path)?;
+            info!(
+                "release ino={}: no more open handles, executing delayed deletion of {}",
+                ino, path
+            );
+            if let Err(e) = self.fs.delete(&path, false).await {
+                warn!("failed to delete {} after last handle closed: {}", path, e);
+            }
         }
+
+        complete_result
     }
 
     async fn forget(&self, op: Forget<'_>) -> FuseResult<()> {
@@ -1153,10 +1176,13 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn unlink(&self, op: Unlink<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
+        let parent_ino = op.header.nodeid;
 
-        self.fs.delete(&path, false).await?;
-        self.state.unlink_node(op.header.nodeid, Some(name))?;
+        if self.state.should_delete_now(parent_ino, Some(name))? {
+            let path = self.state.get_path_common(parent_ino, Some(name))?;
+            self.fs.delete(&path, false).await?;
+        }
+        self.state.unlink_node(parent_ino, Some(name))?;
         Ok(())
     }
 
@@ -1173,6 +1199,8 @@ impl fs::FileSystem for CurvineFileSystem {
         );
 
         self.fs.link(&src_path, &des_path).await?;
+        let src_status = self.fs_get_status(&src_path).await?;
+        self.state.find_link_inode(src_status.id, oldnodeid);
         let attr = self
             .lookup_path(op.header.nodeid, Some(name), &des_path)
             .await?;

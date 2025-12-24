@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::conf::CliConf;
 use crate::conf::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf};
 use crate::rocksdb::DBConf;
 use crate::version;
@@ -57,6 +58,8 @@ pub struct ClusterConf {
     pub s3_gateway: S3GatewayConf,
 
     pub job: JobConf,
+
+    pub cli: CliConf,
 }
 
 impl ClusterConf {
@@ -269,6 +272,7 @@ impl Default for ClusterConf {
             fuse: FuseConf::default(),
             s3_gateway: Default::default(),
             job: Default::default(),
+            cli: Default::default(),
         }
     }
 }
