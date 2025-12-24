@@ -284,12 +284,8 @@ impl ClientConf {
 
 impl Default for ClientConf {
     fn default() -> Self {
-        let master_addrs = vec![InetAddr::new(
-            ClusterConf::DEFAULT_HOSTNAME,
-            ClusterConf::DEFAULT_MASTER_PORT,
-        )];
         let mut conf = Self {
-            master_addrs,
+            master_addrs: vec![],
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             io_threads: 16,
             worker_threads: Utils::worker_threads(16),

@@ -40,9 +40,6 @@ enable_s3_gateway = false
 
 # Customer service configuration.
 [client]
-master_addrs = [
-    { hostname = "localhost", port = 8995 }
-]
 
 # fuse configuration
 [fuse]

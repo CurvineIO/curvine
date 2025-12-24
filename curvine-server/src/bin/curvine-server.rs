@@ -36,7 +36,7 @@ fn main() -> CommonResult<()> {
 
     match service {
         ServiceType::Master => {
-            conf.apply_master_hostname_env()?;
+            conf.check_master_hostname()?;
             let master = Master::with_conf(conf)?;
             master.block_on_start();
         }
