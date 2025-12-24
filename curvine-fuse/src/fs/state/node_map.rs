@@ -177,7 +177,27 @@ impl NodeMap {
         *self.linked_inode_map.entry(curvine_ino).or_insert(fuse_ino)
     }
 
-    // is a peer implementation of the fuse.h try_get_path function.
+    fn convert_to_cv_path(&self, fuse_path: &str) -> FuseResult<Path> {
+        let fs_path = &self.conf.fs_path;
+
+        if fs_path == "/" {
+            return Ok(Path::from_str(fuse_path)?);
+        }
+
+        if fuse_path == "/" {
+            return Ok(Path::from_str(fs_path)?);
+        }
+
+        let fuse_path_without_slash = fuse_path.strip_prefix('/').unwrap_or(fuse_path);
+        let cv_path_str = if fs_path.ends_with('/') {
+            format!("{}{}", fs_path, fuse_path_without_slash)
+        } else {
+            format!("{}/{}", fs_path, fuse_path_without_slash)
+        };
+
+        Ok(Path::from_str(cv_path_str)?)
+    }
+
     pub fn try_get_path<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> FuseResult<Path> {
         let mut buf = VecDeque::new();
         if let Some(v) = name.as_ref() {
@@ -190,8 +210,8 @@ impl NodeMap {
             node = self.get_check(node.parent)?;
         }
 
-        let path = Self::join_path(&buf);
-        Ok(Path::from_str(path)?)
+        let fuse_path = Self::join_path(&buf);
+        self.convert_to_cv_path(&fuse_path)
     }
 
     pub fn get_path_common<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> FuseResult<Path> {
