@@ -19,7 +19,7 @@ use std::fmt;
 pub enum EvictionPolicy {
     Lru,
     Lfu,
-    Arc,
+    //to-do: Arc,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -54,7 +54,7 @@ impl EvictionConf {
         let policy = match master_conf.quota_eviction_policy.to_lowercase().as_str() {
             "lru" => EvictionPolicy::Lru,
             "lfu" => EvictionPolicy::Lfu,
-            "arc" => EvictionPolicy::Arc,
+            // "arc" => EvictionPolicy::Arc,
             _ => EvictionPolicy::Lru,
         };
 

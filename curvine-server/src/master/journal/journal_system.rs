@@ -16,7 +16,7 @@ use crate::master::fs::{MasterFilesystem, WorkerManager};
 use crate::master::journal::{JournalLoader, JournalWriter};
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
 use crate::master::meta::FsDir;
-use crate::master::quota::eviction::evictor::LRUEvictor;
+use crate::master::quota::eviction::evictor::{Evictor, LFUEvictor, LRUEvictor};
 use crate::master::quota::eviction::types::EvictionPolicy;
 use crate::master::quota::eviction::EvictionConf;
 use crate::master::{
@@ -97,10 +97,10 @@ impl JournalSystem {
         let ttl_bucket_list = Arc::new(TtlBucketList::new(conf.master.ttl_bucket_interval_ms()));
 
         let eviction_conf = EvictionConf::from_conf(conf);
-        let evictor = match eviction_conf.policy {
-            EvictionPolicy::Lru | EvictionPolicy::Lfu | EvictionPolicy::Arc => {
-                Arc::new(LRUEvictor::new(eviction_conf.clone()))
-            }
+        let evictor: Arc<dyn Evictor> = match eviction_conf.policy {
+            EvictionPolicy::Lru => Arc::new(LRUEvictor::new(eviction_conf.clone())),
+            EvictionPolicy::Lfu => Arc::new(LFUEvictor::new(eviction_conf.clone())),
+            //to-do: EvictionPolicy::Arc
         };
 
         let fs_dir = SyncFsDir::new(FsDir::new(
