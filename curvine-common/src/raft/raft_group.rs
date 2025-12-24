@@ -77,7 +77,19 @@ impl RaftGroup {
             .find(|x| x.1.hostname == addr.hostname && x.1.port == addr.port);
 
         match find {
-            None => err_box!("Not a master role, address {}", addr),
+            None => {
+                let peers_str = self
+                    .peers
+                    .values()
+                    .map(|p| format!("{}:{}", p.hostname, p.port))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                err_box!(
+                    "Not a master role, address {}. Available peers: [{}]",
+                    addr,
+                    peers_str
+                )
+            }
             Some(v) => Ok(*v.0),
         }
     }

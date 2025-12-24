@@ -236,8 +236,19 @@ impl Master {
         // Keep the web server runtime alive to prevent it from being dropped in the async context.
         let _web_rt = self.web_server.rt();
         rt.block_on(async move {
-            let mut status = self.start().await.unwrap();
-            status.wait_stop().await.unwrap();
+            match self.start().await {
+                Ok(mut status) => {
+                    if let Err(e) = status.wait_stop().await {
+                        error!("Master server stop error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Master server start failed: {}", e);
+                    // Ensure logs are flushed before exit
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::process::exit(1);
+                }
+            }
         });
     }
 
