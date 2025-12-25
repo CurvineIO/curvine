@@ -139,10 +139,12 @@ impl MasterHandler {
 
     pub fn retry_check_open_file(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: OpenFileRequest = ctx.parse_header()?;
-        ctx.set_audit(Some(header.path.to_string()), None);
 
         let opts = ProtoUtils::create_opts_from_pb(header.opts);
         let flags = OpenFlags::new(header.flags);
+        let audit_path = format!("[{}]{}", flags.access_mark(), header.path);
+        ctx.set_audit(Some(audit_path), None);
+
         let file_blocks = self.open_file0(ctx.msg.req_id(), header.path, opts, flags)?;
 
         let rep_header = OpenFileResponse {
@@ -498,8 +500,8 @@ impl MasterHandler {
         let lock = ProtoUtils::file_lock_from_pb(header.lock);
 
         let audit = format!(
-            "{}[{:?}-{:?}]",
-            header.path, lock.lock_flags, lock.lock_type
+            "[{:?}-{:?}]{}",
+            lock.lock_flags, lock.lock_type, header.path
         );
         ctx.set_audit(Some(audit), None);
 

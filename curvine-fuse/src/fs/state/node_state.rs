@@ -246,7 +246,11 @@ impl NodeState {
 
             mode if mode == OpenFlags::RDWR => {
                 let writer = self.new_writer(ino, path, flags, opts).await?;
-                let reader = if let Some((ufs_path, _)) = self.fs.get_mount(path).await? {
+                let (is_ufs, ufs_path) = {
+                    let lock = writer.lock().await;
+                    (lock.is_ufs(), lock.path().full_path().to_string())
+                };
+                let reader = if is_ufs {
                     warn!(
                         "ufs {} -> {} does not support read-write mode for file opening, reader will be None",
                         path,

@@ -336,7 +336,7 @@ impl Default for ClientConf {
 
             enable_read_ahead: true,
             read_ahead_len: 0,
-            read_ahead_len_str: "0".to_string(),
+            read_ahead_len_str: "4MB".to_string(),
             drop_cache_len: 0,
             drop_cache_len_str: "1MB".to_string(),
 

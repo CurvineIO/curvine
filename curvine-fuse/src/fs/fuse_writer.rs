@@ -41,10 +41,12 @@ pub struct FuseWriter {
     sender: AsyncSender<WriteTask>,
     err_monitor: Arc<ErrorMonitor<FsError>>,
     status: FileStatus,
+    is_ufs: bool,
 }
 
 impl FuseWriter {
     pub fn new(conf: &FuseConf, rt: Arc<Runtime>, writer: UnifiedWriter) -> Self {
+        let is_ufs = !writer.path().is_cv();
         let path = writer.path().clone();
         let err_monitor = Arc::new(ErrorMonitor::new());
         let (sender, receiver) = AsyncChannel::new(conf.stream_channel_size).split();
@@ -69,6 +71,7 @@ impl FuseWriter {
             sender,
             err_monitor,
             status,
+            is_ufs,
         }
     }
 
@@ -77,6 +80,10 @@ impl FuseWriter {
     }
     pub fn status(&self) -> &FileStatus {
         &self.status
+    }
+
+    pub fn is_ufs(&self) -> bool {
+        self.is_ufs
     }
 
     fn check_error(&self, e: FsError) -> FsError {

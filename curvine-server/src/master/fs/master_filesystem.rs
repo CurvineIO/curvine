@@ -259,12 +259,16 @@ impl MasterFilesystem {
     ) -> FsResult<FileBlocks> {
         let path = path.as_ref();
 
+        if flags.read_only() {
+            return self.get_block_locations(path);
+        }
+
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
             None => {
-                return if flags.create() && flags.write() {
+                return if flags.create() {
                     drop(fs_dir);
                     let status = self.create_with_opts(path, opts, flags)?;
                     Ok(FileBlocks::new(status, vec![]))
