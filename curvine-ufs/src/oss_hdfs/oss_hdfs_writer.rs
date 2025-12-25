@@ -22,14 +22,58 @@ use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
+use tokio::sync::Notify;
 
-use crate::oss::ffi::*;
+use crate::oss_hdfs::ffi::*;
 
 fn err_from_c(err: *const std::os::raw::c_char) -> Option<String> {
     if err.is_null() {
         None
     } else {
-        Some(unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned())
+        Some(
+            unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+/// Reusable async callback context for a single in-flight `i64` async operation.
+///
+/// This avoids per-call allocations (`oneshot` + `Box`) by storing the completion
+/// result inside the writer and waking the waiter via `Notify`.
+#[derive(Debug, Default)]
+pub(crate) struct I64CallbackCtx {
+    notify: Notify,
+    result: std::sync::Mutex<Option<(JindoStatus, i64, Option<String>)>>,
+}
+
+impl I64CallbackCtx {
+    fn reset(&self) {
+        if let Ok(mut g) = self.result.lock() {
+            *g = None;
+        }
+    }
+
+    fn complete(&self, status: JindoStatus, value: i64, err: *const std::os::raw::c_char) {
+        if let Ok(mut g) = self.result.lock() {
+            *g = Some((status, value, err_from_c(err)));
+        }
+        self.notify.notify_one();
+    }
+
+    async fn wait(&self) -> FsResult<(JindoStatus, i64, Option<String>)> {
+        loop {
+            self.notify.notified().await;
+            match self.result.lock() {
+                Ok(mut g) => {
+                    if let Some(v) = g.take() {
+                        return Ok(v);
+                    }
+                }
+                Err(_) => return Err(FsError::common("Async callback mutex poisoned")),
+            }
+        }
     }
 }
 
@@ -37,7 +81,7 @@ fn err_from_c(err: *const std::os::raw::c_char) -> Option<String> {
 impl OssHdfsWriter {
     /// Get and validate the writer handle.
     ///
-    /// IMPORTANT: returns a copied handle (does not hold a MutexGuard across `.await`).
+    /// IMPORTANT: returns a cloned handle (does not hold a MutexGuard across `.await`).
     fn writer_handle(&self) -> FsResult<JindoWriterHandle> {
         let handle_opt = self
             .writer_handle
@@ -52,7 +96,7 @@ impl OssHdfsWriter {
             return Err(FsError::common("Writer handle pointer is null"));
         }
 
-        Ok(*handle)
+        Ok(handle.clone())
     }
 
     /// Get current write position
@@ -66,14 +110,16 @@ impl OssHdfsWriter {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let tx =
-                unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, i64, Option<String>)>) };
+            let tx = unsafe {
+                Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, i64, Option<String>)>)
+            };
             let _ = tx.send((status, value, err_from_c(err)));
         }
 
         {
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
-            let start_status = unsafe { jindo_writer_tell_async(handle.0, Some(cb), userdata) };
+            let start_status =
+                unsafe { jindo_writer_tell_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
                 unsafe {
                     drop(Box::from_raw(
@@ -120,6 +166,8 @@ pub struct OssHdfsWriter {
     pub(crate) pos: i64,
     pub(crate) chunk_size: usize,
     pub(crate) chunk: BytesMut,
+    // Reusable callback context for async write.
+    pub(crate) write_ctx: I64CallbackCtx,
 }
 
 // Safety: JindoWriterHandle is a *mut c_void pointer from FFI.
@@ -157,7 +205,10 @@ impl Writer for OssHdfsWriter {
     }
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
-        log::info!("write_chunk: {:?}", String::from_utf8_lossy(chunk.as_slice()));
+        log::info!(
+            "write_chunk: {:?}",
+            String::from_utf8_lossy(chunk.as_slice())
+        );
         let data = match chunk {
             DataSlice::Empty => return Ok(0),
             DataSlice::Bytes(bytes) => bytes,
@@ -169,7 +220,7 @@ impl Writer for OssHdfsWriter {
         };
 
         let len = data.len() as i64;
-        
+
         // Ensure data is valid and get pointers before FFI call
         // This ensures data remains valid during the FFI call
         let data_ptr = data.as_ptr();
@@ -180,29 +231,26 @@ impl Writer for OssHdfsWriter {
         }
 
         // Keep `data` alive across the await (pointer must remain valid).
-        let (tx, rx) = oneshot::channel::<(JindoStatus, i64, Option<String>)>();
+        self.write_ctx.reset();
         extern "C" fn cb(
             status: JindoStatus,
             value: i64,
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let tx =
-                unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, i64, Option<String>)>) };
-            let _ = tx.send((status, value, err_from_c(err)));
+            // `userdata` points to a long-lived `I64CallbackCtx` owned by `OssHdfsWriter`.
+            let ctx = unsafe { &*(userdata as *const I64CallbackCtx) };
+            ctx.complete(status, value, err);
         }
 
         let handle = self.writer_handle()?;
         {
-            let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
-            let start_status =
-                unsafe { jindo_writer_write_async(handle.0, data_ptr, data_len, Some(cb), userdata) };
+            // IMPORTANT: keep raw pointer userdata scoped to this block so this Future remains Send.
+            let userdata = (&self.write_ctx as *const I64CallbackCtx) as *mut c_void;
+            let start_status = unsafe {
+                jindo_writer_write_async(handle.as_raw(), data_ptr, data_len, Some(cb), userdata)
+            };
             if start_status != JindoStatus::Ok {
-                unsafe {
-                    drop(Box::from_raw(
-                        userdata as *mut oneshot::Sender<(JindoStatus, i64, Option<String>)>,
-                    ))
-                };
                 let err_msg = unsafe {
                     let err_ptr = jindo_get_last_error();
                     if err_ptr.is_null() {
@@ -211,13 +259,14 @@ impl Writer for OssHdfsWriter {
                         CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
                     }
                 };
-                return Err(FsError::common(format!("Failed to start write: {}", err_msg)));
+                return Err(FsError::common(format!(
+                    "Failed to start write: {}",
+                    err_msg
+                )));
             }
         }
 
-        let (status, written, err) = rx
-            .await
-            .map_err(|_| FsError::common("Async write callback dropped"))?;
+        let (status, written, err) = self.write_ctx.wait().await?;
         if status != JindoStatus::Ok {
             let err_msg = err.unwrap_or_else(|| unsafe {
                 let err_ptr = jindo_get_last_error();
@@ -244,15 +293,21 @@ impl Writer for OssHdfsWriter {
         self.flush_chunk().await?;
         let handle = self.writer_handle()?;
         let (tx, rx) = oneshot::channel::<(JindoStatus, Option<String>)>();
-        extern "C" fn cb(status: JindoStatus, err: *const std::os::raw::c_char, userdata: *mut c_void) {
-            let tx =
-                unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>) };
+        extern "C" fn cb(
+            status: JindoStatus,
+            err: *const std::os::raw::c_char,
+            userdata: *mut c_void,
+        ) {
+            let tx = unsafe {
+                Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>)
+            };
             let _ = tx.send((status, err_from_c(err)));
         }
 
         {
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
-            let start_status = unsafe { jindo_writer_flush_async(handle.0, Some(cb), userdata) };
+            let start_status =
+                unsafe { jindo_writer_flush_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
                 unsafe {
                     drop(Box::from_raw(
@@ -267,7 +322,10 @@ impl Writer for OssHdfsWriter {
                         CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
                     }
                 };
-                return Err(FsError::common(format!("Failed to start flush: {}", err_msg)));
+                return Err(FsError::common(format!(
+                    "Failed to start flush: {}",
+                    err_msg
+                )));
             }
         }
 
@@ -301,17 +359,25 @@ impl Writer for OssHdfsWriter {
         if let Some(handle) = handle {
             let (tx, rx) = oneshot::channel::<(JindoStatus, Option<String>)>();
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
-            extern "C" fn cb(status: JindoStatus, err: *const std::os::raw::c_char, userdata: *mut c_void) {
-                let tx =
-                    unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>) };
+            extern "C" fn cb(
+                status: JindoStatus,
+                err: *const std::os::raw::c_char,
+                userdata: *mut c_void,
+            ) {
+                let tx = unsafe {
+                    Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>)
+                };
                 let _ = tx.send((status, err_from_c(err)));
             }
 
-            let start_status = unsafe { jindo_writer_close_async(handle.0, Some(cb), userdata) };
+            let start_status =
+                unsafe { jindo_writer_close_async(handle.as_raw(), Some(cb), userdata) };
             if start_status != JindoStatus::Ok {
                 unsafe {
-                    drop(Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>));
-                    jindo_writer_free(handle.0);
+                    drop(Box::from_raw(
+                        userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>,
+                    ));
+                    jindo_writer_free(handle.as_raw());
                 }
                 let err_msg = unsafe {
                     let err_ptr = jindo_get_last_error();
@@ -321,14 +387,17 @@ impl Writer for OssHdfsWriter {
                         CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
                     }
                 };
-                return Err(FsError::common(format!("Failed to start close writer: {}", err_msg)));
+                return Err(FsError::common(format!(
+                    "Failed to start close writer: {}",
+                    err_msg
+                )));
             }
 
             let (status, err) = rx
                 .await
                 .map_err(|_| FsError::common("Async close callback dropped"))?;
             // Always free handle after close attempt.
-            unsafe { jindo_writer_free(handle.0) };
+            unsafe { jindo_writer_free(handle.as_raw()) };
 
             if status != JindoStatus::Ok {
                 let err_msg = err.unwrap_or_else(|| unsafe {
@@ -339,7 +408,10 @@ impl Writer for OssHdfsWriter {
                         CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
                     }
                 });
-                return Err(FsError::common(format!("Failed to close writer: {}", err_msg)));
+                return Err(FsError::common(format!(
+                    "Failed to close writer: {}",
+                    err_msg
+                )));
             }
         }
         Ok(())
@@ -355,7 +427,7 @@ impl Writer for OssHdfsWriter {
 
         if let Some(handle) = handle_opt.take() {
             unsafe {
-                jindo_writer_free(handle.0);
+                jindo_writer_free(handle.as_raw());
             }
         }
 
@@ -370,7 +442,7 @@ impl Drop for OssHdfsWriter {
         if let Some(ref mut handle_opt) = handle_opt {
             if let Some(handle) = handle_opt.take() {
                 unsafe {
-                    jindo_writer_free(handle.0);
+                    jindo_writer_free(handle.as_raw());
                 }
             }
         }

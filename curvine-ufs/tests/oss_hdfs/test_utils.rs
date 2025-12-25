@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_common::fs::Path;
-use curvine_ufs::OssConf;
+use curvine_ufs::OssHdfsConf;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,19 +26,21 @@ pub fn create_test_conf() -> Option<HashMap<String, String>> {
 
     let mut config = HashMap::new();
     let endpoint_clone = endpoint.clone();
-    config.insert(OssConf::ENDPOINT.to_string(), endpoint);
-    config.insert(OssConf::ACCESS_KEY_ID.to_string(), access_key_id);
-    config.insert(OssConf::ACCESS_KEY_SECRET.to_string(), access_key_secret);
-    config.insert(OssConf::REGION.to_string(), region);
-    
+    config.insert(OssHdfsConf::ENDPOINT.to_string(), endpoint);
+    config.insert(OssHdfsConf::ACCESS_KEY_ID.to_string(), access_key_id);
+    config.insert(
+        OssHdfsConf::ACCESS_KEY_SECRET.to_string(),
+        access_key_secret,
+    );
+    config.insert(OssHdfsConf::REGION.to_string(), region);
+
     // Use OSS_DATA_ENDPOINT if provided, otherwise derive from endpoint
-    let data_endpoint = std::env::var("OSS_DATA_ENDPOINT")
-        .unwrap_or_else(|_| {
-            // Try to derive from endpoint if not explicitly set
-            // This is a fallback, but still better than hardcoding credentials
-            endpoint_clone.replace(".oss-dls.", "-vpc.oss.")
-        });
-    config.insert(OssConf::DATA_ENDPOINT.to_string(), data_endpoint);
+    let data_endpoint = std::env::var("OSS_DATA_ENDPOINT").unwrap_or_else(|_| {
+        // Try to derive from endpoint if not explicitly set
+        // This is a fallback, but still better than hardcoding credentials
+        endpoint_clone.replace(".oss-dls.", "-vpc.oss.")
+    });
+    config.insert(OssHdfsConf::DATA_ENDPOINT.to_string(), data_endpoint);
 
     Some(config)
 }
@@ -57,4 +59,3 @@ pub fn create_test_path(bucket: &str, prefix: &str) -> Path {
     let path = format!("oss://{}/{}_{}", bucket, prefix, timestamp);
     Path::new(&path).unwrap()
 }
-

@@ -1,0 +1,167 @@
+#!/bin/bash
+# Script to run UFS integration test with OSS backend
+#
+# This script supports two ways to configure OSS-HDFS:
+# 1. Direct configuration via UFS_TEST_* environment variables
+# 2. OSS_* environment variables (automatically converted to UFS_TEST_* format)
+#
+# Example usage:
+#   export OSS_ENDPOINT="cn-beijing.oss-dls.aliyuncs.com"
+#   export OSS_ACCESS_KEY_ID="your-access-key-id"
+#   export OSS_ACCESS_KEY_SECRET="your-secret-key"
+#   export OSS_REGION="cn-beijing"
+#   export OSS_BUCKET="your-bucket-name"
+#   ./run_ufs_oss_hdfs_test.sh
+
+cd /root/github/curvine
+
+# If UFS_TEST_PATH is not set, construct it from OSS_BUCKET
+if [ -z "$UFS_TEST_PATH" ]; then
+    if [ -n "$OSS_BUCKET" ]; then
+        export UFS_TEST_PATH="oss://${OSS_BUCKET}/ufs-test"
+    else
+        echo "Error: Either UFS_TEST_PATH or OSS_BUCKET must be set"
+        exit 1
+    fi
+fi
+
+# If UFS_TEST_MOUNT_PATH is not set, use default
+if [ -z "$UFS_TEST_MOUNT_PATH" ]; then
+    export UFS_TEST_MOUNT_PATH="/ufs-test"
+fi
+
+# If UFS_TEST_PROPERTIES is not set, construct it from OSS_* environment variables
+if [ -z "$UFS_TEST_PROPERTIES" ]; then
+    if [ -n "$OSS_ENDPOINT" ] && [ -n "$OSS_ACCESS_KEY_ID" ] && [ -n "$OSS_ACCESS_KEY_SECRET" ]; then
+        PROPERTIES="fs.oss.endpoint=${OSS_ENDPOINT}"
+        PROPERTIES="${PROPERTIES},fs.oss.accessKeyId=${OSS_ACCESS_KEY_ID}"
+        PROPERTIES="${PROPERTIES},fs.oss.accessKeySecret=${OSS_ACCESS_KEY_SECRET}"
+        
+        if [ -n "$OSS_REGION" ]; then
+            PROPERTIES="${PROPERTIES},fs.oss.region=${OSS_REGION}"
+        fi
+        #PROPERTIES="${PROPERTIES},fs.oss.data.lake.storage.enable=false"
+        export UFS_TEST_PROPERTIES="${PROPERTIES}"
+    else
+        echo "Error: OSS configuration is incomplete. Please set:"
+        echo "  - OSS_ENDPOINT (required)"
+        echo "  - OSS_ACCESS_KEY_ID (required)"
+        echo "  - OSS_ACCESS_KEY_SECRET (required)"
+        echo "  - OSS_REGION (optional)"
+        echo "  - OSS_BUCKET (required if UFS_TEST_PATH is not set)"
+        echo ""
+        echo "Or set UFS_TEST_PATH and UFS_TEST_PROPERTIES directly"
+        exit 1
+    fi
+fi
+
+# Set LD_LIBRARY_PATH to include JindoSDK library directory.
+# Prefer externally provided JINDOSDK_HOME; fall back to common locations for convenience.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+JINDO_CANDIDATE_DIRS=()
+if [ -n "${JINDOSDK_HOME:-}" ]; then
+    # Align with curvine-ufs/build.rs (common layouts):
+    # - $JINDOSDK_HOME/{include,lib}/libjindosdk_c.so*
+    # - $JINDOSDK_HOME/{include,lib/native}/libjindosdk_c.so*
+    # Also accept tarball layout often seen in this repo docs:
+    # - $JINDOSDK_HOME/lib/linux-x86_64/libjindosdk_c.so*
+    JINDO_CANDIDATE_DIRS+=(
+        "$JINDOSDK_HOME"
+        "$JINDOSDK_HOME/lib"
+        "$JINDOSDK_HOME/lib/native"
+        "$JINDOSDK_HOME/lib/linux-x86_64"
+        "$JINDOSDK_HOME/linux-x86_64"
+    )
+else
+    JINDO_CANDIDATE_DIRS+=(
+        "${SCRIPT_DIR}/curvine-ufs/lib/linux-x86_64"
+        "/opt/jindosdk/lib"
+        "/opt/jindosdk/lib/native"
+        "/usr/local/lib"
+        "/usr/lib64"
+    )
+fi
+
+JINDOSDK_LIB_DIR=""
+JINDOSDK_SHIM_DIR=""
+for d in "${JINDO_CANDIDATE_DIRS[@]}"; do
+    [ -d "$d" ] || continue
+
+    # Ideal: SONAME-compatible symlink exists.
+    if [ -f "$d/libjindosdk_c.so.6" ]; then
+        JINDOSDK_LIB_DIR="$d"
+        break
+    fi
+
+    # Common case: only a versioned file exists (e.g. libjindosdk_c.so.6.10.3) but no libjindosdk_c.so.6.
+    # Create a temporary shim dir that provides libjindosdk_c.so.6 -> the versioned file, so the runtime loader can resolve it.
+    ver_file="$(ls -1 "$d"/libjindosdk_c.so.6.* 2>/dev/null | head -n 1 || true)"
+    if [ -n "$ver_file" ] && [ -f "$ver_file" ]; then
+        JINDOSDK_SHIM_DIR="$(mktemp -d /tmp/curvine_jindosdk_shim.XXXXXX)"
+        ln -sf "$ver_file" "${JINDOSDK_SHIM_DIR}/libjindosdk_c.so.6"
+        JINDOSDK_LIB_DIR="$d"
+        break
+    fi
+done
+
+if [ -n "$JINDOSDK_LIB_DIR" ]; then
+    if [ -n "$JINDOSDK_SHIM_DIR" ]; then
+        export LD_LIBRARY_PATH="${JINDOSDK_SHIM_DIR}:${JINDOSDK_LIB_DIR}:${LD_LIBRARY_PATH}"
+        echo "✓ JindoSDK library path set (shim): ${JINDOSDK_SHIM_DIR} -> ${JINDOSDK_LIB_DIR}"
+    else
+        export LD_LIBRARY_PATH="${JINDOSDK_LIB_DIR}:${LD_LIBRARY_PATH}"
+        echo "✓ JindoSDK library path set: $JINDOSDK_LIB_DIR"
+    fi
+else
+    # Keep the original hint for the most common expected layout in this repo.
+    DEFAULT_HINT="${SCRIPT_DIR}/curvine-ufs/lib/linux-x86_64"
+    echo "⚠️  Warning: JindoSDK library directory not found (searched common locations)."
+    echo "   Please ensure libjindosdk_c.so.6 is available via LD_LIBRARY_PATH or set JINDOSDK_HOME"
+    echo "   Default expected dir: $DEFAULT_HINT"
+fi
+
+# Set RUST_BACKTRACE for detailed error information
+# Use "full" for maximum detail, or "1" for basic backtrace
+if [ -z "$RUST_BACKTRACE" ]; then
+    export RUST_BACKTRACE=full
+fi
+
+echo "=== UFS Test Configuration ==="
+echo "UFS_TEST_PATH: $UFS_TEST_PATH"
+echo "UFS_TEST_MOUNT_PATH: $UFS_TEST_MOUNT_PATH"
+echo "UFS_TEST_PROPERTIES: $UFS_TEST_PROPERTIES"
+echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+echo "RUST_BACKTRACE: $RUST_BACKTRACE"
+echo ""
+echo "Starting test compilation and execution with oss feature..."
+echo ""
+
+# Run the UFS test with oss feature enabled via command line
+# Capture output to file for analysis
+OUTPUT_FILE="/tmp/ufs_test_output_$(date +%Y%m%d_%H%M%S).log"
+echo "Test output will be saved to: $OUTPUT_FILE"
+echo ""
+
+# Enable OSS in curvine-tests (drives #[cfg(feature = "oss-hdfs")] in tests),
+# and also enable the dependency feature on curvine-client.
+cargo test -p curvine-tests --test ufs_test --features "oss-hdfs curvine-client/oss-hdfs" ufs_test -- --nocapture 2>&1 | tee "$OUTPUT_FILE"
+
+# Check exit code
+EXIT_CODE=${PIPESTATUS[0]}
+if [ $EXIT_CODE -eq 139 ] || [ $EXIT_CODE -eq 11 ]; then
+    echo ""
+    echo "=========================================="
+    echo "⚠️  SIGSEGV detected! Exit code: $EXIT_CODE"
+    echo "Full output saved to: $OUTPUT_FILE"
+    echo "=========================================="
+    echo ""
+    echo "Last 50 lines of output:"
+    echo "----------------------------------------"
+    tail -50 "$OUTPUT_FILE"
+    echo ""
+    echo "To view full output, run:"
+    echo "  cat $OUTPUT_FILE"
+fi
+
+exit $EXIT_CODE

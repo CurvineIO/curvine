@@ -209,11 +209,11 @@ async fn test_mkdir(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonResult
     // Only enable create_parent for OSS when the `oss` feature is enabled.
     // When the feature is disabled, force it to false to avoid backend-specific behavior.
     let create_parent = {
-        #[cfg(feature = "oss")]
+        #[cfg(feature = "oss-hdfs")]
         {
             config.ufs_path.starts_with("oss://")
         }
-        #[cfg(not(feature = "oss"))]
+        #[cfg(not(feature = "oss-hdfs"))]
         {
             false
         }

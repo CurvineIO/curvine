@@ -28,10 +28,10 @@ use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-use crate::conf::OssConf;
+use crate::conf::OssHdfsConf;
 use crate::err_ufs;
-use crate::oss::ffi::*;
-use crate::oss::{OssHdfsReader, OssHdfsWriter, SCHEME};
+use crate::oss_hdfs::ffi::*;
+use crate::oss_hdfs::{OssHdfsReader, OssHdfsWriter, SCHEME};
 use std::ffi::NulError;
 
 // Helper to convert CString errors
@@ -40,11 +40,7 @@ fn cstring_err(e: NulError) -> FsError {
 }
 
 // Helper to set string configuration in JindoSDK
-unsafe fn set_config_string(
-    config_handle: *mut c_void,
-    key: &str,
-    value: &str,
-) -> FsResult<()> {
+unsafe fn set_config_string(config_handle: *mut c_void, key: &str, value: &str) -> FsResult<()> {
     let key_cstr = CString::new(key).map_err(cstring_err)?;
     let value_cstr = CString::new(value).map_err(cstring_err)?;
     jindo_config_set_string(config_handle, key_cstr.as_ptr(), value_cstr.as_ptr());
@@ -52,11 +48,7 @@ unsafe fn set_config_string(
 }
 
 // Helper to set bool configuration in JindoSDK
-unsafe fn set_config_bool(
-    config_handle: *mut c_void,
-    key: &str,
-    value: bool,
-) -> FsResult<()> {
+unsafe fn set_config_bool(config_handle: *mut c_void, key: &str, value: bool) -> FsResult<()> {
     let key_cstr = CString::new(key).map_err(cstring_err)?;
     jindo_config_set_bool(config_handle, key_cstr.as_ptr(), value);
     Ok(())
@@ -80,7 +72,11 @@ fn err_from_c(err: *const std::os::raw::c_char) -> Option<String> {
     if err.is_null() {
         None
     } else {
-        Some(unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned())
+        Some(
+            unsafe { CStr::from_ptr(err) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 }
 
@@ -91,31 +87,25 @@ pub struct OssHdfsFileSystem {
 }
 
 struct OssHdfsFileSystemInner {
-    fs_handle: Mutex<JindoFileSystemHandle>,
+    fs_handle: JindoFileSystemHandle,
     conf: UfsConf,
 }
 
 impl Drop for OssHdfsFileSystemInner {
     fn drop(&mut self) {
-        // We are in the last Arc reference to this inner, so no other thread can
-        // legitimately be using the handle anymore. Use get_mut() to avoid locking.
-        let handle = match self.fs_handle.get_mut() {
-            Ok(h) => h,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        if !handle.is_null() {
+        if !self.fs_handle.is_null() {
             unsafe {
-                jindo_filesystem_free(handle.0);
+                jindo_filesystem_free(self.fs_handle.as_raw());
             }
-            // Defensive: ensure any accidental future use crashes earlier / is caught.
-            *handle = JindoFileSystemHandle(std::ptr::null_mut());
+            // Defensive: ensure any accidental future use fails fast.
+            self.fs_handle = JindoFileSystemHandle::null();
         }
     }
 }
 
 // Constants for FileStatus defaults
-// Note: OSS-HDFS is an object storage system, not a traditional distributed filesystem.
+// Note: "OSS-HDFS" here is a HDFS-compatible filesystem layer backed by OSS object storage (via JindoSDK),
+// so it does not have HDFS-style blocks/replication semantics.
 // - replicas: Object storage handles redundancy at the storage layer, so we use 1 as a placeholder
 // - block_size: Object storage stores data as objects, not blocks, so this value is informational only
 const DEFAULT_BLOCK_SIZE: i64 = 4 * 1024 * 1024; // 4MB (matches opendal.rs default)
@@ -124,8 +114,7 @@ const DEFAULT_REPLICAS: i32 = 1; // Object storage redundancy is handled by the 
 impl OssHdfsFileSystem {
     pub fn new(path: &Path, conf: HashMap<String, String>) -> FsResult<Self> {
         // Validate scheme
-        path
-            .scheme()
+        path.scheme()
             .ok_or_else(|| FsError::invalid_path(path.full_path(), "Missing scheme"))
             .and_then(|s| {
                 if s == SCHEME {
@@ -145,8 +134,8 @@ impl OssHdfsFileSystem {
 
         // Convert HashMap to UfsConf for storage
         let ufs_conf = UfsConf::with_map(conf.clone());
-        
-        let oss_conf = OssConf::with_map(conf)
+
+        let oss_hdfs_conf = OssHdfsConf::with_map(conf)
             .map_err(|e| FsError::from(e).ctx("Invalid OSS configuration"))?;
 
         // Create JindoSDK config
@@ -155,67 +144,82 @@ impl OssHdfsFileSystem {
             return err_ufs!("Failed to create JindoSDK config");
         }
 
-        let config_handle = JindoConfigHandle(config_handle_ptr);
+        let config_handle = JindoConfigHandle::from_raw(config_handle_ptr);
         // Set configuration parameters
         unsafe {
-            set_config_string(config_handle.0, OssConf::ENDPOINT, &oss_conf.endpoint_url)?;
-            set_config_string(config_handle.0, OssConf::ACCESS_KEY_ID, &oss_conf.access_key)?;
-            set_config_string(config_handle.0, OssConf::ACCESS_KEY_SECRET, &oss_conf.secret_key)?;
+            set_config_string(
+                config_handle.as_raw(),
+                OssHdfsConf::ENDPOINT,
+                &oss_hdfs_conf.endpoint_url,
+            )?;
+            set_config_string(
+                config_handle.as_raw(),
+                OssHdfsConf::ACCESS_KEY_ID,
+                &oss_hdfs_conf.access_key,
+            )?;
+            set_config_string(
+                config_handle.as_raw(),
+                OssHdfsConf::ACCESS_KEY_SECRET,
+                &oss_hdfs_conf.secret_key,
+            )?;
 
-            if let Some(region_name) = &oss_conf.region_name {
-                set_config_string(config_handle.0, OssConf::REGION, region_name)?;
+            if let Some(region_name) = &oss_hdfs_conf.region_name {
+                set_config_string(config_handle.as_raw(), OssHdfsConf::REGION, region_name)?;
             }
 
             // Set OSS-HDFS specific flags
             set_config_bool(
-                config_handle.0,
-                OssConf::SECOND_LEVEL_DOMAIN_ENABLE,
-                oss_conf.second_level_domain_enable,
+                config_handle.as_raw(),
+                OssHdfsConf::SECOND_LEVEL_DOMAIN_ENABLE,
+                oss_hdfs_conf.second_level_domain_enable,
             )?;
             set_config_bool(
-                config_handle.0,
-                OssConf::DATA_LAKE_STORAGE_ENABLE,
-                oss_conf.data_lake_storage_enable,
+                config_handle.as_raw(),
+                OssHdfsConf::DATA_LAKE_STORAGE_ENABLE,
+                oss_hdfs_conf.data_lake_storage_enable,
             )?;
         }
 
         // Create filesystem
         let fs_handle_ptr = unsafe { jindo_filesystem_new() };
         if fs_handle_ptr.is_null() {
-            unsafe { jindo_config_free(config_handle.0) };
+            unsafe { jindo_config_free(config_handle.as_raw()) };
             return err_ufs!("Failed to create JindoSDK filesystem");
         }
 
-        let fs_handle = JindoFileSystemHandle(fs_handle_ptr);
+        let fs_handle = JindoFileSystemHandle::from_raw(fs_handle_ptr);
         // Initialize filesystem
         // Get user from environment variables (similar to HDFS implementation)
         // Priority: HADOOP_USER_NAME -> USER -> default "root"
         let user = std::env::var("HADOOP_USER_NAME")
             .or_else(|_| std::env::var("USER"))
             .unwrap_or_else(|_| "root".to_string());
-        
+
         let bucket_cstr = CString::new(format!("oss://{}/", bucket)).map_err(cstring_err)?;
         let user_cstr = CString::new(user.as_str()).map_err(cstring_err)?;
 
         let status = unsafe {
             jindo_filesystem_init(
-                fs_handle.0,
+                fs_handle.as_raw(),
                 bucket_cstr.as_ptr(),
                 user_cstr.as_ptr(),
-                config_handle.0,
+                config_handle.as_raw(),
             )
         };
 
-        unsafe { jindo_config_free(config_handle.0) };
+        unsafe { jindo_config_free(config_handle.as_raw()) };
 
         if status != JindoStatus::Ok {
-            unsafe { jindo_filesystem_free(fs_handle.0) };
-            return err_ufs!("Failed to initialize JindoSDK filesystem: {}", get_last_error());
+            unsafe { jindo_filesystem_free(fs_handle.as_raw()) };
+            return err_ufs!(
+                "Failed to initialize JindoSDK filesystem: {}",
+                get_last_error()
+            );
         }
 
         Ok(Self {
             inner: Arc::new(OssHdfsFileSystemInner {
-                fs_handle: Mutex::new(fs_handle),
+                fs_handle,
                 conf: ufs_conf,
             }),
         })
@@ -240,25 +244,21 @@ impl OssHdfsFileSystem {
         CString::new(s).map_err(cstring_err)
     }
 
-    /// Execute an FFI operation with the filesystem handle locked.
-    /// This ensures the lock is held for the entire duration of the FFI call.
+    /// Execute an FFI operation with the filesystem handle.
+    ///
+    /// The underlying JindoSDK filesystem handle is thread-safe, so we don't lock here.
     fn with_fs_handle<F, R>(&self, f: F) -> FsResult<R>
     where
         F: FnOnce(*mut c_void) -> R,
     {
-        let handle = self
-            .inner
-            .fs_handle
-            .lock()
-            .map_err(|e| FsError::common(format!("Failed to lock filesystem handle: {}", e)))?;
-        
+        let handle = &self.inner.fs_handle;
+
         // Validate handle before use
         if handle.is_null() {
             return Err(FsError::common("Filesystem handle is null"));
         }
-        
-        log::info!("with_fs_handle: {:?}", handle.0);
-        Ok(f(handle.0))
+
+        Ok(f(handle.as_raw()))
     }
 
     fn check_status(status: JindoStatus, operation: &str) -> FsResult<()> {
@@ -282,7 +282,13 @@ impl OssHdfsFileSystem {
         Ok(())
     }
 
-    fn new_file_status(path: &Path, is_dir: bool, len: i64, mtime: i64, is_complete: bool) -> FileStatus {
+    fn new_file_status(
+        path: &Path,
+        is_dir: bool,
+        len: i64,
+        mtime: i64,
+        is_complete: bool,
+    ) -> FileStatus {
         FileStatus {
             path: path.full_path().to_owned(),
             name: path.name().to_owned(),
@@ -292,7 +298,11 @@ impl OssHdfsFileSystem {
             len,
             replicas: DEFAULT_REPLICAS,
             block_size: DEFAULT_BLOCK_SIZE,
-            file_type: if is_dir { FileType::Dir } else { FileType::File },
+            file_type: if is_dir {
+                FileType::Dir
+            } else {
+                FileType::File
+            },
             ..Default::default()
         }
     }
@@ -373,9 +383,15 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         let path_cstr = self.path_to_cstring(path)?;
         let (tx, rx) = oneshot::channel::<(JindoStatus, Option<String>)>();
 
-        extern "C" fn cb(status: JindoStatus, err: *const std::os::raw::c_char, userdata: *mut c_void) {
+        extern "C" fn cb(
+            status: JindoStatus,
+            err: *const std::os::raw::c_char,
+            userdata: *mut c_void,
+        ) {
             // Safety: userdata is a Box<oneshot::Sender<...>> allocated by Rust.
-            let tx = unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>) };
+            let tx = unsafe {
+                Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>)
+            };
             let _ = tx.send((status, err_from_c(err)));
         }
 
@@ -393,7 +409,9 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             })?;
             if start_status != JindoStatus::Ok {
                 unsafe {
-                    drop(Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>))
+                    drop(Box::from_raw(
+                        userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>,
+                    ))
                 };
                 Self::check_status(start_status, "Failed to start async mkdir")?;
             }
@@ -419,21 +437,32 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         ) {
             let tx = unsafe {
                 Box::from_raw(
-                    userdata as *mut oneshot::Sender<(JindoStatus, JindoWriterHandle, Option<String>)>,
+                    userdata
+                        as *mut oneshot::Sender<(JindoStatus, JindoWriterHandle, Option<String>)>,
                 )
             };
-            let _ = tx.send((status, JindoWriterHandle(writer), err_from_c(err)));
+            let _ = tx.send((status, JindoWriterHandle::from_raw(writer), err_from_c(err)));
         }
 
         {
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
             let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_open_writer_async(fs_handle, path_cstr.as_ptr(), Some(cb), userdata)
+                jindo_filesystem_open_writer_async(
+                    fs_handle,
+                    path_cstr.as_ptr(),
+                    Some(cb),
+                    userdata,
+                )
             })?;
             if start_status != JindoStatus::Ok {
                 unsafe {
                     drop(Box::from_raw(
-                        userdata as *mut oneshot::Sender<(JindoStatus, JindoWriterHandle, Option<String>)>,
+                        userdata
+                            as *mut oneshot::Sender<(
+                                JindoStatus,
+                                JindoWriterHandle,
+                                Option<String>,
+                            )>,
                     ))
                 };
                 Self::check_status(start_status, "Failed to start async open_writer")?;
@@ -458,6 +487,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             pos: 0,
             chunk_size: 8 * 1024 * 1024, // 8MB
             chunk: BytesMut::new(),
+            write_ctx: Default::default(),
         })
     }
 
@@ -475,10 +505,11 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         ) {
             let tx = unsafe {
                 Box::from_raw(
-                    userdata as *mut oneshot::Sender<(JindoStatus, JindoWriterHandle, Option<String>)>,
+                    userdata
+                        as *mut oneshot::Sender<(JindoStatus, JindoWriterHandle, Option<String>)>,
                 )
             };
-            let _ = tx.send((status, JindoWriterHandle(writer), err_from_c(err)));
+            let _ = tx.send((status, JindoWriterHandle::from_raw(writer), err_from_c(err)));
         }
 
         {
@@ -494,7 +525,12 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             if start_status != JindoStatus::Ok {
                 unsafe {
                     drop(Box::from_raw(
-                        userdata as *mut oneshot::Sender<(JindoStatus, JindoWriterHandle, Option<String>)>,
+                        userdata
+                            as *mut oneshot::Sender<(
+                                JindoStatus,
+                                JindoWriterHandle,
+                                Option<String>,
+                            )>,
                     ))
                 };
                 Self::check_status(start_status, "Failed to start async open_writer_append")?;
@@ -506,7 +542,9 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             .map_err(|_| FsError::common("Async open_writer_append callback dropped"))?;
         Self::check_status_with_err(status, "Failed to open writer for append", err)?;
         if writer_handle.is_null() {
-            return Err(FsError::common("Writer handle is null after append creation"));
+            return Err(FsError::common(
+                "Writer handle is null after append creation",
+            ));
         }
 
         // Get current position (file length if file exists, 0 if new file)
@@ -517,18 +555,22 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let tx =
-                unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, i64, Option<String>)>) };
+            let tx = unsafe {
+                Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, i64, Option<String>)>)
+            };
             let _ = tx.send((status, value, err_from_c(err)));
         }
 
         {
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
-            let start_status = unsafe { jindo_writer_tell_async(writer_handle.0, Some(tell_cb), userdata) };
+            let start_status =
+                unsafe { jindo_writer_tell_async(writer_handle.as_raw(), Some(tell_cb), userdata) };
             if start_status != JindoStatus::Ok {
                 unsafe {
-                    drop(Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, i64, Option<String>)>));
-                    jindo_writer_free(writer_handle.0);
+                    drop(Box::from_raw(
+                        userdata as *mut oneshot::Sender<(JindoStatus, i64, Option<String>)>,
+                    ));
+                    jindo_writer_free(writer_handle.as_raw());
                 }
                 Self::check_status(start_status, "Failed to start async writer tell")?;
             }
@@ -538,7 +580,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             .await
             .map_err(|_| FsError::common("Async writer tell callback dropped"))?;
         if status != JindoStatus::Ok {
-            unsafe { jindo_writer_free(writer_handle.0) };
+            unsafe { jindo_writer_free(writer_handle.as_raw()) };
             Self::check_status_with_err(status, "Failed to get writer position for append", err)?;
         }
 
@@ -554,6 +596,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             pos: current_pos,
             chunk_size: 8 * 1024 * 1024, // 8MB
             chunk: BytesMut::new(),
+            write_ctx: Default::default(),
         })
     }
 
@@ -567,8 +610,9 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let tx =
-                unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, bool, Option<String>)>) };
+            let tx = unsafe {
+                Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, bool, Option<String>)>)
+            };
             let _ = tx.send((status, value, err_from_c(err)));
         }
 
@@ -607,20 +651,34 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let tx =
-                unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, JindoReaderHandle, Option<String>)>) };
-            let _ = tx.send((status, JindoReaderHandle(reader), err_from_c(err)));
+            let tx = unsafe {
+                Box::from_raw(
+                    userdata
+                        as *mut oneshot::Sender<(JindoStatus, JindoReaderHandle, Option<String>)>,
+                )
+            };
+            let _ = tx.send((status, JindoReaderHandle::from_raw(reader), err_from_c(err)));
         }
 
         {
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
             let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_open_reader_async(fs_handle, path_cstr.as_ptr(), Some(cb), userdata)
+                jindo_filesystem_open_reader_async(
+                    fs_handle,
+                    path_cstr.as_ptr(),
+                    Some(cb),
+                    userdata,
+                )
             })?;
             if start_status != JindoStatus::Ok {
                 unsafe {
                     drop(Box::from_raw(
-                        userdata as *mut oneshot::Sender<(JindoStatus, JindoReaderHandle, Option<String>)>,
+                        userdata
+                            as *mut oneshot::Sender<(
+                                JindoStatus,
+                                JindoReaderHandle,
+                                Option<String>,
+                            )>,
                     ))
                 };
                 Self::check_status(start_status, "Failed to start async open_reader")?;
@@ -640,7 +698,7 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             Ok(status) => status,
             Err(e) => {
                 // Clean up reader handle on error
-                unsafe { jindo_reader_free(reader_handle.0) };
+                unsafe { jindo_reader_free(reader_handle.as_raw()) };
                 return Err(e);
             }
         };
@@ -661,8 +719,14 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         let dst_cstr = self.path_to_cstring(dst)?;
         let (tx, rx) = oneshot::channel::<(JindoStatus, Option<String>)>();
 
-        extern "C" fn cb(status: JindoStatus, err: *const std::os::raw::c_char, userdata: *mut c_void) {
-            let tx = unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>) };
+        extern "C" fn cb(
+            status: JindoStatus,
+            err: *const std::os::raw::c_char,
+            userdata: *mut c_void,
+        ) {
+            let tx = unsafe {
+                Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>)
+            };
             let _ = tx.send((status, err_from_c(err)));
         }
 
@@ -679,7 +743,9 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             })?;
             if start_status != JindoStatus::Ok {
                 unsafe {
-                    drop(Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>))
+                    drop(Box::from_raw(
+                        userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>,
+                    ))
                 };
                 Self::check_status(start_status, "Failed to start async rename")?;
             }
@@ -697,19 +763,33 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         let path_cstr = self.path_to_cstring(path)?;
         let (tx, rx) = oneshot::channel::<(JindoStatus, Option<String>)>();
 
-        extern "C" fn cb(status: JindoStatus, err: *const std::os::raw::c_char, userdata: *mut c_void) {
-            let tx = unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>) };
+        extern "C" fn cb(
+            status: JindoStatus,
+            err: *const std::os::raw::c_char,
+            userdata: *mut c_void,
+        ) {
+            let tx = unsafe {
+                Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>)
+            };
             let _ = tx.send((status, err_from_c(err)));
         }
 
         {
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
             let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_remove_async(fs_handle, path_cstr.as_ptr(), recursive, Some(cb), userdata)
+                jindo_filesystem_remove_async(
+                    fs_handle,
+                    path_cstr.as_ptr(),
+                    recursive,
+                    Some(cb),
+                    userdata,
+                )
             })?;
             if start_status != JindoStatus::Ok {
                 unsafe {
-                    drop(Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>))
+                    drop(Box::from_raw(
+                        userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>,
+                    ))
                 };
                 Self::check_status(start_status, "Failed to start async delete")?;
             }
@@ -733,19 +813,29 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             err: *const std::os::raw::c_char,
             userdata: *mut c_void,
         ) {
-            let tx =
-                unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, usize, Option<String>)>) };
+            let tx = unsafe {
+                Box::from_raw(
+                    userdata as *mut oneshot::Sender<(JindoStatus, usize, Option<String>)>,
+                )
+            };
             let _ = tx.send((status, info as usize, err_from_c(err)));
         }
 
         {
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
             let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_get_file_info_async(fs_handle, path_cstr.as_ptr(), Some(cb), userdata)
+                jindo_filesystem_get_file_info_async(
+                    fs_handle,
+                    path_cstr.as_ptr(),
+                    Some(cb),
+                    userdata,
+                )
             })?;
             if start_status != JindoStatus::Ok {
                 unsafe {
-                    drop(Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, usize, Option<String>)>))
+                    drop(Box::from_raw(
+                        userdata as *mut oneshot::Sender<(JindoStatus, usize, Option<String>)>,
+                    ))
                 };
                 Self::check_status(start_status, "Failed to start async get_file_info")?;
             }
@@ -777,7 +867,11 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         }
 
         let file_status = unsafe {
-            Self::file_status_from_info(path.full_path().to_owned(), path.name().to_owned(), &*info_ptr)
+            Self::file_status_from_info(
+                path.full_path().to_owned(),
+                path.name().to_owned(),
+                &*info_ptr,
+            )
         };
 
         unsafe {
@@ -809,7 +903,13 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
         {
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
             let start_status = self.with_fs_handle(|fs_handle| unsafe {
-                jindo_filesystem_list_dir_async(fs_handle, path_cstr.as_ptr(), false, Some(cb), userdata)
+                jindo_filesystem_list_dir_async(
+                    fs_handle,
+                    path_cstr.as_ptr(),
+                    false,
+                    Some(cb),
+                    userdata,
+                )
             })?;
             if start_status != JindoStatus::Ok {
                 unsafe {
@@ -856,7 +956,9 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
                 } else {
                     match std::ffi::CStr::from_ptr(info.path).to_str() {
                         Ok(s) => s.to_string(),
-                        Err(_) => std::ffi::CStr::from_ptr(info.path).to_string_lossy().into_owned(),
+                        Err(_) => std::ffi::CStr::from_ptr(info.path)
+                            .to_string_lossy()
+                            .into_owned(),
                     }
                 };
 
@@ -886,8 +988,14 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
             let (tx, rx) = oneshot::channel::<(JindoStatus, Option<String>)>();
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
 
-            extern "C" fn cb(status: JindoStatus, err: *const std::os::raw::c_char, userdata: *mut c_void) {
-                let tx = unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>) };
+            extern "C" fn cb(
+                status: JindoStatus,
+                err: *const std::os::raw::c_char,
+                userdata: *mut c_void,
+            ) {
+                let tx = unsafe {
+                    Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>)
+                };
                 let _ = tx.send((status, err_from_c(err)));
             }
 
@@ -901,7 +1009,11 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
                 )
             })?;
             if start_status != JindoStatus::Ok {
-                unsafe { drop(Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>)) };
+                unsafe {
+                    drop(Box::from_raw(
+                        userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>,
+                    ))
+                };
                 Self::check_status(start_status, "Failed to start async set_permission")?;
             }
 
@@ -913,13 +1025,21 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
 
         // Handle owner
         if opts.owner.is_some() || opts.group.is_some() {
-            let user_cstr = CString::new(opts.owner.as_deref().unwrap_or("")).map_err(cstring_err)?;
-            let group_cstr = CString::new(opts.group.as_deref().unwrap_or("")).map_err(cstring_err)?;
+            let user_cstr =
+                CString::new(opts.owner.as_deref().unwrap_or("")).map_err(cstring_err)?;
+            let group_cstr =
+                CString::new(opts.group.as_deref().unwrap_or("")).map_err(cstring_err)?;
             let (tx, rx) = oneshot::channel::<(JindoStatus, Option<String>)>();
             let userdata = Box::into_raw(Box::new(tx)) as *mut c_void;
 
-            extern "C" fn cb(status: JindoStatus, err: *const std::os::raw::c_char, userdata: *mut c_void) {
-                let tx = unsafe { Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>) };
+            extern "C" fn cb(
+                status: JindoStatus,
+                err: *const std::os::raw::c_char,
+                userdata: *mut c_void,
+            ) {
+                let tx = unsafe {
+                    Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>)
+                };
                 let _ = tx.send((status, err_from_c(err)));
             }
 
@@ -934,7 +1054,11 @@ impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
                 )
             })?;
             if start_status != JindoStatus::Ok {
-                unsafe { drop(Box::from_raw(userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>)) };
+                unsafe {
+                    drop(Box::from_raw(
+                        userdata as *mut oneshot::Sender<(JindoStatus, Option<String>)>,
+                    ))
+                };
                 Self::check_status(start_status, "Failed to start async set_owner")?;
             }
 

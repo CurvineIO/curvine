@@ -14,28 +14,26 @@
 
 //! FFI bindings for JindoSDK C++ library
 
+use orpc::sys::RawPtr;
 use std::os::raw::{c_char, c_void};
 
 // Opaque handle types
-// We use newtype wrappers instead of type aliases to allow implementing Send/Sync
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub struct JindoFileSystemHandle(pub *mut c_void);
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub struct JindoWriterHandle(pub *mut c_void);
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub struct JindoReaderHandle(pub *mut c_void);
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub struct JindoConfigHandle(pub *mut c_void);
+// We wrap raw pointers with `RawPtr` for FFI ergonomics and to make Send/Sync explicit.
+// NOTE: ownership of these pointers is managed by the JindoSDK C++ shim (freed via `jindo_*_free`),
+// so we always create `RawPtr` with `owned = false`.
+#[derive(Clone, Debug)]
+pub struct JindoFileSystemHandle(pub RawPtr<c_void>);
+#[derive(Clone, Debug)]
+pub struct JindoWriterHandle(pub RawPtr<c_void>);
+#[derive(Clone, Debug)]
+pub struct JindoReaderHandle(pub RawPtr<c_void>);
+#[derive(Clone, Debug)]
+pub struct JindoConfigHandle(pub RawPtr<c_void>);
 
 // Safety: These handles are opaque pointers to C++ objects.
 // The underlying JindoSDK C++ library is thread-safe and handles
 // all synchronization internally. We mark these as Send/Sync to allow
-// them to be used across thread boundaries when properly synchronized
-// (e.g., wrapped in Arc<Mutex<>>).
+// them to be used across thread boundaries.
 unsafe impl Send for JindoFileSystemHandle {}
 unsafe impl Sync for JindoFileSystemHandle {}
 unsafe impl Send for JindoWriterHandle {}
@@ -46,28 +44,73 @@ unsafe impl Send for JindoConfigHandle {}
 unsafe impl Sync for JindoConfigHandle {}
 
 impl JindoFileSystemHandle {
+    #[inline]
+    pub fn from_raw(p: *mut c_void) -> Self {
+        Self(RawPtr::from_raw(p as *const c_void))
+    }
+
+    #[inline]
+    pub fn null() -> Self {
+        Self::from_raw(std::ptr::null_mut())
+    }
+
     pub fn is_null(&self) -> bool {
-        self.0.is_null()
+        self.as_raw().is_null()
+    }
+
+    #[inline]
+    pub fn as_raw(&self) -> *mut c_void {
+        self.0.as_mut_ptr()
     }
 }
 
 impl JindoWriterHandle {
+    #[inline]
+    pub fn from_raw(p: *mut c_void) -> Self {
+        Self(RawPtr::from_raw(p as *const c_void))
+    }
+
     #[allow(dead_code)]
     pub fn is_null(&self) -> bool {
-        self.0.is_null()
+        self.as_raw().is_null()
+    }
+
+    #[inline]
+    pub fn as_raw(&self) -> *mut c_void {
+        self.0.as_mut_ptr()
     }
 }
 
 impl JindoReaderHandle {
+    #[inline]
+    pub fn from_raw(p: *mut c_void) -> Self {
+        Self(RawPtr::from_raw(p as *const c_void))
+    }
+
     pub fn is_null(&self) -> bool {
-        self.0.is_null()
+        self.as_raw().is_null()
+    }
+
+    #[inline]
+    pub fn as_raw(&self) -> *mut c_void {
+        self.0.as_mut_ptr()
     }
 }
 
 impl JindoConfigHandle {
+    #[inline]
+    pub fn from_raw(p: *mut c_void) -> Self {
+        Self(RawPtr::from_raw(p as *const c_void))
+    }
+
     #[allow(dead_code)]
     pub fn is_null(&self) -> bool {
-        self.0.is_null()
+        self.as_raw().is_null()
+    }
+
+    #[inline]
+    pub fn as_raw(&self) -> *mut c_void {
+        self.0.as_mut_ptr()
     }
 }
 
@@ -118,11 +161,7 @@ pub struct JindoContentSummary {
 extern "C" {
     // Config functions
     pub fn jindo_config_new() -> *mut c_void;
-    pub fn jindo_config_set_string(
-        config: *mut c_void,
-        key: *const c_char,
-        value: *const c_char,
-    );
+    pub fn jindo_config_set_string(config: *mut c_void, key: *const c_char, value: *const c_char);
     pub fn jindo_config_set_bool(config: *mut c_void, key: *const c_char, value: bool);
     pub fn jindo_config_free(config: *mut c_void);
 
@@ -164,7 +203,12 @@ extern "C" {
         fs: *mut c_void,
         path: *const c_char,
         cb: Option<
-            extern "C" fn(status: JindoStatus, value: bool, err: *const c_char, userdata: *mut c_void),
+            extern "C" fn(
+                status: JindoStatus,
+                value: bool,
+                err: *const c_char,
+                userdata: *mut c_void,
+            ),
         >,
         userdata: *mut c_void,
     ) -> JindoStatus;
@@ -244,19 +288,40 @@ extern "C" {
     pub fn jindo_filesystem_open_writer_async(
         fs: *mut c_void,
         path: *const c_char,
-        cb: Option<extern "C" fn(status: JindoStatus, writer: *mut c_void, err: *const c_char, userdata: *mut c_void)>,
+        cb: Option<
+            extern "C" fn(
+                status: JindoStatus,
+                writer: *mut c_void,
+                err: *const c_char,
+                userdata: *mut c_void,
+            ),
+        >,
         userdata: *mut c_void,
     ) -> JindoStatus;
     pub fn jindo_filesystem_open_writer_append_async(
         fs: *mut c_void,
         path: *const c_char,
-        cb: Option<extern "C" fn(status: JindoStatus, writer: *mut c_void, err: *const c_char, userdata: *mut c_void)>,
+        cb: Option<
+            extern "C" fn(
+                status: JindoStatus,
+                writer: *mut c_void,
+                err: *const c_char,
+                userdata: *mut c_void,
+            ),
+        >,
         userdata: *mut c_void,
     ) -> JindoStatus;
     pub fn jindo_filesystem_open_reader_async(
         fs: *mut c_void,
         path: *const c_char,
-        cb: Option<extern "C" fn(status: JindoStatus, reader: *mut c_void, err: *const c_char, userdata: *mut c_void)>,
+        cb: Option<
+            extern "C" fn(
+                status: JindoStatus,
+                reader: *mut c_void,
+                err: *const c_char,
+                userdata: *mut c_void,
+            ),
+        >,
         userdata: *mut c_void,
     ) -> JindoStatus;
 
@@ -264,7 +329,14 @@ extern "C" {
         writer: *mut c_void,
         data: *const u8,
         len: usize,
-        cb: Option<extern "C" fn(status: JindoStatus, value: i64, err: *const c_char, userdata: *mut c_void)>,
+        cb: Option<
+            extern "C" fn(
+                status: JindoStatus,
+                value: i64,
+                err: *const c_char,
+                userdata: *mut c_void,
+            ),
+        >,
         userdata: *mut c_void,
     ) -> JindoStatus;
     pub fn jindo_writer_flush_async(
@@ -274,7 +346,14 @@ extern "C" {
     ) -> JindoStatus;
     pub fn jindo_writer_tell_async(
         writer: *mut c_void,
-        cb: Option<extern "C" fn(status: JindoStatus, value: i64, err: *const c_char, userdata: *mut c_void)>,
+        cb: Option<
+            extern "C" fn(
+                status: JindoStatus,
+                value: i64,
+                err: *const c_char,
+                userdata: *mut c_void,
+            ),
+        >,
         userdata: *mut c_void,
     ) -> JindoStatus;
     pub fn jindo_writer_close_async(
@@ -287,7 +366,14 @@ extern "C" {
         reader: *mut c_void,
         n: usize,
         scratch: *mut u8,
-        cb: Option<extern "C" fn(status: JindoStatus, value: i64, err: *const c_char, userdata: *mut c_void)>,
+        cb: Option<
+            extern "C" fn(
+                status: JindoStatus,
+                value: i64,
+                err: *const c_char,
+                userdata: *mut c_void,
+            ),
+        >,
         userdata: *mut c_void,
     ) -> JindoStatus;
     pub fn jindo_reader_pread_async(
@@ -295,7 +381,14 @@ extern "C" {
         offset: i64,
         n: usize,
         scratch: *mut u8,
-        cb: Option<extern "C" fn(status: JindoStatus, value: i64, err: *const c_char, userdata: *mut c_void)>,
+        cb: Option<
+            extern "C" fn(
+                status: JindoStatus,
+                value: i64,
+                err: *const c_char,
+                userdata: *mut c_void,
+            ),
+        >,
         userdata: *mut c_void,
     ) -> JindoStatus;
     pub fn jindo_reader_seek_async(
@@ -306,12 +399,26 @@ extern "C" {
     ) -> JindoStatus;
     pub fn jindo_reader_tell_async(
         reader: *mut c_void,
-        cb: Option<extern "C" fn(status: JindoStatus, value: i64, err: *const c_char, userdata: *mut c_void)>,
+        cb: Option<
+            extern "C" fn(
+                status: JindoStatus,
+                value: i64,
+                err: *const c_char,
+                userdata: *mut c_void,
+            ),
+        >,
         userdata: *mut c_void,
     ) -> JindoStatus;
     pub fn jindo_reader_get_file_length_async(
         reader: *mut c_void,
-        cb: Option<extern "C" fn(status: JindoStatus, value: i64, err: *const c_char, userdata: *mut c_void)>,
+        cb: Option<
+            extern "C" fn(
+                status: JindoStatus,
+                value: i64,
+                err: *const c_char,
+                userdata: *mut c_void,
+            ),
+        >,
         userdata: *mut c_void,
     ) -> JindoStatus;
     pub fn jindo_reader_close_async(

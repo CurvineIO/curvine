@@ -16,8 +16,9 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    // Only build FFI bindings if oss feature is enabled
-    if env::var("CARGO_FEATURE_OSS").is_err() {
+    // Only build FFI bindings if OSS-HDFS feature is enabled.
+    // Feature: `oss-hdfs` => env var: CARGO_FEATURE_OSS_HDFS
+    if env::var("CARGO_FEATURE_OSS_HDFS").is_err() {
         return;
     }
 
@@ -35,11 +36,11 @@ fn main() {
         return;
     }
 
-    // Single knob: JINDOSDK_HOME (defaults align with scripts/install-jindosdk.sh)
+    // Single knob: JINDOSDK_HOME (defaults to /opt/jindosdk)
     //
-    // Support both layouts:
-    // - Installed layout (scripts/install-jindosdk.sh): $JINDOSDK_HOME/{include,lib}/libjindosdk_c.so
-    // - Tarball layout (official JindoSDK): $JINDOSDK_HOME/{include,lib/native}/libjindosdk_c.so
+    // Supports both directory layouts:
+    // - $JINDOSDK_HOME/{include,lib}/libjindosdk_c.so
+    // - $JINDOSDK_HOME/{include,lib/native}/libjindosdk_c.so
     let home = env::var("JINDOSDK_HOME").unwrap_or_else(|_| "/opt/jindosdk".into());
     let home = home.trim_end_matches('/').to_string();
     let include_dir = format!("{}/include", home);
@@ -52,13 +53,24 @@ fn main() {
 
     let lib_name = "jindosdk_c";
 
+    // Get the output directory where the static library will be placed
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+
+    // Compile the FFI wrapper
     cc::Build::new()
         .cpp(true)
         .std("c++17")
         .file(&ffi_cpp)
         .include(&ffi_dir)
-        .include(include_dir)
+        .include(&include_dir)
         .compile("jindosdk_ffi");
+
+    // Explicitly add the output directory to the link search path
+    // This ensures dependent crates can find the static library
+    println!("cargo:rustc-link-search=native={}", out_dir);
+
+    // Explicitly link the static library
+    println!("cargo:rustc-link-lib=static=jindosdk_ffi");
 
     // Link JindoSDK C API
     println!("cargo:rustc-link-search=native={}", lib_dir);

@@ -210,9 +210,13 @@ impl Deref for S3Conf {
     }
 }
 
-/// OSS-HDFS configuration
+/// OSS-HDFS configuration (JindoSDK).
+///
+/// Notes:
+/// - The underlying JindoSDK configuration keys are prefixed with `fs.oss.*`.
+/// - This config struct is used by the `oss://` UFS implementation (`oss_hdfs` module).
 #[derive(Debug, Clone)]
-pub struct OssConf {
+pub struct OssHdfsConf {
     pub endpoint_url: String,
     pub access_key: String,
     pub secret_key: String,
@@ -223,7 +227,7 @@ pub struct OssConf {
     pub properties: HashMap<String, String>,
 }
 
-impl OssConf {
+impl OssHdfsConf {
     // Configuration keys
     pub const ENDPOINT: &'static str = "fs.oss.endpoint";
     pub const ACCESS_KEY_ID: &'static str = "fs.oss.accessKeyId";
@@ -237,7 +241,7 @@ impl OssConf {
     pub const DEFAULT_SECOND_LEVEL_DOMAIN_ENABLE: bool = true;
     pub const DEFAULT_DATA_LAKE_STORAGE_ENABLE: bool = true;
 
-    /// Create OssConf from configuration map
+    /// Create OssHdfsConf from configuration map
     pub fn with_map(properties: HashMap<String, String>) -> CommonResult<Self> {
         let map = ConfMap::new(properties);
 
@@ -266,7 +270,7 @@ impl OssConf {
     }
 }
 
-impl Deref for OssConf {
+impl Deref for OssHdfsConf {
     type Target = HashMap<String, String>;
 
     fn deref(&self) -> &Self::Target {

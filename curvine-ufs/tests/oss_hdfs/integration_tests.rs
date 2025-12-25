@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "oss")]
+#[cfg(feature = "oss-hdfs")]
 mod tests {
     use super::super::test_utils::{create_test_conf, create_test_path, get_test_bucket};
     use curvine_common::fs::{FileSystem, Path, Reader, Writer};
     use curvine_common::state::SetAttrOpts;
-    use curvine_ufs::OssConf;
-    use curvine_ufs::oss::OssHdfsFileSystem;
+    use curvine_ufs::oss_hdfs::OssHdfsFileSystem;
+    use curvine_ufs::OssHdfsConf;
     use orpc::sys::DataSlice;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -52,8 +52,11 @@ mod tests {
         // Path::new("oss:///") will fail because URI format is invalid (missing authority)
         // This is expected behavior - invalid paths should fail at Path creation
         let path_result = Path::new("oss:///");
-        assert!(path_result.is_err(), "Path::new should fail with invalid URI format");
-        
+        assert!(
+            path_result.is_err(),
+            "Path::new should fail with invalid URI format"
+        );
+
         // Test with a path that has empty authority (if possible)
         // For a valid path format, we test that OssHdfsFileSystem::new detects missing bucket
         if let Ok(path) = Path::new("oss://bucket/") {
@@ -67,8 +70,14 @@ mod tests {
     #[tokio::test]
     async fn test_filesystem_init_missing_endpoint() {
         let mut conf = HashMap::new();
-        conf.insert(OssConf::ACCESS_KEY_ID.to_string(), "test-key".to_string());
-        conf.insert(OssConf::ACCESS_KEY_SECRET.to_string(), "test-secret".to_string());
+        conf.insert(
+            OssHdfsConf::ACCESS_KEY_ID.to_string(),
+            "test-key".to_string(),
+        );
+        conf.insert(
+            OssHdfsConf::ACCESS_KEY_SECRET.to_string(),
+            "test-secret".to_string(),
+        );
 
         let path = Path::new("oss://bucket/").unwrap();
         let fs = OssHdfsFileSystem::new(&path, conf);
@@ -78,7 +87,10 @@ mod tests {
     #[tokio::test]
     async fn test_filesystem_init_missing_access_key() {
         let mut conf = HashMap::new();
-        conf.insert(OssConf::ENDPOINT.to_string(), "oss-cn-shanghai.aliyuncs.com".to_string());
+        conf.insert(
+            OssHdfsConf::ENDPOINT.to_string(),
+            "oss-cn-shanghai.aliyuncs.com".to_string(),
+        );
 
         let path = Path::new("oss://bucket/").unwrap();
         let fs = OssHdfsFileSystem::new(&path, conf);
@@ -113,8 +125,8 @@ mod tests {
 
         let fs = OssHdfsFileSystem::new(&path, conf.clone()).unwrap();
         assert_eq!(
-            fs.conf().get(OssConf::ENDPOINT),
-            conf.get(OssConf::ENDPOINT).map(|s| s.as_str())
+            fs.conf().get(OssHdfsConf::ENDPOINT),
+            conf.get(OssHdfsConf::ENDPOINT).map(|s| s.as_str())
         );
     }
 
@@ -135,7 +147,11 @@ mod tests {
         let test_dir = create_test_path(&bucket, "test_dir");
         println!("Creating directory: {}", test_dir.full_path());
         let result = fs.mkdir(&test_dir, false).await;
-        assert!(result.is_ok(), "Failed to create directory: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to create directory: {:?}",
+            result.err()
+        );
         println!("✓ Directory created successfully: {}", test_dir.full_path());
     }
 
@@ -151,7 +167,11 @@ mod tests {
 
         let test_dir = create_test_path(&bucket, "test_dir/nested/deep");
         let result = fs.mkdir(&test_dir, true).await;
-        assert!(result.is_ok(), "Failed to create nested directory: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to create nested directory: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
@@ -231,7 +251,10 @@ mod tests {
 
         let statuses = fs.list_status(&test_dir).await.unwrap();
         // Empty directory may return empty list or contain only "." entry
-        assert!(statuses.len() <= 1, "Empty directory should have at most one entry");
+        assert!(
+            statuses.len() <= 1,
+            "Empty directory should have at most one entry"
+        );
     }
 
     // ============================================================================
@@ -273,7 +296,11 @@ mod tests {
         assert!(result.is_ok(), "Failed to write data: {:?}", result.err());
 
         let result = writer.complete().await;
-        assert!(result.is_ok(), "Failed to complete write: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to complete write: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
@@ -294,7 +321,11 @@ mod tests {
         let result = writer
             .write_chunk(DataSlice::Bytes(bytes::Bytes::from(data)))
             .await;
-        assert!(result.is_ok(), "Failed to write large data: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to write large data: {:?}",
+            result.err()
+        );
 
         writer.complete().await.unwrap();
     }
@@ -508,7 +539,11 @@ mod tests {
 
         // Delete directory
         let result = fs.delete(&test_dir, true).await;
-        assert!(result.is_ok(), "Failed to delete directory: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to delete directory: {:?}",
+            result.err()
+        );
 
         // Verify deleted
         let exists = fs.exists(&test_dir).await.unwrap();
@@ -541,8 +576,14 @@ mod tests {
         assert!(result.is_ok(), "Failed to rename file: {:?}", result.err());
 
         // Verify
-        assert!(!fs.exists(&src_file).await.unwrap(), "Source file should not exist");
-        assert!(fs.exists(&dst_file).await.unwrap(), "Destination file should exist");
+        assert!(
+            !fs.exists(&src_file).await.unwrap(),
+            "Source file should not exist"
+        );
+        assert!(
+            fs.exists(&dst_file).await.unwrap(),
+            "Destination file should exist"
+        );
     }
 
     #[tokio::test]
@@ -562,11 +603,21 @@ mod tests {
 
         // Rename
         let result = fs.rename(&src_dir, &dst_dir).await;
-        assert!(result.is_ok(), "Failed to rename directory: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to rename directory: {:?}",
+            result.err()
+        );
 
         // Verify
-        assert!(!fs.exists(&src_dir).await.unwrap(), "Source directory should not exist");
-        assert!(fs.exists(&dst_dir).await.unwrap(), "Destination directory should exist");
+        assert!(
+            !fs.exists(&src_dir).await.unwrap(),
+            "Source directory should not exist"
+        );
+        assert!(
+            fs.exists(&dst_dir).await.unwrap(),
+            "Destination directory should exist"
+        );
     }
 
     // ============================================================================
@@ -632,7 +683,10 @@ mod tests {
 
         let nonexistent = create_test_path(&bucket, "nonexistent_status_12345");
         let result = fs.get_status(&nonexistent).await;
-        assert!(result.is_err(), "Should fail to get status of non-existent path");
+        assert!(
+            result.is_err(),
+            "Should fail to get status of non-existent path"
+        );
     }
 
     // ============================================================================
@@ -675,7 +729,11 @@ mod tests {
             ufs_mtime: None,
         };
         let result = fs.set_attr(&test_file, opts).await;
-        assert!(result.is_ok(), "Failed to set permission: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to set permission: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
@@ -753,7 +811,11 @@ mod tests {
             ufs_mtime: None,
         };
         let result = fs.set_attr(&test_file, opts).await;
-        assert!(result.is_ok(), "Failed to set attributes: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to set attributes: {:?}",
+            result.err()
+        );
     }
 
     // ============================================================================
@@ -990,7 +1052,7 @@ mod tests {
             }
         }
         reader.complete().await.unwrap();
-        
+
         let expected: Vec<u8> = [initial_data.as_slice(), append_data.as_slice()].concat();
         assert_eq!(all_data.len(), expected.len());
         assert_eq!(all_data, expected);
@@ -1044,11 +1106,7 @@ mod tests {
         let fs = OssHdfsFileSystem::new(&fs_path, conf).unwrap();
 
         let test_file = create_test_path(&bucket, "test_append_multiple");
-        let chunks: Vec<&[u8]> = vec![
-            b"First chunk\n",
-            b"Second chunk\n",
-            b"Third chunk\n",
-        ];
+        let chunks: Vec<&[u8]> = vec![b"First chunk\n", b"Second chunk\n", b"Third chunk\n"];
 
         // Create file with first chunk
         let mut writer = fs.create(&test_file, true).await.unwrap();
@@ -1112,7 +1170,10 @@ mod tests {
         assert!(result.is_err(), "Should fail with negative offset");
 
         let result = reader.pread(100, 10).await;
-        assert!(result.is_err(), "Should fail with offset beyond file length");
+        assert!(
+            result.is_err(),
+            "Should fail with offset beyond file length"
+        );
     }
 
     // ============================================================================
@@ -1220,7 +1281,8 @@ mod tests {
             let fs_clone = fs.clone();
             let bucket_clone = bucket.clone();
             let handle = tokio::spawn(async move {
-                let test_file = create_test_path(&bucket_clone, &format!("concurrent_writer_{}", i));
+                let test_file =
+                    create_test_path(&bucket_clone, &format!("concurrent_writer_{}", i));
                 let mut writer = fs_clone.create(&test_file, true).await.unwrap();
 
                 // Write multiple chunks
@@ -1256,7 +1318,8 @@ mod tests {
         let results: Vec<_> = futures::future::join_all(handles).await;
         for result in results {
             let (thread_id, data) = result.unwrap();
-            let expected_size = chunks_per_thread * format!("Thread {} chunk {}\n", thread_id, 0).len();
+            let expected_size =
+                chunks_per_thread * format!("Thread {} chunk {}\n", thread_id, 0).len();
             assert!(
                 data.len() >= expected_size,
                 "Thread {} should have written at least {} bytes, got {}",
@@ -1355,7 +1418,7 @@ mod tests {
                         .write_chunk(DataSlice::Bytes(bytes::Bytes::from(data)))
                         .await
                         .unwrap();
-                    
+
                     // Small delay to increase chance of concurrent access
                     tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                 }
@@ -1376,7 +1439,8 @@ mod tests {
                 Ok(thread_id) => {
                     success_count += 1;
                     // Verify file was created
-                    let test_file = create_test_path(&bucket, &format!("high_concurrent_{}", thread_id));
+                    let test_file =
+                        create_test_path(&bucket, &format!("high_concurrent_{}", thread_id));
                     assert!(
                         fs.exists(&test_file).await.unwrap(),
                         "File from writer {} should exist",
@@ -1390,8 +1454,7 @@ mod tests {
         }
 
         assert_eq!(
-            success_count,
-            num_writers,
+            success_count, num_writers,
             "All {} writers should complete successfully",
             num_writers
         );
@@ -1424,7 +1487,7 @@ mod tests {
                     .write_chunk(DataSlice::Bytes(bytes::Bytes::from(data)))
                     .await
                     .unwrap();
-                
+
                 // Flush after every few writes
                 if i % 3 == 0 {
                     writer.flush().await.unwrap();
@@ -1482,16 +1545,19 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let data = format!("Chunk {}\n", i);
                 let mut writer = writer_clone.lock().await;
-                
+
                 // Write and check position
                 writer
                     .write_chunk(DataSlice::Bytes(bytes::Bytes::from(data.clone())))
                     .await
                     .unwrap();
-                
+
                 // Call tell() concurrently
                 let pos = writer.tell().await.unwrap();
-                assert!(pos >= data.len() as i64, "Position should be at least data length");
+                assert!(
+                    pos >= data.len() as i64,
+                    "Position should be at least data length"
+                );
             });
             handles.push(handle);
         }
@@ -1558,7 +1624,8 @@ mod tests {
                 Ok(thread_id) => {
                     success_count += 1;
                     // Quick verification
-                    let test_file = create_test_path(&bucket, &format!("stress_writer_{}", thread_id));
+                    let test_file =
+                        create_test_path(&bucket, &format!("stress_writer_{}", thread_id));
                     assert!(
                         fs.exists(&test_file).await.unwrap(),
                         "File from stress writer {} should exist",
@@ -1572,8 +1639,7 @@ mod tests {
         }
 
         assert_eq!(
-            success_count,
-            num_writers,
+            success_count, num_writers,
             "All {} stress writers should complete without SIGSEGV",
             num_writers
         );
@@ -1631,7 +1697,10 @@ mod tests {
 
         // Verify file was written
         let status = fs.get_status(&test_file).await.unwrap();
-        assert!(status.len > 0, "File should contain data from concurrent writes");
+        assert!(
+            status.len > 0,
+            "File should contain data from concurrent writes"
+        );
     }
 
     #[tokio::test]
@@ -1735,8 +1804,7 @@ mod tests {
         }
 
         assert_eq!(
-            success_count,
-            num_tasks,
+            success_count, num_tasks,
             "All {} rapid fire writes should complete without SIGSEGV",
             num_tasks
         );
@@ -1851,8 +1919,7 @@ mod tests {
         }
 
         assert_eq!(
-            success_count,
-            num_writers,
+            success_count, num_writers,
             "All {} extreme concurrency writers should complete without SIGSEGV",
             num_writers
         );
@@ -1877,27 +1944,27 @@ mod tests {
             let bucket_clone = bucket.clone();
             let handle = tokio::spawn(async move {
                 let test_file = create_test_path(&bucket_clone, &format!("lifecycle_{}", i));
-                
+
                 // Create writer
                 let mut writer = fs_clone.create(&test_file, true).await.unwrap();
-                
+
                 // Write
                 let data = format!("Lifecycle test {}\n", i);
                 writer
                     .write_chunk(DataSlice::Bytes(bytes::Bytes::from(data)))
                     .await
                     .unwrap();
-                
+
                 // Flush
                 writer.flush().await.unwrap();
-                
+
                 // Complete
                 writer.complete().await.unwrap();
-                
+
                 // Verify
                 let status = fs_clone.get_status(&test_file).await.unwrap();
                 assert!(status.len > 0, "File should have content");
-                
+
                 i
             });
             handles.push(handle);

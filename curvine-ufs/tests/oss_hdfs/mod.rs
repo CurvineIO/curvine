@@ -12,13 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod ffi;
-mod oss_hdfs_filesystem;
-mod oss_hdfs_reader;
-mod oss_hdfs_writer;
-
-pub use self::oss_hdfs_filesystem::OssHdfsFileSystem;
-pub use self::oss_hdfs_reader::OssHdfsReader;
-pub use self::oss_hdfs_writer::OssHdfsWriter;
-
-pub const SCHEME: &str = "oss";
+mod integration_tests;
+mod test_utils;
