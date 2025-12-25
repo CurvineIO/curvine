@@ -73,8 +73,8 @@ pub fn options_to_flag(mount_option: &str) -> libc::c_ulong {
 }
 
 #[cfg(target_os = "macos")]
-pub fn options_to_flag(mount_option: &String) -> libc::c_long {
-    let mut flags = 0;
+pub fn options_to_flag(mount_option: &str) -> libc::c_long {
+    let mut flags: i32 = 0;
     if has_mount_opt(mount_option, "ro") {
         flags |= libc::MNT_RDONLY;
     }
@@ -90,14 +90,12 @@ pub fn options_to_flag(mount_option: &String) -> libc::c_long {
     if has_mount_opt(mount_option, "noatime") {
         flags |= libc::MNT_NOATIME;
     }
-    if has_mount_opt(mount_option, "dirsync") {
-        flags |= libc::MNT_DIRSYNC;
-    }
+    // MNT_DIRSYNC is not available on macOS, skip it
     if has_mount_opt(mount_option, "sync") {
         flags |= libc::MNT_SYNCHRONOUS;
     }
 
-    return flags;
+    flags as libc::c_long
 }
 
 pub fn fuse_mount_pure(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
@@ -159,12 +157,12 @@ fn fuse_mount_sys(mnt: &Path, conf: &FuseConf) -> IOResult<RawIO> {
         }
         #[cfg(target_os = "macos")]
         {
-            let mut c_options = CString::new(mount_options).unwrap();
+            let c_options = CString::new(mount_options).unwrap();
             libc::mount(
                 c_source.as_ptr(),
                 c_mountpoint.as_ptr(),
-                flags,
-                c_options.as_ptr() as *const libc::c_void,
+                flags as i32,
+                c_options.as_ptr() as *mut libc::c_void,
             )
         }
     };
@@ -200,14 +198,18 @@ fn detect_fusermount_bin() -> String {
 
 pub fn fuse_umount_pure(mnt: &Path) {
     let c_mountpoint = CString::new(mnt.to_str().unwrap()).unwrap();
-    let result = unsafe {
+    let result = {
         #[cfg(target_os = "linux")]
         {
-            libc::umount2(c_mountpoint.as_ptr(), 0)
+            unsafe { libc::umount2(c_mountpoint.as_ptr(), 0) }
         }
         #[cfg(target_os = "macos")]
         {
-            libc::umount(c_mountpoint.as_ptr())
+            // macOS uses unmount instead of umount
+            extern "C" {
+                fn unmount(path: *const libc::c_char, flags: libc::c_int) -> libc::c_int;
+            }
+            unsafe { unmount(c_mountpoint.as_ptr(), 0) }
         }
     };
 
