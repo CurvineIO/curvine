@@ -21,6 +21,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)](https://www.rust-lang.org)
 
 **Curvine** is a high-performance, concurrent distributed cache system written in Rust, designed for low-latency and high-throughput workloads.
+**Name Origin** The name "Curvine" is derived from the concatenation of the words "Curvature" and "Engine". It refers to an accelerator for spacecraft in the science fiction novel The Three-Body Problem, symbolizing extremely high performance.
 
 
 ## 📚 Documentation Resources

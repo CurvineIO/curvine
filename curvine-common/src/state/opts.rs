@@ -323,8 +323,8 @@ impl MkdirOptsBuilder {
     }
 
     pub fn acl(mut self, uid: u32, gid: u32, mode: u32) -> Self {
-        self.owner = sys::get_username_by_uid(uid).unwrap_or("".to_string());
-        self.group = sys::get_groupname_by_gid(gid).unwrap_or("".to_string());
+        self.owner = sys::get_username_by_uid(uid).unwrap_or(uid.to_string());
+        self.group = sys::get_groupname_by_gid(gid).unwrap_or(gid.to_string());
         self.mode = mode;
         self
     }

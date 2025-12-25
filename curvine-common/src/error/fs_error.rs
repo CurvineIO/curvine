@@ -198,6 +198,16 @@ impl FsError {
         Self::FileAlreadyExists(ErrorImpl::with_source(msg.into()))
     }
 
+    pub fn parent_not_dir(path: impl AsRef<str>) -> Self {
+        let msg = format!("{} is not a directory", path.as_ref());
+        Self::ParentNotDir(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn dir_not_empty(path: impl AsRef<str>) -> Self {
+        let msg = format!("{} is not empty", path.as_ref());
+        Self::DirNotEmpty(ErrorImpl::with_source(msg.into()))
+    }
+
     pub fn io(error: io::Error) -> Self {
         Self::IO(ErrorImpl::with_source(error))
     }

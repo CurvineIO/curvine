@@ -656,11 +656,7 @@ impl fs::FileSystem for CurvineFileSystem {
             | "security.selinux"
             | "system.posix_acl_access"
             | "system.posix_acl_default" => {
-                // Silently ignore system extended attributes without logging
-                // Return ENODATA error to indicate the attribute doesn't exist
-                // This is the correct FUSE protocol response for non-existent attributes
-                // Empty error message to avoid any logging overhead
-                return err_fuse!(libc::EOPNOTSUPP, "not support get_xattr {}", name);
+                return err_fuse!(libc::ENODATA, "get_xattr {}", name);
             }
             _ => {
                 // Continue with normal processing for other attributes
@@ -992,7 +988,11 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut opts = MkdirOptsBuilder::with_conf(&self.fs.conf().client);
         // Apply requested mode and ownership to directory if provided
         if op.arg.mode != 0 {
-            opts = opts.acl(op.header.uid, op.header.gid, op.arg.mode & 0o7777)
+            opts = opts.acl(
+                op.header.uid,
+                op.header.gid,
+                op.arg.mode & 0o7777 & !op.arg.umask,
+            )
         }
 
         let status = match self.fs.fuse_mkdir(&path, opts.build()).await {
@@ -1106,7 +1106,11 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut opts = CreateFileOptsBuilder::with_conf(&self.fs.conf().client);
         // Apply requested mode and ownership to the new file if provided
         if op.arg.mode != 0 {
-            opts = opts.acl(op.header.uid, op.header.gid, op.arg.mode & 0o7777)
+            opts = opts.acl(
+                op.header.uid,
+                op.header.gid,
+                op.arg.mode & 0o7777 & !op.arg.umask,
+            )
         }
         let handle = self
             .state

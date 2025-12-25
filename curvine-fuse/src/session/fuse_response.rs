@@ -116,7 +116,7 @@ impl FuseResponse {
 
             Err(e) => {
                 let e = e.into();
-                if self.debug || e.errno != libc::ENOENT {
+                if self.debug || (e.errno != libc::ENOENT && e.errno != libc::ENODATA) {
                     warn!("send_rep unique {}: {:?}", self.unique, e);
                 }
                 ResponseData::create(self.unique, e.errno, vec![])
@@ -156,7 +156,7 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                if self.debug || e.errno != libc::ENOENT {
+                if self.debug || (e.errno != libc::ENOENT && e.errno != libc::ENODATA) {
                     warn!("send_buf unique {}: {}", self.unique, e);
                 }
                 ResponseData::create(self.unique, e.errno, vec![])
@@ -177,7 +177,7 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                if self.debug || e.errno != libc::ENOENT {
+                if self.debug || (e.errno != libc::ENOENT && e.errno != libc::ENODATA) {
                     warn!("send_data unique {}: {}", self.unique, e);
                 }
                 ResponseData::create(self.unique, e.errno, vec![])
