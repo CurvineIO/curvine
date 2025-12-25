@@ -271,7 +271,11 @@ impl UnifiedFileSystem {
                 }
 
                 WriteType::Through => {
-                    let writer = mount.ufs.create(&ufs_path, flags.overwrite()).await?;
+                    let writer = if flags.append() {
+                        mount.ufs.append(&ufs_path).await?
+                    } else {
+                        mount.ufs.create(&ufs_path, flags.overwrite()).await?
+                    };
                     Ok(writer)
                 }
 

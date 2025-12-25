@@ -160,4 +160,27 @@ impl OpenFlags {
     pub fn value(self) -> u32 {
         self.bits()
     }
+
+    pub fn access_mark(&self) -> String {
+        let mut mark = String::with_capacity(5);
+
+        match self.access_mode() {
+            OpenFlags::RDONLY => mark.push('R'),
+            OpenFlags::WRONLY => mark.push('W'),
+            OpenFlags::RDWR => mark.push_str("RW"),
+            _ => mark.push('N'),
+        }
+
+        if self.create() {
+            mark.push('C');
+        }
+
+        if self.append() {
+            mark.push('A');
+        } else if self.truncate() {
+            mark.push('T');
+        }
+
+        mark
+    }
 }
