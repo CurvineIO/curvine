@@ -20,7 +20,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)](https://www.rust-lang.org)
 
-**Curvine** The name "Curvine" is derived from the concatenation of the words "Curvature" and "Engine". It refers to an accelerator for spacecraft in the science fiction novel The Three-Body Problem, symbolizing extremely high performance.
+The name "Curvine" is derived from the concatenation of the words "Curvature" and "Engine". It refers to an accelerator for spacecraft in the science fiction novel The Three-Body Problem, symbolizing extremely high performance.
 **Curvine** is a high-performance, concurrent distributed cache system written in Rust, designed for low-latency and high-throughput workloads.
 
 
