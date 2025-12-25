@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use crate::fs::state::file_handle::FileHandle;
+use crate::fs::state::DirHandle;
 use crate::fs::state::{NodeAttr, NodeMap};
-use crate::fs::{FuseReader, FuseWriter};
+use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
-use crate::{err_fuse, FuseResult};
+use crate::{err_fuse, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::FuseConf;
 use curvine_common::fs::{FileSystem, Path};
@@ -31,6 +32,7 @@ use tokio::sync::Mutex;
 pub struct NodeState {
     node_map: RwLock<NodeMap>,
     handles: RwLockHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
+    dir_handles: RwLockHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
     fh_creator: AtomicCounter,
     fs: UnifiedFileSystem,
     conf: FuseConf,
@@ -44,6 +46,7 @@ impl NodeState {
         Self {
             node_map: RwLock::new(node_map),
             handles: RwLockHashMap::default(),
+            dir_handles: RwLockHashMap::default(),
             fs,
             fh_creator: AtomicCounter::new(0),
             conf,
@@ -313,13 +316,15 @@ impl NodeState {
         let lock = self.handles.read();
         if let Some(v) = lock.get(&ino) {
             if let Some(handle) = v.get(&fh) {
-                Ok(handle.clone())
-            } else {
-                err_fuse!(libc::EBADF, "Ino {} fh {}  not found handle", ino, fh)
+                return Ok(handle.clone());
             }
-        } else {
-            err_fuse!(libc::EBADF, "Ino {} fh {}  not found handle", ino, fh)
         }
+        err_fuse!(
+            libc::EBADF,
+            "node_id {} file_handle {}  not found handle",
+            ino,
+            fh
+        )
     }
 
     pub fn remove_handle(&self, ino: u64, fh: u64) -> Option<Arc<FileHandle>> {
@@ -379,6 +384,56 @@ impl NodeState {
 
     pub fn is_pending_delete(&self, ino: u64) -> bool {
         self.node_read().is_pending_delete(ino)
+    }
+
+    pub fn find_dir_handle(&self, ino: u64, fh: u64) -> FuseResult<Arc<DirHandle>> {
+        let lock = self.dir_handles.read();
+        if let Some(v) = lock.get(&ino) {
+            if let Some(handle) = v.get(&fh) {
+                return Ok(handle.clone());
+            }
+        }
+
+        err_fuse!(
+            libc::EBADF,
+            "node_id {} dir_handle {}  not found dir handle",
+            ino,
+            fh
+        )
+    }
+
+    pub fn remove_dir_handle(&self, ino: u64, fh: u64) -> Option<Arc<DirHandle>> {
+        let mut lock = self.dir_handles.write();
+        if let Some(map) = lock.get_mut(&ino) {
+            let handle = map.remove(&fh);
+
+            if map.is_empty() {
+                lock.remove(&ino);
+            }
+
+            handle
+        } else {
+            None
+        }
+    }
+
+    pub async fn new_dir_handle(&self, ino: u64, path: &Path) -> FuseResult<Arc<DirHandle>> {
+        let list = self.fs.list_status(path).await?;
+
+        let mut res = Vec::with_capacity(list.len() + 2);
+        res.push(CurvineFileSystem::new_dot_status(FUSE_CURRENT_DIR));
+        res.push(CurvineFileSystem::new_dot_status(FUSE_PARENT_DIR));
+        for status in list {
+            res.push(status);
+        }
+
+        let handle = Arc::new(DirHandle::new(ino, self.next_fh(), res));
+        let mut lock = self.dir_handles.write();
+        lock.entry(ino)
+            .or_default()
+            .insert(handle.fh, handle.clone());
+
+        Ok(handle)
     }
 }
 

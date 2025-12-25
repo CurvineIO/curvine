@@ -157,7 +157,7 @@ impl CurvineFileSystem {
         }
     }
 
-    fn new_dot_status(name: &str) -> FileStatus {
+    pub fn new_dot_status(name: &str) -> FileStatus {
         FileStatus::with_name(FUSE_UNKNOWN_INO as i64, name.to_string(), true)
     }
 
@@ -196,19 +196,6 @@ impl CurvineFileSystem {
         }
 
         Ok(())
-    }
-
-    async fn fs_list_status(&self, path: &Path) -> FuseResult<Vec<FileStatus>> {
-        let list = self.fs.list_status(path).await?;
-
-        let mut res = Vec::with_capacity(list.len() + 2);
-        res.push(Self::new_dot_status(FUSE_CURRENT_DIR));
-        res.push(Self::new_dot_status(FUSE_PARENT_DIR));
-        for status in list {
-            res.push(status);
-        }
-
-        Ok(res)
     }
 
     async fn fs_get_status(&self, path: &Path) -> FuseResult<FileStatus> {
@@ -267,18 +254,11 @@ impl CurvineFileSystem {
         arg: &fuse_read_in,
         plus: bool,
     ) -> FuseResult<FuseDirentList> {
-        let path = self.state.get_path(header.nodeid)?;
-        let dir_status = self.fs_get_status(&path).await?;
+        let handle = self.state.find_dir_handle(header.nodeid, arg.fh)?;
 
-        // Check directory read permission for reading directory contents
-        self.check_access_permissions(&dir_status, header, libc::R_OK as u32)?;
-
-        let list = self.fs_list_status(&path).await?;
-
-        let start_index = arg.offset as usize;
         let mut map = self.state.node_write();
         let mut res = FuseDirentList::new(arg);
-        for (index, status) in list.iter().enumerate().skip(start_index) {
+        for (index, status) in handle.get_list(arg.offset as usize) {
             let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
                 map.do_lookup(header.nodeid, Some(&status.name), status)?
             } else {
@@ -941,10 +921,13 @@ impl fs::FileSystem for CurvineFileSystem {
         // Use existing permission check function to verify access
         self.check_access_permissions(&dir_status, op.header, action.acl_mask())?;
 
-        let fh = self.state.next_fh();
+        let handle = self
+            .state
+            .new_dir_handle(op.header.nodeid, &dir_path)
+            .await?;
         let open_flags = Self::fill_open_flags(&self.conf, op.arg.flags);
         let attr = fuse_open_out {
-            fh,
+            fh: handle.fh,
             open_flags,
             padding: 0,
         };
@@ -1028,7 +1011,10 @@ impl fs::FileSystem for CurvineFileSystem {
 
     // Release the directory, curvine does not need to implement this interface
     async fn release_dir(&self, op: ReleaseDir<'_>) -> FuseResult<()> {
-        let _ = self.state.get_path(op.header.nodeid)?;
+        match self.state.remove_dir_handle(op.header.nodeid, op.arg.fh) {
+            Some(_) => (),
+            None => return err_fuse!(libc::EBADF),
+        };
         Ok(())
     }
 
