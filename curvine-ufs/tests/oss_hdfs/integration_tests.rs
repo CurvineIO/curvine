@@ -223,7 +223,9 @@ mod tests {
         fs.mkdir(&test_dir, false).await.unwrap();
 
         // Create a file
-        let test_file = Path::new(&format!("{}/test_file.txt", test_dir.path())).unwrap();
+        // IMPORTANT: `test_dir.path()` is a path-only form like "/dir", not a full "oss://bucket/dir".
+        // For OSS-HDFS we must construct a full URI path.
+        let test_file = Path::new(&format!("{}/test_file.txt", test_dir.full_path())).unwrap();
         let mut writer = fs.create(&test_file, true).await.unwrap();
         writer
             .write_chunk(DataSlice::Bytes(bytes::Bytes::from("test content")))
@@ -378,14 +380,10 @@ mod tests {
 
         // Read file
         let mut reader = fs.open(&test_file).await.unwrap();
-        let chunk = reader.read_chunk0().await.unwrap();
+        let chunk = reader.async_read(None).await.unwrap();
 
-        let read_data = match chunk {
-            DataSlice::Bytes(b) => b,
-            _ => panic!("Unexpected data slice type"),
-        };
-
-        assert_eq!(read_data.as_ref(), test_data);
+        let read_data = chunk.as_slice();
+        assert_eq!(read_data, test_data);
         reader.complete().await.unwrap();
     }
 
@@ -409,11 +407,9 @@ mod tests {
         let mut reader = fs.open(&test_file).await.unwrap();
         assert_eq!(reader.len(), 0, "Empty file should have length 0");
 
-        let chunk = reader.read_chunk0().await.unwrap();
-        match chunk {
-            DataSlice::Empty => {} // Expected for empty file
-            _ => panic!("Empty file should return Empty DataSlice"),
-        }
+        let chunk = reader.async_read(None).await.unwrap();
+        // Empty file should return empty data
+        assert_eq!(chunk.len(), 0, "Empty file should return empty data");
 
         reader.complete().await.unwrap();
     }
@@ -458,13 +454,9 @@ mod tests {
         let mut reader = fs.open(&test_file).await.unwrap();
         reader.seek(10).await.unwrap();
 
-        let chunk = reader.read_chunk0().await.unwrap();
-        let read_data = match chunk {
-            DataSlice::Bytes(b) => b,
-            _ => panic!("Unexpected data slice type"),
-        };
-
-        assert_eq!(read_data.as_ref(), b"ABCDEF");
+        let chunk = reader.async_read(None).await.unwrap();
+        let read_data = chunk.as_slice();
+        assert_eq!(read_data, b"ABCDEF");
         reader.complete().await.unwrap();
     }
 
@@ -926,7 +918,7 @@ mod tests {
         let pos = reader.tell().await.unwrap();
         assert_eq!(pos, 0);
 
-        reader.read_chunk0().await.unwrap();
+        reader.async_read(None).await.unwrap();
         let pos = reader.tell().await.unwrap();
         assert!(pos > 0);
 
@@ -1019,12 +1011,9 @@ mod tests {
 
         // Verify initial file content
         let mut reader = fs.open(&test_file).await.unwrap();
-        let chunk = reader.read_chunk0().await.unwrap();
-        let read_data = match chunk {
-            DataSlice::Bytes(b) => b,
-            _ => panic!("Unexpected data slice type"),
-        };
-        assert_eq!(read_data.as_ref(), initial_data);
+        let chunk = reader.async_read(None).await.unwrap();
+        let read_data = chunk.as_slice();
+        assert_eq!(read_data, initial_data);
         reader.complete().await.unwrap();
 
         // Append data to existing file
@@ -1044,11 +1033,10 @@ mod tests {
         let mut reader = fs.open(&test_file).await.unwrap();
         let mut all_data = Vec::new();
         loop {
-            let chunk = reader.read_chunk0().await.unwrap();
+            let chunk = reader.async_read(None).await.unwrap();
             match chunk {
                 DataSlice::Empty => break,
-                DataSlice::Bytes(b) => all_data.extend_from_slice(&b),
-                _ => panic!("Unexpected data slice type"),
+                _ => all_data.extend_from_slice(chunk.as_slice()),
             }
         }
         reader.complete().await.unwrap();
@@ -1086,12 +1074,9 @@ mod tests {
 
         // Verify file was created with correct content
         let mut reader = fs.open(&test_file).await.unwrap();
-        let chunk = reader.read_chunk0().await.unwrap();
-        let read_data = match chunk {
-            DataSlice::Bytes(b) => b,
-            _ => panic!("Unexpected data slice type"),
-        };
-        assert_eq!(read_data.as_ref(), append_data);
+        let chunk = reader.async_read(None).await.unwrap();
+        let read_data = chunk.as_slice();
+        assert_eq!(read_data, append_data);
         reader.complete().await.unwrap();
     }
 
@@ -1130,11 +1115,10 @@ mod tests {
         let mut reader = fs.open(&test_file).await.unwrap();
         let mut all_data = Vec::new();
         loop {
-            let chunk = reader.read_chunk0().await.unwrap();
+            let chunk = reader.async_read(None).await.unwrap();
             match chunk {
                 DataSlice::Empty => break,
-                DataSlice::Bytes(b) => all_data.extend_from_slice(&b),
-                _ => panic!("Unexpected data slice type"),
+                _ => all_data.extend_from_slice(chunk.as_slice()),
             }
         }
         reader.complete().await.unwrap();
@@ -1196,7 +1180,7 @@ mod tests {
         assert!(fs.exists(&test_dir).await.unwrap());
 
         // 2. Create and write file
-        let test_file = Path::new(&format!("{}/test.txt", test_dir.path())).unwrap();
+        let test_file = Path::new(&format!("{}/test.txt", test_dir.full_path())).unwrap();
         let mut writer = fs.create(&test_file, true).await.unwrap();
         let data = b"Integration test data";
         writer
@@ -1215,12 +1199,9 @@ mod tests {
 
         // 5. Read file
         let mut reader = fs.open(&test_file).await.unwrap();
-        let chunk = reader.read_chunk0().await.unwrap();
-        let read_data = match chunk {
-            DataSlice::Bytes(b) => b,
-            _ => panic!("Unexpected data slice type"),
-        };
-        assert_eq!(read_data.as_ref(), data);
+        let chunk = reader.async_read(None).await.unwrap();
+        let read_data = chunk.as_slice();
+        assert_eq!(read_data, data);
         reader.complete().await.unwrap();
 
         // 6. Set attributes
@@ -1241,7 +1222,7 @@ mod tests {
         fs.set_attr(&test_file, opts).await.unwrap();
 
         // 7. Rename file
-        let renamed_file = Path::new(&format!("{}/renamed.txt", test_dir.path())).unwrap();
+        let renamed_file = Path::new(&format!("{}/renamed.txt", test_dir.full_path())).unwrap();
         fs.rename(&test_file, &renamed_file).await.unwrap();
         assert!(!fs.exists(&test_file).await.unwrap());
         assert!(fs.exists(&renamed_file).await.unwrap());
@@ -1300,11 +1281,10 @@ mod tests {
                 let mut reader = fs_clone.open(&test_file).await.unwrap();
                 let mut all_data = Vec::new();
                 loop {
-                    let chunk = reader.read_chunk0().await.unwrap();
+                    let chunk = reader.async_read(None).await.unwrap();
                     match chunk {
                         DataSlice::Empty => break,
-                        DataSlice::Bytes(b) => all_data.extend_from_slice(&b),
-                        _ => panic!("Unexpected data slice type"),
+                        _ => all_data.extend_from_slice(chunk.as_slice()),
                     }
                 }
                 reader.complete().await.unwrap();
@@ -1374,11 +1354,10 @@ mod tests {
         let mut reader = fs.open(&test_file).await.unwrap();
         let mut all_data = Vec::new();
         loop {
-            let chunk = reader.read_chunk0().await.unwrap();
+            let chunk = reader.async_read(None).await.unwrap();
             match chunk {
                 DataSlice::Empty => break,
-                DataSlice::Bytes(b) => all_data.extend_from_slice(&b),
-                _ => panic!("Unexpected data slice type"),
+                _ => all_data.extend_from_slice(chunk.as_slice()),
             }
         }
         reader.complete().await.unwrap();
@@ -1426,7 +1405,7 @@ mod tests {
                 writer.flush().await.unwrap();
                 writer.complete().await.unwrap();
 
-                i
+                (i, test_file)
             });
             handles.push(handle);
         }
@@ -1436,11 +1415,9 @@ mod tests {
         let mut success_count = 0;
         for result in results {
             match result {
-                Ok(thread_id) => {
+                Ok((thread_id, test_file)) => {
                     success_count += 1;
                     // Verify file was created
-                    let test_file =
-                        create_test_path(&bucket, &format!("high_concurrent_{}", thread_id));
                     assert!(
                         fs.exists(&test_file).await.unwrap(),
                         "File from writer {} should exist",
@@ -1511,11 +1488,10 @@ mod tests {
         let mut reader = fs.open(&test_file).await.unwrap();
         let mut all_data = Vec::new();
         loop {
-            let chunk = reader.read_chunk0().await.unwrap();
+            let chunk = reader.async_read(None).await.unwrap();
             match chunk {
                 DataSlice::Empty => break,
-                DataSlice::Bytes(b) => all_data.extend_from_slice(&b),
-                _ => panic!("Unexpected data slice type"),
+                _ => all_data.extend_from_slice(chunk.as_slice()),
             }
         }
         reader.complete().await.unwrap();
@@ -1611,7 +1587,7 @@ mod tests {
                 let status = fs_clone.get_status(&test_file).await.unwrap();
                 assert!(status.len > 0, "File should have content");
 
-                i
+                (i, test_file)
             });
             handles.push(handle);
         }
@@ -1621,11 +1597,8 @@ mod tests {
         let mut success_count = 0;
         for result in results {
             match result {
-                Ok(thread_id) => {
+                Ok((thread_id, test_file)) => {
                     success_count += 1;
-                    // Quick verification
-                    let test_file =
-                        create_test_path(&bucket, &format!("stress_writer_{}", thread_id));
                     assert!(
                         fs.exists(&test_file).await.unwrap(),
                         "File from stress writer {} should exist",
