@@ -23,3 +23,6 @@ pub use self::node_map::NodeMap;
 
 mod file_handle;
 pub use self::file_handle::FileHandle;
+
+mod dir_handle;
+pub use self::dir_handle::DirHandle;
