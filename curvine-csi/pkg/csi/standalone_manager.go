@@ -37,6 +37,7 @@ const (
 	StandaloneLabelNode      = "curvine.io/node"
 
 	// StandaloneImage is the default image for Standalone
+	// This will be overridden by getCurrentPodImage() if available
 	StandaloneImage = "ghcr.io/curvineio/curvine-csi:latest"
 
 	// StandaloneMountPath is the mount path inside Standalone
@@ -62,6 +63,9 @@ const (
 	// This ensures in-flight I/O operations complete before unmount
 	StandalonePreStopSleepSeconds = 5
 
+	// EnvStandaloneImage is the environment variable for Standalone pod image
+	EnvStandaloneImage = "STANDALONE_IMAGE"
+
 	// EnvStandaloneServiceAccount is the environment variable for Standalone pod ServiceAccount
 	EnvStandaloneServiceAccount = "STANDALONE_SERVICE_ACCOUNT"
 
@@ -80,7 +84,8 @@ const (
 
 // StandaloneOptions contains options for creating a Standalone
 type StandaloneOptions struct {
-	ClusterID   string
+	ClusterID   string // Used for logging
+	MountKey    string // Used as key for pod name and mount path (master-addrs + fs-path)
 	MasterAddrs string
 	FSPath      string
 	NodeName    string
@@ -124,30 +129,30 @@ type StandaloneMountManager interface {
 	// Returns the host mount path where FUSE is mounted
 	EnsureStandalone(ctx context.Context, opts *StandaloneOptions) (string, error)
 
-	// DeleteStandalone deletes the Standalone for the given cluster on this node
-	DeleteStandalone(ctx context.Context, clusterID string) error
+	// DeleteStandalone deletes the Standalone for the given mount key on this node
+	DeleteStandalone(ctx context.Context, mountKey string) error
 
 	// GetStandaloneStatus returns the status of the Standalone
-	GetStandaloneStatus(ctx context.Context, clusterID string) (*StandaloneStatus, error)
+	GetStandaloneStatus(ctx context.Context, mountKey string) (*StandaloneStatus, error)
 
 	// WaitForStandaloneReady waits for the Standalone to be ready
-	WaitForStandaloneReady(ctx context.Context, clusterID string, timeout time.Duration) error
+	WaitForStandaloneReady(ctx context.Context, mountKey string, timeout time.Duration) error
 
 	// AddVolumeRef adds a volume reference to the Standalone
-	AddVolumeRef(ctx context.Context, clusterID, volumeID string) error
+	AddVolumeRef(ctx context.Context, mountKey, volumeID string) error
 
 	// RemoveVolumeRef removes a volume reference from the Standalone
 	// Returns true if the Standalone should be deleted (ref count = 0)
-	RemoveVolumeRef(ctx context.Context, clusterID, volumeID string) (bool, error)
+	RemoveVolumeRef(ctx context.Context, mountKey, volumeID string) (bool, error)
 
 	// RecoverState recovers state from ConfigMap on startup
 	RecoverState(ctx context.Context) error
 
-	// GetHostMountPath returns the host mount path for a cluster
-	GetHostMountPath(clusterID string) string
+	// GetHostMountPath returns the host mount path for a mount key
+	GetHostMountPath(mountKey string) string
 
-	// FindClusterIDByVolumeID finds the clusterID that contains the given volumeID
-	FindClusterIDByVolumeID(volumeID string) (string, bool)
+	// FindMountKeyByVolumeID finds the mountKey that contains the given volumeID
+	FindMountKeyByVolumeID(volumeID string) (string, bool)
 
 	// GetState returns a copy of the current state (for garbage collection)
 	GetState() *StandaloneState
@@ -165,10 +170,50 @@ type standaloneMountManagerImpl struct {
 	state *StandaloneState
 }
 
+// getCurrentPodImage attempts to get the image of the current CSI node pod
+// Returns empty string if unable to determine (fallback to default)
+func getCurrentPodImage(client kubernetes.Interface, namespace string) string {
+	// Get pod name from HOSTNAME environment variable (set by Kubernetes)
+	podName := os.Getenv("HOSTNAME")
+	if podName == "" {
+		klog.V(5).Infof("HOSTNAME not set, cannot determine current pod image")
+		return ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Query current pod to get its image
+	pod, err := client.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		klog.V(5).Infof("Failed to get current pod %s/%s: %v", namespace, podName, err)
+		return ""
+	}
+
+	// Find the csi-plugin container image
+	for _, container := range pod.Spec.Containers {
+		if container.Name == "csi-plugin" {
+			klog.Infof("Found current pod image: %s (from pod %s/%s)", container.Image, namespace, podName)
+			return container.Image
+		}
+	}
+	klog.Warningf("No csi-plugin container found in pod %s/%s, using default image", namespace, podName)
+	return ""
+}
+
 // NewStandaloneMountManager creates a new StandaloneMountManager
 func NewStandaloneManager(client kubernetes.Interface, namespace, nodeName, image, serviceAccountName string) StandaloneMountManager {
 	if image == "" {
-		image = StandaloneImage
+		// Try to get current pod image first
+		currentImage := getCurrentPodImage(client, namespace)
+		if currentImage != "" {
+			image = currentImage
+			klog.Infof("Using current pod image as Standalone image: %s", image)
+		} else {
+			// Fallback to default
+			image = StandaloneImage
+			klog.Infof("Using default Standalone image: %s", image)
+		}
 	}
 	return &standaloneMountManagerImpl{
 		client:             client,
@@ -182,16 +227,16 @@ func NewStandaloneManager(client kubernetes.Interface, namespace, nodeName, imag
 	}
 }
 
-// GetHostMountPath returns the host mount path for a cluster
-func (m *standaloneMountManagerImpl) GetHostMountPath(clusterID string) string {
-	return filepath.Join(HostMountBaseDir, clusterID, "fuse-mount")
+// GetHostMountPath returns the host mount path for a mount key
+func (m *standaloneMountManagerImpl) GetHostMountPath(mountKey string) string {
+	return filepath.Join(HostMountBaseDir, mountKey, "fuse-mount")
 }
 
-// getStandaloneName returns the name of the Standalone for a cluster
-func (m *standaloneMountManagerImpl) getStandaloneName(clusterID string) string {
-	// Use short cluster ID and node name hash for uniqueness
+// getStandaloneName returns the name of the Standalone for a mount key
+func (m *standaloneMountManagerImpl) getStandaloneName(mountKey string) string {
+	// Use short mount key and node name hash for uniqueness
 	nodeHash := fmt.Sprintf("%x", hashString(m.nodeName))[:8]
-	return fmt.Sprintf("%s%s-%s", StandaloneNamePrefix, clusterID[:8], nodeHash)
+	return fmt.Sprintf("%s%s-%s", StandaloneNamePrefix, mountKey[:8], nodeHash)
 }
 
 // hashString returns a simple hash of a string
@@ -206,10 +251,10 @@ func hashString(s string) uint32 {
 // EnsureStandalone ensures a Standalone exists for the given cluster
 // Implements self-healing: if pod is unhealthy, it will be deleted and recreated
 func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts *StandaloneOptions) (string, error) {
-	podName := m.getStandaloneName(opts.ClusterID)
-	hostMountPath := m.GetHostMountPath(opts.ClusterID)
+	podName := m.getStandaloneName(opts.MountKey)
+	hostMountPath := m.GetHostMountPath(opts.MountKey)
 
-	klog.Infof("EnsureStandalone: clusterID=%s, podName=%s, hostMountPath=%s", opts.ClusterID, podName, hostMountPath)
+	klog.Infof("EnsureStandalone: clusterID=%s, mountKey=%s, fsPath=%s, podName=%s, hostMountPath=%s", opts.ClusterID, opts.MountKey, opts.FSPath, podName, hostMountPath)
 
 	// Check if Standalone already exists
 	existingPod, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{})
@@ -230,7 +275,7 @@ func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts 
 			return hostMountPath, nil
 		} else {
 			// Pod exists but not ready, wait for it
-			if err := m.WaitForStandaloneReady(ctx, opts.ClusterID, StandaloneReadyTimeout); err != nil {
+			if err := m.WaitForStandaloneReady(ctx, opts.MountKey, StandaloneReadyTimeout); err != nil {
 				// If waiting times out, try self-healing
 				klog.Warningf("Standalone %s not ready after waiting, attempting self-healing", podName)
 				if delErr := m.deleteStandaloneAndWait(ctx, podName); delErr != nil {
@@ -252,7 +297,7 @@ func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts 
 
 	// Create Standalone
 	pod := m.buildStandalone(opts, podName, hostMountPath)
-	klog.Infof("Creating Standalone %s for cluster %s", podName, opts.ClusterID)
+	klog.Infof("Creating Standalone %s for mountKey %s (clusterID: %s, fsPath: %s)", podName, opts.MountKey, opts.ClusterID, opts.FSPath)
 
 	_, err = m.client.CoreV1().Pods(m.namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
@@ -264,13 +309,13 @@ func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts 
 	}
 
 	// Wait for pod to be ready
-	if err := m.WaitForStandaloneReady(ctx, opts.ClusterID, StandaloneReadyTimeout); err != nil {
+	if err := m.WaitForStandaloneReady(ctx, opts.MountKey, StandaloneReadyTimeout); err != nil {
 		return "", fmt.Errorf("Standalone %s not ready after creation: %v", podName, err)
 	}
 
-	// Update state
+	// Update state (use mountKey as key)
 	m.mu.Lock()
-	m.state.Mounts[opts.ClusterID] = &StandaloneStateEntry{
+	m.state.Mounts[opts.MountKey] = &StandaloneStateEntry{
 		PodName:   podName,
 		RefCount:  0,
 		Volumes:   []string{},
@@ -555,10 +600,10 @@ func mountPropagationBidirectionalPtr() *corev1.MountPropagationMode {
 	return &mode
 }
 
-// DeleteStandalone deletes the Standalone for the given cluster on this node
-func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, clusterID string) error {
-	podName := m.getStandaloneName(clusterID)
-	klog.Infof("Deleting Standalone %s for cluster %s", podName, clusterID)
+// DeleteStandalone deletes the Standalone for the given mount key on this node
+func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, mountKey string) error {
+	podName := m.getStandaloneName(mountKey)
+	klog.Infof("Deleting Standalone %s for mountKey %s", podName, mountKey)
 
 	err := m.client.CoreV1().Pods(m.namespace).Delete(ctx, podName, metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
@@ -567,7 +612,7 @@ func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, clust
 
 	// Update state
 	m.mu.Lock()
-	delete(m.state.Mounts, clusterID)
+	delete(m.state.Mounts, mountKey)
 	m.mu.Unlock()
 
 	if err := m.saveState(ctx); err != nil {
@@ -579,8 +624,8 @@ func (m *standaloneMountManagerImpl) DeleteStandalone(ctx context.Context, clust
 }
 
 // GetStandaloneStatus returns the status of the Standalone
-func (m *standaloneMountManagerImpl) GetStandaloneStatus(ctx context.Context, clusterID string) (*StandaloneStatus, error) {
-	podName := m.getStandaloneName(clusterID)
+func (m *standaloneMountManagerImpl) GetStandaloneStatus(ctx context.Context, mountKey string) (*StandaloneStatus, error) {
+	podName := m.getStandaloneName(mountKey)
 
 	pod, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
@@ -593,14 +638,14 @@ func (m *standaloneMountManagerImpl) GetStandaloneStatus(ctx context.Context, cl
 	return &StandaloneStatus{
 		Phase:     pod.Status.Phase,
 		Ready:     isPodReady(pod),
-		MountPath: m.GetHostMountPath(clusterID),
+		MountPath: m.GetHostMountPath(mountKey),
 		PodName:   podName,
 	}, nil
 }
 
 // WaitForStandaloneReady waits for the Standalone to be ready
-func (m *standaloneMountManagerImpl) WaitForStandaloneReady(ctx context.Context, clusterID string, timeout time.Duration) error {
-	podName := m.getStandaloneName(clusterID)
+func (m *standaloneMountManagerImpl) WaitForStandaloneReady(ctx context.Context, mountKey string, timeout time.Duration) error {
+	podName := m.getStandaloneName(mountKey)
 
 	return wait.PollUntilContextTimeout(ctx, StandaloneCheckInterval, timeout, true, func(ctx context.Context) (bool, error) {
 		pod, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{})
@@ -635,26 +680,26 @@ func isPodReady(pod *corev1.Pod) bool {
 }
 
 // AddVolumeRef adds a volume reference to the Standalone
-func (m *standaloneMountManagerImpl) AddVolumeRef(ctx context.Context, clusterID, volumeID string) error {
+func (m *standaloneMountManagerImpl) AddVolumeRef(ctx context.Context, mountKey, volumeID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	entry, ok := m.state.Mounts[clusterID]
+	entry, ok := m.state.Mounts[mountKey]
 	if !ok {
 		// Create new entry if not exists
 		entry = &StandaloneStateEntry{
-			PodName:   m.getStandaloneName(clusterID),
+			PodName:   m.getStandaloneName(mountKey),
 			RefCount:  0,
 			Volumes:   []string{},
 			CreatedAt: time.Now(),
 		}
-		m.state.Mounts[clusterID] = entry
+		m.state.Mounts[mountKey] = entry
 	}
 
 	// Check if volume already referenced
 	for _, v := range entry.Volumes {
 		if v == volumeID {
-			klog.V(4).Infof("Volume %s already referenced for cluster %s", volumeID, clusterID)
+			klog.V(4).Infof("Volume %s already referenced for mountKey %s", volumeID, mountKey)
 			return nil
 		}
 	}
@@ -662,19 +707,19 @@ func (m *standaloneMountManagerImpl) AddVolumeRef(ctx context.Context, clusterID
 	entry.Volumes = append(entry.Volumes, volumeID)
 	entry.RefCount = len(entry.Volumes)
 
-	klog.Infof("Added volume ref %s for cluster %s, refCount=%d", volumeID, clusterID, entry.RefCount)
+	klog.Infof("Added volume ref %s for mountKey %s, refCount=%d", volumeID, mountKey, entry.RefCount)
 
 	return m.saveStateLocked(ctx)
 }
 
 // RemoveVolumeRef removes a volume reference from the Standalone
-func (m *standaloneMountManagerImpl) RemoveVolumeRef(ctx context.Context, clusterID, volumeID string) (bool, error) {
+func (m *standaloneMountManagerImpl) RemoveVolumeRef(ctx context.Context, mountKey, volumeID string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	entry, ok := m.state.Mounts[clusterID]
+	entry, ok := m.state.Mounts[mountKey]
 	if !ok {
-		klog.Warningf("No state found for cluster %s when removing volume %s", clusterID, volumeID)
+		klog.Warningf("No state found for mountKey %s when removing volume %s", mountKey, volumeID)
 		return false, nil
 	}
 
@@ -688,7 +733,7 @@ func (m *standaloneMountManagerImpl) RemoveVolumeRef(ctx context.Context, cluste
 	entry.Volumes = newVolumes
 	entry.RefCount = len(entry.Volumes)
 
-	klog.Infof("Removed volume ref %s for cluster %s, refCount=%d", volumeID, clusterID, entry.RefCount)
+	klog.Infof("Removed volume ref %s for mountKey %s, refCount=%d", volumeID, mountKey, entry.RefCount)
 
 	if err := m.saveStateLocked(ctx); err != nil {
 		return false, err
@@ -730,13 +775,13 @@ func (m *standaloneMountManagerImpl) RecoverState(ctx context.Context) error {
 	klog.Infof("Recovered %d mount entries from state", len(state.Mounts))
 
 	// Verify Standalones exist and are healthy
-	for clusterID, entry := range state.Mounts {
-		podName := m.getStandaloneName(clusterID)
+	for mountKey, entry := range state.Mounts {
+		podName := m.getStandaloneName(mountKey)
 		pod, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{})
 		if err != nil {
 			if errors.IsNotFound(err) {
-				klog.Warningf("Standalone %s for cluster %s not found, but has %d volume refs",
-					entry.PodName, clusterID, entry.RefCount)
+				klog.Warningf("Standalone %s for mountKey %s not found, but has %d volume refs",
+					entry.PodName, mountKey, entry.RefCount)
 				// Mark for potential recreation on next EnsureStandalone call
 				continue
 			}
@@ -812,7 +857,7 @@ func ExtractClusterIDFromVolumeID(volumeID string) string {
 	// VolumeID format: clusterID@volumeName
 	// For static PVs, volumeID is just the volume name without "@"
 	if !strings.Contains(volumeID, "@") {
-		return "" // No clusterID in volumeID, caller should use FindClusterIDByVolumeID
+		return "" // No clusterID in volumeID, caller should use FindMountKeyByVolumeID
 	}
 	parts := strings.Split(volumeID, "@")
 	if len(parts) >= 2 {
@@ -821,21 +866,21 @@ func ExtractClusterIDFromVolumeID(volumeID string) string {
 	return ""
 }
 
-// FindClusterIDByVolumeID finds the clusterID that contains the given volumeID
-// This is needed for static PVs where volumeID doesn't contain clusterID information
-func (m *standaloneMountManagerImpl) FindClusterIDByVolumeID(volumeID string) (string, bool) {
+// FindMountKeyByVolumeID finds the mountKey that contains the given volumeID
+// This is needed for static PVs where volumeID doesn't contain mountKey information
+func (m *standaloneMountManagerImpl) FindMountKeyByVolumeID(volumeID string) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	for clusterID, entry := range m.state.Mounts {
+	for mountKey, entry := range m.state.Mounts {
 		for _, v := range entry.Volumes {
 			if v == volumeID {
-				klog.V(4).Infof("Found clusterID %s for volumeID %s", clusterID, volumeID)
-				return clusterID, true
+				klog.V(4).Infof("Found mountKey %s for volumeID %s", mountKey, volumeID)
+				return mountKey, true
 			}
 		}
 	}
-	klog.V(4).Infof("No clusterID found for volumeID %s", volumeID)
+	klog.V(4).Infof("No mountKey found for volumeID %s", volumeID)
 	return "", false
 }
 
@@ -849,11 +894,11 @@ func (m *standaloneMountManagerImpl) GetState() *StandaloneState {
 		Mounts: make(map[string]*StandaloneStateEntry),
 	}
 
-	for clusterID, entry := range m.state.Mounts {
+	for mountKey, entry := range m.state.Mounts {
 		volumesCopy := make([]string, len(entry.Volumes))
 		copy(volumesCopy, entry.Volumes)
 
-		stateCopy.Mounts[clusterID] = &StandaloneStateEntry{
+		stateCopy.Mounts[mountKey] = &StandaloneStateEntry{
 			PodName:   entry.PodName,
 			RefCount:  entry.RefCount,
 			Volumes:   volumesCopy,

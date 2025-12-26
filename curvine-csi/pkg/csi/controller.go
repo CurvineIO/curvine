@@ -89,6 +89,35 @@ func (d *controllerService) CreateVolume(ctx context.Context, request *csi.Creat
 	// Calculate curvine filesystem path: {fs-path}/{pv-name}
 	curvinePath := GetCurvinePath(params.FSPath, pvName)
 
+	// Ensure fs-path exists before creating curvinePath
+	// This ensures the parent directory exists before creating the volume path
+	// fs-path creation also follows path-type setting
+	if params.FSPath != "/" {
+		klog.Infof("RequestID: %s, Checking if fs-path exists: %s", requestID, params.FSPath)
+		err := d.isCurvinePathExists(ctx, requestID, params.FSPath, params.MasterAddrs)
+		if err != nil {
+			// fs-path doesn't exist
+			if params.PathType == "DirectoryOrCreate" {
+				// Create fs-path if DirectoryOrCreate
+				klog.Infof("RequestID: %s, fs-path does not exist, creating: %s (path-type: DirectoryOrCreate)", requestID, params.FSPath)
+				err := d.CreateCurinveDir(ctx, requestID, params.FSPath, params.MasterAddrs)
+				if err != nil {
+					klog.Errorf("RequestID: %s, Failed to create fs-path %s: %v",
+						requestID, params.FSPath, err)
+					return nil, status.Errorf(codes.Internal, "Failed to create fs-path %s: %v",
+						params.FSPath, err)
+				}
+				klog.Infof("RequestID: %s, Successfully created fs-path: %s", requestID, params.FSPath)
+			} else {
+				// Directory type requires existing fs-path
+				klog.Errorf("RequestID: %s, Directory type requires existing fs-path, but fs-path %s does not exist: %v",
+					requestID, params.FSPath, err)
+				return nil, status.Errorf(codes.Internal, "Directory type requires existing fs-path, but fs-path %s does not exist: %v",
+					params.FSPath, err)
+			}
+		}
+	}
+
 	// Create or verify curvine path based on path-type
 	if params.PathType == "DirectoryOrCreate" {
 		// Check if directory exists
@@ -125,6 +154,8 @@ func (d *controllerService) CreateVolume(ctx context.Context, request *csi.Creat
 	volCtx["author"] = "curvine.io"
 	// Store master-addrs in volume context for Node operations
 	volCtx["master-addrs"] = params.MasterAddrs
+	// Store fs-path in volume context for Node operations (used for FUSE mount)
+	volCtx["fs-path"] = params.FSPath
 	// Store curvine-path (complete path in curvine filesystem)
 	volCtx["curvine-path"] = curvinePath
 	// Note: mnt-path will be auto-generated in NodeStageVolume based on volumeHandle
@@ -200,27 +231,27 @@ func (d *controllerService) DeleteVolume(ctx context.Context, request *csi.Delet
 		return &csi.DeleteVolumeResponse{}, nil
 	}
 
-	// Check if path exists
-	klog.Infof("RequestID: %s, Checking if curvine path exists: %s", requestID, curvinePath)
-	checkErr := d.isCurvinePathExists(ctx, requestID, curvinePath, masterAddrs)
-	if checkErr != nil {
-		// Path doesn't exist, consider deletion successful
-		klog.Infof("RequestID: %s, Curvine path %s does not exist, deletion considered successful", requestID, curvinePath)
-		return &csi.DeleteVolumeResponse{}, nil
-	}
-
 	// Delete the path (but not root path)
 	if curvinePath == "/" {
 		klog.Warningf("RequestID: %s, Attempted to delete root path %s, skipping", requestID, curvinePath)
 		return &csi.DeleteVolumeResponse{}, nil
 	}
 
+	// Try to delete the path directly
+	// If path doesn't exist, deletion is considered successful (idempotent)
 	klog.Infof("RequestID: %s, Deleting curvine path: %s", requestID, curvinePath)
 	deleteErr := d.DeleteCurvineDir(ctx, requestID, curvinePath, masterAddrs)
 	if deleteErr != nil {
-		klog.Errorf("RequestID: %s, Failed to delete curvine directory %s: %v", requestID, curvinePath, deleteErr)
-		// Don't return error, as the path might have been deleted already
-		return &csi.DeleteVolumeResponse{}, nil
+		// Check if path exists - if not, deletion is successful (idempotent)
+		checkErr := d.isCurvinePathExists(ctx, requestID, curvinePath, masterAddrs)
+		if checkErr != nil {
+			// Path doesn't exist, deletion considered successful (idempotent)
+			klog.Infof("RequestID: %s, Curvine path %s does not exist after delete attempt, deletion considered successful", requestID, curvinePath)
+			return &csi.DeleteVolumeResponse{}, nil
+		}
+		// Path still exists, deletion failed
+		klog.Errorf("RequestID: %s, Failed to delete curvine directory %s: %v, path still exists", requestID, curvinePath, deleteErr)
+		return nil, status.Errorf(codes.Internal, "Failed to delete curvine directory %s: %v", curvinePath, deleteErr)
 	}
 
 	klog.Infof("RequestID: %s, Successfully deleted volume: %s", requestID, request.VolumeId)
@@ -392,9 +423,10 @@ func (d *controllerService) DeleteCurvineDir(ctx context.Context, requestID stri
 	cmd := exec.Command(curvineCliPath, args...)
 
 	// Execute command with retry and timeout
-	retryCount := 3
-	retryInterval := 2 * time.Second
-	commandTimeout := 30 * time.Second
+	// For delete operations, use shorter timeout and fewer retries to avoid blocking
+	retryCount := 1
+	retryInterval := 1 * time.Second
+	commandTimeout := 15 * time.Second
 	output, err := ExecuteWithRetry(
 		cmd,
 		retryCount,

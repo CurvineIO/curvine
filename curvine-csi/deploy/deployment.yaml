@@ -23,7 +23,7 @@ spec:
           operator: Exists
       containers:
         - name: csi-plugin
-          image: curvineio/curvine-csi:latest
+          image: ghcr.io/curvineio/curvine-csi:latest
           imagePullPolicy: Always
           command: ["/opt/curvine/csi"]
           args:
@@ -40,6 +40,9 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Controller should not use standalone mode
+            - name: MOUNT_MODE
+              value: "embedded"
           livenessProbe:
             failureThreshold: 5
             httpGet:
@@ -62,7 +65,7 @@ spec:
               name: socket-dir
         - args:
             - --csi-address=$(ADDRESS)
-            - --timeout=60s
+            - --timeout=300s
             - --v=5
           env:
             - name: ADDRESS
