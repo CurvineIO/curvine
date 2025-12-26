@@ -380,16 +380,29 @@ impl InodeStore {
     pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
         let mut root = FsDir::create_root();
         let mut stack = LinkedList::new();
-        stack.push_back((root.as_ptr(), ROOT_INODE_ID));
+        stack.push_back((root.as_ptr(), ROOT_INODE_ID, None));
         let mut last_inode_id = ROOT_INODE_ID;
         let mut file_count = 0i64;
         let mut dir_count = 0i64;
 
-        while let Some((mut parent, child_id)) = stack.pop_front() {
+        while let Some((mut parent, child_id, expected_name)) = stack.pop_front() {
             last_inode_id = last_inode_id.max(child_id);
 
             let next_parent = if child_id != ROOT_INODE_ID {
                 let inode = try_option!(self.store.get_inode(child_id)?);
+
+                // Check if the inode name matches the expected name from edges
+                if let Some(expected) = expected_name {
+                    if inode.name() != expected {
+                        log::warn!(
+                            "Name mismatch for inode {}: expected '{}' but got '{}', skipping",
+                            child_id,
+                            expected,
+                            inode.name()
+                        );
+                        continue;
+                    }
+                }
 
                 // Count files and directories during tree reconstruction
                 match &inode {
@@ -412,9 +425,12 @@ impl InodeStore {
             if next_parent.is_dir() {
                 let childs_iter = self.store.edges_iter(next_parent.id())?;
                 for item in childs_iter {
-                    let (_, value) = try_err!(item);
+                    let (key, value) = try_err!(item);
+                    let (_, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
                     let child_id = RocksUtils::i64_from_bytes(&value)?;
-                    stack.push_back((next_parent.clone(), child_id))
+
+                    // Push both child_id and child_name to stack for name validation
+                    stack.push_back((next_parent.clone(), child_id, Some(child_name.to_string())));
                 }
             }
 
