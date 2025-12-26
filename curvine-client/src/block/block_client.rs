@@ -14,39 +14,73 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::block::{BlockReadContext, CreateBlockContext};
+use crate::block::{BlockClientPool, BlockReadContext, CreateBlockContext};
 use crate::file::FsContext;
 use curvine_common::conf::ClientConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse, DataHeaderProto,
 };
-use curvine_common::state::{ExtendedBlock, StorageType};
+use curvine_common::state::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::client::RpcClient;
+use orpc::common::LocalTime;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
-use orpc::{err_box, CommonResult};
+use orpc::{err_box, try_option_ref, CommonResult};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub struct BlockClient {
-    client: RpcClient,
+    client: Option<RpcClient>,
     client_name: String,
     timeout: Duration,
+    pool: Option<Arc<BlockClientPool>>,
+    worker_addr: WorkerAddress,
+    uptime: u64,
 }
 
 impl BlockClient {
-    pub fn new(client: RpcClient, context: &FsContext) -> Self {
+    pub fn new(client: RpcClient, worker_addr: WorkerAddress, context: &FsContext) -> Self {
         Self {
-            client,
+            client: Some(client),
             client_name: context.clone_client_name(),
             timeout: Duration::from_millis(context.conf.client.data_timeout_ms),
+            pool: None,
+            worker_addr,
+            uptime: LocalTime::mills(),
         }
     }
 
+    pub fn set_pool(&mut self, pool: Arc<BlockClientPool>) {
+        self.pool.replace(pool);
+        self.uptime = LocalTime::mills();
+    }
+
+    pub fn clear_pool(&mut self) {
+        self.pool.take();
+    }
+
+    pub fn worker_addr(&self) -> &WorkerAddress {
+        &self.worker_addr
+    }
+
+    pub fn pool(&self) -> &Option<Arc<BlockClientPool>> {
+        &self.pool
+    }
+
+    pub fn uptime(&self) -> u64 {
+        self.uptime
+    }
+
+    pub fn set_uptime(&mut self) {
+        self.uptime = LocalTime::mills();
+    }
+
     pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
-        let rep_msg = self.client.timeout_rpc(self.timeout, msg).await?;
+        let client = try_option_ref!(self.client);
+        let rep_msg = client.timeout_rpc(self.timeout, msg).await?;
         if !rep_msg.is_success() {
             err_box!(rep_msg.to_error_msg())
         } else {
@@ -251,5 +285,24 @@ impl BlockClient {
 
         let rep = self.rpc(msg).await?;
         Ok(rep.data)
+    }
+}
+
+impl Drop for BlockClient {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            if let Some(moved_client) = self.client.take() {
+                let client = BlockClient {
+                    client: Some(moved_client),
+                    client_name: std::mem::take(&mut self.client_name),
+                    timeout: self.timeout,
+                    pool: Some(pool.clone()),
+                    worker_addr: std::mem::take(&mut self.worker_addr),
+                    uptime: self.uptime,
+                };
+
+                pool.release(client);
+            }
+        }
     }
 }
