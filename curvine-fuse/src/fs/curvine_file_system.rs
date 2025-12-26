@@ -1327,9 +1327,7 @@ impl fs::FileSystem for CurvineFileSystem {
             };
             let res = self.create(op).await?;
             let handle = self.state.remove_handle(res.0.nodeid, res.1.fh);
-            if let Some(handle) = handle {
-                handle.complete(None).await?;
-            } else {
+            if handle.is_none() {
                 return err_fuse!(libc::EIO);
             }
             let out = fuse_entry_out {
