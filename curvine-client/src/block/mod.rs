@@ -38,3 +38,6 @@ pub use self::block_reader_remote::BlockReaderRemote;
 
 mod block_reader_hole;
 pub use self::block_reader_hole::BlockReaderHole;
+
+mod block_client_pool;
+pub use self::block_client_pool::BlockClientPool;

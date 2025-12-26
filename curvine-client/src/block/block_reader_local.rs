@@ -51,7 +51,7 @@ impl BlockReaderLocal {
         let seq_id = 0;
 
         let chunk_size = fs_context.read_chunk_size();
-        let client = fs_context.block_client(&addr).await?;
+        let client = fs_context.acquire_read(&addr, &block).await?;
         let read_context = client
             .open_block(
                 &fs_context.conf.client,
@@ -162,7 +162,10 @@ impl BlockReaderLocal {
     // Reading is completed and the server needs to be notified.
     pub async fn complete(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
-        let client = self.fs_context.block_client(&self.worker_address).await?;
+        let client = self
+            .fs_context
+            .acquire_read(&self.worker_address, &self.block)
+            .await?;
         client
             .read_commit(&self.block, self.req_id, next_seq_id)
             .await?;

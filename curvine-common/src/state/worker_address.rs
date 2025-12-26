@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use orpc::io::net::InetAddr;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -32,6 +33,10 @@ impl WorkerAddress {
 
     pub fn connect_addr(&self) -> String {
         format!("{}:{}", self.ip_addr, self.rpc_port)
+    }
+
+    pub fn inet_addr(&self) -> InetAddr {
+        InetAddr::new(self.ip_addr.clone(), self.rpc_port as u16)
     }
 }
 
