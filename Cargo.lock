@@ -1075,6 +1075,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "cc",
  "curvine-common",
  "fastrand 1.9.0",
  "futures",

@@ -61,7 +61,7 @@
 
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{MountOptions, MountType};
+use curvine_common::state::{MountOptions, MountType, WriteType};
 use curvine_tests::Testing;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
@@ -176,6 +176,7 @@ async fn mount_storage(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonRes
     let opts = MountOptions::builder()
         .set_properties(config.properties.clone())
         .mount_type(MountType::Orch)
+        .write_type(WriteType::Through)
         .build();
 
     let ufs_path: Path = Path::from_str(&config.ufs_path).unwrap();
@@ -205,7 +206,20 @@ async fn test_mkdir(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonResult
 
     // Test creating single-level directory
     let dir1: Path = format!("{}/dir1", base_dir).into();
-    let result = fs.mkdir(&dir1, false).await?;
+    // Only enable create_parent for OSS when the `oss` feature is enabled.
+    // When the feature is disabled, force it to false to avoid backend-specific behavior.
+    let create_parent = {
+        #[cfg(feature = "oss-hdfs")]
+        {
+            config.ufs_path.starts_with("oss://")
+        }
+        #[cfg(not(feature = "oss-hdfs"))]
+        {
+            false
+        }
+    };
+    log::info!("create_parent: {}", create_parent);
+    let result = fs.mkdir(&dir1, create_parent).await?;
     assert!(result, "Directory creation should return true");
     println!("✓ Directory created: {}", dir1);
 
