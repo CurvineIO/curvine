@@ -181,7 +181,7 @@ impl Writer for CacheSyncWriter {
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        if self.pos() != pos {
+        if self.pos() != pos && !self.has_rand_write {
             self.has_rand_write = true;
             if let Err(e) = self.job_client.cancel_job(&self.job_res.job_id).await {
                 warn!("cancel job {} failed: {}", self.job_res.job_id, e);

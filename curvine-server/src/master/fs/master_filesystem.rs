@@ -268,7 +268,7 @@ impl MasterFilesystem {
 
         let inode = match inp.get_last_inode() {
             None => {
-                return if flags.create() {
+                return if flags.create() || flags.append() {
                     drop(fs_dir);
                     let status = self.create_with_opts(path, opts, flags)?;
                     Ok(FileBlocks::new(status, vec![]))
