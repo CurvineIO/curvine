@@ -3,7 +3,7 @@ package proto;
 
 import "common.proto";
 
-message SumbitBlockReplicationRequest {
+message SubmitBlockReplicationRequest {
     required int64 block_id = 1;
     required WorkerAddressProto target_worker_info = 2;
 }

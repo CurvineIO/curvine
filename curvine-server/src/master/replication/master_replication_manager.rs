@@ -17,7 +17,7 @@ use crate::master::{Master, MasterMetrics, SyncWorkerManager};
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    ReportBlockReplicationRequest, SubmitBlockReplicationResponse, SumbitBlockReplicationRequest,
+    ReportBlockReplicationRequest, SubmitBlockReplicationRequest, SubmitBlockReplicationResponse,
 };
 use curvine_common::state::{BlockLocation, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
@@ -162,7 +162,7 @@ impl MasterReplicationManager {
             .create_raw(&source_worker_addr)
             .await?;
 
-        let request = SumbitBlockReplicationRequest {
+        let request = SubmitBlockReplicationRequest {
             block_id,
             target_worker_info: ProtoUtils::worker_address_to_pb(&target_worker_addr),
         };

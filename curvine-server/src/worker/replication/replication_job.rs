@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::proto::SumbitBlockReplicationRequest;
+use curvine_common::proto::SubmitBlockReplicationRequest;
 use curvine_common::state::{StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
 
@@ -22,8 +22,8 @@ pub struct ReplicationJob {
     pub storage_type: Option<StorageType>,
 }
 
-impl From<SumbitBlockReplicationRequest> for ReplicationJob {
-    fn from(val: SumbitBlockReplicationRequest) -> Self {
+impl From<SubmitBlockReplicationRequest> for ReplicationJob {
+    fn from(val: SubmitBlockReplicationRequest) -> Self {
         ReplicationJob {
             block_id: val.block_id,
             target_worker_addr: ProtoUtils::worker_address_from_pb(&val.target_worker_info),
