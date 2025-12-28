@@ -40,7 +40,7 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
             frame,
             handler: RawPtr::from_owned(handler),
             close_idle: conf.close_idle,
-            timeout: Duration::from_millis(conf.timout_ms),
+            timeout: Duration::from_millis(conf.timeout_ms),
         }
     }
 

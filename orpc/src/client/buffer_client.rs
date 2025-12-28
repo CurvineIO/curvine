@@ -42,11 +42,11 @@ impl BufferClient {
         let client_state = Arc::new(raw.state);
         let (sender, receiver) = mpsc::channel(conf.message_size);
         let (read_frame, write_frame) = raw.frame.split();
-        let timout = Duration::from_millis(conf.rpc_timeout_ms);
+        let timeout = Duration::from_millis(conf.rpc_timeout_ms);
 
         let request_future = Self::request_future(
             client_state.clone(),
-            timout,
+            timeout,
             conf.close_idle,
             receiver,
             write_frame,
@@ -58,8 +58,12 @@ impl BufferClient {
             }
         });
 
-        let response_future =
-            Self::response_future(client_state.clone(), timout, read_frame, call_state.clone());
+        let response_future = Self::response_future(
+            client_state.clone(),
+            timeout,
+            read_frame,
+            call_state.clone(),
+        );
         rt.spawn(async move {
             if let Err(e) = response_future.await {
                 error!("response_future error: {}", e)

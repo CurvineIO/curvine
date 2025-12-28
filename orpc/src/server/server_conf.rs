@@ -29,7 +29,7 @@ pub struct ServerConf {
     pub port: u16,
     pub buffer_size: usize,
 
-    pub timout_ms: u64,
+    pub timeout_ms: u64,
     pub keepalive: bool,
 
     pub close_idle: bool,
@@ -60,7 +60,7 @@ impl ServerConf {
             hostname: hostname.into(),
             port,
             buffer_size: 128 * 1024,
-            timout_ms: 120_000,
+            timeout_ms: 120_000,
             keepalive: true,
             close_idle: true,
 
