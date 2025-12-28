@@ -110,7 +110,7 @@ impl CurvineFileSystem {
         } else {
             match sys::get_gid_by_name(&status.group) {
                 Some(gid) => gid,
-                None => conf.uid,
+                None => conf.gid,
             }
         };
 
