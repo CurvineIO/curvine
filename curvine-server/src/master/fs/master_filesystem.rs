@@ -194,7 +194,12 @@ impl MasterFilesystem {
         flags: OpenFlags,
     ) -> FsResult<FileStatus> {
         println!("at create_with_opts:");
-        println!("path: {:?}, otps: {:?}, flags: {:?}", path.as_ref(), opts, flags);
+        println!(
+            "path: {:?}, otps: {:?}, flags: {:?}",
+            path.as_ref(),
+            opts,
+            flags
+        );
         if !flags.create() {
             return err_box!("Flag error {}, cannot create file", flags.value());
         }

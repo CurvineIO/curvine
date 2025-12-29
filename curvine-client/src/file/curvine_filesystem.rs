@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::block::BlockWriter;
 use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
+use curvine_common::state::{BlockLocation, CommitBlock};
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags,
@@ -26,17 +28,15 @@ use curvine_common::state::{
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
 use curvine_common::FsResult;
-use curvine_common::state::{CommitBlock, BlockLocation};
 use log::info;
 use log::warn;
 use orpc::client::ClientConf;
 use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::sys::DataSlice;
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
-use crate::block::BlockWriter;
-use orpc::sys::DataSlice;
 
 #[derive(Clone)]
 pub struct CurvineFileSystem {
@@ -360,10 +360,7 @@ impl CurvineFileSystem {
         }
     }
 
-    pub async fn write_batch_string(
-        &self,
-        files: &[(Path, &str)],
-    ) -> FsResult<()> {
+    pub async fn write_batch_string(&self, files: &[(Path, &str)]) -> FsResult<()> {
         let chunk_size = self.fs_context().write_chunk_size();
         // println!("chunk_size at write_batch_string: {:?}", chunk_size);
         let mut batch = Vec::new();
@@ -375,7 +372,7 @@ impl CurvineFileSystem {
             let content_size: usize = content.len();
 
             if content_size >= chunk_size {
-                self.write_string(&path, content.to_string()).await?;// Minimal clone ONLY here
+                self.write_string(&path, content.to_string()).await?; // Minimal clone ONLY here
                 continue;
             }
 
@@ -383,16 +380,16 @@ impl CurvineFileSystem {
                 self.process_batch(&batch).await?;
                 batch.clear();
                 batch_memory = 0;
-            }  
-            
-            batch.push((path, content.as_ref()));  // Minimal clone for batch
+            }
+
+            batch.push((path, content.as_ref())); // Minimal clone for batch
             batch_memory += content_size;
         }
 
         // Final flush
         if !batch.is_empty() {
             self.process_batch(&batch).await?;
-        } 
+        }
 
         Ok(())
     }
@@ -401,24 +398,20 @@ impl CurvineFileSystem {
         println!("files at process_batch: {:?}", files);
         if files.is_empty() {
             return Ok(());
-        }  
-          
+        }
+
         // Step 1: Batch create files
         let mut create_requests = Vec::new();
         for (path, _) in files {
-            let opts = self.create_opts_builder()
-                .create_parent(true)
-                .build();
+            let opts = self.create_opts_builder().create_parent(true).build();
             let flags = OpenFlags::new_write_only()
                 .set_create(true)
                 .set_overwrite(true);
             create_requests.push((path.encode(), opts, flags));
-        }  
-          
-        let file_statuses = self.fs_client()
-            .create_files_batch(create_requests)
-            .await?;
-          
+        }
+
+        let file_statuses = self.fs_client().create_files_batch(create_requests).await?;
+
         // Step 2: Batch allocate blocks
         let mut add_block_requests = Vec::new();
         for ((path, content), status) in files.iter().zip(file_statuses.iter()) {
@@ -429,38 +422,44 @@ impl CurvineFileSystem {
                 None,
             ));
         }
-        
-        let allocated_blocks = self.fs_client()
+
+        let allocated_blocks = self
+            .fs_client()
             .add_blocks_batch(add_block_requests)
-            .await?; 
+            .await?;
 
         // Step 3: Write data to workers (NEW STEP)
         for ((path, content), block) in files.iter().zip(allocated_blocks.iter()) {
-            let mut block_writer = BlockWriter::new(
-                self.fs_context.clone(),
-                block.clone(),
-                0
-            ).await?;
-            
+            let mut block_writer =
+                BlockWriter::new(self.fs_context.clone(), block.clone(), 0).await?;
+
             // Write the actual file content to all worker replicas
             block_writer.write(DataSlice::from_str(content)).await?;
             block_writer.flush().await?;
             block_writer.complete().await?;
-            println!("Written {} bytes to workers for file: {}", content.len(), path.path());
-        }  
-          
+            println!(
+                "Written {} bytes to workers for file: {}",
+                content.len(),
+                path.path()
+            );
+        }
+
         // Step 3: Batch complete
         let mut complete_requests = Vec::new();
         for ((path, content), block) in files.iter().zip(allocated_blocks.iter()) {
             let commit_block = CommitBlock {
                 block_id: block.block.id,
                 block_len: content.len() as i64,
-                locations: block.locs.iter().map(|l| BlockLocation {
-                    worker_id: l.worker_id,
-                    storage_type: block.block.storage_type
-                }).collect(),
-            };  
-              
+                locations: block
+                    .locs
+                    .iter()
+                    .map(|l| BlockLocation {
+                        worker_id: l.worker_id,
+                        storage_type: block.block.storage_type,
+                    })
+                    .collect(),
+            };
+
             complete_requests.push((
                 path.encode(),
                 content.len() as i64,

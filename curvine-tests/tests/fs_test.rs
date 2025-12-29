@@ -36,8 +36,8 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     let testing = Testing::builder().default().build()?;
     testing.start_cluster()?;
     let mut conf = testing.get_active_cluster_conf()?;
-    conf.client.write_chunk_size = 64;  // Set to 64 bytes 
-    conf.client.write_chunk_size_str = "64B".to_string();  // Update string field
+    conf.client.write_chunk_size = 64; // Set to 64 bytes
+    conf.client.write_chunk_size_str = "64B".to_string(); // Update string field
     conf.client.metric_report_enable = true;
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
     let res: FsResult<()> = rt.block_on(async move {
@@ -306,18 +306,36 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     // 2. Verify all files exist and have correct content
     for (i, (path, _)) in batch_files.clone().iter().enumerate() {
         let status = fs.get_status(path).await?;
-        
+
         let content = read_file_content(fs, path).await?;
         if i == num_files - 1 {
-            assert_eq!(status.len, large_file_size as i64, "File {} length mismatch", i);
-            assert_eq!(content.len(), large_file_size, "File {} content length mismatch", i);
+            assert_eq!(
+                status.len, large_file_size as i64,
+                "File {} length mismatch",
+                i
+            );
+            assert_eq!(
+                content.len(),
+                large_file_size,
+                "File {} content length mismatch",
+                i
+            );
             assert_eq!(content, test_large_data, "File {} content mismatch", i);
         } else {
-            assert_eq!(status.len, small_file_size as i64, "File {} length mismatch", i);
-            assert_eq!(content.len(), small_file_size, "File {} content length mismatch", i);
+            assert_eq!(
+                status.len, small_file_size as i64,
+                "File {} length mismatch",
+                i
+            );
+            assert_eq!(
+                content.len(),
+                small_file_size,
+                "File {} content length mismatch",
+                i
+            );
             assert_eq!(content, test_small_data, "File {} content mismatch", i);
         }
-        
+
         println!("Verified file_{}: len={}, content matches", i, status.len);
     }
     println!("✓ All {} files written and verified correctly", num_files);
