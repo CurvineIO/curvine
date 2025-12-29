@@ -282,8 +282,7 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     let test_small_data = "x".repeat(small_file_size);
     let test_large_data = "x".repeat(large_file_size);
 
-    let mut batch_files = Vec::new();
-    batch_files.reserve(num_files);
+    let mut batch_files = Vec::with_capacity(num_files);
     for i in 0..num_files {
         let path_str = format!("/batch_test/batch/file_{}.txt", i);
         let path = Path::from_str(path_str)?;

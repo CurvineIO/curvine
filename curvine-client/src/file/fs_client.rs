@@ -261,7 +261,7 @@ impl FsClient {
             .map(|(path, commit_blocks, file_len, last_block)| {
                 let commit_blocks = commit_blocks
                     .into_iter()
-                    .map(|v| ProtoUtils::commit_block_to_pb(v))
+                    .map(ProtoUtils::commit_block_to_pb)
                     .collect();
 
                 AddBlockRequest {
@@ -276,7 +276,6 @@ impl FsClient {
             })
             .collect();
 
-        println!("pb_requests: {:?}", pb_requests);
         let header = AddBlocksBatchRequest {
             requests: pb_requests,
         };

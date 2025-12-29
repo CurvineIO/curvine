@@ -366,13 +366,11 @@ impl CurvineFileSystem {
         let mut batch = Vec::new();
         let mut batch_memory = 0;
 
-        let mut files_iter = files.into_iter();
-
-        while let Some((path, content)) = files_iter.next() {
+        for (path, content) in files.iter() {
             let content_size: usize = content.len();
 
             if content_size >= chunk_size {
-                self.write_string(&path, content.to_string()).await?; // Minimal clone ONLY here
+                self.write_string(path, content.to_string()).await?;
                 continue;
             }
 
@@ -382,7 +380,7 @@ impl CurvineFileSystem {
                 batch_memory = 0;
             }
 
-            batch.push((path, content.as_ref())); // Minimal clone for batch
+            batch.push((path, content));
             batch_memory += content_size;
         }
 
@@ -414,7 +412,7 @@ impl CurvineFileSystem {
 
         // Step 2: Batch allocate blocks
         let mut add_block_requests = Vec::new();
-        for ((path, content), status) in files.iter().zip(file_statuses.iter()) {
+        for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
             add_block_requests.push((
                 path.encode(),
                 vec![],
