@@ -44,6 +44,9 @@ pub enum RpcCode {
     GetLock = 20,
     SetLock = 21,
     ListLock = 22,
+    CreateFilesBatch = 23,
+    AddBlocksBatch = 24,
+    CompleteFilesBatch = 25,
 
     // manager interface.
     Mount = 30,

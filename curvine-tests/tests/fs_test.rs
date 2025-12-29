@@ -36,6 +36,8 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     let testing = Testing::builder().default().build()?;
     testing.start_cluster()?;
     let mut conf = testing.get_active_cluster_conf()?;
+    conf.client.write_chunk_size = 64;  // Set to 64 bytes 
+    conf.client.write_chunk_size_str = "64B".to_string();  // Update string field
     conf.client.metric_report_enable = true;
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
     let res: FsResult<()> = rt.block_on(async move {
@@ -50,6 +52,9 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
 
         test_overwrite(&fs).await?;
         println!("test_overwrite done");
+
+        test_batch_writting(&fs).await?;
+        println!("test_batch_writting done");
 
         file_status(&fs).await?;
         println!("file_status done");
@@ -175,6 +180,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     writer.complete().await?;
 
     let initial_status = fs.get_status(&path).await?;
+    println!("initial_statusyyy: {:?}", initial_status);
     let initial_inode_id = initial_status.id;
     let initial_content = read_file_content(fs, &path).await?;
     assert_eq!(initial_content, "initial");
@@ -255,6 +261,66 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
         empty_inode_id, empty_status.len
     );
 
+    Ok(())
+}
+
+async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
+    // Helper function to read file content
+    async fn read_file_content(fs: &CurvineFileSystem, path: &Path) -> CommonResult<String> {
+        let status = fs.get_status(path).await?;
+        let mut reader = fs.open(path).await?;
+        let mut buffer = BytesMut::zeroed(status.len as usize);
+        let bytes_read = reader.read_full(&mut buffer).await?;
+        reader.complete().await?;
+        buffer.truncate(bytes_read);
+        Ok(String::from_utf8(buffer.to_vec())?)
+    }
+
+    let num_files = 5;
+    let small_file_size = 10; // 1KB per file
+    let large_file_size = 65; // 1KB per file
+    let test_small_data = "x".repeat(small_file_size);
+    let test_large_data = "x".repeat(large_file_size);
+
+    let mut batch_files = Vec::new();
+    batch_files.reserve(num_files);
+    for i in 0..num_files {
+        let path_str = format!("/batch_test/batch/file_{}.txt", i);
+        let path = Path::from_str(path_str)?;
+        if i == num_files - 1 {
+            batch_files.push((path.clone(), test_large_data.as_str()));
+            continue;
+        }
+        batch_files.push((path, test_small_data.as_str()));
+    }
+
+    fs.write_batch_string(&batch_files).await?;
+    // Using batch
+    // Get block locations for all files
+    let mut results = Vec::new();
+    for (path, _) in batch_files.clone() {
+        let blocks = fs.get_block_locations(&path).await?;
+        results.push(blocks);
+    }
+
+    // 2. Verify all files exist and have correct content
+    for (i, (path, _)) in batch_files.clone().iter().enumerate() {
+        let status = fs.get_status(path).await?;
+        
+        let content = read_file_content(fs, path).await?;
+        if i == num_files - 1 {
+            assert_eq!(status.len, large_file_size as i64, "File {} length mismatch", i);
+            assert_eq!(content.len(), large_file_size, "File {} content length mismatch", i);
+            assert_eq!(content, test_large_data, "File {} content mismatch", i);
+        } else {
+            assert_eq!(status.len, small_file_size as i64, "File {} length mismatch", i);
+            assert_eq!(content.len(), small_file_size, "File {} content length mismatch", i);
+            assert_eq!(content, test_small_data, "File {} content mismatch", i);
+        }
+        
+        println!("Verified file_{}: len={}, content matches", i, status.len);
+    }
+    println!("✓ All {} files written and verified correctly", num_files);
     Ok(())
 }
 
