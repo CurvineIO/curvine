@@ -1,0 +1,60 @@
+---
+# Check Curvine cluster service status
+# Usage: ansible-playbook status_services.yml
+
+- name: Check Curvine Services Status
+  hosts: all
+  gather_facts: no
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  tasks:
+    - name: Get curvine-master service status (master nodes only)
+      shell: systemctl status curvine-master --no-pager
+      register: master_status
+      ignore_errors: yes
+      when: "'master' in group_names"
+      changed_when: false
+
+    - name: Get curvine-worker service status
+      shell: systemctl status curvine-worker --no-pager
+      register: worker_status
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Get curvine-fuse service status
+      shell: systemctl status curvine-fuse --no-pager
+      register: fuse_status
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display service status for master nodes
+      debug:
+        msg: |
+          ========================================
+          Node: {{ inventory_hostname }} (Master)
+          ========================================
+          
+          Curvine Master Status:
+          {{ master_status.stdout if master_status.stdout is defined else 'N/A' }}
+          
+          Curvine Worker Status:
+          {{ worker_status.stdout }}
+          
+          Curvine FUSE Status:
+          {{ fuse_status.stdout }}
+      when: "'master' in group_names"
+
+    - name: Display service status for worker nodes
+      debug:
+        msg: |
+          ========================================
+          Node: {{ inventory_hostname }} (Worker)
+          ========================================
+          
+          Curvine Worker Status:
+          {{ worker_status.stdout }}
+          
+          Curvine FUSE Status:
+          {{ fuse_status.stdout }}
+      when: "'worker' in group_names"
+
