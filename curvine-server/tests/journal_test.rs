@@ -261,7 +261,10 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
 fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
     Logger::default();
     Master::init_test_metrics();
-    let mut conf = ClusterConf::default();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
     let worker = WorkerInfo::default();
 
     conf.change_test_meta_dir("meta-test-restart");
