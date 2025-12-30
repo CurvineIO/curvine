@@ -20,8 +20,9 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/Rust-1.86%2B-orange)](https://www.rust-lang.org)
 
-**Curvine** is a high-performance, concurrent distributed cache system written in Rust, designed for low-latency and high-throughput workloads.
-**Name Origin** The name "Curvine" is derived from the concatenation of the words "Curvature" and "Engine". It refers to an accelerator for spacecraft in the science fiction novel The Three-Body Problem, symbolizing extremely high performance.
+- **Curvine** is a high-performance, concurrent distributed cache system written in Rust, designed for low-latency and high-throughput workloads.
+
+- **Name Origin** The name "Curvine" is derived from the concatenation of the words "Curvature" and "Engine". It refers to an accelerator for spacecraft in the science fiction novel The Three-Body Problem, symbolizing extremely high performance.
 
 
 ## 📚 Documentation Resources
@@ -36,6 +37,9 @@ For more detailed information, please refer to:
 - [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
 - [Commit convention](COMMIT_CONVENTION.md)
 - [Contribute guidelines](CONTRIBUTING.md)
+
+## Roadmap 2026
+![Evolution from Distributed Cache to AI Agent-Native Infrastructure ](https://github.com/CurvineIO/curvine/discussions/549)
 
 ## Use Case
 ![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
