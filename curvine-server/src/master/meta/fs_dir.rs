@@ -54,7 +54,7 @@ impl FsDir {
 
         let store = RocksInodeStore::new(db_conf, conf.format_master)?;
         let state = InodeStore::new(store, ttl_bucket_list);
-        let (last_inode_id, root_dir) = state.create_tree()?;
+        let (last_inode_id, root_dir) = state.create_blank_tree()?;
 
         let fs_dir = Self {
             root_dir,

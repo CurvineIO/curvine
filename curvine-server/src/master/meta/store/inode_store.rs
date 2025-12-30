@@ -376,6 +376,12 @@ impl InodeStore {
         Ok(())
     }
 
+    pub fn create_blank_tree(&self) -> CommonResult<(i64, InodeView)> {
+        let root = FsDir::create_root();
+        self.fs_stats.set_counts(0, 0);
+        Ok((ROOT_INODE_ID, root))
+    }
+
     // Restore to a directory tree from rocksdb
     pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
         let mut root = FsDir::create_root();
