@@ -397,8 +397,8 @@ impl Default for ClientConf {
             small_file_size: 0,
             small_file_size_str: "4MB".to_string(),
 
-            block_conn_idle_time: Duration::from_secs(30),
-            block_conn_idle_time_str: "30s".to_string(),
+            block_conn_idle_time: Duration::from_secs(60),
+            block_conn_idle_time_str: "60s".to_string(),
         };
 
         conf.init().unwrap();

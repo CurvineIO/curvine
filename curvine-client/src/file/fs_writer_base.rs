@@ -304,7 +304,9 @@ impl FsWriterBase {
         let len = opts.len;
 
         // Step 1: Submit all blocks before resize
-        self.complete0(true).await?;
+        if self.len > 0 {
+            self.complete0(true).await?;
+        }
 
         // Step 2: Execute resize operation
         let file_blocks = self.fs_client.resize(&self.path, opts).await?;

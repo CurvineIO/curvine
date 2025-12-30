@@ -109,6 +109,15 @@ pub struct FuseConf {
 
     pub congestion_threshold: u16,
 
+    // Whether to enable metadata cache
+    pub enable_meta_cache: bool,
+
+    // Metadata cache capacity (number of entries)
+    pub meta_cache_capacity: u64,
+
+    // Metadata cache TTL (time to live)
+    pub meta_cache_ttl: String,
+
     pub node_cache_size: u64,
 
     pub node_cache_timeout: String,
@@ -135,6 +144,9 @@ pub struct FuseConf {
     #[serde(skip_serializing, skip_deserializing)]
     pub node_cache_ttl: Duration,
 
+    #[serde(skip_serializing, skip_deserializing)]
+    pub meta_cache_ttl_duration: Duration,
+
     pub log: LogConf,
 }
 
@@ -156,6 +168,7 @@ impl FuseConf {
         self.entry_ttl = Duration::from_secs_f64(self.entry_timeout);
         self.negative_ttl = Duration::from_secs_f64(self.negative_timeout);
         self.node_cache_ttl = DurationUnit::from_str(&self.node_cache_timeout)?.as_duration();
+        self.meta_cache_ttl_duration = DurationUnit::from_str(&self.meta_cache_ttl)?.as_duration();
 
         if self.mnt_per_task == 0 {
             self.mnt_per_task = self.io_threads;
@@ -276,6 +289,10 @@ impl Default for FuseConf {
             max_background: 256,
             congestion_threshold: 192,
 
+            enable_meta_cache: false,
+            meta_cache_capacity: 100000,
+            meta_cache_ttl: "120s".to_string(),
+
             node_cache_size: 200000,
             node_cache_timeout: "24h".to_string(),
 
@@ -288,6 +305,7 @@ impl Default for FuseConf {
             entry_ttl: Default::default(),
             negative_ttl: Default::default(),
             node_cache_ttl: Default::default(),
+            meta_cache_ttl_duration: Default::default(),
 
             log: LogConf::default(),
         };
