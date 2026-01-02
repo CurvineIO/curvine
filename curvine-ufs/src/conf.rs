@@ -209,3 +209,71 @@ impl Deref for S3Conf {
         &self.properties
     }
 }
+
+/// OSS-HDFS configuration (JindoSDK).
+///
+/// Notes:
+/// - The underlying JindoSDK configuration keys are prefixed with `fs.oss.*`.
+/// - This config struct is used by the `oss://` UFS implementation (`oss_hdfs` module).
+#[derive(Debug, Clone)]
+pub struct OssHdfsConf {
+    pub endpoint_url: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub region_name: Option<String>,
+    pub data_endpoint: Option<String>,
+    pub second_level_domain_enable: bool,
+    pub data_lake_storage_enable: bool,
+    pub properties: HashMap<String, String>,
+}
+
+impl OssHdfsConf {
+    // Configuration keys
+    pub const ENDPOINT: &'static str = "fs.oss.endpoint";
+    pub const ACCESS_KEY_ID: &'static str = "fs.oss.accessKeyId";
+    pub const ACCESS_KEY_SECRET: &'static str = "fs.oss.accessKeySecret";
+    pub const REGION: &'static str = "fs.oss.region";
+    pub const DATA_ENDPOINT: &'static str = "fs.oss.data.endpoint";
+    pub const SECOND_LEVEL_DOMAIN_ENABLE: &'static str = "fs.oss.second.level.domain.enable";
+    pub const DATA_LAKE_STORAGE_ENABLE: &'static str = "fs.oss.data.lake.storage.enable";
+
+    // Default values
+    pub const DEFAULT_SECOND_LEVEL_DOMAIN_ENABLE: bool = true;
+    pub const DEFAULT_DATA_LAKE_STORAGE_ENABLE: bool = true;
+
+    /// Create OssHdfsConf from configuration map
+    pub fn with_map(properties: HashMap<String, String>) -> CommonResult<Self> {
+        let map = ConfMap::new(properties);
+
+        let endpoint_url = map.get_string(Self::ENDPOINT)?;
+        let access_key = map.get_string(Self::ACCESS_KEY_ID)?;
+        let secret_key = map.get_string(Self::ACCESS_KEY_SECRET)?;
+        let region_name = map.get_string(Self::REGION).ok();
+        let data_endpoint = map.get_string(Self::DATA_ENDPOINT).ok();
+        let second_level_domain_enable = map
+            .get_bool(Self::SECOND_LEVEL_DOMAIN_ENABLE)
+            .unwrap_or(Self::DEFAULT_SECOND_LEVEL_DOMAIN_ENABLE);
+        let data_lake_storage_enable = map
+            .get_bool(Self::DATA_LAKE_STORAGE_ENABLE)
+            .unwrap_or(Self::DEFAULT_DATA_LAKE_STORAGE_ENABLE);
+
+        Ok(Self {
+            endpoint_url,
+            access_key,
+            secret_key,
+            region_name,
+            data_endpoint,
+            second_level_domain_enable,
+            data_lake_storage_enable,
+            properties: map.0,
+        })
+    }
+}
+
+impl Deref for OssHdfsConf {
+    type Target = HashMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.properties
+    }
+}
