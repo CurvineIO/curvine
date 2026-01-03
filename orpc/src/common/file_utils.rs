@@ -112,7 +112,7 @@ impl FileUtils {
     pub fn list_files<P: AsRef<Path>>(path: P, contains_parent: bool) -> CommonResult<Vec<String>> {
         let path = Path::new(path.as_ref());
         if !path.exists() {
-            return err_box!("Dir {} not exits", path.display());
+            return err_box!("Dir {} not exists", path.display());
         }
         if !path.is_dir() {
             return err_box!("Not a dir, path {}", path.display());
