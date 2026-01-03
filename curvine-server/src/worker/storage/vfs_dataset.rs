@@ -233,7 +233,7 @@ impl Dataset for VfsDataset {
 
     fn abort_block(&mut self, block: &ExtendedBlock) -> CommonResult<()> {
         let meta = match self.block_map.remove(&block.id) {
-            None => return err_box!("block {} not exits", block.id),
+            None => return err_box!("block {} not exists", block.id),
             Some(v) => v,
         };
 
