@@ -62,7 +62,7 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, AuthError> {
                 ));
             }
             let mut credential = None;
-            let mut singed_headers = None;
+            let mut signed_headers = None;
             let mut signature = None;
             for head in heads {
                 let heads = head.trim().splitn(2, '=').collect::<Vec<&str>>();
@@ -82,7 +82,7 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, AuthError> {
                         credential = Some((heads[0], heads[1], heads[2], heads[3], heads[4]));
                     }
                     "SignedHeaders" => {
-                        singed_headers = Some(heads[1].split(';').collect::<Vec<&str>>());
+                        signed_headers = Some(heads[1].split(';').collect::<Vec<&str>>());
                     }
                     "Signature" => {
                         signature = Some(heads[1]);
@@ -95,14 +95,14 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, AuthError> {
                 }
             }
 
-            if signature.is_none() || singed_headers.is_none() || credential.is_none() {
+            if signature.is_none() || signed_headers.is_none() || credential.is_none() {
                 return Err(AuthError::InvalidFormat(
                     "Invalid authorization header format".to_string(),
                 ));
             }
 
             let signature = signature.unwrap();
-            let singed_headers = singed_headers.unwrap();
+            let signed_headers = signed_headers.unwrap();
             let credential = credential.unwrap();
 
             let content_hash =
@@ -123,7 +123,7 @@ pub fn extract_args<R: VHeader>(r: &R) -> Result<BaseArgs, AuthError> {
                 region: credential.2.to_string(),
                 service: credential.3.to_string(),
                 access_key: credential.0.to_string(),
-                signed_headers: singed_headers.into_iter().map(|v| v.to_string()).collect(),
+                signed_headers: signed_headers.into_iter().map(|v| v.to_string()).collect(),
                 signature: signature.to_string(),
                 date: credential.1.to_string(),
             };

@@ -78,7 +78,7 @@ impl DBEngine {
     pub fn cf(&self, name: &str) -> CommonResult<&ColumnFamily> {
         match self.db.cf_handle(name) {
             Some(v) => Ok(v),
-            None => err_box!("cf {} not exits", name),
+            None => err_box!("cf {} not exists", name),
         }
     }
 

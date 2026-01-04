@@ -236,7 +236,7 @@ impl FsDir {
         flags: RenameFlags,
     ) -> FsResult<Option<DeleteResult>> {
         let src_inode = match src_inp.get_last_inode() {
-            None => return err_box!("File not exits: {}", src_inp.path()),
+            None => return err_box!("File not exists: {}", src_inp.path()),
             Some(v) => v,
         };
         if flags.exchange_mode() {
@@ -244,7 +244,7 @@ impl FsDir {
         }
 
         let mut src_parent = match src_inp.get_inode(-2) {
-            None => return err_box!("Parent not exits: {}", src_inp.path()),
+            None => return err_box!("Parent not exists: {}", src_inp.path()),
             Some(v) => v,
         };
 

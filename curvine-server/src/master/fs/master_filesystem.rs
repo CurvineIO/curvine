@@ -481,7 +481,7 @@ impl MasterFilesystem {
         fs_dir: &FsDir,
         inp: &InodePath,
     ) -> FsResult<FileBlocks> {
-        let inode = try_option!(inp.get_last_inode(), "File {} not exits", path);
+        let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
         let file = inode.as_file_ref()?;
         let blocks = self.get_block_locs(path, fs_dir, file)?;
         Ok(FileBlocks::new(inode.to_file_status(path), blocks))
@@ -533,7 +533,7 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
-        let inode = try_option!(inp.get_last_inode(), "File {} not exits", path);
+        let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
         let file = inode.as_file_ref()?;
         let block_locs = self.get_block_locs(path, &fs_dir, file)?;
         let locate_blocks = FileBlocks {

@@ -45,12 +45,12 @@ impl FileReader {
 
     pub fn read_chunk(&mut self) -> CommonResult<BytesMut> {
         // Read file data.
-        let reaming = self.inner.len() - self.inner.pos();
-        if reaming <= 0 {
+        let remaining = self.inner.len() - self.inner.pos();
+        if remaining <= 0 {
             return Ok(BytesMut::new());
         }
 
-        let len = self.chunk_size.min(reaming as usize);
+        let len = self.chunk_size.min(remaining as usize);
         self.read_buf.reserve(len);
         unsafe {
             self.read_buf.set_len(len);

@@ -97,10 +97,10 @@ pub async fn send_file_full(
     len: usize,
 ) -> IOResult<()> {
     let fd_out = get_raw_io(io_out)?;
-    let mut reaming = len;
-    while reaming > 0 {
+    let mut remaining = len;
+    while remaining > 0 {
         let res = io_out
-            .async_write(|| send_file(fd_in, fd_out, off.as_mut(), reaming))
+            .async_write(|| send_file(fd_in, fd_out, off.as_mut(), remaining))
             .await;
 
         match res {
@@ -108,7 +108,7 @@ pub async fn send_file_full(
                 if transferred == 0 {
                     return err_box!("send_file return 0");
                 }
-                reaming -= transferred as usize;
+                remaining -= transferred as usize;
             }
 
             Err(e) if e.is_would_block() => {
@@ -176,13 +176,13 @@ pub fn splice_out_full(
     mut off_out: Option<i64>,
     len: usize,
 ) -> IOResult<()> {
-    let mut reaming = len;
-    while reaming > 0 {
-        let transferred = splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), reaming)?;
+    let mut remaining = len;
+    while remaining > 0 {
+        let transferred = splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), remaining)?;
         if transferred == 0 {
             return err_box!("unsupported operation");
         }
-        reaming -= transferred as usize;
+        remaining -= transferred as usize;
     }
 
     Ok(())
@@ -197,14 +197,14 @@ pub async fn splice_in_full(
 ) -> IOResult<()> {
     let fd_in = get_raw_io(io_in)?;
 
-    let mut reaming = len;
-    while reaming > 0 {
+    let mut remaining = len;
+    while remaining > 0 {
         let write_res = io_in
-            .async_read(|| splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), reaming))
+            .async_read(|| splice(fd_in, off_in.as_mut(), fd_out, off_out.as_mut(), remaining))
             .await;
 
         match write_res {
-            Ok(transferred) => reaming -= transferred as usize,
+            Ok(transferred) => remaining -= transferred as usize,
 
             Err(e) if e.is_would_block() => continue,
 
@@ -363,12 +363,12 @@ pub fn read(fd: RawIO, buf: &mut [u8]) -> IOResult<CInt> {
 }
 
 pub fn read_full(fd: RawIO, buf: &mut [u8]) -> IOResult<()> {
-    let mut reaming = buf.len();
+    let mut remaining = buf.len();
     let mut off = 0;
 
-    while reaming > 0 {
+    while remaining > 0 {
         let read_len = read(fd, &mut buf[off..])? as usize;
-        reaming -= read_len;
+        remaining -= read_len;
         off += read_len;
     }
 
