@@ -129,7 +129,7 @@ impl MountTable {
         }
 
         if self.mount_point_inuse(cv_path) {
-            return err_box!("{} already exists in mount table", ufs_path);
+            return err_box!("{} already exists in mount table", cv_path);
         }
 
         self.check_conflict(cv_path, ufs_path)?;
