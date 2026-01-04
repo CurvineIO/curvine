@@ -79,6 +79,11 @@ impl ClusterConf {
         let str = try_err!(read_to_string(path.as_ref()));
         let mut conf = try_err!(toml::from_str::<Self>(&str));
 
+        if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
+            conf.master.hostname = v.to_owned();
+            conf.journal.hostname = v;
+        }
+
         // Apply worker hostname from environment variable (used by worker process)
         if let Ok(v) = env::var(Self::ENV_WORKER_HOSTNAME) {
             conf.worker.hostname = v;
@@ -94,33 +99,37 @@ impl ClusterConf {
         conf.fuse.init()?;
         conf.job.init()?;
 
+        if conf.client.master_addrs.is_empty() {
+            for peer in &mut conf.journal.journal_addrs {
+                let node = InetAddr::new(&peer.hostname, conf.master.rpc_port);
+                conf.client.master_addrs.push(node);
+            }
+        }
+
         Ok(conf)
     }
 
-    pub fn apply_master_hostname_env(&mut self) -> CommonResult<()> {
-        if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
-            self.master.hostname = v.to_owned();
-            let hostname_exists = self
-                .journal
-                .journal_addrs
-                .iter()
-                .any(|peer| peer.hostname == v);
+    pub fn check_master_hostname(&mut self) -> CommonResult<()> {
+        let hostname_exists = self
+            .journal
+            .journal_addrs
+            .iter()
+            .any(|peer| peer.hostname == self.master.hostname);
 
-            if !hostname_exists {
-                return err_box!(
-                    "Hostname '{}' from {} is not found in journal_addrs. Available hostnames: [{}]",
-                    v,
-                    Self::ENV_MASTER_HOSTNAME,
-                    self.journal.journal_addrs
-                        .iter()
-                        .map(|peer| peer.hostname.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-
-            self.journal.hostname = v;
+        if !hostname_exists {
+            return err_box!(
+                "hostname '{}' from {} is not found in journal_addrs. Available hostnames: [{}]",
+                self.master.hostname,
+                Self::ENV_MASTER_HOSTNAME,
+                self.journal
+                    .journal_addrs
+                    .iter()
+                    .map(|peer| peer.hostname.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
+
         Ok(())
     }
 
@@ -132,7 +141,7 @@ impl ClusterConf {
         conf.worker_threads = self.master.worker_threads;
         // master will automatically close the idle connection, and the customer service will automatically maintain a heartbeat.
         conf.close_idle = self.master.io_close_idle;
-        conf.timout_ms = self.master.io_timeout_ms();
+        conf.timeout_ms = self.master.io_timeout_ms();
         conf
     }
 
@@ -185,7 +194,7 @@ impl ClusterConf {
 
         // The raw client used by the worker does not currently implement heartbeat checks, so the default server does not actively close the connection.
         conf.close_idle = self.worker.io_close_idle;
-        conf.timout_ms = self.worker.io_timeout_ms();
+        conf.timeout_ms = self.worker.io_timeout_ms();
 
         conf.enable_splice = self.worker.enable_splice;
         conf.pipe_buf_size = self.worker.pipe_buf_size;

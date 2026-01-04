@@ -271,11 +271,18 @@ impl UnifiedFileSystem {
                 }
 
                 WriteType::Through => {
-                    let writer = mount.ufs.create(&ufs_path, flags.overwrite()).await?;
+                    let writer = if flags.append() {
+                        mount.ufs.append(&ufs_path).await?
+                    } else {
+                        mount.ufs.create(&ufs_path, flags.overwrite()).await?
+                    };
                     Ok(writer)
                 }
 
                 _ => {
+                    // ufs creates an empty file to prevent errors when accessing metadata.
+                    mount.ufs.create(&ufs_path, true).await?;
+
                     let writer = CacheSyncWriter::new(self, path, &mount, flags).await?;
                     Ok(UnifiedWriter::CacheSync(writer))
                 }

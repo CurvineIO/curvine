@@ -376,20 +376,34 @@ impl InodeStore {
         Ok(())
     }
 
+    pub fn create_blank_tree(&self) -> CommonResult<(i64, InodeView)> {
+        let root = FsDir::create_root();
+        self.fs_stats.set_counts(0, 0);
+        Ok((ROOT_INODE_ID, root))
+    }
+
     // Restore to a directory tree from rocksdb
     pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
         let mut root = FsDir::create_root();
         let mut stack = LinkedList::new();
-        stack.push_back((root.as_ptr(), ROOT_INODE_ID));
+        stack.push_back((
+            root.as_ptr(),
+            ROOT_INODE_ID,
+            InodeView::FileEntry(String::new(), ROOT_INODE_ID),
+        ));
         let mut last_inode_id = ROOT_INODE_ID;
         let mut file_count = 0i64;
         let mut dir_count = 0i64;
-
-        while let Some((mut parent, child_id)) = stack.pop_front() {
+        while let Some((mut parent, child_id, file_entry)) = stack.pop_front() {
             last_inode_id = last_inode_id.max(child_id);
 
             let next_parent = if child_id != ROOT_INODE_ID {
-                let inode = try_option!(self.store.get_inode(child_id)?);
+                let store_inode = try_option!(self.store.get_inode(child_id)?);
+                let inode = if matches!(store_inode, InodeView::Dir(_, _)) {
+                    store_inode
+                } else {
+                    file_entry
+                };
 
                 // Count files and directories during tree reconstruction
                 match &inode {
@@ -412,21 +426,23 @@ impl InodeStore {
             if next_parent.is_dir() {
                 let childs_iter = self.store.edges_iter(next_parent.id())?;
                 for item in childs_iter {
-                    let (_, value) = try_err!(item);
+                    let (key, value) = try_err!(item);
+                    let (_, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
                     let child_id = RocksUtils::i64_from_bytes(&value)?;
-                    stack.push_back((next_parent.clone(), child_id))
-                }
-            }
+                    let file_entry = InodeView::FileEntry(child_name.to_string(), child_id);
 
-            if let Some(ttl_config) = next_parent.ttl_config() {
-                let inode_id = next_parent.id() as u64;
-                let expiration_ms = ttl_config.expiry_time_ms();
-                if let Err(e) = self.ttl_bucket_list.add_inode(inode_id, expiration_ms) {
-                    log::warn!(
-                        "Direct ttl registration failed during tree creation for inode {}: {}",
-                        next_parent.id(),
-                        e
-                    );
+                    stack.push_back((next_parent.clone(), child_id, file_entry))
+                }
+                if let Some(ttl_config) = next_parent.ttl_config() {
+                    let inode_id = next_parent.id() as u64;
+                    let expiration_ms = ttl_config.expiry_time_ms();
+                    if let Err(e) = self.ttl_bucket_list.add_inode(inode_id, expiration_ms) {
+                        log::warn!(
+                            "Direct ttl registration failed during tree creation for inode {}: {}",
+                            next_parent.id(),
+                            e
+                        );
+                    }
                 }
             }
         }

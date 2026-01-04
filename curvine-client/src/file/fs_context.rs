@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::BlockClient;
+use crate::block::{BlockClient, BlockClientPool};
 use crate::file::CurvineFileSystem;
 use crate::ClientMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::ClientAddressProto;
-use curvine_common::state::{ClientAddress, WorkerAddress};
+use curvine_common::state::{ClientAddress, ExtendedBlock, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use fxhash::FxHasher;
@@ -27,7 +27,7 @@ use moka::sync::{Cache, CacheBuilder};
 use once_cell::sync::OnceCell;
 use orpc::client::{ClientConf, ClusterConnector};
 use orpc::common::Utils;
-use orpc::io::net::{InetAddr, NetUtils};
+use orpc::io::net::NetUtils;
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::CacheManager;
@@ -46,6 +46,7 @@ pub struct FsContext {
     pub(crate) client_addr: ClientAddress,
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
+    pub(crate) block_pool: Arc<BlockClientPool>,
 }
 
 impl FsContext {
@@ -83,12 +84,20 @@ impl FsContext {
             .eviction_policy(EvictionPolicy::lru())
             .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
 
+        let block_pool = Arc::new(BlockClientPool::new(
+            conf.client.enable_block_conn_pool,
+            conf.client.block_conn_idle_size,
+            conf.client.small_file_size,
+            conf.client.block_conn_idle_time.as_millis() as u64,
+        ));
+
         let context = Self {
             conf,
             connector: Arc::new(connector),
             client_addr,
             os_cache,
             failed_workers: exclude_workers,
+            block_pool,
         };
         Ok(context)
     }
@@ -110,9 +119,27 @@ impl FsContext {
     }
 
     pub async fn block_client(&self, addr: &WorkerAddress) -> IOResult<BlockClient> {
-        let addr = InetAddr::new(addr.hostname.clone(), addr.rpc_port as u16);
-        let client = self.connector.create_client(&addr, false).await?;
-        Ok(BlockClient::new(client, self))
+        let client = self
+            .connector
+            .create_client(&addr.inet_addr(), false)
+            .await?;
+        Ok(BlockClient::new(client, addr.clone(), self))
+    }
+
+    pub async fn acquire_write(
+        &self,
+        addr: &WorkerAddress,
+        block: &ExtendedBlock,
+    ) -> IOResult<BlockClient> {
+        self.block_pool.acquire_write(self, addr, block).await
+    }
+
+    pub async fn acquire_read(
+        &self,
+        addr: &WorkerAddress,
+        block: &ExtendedBlock,
+    ) -> IOResult<BlockClient> {
+        self.block_pool.acquire_read(self, addr, block).await
     }
 
     pub fn read_chunk_size(&self) -> usize {
@@ -185,18 +212,21 @@ impl FsContext {
         self.failed_workers.iter().map(|x| x.1.worker_id).collect()
     }
 
-    pub fn start_metrics_report_task(fs: CurvineFileSystem) {
-        if !fs.conf().client.metric_report_enable {
-            return;
-        }
+    pub fn start_clean_task(fs: CurvineFileSystem, pool: Arc<BlockClientPool>) {
+        let metric_report_enable = fs.conf().client.metric_report_enable;
+        let interval = fs.conf().client.clean_task_interval;
 
-        let interval = fs.conf().client.metric_report_interval;
         fs.clone_runtime().spawn(async move {
             let mut interval = tokio::time::interval(interval);
             loop {
                 interval.tick().await;
-                if let Err(e) = fs.metrics_report().await {
-                    warn!("metrics report: {}", e)
+
+                pool.clear_idle_conn();
+
+                if metric_report_enable {
+                    if let Err(e) = fs.metrics_report().await {
+                        warn!("metrics report: {}", e)
+                    }
                 }
             }
         });

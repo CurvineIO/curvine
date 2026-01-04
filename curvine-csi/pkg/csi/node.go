@@ -114,14 +114,28 @@ func (n *nodeService) NodeStageVolume(ctx context.Context, request *csi.NodeStag
 		return nil, status.Error(codes.InvalidArgument, "master-addrs parameter is required")
 	}
 
+	// Get fs-path from VolumeContext or PublishContext (used for FUSE mount)
+	// If not specified, default to root path "/"
+	fsPathToMount := volumeContext["fs-path"]
+	if fsPathToMount == "" {
+		fsPathToMount = publishContext["fs-path"]
+	}
+	if fsPathToMount == "" {
+		fsPathToMount = "/"
+		klog.Infof("RequestID: %s, fs-path not specified, using default root path: /", requestID)
+	} else {
+		klog.Infof("RequestID: %s, Using fs-path from context: %s", requestID, fsPathToMount)
+	}
+
 	// Generate cluster-id from master-addrs
 	clusterID := GenerateClusterID(masterAddrs)
 
-	// Generate mnt-path based on cluster-id only
-	// All PVs in same cluster share one FUSE process that mounts root path
-	mntPath := fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/curvine/%s/fuse-mount", clusterID)
-	klog.Infof("RequestID: %s, Generated mnt-path: %s (cluster-id: %s, master-addrs: %s)",
-		requestID, mntPath, clusterID, masterAddrs)
+	// Generate mnt-path based on mount-key (master-addrs + fs-path)
+	// This ensures different StorageClasses with same master-addrs but different fs-path get different mount points
+	mountKey := GenerateMountKey(masterAddrs, fsPathToMount)
+	mntPath := fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/curvine/%s/fuse-mount", mountKey)
+	klog.Infof("RequestID: %s, Generated mnt-path: %s (mount-key: %s, cluster-id: %s, master-addrs: %s, fs-path: %s)",
+		requestID, mntPath, mountKey, clusterID, masterAddrs, fsPathToMount)
 
 	// Collect FUSE parameters from VolumeContext or PublishContext
 	fuseParams := make(map[string]string)
@@ -154,9 +168,8 @@ func (n *nodeService) NodeStageVolume(ctx context.Context, request *csi.NodeStag
 	}
 
 	// Start FUSE process for shared mount point
-	// Always mount root path "/" of curvine filesystem
-	fsPathToMount := "/"
-	klog.Infof("RequestID: %s, Starting FUSE process for cluster: %s, mounting curvine root path: %s to: %s",
+	// Mount fs-path (can be root "/" or subdirectory like "/test-data")
+	klog.Infof("RequestID: %s, Starting FUSE process for cluster: %s, mounting curvine path: %s to: %s",
 		requestID, clusterID, fsPathToMount, mntPath)
 	if err := n.fuseManager.StartFuseProcess(ctx, mntPath, clusterID, masterAddrs, fsPathToMount, fuseParams); err != nil {
 		klog.Errorf("RequestID: %s, Failed to start FUSE process: %v", requestID, err)
@@ -185,27 +198,37 @@ func (n *nodeService) NodeUnstageVolume(ctx context.Context, request *csi.NodeUn
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
-	// Try to parse VolumeHandle to get cluster-id
+	// Try to parse VolumeHandle to get cluster-id and fs-path
 	components, parseErr := ParseVolumeHandle(volumeID)
 	var clusterID string
+	var mntPath string
+	var mountInfo *MountInfo
+	var exists bool
 
 	if parseErr == nil {
 		clusterID = components.ClusterID
+		// Calculate mnt-path from fs-path and master-addrs
+		// Need to get master-addrs from mount state or use a different approach
+		// For now, try to find mount by cluster-id first, then verify fs-path matches
+		mountInfo, exists = n.mountState.GetMountByClusterID(clusterID)
+		if !exists {
+			klog.Warningf("RequestID: %s, Mount info not found for cluster-id %s, skipping cleanup", requestID, clusterID)
+			return &csi.NodeUnstageVolumeResponse{}, nil
+		}
+		// Verify fs-path matches (if mount has fs-path stored)
+		if mountInfo.FSPath != "" && mountInfo.FSPath != components.FSPath {
+			klog.Warningf("RequestID: %s, Mount fs-path %s does not match volume fs-path %s, skipping cleanup",
+				requestID, mountInfo.FSPath, components.FSPath)
+			return &csi.NodeUnstageVolumeResponse{}, nil
+		}
+		mntPath = mountInfo.MntPath
 	} else {
-		// Non-structured volumeHandle: generate cluster-id from volumeContext
+		// Non-structured volumeHandle: try to find mount by cluster-id
 		// (This should not happen for NodeUnstageVolume as volume should have been staged first)
 		klog.Warningf("RequestID: %s, Failed to parse volumeHandle, cannot determine cluster-id: %v", requestID, parseErr)
 		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 
-	// Get mnt-path from mount state by cluster-id
-	mountInfo, exists := n.mountState.GetMountByClusterID(clusterID)
-	if !exists {
-		klog.Warningf("RequestID: %s, Mount info not found for cluster-id %s, skipping cleanup", requestID, components.ClusterID)
-		return &csi.NodeUnstageVolumeResponse{}, nil
-	}
-
-	mntPath := mountInfo.MntPath
 	if mntPath == "" {
 		klog.Warningf("RequestID: %s, mnt-path not found in mount state, skipping cleanup", requestID)
 		return &csi.NodeUnstageVolumeResponse{}, nil
@@ -291,9 +314,20 @@ func (n *nodeService) NodePublishVolume(ctx context.Context, request *csi.NodePu
 		return nil, status.Error(codes.InvalidArgument, "curvine-path parameter is required")
 	}
 
+	// Get fs-path from VolumeContext or PublishContext (used for mnt-path generation)
+	// If not specified, default to root path "/"
+	fsPath := volumeContext["fs-path"]
+	if fsPath == "" {
+		fsPath = publishContext["fs-path"]
+	}
+	if fsPath == "" {
+		fsPath = "/"
+	}
+
 	// Generate cluster-id and mnt-path (same as NodeStageVolume)
 	clusterID := GenerateClusterID(masterAddrs)
-	mntPath := fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/curvine/%s/fuse-mount", clusterID)
+	mountKey := GenerateMountKey(masterAddrs, fsPath)
+	mntPath := fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/curvine/%s/fuse-mount", mountKey)
 
 	// Ensure shared mount point is ready (call NodeStageVolume logic if needed)
 	klog.Infof("RequestID: %s, Checking mount state for mntPath: %s, clusterID: %s, curvine-path: %s",
@@ -328,17 +362,37 @@ func (n *nodeService) NodePublishVolume(ctx context.Context, request *csi.NodePu
 		klog.Infof("RequestID: %s, Mount state exists, FUSE PID: %d", requestID, mountInfo.FusePID)
 	}
 
-	// Calculate host sub-path: mnt-path + curvine-path
-	// FUSE mounts curvine root "/" to mnt-path, so curvine-path is accessible at mnt-path + curvine-path
-	// For example: mnt-path="/xyz", curvine-path="/pvc-abc" → hostSubPath="/xyz/pvc-abc"
-	// Need to strip leading "/" from curvine-path to avoid double slash
-	curvineSubPath := strings.TrimPrefix(curvinePath, "/")
-	hostSubPath := mntPath
-	if curvineSubPath != "" {
-		hostSubPath = mntPath + "/" + curvineSubPath
+	// Calculate host sub-path based on fs-path
+	// If fs-path is "/", FUSE mounts root, so curvine-path is accessible at mnt-path + curvine-path
+	// If fs-path is not "/", FUSE mounts fs-path, so need to calculate relative path
+	// Example 1: fs-path="/", curvine-path="/pvc-abc" → hostSubPath="/xyz/pvc-abc"
+	// Example 2: fs-path="/test-data", curvine-path="/test-data/pvc-abc" → hostSubPath="/xyz/pvc-abc"
+	var hostSubPath string
+	if fsPath == "/" {
+		// FUSE mounts root, curvine-path is relative to root
+		curvineSubPath := strings.TrimPrefix(curvinePath, "/")
+		hostSubPath = mntPath
+		if curvineSubPath != "" {
+			hostSubPath = mntPath + "/" + curvineSubPath
+		}
+	} else {
+		// FUSE mounts fs-path, need to calculate relative path from curvine-path
+		// curvine-path should start with fs-path, remove fs-path prefix to get relative path
+		if !strings.HasPrefix(curvinePath, fsPath) {
+			klog.Errorf("RequestID: %s, curvine-path %s does not start with fs-path %s", requestID, curvinePath, fsPath)
+			return nil, status.Errorf(codes.Internal, "curvine-path %s does not match fs-path %s", curvinePath, fsPath)
+		}
+		// Remove fs-path prefix from curvine-path
+		relativePath := strings.TrimPrefix(curvinePath, fsPath)
+		// Remove leading "/" if present
+		relativePath = strings.TrimPrefix(relativePath, "/")
+		hostSubPath = mntPath
+		if relativePath != "" {
+			hostSubPath = mntPath + "/" + relativePath
+		}
 	}
-	klog.Infof("RequestID: %s, Calculated host sub-path: %s (mnt-path: %s, curvine-path: %s)",
-		requestID, hostSubPath, mntPath, curvinePath)
+	klog.Infof("RequestID: %s, Calculated host sub-path: %s (mnt-path: %s, fs-path: %s, curvine-path: %s)",
+		requestID, hostSubPath, mntPath, fsPath, curvinePath)
 
 	// Check if sub-path exists (should be created by Controller in remote storage)
 	klog.Infof("RequestID: %s, Checking if sub-path exists: %s", requestID, hostSubPath)

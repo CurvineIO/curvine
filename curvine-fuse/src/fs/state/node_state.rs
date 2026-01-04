@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::fs::state::file_handle::FileHandle;
+use crate::fs::state::DirHandle;
 use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::FuseConf;
-use curvine_common::fs::{FileSystem, Path};
+use curvine_common::fs::{FileSystem, MetaCache, Path};
 use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
 use log::{info, warn};
 use orpc::common::FastHashMap;
@@ -31,7 +32,9 @@ use tokio::sync::Mutex;
 pub struct NodeState {
     node_map: RwLock<NodeMap>,
     handles: RwLockHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
+    dir_handles: RwLockHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
     fh_creator: AtomicCounter,
+    meta_cache: MetaCache,
     fs: UnifiedFileSystem,
     conf: FuseConf,
 }
@@ -40,12 +43,15 @@ impl NodeState {
     pub fn new(fs: UnifiedFileSystem) -> Self {
         let conf = fs.conf().fuse.clone();
         let node_map = NodeMap::new(&conf);
+        let meta_cache = MetaCache::new(conf.meta_cache_capacity, conf.meta_cache_ttl_duration);
 
         Self {
             node_map: RwLock::new(node_map),
             handles: RwLockHashMap::default(),
-            fs,
+            dir_handles: RwLockHashMap::default(),
             fh_creator: AtomicCounter::new(0),
+            meta_cache,
+            fs,
             conf,
         }
     }
@@ -56,6 +62,10 @@ impl NodeState {
 
     pub fn node_read(&self) -> RwLockReadGuard<'_, NodeMap> {
         self.node_map.read().unwrap()
+    }
+
+    pub fn meta_cache(&self) -> &MetaCache {
+        &self.meta_cache
     }
 
     pub fn get_node(&self, id: u64) -> FuseResult<NodeAttr> {
@@ -246,7 +256,11 @@ impl NodeState {
 
             mode if mode == OpenFlags::RDWR => {
                 let writer = self.new_writer(ino, path, flags, opts).await?;
-                let reader = if let Some((ufs_path, _)) = self.fs.get_mount(path).await? {
+                let (is_ufs, ufs_path) = {
+                    let lock = writer.lock().await;
+                    (lock.is_ufs(), lock.path().full_path().to_string())
+                };
+                let reader = if is_ufs {
                     warn!(
                         "ufs {} -> {} does not support read-write mode for file opening, reader will be None",
                         path,
@@ -309,13 +323,15 @@ impl NodeState {
         let lock = self.handles.read();
         if let Some(v) = lock.get(&ino) {
             if let Some(handle) = v.get(&fh) {
-                Ok(handle.clone())
-            } else {
-                err_fuse!(libc::EBADF, "Ino {} fh {}  not found handle", ino, fh)
+                return Ok(handle.clone());
             }
-        } else {
-            err_fuse!(libc::EBADF, "Ino {} fh {}  not found handle", ino, fh)
         }
+        err_fuse!(
+            libc::EBADF,
+            "node_id {} file_handle {}  not found handle",
+            ino,
+            fh
+        )
     }
 
     pub fn remove_handle(&self, ino: u64, fh: u64) -> Option<Arc<FileHandle>> {
@@ -349,24 +365,26 @@ impl NodeState {
     ) -> FuseResult<bool> {
         let name = name.as_ref();
 
-        let mut map = self.node_write();
-        let id = match map.lookup_node(parent, name) {
-            Some(v) => v.id,
-            None => return err_fuse!(libc::ENOENT, "node {} not found", parent),
+        let id = {
+            let map = self.node_read();
+            match map.lookup_node(parent, name) {
+                Some(v) => v.id,
+                None => return err_fuse!(libc::ENOENT, "node {} not found", parent),
+            }
         };
 
-        let delete = if self.has_open_handles(id) {
+        if self.has_open_handles(id) {
+            let mut map = self.node_write();
             map.mark_pending_delete(id);
-            let path = map.get_path_common(id, name)?;
+            let path = map.get_path(id)?;
             info!(
                 "unlink {}: file has open handles (ino={}), marking for delayed deletion",
                 path, id
             );
-            false
+            Ok(false)
         } else {
-            true
-        };
-        Ok(delete)
+            Ok(true)
+        }
     }
 
     pub fn remove_pending_delete(&self, ino: u64) -> bool {
@@ -375,6 +393,51 @@ impl NodeState {
 
     pub fn is_pending_delete(&self, ino: u64) -> bool {
         self.node_read().is_pending_delete(ino)
+    }
+
+    pub fn find_dir_handle(&self, ino: u64, fh: u64) -> FuseResult<Arc<DirHandle>> {
+        let lock = self.dir_handles.read();
+        if let Some(v) = lock.get(&ino) {
+            if let Some(handle) = v.get(&fh) {
+                return Ok(handle.clone());
+            }
+        }
+
+        err_fuse!(
+            libc::EBADF,
+            "node_id {} dir_handle {}  not found dir handle",
+            ino,
+            fh
+        )
+    }
+
+    pub fn remove_dir_handle(&self, ino: u64, fh: u64) -> Option<Arc<DirHandle>> {
+        let mut lock = self.dir_handles.write();
+        if let Some(map) = lock.get_mut(&ino) {
+            let handle = map.remove(&fh);
+
+            if map.is_empty() {
+                lock.remove(&ino);
+            }
+
+            handle
+        } else {
+            None
+        }
+    }
+
+    pub async fn new_dir_handle(
+        &self,
+        ino: u64,
+        list: Vec<FileStatus>,
+    ) -> FuseResult<Arc<DirHandle>> {
+        let handle = Arc::new(DirHandle::new(ino, self.next_fh(), list));
+        let mut lock = self.dir_handles.write();
+        lock.entry(ino)
+            .or_default()
+            .insert(handle.fh, handle.clone());
+
+        Ok(handle)
     }
 }
 
