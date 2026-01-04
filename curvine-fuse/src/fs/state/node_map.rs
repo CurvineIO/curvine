@@ -394,20 +394,11 @@ impl NodeMap {
 
     // Helper function to parse a name key back into (parent_id, name)
     fn parse_name_key(key: &str) -> Option<(u64, String)> {
-        // The key format is "{parent_id}{name}"
-        // We need to find where the parent_id ends and name begins
-
-        // Try to parse increasing prefixes as parent_id
-        for i in 1..=key.len() {
-            if let Ok(parent_id) = key[..i].parse::<u64>() {
-                // Check if there's a name part after the parent_id
-                if i < key.len() {
-                    let name = key[i..].to_string();
-                    return Some((parent_id, name));
-                }
-            }
-        }
-        None
+        // The key format is "{parent_id}\0{name}" (null character as separator)
+        // Split by the null character separator
+        let (parent_str, name) = key.split_once('\0')?;
+        let parent_id = parent_str.parse::<u64>().ok()?;
+        Some((parent_id, name.to_string()))
     }
 
     pub fn clean_cache(&mut self) {
@@ -461,5 +452,33 @@ impl NodeMap {
 
     pub fn is_pending_delete(&self, ino: u64) -> bool {
         self.pending_deletes.contains(&ino)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::octal_escapes)]
+    fn test_name_key_and_parse_name_key() {
+        // Test basic case
+        let key = NodeMap::name_key(123, "test.txt");
+        assert_eq!(key, "123\0test.txt");
+
+        let parsed = NodeMap::parse_name_key(&key);
+        assert_eq!(parsed, Some((123, "test.txt".to_string())));
+
+        let key = NodeMap::name_key(1, "234file.txt");
+        assert_eq!(key, "1\0234file.txt");
+
+        let parsed = NodeMap::parse_name_key(&key);
+        assert_eq!(parsed, Some((1, "234file.txt".to_string())));
+
+        let key2 = NodeMap::name_key(100, "999");
+        assert_eq!(key2, "100\0999");
+
+        let parsed2 = NodeMap::parse_name_key(&key2);
+        assert_eq!(parsed2, Some((100, "999".to_string())));
     }
 }
