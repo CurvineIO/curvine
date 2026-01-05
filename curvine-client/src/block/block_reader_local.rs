@@ -66,13 +66,6 @@ impl BlockReaderLocal {
 
         let path = try_option!(read_context.path);
         let file = LocalFile::with_read(&path, off as u64)?;
-        if file.len() < read_context.len {
-            return err_box!(
-                "File data is lost. block len: {}, actual file length: {}",
-                read_context.len,
-                file.len()
-            );
-        }
 
         let reader = Self {
             rt: fs_context.clone_runtime(),
