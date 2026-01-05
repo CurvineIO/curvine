@@ -123,6 +123,7 @@ where
     }
 }
 
+#[allow(unused)]
 struct TestWebService;
 
 impl WebHandlerService for TestWebService {

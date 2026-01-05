@@ -94,7 +94,7 @@ where
         self.capacity
     }
 
-    pub fn iter(&self) -> LFUIterator<K> {
+    pub fn iter(&self) -> LFUIterator<'_, K> {
         LFUIterator::new(self)
     }
 

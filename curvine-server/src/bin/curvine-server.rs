@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::{arg, Parser};
+use clap::Parser;
 use curvine_common::conf::ClusterConf;
 use curvine_common::version;
 use curvine_server::master::Master;

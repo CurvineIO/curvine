@@ -17,12 +17,22 @@ use serde::{Deserialize, Serialize};
 
 #[repr(i32)]
 #[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, IntoPrimitive, FromPrimitive,
+    Debug,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    Hash,
+    IntoPrimitive,
+    FromPrimitive,
+    Default,
 )]
 pub enum FileType {
     Dir = 0,
 
-    #[num_enum(default)]
+    #[default]
     File = 1,
 
     Link = 2,
@@ -32,10 +42,4 @@ pub enum FileType {
     Agg = 4,
 
     Object = 5,
-}
-
-impl Default for FileType {
-    fn default() -> Self {
-        Self::File
-    }
 }

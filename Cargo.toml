@@ -74,7 +74,7 @@ clap = { version = "4.3.10", features = ["derive"] }
 toml = "0.8.11"
 indexmap = "2.0.2"
 regex = "1.9.4"
-num_enum = "0.7.0"
+num_enum = "0.7.5"
 hyper = "1.2.0"
 pin-project-lite = "0.2.15"
 uuid = { version = "1.11.0", features = ["v4", "fast-rng", "macro-diagnostics"] }

@@ -15,6 +15,7 @@
 use curvine_common::state::{BlockLocation, CommitBlock, FileAllocOpts, WorkerAddress};
 use serde::{Deserialize, Serialize};
 
+#[allow(unused)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize, Serialize)]
 #[repr(i8)]
 pub enum BlockState {

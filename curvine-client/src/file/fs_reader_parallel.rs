@@ -60,7 +60,7 @@ impl FsReaderParallel {
         chunk_size: usize,
     ) -> FsResult<Vec<Self>> {
         // Check the alignment
-        if chunk_size % FILE_MIN_ALIGN_SIZE != 0 || chunk_size < FILE_MIN_ALIGN_SIZE {
+        if !chunk_size.is_multiple_of(FILE_MIN_ALIGN_SIZE) || chunk_size < FILE_MIN_ALIGN_SIZE {
             return err_box!(
                 "chunk_size must be an integer multiple of {}",
                 FILE_MIN_ALIGN_SIZE
