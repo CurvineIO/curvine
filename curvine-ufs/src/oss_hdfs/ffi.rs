@@ -15,7 +15,24 @@
 //! FFI bindings for JindoSDK C++ library
 
 use orpc::sys::RawPtr;
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
+
+/// Fetch the last error message reported by the JindoSDK C++ shim.
+///
+/// This is a thin convenience helper around `jindo_get_last_error()` to avoid
+/// repeating unsafe string conversions at every call site.
+#[inline]
+pub(crate) fn jindo_last_error() -> String {
+    unsafe {
+        let err_ptr = jindo_get_last_error();
+        if err_ptr.is_null() {
+            String::from("Unknown error")
+        } else {
+            CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+        }
+    }
+}
 
 // Opaque handle types
 // We wrap raw pointers with `RawPtr` for FFI ergonomics and to make Send/Sync explicit.
@@ -30,18 +47,10 @@ pub struct JindoReaderHandle(pub RawPtr<c_void>);
 #[derive(Clone, Debug)]
 pub struct JindoConfigHandle(pub RawPtr<c_void>);
 
-// Safety: These handles are opaque pointers to C++ objects.
-// The underlying JindoSDK C++ library is thread-safe and handles
-// all synchronization internally. We mark these as Send/Sync to allow
-// them to be used across thread boundaries.
-unsafe impl Send for JindoFileSystemHandle {}
-unsafe impl Sync for JindoFileSystemHandle {}
-unsafe impl Send for JindoWriterHandle {}
-unsafe impl Sync for JindoWriterHandle {}
-unsafe impl Send for JindoReaderHandle {}
-unsafe impl Sync for JindoReaderHandle {}
-unsafe impl Send for JindoConfigHandle {}
-unsafe impl Sync for JindoConfigHandle {}
+// NOTE:
+// These handle newtypes inherit auto-traits (`Send`/`Sync`) from `RawPtr<c_void>`.
+// We intentionally do not add explicit `unsafe impl Send/Sync` here to avoid
+// duplicating unsafe promises in multiple places.
 
 impl JindoFileSystemHandle {
     #[inline]
@@ -70,7 +79,6 @@ impl JindoWriterHandle {
         Self(RawPtr::from_raw(p as *const c_void))
     }
 
-    #[allow(dead_code)]
     pub fn is_null(&self) -> bool {
         self.as_raw().is_null()
     }
@@ -103,11 +111,6 @@ impl JindoConfigHandle {
         Self(RawPtr::from_raw(p as *const c_void))
     }
 
-    #[allow(dead_code)]
-    pub fn is_null(&self) -> bool {
-        self.as_raw().is_null()
-    }
-
     #[inline]
     pub fn as_raw(&self) -> *mut c_void {
         self.0.as_mut_ptr()
@@ -119,9 +122,11 @@ impl JindoConfigHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JindoStatus {
     Ok = 0,
+    // Kept for ABI completeness with the C++ shim even if currently unused by Rust call sites.
     #[allow(dead_code)]
     Error = 1,
     FileNotFound = 2,
+    // Kept for ABI completeness with the C++ shim even if currently unused by Rust call sites.
     #[allow(dead_code)]
     IoError = 3,
 }
@@ -149,6 +154,7 @@ pub struct JindoListResult {
 
 // Content summary structure
 #[repr(C)]
+// Kept for ABI completeness with the C++ shim even if currently unused by Rust call sites.
 #[allow(dead_code)]
 pub struct JindoContentSummary {
     pub file_count: i64,
@@ -247,6 +253,7 @@ extern "C" {
     ) -> JindoStatus;
 
     #[allow(dead_code)]
+    // Kept for ABI completeness with the C++ shim even if currently unused by Rust call sites.
     pub fn jindo_filesystem_get_content_summary_async(
         fs: *mut c_void,
         path: *const c_char,

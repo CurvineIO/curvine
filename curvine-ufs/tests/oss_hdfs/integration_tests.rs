@@ -482,7 +482,7 @@ mod tests {
         writer.complete().await.unwrap();
 
         // Random read
-        let reader = fs.open(&test_file).await.unwrap();
+        let mut reader = fs.open(&test_file).await.unwrap();
         let data = reader.pread(5, 5).await.unwrap();
         assert_eq!(data.as_ref(), b"56789");
     }
@@ -1149,7 +1149,7 @@ mod tests {
         writer.complete().await.unwrap();
 
         // Try invalid offset
-        let reader = fs.open(&test_file).await.unwrap();
+        let mut reader = fs.open(&test_file).await.unwrap();
         let result = reader.pread(-1, 10).await;
         assert!(result.is_err(), "Should fail with negative offset");
 
