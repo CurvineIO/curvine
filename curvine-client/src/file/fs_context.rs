@@ -77,6 +77,7 @@ impl FsContext {
             conf.client.enable_read_ahead,
             conf.client.read_ahead_len,
             conf.client.drop_cache_len,
+            conf.client.read_chunk_size as i64,
         );
 
         let exclude_workers = CacheBuilder::default()
