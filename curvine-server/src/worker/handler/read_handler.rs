@@ -94,6 +94,7 @@ impl ReadHandler {
             context.enable_read_ahead,
             context.read_ahead_len,
             context.drop_cache_len,
+            context.chuck_size as i64,
         );
 
         let log_msg = format!(
