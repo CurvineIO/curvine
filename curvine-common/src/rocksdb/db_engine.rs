@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::rocksdb::{DBConf, RocksUtils};
-use log::info;
+use log::{info, warn};
 use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, CommonResult};
 use rocksdb::checkpoint::Checkpoint;
@@ -205,13 +205,24 @@ impl DBEngine {
     // Create a checkpoint.
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
         let checkpoint_path = self.get_checkpoint_path(id);
-        if FileUtils::exists(&checkpoint_path) {
+        let existed = FileUtils::exists(&checkpoint_path);
+
+        if existed {
+            warn!(
+                "checkpoint directory already exists, will be deleted and recreated: {}, id: {}",
+                checkpoint_path, id
+            );
             FileUtils::delete_path(&checkpoint_path, true)?;
         }
 
         FileUtils::create_parent_dir(&checkpoint_path, true)?;
         let checkpoint = try_err!(Checkpoint::new(&self.db));
         checkpoint.create_checkpoint(&checkpoint_path)?;
+
+        info!(
+            "created checkpoint successfully, id: {}, path: {}, existed_before: {}",
+            id, checkpoint_path, existed
+        );
 
         Ok(checkpoint_path)
     }

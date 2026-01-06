@@ -15,7 +15,7 @@
 use crate::proto::raft::{SnapshotDownloadRequest, SnapshotDownloadResponse};
 use crate::raft::snapshot::FileReader;
 use crate::raft::{RaftError, RaftResult, RaftUtils};
-use log::error;
+use log::{debug, error};
 use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
@@ -53,6 +53,12 @@ impl SnapshotDownloadHandler {
             );
         }
 
+        debug!(
+            "sender opening snapshot file for transfer: {}, len: {}",
+            path,
+            reader.len()
+        );
+
         self.reader = Some(reader);
         let rep = Builder::success(msg)
             .proto_header(SnapshotDownloadResponse::default())
@@ -63,9 +69,15 @@ impl SnapshotDownloadHandler {
     pub fn read_chunk(&mut self, req: &Message) -> RaftResult<Message> {
         let reader = try_option_mut!(self.reader);
         let builder = if !reader.has_remaining() {
+            let checksum = reader.checksum();
+            debug!(
+                "sender snapshot file transfer complete, checksum: {}, len: {}",
+                checksum,
+                reader.len()
+            );
             let header = SnapshotDownloadResponse {
                 is_last: true,
-                checksum: reader.checksum(),
+                checksum,
             };
             let _ = self.reader.take();
             Builder::success(req).proto_header(header)

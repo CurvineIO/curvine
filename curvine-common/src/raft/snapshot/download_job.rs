@@ -16,7 +16,7 @@ use crate::conf::JournalConf;
 use crate::proto::raft::{SnapshotDownloadResponse, SnapshotFileInfo, SnapshotFileList};
 use crate::raft::snapshot::{FileWriter, SnapshotClient};
 use crate::raft::{NodeId, RaftClient, RaftResult};
-use log::info;
+use log::{debug, error, info};
 use orpc::common::{ByteUnit, FileUtils, TimeSpent};
 use orpc::err_box;
 use orpc::runtime::GroupExecutor;
@@ -124,10 +124,32 @@ impl DownloadJob {
                 let header: SnapshotDownloadResponse = msg.parse_header()?;
                 if header.is_last {
                     // Check check_sum
-                    if header.checksum != writer.checksum() {
-                        return err_box!("Snapshot file {}, checksum verification failed, expected {}, actual {}",
-                            client.file_path(), writer.checksum(), header.checksum);
+                    let receiver_checksum = writer.checksum();
+                    let sender_checksum = header.checksum;
+                    if sender_checksum != receiver_checksum {
+                        error!(
+                            "receiver snapshot file {} checksum mismatch! \
+                            receiver_checksum: {}, sender_checksum: {}, \
+                            written_len: {}, expected_len: {}",
+                            client.file_path(),
+                            receiver_checksum,
+                            sender_checksum,
+                            writer.write_len(),
+                            client.file_len()
+                        );
+                        return err_box!(
+                            "Snapshot file {}, checksum verification failed, \
+                            receiver_checksum: {}, sender_checksum: {}",
+                            client.file_path(),
+                            receiver_checksum,
+                            sender_checksum
+                        );
                     }
+                    debug!(
+                        "receiver snapshot file {} checksum verified, checksum: {}",
+                        client.file_path(),
+                        receiver_checksum
+                    );
                     break;
                 } else {
                     return err_box!("Status Error");
