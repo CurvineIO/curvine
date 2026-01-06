@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::fs_writer_buffer::WriterAdapter::{Base, Buffer};
 use crate::file::FsWriterBase;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
@@ -102,53 +101,11 @@ impl BufferChannel {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
-enum WriterAdapter {
-    Buffer(BufferChannel),
-    Base(FsWriterBase),
-}
-
-impl WriterAdapter {
-    async fn write(&mut self, data: DataSlice) -> FsResult<()> {
-        match self {
-            Base(w) => w.write(data).await,
-            Buffer(w) => w.write(data).await,
-        }
-    }
-
-    async fn flush(&mut self) -> FsResult<()> {
-        match self {
-            Base(w) => w.flush().await,
-            Buffer(w) => w.flush().await,
-        }
-    }
-    async fn complete(&mut self) -> FsResult<()> {
-        match self {
-            Base(w) => w.complete().await,
-            Buffer(w) => w.complete().await,
-        }
-    }
-
-    async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        match self {
-            Base(w) => w.seek(pos).await,
-            Buffer(w) => w.seek(pos).await,
-        }
-    }
-
-    async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
-        match self {
-            Base(w) => w.resize(opts).await,
-            Buffer(w) => w.resize(opts).await,
-        }
-    }
-}
-
 // Reader with buffer.
 pub struct FsWriterBuffer {
     path: Path,
     status: FileStatus,
-    writer: WriterAdapter,
+    writer: BufferChannel,
     pos: i64,
 }
 
@@ -159,30 +116,26 @@ impl FsWriterBuffer {
         let status = writer.status().clone();
         let pos = writer.pos();
 
-        let writer = if chunk_num == 1 {
-            Base(writer)
-        } else {
-            let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
-            let (task_sender, task_receiver) = AsyncChannel::new(2).split();
-            let monitor = err_monitor.clone();
+        let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
+        let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+        let monitor = err_monitor.clone();
 
-            let rt = writer.fs_context().clone_runtime();
-            rt.spawn(async move {
-                let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
-                match res {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("buffer writer error: {:?}", e);
-                        monitor.set_error(e);
-                    }
+        let rt = writer.fs_context().clone_runtime();
+        rt.spawn(async move {
+            let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("buffer writer error: {:?}", e);
+                    monitor.set_error(e);
                 }
-            });
+            }
+        });
 
-            Buffer(BufferChannel {
-                chunk_sender,
-                task_sender,
-                err_monitor,
-            })
+        let writer = BufferChannel {
+            chunk_sender,
+            task_sender,
+            err_monitor,
         };
 
         Self {

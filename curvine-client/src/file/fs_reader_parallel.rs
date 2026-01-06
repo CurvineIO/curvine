@@ -173,8 +173,13 @@ impl FsReaderParallel {
             }
 
             None => {
-                self.inner.seek(self.inner.len()).await?;
-                let _ = self.cur_idx.insert(self.alloc_slices.len() - 1);
+                if let Some(last_slice) = self.alloc_slices.last() {
+                    self.inner.seek(last_slice.end).await?;
+                    let _ = self.cur_idx.insert(self.alloc_slices.len() - 1);
+                } else {
+                    self.inner.seek(0).await?;
+                    self.cur_idx = None;
+                }
             }
         }
         Ok(())

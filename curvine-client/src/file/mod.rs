@@ -41,3 +41,6 @@ pub use self::fs_reader_parallel::FsReaderParallel;
 
 mod fs_writer_buffer;
 pub use self::fs_writer_buffer::FsWriterBuffer;
+
+mod read_detector;
+pub use self::read_detector::*;

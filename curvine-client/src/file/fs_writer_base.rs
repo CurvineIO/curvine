@@ -255,13 +255,15 @@ impl FsWriterBase {
         let (block_off, seek_block) = self.file_blocks.get_block_check(pos)?;
         // Check if we have a current writer
         if let Some(writer) = &mut self.cur_writer {
-            if writer.block_id() != seek_block.block.id {
+            if writer.block_id() == seek_block.block.id {
+                writer.seek(block_off).await?;
+            } else {
                 // If seek position is outside current block, clear current writer through update_writer
                 // This ensures all writer caching logic is handled consistently in update_writer
-                self.close_writer_times = self.close_writer_times.saturating_add(1);
+                if writer.block_id() + 1 != seek_block.block.id {
+                    self.close_writer_times = self.close_writer_times.saturating_add(1);
+                }
                 self.update_writer(None).await?;
-            } else {
-                writer.seek(block_off).await?;
             }
         }
 

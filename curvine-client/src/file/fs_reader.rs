@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::{FsContext, FsReaderBuffer};
+use crate::file::{FsContext, FsReaderBuffer, ReadDetector};
 use curvine_common::fs::{Path, Reader};
 use curvine_common::state::{FileBlocks, FileStatus};
 use curvine_common::FsResult;
@@ -40,6 +40,8 @@ impl FsReader {
         let conf = &fs_context.conf.client;
         let status = file_blocks.status.clone();
 
+        let read_detector = ReadDetector::with_conf(conf, len);
+
         info!(
             "Create reader, path={}, len={}, blocks={}, chunk_size={}, chunk_number={}, read_parallel={}, slice_size={}, read_ahead={}-{}",
             &file_blocks.status.path,
@@ -47,13 +49,13 @@ impl FsReader {
             file_blocks.block_locs.len(),
             chunk_size,
             conf.read_chunk_num,
-            conf.read_parallel,
+            read_detector.read_parallel(),
             conf.read_slice_size,
             conf.enable_read_ahead,
             conf.read_ahead_len
         );
 
-        let inner = FsReaderBuffer::new(path, fs_context, file_blocks)?;
+        let inner = FsReaderBuffer::new(path, fs_context, file_blocks, read_detector)?;
         let reader = Self {
             inner,
             chunk: DataSlice::Empty,
