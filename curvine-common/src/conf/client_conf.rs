@@ -203,6 +203,20 @@ pub struct ClientConf {
     pub small_file_size: i64,
     #[serde(alias = "small_file_size")]
     pub small_file_size_str: String,
+
+    // Smart prefetch configuration
+    // Whether to enable smart prefetch, default is true
+    pub enable_smart_prefetch: bool,
+
+    #[serde(skip)]
+    pub large_file_size: i64,
+    #[serde(alias = "large_file_size")]
+    pub large_file_size_str: String,
+
+    pub max_read_parallel: i64,
+
+    // Sequential read check threshold
+    pub sequential_read_threshold: u64,
 }
 
 impl ClientConf {
@@ -265,6 +279,9 @@ impl ClientConf {
         self.max_sync_wait_timeout =
             DurationUnit::from_str(&self.max_sync_wait_timeout_str)?.as_duration();
 
+        // Process smart prefetch configuration
+        self.large_file_size = ByteUnit::from_str(&self.large_file_size_str)?.as_byte() as i64;
+
         Ok(())
     }
 
@@ -322,8 +339,8 @@ impl Default for ClientConf {
             read_parallel: 1,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
-            close_reader_limit: 20,
-            close_writer_limit: 20,
+            close_reader_limit: 7,
+            close_writer_limit: 7,
 
             short_circuit: true,
 
@@ -354,7 +371,7 @@ impl Default for ClientConf {
 
             enable_read_ahead: true,
             read_ahead_len: 0,
-            read_ahead_len_str: "4MB".to_string(),
+            read_ahead_len_str: "0".to_string(),
             drop_cache_len: 0,
             drop_cache_len_str: "1MB".to_string(),
 
@@ -399,6 +416,12 @@ impl Default for ClientConf {
 
             block_conn_idle_time: Duration::from_secs(60),
             block_conn_idle_time_str: "60s".to_string(),
+
+            enable_smart_prefetch: true,
+            large_file_size: 0,
+            large_file_size_str: "10GB".to_string(),
+            max_read_parallel: 8,
+            sequential_read_threshold: 7,
         };
 
         conf.init().unwrap();

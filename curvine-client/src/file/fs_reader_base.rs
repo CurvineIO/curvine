@@ -125,7 +125,9 @@ impl FsReaderBase {
                 // Within the same block, seek to the correct block offset
                 reader.seek(block_off)?;
             } else {
-                self.close_reader_times = self.close_reader_times.saturating_add(1);
+                if reader.block_id() + 1 != loc.block.id {
+                    self.close_reader_times = self.close_reader_times.saturating_add(1);
+                }
                 self.update_reader(None).await?;
             }
         }

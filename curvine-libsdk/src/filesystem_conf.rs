@@ -41,6 +41,7 @@ pub struct FilesystemConf {
     pub read_parallel: i64,
     pub read_slice_size: String,
     pub close_reader_limit: u32,
+    pub close_writer_limit: u32,
 
     pub storage_type: String,
     pub ttl_ms: String,
@@ -140,6 +141,7 @@ impl FilesystemConf {
             read_slice_size: 0,
             read_slice_size_str: self.read_slice_size,
             close_reader_limit: self.close_reader_limit,
+            close_writer_limit: self.close_writer_limit,
 
             conn_retry_max_duration_ms: self.conn_retry_max_duration_ms,
             conn_retry_min_sleep_ms: self.conn_retry_min_sleep_ms,

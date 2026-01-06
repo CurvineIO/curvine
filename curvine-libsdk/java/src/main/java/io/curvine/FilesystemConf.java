@@ -38,7 +38,8 @@ public class FilesystemConf {
     public int read_chunk_num = 8;
     public int read_parallel = 1;
     public String read_slice_size = "0";
-    public int close_reader_limit = 20;
+    public int close_reader_limit = 7;
+    public int close_writer_limit = 7;
 
     public String storage_type = "disk";
     public String ttl_ms = "0";
@@ -202,6 +203,7 @@ public class FilesystemConf {
                 ", read_parallel=" + read_parallel +
                 ", read_slice_size='" + read_slice_size + '\'' +
                 ", close_reader_limit=" + close_reader_limit +
+                ", close_writer_limit=" + close_writer_limit +
                 ", storage_type='" + storage_type + '\'' +
                 ", ttl_ms=" + ttl_ms +
                 ", ttl_action='" + ttl_action + '\'' +
