@@ -274,6 +274,8 @@ impl InodeStore {
 
         batch.commit()?;
 
+        self.fs_stats.increment_file_count();
+
         Ok(())
     }
 
@@ -316,6 +318,8 @@ impl InodeStore {
 
         batch.commit()?;
 
+        self.fs_stats.decrement_file_count();
+
         // Create a delete result indicating only the directory entry was removed
         // For unlink operations, we don't delete blocks since the inode still exists
         Ok(DeleteResult {
@@ -342,6 +346,8 @@ impl InodeStore {
         self.decrement_inode_nlink(inode_id)?;
 
         batch.commit()?;
+
+        self.fs_stats.decrement_file_count();
 
         // Create a delete result indicating only the directory entry was removed
         Ok(DeleteResult {
