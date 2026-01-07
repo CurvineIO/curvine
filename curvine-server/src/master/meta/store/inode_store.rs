@@ -25,7 +25,10 @@ use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
 
 // Currently, only RockSDB is supported.
-#[derive(Clone)]
+// Note: InodeStore is intentionally NOT Clone.
+// Cloning InodeStore increases Arc<RocksInodeStore> refcount, which prevents
+// the RocksDB lock from being released during Raft snapshot restore.
+// If you need to share InodeStore, use Arc<InodeStore> or access it via FsDir.
 pub struct InodeStore {
     pub(crate) store: Arc<RocksInodeStore>,
     pub(crate) fs_stats: Arc<FileSystemStats>,

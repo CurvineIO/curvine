@@ -68,9 +68,11 @@ impl FsDir {
         Ok(fs_dir)
     }
 
-    pub fn inode_store(&self) -> InodeStore {
-        self.store.clone()
-    }
+    // Note: inode_store() method was intentionally removed.
+    // Cloning InodeStore increases Arc<RocksInodeStore> refcount, which prevents
+    // the RocksDB lock from being released during Raft snapshot restore.
+    // Access inode_store via self references instead of cloning.
+
     // Create root directory
     pub fn create_root() -> InodeView {
         Dir(ROOT_INODE_NAME.to_string(), InodeDir::new(ROOT_INODE_ID, 0))
