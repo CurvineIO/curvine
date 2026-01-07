@@ -431,7 +431,7 @@ impl OpendalFileSystem {
                     builder = builder.access_key_id(access_key);
                 }
                 if let Some(secret_key) = conf.get("oss.credentials.secret") {
-                    builder = builder.secret_access_key(secret_key);
+                    builder = builder.access_key_secret(secret_key);
                 }
 
                 let base_op = Operator::new(builder)

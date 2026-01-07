@@ -45,16 +45,15 @@ fn main() {
     let home = home.trim_end_matches('/').to_string();
     let include_dir = format!("{}/include", home);
 
-    let lib_dir_candidates = [format!("{}/lib", home), format!("{}/lib/native", home)];
-    let lib_dir = lib_dir_candidates
-        .into_iter()
-        .find(|p| PathBuf::from(p).exists())
-        .unwrap_or_else(|| format!("{}/lib", home));
-
     let lib_name = "jindosdk_c";
 
     // Get the output directory where the static library will be placed
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+
+    // Print friendly build info
+    eprintln!("[JindoSDK] Configuring OSS-HDFS support");
+    eprintln!("[JindoSDK]   JINDOSDK_HOME: {}", home);
+    eprintln!("[JindoSDK]   Include path: {}", include_dir);
 
     // Compile the FFI wrapper
     cc::Build::new()
@@ -73,7 +72,29 @@ fn main() {
     println!("cargo:rustc-link-lib=static=jindosdk_ffi");
 
     // Link JindoSDK C API
-    println!("cargo:rustc-link-search=native={}", lib_dir);
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir);
+    // Add both lib and lib/native to search paths for better compatibility
+    // The actual .so files are typically in lib/native for JindoSDK distributions
+    let lib_base = format!("{}/lib", home);
+    let lib_native = format!("{}/lib/native", home);
+
+    // Verify library file exists and print status
+    let lib_file = PathBuf::from(&lib_native).join(format!("lib{}.so", lib_name));
+    let lib_exists = lib_file.exists();
+    if lib_exists {
+        eprintln!("[JindoSDK]   Library found: {}", lib_file.display());
+    } else {
+        eprintln!(
+            "[JindoSDK]   Library location: {} (assuming available at runtime)",
+            lib_file.display()
+        );
+    }
+
+    // Prioritize lib/native first
+    println!("cargo:rustc-link-search=native={}", lib_native);
+    println!("cargo:rustc-link-search=native={}", lib_base);
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_native);
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_base);
     println!("cargo:rustc-link-lib=dylib={}", lib_name);
+
+    eprintln!("[JindoSDK] Configuration completed successfully");
 }

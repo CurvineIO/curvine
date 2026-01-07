@@ -46,10 +46,12 @@ RUN mkdir -p /app/protoc && cd /app/protoc && \
 
 # Install Maven
 RUN cd /app && \
-    curl -k -LO https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz && \
-    tar -xzf apache-maven-3.9.11-bin.tar.gz && \
-    mv apache-maven-3.9.11 maven && \
-    rm -f *.tar.gz
+    MAVEN_VERSION=3.9.12 && \
+    curl -kfL -o apache-maven-${MAVEN_VERSION}-bin.tar.gz https://downloads.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    tar -xzf apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    mv apache-maven-${MAVEN_VERSION} maven && \
+    rm -f *.tar.gz && \
+    echo "✓ Maven ${MAVEN_VERSION} installed successfully"
 
 # Copy and apply build configurations
 COPY compile/ /build-config/

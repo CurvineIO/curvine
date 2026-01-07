@@ -155,7 +155,7 @@ curvine-csi-quick-push: curvine-csi-quick
 # Build with HDFS support (native HDFS + WebHDFS)
 build-hdfs: check-env
 	@echo "Building Curvine with HDFS support..."
-	$(SHELL_CMD) build/build.sh --features opendal-hdfs,opendal-webhdfs,jni $(ARGS)
+	$(SHELL_CMD) build/build.sh --ufs opendal-hdfs --ufs opendal-webhdfs $(ARGS)
 
 # 8. All in one
 all: build

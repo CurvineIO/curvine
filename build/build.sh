@@ -96,6 +96,8 @@ print_help() {
   echo "                          - opendal-oss: OpenDAL OSS"
   echo "                          - opendal-azblob: OpenDAL Azure Blob"
   echo "                          - opendal-gcs: OpenDAL GCS"
+  echo "                          - opendal-hdfs: OpenDAL HDFS (native, includes JNI)"
+  echo "                          - opendal-webhdfs: OpenDAL WebHDFS"
   echo "                          - oss-hdfs: OSS-HDFS (JindoSDK)"
   echo
   echo "  -d, --debug           Build in debug mode (default: release mode)"
@@ -109,7 +111,7 @@ print_help() {
   echo "  $0 --package core --ufs s3             # Build core packages with server, client and cli"
   echo "  $0 -p web --package fuse --debug       # Build web and fuse in debug mode"
   echo "  $0 --package all --ufs opendal-s3 -z   # Build all packages with OpenDAL S3 and create zip"
-  echo "  $0 --features opendal-hdfs,opendal-webhdfs  # Build with HDFS support"
+  echo "  $0 --ufs opendal-hdfs --ufs opendal-webhdfs  # Build with HDFS support"
   echo "  $0 --ufs oss-hdfs                         # Build with OSS-HDFS support (JindoSDK)"
   echo "  $0 --features jni --package client     # Build client with JNI support"
   echo "  $0 --skip-java-sdk                         # Build all packages except Java SDK"
@@ -322,6 +324,33 @@ if [ ${#RUST_BUILD_ARGS[@]} -gt 0 ]; then
   # Add FUSE features if we're building fuse
   if [[ " ${RUST_BUILD_ARGS[@]} " =~ " -p curvine-fuse " ]]; then
     FEATURES+=("curvine-fuse/$FUSE_VERSION")
+    # FUSE depends on curvine-client, so we need to add UFS features for client
+    # to enable OSS and other storage backend support in fuse
+    for ufs in "${UFS_TYPES[@]}"; do
+      case $ufs in
+        oss-hdfs)
+          # OSS uses JindoSDK. curvine-client/oss-hdfs already includes curvine-ufs/oss-hdfs,
+          # but we specify both explicitly for clarity and to ensure all packages can use it
+          FEATURES+=("curvine-ufs/oss-hdfs")
+          FEATURES+=("curvine-client/oss-hdfs")
+          ;;
+        opendal-hdfs)
+          # HDFS native support requires JNI
+          FEATURES+=("curvine-ufs/opendal-hdfs")
+          FEATURES+=("curvine-client/opendal-hdfs")
+          FEATURES+=("curvine-ufs/jni")
+          FEATURES+=("curvine-server/jni")
+          ;;
+        opendal-webhdfs)
+          # WebHDFS support (no JNI required)
+          FEATURES+=("curvine-ufs/opendal-webhdfs")
+          FEATURES+=("curvine-client/opendal-webhdfs")
+          ;;
+        *)
+          FEATURES+=("curvine-client/$ufs")
+          ;;
+      esac
+    done
   fi
 
   # Add UFS features if we're building client
@@ -333,6 +362,18 @@ if [ ${#RUST_BUILD_ARGS[@]} -gt 0 ]; then
           # but we specify both explicitly for clarity and to ensure all packages can use it
           FEATURES+=("curvine-ufs/oss-hdfs")
           FEATURES+=("curvine-client/oss-hdfs")
+          ;;
+        opendal-hdfs)
+          # HDFS native support requires JNI
+          FEATURES+=("curvine-ufs/opendal-hdfs")
+          FEATURES+=("curvine-client/opendal-hdfs")
+          FEATURES+=("curvine-ufs/jni")
+          FEATURES+=("curvine-server/jni")
+          ;;
+        opendal-webhdfs)
+          # WebHDFS support (no JNI required)
+          FEATURES+=("curvine-ufs/opendal-webhdfs")
+          FEATURES+=("curvine-client/opendal-webhdfs")
           ;;
         *)
           FEATURES+=("curvine-client/$ufs")
@@ -350,6 +391,18 @@ else
         # but we specify both explicitly for clarity and to ensure all packages can use it
         FEATURES+=("curvine-ufs/oss-hdfs")
         FEATURES+=("curvine-client/oss-hdfs")
+        ;;
+      opendal-hdfs)
+        # HDFS native support requires JNI
+        FEATURES+=("curvine-ufs/opendal-hdfs")
+        FEATURES+=("curvine-client/opendal-hdfs")
+        FEATURES+=("curvine-ufs/jni")
+        FEATURES+=("curvine-server/jni")
+        ;;
+      opendal-webhdfs)
+        # WebHDFS support (no JNI required)
+        FEATURES+=("curvine-ufs/opendal-webhdfs")
+        FEATURES+=("curvine-client/opendal-webhdfs")
         ;;
       *)
         FEATURES+=("curvine-client/$ufs")
