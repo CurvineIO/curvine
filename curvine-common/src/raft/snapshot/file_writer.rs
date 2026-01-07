@@ -14,6 +14,7 @@
 
 use crate::raft::{RaftResult, RaftUtils};
 use flate2::read::ZlibDecoder;
+use log::warn;
 use orpc::common::Utils;
 use orpc::io::LocalFile;
 use prost::bytes::BytesMut;
@@ -40,14 +41,30 @@ impl FileWriter {
     }
 
     pub fn write_chunk(&mut self, chunk: &[u8]) -> RaftResult<()> {
-        self.buf.reserve(self.chunk_size);
+        // Allocate extra space for decompression - compressed data can expand
+        // For small files, zlib overhead may cause compressed > original
+        // Use 2x chunk_size + 256 to be safe
+        let buf_size = self.chunk_size * 2 + 256;
+        self.buf.reserve(buf_size);
         unsafe {
-            self.buf.set_len(self.chunk_size);
+            self.buf.set_len(buf_size);
         }
 
         // Decompress the data.
         let mut decoder = ZlibDecoder::new(chunk);
         let read_len = RaftUtils::zlib_read_full(&mut decoder, &mut self.buf)?;
+
+        // Check if buffer was too small (should not happen with 2x size)
+        if read_len >= buf_size {
+            warn!(
+                "[FileWriter] Decompression buffer may be too small! \
+                read_len: {}, buf_size: {}, compressed_len: {}",
+                read_len,
+                buf_size,
+                chunk.len()
+            );
+        }
+
         let decompress_data = self.buf.split_to(read_len);
 
         // Write data to file
