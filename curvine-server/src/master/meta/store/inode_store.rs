@@ -91,8 +91,7 @@ impl InodeStore {
         let mut deleted_dirs = 0i64;
 
         while let Some((parent_id, inode)) = stack.pop_front() {
-            // Delete inode nodes and edges
-            batch.delete_inode(inode.id())?;
+            // Delete inode edges
             batch.delete_child(parent_id, inode.name())?;
             del_res.inodes += 1;
 
@@ -101,22 +100,8 @@ impl InodeStore {
             }
 
             match &inode {
-                InodeView::File(_, file) => {
-                    deleted_files += 1;
-                    for meta in &file.blocks {
-                        if let Some(locs) = &meta.locs {
-                            // Uncommitted block.
-                            del_res.blocks.insert(meta.id, locs.clone());
-                        } else {
-                            let locs = self.store.get_locations(meta.id)?;
-                            if !locs.is_empty() {
-                                del_res.blocks.insert(meta.id, locs);
-                            }
-                        }
-                    }
-                }
-
                 InodeView::Dir(_, dir) => {
+                    batch.delete_inode(inode.id())?;
                     // Don't count root directory
                     if dir.id != ROOT_INODE_ID {
                         deleted_dirs += 1;
@@ -126,12 +111,10 @@ impl InodeStore {
                     }
                 }
 
-                InodeView::FileEntry(name, id) => {
-                    let inode_opt = self.get_inode(*id, Some(name))?;
-                    if let Some(inode_view) = inode_opt {
-                        deleted_files += 1;
-                        stack.push_back((parent_id, inode_view));
-                    }
+                _ => {
+                    deleted_files += 1;
+                    let res = self.decrement_inode_nlink(inode.id())?;
+                    del_res.blocks.extend(res.blocks);
                 }
             }
         }
@@ -357,19 +340,38 @@ impl InodeStore {
     }
 
     // Helper method to decrement nlink count of an inode
-    fn decrement_inode_nlink(&self, inode_id: i64) -> CommonResult<()> {
+    fn decrement_inode_nlink(&self, inode_id: i64) -> CommonResult<DeleteResult> {
+        let mut del_res = DeleteResult::new();
         // Load the inode from storage
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {
                 InodeView::File(_, file) => {
+                    let mut batch = self.store.new_batch();
+
                     let remaining_links = file.decrement_nlink();
                     if remaining_links == 0 {
-                        // TODO: When nlink reaches 0, we should delete the inode and its blocks
-                        // For now, we just write back the updated inode
+                        batch.delete_inode(inode_id)?;
+
+                        // Collect block info
+                        for meta in &file.blocks {
+                            if let Some(locs) = &meta.locs {
+                                del_res.blocks.insert(meta.id, locs.clone());
+                            } else {
+                                let locs = self.store.get_locations(meta.id)?;
+                                if !locs.is_empty() {
+                                    del_res.blocks.insert(meta.id, locs);
+                                }
+                            }
+                        }
+
+                        // Remove from TTL
+                        if let Err(e) = self.ttl_bucket_list.remove_inode(inode_id as u64) {
+                            log::warn!("Direct ttl removal failed for inode {}: {}", inode_id, e);
+                        }
+                    } else {
+                        // Write the updated inode back to storage
+                        batch.write_inode(&inode_view)?;
                     }
-                    // Write the updated inode back to storage
-                    let mut batch = self.store.new_batch();
-                    batch.write_inode(&inode_view)?;
                     batch.commit()?;
                 }
                 _ => {
@@ -379,7 +381,7 @@ impl InodeStore {
         } else {
             return err_box!("Inode {} not found when decrementing nlink", inode_id);
         }
-        Ok(())
+        Ok(del_res)
     }
 
     pub fn create_blank_tree(&self) -> CommonResult<(i64, InodeView)> {
