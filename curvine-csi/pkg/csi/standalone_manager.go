@@ -28,7 +28,7 @@ import (
 
 const (
 	// StandaloneNamePrefix is the prefix for Standalone names
-	StandaloneNamePrefix = "curvine-standalone-"
+	StandaloneNamePrefix = "curvine-csi-standalone-"
 
 	// StandaloneLabel is the label for Standalone
 	StandaloneLabelApp       = "app"
@@ -233,10 +233,29 @@ func (m *standaloneMountManagerImpl) GetHostMountPath(mountKey string) string {
 }
 
 // getStandaloneName returns the name of the Standalone for a mount key
+// mountKey is generated using UUID v5 algorithm, which always produces 32 hex characters (128 bits)
+// We use first 8 characters (32 bits) for Pod name to keep it short and follow Kubernetes naming conventions
 func (m *standaloneMountManagerImpl) getStandaloneName(mountKey string) string {
-	// Use short mount key and node name hash for uniqueness
-	nodeHash := fmt.Sprintf("%x", hashString(m.nodeName))[:8]
-	return fmt.Sprintf("%s%s-%s", StandaloneNamePrefix, mountKey[:8], nodeHash)
+	// UUID v5 mountKey is always 32 characters, use first 8 chars for Pod name
+	mountKeyShort := mountKey
+	if len(mountKey) < 8 {
+		// If mountKey is too short (shouldn't happen with UUID v5), pad with hash
+		hash := hashString(mountKey)
+		mountKeyShort = fmt.Sprintf("%08x", hash)
+	} else {
+		// Use first 8 characters (32 bits) - sufficient for uniqueness per node
+		mountKeyShort = mountKey[:8]
+	}
+	
+	// Generate nodeHash (uint32 hash produces 8 hex chars, use first 5 for shorter Pod name)
+	// Kubernetes typically uses 5-char suffixes for Pod names (e.g., ReplicaSet pods)
+	nodeHashFull := fmt.Sprintf("%08x", hashString(m.nodeName))
+	nodeHash := nodeHashFull[:5]
+	
+	// Pod name format: curvine-csi-standalone-{mountKey8chars}-{nodeHash5chars}
+	// Total length: 23 + 8 + 1 + 5 = 37 characters (follows Kubernetes naming best practices)
+	// Combined uniqueness: 2^32 (mountKey) * 2^20 (nodeHash) = 2^52 per node (still very high)
+	return fmt.Sprintf("%s%s-%s", StandaloneNamePrefix, mountKeyShort, nodeHash)
 }
 
 // hashString returns a simple hash of a string
