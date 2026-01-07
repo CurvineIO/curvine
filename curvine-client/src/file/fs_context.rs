@@ -88,7 +88,6 @@ impl FsContext {
         let block_pool = Arc::new(BlockClientPool::new(
             conf.client.enable_block_conn_pool,
             conf.client.block_conn_idle_size,
-            conf.client.small_file_size,
             conf.client.block_conn_idle_time.as_millis() as u64,
         ));
 
@@ -130,17 +129,17 @@ impl FsContext {
     pub async fn acquire_write(
         &self,
         addr: &WorkerAddress,
-        block: &ExtendedBlock,
+        _block: &ExtendedBlock,
     ) -> IOResult<BlockClient> {
-        self.block_pool.acquire_write(self, addr, block).await
+        self.block_pool.acquire_write(self, addr).await
     }
 
     pub async fn acquire_read(
         &self,
         addr: &WorkerAddress,
-        block: &ExtendedBlock,
+        _block: &ExtendedBlock,
     ) -> IOResult<BlockClient> {
-        self.block_pool.acquire_read(self, addr, block).await
+        self.block_pool.acquire_read(self, addr).await
     }
 
     pub fn read_chunk_size(&self) -> usize {
