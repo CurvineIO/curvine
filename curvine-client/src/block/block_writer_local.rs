@@ -45,7 +45,7 @@ impl BlockWriterLocal {
         let seq_id = 0;
 
         let block_size = fs_context.block_size();
-        let client = fs_context.acquire_write(&worker_address, &block).await?;
+        let client = fs_context.acquire_write(&worker_address).await?;
         let write_context = client
             .write_block(
                 &block,
@@ -117,10 +117,7 @@ impl BlockWriterLocal {
     pub async fn complete(&mut self) -> FsResult<()> {
         self.flush().await?;
         let next_seq_id = self.next_seq_id();
-        let client = self
-            .fs_context
-            .acquire_write(&self.worker_address, &self.block)
-            .await?;
+        let client = self.fs_context.acquire_write(&self.worker_address).await?;
         client
             .write_commit(
                 &self.block,
@@ -135,10 +132,7 @@ impl BlockWriterLocal {
 
     pub async fn cancel(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
-        let client = self
-            .fs_context
-            .acquire_write(&self.worker_address, &self.block)
-            .await?;
+        let client = self.fs_context.acquire_write(&self.worker_address).await?;
         client
             .write_commit(
                 &self.block,

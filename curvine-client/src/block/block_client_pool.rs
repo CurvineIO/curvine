@@ -14,7 +14,7 @@
 
 use crate::block::BlockClient;
 use crate::file::FsContext;
-use curvine_common::state::{ExtendedBlock, WorkerAddress};
+use curvine_common::state::WorkerAddress;
 use log::{debug, info, warn};
 use orpc::common::{LocalTime, TimeSpent, Utils};
 use orpc::io::IOResult;
@@ -50,17 +50,11 @@ pub struct BlockClientPool {
     id: u64,
     cur_idle_size: AtomicLen,
     max_idle_size: usize,
-    small_file_size: i64,
     idle_time_ms: u64,
 }
 
 impl BlockClientPool {
-    pub fn new(
-        enable: bool,
-        max_idle_size: usize,
-        small_file_size: i64,
-        idle_time_ms: u64,
-    ) -> Self {
+    pub fn new(enable: bool, max_idle_size: usize, idle_time_ms: u64) -> Self {
         let pool = FastDashMap::with_capacity(max_idle_size);
         let pool_instance = Self {
             enable,
@@ -68,17 +62,13 @@ impl BlockClientPool {
             id: Utils::unique_id(),
             cur_idle_size: AtomicLen::new(0),
             max_idle_size,
-            small_file_size,
             idle_time_ms,
         };
 
         if enable {
             info!(
-                "block client pool created: enable={}, max_idle_size={}, small_file_size={}B, idle_time_ms={}ms",
-                pool_instance.enable,
-                pool_instance.max_idle_size,
-                pool_instance.small_file_size,
-                pool_instance.idle_time_ms
+                "block client pool created: enable={}, max_idle_size={}, idle_time_ms={}ms",
+                pool_instance.enable, pool_instance.max_idle_size, pool_instance.idle_time_ms
             );
         }
 
@@ -89,16 +79,9 @@ impl BlockClientPool {
         self: &Arc<Self>,
         context: &FsContext,
         addr: &WorkerAddress,
-        block: &ExtendedBlock,
     ) -> IOResult<BlockClient> {
         if !self.enable {
             return context.block_client(addr).await;
-        }
-
-        if let Some(opts) = &block.alloc_opts {
-            if opts.len > self.small_file_size {
-                return context.block_client(addr).await;
-            }
         }
 
         self.acquire(context, addr).await
@@ -108,13 +91,8 @@ impl BlockClientPool {
         self: &Arc<Self>,
         context: &FsContext,
         addr: &WorkerAddress,
-        block: &ExtendedBlock,
     ) -> IOResult<BlockClient> {
         if !self.enable {
-            return context.block_client(addr).await;
-        }
-
-        if block.len > self.small_file_size {
             return context.block_client(addr).await;
         }
 

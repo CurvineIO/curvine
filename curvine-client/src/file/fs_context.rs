@@ -17,7 +17,7 @@ use crate::file::CurvineFileSystem;
 use crate::ClientMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::ClientAddressProto;
-use curvine_common::state::{ClientAddress, ExtendedBlock, WorkerAddress};
+use curvine_common::state::{ClientAddress, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use fxhash::FxHasher;
@@ -88,7 +88,6 @@ impl FsContext {
         let block_pool = Arc::new(BlockClientPool::new(
             conf.client.enable_block_conn_pool,
             conf.client.block_conn_idle_size,
-            conf.client.small_file_size,
             conf.client.block_conn_idle_time.as_millis() as u64,
         ));
 
@@ -127,20 +126,12 @@ impl FsContext {
         Ok(BlockClient::new(client, addr.clone(), self))
     }
 
-    pub async fn acquire_write(
-        &self,
-        addr: &WorkerAddress,
-        block: &ExtendedBlock,
-    ) -> IOResult<BlockClient> {
-        self.block_pool.acquire_write(self, addr, block).await
+    pub async fn acquire_write(&self, addr: &WorkerAddress) -> IOResult<BlockClient> {
+        self.block_pool.acquire_write(self, addr).await
     }
 
-    pub async fn acquire_read(
-        &self,
-        addr: &WorkerAddress,
-        block: &ExtendedBlock,
-    ) -> IOResult<BlockClient> {
-        self.block_pool.acquire_read(self, addr, block).await
+    pub async fn acquire_read(&self, addr: &WorkerAddress) -> IOResult<BlockClient> {
+        self.block_pool.acquire_read(self, addr).await
     }
 
     pub fn read_chunk_size(&self) -> usize {

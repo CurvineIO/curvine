@@ -17,11 +17,9 @@ use crate::file::FsContext;
 use curvine_common::fs::Path;
 use curvine_common::state::{FileBlocks, SearchFileBlocks};
 use curvine_common::FsResult;
-use orpc::common::FastHashMap;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use orpc::{err_box, try_option_mut};
-use std::mem;
 use std::sync::Arc;
 
 pub struct FsReaderBase {
@@ -33,17 +31,11 @@ pub struct FsReaderBase {
 
     // The block that is currently being read
     cur_reader: Option<BlockReader>,
-
-    // All read blocks are reused; reduce the overhead of creating connections and improve the performance of random reads.
-    close_reader_times: u32,
-    close_reader_limit: u32,
-    all_reader: FastHashMap<i64, BlockReader>,
 }
 
 impl FsReaderBase {
     pub fn new(path: Path, fs_context: Arc<FsContext>, file_blocks: FileBlocks) -> Self {
         let len = file_blocks.status.len;
-        let close_reader_limit = fs_context.conf.client.close_reader_limit;
         Self {
             path,
             fs_context,
@@ -51,9 +43,6 @@ impl FsReaderBase {
             pos: 0,
             len,
             cur_reader: None,
-            close_reader_times: 0,
-            close_reader_limit,
-            all_reader: FastHashMap::default(),
         }
     }
 
@@ -125,10 +114,7 @@ impl FsReaderBase {
                 // Within the same block, seek to the correct block offset
                 reader.seek(block_off)?;
             } else {
-                if reader.block_id() + 1 != loc.block.id {
-                    self.close_reader_times = self.close_reader_times.saturating_add(1);
-                }
-                self.update_reader(None).await?;
+                let _ = self.cur_reader.take();
             }
         }
 
@@ -140,23 +126,6 @@ impl FsReaderBase {
         if let Some(mut reader) = self.cur_reader.take() {
             reader.complete().await?;
         }
-        // Clean all cached readers.
-        for (_, mut reader) in self.all_reader.drain() {
-            reader.complete().await?;
-        }
-
-        Ok(())
-    }
-
-    async fn update_reader(&mut self, cur: Option<BlockReader>) -> FsResult<()> {
-        if let Some(mut old) = mem::replace(&mut self.cur_reader, cur) {
-            if self.close_reader_times > self.close_reader_limit {
-                self.all_reader.insert(old.block_id(), old);
-            } else {
-                old.complete().await?;
-            }
-        }
-
         Ok(())
     }
 
@@ -166,19 +135,12 @@ impl FsReaderBase {
 
             _ => {
                 let (block_off, loc) = self.file_blocks.get_read_block(self.pos)?;
-                let mut new_reader = match self.all_reader.remove(&loc.block.id) {
-                    Some(v) => {
-                        // Use the existing block reader
-                        v
-                    }
+                let new_reader =
+                    BlockReader::new(self.fs_context.clone(), loc.clone(), block_off).await?;
 
-                    None => {
-                        // Create a new block reader
-                        BlockReader::new(self.fs_context.clone(), loc.clone(), block_off).await?
-                    }
-                };
-                new_reader.seek(block_off)?;
-                self.update_reader(Some(new_reader)).await?;
+                if let Some(mut old) = self.cur_reader.replace(new_reader) {
+                    old.complete().await?;
+                }
             }
         }
 

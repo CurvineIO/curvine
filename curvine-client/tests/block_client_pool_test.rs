@@ -15,9 +15,7 @@
 use curvine_client::block::BlockClientPool;
 use curvine_client::file::FsContext;
 use curvine_common::conf::ClusterConf;
-use curvine_common::state::{
-    ExtendedBlock, FileAllocMode, FileAllocOpts, FileType, StorageType, WorkerAddress,
-};
+use curvine_common::state::WorkerAddress;
 use once_cell::sync::Lazy;
 use orpc::runtime::Runtime;
 use orpc::test::SimpleServer;
@@ -43,54 +41,18 @@ static TEST_SERVER: Lazy<(WorkerAddress, Arc<Runtime>)> = Lazy::new(|| {
     (worker_addr, rt)
 });
 
-fn create_test_pool(enable: bool, small_file_size: i64, idle_time_ms: u64) -> Arc<BlockClientPool> {
-    Arc::new(BlockClientPool::new(
-        enable,
-        10,
-        small_file_size,
-        idle_time_ms,
-    ))
+fn create_test_pool(enable: bool, idle_time_ms: u64) -> Arc<BlockClientPool> {
+    Arc::new(BlockClientPool::new(enable, 10, idle_time_ms))
 }
 
 fn get_test_server_addr() -> WorkerAddress {
     TEST_SERVER.0.clone()
 }
 
-fn create_small_block(id: i64, len: i64) -> ExtendedBlock {
-    ExtendedBlock {
-        id,
-        len,
-        storage_type: StorageType::Disk,
-        file_type: FileType::File,
-        alloc_opts: Some(FileAllocOpts {
-            truncate: false,
-            off: 0,
-            len,
-            mode: FileAllocMode::DEFAULT,
-        }),
-    }
-}
-
-fn create_large_block(id: i64, len: i64) -> ExtendedBlock {
-    ExtendedBlock {
-        id,
-        len,
-        storage_type: StorageType::Disk,
-        file_type: FileType::File,
-        alloc_opts: Some(FileAllocOpts {
-            truncate: false,
-            off: 0,
-            len,
-            mode: FileAllocMode::DEFAULT,
-        }),
-    }
-}
-
 fn create_test_context() -> FsContext {
     let mut conf = ClusterConf::default();
     conf.client.enable_block_conn_pool = true;
     conf.client.block_conn_idle_size = 10;
-    conf.client.small_file_size = 4 * 1024 * 1024; // 4MB threshold
     conf.client.block_conn_idle_time = Duration::from_secs(30);
 
     let rt = TEST_SERVER.1.clone();
@@ -98,28 +60,24 @@ fn create_test_context() -> FsContext {
 }
 
 #[tokio::test]
-async fn test_writer_small_file_uses_pool() {
+async fn test_writer_uses_pool() {
     let worker_addr = get_test_server_addr();
-    let pool = create_test_pool(true, 4 * 1024 * 1024, 30000);
+    let pool = create_test_pool(true, 30000);
     let context = Arc::new(create_test_context());
 
-    // Create small file block (2MB < 4MB threshold)
-    let small_block = create_small_block(1, 2 * 1024 * 1024);
-
     // First acquire should create a new connection
-    let client1 = pool
-        .acquire_write(&context, &worker_addr, &small_block)
-        .await;
+    let client1 = pool.acquire_write(&context, &worker_addr).await;
     assert!(client1.is_ok());
 
-    // Release connection back to pool
+    // Connection should have pool set
     let client1 = client1.unwrap();
+    assert!(client1.pool().is_some());
+
+    // Release connection back to pool
     pool.release(client1);
 
     // Second acquire should get connection from pool
-    let client2 = pool
-        .acquire_write(&context, &worker_addr, &small_block)
-        .await;
+    let client2 = pool.acquire_write(&context, &worker_addr).await;
     assert!(client2.is_ok());
 
     // Verify connection count (connection taken from pool, idle count is 0)
@@ -127,111 +85,38 @@ async fn test_writer_small_file_uses_pool() {
 }
 
 #[tokio::test]
-async fn test_writer_large_file_direct_connection() {
+async fn test_reader_uses_pool() {
     let worker_addr = get_test_server_addr();
-    let pool = create_test_pool(true, 4 * 1024 * 1024, 30000);
+    let pool = create_test_pool(true, 30000);
     let context = Arc::new(create_test_context());
-
-    // Create large file block (8MB > 4MB threshold)
-    let large_block = create_large_block(1, 8 * 1024 * 1024);
-
-    // Acquire connection should create direct connection, not use pool
-    let client = pool
-        .acquire_write(&context, &worker_addr, &large_block)
-        .await;
-    assert!(client.is_ok());
-
-    let client = client.unwrap();
-    // Large file connection should not have pool set
-    assert!(client.pool().is_none());
-
-    // Verify connection count
-    assert_eq!(pool.idle_conn(), 0);
-}
-
-#[tokio::test]
-async fn test_reader_small_file_uses_pool() {
-    let worker_addr = get_test_server_addr();
-    let pool = create_test_pool(true, 4 * 1024 * 1024, 30000);
-    let context = Arc::new(create_test_context());
-
-    // Create small file block (2MB < 4MB threshold)
-    let small_block = ExtendedBlock {
-        id: 1,
-        len: 2 * 1024 * 1024,
-        storage_type: StorageType::Disk,
-        file_type: FileType::File,
-        alloc_opts: None,
-    };
 
     // First acquire should create a new connection
-    let client1 = pool
-        .acquire_read(&context, &worker_addr, &small_block)
-        .await;
+    let client1 = pool.acquire_read(&context, &worker_addr).await;
     assert!(client1.is_ok());
 
-    // Release connection back to pool
+    // Connection should have pool set
     let client1 = client1.unwrap();
+    assert!(client1.pool().is_some());
+
+    // Release connection back to pool
     pool.release(client1);
 
     // Second acquire should get connection from pool
-    let client2 = pool
-        .acquire_read(&context, &worker_addr, &small_block)
-        .await;
+    let client2 = pool.acquire_read(&context, &worker_addr).await;
     assert!(client2.is_ok());
 
     // Verify connection count (connection taken from pool, idle count is 0)
-    assert_eq!(pool.idle_conn(), 0);
-}
-
-#[tokio::test]
-async fn test_reader_large_file_direct_connection() {
-    let worker_addr = get_test_server_addr();
-    let pool = create_test_pool(true, 4 * 1024 * 1024, 30000);
-    let context = Arc::new(create_test_context());
-
-    // Create large file block (8MB > 4MB threshold)
-    let large_block = ExtendedBlock {
-        id: 1,
-        len: 8 * 1024 * 1024,
-        storage_type: StorageType::Disk,
-        file_type: FileType::File,
-        alloc_opts: None,
-    };
-
-    // Acquire connection should create direct connection, not use pool
-    let client = pool
-        .acquire_read(&context, &worker_addr, &large_block)
-        .await;
-    assert!(client.is_ok());
-
-    let client = client.unwrap();
-    // Large file connection should not have pool set
-    assert!(client.pool().is_none());
-
-    // Verify connection count
     assert_eq!(pool.idle_conn(), 0);
 }
 
 #[tokio::test]
 async fn test_expired_connection_not_acquired() {
     let worker_addr = get_test_server_addr();
-    let pool = create_test_pool(true, 4 * 1024 * 1024, 100); // 100ms idle time
+    let pool = create_test_pool(true, 100); // 100ms idle time
     let context = Arc::new(create_test_context());
 
-    let small_block = ExtendedBlock {
-        id: 1,
-        len: 2 * 1024 * 1024,
-        storage_type: StorageType::Disk,
-        file_type: FileType::File,
-        alloc_opts: None,
-    };
-
     // First acquire connection
-    let client1 = pool
-        .acquire_read(&context, &worker_addr, &small_block)
-        .await
-        .unwrap();
+    let client1 = pool.acquire_read(&context, &worker_addr).await.unwrap();
 
     // Release connection
     pool.release(client1);
@@ -242,9 +127,7 @@ async fn test_expired_connection_not_acquired() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Acquire again, should create new connection (old connection expired)
-    let client2 = pool
-        .acquire_read(&context, &worker_addr, &small_block)
-        .await;
+    let client2 = pool.acquire_read(&context, &worker_addr).await;
     assert!(client2.is_ok());
 
     // Verify expired connection has been cleaned up
@@ -254,24 +137,13 @@ async fn test_expired_connection_not_acquired() {
 #[tokio::test]
 async fn test_clear_idle_connections() {
     let worker_addr = get_test_server_addr();
-    let pool = create_test_pool(true, 4 * 1024 * 1024, 100); // 100ms idle time
+    let pool = create_test_pool(true, 100); // 100ms idle time
     let context = Arc::new(create_test_context());
-
-    let small_block = ExtendedBlock {
-        id: 1,
-        len: 2 * 1024 * 1024,
-        storage_type: StorageType::Disk,
-        file_type: FileType::File,
-        alloc_opts: None,
-    };
 
     // Create and release multiple connections
     let mut clients = vec![];
     for _ in 0..3 {
-        let client = pool
-            .acquire_read(&context, &worker_addr, &small_block)
-            .await
-            .unwrap();
+        let client = pool.acquire_read(&context, &worker_addr).await.unwrap();
         clients.push(client);
     }
     assert_eq!(pool.idle_conn(), 0);
@@ -296,25 +168,14 @@ async fn test_clear_idle_connections() {
 #[tokio::test]
 async fn test_pool_acquire_release_count() {
     let worker_addr = get_test_server_addr();
-    let pool = create_test_pool(true, 4 * 1024 * 1024, 30000);
+    let pool = create_test_pool(true, 30000);
     let context = Arc::new(create_test_context());
-
-    let small_block = ExtendedBlock {
-        id: 1,
-        len: 2 * 1024 * 1024,
-        storage_type: StorageType::Disk,
-        file_type: FileType::File,
-        alloc_opts: None,
-    };
 
     // Initial state
     assert_eq!(pool.idle_conn(), 0);
 
     // Acquire connection
-    let client1 = pool
-        .acquire_read(&context, &worker_addr, &small_block)
-        .await
-        .unwrap();
+    let client1 = pool.acquire_read(&context, &worker_addr).await.unwrap();
     assert_eq!(pool.idle_conn(), 0);
 
     // Release connection
@@ -322,10 +183,7 @@ async fn test_pool_acquire_release_count() {
     assert_eq!(pool.idle_conn(), 1);
 
     // Acquire again (from pool)
-    let client2 = pool
-        .acquire_read(&context, &worker_addr, &small_block)
-        .await
-        .unwrap();
+    let client2 = pool.acquire_read(&context, &worker_addr).await.unwrap();
     assert_eq!(pool.idle_conn(), 0);
 
     // Release again
@@ -333,14 +191,8 @@ async fn test_pool_acquire_release_count() {
     assert_eq!(pool.idle_conn(), 1);
 
     // Acquire multiple connections
-    let client3 = pool
-        .acquire_read(&context, &worker_addr, &small_block)
-        .await
-        .unwrap();
-    let client4 = pool
-        .acquire_read(&context, &worker_addr, &small_block)
-        .await
-        .unwrap();
+    let client3 = pool.acquire_read(&context, &worker_addr).await.unwrap();
+    let client4 = pool.acquire_read(&context, &worker_addr).await.unwrap();
     assert_eq!(pool.idle_conn(), 0);
 
     // Release multiple connections
