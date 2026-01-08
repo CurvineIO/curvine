@@ -37,7 +37,7 @@ impl BlockHandler {
 
             RpcCode::WriteBlocksBatch => BatchWriter(BatchWriteHandler::new(store)),
 
-            code => return err_box!("Unsupported request type hehehe: {:?}", code),
+            code => return err_box!("Unsupported request type: {:?}", code),
         };
 
         Ok(handler)
