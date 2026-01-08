@@ -34,6 +34,7 @@ impl ProtoUtils {
             reserved_bytes: item.reserved_bytes,
             storage_type: item.storage_type.into(),
             block_num: item.block_num,
+            dir_path: item.dir_path,
         }
     }
 
@@ -49,6 +50,7 @@ impl ProtoUtils {
             reserved_bytes: item.reserved_bytes,
             storage_type: StorageType::from(item.storage_type),
             block_num: item.block_num,
+            dir_path: item.dir_path,
         }
     }
 

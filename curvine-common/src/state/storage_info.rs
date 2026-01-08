@@ -98,4 +98,5 @@ pub struct StorageInfo {
     pub reserved_bytes: i64,
     pub storage_type: StorageType,
     pub block_num: i64,
+    pub dir_path: String,
 }
