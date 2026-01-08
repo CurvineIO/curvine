@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::block::block_writer::WriterAdapter::{Local, Remote};
-
 use crate::block::{BlockWriterLocal, BlockWriterRemote};
 use crate::file::FsContext;
 use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress};
@@ -101,6 +100,7 @@ impl WriterAdapter {
         }
     }
 
+    // Create new WriterAdapter
     async fn new(
         fs_context: Arc<FsContext>,
         located_block: &LocatedBlock,
@@ -120,7 +120,6 @@ impl WriterAdapter {
             .await?;
             Local(writer)
         } else {
-            // Remote writers don't support buffering
             let writer = BlockWriterRemote::new(
                 &fs_context,
                 located_block.block.clone(),

@@ -243,8 +243,10 @@ impl BlockClient {
 
         let rep = self.rpc(msg).await?;
         let rep_header: BlockReadResponse = rep.parse_header()?;
+
         Ok(BlockReadContext::from_req(rep_header))
     }
+    
     pub async fn read_commit(
         &self,
         block: &ExtendedBlock,
