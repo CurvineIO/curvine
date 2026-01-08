@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-cli"
-version = "0.2.1-beta"
+version = "0.2.0"
 dependencies = [
  "bigdecimal",
  "bytes",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-client"
-version = "0.2.1-beta"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "curvine-common",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-common"
-version = "0.2.1-beta"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-fuse"
-version = "0.2.1-beta"
+version = "0.2.0"
 dependencies = [
  "axum 0.7.9",
  "bindgen",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-libsdk"
-version = "0.2.1-beta"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "cc",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-server"
-version = "0.2.1-beta"
+version = "0.2.0"
 dependencies = [
  "axum 0.7.9",
  "bincode",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-ufs"
-version = "0.2.1-beta"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1089,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "curvine-web"
-version = "0.2.1-beta"
+version = "0.2.0"
 dependencies = [
  "axum 0.7.9",
  "curvine-client",
@@ -2735,7 +2735,7 @@ dependencies = [
 
 [[package]]
 name = "orpc"
-version = "0.2.1-beta"
+version = "0.2.0"
 dependencies = [
  "axum 0.7.9",
  "bincode",
