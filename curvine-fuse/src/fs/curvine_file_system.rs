@@ -260,6 +260,10 @@ impl CurvineFileSystem {
         let mut res = FuseDirentList::new(arg);
         for (index, status) in handle.get_list(arg.offset as usize) {
             let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
+                if self.conf.enable_meta_cache {
+                    let path = Path::from_str(&status.path)?;
+                    self.state.meta_cache().put_status(&path, status.clone());
+                }
                 map.do_lookup(header.nodeid, Some(&status.name), status)?
             } else {
                 Self::status_to_attr(&self.conf, status)?
