@@ -201,13 +201,13 @@ impl BatchWriteHandler {
 
             self.write_handler.file = Some(file);
             self.write_handler.context = Some(context);
-            
+
             let response = self.write_handler.write(&single_msg);
 
             // Transfer back
             let file = self.write_handler.file.take().unwrap();
             let context = self.write_handler.context.take().unwrap();
-            
+
             self.file.as_mut().unwrap()[i] = file;
             self.context.as_mut().unwrap()[i] = context;
 
