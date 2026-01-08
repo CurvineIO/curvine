@@ -134,6 +134,7 @@ impl BlockStore {
                 reserved_bytes: item.reserved_bytes(),
                 storage_type: item.storage_type(),
                 block_num: state.num_blocks() as i64,
+                dir_path: item.path_str().to_string(),
             };
             vec.push(info);
         }

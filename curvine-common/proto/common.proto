@@ -127,6 +127,7 @@ message StorageInfoProto {
     required int64 reserved_bytes = 8 [default = 0];
     required StorageTypeProto storage_type = 9 [default = STORAGE_TYPE_PROTO_DISK];
     required int64 block_num = 10;
+    required string dir_path = 11 [default = ""];
 }
 
 // Represents a customer service address.

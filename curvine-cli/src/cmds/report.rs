@@ -32,7 +32,10 @@ pub enum ReportSubCommand {
         #[clap(long, default_value = "true")]
         show_workers: bool,
     },
-    Capacity,
+    Capacity {
+        #[clap(value_name = "WORKER_ADDRESS")]
+        worker_address: Option<String>,
+    },
     Used,
     Available,
 }
@@ -49,8 +52,12 @@ impl ReportCommand {
                 ReportSubCommand::All { show_workers } => {
                     println!("{}", report.simple(*show_workers));
                 }
-                ReportSubCommand::Capacity => {
-                    println!("{}", report.capacity());
+                ReportSubCommand::Capacity { worker_address } => {
+                    if let Some(addr) = worker_address {
+                        println!("{}", report.capacity_worker(addr));
+                    } else {
+                        println!("{}", report.capacity_cluster());
+                    }
                 }
                 ReportSubCommand::Used => {
                     println!("{}", report.used());
@@ -195,17 +202,110 @@ impl CurvineReport {
         builder
     }
 
-    pub fn capacity(&self) -> String {
+    pub fn capacity_cluster(&self) -> String {
         let mut builder = String::new();
-        for i in 0..self.info.live_workers.len() {
-            if let Some(worker) = self.info.get_live_worker(i) {
-                let str = format!(
-                    "{}:{}  {}",
-                    worker.address.hostname,
-                    worker.address.rpc_port,
-                    bytes_to_string(&worker.capacity.to_bigint().unwrap()),
-                );
-                builder.push_str(&format!("{}\n", str));
+
+        // Cluster level summary only
+        builder.push_str("=== Cluster Capacity ===\n");
+        builder.push_str(&format!(
+            "Total Capacity: {}\n",
+            bytes_to_string(&self.info.capacity.to_bigint().unwrap())
+        ));
+        builder.push_str(&format!(
+            "Total Available: {} ({:.2}%)\n",
+            bytes_to_string(&self.info.available.to_bigint().unwrap()),
+            Self::get_percent(self.info.available, self.info.capacity)
+        ));
+        builder.push_str(&format!(
+            "Total fs-used: {} ({:.2}%)\n",
+            bytes_to_string(&self.info.fs_used.to_bigint().unwrap()),
+            Self::get_percent(self.info.fs_used, self.info.capacity)
+        ));
+        builder.push_str(&format!(
+            "Total Non-FS Used: {}\n",
+            bytes_to_string(&self.info.non_fs_used.to_bigint().unwrap())
+        ));
+
+        builder
+    }
+
+    pub fn capacity_worker(&self, worker_address: &str) -> String {
+        let mut builder = String::new();
+
+        // Find the worker by IP address (only match IP, ignore port)
+        let worker = self
+            .info
+            .live_workers
+            .iter()
+            .find(|w| w.address.ip_addr == worker_address);
+
+        let worker = match worker {
+            Some(w) => w,
+            None => {
+                return format!("Worker not found: {}", worker_address);
+            }
+        };
+
+        // Worker level summary
+        builder.push_str(&format!(
+            "=== Worker {}:{} ===\n",
+            worker.address.hostname, worker.address.rpc_port
+        ));
+        builder.push_str(&format!(
+            "Capacity: {}\n",
+            bytes_to_string(&worker.capacity.to_bigint().unwrap())
+        ));
+        builder.push_str(&format!(
+            "Available: {} ({:.2}%)\n",
+            bytes_to_string(&worker.available.to_bigint().unwrap()),
+            Self::get_percent(worker.available, worker.capacity)
+        ));
+        builder.push_str(&format!(
+            "Fs-used: {} ({:.2}%)\n",
+            bytes_to_string(&worker.fs_used.to_bigint().unwrap()),
+            Self::get_percent(worker.fs_used, worker.capacity)
+        ));
+        builder.push_str(&format!(
+            "Non-FS Used: {}\n",
+            bytes_to_string(&worker.non_fs_used.to_bigint().unwrap())
+        ));
+        builder.push('\n');
+
+        // Storage level details
+        builder.push_str("=== Storages ===\n");
+        if worker.storage_map.is_empty() {
+            builder.push_str("  No storages found\n");
+        } else {
+            let mut storages: Vec<_> = worker.storage_map.values().collect();
+            storages.sort_by_key(|s| s.dir_id);
+            for storage in storages {
+                builder.push_str(&format!(
+                    "  [{}]：  {}:\n",
+                    storage.storage_type.as_str_name(),
+                    storage.dir_path
+                ));
+                builder.push_str(&format!(
+                    "    Capacity: {}\n",
+                    bytes_to_string(&storage.capacity.to_bigint().unwrap())
+                ));
+                builder.push_str(&format!(
+                    "    Available: {} ({:.2}%)\n",
+                    bytes_to_string(&storage.available.to_bigint().unwrap()),
+                    Self::get_percent(storage.available, storage.capacity)
+                ));
+                builder.push_str(&format!(
+                    "    Fs-used: {} ({:.2}%)\n",
+                    bytes_to_string(&storage.fs_used.to_bigint().unwrap()),
+                    Self::get_percent(storage.fs_used, storage.capacity)
+                ));
+                builder.push_str(&format!(
+                    "    Non-FS Used: {}\n",
+                    bytes_to_string(&storage.non_fs_used.to_bigint().unwrap())
+                ));
+                if storage.failed {
+                    builder.push_str("    Status: FAILED\n");
+                }
+                builder.push('\n');
             }
         }
 
