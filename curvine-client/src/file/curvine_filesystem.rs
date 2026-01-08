@@ -428,7 +428,7 @@ impl CurvineFileSystem {
         // Step 4: Complete all files at worker side
         let commit_blocks = batch_writer.complete().await?;
 
-        // Step 4: Batch complete at master side
+        // Step 5: Batch complete at master side
         let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> =
             Vec::with_capacity(files.len());
         for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {

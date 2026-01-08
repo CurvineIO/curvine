@@ -197,7 +197,6 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     writer.complete().await?;
 
     let initial_status = fs.get_status(&path).await?;
-    println!("initial_statusyyy: {:?}", initial_status);
     let initial_inode_id = initial_status.id;
     let initial_content = read_file_content(fs, &path).await?;
     assert_eq!(initial_content, "initial");
@@ -208,18 +207,13 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     );
 
     // 2. Use overwrite mode to rewrite file content to "overwritten_content"
-    println!("xx overwrite_inode_id");
     let mut writer = fs.create(&path, true).await?;
     writer.write("overwritten_content".as_bytes()).await?;
-    println!("yy overwrite_inode_id");
     writer.complete().await?;
-    println!("xxyy overwrite_inode_id");
 
     let overwrite_status = fs.get_status(&path).await?;
     let overwrite_inode_id = overwrite_status.id;
-    println!("x overwrite_inode_id: {}", overwrite_inode_id);
     let overwrite_content = read_file_content(fs, &path).await?;
-    println!("y overwrite_content: {}", overwrite_content);
 
     // 3. Verify state after overwrite
     assert_eq!(overwrite_content, "overwritten_content");
@@ -285,11 +279,9 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Helper function to read file content
     async fn read_file_content(fs: &CurvineFileSystem, path: &Path) -> CommonResult<String> {
         let status = fs.get_status(path).await?;
-        println!("DEBUG: at read_file_content, status: {:?}", status);
         let mut reader = fs.open(path).await?;
         let mut buffer = BytesMut::zeroed(status.len as usize);
         let bytes_read = reader.read_full(&mut buffer).await?;
-        println!("DEBUG: at read_file_content, bytes_read: {}", bytes_read);
         reader.complete().await?;
         buffer.truncate(bytes_read);
         Ok(String::from_utf8(buffer.to_vec())?)
@@ -325,9 +317,7 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     for (i, (path, _)) in batch_files.clone().iter().enumerate() {
         let status = fs.get_status(path).await?;
 
-        println!("status of file_{}: {:?}", i, status);
         let content = read_file_content(fs, path).await?;
-        println!("content of file_{}: {:?}", i, content);
         if i == num_files - 1 {
             assert_eq!(
                 status.len, large_file_size as i64,

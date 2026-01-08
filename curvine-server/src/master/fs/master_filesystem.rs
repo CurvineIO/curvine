@@ -193,13 +193,6 @@ impl MasterFilesystem {
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<FileStatus> {
-        println!("at create_with_opts:");
-        println!(
-            "path: {:?}, otps: {:?}, flags: {:?}",
-            path.as_ref(),
-            opts,
-            flags
-        );
         if !flags.create() {
             return err_box!("Flag error {}, cannot create file", flags.value());
         }
@@ -463,7 +456,6 @@ impl MasterFilesystem {
         client_name: T,
         only_flush: bool,
     ) -> FsResult<Option<FileBlocks>> {
-        println!("check complete_file for path: {:?} with len: {:?}, commit_blocks: {:?}, only_flush: {:?}", path.as_ref(), len, commit_blocks, only_flush);
         let path = path.as_ref();
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;

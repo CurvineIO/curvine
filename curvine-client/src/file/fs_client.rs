@@ -81,10 +81,6 @@ impl FsClient {
             })
             .collect();
 
-        println!(
-            "DEBUG: at create_files_batch pb_requests: {:?}",
-            pb_requests
-        );
         let header = CreateFilesBatchRequest {
             requests: pb_requests,
         };
@@ -263,7 +259,7 @@ impl FsClient {
                     exclude_workers: self.context.exclude_workers(),
                     located: true,
                     client_address: self.context.client_addr_pb(),
-                    file_len: 0, //file_len
+                    file_len: 0,
                     last_block: None,
                 }
             })
@@ -307,7 +303,6 @@ impl FsClient {
         &self,
         requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)>,
     ) -> FsResult<Vec<bool>> {
-        println!("enter: complete_files_batch function");
         let pb_requests: Vec<CompleteFileRequest> = requests
             .into_iter()
             .map(|(path, len, commit_blocks, client_name, only_flush)| {

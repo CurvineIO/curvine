@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::block::batch_block_writer::BatchWriterAdapter::{BatchLocal, BatchRemote};
-
 use crate::block::{BatchBlockWriterLocal, BatchBlockWriterRemote};
 use crate::file::FsContext;
 use curvine_common::fs::Path;
@@ -112,12 +111,13 @@ impl BatchBlockWriter {
                 BatchWriterAdapter::new(fs_context.clone(), &located_blocks, addr).await?;
             inners.push(adapter);
         }
+        let num_of_blocks = located_blocks.len();
 
         Ok(Self {
             inners,
             fs_context,
             located_blocks,
-            file_lengths: Vec::new(),
+            file_lengths: Vec::with_capacity(num_of_blocks),
         })
     }
 
@@ -130,7 +130,7 @@ impl BatchBlockWriter {
         let futures = self.inners.iter_mut().map(|writer| {
             async move {
                 writer
-                    .write(files) // Pass index here
+                    .write(files)
                     .await
                     .map_err(|e| (writer.worker_address().clone(), e))
             }

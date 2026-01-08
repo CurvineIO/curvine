@@ -29,18 +29,6 @@ enum WriterAdapter {
     Remote(BlockWriterRemote),
 }
 
-impl std::fmt::Debug for WriterAdapter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WriterAdapter::Local(_writer) => {
-                write!(f, "WriterAdapter::Local()")
-            }
-            WriterAdapter::Remote(_writer) => {
-                write!(f, "WriterAdapter::Remote()")
-            }
-        }
-    }
-}
 impl WriterAdapter {
     fn worker_address(&self) -> &WorkerAddress {
         match self {

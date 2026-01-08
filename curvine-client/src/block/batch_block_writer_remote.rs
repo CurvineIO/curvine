@@ -67,7 +67,6 @@ impl BatchBlockWriterRemote {
         let writer = Self {
             blocks,
             worker_address,
-            // files: Some(files),
             client,
             pos,
             seq_id,
@@ -85,13 +84,7 @@ impl BatchBlockWriterRemote {
 
     // Write data.
     pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
-        println!("DEBUG: BatchBlockWriteRemote writing {} files", files.len());
-
         let next_seq_id = self.next_seq_id();
-        println!(
-            "DEBUG: BatchBlockWriteRemote, at write, next_seq_id: {:?}, req_id: {:?}",
-            next_seq_id, self.req_id
-        );
 
         // Send all files in one RPC call
         self.client
@@ -107,7 +100,6 @@ impl BatchBlockWriterRemote {
         Ok(())
     }
 
-    // refresh.
     pub async fn flush(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
         self.client

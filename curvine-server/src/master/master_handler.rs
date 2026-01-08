@@ -293,10 +293,8 @@ impl MasterHandler {
     }
 
     pub fn create_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        println!("start create files batch");
         let header: CreateFilesBatchRequest = ctx.parse_header()?;
 
-        println!("DEBUG: at create_files_batch, parse header: {:?}", header);
         let mut results = Vec::with_capacity(header.requests.len());
         for (index, req) in header.requests.into_iter().enumerate() {
             let opts = ProtoUtils::create_opts_from_pb(req.opts);
