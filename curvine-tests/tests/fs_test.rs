@@ -15,6 +15,7 @@
 use bytes::BytesMut;
 use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_client::ClientMetrics;
+use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
     CreateFileOptsBuilder, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
@@ -32,13 +33,25 @@ const PATH: &str = "/fs_test/a.log";
 #[test]
 fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     let rt = Arc::new(AsyncRuntime::single());
-
     let testing = Testing::builder().default().build()?;
     testing.start_cluster()?;
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.write_chunk_size = 64; // Set to 64 bytes
     conf.client.write_chunk_size_str = "64B".to_string(); // Update string field
     conf.client.metric_report_enable = true;
+    
+    // Test short_circuit = false
+    conf.client.short_circuit = false;
+    run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone(), )?;
+    
+    // Test short_circuit = true
+    conf.client.short_circuit = true;
+    run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
+    
+    Ok(())
+}
+
+fn run_filesystem_end_to_end_operations_on_cluster(testing: &Testing, rt: &Arc<AsyncRuntime>, conf: ClusterConf, ) -> FsResult<()> {
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
     let res: FsResult<()> = rt.block_on(async move {
         let path = Path::from_str("/fs_test")?;
@@ -268,9 +281,11 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Helper function to read file content
     async fn read_file_content(fs: &CurvineFileSystem, path: &Path) -> CommonResult<String> {
         let status = fs.get_status(path).await?;
+        println!("DEBUG: at read_file_content, status: {:?}", status);
         let mut reader = fs.open(path).await?;
         let mut buffer = BytesMut::zeroed(status.len as usize);
         let bytes_read = reader.read_full(&mut buffer).await?;
+        println!("DEBUG: at read_file_content, bytes_read: {}", bytes_read);
         reader.complete().await?;
         buffer.truncate(bytes_read);
         Ok(String::from_utf8(buffer.to_vec())?)
@@ -306,7 +321,9 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     for (i, (path, _)) in batch_files.clone().iter().enumerate() {
         let status = fs.get_status(path).await?;
 
+        println!("status of file_{}: {:?}", i, status);
         let content = read_file_content(fs, path).await?;
+        println!("content of file_{}: {:?}", i, content);
         if i == num_files - 1 {
             assert_eq!(
                 status.len, large_file_size as i64,

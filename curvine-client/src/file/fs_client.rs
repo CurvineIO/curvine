@@ -254,24 +254,20 @@ impl FsClient {
 
     pub async fn add_blocks_batch(
         &self,
-        requests: Vec<(String, Vec<CommitBlock>, i64, Option<ExtendedBlock>)>,
+        requests: Vec<String>,
     ) -> FsResult<Vec<LocatedBlock>> {
         let pb_requests: Vec<AddBlockRequest> = requests
             .into_iter()
-            .map(|(path, commit_blocks, file_len, last_block)| {
-                let commit_blocks = commit_blocks
-                    .into_iter()
-                    .map(ProtoUtils::commit_block_to_pb)
-                    .collect();
-
+            .map(|path| {
+                let commit_blocks: Vec<CommitBlockProto> = Vec::new();
                 AddBlockRequest {
                     path,
                     commit_blocks,
                     exclude_workers: self.context.exclude_workers(),
                     located: true,
                     client_address: self.context.client_addr_pb(),
-                    file_len,
-                    last_block: last_block.map(ProtoUtils::extend_block_to_pb),
+                    file_len: 0, //file_len
+                    last_block: None,
                 }
             })
             .collect();
@@ -279,7 +275,6 @@ impl FsClient {
         let header = AddBlocksBatchRequest {
             requests: pb_requests,
         };
-
         let rep: AddBlocksBatchResponse = self.rpc(RpcCode::AddBlocksBatch, header).await?;
         Ok(rep
             .blocks
@@ -307,7 +302,6 @@ impl FsClient {
             commit_blocks,
             only_flush,
         };
-
         let rep: CompleteFileResponse = self.rpc(RpcCode::CompleteFile, header).await?;
         Ok(rep.file_blocks.map(ProtoUtils::file_blocks_from_pb))
     }
@@ -316,6 +310,7 @@ impl FsClient {
         &self,
         requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)>,
     ) -> FsResult<Vec<bool>> {
+        println!("enter: complete_files_batch function");
         let pb_requests: Vec<CompleteFileRequest> = requests
             .into_iter()
             .map(|(path, len, commit_blocks, client_name, only_flush)| {
@@ -333,13 +328,11 @@ impl FsClient {
             })
             .collect();
 
-        println!("pb_requests: {:?}", pb_requests);
         let header = CompleteFilesBatchRequest {
             requests: pb_requests,
         };
 
         let rep: CompleteFilesBatchResponse = self.rpc(RpcCode::CompleteFilesBatch, header).await?;
-        println!("rep from complete files batch: {:?}", rep);
         Ok(rep.results)
     }
 

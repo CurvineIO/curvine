@@ -12,22 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
 use crate::block::block_writer::WriterAdapter::{Local, Remote};
-use crate::block::{BlockWriterLocal, BlockWriterRemote};
+
+
+use crate::block::{
+    BlockWriterLocal, BlockWriterRemote,
+};
 use crate::file::FsContext;
-use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress};
+use curvine_common::state::{
+    BlockLocation, CommitBlock, LocatedBlock, WorkerAddress,
+};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
-use orpc::err_box;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use std::sync::Arc;
+use orpc::err_box;
 
 enum WriterAdapter {
     Local(BlockWriterLocal),
     Remote(BlockWriterRemote),
 }
 
+
+impl std::fmt::Debug for WriterAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriterAdapter::Local(_writer) => {
+                write!(f, "WriterAdapter::Local()")
+            }
+            WriterAdapter::Remote(_writer) => {
+                write!(f, "WriterAdapter::Remote()")
+            }
+        }
+    }
+}
 impl WriterAdapter {
     fn worker_address(&self) -> &WorkerAddress {
         match self {
@@ -36,12 +56,14 @@ impl WriterAdapter {
         }
     }
 
+
     async fn write(&mut self, buf: DataSlice) -> FsResult<()> {
         match self {
             Local(f) => f.write(buf).await,
             Remote(f) => f.write(buf).await,
         }
     }
+
 
     fn blocking_write(&mut self, rt: &Runtime, buf: DataSlice) -> FsResult<()> {
         match self {
@@ -50,12 +72,14 @@ impl WriterAdapter {
         }
     }
 
+
     async fn flush(&mut self) -> FsResult<()> {
         match self {
             Local(f) => f.flush().await,
             Remote(f) => f.flush().await,
         }
     }
+
 
     async fn complete(&mut self) -> FsResult<()> {
         match self {
@@ -64,12 +88,14 @@ impl WriterAdapter {
         }
     }
 
+
     async fn cancel(&mut self) -> FsResult<()> {
         match self {
             Local(f) => f.cancel().await,
             Remote(f) => f.cancel().await,
         }
     }
+
 
     fn remaining(&self) -> i64 {
         match self {
@@ -78,12 +104,14 @@ impl WriterAdapter {
         }
     }
 
+
     fn pos(&self) -> i64 {
         match self {
             Local(f) => f.pos(),
             Remote(f) => f.pos(),
         }
     }
+
 
     // Add seek support for WriterAdapter
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
@@ -93,6 +121,7 @@ impl WriterAdapter {
         }
     }
 
+
     fn len(&self) -> i64 {
         match self {
             Local(f) => f.len(),
@@ -100,7 +129,7 @@ impl WriterAdapter {
         }
     }
 
-    // Create new WriterAdapter
+
     async fn new(
         fs_context: Arc<FsContext>,
         located_block: &LocatedBlock,
@@ -110,16 +139,18 @@ impl WriterAdapter {
         let conf = &fs_context.conf.client;
         let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
 
+
         let adapter = if short_circuit {
             let writer = BlockWriterLocal::new(
-                fs_context,
-                located_block.block.clone(),
-                worker_addr.clone(),
-                pos,
-            )
-            .await?;
+                    fs_context,
+                    located_block.block.clone(),
+                    worker_addr.clone(),
+                    pos,
+                )
+                .await?;
             Local(writer)
         } else {
+            // Remote writers don't support buffering
             let writer = BlockWriterRemote::new(
                 &fs_context,
                 located_block.block.clone(),
@@ -130,9 +161,11 @@ impl WriterAdapter {
             Remote(writer)
         };
 
+
         Ok(adapter)
     }
 }
+
 
 pub struct BlockWriter {
     inners: Vec<WriterAdapter>,
@@ -140,15 +173,21 @@ pub struct BlockWriter {
     fs_context: Arc<FsContext>,
 }
 
+
 impl BlockWriter {
-    pub async fn new(fs_context: Arc<FsContext>, locate: LocatedBlock, pos: i64) -> FsResult<Self> {
+    pub async fn new(
+        fs_context: Arc<FsContext>,
+        locate: LocatedBlock,
+        pos: i64,
+    ) -> FsResult<Self> {
         if locate.locs.is_empty() {
             return err_box!("There is no available worker");
         }
 
         let mut inners = Vec::with_capacity(locate.locs.len());
         for addr in &locate.locs {
-            let adapter = WriterAdapter::new(fs_context.clone(), &locate, addr, pos).await?;
+            let adapter =
+                WriterAdapter::new(fs_context.clone(), &locate, addr, pos).await?;
             inners.push(adapter);
         }
 

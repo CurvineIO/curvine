@@ -27,6 +27,19 @@ pub struct WriteContext {
     pub off: i64,
     pub block_size: i64,
 }
+impl Default for WriteContext {
+    #[inline(always)]
+    fn default() -> Self {
+        Self {
+            block: ExtendedBlock::default(),
+            req_id: 0,
+            chunk_size: 0,
+            short_circuit: false,
+            off: 0,
+            block_size: 0,
+        }
+    }
+}
 
 impl WriteContext {
     pub fn from_req(msg: &Message) -> FsResult<Self> {

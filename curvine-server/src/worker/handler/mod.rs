@@ -18,6 +18,9 @@ pub use self::worker_handler::WorkerHandler;
 mod write_handler;
 pub use self::write_handler::WriteHandler;
 
+mod batch_write_handler;
+pub use self::batch_write_handler::BatchWriteHandler;
+
 mod read_handler;
 pub use self::read_handler::ReadHandler;
 

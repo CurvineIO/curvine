@@ -297,7 +297,7 @@ impl MasterHandler {
         let header: CreateFilesBatchRequest = ctx.parse_header()?;
 
         println!("DEBUG: at create_files_batch, parse header: {:?}", header);
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(header.requests.len());
         for (index, req) in header.requests.into_iter().enumerate() {
             let opts = ProtoUtils::create_opts_from_pb(req.opts);
             let flags = OpenFlags::new(req.flags);
@@ -319,7 +319,7 @@ impl MasterHandler {
 
     pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: AddBlocksBatchRequest = ctx.parse_header()?;
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(header.requests.len());
         for req in header.requests {
             let path = req.path;
             let client_addr = ProtoUtils::client_address_from_pb(req.client_address);

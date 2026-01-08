@@ -14,12 +14,16 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use crate::block::{BlockReadContext, CreateBlockContext};
+
+use crate::block::{BlockReadContext, CreateBatchBlockContext, CreateBlockContext};
 use crate::file::FsContext;
 use curvine_common::conf::ClientConf;
+use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse, DataHeaderProto,
+    FilesBatchWriteRequest, BlockReadRequest, BlockReadResponse, BlockWriteRequest,
+    BlockWriteResponse, BlocksBatchCommitRequest,
+    BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto, FileWriteData,
 };
 use curvine_common::state::{ExtendedBlock, StorageType};
 use curvine_common::utils::ProtoUtils;
@@ -204,10 +208,8 @@ impl BlockClient {
 
         let rep = self.rpc(msg).await?;
         let rep_header: BlockReadResponse = rep.parse_header()?;
-
         Ok(BlockReadContext::from_req(rep_header))
     }
-
     pub async fn read_commit(
         &self,
         block: &ExtendedBlock,
@@ -226,6 +228,7 @@ impl BlockClient {
             .seq_id(seq_id)
             .proto_header(request)
             .build();
+
 
         let _ = self.rpc(msg).await?;
         Ok(())
@@ -251,5 +254,136 @@ impl BlockClient {
 
         let rep = self.rpc(msg).await?;
         Ok(rep.data)
+    }
+    pub async fn write_blocks_batch(
+        &self,
+        blocks: &[ExtendedBlock],
+        off: i64,
+        block_size: i64,
+        req_id: i64,
+        seq_id: i32,
+        chunk_size: i32,
+        short_circuit: bool,
+    ) -> FsResult<CreateBatchBlockContext> {
+        let blocks_pb: Vec<_> = blocks
+            .iter()
+            .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
+            .collect();
+
+
+        let req_header = BlocksBatchWriteRequest {
+            blocks: blocks_pb,
+            off,
+            block_size,
+            req_id,
+            seq_id,
+            chunk_size,
+            short_circuit,
+            client_name: self.client_name.to_string(),
+        };
+
+        let msg = Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::OpenBatch)
+            .req_id(req_id)
+            .seq_id(seq_id)
+            .proto_header(req_header)
+            .build();
+
+        let rep = self.rpc(msg).await?;
+        let rep_header: BlocksBatchWriteResponse = rep.parse_header()?;
+        let mut batch_context = CreateBatchBlockContext::new(req_id);
+
+        for response in rep_header.responses {
+            let context = CreateBlockContext {
+                id: response.id,
+                off: response.off,
+                block_size: response.block_size,
+                storage_type: StorageType::from(response.storage_type),
+                path: response.path,
+            };
+            batch_context.push(context);
+        }
+
+        Ok(batch_context)
+    }
+
+
+    pub async fn write_commit_batch(
+        &self,
+        blocks: &[ExtendedBlock],
+        off: i64,
+        block_size: i64,
+        req_id: i64,
+        seq_id: i32,
+        cancel: bool,
+    ) -> FsResult<()> {
+        // Convert blocks to protobuf
+        let blocks_pb: Vec<_> = blocks
+            .iter()
+            .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
+            .collect();
+        
+        let header = BlocksBatchCommitRequest {
+            blocks: blocks_pb,
+            off,
+            block_size,
+            req_id,
+            seq_id,
+            cancel,
+        };
+
+        let status = if cancel {
+            RequestStatus::CancelBatch
+        } else {
+            RequestStatus::CompleteBatch
+        };
+
+        let msg = Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(status)
+            .req_id(req_id)
+            .seq_id(seq_id)
+            .proto_header(header)
+            .build();
+
+        let _ = self.rpc(msg).await?;
+        Ok(())
+    }
+
+
+    pub async fn write_files_batch(
+        &self,
+        files: &[(&Path, &str)],
+        req_id: i64,
+        seq_id: i32,
+    ) -> CommonResult<()> {
+        let file_data: Vec<_> = files
+            .iter()
+            .map(|(path, content)| FileWriteData {
+                path: path.to_string(),
+                content: content.as_bytes().to_vec(),
+            })
+            .collect();
+
+
+        let header = FilesBatchWriteRequest {
+            files: file_data,
+            req_id,
+            seq_id,
+        };
+
+
+        let msg = Builder::new()
+            .code(RpcCode::WriteBlocksBatch)
+            .request(RequestStatus::RunningBatch)
+            .req_id(req_id)
+            .seq_id(seq_id)
+            .proto_header(header)
+            .build();
+
+
+        let _ = self.rpc(msg).await?;
+        Ok(())
     }
 }

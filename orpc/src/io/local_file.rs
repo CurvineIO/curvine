@@ -36,6 +36,32 @@ pub struct LocalFile {
     buf: BytesMut,
 }
 
+impl Default for LocalFile {
+    #[inline(always)]
+    fn default() -> Self {
+        use std::env;
+        use std::fs::File as StdFile;
+
+        // Create a temporary file for the inner field
+        let temp_dir = env::temp_dir();
+        let temp_path = temp_dir.join(format!("localfile_default_{}.tmp", std::process::id()));
+
+        let file = StdFile::create(&temp_path)
+            .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
+
+        std::fs::remove_file(&temp_path).ok();
+        Self {
+            inner: file,
+            path: temp_path.to_string_lossy().to_string(),
+            is_tmpfs: false,
+            len: 0,
+            pos: 0,
+            buf: BytesMut::new(),
+        }
+    }
+}
+
+
 impl LocalFile {
     pub fn new<T: AsRef<str>>(path: T, mut inner: fs::File) -> IOResult<Self> {
         let is_tmpfs = sys::is_tmpfs(path.as_ref())?;
@@ -53,7 +79,7 @@ impl LocalFile {
 
         Ok(file)
     }
-
+    
     // Append write.
     pub fn with_append<T: AsRef<str>>(path: T) -> IOResult<Self> {
         let file = OpenOptions::new().append(true).open(path.as_ref())?;
