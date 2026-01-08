@@ -43,7 +43,7 @@ impl BlockReaderRemote {
         let req_id = Utils::req_id();
         let seq_id = 0;
 
-        let client = fs_context.block_client(&worker_address).await?;
+        let client = fs_context.acquire_read(&worker_address).await?;
         let _ = client
             .open_block(
                 &fs_context.conf.client,

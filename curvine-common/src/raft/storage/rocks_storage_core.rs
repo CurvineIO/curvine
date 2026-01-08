@@ -89,7 +89,7 @@ impl RocksStorageCore {
 
     pub fn get_check(&self, index: u64) -> RaftResult<Entry> {
         match self.get(index)? {
-            None => err_box!("entry {} not exits", index),
+            None => err_box!("entry {} not exists", index),
             Some(v) => Ok(v),
         }
     }

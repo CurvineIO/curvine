@@ -52,7 +52,8 @@ impl CurvineFileSystem {
             fs_client: Arc::new(fs_client),
         };
 
-        FsContext::start_metrics_report_task(fs.clone());
+        FsContext::start_clean_task(fs.clone(), fs.fs_context.block_pool.clone());
+
         let c = &fs.conf().client;
         info!(
             "Create new filesystem, git version: {}, masters: {}, threads: {}-{}, \

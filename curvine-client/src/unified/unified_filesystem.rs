@@ -280,6 +280,9 @@ impl UnifiedFileSystem {
                 }
 
                 _ => {
+                    // ufs creates an empty file to prevent errors when accessing metadata.
+                    mount.ufs.create(&ufs_path, true).await?;
+
                     let writer = CacheSyncWriter::new(self, path, &mount, flags).await?;
                     Ok(UnifiedWriter::CacheSync(writer))
                 }

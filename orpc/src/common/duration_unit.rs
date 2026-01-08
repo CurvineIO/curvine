@@ -109,13 +109,13 @@ impl fmt::Display for DurationUnit {
         let ms = self.0;
         if ms == 0 {
             write!(f, "{}ms", ms)
-        } else if ms % Self::DAY == 0 {
+        } else if ms.is_multiple_of(Self::DAY) {
             write!(f, "{}d", ms / Self::DAY)
-        } else if ms % Self::HOUR == 0 {
+        } else if ms.is_multiple_of(Self::HOUR) {
             write!(f, "{}h", ms / Self::HOUR)
-        } else if ms % Self::MINUTE == 0 {
+        } else if ms.is_multiple_of(Self::MINUTE) {
             write!(f, "{}m", ms / Self::MINUTE)
-        } else if ms % Self::SECONDS == 0 {
+        } else if ms.is_multiple_of(Self::SECONDS) {
             write!(f, "{}s", ms / Self::SECONDS)
         } else {
             write!(f, "{}ms", ms)

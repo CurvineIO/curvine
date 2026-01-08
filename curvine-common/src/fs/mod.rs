@@ -27,5 +27,8 @@ pub use self::writer::Writer;
 mod filesystem;
 pub use self::filesystem::FileSystem;
 
+mod meta_cache;
+pub use self::meta_cache::MetaCache;
+
 // CurvineURI is used in the Curvine system to describe paths, including external storage
 pub type CurvineURI = Path;

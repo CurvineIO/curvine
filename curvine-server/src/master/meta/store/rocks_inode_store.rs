@@ -45,7 +45,11 @@ impl RocksInodeStore {
         Ok(Self { db })
     }
 
-    pub fn get_child_ids(&self, id: i64, prefix: Option<&str>) -> CommonResult<InodeChildrenIter> {
+    pub fn get_child_ids(
+        &self,
+        id: i64,
+        prefix: Option<&str>,
+    ) -> CommonResult<InodeChildrenIter<'_>> {
         let iter = match prefix {
             None => {
                 let key = RocksUtils::i64_to_bytes(id);
@@ -76,15 +80,15 @@ impl RocksInodeStore {
         Ok(vec)
     }
 
-    pub fn new_batch(&self) -> InodeWriteBatch {
+    pub fn new_batch(&self) -> InodeWriteBatch<'_> {
         InodeWriteBatch::new(&self.db)
     }
 
-    pub fn inodes_iter(&self) -> CommonResult<RocksIterator> {
+    pub fn inodes_iter(&self) -> CommonResult<RocksIterator<'_>> {
         self.db.scan(Self::CF_INODES)
     }
 
-    pub fn edges_iter(&self, id: i64) -> CommonResult<RocksIterator> {
+    pub fn edges_iter(&self, id: i64) -> CommonResult<RocksIterator<'_>> {
         self.db
             .prefix_scan(Self::CF_EDGES, RocksUtils::i64_to_bytes(id))
     }

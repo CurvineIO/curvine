@@ -24,7 +24,7 @@ use curvine_common::utils::SerdeUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
-use orpc::message::{Builder, Message};
+use orpc::message::{Builder, Message, RequestStatus};
 use orpc::runtime::Runtime;
 use std::sync::Arc;
 
@@ -58,7 +58,7 @@ impl MessageHandler for WorkerHandler {
 
 impl WorkerHandler {
     fn get_handler(&mut self, msg: &Message) -> FsResult<&mut BlockHandler> {
-        if self.handler.is_none() {
+        if self.handler.is_none() || !matches!(msg.request_status(), RequestStatus::Running | RequestStatus::RunningBatch)  {
             let handler = BlockHandler::new(RpcCode::from(msg.code()), self.store.clone())?;
 
             let _ = self.handler.replace(handler);

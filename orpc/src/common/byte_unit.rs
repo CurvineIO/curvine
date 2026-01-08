@@ -132,15 +132,15 @@ impl fmt::Display for ByteUnit {
         let size = self.0;
         if size == 0 {
             write!(f, "{}B", size)
-        } else if size % Self::PB == 0 {
+        } else if size.is_multiple_of(Self::PB) {
             write!(f, "{}PB", size / Self::PB)
-        } else if size % Self::TB == 0 {
+        } else if size.is_multiple_of(Self::TB) {
             write!(f, "{}TB", size / Self::TB)
-        } else if size % Self::GB == 0 {
+        } else if size.is_multiple_of(Self::GB) {
             write!(f, "{}GB", size / Self::GB)
-        } else if size % Self::MB == 0 {
+        } else if size.is_multiple_of(Self::MB) {
             write!(f, "{}MB", size / Self::MB)
-        } else if size % Self::KB == 0 {
+        } else if size.is_multiple_of(Self::KB) {
             write!(f, "{}KB", size / Self::KB)
         } else {
             write!(f, "{}B", size)

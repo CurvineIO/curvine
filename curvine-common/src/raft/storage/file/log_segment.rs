@@ -39,7 +39,7 @@ impl LogSegment {
     }
 
     pub fn get_first_entry(&self) -> Option<&Entry> {
-        self.cache.last()
+        self.cache.first()
     }
 
     pub fn append(&mut self, mut entry: Entry) -> RaftResult<()> {

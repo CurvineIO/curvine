@@ -15,12 +15,12 @@
 use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
 use crate::fs::state::{NodeAttr, NodeMap};
-use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
+use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
-use crate::{err_fuse, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR};
+use crate::{err_fuse, FuseResult};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::FuseConf;
-use curvine_common::fs::{FileSystem, Path};
+use curvine_common::fs::{FileSystem, MetaCache, Path};
 use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
 use log::{info, warn};
 use orpc::common::FastHashMap;
@@ -34,6 +34,7 @@ pub struct NodeState {
     handles: RwLockHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
     dir_handles: RwLockHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
     fh_creator: AtomicCounter,
+    meta_cache: MetaCache,
     fs: UnifiedFileSystem,
     conf: FuseConf,
 }
@@ -42,13 +43,15 @@ impl NodeState {
     pub fn new(fs: UnifiedFileSystem) -> Self {
         let conf = fs.conf().fuse.clone();
         let node_map = NodeMap::new(&conf);
+        let meta_cache = MetaCache::new(conf.meta_cache_capacity, conf.meta_cache_ttl_duration);
 
         Self {
             node_map: RwLock::new(node_map),
             handles: RwLockHashMap::default(),
             dir_handles: RwLockHashMap::default(),
-            fs,
             fh_creator: AtomicCounter::new(0),
+            meta_cache,
+            fs,
             conf,
         }
     }
@@ -59,6 +62,10 @@ impl NodeState {
 
     pub fn node_read(&self) -> RwLockReadGuard<'_, NodeMap> {
         self.node_map.read().unwrap()
+    }
+
+    pub fn meta_cache(&self) -> &MetaCache {
+        &self.meta_cache
     }
 
     pub fn get_node(&self, id: u64) -> FuseResult<NodeAttr> {
@@ -358,24 +365,26 @@ impl NodeState {
     ) -> FuseResult<bool> {
         let name = name.as_ref();
 
-        let mut map = self.node_write();
-        let id = match map.lookup_node(parent, name) {
-            Some(v) => v.id,
-            None => return err_fuse!(libc::ENOENT, "node {} not found", parent),
+        let id = {
+            let map = self.node_read();
+            match map.lookup_node(parent, name) {
+                Some(v) => v.id,
+                None => return err_fuse!(libc::ENOENT, "node {} not found", parent),
+            }
         };
 
-        let delete = if self.has_open_handles(id) {
+        if self.has_open_handles(id) {
+            let mut map = self.node_write();
             map.mark_pending_delete(id);
-            let path = map.get_path_common(id, name)?;
+            let path = map.get_path(id)?;
             info!(
                 "unlink {}: file has open handles (ino={}), marking for delayed deletion",
                 path, id
             );
-            false
+            Ok(false)
         } else {
-            true
-        };
-        Ok(delete)
+            Ok(true)
+        }
     }
 
     pub fn remove_pending_delete(&self, ino: u64) -> bool {
@@ -417,17 +426,12 @@ impl NodeState {
         }
     }
 
-    pub async fn new_dir_handle(&self, ino: u64, path: &Path) -> FuseResult<Arc<DirHandle>> {
-        let list = self.fs.list_status(path).await?;
-
-        let mut res = Vec::with_capacity(list.len() + 2);
-        res.push(CurvineFileSystem::new_dot_status(FUSE_CURRENT_DIR));
-        res.push(CurvineFileSystem::new_dot_status(FUSE_PARENT_DIR));
-        for status in list {
-            res.push(status);
-        }
-
-        let handle = Arc::new(DirHandle::new(ino, self.next_fh(), res));
+    pub async fn new_dir_handle(
+        &self,
+        ino: u64,
+        list: Vec<FileStatus>,
+    ) -> FuseResult<Arc<DirHandle>> {
+        let handle = Arc::new(DirHandle::new(ino, self.next_fh(), list));
         let mut lock = self.dir_handles.write();
         lock.entry(ino)
             .or_default()

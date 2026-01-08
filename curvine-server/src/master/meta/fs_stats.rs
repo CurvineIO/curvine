@@ -36,6 +36,10 @@ impl FileSystemStats {
         self.metrics.inode_dir_num.inc()
     }
 
+    pub fn decrement_file_count(&self) {
+        self.metrics.inode_file_num.dec();
+    }
+
     pub fn add_file_count(&self, count: i64) {
         self.metrics.inode_file_num.add(count)
     }

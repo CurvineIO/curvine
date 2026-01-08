@@ -15,6 +15,7 @@
 package csi
 
 import (
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -44,13 +45,26 @@ func GenerateClusterID(masterAddrs string) string {
 	return clusterID
 }
 
-// GenerateMountKey generates a unique mount key from master-addrs and fs-path using SHA256 hash
+// mountKeyNamespace is a fixed namespace UUID for generating deterministic mount keys
+// Using UUID v5 algorithm ensures same input always produces same output
+var mountKeyNamespace = []byte("curvine-mount-key-namespace-v1")
+
+// GenerateMountKey generates a unique mount key from master-addrs and fs-path using UUID v5 algorithm
+// UUID v5 is deterministic: same input always produces same output
 // This ensures different StorageClasses with same master-addrs but different fs-path get different mount points
-// Returns first 8 hex characters of the hash
+// Returns 32 hex characters (128 bits, standard UUID length without dashes) for maximum collision resistance
 func GenerateMountKey(masterAddrs, fsPath string) string {
 	combined := fmt.Sprintf("%s|%s", masterAddrs, fsPath)
-	hash := sha256.Sum256([]byte(combined))
-	mountKey := hex.EncodeToString(hash[:])[:8]
+	
+	// UUID v5 uses SHA1 hash of namespace + name
+	hash := sha1.New()
+	hash.Write(mountKeyNamespace)
+	hash.Write([]byte(combined))
+	uuidBytes := hash.Sum(nil)
+	
+	// Return first 32 hex chars (128 bits, standard UUID length)
+	// This provides 2^128 collision space, much larger than previous 2^64
+	mountKey := hex.EncodeToString(uuidBytes)[:32]
 	klog.V(5).Infof("Generated mount-key: %s from master-addrs: %s, fs-path: %s", mountKey, masterAddrs, fsPath)
 	return mountKey
 }

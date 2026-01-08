@@ -141,7 +141,7 @@ impl ClusterConf {
         conf.worker_threads = self.master.worker_threads;
         // master will automatically close the idle connection, and the customer service will automatically maintain a heartbeat.
         conf.close_idle = self.master.io_close_idle;
-        conf.timout_ms = self.master.io_timeout_ms();
+        conf.timeout_ms = self.master.io_timeout_ms();
         conf
     }
 
@@ -194,7 +194,7 @@ impl ClusterConf {
 
         // The raw client used by the worker does not currently implement heartbeat checks, so the default server does not actively close the connection.
         conf.close_idle = self.worker.io_close_idle;
-        conf.timout_ms = self.worker.io_timeout_ms();
+        conf.timeout_ms = self.worker.io_timeout_ms();
 
         conf.enable_splice = self.worker.enable_splice;
         conf.pipe_buf_size = self.worker.pipe_buf_size;

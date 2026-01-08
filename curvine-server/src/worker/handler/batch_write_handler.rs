@@ -44,8 +44,8 @@ impl BatchWriteHandler {
         let store_clone = store.clone();
         Self {
             store,
-            context: Some(Vec::new()),
-            file: Some(Vec::new()),
+            context: None,
+            file: None,
             is_commit: false,
             write_handler: WriteHandler::new(store_clone),
         }
@@ -75,7 +75,7 @@ impl BatchWriteHandler {
         let header: BlocksBatchWriteRequest = msg.parse_header()?;
         let mut responses = Vec::with_capacity(header.blocks.len());
 
-        // reserve size of files and contexts
+        // Initialize ONCE with capacity
         self.file = Some(Vec::with_capacity(header.blocks.len()));
         self.context = Some(Vec::with_capacity(header.blocks.len()));
 
@@ -195,24 +195,20 @@ impl BatchWriteHandler {
                 .data(data_slice)
                 .build();
 
-            #[allow(clippy::mem_replace_with_default)]
-            let file = std::mem::replace(&mut self.file.as_mut().unwrap()[i], LocalFile::default());
+            // Transfer to handler
+            let file = std::mem::take(&mut self.file.as_mut().unwrap()[i]);
+            let context = std::mem::take(&mut self.context.as_mut().unwrap()[i]);
 
-            #[allow(clippy::mem_replace_with_default)]
-            let context = std::mem::replace(
-                &mut self.context.as_mut().unwrap()[i],
-                WriteContext::default(),
-            );
-
-            // Set handler state via raw pointers
             self.write_handler.file = Some(file);
             self.write_handler.context = Some(context);
+            
             let response = self.write_handler.write(&single_msg);
 
-            // Restore back to vector
+            // Transfer back
             let file = self.write_handler.file.take().unwrap();
-            self.file.as_mut().unwrap()[i] = file;
             let context = self.write_handler.context.take().unwrap();
+            
+            self.file.as_mut().unwrap()[i] = file;
             self.context.as_mut().unwrap()[i] = context;
 
             results.push(response.is_ok());

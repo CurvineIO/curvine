@@ -47,3 +47,6 @@ pub use self::block_reader_hole::BlockReaderHole;
 
 mod batch_block_writer_local;
 pub use self::batch_block_writer_local::BatchBlockWriterLocal;
+
+mod block_client_pool;
+pub use self::block_client_pool::BlockClientPool;

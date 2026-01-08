@@ -157,9 +157,16 @@ impl Path {
     }
 
     pub fn parent(&self) -> CommonResult<Option<Path>> {
+        if self.is_root() {
+            return Ok(None);
+        }
+
         let path = self.full_path();
         match path.rfind(Self::SEPARATOR).map(|v| &path[..v]) {
             None => Ok(None),
+
+            Some("") => Path::from_str(Self::SEPARATOR).map(Some),
+
             Some(v) => {
                 let res = Path::from_str(v)?;
                 Ok(Some(res))

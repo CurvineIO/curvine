@@ -14,8 +14,8 @@
 
 use crate::file::FsContext;
 use curvine_common::state::{MetricType, MetricValue};
-use orpc::common::Metrics;
 use orpc::common::{Counter, CounterVec, HistogramVec, Metrics as m};
+use orpc::common::{Gauge, Metrics};
 use orpc::sync::FastDashMap;
 use orpc::CommonResult;
 use std::collections::HashMap;
@@ -31,6 +31,7 @@ pub struct ClientMetrics {
     pub write_time_us: Counter,
     pub read_bytes: Counter,
     pub read_time_us: Counter,
+    pub block_idle_conn: Gauge,
 }
 
 impl ClientMetrics {
@@ -61,6 +62,7 @@ impl ClientMetrics {
             write_time_us: m::new_counter("client_write_time_us", "write time us total")?,
             read_bytes: m::new_counter("client_read_bytes", "read bytes total")?,
             read_time_us: m::new_counter("client_read_time_us", "read time us total")?,
+            block_idle_conn: m::new_gauge("block_idle_conn", "block idle conn total")?,
         };
 
         Ok(cm)
@@ -72,7 +74,6 @@ impl ClientMetrics {
 
     pub fn encode() -> CommonResult<Vec<MetricValue>> {
         let cm = FsContext::get_metrics();
-
         let mut metric_values = Vec::new();
         let metric_families = Metrics::registry().gather();
         for mf in metric_families {

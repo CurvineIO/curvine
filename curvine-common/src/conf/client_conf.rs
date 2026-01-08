@@ -162,9 +162,9 @@ pub struct ClientConf {
     pub metric_report_enable: bool,
 
     #[serde(skip)]
-    pub metric_report_interval: Duration,
-    #[serde(alias = "metric_report_interval")]
-    pub metric_report_interval_str: String,
+    pub clean_task_interval: Duration,
+    #[serde(alias = "clean_task_interval")]
+    pub clean_task_interval_str: String,
 
     pub close_timeout_secs: u64,
 
@@ -190,6 +190,33 @@ pub struct ClientConf {
 
     // Number of sync_check_interval cycles before logging
     pub sync_check_log_tick: u32,
+
+    pub enable_block_conn_pool: bool,
+    pub block_conn_idle_size: usize,
+
+    #[serde(skip)]
+    pub block_conn_idle_time: Duration,
+    #[serde(alias = "block_conn_idle_time")]
+    pub block_conn_idle_time_str: String,
+
+    #[serde(skip)]
+    pub small_file_size: i64,
+    #[serde(alias = "small_file_size")]
+    pub small_file_size_str: String,
+
+    // Smart prefetch configuration
+    // Whether to enable smart prefetch, default is true
+    pub enable_smart_prefetch: bool,
+
+    #[serde(skip)]
+    pub large_file_size: i64,
+    #[serde(alias = "large_file_size")]
+    pub large_file_size_str: String,
+
+    pub max_read_parallel: i64,
+
+    // Sequential read check threshold
+    pub sequential_read_threshold: u64,
 }
 
 impl ClientConf {
@@ -199,7 +226,7 @@ impl ClientConf {
 
     pub const DEFAULT_FILE_SYSTEM_MODE: u32 = 0o777;
 
-    pub const DEFAULT_METRIC_REPORT_INTERVAL_STR: &'static str = "10s";
+    pub const DEFAULT_CLEAN_TASK_INTERVAL_STR: &'static str = "10s";
 
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
@@ -232,12 +259,17 @@ impl ClientConf {
         self.failed_worker_ttl = DurationUnit::from_str(&self.failed_worker_ttl_str)?.as_duration();
         self.mount_update_ttl = DurationUnit::from_str(&self.mount_update_ttl_str)?.as_duration();
 
+        self.small_file_size = ByteUnit::from_str(&self.small_file_size_str)?.as_byte() as i64;
+
+        self.block_conn_idle_time =
+            DurationUnit::from_str(&self.block_conn_idle_time_str)?.as_duration();
+
         self.ttl_ms = DurationUnit::from_str(&self.ttl_ms_str)?.as_millis() as i64;
         self.ttl_action = TtlAction::try_from(self.ttl_action_str.as_str())?;
         self.storage_type = StorageType::try_from(self.storage_type_str.as_str())?;
 
-        self.metric_report_interval =
-            DurationUnit::from_str(&self.metric_report_interval_str)?.as_duration();
+        self.clean_task_interval =
+            DurationUnit::from_str(&self.clean_task_interval_str)?.as_duration();
 
         self.sync_check_interval_min =
             DurationUnit::from_str(&self.sync_check_interval_min_str)?.as_duration();
@@ -246,6 +278,9 @@ impl ClientConf {
 
         self.max_sync_wait_timeout =
             DurationUnit::from_str(&self.max_sync_wait_timeout_str)?.as_duration();
+
+        // Process smart prefetch configuration
+        self.large_file_size = ByteUnit::from_str(&self.large_file_size_str)?.as_byte() as i64;
 
         Ok(())
     }
@@ -304,8 +339,8 @@ impl Default for ClientConf {
             read_parallel: 1,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
-            close_reader_limit: 20,
-            close_writer_limit: 20,
+            close_reader_limit: 7,
+            close_writer_limit: 7,
 
             short_circuit: true,
 
@@ -336,7 +371,7 @@ impl Default for ClientConf {
 
             enable_read_ahead: true,
             read_ahead_len: 0,
-            read_ahead_len_str: "4MB".to_string(),
+            read_ahead_len_str: "0".to_string(),
             drop_cache_len: 0,
             drop_cache_len_str: "1MB".to_string(),
 
@@ -352,8 +387,10 @@ impl Default for ClientConf {
             umask: Self::DEFAULT_FILE_SYSTEM_UMASK,
 
             metric_report_enable: true,
-            metric_report_interval: Default::default(),
-            metric_report_interval_str: Self::DEFAULT_METRIC_REPORT_INTERVAL_STR.to_string(),
+
+            clean_task_interval: Default::default(),
+            clean_task_interval_str: Self::DEFAULT_CLEAN_TASK_INTERVAL_STR.to_string(),
+
             close_timeout_secs: Self::DEFAULT_CLOSE_TIMEOUT_SECS,
 
             metadata_operation_buckets: vec![
@@ -370,6 +407,21 @@ impl Default for ClientConf {
             max_sync_wait_timeout_str: "5m".to_string(),
 
             sync_check_log_tick: 3,
+
+            enable_block_conn_pool: true,
+            block_conn_idle_size: 128,
+
+            small_file_size: 0,
+            small_file_size_str: "4MB".to_string(),
+
+            block_conn_idle_time: Duration::from_secs(60),
+            block_conn_idle_time_str: "60s".to_string(),
+
+            enable_smart_prefetch: true,
+            large_file_size: 0,
+            large_file_size_str: "10GB".to_string(),
+            max_read_parallel: 8,
+            sequential_read_threshold: 7,
         };
 
         conf.init().unwrap();

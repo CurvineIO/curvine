@@ -50,6 +50,7 @@ pub trait HandlerService: Send + Sync + 'static {
     }
 }
 
+#[allow(unused)]
 #[derive(Default)]
 pub struct TestService;
 

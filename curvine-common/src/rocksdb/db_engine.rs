@@ -78,7 +78,7 @@ impl DBEngine {
     pub fn cf(&self, name: &str) -> CommonResult<&ColumnFamily> {
         match self.db.cf_handle(name) {
             Some(v) => Ok(v),
-            None => err_box!("cf {} not exits", name),
+            None => err_box!("cf {} not exists", name),
         }
     }
 
@@ -138,7 +138,7 @@ impl DBEngine {
 
     // Scan a column family
     // Note: If the mem table is of hash type, then the method cannot obtain data. It needs to set set_total_order_seek to true
-    pub fn scan(&self, cf: &str) -> CommonResult<RocksIterator> {
+    pub fn scan(&self, cf: &str) -> CommonResult<RocksIterator<'_>> {
         let opt = self.conf.create_read_opt();
         let cf = self.cf(cf)?;
 
@@ -149,7 +149,7 @@ impl DBEngine {
 
     // Describe the data in the specified key range of column families.
     // If the mem table is of hash type, then the method may not get the correct data. It needs to set set_total_order_seek to true
-    pub fn range_scan<K>(&self, cf: &str, start: K, end: K) -> CommonResult<RocksIterator>
+    pub fn range_scan<K>(&self, cf: &str, start: K, end: K) -> CommonResult<RocksIterator<'_>>
     where
         K: AsRef<[u8]>,
     {
@@ -166,7 +166,7 @@ impl DBEngine {
     // Prefix matcher.
     // lower_bound: key contains.
     // upper_bound: key + 1, not included.
-    pub fn prefix_scan<K>(&self, cf: &str, key: K) -> CommonResult<RocksIterator>
+    pub fn prefix_scan<K>(&self, cf: &str, key: K) -> CommonResult<RocksIterator<'_>>
     where
         K: AsRef<[u8]>,
     {
