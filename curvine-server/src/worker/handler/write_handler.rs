@@ -40,7 +40,6 @@ impl WriteHandler {
     pub fn new(store: BlockStore) -> Self {
         let conf = Worker::get_conf();
         let metrics = Worker::get_metrics();
-        println!("WriteHandler::new");
         Self {
             store,
             context: None,
