@@ -127,13 +127,11 @@ impl BatchBlockWriter {
             self.file_lengths.push(content.len() as i64);
         }
         // Write each file separately to all writers with index
-        let futures = self.inners.iter_mut().map(|writer| {
-            async move {
-                writer
-                    .write(files)
-                    .await
-                    .map_err(|e| (writer.worker_address().clone(), e))
-            }
+        let futures = self.inners.iter_mut().map(|writer| async move {
+            writer
+                .write(files)
+                .await
+                .map_err(|e| (writer.worker_address().clone(), e))
         });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {

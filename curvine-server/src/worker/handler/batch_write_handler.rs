@@ -25,7 +25,6 @@ use curvine_common::proto::{
 use curvine_common::state::ExtendedBlock;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use log::info;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
@@ -42,7 +41,6 @@ pub struct BatchWriteHandler {
 
 impl BatchWriteHandler {
     pub fn new(store: BlockStore) -> Self {
-        println!("DEBUG: at BatchWriteHandler::new()");
         let store_clone = store.clone();
         Self {
             store,
@@ -71,51 +69,6 @@ impl BatchWriteHandler {
             self.store.abort_block(block)?;
         }
         Ok(())
-    }
-
-    pub fn complete(&mut self, msg: &Message, commit: bool, index: usize) -> FsResult<Message> {
-        if self.is_commit {
-            return if !msg.data.is_empty() {
-                err_box!("The block has been committed and data cannot be written anymore.")
-            } else {
-                println!("short circuit complete");
-                Ok(msg.success())
-            };
-        }
-
-        if let Some(context) = self.context.take() {
-            Self::check_context(&context[index], msg)?;
-        }
-        let context = WriteContext::from_req(msg)?;
-
-        // flush and close the file.
-        let file = self.file.take();
-        if let Some(mut file) = file {
-            file[index].flush()?;
-            drop(file);
-        }
-
-        if context.block.len > context.block_size {
-            return err_box!(
-                "Invalid write offset: {}, block size: {}",
-                context.off,
-                context.block_size
-            );
-        }
-
-        // Submit block.
-        self.commit_block(&context.block, commit)?;
-        self.is_commit = true;
-
-        info!(
-            "write block end for req_id {}, is commit: {}, off: {}, len: {}",
-            msg.req_id(),
-            commit,
-            context.off,
-            context.block.len
-        );
-
-        Ok(msg.success())
     }
 
     pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {
@@ -148,7 +101,6 @@ impl BatchWriteHandler {
                 .build();
 
             let response = self.write_handler.open(&single_msg_req)?;
-            println!("DEBUG, at BatchWriteHandler, response={:?}", response);
             let block_response: BlockWriteResponse = response.parse_header()?;
             responses.push(block_response);
 

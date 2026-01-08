@@ -207,13 +207,18 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     );
 
     // 2. Use overwrite mode to rewrite file content to "overwritten_content"
+    println!("xx overwrite_inode_id");
     let mut writer = fs.create(&path, true).await?;
     writer.write("overwritten_content".as_bytes()).await?;
+    println!("yy overwrite_inode_id");
     writer.complete().await?;
+    println!("xxyy overwrite_inode_id");
 
     let overwrite_status = fs.get_status(&path).await?;
     let overwrite_inode_id = overwrite_status.id;
+    println!("x overwrite_inode_id: {}", overwrite_inode_id);
     let overwrite_content = read_file_content(fs, &path).await?;
+    println!("y overwrite_content: {}", overwrite_content);
 
     // 3. Verify state after overwrite
     assert_eq!(overwrite_content, "overwritten_content");
