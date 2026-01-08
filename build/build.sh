@@ -118,7 +118,7 @@ print_help() {
 # Create a version file.
 GIT_VERSION="unknown"
 if command -v git &> /dev/null && git rev-parse --git-dir &> /dev/null; then
-    GIT_VERSION=$(git rev-parse HEAD)
+    GIT_VERSION=$(git rev-parse --short HEAD)
 fi
 
 # Get the necessary environment parameters
@@ -128,7 +128,7 @@ FUSE_VERSION=$(get_fuse_version)
 CURVINE_VERSION=$(grep '^version =' "$FS_HOME/Cargo.toml" | sed 's/^version = "\(.*\)"/\1/')
 
 # Package Directory
-DIST_DIR="$FS_HOME/build/dist/"
+DIST_DIR="$FS_HOME/build/dist"
 DIST_ZIP=curvine-${CURVINE_VERSION}-${ARCH_NAME}-${OS_VERSION}.zip
 
 # Process command parameters
