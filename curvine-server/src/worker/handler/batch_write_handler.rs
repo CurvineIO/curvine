@@ -12,26 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    FilesBatchWriteRequest, FilesBatchWriteResponse, BlockWriteRequest, BlockWriteResponse,
-    BlocksBatchCommitRequest, BlocksBatchCommitResponse, BlocksBatchWriteRequest,
-    BlocksBatchWriteResponse
+    BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
+    BlocksBatchWriteRequest, BlocksBatchWriteResponse, FilesBatchWriteRequest,
+    FilesBatchWriteResponse,
 };
 use curvine_common::state::ExtendedBlock;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use log::info;
+use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
-use orpc::err_box;
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
@@ -40,7 +39,6 @@ pub struct BatchWriteHandler {
     pub(crate) is_commit: bool,
     pub(crate) write_handler: WriteHandler,
 }
-
 
 impl BatchWriteHandler {
     pub fn new(store: BlockStore) -> Self {
@@ -55,7 +53,6 @@ impl BatchWriteHandler {
         }
     }
 
-
     fn check_context(context: &WriteContext, msg: &Message) -> FsResult<()> {
         if context.req_id != msg.req_id() {
             return err_box!(
@@ -67,7 +64,6 @@ impl BatchWriteHandler {
         Ok(())
     }
 
-
     fn commit_block(&self, block: &ExtendedBlock, commit: bool) -> FsResult<()> {
         if commit {
             self.store.finalize_block(block)?;
@@ -76,7 +72,6 @@ impl BatchWriteHandler {
         }
         Ok(())
     }
-
 
     pub fn complete(&mut self, msg: &Message, commit: bool, index: usize) -> FsResult<Message> {
         if self.is_commit {
@@ -108,11 +103,9 @@ impl BatchWriteHandler {
             );
         }
 
-
         // Submit block.
         self.commit_block(&context.block, commit)?;
         self.is_commit = true;
-
 
         info!(
             "write block end for req_id {}, is commit: {}, off: {}, len: {}",
@@ -122,15 +115,12 @@ impl BatchWriteHandler {
             context.block.len
         );
 
-
         Ok(msg.success())
     }
-
 
     pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {
         let header: BlocksBatchWriteRequest = msg.parse_header()?;
         let mut responses = Vec::with_capacity(header.blocks.len());
-
 
         // reserve size of files and contexts
         self.file = Some(Vec::with_capacity(header.blocks.len()));
@@ -148,7 +138,6 @@ impl BatchWriteHandler {
                 chunk_size: header.chunk_size,
             };
 
-
             // Create single request message for each block
             let single_msg_req = Builder::new()
                 .code(msg.code())
@@ -158,12 +147,10 @@ impl BatchWriteHandler {
                 .proto_header(header)
                 .build();
 
-
             let response = self.write_handler.open(&single_msg_req)?;
             println!("DEBUG, at BatchWriteHandler, response={:?}", response);
             let block_response: BlockWriteResponse = response.parse_header()?;
             responses.push(block_response);
-
 
             // Extract file and context from handler and store in batch vectors
             if let Some(file) = self.write_handler.file.take() {
@@ -178,7 +165,6 @@ impl BatchWriteHandler {
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
 
-
     pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
         // Parse the flattened batch request
         let header: BlocksBatchCommitRequest = msg.parse_header()?;
@@ -191,7 +177,6 @@ impl BatchWriteHandler {
                 Ok(msg.success())
             };
         }
-
 
         // Process each block independently
         for (i, block_proto) in header.blocks.into_iter().enumerate() {
@@ -240,16 +225,13 @@ impl BatchWriteHandler {
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
 
-
     pub fn write_batch(&mut self, msg: &Message) -> FsResult<Message> {
         let header: FilesBatchWriteRequest = msg.parse_header()?;
         let mut results = Vec::new();
 
-
         for (i, file_data) in header.files.iter().enumerate() {
             // Convert bytes to DataSlice
             let data_slice = DataSlice::Bytes(bytes::Bytes::from(file_data.clone().content));
-
 
             let unique_req_id = header.req_id + i as i64;
             // Create a temporary message for each file
@@ -262,10 +244,8 @@ impl BatchWriteHandler {
                 .build();
 
             #[allow(clippy::mem_replace_with_default)]
-            let file = std::mem::replace(
-                &mut self.file.as_mut().unwrap()[i],
-                LocalFile::default());
-            
+            let file = std::mem::replace(&mut self.file.as_mut().unwrap()[i], LocalFile::default());
+
             #[allow(clippy::mem_replace_with_default)]
             let context = std::mem::replace(
                 &mut self.context.as_mut().unwrap()[i],
@@ -286,12 +266,10 @@ impl BatchWriteHandler {
             results.push(response.is_ok());
         }
 
-
         let batch_response = FilesBatchWriteResponse { results };
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
 }
-
 
 impl MessageHandler for BatchWriteHandler {
     type Error = FsError;

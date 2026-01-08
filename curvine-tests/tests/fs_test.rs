@@ -39,19 +39,23 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     conf.client.write_chunk_size = 64; // Set to 64 bytes
     conf.client.write_chunk_size_str = "64B".to_string(); // Update string field
     conf.client.metric_report_enable = true;
-    
+
     // Test short_circuit = false
     conf.client.short_circuit = false;
-    run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone(), )?;
-    
+    run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
+
     // Test short_circuit = true
     conf.client.short_circuit = true;
     run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
-    
+
     Ok(())
 }
 
-fn run_filesystem_end_to_end_operations_on_cluster(testing: &Testing, rt: &Arc<AsyncRuntime>, conf: ClusterConf, ) -> FsResult<()> {
+fn run_filesystem_end_to_end_operations_on_cluster(
+    testing: &Testing,
+    rt: &Arc<AsyncRuntime>,
+    conf: ClusterConf,
+) -> FsResult<()> {
     let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
     let res: FsResult<()> = rt.block_on(async move {
         let path = Path::from_str("/fs_test")?;

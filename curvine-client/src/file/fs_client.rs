@@ -252,10 +252,7 @@ impl FsClient {
         Ok(locate_block)
     }
 
-    pub async fn add_blocks_batch(
-        &self,
-        requests: Vec<String>,
-    ) -> FsResult<Vec<LocatedBlock>> {
+    pub async fn add_blocks_batch(&self, requests: Vec<String>) -> FsResult<Vec<LocatedBlock>> {
         let pb_requests: Vec<AddBlockRequest> = requests
             .into_iter()
             .map(|path| {

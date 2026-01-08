@@ -36,7 +36,7 @@ impl BlockHandler {
             RpcCode::ReadBlock => Reader(ReadHandler::new(store)),
 
             RpcCode::WriteBlocksBatch => BatchWriter(BatchWriteHandler::new(store)),
-            
+
             code => return err_box!("Unsupported request type hehehe: {:?}", code),
         };
 
@@ -51,9 +51,7 @@ impl MessageHandler for BlockHandler {
         let response = match self {
             Writer(h) => h.handle(msg),
             Reader(h) => h.handle(msg),
-            BatchWriter(h) => {
-                h.handle(msg)
-            }
+            BatchWriter(h) => h.handle(msg),
         };
 
         match response {

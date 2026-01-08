@@ -61,7 +61,6 @@ impl Default for LocalFile {
     }
 }
 
-
 impl LocalFile {
     pub fn new<T: AsRef<str>>(path: T, mut inner: fs::File) -> IOResult<Self> {
         let is_tmpfs = sys::is_tmpfs(path.as_ref())?;
@@ -79,7 +78,7 @@ impl LocalFile {
 
         Ok(file)
     }
-    
+
     // Append write.
     pub fn with_append<T: AsRef<str>>(path: T) -> IOResult<Self> {
         let file = OpenOptions::new().append(true).open(path.as_ref())?;

@@ -94,8 +94,7 @@ impl BatchBlockWriterRemote {
         );
 
         // Send all files in one RPC call
-        self
-            .client
+        self.client
             .write_files_batch(files, self.req_id, next_seq_id)
             .await?;
 
@@ -137,6 +136,4 @@ impl BatchBlockWriterRemote {
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
     }
-
-
 }

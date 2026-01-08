@@ -14,16 +14,15 @@
 
 #![allow(clippy::too_many_arguments)]
 
-
 use crate::block::{BlockReadContext, CreateBatchBlockContext, CreateBlockContext};
 use crate::file::FsContext;
 use curvine_common::conf::ClientConf;
 use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
-    FilesBatchWriteRequest, BlockReadRequest, BlockReadResponse, BlockWriteRequest,
-    BlockWriteResponse, BlocksBatchCommitRequest,
-    BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto, FileWriteData,
+    BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
+    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
+    FileWriteData, FilesBatchWriteRequest,
 };
 use curvine_common::state::{ExtendedBlock, StorageType};
 use curvine_common::utils::ProtoUtils;
@@ -229,7 +228,6 @@ impl BlockClient {
             .proto_header(request)
             .build();
 
-
         let _ = self.rpc(msg).await?;
         Ok(())
     }
@@ -270,7 +268,6 @@ impl BlockClient {
             .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
             .collect();
 
-
         let req_header = BlocksBatchWriteRequest {
             blocks: blocks_pb,
             off,
@@ -308,7 +305,6 @@ impl BlockClient {
         Ok(batch_context)
     }
 
-
     pub async fn write_commit_batch(
         &self,
         blocks: &[ExtendedBlock],
@@ -323,7 +319,7 @@ impl BlockClient {
             .iter()
             .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
             .collect();
-        
+
         let header = BlocksBatchCommitRequest {
             blocks: blocks_pb,
             off,
@@ -351,7 +347,6 @@ impl BlockClient {
         Ok(())
     }
 
-
     pub async fn write_files_batch(
         &self,
         files: &[(&Path, &str)],
@@ -366,13 +361,11 @@ impl BlockClient {
             })
             .collect();
 
-
         let header = FilesBatchWriteRequest {
             files: file_data,
             req_id,
             seq_id,
         };
-
 
         let msg = Builder::new()
             .code(RpcCode::WriteBlocksBatch)
@@ -381,7 +374,6 @@ impl BlockClient {
             .seq_id(seq_id)
             .proto_header(header)
             .build();
-
 
         let _ = self.rpc(msg).await?;
         Ok(())
