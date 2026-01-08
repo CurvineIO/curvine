@@ -246,7 +246,7 @@ impl BlockClient {
 
         Ok(BlockReadContext::from_req(rep_header))
     }
-    
+
     pub async fn read_commit(
         &self,
         block: &ExtendedBlock,

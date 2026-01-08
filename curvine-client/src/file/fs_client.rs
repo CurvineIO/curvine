@@ -295,7 +295,7 @@ impl FsClient {
             commit_blocks,
             only_flush,
         };
-        
+
         let rep: CompleteFileResponse = self.rpc(RpcCode::CompleteFile, header).await?;
 
         Ok(rep.file_blocks.map(ProtoUtils::file_blocks_from_pb))
