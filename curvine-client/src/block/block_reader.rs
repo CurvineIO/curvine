@@ -39,6 +39,7 @@ impl ReaderAdapter {
         }
     }
 
+    #[allow(unused)]
     fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
         match self {
             Local(r) => r.blocking_read(),
@@ -177,10 +178,6 @@ impl BlockReader {
 
         let short_circuit = fs_context.conf.client.short_circuit;
         for loc in locs {
-            if fs_context.is_failed_worker(loc) {
-                continue;
-            }
-
             let short_circuit = short_circuit && fs_context.is_local_worker(loc);
             let res: FsResult<ReaderAdapter> = {
                 if short_circuit {
@@ -203,12 +200,7 @@ impl BlockReader {
             match res {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    warn!(
-                        "fail to create block reader for {}: {}",
-                        loc.connect_addr(),
-                        e
-                    );
-                    fs_context.add_failed_worker(loc);
+                    warn!("fail to create block reader for {}: {}", loc, e);
                 }
             }
         }
@@ -227,75 +219,45 @@ impl BlockReader {
             return Ok(DataSlice::empty());
         }
 
-        let res = self.inner.read().await;
-        match res {
-            _ if self.locs.is_empty() => res,
+        while !self.locs.is_empty() {
+            match self.inner.read().await {
+                Ok(v) => return Ok(v),
 
-            Ok(v) => Ok(v),
-
-            Err(e) => {
-                warn!(
-                    "Read data error block id {}, addr {}: {}",
-                    self.block_id(),
-                    self.inner.worker_address(),
-                    e
-                );
-                self.fs_context
-                    .add_failed_worker(self.inner.worker_address());
-
-                let reader = Self::get_reader(
-                    &self.locs,
-                    self.block.clone(),
-                    self.fs_context.clone(),
-                    self.pos(),
-                    self.len(),
-                )
-                .await?;
-
-                self.inner = reader;
-                self.inner.read().await
+                Err(e) => {
+                    warn!(
+                        "read data error block id {}, addr {}: {}",
+                        self.block_id(),
+                        self.inner.worker_address(),
+                        e
+                    );
+                    self.locs.retain(|x| x != self.inner.worker_address());
+                    self.inner = Self::get_reader(
+                        &self.locs,
+                        self.block.clone(),
+                        self.fs_context.clone(),
+                        self.pos(),
+                        self.len(),
+                    )
+                    .await?;
+                }
             }
         }
+
+        err_box!("fail to read block {} from all workers", self.block_id())
     }
 
     pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
         if !self.has_remaining() {
             return Ok(DataSlice::empty()); // end of block file
         }
-
-        let res = self.inner.blocking_read(rt);
-
-        match res {
-            _ if self.locs.is_empty() => res,
-
-            Ok(v) => Ok(v),
-
-            Err(e) => {
-                warn!(
-                    "Read data error block id {}, addr {}: {}",
-                    self.block_id(),
-                    self.inner.worker_address(),
-                    e
-                );
-                self.fs_context
-                    .add_failed_worker(self.inner.worker_address());
-
-                let reader = rt.block_on(Self::get_reader(
-                    &self.locs,
-                    self.block.clone(),
-                    self.fs_context.clone(),
-                    self.pos(),
-                    self.len(),
-                ))?;
-
-                self.inner = reader;
-                self.inner.blocking_read(rt)
-            }
-        }
+        rt.block_on(self.read())
     }
 
     pub async fn complete(&mut self) -> FsResult<()> {
-        self.inner.complete().await
+        if let Err(e) = self.inner.complete().await {
+            warn!("fail to complete reader: {}", e);
+        }
+        Ok(())
     }
 
     pub fn remaining(&self) -> i64 {
