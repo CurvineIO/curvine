@@ -53,7 +53,7 @@ impl UfsFactory {
             return Ok(v);
         };
         let path = Path::from_str(&mnt.ufs_path)?;
-        let ufs = UfsFileSystem::new(&path, mnt.properties.clone())?;
+        let ufs = UfsFileSystem::new(&path, mnt.properties.clone(), None)?;
         self.ufs_cache.insert(mnt.mount_id, ufs.clone());
         Ok(ufs)
     }

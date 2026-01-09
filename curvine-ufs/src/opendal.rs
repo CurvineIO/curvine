@@ -308,8 +308,31 @@ impl OpendalFileSystem {
             .to_string();
 
         let operator = match scheme {
+            // OSS native implementation (higher priority than HDFS-based OSS)
+            #[cfg(feature = "opendal-oss")]
+            "oss" => {
+                let mut builder = Oss::default();
+                builder = builder.bucket(&bucket_or_container);
+
+                if let Some(endpoint) = conf.get("oss.endpoint_url") {
+                    builder = builder.endpoint(endpoint);
+                }
+                if let Some(access_key) = conf.get("oss.credentials.access") {
+                    builder = builder.access_key_id(access_key);
+                }
+                if let Some(secret_key) = conf.get("oss.credentials.secret") {
+                    builder = builder.access_key_secret(secret_key);
+                }
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create OSS operator: {}", e)))?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
             #[cfg(feature = "opendal-hdfs")]
-            "hdfs" | "oss" => {
+            "hdfs" => {
                 use crate::jni::{register_jvm, JVM};
 
                 register_jvm();
@@ -414,28 +437,6 @@ impl OpendalFileSystem {
 
                 let base_op = Operator::new(builder)
                     .map_err(|e| FsError::common(format!("Failed to create S3 operator: {}", e)))?
-                    .finish();
-
-                Self::add_stability_layers(base_op, &conf)?
-            }
-
-            #[cfg(feature = "opendal-oss")]
-            "oss" => {
-                let mut builder = Oss::default();
-                builder = builder.bucket(&bucket_or_container);
-
-                if let Some(endpoint) = conf.get("oss.endpoint_url") {
-                    builder = builder.endpoint(endpoint);
-                }
-                if let Some(access_key) = conf.get("oss.credentials.access") {
-                    builder = builder.access_key_id(access_key);
-                }
-                if let Some(secret_key) = conf.get("oss.credentials.secret") {
-                    builder = builder.access_key_secret(secret_key);
-                }
-
-                let base_op = Operator::new(builder)
-                    .map_err(|e| FsError::common(format!("Failed to create OSS operator: {}", e)))?
                     .finish();
 
                 Self::add_stability_layers(base_op, &conf)?
