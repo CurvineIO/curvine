@@ -17,13 +17,6 @@ RUN mkdir -p /root/.cargo && \
 
 # Ensure environment variables are set (from compile image)
 ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
-# Set JAVA_HOME for JNI support (required for opendal-hdfs feature)
-ENV JAVA_HOME=/usr/lib/jvm/java-1.8.0-openjdk
-# Create symlink for hdfs-sys compatibility (it looks for jre/include)
-RUN if [ -d "$JAVA_HOME/include" ] && [ ! -d "$JAVA_HOME/jre/include" ]; then \
-        mkdir -p "$JAVA_HOME/jre" && \
-        ln -s ../include "$JAVA_HOME/jre/include"; \
-    fi
 
 # Copy and build source code if building from source
 COPY . /workspace/
@@ -61,8 +54,8 @@ RUN echo "Building Curvine from source..." && \
     # Build with retry mechanism
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs'; then \
-            echo "✓ Build succeeded with 'make all --skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs'" && \
+        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'; then \
+            echo "✓ Build succeeded with 'make all --skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'" && \
             break; \
         else \
             echo "✗ Build attempt $attempt failed" && \
@@ -105,7 +98,6 @@ FROM rockylinux:9
 RUN dnf install -y --allowerasing \
     fuse3 \
     procps-ng \
-    java-1.8.0-openjdk-headless \
     && dnf clean all \
     && rm -rf /var/cache/dnf/*
 

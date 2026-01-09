@@ -14,34 +14,6 @@ ENV GOPROXY=${GOPROXY:-https://proxy.golang.org}
 # Go toolchain is already included: PATH="/usr/local/go/bin:...", GOPATH=/go, GOROOT=/usr/local/go
 ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:/usr/local/go/bin:${PATH}"
 
-# Set JAVA_HOME with multi-arch support (required for HDFS JNI compilation)
-RUN ARCH=$(uname -m) && \
-    case "${ARCH}" in \
-        x86_64) JAVA_HOME_VALUE="/usr/lib/jvm/java-8-openjdk-amd64" ;; \
-        aarch64) \
-            if [ -d "/usr/lib/jvm/java-8-openjdk-arm64" ]; then \
-                JAVA_HOME_VALUE="/usr/lib/jvm/java-8-openjdk-arm64"; \
-            elif [ -d "/usr/lib/jvm/java-8-openjdk-aarch64" ]; then \
-                JAVA_HOME_VALUE="/usr/lib/jvm/java-8-openjdk-aarch64"; \
-            else \
-                JAVA_HOME_VALUE="/usr/lib/jvm/java-8-openjdk-amd64"; \
-            fi ;; \
-        *) JAVA_HOME_VALUE="/usr/lib/jvm/java-8-openjdk-amd64" ;; \
-    esac && \
-    echo "Detected architecture: ${ARCH}, setting JAVA_HOME: ${JAVA_HOME_VALUE}" && \
-    if [ ! -d "$JAVA_HOME_VALUE" ]; then \
-        echo "Warning: JAVA_HOME directory not found, using fallback..." && \
-        JAVA_HOME_VALUE=$(update-alternatives --list java 2>/dev/null | head -1 | sed 's|/bin/java||') || JAVA_HOME_VALUE="/usr/lib/jvm/java-8-openjdk-amd64"; \
-    fi && \
-    # Create symlink for hdfs-sys JNI compatibility (it looks for jre/include)
-    if [ -d "$JAVA_HOME_VALUE/include" ] && [ ! -d "$JAVA_HOME_VALUE/jre/include" ]; then \
-        mkdir -p "$JAVA_HOME_VALUE/jre" && \
-        ln -s ../include "$JAVA_HOME_VALUE/jre/include"; \
-    fi && \
-    # Verify Java is available
-    export JAVA_HOME=$JAVA_HOME_VALUE && \
-    java -version
-
 WORKDIR /workspace
 
 # Copy entire Curvine source code
@@ -65,21 +37,6 @@ RUN if [ -f "/workspace/build/build.sh" ]; then \
 
 # Build Curvine from source
 RUN echo "Building Curvine from source..." && \
-    # Detect and set JAVA_HOME for HDFS JNI compilation
-    ARCH=$(uname -m) && \
-    case "${ARCH}" in \
-        x86_64) export JAVA_HOME="/usr/lib/jvm/java-8-openjdk-amd64" ;; \
-        aarch64) \
-            if [ -d "/usr/lib/jvm/java-8-openjdk-arm64" ]; then \
-                export JAVA_HOME="/usr/lib/jvm/java-8-openjdk-arm64"; \
-            elif [ -d "/usr/lib/jvm/java-8-openjdk-aarch64" ]; then \
-                export JAVA_HOME="/usr/lib/jvm/java-8-openjdk-aarch64"; \
-            else \
-                export JAVA_HOME="/usr/lib/jvm/java-8-openjdk-amd64"; \
-            fi ;; \
-        *) export JAVA_HOME="/usr/lib/jvm/java-8-openjdk-amd64" ;; \
-    esac && \
-    echo "Using JAVA_HOME: ${JAVA_HOME} for HDFS JNI compilation" && \
     export CURVINE_HOME=/workspace && \
     mkdir -p /workspace/tmp && \
     export TMPDIR=/workspace/tmp && \
@@ -87,7 +44,7 @@ RUN echo "Building Curvine from source..." && \
     echo "Running 'make all' with --skip-java-sdk (CSI doesn't need Java SDK)..." && \
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs'; then \
+        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'; then \
             echo "✓ Build succeeded" && \
             break; \
         else \
@@ -131,7 +88,6 @@ RUN sed -i 's/archive.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/source
     fuse3 \
     libfuse3-3 \
     ca-certificates \
-    openjdk-8-jre-headless \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
