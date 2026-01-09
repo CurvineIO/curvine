@@ -83,7 +83,7 @@ pub struct MountValue {
 impl MountValue {
     pub fn new(info: MountInfo) -> FsResult<Self> {
         let ufs_path = Path::from_str(&info.ufs_path)?;
-        let ufs = UfsFileSystem::new(&ufs_path, info.properties.clone())?;
+        let ufs = UfsFileSystem::new(&ufs_path, info.properties.clone(), info.provider)?;
         let mount_id = format!("{}", info.mount_id);
 
         Ok(Self {

@@ -17,7 +17,7 @@ use clap::Parser;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    ConsistencyStrategy, MountOptions, MountType, StorageType, TtlAction, WriteType,
+    ConsistencyStrategy, MountOptions, MountType, Provider, StorageType, TtlAction, WriteType,
 };
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
@@ -72,6 +72,12 @@ pub struct MountCommand {
     )]
     write_type: String,
 
+    #[arg(
+        long,
+        help = "UFS provider: auto, oss-hdfs, opendal. Controls which implementation to use for the given scheme."
+    )]
+    provider: Option<String>,
+
     #[arg(long, default_value_t = false)]
     check: bool,
 }
@@ -93,7 +99,7 @@ impl MountCommand {
                     max_len = max_len.max(ufs_path.to_string().len());
                     max_len = max_len.max(mnt.cv_path.len());
                     max_len = max_len.max(mnt.mount_id.to_string().len());
-                    let res = UfsFileSystem::new(&ufs_path, mnt.properties.clone());
+                    let res = UfsFileSystem::new(&ufs_path, mnt.properties.clone(), mnt.provider);
                     match res {
                         Err(_) => status.push("Invalid"),
                         Ok(ufs) => {
@@ -203,16 +209,16 @@ impl MountCommand {
         let ufs_path = Path::from_str(&self.ufs_path)?;
         let cv_path = Path::from_str(&self.cv_path)?;
 
-        // Creating a MountOptions Object
         let mnt_opts = self.to_mnt_opts()?;
 
-        // try to create ufsFileSystem
-        if !mnt_opts.update {
-            let ufs = UfsFileSystem::new(&ufs_path, mnt_opts.add_properties.clone())?;
-            if let Err(e) = ufs.list_status(&ufs_path).await {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
+        let ufs = UfsFileSystem::new(
+            &ufs_path,
+            mnt_opts.add_properties.clone(),
+            mnt_opts.provider,
+        )?;
+        if let Err(e) = ufs.list_status(&ufs_path).await {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
         }
 
         handle_rpc_result(fs.mount(&ufs_path, &cv_path, mnt_opts)).await;
@@ -262,6 +268,11 @@ impl MountCommand {
 
         let write_type = WriteType::try_from(self.write_type.as_str())?;
         opts = opts.write_type(write_type);
+
+        if let Some(provider_str) = self.provider.as_ref() {
+            let provider = Provider::try_from(provider_str.as_str())?;
+            opts = opts.provider(provider);
+        }
 
         Ok(opts.build())
     }
