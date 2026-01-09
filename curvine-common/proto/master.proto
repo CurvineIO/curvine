@@ -54,6 +54,22 @@ message CreateFileResponse {
     required FileStatusProto file_status = 1;
 }
 
+message CreateFilesBatchRequest {  
+    repeated CreateFileRequest requests = 1;  
+}  
+  
+message CreateFilesBatchResponse {  
+    repeated FileStatusProto file_statuses = 1;  
+}  
+  
+message CompleteFilesBatchRequest {  
+    repeated CompleteFileRequest requests = 1;  
+}  
+  
+message CompleteFilesBatchResponse {  
+    repeated bool results = 1;  
+}
+
 message OpenFileRequest {
     required string path = 1;
     required CreateFileOptsProto opts = 2;
@@ -123,6 +139,15 @@ message AddBlockRequest {
 
 message AddBlockResponse {
     required LocatedBlockProto block = 1;
+}
+
+// apply for allocation of blocks batch
+message AddBlocksBatchRequest {  
+    repeated AddBlockRequest requests = 1;  
+}  
+  
+message AddBlocksBatchResponse {  
+    repeated LocatedBlockProto blocks = 1;  
 }
 
 // File writing is completed.

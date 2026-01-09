@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::block::BatchBlockWriter;
 use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
+use curvine_common::state::CommitBlock;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags,
@@ -356,5 +358,92 @@ impl CurvineFileSystem {
         if let Err(e) = res {
             warn!("close {}", e);
         }
+    }
+
+    pub async fn write_batch_string(&self, files: &[(Path, &str)]) -> FsResult<()> {
+        let chunk_size = self.fs_context().write_chunk_size();
+        let mut batch = Vec::with_capacity(files.len());
+        let mut batch_memory = 0;
+
+        for (path, content) in files.iter() {
+            let content_size: usize = content.len();
+
+            if content_size >= chunk_size {
+                self.write_string(path, content.to_string()).await?;
+                continue;
+            }
+
+            if batch_memory + content_size > chunk_size {
+                self.handle_batch_files(&batch).await?;
+                batch.clear();
+                batch_memory = 0;
+            }
+
+            batch.push((path, content));
+            batch_memory += content_size;
+        }
+
+        // Final flush
+        if !batch.is_empty() {
+            self.handle_batch_files(&batch).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_batch_files(&self, files: &[(&Path, &str)]) -> FsResult<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        // Step 1: Batch create files
+        let mut create_requests = Vec::with_capacity(files.len());
+        for (path, _) in files {
+            let opts = self.create_opts_builder().create_parent(true).build();
+            let flags = OpenFlags::new_write_only()
+                .set_create(true)
+                .set_overwrite(true);
+            create_requests.push((path.encode(), opts, flags));
+        }
+
+        let file_statuses = self.fs_client().create_files_batch(create_requests).await?;
+
+        // Step 2: Batch allocate blocks
+        let mut add_block_requests = Vec::with_capacity(file_statuses.len());
+        for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
+            add_block_requests.push(path.encode());
+        }
+
+        let allocated_blocks: Vec<curvine_common::state::LocatedBlock> = self
+            .fs_client()
+            .add_blocks_batch(add_block_requests)
+            .await?;
+
+        // assert if allocated_blocks is not smae with add_block_requests
+        let mut batch_writer =
+            BatchBlockWriter::new(self.fs_context.clone(), allocated_blocks).await?;
+
+        // Write all data (no flushing yet)
+        batch_writer.write(files).await?;
+
+        // Step 4: Complete all files at worker side
+        let commit_blocks = batch_writer.complete().await?;
+
+        // Step 5: Batch complete at master side
+        let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> =
+            Vec::with_capacity(files.len());
+        for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {
+            complete_requests.push((
+                path.encode(),
+                content.len() as i64,
+                vec![commit_block.clone()],
+                self.fs_context().clone_client_name(),
+                false,
+            ));
+        }
+        self.fs_client()
+            .complete_files_batch(complete_requests)
+            .await?;
+        Ok(())
     }
 }

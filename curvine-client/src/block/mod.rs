@@ -21,6 +21,12 @@ pub use self::block_writer_remote::BlockWriterRemote;
 mod block_writer_local;
 pub use self::block_writer_local::BlockWriterLocal;
 
+mod batch_block_writer_remote;
+pub use self::batch_block_writer_remote::BatchBlockWriterRemote;
+
+mod batch_block_writer;
+pub use self::batch_block_writer::BatchBlockWriter;
+
 mod block_writer;
 pub use self::block_writer::BlockWriter;
 
@@ -38,6 +44,9 @@ pub use self::block_reader_remote::BlockReaderRemote;
 
 mod block_reader_hole;
 pub use self::block_reader_hole::BlockReaderHole;
+
+mod batch_block_writer_local;
+pub use self::batch_block_writer_local::BatchBlockWriterLocal;
 
 mod block_client_pool;
 pub use self::block_client_pool::BlockClientPool;
