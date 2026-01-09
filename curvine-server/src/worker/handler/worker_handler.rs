@@ -58,12 +58,7 @@ impl MessageHandler for WorkerHandler {
 
 impl WorkerHandler {
     fn get_handler(&mut self, msg: &Message) -> FsResult<&mut BlockHandler> {
-        if self.handler.is_none()
-            || !matches!(
-                msg.request_status(),
-                RequestStatus::Running | RequestStatus::RunningBatch
-            )
-        {
+        if self.handler.is_none() || !matches!(msg.request_status(), RequestStatus::Running) {
             let handler = BlockHandler::new(RpcCode::from(msg.code()), self.store.clone())?;
 
             let _ = self.handler.replace(handler);

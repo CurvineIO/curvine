@@ -28,9 +28,9 @@ pub struct WriteContext {
     pub block_size: i64,
 }
 
-impl Default for WriteContext {
+impl WriteContext {
     #[inline(always)]
-    fn default() -> Self {
+    pub fn place_holder() -> Self {
         Self {
             block: ExtendedBlock::default(),
             req_id: 0,
@@ -40,9 +40,6 @@ impl Default for WriteContext {
             block_size: 0,
         }
     }
-}
-
-impl WriteContext {
     pub fn from_req(msg: &Message) -> FsResult<Self> {
         let req: BlockWriteRequest = msg.parse_header()?;
 

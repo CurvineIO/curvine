@@ -36,9 +36,26 @@ pub struct LocalFile {
     buf: BytesMut,
 }
 
-impl Default for LocalFile {
+impl LocalFile {
+    pub fn new<T: AsRef<str>>(path: T, mut inner: fs::File) -> IOResult<Self> {
+        let is_tmpfs = sys::is_tmpfs(path.as_ref())?;
+
+        let len = inner.metadata()?.len() as i64;
+        let pos = inner.stream_position()? as i64;
+        let file = Self {
+            inner,
+            path: path.as_ref().to_string(),
+            is_tmpfs,
+            len,
+            pos,
+            buf: BytesMut::new(),
+        };
+
+        Ok(file)
+    }
+
     #[inline(always)]
-    fn default() -> Self {
+    pub fn place_holder() -> Self {
         use std::env;
         use std::fs::File as StdFile;
 
@@ -58,24 +75,6 @@ impl Default for LocalFile {
             pos: 0,
             buf: BytesMut::new(),
         }
-    }
-}
-impl LocalFile {
-    pub fn new<T: AsRef<str>>(path: T, mut inner: fs::File) -> IOResult<Self> {
-        let is_tmpfs = sys::is_tmpfs(path.as_ref())?;
-
-        let len = inner.metadata()?.len() as i64;
-        let pos = inner.stream_position()? as i64;
-        let file = Self {
-            inner,
-            path: path.as_ref().to_string(),
-            is_tmpfs,
-            len,
-            pos,
-            buf: BytesMut::new(),
-        };
-
-        Ok(file)
     }
 
     // Append write.

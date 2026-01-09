@@ -319,7 +319,7 @@ impl BlockClient {
 
         let msg = Builder::new()
             .code(RpcCode::WriteBlocksBatch)
-            .request(RequestStatus::OpenBatch)
+            .request(RequestStatus::Open)
             .req_id(req_id)
             .seq_id(seq_id)
             .proto_header(req_header)
@@ -368,9 +368,9 @@ impl BlockClient {
         };
 
         let status = if cancel {
-            RequestStatus::CancelBatch
+            RequestStatus::Cancel
         } else {
-            RequestStatus::CompleteBatch
+            RequestStatus::Complete
         };
 
         let msg = Builder::new()
@@ -407,7 +407,7 @@ impl BlockClient {
 
         let msg = Builder::new()
             .code(RpcCode::WriteBlocksBatch)
-            .request(RequestStatus::RunningBatch)
+            .request(RequestStatus::Running)
             .req_id(req_id)
             .seq_id(seq_id)
             .proto_header(header)

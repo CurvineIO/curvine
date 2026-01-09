@@ -196,8 +196,16 @@ impl BatchWriteHandler {
                 .build();
 
             // Transfer to handler
-            let file = std::mem::take(&mut self.file.as_mut().unwrap()[i]);
-            let context = std::mem::take(&mut self.context.as_mut().unwrap()[i]);
+            #[allow(clippy::mem_replace_with_default)]
+            let file = std::mem::replace(
+                &mut self.file.as_mut().unwrap()[i],
+                LocalFile::place_holder(),
+            );
+            #[allow(clippy::mem_replace_with_default)]
+            let context = std::mem::replace(
+                &mut self.context.as_mut().unwrap()[i],
+                WriteContext::place_holder(),
+            );
 
             self.write_handler.file = Some(file);
             self.write_handler.context = Some(context);
@@ -225,10 +233,10 @@ impl MessageHandler for BatchWriteHandler {
         let request_status = msg.request_status();
         match request_status {
             // batch operations
-            RequestStatus::OpenBatch => self.open_batch(msg),
-            RequestStatus::RunningBatch => self.write_batch(msg),
-            RequestStatus::CompleteBatch => self.complete_batch(msg, true),
-            RequestStatus::CancelBatch => self.complete_batch(msg, false),
+            RequestStatus::Open => self.open_batch(msg),
+            RequestStatus::Running => self.write_batch(msg),
+            RequestStatus::Complete => self.complete_batch(msg, true),
+            RequestStatus::Cancel => self.complete_batch(msg, false),
             _ => err_box!("Unsupported request type"),
         }
     }
