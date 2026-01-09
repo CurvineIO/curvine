@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile all dist dist-only
+.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -34,6 +34,9 @@ help:
 	@echo "  make docker-build-compile         - Build compilation Docker image (interactive)"
 	@echo "  make docker-compile               - Compile code in Docker container (output to local build/dist)"
 	@echo ""
+	@echo "Fluid (Kubernetes):"
+	@echo "  make docker-build-fluid          - Build unified Fluid Docker image (supports both cache-runtime and thin-runtime)"
+	@echo ""
 	@echo "CSI (Container Storage Interface):"
 	@echo "  make curvine-csi                 - Build curvine-csi Docker image"
 	@echo ""
@@ -58,6 +61,7 @@ help:
 	@echo "  RELEASE_VERSION=v1.0.0 make dist           - Build and package with specific version"
 	@echo "  make cargo ARGS='test --verbose'            - Run cargo test with verbose output"
 	@echo "  make curvine-csi                            - Build curvine-csi Docker image"
+	@echo "  make docker-build-fluid                  - Build unified Fluid Docker image"
 
 # 1. Check build environment dependencies
 check-env:
@@ -109,6 +113,36 @@ docker-build-compile:
 docker-compile:
 	@echo "Compiling code in Docker container..."
 	docker run --rm --entrypoint="" -v $(PWD):/workspace -w /workspace curvine/curvine-compile:build-cached bash -c "make all"
+
+# 7.1. Build Fluid CacheRuntime Docker image
+docker-build-fluid-cache:
+	@echo "Building Fluid CacheRuntime Docker image..."
+	@bash curvine-docker/fluid/cache-runtime/build-image.sh
+
+# 7.2. Build Fluid ThinRuntime Docker image
+docker-build-fluid-thin:
+	@echo "Building Fluid ThinRuntime Docker image..."
+	@bash curvine-docker/fluid/thin-runtime/build-image.sh
+
+# 7.3. Build unified Fluid Docker image
+docker-build-fluid:
+	@echo "Building unified Fluid Docker image..."
+	@echo "This image supports both cache-runtime and thin-runtime modes"
+	@if ! docker image inspect ghcr.io/curvineio/curvine:latest >/dev/null 2>&1; then \
+		echo "Warning: Base image ghcr.io/curvineio/curvine:latest not found locally."; \
+		echo "Attempting to pull from registry..."; \
+		docker pull ghcr.io/curvineio/curvine:latest || \
+		(echo "Error: Failed to pull base image. Please build it first with 'make docker-build' or pull from registry." && exit 1); \
+	fi
+	@cd curvine-docker/fluid && docker build -f Dockerfile -t curvine-fluid:latest .
+	@echo "✓ Unified Fluid Docker image built successfully: curvine-fluid:latest"
+	@echo ""
+	@echo "Usage examples:"
+	@echo "  # CacheRuntime mode:"
+	@echo "  docker run -e FLUID_RUNTIME_COMPONENT_TYPE=master curvine-fluid:latest master start"
+	@echo ""
+	@echo "  # ThinRuntime mode:"
+	@echo "  docker run curvine-fluid:latest fluid-thin-runtime"
 
 # 8. CSI (Container Storage Interface) target
 .PHONY: curvine-csi

@@ -1,0 +1,106 @@
+---
+apiVersion: data.fluid.io/v1alpha1
+kind: Dataset
+metadata:
+  name: curvine-demo
+  namespace: default
+spec:
+  placement: Shared
+  accessModes:
+  - ReadWriteMany
+  mounts:
+  - name: demo
+    mountPoint: "curvine:///data"
+    options:
+      cluster_id: "curvine-demo"
+---
+apiVersion: data.fluid.io/v1alpha1
+kind: CacheRuntime
+metadata:
+  name: curvine-demo
+  namespace: default
+spec:
+  runtimeClassName: curvine
+  
+  volumes:
+  - name: curvine-logs
+    emptyDir: {}
+  - name: curvine-cache
+    emptyDir: {}
+  - name: curvine-meta
+    emptyDir: {}
+  - name: curvine-journal
+    emptyDir: {}
+  
+  master:
+    options:
+      format_master: "false"
+      io_close_idle: "false"
+      rpc_port: "8995"
+      journal_port: "8996"
+      web_port: "9000"
+      meta_dir: "/opt/curvine/data/meta"
+      journal_dir: "/opt/curvine/data/journal"
+      meta_disable_wal: "false"
+      meta_compression_type: "lz4"
+      meta_write_buffer_size: "64MB"
+    replicas: 3
+    volumeMounts:
+    - name: curvine-logs
+      mountPath: /opt/curvine/logs
+    - name: curvine-meta
+      mountPath: /opt/curvine/data/meta
+    - name: curvine-journal
+      mountPath: /opt/curvine/data/journal
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+  
+  worker:
+    options:
+      format_worker: "false"
+      rpc_port: "8997"
+      web_port: "9001"
+      dir_reserved: "5GB"
+      data_dir: "/opt/curvine/data"
+    replicas: 1
+    volumeMounts:
+    - name: curvine-logs
+      mountPath: /opt/curvine/logs
+    - name: curvine-cache
+      mountPath: /opt/curvine/data
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "200m"
+      limits:
+        memory: "2Gi"
+        cpu: "1000m"
+    tieredStore:
+      levels:
+      - quota: 5Gi
+        low: "0.5"
+        high: "0.8"
+        path: "/opt/curvine/data"
+        medium:
+          inline:
+            emptyDir: {}
+  
+  client:
+    options:
+      debug: "true"
+      log_level: "info"
+      rpc_timeout_ms: "60000"
+      data_timeout_ms: "60000"
+      rpc_close_idle: "false"
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "512Mi"
+        cpu: "200m"

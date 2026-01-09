@@ -1,0 +1,77 @@
+apiVersion: data.fluid.io/v1alpha1
+kind: CacheRuntimeClass
+metadata:
+  name: curvine
+fileSystemType: fuse
+topology:
+  master:
+    workloadType:
+      apiVersion: apps/v1
+      kind: StatefulSet
+    service:
+      headless: {}
+    dependencies:
+      encryptOption: {}
+    podTemplateSpec:
+      spec:
+        restartPolicy: Always
+        containers:
+        - name: master
+          image: ghcr.io/curvineio/curvine-fluid:latest
+          args:
+          - master
+          imagePullPolicy: IfNotPresent
+  worker:
+    workloadType:
+      apiVersion: apps/v1
+      kind: StatefulSet
+    service:
+      headless: {}
+    dependencies: {}
+    podTemplateSpec:
+      spec:
+        restartPolicy: Always
+        containers:
+        - name: worker
+          image: ghcr.io/curvineio/curvine-fluid:latest
+          args:
+          - worker
+          imagePullPolicy: IfNotPresent
+  client:
+    workloadType:
+      apiVersion: apps/v1
+      kind: DaemonSet
+    dependencies:
+      encryptOption: {}
+    podTemplateSpec:
+      spec:
+        restartPolicy: Always
+        containers:
+        - name: client
+          image: ghcr.io/curvineio/curvine-fluid:latest
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          args:
+          - client
+          imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                - /bin/sh
+                - -c
+                - |
+                  echo "PreStop: Cleaning up FUSE mount..."
+                  target_path="${CURVINE_TARGET_PATH:-${FLUID_RUNTIME_MOUNT_PATH}}"
+                  if [ -z "$target_path" ]; then
+                    echo "WARNING: Neither CURVINE_TARGET_PATH nor FLUID_RUNTIME_MOUNT_PATH is set, skipping unmount"
+                    exit 0
+                  fi
+                  if mountpoint -q "$target_path" 2>/dev/null; then
+                    echo "Unmounting $target_path"
+                    fusermount -u "$target_path" 2>/dev/null || umount -f "$target_path" 2>/dev/null || true
+                  else
+                    echo "Mount point $target_path is not mounted, skipping"
+                  fi
+                  echo "PreStop: Cleanup completed"
