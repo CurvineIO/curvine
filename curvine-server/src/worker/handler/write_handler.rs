@@ -224,7 +224,7 @@ impl WriteHandler {
         if context.block.len > context.block_size {
             return err_box!(
                 "Invalid write offset: {}, block size: {}",
-                context.off,
+                context.block.len,
                 context.block_size
             );
         }

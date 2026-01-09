@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(unused)]
+
 use crate::block::block_writer::WriterAdapter::{Local, Remote};
 use crate::block::{BlockWriterLocal, BlockWriterRemote};
 use crate::file::FsContext;
@@ -19,6 +21,7 @@ use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddr
 use curvine_common::FsResult;
 use futures::future::try_join_all;
 use orpc::err_box;
+use orpc::error::ErrorExt;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use std::sync::Arc;
@@ -173,25 +176,13 @@ impl BlockWriter {
         });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
-            self.fs_context.add_failed_worker(&worker_addr);
-            return Err(e);
+            return Err(e.ctx(format!("failed to write block on {}", worker_addr)));
         }
         Ok(())
     }
 
     pub fn blocking_write(&mut self, rt: &Runtime, chunk: DataSlice) -> FsResult<()> {
-        if self.inners.len() == 1 {
-            if let Err(e) = self.inners[0].blocking_write(rt, chunk) {
-                self.fs_context
-                    .add_failed_worker(self.inners[0].worker_address());
-                Err(e)
-            } else {
-                Ok(())
-            }
-        } else {
-            rt.block_on(self.write(chunk))?;
-            Ok(())
-        }
+        rt.block_on(self.write(chunk))
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
@@ -203,8 +194,7 @@ impl BlockWriter {
         });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
-            self.fs_context.add_failed_worker(&worker_addr);
-            return Err(e);
+            return Err(e.ctx(format!("failed to flush block on {}", worker_addr)));
         }
         Ok(())
     }
@@ -218,8 +208,7 @@ impl BlockWriter {
         });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
-            self.fs_context.add_failed_worker(&worker_addr);
-            return Err(e);
+            return Err(e.ctx(format!("failed to complete block on {}", worker_addr)));
         }
         Ok(self.to_commit_block())
     }
@@ -233,8 +222,7 @@ impl BlockWriter {
         });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
-            self.fs_context.add_failed_worker(&worker_addr);
-            return Err(e);
+            return Err(e.ctx(format!("failed to cancel block on {}", worker_addr)));
         }
         Ok(())
     }
@@ -278,8 +266,7 @@ impl BlockWriter {
         });
 
         if let Err((worker_addr, e)) = try_join_all(futures).await {
-            self.fs_context.add_failed_worker(&worker_addr);
-            return Err(e);
+            return Err(e.ctx(format!("failed to seek to worker {}", worker_addr)));
         }
         Ok(())
     }
