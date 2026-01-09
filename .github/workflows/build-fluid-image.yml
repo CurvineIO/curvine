@@ -1,0 +1,283 @@
+name: Build Curvine Fluid Docker Image
+
+on:
+  push:
+    tags:
+      - 'v*'
+    paths:
+      - 'curvine-docker/fluid/**'
+      - '.github/workflows/build-fluid-image.yml'
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: 'Whether to push image to registries'
+        required: false
+        default: false
+        type: boolean
+      image_tag:
+        description: 'Image tag (e.g., latest, v1.0.0). Leave empty to use git tag.'
+        required: false
+        default: ''
+        type: string
+      platforms:
+        description: 'Target platforms (comma-separated)'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+        type: string
+      base_image_tag:
+        description: 'Base image tag (e.g., v1.0.0, latest). Leave empty to auto-detect from image_tag.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # Prepare metadata shared across all jobs
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      push_image: ${{ steps.meta.outputs.push_image }}
+      ghcr_image: ${{ steps.meta.outputs.ghcr_image }}
+      docker_image: ${{ steps.meta.outputs.docker_image }}
+      also_latest: ${{ steps.meta.outputs.also_latest }}
+      base_image_tag: ${{ steps.meta.outputs.base_image_tag }}
+    steps:
+      - name: Extract metadata for Docker
+        id: meta
+        run: |
+          # Determine tag: use git tag if triggered by push, otherwise use input or 'latest'
+          if [ "${{ github.event_name }}" == "push" ]; then
+            # Extract tag from ref (refs/tags/v1.0.0 -> v1.0.0)
+            TAG="${GITHUB_REF#refs/tags/}"
+            PUSH_IMAGE="true"
+            echo "Triggered by tag push: ${TAG}"
+          elif [ -n "${{ inputs.image_tag }}" ]; then
+            TAG="${{ inputs.image_tag }}"
+            PUSH_IMAGE="${{ inputs.push_image }}"
+            echo "Using manual tag: ${TAG}"
+          else
+            TAG="latest"
+            PUSH_IMAGE="${{ inputs.push_image }}"
+            echo "Using default tag: ${TAG}"
+          fi
+          
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "push_image=${PUSH_IMAGE}" >> $GITHUB_OUTPUT
+          
+          # Generate image names for Fluid
+          GHCR_IMAGE="ghcr.io/curvineio/curvine-fluid"
+          DOCKER_IMAGE="curvine/curvine-fluid"
+          
+          echo "ghcr_image=${GHCR_IMAGE}" >> $GITHUB_OUTPUT
+          echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
+          
+          # Also tag as 'latest' if this is a version tag
+          if [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "also_latest=true" >> $GITHUB_OUTPUT
+            echo "Will also tag as 'latest'"
+          else
+            echo "also_latest=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Determine base image tag: use input if provided, otherwise auto-detect from tag
+          if [ -n "${{ inputs.base_image_tag }}" ]; then
+            BASE_IMAGE_TAG="${{ inputs.base_image_tag }}"
+            echo "Using manual base image tag: ${BASE_IMAGE_TAG}"
+          elif [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            # Use the same version tag for base image
+            BASE_IMAGE_TAG="${TAG}"
+            echo "Using base image tag from version: ${BASE_IMAGE_TAG}"
+          else
+            # Use 'latest' for base image when not a version tag
+            BASE_IMAGE_TAG="latest"
+            echo "Using default base image tag: ${BASE_IMAGE_TAG}"
+          fi
+          
+          echo "base_image_tag=${BASE_IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+  # Build for each architecture on native runners
+  build-arch:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to GitHub Container Registry
+        if: needs.prepare.outputs.push_image == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.PAT_GITHUB_TOKEN }}
+      
+      - name: Login to Docker Hub
+        if: needs.prepare.outputs.push_image == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: curvine
+          password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
+      
+      - name: Build and push Fluid image for ${{ matrix.arch }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./curvine-docker/fluid/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: ${{ needs.prepare.outputs.push_image == 'true' }}
+          tags: |
+            ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
+            ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=fluid-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=fluid-${{ matrix.arch }}
+          shm-size: 2g
+          build-args: |
+            BASE_IMAGE_TAG=${{ needs.prepare.outputs.base_image_tag }}
+            TARGETARCH=${{ matrix.arch }}
+            TARGETOS=linux
+      
+      - name: Build summary for ${{ matrix.arch }}
+        run: |
+          echo "✅ Built Fluid image for ${{ matrix.arch }} architecture" >> $GITHUB_STEP_SUMMARY
+          echo "Image: ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
+
+  # Create multi-arch manifest
+  create-manifest:
+    needs: [prepare, build-arch]
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.push_image == 'true'
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.PAT_GITHUB_TOKEN }}
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: curvine
+          password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
+      
+      - name: Create and push multi-arch manifest for GHCR
+        run: |
+          # Create manifest for version tag
+          docker buildx imagetools create -t ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }} \
+            ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-amd64 \
+            ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-arm64
+          
+          # Create manifest for latest tag if needed
+          if [ "${{ needs.prepare.outputs.also_latest }}" == "true" ]; then
+            docker buildx imagetools create -t ${{ needs.prepare.outputs.ghcr_image }}:latest \
+              ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-amd64 \
+              ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-arm64
+          fi
+      
+      - name: Create and push multi-arch manifest for Docker Hub
+        run: |
+          # Create manifest for version tag
+          docker buildx imagetools create -t ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }} \
+            ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-amd64 \
+            ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-arm64
+          
+          # Create manifest for latest tag if needed
+          if [ "${{ needs.prepare.outputs.also_latest }}" == "true" ]; then
+            docker buildx imagetools create -t ${{ needs.prepare.outputs.docker_image }}:latest \
+              ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-amd64 \
+              ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-arm64
+          fi
+      
+      - name: Manifest creation summary
+        run: |
+          echo "### Multi-arch Manifest Created 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Combined architectures:** amd64, arm64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Manifests created:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.prepare.outputs.also_latest }}" == "true" ]; then
+            echo "- \`${{ needs.prepare.outputs.ghcr_image }}:latest\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${{ needs.prepare.outputs.docker_image }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Final summary
+  summary:
+    needs: [prepare, build-arch, create-manifest]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Final build summary
+        run: |
+          echo "### Curvine Fluid Image Build Summary 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Base Image:** ghcr.io/curvineio/curvine:${{ needs.prepare.outputs.base_image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Architectures:** amd64 (native), arm64 (native)" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Components:** Fluid runtime (cache-runtime & thin-runtime support)" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Strategy:** Native runners for each architecture" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.prepare.outputs.push_image }}" == "true" ]; then
+            echo "**Multi-arch images pushed to:**" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ needs.prepare.outputs.also_latest }}" == "true" ]; then
+              echo "- \`${{ needs.prepare.outputs.ghcr_image }}:latest\`" >> $GITHUB_STEP_SUMMARY
+              echo "- \`${{ needs.prepare.outputs.docker_image }}:latest\`" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Pull commands:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "# Pull from GitHub Container Registry" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "# Pull from Docker Hub" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ needs.prepare.outputs.also_latest }}" == "true" ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "# Pull latest version" >> $GITHUB_STEP_SUMMARY
+              echo "docker pull ${{ needs.prepare.outputs.ghcr_image }}:latest" >> $GITHUB_STEP_SUMMARY
+              echo "docker pull ${{ needs.prepare.outputs.docker_image }}:latest" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Verify multi-arch:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "docker buildx imagetools inspect ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Usage in Fluid CacheRuntimeClass:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`yaml" >> $GITHUB_STEP_SUMMARY
+            echo "containers:" >> $GITHUB_STEP_SUMMARY
+            echo "  - name: master" >> $GITHUB_STEP_SUMMARY
+            echo "    image: ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "  - name: worker" >> $GITHUB_STEP_SUMMARY
+            echo "    image: ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "  - name: client" >> $GITHUB_STEP_SUMMARY
+            echo "    image: ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Note:** Image was built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY
+          fi
+

@@ -5,8 +5,8 @@ metadata:
 spec:
   fileSystemType: fuse
   fuse:
-    image: fluid-cloudnative/curvine-thinruntime
-    imageTag: v1.0.0
+    image: ghcr.io/curvineio/curvine-fluid
+    imageTag: latest
     imagePullPolicy: IfNotPresent
 ---
 # Dataset definition
@@ -19,7 +19,7 @@ spec:
   - mountPoint: curvine:///data  # curvine://path format
     name: curvine
     options:
-      master-endpoints: "10.119.43.216:8995"  # Replace with your Curvine master
+      master-endpoints: "127.0.0.1:8995"  # Replace with your Curvine master
   accessModes:
     - ReadOnlyMany
 ---

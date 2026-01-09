@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: curvine-demo
+spec:
+  containers:
+  - name: test
+    image: curvine-fluid:latest
+    imagePullPolicy: IfNotPresent
+    command: ["bash"]
+    args:
+      - -c
+      - |
+        echo "=== Curvine cache-runtime 测试 ==="
+        echo "1. 检查挂载点"
+        ls -lh /data
+        echo "2. 写入测试文件"
+        echo 'hello from fluid test' > /data/test-file.txt
+        echo "3. 读取测试文件"
+        cat /data/test-file.txt
+        echo "4. 列出文件"
+        ls -lh /data
+        echo "5. 创建目录和多个文件"
+        mkdir -p /data/test-dir
+        echo 'file1' > /data/test-dir/file1.txt
+        echo 'file2' > /data/test-dir/file2.txt
+        ls -lh /data/test-dir
+        echo "=== 测试完成，保持运行 ==="
+        sleep infinity
+    volumeMounts:
+    - mountPath: /data
+      name: data-vol
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+  volumes:
+  - name: data-vol
+    persistentVolumeClaim:
+      claimName: curvine-demo
+  restartPolicy: Always
