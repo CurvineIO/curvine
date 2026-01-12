@@ -80,7 +80,8 @@ impl FsReaderParallel {
                 continue;
             }
 
-            let base = FsReaderBase::new(path.clone(), fs_context.clone(), file_blocks.clone());
+            let mut base = FsReaderBase::new(path.clone(), fs_context.clone(), file_blocks.clone());
+            base.disable_cache_handles();
 
             let reader = Self::from_base(base, parallel_id, chunk_size as i64, slice, ino);
 

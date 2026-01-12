@@ -74,6 +74,11 @@ pub struct ClientConf {
     // If seek is detected that causes block switching to exceed this value, all block writers will be cached.
     pub close_writer_limit: u32,
 
+    // Maximum number of open block handles (readers and writers).
+    // When the limit is reached, FIFO eviction will close the oldest (first opened) handle.
+    // This limits memory usage and connection count in random read/write scenarios.
+    pub max_cache_block_handles: usize,
+
     pub short_circuit: bool,
 
     #[serde(skip)]
@@ -341,6 +346,7 @@ impl Default for ClientConf {
             read_slice_size_str: "0".to_owned(),
             close_reader_limit: 7,
             close_writer_limit: 7,
+            max_cache_block_handles: 10,
 
             short_circuit: true,
 

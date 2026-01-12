@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::{FsContext, FsReaderParallel, ReadDetector, ReadPattern};
-use crate::FileChunk;
+use crate::file::{FsContext, FsReaderBase, FsReaderParallel, ReadDetector};
+use crate::{FileChunk, FileSlice};
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::state::FileBlocks;
@@ -32,8 +32,7 @@ use tokio::task::yield_now;
 enum ReadTask {
     Seek(i64, CallSender<i8>),
     Stop(CallSender<i8>),
-    Pause(bool),
-    ReadOnce,
+    Pause((i64, bool)),
 }
 
 enum SelectTask<'a> {
@@ -55,11 +54,7 @@ impl BufferChannel {
         self.err_monitor.take_error().unwrap_or(e.into())
     }
 
-    async fn read(&mut self, read_pattern: ReadPattern) -> FsResult<FileChunk> {
-        if read_pattern.is_random() {
-            self.task_sender.send(ReadTask::ReadOnce).await?;
-        }
-
+    async fn read(&mut self) -> FsResult<FileChunk> {
         self.chunk_receiver
             .recv_check()
             .await
@@ -94,15 +89,51 @@ impl BufferChannel {
         fun.await.map_err(|e| self.check_error(e))
     }
 
-    async fn pause(&self, pause: bool) -> FsResult<()> {
-        let fun = async { self.task_sender.send(ReadTask::Pause(pause)).await };
+    async fn pause(&self, pos: i64, pause: bool) -> FsResult<()> {
+        let fun = async { self.task_sender.send(ReadTask::Pause((pos, pause))).await };
         fun.await.map_err(|e| self.check_error(e))
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+enum ReaderAdapter {
+    Buffer(BufferChannel),
+    Base(FsReaderParallel),
+}
+
+impl ReaderAdapter {
+    async fn read(&mut self) -> FsResult<FileChunk> {
+        match self {
+            ReaderAdapter::Buffer(r) => r.read().await,
+            ReaderAdapter::Base(r) => r.read().await,
+        }
+    }
+
+    async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        match self {
+            ReaderAdapter::Buffer(r) => r.seek(pos).await,
+            ReaderAdapter::Base(r) => r.seek(pos).await,
+        }
+    }
+
+    async fn complete(&mut self) -> FsResult<()> {
+        match self {
+            ReaderAdapter::Buffer(r) => r.complete().await,
+            ReaderAdapter::Base(r) => r.complete().await,
+        }
+    }
+
+    async fn pause(&mut self, pos: i64, pause: bool) -> FsResult<()> {
+        match self {
+            ReaderAdapter::Buffer(r) => r.pause(pos, pause).await,
+            ReaderAdapter::Base(r) => r.seek(pos).await,
+        }
     }
 }
 
 // Reader with buffer.
 pub struct FsReaderBuffer {
-    readers: Vec<BufferChannel>,
+    readers: Vec<ReaderAdapter>,
     path: Path,
     pos: i64,
     len: i64,
@@ -130,6 +161,14 @@ impl FsReaderBuffer {
         let pos = 0;
         let len = file_blocks.status.len;
 
+        let base = FsReaderParallel::from_base(
+            FsReaderBase::new(path.clone(), fs_context.clone(), file_blocks.clone()),
+            read_detector.read_parallel() as usize,
+            slice_size,
+            vec![FileSlice::new(0, len)],
+            file_blocks.status.id,
+        );
+
         let all = FsReaderParallel::create_all(
             path.clone(),
             fs_context,
@@ -139,31 +178,37 @@ impl FsReaderBuffer {
             chunk_size,
         )?;
 
-        let mut readers = Vec::with_capacity(all.len());
+        let mut readers = Vec::with_capacity(all.len() + 1);
         for reader in all {
-            let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
-            let (task_sender, task_receiver) = AsyncChannel::new(2).split();
-            let monitor = err_monitor.clone();
-            let parallel_id = reader.parallel_id();
+            let reader = if chunk_num == 1 {
+                ReaderAdapter::Base(reader)
+            } else {
+                let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
+                let (task_sender, task_receiver) = AsyncChannel::new(2).split();
+                let monitor = err_monitor.clone();
+                let parallel_id = reader.parallel_id();
 
-            rt.spawn(async move {
-                let res = Self::read_future(chunk_sender, task_receiver, reader).await;
-                match res {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("buffer read(parallel id {})error: {:?}", parallel_id, e);
-                        monitor.set_error(e);
+                rt.spawn(async move {
+                    let res = Self::read_future(chunk_sender, task_receiver, reader).await;
+                    match res {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("buffer read(parallel id {})error: {:?}", parallel_id, e);
+                            monitor.set_error(e);
+                        }
                     }
-                }
-            });
-            let channel = BufferChannel {
-                chunk_receiver,
-                task_sender,
-                err_monitor: err_monitor.clone(),
+                });
+                let channel = BufferChannel {
+                    chunk_receiver,
+                    task_sender,
+                    err_monitor: err_monitor.clone(),
+                };
+                ReaderAdapter::Buffer(channel)
             };
-
-            readers.push(channel);
+            readers.push(reader);
         }
+
+        readers.push(ReaderAdapter::Base(base));
 
         let reader = Self {
             readers,
@@ -200,8 +245,13 @@ impl FsReaderBuffer {
         &self.path
     }
 
-    fn get_reader(&mut self) -> FsResult<&mut BufferChannel> {
-        let id = self.pos / self.slice_size % self.read_detector.read_parallel();
+    fn get_reader(&mut self) -> FsResult<&mut ReaderAdapter> {
+        let id = if self.read_detector.is_random() {
+            self.read_detector.read_parallel()
+        } else {
+            self.pos / self.slice_size % self.read_detector.read_parallel()
+        };
+
         match self.readers.get_mut(id as usize) {
             Some(v) => Ok(v),
             None => err_box!("reader {} is not initialized", id),
@@ -213,9 +263,8 @@ impl FsReaderBuffer {
             return Ok(DataSlice::Empty);
         }
 
-        let read_pattern = self.read_detector.read_pattern();
         let reader = self.get_reader()?;
-        let mut chunk = reader.read(read_pattern).await?;
+        let mut chunk = reader.read().await?;
 
         // Handle data alignment issues.
         // The chunk read by the underlying reader may be aligned according to chunk_size,
@@ -240,9 +289,11 @@ impl FsReaderBuffer {
         let is_changed = self
             .read_detector
             .record_read(start_pos, self.pos, &self.path);
-        if is_changed && self.read_detector.is_sequential() {
+        if is_changed {
             for reader in &mut self.readers {
-                reader.pause(false).await?;
+                if self.read_detector.is_sequential() {
+                    reader.pause(self.pos, false).await?;
+                }
             }
         }
 
@@ -263,7 +314,7 @@ impl FsReaderBuffer {
             reader.seek(pos).await?;
 
             if !self.read_detector.enabled {
-                reader.pause(false).await?;
+                reader.pause(pos, false).await?;
             }
         }
 
@@ -325,13 +376,9 @@ impl FsReaderBuffer {
                             tx.send(1)?;
                         }
 
-                        ReadTask::Pause(v) => {
+                        ReadTask::Pause((pos, v)) => {
                             paused = v;
-                        }
-
-                        ReadTask::ReadOnce => {
-                            let chunk = reader.read().await?;
-                            chunk_sender.send(chunk).await?;
+                            reader.seek(pos).await?;
                         }
 
                         ReadTask::Stop(tx) => {
