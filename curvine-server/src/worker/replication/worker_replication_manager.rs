@@ -33,12 +33,8 @@ pub struct WorkerReplicationManager {
     block_store: BlockStore,
     replication_semaphore: Arc<Semaphore>,
     jobs_queue_sender: Arc<Sender<ReplicationJob>>,
-
-    runtime: Arc<AsyncRuntime>,
     fs_client_context: Arc<FsContext>,
-
     master_client: OnceCell<MasterClient>,
-
     replicate_chunk_size: usize,
     // todo: add more metrics to track
 }
@@ -57,7 +53,6 @@ impl WorkerReplicationManager {
                 conf.worker.block_replication_concurrency_limit,
             )),
             jobs_queue_sender: Arc::new(send),
-            runtime: async_runtime.clone(),
             fs_client_context: fs_client_context.clone(),
             master_client: Default::default(),
             replicate_chunk_size: conf.worker.block_replication_chunk_size,
@@ -103,7 +98,10 @@ impl WorkerReplicationManager {
             success: err_msg.is_none(),
             message: err_msg,
         };
-        let response: ReportBlockReplicationResponse = try_option!(self.master_client.get())
+
+        let master_client = try_option!(self.master_client.get());
+
+        let response: ReportBlockReplicationResponse = master_client
             .fs_client
             .rpc(RpcCode::ReportBlockReplicationResult, request)
             .await?;
@@ -152,10 +150,9 @@ impl WorkerReplicationManager {
     }
 
     pub fn accept_job(&self, job: ReplicationJob) -> CommonResult<()> {
-        // step1: check the block_id existence (todo)
-        // step2: push into the queue
-        self.runtime
-            .block_on(async move { self.jobs_queue_sender.send(job).await })?;
+        if let Err(e) = self.jobs_queue_sender.try_send(job) {
+            return err_box!("Failed to queue replication job: {}", e);
+        }
         Ok(())
     }
 
