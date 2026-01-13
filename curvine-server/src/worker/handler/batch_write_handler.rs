@@ -162,7 +162,7 @@ impl BatchWriteHandler {
             if context.block.len > context.block_size {
                 return err_box!(
                     "Invalid write offset: {}, block size: {}",
-                    context.off,
+                    context.block.len,
                     context.block_size
                 );
             }
@@ -195,17 +195,9 @@ impl BatchWriteHandler {
                 .data(data_slice)
                 .build();
 
-            // Transfer to handler
-            #[allow(clippy::mem_replace_with_default)]
-            let file = std::mem::replace(
-                &mut self.file.as_mut().unwrap()[i],
-                LocalFile::place_holder(),
-            );
-            #[allow(clippy::mem_replace_with_default)]
-            let context = std::mem::replace(
-                &mut self.context.as_mut().unwrap()[i],
-                WriteContext::place_holder(),
-            );
+            // Transfer to handler using swap_remove and push back pattern
+            let file = self.file.as_mut().unwrap().swap_remove(i);
+            let context = self.context.as_mut().unwrap().swap_remove(i);
 
             self.write_handler.file = Some(file);
             self.write_handler.context = Some(context);
@@ -216,8 +208,8 @@ impl BatchWriteHandler {
             let file = self.write_handler.file.take().unwrap();
             let context = self.write_handler.context.take().unwrap();
 
-            self.file.as_mut().unwrap()[i] = file;
-            self.context.as_mut().unwrap()[i] = context;
+            self.file.as_mut().unwrap().insert(i, file);
+            self.context.as_mut().unwrap().insert(i, context);
 
             results.push(response.is_ok());
         }
