@@ -292,6 +292,83 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    pub fn create_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: CreateFilesBatchRequest = ctx.parse_header()?;
+
+        let mut results = Vec::with_capacity(header.requests.len());
+        for (index, req) in header.requests.into_iter().enumerate() {
+            let opts = ProtoUtils::create_opts_from_pb(req.opts);
+            let flags = OpenFlags::new(req.flags);
+
+            // Generate unique req_id for each file in batch
+            let unique_req_id = ctx.msg.req_id() + index as i64;
+            let status = self.create_file0(unique_req_id, req.path, opts, flags)?;
+            results.push(status);
+        }
+
+        let rep_header = CreateFilesBatchResponse {
+            file_statuses: results
+                .into_iter()
+                .map(ProtoUtils::file_status_to_pb)
+                .collect(),
+        };
+        ctx.response(rep_header)
+    }
+
+    pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: AddBlocksBatchRequest = ctx.parse_header()?;
+        let mut results = Vec::with_capacity(header.requests.len());
+        for req in header.requests {
+            let path = req.path;
+            let client_addr = ProtoUtils::client_address_from_pb(req.client_address);
+            let commit_blocks = req
+                .commit_blocks
+                .into_iter()
+                .map(ProtoUtils::commit_block_from_pb)
+                .collect();
+
+            let located_block = self.fs.add_block(
+                path,
+                client_addr,
+                commit_blocks,
+                req.exclude_workers,
+                req.file_len,
+                req.last_block.map(ProtoUtils::extend_block_from_pb),
+            )?;
+            results.push(ProtoUtils::located_block_to_pb(located_block));
+        }
+
+        let rep_header = AddBlocksBatchResponse { blocks: results };
+        ctx.response(rep_header)
+    }
+
+    pub fn complete_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: CompleteFilesBatchRequest = ctx.parse_header()?;
+
+        let mut results = Vec::new();
+        for req in header.requests {
+            let commit_blocks = req
+                .commit_blocks
+                .into_iter()
+                .map(ProtoUtils::commit_block_from_pb)
+                .collect();
+            let result = self
+                .fs
+                .complete_file(
+                    req.path,
+                    req.len,
+                    commit_blocks,
+                    req.client_name,
+                    req.only_flush,
+                )
+                .is_ok();
+            results.push(result);
+        }
+
+        let rep_header = CompleteFilesBatchResponse { results };
+        ctx.response(rep_header)
+    }
+
     pub fn get_block_locations(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: GetBlockLocationsRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.path.to_string()), None);
@@ -535,6 +612,9 @@ impl MessageHandler for MasterHandler {
             RpcCode::FileStatus => self.file_status(ctx),
             RpcCode::AddBlock => self.add_block(ctx),
             RpcCode::CompleteFile => self.complete_file(ctx),
+            RpcCode::CreateFilesBatch => self.create_files_batch(ctx),
+            RpcCode::AddBlocksBatch => self.add_blocks_batch(ctx),
+            RpcCode::CompleteFilesBatch => self.complete_files_batch(ctx),
             RpcCode::Exists => self.exists(ctx),
             RpcCode::Delete => self.retry_check_delete(ctx),
             RpcCode::Rename => self.retry_check_rename(ctx),

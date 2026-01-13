@@ -18,13 +18,14 @@ message BlockWriteRequest {
     required int32 chunk_size = 6;
 }
 
-message BlockWriteResponse {
-    required int64 id = 1;
-    optional string path = 2;
-    required int64 off = 3;
-    required int64 block_size = 4;
-    required StorageTypeProto storage_type = 5;
-}
+
+
+message WriteCommitRequest {  
+    required ExtendedBlockProto block = 1;  
+    required int64 pos = 2;  
+    required int64 block_size = 3;  
+    required bool cancel = 4;  
+}  
 
 message BlockReadRequest {
     required int64 id = 1;
@@ -100,4 +101,20 @@ message BlockReportListRequest {
 
 message BlockReportListResponse {
     repeated WorkerCommandProto cmds = 1;
+}
+
+message WriteBlocksBatchRequest {  
+    repeated BlockWriteRequest requests = 1;  
+}  
+  
+message WriteBlocksBatchResponse {  
+    repeated BlockWriteResponse responses = 1;  
+}  
+  
+message WriteCommitsBatchRequest {  
+    repeated WriteCommitRequest requests = 1;  
+}  
+  
+message WriteCommitsBatchResponse {  
+    repeated bool results = 1;  
 }

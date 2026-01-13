@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::worker::block::BlockStore;
-use crate::worker::handler::BlockHandler::{Reader, Writer};
-use crate::worker::handler::{ReadHandler, WriteHandler};
+use crate::worker::handler::BlockHandler::{BatchWriter, Reader, Writer};
+use crate::worker::handler::{BatchWriteHandler, ReadHandler, WriteHandler};
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::FsResult;
@@ -25,6 +25,7 @@ use orpc::{err_box, CommonResult};
 pub enum BlockHandler {
     Writer(WriteHandler),
     Reader(ReadHandler),
+    BatchWriter(BatchWriteHandler),
 }
 
 impl BlockHandler {
@@ -33,6 +34,8 @@ impl BlockHandler {
             RpcCode::WriteBlock => Writer(WriteHandler::new(store)),
 
             RpcCode::ReadBlock => Reader(ReadHandler::new(store)),
+
+            RpcCode::WriteBlocksBatch => BatchWriter(BatchWriteHandler::new(store)),
 
             code => return err_box!("Unsupported request type: {:?}", code),
         };
@@ -48,6 +51,7 @@ impl MessageHandler for BlockHandler {
         let response = match self {
             Writer(h) => h.handle(msg),
             Reader(h) => h.handle(msg),
+            BatchWriter(h) => h.handle(msg),
         };
 
         match response {
