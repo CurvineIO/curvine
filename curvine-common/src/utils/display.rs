@@ -12,11 +12,72 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::{GetMountTableResponse, MountResponse, UnMountResponse};
+use crate::proto::{
+    ConsistencyStrategyProto, GetMountTableResponse, MountResponse, MountTypeProto, TtlActionProto,
+    UnMountResponse, WriteTypeProto,
+};
 use crate::state::{JobStatus, JobTaskState, LoadJobResult};
 use chrono::DateTime;
 use std::fmt;
 use std::fmt::Display;
+
+/// Convert WriteTypeProto to a readable string
+fn write_type_to_str(write_type: WriteTypeProto) -> &'static str {
+    match write_type {
+        WriteTypeProto::Cache => "cache",
+        WriteTypeProto::Through => "through",
+        WriteTypeProto::AsyncThrough => "async_through",
+        WriteTypeProto::CacheThrough => "cache_through",
+    }
+}
+
+/// Convert MountTypeProto to a readable string
+fn mount_type_to_str(mount_type: MountTypeProto) -> &'static str {
+    match mount_type {
+        MountTypeProto::Cst => "cst",
+        MountTypeProto::Orch => "orch",
+    }
+}
+
+/// Convert ConsistencyStrategyProto to a readable string
+fn consistency_strategy_to_str(strategy: ConsistencyStrategyProto) -> &'static str {
+    match strategy {
+        ConsistencyStrategyProto::None => "none",
+        ConsistencyStrategyProto::Always => "always",
+    }
+}
+
+/// Convert storage_type i32 to a readable string
+fn storage_type_to_str(storage_type: Option<i32>) -> &'static str {
+    match storage_type {
+        Some(0) => "mem",  // StorageTypeProto::Mem
+        Some(1) => "ssd",  // StorageTypeProto::Ssd
+        Some(2) => "hdd",  // StorageTypeProto::Hdd
+        Some(3) => "ufs",  // StorageTypeProto::Ufs
+        Some(4) => "disk", // StorageTypeProto::Disk
+        _ => "-",
+    }
+}
+
+/// Convert TtlActionProto to a readable string
+fn ttl_action_to_str(ttl_action: TtlActionProto) -> &'static str {
+    match ttl_action {
+        TtlActionProto::None => "none",
+        TtlActionProto::Move => "move",
+        TtlActionProto::Ufs => "ufs",
+        TtlActionProto::Delete => "delete",
+    }
+}
+
+/// Convert provider i32 to a readable string
+fn provider_to_str(provider: Option<i32>) -> &'static str {
+    match provider {
+        Some(0) => "auto",     // ProviderProto::Auto
+        Some(1) => "oss-hdfs", // ProviderProto::OssHdfs
+        Some(2) => "opendal",  // ProviderProto::Opendal
+        _ => "-",
+    }
+}
 
 /// Configuration options for progress display
 pub struct ProgressDisplayOptions {
@@ -206,19 +267,39 @@ impl Display for GetMountTableResponse {
         }
 
         // Calculate the maximum width of each column
-        let mut id_width = 2; //length of "ID"
-        let mut curvine_width = 12; //length of "Curvine Path"
-        let mut ufs_width = 8; //length of "UFS Path"
+        let mut id_width = 2; // "ID"
+        let mut curvine_width = 12; // "Curvine Path"
+        let mut ufs_width = 8; // "UFS Path"
+        let mut write_type_width = 10; // "Write Type"
+        let mut mount_type_width = 10; // "Mount Type"
+        let mut consistency_width = 11; // "Consistency"
+        let mut storage_width = 7; // "Storage"
+        let mut ttl_action_width = 10; // "TTL Action"
+        let mut provider_width = 8; // "Provider"
+
         for mnt in &self.mount_table {
             id_width = id_width.max(mnt.mount_id.to_string().len());
             curvine_width = curvine_width.max(mnt.cv_path.len());
             ufs_width = ufs_width.max(mnt.ufs_path.len());
+            write_type_width = write_type_width.max(write_type_to_str(mnt.write_type()).len());
+            mount_type_width = mount_type_width.max(mount_type_to_str(mnt.mount_type()).len());
+            consistency_width = consistency_width
+                .max(consistency_strategy_to_str(mnt.consistency_strategy()).len());
+            storage_width = storage_width.max(storage_type_to_str(mnt.storage_type).len());
+            ttl_action_width = ttl_action_width.max(ttl_action_to_str(mnt.ttl_action()).len());
+            provider_width = provider_width.max(provider_to_str(mnt.provider).len());
         }
 
-        // For the sake of beauty, add some filling
+        // Add padding for aesthetics
         id_width += 2;
         curvine_width += 2;
         ufs_width += 2;
+        write_type_width += 2;
+        mount_type_width += 2;
+        consistency_width += 2;
+        storage_width += 2;
+        ttl_action_width += 2;
+        provider_width += 2;
 
         // Table header
         writeln!(f, "Mount Table:")?;
@@ -227,35 +308,115 @@ impl Display for GetMountTableResponse {
         write!(f, "+")?;
         write!(f, "{:-^width$}+", "", width = id_width)?;
         write!(f, "{:-^width$}+", "", width = curvine_width)?;
-        writeln!(f, "{:-^width$}+", "", width = ufs_width)?;
+        write!(f, "{:-^width$}+", "", width = ufs_width)?;
+        write!(f, "{:-^width$}+", "", width = write_type_width)?;
+        write!(f, "{:-^width$}+", "", width = mount_type_width)?;
+        write!(f, "{:-^width$}+", "", width = consistency_width)?;
+        write!(f, "{:-^width$}+", "", width = storage_width)?;
+        write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
+        writeln!(f, "{:-^width$}+", "", width = provider_width)?;
 
         // Title line
         write!(f, "|")?;
         write!(f, " {:<width$}|", "ID", width = id_width - 1)?;
         write!(f, " {:<width$}|", "Curvine Path", width = curvine_width - 1)?;
-        writeln!(f, " {:<width$}|", "UFS Path", width = ufs_width - 1)?;
+        write!(f, " {:<width$}|", "UFS Path", width = ufs_width - 1)?;
+        write!(
+            f,
+            " {:<width$}|",
+            "Write Type",
+            width = write_type_width - 1
+        )?;
+        write!(
+            f,
+            " {:<width$}|",
+            "Mount Type",
+            width = mount_type_width - 1
+        )?;
+        write!(
+            f,
+            " {:<width$}|",
+            "Consistency",
+            width = consistency_width - 1
+        )?;
+        write!(f, " {:<width$}|", "Storage", width = storage_width - 1)?;
+        write!(
+            f,
+            " {:<width$}|",
+            "TTL Action",
+            width = ttl_action_width - 1
+        )?;
+        writeln!(f, " {:<width$}|", "Provider", width = provider_width - 1)?;
 
         // Dividing line
         write!(f, "+")?;
         write!(f, "{:-^width$}+", "", width = id_width)?;
         write!(f, "{:-^width$}+", "", width = curvine_width)?;
-        writeln!(f, "{:-^width$}+", "", width = ufs_width)?;
+        write!(f, "{:-^width$}+", "", width = ufs_width)?;
+        write!(f, "{:-^width$}+", "", width = write_type_width)?;
+        write!(f, "{:-^width$}+", "", width = mount_type_width)?;
+        write!(f, "{:-^width$}+", "", width = consistency_width)?;
+        write!(f, "{:-^width$}+", "", width = storage_width)?;
+        write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
+        writeln!(f, "{:-^width$}+", "", width = provider_width)?;
 
-        // Data line
+        // Data lines
         for mnt in &self.mount_table {
             write!(f, "|")?;
             write!(f, " {:<width$}|", mnt.mount_id, width = id_width - 1)?;
             write!(f, " {:<width$}|", mnt.cv_path, width = curvine_width - 1)?;
-            writeln!(f, " {:<width$}|", mnt.ufs_path, width = ufs_width - 1)?;
+            write!(f, " {:<width$}|", mnt.ufs_path, width = ufs_width - 1)?;
+            write!(
+                f,
+                " {:<width$}|",
+                write_type_to_str(mnt.write_type()),
+                width = write_type_width - 1
+            )?;
+            write!(
+                f,
+                " {:<width$}|",
+                mount_type_to_str(mnt.mount_type()),
+                width = mount_type_width - 1
+            )?;
+            write!(
+                f,
+                " {:<width$}|",
+                consistency_strategy_to_str(mnt.consistency_strategy()),
+                width = consistency_width - 1
+            )?;
+            write!(
+                f,
+                " {:<width$}|",
+                storage_type_to_str(mnt.storage_type),
+                width = storage_width - 1
+            )?;
+            write!(
+                f,
+                " {:<width$}|",
+                ttl_action_to_str(mnt.ttl_action()),
+                width = ttl_action_width - 1
+            )?;
+            writeln!(
+                f,
+                " {:<width$}|",
+                provider_to_str(mnt.provider),
+                width = provider_width - 1
+            )?;
         }
 
-        // The lower border
+        // Bottom border
         write!(f, "+")?;
         write!(f, "{:-^width$}+", "", width = id_width)?;
         write!(f, "{:-^width$}+", "", width = curvine_width)?;
-        writeln!(f, "{:-^width$}+", "", width = ufs_width)?;
+        write!(f, "{:-^width$}+", "", width = ufs_width)?;
+        write!(f, "{:-^width$}+", "", width = write_type_width)?;
+        write!(f, "{:-^width$}+", "", width = mount_type_width)?;
+        write!(f, "{:-^width$}+", "", width = consistency_width)?;
+        write!(f, "{:-^width$}+", "", width = storage_width)?;
+        write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
+        writeln!(f, "{:-^width$}+", "", width = provider_width)?;
 
-        // Summary of information
+        // Summary
         writeln!(f, "Total mount points: {}", self.mount_table.len())?;
 
         Ok(())
