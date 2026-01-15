@@ -450,8 +450,9 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 			TerminationGracePeriodSeconds: &terminationGracePeriod,
 			Containers: []corev1.Container{
 				{
-					Name:  "curvine-fuse",
-					Image: image,
+					Name:            "curvine-fuse",
+					Image:           image,
+					ImagePullPolicy: corev1.PullNever,
 					Command: []string{
 						"/opt/curvine/curvine-fuse",
 					},
@@ -935,19 +936,40 @@ func (m *standaloneMountManagerImpl) GetState() *StandaloneState {
 }
 
 // isMountPoint checks if a path is a mount point
+// Uses /proc/mounts for reliable detection without requiring special permissions
 func isMountPoint(path string) (bool, error) {
-	cmd := exec.Command("mountpoint", "-q", path)
-	err := cmd.Run()
-	if err == nil {
-		return true, nil // Is a mount point
+	// First check if path exists
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil // Path doesn't exist, not a mount point
+		}
+		return false, err // Other stat error
 	}
 	
-	// mountpoint returns exit code 1 if not a mount point
-	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-		return false, nil // Not a mount point
+	// Read /proc/mounts to check if path is mounted
+	// This is more reliable than mountpoint command in containers
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return false, fmt.Errorf("failed to read /proc/mounts: %v", err)
 	}
 	
-	return false, err // Other error
+	// Normalize path for comparison
+	cleanPath := filepath.Clean(path)
+	
+	// Check each mount point in /proc/mounts
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		mountPoint := fields[1]
+		if mountPoint == cleanPath {
+			return true, nil
+		}
+	}
+	
+	return false, nil // Not found in /proc/mounts, not a mount point
 }
 
 // cleanupStaleMountPoint safely cleans up a stale mount point
