@@ -45,7 +45,7 @@ pub struct FuseWriter {
 }
 
 impl FuseWriter {
-    pub fn new(conf: &FuseConf, rt: Arc<Runtime>, writer: UnifiedWriter) -> Self {
+    pub fn new(conf: &FuseConf, rt: Arc<Runtime>, writer: UnifiedWriter, ino: u64) -> Self {
         let is_ufs = !writer.path().is_cv();
         let path = writer.path().clone();
         let err_monitor = Arc::new(ErrorMonitor::new());
@@ -55,7 +55,7 @@ impl FuseWriter {
         let monitor = err_monitor.clone();
 
         rt.spawn(async move {
-            let res = Self::writer_future(writer, receiver).await;
+            let res = Self::writer_future(writer, receiver, ino).await;
             match res {
                 Ok(_) => (),
 
@@ -130,6 +130,7 @@ impl FuseWriter {
     async fn writer_future(
         mut writer: UnifiedWriter,
         mut req_receiver: AsyncReceiver<WriteTask>,
+        ino: u64,
     ) -> FsResult<()> {
         while let Some(task) = req_receiver.recv().await {
             match task {
@@ -148,6 +149,7 @@ impl FuseWriter {
                 WriteTask::Flush(tx, reply) => {
                     let res = writer.flush().await;
                     if let Some(reply) = reply {
+                        reply.send_inode_out(ino, 0, -1).await?;
                         reply.send_rep(res).await?;
                     }
                     tx.send(1)?;
@@ -156,6 +158,7 @@ impl FuseWriter {
                 WriteTask::Complete(tx, reply) => {
                     let res = writer.complete().await;
                     if let Some(reply) = reply {
+                        reply.send_inode_out(ino, 0, -1).await?;
                         reply.send_rep(res).await?;
                     }
                     tx.send(1)?;
