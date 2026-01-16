@@ -14,6 +14,7 @@
 
 use crate::error::{ErrorImpl, StringError};
 use bytes::{Buf, BytesMut};
+use log::warn;
 use serde::de::DeserializeOwned;
 
 // Error deserializer.
@@ -45,12 +46,31 @@ impl ErrorDecoder {
 
     pub fn get_data<D: DeserializeOwned>(&mut self) -> Option<D> {
         // Read data
+        if self.bytes.remaining() < 4 {
+            return None;
+        }
+
         let data_len = self.bytes.get_u32() as usize;
-        if data_len > 0 {
-            let data_buf = self.bytes.split_to(data_len);
-            Some(bincode::deserialize(&data_buf).unwrap())
-        } else {
-            None
+        if data_len == 0 {
+            return None;
+        }
+
+        if self.bytes.remaining() < data_len {
+            warn!(
+                "error decode: not enough bytes for data, need {}, have {}",
+                data_len,
+                self.bytes.remaining()
+            );
+            return None;
+        }
+
+        let data_buf = self.bytes.split_to(data_len);
+        match bincode::deserialize(&data_buf) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("error decode: data deserialize failed: {}", e);
+                None
+            }
         }
     }
 
