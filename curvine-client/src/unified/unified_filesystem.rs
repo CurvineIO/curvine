@@ -116,20 +116,31 @@ impl UnifiedFileSystem {
 
     // Get the file status in curvine. If it does not exist or expired, return None
     pub async fn get_cache_status(&self, path: &Path) -> FsResult<Option<FileStatus>> {
-        match self.cv.get_status(path).await {
-            Ok(v) => {
-                if v.is_complete && !v.is_expired() {
-                    Ok(Some(v))
-                } else {
-                    Ok(None)
+        let status = match self.cv.get_status(path).await {
+            Ok(v) => v,
+
+            Err(e) => {
+                return match e {
+                    FsError::FileNotFound(_) => Ok(None),
+                    FsError::Expired(_) => Ok(None),
+                    _ => Err(e),
                 }
             }
+        };
 
-            Err(e) => match e {
-                FsError::FileNotFound(_) => Ok(None),
-                FsError::Expired(_) => Ok(None),
-                _ => Err(e),
-            },
+        // Return None if expired
+        if status.is_expired() {
+            return Ok(None);
+        }
+
+        // Return Some if:
+        // 1. File only exists in Curvine (cv_only), or
+        // 2. File is complete (cached from UFS and ready to use)
+        if status.is_cv_only() || status.is_complete {
+            Ok(Some(status))
+        } else {
+            // File is being cached but not complete yet
+            Ok(None)
         }
     }
 
@@ -477,10 +488,11 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         match self.get_mount(path).await? {
             None => self.cv.get_status(path).await,
             Some((ufs_path, mount)) => {
-                if mount.info.cv_path == path.path() {
-                    return self.cv.get_status(path).await;
+                if let Some(v) = self.get_cache_status(path).await? {
+                    Ok(v)
+                } else {
+                    mount.ufs.get_status(&ufs_path).await
                 }
-                mount.ufs.get_status(&ufs_path).await
             }
         }
     }

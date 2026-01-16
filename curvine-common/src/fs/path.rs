@@ -99,17 +99,16 @@ impl Path {
         self.full_path.clone()
     }
 
-    pub fn authority_path(&self) -> String {
-        // Return "authority/path" or just "path" for local files
-        if let Some(authority) = &self.authority {
-            if self.path == Self::SEPARATOR {
-                authority.clone()
-            } else {
-                format!("{}{}", authority, &self.path)
-            }
+    pub fn authority_path(&self) -> &str {
+        let full_path = self.full_path();
+
+        let auth_path = if let Some(scheme_end) = full_path.find(Self::SCHEME_DELIMITER) {
+            let start_index = scheme_end + 2;
+            &full_path[start_index..]
         } else {
-            self.path.trim_end_matches(Self::SEPARATOR).to_string()
-        }
+            full_path
+        };
+        auth_path.trim_end_matches(Self::SEPARATOR)
     }
 
     pub fn name(&self) -> &str {
@@ -548,11 +547,11 @@ mod tests {
 
         // Scheme with root path
         let p3 = Path::from_str("s3://bucket/")?;
-        assert_eq!(p3.authority_path(), "bucket");
+        assert_eq!(p3.authority_path(), "/bucket");
 
         // Scheme with path
         let p4 = Path::from_str("s3://my-bucket/path/file.txt")?;
-        assert_eq!(p4.authority_path(), "my-bucket/path/file.txt");
+        assert_eq!(p4.authority_path(), "/my-bucket/path/file.txt");
 
         Ok(())
     }

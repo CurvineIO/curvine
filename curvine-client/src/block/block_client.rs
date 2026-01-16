@@ -19,6 +19,7 @@ use crate::block::{
 };
 use crate::file::FsContext;
 use curvine_common::conf::ClientConf;
+use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
@@ -31,9 +32,10 @@ use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::client::RpcClient;
 use orpc::common::LocalTime;
+use orpc::error::ErrorExt;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
-use orpc::{err_box, try_option_ref, CommonResult};
+use orpc::{try_option_ref, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,10 +88,9 @@ impl BlockClient {
     pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
         let client = try_option_ref!(self.client);
         let rep_msg = client.timeout_rpc(self.timeout, msg).await?;
-        if !rep_msg.is_success() {
-            err_box!(rep_msg.to_error_msg())
-        } else {
-            Ok(rep_msg)
+        match rep_msg.check_error_ext::<FsError>() {
+            Ok(_) => Ok(rep_msg),
+            Err(e) => Err(e.ctx(format!("rpc failed to worker {}", self.worker_addr))),
         }
     }
 
