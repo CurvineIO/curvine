@@ -12,4 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Include the version constants generated at build time
 include!(concat!(env!("OUT_DIR"), "/version.rs"));

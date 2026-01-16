@@ -14,6 +14,7 @@
 
 use clap::{Parser, Subcommand};
 use curvine_common::conf::ClusterConf;
+use curvine_common::version;
 use curvine_s3_gateway::auth::{
     AccessKeyStoreEnum, CredentialEntry, CredentialStore, CurvineAccessKeyStore,
     LocalAccessKeyStore,
@@ -24,6 +25,7 @@ use rand::Rng;
 use std::sync::Arc;
 
 #[derive(Debug, Parser, Clone)]
+#[command(version = version::VERSION)]
 pub struct ObjectArgs {
     #[arg(
         short,

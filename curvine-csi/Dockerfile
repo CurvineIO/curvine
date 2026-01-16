@@ -63,9 +63,20 @@ RUN echo "Building Curvine from source..." && \
     fi && \
     rm -rf /workspace/tmp
 
-# Build CSI binary
+# Build CSI binary with version info
 RUN cd /workspace/curvine-csi && \
-    go build -o bin/csi main.go
+    VERSION=$(grep '^version =' /workspace/Cargo.toml | head -1 | sed 's/^version = "\(.*\)"/\1/') && \
+    GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown") && \
+    GIT_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "") && \
+    GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "") && \
+    BUILD_DATE=$(date -u '+%Y-%m-%d_%H:%M:%S') && \
+    go build \
+        -ldflags "-X github.com/curvineio/curvine-csi/pkg/csi.driverVersion=${VERSION} \
+                  -X github.com/curvineio/curvine-csi/pkg/csi.gitCommit=${GIT_COMMIT} \
+                  -X github.com/curvineio/curvine-csi/pkg/csi.gitTag=${GIT_TAG} \
+                  -X github.com/curvineio/curvine-csi/pkg/csi.gitBranch=${GIT_BRANCH} \
+                  -X github.com/curvineio/curvine-csi/pkg/csi.buildDate=${BUILD_DATE}" \
+        -o bin/csi main.go
 
 # Create output directory and copy build artifacts
 RUN mkdir -p /build-output && \

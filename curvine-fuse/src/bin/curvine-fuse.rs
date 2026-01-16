@@ -14,6 +14,7 @@
 
 use clap::Parser;
 use curvine_common::conf::ClusterConf;
+use curvine_common::version;
 use curvine_fuse::fs::CurvineFileSystem;
 use curvine_fuse::session::FuseSession;
 use curvine_fuse::web_server::WebServer;
@@ -65,6 +66,7 @@ fn main() -> CommonResult<()> {
 
 // Mount command function parameters
 #[derive(Debug, Parser, Clone)]
+#[command(version = version::VERSION)]
 pub struct FuseArgs {
     // Mount the mount point, mount the file system to a directory of the machine.
     #[arg(long, default_value = "/curvine-fuse")]

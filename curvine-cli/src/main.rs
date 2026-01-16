@@ -126,7 +126,7 @@ fn main() -> CommonResult<()> {
             Commands::UnMount(cmd) => cmd.execute(fs_client).await,
             Commands::Node(cmd) => cmd.execute(fs_client, conf.clone()).await,
             Commands::Version => {
-                println!("Curvine version: {}", version::GIT_VERSION);
+                println!("curvine-cli {}", version::VERSION);
                 Ok(())
             }
         };
