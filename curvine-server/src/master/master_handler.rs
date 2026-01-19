@@ -1,4 +1,5 @@
 // Copyright 2025 OPPO.
+use log::warn;
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,11 +28,13 @@ use curvine_common::state::{
     CreateFileOpts, FileBlocks, FileStatus, HeartbeatStatus, OpenFlags, RenameFlags,
 };
 use curvine_common::utils::ProtoUtils;
+use curvine_common::version::Version;
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::net::ConnState;
 use orpc::message::Message;
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub struct MasterHandler {
@@ -392,11 +395,27 @@ impl MasterHandler {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
         let mut wm = self.fs.worker_manager.write();
 
+        // Parse worker version from request
+        let worker_version_str = &header.version;
+        let worker_version = if !worker_version_str.is_empty() {
+            Version::from_str(worker_version_str).map_err(|e| {
+                FsError::common(format!(
+                    "Failed to parse worker version '{}': {}",
+                    worker_version_str, e
+                ))
+            })?
+        } else {
+            // No version information - use default 0.1.0
+            warn!("Worker did not provide version information, using default 0.1.0");
+            Version::new(0, 1, 0)
+        };
+
         let cmds = wm.heartbeat(
             &header.cluster_id,
             HeartbeatStatus::from(header.status),
             ProtoUtils::worker_address_from_pb(&header.address),
             ProtoUtils::storage_info_list_from_pb(header.storages),
+            worker_version,
         )?;
         drop(wm);
 

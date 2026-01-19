@@ -55,11 +55,15 @@ impl MasterClient {
         status: HeartbeatStatus,
         storages: Vec<StorageInfo>,
     ) -> CommonResult<WorkerHeartbeatResponse> {
+        // Get version from Cargo.toml
+        let version_string = env!("CARGO_PKG_VERSION");
+
         let mut req = WorkerHeartbeatRequest {
             status: status.into(),
             cluster_id: self.cluster_id.clone(),
             worker_id: self.worker_id,
             address: ProtoUtils::worker_address_to_pb(&self.worker_addr),
+            version: version_string.to_string(),
             ..Default::default()
         };
         for item in storages {
