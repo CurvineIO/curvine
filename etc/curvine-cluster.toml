@@ -10,6 +10,8 @@ format_worker = false
 [master]
 # Minimum supported worker version (backward compatibility)
 min_worker_version = "0.1.0"
+# Minimum supported client version (backward compatibility)
+min_client_version = "0.1.0"
 meta_dir = "testing/meta"
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 
