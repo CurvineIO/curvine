@@ -17,7 +17,7 @@ use crate::worker::handler::WriteContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::proto::{BlockWriteResponse, DataHeaderProto};
-use curvine_common::state::ExtendedBlock;
+use curvine_common::state::{ExtendedBlock, FileAllocMode};
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
@@ -65,11 +65,22 @@ impl WriteHandler {
                 ctx.block_size
             );
         }
-        if opts.len == 0 {
-            return Ok(());
+
+        // Remove KEEP_SIZE flag to ensure file size is properly set
+        // KEEP_SIZE only pre-allocates space without changing file size, which causes
+        // length mismatch issues during finalization. Other flags are preserved.
+        let mut mode = opts.mode;
+        mode.remove(FileAllocMode::KEEP_SIZE);
+        file.resize(opts.truncate, opts.off, opts.len, mode.bits())?;
+
+        if opts.len != file.len() {
+            return err_box!(
+                "invalid resize operation: resize {} != actual {}",
+                opts.len,
+                file.len()
+            );
         }
 
-        file.resize(opts.truncate, opts.off, opts.len, opts.mode.bits())?;
         Ok(())
     }
 
