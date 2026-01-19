@@ -28,7 +28,7 @@ use curvine_common::state::{
     CreateFileOpts, FileBlocks, FileStatus, HeartbeatStatus, OpenFlags, RenameFlags,
 };
 use curvine_common::utils::ProtoUtils;
-use curvine_common::version::Version;
+use curvine_common::version::{CompatibilityPolicy, CompatibilityResult, Version, VersionChecker};
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
@@ -46,6 +46,8 @@ pub struct MasterHandler {
     pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
+    pub(crate) worker_version_checker: VersionChecker,
+    pub(crate) client_version_checker: VersionChecker,
 }
 
 impl MasterHandler {
@@ -59,6 +61,34 @@ impl MasterHandler {
         job_handler: JobHandler,
         replication_manager: Arc<MasterReplicationManager>,
     ) -> Self {
+        let master_version = Version::current();
+
+        // Initialize Worker version checker
+        let worker_min_version =
+            Version::from_str(&conf.master.min_worker_version).unwrap_or_else(|e| {
+                warn!(
+                    "Failed to parse min_worker_version '{}': {}, using default 0.1.0",
+                    conf.master.min_worker_version, e
+                );
+                Version::new(0, 1, 0)
+            });
+        let worker_policy = CompatibilityPolicy::new(worker_min_version);
+        let worker_version_checker = VersionChecker::new(master_version, worker_policy);
+
+        // Initialize Client version checker (looser policy - no upper bound)
+        let client_min_version =
+            Version::from_str(&conf.master.min_client_version).unwrap_or_else(|e| {
+                warn!(
+                    "Failed to parse min_client_version '{}': {}, using default 0.1.0",
+                    conf.master.min_client_version, e
+                );
+                Version::new(0, 1, 0)
+            });
+        let client_policy = CompatibilityPolicy::new(client_min_version);
+        // Client uses a very large upper bound for compatibility
+        let client_version_checker =
+            VersionChecker::new(Version::new(u32::MAX, u32::MAX, u32::MAX), client_policy);
+
         Self {
             fs,
             retry_cache,
@@ -68,6 +98,8 @@ impl MasterHandler {
             mount_manager,
             job_handler,
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
+            worker_version_checker,
+            client_version_checker,
         }
     }
 
@@ -384,7 +416,36 @@ impl MasterHandler {
     }
 
     pub fn get_master_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let _: GetMasterInfoRequest = ctx.parse_header()?;
+        let header: GetMasterInfoRequest = ctx.parse_header()?;
+
+        // Check client version if provided
+        if let Some(client_version_str) = &header.client_version {
+            if !client_version_str.is_empty() {
+                let client_version = Version::from_str(client_version_str).map_err(|e| {
+                    FsError::common(format!(
+                        "Failed to parse client version '{}': {}",
+                        client_version_str, e
+                    ))
+                })?;
+
+                let compat_result = self
+                    .client_version_checker
+                    .check_compatibility(&client_version);
+                if let CompatibilityResult::Incompatible(reason) = compat_result {
+                    warn!("Client version {} rejected: {}", client_version, reason);
+                    return Err(FsError::version_incompatible(reason));
+                }
+
+                // Version check passed
+                log::info!("Client version {} accepted", client_version);
+            } else {
+                // Empty version string - backward compatibility
+                warn!("Client connected without version information (backward compatibility mode)");
+            }
+        } else {
+            // No version field - old client (backward compatibility)
+            warn!("Client connected without version information (backward compatibility mode)");
+        }
 
         let info = self.fs.master_info()?;
         let rep_header = ProtoUtils::master_info_to_pb(info);
@@ -393,7 +454,6 @@ impl MasterHandler {
 
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
-        let mut wm = self.fs.worker_manager.write();
 
         // Parse worker version from request
         let worker_version_str = &header.version;
@@ -410,10 +470,25 @@ impl MasterHandler {
             Version::new(0, 1, 0)
         };
 
+        // Check version compatibility at Handler layer
+        let worker_addr = ProtoUtils::worker_address_from_pb(&header.address);
+        let compat_result = self
+            .worker_version_checker
+            .check_compatibility(&worker_version);
+        if let CompatibilityResult::Incompatible(reason) = compat_result {
+            warn!(
+                "Worker {} registration rejected due to version incompatibility: {}",
+                worker_addr, reason
+            );
+            return Err(FsError::version_incompatible(reason));
+        }
+
+        // Version check passed, proceed with heartbeat
+        let mut wm = self.fs.worker_manager.write();
         let cmds = wm.heartbeat(
             &header.cluster_id,
             HeartbeatStatus::from(header.status),
-            ProtoUtils::worker_address_from_pb(&header.address),
+            worker_addr,
             ProtoUtils::storage_info_list_from_pb(header.storages),
             worker_version,
         )?;
