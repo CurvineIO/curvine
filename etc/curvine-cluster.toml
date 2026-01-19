@@ -8,6 +8,8 @@ format_worker = false
 
 # master configuration
 [master]
+# Minimum supported worker version (backward compatibility)
+min_worker_version = "0.1.0"
 meta_dir = "testing/meta"
 log = { level = "info", log_dir = "stdout", file_name = "master.log" }
 

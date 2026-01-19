@@ -20,12 +20,14 @@ use curvine_common::state::{
     BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, WorkerAddress,
     WorkerCommand, WorkerInfo, WorkerStatus,
 };
+use curvine_common::version::{CompatibilityPolicy, CompatibilityResult, Version, VersionChecker};
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::ByteUnit;
 use orpc::{err_box, CommonResult};
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
+use std::str::FromStr;
 
 pub struct WorkerManager {
     pub(crate) worker_map: WorkerMap,
@@ -33,11 +35,17 @@ pub struct WorkerManager {
     pub(crate) worker_policy: WorkerPolicyAdapter,
     pub(crate) cluster_id: String,
     pub(crate) conf: ClusterConf,
+    pub(crate) version_checker: VersionChecker,
 }
 
 impl WorkerManager {
     pub fn new(conf: &ClusterConf) -> Self {
         let worker_policy = WorkerPolicyAdapter::from_conf(conf).unwrap();
+
+        // Parse master version and compatibility policy
+        let master_version = Version::current();
+        let policy = Self::parse_compatibility_policy(conf);
+        let version_checker = VersionChecker::new(master_version, policy);
 
         Self {
             worker_map: WorkerMap::new(),
@@ -45,7 +53,21 @@ impl WorkerManager {
             worker_policy,
             cluster_id: conf.cluster_id.to_string(),
             conf: conf.clone(),
+            version_checker,
         }
+    }
+
+    fn parse_compatibility_policy(conf: &ClusterConf) -> CompatibilityPolicy {
+        // Parse min_worker_version from configuration
+        let min_version = Version::from_str(&conf.master.min_worker_version).unwrap_or_else(|e| {
+            warn!(
+                "Failed to parse min_worker_version '{}': {}, using default 0.1.0",
+                conf.master.min_worker_version, e
+            );
+            Version::new(0, 1, 0)
+        });
+
+        CompatibilityPolicy::new(min_version)
     }
 
     pub fn heartbeat(
@@ -54,6 +76,7 @@ impl WorkerManager {
         status: HeartbeatStatus,
         addr: WorkerAddress,
         storages: Vec<StorageInfo>,
+        version: Version,
     ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
         if cluster_id != self.cluster_id {
@@ -63,6 +86,21 @@ impl WorkerManager {
                 cluster_id
             );
         }
+
+        // Check version compatibility
+        let compat_result = self.version_checker.check_compatibility(&version);
+        if let CompatibilityResult::Incompatible(reason) = compat_result {
+            warn!(
+                "Worker {} registration rejected due to version incompatibility: {}",
+                addr, reason
+            );
+            return Err(curvine_common::error::FsError::version_incompatible(reason));
+        }
+
+        info!(
+            "Worker {} registered successfully with version {}",
+            addr, version
+        );
 
         let cmds = match status {
             HeartbeatStatus::Start => {
@@ -79,7 +117,7 @@ impl WorkerManager {
             }
         };
 
-        self.worker_map.insert(addr, storages)?;
+        self.worker_map.insert(addr, storages, version)?;
         Ok(cmds)
     }
 
