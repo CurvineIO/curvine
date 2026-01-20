@@ -127,6 +127,13 @@ impl FsReaderBase {
             return err_box!("seek position {} can not exceed file len {}", pos, self.len);
         }
 
+        // Seeking to EOF is allowed but no block lookup needed - just update position
+        if pos == self.len {
+            self.update_reader(None, true).await?;
+            self.pos = pos;
+            return Ok(());
+        }
+
         let (block_off, loc) = self.file_blocks.get_read_block(pos)?;
         if let Some(reader) = &mut self.cur_reader {
             // Check if the target position is in the current block
