@@ -18,7 +18,7 @@ use curvine_client::ClientMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOptsBuilder, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
+    CreateFileOptsBuilder, FileAllocOpts, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
 };
 use curvine_common::state::{FileLock, LockFlags, LockType};
 use curvine_common::FsResult;
@@ -1015,5 +1015,148 @@ fn get_lock() {
 
         // Cleanup
         info!("=== get_lock test completed ===");
+    })
+}
+
+/// Test truncate functionality - shrinking and extending files
+#[test]
+fn test_truncate_operations() -> FsResult<()> {
+    let rt = Arc::new(AsyncRuntime::single());
+    let testing = Testing::builder().default().build()?;
+    testing.start_cluster()?;
+    let conf = testing.get_active_cluster_conf()?;
+
+    let fs = testing.get_fs(Some(rt.clone()), Some(conf))?;
+    rt.block_on(async move {
+        let path = Path::from_str("/fs_test/truncate_test.bin")?;
+
+        // Cleanup any existing file
+        let _ = fs.delete(&path, false).await;
+
+        // Helper function to read file content
+        async fn read_file_content(
+            fs: &CurvineFileSystem,
+            path: &Path,
+            len: usize,
+        ) -> CommonResult<Vec<u8>> {
+            let mut reader = fs.open(path).await?;
+            let mut buffer = BytesMut::zeroed(len);
+            let bytes_read = reader.read_full(&mut buffer).await?;
+            reader.complete().await?;
+            buffer.truncate(bytes_read);
+            Ok(buffer.to_vec())
+        }
+
+        info!("=== Test 1: Basic truncate (shrink) ===");
+
+        // Create a 10KB file
+        let initial_data = vec![0x42u8; 10 * 1024];
+        let mut writer = fs.create(&path, true).await?;
+        writer.write(&initial_data).await?;
+        writer.complete().await?;
+
+        let status = fs.get_status(&path).await?;
+        assert_eq!(status.len, 10 * 1024, "Initial file should be 10KB");
+        info!("Created 10KB file, len={}", status.len);
+
+        // Truncate to 5KB using resize
+        fs.resize(&path, FileAllocOpts::with_truncate(5 * 1024))
+            .await?;
+
+        let status = fs.get_status(&path).await?;
+        assert_eq!(status.len, 5 * 1024, "File should be truncated to 5KB");
+        info!("Truncated to 5KB, len={}", status.len);
+
+        // Verify content is preserved (first 5KB)
+        let content = read_file_content(&fs, &path, status.len as usize).await?;
+        assert_eq!(content.len(), 5 * 1024);
+        assert!(
+            content.iter().all(|&b| b == 0x42),
+            "Content should be preserved"
+        );
+        info!("✓ Content preserved after truncate");
+
+        info!("=== Test 2: Truncate to zero ===");
+
+        // Truncate to 0
+        fs.resize(&path, FileAllocOpts::with_truncate(0)).await?;
+
+        let status = fs.get_status(&path).await?;
+        assert_eq!(status.len, 0, "File should be truncated to 0");
+        info!("✓ Truncated to 0, len={}", status.len);
+
+        info!("=== Test 3: Extend file (fallocate) ===");
+
+        // Write some initial content
+        let mut writer = fs.create(&path, true).await?;
+        writer.write(&[0x55u8; 1024]).await?;
+        writer.complete().await?;
+
+        let status = fs.get_status(&path).await?;
+        assert_eq!(status.len, 1024, "File should be 1KB");
+
+        // Extend to 5KB
+        fs.resize(&path, FileAllocOpts::with_truncate(5 * 1024))
+            .await?;
+
+        let status = fs.get_status(&path).await?;
+        assert_eq!(status.len, 5 * 1024, "File should be extended to 5KB");
+        info!("Extended to 5KB, len={}", status.len);
+
+        // Verify original content is preserved and extension is zeros
+        let content = read_file_content(&fs, &path, status.len as usize).await?;
+        assert_eq!(content.len(), 5 * 1024);
+        assert!(
+            content[..1024].iter().all(|&b| b == 0x55),
+            "Original content should be preserved"
+        );
+        assert!(
+            content[1024..].iter().all(|&b| b == 0x00),
+            "Extended region should be zeros"
+        );
+        info!("✓ Extended region filled with zeros");
+
+        info!("=== Test 4: Overwrite with smaller content (O_TRUNC simulation) ===");
+
+        // First, write a large file
+        let large_data = vec![0xAAu8; 20 * 1024];
+        let mut writer = fs.create(&path, true).await?;
+        writer.write(&large_data).await?;
+        writer.complete().await?;
+
+        let status = fs.get_status(&path).await?;
+        assert_eq!(status.len, 20 * 1024, "File should be 20KB");
+        info!("Created 20KB file");
+
+        // Overwrite with smaller content (simulates O_TRUNC + write)
+        // First truncate to 0, then write smaller content
+        fs.resize(&path, FileAllocOpts::with_truncate(0)).await?;
+
+        let small_data = vec![0xBBu8; 5 * 1024];
+        let mut writer = fs.open_for_write(&path, true).await?;
+        writer.write(&small_data).await?;
+        writer.complete().await?;
+
+        let status = fs.get_status(&path).await?;
+        assert_eq!(
+            status.len,
+            5 * 1024,
+            "File should be 5KB after overwrite with smaller content"
+        );
+        info!("✓ Overwritten with smaller content, len={}", status.len);
+
+        // Verify content is exactly what we wrote
+        let content = read_file_content(&fs, &path, status.len as usize).await?;
+        assert_eq!(content.len(), 5 * 1024);
+        assert!(
+            content.iter().all(|&b| b == 0xBB),
+            "Content should be the new data only"
+        );
+        info!("✓ Content is exactly the new smaller data");
+
+        // Cleanup
+        fs.delete(&path, false).await?;
+        info!("=== truncate test completed ===");
+        Ok(())
     })
 }

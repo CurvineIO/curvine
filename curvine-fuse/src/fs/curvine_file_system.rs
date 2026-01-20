@@ -508,26 +508,32 @@ impl CurvineFileSystem {
         fh: u64,
         opts: FileAllocOpts,
     ) -> FuseResult<()> {
+        opts.validate()?;
+
+        // If we have an active file handle with a writer, use it for resize.
+        // This works for both regular files and UFS-backed files (cache mode).
+        if fh != 0 {
+            let handle = self.state.find_handle(ino, fh)?;
+            if let Some(writer) = &handle.writer {
+                writer.lock().await.resize(opts).await?;
+                self.invalidate_cache(path)?;
+                return Ok(());
+            } else {
+                return err_fuse!(libc::EACCES);
+            }
+        }
+
+        // For resize without active file handle, check if this is a UFS mount
         if let Some((ufs_path, _)) = self.fs.get_mount(path).await? {
             warn!(
-                "ufs {} -> {} does not support resize, will ignore",
+                "ufs {} -> {} does not support resize without active writer, will ignore",
                 path, ufs_path
             );
             return Ok(());
         }
 
-        opts.validate()?;
-        if fh != 0 {
-            let handle = self.state.find_handle(ino, fh)?;
-            if let Some(writer) = &handle.writer {
-                writer.lock().await.resize(opts).await?;
-            } else {
-                return err_fuse!(libc::EACCES);
-            }
-        } else {
-            self.fs.resize(path, opts).await?;
-        };
-
+        // Regular curvine file without active handle
+        self.fs.resize(path, opts).await?;
         self.invalidate_cache(path)?;
         Ok(())
     }
@@ -1097,6 +1103,19 @@ impl fs::FileSystem for CurvineFileSystem {
         // Check file access permissions before opening
         let action = OpenAction::try_from(op.arg.flags)?;
         self.check_access_permissions(handle.status(), op.header, action.acl_mask())?;
+
+        // Handle O_TRUNC flag: truncate file to zero length when opening for write
+        // This is critical for applications like PyTorch that overwrite files with smaller content
+        if FuseUtils::has_truncate(op.arg.flags) && handle.status().len > 0 {
+            debug!(
+                "open with O_TRUNC: path={}, truncating from {} to 0",
+                path,
+                handle.status().len
+            );
+            let resize_opts = FileAllocOpts::with_truncate(0);
+            self.fs_resize(&path, op.header.nodeid, handle.fh, resize_opts)
+                .await?;
+        }
 
         let mut open_flags = op.arg.flags;
         if self.conf.direct_io {
