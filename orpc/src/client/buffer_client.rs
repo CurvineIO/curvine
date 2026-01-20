@@ -15,7 +15,7 @@
 use crate::client::dispatch::{CallMap, Envelope};
 use crate::client::raw_client::RawClient;
 use crate::client::{ClientConf, ClientState};
-use crate::err_box;
+use crate::{err_box, err_msg};
 use crate::handler::{ReadFrame, WriteFrame};
 use crate::io::net::InetAddr;
 use crate::io::{IOError, IOResult};
@@ -194,7 +194,14 @@ impl BufferClient {
                 }
             };
 
-            let msg = read_res?;
+            let msg = match read_res {
+                Ok(v) => v,
+                Err(e) => {
+                    client_state.set_error(e);
+                    break;
+                }
+            };
+
             if msg.is_empty() {
                 break;
             }
@@ -223,7 +230,7 @@ impl BufferClient {
             }
         }
 
-        Ok(())
+        Self::check_calls(call_map, client_state)
     }
 
     fn check_calls(map: Arc<CallMap>, client_state: Arc<ClientState>) -> IOResult<()> {
@@ -231,9 +238,9 @@ impl BufferClient {
         let inflight = map.clear();
         let len = inflight.len();
 
+        let err_msg = err_msg!("connection {}: {:?}", client_state.conn_info(), client_state.take_error());
         for (id, cb) in inflight {
-            let error: IOResult<Message> =
-                err_box!("Connection {} closed", client_state.conn_info());
+            let error: IOResult<Message> = Err(err_msg.clone().into());
             if let Err(e) = cb.send(error) {
                 info!(
                     "Request({},{}) callback execute fail: {:?}",
