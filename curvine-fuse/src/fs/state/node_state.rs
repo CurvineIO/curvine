@@ -358,6 +358,23 @@ impl NodeState {
         }
     }
 
+    /// Get all file handles for a given ino
+    pub fn get_handles(&self, ino: u64) -> Vec<Arc<FileHandle>> {
+        let lock = self.handles.read();
+        if let Some(map) = lock.get(&ino) {
+            map.values().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get ino by parent and name, returns None if not found
+    pub fn get_ino_by_name<T: AsRef<str>>(&self, parent: u64, name: T) -> Option<u64> {
+        self.node_read()
+            .lookup_node(parent, Some(name))
+            .map(|n| n.id)
+    }
+
     pub fn should_delete_now<T: AsRef<str>>(
         &self,
         parent: u64,

@@ -454,7 +454,13 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 let _ = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
 
                 if self.cv.exists(src).await? {
-                    self.cv.delete(src, true).await?;
+                    if let Err(e) = self.cv.rename(src, dst).await {
+                        warn!(
+                            "rename cache failed, src: {}, dst: {}, err: {}",
+                            src, dst, e
+                        );
+                        self.cv.delete(src, true).await?;
+                    }
                 }
                 Ok(true)
             }

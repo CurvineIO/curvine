@@ -1297,6 +1297,23 @@ impl fs::FileSystem for CurvineFileSystem {
             self.state
                 .get_path2(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
 
+        // Flush all open handles for the source file before rename
+        // to prevent data loss from pending async writes
+        if let Some(ino) = self.state.get_ino_by_name(op.header.nodeid, old_name) {
+            let handles = self.state.get_handles(ino);
+            if !handles.is_empty() {
+                debug!(
+                    "rename {}: flushing {} open handle(s) before rename",
+                    old_path,
+                    handles.len()
+                );
+                for handle in handles {
+                    handle.flush(None).await?;
+                }
+                debug!("rename {}: flush completed", old_path);
+            }
+        }
+
         self.fs.rename(&old_path, &new_path).await?;
 
         self.state
