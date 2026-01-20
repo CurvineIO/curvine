@@ -27,7 +27,7 @@ use curvine_common::state::{
     MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{debug, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
@@ -942,6 +942,20 @@ impl FsDir {
         if file.len == opts.len {
             return Ok(DeleteResult::new());
         }
+
+        // Clear ufs_mtime when truncating a file that was cached from UFS.
+        // This ensures the file is treated as "cv_only" until the new sync job
+        // completes, preventing stale data reads from UFS during the sync window.
+        let is_truncating = opts.len < file.len;
+        if is_truncating && file.storage_policy.ufs_mtime != 0 {
+            debug!(
+                "clearing ufs_mtime for {} during truncate (was {})",
+                inp.path(),
+                file.storage_policy.ufs_mtime
+            );
+            file.storage_policy.ufs_mtime = 0;
+        }
+
         let del_blocks = file.resize(opts.clone())?;
         info!("resize file {} success, opts: {:?}", inp.path(), opts);
 
