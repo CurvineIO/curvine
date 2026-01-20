@@ -837,10 +837,24 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                 Ok(metadata) if metadata.is_dir() => self.operator.remove_all(&object_path).await,
                 _ => self.operator.delete(&object_path).await,
             }
+            .map_err(|e| FsError::common(format!("Failed to delete recursive: {}", e)))?;
         } else {
-            self.operator.delete(&object_path).await
+            // Try to delete as file first
+            self.operator
+                .delete(&object_path)
+                .await
+                .map_err(|e| FsError::common(format!("Failed to delete file: {}", e)))?;
+
+            // Also try to delete as directory marker (with suffix)
+            // S3 delete is idempotent, so it's safe to try deleting the marker even if it doesn't exist
+            // or if we just deleted a file.
+            let dir_path = self.get_dir_path(path)?;
+            if dir_path != object_path {
+                self.operator.delete(&dir_path).await.map_err(|e| {
+                    FsError::common(format!("Failed to delete directory marker: {}", e))
+                })?;
+            }
         }
-        .map_err(|e| FsError::common(format!("Failed to delete: {}", e)))?;
 
         Ok(())
     }
