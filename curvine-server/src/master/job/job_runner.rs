@@ -22,10 +22,11 @@ use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
     FileStatus, JobTaskState, LoadJobCommand, LoadJobResult, LoadTaskInfo, MountInfo, WorkerAddress,
 };
+use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use futures::future;
 use log::{error, info, warn};
-use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime, Utils};
+use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use orpc::err_box;
 use std::collections::LinkedList;
 use std::sync::Arc;
@@ -50,10 +51,6 @@ impl LoadJobRunner {
             factory,
             job_max_files,
         }
-    }
-
-    fn create_job_id(source: impl AsRef<str>) -> String {
-        format!("job_{}", Utils::md5(source))
     }
 
     pub fn choose_worker(&self, block_size: i64) -> FsResult<WorkerAddress> {
@@ -118,7 +115,7 @@ impl LoadJobRunner {
             mnt.get_cv_path(&source_path)?
         };
 
-        let job_id = Self::create_job_id(source_path.full_path());
+        let job_id = CommonUtils::create_job_id(source_path.full_path());
         let result = LoadJobResult {
             job_id: job_id.clone(),
             target_path: target_path.clone_uri(),

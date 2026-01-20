@@ -26,9 +26,9 @@ use curvine_common::state::{
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::LocalTime;
-use orpc::err_box;
 use orpc::runtime::{LoopTask, RpcRuntime, Runtime};
 use orpc::sync::channel::BlockingChannel;
+use orpc::{err_box, err_ext};
 use std::sync::Arc;
 
 /// Load the Task Manager
@@ -95,7 +95,7 @@ impl JobManager {
                 progress: job.progress.clone(),
             })
         } else {
-            err_box!("Not fond job {}", job_id)
+            err_ext!(FsError::job_not_found(job_id))
         }
     }
 

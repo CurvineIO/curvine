@@ -57,6 +57,7 @@ pub enum ErrorKind {
     Ufs = 20,
     Expired = 21,
     UnsupportedUfsRead = 22,
+    JobNotFound = 23,
 
     #[num_enum(default)]
     Common = 10000,
@@ -150,6 +151,10 @@ pub enum FsError {
     #[error("{0}")]
     UnsupportedUfsRead(ErrorImpl<StringError>),
 
+    // Job not found
+    #[error("{0}")]
+    JobNotFound(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -191,6 +196,11 @@ impl FsError {
     pub fn unsupported_ufs_read(path: impl AsRef<str>) -> Self {
         let msg = format!("File {} unsupported ufs read", path.as_ref());
         Self::UnsupportedUfsRead(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn job_not_found(job_id: impl AsRef<str>) -> Self {
+        let msg = format!("Job {} not found", job_id.as_ref());
+        Self::JobNotFound(ErrorImpl::with_source(msg.into()))
     }
 
     pub fn file_exists(path: impl AsRef<str>) -> Self {
@@ -259,6 +269,7 @@ impl FsError {
             FsError::Ufs(_) => ErrorKind::Ufs,
             FsError::Expired(_) => ErrorKind::Expired,
             FsError::UnsupportedUfsRead(_) => ErrorKind::UnsupportedUfsRead,
+            FsError::JobNotFound(_) => ErrorKind::JobNotFound,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -372,6 +383,7 @@ impl ErrorExt for FsError {
             FsError::Ufs(e) => FsError::Ufs(e.ctx(ctx)),
             FsError::Expired(e) => FsError::Expired(e.ctx(ctx)),
             FsError::UnsupportedUfsRead(e) => FsError::UnsupportedUfsRead(e.ctx(ctx)),
+            FsError::JobNotFound(e) => FsError::JobNotFound(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -400,6 +412,7 @@ impl ErrorExt for FsError {
             FsError::Ufs(e) => e.encode(ErrorKind::Ufs),
             FsError::Expired(e) => e.encode(ErrorKind::Expired),
             FsError::UnsupportedUfsRead(e) => e.encode(ErrorKind::UnsupportedUfsRead),
+            FsError::JobNotFound(e) => e.encode(ErrorKind::JobNotFound),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -431,6 +444,7 @@ impl ErrorExt for FsError {
             ErrorKind::Ufs => FsError::Ufs(de.into_string()),
             ErrorKind::Expired => FsError::Expired(de.into_string()),
             ErrorKind::UnsupportedUfsRead => FsError::UnsupportedUfsRead(de.into_string()),
+            ErrorKind::JobNotFound => FsError::JobNotFound(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }

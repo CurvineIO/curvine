@@ -12,17 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
-
 use bytes::BytesMut;
 use log::info;
-use tokio::time;
 use tracing::warn;
 
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileStatus, JobTaskState, LoadJobResult, OpenFlags, WriteType};
+use curvine_common::state::{FileStatus, LoadJobResult, OpenFlags, WriteType};
 use curvine_common::FsResult;
-use orpc::common::TimeSpent;
 use orpc::err_box;
 use orpc::sys::DataSlice;
 
@@ -35,10 +31,6 @@ pub struct CacheSyncWriter {
     inner: FsWriter,
     write_type: WriteType,
     job_res: LoadJobResult,
-    check_interval_min: Duration,
-    check_interval_max: Duration,
-    log_ticks: u32,
-    max_wait: Duration,
     has_rand_write: bool,
 }
 
@@ -73,51 +65,15 @@ impl CacheSyncWriter {
             inner,
             write_type,
             job_res,
-            check_interval_min: conf.sync_check_interval_min,
-            check_interval_max: conf.sync_check_interval_max,
-            log_ticks: conf.sync_check_log_tick,
-            max_wait: conf.max_sync_wait_timeout,
             has_rand_write: false,
         };
         Ok(writer)
     }
 
     pub async fn wait_job_complete(&self) -> FsResult<()> {
-        let mut ticks = 0;
-        let time = TimeSpent::new();
-        loop {
-            let status = self.job_client.get_job_status(&self.job_res.job_id).await?;
-            match status.state {
-                JobTaskState::Completed => break,
-
-                JobTaskState::Failed | JobTaskState::Canceled => {
-                    return err_box!(
-                        "job {} {:?}: {}",
-                        status.job_id,
-                        status.state,
-                        status.progress.message
-                    )
-                }
-
-                _ => {
-                    ticks += 1;
-
-                    let sleep_time = self.check_interval_max.min(self.check_interval_min * ticks);
-                    time::sleep(sleep_time).await;
-
-                    if ticks % self.log_ticks == 0 {
-                        info!(
-                            "waiting for job {} to complete, elapsed: {} ms, progress: {}",
-                            status.job_id,
-                            time.used_ms(),
-                            status.progress_string(false)
-                        );
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        self.job_client
+            .wait_job_complete(&self.job_res.job_id, "cache-sync")
+            .await
     }
 }
 
@@ -170,7 +126,7 @@ impl Writer for CacheSyncWriter {
         }
 
         if matches!(self.write_type, WriteType::CacheThrough) {
-            time::timeout(self.max_wait, self.wait_job_complete()).await??;
+            self.wait_job_complete().await?;
         }
 
         Ok(())

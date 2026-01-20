@@ -147,13 +147,19 @@ impl FsDir {
     // Delete files or directories
     pub fn delete(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
         let op_ms = LocalTime::mills();
-        if !inp.is_full() {
-            return err_box!("Path not exists: {}", inp.path());
+
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be deleted");
+        }
+
+        if inp.is_empty() || inp.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(inp.path()));
         }
 
         if !inp.is_empty_dir() && !recursive {
-            return err_box!("{} is non empty", inp.path());
+            return err_ext!(FsError::dir_not_empty(inp.path()));
         }
+
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
         self.journal_writer
             .log_delete(op_ms, inp.path(), op_ms as i64)?;
@@ -238,7 +244,7 @@ impl FsDir {
         flags: RenameFlags,
     ) -> FsResult<Option<DeleteResult>> {
         let src_inode = match src_inp.get_last_inode() {
-            None => return err_box!("File not exists: {}", src_inp.path()),
+            None => return err_ext!(FsError::file_not_found(src_inp.path())),
             Some(v) => v,
         };
         if flags.exchange_mode() {
