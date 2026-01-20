@@ -1032,7 +1032,7 @@ impl fs::FileSystem for CurvineFileSystem {
             )
         }
 
-        let status = match self.fs.fuse_mkdir(&path, opts.build()).await {
+        let status = match self.fs.mkdir_with_opts(&path, opts.build()).await {
             Ok(status) => match status {
                 Some(v) => v,
                 None => self.fs.get_status(&path).await?,

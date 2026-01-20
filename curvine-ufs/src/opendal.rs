@@ -703,11 +703,11 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     }
 
     /// OpenDal only supports overwrite, so the overwrite parameter is ignored here.
-    async fn create(&self, path: &Path, _overwrite: bool) -> FsResult<OpendalWriter> {
+    async fn create(&self, path: &Path, overwrite: bool) -> FsResult<OpendalWriter> {
         let object_path = self.get_object_path(path)?;
 
         let exist = self.get_object_status(&object_path).await?.is_some();
-        if !exist {
+        if !exist || overwrite {
             // If no data is written to OpenDal, no file will be created.
             // This does not conform to POSIX semantics, so an empty file is created.
             self.operator

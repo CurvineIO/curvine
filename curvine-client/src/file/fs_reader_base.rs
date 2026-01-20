@@ -123,6 +123,10 @@ impl FsReaderBase {
     pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos == self.pos {
             return Ok(());
+        } else if pos == self.len {
+            self.pos = pos;
+            self.update_reader(None, false).await?;
+            return Ok(());
         } else if pos > self.len {
             return err_box!("seek position {} can not exceed file len {}", pos, self.len);
         }

@@ -20,5 +20,7 @@ pub use self::serde_utils::SerdeUtils;
 
 pub mod display;
 mod rpc_utils;
-
 pub use self::rpc_utils::RpcUtils;
+
+mod common_utils;
+pub use self::common_utils::CommonUtils;

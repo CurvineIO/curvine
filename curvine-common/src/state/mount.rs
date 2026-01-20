@@ -155,6 +155,20 @@ impl MountInfo {
             .ttl_action(self.ttl_action)
             .build()
     }
+
+    pub fn is_write_through(&self) -> bool {
+        matches!(
+            self.write_type,
+            WriteType::CacheThrough | WriteType::AsyncThrough
+        )
+    }
+
+    /// Check if this write type stores data in UFS
+    /// Cache mode only stores data in Curvine, not in UFS
+    /// Other modes (Through/AsyncThrough/CacheThrough) store data in UFS
+    pub fn has_ufs_data(&self) -> bool {
+        !matches!(self.write_type, WriteType::Cache)
+    }
 }
 
 #[derive(Debug, Clone)]

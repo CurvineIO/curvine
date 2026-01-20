@@ -127,18 +127,6 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
-        if !inp.is_empty_dir() && !recursive {
-            return err_ext!(FsError::dir_not_empty(inp.path()));
-        }
-
-        if inp.is_root() {
-            return err_box!("The root is not allowed to be deleted");
-        }
-
-        if inp.is_empty() || inp.get_last_inode().is_none() {
-            return err_box!("Failed to remove {} because it does not exist", inp.path());
-        }
-
         let delete_result = fs_dir.delete(&inp, recursive)?;
 
         let mut worker_manager = self.worker_manager.write();
