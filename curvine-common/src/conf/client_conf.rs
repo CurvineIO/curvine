@@ -64,16 +64,6 @@ pub struct ClientConf {
     #[serde(alias = "read_slice_size")]
     pub read_slice_size_str: String,
 
-    // In random read scenarios, the seek operation may frequently switch blocks, and the connection will be closed by default.
-    // This will have huge overhead.
-    // If seek is detected that causes block switching to exceed this value, all block readers will be cached.
-    pub close_reader_limit: u32,
-
-    // In random write scenarios, the seek operation may frequently switch blocks, and the connection will be closed by default.
-    // This will have huge overhead.
-    // If seek is detected that causes block switching to exceed this value, all block writers will be cached.
-    pub close_writer_limit: u32,
-
     // Maximum number of open block handles (readers and writers).
     // When the limit is reached, FIFO eviction will close the oldest (first opened) handle.
     // This limits memory usage and connection count in random read/write scenarios.
@@ -344,8 +334,6 @@ impl Default for ClientConf {
             read_parallel: 1,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
-            close_reader_limit: 7,
-            close_writer_limit: 7,
             max_cache_block_handles: 10,
 
             short_circuit: true,

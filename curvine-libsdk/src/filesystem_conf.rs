@@ -40,8 +40,8 @@ pub struct FilesystemConf {
     pub read_chunk_num: usize,
     pub read_parallel: i64,
     pub read_slice_size: String,
-    pub close_reader_limit: u32,
-    pub close_writer_limit: u32,
+
+    pub max_cache_block_handles: usize,
 
     pub storage_type: String,
     pub ttl_ms: String,
@@ -95,6 +95,22 @@ pub struct FilesystemConf {
     pub enable_rust_read_ufs: bool,
 
     pub mount_update_ttl: String,
+
+    pub sync_check_interval_min: String,
+    pub sync_check_interval_max: String,
+    pub max_sync_wait_timeout: String,
+    pub sync_check_log_tick: u32,
+
+    pub enable_block_conn_pool: bool,
+    pub block_conn_idle_size: usize,
+    pub block_conn_idle_time: String,
+
+    pub small_file_size: String,
+
+    pub enable_smart_prefetch: bool,
+    pub large_file_size: String,
+    pub max_read_parallel: i64,
+    pub sequential_read_threshold: u64,
 }
 
 impl FilesystemConf {
@@ -140,8 +156,8 @@ impl FilesystemConf {
             read_parallel: self.read_parallel,
             read_slice_size: 0,
             read_slice_size_str: self.read_slice_size,
-            close_reader_limit: self.close_reader_limit,
-            close_writer_limit: self.close_writer_limit,
+
+            max_cache_block_handles: self.max_cache_block_handles,
 
             conn_retry_max_duration_ms: self.conn_retry_max_duration_ms,
             conn_retry_min_sleep_ms: self.conn_retry_min_sleep_ms,
@@ -177,6 +193,22 @@ impl FilesystemConf {
             enable_unified_fs: self.enable_unified_fs,
             enable_rust_read_ufs: self.enable_rust_read_ufs,
             mount_update_ttl_str: self.mount_update_ttl,
+
+            sync_check_interval_min_str: self.sync_check_interval_min,
+            sync_check_interval_max_str: self.sync_check_interval_max,
+            max_sync_wait_timeout_str: self.max_sync_wait_timeout,
+            sync_check_log_tick: self.sync_check_log_tick,
+
+            enable_block_conn_pool: self.enable_block_conn_pool,
+            block_conn_idle_size: self.block_conn_idle_size,
+            block_conn_idle_time_str: self.block_conn_idle_time,
+
+            small_file_size_str: self.small_file_size,
+
+            enable_smart_prefetch: self.enable_smart_prefetch,
+            large_file_size_str: self.large_file_size,
+            max_read_parallel: self.max_read_parallel,
+            sequential_read_threshold: self.sequential_read_threshold,
 
             ..Default::default()
         };
