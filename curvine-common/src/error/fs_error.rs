@@ -57,6 +57,7 @@ pub enum ErrorKind {
     Ufs = 20,
     Expired = 21,
     UnsupportedUfsRead = 22,
+    VersionIncompatible = 23,
 
     #[num_enum(default)]
     Common = 10000,
@@ -150,6 +151,10 @@ pub enum FsError {
     #[error("{0}")]
     UnsupportedUfsRead(ErrorImpl<StringError>),
 
+    // Version incompatibility error
+    #[error("{0}")]
+    VersionIncompatible(ErrorImpl<StringError>),
+
     // Other errors that are not defined.
     #[error("{0}")]
     Common(ErrorImpl<StringError>),
@@ -222,6 +227,11 @@ impl FsError {
         Self::Unsupported(ErrorImpl::with_source(msg.into()))
     }
 
+    pub fn version_incompatible(reason: impl std::fmt::Display) -> Self {
+        let msg = format!("Version incompatible: {}", reason);
+        Self::VersionIncompatible(ErrorImpl::with_source(msg.into()))
+    }
+
     // Determine whether the current error allows retry.
     // NotLeaderMaster error indicates that a master switch has occurred and you need to retry access to the next master
     pub fn retry_master(&self) -> bool {
@@ -259,6 +269,7 @@ impl FsError {
             FsError::Ufs(_) => ErrorKind::Ufs,
             FsError::Expired(_) => ErrorKind::Expired,
             FsError::UnsupportedUfsRead(_) => ErrorKind::UnsupportedUfsRead,
+            FsError::VersionIncompatible(_) => ErrorKind::VersionIncompatible,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -372,6 +383,7 @@ impl ErrorExt for FsError {
             FsError::Ufs(e) => FsError::Ufs(e.ctx(ctx)),
             FsError::Expired(e) => FsError::Expired(e.ctx(ctx)),
             FsError::UnsupportedUfsRead(e) => FsError::UnsupportedUfsRead(e.ctx(ctx)),
+            FsError::VersionIncompatible(e) => FsError::VersionIncompatible(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -400,6 +412,7 @@ impl ErrorExt for FsError {
             FsError::Ufs(e) => e.encode(ErrorKind::Ufs),
             FsError::Expired(e) => e.encode(ErrorKind::Expired),
             FsError::UnsupportedUfsRead(e) => e.encode(ErrorKind::UnsupportedUfsRead),
+            FsError::VersionIncompatible(e) => e.encode(ErrorKind::VersionIncompatible),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -431,6 +444,7 @@ impl ErrorExt for FsError {
             ErrorKind::Ufs => FsError::Ufs(de.into_string()),
             ErrorKind::Expired => FsError::Expired(de.into_string()),
             ErrorKind::UnsupportedUfsRead => FsError::UnsupportedUfsRead(de.into_string()),
+            ErrorKind::VersionIncompatible => FsError::VersionIncompatible(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }

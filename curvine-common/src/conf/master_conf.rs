@@ -89,6 +89,8 @@ pub struct MasterConf {
     pub block_replication_concurrency_limit: usize,
 
     pub log: LogConf,
+    pub min_worker_version: String,
+    pub min_client_version: String,
 
     pub ttl_checker_retry_attempts: u32,
 
@@ -265,6 +267,8 @@ impl Default for MasterConf {
             block_replication_enabled: false,
             block_replication_concurrency_limit: 1000,
             log: Default::default(),
+            min_worker_version: "0.1.0".to_string(),
+            min_client_version: "0.1.0".to_string(),
 
             ttl_checker_retry_attempts: 3,
 

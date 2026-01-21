@@ -20,6 +20,7 @@ use curvine_common::state::{
     BlockLocation, ExtendedBlock, HeartbeatStatus, LocatedBlock, StorageInfo, WorkerAddress,
     WorkerCommand, WorkerInfo, WorkerStatus,
 };
+use curvine_common::version::Version;
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::ByteUnit;
@@ -54,6 +55,7 @@ impl WorkerManager {
         status: HeartbeatStatus,
         addr: WorkerAddress,
         storages: Vec<StorageInfo>,
+        version: Version,
     ) -> FsResult<Vec<WorkerCommand>> {
         // The cluster id must match to prevent misregistration.
         if cluster_id != self.cluster_id {
@@ -63,6 +65,9 @@ impl WorkerManager {
                 cluster_id
             );
         }
+
+        // Version check is performed in MasterHandler layer
+        info!("Worker {} registered with version {}", addr, version);
 
         let cmds = match status {
             HeartbeatStatus::Start => {
@@ -79,7 +84,7 @@ impl WorkerManager {
             }
         };
 
-        self.worker_map.insert(addr, storages)?;
+        self.worker_map.insert(addr, storages, version)?;
         Ok(cmds)
     }
 
