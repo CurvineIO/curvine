@@ -17,7 +17,7 @@ use log::info;
 use tracing::warn;
 
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileStatus, LoadJobResult, OpenFlags, WriteType};
+use curvine_common::state::{FileAllocOpts, FileStatus, LoadJobResult, OpenFlags, WriteType};
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::sys::DataSlice;
@@ -150,5 +150,19 @@ impl Writer for CacheSyncWriter {
         }
 
         self.inner.seek(pos).await
+    }
+
+    async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        // Cancel and resubmit the sync job since file size is changing
+        if !self.has_rand_write {
+            self.has_rand_write = true;
+            if let Err(e) = self.job_client.cancel_job(&self.job_res.job_id).await {
+                warn!("cancel job {} failed: {}", self.job_res.job_id, e);
+            } else {
+                info!("cancel(resize) job {} successfully", self.job_res.job_id);
+            }
+        }
+
+        self.inner.resize(opts).await
     }
 }

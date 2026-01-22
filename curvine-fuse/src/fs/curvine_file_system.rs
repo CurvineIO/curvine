@@ -508,14 +508,6 @@ impl CurvineFileSystem {
         fh: u64,
         opts: FileAllocOpts,
     ) -> FuseResult<()> {
-        if let Some((ufs_path, _)) = self.fs.get_mount(path).await? {
-            warn!(
-                "ufs {} -> {} does not support resize, will ignore",
-                path, ufs_path
-            );
-            return Ok(());
-        }
-
         opts.validate()?;
         if fh != 0 {
             let handle = self.state.find_handle(ino, fh)?;

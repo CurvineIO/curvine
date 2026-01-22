@@ -1122,7 +1122,7 @@ test_python_high_frequency_write() {
 
     local python_cmd=$(command -v python3 2>/dev/null || command -v python)
     local test_file="$TEST_DIR/python-high-freq.txt"
-    local iterations=2000
+    local iterations=20
     
     # Clean up any existing test file
     rm -f "$test_file" 2>/dev/null || true

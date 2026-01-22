@@ -175,6 +175,15 @@ impl MasterFilesystem {
         self.create_with_opts(path, ctx, OpenFlags::new_create().set_overwrite(true))
     }
 
+    fn truncate(&self, fs_dir: &mut FsDir, inp: &InodePath, opts: CreateFileOpts) -> FsResult<()> {
+        let clean_result = fs_dir.overwrite_file(inp, opts)?;
+        if !clean_result.blocks.is_empty() {
+            let mut worker_manager = self.worker_manager.write();
+            worker_manager.remove_blocks(&clean_result);
+        }
+        Ok(())
+    }
+
     pub fn create_with_opts<T: AsRef<str>>(
         &self,
         path: T,
@@ -182,7 +191,7 @@ impl MasterFilesystem {
         flags: OpenFlags,
     ) -> FsResult<FileStatus> {
         if !flags.create() {
-            return err_box!("Flag error {}, cannot create file", flags.value());
+            return err_box!("create_with_opts requires O_CREAT flag");
         }
         let path = path.as_ref();
 
@@ -215,22 +224,22 @@ impl MasterFilesystem {
             if inode.is_dir() {
                 return err_box!("{}  already exists as a dir", inp.path());
             }
+
+            if flags.exclusive() {
+                return err_ext!(FsError::file_exists(inp.path()));
+            }
         }
 
         if !opts.create_parent {
             Self::check_parent(&inp)?;
         }
 
-        // If the file already exists and overwrite is enabled, overwrite the file
-        let inp = if last_inode.is_some() && flags.overwrite() {
-            let clean_result = fs_dir.overwrite_file(&inp, opts)?;
-            if !clean_result.blocks.is_empty() {
-                let mut worker_manager = self.worker_manager.write();
-                worker_manager.remove_blocks(&clean_result);
+        let inp = if last_inode.is_some() {
+            if flags.overwrite() {
+                self.truncate(&mut fs_dir, &inp, opts)?;
             }
             inp
         } else {
-            // If the file does not exist, create a new file
             fs_dir.create_file(inp, opts)?
         };
 
@@ -248,31 +257,40 @@ impl MasterFilesystem {
         let path = path.as_ref();
 
         if flags.read_only() {
+            if flags.truncate() {
+                return err_box!("cannot combine O_RDONLY with O_TRUNC");
+            }
+            if flags.create() {
+                return err_box!("cannot combine O_RDONLY with O_CREAT");
+            }
             return self.get_block_locations(path);
+        }
+
+        if flags.create() {
+            let status = self.create_with_opts(path, opts, flags)?;
+            return Ok(FileBlocks::new(status, vec![]));
         }
 
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
-            None => {
-                return if flags.create() || flags.append() {
-                    drop(fs_dir);
-                    let status = self.create_with_opts(path, opts, flags)?;
-                    Ok(FileBlocks::new(status, vec![]))
-                } else {
-                    err_ext!(FsError::file_not_found(inp.path()))
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+            Some(inode) => {
+                if inode.is_dir() {
+                    return err_box!("{} is a directory", inp.path());
                 }
+                inode
             }
-            Some(inode) => inode,
         };
 
-        let status = if flags.write() {
-            fs_dir.reopen_file(&inp, opts.client_name)?
-        } else {
-            fs_dir.file_status(&inp)?
-        };
+        if flags.truncate() {
+            self.truncate(&mut fs_dir, &inp, opts)?;
+            let status = fs_dir.file_status(&inp)?;
+            return Ok(FileBlocks::new(status, vec![]));
+        }
 
+        let status = fs_dir.reopen_file(&inp, opts.client_name)?;
         let file = inode.as_file_ref()?;
         let blocks = if !file.blocks.is_empty() {
             self.get_block_locs(path, &fs_dir, file)?
