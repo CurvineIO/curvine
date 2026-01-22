@@ -856,9 +856,19 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut fuse_attr = Self::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
 
+        let keep_cache = self.state.should_keep_cache(op.header.nodeid, &status)?;
+        let (attr_valid, attr_valid_nsec) = if keep_cache {
+            (
+                self.conf.attr_ttl.as_secs(),
+                self.conf.attr_ttl.subsec_nanos(),
+            )
+        } else {
+            (0, 0)
+        };
+
         let attr = fuse_attr_out {
-            attr_valid: self.conf.attr_ttl.as_secs(),
-            attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
+            attr_valid,
+            attr_valid_nsec,
             dummy: 0,
             attr: fuse_attr,
         };
