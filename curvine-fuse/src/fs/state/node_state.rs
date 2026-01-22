@@ -216,7 +216,7 @@ impl NodeState {
         }
 
         let writer = self.fs.open_with_opts(path, opts, flags).await?;
-        let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer, ino);
+        let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
         Ok(Arc::new(Mutex::new(writer)))
     }
 
