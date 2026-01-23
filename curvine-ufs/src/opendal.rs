@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use crate::OpendalConf;
+#[cfg(feature = "opendal-oss")]
+use crate::OssHdfsConf;
 use crate::{err_ufs, FOLDER_SUFFIX};
 use bytes::BytesMut;
 use curvine_common::error::FsError;
@@ -314,13 +316,13 @@ impl OpendalFileSystem {
                 let mut builder = Oss::default();
                 builder = builder.bucket(&bucket_or_container);
 
-                if let Some(endpoint) = conf.get("oss.endpoint_url") {
+                if let Some(endpoint) = conf.get(OssHdfsConf::USER_ENDPOINT) {
                     builder = builder.endpoint(endpoint);
                 }
-                if let Some(access_key) = conf.get("oss.credentials.access") {
+                if let Some(access_key) = conf.get(OssHdfsConf::USER_ACCESS_KEY_ID) {
                     builder = builder.access_key_id(access_key);
                 }
-                if let Some(secret_key) = conf.get("oss.credentials.secret") {
+                if let Some(secret_key) = conf.get(OssHdfsConf::USER_ACCESS_KEY_SECRET) {
                     builder = builder.access_key_secret(secret_key);
                 }
 
