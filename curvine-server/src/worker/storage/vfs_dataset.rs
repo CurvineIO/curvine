@@ -133,6 +133,14 @@ impl VfsDataset {
         }
         vec
     }
+    pub fn create_container_block(
+        &mut self,
+        container_path: &str,
+        total_size: i64,
+    ) -> CommonResult<BlockMeta> {
+        let dir = self.dir_list.choose_dir_for_container(total_size)?;
+        dir.create_container_block(container_path, total_size)
+    }
 }
 
 impl Dataset for VfsDataset {
@@ -203,6 +211,7 @@ impl Dataset for VfsDataset {
     }
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
+        println!("DEBUG at VfsDataset: start finalize_block");
         let meta = self.get_block_check(block.id)?;
         if meta.state() != &BlockState::Writing {
             return err_box!(

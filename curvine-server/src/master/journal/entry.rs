@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::{InodeDir, InodeFile};
+use crate::master::meta::inode::SmallFileMeta;
+use crate::master::meta::inode::{InodeContainer, InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct MkdirEntry {
@@ -29,6 +31,20 @@ pub struct CreateFileEntry {
     pub(crate) op_ms: u64,
     pub(crate) path: String,
     pub(crate) file: InodeFile,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CreateContainerEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) path: String,
+    pub(crate) container: InodeContainer,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct AddFilesToContainerEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) container_path: String,
+    pub(crate) files: HashMap<String, SmallFileMeta>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -129,6 +145,8 @@ pub struct SetLocksEntry {
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
+    CreateContainer(CreateContainerEntry),
+    AddFilesToContainer(AddFilesToContainerEntry),
     ReopenFile(ReopenFileEntry),
     OverWriteFile(OverWriteFileEntry),
     AddBlock(AddBlockEntry),

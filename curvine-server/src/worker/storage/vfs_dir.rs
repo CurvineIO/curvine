@@ -14,9 +14,12 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{DirState, StorageVersion, ACTIVE_DIR, STAGING_DIR};
+use byteorder::{BigEndian, WriteBytesExt};
 use curvine_common::conf::WorkerDataDir;
+use curvine_common::state::FileType;
 use curvine_common::state::{ExtendedBlock, StorageType};
 use log::*;
+use orpc::common::Utils;
 use orpc::common::{ByteUnit, FileUtils};
 use orpc::io::LocalFile;
 use orpc::sync::AtomicLong;
@@ -28,6 +31,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+// Magic bytes to identify container files
+const CONTAINER_MAGIC_BYTES: &[u8] = b"CVNC";
 
 pub struct VfsDir {
     pub(crate) version: StorageVersion,
@@ -269,6 +275,32 @@ impl VfsDir {
 
     pub fn set_failed(&self) {
         self.check_failed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn create_container_block(
+        &self,
+        container_path: &str,
+        total_size: i64,
+    ) -> CommonResult<BlockMeta> {
+        // Create a special block marked as container
+        let container_block = ExtendedBlock {
+            id: Utils::unique_id() as i64,
+            len: total_size,
+            storage_type: StorageType::default(),
+            file_type: FileType::Container, // New file type
+            ..Default::default()
+        };
+
+        let meta = BlockMeta::with_tmp(&container_block, self);
+        let file = meta.get_block_path()?;
+
+        // Initialize container file with header
+        let mut local_file = LocalFile::with_write(file.to_string_lossy().as_ref(), false)?;
+        local_file.write_all(&CONTAINER_MAGIC_BYTES)?;
+        local_file.write_i64::<BigEndian>(total_size)?;
+        local_file.write_i32::<BigEndian>(0)?;
+
+        Ok(meta)
     }
 }
 

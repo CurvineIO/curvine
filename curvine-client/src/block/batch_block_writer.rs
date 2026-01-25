@@ -65,6 +65,7 @@ impl BatchWriterAdapter {
         let conf = &fs_context.conf.client;
         let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
 
+        println!("Debug at BatchWriterAdapter: {:?}", located_blocks);
         let blocks: Vec<ExtendedBlock> = located_blocks.iter().map(|lb| lb.block.clone()).collect();
         let adapter = if short_circuit {
             let writer =

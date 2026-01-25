@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::glob_utils::parse_glob_pattern;
-use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
+use crate::master::meta::inode::InodeView::{self, Container, Dir, File, FileEntry};
 use crate::master::meta::inode::{
     InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_ID,
 };
@@ -37,6 +37,7 @@ impl InodePath {
         store: &InodeStore,
     ) -> CommonResult<Self> {
         let components = InodeView::path_components(path.as_ref())?;
+        println!("DEBUG at InodePath,at resolve, components: {:?}", components);
         let name = try_option!(components.last());
 
         if name.is_empty() {
@@ -69,10 +70,13 @@ impl InodePath {
 
             index += 1;
             let child_name: &str = components[index].as_str();
+            println!("DEBUG at InodePath,at resolve, child_name: {:?}", child_name);
             match cur_inode.as_mut() {
                 Dir(_, d) => {
+                    println!("DEBUG at InodePath,at resolve, child name is directory: {:?}", d);
                     if let Some(child) = d.get_child_ptr(child_name) {
                         cur_inode = child;
+                        println!("DEBUG at InodePath,at resolve, child of child name {:?} is directory: {:?}", child_name, cur_inode);
                     } else {
                         // The directory has not been created, so there is no need to search again.
                         break;
@@ -80,7 +84,14 @@ impl InodePath {
                 }
 
                 File(_, _) | FileEntry(_, _) => {
+                    println!("DEBUG at InodePath,at resolve, child name is file entry");
                     // File or FileEntry nodes cannot have children, stop path resolution
+                    break;
+                }
+
+                Container(_, _) => {
+                    println!("DEBUG at InodePath,at resolve, child name is container");
+                    // Container nodes cannot have children, stop path resolution
                     break;
                 }
             }
@@ -122,6 +133,7 @@ impl InodePath {
                 };
                 path_inodes_rebuild.push(resolved_leaf_node);
             }
+            Container(_, _) => {} // will update later
         }
 
         // Parents

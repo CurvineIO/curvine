@@ -1,6 +1,7 @@
 use crate::file::FsContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
+use curvine_common::proto::ContainerMetadata;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
@@ -18,6 +19,7 @@ pub struct BatchBlockWriterLocal {
     files: Vec<RawPtr<LocalFile>>,
     block_size: i64,
     pos: i64,
+    container_meta: Option<ContainerMetadata>,
 }
 
 impl BatchBlockWriterLocal {
@@ -44,6 +46,8 @@ impl BatchBlockWriterLocal {
             )
             .await?;
 
+        let container_meta = write_context.container_meta.clone();
+
         // Create multiple files, one for each block context
         let mut files = Vec::new();
         for context in &write_context.contexts {
@@ -60,6 +64,7 @@ impl BatchBlockWriterLocal {
             files,
             block_size,
             pos: 0,
+            container_meta,
         })
     }
 
@@ -76,6 +81,7 @@ impl BatchBlockWriterLocal {
                 Utils::req_id(),
                 0,
                 false,
+                self.container_meta.clone(),
             )
             .await
     }

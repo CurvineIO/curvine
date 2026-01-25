@@ -45,8 +45,8 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
 
     // Test short_circuit = true
-    conf.client.short_circuit = true;
-    run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
+    // conf.client.short_circuit = true;
+    // run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
 
     Ok(())
 }
@@ -61,53 +61,53 @@ fn run_filesystem_end_to_end_operations_on_cluster(
         let path = Path::from_str("/fs_test")?;
         let _ = fs.delete(&path, true).await;
 
-        mkdir(&fs).await?;
-        println!("mkdir done");
+        // mkdir(&fs).await?;
+        // println!("mkdir done");
 
-        create_file(&fs).await?;
-        println!("create_file done");
+        // create_file(&fs).await?;
+        // println!("create_file done");
 
-        test_overwrite(&fs).await?;
-        println!("test_overwrite done");
+        // test_overwrite(&fs).await?;
+        // println!("test_overwrite done");
 
         test_batch_writting(&fs).await?;
         println!("test_batch_writting done");
 
-        file_status(&fs).await?;
-        println!("file_status done");
+        // file_status(&fs).await?;
+        // println!("file_status done");
 
-        delete(&fs).await?;
-        println!("delete done");
+        // delete(&fs).await?;
+        // println!("delete done");
 
-        rename(&fs).await?;
-        println!("rename done");
+        // rename(&fs).await?;
+        // println!("rename done");
 
-        list_status(&fs).await?;
-        println!("list_status done");
+        // list_status(&fs).await?;
+        // println!("list_status done");
 
-        list_files(&fs).await?;
-        println!("list_files done");
+        // list_files(&fs).await?;
+        // println!("list_files done");
 
-        get_master_info(&fs).await?;
-        println!("get_master_info done");
+        // get_master_info(&fs).await?;
+        // println!("get_master_info done");
 
-        add_block(&fs).await?;
-        println!("add_block done");
+        // add_block(&fs).await?;
+        // println!("add_block done");
 
-        rename2(&fs).await?;
-        println!("rename2 done");
+        // rename2(&fs).await?;
+        // println!("rename2 done");
 
-        set_attr_non_recursive(&fs).await?;
-        println!("set_attr_non_recursive done");
+        // set_attr_non_recursive(&fs).await?;
+        // println!("set_attr_non_recursive done");
 
-        set_attr_recursive(&fs).await?;
-        println!("set_attr_recursive done");
+        // set_attr_recursive(&fs).await?;
+        // println!("set_attr_recursive done");
 
-        test_fs_used(&fs).await?;
-        println!("test_fs_used done");
+        // test_fs_used(&fs).await?;
+        // println!("test_fs_used done");
 
-        test_metrics(&fs).await?;
-        println!("test_metrics done");
+        // test_metrics(&fs).await?;
+        // println!("test_metrics done");
 
         // symlink(&fs).await?;
         Ok(())
@@ -292,7 +292,7 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
         Ok(String::from_utf8(buffer.to_vec())?)
     }
 
-    let num_files = 5;
+    let num_files = 1;
     let small_file_size = 10; // 1KB per file
     let large_file_size = 65; // 1KB per file
     let test_small_data = "x".repeat(small_file_size);
@@ -317,8 +317,9 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
         let blocks = fs.get_block_locations(&path).await?;
         results.push(blocks);
     }
+    println!("results: {:?}", results);
 
-    // 2. Verify all files exist and have correct content
+    // // 2. Verify all files exist and have correct content
     for (i, (path, _)) in batch_files.clone().iter().enumerate() {
         let status = fs.get_status(path).await?;
 

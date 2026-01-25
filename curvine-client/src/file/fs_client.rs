@@ -71,7 +71,7 @@ impl FsClient {
     pub async fn create_files_batch(
         &self,
         requests: Vec<(String, CreateFileOpts, OpenFlags)>,
-    ) -> FsResult<Vec<FileStatus>> {
+    ) -> FsResult<ContainerStatus> {
         let pb_requests: Vec<CreateFileRequest> = requests
             .into_iter()
             .map(|(path, opts, flags)| CreateFileRequest {
@@ -86,11 +86,44 @@ impl FsClient {
         };
 
         let rep: CreateFilesBatchResponse = self.rpc(RpcCode::CreateFilesBatch, header).await?;
-        Ok(rep
-            .file_statuses
-            .into_iter()
-            .map(ProtoUtils::file_status_from_pb)
-            .collect())
+        match rep.result {
+            // Some(create_files_batch_response::Result::FileStatuses(file_list)) => {
+            //     // Handle individual files - extract from FileStatusList
+            //     Ok(file_list.statuses
+            //         .into_iter()
+            //         .map(ProtoUtils::file_status_from_pb)
+            //         .collect())
+            // }
+            Some(create_files_batch_response::Result::Container(container)) => {
+                println!(
+                    "Debug at FsClient, create_files_batch, container: {:?}",
+                    container
+                );
+                // get total size
+                let total_size: i64 = container.files.iter().map(|f| f.len).sum();
+                let file_count = container.files.len();
+                // Handle container - extract composed FileStatus objects
+                let individual_files: Vec<FileStatus> = container
+                    .files
+                    .into_iter()
+                    .map(ProtoUtils::file_status_from_pb)
+                    .collect();
+
+                let container_path = individual_files
+                    .first()
+                    .map(|f| f.path.clone())
+                    .unwrap_or_else(|| format!("container_{}", container.container_id));
+
+                Ok(ContainerStatus {
+                    container_id: container.container_id,
+                    container_path: container_path,
+                    files: individual_files,
+                    total_size: total_size,
+                    file_count: file_count,
+                })
+            }
+            _ => Err(FsError::common("No result in batch response")),
+        }
     }
 
     pub async fn create_with_opts(
@@ -248,10 +281,13 @@ impl FsClient {
         Ok(locate_block)
     }
 
-    pub async fn add_blocks_batch(&self, requests: Vec<String>) -> FsResult<Vec<LocatedBlock>> {
+    pub async fn add_blocks_batch(
+        &self,
+        requests: Vec<(String, usize)>,
+    ) -> FsResult<Vec<LocatedBlock>> {
         let pb_requests: Vec<AddBlockRequest> = requests
             .into_iter()
-            .map(|path| {
+            .map(|(path, content_len)| {
                 let commit_blocks: Vec<CommitBlockProto> = Vec::new();
                 AddBlockRequest {
                     path,

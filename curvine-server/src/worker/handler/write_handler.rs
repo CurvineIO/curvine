@@ -38,6 +38,7 @@ pub struct WriteHandler {
 
 impl WriteHandler {
     pub fn new(store: BlockStore) -> Self {
+        println!("DEBUG at BatchWriteHandler, call new:()");
         let conf = Worker::get_conf();
         let metrics = Worker::get_metrics();
         Self {
@@ -75,6 +76,10 @@ impl WriteHandler {
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
         let context = WriteContext::from_req(msg)?;
+        println!(
+            "DEBUG at writeHandler, at open(), context.off: {:?}, context.block_size: {:?}",
+            context.off, context.block_size
+        );
         if context.off > context.block_size {
             return err_box!(
                 "Invalid write offset: {}, block size: {}",
@@ -87,6 +92,11 @@ impl WriteHandler {
             len: context.block_size,
             ..context.block.clone()
         };
+
+        println!(
+            "Debug at WriteHandler, at open, open_block: {:?}",
+            open_block
+        );
 
         let meta = self.store.open_block(&open_block)?;
         let mut file = meta.create_writer(context.off, false)?;
@@ -200,6 +210,7 @@ impl WriteHandler {
     }
 
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
+        println!("DEBUG at BatchWriteHandler, start the complete with file: {:?}", self.file);
         if self.is_commit {
             return if !msg.data.is_empty() {
                 err_box!("The block has been committed and data cannot be written anymore.")

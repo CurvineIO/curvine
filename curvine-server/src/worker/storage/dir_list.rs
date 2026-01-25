@@ -136,6 +136,15 @@ impl DirList {
 
         Ok(())
     }
+    pub fn choose_dir_for_container(&mut self, total_size: i64) -> CommonResult<&VfsDir> {
+        // Create a temporary block for directory selection
+        let block = ExtendedBlock::new(0, total_size, StorageType::default(), FileType::Container);
+        println!(
+            "DEBUG at DirList, at choose_dir_for_container, block: {:?}",
+            block
+        );
+        self.choose_dir(&block)
+    }
 }
 
 impl Index<usize> for DirList {

@@ -1,0 +1,55 @@
+BatchBlockWriterLocal::new_batch => new()
+BatchBlockWriterRemote::new_batch => new()
+
+
+
+at curvine-client/src/block/batch_block_writer_local.rs:
+remove: block_index
+
+
+curvine-client/src/block/batch_block_writer_remote.rs
+remove seek,..
+
+
+Block_client.rs:
+
+
+consider to rename: write_blocks_batch
+
+
+
+at write_blocks_batch function:
+avoid clone from map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
+=>> note for later:
+
+
+
+
+consider to rename: write_files_batch
+
+
+FilesBatchWriteRequest
+
+
+
+at block_writer file
+- remove use_buffered
+
+
+
+should move BatchBlockWriter to another file
+
+
+
+at block_writer_local.rs
+remove is_buffered
+
+
+
+migrate CreateBatchBlockContext to new files.
+
+
+
+test batch writing should add test case 1: for short_circuit = 0/1
+
+should rename to blocks/files before batch

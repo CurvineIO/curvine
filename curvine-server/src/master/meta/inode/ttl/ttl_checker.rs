@@ -189,6 +189,9 @@ impl InodeTtlChecker {
             InodeView::File(_, file) => &file.storage_policy,
             InodeView::Dir(_, dir) => &dir.storage_policy,
             InodeView::FileEntry(..) => &StoragePolicy::default(),
+            InodeView::Container(_, container) => {
+                panic!("Container inode ttl action not implemented yet")
+            } // will update
         };
 
         let action = &storage_policy.ttl_action;

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_common::proto::BlockReadResponse;
+use curvine_common::proto::{BlockReadResponse, ContainerMetadata};
 use curvine_common::state::StorageType;
 
 pub struct CreateBlockContext {
@@ -44,6 +44,7 @@ impl BlockReadContext {
 pub struct CreateBatchBlockContext {
     pub contexts: Vec<CreateBlockContext>,
     pub batch_id: i64,
+    pub container_meta: Option<ContainerMetadata>,
 }
 
 impl CreateBatchBlockContext {
@@ -51,11 +52,13 @@ impl CreateBatchBlockContext {
         Self {
             contexts: Vec::new(),
             batch_id,
+            container_meta: None,
         }
     }
 
-    pub fn push(&mut self, context: CreateBlockContext) {
+    pub fn push(&mut self, context: CreateBlockContext, container_meta: Option<ContainerMetadata>) {
         self.contexts.push(context);
+        self.container_meta = container_meta;
     }
 
     pub fn len(&self) -> usize {

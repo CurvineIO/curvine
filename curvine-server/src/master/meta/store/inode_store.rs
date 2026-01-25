@@ -19,8 +19,10 @@ use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
 use curvine_common::state::{BlockLocation, CommitBlock, FileLock, MountInfo};
+use curvine_common::utils::SerdeUtils as Serde;
 use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, try_option, CommonResult};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
 
@@ -75,6 +77,7 @@ impl InodeStore {
                 }
             }
             InodeView::FileEntry(..) => self.fs_stats.increment_file_count(),
+            InodeView::Container(..) => {} // will update
         }
 
         Ok(())
@@ -423,6 +426,7 @@ impl InodeStore {
                         }
                     }
                     InodeView::FileEntry(..) => file_count += 1,
+                    InodeView::Container(..) => file_count += 1, //need update count for container
                 }
 
                 parent.add_child(inode)?
@@ -566,5 +570,17 @@ impl InodeStore {
 
     pub fn apply_set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
         self.store.set_locks(id, lock)
+    }
+    pub fn apply_add_files_to_container(&self, inode: &InodeView) -> CommonResult<()> {
+        match inode {
+            InodeView::Container(_, container) => {
+                let key = RocksUtils::i64_to_bytes(container.id);
+                let value = Serde::serialize(container)?;
+                self.store
+                    .db
+                    .put_cf(&RocksInodeStore::CF_INODES, &key, &value)
+            }
+            _ => err_box!("Not a container inode"),
+        }
     }
 }

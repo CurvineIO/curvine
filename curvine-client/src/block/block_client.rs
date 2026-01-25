@@ -23,8 +23,8 @@ use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
-    FileWriteData, FilesBatchWriteRequest,
+    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadata,
+    DataHeaderProto, FileWriteData, FilesBatchWriteRequest,
 };
 use curvine_common::state::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
@@ -301,6 +301,7 @@ impl BlockClient {
         chunk_size: i32,
         short_circuit: bool,
     ) -> FsResult<CreateBatchBlockContext> {
+        println!("Debug, at BlockClient: blocks={:?}", blocks);
         let blocks_pb: Vec<_> = blocks
             .iter()
             .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
@@ -329,6 +330,8 @@ impl BlockClient {
         let rep_header: BlocksBatchWriteResponse = rep.parse_header()?;
         let mut batch_context = CreateBatchBlockContext::new(req_id);
 
+        println!("DEBUG at BlockClient, at write_blocks_batch,rep_header: {:?} ", rep_header);
+        let container_meta = rep_header.container_meta;
         for response in rep_header.responses {
             let context = CreateBlockContext {
                 id: response.id,
@@ -337,7 +340,8 @@ impl BlockClient {
                 storage_type: StorageType::from(response.storage_type),
                 path: response.path,
             };
-            batch_context.push(context);
+            println!("DEBUG at BlockClient, at write_blocks_batch,context: {:?}, context.block_size: {:?}",context.path, context.block_size);
+            batch_context.push(context, container_meta.clone());
         }
 
         Ok(batch_context)
@@ -351,6 +355,7 @@ impl BlockClient {
         req_id: i64,
         seq_id: i32,
         cancel: bool,
+        container_meta: Option<ContainerMetadata>,
     ) -> FsResult<()> {
         // Convert blocks to protobuf
         let blocks_pb: Vec<_> = blocks
@@ -365,6 +370,7 @@ impl BlockClient {
             req_id,
             seq_id,
             cancel,
+            container_meta,
         };
 
         let status = if cancel {
@@ -390,6 +396,7 @@ impl BlockClient {
         files: &[(&Path, &str)],
         req_id: i64,
         seq_id: i32,
+        container_meta: Option<ContainerMetadata>,
     ) -> CommonResult<()> {
         let file_data: Vec<_> = files
             .iter()
@@ -403,6 +410,7 @@ impl BlockClient {
             files: file_data,
             req_id,
             seq_id,
+            container_meta,
         };
 
         let msg = Builder::new()

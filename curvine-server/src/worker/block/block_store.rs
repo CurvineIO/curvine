@@ -141,4 +141,12 @@ impl BlockStore {
 
         vec
     }
+    pub fn create_container_block(
+        &self,
+        container_path: &str,
+        total_size: i64,
+    ) -> CommonResult<BlockMeta> {
+        self.write()
+            .create_container_block(container_path, total_size)
+    }
 }

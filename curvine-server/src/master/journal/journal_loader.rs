@@ -16,7 +16,7 @@
 
 use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
-use crate::master::meta::inode::InodeView::{Dir, File};
+use crate::master::meta::inode::InodeView::{Container, Dir, File};
 use crate::master::{MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::raft::SnapshotData;
@@ -59,6 +59,10 @@ impl JournalLoader {
             JournalEntry::Mkdir(e) => self.mkdir(e),
 
             JournalEntry::CreateFile(e) => self.create_file(e),
+
+            JournalEntry::CreateContainer(e) => self.create_container(e),
+
+            JournalEntry::AddFilesToContainer(e) => self.add_files_to_container(e),
 
             JournalEntry::OverWriteFile(e) => self.overwrite_file(e),
 
@@ -287,6 +291,31 @@ impl JournalLoader {
             }
         }
 
+        Ok(())
+    }
+
+    fn create_container(&self, entry: CreateContainerEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.update_last_inode_id(entry.container.id)?;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+        let name = inp.name().to_string();
+        let _ = fs_dir.add_last_inode(inp, Container(name, entry.container))?;
+        Ok(())
+    }
+
+    fn add_files_to_container(&self, entry: AddFilesToContainerEntry) -> CommonResult<()> {
+        let fs_dir = self.fs_dir.write();
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.container_path, &fs_dir.store)?;
+
+        let mut inode = try_option!(inp.get_last_inode());
+        let container = inode.as_mut().as_container_mut()?;
+
+        // Add new files to existing container
+        for (file_name, file_meta) in entry.files {
+            container.files.insert(file_name, file_meta);
+        }
+
+        fs_dir.store.apply_add_files_to_container(inode.as_ref())?;
         Ok(())
     }
 }

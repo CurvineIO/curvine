@@ -36,6 +36,18 @@ pub struct LocalFile {
     buf: BytesMut,
 }
 
+impl std::fmt::Debug for LocalFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalFile")
+            .field("path", &self.path)
+            .field("is_tmpfs", &self.is_tmpfs)
+            .field("len", &self.len)
+            .field("pos", &self.pos)
+            .field("buf_len", &self.buf.len())
+            .finish()
+    }
+}
+
 impl LocalFile {
     pub fn new<T: AsRef<str>>(path: T, mut inner: fs::File) -> IOResult<Self> {
         let is_tmpfs = sys::is_tmpfs(path.as_ref())?;

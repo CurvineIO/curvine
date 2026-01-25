@@ -212,7 +212,8 @@ message BlockWriteResponse {
 }
 
 message BlocksBatchWriteResponse {  
-    repeated BlockWriteResponse responses = 1;  
+    repeated BlockWriteResponse responses = 1; 
+    optional ContainerMetadata container_meta = 2; 
 }
 
 message BlocksBatchCommitRequest {  
@@ -222,6 +223,7 @@ message BlocksBatchCommitRequest {
     required int64 req_id = 4;  
     required int32 seq_id = 5;  
     required bool cancel = 6;  
+    optional ContainerMetadata container_meta = 7;
 }  
   
 message BlocksBatchCommitResponse {  
@@ -233,6 +235,7 @@ message FilesBatchWriteRequest {
     repeated FileWriteData files = 1;  
     required int64 req_id = 2;  
     required int32 seq_id = 3;  
+    optional ContainerMetadata container_meta = 4;
 }  
   
 message FileWriteData {  
@@ -241,5 +244,22 @@ message FileWriteData {
 }  
   
 message FilesBatchWriteResponse {  
-    repeated bool results = 1;  
+    repeated bool results = 1;
+    optional ContainerMetadata container_meta = 2;
 }
+
+message ContainerMetadata {  
+    required int64 container_block_id = 1;  
+    required string container_path = 2;  
+    repeated SmallFileMeta files = 3;  
+}  
+
+message SmallFileMeta {  
+    required int64 offset = 1;  
+    required int64 len = 2;  
+    required int32 block_index = 3;  
+    required int64 mtime = 4;  
+}
+
+
+

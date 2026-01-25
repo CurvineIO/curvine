@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::InodeView;
+use crate::master::meta::inode::{Inode, InodeContainer, InodeView, SmallFileMeta};
 use crate::master::meta::LockMeta;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
 use curvine_common::state::{BlockLocation, FileLock, MountInfo};
@@ -283,6 +283,22 @@ impl<'a> InodeWriteBatch<'a> {
         self.put_cf(RocksInodeStore::CF_INODES, key, value)
     }
 
+    pub fn write_container_inode(&mut self, container: &InodeContainer) -> CommonResult<()> {
+        let key = RocksUtils::i64_to_bytes(container.id);
+        let value = Serde::serialize(container)?;
+        self.put_cf(RocksInodeStore::CF_INODES, key, value)
+    }
+
+    pub fn add_container_file(
+        &mut self,
+        container_id: i64,
+        file_name: &str,
+        file_meta: &SmallFileMeta,
+    ) -> CommonResult<()> {
+        let key = RocksUtils::i64_str_to_bytes(container_id, file_name);
+        let value = Serde::serialize(file_meta)?;
+        self.put_cf(RocksInodeStore::CF_EDGES, key, value)
+    }
     // Add an edge to identify the subordinate relationship between inodes
     pub fn add_child(
         &mut self,

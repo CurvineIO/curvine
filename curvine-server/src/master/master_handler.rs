@@ -23,6 +23,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
+use curvine_common::state::FileType;
 use curvine_common::state::{
     CreateFileOpts, FileBlocks, FileStatus, HeartbeatStatus, OpenFlags, RenameFlags,
 };
@@ -33,6 +34,11 @@ use orpc::handler::MessageHandler;
 use orpc::io::net::ConnState;
 use orpc::message::Message;
 use std::sync::Arc;
+
+struct ContainerBatchResult {
+    container_status: FileStatus,
+    container_meta: ContainerMetadata,
+}
 
 pub struct MasterHandler {
     pub(crate) fs: MasterFilesystem,
@@ -292,27 +298,110 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    // pub fn create_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    //     let header: CreateFilesBatchRequest = ctx.parse_header()?;
+
+    //     let mut results = Vec::with_capacity(header.requests.len());
+    //     for (index, req) in header.requests.into_iter().enumerate() {
+    //         let opts = ProtoUtils::create_opts_from_pb(req.opts);
+    //         let flags = OpenFlags::new(req.flags);
+
+    //         // Generate unique req_id for each file in batch
+    //         let unique_req_id = ctx.msg.req_id() + index as i64;
+    //         let status = self.create_file0(unique_req_id, req.path, opts, flags)?;
+    //         results.push(status);
+    //     }
+
+    //     let rep_header = CreateFilesBatchResponse {
+    //         file_statuses: results
+    //             .into_iter()
+    //             .map(ProtoUtils::file_status_to_pb)
+    //             .collect(),
+    //     };
+    //     ctx.response(rep_header)
+    // }
+
     pub fn create_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: CreateFilesBatchRequest = ctx.parse_header()?;
 
-        let mut results = Vec::with_capacity(header.requests.len());
-        for (index, req) in header.requests.into_iter().enumerate() {
-            let opts = ProtoUtils::create_opts_from_pb(req.opts);
-            let flags = OpenFlags::new(req.flags);
-
-            // Generate unique req_id for each file in batch
-            let unique_req_id = ctx.msg.req_id() + index as i64;
-            let status = self.create_file0(unique_req_id, req.path, opts, flags)?;
-            results.push(status);
+        // Create single container for all files
+        let container_result = self.create_container_batch(ctx, &header.requests)?;
+        // Create individual FileStatus objects for each file in container
+        let mut container_files = Vec::new();
+        for (i, req) in header.requests.iter().enumerate() {
+            let mut file_status = container_result.container_status.clone();
+            file_status.path = req.path.clone();
+            file_status.name = Path::new(&req.path)
+                .map(|p| p.name().to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
+            file_status.len = container_result.container_meta.files[i].len;
+            file_status.file_type = FileType::File; // Individual files, not Container
+            file_status.id = ctx.msg.req_id() + i as i64;
+            container_files.push(ProtoUtils::file_status_to_pb(file_status));
         }
 
+        let container_status_response = ContainerStatusReponse {
+            container_id: container_result.container_status.id,
+            files: container_files,
+            mtime: container_result.container_status.mtime,
+            block_size: container_result.container_status.block_size,
+            file_type: FileType::Container.into(),
+            replicas: container_result.container_status.replicas as i32,
+            storage_policy: ProtoUtils::storage_policy_to_pb(
+                container_result.container_status.storage_policy,
+            ),
+            owner: container_result.container_status.owner,
+            group: container_result.container_status.group,
+            mode: container_result.container_status.mode,
+            nlink: container_result.container_status.nlink,
+        };
+
         let rep_header = CreateFilesBatchResponse {
-            file_statuses: results
-                .into_iter()
-                .map(ProtoUtils::file_status_to_pb)
-                .collect(),
+            result: Some(create_files_batch_response::Result::Container(
+                container_status_response,
+            )),
         };
         ctx.response(rep_header)
+    }
+
+    fn create_container_batch(
+        &mut self,
+        ctx: &mut RpcContext<'_>,
+        requests: &[CreateFileRequest],
+    ) -> FsResult<ContainerBatchResult> {
+        // Create container inode with first file's path as container path
+        let container_path = format!("{}", requests[0].path);
+        let mut container_opts = CreateFileOpts::with_create(true);
+        container_opts.file_type = FileType::Container;
+        container_opts.block_size = requests.iter().map(|r| r.opts.block_size).sum();
+        container_opts.replicas = requests[0].opts.replicas as u16;
+
+        let container_status = self.create_file0(
+            ctx.msg.req_id(),
+            container_path,
+            container_opts,
+            OpenFlags::new_create(),
+        )?;
+
+        let container_meta = ContainerMetadata {
+            container_block_id: container_status.id,
+            container_path: container_status.path.clone(),
+            files: requests
+                .iter()
+                .enumerate()
+                .map(|(i, req)| SmallFileMeta {
+                    offset: requests[0..i].iter().map(|r| r.opts.block_size).sum(),
+                    len: req.opts.block_size,
+                    block_index: 0,
+                    mtime: container_status.mtime,
+                })
+                .collect(),
+        };
+
+        Ok(ContainerBatchResult {
+            container_status,
+            container_meta,
+        })
     }
 
     pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {

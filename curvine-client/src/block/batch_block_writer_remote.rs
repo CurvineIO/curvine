@@ -15,6 +15,7 @@
 use crate::block::block_client::BlockClient;
 use crate::file::FsContext;
 use curvine_common::fs::Path;
+use curvine_common::proto::ContainerMetadata;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
@@ -28,6 +29,7 @@ pub struct BatchBlockWriterRemote {
     seq_id: i32,
     req_id: i64,
     block_size: i64,
+    container_meta: Option<ContainerMetadata>,
 }
 
 impl BatchBlockWriterRemote {
@@ -40,6 +42,10 @@ impl BatchBlockWriterRemote {
         let req_id = Utils::req_id();
         let seq_id = 0;
         let block_size = fs_context.block_size();
+        println!(
+            "DEBUG at BatchBlockWriterRemote, block_size: {:?}",
+            block_size
+        );
 
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
@@ -53,6 +59,14 @@ impl BatchBlockWriterRemote {
                 false,
             )
             .await?;
+
+        // Extract container metadata from response
+        let container_meta = write_context.container_meta.clone();
+        
+        println!(
+            "DEBUG at BatchBlockWriterRemote, container_meta: {:?}",
+            container_meta
+        );
 
         for context in &write_context.contexts {
             if block_size != context.block_size {
@@ -72,6 +86,7 @@ impl BatchBlockWriterRemote {
             seq_id,
             req_id,
             block_size,
+            container_meta,
         };
 
         Ok(writer)
@@ -86,9 +101,11 @@ impl BatchBlockWriterRemote {
     pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
 
+        println!("DEBUG at BatchBlockWriterRemote, at write, container_meta: {:?}", self.container_meta);
+
         // Send all files in one RPC call
         self.client
-            .write_files_batch(files, self.req_id, next_seq_id)
+            .write_files_batch(files, self.req_id, next_seq_id, self.container_meta.clone())
             .await?;
 
         for (i, (_, content)) in files.iter().enumerate() {
@@ -120,6 +137,7 @@ impl BatchBlockWriterRemote {
                 self.req_id,
                 next_seq_id,
                 false,
+                self.container_meta.take(),
             )
             .await?;
         Ok(())

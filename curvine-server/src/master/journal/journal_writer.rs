@@ -15,7 +15,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::master::journal::*;
-use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
+use crate::master::meta::inode::{InodeContainer, InodeDir, InodeFile, InodePath};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
@@ -252,5 +252,24 @@ impl JournalWriter {
             entries.push(v)
         }
         entries
+    }
+    pub fn log_create_container(
+        &self,
+        op_ms: u64,
+        parent_path: &str,
+        container_name: &str,
+        container: &InodeContainer,
+    ) -> FsResult<()> {
+        let entry = CreateContainerEntry {
+            op_ms,
+            path: format!("{}/{}", parent_path, container_name),
+            container: container.clone(),
+        };
+
+        if self.enable {
+            let _ = self.sender.send(JournalEntry::CreateContainer(entry));
+        }
+
+        Ok(())
     }
 }

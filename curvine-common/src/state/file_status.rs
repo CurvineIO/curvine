@@ -46,6 +46,15 @@ pub struct FileStatus {
     pub target: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContainerStatus {
+    pub container_id: i64,
+    pub container_path: String,
+    pub files: Vec<FileStatus>,
+    pub total_size: i64,
+    pub file_count: usize,
+}
+
 impl FileStatus {
     pub fn with_name(id: i64, name: String, is_dir: bool) -> Self {
         FileStatus {

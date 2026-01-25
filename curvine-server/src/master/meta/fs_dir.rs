@@ -15,7 +15,8 @@
 use crate::master::fs::DeleteResult;
 use crate::master::journal::{JournalEntry, JournalWriter};
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
-use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
+use crate::master::meta::inode::InodeContainer;
+use crate::master::meta::inode::InodeView::{Container, Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
 use crate::master::meta::{BlockMeta, InodeId};
@@ -28,6 +29,7 @@ use curvine_common::state::{
 };
 use curvine_common::FsResult;
 use log::{info, warn};
+use orpc::common::Utils;
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
@@ -203,6 +205,7 @@ impl FsDir {
                 // Directories are always deleted
                 self.store.apply_delete(parent.as_ref(), child)?
             }
+            Container(_, _) => return err_box!("Container deletion is not supported"), // will update
         };
 
         // After deletion occurs, the target address cannot be used.
@@ -319,6 +322,78 @@ impl FsDir {
         Ok(inp)
     }
 
+    pub fn add_files_to_container(
+        &mut self,
+        parent_path: InodePath,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> FsResult<InodePath> {
+        let op_ms = LocalTime::mills();
+
+        // Check if parent exists and is a directory
+        let mut parent = match parent_path.get_inode(-1) {
+            Some(v) if v.is_dir() => v,
+            Some(_) => return err_box!("Parent is not a directory: {}", parent_path.path()),
+            None => return err_box!("Parent does not exist: {}", parent_path.path()),
+        };
+
+        // Create container name and check if it already exists
+        let container_name = format!("container_{}", Utils::unique_id());
+
+        // Create new container inode
+        let mut container = InodeContainer {
+            id: self.next_inode_id()?,
+            files: HashMap::new(),
+            blocks: Vec::new(),
+            total_size: 0,
+            max_file_size: 64 * 1024, // 64KB default
+        };
+
+        // Add files to container
+        let mut offset = 0i64;
+        for (name, data) in files {
+            let file_meta = SmallFileMeta {
+                offset,
+                len: data.len() as i64,
+                block_index: 0,
+                mtime: op_ms as i64,
+            };
+            container.files.insert(name, file_meta);
+            offset += data.len() as i64;
+        }
+
+        // Update container total size
+        let mut container = container;
+        container.total_size = offset;
+
+        // Add container to parent directory
+        parent.update_mtime(op_ms as i64);
+        let container_inode = InodeView::Container(container_name.clone(), container.clone());
+        let added = parent.add_child(container_inode)?;
+        self.store.apply_add(parent.as_ref(), added.as_ref())?;
+
+        // Log the operation
+        self.journal_writer.log_create_container(
+            op_ms,
+            &parent_path.path(),
+            &container_name,
+            &container,
+        )?;
+
+        let mut result_path = parent_path;
+        result_path.append(added)?;
+
+        Ok(result_path)
+    }
+
+    pub fn create_small_file_batch(
+        &mut self,
+        parent_path: InodePath,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> FsResult<InodePath> {
+        // Check if files are small enough for container
+        self.add_files_to_container(parent_path, files)
+    }
+
     pub(crate) fn add_last_inode(
         &mut self,
         mut inp: InodePath,
@@ -368,6 +443,9 @@ impl FsDir {
             FileEntry(..) => {
                 return err_box!("FileEntry is not supported");
             }
+            Container(..) => {
+                return err_box!("Container is not supported in file_status");
+            }
         };
 
         Ok(status)
@@ -394,6 +472,9 @@ impl FsDir {
                                 res.push(inode_view.to_file_status(&child_path));
                             }
                         }
+                        Container(_, _) => {
+                            return err_box!("Container is not supported in list_status");
+                        } // will update
                     }
                 }
             }
@@ -405,6 +486,9 @@ impl FsDir {
                     None => return err_box!("File {} not exists", inp.path()),
                 }
             }
+            Container(_, _) => {
+                return err_box!("Container is not supported in file_status");
+            } // will update
         }
 
         Ok(res)
@@ -445,6 +529,7 @@ impl FsDir {
             inode.as_file_ref()?,
             commit_blocks,
         )?;
+        println!("pass acquire_new_block");
         Ok(block)
     }
 
@@ -472,6 +557,7 @@ impl FsDir {
             commit_block,
         )?;
 
+        println!("pass complete file");
         Ok(true)
     }
 
@@ -511,6 +597,10 @@ impl FsDir {
                 let err_msg = format!("Cannot append to already exists {} directory", inp.path());
                 return err_ext!(FsError::file_exists(err_msg));
             }
+            Container(..) => {
+                let err_msg = format!("Cannot append to already exists {} container", inp.path());
+                return err_ext!(FsError::file_exists(err_msg));
+            } // will update
             FileEntry(..) => {
                 return err_box!("FileEntry is not supported");
             }
@@ -852,6 +942,9 @@ impl FsDir {
                 }
                 FileEntry(_, inode_id) => (*inode_id, None), // FileEntry already points to an inode
                 Dir(_, _) => return err_ext!(FsError::common("Cannot create link to directory")),
+                Container(_, _) => {
+                    return err_ext!(FsError::common("Cannot create link to container"))
+                } // will update
             },
             None => return err_ext!(FsError::file_not_found(src_path.path())),
         };
@@ -956,6 +1049,7 @@ impl FsDir {
         self.journal_writer
             .log_complete_file(op_ms, inp.path(), inode.as_file_ref()?, vec![])?;
 
+        println!("pass resize");
         Ok(del_res)
     }
 

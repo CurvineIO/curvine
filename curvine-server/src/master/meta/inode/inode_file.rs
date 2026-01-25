@@ -306,8 +306,19 @@ impl InodeFile {
             let meta = self.search_block_mut_check(block.block_id)?;
             meta.commit(block);
         }
-
+        println!(
+            "DEBUG at inode_file: at complete function, self.blocks: {:?}",
+            self.blocks
+        );
+        println!(
+            "DEBUG at inode_file: at complete function, self.len before: {:?}",
+            self.len
+        );
         self.len = self.len.max(len);
+        println!(
+            "DEBUG at inode_file: at complete function, self.len after: {:?}",
+            self.len
+        );
         let complete_len = self.compute_len();
         if complete_len != self.len {
             return err_box!(

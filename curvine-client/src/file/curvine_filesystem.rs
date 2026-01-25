@@ -369,6 +369,7 @@ impl CurvineFileSystem {
             let content_size: usize = content.len();
 
             if content_size >= chunk_size {
+                println!("large_file_processing");
                 self.write_string(path, content.to_string()).await?;
                 continue;
             }
@@ -392,6 +393,7 @@ impl CurvineFileSystem {
     }
 
     async fn handle_batch_files(&self, files: &[(&Path, &str)]) -> FsResult<()> {
+        println!("handle batch files");
         if files.is_empty() {
             return Ok(());
         }
@@ -408,17 +410,26 @@ impl CurvineFileSystem {
 
         let file_statuses = self.fs_client().create_files_batch(create_requests).await?;
 
+        println!(
+            "DEBUG at handle_batch_files, file_statuses: {:?}",
+            file_statuses
+        );
+
         // Step 2: Batch allocate blocks
-        let mut add_block_requests = Vec::with_capacity(file_statuses.len());
-        for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
-            add_block_requests.push(path.encode());
-        }
+        // let mut add_block_requests = Vec::with_capacity(file_statuses.len());
+        // for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
+        //     add_block_requests.push((path.encode(), _content.len()));
+        // }
+
+        let mut add_block_requests = Vec::with_capacity(1);
+        add_block_requests.push((file_statuses.container_path, 1));
 
         let allocated_blocks: Vec<curvine_common::state::LocatedBlock> = self
             .fs_client()
             .add_blocks_batch(add_block_requests)
             .await?;
 
+        println!("at CurvineFileSystem: {:?}", allocated_blocks);
         // assert if allocated_blocks is not smae with add_block_requests
         let mut batch_writer =
             BatchBlockWriter::new(self.fs_context.clone(), allocated_blocks).await?;

@@ -58,9 +58,32 @@ message CreateFilesBatchRequest {
     repeated CreateFileRequest requests = 1;  
 }  
   
-message CreateFilesBatchResponse {  
-    repeated FileStatusProto file_statuses = 1;  
+message ContainerStatusReponse {  
+    required int64 container_id = 1;  
+    repeated FileStatusProto files = 2;  // Compose FileStatus objects  
+    required int64 mtime = 6;  
+    required int64 block_size = 7;  
+    required FileTypeProto file_type = 8;  
+    required int32 replicas = 9;  
+    required StoragePolicyProto storage_policy = 10;  
+    required string owner = 11;  
+    required string group = 12;  
+    required uint32 mode = 13;  
+    required uint32 nlink = 14;  
 }  
+  
+message CreateFilesBatchResponse {  
+    oneof result {  
+        FileStatusList file_statuses = 1;   
+        ContainerStatusReponse container = 2;  
+    }  
+}  
+  
+message FileStatusList {  
+    repeated FileStatusProto statuses = 1;  
+}
+
+
   
 message CompleteFilesBatchRequest {  
     repeated CompleteFileRequest requests = 1;  

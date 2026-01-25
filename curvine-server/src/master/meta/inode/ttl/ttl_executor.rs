@@ -124,6 +124,10 @@ impl InodeTtlExecutor {
                     // For empty files, we can't determine parent_id, so return a basic path
                     return Ok(format!("/{}", name));
                 }
+                InodeView::Container(name, _) => {
+                    // For containers, we can't determine parent_id, so return a basic path
+                    return Ok(format!("/{}", name));
+                } // will update
             }
         }
 
@@ -185,6 +189,7 @@ impl InodeTtlExecutor {
                     path
                 )));
             }
+            InodeView::Container(_, _) => {} // will update
         }
 
         Ok(())
