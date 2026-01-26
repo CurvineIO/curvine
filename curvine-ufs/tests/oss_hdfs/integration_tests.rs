@@ -71,11 +71,11 @@ mod tests {
     async fn test_filesystem_init_missing_endpoint() {
         let mut conf = HashMap::new();
         conf.insert(
-            OssHdfsConf::ACCESS_KEY_ID.to_string(),
+            OssHdfsConf::USER_ACCESS_KEY_ID.to_string(),
             "test-key".to_string(),
         );
         conf.insert(
-            OssHdfsConf::ACCESS_KEY_SECRET.to_string(),
+            OssHdfsConf::USER_ACCESS_KEY_SECRET.to_string(),
             "test-secret".to_string(),
         );
 
@@ -88,7 +88,7 @@ mod tests {
     async fn test_filesystem_init_missing_access_key() {
         let mut conf = HashMap::new();
         conf.insert(
-            OssHdfsConf::ENDPOINT.to_string(),
+            OssHdfsConf::USER_ENDPOINT.to_string(),
             "oss-cn-shanghai.aliyuncs.com".to_string(),
         );
 
@@ -125,8 +125,8 @@ mod tests {
 
         let fs = OssHdfsFileSystem::new(&path, conf.clone()).unwrap();
         assert_eq!(
-            fs.conf().get(OssHdfsConf::ENDPOINT),
-            conf.get(OssHdfsConf::ENDPOINT).map(|s| s.as_str())
+            fs.conf().get(OssHdfsConf::USER_ENDPOINT),
+            conf.get(OssHdfsConf::USER_ENDPOINT).map(|s| s.as_str())
         );
     }
 
