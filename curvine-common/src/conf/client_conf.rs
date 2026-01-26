@@ -117,6 +117,7 @@ pub struct ClientConf {
     pub conn_timeout_ms: u64,
     pub rpc_timeout_ms: u64,
     pub data_timeout_ms: u64,
+    pub pipeline_timeout_ms: u64,
 
     // Number of fs master connections.
     // After testing 3 connections, the best performance can be achieved, so the default value is 3.
@@ -361,6 +362,7 @@ impl Default for ClientConf {
             conn_timeout_ms: 30 * 1000,
             rpc_timeout_ms: 120 * 1000,
             data_timeout_ms: 120 * 1000,
+            pipeline_timeout_ms: 120 * 1000,
             master_conn_pool_size: 1,
 
             enable_read_ahead: true,

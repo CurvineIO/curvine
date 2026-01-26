@@ -126,6 +126,7 @@ impl WriteHandler {
             off: context.off,
             block_size: context.block_size,
             storage_type: meta.storage_type().into(),
+            pipeline_status: None,
         };
 
         let _ = mem::replace(&mut self.file, file);

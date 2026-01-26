@@ -66,6 +66,7 @@ fn block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         short_circuit: false,
         client_name: "test".to_string(),
         chunk_size: CHUNK_SIZE,
+        pipeline_stream: Vec::new(),
     };
 
     let req_id = Utils::req_id();

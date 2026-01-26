@@ -58,6 +58,8 @@ pub enum ErrorKind {
     Expired = 21,
     UnsupportedUfsRead = 22,
     JobNotFound = 23,
+    Pipeline = 24,
+    MinReplicasNotMet = 25,
 
     #[num_enum(default)]
     Common = 10000,
@@ -151,6 +153,13 @@ pub enum FsError {
     #[error("{0}")]
     UnsupportedUfsRead(ErrorImpl<StringError>),
 
+    // Pipeline replication error with failed worker info
+    #[error("{0}")]
+    Pipeline(ErrorImpl<StringError>),
+
+    // Pipeline replication does not meet minimum replicas
+    #[error("{0}")]
+    MinReplicasNotMet(ErrorImpl<StringError>),
     // Job not found
     #[error("{0}")]
     JobNotFound(ErrorImpl<StringError>),
@@ -232,6 +241,38 @@ impl FsError {
         Self::Unsupported(ErrorImpl::with_source(msg.into()))
     }
 
+    pub fn pipeline_error(failed_worker_id: u32, message: impl Into<String>) -> Self {
+        let msg = format!("worker_id={}:{}", failed_worker_id, message.into());
+        Self::Pipeline(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn min_replicas_not_met(min_replicas: usize, established: usize, block_id: i64) -> Self {
+        let msg = format!(
+            "min_replicas={} not met, established={}, block_id={}",
+            min_replicas, established, block_id
+        );
+        Self::MinReplicasNotMet(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn is_pipeline_error(&self) -> bool {
+        matches!(self, FsError::Pipeline(_))
+    }
+
+    pub fn failed_worker_id(&self) -> Option<u32> {
+        match self {
+            FsError::Pipeline(e) => {
+                let msg = e.source.to_string();
+                if let Some(rest) = msg.strip_prefix("worker_id=") {
+                    if let Some(colon_pos) = rest.find(':') {
+                        return rest[..colon_pos].parse().ok();
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     // Determine whether the current error allows retry.
     // NotLeaderMaster error indicates that a master switch has occurred and you need to retry access to the next master
     pub fn retry_master(&self) -> bool {
@@ -269,6 +310,8 @@ impl FsError {
             FsError::Ufs(_) => ErrorKind::Ufs,
             FsError::Expired(_) => ErrorKind::Expired,
             FsError::UnsupportedUfsRead(_) => ErrorKind::UnsupportedUfsRead,
+            FsError::Pipeline(_) => ErrorKind::Pipeline,
+            FsError::MinReplicasNotMet(_) => ErrorKind::MinReplicasNotMet,
             FsError::JobNotFound(_) => ErrorKind::JobNotFound,
             FsError::Common(_) => ErrorKind::Common,
         }
@@ -383,6 +426,8 @@ impl ErrorExt for FsError {
             FsError::Ufs(e) => FsError::Ufs(e.ctx(ctx)),
             FsError::Expired(e) => FsError::Expired(e.ctx(ctx)),
             FsError::UnsupportedUfsRead(e) => FsError::UnsupportedUfsRead(e.ctx(ctx)),
+            FsError::Pipeline(e) => FsError::Pipeline(e.ctx(ctx)),
+            FsError::MinReplicasNotMet(e) => FsError::MinReplicasNotMet(e.ctx(ctx)),
             FsError::JobNotFound(e) => FsError::JobNotFound(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
@@ -412,6 +457,8 @@ impl ErrorExt for FsError {
             FsError::Ufs(e) => e.encode(ErrorKind::Ufs),
             FsError::Expired(e) => e.encode(ErrorKind::Expired),
             FsError::UnsupportedUfsRead(e) => e.encode(ErrorKind::UnsupportedUfsRead),
+            FsError::Pipeline(e) => e.encode(ErrorKind::Pipeline),
+            FsError::MinReplicasNotMet(e) => e.encode(ErrorKind::MinReplicasNotMet),
             FsError::JobNotFound(e) => e.encode(ErrorKind::JobNotFound),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
@@ -444,6 +491,8 @@ impl ErrorExt for FsError {
             ErrorKind::Ufs => FsError::Ufs(de.into_string()),
             ErrorKind::Expired => FsError::Expired(de.into_string()),
             ErrorKind::UnsupportedUfsRead => FsError::UnsupportedUfsRead(de.into_string()),
+            ErrorKind::Pipeline => FsError::Pipeline(de.into_string()),
+            ErrorKind::MinReplicasNotMet => FsError::MinReplicasNotMet(de.into_string()),
             ErrorKind::JobNotFound => FsError::JobNotFound(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
@@ -456,6 +505,7 @@ impl ErrorExt for FsError {
 
 #[cfg(test)]
 mod tests {
+    use super::ErrorKind;
     use crate::error::fs_error::FsError;
     use orpc::error::{ErrorExt, ErrorImpl};
 
@@ -469,5 +519,51 @@ mod tests {
         let check = matches!(error, FsError::DiskOutOfSpace(_));
 
         assert!(check)
+    }
+
+    #[test]
+    pub fn pipeline_error_test() {
+        let error = FsError::pipeline_error(123, "Connection refused");
+
+        assert!(error.is_pipeline_error());
+        assert_eq!(error.failed_worker_id(), Some(123));
+        assert!(error.to_string().contains("123"));
+        assert!(error.to_string().contains("Connection refused"));
+    }
+
+    #[test]
+    pub fn pipeline_error_round_trip_test() {
+        let error = FsError::pipeline_error(456, "Timeout");
+
+        let bytes = error.encode();
+        let decoded = FsError::decode(bytes);
+
+        assert!(decoded.is_pipeline_error());
+        assert_eq!(decoded.failed_worker_id(), Some(456));
+    }
+
+    #[test]
+    pub fn non_pipeline_error_test() {
+        let error = FsError::common("Some error");
+
+        assert!(!error.is_pipeline_error());
+        assert_eq!(error.failed_worker_id(), None);
+    }
+
+    #[test]
+    pub fn pipeline_error_kind_test() {
+        let error = FsError::pipeline_error(789, "Test error");
+
+        assert!(matches!(error.kind(), ErrorKind::Pipeline));
+    }
+
+    #[test]
+    pub fn min_replicas_error_kind_test() {
+        let error = FsError::min_replicas_not_met(2, 1, 42);
+
+        assert!(matches!(error.kind(), ErrorKind::MinReplicasNotMet));
+        let bytes = error.encode();
+        let decoded = FsError::decode(bytes);
+        assert!(matches!(decoded.kind(), ErrorKind::MinReplicasNotMet));
     }
 }

@@ -65,6 +65,8 @@ pub enum RpcCode {
 
     SubmitBlockReplicationJob = 42,
     ReportBlockReplicationResult = 43,
+    RequestReplacementWorker = 44,
+    ReportUnderReplicatedBlocks = 45,
 
     MetricsReport = 60,
 
