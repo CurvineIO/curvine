@@ -103,7 +103,12 @@ impl BlockClient {
         seq_id: i32,
         chunk_size: i32,
         short_circuit: bool,
+        pipeline_stream: Vec<WorkerAddress>,
     ) -> FsResult<CreateBlockContext> {
+        let pipeline_stream = pipeline_stream
+            .iter()
+            .map(ProtoUtils::worker_address_to_pb)
+            .collect();
         let header = BlockWriteRequest {
             block: ProtoUtils::extend_block_to_pb(blk.clone()),
             off,
@@ -111,6 +116,7 @@ impl BlockClient {
             short_circuit,
             client_name: self.client_name.to_string(),
             chunk_size,
+            pipeline_stream,
         };
 
         let msg = Builder::new()

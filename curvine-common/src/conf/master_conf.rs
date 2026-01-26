@@ -87,6 +87,9 @@ pub struct MasterConf {
     // Block replication
     pub block_replication_enabled: bool,
     pub block_replication_concurrency_limit: usize,
+    pub block_replication_retry_interval: String,
+    #[serde(skip)]
+    pub block_replication_retry_interval_unit: DurationUnit,
 
     pub log: LogConf,
 
@@ -145,6 +148,8 @@ impl MasterConf {
         self.ttl_bucket_interval_unit = DurationUnit::from_str(&self.ttl_bucket_interval)?;
         self.ttl_max_retry_duration_unit = DurationUnit::from_str(&self.ttl_max_retry_duration)?;
         self.ttl_retry_interval_unit = DurationUnit::from_str(&self.ttl_retry_interval)?;
+        self.block_replication_retry_interval_unit =
+            DurationUnit::from_str(&self.block_replication_retry_interval)?;
 
         // Initialize lock expiration time
         self.lock_expire_time_unit = DurationUnit::from_str(&self.lock_expire_time)?;
@@ -190,6 +195,10 @@ impl MasterConf {
 
     pub fn ttl_retry_interval_ms(&self) -> u64 {
         self.ttl_retry_interval_unit.as_millis()
+    }
+
+    pub fn block_replication_retry_interval_ms(&self) -> u64 {
+        self.block_replication_retry_interval_unit.as_millis()
     }
 
     pub fn lock_expire_time_ms(&self) -> u64 {
@@ -264,6 +273,8 @@ impl Default for MasterConf {
 
             block_replication_enabled: false,
             block_replication_concurrency_limit: 1000,
+            block_replication_retry_interval: "5s".to_string(),
+            block_replication_retry_interval_unit: Default::default(),
             log: Default::default(),
 
             ttl_checker_retry_attempts: 3,

@@ -89,6 +89,7 @@ impl BatchWriteHandler {
                 short_circuit: header.short_circuit,
                 client_name: header.client_name.clone(),
                 chunk_size: header.chunk_size,
+                pipeline_stream: Vec::new(),
             };
 
             // Create single request message for each block

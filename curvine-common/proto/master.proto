@@ -150,6 +150,24 @@ message AddBlocksBatchResponse {
     repeated LocatedBlockProto blocks = 1;  
 }
 
+message RequestReplacementWorkerRequest {
+    required int64 block_id = 1;
+    repeated uint32 exclude_workers = 2;
+}
+
+message RequestReplacementWorkerResponse {
+    required WorkerAddressProto worker = 1;
+}
+
+message ReportUnderReplicatedBlocksRequest {
+    repeated int64 block_ids = 1;
+}
+
+message ReportUnderReplicatedBlocksResponse {
+    required bool success = 1;
+    optional string message = 2;
+}
+
 // File writing is completed.
 message CompleteFileRequest {
     required string path = 1;
