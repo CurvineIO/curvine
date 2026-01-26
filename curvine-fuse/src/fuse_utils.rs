@@ -129,7 +129,8 @@ impl FuseUtils {
         {
             use nix;
             // request_code_read! macro is equivalent to linux _IOR macro
-            nix::request_code_read!(229, 0, 4)
+            // Cast to u64 to handle type differences between musl (i32) and glibc (u64)
+            nix::request_code_read!(229, 0, 4) as u64
         }
     }
 

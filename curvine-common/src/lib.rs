@@ -16,9 +16,12 @@ use crate::error::FsError;
 
 pub mod conf;
 pub mod error;
+#[cfg(feature = "server")]
 pub mod executor;
 pub mod fs;
+#[cfg(feature = "server")]
 pub mod raft;
+#[cfg(feature = "server")]
 pub mod rocksdb;
 pub mod state;
 pub mod utils;
@@ -27,6 +30,7 @@ pub mod version;
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/protos/proto.rs"));
 
+    #[cfg(feature = "server")]
     pub mod raft {
         include!(concat!(env!("OUT_DIR"), "/protos/raft.rs"));
     }
