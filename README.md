@@ -44,10 +44,10 @@ For more detailed information, please refer to:
 ## Use Case
 ![use_case](https://raw.githubusercontent.com/CurvineIO/curvine-doc/refs/heads/main/docs/1-Overview/img/curvine-scene.png)
 
-- **Case1**: Training acceleration
-- **Case2**: Model distribution
-- **Case3**: Hot table data acceleration
-- **Case4**: Shuffle acceleration
+- **Case1**: LLM Training acceleration Acceleration
+- **Case2**: LLM Model distribution Acceleration
+- **Case3**: Multimodal Data Lake Access Acceleration
+- **Case4**: OLAP Engine Query Acceleration in Compute-Storage Separation Scenarios
 - **Case5**: Multi-cloud data caching
 
 
