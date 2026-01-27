@@ -33,6 +33,7 @@ pub enum ServerState {
 }
 
 // Asynchronous task status monitor.
+#[derive(Clone)]
 pub struct ServerMonitor(StateMonitor);
 
 impl ServerMonitor {
@@ -58,6 +59,10 @@ impl ServerMonitor {
 
     pub fn read_ctl(&self) -> StateCtl {
         self.0.read_ctl()
+    }
+
+    pub fn state(&self) -> ServerState {
+        self.0.state()
     }
 }
 

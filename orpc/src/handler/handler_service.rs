@@ -15,7 +15,8 @@
 use crate::handler::{Frame, MessageHandler, StreamHandler, TestMessageHandler};
 use crate::io::net::ConnState;
 use crate::runtime::Runtime;
-use crate::server::ServerConf;
+use crate::server::{ServerConf, ServerStateListener};
+use crate::sync::StateCtl;
 use std::sync::Arc;
 
 /// The message processor runs and manages the following functions:
@@ -47,6 +48,24 @@ pub trait HandlerService: Send + Sync + 'static {
 
         let handler = self.get_message_handler(conn_state);
         StreamHandler::new(rt, frame, handler, conf)
+    }
+
+    fn get_stream_handler_with_shutdown<F: Frame>(
+        &self,
+        rt: Arc<Runtime>,
+        frame: F,
+        conf: &ServerConf,
+        shutdown_ctl: StateCtl,
+        shutdown_listener: ServerStateListener,
+    ) -> StreamHandler<F, Self::Item> {
+        let conn_state = if self.has_conn_state() {
+            Some(frame.new_conn_state())
+        } else {
+            None
+        };
+
+        let handler = self.get_message_handler(conn_state);
+        StreamHandler::new_with_shutdown(rt, frame, handler, conf, shutdown_ctl, shutdown_listener)
     }
 }
 

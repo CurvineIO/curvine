@@ -15,7 +15,7 @@
 use crate::handler::{HandlerService, MessageHandler, RpcFrame};
 use crate::io::net::InetAddr;
 use crate::runtime::{RpcRuntime, Runtime};
-use crate::server::{ServerConf, ServerMonitor, ServerStateListener};
+use crate::server::{ServerConf, ServerMonitor, ServerState, ServerStateListener};
 use crate::sync::StateCtl;
 use crate::CommonResult;
 use log::*;
@@ -88,6 +88,8 @@ where
     // Start server asynchronously
     async fn start0(&self) {
         let ctrl_c = tokio::signal::ctrl_c();
+        let mut shutdown_listener = self.monitor.new_listener();
+        let shutdown_requested = self.monitor.state() >= ServerState::Shutdown;
 
         #[cfg(target_os = "linux")]
         {
@@ -95,34 +97,49 @@ where
             // kill -p pid will send libc::SIGTERM signal (15).
             let mut unix_sig = signal(SignalKind::terminate()).unwrap();
 
-            tokio::select! {
-                res = self.run() => {
-                    if let Err(err) = res {
-                        error!("failed to accept, cause = {:?}", err);
+            if !shutdown_requested {
+                tokio::select! {
+                    res = self.run() => {
+                        if let Err(err) = res {
+                            error!("failed to accept, cause = {:?}", err);
+                        }
                     }
-                }
 
-                _ = ctrl_c => {
-                    info!("Receive ctrl_c signal, shutting down {}", self.conf.name);
-                }
+                    _ = ctrl_c => {
+                        info!("Receive ctrl_c signal, shutting down {}", self.conf.name);
+                        self.monitor.advance_shutdown();
+                    }
 
-                _ = unix_sig.recv()  => {
-                      info!("Received SIGTERM, shutting down {} gracefully...", self.conf.name);
+                    _ = unix_sig.recv()  => {
+                        info!("Received SIGTERM, shutting down {} gracefully...", self.conf.name);
+                        self.monitor.advance_shutdown();
+                    }
+
+                    _ = shutdown_listener.wait_shutdown() => {
+                        info!("Receive shutdown signal, shutting down {}", self.conf.name);
+                    }
                 }
             }
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            tokio::select! {
-                res = self.run() => {
-                    if let Err(err) = res {
-                        error!("failed to accept, cause = {:?}", err);
+            if !shutdown_requested {
+                tokio::select! {
+                    res = self.run() => {
+                        if let Err(err) = res {
+                            error!("failed to accept, cause = {:?}", err);
+                        }
                     }
-                }
 
-                _ = ctrl_c => {
-                    info!("Receive ctrl_c signal, shutting down {}", self.conf.name);
+                    _ = ctrl_c => {
+                        info!("Receive ctrl_c signal, shutting down {}", self.conf.name);
+                        self.monitor.advance_shutdown();
+                    }
+
+                    _ = shutdown_listener.wait_shutdown() => {
+                        info!("Receive shutdown signal, shutting down {}", self.conf.name);
+                    }
                 }
             }
         }
@@ -161,9 +178,20 @@ where
 
             let frame = RpcFrame::with_server(stream, &self.conf);
             let bind_addr = self.bind_addr().clone();
-            let mut handler = self
-                .service
-                .get_stream_handler(self.rt.clone(), frame, &self.conf);
+            let mut handler = if self.conf.enable_shutdown_listener {
+                let shutdown_ctl = self.monitor.read_ctl();
+                let shutdown_listener = self.monitor.new_listener();
+                self.service.get_stream_handler_with_shutdown(
+                    self.rt.clone(),
+                    frame,
+                    &self.conf,
+                    shutdown_ctl,
+                    shutdown_listener,
+                )
+            } else {
+                self.service
+                    .get_stream_handler(self.rt.clone(), frame, &self.conf)
+            };
             self.rt.spawn(async move {
                 if let Err(e) = handler.run().await {
                     error!("Connection[{} -> {}]: {}", bind_addr, client_addr, e);
@@ -206,6 +234,10 @@ where
 
     pub fn new_state_listener(&self) -> ServerStateListener {
         self.monitor.new_listener()
+    }
+
+    pub fn shutdown(&self) {
+        self.monitor.advance_shutdown();
     }
 
     pub fn add_shutdown_hook<T: FnOnce() + Send + Sync + 'static>(&self, hook: T) {

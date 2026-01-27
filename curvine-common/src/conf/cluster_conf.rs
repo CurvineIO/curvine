@@ -142,6 +142,7 @@ impl ClusterConf {
         // master will automatically close the idle connection, and the customer service will automatically maintain a heartbeat.
         conf.close_idle = self.master.io_close_idle;
         conf.timeout_ms = self.master.io_timeout_ms();
+        conf.enable_shutdown_listener = self.testing;
         conf
     }
 
@@ -203,6 +204,7 @@ impl ClusterConf {
         conf.pipe_pool_idle_time = self.worker.pipe_pool_idle_time;
 
         conf.enable_send_file = self.worker.enable_send_file;
+        conf.enable_shutdown_listener = self.testing;
         conf
     }
 

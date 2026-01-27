@@ -17,7 +17,8 @@ use crate::handler::{Frame, MessageHandler};
 use crate::io::IOResult;
 use crate::message::Message;
 use crate::runtime::{RpcRuntime, Runtime};
-use crate::server::ServerConf;
+use crate::server::{ServerConf, ServerState, ServerStateListener};
+use crate::sync::StateCtl;
 use crate::sys::RawPtr;
 use log::debug;
 use std::sync::Arc;
@@ -31,6 +32,8 @@ pub struct StreamHandler<F, M> {
     handler: RawPtr<M>,
     close_idle: bool,
     timeout: Duration,
+    shutdown_ctl: Option<StateCtl>,
+    shutdown_listener: Option<ServerStateListener>,
 }
 
 impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
@@ -41,12 +44,47 @@ impl<F: Frame, M: MessageHandler> StreamHandler<F, M> {
             handler: RawPtr::from_owned(handler),
             close_idle: conf.close_idle,
             timeout: Duration::from_millis(conf.timeout_ms),
+            shutdown_ctl: None,
+            shutdown_listener: None,
+        }
+    }
+
+    pub fn new_with_shutdown(
+        rt: Arc<Runtime>,
+        frame: F,
+        handler: M,
+        conf: &ServerConf,
+        shutdown_ctl: StateCtl,
+        shutdown_listener: ServerStateListener,
+    ) -> Self {
+        StreamHandler {
+            rt,
+            frame,
+            handler: RawPtr::from_owned(handler),
+            close_idle: conf.close_idle,
+            timeout: Duration::from_millis(conf.timeout_ms),
+            shutdown_ctl: Some(shutdown_ctl),
+            shutdown_listener: Some(shutdown_listener),
         }
     }
 
     pub async fn run(&mut self) -> IOResult<()> {
         loop {
-            let res = timeout(self.timeout, self.frame.receive()).await;
+            let res = if let (Some(shutdown_ctl), Some(shutdown_listener)) =
+                (&self.shutdown_ctl, &mut self.shutdown_listener)
+            {
+                if shutdown_ctl.state::<ServerState>() >= ServerState::Shutdown {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = shutdown_listener.wait_shutdown() => {
+                        return Ok(());
+                    }
+                    res = timeout(self.timeout, self.frame.receive()) => res,
+                }
+            } else {
+                timeout(self.timeout, self.frame.receive()).await
+            };
             let res = match res {
                 Ok(v) => v,
 

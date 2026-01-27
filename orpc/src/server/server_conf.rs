@@ -34,6 +34,8 @@ pub struct ServerConf {
 
     pub close_idle: bool,
 
+    pub enable_shutdown_listener: bool,
+
     pub enable_read_ahead: bool,
     pub read_ahead_len: u64,
 
@@ -63,6 +65,7 @@ impl ServerConf {
             timeout_ms: 120_000,
             keepalive: true,
             close_idle: true,
+            enable_shutdown_listener: false,
 
             enable_read_ahead: true,
             read_ahead_len: 4 * 1024 * 1024,
