@@ -12,21 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::os::windows::raw::HANDLE;
 use crate::fs::operator::{Read, Write};
 use crate::fs::state::NodeState;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseError, FuseResult};
-use curvine_common::state::{CreateFileOpts, CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
-use orpc::sys::RawPtr;
-use std::sync::Arc;
-use libc::stat;
-use log::__private_api::loc;
-use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use curvine_common::fs::{Path, StateReader, StateWriter};
-use orpc::{err_box, try_option, try_option_ref};
+use curvine_common::state::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
+use orpc::err_box;
+use orpc::sys::RawPtr;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct HandleLock {
@@ -161,6 +158,8 @@ impl FileHandle {
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
+        self.complete(None).await?;
+
         writer.write_len(self.ino)?;
         writer.write_len(self.fh)?;
         writer.write_struct(&self.status)?;
@@ -178,21 +177,27 @@ impl FileHandle {
         let ino = reader.read_len()?;
         let fh = reader.read_len()?;
         let status: FileStatus = reader.read_struct()?;
-        
+
         let has_writer: bool = reader.read_struct()?;
         let has_reader: bool = reader.read_struct()?;
         if !has_writer && !has_reader {
-            return err_box!("FileHandle has neither reader nor writer for ino={}, path={}", ino, status.path);
+            return err_box!(
+                "FileHandle has neither reader nor writer for ino={}, path={}",
+                ino,
+                status.path
+            );
         }
         let locks: HandleLock = reader.read_struct()?;
 
         let path = Path::from_str(&status.path)?;
         let writer = if has_writer {
             let opts = CreateFileOptsBuilder::with_conf(state.client_conf()).build();
-            let writer = state.new_writer(ino, &path, OpenFlags::new_write_only(), opts).await?;
+            let writer = state
+                .new_writer(ino, &path, OpenFlags::new_write_only(), opts)
+                .await?;
             Some(writer)
         } else {
-             None
+            None
         };
 
         let reader = if has_reader {

@@ -17,18 +17,18 @@ use crate::fs::state::DirHandle;
 use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
-use crate::{err_fuse, FuseResult};
+use crate::{err_fuse, FuseResult, STATE_FILE_MAGIC, STATE_FILE_VERSION};
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::{ClientConf, FuseConf};
+use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
 use curvine_common::fs::{FileSystem, MetaCache, Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
-use log::{info, warn};
+use log::{error, info, warn};
 use orpc::common::FastHashMap;
+use orpc::err_box;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::Mutex;
-use curvine_common::FsResult;
 
 pub struct NodeState {
     node_map: RwLock<NodeMap>,
@@ -71,6 +71,14 @@ impl NodeState {
 
     pub fn client_conf(&self) -> &ClientConf {
         &self.fs.conf().client
+    }
+
+    pub fn cluster_conf(&self) -> &ClusterConf {
+        self.fs.conf()
+    }
+
+    pub fn current_fh(&self) -> u64 {
+        self.fh_creator.get()
     }
 
     pub fn get_node(&self, id: u64) -> FuseResult<NodeAttr> {
@@ -445,69 +453,130 @@ impl NodeState {
         Ok(handle)
     }
 
-    pub async fn persist(&self, writer: &mut StateWriter) -> FsResult<()> {
-        let node_lock = self.node_read();
-        node_lock.persist(writer)?;
-        drop(node_lock);
+    pub fn all_handles(&self) -> Vec<Arc<FileHandle>> {
+        let lock = self.handles.read();
+        lock.values()
+            .flat_map(|v| v.values().cloned())
+            .collect::<Vec<_>>()
+    }
 
-        let handles_lock = self.handles.read();
-        let total_handles: usize = handles_lock.iter().map(|(_, h)| h.len()).sum();
-        writer.write_len(total_handles as u64)?;
-        for (_, handles) in handles_lock.iter() {
-            for (_, handle) in handles.iter() {
-                handle.persist(writer).await?;
-           }
+    pub fn all_dir_handles(&self) -> Vec<Arc<DirHandle>> {
+        let lock = self.dir_handles.read();
+        lock.values()
+            .flat_map(|v| v.values().cloned())
+            .collect::<Vec<_>>()
+    }
+
+    pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
+        writer.write_all(STATE_FILE_MAGIC)?;
+        writer.write_len(STATE_FILE_VERSION)?;
+
+        {
+            info!("node_state::persist: saving node_map");
+            let node_lock = self.node_read();
+            node_lock.persist(writer)?;
+            info!("node_state::persist: {} node saved", node_lock.nodes_len());
         }
-        drop(handles_lock);
 
-        let dir_handles_lock = self.dir_handles.read();
-        let total_dir_handles: usize = dir_handles_lock.iter().map(|(_, h)| h.len()).sum();
-        writer.write_len(total_dir_handles as u64)?;
-        for (_, handles) in dir_handles_lock.iter() {
-            for (_, handle) in handles.iter() {
-                writer.write_struct(&**handle)?;
+        info!("node_state::persist: saving file_handles");
+        let handles = self.all_handles();
+        writer.write_len(handles.len() as u64)?;
+        for handle in &handles {
+            if let Err(e) = handle.persist(writer).await {
+                error!("node_state::persist: error saving file_handle {:?}", e)
             }
         }
-        drop(dir_handles_lock);
+        info!("node_state::persist: {} file_handles saved", handles.len());
+
+        info!("node_state::persist: saving dir_handles");
+        let dir_handles = self.all_dir_handles();
+        writer.write_len(dir_handles.len() as u64)?;
+        for dir_handle in &dir_handles {
+            writer.write_struct(&**dir_handle)?;
+        }
+        info!(
+            "node_state::persist: {} dir_handles saved",
+            dir_handles.len()
+        );
 
         writer.write_len(self.fh_creator.get())?;
 
         Ok(())
     }
 
-    pub async fn restore(&mut self, reader: &mut StateReader) -> FsResult<()> {
-        let mut node_map = self.node_write();
-        node_map.restore(reader)?;
-        drop(node_map);
+    pub async fn restore(&mut self, reader: &mut StateReader) -> FuseResult<()> {
+        let mut magic = [0u8; 4];
+        reader.read_exact(&mut magic)?;
+        if &magic != STATE_FILE_MAGIC {
+            return err_box!(
+                "invalid magic: expected {:?}, got {:?}",
+                STATE_FILE_MAGIC,
+                magic
+            );
+        }
 
+        let version: u64 = reader.read_len()?;
+        if version != STATE_FILE_VERSION {
+            return err_box!(
+                "unsupported version: expected {}, got {}",
+                STATE_FILE_VERSION,
+                version
+            );
+        }
+
+        {
+            info!("node_state::restore: restoring node_map");
+            let mut node_lock = self.node_write();
+            node_lock.restore(reader)?;
+            info!(
+                "node_state::restore: node_map {}restored",
+                node_lock.nodes_len()
+            );
+        }
+
+        info!("node_state::restore: restoring file_handles");
         let handles_count = reader.read_len()?;
-        let mut handles_lock = self.handles.write();
+        let mut restored_handles = 0;
         for i in 0..handles_count {
-            let handle =  match FileHandle::restore(reader, self).await {
+            let handle = match FileHandle::restore(reader, self).await {
                 Ok(handle) => handle,
                 Err(e) => {
-                    // The file may have been deleted, so ignore this error.
-                    warn!("failed to restore FileHandle {}/{}: {}", i + 1, handles_count, e);
+                    error!(
+                        "failed to restore file_handle {}/{}: {}",
+                        i + 1,
+                        handles_count,
+                        e
+                    );
                     continue;
                 }
             };
-            handles_lock
-                .entry(handle.ino)
-                .or_default()
-                .insert(handle.fh, Arc::new(handle));
-        }
-        drop(handles_lock);
 
+            self.handles
+                .write()
+                .entry(handle.ino)
+                .or_default()
+                .insert(handle.fh, Arc::new(handle));
+            restored_handles += 1;
+        }
+        info!(
+            "node_state::restore: {}/{} file_handles restored",
+            restored_handles, handles_count
+        );
+
+        info!("node_state::restore: restoring dir_handles");
         let dir_handles_count = reader.read_len()?;
-        let mut dir_handles_lock = self.dir_handles.write();
-        for i in 0..dir_handles_count {
-            let handle =reader.read_struct::<DirHandle>()?;
-            dir_handles_lock
+        for _ in 0..dir_handles_count {
+            let handle = reader.read_struct::<DirHandle>()?;
+            self.dir_handles
+                .write()
                 .entry(handle.ino)
                 .or_default()
                 .insert(handle.fh, Arc::new(handle));
         }
-        drop(dir_handles_lock);
+        info!(
+            "node_state::restore: {} dir_handles restored",
+            dir_handles_count
+        );
 
         let fh_creator_value = reader.read_len()?;
         self.fh_creator = AtomicCounter::new(fh_creator_value);
@@ -522,7 +591,9 @@ mod test {
     use crate::FUSE_ROOT_ID;
     use curvine_client::unified::UnifiedFileSystem;
     use curvine_common::conf::{ClusterConf, FuseConf};
+
     use curvine_common::state::FileStatus;
+
     use orpc::runtime::AsyncRuntime;
     use orpc::CommonResult;
     use std::sync::Arc;

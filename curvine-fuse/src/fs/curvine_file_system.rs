@@ -22,7 +22,7 @@ use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path};
+use curvine_common::fs::{FileSystem, Path, StateReader, StateWriter};
 use curvine_common::state::{
     CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileLock, FileStatus, LockFlags, LockType,
     MkdirOptsBuilder, OpenFlags, SetAttrOpts,
@@ -76,6 +76,44 @@ impl CurvineFileSystem {
 
     pub fn conf(&self) -> &FuseConf {
         &self.conf
+    }
+
+    fn state_file_path(&self) -> String {
+        let pid = std::process::id();
+        format!("{}/curvine_fuse_state_{}.data", self.conf.state_dir, pid)
+    }
+
+    pub async fn persist(&self) -> FuseResult<()> {
+        let ts = TimeSpent::new();
+        info!("persist: task started");
+
+        let state_path = self.state_file_path();
+        let mut writer = StateWriter::new(&state_path)?;
+        self.state.persist(&mut writer).await?;
+        let file_size = writer.len();
+        drop(writer);
+
+        info!(
+            "persist: task completed, file_size={}, elapsed={}ms",
+            ByteUnit::byte_to_string(file_size),
+            ts.used_ms()
+        );
+
+        Ok(())
+    }
+
+    pub async fn restore(&mut self) -> FuseResult<()> {
+        let ts = TimeSpent::new();
+        info!("restore: task started");
+
+        let state_path = self.state_file_path();
+        let mut reader = StateReader::new(&state_path)?;
+        self.state.restore(&mut reader).await?;
+        drop(reader);
+
+        info!("restore: task completed, elapsed={}ms", ts.used_ms());
+
+        Ok(())
     }
 
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {

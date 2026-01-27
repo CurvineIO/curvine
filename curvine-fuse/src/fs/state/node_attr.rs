@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::FUSE_ROOT_ID;
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 // The cache inode property is the equivalent implementation of the libfuse node struct.
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]

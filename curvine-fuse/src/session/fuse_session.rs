@@ -27,6 +27,7 @@ use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{error, info, warn};
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::sys::SignalWatch;
 use orpc::CommonResult;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -84,18 +85,11 @@ impl<T: FileSystem> FuseSession<T> {
 
     pub async fn run(&mut self) -> CommonResult<()> {
         info!("fuse session started running");
-        let ctrl_c = tokio::signal::ctrl_c();
         let channels = std::mem::take(&mut self.channels);
         let mnts = std::mem::take(&mut self.mnts);
 
         #[cfg(target_os = "linux")]
         {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).unwrap();
-            let mut sigint = signal(SignalKind::interrupt()).unwrap();
-            let mut sighup = signal(SignalKind::hangup()).unwrap();
-            let mut sigquit = signal(SignalKind::quit()).unwrap();
-
             //check umount signal
             {
                 let watch_fds: Vec<orpc::sys::RawIO> = mnts.iter().map(|m| m.fd).collect();
@@ -110,28 +104,15 @@ impl<T: FileSystem> FuseSession<T> {
                     info!("run_all finished; proceeding to unmount and exit");
                 }
 
-                _ = ctrl_c => {
-                    info!("received Ctrl-C (SIGINT via terminal), shutting down fuse");
-                    let _ = self.shutdown_tx.send(true);
-                }
-
-                _ = sigterm.recv()  => {
-                    info!("received SIGTERM, shutting down fuse gracefully...");
-                    let _ = self.shutdown_tx.send(true);
-                }
-
-                _ = sigint.recv()  => {
-                    info!("received SIGINT, shutting down fuse gracefully...");
-                    let _ = self.shutdown_tx.send(true);
-                }
-
-                _ = sighup.recv()  => {
-                    info!("received SIGHUP, shutting down fuse gracefully...");
-                    let _ = self.shutdown_tx.send(true);
-                }
-
-                _ = sigquit.recv()  => {
-                    info!("received SIGQUIT, shutting down fuse gracefully...");
+                signal_result = SignalWatch::wait_quit() => {
+                    match signal_result {
+                        Ok(kind) => {
+                            info!("received {}, shutting down fuse gracefully...", kind);
+                        }
+                        Err(e) => {
+                            error!("error waiting for signal: {:?}", e);
+                        }
+                    }
                     let _ = self.shutdown_tx.send(true);
                 }
             }
