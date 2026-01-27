@@ -26,6 +26,8 @@ pub struct WorkerMetrics {
     pub(crate) write_time_us: Counter,
     pub(crate) write_count: Counter,
     pub(crate) write_blocks: CounterVec,
+    pub(crate) pipeline_establish_total: Counter,
+    pub(crate) pipeline_establish_failed: Counter,
 
     pub(crate) read_bytes: Counter,
     pub(crate) read_time_us: Counter,
@@ -52,6 +54,14 @@ impl WorkerMetrics {
             write_time_us: m::new_counter("write_time_us", "Microseconds spent writing")?,
             write_count: m::new_counter("write_count", "Number of writes")?,
             write_blocks: m::new_counter_vec("write_blocks", "write_blocks", &["type"])?,
+            pipeline_establish_total: m::new_counter(
+                "pipeline_establish_total",
+                "Total pipeline establishment attempts",
+            )?,
+            pipeline_establish_failed: m::new_counter(
+                "pipeline_establish_failed",
+                "Failed pipeline establishment attempts",
+            )?,
 
             read_bytes: m::new_counter("read_bytes", "worker read total bytes")?,
             read_time_us: m::new_counter("read_time_us", "Microseconds spent read")?,

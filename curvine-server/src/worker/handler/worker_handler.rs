@@ -14,15 +14,17 @@
 
 use crate::worker::block::BlockStore;
 use crate::worker::handler::BlockHandler;
+use crate::worker::handler::WriteContext;
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::task::TaskManager;
+use curvine_client::file::FsContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::state::LoadTaskInfo;
 use curvine_common::utils::SerdeUtils;
 use curvine_common::FsResult;
-use orpc::err_box;
+use log::debug;
 use orpc::handler::MessageHandler;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::runtime::Runtime;
@@ -34,31 +36,52 @@ pub struct WorkerHandler {
     pub task_manager: Arc<TaskManager>,
     pub rt: Arc<Runtime>,
     pub replication_handler: WorkerReplicationHandler,
+    pub fs_context: Arc<FsContext>,
 }
 
 impl MessageHandler for WorkerHandler {
     type Error = FsError;
 
+    fn is_sync(&self, msg: &Message) -> bool {
+        self.is_sync_request(msg)
+    }
+
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let code = RpcCode::from(msg.code());
         match code {
             RpcCode::SubmitTask => self.task_submit(msg),
-
             RpcCode::CancelJob => self.cancel_job(msg),
-
             RpcCode::SubmitBlockReplicationJob => self.replication_handler.handle(msg),
-
             _ => {
                 let h = self.get_handler(msg)?;
                 let res = h.handle(msg);
-
                 if matches!(
                     msg.request_status(),
                     RequestStatus::Cancel | RequestStatus::Complete
                 ) {
                     let _ = self.handler.take();
-                };
+                }
+                res
+            }
+        }
+    }
 
+    async fn async_handle(&mut self, msg: Message) -> FsResult<Message> {
+        let code = RpcCode::from(msg.code());
+        match code {
+            RpcCode::SubmitTask => self.task_submit(&msg),
+            RpcCode::CancelJob => self.cancel_job(&msg),
+            RpcCode::SubmitBlockReplicationJob => self.replication_handler.handle(&msg),
+            _ => {
+                let request_status = msg.request_status();
+                let h = self.get_handler(&msg)?;
+                let res = h.async_handle(msg).await;
+                if matches!(
+                    request_status,
+                    RequestStatus::Cancel | RequestStatus::Complete
+                ) {
+                    let _ = self.handler.take();
+                }
                 res
             }
         }
@@ -66,35 +89,79 @@ impl MessageHandler for WorkerHandler {
 }
 
 impl WorkerHandler {
-    fn get_handler(&mut self, msg: &Message) -> FsResult<&mut BlockHandler> {
+    fn is_sync_request(&self, msg: &Message) -> bool {
         let code = RpcCode::from(msg.code());
-
-        let need_new_handler = self.handler.is_none()
-            || !matches!(msg.request_status(), RequestStatus::Running)
-            || !Self::handler_matches_code(&self.handler, code);
-
-        if need_new_handler {
-            let handler = BlockHandler::new(code, self.store.clone())?;
-            let _ = self.handler.replace(handler);
-        }
-
-        match self.handler.as_mut() {
-            None => err_box!("The request is not initialized"),
-            Some(v) => Ok(v),
+        match code {
+            RpcCode::SubmitTask | RpcCode::CancelJob | RpcCode::SubmitBlockReplicationJob => true,
+            RpcCode::WriteBlock => {
+                if let Some(handler) = self
+                    .handler
+                    .as_ref()
+                    .filter(|h| Self::handler_matches_code(h, code))
+                {
+                    handler.is_sync(msg)
+                } else if msg.request_status() == RequestStatus::Open {
+                    match WriteContext::from_req(msg) {
+                        Ok(ctx) => {
+                            let has_pipeline_stream = ctx.has_pipeline_stream();
+                            let result = !has_pipeline_stream;
+                            debug!(
+                                "WorkerHandler::is_sync_request: WriteBlock Open, has_pipeline_stream={}, is_sync={}, block_id={}",
+                                has_pipeline_stream, result, ctx.block.id
+                            );
+                            result
+                        }
+                        Err(e) => {
+                            debug!(
+                                "WorkerHandler::is_sync_request: failed to parse WriteContext: {}, defaulting to sync",
+                                e
+                            );
+                            true
+                        }
+                    }
+                } else {
+                    false
+                }
+            }
+            RpcCode::ReadBlock | RpcCode::WriteBlocksBatch => true,
+            _ => self
+                .handler
+                .as_ref()
+                .filter(|h| Self::handler_matches_code(h, code))
+                .map(|h| h.is_sync(msg))
+                .unwrap_or(true),
         }
     }
 
-    // Check if the current handler type matches the request code
-    fn handler_matches_code(handler: &Option<BlockHandler>, code: RpcCode) -> bool {
+    fn handler_matches_code(handler: &BlockHandler, code: RpcCode) -> bool {
         matches!(
             (handler, code),
-            (Some(BlockHandler::Writer(_)), RpcCode::WriteBlock)
-                | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock)
-                | (
-                    Some(BlockHandler::BatchWriter(_)),
-                    RpcCode::WriteBlocksBatch
-                )
+            (BlockHandler::Writer(_), RpcCode::WriteBlock)
+                | (BlockHandler::Reader(_), RpcCode::ReadBlock)
+                | (BlockHandler::BatchWriter(_), RpcCode::WriteBlocksBatch)
         )
+    }
+
+    fn get_handler(&mut self, msg: &Message) -> FsResult<&mut BlockHandler> {
+        let code = RpcCode::from(msg.code());
+        let need_new = self.handler.is_none()
+            || matches!(msg.request_status(), RequestStatus::Open)
+            || self
+                .handler
+                .as_ref()
+                .map(|h| !Self::handler_matches_code(h, code))
+                .unwrap_or(true);
+        if need_new {
+            self.handler = Some(BlockHandler::new(
+                msg,
+                self.store.clone(),
+                self.fs_context.clone(),
+            )?);
+        }
+
+        self.handler
+            .as_mut()
+            .ok_or_else(|| FsError::common("The request is not initialized"))
     }
 
     pub fn task_submit(&self, msg: &Message) -> FsResult<Message> {

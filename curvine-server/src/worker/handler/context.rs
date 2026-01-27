@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use curvine_common::proto::{BlockReadRequest, BlockWriteRequest};
-use curvine_common::state::ExtendedBlock;
+use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::message::Message;
@@ -26,11 +26,18 @@ pub struct WriteContext {
     pub short_circuit: bool,
     pub off: i64,
     pub block_size: i64,
+    pub pipeline_stream: Vec<WorkerAddress>,
 }
 
 impl WriteContext {
     pub fn from_req(msg: &Message) -> FsResult<Self> {
         let req: BlockWriteRequest = msg.parse_header()?;
+
+        let pipeline_stream = req
+            .pipeline_stream
+            .iter()
+            .map(ProtoUtils::worker_address_from_pb)
+            .collect();
 
         let context = Self {
             block: ProtoUtils::extend_block_from_pb(req.block),
@@ -39,9 +46,14 @@ impl WriteContext {
             short_circuit: req.short_circuit,
             off: req.off,
             block_size: req.block_size,
+            pipeline_stream,
         };
 
         Ok(context)
+    }
+
+    pub fn has_pipeline_stream(&self) -> bool {
+        !self.pipeline_stream.is_empty()
     }
 }
 

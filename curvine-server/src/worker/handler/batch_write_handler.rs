@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::worker::block::BlockStore;
-use crate::worker::handler::WriteContext;
-use crate::worker::handler::WriteHandler;
+use crate::worker::handler::{WriteContext, WriteHandler};
+use curvine_client::file::FsContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
@@ -30,6 +30,7 @@ use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
+use std::sync::Arc;
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
@@ -40,7 +41,7 @@ pub struct BatchWriteHandler {
 }
 
 impl BatchWriteHandler {
-    pub fn new(store: BlockStore) -> Self {
+    pub fn new(store: BlockStore, _fs_context: Arc<FsContext>) -> Self {
         let store_clone = store.clone();
         Self {
             store,
@@ -81,7 +82,6 @@ impl BatchWriteHandler {
 
         for (i, block_proto) in header.blocks.into_iter().enumerate() {
             let unique_req_id = msg.req_id() + i as i64;
-            // Create a single BlockWriteRequest from the block
             let header = BlockWriteRequest {
                 block: block_proto,
                 off: header.off,
@@ -89,7 +89,7 @@ impl BatchWriteHandler {
                 short_circuit: header.short_circuit,
                 client_name: header.client_name.clone(),
                 chunk_size: header.chunk_size,
-                pipeline_stream: Vec::new(),
+                pipeline_stream: vec![],
             };
 
             // Create single request message for each block
@@ -157,6 +157,7 @@ impl BatchWriteHandler {
                 short_circuit: false,
                 off: header.off,
                 block_size: header.block_size,
+                pipeline_stream: vec![],
             };
 
             // Validate block length (same as complete)

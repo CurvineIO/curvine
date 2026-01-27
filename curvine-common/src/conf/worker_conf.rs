@@ -159,6 +159,10 @@ pub struct WorkerConf {
 
     // Enable S3 gateway alongside worker
     pub enable_s3_gateway: bool,
+
+    pub pipeline_queue_size: usize,
+
+    pub pipeline_write_delay_ms: u64,
 }
 
 impl WorkerConf {
@@ -203,6 +207,8 @@ impl Default for WorkerConf {
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
             enable_s3_gateway: false,
+            pipeline_queue_size: 0,
+            pipeline_write_delay_ms: 0,
         }
     }
 }

@@ -39,6 +39,16 @@ impl BlockWriterRemote {
         worker_address: WorkerAddress,
         pos: i64,
     ) -> FsResult<Self> {
+        Self::new_with_pipeline(fs_context, block, worker_address, pos, Vec::new()).await
+    }
+
+    pub async fn new_with_pipeline(
+        fs_context: &FsContext,
+        block: ExtendedBlock,
+        worker_address: WorkerAddress,
+        pos: i64,
+        pipeline_stream: Vec<WorkerAddress>,
+    ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let seq_id = 0;
         let block_size = fs_context.block_size();
@@ -53,7 +63,7 @@ impl BlockWriterRemote {
                 seq_id,
                 fs_context.write_chunk_size() as i32,
                 false,
-                Vec::new(),
+                pipeline_stream,
             )
             .await?;
 

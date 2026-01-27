@@ -18,6 +18,12 @@ pub use self::worker_handler::WorkerHandler;
 mod write_handler;
 pub use self::write_handler::WriteHandler;
 
+mod pipeline_writer;
+pub use self::pipeline_writer::{ClientPipelineForwarder, PipelineStream};
+
+mod pipeline_write_handler;
+pub use self::pipeline_write_handler::PipelineWriteHandler;
+
 mod batch_write_handler;
 pub use self::batch_write_handler::BatchWriteHandler;
 

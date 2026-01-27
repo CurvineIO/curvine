@@ -17,9 +17,11 @@
 use crate::block::block_writer::WriterAdapter::{Local, Remote};
 use crate::block::{BlockWriterLocal, BlockWriterRemote};
 use crate::file::FsContext;
+use curvine_common::error::FsError;
 use curvine_common::state::{BlockLocation, CommitBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
+use log::info;
 use orpc::err_box;
 use orpc::error::ErrorExt;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -109,9 +111,12 @@ impl WriterAdapter {
         located_block: &LocatedBlock,
         worker_addr: &WorkerAddress,
         pos: i64,
+        pipeline_stream: Vec<WorkerAddress>,
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
-        let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
+        let short_circuit = conf.short_circuit
+            && fs_context.is_local_worker(worker_addr)
+            && pipeline_stream.is_empty();
 
         let adapter = if short_circuit {
             let writer = BlockWriterLocal::new(
@@ -123,11 +128,12 @@ impl WriterAdapter {
             .await?;
             Local(writer)
         } else {
-            let writer = BlockWriterRemote::new(
+            let writer = BlockWriterRemote::new_with_pipeline(
                 &fs_context,
                 located_block.block.clone(),
                 worker_addr.clone(),
                 pos,
+                pipeline_stream,
             )
             .await?;
             Remote(writer)
@@ -149,10 +155,34 @@ impl BlockWriter {
             return err_box!("There is no available worker");
         }
 
+        let pipeline_enabled = fs_context.conf.client.enable_pipeline_write;
         let mut inners = Vec::with_capacity(locate.locs.len());
-        for addr in &locate.locs {
-            let adapter = WriterAdapter::new(fs_context.clone(), &locate, addr, pos).await?;
+        if pipeline_enabled && locate.locs.len() > 1 {
+            log::info!(
+                "BlockWriter::new: pipeline enabled, head_worker={}, downstream_count={}",
+                locate.locs[0].worker_id,
+                locate.locs.len() - 1
+            );
+            let head = locate
+                .locs
+                .first()
+                .ok_or_else(|| FsError::common("No pipeline head worker"))?
+                .clone();
+            let pipeline_stream = locate.locs[1..].to_vec();
+            let adapter =
+                WriterAdapter::new(fs_context.clone(), &locate, &head, pos, pipeline_stream)
+                    .await?;
             inners.push(adapter);
+        } else {
+            log::info!(
+                "BlockWriter::new: pipeline disabled, replica_count={}",
+                locate.locs.len()
+            );
+            for addr in &locate.locs {
+                let adapter =
+                    WriterAdapter::new(fs_context.clone(), &locate, addr, pos, Vec::new()).await?;
+                inners.push(adapter);
+            }
         }
 
         let writer = Self {
