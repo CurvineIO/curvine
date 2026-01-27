@@ -19,8 +19,8 @@ use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult};
 use curvine_client::unified::UnifiedFileSystem;
-use curvine_common::conf::FuseConf;
-use curvine_common::fs::{FileSystem, MetaCache, Path};
+use curvine_common::conf::{ClientConf, FuseConf};
+use curvine_common::fs::{FileSystem, MetaCache, Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
 use log::{info, warn};
 use orpc::common::FastHashMap;
@@ -28,6 +28,7 @@ use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::Mutex;
+use curvine_common::FsResult;
 
 pub struct NodeState {
     node_map: RwLock<NodeMap>,
@@ -66,6 +67,10 @@ impl NodeState {
 
     pub fn meta_cache(&self) -> &MetaCache {
         &self.meta_cache
+    }
+
+    pub fn client_conf(&self) -> &ClientConf {
+        &self.fs.conf().client
     }
 
     pub fn get_node(&self, id: u64) -> FuseResult<NodeAttr> {
@@ -438,6 +443,76 @@ impl NodeState {
             .insert(handle.fh, handle.clone());
 
         Ok(handle)
+    }
+
+    pub async fn persist(&self, writer: &mut StateWriter) -> FsResult<()> {
+        let node_lock = self.node_read();
+        node_lock.persist(writer)?;
+        drop(node_lock);
+
+        let handles_lock = self.handles.read();
+        let total_handles: usize = handles_lock.iter().map(|(_, h)| h.len()).sum();
+        writer.write_len(total_handles as u64)?;
+        for (_, handles) in handles_lock.iter() {
+            for (_, handle) in handles.iter() {
+                handle.persist(writer).await?;
+           }
+        }
+        drop(handles_lock);
+
+        let dir_handles_lock = self.dir_handles.read();
+        let total_dir_handles: usize = dir_handles_lock.iter().map(|(_, h)| h.len()).sum();
+        writer.write_len(total_dir_handles as u64)?;
+        for (_, handles) in dir_handles_lock.iter() {
+            for (_, handle) in handles.iter() {
+                writer.write_struct(&**handle)?;
+            }
+        }
+        drop(dir_handles_lock);
+
+        writer.write_len(self.fh_creator.get())?;
+
+        Ok(())
+    }
+
+    pub async fn restore(&mut self, reader: &mut StateReader) -> FsResult<()> {
+        let mut node_map = self.node_write();
+        node_map.restore(reader)?;
+        drop(node_map);
+
+        let handles_count = reader.read_len()?;
+        let mut handles_lock = self.handles.write();
+        for i in 0..handles_count {
+            let handle =  match FileHandle::restore(reader, self).await {
+                Ok(handle) => handle,
+                Err(e) => {
+                    // The file may have been deleted, so ignore this error.
+                    warn!("failed to restore FileHandle {}/{}: {}", i + 1, handles_count, e);
+                    continue;
+                }
+            };
+            handles_lock
+                .entry(handle.ino)
+                .or_default()
+                .insert(handle.fh, Arc::new(handle));
+        }
+        drop(handles_lock);
+
+        let dir_handles_count = reader.read_len()?;
+        let mut dir_handles_lock = self.dir_handles.write();
+        for i in 0..dir_handles_count {
+            let handle =reader.read_struct::<DirHandle>()?;
+            dir_handles_lock
+                .entry(handle.ino)
+                .or_default()
+                .insert(handle.fh, Arc::new(handle));
+        }
+        drop(dir_handles_lock);
+
+        let fh_creator_value = reader.read_len()?;
+        self.fh_creator = AtomicCounter::new(fh_creator_value);
+
+        Ok(())
     }
 }
 

@@ -16,7 +16,9 @@ use fxhash::FxHasher;
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hash};
 use std::ops::{Deref, DerefMut};
+use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize)]
 pub struct FastHashSet<T>(HashSet<T, BuildHasherDefault<FxHasher>>);
 
 impl<T: Eq + Hash> FastHashSet<T> {

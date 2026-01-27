@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bincode::{DefaultOptions, Options};
 use orpc::{try_err, CommonResult};
 
 pub struct SerdeUtils;
@@ -26,11 +27,29 @@ impl SerdeUtils {
         Ok(bytes)
     }
 
+    pub fn serialize_into<W, T: ?Sized>(writer: W, value: &T) -> CommonResult<()>
+        where
+            W: std::io::Write,
+            T: serde::Serialize,
+    {
+        try_err!(bincode::serialize_into(writer, value));
+        Ok(())
+    }
+
     pub fn deserialize<'a, T>(bytes: &'a [u8]) -> CommonResult<T>
     where
         T: serde::de::Deserialize<'a>,
     {
         let res = try_err!(bincode::deserialize::<T>(bytes));
+        Ok(res)
+    }
+
+    pub fn deserialize_from<R, T>(reader: R) -> CommonResult<T>
+        where
+            R: std::io::Read,
+            T: serde::de::DeserializeOwned,
+    {
+        let res = try_err!(bincode::deserialize_from::<R, T>(reader));
         Ok(res)
     }
 }

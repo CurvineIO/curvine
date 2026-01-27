@@ -18,7 +18,9 @@ use std::fmt;
 use std::fmt::Debug;
 use std::hash::{BuildHasherDefault, Hash};
 use std::ops::{Deref, DerefMut};
+use serde::{Deserialize, Serialize};
 
+#[derive(Deserialize, Serialize)]
 pub struct FastHashMap<K, V>(HashMap<K, V, BuildHasherDefault<FxHasher>>);
 
 impl<K: Eq + Hash, V> FastHashMap<K, V> {
