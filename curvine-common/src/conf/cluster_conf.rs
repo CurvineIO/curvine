@@ -16,17 +16,16 @@ use crate::conf::CliConf;
 use crate::conf::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf};
 use crate::rocksdb::DBConf;
 use crate::version;
+use config::{Config, Environment, File, FileFormat};
 use log::info;
 use orpc::client::{ClientConf as RpcConf, ClientFactory, SyncClient};
 use orpc::common::{LogConf, Utils};
 use orpc::io::net::{InetAddr, NodeAddr};
 use orpc::io::retry::TimeBondedRetryBuilder;
 use orpc::server::ServerConf;
-use orpc::{err_box, try_err, CommonResult};
+use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::fmt::{Display, Formatter};
-use std::fs::read_to_string;
 use std::time::Duration;
 
 // Cluster configuration files.
@@ -75,23 +74,45 @@ impl ClusterConf {
     pub const ENV_CLIENT_HOSTNAME: &'static str = "CURVINE_CLIENT_HOSTNAME";
     pub const ENV_CONF_FILE: &'static str = "CURVINE_CONF_FILE";
 
-    pub fn from<T: AsRef<str>>(path: T) -> CommonResult<Self> {
-        let str = try_err!(read_to_string(path.as_ref()));
-        let mut conf = try_err!(toml::from_str::<Self>(&str));
+    pub fn from<T: AsRef<str>>(path: T, args: Option<&str>) -> CommonResult<Self> {
+        let cli_source = args.unwrap_or("{}").to_string();
 
-        if let Ok(v) = env::var(Self::ENV_MASTER_HOSTNAME) {
-            conf.master.hostname = v.to_owned();
-            conf.journal.hostname = v;
-        }
+        // Get cluster configuration with priority: CLI args > env vars > config file > defaults
+        let config = Config::builder()
+            .add_source(File::new(path.as_ref(), FileFormat::Toml))
+            .add_source(Environment::with_prefix("CURVINE").separator("_"))
+            .add_source(File::from_str(&cli_source, FileFormat::Json));
 
-        // Apply worker hostname from environment variable (used by worker process)
-        if let Ok(v) = env::var(Self::ENV_WORKER_HOSTNAME) {
-            conf.worker.hostname = v;
-        }
-
-        // Apply client hostname from environment variable
-        if let Ok(v) = env::var(Self::ENV_CLIENT_HOSTNAME) {
-            conf.client.hostname = v;
+        let mut conf;
+        match config.build() {
+            Ok(config) => {
+                conf = Self {
+                    format_master: true,
+                    format_worker: true,
+                    testing: false,
+                    cluster_id: "curvine".to_string(),
+                    master: config.get::<MasterConf>("master").unwrap_or_default(),
+                    journal: config.get::<JournalConf>("journal").unwrap_or_default(),
+                    worker: config.get::<WorkerConf>("worker").unwrap_or_default(),
+                    log: config.get::<LogConf>("log").unwrap_or_default(),
+                    client: config.get::<ClientConf>("client").unwrap_or_default(),
+                    fuse: config.get::<FuseConf>("fuse").unwrap_or_default(),
+                    s3_gateway: config
+                        .get::<S3GatewayConf>("s3_gateway")
+                        .unwrap_or_default(),
+                    job: config.get::<JobConf>("job").unwrap_or_default(),
+                    cli: config.get::<CliConf>("cli").unwrap_or_default(),
+                };
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to load config file '{}': {}",
+                    path.as_ref(),
+                    e
+                );
+                eprintln!("Using default configuration");
+                conf = ClusterConf::default();
+            }
         }
 
         conf.master.init()?;
@@ -268,7 +289,7 @@ impl ClusterConf {
 
 impl Default for ClusterConf {
     fn default() -> Self {
-        Self {
+        let mut conf = Self {
             format_master: true,
             format_worker: true,
             testing: false,
@@ -282,7 +303,14 @@ impl Default for ClusterConf {
             s3_gateway: Default::default(),
             job: Default::default(),
             cli: Default::default(),
-        }
+        };
+
+        conf.master.init().unwrap();
+        conf.client.init().unwrap();
+        conf.fuse.init().unwrap();
+        conf.job.init().unwrap();
+
+        conf
     }
 }
 

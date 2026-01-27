@@ -40,6 +40,7 @@ slog = { workspace = true }
 slog-stdlog  = { workspace = true }
 chrono = { workspace = true }
 trait-variant = { workspace = true }
+config = { workspace = true }
 
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn cluster() {
         let path = "../etc/curvine-cluster.toml";
-        let conf = ClusterConf::from(path).unwrap();
+        let conf = ClusterConf::from(path, None).unwrap();
         println!("conf = {:#?}", conf)
     }
 

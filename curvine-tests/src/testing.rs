@@ -93,7 +93,7 @@ impl Testing {
 
     /// Read the active cluster configuration from the persisted path.
     pub fn get_active_cluster_conf(&self) -> CommonResult<ClusterConf> {
-        ClusterConf::from(self.active_cluster_conf_path.clone())
+        ClusterConf::from(self.active_cluster_conf_path.clone(), None)
     }
 
     /// Expose the active config file path.
@@ -225,7 +225,7 @@ impl TestingBuilder {
         let mut conf = if let Some(c) = self.base_conf {
             c
         } else if let Some(p) = self.base_conf_path {
-            ClusterConf::from(p)?
+            ClusterConf::from(p, None)?
         } else {
             ClusterConf::default()
         };
