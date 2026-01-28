@@ -23,12 +23,13 @@ use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::version;
 use orpc::common::{Logger, Utils};
-use orpc::io::net::InetAddr;
 use orpc::runtime::RpcRuntime;
-use orpc::{err_box, CommonResult};
+use orpc::CommonResult;
+use serde::Serialize;
+use serde_json::json;
 use std::sync::Arc;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Serialize)]
 #[command(author, version = version::VERSION, about, long_about = None)]
 pub struct CurvineArgs {
     /// Configuration file path (optional)
@@ -48,58 +49,60 @@ pub struct CurvineArgs {
     )]
     pub master_addrs: Option<String>,
 
+    #[serde(skip_serializing)]
     #[command(subcommand)]
     command: Commands,
 }
 
 impl CurvineArgs {
-    /// Get cluster configuration with priority: CLI args > config file > env vars > defaults
     pub fn get_conf(&self) -> CommonResult<ClusterConf> {
-        // Priority 1: Try to load from config file (CLI arg or env var)
         let conf_path = self
             .conf
             .clone()
             .or_else(|| std::env::var(ClusterConf::ENV_CONF_FILE).ok());
 
-        let mut conf = if let Some(path) = conf_path {
-            match ClusterConf::from(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Warning: Failed to load config file '{}': {}", path, e);
-                    eprintln!("Using default configuration");
-                    Self::create_default_conf()
-                }
-            }
+        let args_value = serde_json::to_value(self).unwrap();
+
+        // Change the format of master_addrs from "m1:8995,..." to [{"hostname": "m1", "port": 8995}, ...]
+        let master_addrs = if let Some(master_addrs_str) =
+            args_value.get("master_addrs").and_then(|v| v.as_str())
+        {
+            master_addrs_str
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|addr| {
+                    let addr = addr.trim();
+                    let parts: Vec<&str> = addr.split(':').collect();
+
+                    if parts.len() == 2 {
+                        let hostname = parts[0];
+                        let port = parts[1]
+                            .parse::<u16>()
+                            .map_err(|_| format!("Invalid port: {}", parts[1]))?;
+
+                        Ok(json!({
+                            "hostname": hostname,
+                            "port": port
+                        }))
+                    } else {
+                        Err(format!("Invalid address format: {}", addr))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
         } else {
-            println!("No config file specified, using default configuration");
-            Self::create_default_conf()
+            Vec::new()
         };
 
-        // Priority 2: Override with CLI master_addrs if provided
-        if let Some(master_addrs) = &self.master_addrs {
-            let mut vec = vec![];
-            for node in master_addrs.split(',') {
-                let tmp: Vec<&str> = node.split(':').collect();
-                if tmp.len() != 2 {
-                    return err_box!("Invalid master_addrs format: '{}'. Expected format: 'host1:port1,host2:port2'", master_addrs);
-                }
-                let hostname = tmp[0].to_string();
-                let port: u16 = tmp[1]
-                    .parse()
-                    .map_err(|_| format!("Invalid port number in master_addrs: '{}'", tmp[1]))?;
-                vec.push(InetAddr::new(hostname, port));
+        let args_json = json!({
+            "cli": args_value,
+            "client": {
+                "master_addrs": master_addrs
             }
-            conf.client.master_addrs = vec;
-        }
+        })
+        .to_string();
 
-        // Initialize configuration (parse string values to actual types)
-        conf.client.init()?;
-
-        Ok(conf)
-    }
-
-    fn create_default_conf() -> ClusterConf {
-        ClusterConf::default()
+        ClusterConf::from(conf_path.unwrap(), Some(&args_json))
     }
 }
 

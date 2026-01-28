@@ -27,6 +27,9 @@ mini-moka = { workspace = true }
 fxhash = { workspace = true }
 dashmap = { workspace = true }
 bitflags = { workspace = true }
+serde = { workspace = true }
+serde_with = { workspace = true }
+serde_json = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

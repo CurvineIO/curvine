@@ -19,9 +19,11 @@ use curvine_fuse::fs::CurvineFileSystem;
 use curvine_fuse::session::FuseSession;
 use curvine_fuse::web_server::WebServer;
 use orpc::common::Logger;
-use orpc::io::net::InetAddr;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::{err_box, CommonResult};
+use orpc::CommonResult;
+use serde::Serialize;
+use serde_json::json;
+use serde_with::skip_serializing_none;
 use std::sync::Arc;
 
 // fuse mount.
@@ -48,8 +50,9 @@ fn main() -> CommonResult<()> {
 
     let fuse_rt = rt.clone();
 
+    let web_port = cluster_conf.fuse.web_port;
     rt.spawn(async move {
-        if let Err(e) = WebServer::start(cluster_conf.fuse.web_port).await {
+        if let Err(e) = WebServer::start(web_port).await {
             tracing::error!("Failed to start metrics server: {}", e);
         }
     });
@@ -65,7 +68,8 @@ fn main() -> CommonResult<()> {
 }
 
 // Mount command function parameters
-#[derive(Debug, Parser, Clone)]
+#[skip_serializing_none]
+#[derive(Debug, Parser, Clone, Serialize)]
 #[command(version = version::VERSION)]
 pub struct FuseArgs {
     // Mount the mount point, mount the file system to a directory of the machine.
@@ -162,123 +166,50 @@ pub struct FuseArgs {
 impl FuseArgs {
     // parse the cluster configuration file.
     pub fn get_conf(&self) -> CommonResult<ClusterConf> {
-        let mut conf = match ClusterConf::from(&self.conf) {
-            Ok(c) => {
-                println!("Loaded configuration from {}", self.conf);
-                c
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to load config file '{}': {}", self.conf, e);
-                eprintln!("Using default configuration");
-                Self::create_default_conf()
-            }
+        let args_value = serde_json::to_value(self).unwrap();
+
+        // Change the format of master_addrs from "m1:8995,..." to [{"hostname": "m1", "port": 8995}, ...]
+        let master_addrs = if let Some(master_addrs_str) =
+            args_value.get("master_addrs").and_then(|v| v.as_str())
+        {
+            master_addrs_str
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|addr| {
+                    let addr = addr.trim();
+                    let parts: Vec<&str> = addr.split(':').collect();
+
+                    if parts.len() == 2 {
+                        let hostname = parts[0];
+                        let port = parts[1]
+                            .parse::<u16>()
+                            .map_err(|_| format!("Invalid port: {}", parts[1]))?;
+
+                        Ok(json!({
+                            "hostname": hostname,
+                            "port": port
+                        }))
+                    } else {
+                        Err(format!("Invalid address format: {}", addr))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        } else {
+            Vec::new()
         };
 
-        // FUSE configuration - only override if command line values are specified
-        if let Some(mnt_path) = &self.mnt_path {
-            conf.fuse.mnt_path = mnt_path.clone();
-        }
-        if let Some(fs_path) = &self.fs_path {
-            conf.fuse.fs_path = fs_path.clone();
-        }
-        if let Some(mnt_number) = self.mnt_number {
-            conf.fuse.mnt_number = mnt_number;
-        }
-        if self.debug {
-            conf.fuse.debug = true;
-        }
-
-        // Optional FUSE parameters - only override if specified
-        if let Some(io_threads) = self.io_threads {
-            conf.fuse.io_threads = io_threads;
-        }
-
-        if let Some(worker_threads) = self.worker_threads {
-            conf.fuse.worker_threads = worker_threads;
-        }
-
-        if let Some(mnt_per_task) = self.mnt_per_task {
-            conf.fuse.mnt_per_task = mnt_per_task;
-        }
-
-        if let Some(clone_fd) = self.clone_fd {
-            conf.fuse.clone_fd = clone_fd;
-        }
-
-        if let Some(fuse_channel_size) = self.fuse_channel_size {
-            conf.fuse.fuse_channel_size = fuse_channel_size;
-        }
-
-        if let Some(stream_channel_size) = self.stream_channel_size {
-            conf.fuse.stream_channel_size = stream_channel_size;
-        }
-
-        if let Some(direct_io) = self.direct_io {
-            conf.fuse.direct_io = direct_io;
-        }
-
-        if let Some(cache_readdir) = self.cache_readdir {
-            conf.fuse.cache_readdir = cache_readdir;
-        }
-
-        if let Some(entry_timeout) = self.entry_timeout {
-            conf.fuse.entry_timeout = entry_timeout;
-        }
-
-        if let Some(attr_timeout) = self.attr_timeout {
-            conf.fuse.attr_timeout = attr_timeout;
-        }
-
-        if let Some(negative_timeout) = self.negative_timeout {
-            conf.fuse.negative_timeout = negative_timeout;
-        }
-
-        if let Some(max_background) = self.max_background {
-            conf.fuse.max_background = max_background;
-        }
-
-        if let Some(congestion_threshold) = self.congestion_threshold {
-            conf.fuse.congestion_threshold = congestion_threshold;
-        }
-
-        if let Some(node_cache_size) = self.node_cache_size {
-            conf.fuse.node_cache_size = node_cache_size;
-        }
-
-        if let Some(node_cache_timeout) = &self.node_cache_timeout {
-            conf.fuse.node_cache_timeout = node_cache_timeout.clone();
-        }
-
-        if let Some(web_port) = self.web_port {
-            conf.fuse.web_port = web_port;
-        }
-
-        if let Some(master_addrs) = &self.master_addrs {
-            let mut vec = vec![];
-            for node in master_addrs.split(",") {
-                let tmp: Vec<&str> = node.split(":").collect();
-                if tmp.len() != 2 {
-                    return err_box!("wrong format master_addrs {}", master_addrs);
-                }
-                let hostname = tmp[0].to_string();
-                let port: u16 = tmp[1].parse()?;
-                vec.push(InetAddr::new(hostname, port));
+        let args_json = json!({
+            "fuse": args_value,
+            "client": {
+                "master_addrs": master_addrs
             }
-            conf.client.master_addrs = vec;
-        }
+        })
+        .to_string();
 
-        // FUSE options - override if provided
-        if !self.options.is_empty() {
-            conf.fuse.fuse_opts = self.options.clone()
-        } else {
-            conf.fuse.fuse_opts = Self::default_mnt_opts();
-        }
-
-        Ok(conf)
-    }
-
-    fn create_default_conf() -> ClusterConf {
-        ClusterConf::default()
+        let conf = ClusterConf::from(&self.conf, Some(&args_json));
+        println!("Loaded configuration from {}", &self.conf);
+        conf
     }
 
     pub fn default_mnt_opts() -> Vec<String> {

@@ -22,9 +22,13 @@ use curvine_s3_gateway::auth::{
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
 use rand::Rng;
+use serde::Serialize;
+use serde_json::json;
+use serde_with::skip_serializing_none;
 use std::sync::Arc;
 
-#[derive(Debug, Parser, Clone)]
+#[skip_serializing_none]
+#[derive(Debug, Parser, Clone, Serialize)]
 #[command(version = version::VERSION)]
 pub struct ObjectArgs {
     #[arg(
@@ -44,6 +48,7 @@ pub struct ObjectArgs {
     #[arg(long)]
     pub credentials_path: Option<String>,
 
+    #[serde(skip_serializing)]
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -81,19 +86,13 @@ pub enum CredentialAction {
 fn main() -> CommonResult<()> {
     let args = ObjectArgs::parse();
 
-    let conf = match ClusterConf::from(&args.conf) {
-        Ok(c) => {
-            tracing::info!("Loaded configuration from {}", args.conf);
-            c
-        }
-        Err(e) => {
-            println!(
-                "Warning: Failed to load config file '{}': {}. Using default configuration",
-                args.conf, e
-            );
-            ClusterConf::default()
-        }
-    };
+    let args_value = serde_json::to_value(&args).unwrap();
+    let args_json = json!({
+        "s3_gateway": args_value,
+    })
+    .to_string();
+    let conf = ClusterConf::from(&args.conf, Some(&args_json))?;
+    println!("Loaded configuration from {}", &args.conf);
 
     orpc::common::Logger::init(conf.master.log.clone());
 
@@ -101,21 +100,12 @@ fn main() -> CommonResult<()> {
         return handle_credential_command(&args, &conf, action.clone());
     }
 
-    serve_gateway(args, conf)
+    serve_gateway(conf)
 }
 
-fn serve_gateway(args: ObjectArgs, conf: ClusterConf) -> CommonResult<()> {
-    let listen = if args.listen != "0.0.0.0:9900" {
-        args.listen.clone()
-    } else {
-        conf.s3_gateway.listen.clone()
-    };
-
-    let region = if args.region != "us-east-1" {
-        args.region.clone()
-    } else {
-        conf.s3_gateway.region.clone()
-    };
+fn serve_gateway(conf: ClusterConf) -> CommonResult<()> {
+    let listen = conf.s3_gateway.listen.clone();
+    let region = conf.s3_gateway.region.clone();
 
     tracing::info!(
         "S3 Gateway configuration - Listen: {}, Region: {}",
