@@ -622,6 +622,7 @@ impl OpendalFileSystem {
             replicas: 1,
             block_size: 4 * 1024 * 1024,
             file_type: FileType::File,
+            mode: 0o777,
             ..Default::default()
         }
     }
@@ -647,6 +648,7 @@ impl OpendalFileSystem {
             is_complete: true,
             replicas: 1,
             block_size: 4 * 1024 * 1024,
+            mode: 0o777,
             ..Default::default()
         }
     }
