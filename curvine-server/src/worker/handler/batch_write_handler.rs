@@ -182,6 +182,17 @@ impl BatchWriteHandler {
         let header: FilesBatchWriteRequest = msg.parse_header()?;
         let mut results = Vec::new();
 
+        // Use drain to extract elements while preserving the vector's allocated memory
+        let files_vec = self.file.as_mut().unwrap();
+        let contexts_vec = self.context.as_mut().unwrap();
+
+        let files_drain: Vec<_> = std::mem::take(files_vec);
+        let contexts_drain: Vec<_> = std::mem::take(contexts_vec);
+
+        // Process each file in order
+        let mut files_iter = files_drain.into_iter();
+        let mut contexts_iter = contexts_drain.into_iter();
+
         for (i, file_data) in header.files.iter().enumerate() {
             // Convert bytes to DataSlice
             let data_slice = DataSlice::Bytes(bytes::Bytes::from(file_data.clone().content));
@@ -196,21 +207,22 @@ impl BatchWriteHandler {
                 .data(data_slice)
                 .build();
 
-            // Transfer to handler using swap_remove and push back pattern
-            let file = self.file.as_mut().unwrap().swap_remove(i);
-            let context = self.context.as_mut().unwrap().swap_remove(i);
+            // Get the next file and context from iterators (preserves original order)
+            let file = files_iter.next().unwrap();
+            let context = contexts_iter.next().unwrap();
 
             self.write_handler.file = Some(file);
             self.write_handler.context = Some(context);
 
             let response = self.write_handler.write(&single_msg);
 
-            // Transfer back
+            // Collect processed file and context back into the original vectors
             let file = self.write_handler.file.take().unwrap();
             let context = self.write_handler.context.take().unwrap();
 
-            self.file.as_mut().unwrap().insert(i, file);
-            self.context.as_mut().unwrap().insert(i, context);
+            // Push back to reuse the pre-allocated capacity from open_batch
+            files_vec.push(file);
+            contexts_vec.push(context);
 
             results.push(response.is_ok());
         }
