@@ -115,19 +115,30 @@ impl ClusterConf {
             }
         }
 
-        conf.master.init()?;
-        conf.client.init()?;
-        conf.fuse.init()?;
-        conf.job.init()?;
+        conf.init()?;
 
-        if conf.client.master_addrs.is_empty() {
-            for peer in &mut conf.journal.journal_addrs {
-                let node = InetAddr::new(&peer.hostname, conf.master.rpc_port);
-                conf.client.master_addrs.push(node);
+        Ok(conf)
+    }
+
+    pub fn init(&mut self) -> CommonResult<()> {
+        self.master.init()?;
+        self.journal.init()?;
+        self.worker.init()?;
+        self.log.init()?;
+        self.client.init()?;
+        self.fuse.init()?;
+        self.s3_gateway.init()?;
+        self.job.init()?;
+        self.cli.init()?;
+
+        if self.client.master_addrs.is_empty() {
+            for peer in &mut self.journal.journal_addrs {
+                let node = InetAddr::new(&peer.hostname, self.master.rpc_port);
+                self.client.master_addrs.push(node);
             }
         }
 
-        Ok(conf)
+        Ok(())
     }
 
     pub fn check_master_hostname(&mut self) -> CommonResult<()> {
@@ -305,10 +316,7 @@ impl Default for ClusterConf {
             cli: Default::default(),
         };
 
-        conf.master.init().unwrap();
-        conf.client.init().unwrap();
-        conf.fuse.init().unwrap();
-        conf.job.init().unwrap();
+        conf.init().unwrap();
 
         conf
     }
@@ -336,6 +344,12 @@ pub struct S3GatewayConf {
     pub cache_refresh_interval_secs: u64,
     pub get_chunk_size_mb: f32,
     pub web_port: u16,
+}
+
+impl S3GatewayConf {
+    pub fn init(&mut self) -> CommonResult<()> {
+        Ok(())
+    }
 }
 
 impl Default for S3GatewayConf {

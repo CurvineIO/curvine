@@ -162,6 +162,10 @@ pub struct WorkerConf {
 }
 
 impl WorkerConf {
+    pub fn init(&mut self) -> CommonResult<()> {
+        Ok(())
+    }
+
     pub fn io_slow_us(&self) -> u64 {
         let dur = DurationUnit::from_str(&self.io_slow_threshold).unwrap();
         dur.as_millis() * 1000
