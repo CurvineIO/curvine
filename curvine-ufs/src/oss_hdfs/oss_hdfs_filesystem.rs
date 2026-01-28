@@ -293,6 +293,7 @@ impl OssHdfsFileSystem {
             } else {
                 FileType::File
             },
+            mode: 0o777,
             ..Default::default()
         }
     }
