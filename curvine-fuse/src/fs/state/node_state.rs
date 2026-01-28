@@ -504,7 +504,7 @@ impl NodeState {
         Ok(())
     }
 
-    pub async fn restore(&mut self, reader: &mut StateReader) -> FuseResult<()> {
+    pub async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != STATE_FILE_MAGIC {
@@ -579,7 +579,7 @@ impl NodeState {
         );
 
         let fh_creator_value = reader.read_len()?;
-        self.fh_creator = AtomicCounter::new(fh_creator_value);
+        self.fh_creator.set(fh_creator_value);
 
         Ok(())
     }

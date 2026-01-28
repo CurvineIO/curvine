@@ -83,39 +83,6 @@ impl CurvineFileSystem {
         format!("{}/curvine_fuse_state_{}.data", self.conf.state_dir, pid)
     }
 
-    pub async fn persist(&self) -> FuseResult<()> {
-        let ts = TimeSpent::new();
-        info!("persist: task started");
-
-        let state_path = self.state_file_path();
-        let mut writer = StateWriter::new(&state_path)?;
-        self.state.persist(&mut writer).await?;
-        let file_size = writer.len();
-        drop(writer);
-
-        info!(
-            "persist: task completed, file_size={}, elapsed={}ms",
-            ByteUnit::byte_to_string(file_size),
-            ts.used_ms()
-        );
-
-        Ok(())
-    }
-
-    pub async fn restore(&mut self) -> FuseResult<()> {
-        let ts = TimeSpent::new();
-        info!("restore: task started");
-
-        let state_path = self.state_file_path();
-        let mut reader = StateReader::new(&state_path)?;
-        self.state.restore(&mut reader).await?;
-        drop(reader);
-
-        info!("restore: task completed, elapsed={}ms", ts.used_ms());
-
-        Ok(())
-    }
-
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
         let blocks = ((status.len + 511) / 512) as u64;
 
@@ -1546,5 +1513,39 @@ impl fs::FileSystem for CurvineFileSystem {
                 info!("waiting lock for {}, elapsed: {} ms", path, time.used_ms());
             }
         }
+    }
+
+    async fn persist(&self) -> FuseResult<()> {
+        let ts = TimeSpent::new();
+        info!("persist: task started");
+
+        let state_path = self.state_file_path();
+        let mut writer = StateWriter::new(&state_path)?;
+        self.state.persist(&mut writer).await?;
+        let file_size = writer.len();
+        drop(writer);
+
+        info!(
+            "persist: task completed, file_path={}, file_size={}, elapsed={}ms",
+            state_path,
+            ByteUnit::byte_to_string(file_size),
+            ts.used_ms()
+        );
+
+        Ok(())
+    }
+
+    async fn restore(&self) -> FuseResult<()> {
+        let ts = TimeSpent::new();
+        info!("restore: task started");
+
+        let state_path = self.state_file_path();
+        let mut reader = StateReader::new(&state_path)?;
+        self.state.restore(&mut reader).await?;
+        drop(reader);
+
+        info!("restore: task completed, elapsed={}ms", ts.used_ms());
+
+        Ok(())
     }
 }

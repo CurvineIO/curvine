@@ -27,7 +27,7 @@ use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{error, info, warn};
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::SignalWatch;
+use orpc::sys::{SignalKind, SignalWatch};
 use orpc::CommonResult;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -91,31 +91,43 @@ impl<T: FileSystem> FuseSession<T> {
         #[cfg(target_os = "linux")]
         {
             //check umount signal
-            {
-                let watch_fds: Vec<orpc::sys::RawIO> = mnts.iter().map(|m| m.fd).collect();
-                self.spawn_fd_watcher(&watch_fds);
+            let watch_fds: Vec<orpc::sys::RawIO> = mnts.iter().map(|m| m.fd).collect();
+            self.spawn_fd_watcher(&watch_fds);
+        }
+
+        tokio::select! {
+            res = Self::run_all(self.rt.clone(), self.fs.clone(), channels, self.shutdown_tx.subscribe()) => {
+                if let Err(err) = res {
+                    error!("fatal error, cause = {:?}", err);
+                }
+                info!("run_all finished; proceeding to unmount and exit");
             }
 
-            tokio::select! {
-                res = Self::run_all(self.rt.clone(), self.fs.clone(), channels, self.shutdown_tx.subscribe()) => {
-                    if let Err(err) = res {
-                        error!("fatal error, cause = {:?}", err);
+            signal_result = SignalWatch::wait_quit() => {
+                match signal_result {
+                    Ok(kind) => {
+                        info!("received {}, shutting down fuse gracefully...", kind);
                     }
-                    info!("run_all finished; proceeding to unmount and exit");
-                }
-
-                signal_result = SignalWatch::wait_quit() => {
-                    match signal_result {
-                        Ok(kind) => {
-                            info!("received {}, shutting down fuse gracefully...", kind);
-                        }
-                        Err(e) => {
-                            error!("error waiting for signal: {:?}", e);
-                        }
+                    Err(e) => {
+                        error!("error waiting for signal: {:?}", e);
                     }
-                    let _ = self.shutdown_tx.send(true);
                 }
+                let _ = self.shutdown_tx.send(true);
             }
+
+            signal_result = SignalWatch::wait_one(SignalKind::User1) => {
+                match signal_result {
+                    Ok(kind) => {
+                        info!("received {}, shutting down fuse gracefully...", kind);
+                        self.fs.persist().await.unwrap();
+                    }
+                    Err(e) => {
+                        error!("error waiting for signal: {:?}", e);
+                    }
+                }
+                let _ = self.shutdown_tx.send(true);
+            }
+
         }
 
         info!("calling fs.unmount() and finishing fuse session");
