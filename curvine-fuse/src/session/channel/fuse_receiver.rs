@@ -18,7 +18,7 @@ use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::AsyncSender;
@@ -144,7 +144,7 @@ impl<T: FileSystem> FuseReceiver<T> {
     }
 
     pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
-        debug!("fuse receiver started");
+        warn!("fuse receiver started");
         loop {
             tokio::select! {
                 res = self.receive() => {

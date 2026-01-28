@@ -54,6 +54,16 @@ impl FuseMnt {
         }
     }
 
+    pub fn restore(path: PathBuf, conf: &FuseConf, fd: RawIO) -> Self {
+        sys::set_pipe_blocking(fd, false).unwrap();
+        info!("fuse restore success, path {:?}, fd {}", path, fd);
+        Self {
+            path,
+            fd,
+            clone_fds: Mutex::new(vec![]),
+        }
+    }
+
     fn crate_task_fd(&self, clone: bool) -> IOResult<BorrowedFd> {
         let clone_fd = if clone && *UNIX_KERNEL_VERSION >= FUSE_CLONE_FD_MIN_VERSION {
             match FuseUtils::fuse_clone_fd(self.fd) {
@@ -95,7 +105,7 @@ impl FuseMnt {
 
 impl Drop for FuseMnt {
     fn drop(&mut self) {
-        fuse_umount_pure(self.path.as_path());
+        // fuse_umount_pure(self.path.as_path());
         info!("unmount {:?}", self.path)
     }
 }

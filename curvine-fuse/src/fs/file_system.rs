@@ -19,6 +19,7 @@ use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
 use std::future::Future;
 use tokio_util::bytes::BytesMut;
+use curvine_common::fs::{StateReader, StateWriter};
 
 pub trait FileSystem: Send + Sync + 'static {
     fn init(&self, op: Init<'_>) -> impl Future<Output = FuseResult<fuse_init_out>> + Send {
@@ -194,11 +195,11 @@ pub trait FileSystem: Send + Sync + 'static {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
     }
 
-    fn persist(&self) -> impl Future<Output = FuseResult<()>> + Send {
+    fn persist(&self, _writer: &mut StateWriter) -> impl Future<Output = FuseResult<()>> + Send {
         async move { err_fuse!(libc::ENOSYS, "persist") }
     }
 
-    fn restore(&self) -> impl Future<Output = FuseResult<()>> + Send {
+    fn restore(&self, _reader: &mut StateReader) -> impl Future<Output = FuseResult<()>> + Send {
         async move { err_fuse!(libc::ENOSYS, "restore") }
     }
 }
