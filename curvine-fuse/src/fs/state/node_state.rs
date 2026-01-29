@@ -499,15 +499,17 @@ mod test {
         let status_c = FileStatus::with_name(4, "c".to_string(), true);
         let a = state.do_lookup(FUSE_ROOT_ID, Some("a"), &status_a)?;
         let b = state.do_lookup(a.ino, Some("b"), &status_b)?;
-        let _ = state.do_lookup(b.ino, Some("c"), &status_c)?;
+        let c = state.do_lookup(b.ino, Some("c"), &status_c)?;
 
+        state.forget_node(c.ino, 1)?;
+        state.forget_node(b.ino, 1)?;
         thread::sleep(Duration::from_secs(1));
 
         // Trigger cache cleaning
         let a1 = state.find_node(FUSE_ROOT_ID, Some("a"));
         assert!(a1.is_ok());
 
-        let c1 = state.get_path_common(b.ino, Some("c"));
+        let c1 = state.get_path_common(c.ino, Some("1.log"));
         assert!(c1.is_err());
 
         Ok(())
