@@ -103,3 +103,9 @@ impl From<Elapsed> for FuseError {
         Self::new(libc::EIO, value.into())
     }
 }
+
+impl From<std::io::Error> for FuseError {
+    fn from(value: std::io::Error) -> Self {
+        Self::new(libc::EIO, value.into())
+    }
+}
