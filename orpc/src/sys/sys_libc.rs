@@ -333,7 +333,10 @@ pub fn is_tmpfs(file_path: &str) -> IOResult<bool> {
         unsafe {
             let mut stat: libc::statfs = std::mem::zeroed();
             err_io!(libc::statfs(path.as_ptr(), &mut stat))?;
-            Ok(stat.f_type == libc::TMPFS_MAGIC)
+            // Use as to handle type differences between musl (i64) and glibc (u64)
+            #[allow(clippy::unnecessary_cast)]
+            let is_tmpfs = stat.f_type as i64 == libc::TMPFS_MAGIC as i64;
+            Ok(is_tmpfs)
         }
     }
 }
@@ -472,7 +475,8 @@ pub fn ioctl(fd: RawIO, request: u64, arg: *mut libc::c_void) -> IOResult<CInt> 
 
     #[cfg(target_os = "linux")]
     {
-        let res = unsafe { libc::ioctl(fd, request, arg) };
+        // Use as to handle type differences between musl (i32) and glibc (u64)
+        let res = unsafe { libc::ioctl(fd, request as libc::Ioctl, arg) };
         err_io!(res)
     }
 }

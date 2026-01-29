@@ -11,7 +11,7 @@ orpc = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 log = { workspace = true }
-raft = { workspace = true }
+raft = { workspace = true, optional = true }
 prost = { workspace = true }
 prost-build = { workspace = true }
 serde = { workspace = true }
@@ -28,16 +28,16 @@ percent-encoding = "2.3"
 bincode = { workspace = true }
 thiserror = { workspace = true }
 crc32fast = { workspace = true }
-rocksdb = { workspace = true }
+rocksdb = { workspace = true, optional = true }
 byteorder = { workspace = true }
-flate2 = { workspace = true }
+flate2 = { workspace = true, optional = true }
 dashmap = { workspace = true }
 linked-hash-map = { workspace = true }
 crossbeam = { workspace = true }
 axum = { workspace = true }
 mini-moka = { workspace = true }
-slog = { workspace = true }
-slog-stdlog  = { workspace = true }
+slog = { workspace = true, optional = true }
+slog-stdlog  = { workspace = true, optional = true }
 chrono = { workspace = true }
 trait-variant = { workspace = true }
 
@@ -47,6 +47,8 @@ bitflags = { workspace = true }
 
 [features]
 default = []
+# Server features include raft, rocksdb for master/worker nodes
+server = ["raft", "rocksdb", "flate2", "slog", "slog-stdlog"]
 
 [build-dependencies]
 prost-build = { workspace = true }

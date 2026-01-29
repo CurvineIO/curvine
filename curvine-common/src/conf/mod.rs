@@ -46,6 +46,9 @@ pub use self::job_conf::JobConf;
 mod cli_conf;
 pub use self::cli_conf::CliConf;
 
+mod peer;
+pub use self::peer::{NodeId, RaftPeer};
+
 #[cfg(test)]
 mod tests {
     use crate::conf::{ClusterConf, WorkerDataDir};
