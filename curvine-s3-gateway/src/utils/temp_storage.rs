@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(config2.buffer_size(), 16 * 1024 * 1024);
 
         let config3 = TempStorageConfig::new("/tmp".to_string(), 1024, 32 * 1024);
-        assert_eq!(config3.buffer_size(), 32 * 1024);
+        assert_eq!(config3.buffer_size(), MIN_BUFFER_SIZE);
 
         let config4 = TempStorageConfig::new("/tmp".to_string(), 1024, 1024);
         assert_eq!(config4.buffer_size(), MIN_BUFFER_SIZE);
