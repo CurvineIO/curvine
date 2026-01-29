@@ -32,25 +32,29 @@ pub struct FuseMnt {
     // OwnedFd is not used here, and in some cases fd cannot be turned off by rust.
     pub(crate) fd: RawIO,
     pub(crate) clone_fds: Mutex<Vec<OwnedFd>>,
+    auto_unmount: bool,
 }
 
 impl FuseMnt {
     pub fn new(path: PathBuf, conf: &FuseConf) -> Self {
         let res = fuse_mount_pure(path.as_path(), conf);
         match res {
-            Ok(fd) => {
-                sys::set_pipe_blocking(fd, false).unwrap();
-                info!("fuse mount success, path {:?}, fd {}", path, fd);
-                Self {
-                    path,
-                    fd,
-                    clone_fds: Mutex::new(vec![]),
-                }
-            }
+            Ok(fd) => Self::from_fd(path, conf, fd),
+
             Err(e) => {
-                error!("fuse mount failed, path {:?}, err {:?}", path, e);
-                panic!("fuse mount failed");
+                panic!("fuse mount failed, path {:?}, err {:?}", path, e);
             }
+        }
+    }
+
+    pub fn from_fd(path: PathBuf, conf: &FuseConf, fd: RawIO) -> Self {
+        sys::set_pipe_blocking(fd, false).unwrap();
+        info!("fuse mount success, path {:?}, fd {}", path, fd);
+        Self {
+            path,
+            fd,
+            clone_fds: Mutex::new(vec![]),
+            auto_unmount: true,
         }
     }
 
@@ -91,11 +95,17 @@ impl FuseMnt {
         let fd = Arc::new(AsyncFd::new(fd)?);
         Ok(fd)
     }
+
+    pub fn auto_unmount(&mut self, auto_unmount: bool) {
+        self.auto_unmount = auto_unmount;
+    }
 }
 
 impl Drop for FuseMnt {
     fn drop(&mut self) {
-        fuse_umount_pure(self.path.as_path());
-        info!("unmount {:?}", self.path)
+        if self.auto_unmount {
+            fuse_umount_pure(self.path.as_path());
+            info!("unmount path={:?}, fd={}", self.path, self.fd);
+        }
     }
 }
