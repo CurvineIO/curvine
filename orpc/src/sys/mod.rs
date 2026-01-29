@@ -41,6 +41,9 @@ pub use self::raw_io_slice::RawIOSlice;
 mod sys_utils;
 pub use self::sys_utils::SysUtils;
 
+mod signal;
+pub use self::signal::*;
+
 pub type CInt = std::ffi::c_int;
 
 pub type CLong = std::ffi::c_longlong;
