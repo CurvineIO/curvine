@@ -22,7 +22,7 @@ use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path};
+use curvine_common::fs::{FileSystem, Path, StateReader, StateWriter};
 use curvine_common::state::{
     CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileLock, FileStatus, LockFlags, LockType,
     MkdirOptsBuilder, OpenFlags, SetAttrOpts,
@@ -1508,5 +1508,13 @@ impl fs::FileSystem for CurvineFileSystem {
                 info!("waiting lock for {}, elapsed: {} ms", path, time.used_ms());
             }
         }
+    }
+
+    async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
+        self.state.persist(writer).await
+    }
+
+    async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
+        self.state.restore(reader).await
     }
 }

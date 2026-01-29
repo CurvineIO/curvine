@@ -17,7 +17,7 @@ use crate::fs::CurvineFileSystem;
 use crate::raw::fuse_abi::fuse_attr;
 use crate::{err_fuse, FuseResult, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID, FUSE_UNKNOWN_INO};
 use curvine_common::conf::FuseConf;
-use curvine_common::fs::Path;
+use curvine_common::fs::{Path, StateReader, StateWriter};
 use curvine_common::state::FileStatus;
 use log::{error, info};
 use orpc::common::{FastHashMap, FastHashSet, LocalTime};
@@ -55,8 +55,16 @@ impl NodeMap {
         }
     }
 
+    pub fn current_id(&self) -> u64 {
+        self.id_creator.get()
+    }
+
     fn name_key<T: AsRef<str>>(id: u64, name: T) -> String {
         format!("{}\0{}", id, name.as_ref())
+    }
+
+    pub fn nodes_len(&self) -> usize {
+        self.nodes.len()
     }
 
     pub fn get(&self, id: u64) -> Option<&NodeAttr> {
@@ -461,5 +469,55 @@ impl NodeMap {
 
     pub fn is_pending_delete(&self, ino: u64) -> bool {
         self.pending_deletes.contains(&ino)
+    }
+
+    /// Create snapshot of NodeMap state (stream-based, memory-efficient)
+    /// Serializes: nodes, names, linked_inode_map, pending_deletes, id_creator
+    pub fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
+        writer.write_len(self.id_creator.get())?;
+
+        writer.write_len(self.nodes.len() as u64)?;
+        for item in self.nodes.iter() {
+            writer.write_struct(&item)?;
+        }
+
+        writer.write_len(self.names.len() as u64)?;
+        for item in self.names.iter() {
+            writer.write_struct(&item)?;
+        }
+
+        writer.write_struct(&self.linked_inode_map)?;
+        writer.write_struct(&self.pending_deletes)?;
+
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Restore NodeMap state from snapshot (stream-based, memory-efficient)
+    /// Deserializes: nodes, names, linked_inode_map, pending_deletes, id_creator
+    pub fn restore(&mut self, reader: &mut StateReader) -> FuseResult<()> {
+        let id_creator_value = reader.read_len()?;
+        self.id_creator = AtomicCounter::new(id_creator_value);
+
+        let nodes_count = reader.read_len()?;
+        self.nodes.clear();
+        self.nodes.reserve(nodes_count as usize);
+        for _ in 0..nodes_count {
+            let (id, node): (u64, NodeAttr) = reader.read_struct()?;
+            self.nodes.insert(id, node);
+        }
+
+        let names_count = reader.read_len()?;
+        self.names.clear();
+        self.names.reserve(names_count as usize);
+        for _ in 0..names_count {
+            let (name, id): (String, u64) = reader.read_struct()?;
+            self.names.insert(name, id);
+        }
+
+        self.linked_inode_map = reader.read_struct()?;
+        self.pending_deletes = reader.read_struct()?;
+
+        Ok(())
     }
 }

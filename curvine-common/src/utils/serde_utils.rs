@@ -35,6 +35,23 @@ impl SerdeUtils {
         Ok(())
     }
 
+    pub fn serialize_json<T>(value: &T) -> CommonResult<Vec<u8>>
+    where
+        T: serde::Serialize,
+    {
+        let bytes = try_err!(serde_json::to_vec(value));
+        Ok(bytes)
+    }
+
+    pub fn serialize_json_into<W, T>(writer: W, value: &T) -> CommonResult<()>
+    where
+        W: std::io::Write,
+        T: serde::Serialize + ?Sized,
+    {
+        try_err!(serde_json::to_writer(writer, value));
+        Ok(())
+    }
+
     pub fn deserialize<'a, T>(bytes: &'a [u8]) -> CommonResult<T>
     where
         T: serde::de::Deserialize<'a>,
@@ -49,6 +66,23 @@ impl SerdeUtils {
         T: serde::de::DeserializeOwned,
     {
         let res = try_err!(bincode::deserialize_from::<R, T>(reader));
+        Ok(res)
+    }
+
+    pub fn deserialize_json<'a, T>(bytes: &'a [u8]) -> CommonResult<T>
+    where
+        T: serde::de::Deserialize<'a>,
+    {
+        let res = try_err!(serde_json::from_slice::<T>(bytes));
+        Ok(res)
+    }
+
+    pub fn deserialize_json_from<R, T>(reader: R) -> CommonResult<T>
+    where
+        R: std::io::Read,
+        T: serde::de::DeserializeOwned,
+    {
+        let res = try_err!(serde_json::from_reader::<R, T>(reader));
         Ok(res)
     }
 }
