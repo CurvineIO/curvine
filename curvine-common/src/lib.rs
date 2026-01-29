@@ -33,3 +33,5 @@ pub mod proto {
 }
 
 pub type FsResult<T> = Result<T, FsError>;
+
+pub const FILE_BUFFER_SIZE: usize = 128 * 1024;
