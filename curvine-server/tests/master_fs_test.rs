@@ -32,12 +32,14 @@ use orpc::runtime::AsyncRuntime;
 use orpc::CommonResult;
 use std::sync::Arc;
 // Test the master filesystem function separately.
-// This test does not require a cluster startup
-fn new_fs(format: bool, name: &str) -> MasterFilesystem {
+// This test does not require a cluster startup.
+// Returns (MasterFilesystem, JournalSystem) to ensure proper resource cleanup.
+fn new_fs(format: bool, name: &str) -> (MasterFilesystem, JournalSystem) {
     Master::init_test_metrics();
 
     let conf = ClusterConf {
         format_master: format,
+        testing: true, // Enable testing mode to prevent background thread spawn
         master: MasterConf {
             meta_dir: Utils::test_sub_dir(format!("master-fs-test/meta-{}", name)),
             ..Default::default()
@@ -54,7 +56,7 @@ fn new_fs(format: bool, name: &str) -> MasterFilesystem {
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
     fs.add_test_worker(WorkerInfo::default());
 
-    fs
+    (fs, journal_system)
 }
 
 fn new_handler() -> MasterHandler {
@@ -94,7 +96,7 @@ fn new_handler() -> MasterHandler {
 
 #[test]
 fn test_master_filesystem_core_operations() -> CommonResult<()> {
-    let fs = new_fs(true, "fs_test");
+    let (fs, _js) = new_fs(true, "fs_test");
 
     mkdir(&fs)?;
     delete(&fs)?;
@@ -123,13 +125,21 @@ fn test_rpc_retry_cache_for_idempotent_operations() -> CommonResult<()> {
 
 #[test]
 fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
-    let fs = new_fs(true, "restore");
-    fs.mkdir("/a", false)?;
-    fs.mkdir("/x1/x2/x3", true)?;
-    let hash1 = fs.sum_hash();
-    drop(fs);
+    // First phase: create metadata and persist to RocksDB
+    let hash1 = {
+        let (fs, _js) = new_fs(true, "restore");
+        fs.mkdir("/a", false)?;
+        fs.mkdir("/x1/x2/x3", true)?;
+        let hash = fs.sum_hash();
+        drop(fs);
+        drop(_js); // Explicitly drop JournalSystem to release RocksDB lock
+        hash
+    }; // Scope ensures all resources are dropped before reopening DB
 
-    let fs = new_fs(false, "restore");
+    // Second phase: restore from persisted metadata
+    let (fs, _js) = new_fs(false, "restore");
+    fs.restore_from_rocksdb()?;
+
     assert!(fs.exists("/a")?);
     assert!(fs.exists("/x1/x2/x3")?);
     let hash2 = fs.sum_hash();
@@ -407,7 +417,7 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
 
 #[test]
 fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
-    let fs = new_fs(true, "link_test");
+    let (fs, _js) = new_fs(true, "link_test");
     fs.mkdir("/a/b", true)?;
     fs.create("/a/b/file.log", true)?;
     fs.print_tree();
@@ -537,8 +547,11 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
     println!("locs = {:?}", locs);
     assert_eq!(locs.block_locs.len(), 1);
 
+    // Get the first block info to use as last_block parameter
+    let first_block = b1.block.clone();
+
     let commit = CommitBlock {
-        block_id: b1.block.id,
+        block_id: first_block.id,
         block_len: status.block_size,
         locations: vec![BlockLocation {
             worker_id: b1.locs[0].worker_id,
@@ -546,6 +559,7 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
         }],
     };
 
+    // Add second block with first block as last_block parameter
     let b1 = fs
         .add_block(
             path,
@@ -553,7 +567,7 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
             vec![commit.clone()],
             vec![],
             status.block_size,
-            None,
+            Some(first_block.clone()), // Specify we want block after first_block
         )
         .unwrap();
     let b2 = fs
@@ -563,7 +577,7 @@ fn add_block_retry(fs: &MasterFilesystem) -> CommonResult<()> {
             vec![commit],
             vec![],
             status.block_size,
-            None,
+            Some(first_block), // Retry with same parameters (should return b1)
         )
         .unwrap();
     assert_eq!(b1.block.id, b2.block.id);

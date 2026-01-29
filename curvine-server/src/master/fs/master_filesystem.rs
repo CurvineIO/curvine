@@ -620,6 +620,13 @@ impl MasterFilesystem {
         fs_dir.create_tree()
     }
 
+    // Restore in-memory tree from RocksDB (for testing without Raft).
+    // In production, Raft automatically restores via apply_snapshot().
+    pub fn restore_from_rocksdb(&self) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.restore_from_rocksdb()
+    }
+
     fn block_exists(&self, id: i64) -> FsResult<bool> {
         let fs_dir = self.fs_dir.read();
         fs_dir.block_exists(id)

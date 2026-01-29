@@ -624,6 +624,15 @@ impl FsDir {
         self.store.create_tree().map(|x| x.1)
     }
 
+    // Restore in-memory tree from RocksDB without checkpoint (for testing only).
+    // In production, use restore() with checkpoint path via Raft snapshot.
+    pub fn restore_from_rocksdb(&mut self) -> CommonResult<()> {
+        let (last_inode_id, root_dir) = self.store.create_tree()?;
+        self.root_dir = root_dir;
+        self.update_last_inode_id(last_inode_id)?;
+        Ok(())
+    }
+
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
         self.store.create_checkpoint(id)
     }
