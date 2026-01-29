@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use fxhash::FxHasher;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hash};
 use std::ops::{Deref, DerefMut};
@@ -67,5 +68,37 @@ where
     #[inline]
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+impl<T> Serialize for FastHashSet<T>
+where
+    T: Serialize + Eq + Hash,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for item in self.0.iter() {
+            seq.serialize_element(item)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de, T> Deserialize<'de> for FastHashSet<T>
+where
+    T: Deserialize<'de> + Eq + Hash,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let set: HashSet<T> = HashSet::deserialize(deserializer)?;
+        let mut fast_set = HashSet::with_hasher(BuildHasherDefault::<FxHasher>::default());
+        fast_set.extend(set);
+        Ok(FastHashSet(fast_set))
     }
 }

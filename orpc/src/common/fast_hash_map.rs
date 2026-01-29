@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use fxhash::FxHasher;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
@@ -76,5 +77,39 @@ where
     #[inline]
     fn clone(&self) -> Self {
         Self(self.0.clone())
+    }
+}
+
+impl<K, V> Serialize for FastHashMap<K, V>
+where
+    K: Serialize + Eq + Hash,
+    V: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (k, v) in self.0.iter() {
+            map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de, K, V> Deserialize<'de> for FastHashMap<K, V>
+where
+    K: Deserialize<'de> + Eq + Hash,
+    V: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let map: HashMap<K, V> = HashMap::deserialize(deserializer)?;
+        let mut fast_map = HashMap::with_hasher(BuildHasherDefault::<FxHasher>::default());
+        fast_map.extend(map);
+        Ok(FastHashMap(fast_map))
     }
 }
