@@ -39,14 +39,6 @@ for arg in "$@"; do
     fi
 done
 
-# Cancel the last mount.
-umount -f "$MNT_PATH" 2>/dev/null || true
-if [ -d "$MNT_PATH" ]; then
-  for file in $(ls "$MNT_PATH" 2>/dev/null || true); do
-      umount -f "$MNT_PATH/$file" 2>/dev/null || true
-  done
-fi
-
 mkdir -p "$MNT_PATH"
 
 echo "Starting curvine-fuse with arguments: $*"
