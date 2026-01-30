@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use curvine_common::state::FileStatus;
+use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Deserialize, Serialize)]
 pub struct DirHandle {
     pub ino: u64,
     pub fh: u64,

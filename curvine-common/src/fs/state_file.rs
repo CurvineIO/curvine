@@ -15,9 +15,10 @@
 use crate::utils::SerdeUtils;
 use crate::FILE_BUFFER_SIZE;
 use orpc::io::IOResult;
+use orpc::try_err;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 
 pub struct StateWriter {
     path: String,
@@ -52,8 +53,7 @@ impl StateWriter {
     }
 
     pub fn write_len(&mut self, len: u64) -> IOResult<()> {
-        SerdeUtils::serialize_into(&mut self.inner, &len)?;
-        Ok(())
+        self.write_struct(&len)
     }
 
     pub fn write_all(&mut self, buf: &[u8]) -> IOResult<()> {
@@ -62,7 +62,8 @@ impl StateWriter {
     }
 
     pub fn write_struct<T: Serialize>(&mut self, obj: &T) -> IOResult<()> {
-        SerdeUtils::serialize_into(&mut self.inner, obj)?;
+        SerdeUtils::serialize_json_into(&mut self.inner, obj)?;
+        writeln!(self.inner)?;
         Ok(())
     }
 
@@ -110,13 +111,18 @@ impl StateReader {
     }
 
     pub fn read_len(&mut self) -> IOResult<u64> {
-        let len = SerdeUtils::deserialize_from(&mut self.inner)?;
-        Ok(len)
+        self.read_json_line::<u64>()
     }
 
     pub fn read_struct<T: for<'de> Deserialize<'de>>(&mut self) -> IOResult<T> {
-        let st = SerdeUtils::deserialize_from(&mut self.inner)?;
-        Ok(st)
+        self.read_json_line()
+    }
+
+    fn read_json_line<T: for<'de> Deserialize<'de>>(&mut self) -> IOResult<T> {
+        let mut line = String::new();
+        self.inner.read_line(&mut line)?;
+        let res = try_err!(serde_json::from_str(line.trim_end()));
+        Ok(res)
     }
 }
 

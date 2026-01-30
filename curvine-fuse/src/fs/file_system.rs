@@ -17,6 +17,7 @@ use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseResult};
+use curvine_common::fs::{StateReader, StateWriter};
 use std::future::Future;
 use tokio_util::bytes::BytesMut;
 
@@ -192,5 +193,13 @@ pub trait FileSystem: Send + Sync + 'static {
 
     fn set_lkw(&self, op: SetLkW<'_>) -> impl Future<Output = FuseResult<()>> + Send {
         async move { err_fuse!(libc::ENOSYS, "{:?}", op) }
+    }
+
+    fn persist(&self, _writer: &mut StateWriter) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "persist") }
+    }
+
+    fn restore(&self, _reader: &mut StateReader) -> impl Future<Output = FuseResult<()>> + Send {
+        async move { err_fuse!(libc::ENOSYS, "restore") }
     }
 }
