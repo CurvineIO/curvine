@@ -595,13 +595,20 @@ impl fs::FileSystem for CurvineFileSystem {
             | FUSE_READDIRPLUS_AUTO;
 
         let max_write = FuseUtils::get_fuse_buf_size() - FUSE_BUFFER_HEADER_SIZE;
-        let page_size = sys::get_pagesize()?;
-        let max_pages = if op.arg.flags & FUSE_MAX_PAGES != 0 {
-            out_flags |= FUSE_MAX_PAGES;
-            (max_write - 1) / page_size + 1
-        } else {
-            0
+        #[cfg(feature = "fuse3")]
+        let max_pages = {
+            let page_size = sys::get_pagesize()?;
+            if op.arg.flags & FUSE_MAX_PAGES != 0 {
+                out_flags |= FUSE_MAX_PAGES;
+                (max_write - 1) / page_size + 1
+            } else {
+                0
+            }
         };
+        #[cfg(not(feature = "fuse3"))]
+        if op.arg.flags & FUSE_MAX_PAGES != 0 {
+            out_flags |= FUSE_MAX_PAGES;
+        }
 
         out_flags |= op.arg.flags;
         if self.conf.write_back_cache {

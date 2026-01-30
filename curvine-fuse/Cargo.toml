@@ -36,6 +36,8 @@ tracing-subscriber = { workspace = true }
 default = ["fuse3"]
 fuse2 = []
 fuse3 = []
+# Static build: skip libfuse pkg-config check (curvine-fuse uses pure Rust FUSE impl)
+static = []
 
 [build-dependencies]
 bindgen = { workspace = true }

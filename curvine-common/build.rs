@@ -37,13 +37,29 @@ fn main() {
         .compile_protos(&src, &["proto/"])
         .unwrap();
 
-    let src = vec!["raft.proto"];
-    let mut build = prost_build::Config::new();
-    build
-        .out_dir(&output)
-        .extern_path(".eraftpb", "::raft::eraftpb")
-        .compile_protos(&src, &["proto/", ""])
+    // Only compile raft.proto when server feature is enabled
+    #[cfg(feature = "server")]
+    {
+        let src = vec!["raft.proto"];
+        let mut build = prost_build::Config::new();
+        build
+            .out_dir(&output)
+            .extern_path(".eraftpb", "::raft::eraftpb")
+            .compile_protos(&src, &["proto/", ""])
+            .unwrap();
+    }
+
+    // Create an empty raft.rs file when server feature is disabled
+    // to avoid missing file errors
+    #[cfg(not(feature = "server"))]
+    {
+        let raft_file = format!("{}/raft.rs", output);
+        fs::write(
+            &raft_file,
+            "// raft proto disabled without server feature\n",
+        )
         .unwrap();
+    }
 
     // Build version number file
     let ver_file = format!("{}/version.rs", base);
