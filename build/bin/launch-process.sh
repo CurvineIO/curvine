@@ -24,6 +24,7 @@ PARAMS="${@:3}"
 
 PID_FILE=${CURVINE_HOME}/${SERVICE_NAME}.pid
 GRACEFULLY_TIMEOUT=15
+RELOAD_LOCK_FILE=${CURVINE_HOME}/${SERVICE_NAME}.reload.lock
 
 LOG_DIR=${CURVINE_HOME}/logs
 OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
@@ -119,6 +120,77 @@ stop() {
   fi
 }
 
+reload() {
+  # Prevent concurrent reload operations
+  if [ -f "${RELOAD_LOCK_FILE}" ]; then
+    local LOCK_PID=`cat ${RELOAD_LOCK_FILE} 2>/dev/null`
+    if kill -0 $LOCK_PID > /dev/null 2>&1; then
+      echo "reload already in progress (lock held by pid ${LOCK_PID})"
+      exit 1
+    else
+      # Stale lock file, remove it
+      rm -f ${RELOAD_LOCK_FILE}
+    fi
+  fi
+  
+  # Create lock file
+  echo $$ > ${RELOAD_LOCK_FILE}
+  trap "rm -f ${RELOAD_LOCK_FILE}" EXIT
+  
+  if [ -f "${PID_FILE}" ]; then
+    local OLD_PID=`cat ${PID_FILE}`
+    if kill -0 $OLD_PID > /dev/null 2>&1; then
+      echo "reloading ${SERVICE_NAME} (sending SIGUSR1 to pid ${OLD_PID})"
+      kill -USR1 ${OLD_PID}
+      if [ $? -ne 0 ]; then
+        echo "failed to send reload signal to ${SERVICE_NAME}"
+        exit 1
+      fi
+      
+      echo "${SERVICE_NAME} reload signal sent successfully, waiting for old process to exit and new process to start..."
+
+      # Wait for old process to exit (graceful shutdown)
+      # Old process will persist state and spawn new process before exiting
+      waitPid $OLD_PID
+      
+      # Wait a bit for new process to start
+      sleep 3
+
+      # Find new process - simple approach: find any running curvine-fuse process
+      # Since old process has exited, any found process should be the new one
+      # Take the last one as it's the newest process
+      local NEW_PID=""
+      if command -v pgrep > /dev/null 2>&1; then
+        # Get all curvine-fuse PIDs, exclude old PID, take the last one (newest)
+        NEW_PID=$(pgrep -f "curvine-fuse" 2>/dev/null | grep -v "^${OLD_PID}$" | tail -1)
+      else
+        NEW_PID=$(ps aux | grep "curvine-fuse" | awk '{print $2}' | grep -v "^${OLD_PID}$" | tail -1)
+      fi
+      
+      # Verify and update PID file
+      if [ -n "$NEW_PID" ] && kill -0 $NEW_PID > /dev/null 2>&1; then
+        # Verify it's actually curvine-fuse
+        if ps -p $NEW_PID -o comm= 2>/dev/null | grep -q "curvine-fuse"; then
+          echo $NEW_PID > ${PID_FILE}
+          echo "${SERVICE_NAME} reloaded successfully, new pid=${NEW_PID}"
+          exit 0
+        fi
+      fi
+
+      # If we get here, failed to find new process
+      echo "error: could not find new ${SERVICE_NAME} process after ${max_retries} seconds"
+      echo "please check ${SERVICE_NAME} status manually"
+      exit 1
+    else
+      echo "${SERVICE_NAME} is not running (pid ${OLD_PID} not found)"
+      exit 1
+    fi
+  else
+    echo "Not found ${SERVICE_NAME} pid file"
+    exit 1
+  fi
+}
+
 run() {
 case $1 in
     "start")
@@ -132,8 +204,19 @@ case $1 in
         sleep 1
         start
         ;;
+    "reload")
+        if [[ "$SERVICE_NAME" != "fuse" ]]; then
+          echo "reload is only supported for fuse service, ${SERVICE_NAME} does not support reload"
+          exit 1
+        fi
+        reload
+        ;;
      *)
-        echo "Use age [start|stop|restart]"
+        if [[ "$SERVICE_NAME" = "fuse" ]]; then
+          echo "Usage: [start|stop|restart|reload]"
+        else
+          echo "Usage: [start|stop|restart]"
+        fi
         ;;
 esac
 }
