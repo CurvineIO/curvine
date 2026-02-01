@@ -234,13 +234,13 @@ message BlocksBatchCommitResponse {
 
 
 message FilesBatchWriteRequest {  
-    repeated FileWriteData files = 1;  
+    repeated FileWriteDataProto files = 1;  
     required int64 req_id = 2;  
     required int32 seq_id = 3;  
     optional ContainerMetadataProto container_meta = 4;
 }  
   
-message FileWriteData {  
+message FileWriteDataProto {  
     required string path = 1;  
     required bytes content = 2;  
 }  

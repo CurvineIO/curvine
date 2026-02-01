@@ -22,7 +22,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::ExtendedBlockProto;
 use curvine_common::proto::{
     BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
-    BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadataProto, FileWriteData,
+    BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadataProto, FileWriteDataProto,
     FilesBatchWriteRequest, FilesBatchWriteResponse, SmallFileMetaProto,
 };
 use curvine_common::state::ExtendedBlock;
@@ -484,7 +484,7 @@ impl BatchWriteHandler {
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
 
-    fn write_container_batch(&mut self, files: &[FileWriteData]) -> FsResult<()> {
+    fn write_container_batch(&mut self, files: &[FileWriteDataProto]) -> FsResult<()> {
         let mut offset = 0;
 
         // Write all files to container sequentially

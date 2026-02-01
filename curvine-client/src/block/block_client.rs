@@ -24,7 +24,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
     BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadataProto,
-    DataHeaderProto, FileWriteData, FilesBatchWriteRequest, SmallFileMetaProto,
+    DataHeaderProto, FileWriteDataProto, FilesBatchWriteRequest, SmallFileMetaProto,
 };
 use curvine_common::state::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
@@ -412,7 +412,7 @@ impl BlockClient {
     ) -> CommonResult<()> {
         let file_data: Vec<_> = files
             .iter()
-            .map(|(path, content)| FileWriteData {
+            .map(|(path, content)| FileWriteDataProto {
                 path: path.to_string(),
                 content: content.as_bytes().to_vec(),
             })
