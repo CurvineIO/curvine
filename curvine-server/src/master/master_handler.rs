@@ -39,7 +39,7 @@ use std::sync::Arc;
 use crate::master::meta::inode::{InodeView, PATH_SEPARATOR};
 struct ContainerBatchResult {
     container_status: FileStatus,
-    container_meta: ContainerMetadata,
+    container_meta: ContainerMetadataProto,
 }
 
 pub struct MasterHandler {
@@ -399,7 +399,7 @@ impl MasterHandler {
         )?;
 
         println!("DEBUG at MasterHandler, at create_container_batch, container_status: {:?}", container_status);
-        let container_meta = ContainerMetadata {
+        let container_meta = ContainerMetadataProto {
             container_block_id: container_status.id,
             container_path: container_path.clone(),
             container_name: container_name,

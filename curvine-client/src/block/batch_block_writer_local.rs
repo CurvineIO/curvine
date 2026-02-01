@@ -1,7 +1,7 @@
 use crate::file::FsContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
-use curvine_common::proto::ContainerMetadata;
+use curvine_common::proto::ContainerMetadataProto;
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
@@ -19,7 +19,7 @@ pub struct BatchBlockWriterLocal {
     files: Vec<RawPtr<LocalFile>>,
     block_size: i64,
     pos: i64,
-    container_meta: Option<ContainerMetadata>,
+    container_meta: Option<ContainerMetadataProto>,
 }
 
 impl BatchBlockWriterLocal {

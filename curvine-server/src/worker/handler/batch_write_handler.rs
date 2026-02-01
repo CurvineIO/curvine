@@ -22,7 +22,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::ExtendedBlockProto;
 use curvine_common::proto::{
     BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
-    BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadata, FileWriteData,
+    BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadataProto, FileWriteData,
     FilesBatchWriteRequest, FilesBatchWriteResponse, SmallFileMetaProto,
 };
 use curvine_common::state::ExtendedBlock;
@@ -145,7 +145,7 @@ impl BatchWriteHandler {
         // All files are small - pack them into container blocks
         self.handle_small_files_batch(header.clone().blocks)?;
 
-        let container_meta = ContainerMetadata {
+        let container_meta = ContainerMetadataProto {
             container_block_id: self.container_block_id,
             container_path: self.container_path.clone(),
             container_name: self.container_name.clone(),
@@ -468,7 +468,7 @@ impl BatchWriteHandler {
 
         results = vec![true; header.files.len()];
 
-        let updated_meta = ContainerMetadata {
+        let updated_meta = ContainerMetadataProto {
             container_block_id: self.container_block_id,
             container_path: self.container_path.clone(),
             container_name: self.container_name.clone(),

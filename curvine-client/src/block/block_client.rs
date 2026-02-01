@@ -23,7 +23,7 @@ use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadata,
+    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadataProto,
     DataHeaderProto, FileWriteData, FilesBatchWriteRequest, SmallFileMetaProto,
 };
 use curvine_common::state::{ExtendedBlock, StorageType, WorkerAddress};
@@ -319,7 +319,7 @@ impl BlockClient {
             chunk_size,
             short_circuit,
             client_name: self.client_name.to_string(),
-            files_metadata: small_files_metadata.map(|files| ContainerMetadata {
+            files_metadata: small_files_metadata.map(|files| ContainerMetadataProto {
                 container_block_id: 0,         // Will be set by worker
                 container_path: container_path.unwrap(), // Will be set by worker
                 container_name: container_name.unwrap(),
@@ -367,7 +367,7 @@ impl BlockClient {
         req_id: i64,
         seq_id: i32,
         cancel: bool,
-        container_meta: Option<ContainerMetadata>,
+        container_meta: Option<ContainerMetadataProto>,
     ) -> FsResult<()> {
         // Convert blocks to protobuf
         let blocks_pb: Vec<_> = blocks
@@ -408,7 +408,7 @@ impl BlockClient {
         files: &[(&Path, &str)],
         req_id: i64,
         seq_id: i32,
-        container_meta: Option<ContainerMetadata>,
+        container_meta: Option<ContainerMetadataProto>,
     ) -> CommonResult<()> {
         let file_data: Vec<_> = files
             .iter()
