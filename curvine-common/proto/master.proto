@@ -168,11 +168,11 @@ message AddBlockResponse {
 
 // apply for allocation of blocks batch
 message AddBlocksBatchRequest {  
-    repeated AddBlockRequest requests = 1;  
+    required AddBlockRequest requests = 1;  
 }  
   
 message AddBlocksBatchResponse {  
-    repeated LocatedBlockProto blocks = 1;  
+    required LocatedBlockProto blocks = 1;  
 }
 
 

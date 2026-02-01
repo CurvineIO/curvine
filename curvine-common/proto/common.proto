@@ -37,6 +37,7 @@ enum FileTypeProto {
     FILE_TYPE_PROTO_STREAM = 3;
     FILE_TYPE_PROTO_AGG = 4;
     FILE_TYPE_PROTO_OBJECT = 5;
+    FILE_TYPE_PROTO_CONTAINER = 6;
 }
 
 // File storage policy
@@ -194,7 +195,7 @@ message FileLockProto {
 }
 
 message BlocksBatchWriteRequest {  
-    repeated ExtendedBlockProto blocks = 1;  
+    required ExtendedBlockProto block = 1;  
     required int64 off = 2;  
     required int64 block_size = 3;  
     required int64 req_id = 4;  
@@ -219,7 +220,7 @@ message BlocksBatchWriteResponse {
 }
 
 message BlocksBatchCommitRequest {  
-    repeated ExtendedBlockProto blocks = 1;  
+    required ExtendedBlockProto block = 1;  
     required int64 off = 2;  
     required int64 block_size = 3;  
     required int64 req_id = 4;  
@@ -229,7 +230,7 @@ message BlocksBatchCommitRequest {
 }  
   
 message BlocksBatchCommitResponse {  
-    repeated bool results = 1;  
+    required bool results = 1;  
 }
 
 

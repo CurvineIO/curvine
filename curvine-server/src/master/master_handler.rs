@@ -273,6 +273,7 @@ impl MasterHandler {
             req.last_block.map(ProtoUtils::extend_block_from_pb),
         )?;
         let rep_header = ProtoUtils::located_block_to_pb(located_block);
+        println!("DEBUG at MasterHandler, at add_block, convert located_block to located_block_proto, rep_header {:?}", rep_header);
         ctx.response(rep_header)
     }
 
@@ -332,18 +333,19 @@ impl MasterHandler {
         println!("DEBUG at MasterHandler, at create_files_batch, container_meta {:?}", container_result.container_meta);
         // Create individual FileStatus objects for each file in container
         let mut container_files = Vec::new();
+
         for (i, req) in header.requests.iter().enumerate() {
             let mut file_status = container_result.container_status.clone();
             file_status.path = req.path.clone();
             file_status.name = Path::new(&req.path)
                 .map(|p| p.name().to_string())
-                .unwrap_or_else(|_| "unknown".to_string());
+                // .unwrap_or_else(|_| "unknown".to_string());
+                .unwrap();
             file_status.len = container_result.container_meta.files[i].len;
             file_status.file_type = FileType::File; // Individual files, not Container
             file_status.id = ctx.msg.req_id() + i as i64;
             println!("DEBUG at MasterHandler, at create_files_batch, file_status {:?}", file_status);
             container_files.push(ProtoUtils::file_status_to_pb(file_status));
-            
         }
         
 
@@ -386,6 +388,7 @@ impl MasterHandler {
         container_path_components[container_path_len -1] = container_name.clone();
         let container_path = container_path_components.join(PATH_SEPARATOR);
 
+        // initialize container_opts
         let mut container_opts = CreateFileOpts::with_create(true);
         container_opts.file_type = FileType::Container;
         container_opts.block_size = requests.iter().map(|r| r.opts.block_size).sum();
@@ -424,33 +427,34 @@ impl MasterHandler {
         })
     }
 
-    pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: AddBlocksBatchRequest = ctx.parse_header()?;
-        let mut results = Vec::with_capacity(header.requests.len());
-        for req in header.requests {
-            let path = req.path;
-            let client_addr = ProtoUtils::client_address_from_pb(req.client_address);
-            let commit_blocks = req
-                .commit_blocks
-                .into_iter()
-                .map(ProtoUtils::commit_block_from_pb)
-                .collect();
+    // pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    //     let header: AddBlocksBatchRequest = ctx.parse_header()?;
+        
+    //     let mut results = Vec::with_capacity(header.requests.len());
+    //     for req in header.requests {
+    //         let path = req.path;
+    //         let client_addr = ProtoUtils::client_address_from_pb(req.client_address);
+    //         let commit_blocks = req
+    //             .commit_blocks
+    //             .into_iter()
+    //             .map(ProtoUtils::commit_block_from_pb)
+    //             .collect();
 
-            let located_block = self.fs.add_block(
-                path,
-                client_addr,
-                commit_blocks,
-                req.exclude_workers,
-                req.file_len,
-                req.last_block.map(ProtoUtils::extend_block_from_pb),
-            )?;
-            println!("DEBUG at MasterHandler, at add_blocks_batch, located_block {:?}", located_block);
-            results.push(ProtoUtils::located_block_to_pb(located_block));
-        }
+    //         let located_block = self.fs.add_block(
+    //             path,
+    //             client_addr,
+    //             commit_blocks,
+    //             req.exclude_workers,
+    //             req.file_len,
+    //             req.last_block.map(ProtoUtils::extend_block_from_pb),
+    //         )?;
+    //         println!("DEBUG at MasterHandler, at add_blocks_batch, located_block {:?}", located_block);
+    //         results.push(ProtoUtils::located_block_to_pb(located_block));
+    //     }
 
-        let rep_header = AddBlocksBatchResponse { blocks: results };
-        ctx.response(rep_header)
-    }
+    //     let rep_header = AddBlocksBatchResponse { blocks: results };
+    //     ctx.response(rep_header)
+    // }
 
     pub fn complete_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: CompleteFilesBatchRequest = ctx.parse_header()?;
@@ -736,7 +740,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::AddBlock => self.add_block(ctx),
             RpcCode::CompleteFile => self.complete_file(ctx),
             RpcCode::CreateFilesBatch => self.create_files_batch(ctx),
-            RpcCode::AddBlocksBatch => self.add_blocks_batch(ctx),
+            // RpcCode::AddBlocksBatch => self.add_blocks_batch(ctx),
             RpcCode::CompleteFilesBatch => self.complete_files_batch(ctx),
             RpcCode::Exists => self.exists(ctx),
             RpcCode::Delete => self.retry_check_delete(ctx),

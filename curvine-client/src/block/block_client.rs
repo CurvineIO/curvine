@@ -293,7 +293,7 @@ impl BlockClient {
     }
     pub async fn write_blocks_batch(
         &self,
-        blocks: &[ExtendedBlock],
+        block: &ExtendedBlock,
         off: i64,
         block_size: i64,
         req_id: i64,
@@ -304,14 +304,15 @@ impl BlockClient {
         container_name: Option<String>,
         container_path: Option<String>
     ) -> FsResult<CreateBatchBlockContext> {
-        println!("Debug, at BlockClient: blocks={:?}", blocks);
-        let blocks_pb: Vec<_> = blocks
-            .iter()
-            .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
-            .collect();
+        println!("Debug, at BlockClient: blocks={:?}", block);
+        // let blocks_pb: Vec<_> = blocks
+        //     .iter()
+        //     .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
+        //     .collect();
+        let block_pb = ProtoUtils::extend_block_to_pb(block.clone());
 
         let req_header = BlocksBatchWriteRequest {
-            blocks: blocks_pb,
+            block: block_pb,
             off,
             block_size,
             req_id,
@@ -361,7 +362,7 @@ impl BlockClient {
 
     pub async fn write_commit_batch(
         &self,
-        blocks: &[ExtendedBlock],
+        block: &ExtendedBlock,
         off: i64,
         block_size: i64,
         req_id: i64,
@@ -370,13 +371,14 @@ impl BlockClient {
         container_meta: Option<ContainerMetadataProto>,
     ) -> FsResult<()> {
         // Convert blocks to protobuf
-        let blocks_pb: Vec<_> = blocks
-            .iter()
-            .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
-            .collect();
+        // let blocks_pb: Vec<_> = blocks
+        //     .iter()
+        //     .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
+        //     .collect();
 
+        let block_pb = ProtoUtils::extend_block_to_pb(block.clone());
         let header = BlocksBatchCommitRequest {
-            blocks: blocks_pb,
+            block: block_pb,
             off,
             block_size,
             req_id,

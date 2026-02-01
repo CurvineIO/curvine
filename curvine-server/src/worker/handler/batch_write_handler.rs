@@ -138,12 +138,12 @@ impl BatchWriteHandler {
         let header: BlocksBatchWriteRequest = msg.parse_header()?;
         println!(
             "DEBUG at BatchWriteHandler, open_batch, header.blocks: {:?}, block_size: {:?}",
-            header.clone().blocks,
+            header.clone().block,
             header.clone().block_size
         );
         self.container_files = header.clone().files_metadata.unwrap().files;
         // All files are small - pack them into container blocks
-        self.handle_small_files_batch(header.clone().blocks)?;
+        self.handle_small_files_batch(header.clone().block)?;
 
         let container_meta = ContainerMetadataProto {
             container_block_id: self.container_block_id,
@@ -171,10 +171,10 @@ impl BatchWriteHandler {
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
 
-    fn handle_small_files_batch(&mut self, blocks: Vec<ExtendedBlockProto>) -> FsResult<()> {
+    fn handle_small_files_batch(&mut self, block: ExtendedBlockProto) -> FsResult<()> {
         println!(
             "Debug at BatchWriteHandler, at handle_small_files_batch, blocks: {:?}",
-            blocks
+            block
         );
         println!(
             "Debug at BatchWriteHandler, at handle_small_files_batch, self address: {:p}",
@@ -182,7 +182,7 @@ impl BatchWriteHandler {
         );
 
         // Calculate total size needed for container
-        let total_size: i64 = blocks.iter().map(|b| b.block_size).sum();
+        let total_size: i64 = block.block_size;
 
         let container_block = ExtendedBlock {
             id: self.container_block_id ,// Utils::unique_id() as i64,
@@ -205,8 +205,8 @@ impl BatchWriteHandler {
         self.container_path = container_file.path().to_string();
         // Store file metadata for later writes
         println!(
-            "Debug at BatchWriteHandler, at handle_small_files_batch, blocks: {:?}",
-            blocks
+            "Debug at BatchWriteHandler, at handle_small_files_batch, block: {:?}",
+            block
         );
         // self.container_files = blocks
         //     .iter()
@@ -315,7 +315,7 @@ impl BatchWriteHandler {
 
     fn complete_container_batch(
         &mut self,
-        blocks: &[ExtendedBlockProto],
+        block: &ExtendedBlockProto,
         commit: bool,
     ) -> FsResult<()> {
         println!(
@@ -371,7 +371,6 @@ impl BatchWriteHandler {
         );
         // Parse the flattened batch request
         let header: BlocksBatchCommitRequest = msg.parse_header()?;
-        let mut results = Vec::new();
 
         if self.is_commit {
             return if !msg.data.is_empty() {
@@ -392,10 +391,10 @@ impl BatchWriteHandler {
 
         println!(
             "Debug at BatchWriteHandler,at complete_batch, blocks for complete_container_batch: {:?}",
-            &header.blocks
+            &header.block
         );
-        self.complete_container_batch(&header.blocks, commit)?;
-        results = vec![true; header.blocks.len()];
+        self.complete_container_batch(&header.block, commit)?;
+        let results = true;
         let batch_response: BlocksBatchCommitResponse = BlocksBatchCommitResponse { results };
 
         Ok(Builder::success(msg).proto_header(batch_response).build())

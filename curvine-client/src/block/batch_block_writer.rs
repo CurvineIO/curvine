@@ -60,7 +60,7 @@ impl BatchWriterAdapter {
     // Create new WriterAdapter
     async fn new(
         fs_context: Arc<FsContext>,
-        located_blocks: &[LocatedBlock],
+        located_blocks: &LocatedBlock,
         worker_addr: &WorkerAddress,
         small_files_metadata: Option<Vec<SmallFileMetaProto>>,
         container_name: String,
@@ -71,15 +71,15 @@ impl BatchWriterAdapter {
 
         println!("Debug at BatchWriterAdapter, located_blocks: {:?}", located_blocks);
         println!("Debug at BatchWriterAdapter, worker_addr: {:?}", worker_addr);
-        let blocks: Vec<ExtendedBlock> = located_blocks.iter().map(|lb| lb.block.clone()).collect();
+        let block: ExtendedBlock = located_blocks.block.clone();
         let adapter = if short_circuit {
             let writer =
-                BatchBlockWriterLocal::new(fs_context, blocks, worker_addr.clone(), 0).await?;
+                BatchBlockWriterLocal::new(fs_context, block, worker_addr.clone(), 0).await?;
             BatchLocal(writer)
         } else {
             let writer = BatchBlockWriterRemote::new(
                 &fs_context,
-                blocks,
+                block,
                 worker_addr.clone(),
                 0,
                 small_files_metadata,
@@ -97,24 +97,24 @@ impl BatchWriterAdapter {
 pub struct BatchBlockWriter {
     inners: Vec<BatchWriterAdapter>,
     fs_context: Arc<FsContext>,
-    located_blocks: Vec<LocatedBlock>,
+    located_blocks: LocatedBlock,
     file_lengths: Vec<i64>,
 }
 impl BatchBlockWriter {
     /// Create multiple BlockWriters for batch operations  
     pub async fn new(
         fs_context: Arc<FsContext>,
-        located_blocks: Vec<LocatedBlock>, // all blocks have the same worker information
+        located_blocks: LocatedBlock, // all blocks have the same worker information
         small_files_metadata: Option<Vec<SmallFileMetaProto>>,
         container_name: String,
         container_path: String
     ) -> FsResult<Self> {
-        if located_blocks.is_empty() {
-            return err_box!("No blocks provided");
-        }
+        // if located_blocks.is_empty() {
+        //     return err_box!("No blocks provided");
+        // }
 
         // Get the first block to extract worker information
-        let first_locate = located_blocks.first().unwrap();
+        let first_locate = located_blocks.clone();
 
         if first_locate.locs.is_empty() {
             return err_box!("There is no available worker");
@@ -135,7 +135,7 @@ impl BatchBlockWriter {
             .await?;
             inners.push(adapter);
         }
-        let num_of_blocks = located_blocks.len();
+        let num_of_blocks = 1;
 
         println!("DEBUG at BatchBlockWriter, located_blocks: {:?} ",located_blocks);
         Ok(Self {
@@ -183,7 +183,7 @@ impl BatchBlockWriter {
     }
 
     /// Complete all writers and return commit blocks  
-    pub async fn complete(&mut self) -> FsResult<Vec<CommitBlock>> {
+    pub async fn complete(&mut self) -> FsResult<CommitBlock> {
         let futures = self.inners.iter_mut().map(|writer| async move {
             writer
                 .complete()
@@ -199,23 +199,28 @@ impl BatchBlockWriter {
         Ok(self.to_commit_blocks())
     }
 
-    pub fn to_commit_blocks(&self) -> Vec<CommitBlock> {
-        let mut commit_blocks = Vec::with_capacity(self.located_blocks.len());
+    pub fn to_commit_blocks(&self) -> CommitBlock {
+        // let mut commit_blocks = Vec::with_capacity(self.located_blocks.len());
 
-        println!("DEBUG at BatchBlockWriter, at to_commit_blocks, located_blocks {:?}", self.located_blocks);
-        for (i, located_block) in self.located_blocks.iter().enumerate() {
-            let mut commit_block = CommitBlock::from(located_block);
+        // println!("DEBUG at BatchBlockWriter, at to_commit_blocks, located_blocks {:?}", self.located_blocks);
+        // for (i, located_block) in self.located_blocks.iter().enumerate() {
+        //     let mut commit_block = CommitBlock::from(located_block);
 
-            // if let Some(&length) = self.file_lengths.get(i) {
+        //     // if let Some(&length) = self.file_lengths.get(i) {
                 
-            // }
+        //     // }
 
-            commit_block.block_len += self.file_lengths.iter().map(|&len| len).sum::<i64>();
+        //     commit_block.block_len += self.file_lengths.iter().map(|&len| len).sum::<i64>();
 
 
-            commit_blocks.push(commit_block);
-        }
+        //     commit_blocks.push(commit_block);
+        // }
 
-        commit_blocks
+        let mut commit_block = CommitBlock::from(&self.located_blocks);
+
+        commit_block.block_len = self.file_lengths.iter().map(|&len| len).sum::<i64>();
+            // commit_blocks.push(commit_block);
+
+        commit_block
     }
 }

@@ -397,6 +397,7 @@ impl CurvineFileSystem {
 
     async fn handle_batch_files(&self, files: &[(&Path, &str)]) -> FsResult<()> {
         println!("handle batch files");
+        // currently, this feature support all files in the same last sub-folder inode
         if files.is_empty() {
             return Ok(());
         }
@@ -420,24 +421,20 @@ impl CurvineFileSystem {
         );
 
         // Step 2: Batch allocate blocks
-        // let mut add_block_requests = Vec::with_capacity(file_statuses.len());
-        // for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
-        //     add_block_requests.push((path.encode(), _content.len()));
-        // }
+        // let mut add_block_requests = Vec::with_capacity(1);
+        // add_block_requests.push((file_statuses.container_path.clone(), 1));
 
-        let mut add_block_requests = Vec::with_capacity(1);
-        add_block_requests.push((file_statuses.container_path.clone(), 1));
+        let container_path = file_statuses.container_path.clone();
 
-        let allocated_blocks: Vec<curvine_common::state::LocatedBlock> = self
+        let allocated_blocks: curvine_common::state::LocatedBlock = self
             .fs_client()
-            .add_blocks_batch(add_block_requests)
+            .add_blocks_batch(container_path)
             .await?;
 
         println!("at CurvineFileSystem: done add_blocks_batch {:?}", allocated_blocks);
 
         // Compute small files metadata for containerization
         let small_files_metadata = self.compute_container_metadata(files, &allocated_blocks)?;
-
         println!(
             "at CurvineFileSystem, add_block_requests: {:?}",
             allocated_blocks
@@ -477,22 +474,14 @@ impl CurvineFileSystem {
             .collect();
 
         println!("DEBUG at CurvineFileSystem, files_index: {:?}", files_index);
-        // for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {
-        //     complete_requests.push((
-        //         path.encode(),
-        //         content.len() as i64,
-        //         vec![commit_block.clone()],
-        //         self.fs_context().clone_client_name(),
-        //         false,
-        //     ));
-        // }
+
         let content_len: i64 = files.iter().map(|(_, content)| content.len() as i64).sum();
         self.fs_client()
             .complete_files_batch(
                 file_statuses.container_path,
                 content_len,
                 self.fs_context().clone_client_name(),
-                commit_blocks.first().cloned().unwrap(),
+                commit_blocks,
                 false,
                 files_index,
             )
@@ -503,7 +492,7 @@ impl CurvineFileSystem {
     fn compute_container_metadata(
         &self,
         files: &[(&Path, &str)],
-        allocated_blocks: &[curvine_common::state::LocatedBlock],
+        allocated_blocks: &curvine_common::state::LocatedBlock,
     ) -> FsResult<Vec<SmallFileMetaProto>> {
         const SMALL_FILE_THRESHOLD: i64 = 64 * 1024; // 64KB
 

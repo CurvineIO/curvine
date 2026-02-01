@@ -88,13 +88,6 @@ impl FsClient {
 
         let rep: CreateFilesBatchResponse = self.rpc(RpcCode::CreateFilesBatch, header).await?;
         match rep.result {
-            // Some(create_files_batch_response::Result::FileStatuses(file_list)) => {
-            //     // Handle individual files - extract from FileStatusList
-            //     Ok(file_list.statuses
-            //         .into_iter()
-            //         .map(ProtoUtils::file_status_from_pb)
-            //         .collect())
-            // }
             Some(create_files_batch_response::Result::Container(container)) => {
                 println!(
                     "Debug at FsClient, create_files_batch, container: {:?}",
@@ -103,21 +96,13 @@ impl FsClient {
                 // get total size
                 let total_size: i64 = container.files.iter().map(|f| f.len).sum();
                 let file_count = container.files.len();
+
                 // Handle container - extract composed FileStatus objects
                 let individual_files: Vec<FileStatus> = container
                     .files
                     .into_iter()
                     .map(ProtoUtils::file_status_from_pb)
                     .collect();
-                
-
-                // let container_uuid_suffix = Uuid::new_v4().to_string();
-                // let container_name = format!("container_{container_uuid_suffix}");
-
-                // let container_path = individual_files
-                //     .first()
-                //     .map(|f| f.path.clone())
-                //     .unwrap_or_else(|| format!("container_{}", container.container_id));
 
                 Ok(ContainerStatus {
                     container_id: container.container_id,
@@ -289,33 +274,47 @@ impl FsClient {
 
     pub async fn add_blocks_batch(
         &self,
-        requests: Vec<(String, usize)>,
-    ) -> FsResult<Vec<LocatedBlock>> {
-        let pb_requests: Vec<AddBlockRequest> = requests
-            .into_iter()
-            .map(|(path, content_len)| {
-                let commit_blocks: Vec<CommitBlockProto> = Vec::new();
-                AddBlockRequest {
-                    path,
-                    commit_blocks,
-                    exclude_workers: self.context.exclude_workers(),
-                    located: true,
-                    client_address: self.context.client_addr_pb(),
-                    file_len: 0,
-                    last_block: None,
-                }
-            })
-            .collect();
-
-        let header = AddBlocksBatchRequest {
-            requests: pb_requests,
+        container_path: String,
+    ) -> FsResult<LocatedBlock> {
+        // let pb_requests: Vec<AddBlockRequest> = requests
+        //     .into_iter()
+        //     .map(|(path, content_len)| {
+        //         let commit_blocks: Vec<CommitBlockProto> = Vec::new();
+        //         AddBlockRequest {
+        //             path,
+        //             commit_blocks,
+        //             exclude_workers: self.context.exclude_workers(),
+        //             located: true,
+        //             client_address: self.context.client_addr_pb(),
+        //             file_len: 0,
+        //             last_block: None,
+        //         }
+        //     })
+        //     .collect();
+        
+        let commit_blocks: Vec<CommitBlockProto> = Vec::new();
+        let pb_request = AddBlockRequest {
+            path: container_path,
+            commit_blocks,
+            exclude_workers: self.context.exclude_workers(),
+            located: true,
+            client_address: self.context.client_addr_pb(),
+            file_len: 0,
+            last_block: None,
         };
-        let rep: AddBlocksBatchResponse = self.rpc(RpcCode::AddBlocksBatch, header).await?;
-        Ok(rep
-            .blocks
-            .into_iter()
-            .map(ProtoUtils::located_block_from_pb)
-            .collect())
+
+        // let header = AddBlocksBatchRequest {
+        //     requests: pb_request,
+        // };
+        println!("DEBUG at FsClient, at add_blocks_batch, before run rpc");
+        let rep: LocatedBlockProto = self.rpc(RpcCode::AddBlock, pb_request).await?;
+        // Ok(rep
+        //     .blocks
+        //     .into_iter()
+        //     .map()
+        //     .collect())
+        println!("DEBUG at FsClient, at add_blocks_batch, before return located_block_from_pb");
+        Ok(ProtoUtils::located_block_from_pb(rep))
     }
     // File writing is completed.
     pub async fn complete_file(

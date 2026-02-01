@@ -23,7 +23,7 @@ use orpc::common::Utils;
 use orpc::err_box;
 
 pub struct BatchBlockWriterRemote {
-    blocks: Vec<ExtendedBlock>,
+    block: ExtendedBlock,
     worker_address: WorkerAddress,
     client: BlockClient,
     pos: i64,
@@ -36,7 +36,7 @@ pub struct BatchBlockWriterRemote {
 impl BatchBlockWriterRemote {
     pub async fn new(
         fs_context: &FsContext,
-        blocks: Vec<ExtendedBlock>,
+        block: ExtendedBlock,
         worker_address: WorkerAddress,
         pos: i64,
         small_files_metadata: Option<Vec<SmallFileMetaProto>>,
@@ -54,7 +54,7 @@ impl BatchBlockWriterRemote {
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
             .write_blocks_batch(
-                &blocks,
+                &block,
                 0,
                 block_size,
                 req_id,
@@ -86,7 +86,7 @@ impl BatchBlockWriterRemote {
         }
 
         let writer = Self {
-            blocks,
+            block,
             worker_address,
             client,
             pos,
@@ -122,14 +122,19 @@ impl BatchBlockWriterRemote {
             .write_files_batch(files, self.req_id, next_seq_id, self.container_meta.clone())
             .await?;
 
-        println!("DEBUG at Batch Block Writer Remote, before: {:?}", self.blocks);
-        for (i, (_, content)) in files.iter().enumerate() {
-            if i < self.blocks.len() {
-                let file_len = content.len() as i64;
-                self.blocks[i].len = file_len;
-            }
+        // println!("DEBUG at Batch Block Writer Remote, before: {:?}", self.block);
+        // for (i, (_, content)) in files.iter().enumerate() {
+        //     if i < self.blocks.len() {
+        //         let file_len = content.len() as i64;
+        //         self.blocks[i].len = file_len;
+        //     }
+        // }
+        let file_len = files.iter().map(| x: &(&Path, &str) |  x.1.len()).sum::<usize>() as i64;
+        if self.block.len < file_len {
+            self.block.len = file_len
         }
-        println!("DEBUG at Batch Block Writer Remote, after: {:?}", self.blocks);
+
+        println!("DEBUG at Batch Block Writer Remote, after: {:?}", self.block);
         Ok(())
     }
 
@@ -145,11 +150,11 @@ impl BatchBlockWriterRemote {
     // Write complete
     pub async fn complete(&mut self) -> FsResult<()> {
         println!("DEBUG at BatchBlockWRiterRemote, at complte, self.container_meta: {:?}", self.container_meta);
-        println!("DEBUG at BatchBlockWRiterRemote, at complte, self.blocks: {:?}", self.blocks);
+        println!("DEBUG at BatchBlockWRiterRemote, at complte, self.blocks: {:?}", self.block);
         let next_seq_id = self.next_seq_id();
         self.client
             .write_commit_batch(
-                &self.blocks,
+                &self.block,
                 self.pos,
                 self.block_size,
                 self.req_id,

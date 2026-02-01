@@ -528,7 +528,7 @@ impl MasterFilesystem {
                 if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
                     let locs = fs_dir.get_block_locations(next.id)?;
                     let extend_block = ExtendedBlock {
-                        id: next.id,
+                    id: next.id,
                         len: next.len,
                         storage_type: file.storage_policy.storage_type,
                         file_type: file.file_type,

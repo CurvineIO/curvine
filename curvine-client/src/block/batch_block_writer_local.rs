@@ -14,7 +14,7 @@ use std::sync::Arc;
 pub struct BatchBlockWriterLocal {
     rt: Arc<Runtime>,
     fs_context: Arc<FsContext>,
-    blocks: Vec<ExtendedBlock>,
+    block: ExtendedBlock,
     worker_address: WorkerAddress,
     files: Vec<RawPtr<LocalFile>>,
     block_size: i64,
@@ -25,7 +25,7 @@ pub struct BatchBlockWriterLocal {
 impl BatchBlockWriterLocal {
     pub async fn new(
         fs_context: Arc<FsContext>,
-        blocks: Vec<ExtendedBlock>,
+        block: ExtendedBlock,
         worker_address: WorkerAddress,
         pos: i64,
     ) -> FsResult<Self> {
@@ -36,7 +36,7 @@ impl BatchBlockWriterLocal {
         // SINGLE RPC call to setup multiple blocks
         let write_context = client
             .write_blocks_batch(
-                &blocks,
+                &block,
                 0,
                 block_size,
                 req_id,
@@ -62,7 +62,7 @@ impl BatchBlockWriterLocal {
         Ok(Self {
             rt: fs_context.clone_runtime(),
             fs_context,
-            blocks,
+            block,
             worker_address,
             files,
             block_size,
@@ -78,7 +78,7 @@ impl BatchBlockWriterLocal {
         let client = self.fs_context.block_client(&self.worker_address).await?;
         client
             .write_commit_batch(
-                &self.blocks,
+                &self.block,
                 self.pos,
                 self.block_size,
                 Utils::req_id(),
@@ -119,8 +119,8 @@ impl BatchBlockWriterLocal {
             handle.await??;
 
             // update length of block
-            if current_pos > self.blocks[index].len {
-                self.blocks[index].len = current_pos;
+            if current_pos > self.block.len {
+                self.block.len = current_pos;
             }
         }
 
