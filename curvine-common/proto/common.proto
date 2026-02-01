@@ -51,23 +51,24 @@ message FileStatusProto {
     required int64 id = 1;
     required string path = 2;
     required string name = 3;
-    required bool is_dir = 4;
-    required int64 mtime = 5;
-    required int64 atime = 6;
-    required int32 children_num = 7;
-    required bool is_complete = 8 [default = false];
-    required int64 len = 9;
-    required int32 replicas = 10;
-    required int64 block_size = 11;
-    required FileTypeProto file_type = 12 [default = FILE_TYPE_PROTO_FILE];
+    optional string container_name = 4;
+    required bool is_dir = 5;
+    required int64 mtime = 6;
+    required int64 atime = 7;
+    required int32 children_num = 8;
+    required bool is_complete = 9 [default = false];
+    required int64 len = 10;
+    required int32 replicas = 11;
+    required int64 block_size = 12;
+    required FileTypeProto file_type = 13 [default = FILE_TYPE_PROTO_FILE];
 
-    map<string, bytes> x_attr = 13;
-    required StoragePolicyProto storage_policy = 14;
-    required string owner = 15;
-    required string group = 16;
-    required uint32 mode = 17;
-    optional string target = 18;
-    required uint32 nlink = 19;
+    map<string, bytes> x_attr = 14;
+    required StoragePolicyProto storage_policy = 15;
+    required string owner = 16;
+    required string group = 17;
+    required uint32 mode = 18;
+    optional string target = 19;
+    required uint32 nlink = 20;
 }
 
 // Describe the worker address information.
@@ -201,6 +202,7 @@ message BlocksBatchWriteRequest {
     required int32 chunk_size = 6;  
     required bool short_circuit = 7;  
     required string client_name = 8;  
+    optional ContainerMetadata files_metadata = 9;
 }  
 
 message BlockWriteResponse {
@@ -251,7 +253,8 @@ message FilesBatchWriteResponse {
 message ContainerMetadata {  
     required int64 container_block_id = 1;  
     required string container_path = 2;  
-    repeated SmallFileMeta files = 3;  
+    required string container_name = 3;   
+    repeated SmallFileMeta files = 4;  
 }  
 
 message SmallFileMeta {  

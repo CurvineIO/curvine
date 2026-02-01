@@ -60,16 +60,18 @@ message CreateFilesBatchRequest {
   
 message ContainerStatusReponse {  
     required int64 container_id = 1;  
-    repeated FileStatusProto files = 2;  // Compose FileStatus objects  
-    required int64 mtime = 6;  
-    required int64 block_size = 7;  
-    required FileTypeProto file_type = 8;  
-    required int32 replicas = 9;  
-    required StoragePolicyProto storage_policy = 10;  
-    required string owner = 11;  
-    required string group = 12;  
-    required uint32 mode = 13;  
-    required uint32 nlink = 14;  
+    required string container_path = 2;
+    required string container_name = 3;
+    repeated FileStatusProto files = 4;  // Compose FileStatus objects  
+    required int64 mtime = 5;  
+    required int64 block_size = 6;  
+    required FileTypeProto file_type = 7;  
+    required int32 replicas = 8;  
+    required StoragePolicyProto storage_policy = 9;  
+    required string owner = 10;  
+    required string group = 11;  
+    required uint32 mode = 12;  
+    required uint32 nlink = 13;  
 }  
   
 message CreateFilesBatchResponse {  
@@ -86,7 +88,7 @@ message FileStatusList {
 
   
 message CompleteFilesBatchRequest {  
-    repeated CompleteFileRequest requests = 1;  
+    required CompleteContainerRequest requests = 1;  
 }  
   
 message CompleteFilesBatchResponse {  
@@ -173,6 +175,7 @@ message AddBlocksBatchResponse {
     repeated LocatedBlockProto blocks = 1;  
 }
 
+
 // File writing is completed.
 message CompleteFileRequest {
     required string path = 1;
@@ -180,6 +183,17 @@ message CompleteFileRequest {
     required string client_name = 3;
     repeated CommitBlockProto commit_blocks = 4;
     required bool only_flush = 5 [default = false];
+}
+
+
+// File writing is completed.
+message CompleteContainerRequest {
+    required string path = 1;
+    required int64 len = 2;
+    required string client_name = 3;
+    required CommitBlockProto commit_block = 4;
+    required bool only_flush = 5 [default = false];
+    map<string, SmallFileMeta> files_index = 6;
 }
 
 message CompleteFileResponse {

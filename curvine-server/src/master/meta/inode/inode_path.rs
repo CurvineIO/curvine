@@ -37,7 +37,10 @@ impl InodePath {
         store: &InodeStore,
     ) -> CommonResult<Self> {
         let components = InodeView::path_components(path.as_ref())?;
-        println!("DEBUG at InodePath,at resolve, components: {:?}", components);
+        println!(
+            "DEBUG at InodePath,at resolve, components: {:?}",
+            components
+        );
         let name = try_option!(components.last());
 
         if name.is_empty() {
@@ -59,6 +62,10 @@ impl InodePath {
                         None => return err_box!("Failed to load inode {} from store", id),
                     }
                 }
+                Container(name, id) => {
+                    println!("DEBUG at InodePath, at resolve, name={:?}", name);
+                    cur_inode.clone()
+                }
                 _ => cur_inode.clone(),
             };
 
@@ -70,16 +77,25 @@ impl InodePath {
 
             index += 1;
             let child_name: &str = components[index].as_str();
-            println!("DEBUG at InodePath,at resolve, child_name: {:?}", child_name);
+            println!(
+                "DEBUG at InodePath,at resolve, at index: {:?}, child_name: {:?}",
+                index, child_name
+            );
             match cur_inode.as_mut() {
                 Dir(_, d) => {
-                    println!("DEBUG at InodePath,at resolve, child name is directory: {:?}", d);
-                    if let Some(child) = d.get_child_ptr(child_name) {
+                    // First attempt: search without container lookup
+                    if let Some(child) = d.get_child_ptr(child_name, false) {
                         cur_inode = child;
-                        println!("DEBUG at InodePath,at resolve, child of child name {:?} is directory: {:?}", child_name, cur_inode);
+                        println!("DEBUG at InodePath,at resolve, child of child name, search only file branch, {:?} is directory: {:?}", child_name, cur_inode);
                     } else {
-                        // The directory has not been created, so there is no need to search again.
-                        break;
+                        // Second attempt: search in containers
+                        if let Some(child) = d.get_child_ptr(child_name, true) {
+                            cur_inode = child;
+                            println!("DEBUG at InodePath,at resolve, child of child name, search file in container branch, {:?} is directory: {:?}", child_name, cur_inode);
+                        } else {
+                            // The directory has not been created, so there is no need to search again.
+                            break;
+                        }
                     }
                 }
 
@@ -97,13 +113,14 @@ impl InodePath {
             }
         }
 
+        println!("DEBUG at InodePath, at resolve, name: {:?}", name);
         let inode_path = Self {
             path: path.as_ref().to_string(),
             name: name.to_string(),
             components,
             inodes,
         };
-
+        println!("DEBUG at InodePath, at resolve, done.");
         Ok(inode_path)
     }
 
@@ -240,7 +257,7 @@ impl InodePath {
                                 queue.push_back((curr_index + 1, child_ptr.clone()));
                             }
                         }
-                    } else if let Some(child) = d.get_child_ptr(child_name_str) {
+                    } else if let Some(child) = d.get_child_ptr(child_name_str, false) {
                         parent_map.insert(child.id(), (curr_index + 1, curr_node.id()));
                         queue.push_back((curr_index + 1, child));
                     }

@@ -14,6 +14,7 @@
 
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
+use crate::master::meta::inode::SmallFileMeta;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MountManager;
@@ -33,8 +34,9 @@ use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::net::ConnState;
 use orpc::message::Message;
+use std::collections::HashMap;
 use std::sync::Arc;
-
+use crate::master::meta::inode::{InodeView, PATH_SEPARATOR};
 struct ContainerBatchResult {
     container_status: FileStatus,
     container_meta: ContainerMetadata,
@@ -326,6 +328,8 @@ impl MasterHandler {
 
         // Create single container for all files
         let container_result = self.create_container_batch(ctx, &header.requests)?;
+        println!("DEBUG at MasterHandler, at create_files_batch, container_result {:?}", container_result.container_status);
+        println!("DEBUG at MasterHandler, at create_files_batch, container_meta {:?}", container_result.container_meta);
         // Create individual FileStatus objects for each file in container
         let mut container_files = Vec::new();
         for (i, req) in header.requests.iter().enumerate() {
@@ -337,11 +341,16 @@ impl MasterHandler {
             file_status.len = container_result.container_meta.files[i].len;
             file_status.file_type = FileType::File; // Individual files, not Container
             file_status.id = ctx.msg.req_id() + i as i64;
+            println!("DEBUG at MasterHandler, at create_files_batch, file_status {:?}", file_status);
             container_files.push(ProtoUtils::file_status_to_pb(file_status));
+            
         }
+        
 
         let container_status_response = ContainerStatusReponse {
-            container_id: container_result.container_status.id,
+            container_id: container_result.container_meta.container_block_id,
+            container_path: container_result.container_meta.container_path,
+            container_name: container_result.container_meta.container_name,
             files: container_files,
             mtime: container_result.container_status.mtime,
             block_size: container_result.container_status.block_size,
@@ -370,7 +379,13 @@ impl MasterHandler {
         requests: &[CreateFileRequest],
     ) -> FsResult<ContainerBatchResult> {
         // Create container inode with first file's path as container path
-        let container_path = format!("{}", requests[0].path);
+        let mut container_path_components = InodeView::path_components(requests[0].path.as_ref())?;
+        let container_path_len = container_path_components.len();
+        let container_uuid_suffix = ctx.msg.req_id().to_string();
+        let container_name = format!("container_{container_uuid_suffix}");
+        container_path_components[container_path_len -1] = container_name.clone();
+        let container_path = container_path_components.join(PATH_SEPARATOR);
+
         let mut container_opts = CreateFileOpts::with_create(true);
         container_opts.file_type = FileType::Container;
         container_opts.block_size = requests.iter().map(|r| r.opts.block_size).sum();
@@ -378,26 +393,31 @@ impl MasterHandler {
 
         let container_status = self.create_file0(
             ctx.msg.req_id(),
-            container_path,
+            container_path.clone(),
             container_opts,
             OpenFlags::new_create(),
         )?;
 
+        println!("DEBUG at MasterHandler, at create_container_batch, container_status: {:?}", container_status);
         let container_meta = ContainerMetadata {
             container_block_id: container_status.id,
-            container_path: container_status.path.clone(),
+            container_path: container_path.clone(),
+            container_name: container_name,
             files: requests
                 .iter()
                 .enumerate()
-                .map(|(i, req)| SmallFileMeta {
-                    offset: requests[0..i].iter().map(|r| r.opts.block_size).sum(),
-                    len: req.opts.block_size,
-                    block_index: 0,
-                    mtime: container_status.mtime,
+                .map(|(i, req)| {
+                    SmallFileMeta {
+                        offset: requests[0..i].iter().map(|r| r.opts.block_size).sum(),
+                        len: req.opts.block_size,
+                        block_index: 0,
+                        mtime: container_status.mtime,
+                    }
+                    .to_proto()
                 })
                 .collect(),
         };
-
+        println!("DEBUG at MasterHandler, at create_container_batch, container_meta: {:?}", container_meta);
         Ok(ContainerBatchResult {
             container_status,
             container_meta,
@@ -424,6 +444,7 @@ impl MasterHandler {
                 req.file_len,
                 req.last_block.map(ProtoUtils::extend_block_from_pb),
             )?;
+            println!("DEBUG at MasterHandler, at add_blocks_batch, located_block {:?}", located_block);
             results.push(ProtoUtils::located_block_to_pb(located_block));
         }
 
@@ -433,26 +454,39 @@ impl MasterHandler {
 
     pub fn complete_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: CompleteFilesBatchRequest = ctx.parse_header()?;
-
+        println!("DEBUG at MasterHandler, at complete_files_batch, starting");
         let mut results = Vec::new();
-        for req in header.requests {
-            let commit_blocks = req
-                .commit_blocks
-                .into_iter()
-                .map(ProtoUtils::commit_block_from_pb)
-                .collect();
-            let result = self
-                .fs
-                .complete_file(
-                    req.path,
-                    req.len,
-                    commit_blocks,
-                    req.client_name,
-                    req.only_flush,
-                )
-                .is_ok();
-            results.push(result);
-        }
+        let req = header.requests;
+        // let commit_blocks = req
+        //         .commit_block
+        //         .into_iter()
+        //         .map(ProtoUtils::commit_block_from_pb)
+        //         .collect();
+        let commit_block = ProtoUtils::commit_block_from_pb(req.commit_block);
+
+        println!(
+            "DEBUG at MasterHandler, at complete_files_batch req.len = {:?}, commit_blocks = {:?}",
+            req.len, commit_block
+        );
+        let files_index: HashMap<String, SmallFileMeta> = req
+            .files_index
+            .into_iter()
+            .map(|(k, v)| (k, SmallFileMeta::from_proto(v)))
+            .collect();
+        let result = self
+            .fs
+            .complete_container(
+                req.path,
+                req.len,
+                commit_block,
+                req.client_name,
+                req.only_flush,
+                files_index,
+            )
+            .is_ok();
+
+        // should add complete information about files = index and offset of all files
+        results.push(result);
 
         let rep_header = CompleteFilesBatchResponse { results };
         ctx.response(rep_header)

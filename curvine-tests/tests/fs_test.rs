@@ -183,9 +183,12 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Helper function to read file content
     async fn read_file_content(fs: &CurvineFileSystem, path: &Path) -> CommonResult<String> {
         let status = fs.get_status(path).await?;
+        println!("DEBUG at read_file_content, before create fs_reader");
         let mut reader = fs.open(path).await?;
         let mut buffer = BytesMut::zeroed(status.len as usize);
+        println!("DEBUG at read_file_content, before read_full");
         let bytes_read = reader.read_full(&mut buffer).await?;
+        println!("DEBUG at read_file_content, after read_full");
         reader.complete().await?;
         buffer.truncate(bytes_read);
         Ok(String::from_utf8(buffer.to_vec())?)
@@ -284,15 +287,18 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Helper function to read file content
     async fn read_file_content(fs: &CurvineFileSystem, path: &Path) -> CommonResult<String> {
         let status = fs.get_status(path).await?;
+        println!("DEBUG at read_file_content, before create fs_reader");
         let mut reader = fs.open(path).await?;
         let mut buffer = BytesMut::zeroed(status.len as usize);
+        println!("DEBUG at read_file_content, before read_full, with reader:");
         let bytes_read = reader.read_full(&mut buffer).await?;
+        println!("DEBUG at read_file_content, after read_full");
         reader.complete().await?;
         buffer.truncate(bytes_read);
         Ok(String::from_utf8(buffer.to_vec())?)
     }
 
-    let num_files = 1;
+    let num_files = 5;
     let small_file_size = 10; // 1KB per file
     let large_file_size = 65; // 1KB per file
     let test_small_data = "x".repeat(small_file_size);
@@ -310,11 +316,13 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     }
 
     fs.write_batch_string(&batch_files).await?;
+    println!("at fs_tests, complete the write_batch_string process");
     // Using batch
     // Get block locations for all files
     let mut results = Vec::new();
     for (path, _) in batch_files.clone() {
         let blocks = fs.get_block_locations(&path).await?;
+        println!("DEBUG block location for path: {:?} is {:?}", path, blocks);
         results.push(blocks);
     }
     println!("results: {:?}", results);
@@ -323,7 +331,9 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     for (i, (path, _)) in batch_files.clone().iter().enumerate() {
         let status = fs.get_status(path).await?;
 
+        println!("DEBUG at test_batch_writting, test_batch_writting, file status: {:?}", status);
         let content = read_file_content(fs, path).await?;
+        println!("DEBUG at test_batch_writting, test_batch_writting, content: {:?}", content);
         if i == num_files - 1 {
             assert_eq!(
                 status.len, large_file_size as i64,

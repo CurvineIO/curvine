@@ -79,6 +79,13 @@ pub struct CompleteFileEntry {
     pub(crate) commit_blocks: Vec<CommitBlock>,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CompleteContainer {
+    pub(crate) op_ms: u64,
+    pub(crate) path: String,
+    pub(crate) file: InodeContainer,
+    pub(crate) commit_blocks: Vec<CommitBlock>,
+}
 // Rename
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct RenameEntry {
@@ -151,6 +158,7 @@ pub enum JournalEntry {
     OverWriteFile(OverWriteFileEntry),
     AddBlock(AddBlockEntry),
     CompleteFile(CompleteFileEntry),
+    CompleteContainer(CompleteContainer),
     Rename(RenameEntry),
     Delete(DeleteEntry),
     Mount(MountEntry),

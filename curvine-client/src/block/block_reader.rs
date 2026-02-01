@@ -170,6 +170,8 @@ impl BlockReader {
         off: i64,
         len: i64,
     ) -> FsResult<ReaderAdapter> {
+        println!("DEBUG at BlockReader, locs: {:?}", locs);
+        println!("DEBUG at BlockReader, block: {:?}", block);
         if locs.is_empty() && block.alloc_opts.is_some() {
             let reader = BlockReaderHole::new(fs_context.clone(), block.clone(), off, len)?;
             return Ok(Hole(reader));

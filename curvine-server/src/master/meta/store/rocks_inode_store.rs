@@ -195,6 +195,7 @@ impl RocksInodeStore {
     }
 
     pub fn set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
+        println!("DEBUG at RocksInodeStorem, id: {:?} and lock: {:?}", id, lock);
         let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_LOCK, id);
         if lock.is_empty() {
             self.db.delete_cf(RocksInodeStore::CF_COMMON, key)
@@ -278,6 +279,7 @@ impl<'a> InodeWriteBatch<'a> {
 
     // Add an inode.
     pub fn write_inode(&mut self, inode: &InodeView) -> CommonResult<()> {
+        println!("DEBUG at InodeWriteBatch, {:?}", inode);
         let key = RocksUtils::i64_to_bytes(inode.id());
         let value = Serde::serialize(inode)?;
         self.put_cf(RocksInodeStore::CF_INODES, key, value)

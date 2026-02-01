@@ -16,6 +16,7 @@ use crate::block::batch_block_writer::BatchWriterAdapter::{BatchLocal, BatchRemo
 use crate::block::{BatchBlockWriterLocal, BatchBlockWriterRemote};
 use crate::file::FsContext;
 use curvine_common::fs::Path;
+use curvine_common::proto::{ContainerMetadata, SmallFileMeta};
 use curvine_common::state::{CommitBlock, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
@@ -61,19 +62,31 @@ impl BatchWriterAdapter {
         fs_context: Arc<FsContext>,
         located_blocks: &[LocatedBlock],
         worker_addr: &WorkerAddress,
+        small_files_metadata: Option<Vec<SmallFileMeta>>,
+        container_name: String,
+        container_path: String
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
         let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
 
-        println!("Debug at BatchWriterAdapter: {:?}", located_blocks);
+        println!("Debug at BatchWriterAdapter, located_blocks: {:?}", located_blocks);
+        println!("Debug at BatchWriterAdapter, worker_addr: {:?}", worker_addr);
         let blocks: Vec<ExtendedBlock> = located_blocks.iter().map(|lb| lb.block.clone()).collect();
         let adapter = if short_circuit {
             let writer =
                 BatchBlockWriterLocal::new(fs_context, blocks, worker_addr.clone(), 0).await?;
             BatchLocal(writer)
         } else {
-            let writer =
-                BatchBlockWriterRemote::new(&fs_context, blocks, worker_addr.clone(), 0).await?;
+            let writer = BatchBlockWriterRemote::new(
+                &fs_context,
+                blocks,
+                worker_addr.clone(),
+                0,
+                small_files_metadata,
+                container_name,
+                container_path
+            )
+            .await?;
             BatchRemote(writer)
         };
 
@@ -92,6 +105,9 @@ impl BatchBlockWriter {
     pub async fn new(
         fs_context: Arc<FsContext>,
         located_blocks: Vec<LocatedBlock>, // all blocks have the same worker information
+        small_files_metadata: Option<Vec<SmallFileMeta>>,
+        container_name: String,
+        container_path: String
     ) -> FsResult<Self> {
         if located_blocks.is_empty() {
             return err_box!("No blocks provided");
@@ -108,12 +124,20 @@ impl BatchBlockWriter {
         let mut inners = Vec::with_capacity(first_locate.locs.len());
         for addr in &first_locate.locs {
             // Create a batch adapter that can handle multiple blocks
-            let adapter =
-                BatchWriterAdapter::new(fs_context.clone(), &located_blocks, addr).await?;
+            let adapter = BatchWriterAdapter::new(
+                fs_context.clone(),
+                &located_blocks,
+                addr,
+                small_files_metadata.clone(),
+                container_name.clone(),
+                container_path.clone()
+            )
+            .await?;
             inners.push(adapter);
         }
         let num_of_blocks = located_blocks.len();
 
+        println!("DEBUG at BatchBlockWriter, located_blocks: {:?} ",located_blocks);
         Ok(Self {
             inners,
             fs_context,
@@ -178,12 +202,16 @@ impl BatchBlockWriter {
     pub fn to_commit_blocks(&self) -> Vec<CommitBlock> {
         let mut commit_blocks = Vec::with_capacity(self.located_blocks.len());
 
+        println!("DEBUG at BatchBlockWriter, at to_commit_blocks, located_blocks {:?}", self.located_blocks);
         for (i, located_block) in self.located_blocks.iter().enumerate() {
             let mut commit_block = CommitBlock::from(located_block);
 
-            if let Some(&length) = self.file_lengths.get(i) {
-                commit_block.block_len = length;
-            }
+            // if let Some(&length) = self.file_lengths.get(i) {
+                
+            // }
+
+            commit_block.block_len += self.file_lengths.iter().map(|&len| len).sum::<i64>();
+
 
             commit_blocks.push(commit_block);
         }

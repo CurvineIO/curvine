@@ -47,6 +47,7 @@ pub struct BatchWriteHandler {
     pub(crate) container_block_id: i64,
     pub(crate) container_path: String,
     pub(crate) container_files: Vec<SmallFileMeta>,
+    pub(crate) container_name: String
 }
 
 impl BatchWriteHandler {
@@ -62,6 +63,7 @@ impl BatchWriteHandler {
             container_block_id: 0,
             container_path: String::new(),
             container_files: Vec::new(),
+            container_name: String::new()
         }
     }
 
@@ -139,12 +141,14 @@ impl BatchWriteHandler {
             header.clone().blocks,
             header.clone().block_size
         );
+        self.container_files = header.clone().files_metadata.unwrap().files;
         // All files are small - pack them into container blocks
         self.handle_small_files_batch(header.clone().blocks)?;
 
         let container_meta = ContainerMetadata {
             container_block_id: self.container_block_id,
             container_path: self.container_path.clone(),
+            container_name: self.container_name.clone(),
             files: self.container_files.clone(),
         };
 
@@ -181,7 +185,7 @@ impl BatchWriteHandler {
         let total_size: i64 = blocks.iter().map(|b| b.block_size).sum();
 
         let container_block = ExtendedBlock {
-            id: Utils::unique_id() as i64,
+            id: self.container_block_id ,// Utils::unique_id() as i64,
             len: total_size,
             storage_type: StorageType::default(),
             file_type: FileType::Container, // New file type
@@ -200,16 +204,20 @@ impl BatchWriteHandler {
         self.container_block_id = container_meta.id();
         self.container_path = container_file.path().to_string();
         // Store file metadata for later writes
-        self.container_files = blocks
-            .iter()
-            .enumerate()
-            .map(|(i, block)| SmallFileMeta {
-                offset: blocks[0..i].iter().map(|b| b.block_size).sum(),
-                len: block.block_size,
-                block_index: 0,
-                mtime: 0,
-            })
-            .collect();
+        println!(
+            "Debug at BatchWriteHandler, at handle_small_files_batch, blocks: {:?}",
+            blocks
+        );
+        // self.container_files = blocks
+        //     .iter()
+        //     .enumerate()
+        //     .map(|(i, block)| SmallFileMeta {
+        //         offset: blocks[0..i].iter().map(|b| b.block_size).sum(),
+        //         len: block.block_size,
+        //         block_index: 0,
+        //         mtime: 0,
+        //     })
+        //     .collect();
 
         self.file = Some(vec![container_file]);
 
@@ -329,6 +337,10 @@ impl BatchWriteHandler {
         // Flush the container file
         if let Some(ref mut files) = self.file {
             if let Some(container_file) = files.first_mut() {
+                println!(
+                    "DEBUG at BatchWriteHanlder, start complete_container_batch flush = {:?}",
+                    container_file.path()
+                );
                 container_file.flush()?;
             }
         }
@@ -337,15 +349,15 @@ impl BatchWriteHandler {
         // (This would be done if we need to update the container header)
 
         // Commit the container block
-        if let Some(container_file_meta) = self.container_files.first() {
+        if let Some(container_file_meta) = self.container_files.last() {
             let container_block = ExtendedBlock {
                 id: self.container_block_id,
-                len: container_file_meta.len,
+                len: container_file_meta.offset + container_file_meta.len,
                 storage_type: StorageType::default(),
                 file_type: FileType::Container,
                 ..Default::default()
             };
-
+            println!("DEBUG at BatchWriteHandler, at complete_container_batch, container_block: {:?}", container_block);
             self.commit_block(&container_block, commit)?;
         }
 
@@ -370,12 +382,18 @@ impl BatchWriteHandler {
         }
 
         if let Some(ref container_meta) = header.container_meta {
+            println!("DEBUG at BatchWriteHandler, at complete_batch, container_meta: {:?}", container_meta);
             self.container_block_id = container_meta.container_block_id;
             self.container_path = container_meta.container_path.clone();
             self.container_files = container_meta.files.clone();
         }
 
         // Container optimization: finalize single container block
+
+        println!(
+            "Debug at BatchWriteHandler,at complete_batch, blocks for complete_container_batch: {:?}",
+            &header.blocks
+        );
         self.complete_container_batch(&header.blocks, commit)?;
         results = vec![true; header.blocks.len()];
         let batch_response: BlocksBatchCommitResponse = BlocksBatchCommitResponse { results };
@@ -436,9 +454,14 @@ impl BatchWriteHandler {
         let mut results = Vec::new();
 
         if let Some(ref container_meta) = header.container_meta {
+            println!(
+                "DEBUG at BatchWriteHandler, at write_batch, container_meta= {:?}",
+                container_meta
+            );
             self.container_block_id = container_meta.container_block_id;
             self.container_path = container_meta.container_path.clone();
             self.container_files = container_meta.files.clone();
+            self.container_name = container_meta.container_name.clone();
         }
         // Container optimization: write all files to single container
         self.write_container_batch(&header.files)?;
@@ -448,8 +471,11 @@ impl BatchWriteHandler {
         let updated_meta = ContainerMetadata {
             container_block_id: self.container_block_id,
             container_path: self.container_path.clone(),
+            container_name: self.container_name.clone(),
             files: self.container_files.clone(),
         };
+
+        println!("DEBUG at BatchWriteHandler, updated_meta {:?}", updated_meta);
 
         let batch_response = FilesBatchWriteResponse {
             results,
@@ -477,10 +503,22 @@ impl BatchWriteHandler {
                 }
             }
         }
+
+        // update block len
+
+        if let Some(files) = self.file.as_mut() {  
+            if let Some(first_file) = files.first_mut() {  
+                let current_pos = first_file.pos();  
+                // This will update both the file system and the len field  
+                first_file.resize(true, 0, current_pos, 0)?;  
+            }  
+        }
+
         println!(
             "DEBUG at BatchWriteHandler, at write_container_batch, self.file.path: {:?}",
             self.file.as_mut().unwrap().first()
         );
+
         println!(
             "DEBUG at BatchWriteHandler, at write_container_batch, self.file.path: {:?}",
             self.file.as_mut().unwrap().first()

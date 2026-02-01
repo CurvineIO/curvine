@@ -215,6 +215,7 @@ impl SearchFileBlocks {
 
     pub fn get_read_block(&self, file_pos: i64) -> FsResult<(i64, LocatedBlock)> {
         let index = self.search_off.partition_point(|x| x.end <= file_pos);
+        println!("DEBUG at SearchFileBlocks, self.block_locs {:?}", self.block_locs);
         if let Some(lc) = self.block_locs.get(index) {
             let block_off = file_pos - self.search_off[index].start;
             Ok((block_off, lc.clone()))

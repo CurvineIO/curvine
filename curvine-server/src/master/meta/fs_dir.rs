@@ -25,7 +25,7 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
+    FileType, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -305,6 +305,7 @@ impl FsDir {
     }
 
     pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
+        println!("DEBUG at FsDir, at create_file, inp: {:?}", inp);
         let op_ms = LocalTime::mills();
         if inp.get_last_inode().is_some() {
             return err_ext!(FsError::file_exists(inp.path()));
@@ -318,6 +319,36 @@ impl FsDir {
         let file = InodeFile::with_opts(self.inode_id.next()?, LocalTime::mills() as i64, opts);
         inp = self.add_last_inode(inp, File(name, file))?;
         self.journal_writer.log_create_file(op_ms, &inp)?;
+
+        Ok(inp)
+    }
+
+    pub fn create_container(
+        &mut self,
+        mut inp: InodePath,
+        opts: CreateFileOpts,
+    ) -> FsResult<InodePath> {
+        println!("DEBUG at FsDir, at create_container, inp: {:?}", inp);
+        let op_ms = LocalTime::mills();
+        if inp.get_last_inode().is_some() {
+            return err_ext!(FsError::file_exists(inp.path()));
+        }
+
+        // Create a directory that does not exist.
+        inp = self.create_parent_dir(inp, opts.dir_opts())?;
+        let name = inp.name().to_string();
+
+        // Create an inode file node.
+        // need to add metadata for InodeContainer
+        let container =
+            InodeContainer::with_opts(self.inode_id.next()?, LocalTime::mills() as i64, opts);
+        println!(
+            "DEBUG at FsDir, at create_container, container: {:?}",
+            container
+        );
+        inp = self.add_last_inode(inp, Container(name.clone(), container.clone()))?;
+        self.journal_writer
+            .log_create_container(op_ms, &inp.path(), &name, &container)?;
 
         Ok(inp)
     }
@@ -340,13 +371,7 @@ impl FsDir {
         let container_name = format!("container_{}", Utils::unique_id());
 
         // Create new container inode
-        let mut container = InodeContainer {
-            id: self.next_inode_id()?,
-            files: HashMap::new(),
-            blocks: Vec::new(),
-            total_size: 0,
-            max_file_size: 64 * 1024, // 64KB default
-        };
+        let mut container = InodeContainer::new(self.next_inode_id()?, LocalTime::mills() as i64);
 
         // Add files to container
         let mut offset = 0i64;
@@ -367,8 +392,14 @@ impl FsDir {
 
         // Add container to parent directory
         parent.update_mtime(op_ms as i64);
+
+        println!(
+            "DEBUG at FsDir, at add_files_to_container, container before insert: {:?}",
+            container
+        );
         let container_inode = InodeView::Container(container_name.clone(), container.clone());
         let added = parent.add_child(container_inode)?;
+        println!("DEBUG at FsDir, at add_files_to_container, done add_child");
         self.store.apply_add(parent.as_ref(), added.as_ref())?;
 
         // Log the operation
@@ -424,7 +455,8 @@ impl FsDir {
             parent.incr_nlink();
         }
 
-        let added = parent.add_child(child)?;
+        let added = parent.add_child(child.clone())?;
+        println!("DEBUG at FsDir, after ad child, parent name is {:?}, with child is {:?}", parent.name(), child);
         self.store.apply_add(parent.as_ref(), added.as_ref())?;
         inp.append(added)?;
 
@@ -436,6 +468,7 @@ impl FsDir {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
+        println!("DEBUG at FsDir, at file_status, inode: {:?}", inode);
         assert!(!inode.is_file_entry());
 
         let status = match inode.as_ref() {
@@ -444,10 +477,11 @@ impl FsDir {
                 return err_box!("FileEntry is not supported");
             }
             Container(..) => {
-                return err_box!("Container is not supported in file_status");
+                println!("DEBUG at FsDir, at file_status, proceed container");
+                inode.to_file_status(inp.path())
             }
         };
-
+        println!("DEBUG at FsDir, at file_status, status: {:?}", status);
         Ok(status)
     }
 
@@ -501,36 +535,106 @@ impl FsDir {
         choose_workers: &[WorkerAddress],
         file_len: i64,
     ) -> FsResult<ExtendedBlock> {
+        println!("DEBUG at FsDir, start acquire_new_block");
         let op_ms = LocalTime::mills();
         let mut inode = try_option!(inp.get_last_inode());
-        let file = inode.as_file_mut()?;
 
-        let new_block_id = file.next_block_id()?;
+        // update
+        let result_located_block: ExtendedBlock = match inode.as_ref() {
+            InodeView::Container(_, _) => {
+                println!("DEBUG at FsDir, start with Container");
+                let container = inode.as_container_mut()?;
 
-        // flush file and commit block
-        file.complete(file_len, &commit_blocks, "", true)?;
+                let block_in_container = 0 as i64;
 
-        // create block.
-        file.add_block(BlockMeta::with_pre(new_block_id, choose_workers));
+                println!("DEBUG at FsDir, start with Container, before add_block, with curr_block_id: {:?} curr_block_id, and choose_workers: {:?}", block_in_container, choose_workers);
+                // create block.
+                container.add_block(BlockMeta::with_pre(block_in_container, choose_workers));
 
-        let block = ExtendedBlock {
-            id: new_block_id,
-            len: 0,
-            storage_type: file.storage_policy.storage_type,
-            file_type: file.file_type,
-            alloc_opts: None,
+                println!("DEBUG at FsDir, start with Container,accquire_new_block, container: {:?}", container);
+
+                let block = ExtendedBlock {
+                    id: 0, //always 0 because just exist only one block per container
+                    len: 0,
+                    storage_type: container.storage_policy.storage_type,
+                    file_type: FileType::Container,
+                    alloc_opts: None,
+                };
+                println!(
+                    "DEBUG at FsDir, start with Container, create block={:?}",
+                    block
+                );
+                self.journal_writer.log_add_block_for_container(
+                    op_ms,
+                    inp.path(),
+                    inode.as_container_mut()?,
+                    commit_blocks.clone(),
+                )?;
+                println!("pass acquire_new_block");
+                block
+            }
+            InodeView::File(_, _) => {
+                let file = inode.as_file_mut()?;
+
+                let new_block_id = file.next_block_id()?;
+
+                // flush file and commit block
+                file.complete(file_len, &commit_blocks, "", true)?;
+
+                // create block.
+                file.add_block(BlockMeta::with_pre(new_block_id, choose_workers));
+
+                let block = ExtendedBlock {
+                    id: new_block_id,
+                    len: 0,
+                    storage_type: file.storage_policy.storage_type,
+                    file_type: file.file_type,
+                    alloc_opts: None,
+                };
+
+                self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
+                self.journal_writer.log_add_block(
+                    op_ms,
+                    inp.path(),
+                    inode.as_file_ref()?,
+                    commit_blocks,
+                )?;
+                println!("pass acquire_new_block");
+                block
+            }
+            _ => {
+                panic!("llm")
+            }
         };
+        // let file = inode.as_file_mut()?;
 
+        // let new_block_id = file.next_block_id()?;
+
+        // // flush file and commit block
+        // file.complete(file_len, &commit_blocks, "", true)?;
+
+        // // create block.
+        // file.add_block(BlockMeta::with_pre(new_block_id, choose_workers));
+
+        // let block = ExtendedBlock {
+        //     id: new_block_id,
+        //     len: 0,
+        //     storage_type: file.storage_policy.storage_type,
+        //     file_type: file.file_type,
+        //     alloc_opts: None,
+        // };
+
+        //
         // state add block.
-        self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
-        self.journal_writer.log_add_block(
-            op_ms,
-            inp.path(),
-            inode.as_file_ref()?,
-            commit_blocks,
-        )?;
+        // self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
+        // self.journal_writer.log_add_block(
+        //     op_ms,
+        //     inp.path(),
+        //     inode.as_file_ref()?,
+        //     commit_blocks,
+        // )?;
         println!("pass acquire_new_block");
-        Ok(block)
+        Ok(result_located_block)
     }
 
     pub fn complete_file(
@@ -545,7 +649,7 @@ impl FsDir {
         let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
         file.complete(len, &commit_block, client_name, only_flush)?;
-
+        println!("DEBUG at FsDir, at complete_container, file: {:?}", file);
         self.evictor.on_access(file.id());
 
         self.store
@@ -555,6 +659,38 @@ impl FsDir {
             inp.path(),
             inode.as_file_ref()?,
             commit_block,
+        )?;
+
+        println!("pass complete file");
+        Ok(true)
+    }
+
+    pub fn complete_container(
+        &mut self,
+        inp: &InodePath,
+        len: i64,
+        commit_block: CommitBlock,
+        client_name: impl AsRef<str>,
+        only_flush: bool,
+        files: HashMap<String, SmallFileMeta>,
+    ) -> FsResult<bool> {
+        let op_ms = LocalTime::mills();
+        let mut inode = try_option!(inp.get_last_inode());
+        let container = inode.as_container_mut()?;
+
+        println!("DEBUG at MasterFileSystem, at complete_container, len: {:?}, commit_block {:?}", len, commit_block);
+        container.complete(len, &commit_block, client_name, only_flush, files)?;
+
+        println!("DEBUG at FsDir, at complete_container, container: {:?}", container);
+        self.evictor.on_access(container.id());
+
+        self.store
+            .apply_complete_file(inode.as_ref(), &[commit_block.clone()])?;
+        self.journal_writer.log_complete_container(
+            op_ms,
+            inp.path(),
+            inode.as_container_ref()?,
+            vec![commit_block.clone()],
         )?;
 
         println!("pass complete file");

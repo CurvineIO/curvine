@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use crate::block::BatchBlockWriter;
-use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
+use crate::file::{self, FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
+use curvine_common::proto::SmallFileMeta;
 use curvine_common::state::CommitBlock;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
@@ -33,6 +34,7 @@ use log::warn;
 use orpc::client::ClientConf;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, err_ext};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -151,6 +153,7 @@ impl CurvineFileSystem {
 
     pub async fn open(&self, path: &Path) -> FsResult<FsReader> {
         let file_blocks = self.fs_client.get_block_locations(path).await?;
+        println!("DEBUG at CurvineFileSystem: file_blocks {:?}", file_blocks);
         Self::check_read_status(path, &file_blocks)?;
 
         let reader = FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)?;
@@ -408,6 +411,7 @@ impl CurvineFileSystem {
             create_requests.push((path.encode(), opts, flags));
         }
 
+        println!("DEBUG at handle_batch_files, create_requests: {:?}", create_requests);
         let file_statuses = self.fs_client().create_files_batch(create_requests).await?;
 
         println!(
@@ -422,17 +426,35 @@ impl CurvineFileSystem {
         // }
 
         let mut add_block_requests = Vec::with_capacity(1);
-        add_block_requests.push((file_statuses.container_path, 1));
+        add_block_requests.push((file_statuses.container_path.clone(), 1));
 
         let allocated_blocks: Vec<curvine_common::state::LocatedBlock> = self
             .fs_client()
             .add_blocks_batch(add_block_requests)
             .await?;
 
-        println!("at CurvineFileSystem: {:?}", allocated_blocks);
+        println!("at CurvineFileSystem: done add_blocks_batch {:?}", allocated_blocks);
+
+        // Compute small files metadata for containerization
+        let small_files_metadata = self.compute_container_metadata(files, &allocated_blocks)?;
+
+        println!(
+            "at CurvineFileSystem, add_block_requests: {:?}",
+            allocated_blocks
+        );
+        println!(
+            "at CurvineFileSystem, small_files_metadata: {:?}",
+            small_files_metadata
+        );
         // assert if allocated_blocks is not smae with add_block_requests
-        let mut batch_writer =
-            BatchBlockWriter::new(self.fs_context.clone(), allocated_blocks).await?;
+        let mut batch_writer = BatchBlockWriter::new(
+            self.fs_context.clone(),
+            allocated_blocks,
+            Some(small_files_metadata.clone()),
+            file_statuses.container_name,
+            file_statuses.container_path.clone()
+        )
+        .await?;
 
         // Write all data (no flushing yet)
         batch_writer.write(files).await?;
@@ -440,21 +462,69 @@ impl CurvineFileSystem {
         // Step 4: Complete all files at worker side
         let commit_blocks = batch_writer.complete().await?;
 
-        // Step 5: Batch complete at master side
-        let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> =
-            Vec::with_capacity(files.len());
-        for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {
-            complete_requests.push((
-                path.encode(),
-                content.len() as i64,
-                vec![commit_block.clone()],
-                self.fs_context().clone_client_name(),
-                false,
-            ));
-        }
+        println!("DEBUG at CurvineFileSystem, commit_blocks: {:?}", commit_blocks);
+        // // Step 5: Batch complete at master side
+        // let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> =
+        //     Vec::with_capacity(files.len());
+
+        let files_index: HashMap<String, SmallFileMeta> = file_statuses  
+            .files  
+            .iter()  
+            .zip(small_files_metadata.iter())  
+            .map(|(file_status, meta)| {  
+                (file_status.name.clone(), meta.clone())  // Use name field as key  
+            })  
+            .collect();
+
+        println!("DEBUG at CurvineFileSystem, files_index: {:?}", files_index);
+        // for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {
+        //     complete_requests.push((
+        //         path.encode(),
+        //         content.len() as i64,
+        //         vec![commit_block.clone()],
+        //         self.fs_context().clone_client_name(),
+        //         false,
+        //     ));
+        // }
+        let content_len: i64 = files.iter().map(|(_, content)| content.len() as i64).sum();
         self.fs_client()
-            .complete_files_batch(complete_requests)
+            .complete_files_batch(
+                file_statuses.container_path,
+                content_len,
+                self.fs_context().clone_client_name(),
+                commit_blocks.first().cloned().unwrap(),
+                false,
+                files_index,
+            )
             .await?;
         Ok(())
+    }
+
+    fn compute_container_metadata(
+        &self,
+        files: &[(&Path, &str)],
+        allocated_blocks: &[curvine_common::state::LocatedBlock],
+    ) -> FsResult<Vec<SmallFileMeta>> {
+        const SMALL_FILE_THRESHOLD: i64 = 64 * 1024; // 64KB
+
+        let mut metadata = Vec::new();
+        let mut offset = 0;
+
+        for (i, (path, content)) in files.iter().enumerate() {
+            let file_size = content.len() as i64;
+
+            // Only include small files in container metadata
+            if file_size <= SMALL_FILE_THRESHOLD {
+                metadata.push(SmallFileMeta {
+                    offset,
+                    len: file_size,
+                    block_index: 0,
+                    mtime: 0, // Will be set during write
+                });
+                offset += file_size;
+            }
+        }
+
+        Ok(metadata)
     }
 }

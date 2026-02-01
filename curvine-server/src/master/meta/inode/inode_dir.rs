@@ -83,8 +83,13 @@ impl InodeDir {
         self.children.get_child(name)
     }
 
-    pub fn get_child_ptr(&mut self, name: &str) -> Option<InodePtr> {
-        self.children.get_child_ptr(name)
+    pub fn get_child_ptr(
+        &mut self,
+        name: &str,
+        is_enable_container_search: bool,
+    ) -> Option<InodePtr> {
+        self.children
+            .get_child_ptr(name, is_enable_container_search)
     }
 
     pub fn get_child_ptr_by_glob_pattern(

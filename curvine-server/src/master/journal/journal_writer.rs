@@ -98,11 +98,19 @@ impl JournalWriter {
     }
 
     pub fn log_create_file(&self, op_ms: u64, inp: &InodePath) -> FsResult<()> {
+        println!(
+            "DEBUG at JournalWriter, at log_create_file start with inp: {:?}",
+            inp
+        );
         let entry = CreateFileEntry {
             op_ms,
             path: inp.path().to_string(),
             file: inp.clone_last_file()?,
         };
+        println!(
+            "DEBUG at JournalWriter, at log_create_file end with inp: {:?}",
+            inp
+        );
         self.send(JournalEntry::CreateFile(entry))
     }
 
@@ -137,6 +145,23 @@ impl JournalWriter {
         self.send(JournalEntry::AddBlock(entry))
     }
 
+    pub fn log_add_block_for_container<P: AsRef<str>>(
+        &self,
+        op_ms: u64,
+        path: P,
+        file: &InodeContainer,
+        commit_block: Vec<CommitBlock>,
+    ) -> FsResult<()> {
+        let entry = AddBlockEntry {
+            op_ms,
+            path: path.as_ref().to_string(),
+            blocks: file.blocks.clone(),
+            commit_block,
+        };
+
+        self.send(JournalEntry::AddBlock(entry))
+    }
+
     pub fn log_complete_file<P: AsRef<str>>(
         &self,
         op_ms: u64,
@@ -152,6 +177,23 @@ impl JournalWriter {
         };
 
         self.send(JournalEntry::CompleteFile(entry))
+    }
+
+    pub fn log_complete_container<P: AsRef<str>>(
+        &self,
+        op_ms: u64,
+        path: P,
+        file: &InodeContainer,
+        commit_blocks: Vec<CommitBlock>,
+    ) -> FsResult<()> {
+        let entry = CompleteContainer {
+            op_ms,
+            path: path.as_ref().to_string(),
+            file: file.clone(),
+            commit_blocks,
+        };
+
+        self.send(JournalEntry::CompleteContainer(entry))
     }
 
     pub fn log_overwrite_file(&self, op_ms: u64, inp: &InodePath) -> FsResult<()> {
@@ -266,9 +308,7 @@ impl JournalWriter {
             container: container.clone(),
         };
 
-        if self.enable {
-            let _ = self.sender.send(JournalEntry::CreateContainer(entry));
-        }
+        let _ = self.sender.send(JournalEntry::CreateContainer(entry));
 
         Ok(())
     }

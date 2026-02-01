@@ -26,8 +26,9 @@ use orpc::err_box;
 use orpc::message::MessageBuilder;
 use orpc::runtime::RpcRuntime;
 use prost::Message as PMessage;
-use std::collections::LinkedList;
+use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct FsClient {
@@ -108,15 +109,20 @@ impl FsClient {
                     .into_iter()
                     .map(ProtoUtils::file_status_from_pb)
                     .collect();
+                
 
-                let container_path = individual_files
-                    .first()
-                    .map(|f| f.path.clone())
-                    .unwrap_or_else(|| format!("container_{}", container.container_id));
+                // let container_uuid_suffix = Uuid::new_v4().to_string();
+                // let container_name = format!("container_{container_uuid_suffix}");
+
+                // let container_path = individual_files
+                //     .first()
+                //     .map(|f| f.path.clone())
+                //     .unwrap_or_else(|| format!("container_{}", container.container_id));
 
                 Ok(ContainerStatus {
                     container_id: container.container_id,
-                    container_path: container_path,
+                    container_path: container.container_path,
+                    container_name: container.container_name,
                     files: individual_files,
                     total_size: total_size,
                     file_count: file_count,
@@ -339,34 +345,50 @@ impl FsClient {
 
     pub async fn complete_files_batch(
         &self,
-        requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)>,
+        container_name: String,
+        container_len: i64,
+        client_name: String,
+        commit_block: CommitBlock,
+        only_flush: bool,
+        files_index: HashMap<String, SmallFileMeta>,
     ) -> FsResult<Vec<bool>> {
-        let pb_requests: Vec<CompleteFileRequest> = requests
-            .into_iter()
-            .map(|(path, len, commit_blocks, client_name, only_flush)| {
-                let commit_blocks = commit_blocks
-                    .into_iter()
-                    .map(ProtoUtils::commit_block_to_pb)
-                    .collect();
-                CompleteFileRequest {
-                    path,
-                    len,
-                    client_name,
-                    commit_blocks,
-                    only_flush,
-                }
-            })
-            .collect();
+        let commit_block_proto = ProtoUtils::commit_block_to_pb(commit_block);
+        let pb_requests = CompleteContainerRequest {
+            path: container_name,
+            len: container_len,
+            client_name: client_name,
+            commit_block: commit_block_proto,
+            only_flush: only_flush,
+            files_index: files_index,
+        };
+        // let pb_requests: Vec<CompleteFileRequest> = requests
+        //     .into_iter()
+        //     .map(|(path, len, commit_blocks, client_name, only_flush)| {
+        //         let commit_blocks = commit_blocks
+        //             .into_iter()
+        //             .map(ProtoUtils::commit_block_to_pb)
+        //             .collect();
+        //         CompleteFileRequest {
+        //             path,
+        //             len,
+        //             client_name,
+        //             commit_blocks,
+        //             only_flush,
+        //         }
+        //     })
+        //     .collect();
 
         let header = CompleteFilesBatchRequest {
             requests: pb_requests,
         };
 
+        println!("DEBUG at FsClient, at complete_files_batch, {:?}", header);
         let rep: CompleteFilesBatchResponse = self.rpc(RpcCode::CompleteFilesBatch, header).await?;
         Ok(rep.results)
     }
 
     pub async fn get_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {
+        println!("DEBUG at FsClient, at get_block_locations, start");
         let header = GetBlockLocationsRequest {
             path: path.encode(),
         };

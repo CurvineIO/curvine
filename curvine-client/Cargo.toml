@@ -27,6 +27,7 @@ futures = { workspace = true }
 moka = { workspace = true }
 fxhash = { workspace = true }
 prometheus = { workspace = true }
+uuid = { workspace = true }
 
 [features]
 default = ["opendal-s3"]

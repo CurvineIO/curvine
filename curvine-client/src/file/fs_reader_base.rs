@@ -135,6 +135,7 @@ impl FsReaderBase {
 
             _ => {
                 let (block_off, loc) = self.file_blocks.get_read_block(self.pos)?;
+                println!("DEBUG at FsReaderBase, block_off {:?}, loc {:?}", block_off, loc);
                 let new_reader =
                     BlockReader::new(self.fs_context.clone(), loc.clone(), block_off).await?;
 

@@ -43,6 +43,9 @@ impl BatchBlockWriterLocal {
                 0_i32,
                 fs_context.write_chunk_size() as i32,
                 true,
+                None,
+                None,
+                None
             )
             .await?;
 

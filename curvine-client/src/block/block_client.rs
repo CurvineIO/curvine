@@ -24,11 +24,12 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
     BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadata,
-    DataHeaderProto, FileWriteData, FilesBatchWriteRequest,
+    DataHeaderProto, FileWriteData, FilesBatchWriteRequest, SmallFileMeta,
 };
 use curvine_common::state::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
+use moka::ops::compute::Op;
 use orpc::client::RpcClient;
 use orpc::common::LocalTime;
 use orpc::message::{Builder, Message, RequestStatus};
@@ -36,7 +37,6 @@ use orpc::sys::DataSlice;
 use orpc::{err_box, try_option_ref, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
-
 pub struct BlockClient {
     client: Option<RpcClient>,
     client_name: String,
@@ -300,6 +300,9 @@ impl BlockClient {
         seq_id: i32,
         chunk_size: i32,
         short_circuit: bool,
+        small_files_metadata: Option<Vec<SmallFileMeta>>,
+        container_name: Option<String>,
+        container_path: Option<String>
     ) -> FsResult<CreateBatchBlockContext> {
         println!("Debug, at BlockClient: blocks={:?}", blocks);
         let blocks_pb: Vec<_> = blocks
@@ -316,6 +319,12 @@ impl BlockClient {
             chunk_size,
             short_circuit,
             client_name: self.client_name.to_string(),
+            files_metadata: small_files_metadata.map(|files| ContainerMetadata {
+                container_block_id: 0,         // Will be set by worker
+                container_path: container_path.unwrap(), // Will be set by worker
+                container_name: container_name.unwrap(),
+                files,
+            }),
         };
 
         let msg = Builder::new()
@@ -330,7 +339,10 @@ impl BlockClient {
         let rep_header: BlocksBatchWriteResponse = rep.parse_header()?;
         let mut batch_context = CreateBatchBlockContext::new(req_id);
 
-        println!("DEBUG at BlockClient, at write_blocks_batch,rep_header: {:?} ", rep_header);
+        println!(
+            "DEBUG at BlockClient, at write_blocks_batch,rep_header: {:?} ",
+            rep_header
+        );
         let container_meta = rep_header.container_meta;
         for response in rep_header.responses {
             let context = CreateBlockContext {
@@ -406,6 +418,8 @@ impl BlockClient {
             })
             .collect();
 
+        println!("DEBUG at write_files_batch, files: {:?}", file_data);
+        println!("DEBUG at write_files_batch, container_meta: {:?}", container_meta);
         let header = FilesBatchWriteRequest {
             files: file_data,
             req_id,

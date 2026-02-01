@@ -69,6 +69,7 @@ impl JournalLoader {
             JournalEntry::AddBlock(e) => self.add_block(e),
 
             JournalEntry::CompleteFile(e) => self.complete_file(e),
+            JournalEntry::CompleteContainer(e) => self.complete_container(e),
 
             JournalEntry::Rename(e) => self.rename(e),
 
@@ -155,6 +156,22 @@ impl JournalLoader {
 
         let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
+
+        let _ = mem::replace(file, entry.file);
+        // Update block location
+        fs_dir
+            .store
+            .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
+
+        Ok(())
+    }
+
+    fn complete_container(&self, entry: CompleteContainer) -> CommonResult<()> {
+        let fs_dir = self.fs_dir.write();
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+
+        let mut inode = try_option!(inp.get_last_inode());
+        let file = inode.as_container_mut()?;
 
         let _ = mem::replace(file, entry.file);
         // Update block location
@@ -299,6 +316,10 @@ impl JournalLoader {
         fs_dir.update_last_inode_id(entry.container.id)?;
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
         let name = inp.name().to_string();
+        println!(
+            "DEBUG at JounalLoader, at create_container, entry.container: {:?}",
+            entry.container
+        );
         let _ = fs_dir.add_last_inode(inp, Container(name, entry.container))?;
         Ok(())
     }
