@@ -350,7 +350,7 @@ impl FsClient {
         client_name: String,
         commit_block: CommitBlock,
         only_flush: bool,
-        files_index: HashMap<String, SmallFileMeta>,
+        files_index: HashMap<String, SmallFileMetaProto>,
     ) -> FsResult<Vec<bool>> {
         let commit_block_proto = ProtoUtils::commit_block_to_pb(commit_block);
         let pb_requests = CompleteContainerRequest {

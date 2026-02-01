@@ -254,10 +254,10 @@ message ContainerMetadata {
     required int64 container_block_id = 1;  
     required string container_path = 2;  
     required string container_name = 3;   
-    repeated SmallFileMeta files = 4;  
+    repeated SmallFileMetaProto files = 4;  
 }  
 
-message SmallFileMeta {  
+message SmallFileMetaProto {  
     required int64 offset = 1;  
     required int64 len = 2;  
     required int32 block_index = 3;  

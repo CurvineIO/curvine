@@ -24,7 +24,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
     BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadata,
-    DataHeaderProto, FileWriteData, FilesBatchWriteRequest, SmallFileMeta,
+    DataHeaderProto, FileWriteData, FilesBatchWriteRequest, SmallFileMetaProto,
 };
 use curvine_common::state::{ExtendedBlock, StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
@@ -300,7 +300,7 @@ impl BlockClient {
         seq_id: i32,
         chunk_size: i32,
         short_circuit: bool,
-        small_files_metadata: Option<Vec<SmallFileMeta>>,
+        small_files_metadata: Option<Vec<SmallFileMetaProto>>,
         container_name: Option<String>,
         container_path: Option<String>
     ) -> FsResult<CreateBatchBlockContext> {

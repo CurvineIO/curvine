@@ -34,6 +34,3 @@ pub use glob_utils::*;
 
 mod lock_meta;
 pub use self::lock_meta::LockMeta;
-
-// mod inode;
-// pub use inode::SmallFileMeta;

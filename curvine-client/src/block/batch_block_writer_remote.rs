@@ -15,7 +15,7 @@
 use crate::block::block_client::BlockClient;
 use crate::file::FsContext;
 use curvine_common::fs::Path;
-use curvine_common::proto::{ContainerMetadata, SmallFileMeta};
+use curvine_common::proto::{ContainerMetadata, SmallFileMetaProto};
 use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use moka::ops::compute::Op;
@@ -39,7 +39,7 @@ impl BatchBlockWriterRemote {
         blocks: Vec<ExtendedBlock>,
         worker_address: WorkerAddress,
         pos: i64,
-        small_files_metadata: Option<Vec<SmallFileMeta>>,
+        small_files_metadata: Option<Vec<SmallFileMetaProto>>,
         container_name: String,
         container_path: String
     ) -> FsResult<Self> {

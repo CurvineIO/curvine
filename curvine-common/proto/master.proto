@@ -193,7 +193,7 @@ message CompleteContainerRequest {
     required string client_name = 3;
     required CommitBlockProto commit_block = 4;
     required bool only_flush = 5 [default = false];
-    map<string, SmallFileMeta> files_index = 6;
+    map<string, SmallFileMetaProto> files_index = 6;
 }
 
 message CompleteFileResponse {

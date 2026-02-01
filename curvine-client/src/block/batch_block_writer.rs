@@ -16,7 +16,7 @@ use crate::block::batch_block_writer::BatchWriterAdapter::{BatchLocal, BatchRemo
 use crate::block::{BatchBlockWriterLocal, BatchBlockWriterRemote};
 use crate::file::FsContext;
 use curvine_common::fs::Path;
-use curvine_common::proto::{ContainerMetadata, SmallFileMeta};
+use curvine_common::proto::{SmallFileMetaProto};
 use curvine_common::state::{CommitBlock, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
@@ -62,7 +62,7 @@ impl BatchWriterAdapter {
         fs_context: Arc<FsContext>,
         located_blocks: &[LocatedBlock],
         worker_addr: &WorkerAddress,
-        small_files_metadata: Option<Vec<SmallFileMeta>>,
+        small_files_metadata: Option<Vec<SmallFileMetaProto>>,
         container_name: String,
         container_path: String
     ) -> FsResult<Self> {
@@ -105,7 +105,7 @@ impl BatchBlockWriter {
     pub async fn new(
         fs_context: Arc<FsContext>,
         located_blocks: Vec<LocatedBlock>, // all blocks have the same worker information
-        small_files_metadata: Option<Vec<SmallFileMeta>>,
+        small_files_metadata: Option<Vec<SmallFileMetaProto>>,
         container_name: String,
         container_path: String
     ) -> FsResult<Self> {

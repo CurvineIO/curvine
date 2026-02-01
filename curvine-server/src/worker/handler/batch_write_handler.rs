@@ -23,7 +23,7 @@ use curvine_common::proto::ExtendedBlockProto;
 use curvine_common::proto::{
     BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
     BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadata, FileWriteData,
-    FilesBatchWriteRequest, FilesBatchWriteResponse, SmallFileMeta,
+    FilesBatchWriteRequest, FilesBatchWriteResponse, SmallFileMetaProto,
 };
 use curvine_common::state::ExtendedBlock;
 use curvine_common::state::FileType;
@@ -46,7 +46,7 @@ pub struct BatchWriteHandler {
     // for small file containerization
     pub(crate) container_block_id: i64,
     pub(crate) container_path: String,
-    pub(crate) container_files: Vec<SmallFileMeta>,
+    pub(crate) container_files: Vec<SmallFileMetaProto>,
     pub(crate) container_name: String
 }
 

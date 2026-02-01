@@ -19,7 +19,7 @@ use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::proto::SmallFileMeta;
+use curvine_common::proto::SmallFileMetaProto;
 use curvine_common::state::CommitBlock;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
@@ -467,7 +467,7 @@ impl CurvineFileSystem {
         // let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> =
         //     Vec::with_capacity(files.len());
 
-        let files_index: HashMap<String, SmallFileMeta> = file_statuses  
+        let files_index: HashMap<String, SmallFileMetaProto> = file_statuses  
             .files  
             .iter()  
             .zip(small_files_metadata.iter())  
@@ -504,7 +504,7 @@ impl CurvineFileSystem {
         &self,
         files: &[(&Path, &str)],
         allocated_blocks: &[curvine_common::state::LocatedBlock],
-    ) -> FsResult<Vec<SmallFileMeta>> {
+    ) -> FsResult<Vec<SmallFileMetaProto>> {
         const SMALL_FILE_THRESHOLD: i64 = 64 * 1024; // 64KB
 
         let mut metadata = Vec::new();
@@ -515,7 +515,7 @@ impl CurvineFileSystem {
 
             // Only include small files in container metadata
             if file_size <= SMALL_FILE_THRESHOLD {
-                metadata.push(SmallFileMeta {
+                metadata.push(SmallFileMetaProto {
                     offset,
                     len: file_size,
                     block_index: 0,

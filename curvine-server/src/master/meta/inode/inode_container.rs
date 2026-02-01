@@ -205,7 +205,7 @@ impl PartialEq for InodeContainer {
 }
 
 impl SmallFileMeta {
-    pub fn from_proto(meta: curvine_common::proto::SmallFileMeta) -> Self {
+    pub fn from_proto(meta: curvine_common::proto::SmallFileMetaProto) -> Self {
         Self {
             offset: meta.offset,
             len: meta.len,
@@ -213,8 +213,8 @@ impl SmallFileMeta {
             mtime: meta.mtime,
         }
     }
-    pub fn to_proto(&self) -> curvine_common::proto::SmallFileMeta {
-        curvine_common::proto::SmallFileMeta {
+    pub fn to_proto(&self) -> curvine_common::proto::SmallFileMetaProto {
+        curvine_common::proto::SmallFileMetaProto {
             offset: self.offset,
             len: self.len,
             block_index: self.block_index as i32,
