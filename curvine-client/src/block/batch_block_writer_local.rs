@@ -1,8 +1,8 @@
 use crate::file::FsContext;
 use curvine_common::error::FsError;
 use curvine_common::fs::Path;
-use curvine_common::proto::ContainerMetadataProto;
-use curvine_common::state::{ExtendedBlock, WorkerAddress};
+use curvine_common::proto::{ContainerMetadataProto, SmallFileMetaProto};
+use curvine_common::state::{ContainerStatus, ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
 use orpc::io::LocalFile;
@@ -11,7 +11,7 @@ use orpc::sys::RawPtr;
 use orpc::try_option;
 use std::sync::Arc;
 
-pub struct BatchBlockWriterLocal {
+pub struct ContainerBlockWriterLocal {
     rt: Arc<Runtime>,
     fs_context: Arc<FsContext>,
     block: ExtendedBlock,
@@ -22,12 +22,14 @@ pub struct BatchBlockWriterLocal {
     container_meta: Option<ContainerMetadataProto>,
 }
 
-impl BatchBlockWriterLocal {
+impl ContainerBlockWriterLocal {
     pub async fn new(
         fs_context: Arc<FsContext>,
         block: ExtendedBlock,
         worker_address: WorkerAddress,
         pos: i64,
+        container_status: ContainerStatus,
+        small_files_metadata: Vec<SmallFileMetaProto>
     ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let block_size = fs_context.block_size();
@@ -43,9 +45,8 @@ impl BatchBlockWriterLocal {
                 0_i32,
                 fs_context.write_chunk_size() as i32,
                 true,
-                None,
-                None,
-                None
+                container_status,
+                small_files_metadata
             )
             .await?;
 

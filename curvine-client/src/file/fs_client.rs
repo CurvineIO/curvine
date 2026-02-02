@@ -69,7 +69,7 @@ impl FsClient {
         self.create_with_opts(path, opts, overwrite).await
     }
 
-    pub async fn create_files_batch(
+    pub async fn create_container(
         &self,
         requests: Vec<(String, CreateFileOpts, OpenFlags)>,
     ) -> FsResult<ContainerStatus> {
@@ -82,15 +82,15 @@ impl FsClient {
             })
             .collect();
 
-        let header = CreateFilesBatchRequest {
+        let header = CreateContainerRequest {
             requests: pb_requests,
         };
 
-        let rep: CreateFilesBatchResponse = self.rpc(RpcCode::CreateFilesBatch, header).await?;
+        let rep: CreateContainerResponse = self.rpc(RpcCode::CreateContainer, header).await?;
         match rep.result {
-            Some(create_files_batch_response::Result::Container(container)) => {
+            Some(create_container_response::Result::Container(container)) => {
                 println!(
-                    "Debug at FsClient, create_files_batch, container: {:?}",
+                    "Debug at FsClient, create_container, container: {:?}",
                     container
                 );
                 // get total size
@@ -272,26 +272,10 @@ impl FsClient {
         Ok(locate_block)
     }
 
-    pub async fn add_blocks_batch(
+    pub async fn add_container_block(
         &self,
         container_path: String,
     ) -> FsResult<LocatedBlock> {
-        // let pb_requests: Vec<AddBlockRequest> = requests
-        //     .into_iter()
-        //     .map(|(path, content_len)| {
-        //         let commit_blocks: Vec<CommitBlockProto> = Vec::new();
-        //         AddBlockRequest {
-        //             path,
-        //             commit_blocks,
-        //             exclude_workers: self.context.exclude_workers(),
-        //             located: true,
-        //             client_address: self.context.client_addr_pb(),
-        //             file_len: 0,
-        //             last_block: None,
-        //         }
-        //     })
-        //     .collect();
-        
         let commit_blocks: Vec<CommitBlockProto> = Vec::new();
         let pb_request = AddBlockRequest {
             path: container_path,
@@ -303,17 +287,9 @@ impl FsClient {
             last_block: None,
         };
 
-        // let header = AddBlocksBatchRequest {
-        //     requests: pb_request,
-        // };
-        println!("DEBUG at FsClient, at add_blocks_batch, before run rpc");
+        println!("DEBUG at FsClient, at add_container_block, before run rpc");
         let rep: LocatedBlockProto = self.rpc(RpcCode::AddBlock, pb_request).await?;
-        // Ok(rep
-        //     .blocks
-        //     .into_iter()
-        //     .map()
-        //     .collect())
-        println!("DEBUG at FsClient, at add_blocks_batch, before return located_block_from_pb");
+        println!("DEBUG at FsClient, at add_container_block, before return located_block_from_pb");
         Ok(ProtoUtils::located_block_from_pb(rep))
     }
     // File writing is completed.
@@ -337,53 +313,44 @@ impl FsClient {
             only_flush,
         };
 
-        let rep: CompleteFileResponse = self.rpc(RpcCode::CompleteFile, header).await?;
+    let rep: CompleteFileResponse = self.rpc(RpcCode::CompleteFile, header).await?;
 
         Ok(rep.file_blocks.map(ProtoUtils::file_blocks_from_pb))
     }
 
-    pub async fn complete_files_batch(
+    pub async fn complete_container(
         &self,
-        container_name: String,
-        container_len: i64,
+        container_status: ContainerStatus,
         client_name: String,
         commit_block: CommitBlock,
         only_flush: bool,
-        files_index: HashMap<String, SmallFileMetaProto>,
-    ) -> FsResult<Vec<bool>> {
+        small_files_metadata: Vec<SmallFileMetaProto>
+    ) -> FsResult<bool> {
+        let block_len = commit_block.block_len;
         let commit_block_proto = ProtoUtils::commit_block_to_pb(commit_block);
+
+        let files_index: HashMap<String, SmallFileMetaProto> = container_status  
+            .files  
+            .iter()  
+            .zip(small_files_metadata.iter())  
+            .map(|(file_status, meta)| {  
+                (file_status.name.clone(), meta.clone())  // Use name field as key  
+            })  
+            .collect();
         let pb_requests = CompleteContainerRequest {
-            path: container_name,
-            len: container_len,
+            path: container_status.container_path,
+            len: block_len,
             client_name: client_name,
             commit_block: commit_block_proto,
             only_flush: only_flush,
-            files_index: files_index,
-        };
-        // let pb_requests: Vec<CompleteFileRequest> = requests
-        //     .into_iter()
-        //     .map(|(path, len, commit_blocks, client_name, only_flush)| {
-        //         let commit_blocks = commit_blocks
-        //             .into_iter()
-        //             .map(ProtoUtils::commit_block_to_pb)
-        //             .collect();
-        //         CompleteFileRequest {
-        //             path,
-        //             len,
-        //             client_name,
-        //             commit_blocks,
-        //             only_flush,
-        //         }
-        //     })
-        //     .collect();
-
-        let header = CompleteFilesBatchRequest {
-            requests: pb_requests,
+            files: files_index,
         };
 
-        println!("DEBUG at FsClient, at complete_files_batch, {:?}", header);
-        let rep: CompleteFilesBatchResponse = self.rpc(RpcCode::CompleteFilesBatch, header).await?;
-        Ok(rep.results)
+        let header = pb_requests;
+
+        println!("DEBUG at FsClient, at complete_container, {:?}", header);
+        let rep: CompleteContainerResponse = self.rpc(RpcCode::CompleteContainer, header).await?;
+        Ok(rep.result)
     }
 
     pub async fn get_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {

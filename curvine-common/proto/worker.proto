@@ -103,11 +103,11 @@ message BlockReportListResponse {
     repeated WorkerCommandProto cmds = 1;
 }
 
-message WriteBlocksBatchRequest {  
+message WriteContainerBlockRequest {  
     repeated BlockWriteRequest requests = 1;  
 }  
   
-message WriteBlocksBatchResponse {  
+message WriteContainerBlockResponse {  
     repeated BlockWriteResponse responses = 1;  
 }  
   

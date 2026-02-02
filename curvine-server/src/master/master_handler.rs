@@ -324,13 +324,13 @@ impl MasterHandler {
     //     ctx.response(rep_header)
     // }
 
-    pub fn create_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: CreateFilesBatchRequest = ctx.parse_header()?;
+    pub fn create_container(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: CreateContainerRequest = ctx.parse_header()?;
 
         // Create single container for all files
         let container_result = self.create_container_batch(ctx, &header.requests)?;
-        println!("DEBUG at MasterHandler, at create_files_batch, container_result {:?}", container_result.container_status);
-        println!("DEBUG at MasterHandler, at create_files_batch, container_meta {:?}", container_result.container_meta);
+        println!("DEBUG at MasterHandler, at create_container, container_result {:?}", container_result.container_status);
+        println!("DEBUG at MasterHandler, at create_container, container_meta {:?}", container_result.container_meta);
         // Create individual FileStatus objects for each file in container
         let mut container_files = Vec::new();
 
@@ -344,7 +344,7 @@ impl MasterHandler {
             file_status.len = container_result.container_meta.files[i].len;
             file_status.file_type = FileType::File; // Individual files, not Container
             file_status.id = ctx.msg.req_id() + i as i64;
-            println!("DEBUG at MasterHandler, at create_files_batch, file_status {:?}", file_status);
+            println!("DEBUG at MasterHandler, at create_container, file_status {:?}", file_status);
             container_files.push(ProtoUtils::file_status_to_pb(file_status));
         }
         
@@ -367,8 +367,8 @@ impl MasterHandler {
             nlink: container_result.container_status.nlink,
         };
 
-        let rep_header = CreateFilesBatchResponse {
-            result: Some(create_files_batch_response::Result::Container(
+        let rep_header = CreateContainerResponse {
+            result: Some(create_container_response::Result::Container(
                 container_status_response,
             )),
         };
@@ -456,11 +456,11 @@ impl MasterHandler {
     //     ctx.response(rep_header)
     // }
 
-    pub fn complete_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: CompleteFilesBatchRequest = ctx.parse_header()?;
-        println!("DEBUG at MasterHandler, at complete_files_batch, starting");
-        let mut results = Vec::new();
-        let req = header.requests;
+    pub fn complete_container(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: CompleteContainerRequest = ctx.parse_header()?;
+        println!("DEBUG at MasterHandler, at complete_container, starting");
+        // let mut results = Vec::new();
+        let req = header;
         // let commit_blocks = req
         //         .commit_block
         //         .into_iter()
@@ -469,11 +469,11 @@ impl MasterHandler {
         let commit_block = ProtoUtils::commit_block_from_pb(req.commit_block);
 
         println!(
-            "DEBUG at MasterHandler, at complete_files_batch req.len = {:?}, commit_blocks = {:?}",
+            "DEBUG at MasterHandler, at complete_container req.len = {:?}, commit_blocks = {:?}",
             req.len, commit_block
         );
         let files_index: HashMap<String, SmallFileMeta> = req
-            .files_index
+            .files
             .into_iter()
             .map(|(k, v)| (k, SmallFileMeta::from_proto(v)))
             .collect();
@@ -490,9 +490,9 @@ impl MasterHandler {
             .is_ok();
 
         // should add complete information about files = index and offset of all files
-        results.push(result);
+        // results.push(result);
 
-        let rep_header = CompleteFilesBatchResponse { results };
+        let rep_header = CompleteContainerResponse { result };
         ctx.response(rep_header)
     }
 
@@ -739,9 +739,9 @@ impl MessageHandler for MasterHandler {
             RpcCode::FileStatus => self.file_status(ctx),
             RpcCode::AddBlock => self.add_block(ctx),
             RpcCode::CompleteFile => self.complete_file(ctx),
-            RpcCode::CreateFilesBatch => self.create_files_batch(ctx),
-            // RpcCode::AddBlocksBatch => self.add_blocks_batch(ctx),
-            RpcCode::CompleteFilesBatch => self.complete_files_batch(ctx),
+            RpcCode::CreateContainer => self.create_container(ctx),
+            // RpcCode::AddContainer => self.add_container(ctx),
+            RpcCode::CompleteContainer => self.complete_container(ctx),
             RpcCode::Exists => self.exists(ctx),
             RpcCode::Delete => self.retry_check_delete(ctx),
             RpcCode::Rename => self.retry_check_rename(ctx),

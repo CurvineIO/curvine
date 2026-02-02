@@ -24,9 +24,9 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
     BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadataProto,
-    DataHeaderProto, FileWriteDataProto, FilesBatchWriteRequest, SmallFileMetaProto,
+    DataHeaderProto, FileWriteDataProto, ContainerWriteRequest, SmallFileMetaProto,
 };
-use curvine_common::state::{ExtendedBlock, StorageType, WorkerAddress};
+use curvine_common::state::{ContainerStatus, ExtendedBlock, StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use moka::ops::compute::Op;
@@ -300,9 +300,8 @@ impl BlockClient {
         seq_id: i32,
         chunk_size: i32,
         short_circuit: bool,
-        small_files_metadata: Option<Vec<SmallFileMetaProto>>,
-        container_name: Option<String>,
-        container_path: Option<String>
+        container_status: ContainerStatus,
+        small_files_metadata: Vec<SmallFileMetaProto>
     ) -> FsResult<CreateBatchBlockContext> {
         println!("Debug, at BlockClient: blocks={:?}", block);
         // let blocks_pb: Vec<_> = blocks
@@ -320,16 +319,16 @@ impl BlockClient {
             chunk_size,
             short_circuit,
             client_name: self.client_name.to_string(),
-            files_metadata: small_files_metadata.map(|files| ContainerMetadataProto {
-                container_block_id: 0,         // Will be set by worker
-                container_path: container_path.unwrap(), // Will be set by worker
-                container_name: container_name.unwrap(),
-                files,
-            }),
+            files_metadata : ContainerMetadataProto {  
+                container_block_id: 0,  // will be set by worker
+                container_path: container_status.container_path.clone(),  
+                container_name: container_status.container_name.clone(),  
+                files: small_files_metadata,  // All files in one metadata  
+            }
         };
 
         let msg = Builder::new()
-            .code(RpcCode::WriteBlocksBatch)
+            .code(RpcCode::WriteContainerBlock)
             .request(RequestStatus::Open)
             .req_id(req_id)
             .seq_id(seq_id)
@@ -354,7 +353,7 @@ impl BlockClient {
                 path: response.path,
             };
             println!("DEBUG at BlockClient, at write_blocks_batch,context: {:?}, context.block_size: {:?}",context.path, context.block_size);
-            batch_context.push(context, container_meta.clone());
+            batch_context.push(context, Some(container_meta.clone()));
         }
 
         Ok(batch_context)
@@ -394,7 +393,7 @@ impl BlockClient {
         };
 
         let msg = Builder::new()
-            .code(RpcCode::WriteBlocksBatch)
+            .code(RpcCode::WriteContainerBlock)
             .request(status)
             .req_id(req_id)
             .seq_id(seq_id)
@@ -405,7 +404,7 @@ impl BlockClient {
         Ok(())
     }
 
-    pub async fn write_files_batch(
+    pub async fn write_container(
         &self,
         files: &[(&Path, &str)],
         req_id: i64,
@@ -420,9 +419,9 @@ impl BlockClient {
             })
             .collect();
 
-        println!("DEBUG at write_files_batch, files: {:?}", file_data);
-        println!("DEBUG at write_files_batch, container_meta: {:?}", container_meta);
-        let header = FilesBatchWriteRequest {
+        println!("DEBUG at write_container, files: {:?}", file_data);
+        println!("DEBUG at write_container, container_meta: {:?}", container_meta);
+        let header = ContainerWriteRequest {
             files: file_data,
             req_id,
             seq_id,
@@ -430,7 +429,7 @@ impl BlockClient {
         };
 
         let msg = Builder::new()
-            .code(RpcCode::WriteBlocksBatch)
+            .code(RpcCode::WriteContainerBlock)
             .request(RequestStatus::Running)
             .req_id(req_id)
             .seq_id(seq_id)

@@ -54,7 +54,7 @@ message CreateFileResponse {
     required FileStatusProto file_status = 1;
 }
 
-message CreateFilesBatchRequest {  
+message CreateContainerRequest {  
     repeated CreateFileRequest requests = 1;  
 }  
   
@@ -74,7 +74,7 @@ message ContainerStatusReponse {
     required uint32 nlink = 13;  
 }  
   
-message CreateFilesBatchResponse {  
+message CreateContainerResponse {  
     oneof result {  
         FileStatusList file_statuses = 1;   
         ContainerStatusReponse container = 2;  
@@ -87,12 +87,12 @@ message FileStatusList {
 
 
   
-message CompleteFilesBatchRequest {  
-    required CompleteContainerRequest requests = 1;  
-}  
+// message CompleteContainerRequest {  
+//     required CompleteContainerRequest requests = 1;  
+// }  
   
-message CompleteFilesBatchResponse {  
-    repeated bool results = 1;  
+message CompleteContainerResponse {  
+    required bool result = 1;  
 }
 
 message OpenFileRequest {
@@ -193,7 +193,7 @@ message CompleteContainerRequest {
     required string client_name = 3;
     required CommitBlockProto commit_block = 4;
     required bool only_flush = 5 [default = false];
-    map<string, SmallFileMetaProto> files_index = 6;
+    map<string, SmallFileMetaProto> files = 6;
 }
 
 message CompleteFileResponse {

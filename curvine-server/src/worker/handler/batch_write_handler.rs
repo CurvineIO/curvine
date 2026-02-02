@@ -23,7 +23,7 @@ use curvine_common::proto::ExtendedBlockProto;
 use curvine_common::proto::{
     BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
     BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadataProto, FileWriteDataProto,
-    FilesBatchWriteRequest, FilesBatchWriteResponse, SmallFileMetaProto,
+    ContainerWriteRequest, ContainerWriteResponse, SmallFileMetaProto,
 };
 use curvine_common::state::ExtendedBlock;
 use curvine_common::state::FileType;
@@ -141,7 +141,7 @@ impl BatchWriteHandler {
             header.clone().block,
             header.clone().block_size
         );
-        self.container_files = header.clone().files_metadata.unwrap().files;
+        self.container_files = header.clone().files_metadata.files;
         // All files are small - pack them into container blocks
         self.handle_small_files_batch(header.clone().block)?;
 
@@ -165,7 +165,7 @@ impl BatchWriteHandler {
 
         let batch_response = BlocksBatchWriteResponse {
             responses: vec![container_response],
-            container_meta: Some(container_meta),
+            container_meta: container_meta,
         };
 
         Ok(Builder::success(msg).proto_header(batch_response).build())
@@ -401,7 +401,7 @@ impl BatchWriteHandler {
     }
 
     // pub fn write_batch(&mut self, msg: &Message) -> FsResult<Message> {
-    //     let header: FilesBatchWriteRequest = msg.parse_header()?;
+    //     let header: ContainerWriteRequest = msg.parse_header()?;
     //     let mut results = Vec::new();
 
     //     for (i, file_data) in header.files.iter().enumerate() {
@@ -449,7 +449,7 @@ impl BatchWriteHandler {
     //     Ok(Builder::success(msg).proto_header(batch_response).build())
     // }
     pub fn write_batch(&mut self, msg: &Message) -> FsResult<Message> {
-        let header: FilesBatchWriteRequest = msg.parse_header()?;
+        let header: ContainerWriteRequest = msg.parse_header()?;
         let mut results = Vec::new();
 
         if let Some(ref container_meta) = header.container_meta {
@@ -476,7 +476,7 @@ impl BatchWriteHandler {
 
         println!("DEBUG at BatchWriteHandler, updated_meta {:?}", updated_meta);
 
-        let batch_response = FilesBatchWriteResponse {
+        let batch_response = ContainerWriteResponse {
             results,
             container_meta: Some(updated_meta),
         };

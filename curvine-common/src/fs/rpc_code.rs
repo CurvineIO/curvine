@@ -44,9 +44,9 @@ pub enum RpcCode {
     GetLock = 20,
     SetLock = 21,
     ListLock = 22,
-    CreateFilesBatch = 23,
-    AddBlocksBatch = 24,
-    CompleteFilesBatch = 25,
+    CreateContainer = 23,
+    AddContainer = 24,
+    CompleteContainer = 25,
 
     // manager interface.
     Mount = 30,
@@ -71,7 +71,7 @@ pub enum RpcCode {
     // block interface.
     WriteBlock = 80,
     ReadBlock = 81,
-    WriteBlocksBatch = 82,
+    WriteContainerBlock = 82,
     WriteCommitsBatch = 83,
 }
 

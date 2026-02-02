@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::BatchBlockWriter;
+use crate::block::ContainerBlockWriter;
 use crate::file::{self, FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
 use bytes::BytesMut;
@@ -398,6 +398,7 @@ impl CurvineFileSystem {
     async fn handle_batch_files(&self, files: &[(&Path, &str)]) -> FsResult<()> {
         println!("handle batch files");
         // currently, this feature support all files in the same last sub-folder inode
+        // checking is needed
         if files.is_empty() {
             return Ok(());
         }
@@ -413,28 +414,23 @@ impl CurvineFileSystem {
         }
 
         println!("DEBUG at handle_batch_files, create_requests: {:?}", create_requests);
-        let file_statuses = self.fs_client().create_files_batch(create_requests).await?;
+        let container_status = self.fs_client().create_container(create_requests).await?;
 
         println!(
-            "DEBUG at handle_batch_files, file_statuses: {:?}",
-            file_statuses
+            "DEBUG at handle_batch_files, container_status: {:?}",
+            container_status
         );
 
-        // Step 2: Batch allocate blocks
-        // let mut add_block_requests = Vec::with_capacity(1);
-        // add_block_requests.push((file_statuses.container_path.clone(), 1));
-
-        let container_path = file_statuses.container_path.clone();
-
+        // Step 2: Container Block allocation
+        let container_path = container_status.container_path.clone();
         let allocated_blocks: curvine_common::state::LocatedBlock = self
             .fs_client()
-            .add_blocks_batch(container_path)
+            .add_container_block(container_path)
             .await?;
-
-        println!("at CurvineFileSystem: done add_blocks_batch {:?}", allocated_blocks);
+        println!("at CurvineFileSystem: done add_container_block {:?}", allocated_blocks);
 
         // Compute small files metadata for containerization
-        let small_files_metadata = self.compute_container_metadata(files, &allocated_blocks)?;
+        let small_files_metadata  = self.compute_container_metadata(files, &allocated_blocks)?;
         println!(
             "at CurvineFileSystem, add_block_requests: {:?}",
             allocated_blocks
@@ -444,46 +440,30 @@ impl CurvineFileSystem {
             small_files_metadata
         );
         // assert if allocated_blocks is not smae with add_block_requests
-        let mut batch_writer = BatchBlockWriter::new(
+        let mut container_writer = ContainerBlockWriter::new(
             self.fs_context.clone(),
+            container_status.clone(),
             allocated_blocks,
-            Some(small_files_metadata.clone()),
-            file_statuses.container_name,
-            file_statuses.container_path.clone()
+            small_files_metadata.clone(),
         )
         .await?;
 
         // Write all data (no flushing yet)
-        batch_writer.write(files).await?;
+        container_writer.write(files).await?;
 
         // Step 4: Complete all files at worker side
-        let commit_blocks = batch_writer.complete().await?;
+        let commit_blocks = container_writer.complete().await?;
 
         println!("DEBUG at CurvineFileSystem, commit_blocks: {:?}", commit_blocks);
         // // Step 5: Batch complete at master side
-        // let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> =
-        //     Vec::with_capacity(files.len());
-
-        let files_index: HashMap<String, SmallFileMetaProto> = file_statuses  
-            .files  
-            .iter()  
-            .zip(small_files_metadata.iter())  
-            .map(|(file_status, meta)| {  
-                (file_status.name.clone(), meta.clone())  // Use name field as key  
-            })  
-            .collect();
-
-        println!("DEBUG at CurvineFileSystem, files_index: {:?}", files_index);
-
-        let content_len: i64 = files.iter().map(|(_, content)| content.len() as i64).sum();
+        
         self.fs_client()
-            .complete_files_batch(
-                file_statuses.container_path,
-                content_len,
+            .complete_container(
+                container_status,
                 self.fs_context().clone_client_name(),
                 commit_blocks,
                 false,
-                files_index,
+                small_files_metadata,
             )
             .await?;
         Ok(())

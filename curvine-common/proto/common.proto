@@ -203,7 +203,7 @@ message BlocksBatchWriteRequest {
     required int32 chunk_size = 6;  
     required bool short_circuit = 7;  
     required string client_name = 8;  
-    optional ContainerMetadataProto files_metadata = 9;
+    required ContainerMetadataProto files_metadata = 9;
 }  
 
 message BlockWriteResponse {
@@ -216,7 +216,7 @@ message BlockWriteResponse {
 
 message BlocksBatchWriteResponse {  
     repeated BlockWriteResponse responses = 1; 
-    optional ContainerMetadataProto container_meta = 2; 
+    required ContainerMetadataProto container_meta = 2; 
 }
 
 message BlocksBatchCommitRequest {  
@@ -234,7 +234,7 @@ message BlocksBatchCommitResponse {
 }
 
 
-message FilesBatchWriteRequest {  
+message ContainerWriteRequest {  
     repeated FileWriteDataProto files = 1;  
     required int64 req_id = 2;  
     required int32 seq_id = 3;  
@@ -246,7 +246,7 @@ message FileWriteDataProto {
     required bytes content = 2;  
 }  
   
-message FilesBatchWriteResponse {  
+message ContainerWriteResponse {  
     repeated bool results = 1;
     optional ContainerMetadataProto container_meta = 2;
 }
