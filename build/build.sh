@@ -236,8 +236,11 @@ cp "$FS_HOME"/etc/* "$DIST_DIR"/conf
 cp "$FS_HOME"/build/bin/* "$DIST_DIR"/bin
 chmod +x "$DIST_DIR"/bin/*
 
-cp "$FS_HOME"/build/tests/* "$DIST_DIR"/tests
-chmod +x "$DIST_DIR"/tests/*
+# Copy tests (including scripts directory)
+cp -R "$FS_HOME"/build/tests/. "$DIST_DIR"/tests/
+
+# Ensure test scripts are executable (avoid failing on empty globs)
+chmod +x "$DIST_DIR"/tests/*.sh "$DIST_DIR"/tests/scripts/* 2>/dev/null || true
 
 
 # Write version file
