@@ -68,7 +68,7 @@ impl<T: FileSystem> FuseSession<T> {
          io threads: {}, worker threads: {}, fuse channel size: {}",
             GIT_VERSION,
             conf.mnt_number,
-            channels.len(),
+            channels[0].senders.len(),
             rt.io_threads(),
             rt.worker_threads(),
             conf.fuse_channel_size,

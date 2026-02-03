@@ -44,7 +44,7 @@ pub struct MountCommand {
     #[arg(long, default_value = "cst")]
     mnt_type: String,
 
-    #[arg(long, default_value = "always")]
+    #[arg(long, default_value = "none")]
     consistency_strategy: String,
 
     #[arg(long, default_value = "7d")]

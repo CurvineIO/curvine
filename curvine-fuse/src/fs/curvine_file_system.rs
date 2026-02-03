@@ -81,16 +81,14 @@ impl CurvineFileSystem {
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
         let blocks = ((status.len + 511) / 512) as u64;
 
-        let ctime_sec = if status.atime > 0 {
-            (status.atime / 1000) as u64
-        } else {
-            (status.mtime / 1000) as u64
-        };
-        let ctime_nsec = if status.atime > 0 {
-            ((status.atime % 1000) * 1000) as u32
-        } else {
-            ((status.mtime % 1000) * 1000) as u32
-        };
+        let mtime_sec = (status.mtime.max(0) / 1000) as u64;
+        let mtime_nsec = ((status.mtime.max(0) % 1000) * 1_000_000) as u32;
+
+        let atime_sec = (status.atime.max(0) / 1000) as u64;
+        let atime_nsec = ((status.atime.max(0) % 1000) * 1_000_000) as u32;
+
+        let ctime_sec = mtime_sec;
+        let ctime_nsec = mtime_nsec;
 
         let uid = if status.owner.is_empty() {
             conf.uid
@@ -129,11 +127,11 @@ impl CurvineFileSystem {
             ino: status.id as u64,
             size,
             blocks,
-            atime: ctime_sec,
-            mtime: ctime_sec,
+            atime: atime_sec,
+            mtime: mtime_sec,
             ctime: ctime_sec,
-            atimensec: ctime_nsec,
-            mtimensec: ctime_nsec,
+            atimensec: atime_nsec,
+            mtimensec: mtime_nsec,
             ctimensec: ctime_nsec,
             mode,
             nlink,
