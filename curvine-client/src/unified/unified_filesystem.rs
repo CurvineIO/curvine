@@ -12,38 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::file::{CurvineFileSystem, FsClient, FsContext};
+use crate::file::{CurvineFileSystem, FsClient, FsContext, FsReader};
 use crate::rpc::JobMasterClient;
 use crate::unified::{CacheSyncWriter, MountCache, MountValue, UnifiedReader, UnifiedWriter};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path};
+use curvine_common::fs::{FileSystem, Path, Reader};
 use curvine_common::state::{
     ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, LoadJobCommand,
-    LoadJobResult, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
-    SetAttrOpts, WriteType,
+    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
+    WriteType,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::TimeSpent;
-use orpc::runtime::Runtime;
+use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
-
-#[derive(Clone, Copy, PartialOrd, PartialEq, Debug)]
-enum CacheValidity {
-    Valid,
-    Invalid,
-}
-
-impl CacheValidity {
-    fn is_valid(&self) -> bool {
-        self == &CacheValidity::Valid
-    }
-}
 
 #[derive(Clone)]
 pub struct UnifiedFileSystem {
@@ -116,15 +104,15 @@ impl UnifiedFileSystem {
     }
 
     // Get the file status in curvine. If it does not exist or expired, return None
-    pub async fn get_cache_status(&self, path: &Path) -> FsResult<Option<FileStatus>> {
+    pub async fn get_cv_status(&self, path: &Path) -> FsResult<Option<FileStatus>> {
         let status = match self.cv.get_status(path).await {
             Ok(v) => v,
 
             Err(e) => {
-                return match e {
-                    FsError::FileNotFound(_) => Ok(None),
-                    FsError::Expired(_) => Ok(None),
-                    _ => Err(e),
+                return if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
+                    err_box!("failed to get status file {}: {}", path, e)
+                } else {
+                    Ok(None)
                 }
             }
         };
@@ -220,39 +208,56 @@ impl UnifiedFileSystem {
         }
     }
 
-    async fn get_cache_validity(
+    async fn get_cv_reader(
         &self,
         cv_path: &Path,
         ufs_path: &Path,
         mount: &MountValue,
-    ) -> FsResult<CacheValidity> {
-        let cv_status = match self.get_cache_status(cv_path).await? {
-            Some(v) => v,
-            None => return Ok(CacheValidity::Invalid),
+    ) -> FsResult<Option<FsReader>> {
+        let reader = match self.cv().open(cv_path).await {
+            Ok(reader) => reader,
+            Err(e) => {
+                return if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
+                    err_box!("failed to open curvine file {}: {}", cv_path, e)
+                } else {
+                    Ok(None)
+                }
+            }
         };
-        if cv_status.is_cv_only() {
-            return Ok(CacheValidity::Valid);
-        }
 
-        if mount.info.consistency_strategy == ConsistencyStrategy::None {
-            Ok(CacheValidity::Valid)
+        let cv_status = reader.status();
+        if cv_status.is_cv_only() || mount.info.consistency_strategy == ConsistencyStrategy::None {
+            Ok(Some(reader))
         } else {
             let ufs_status = mount.ufs.get_status(ufs_path).await?;
             if cv_status.len == ufs_status.len
                 && cv_status.storage_policy.ufs_mtime != 0
                 && cv_status.storage_policy.ufs_mtime == ufs_status.mtime
             {
-                Ok(CacheValidity::Valid)
+                Ok(Some(reader))
             } else {
-                Ok(CacheValidity::Invalid)
+                Ok(None)
             }
         }
     }
 
-    pub async fn async_cache(&self, source_path: &Path) -> FsResult<LoadJobResult> {
+    pub fn async_cache(&self, source_path: &Path) -> FsResult<()> {
         let client = JobMasterClient::new(self.fs_client());
-        let command = LoadJobCommand::builder(source_path.clone_uri()).build();
-        client.submit_load_job(command).await
+        let source_path = source_path.clone_uri();
+
+        self.fs_context().rt().spawn(async move {
+            let command = LoadJobCommand::builder(source_path.clone()).build();
+            let res = client.submit_load_job(command).await;
+            match res {
+                Err(e) => warn!("submit async cache error for {}: {}", source_path, e),
+                Ok(res) => info!(
+                    "submit async cache successfully for {}, job id {}, target_path {}",
+                    source_path, res.job_id, res.target_path
+                ),
+            }
+        });
+
+        Ok(())
     }
 
     pub async fn wait_job_complete(&self, path: &Path, mark: &str) -> FsResult<()> {
@@ -432,43 +437,35 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Some(v) => v,
         };
 
-        let read_cache = self.get_cache_validity(path, &ufs_path, &mount).await?;
-
-        // Read data from the curvine cache
-        if read_cache.is_valid() {
+        if let Some(reader) = self.get_cv_reader(path, &ufs_path, &mount).await? {
             info!(
                 "read from Curvine(cache), ufs path {}, cv path: {}",
                 ufs_path, path
             );
+
             self.metrics
                 .mount_cache_hits
                 .with_label_values(&[mount.mount_id()])
                 .inc();
 
-            return Ok(UnifiedReader::Cv(self.cv.open(path).await?));
+            Ok(UnifiedReader::Cv(reader))
         } else {
             self.metrics
                 .mount_cache_misses
                 .with_label_values(&[mount.mount_id()])
                 .inc();
-        }
 
-        if mount.info.auto_cache() {
-            match self.async_cache(&ufs_path).await {
-                Err(e) => warn!("submit async cache error for {}: {}", ufs_path, e),
-                Ok(res) => info!(
-                    "submit async cache successfully for {}, job id {}, target_path {}",
-                    ufs_path, res.job_id, res.target_path
-                ),
+            if mount.info.auto_cache() {
+                self.async_cache(&ufs_path)?;
             }
-        }
 
-        // Reading from ufs
-        if self.enable_read_ufs {
-            info!("read from ufs, ufs path {}, cv path: {}", ufs_path, path);
-            mount.ufs.open(&ufs_path).await
-        } else {
-            err_ext!(FsError::unsupported_ufs_read(path.path()))
+            // Reading from ufs
+            if self.enable_read_ufs {
+                info!("read from ufs, ufs path {}, cv path: {}", ufs_path, path);
+                mount.ufs.open(&ufs_path).await
+            } else {
+                err_ext!(FsError::unsupported_ufs_read(path.path()))
+            }
         }
     }
 
@@ -533,7 +530,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         match self.get_mount(path).await? {
             None => self.cv.get_status(path).await,
             Some((ufs_path, mount)) => {
-                if let Some(v) = self.get_cache_status(path).await? {
+                if let Some(v) = self.get_cv_status(path).await? {
                     Ok(v)
                 } else {
                     mount.ufs.get_status(&ufs_path).await
