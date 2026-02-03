@@ -187,38 +187,56 @@ impl JournalWriter {
     //     self.send(JournalEntry::AddBlock(entry))
     // }
 
-    pub fn log_complete_file<P: AsRef<str>>(
+    // pub fn log_complete_file<P: AsRef<str>>(
+    //     &self,
+    //     op_ms: u64,
+    //     path: P,
+    //     file: &InodeFile,
+    //     commit_blocks: Vec<CommitBlock>,
+    // ) -> FsResult<()> {
+    //     let entry = CompleteFileEntry {
+    //         op_ms,
+    //         path: path.as_ref().to_string(),
+    //         file: file.clone(),
+    //         commit_blocks,
+    //     };
+
+    //     self.send(JournalEntry::CompleteFile(entry))
+    // }
+
+    // pub fn log_complete_container<P: AsRef<str>>(
+    //     &self,
+    //     op_ms: u64,
+    //     path: P,
+    //     file: &InodeContainer,
+    //     commit_blocks: Vec<CommitBlock>,
+    // ) -> FsResult<()> {
+    //     let entry = CompleteContainerEntry {
+    //         op_ms,
+    //         path: path.as_ref().to_string(),
+    //         file: file.clone(),
+    //         commit_blocks,
+    //     };
+
+    //     self.send(JournalEntry::CompleteContainer(entry))
+    // }
+
+
+    pub fn log_complete_inode_entry<P: AsRef<str>>(
         &self,
         op_ms: u64,
         path: P,
-        file: &InodeFile,
+        inode: RawPtr<InodeView>,
         commit_blocks: Vec<CommitBlock>,
     ) -> FsResult<()> {
-        let entry = CompleteFileEntry {
+        let entry = CompleteInodeEntry {
             op_ms,
             path: path.as_ref().to_string(),
-            file: file.clone(),
+            inode: inode.as_ref().clone(),
             commit_blocks,
         };
 
-        self.send(JournalEntry::CompleteFile(entry))
-    }
-
-    pub fn log_complete_container<P: AsRef<str>>(
-        &self,
-        op_ms: u64,
-        path: P,
-        file: &InodeContainer,
-        commit_blocks: Vec<CommitBlock>,
-    ) -> FsResult<()> {
-        let entry = CompleteContainer {
-            op_ms,
-            path: path.as_ref().to_string(),
-            file: file.clone(),
-            commit_blocks,
-        };
-
-        self.send(JournalEntry::CompleteContainer(entry))
+        self.send(JournalEntry::CompleteInode(entry))
     }
 
     pub fn log_overwrite_file(&self, op_ms: u64, inp: &InodePath) -> FsResult<()> {

@@ -16,6 +16,7 @@
 
 use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
+use crate::master::meta::inode::InodeView;
 use crate::master::meta::inode::InodeView::{Container, Dir, File};
 use crate::master::{MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
@@ -68,8 +69,10 @@ impl JournalLoader {
 
             JournalEntry::AddBlock(e) => self.add_block(e),
 
-            JournalEntry::CompleteFile(e) => self.complete_file(e),
-            JournalEntry::CompleteContainer(e) => self.complete_container(e),
+            JournalEntry::CompleteInode(e) => self.complete_inode_entry(e),
+
+            // JournalEntry::CompleteFile(e) => self.complete_file(e),
+            // JournalEntry::CompleteContainer(e) => self.complete_container(e),
 
             JournalEntry::Rename(e) => self.rename(e),
 
@@ -150,36 +153,57 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+    // fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
+    //     let fs_dir = self.fs_dir.write();
+    //     let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
-        let mut inode = try_option!(inp.get_last_inode());
-        let file = inode.as_file_mut()?;
+    //     let mut inode = try_option!(inp.get_last_inode());
+    //     let file = inode.as_file_mut()?;
 
-        let _ = mem::replace(file, entry.file);
-        // Update block location
-        fs_dir
-            .store
-            .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
+    //     let _ = mem::replace(file, entry.file);
+    //     // Update block location
+    //     fs_dir
+    //         .store
+    //         .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    fn complete_container(&self, entry: CompleteContainer) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+    // fn complete_container(&self, entry: CompleteContainerEntry) -> CommonResult<()> {
+    //     let fs_dir = self.fs_dir.write();
+    //     let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
-        let mut inode = try_option!(inp.get_last_inode());
-        let file = inode.as_container_mut()?;
+    //     let mut inode = try_option!(inp.get_last_inode());
+    //     let file = inode.as_container_mut()?;
 
-        let _ = mem::replace(file, entry.file);
-        // Update block location
-        fs_dir
-            .store
-            .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
+    //     let _ = mem::replace(file, entry.file);
+    //     // Update block location
+    //     fs_dir
+    //         .store
+    //         .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
 
-        Ok(())
+    //     Ok(())
+    // }
+
+
+    fn complete_inode_entry(&self, entry: CompleteInodeEntry) -> CommonResult<()> {  
+        let fs_dir = self.fs_dir.write();  
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;  
+    
+        let inode = try_option!(inp.get_last_inode());  
+        
+        match (inode.as_mut(), entry.inode) {  
+            (InodeView::File(_, file), InodeView::File(_, new_file)) => {  
+                let _ = mem::replace(file, new_file);  
+            }  
+            (InodeView::Container(_, container), InodeView::Container(_, new_container)) => {  
+                let _ = mem::replace(container, new_container);  
+            }  
+            _ => return err_box!("Inode type mismatch during complete"),  
+        }  
+        
+        fs_dir.store.apply_complete_inode_entry(inode.as_ref(), &entry.commit_blocks)?;  
+        Ok(())  
     }
 
     pub fn rename(&self, entry: RenameEntry) -> CommonResult<()> {

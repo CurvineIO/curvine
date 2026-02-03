@@ -177,14 +177,32 @@ impl InodeStore {
         batch.commit()
     }
 
-    pub fn apply_complete_file(
+    // pub fn apply_complete_file(
+    //     &self,
+    //     file: &InodeView,
+    //     commit_blocks: &[CommitBlock],
+    // ) -> CommonResult<()> {
+    //     let mut batch = self.store.new_batch();
+
+    //     batch.write_inode(file)?;
+    //     for commit in commit_blocks {
+    //         for item in &commit.locations {
+    //             batch.add_location(commit.block_id, item)?;
+    //         }
+    //         println!("DEBUG at InodeStore, at apply_complete_file, commit: {:?}", commit);
+    //     }
+
+    //     batch.commit()
+    // }
+
+    pub fn apply_complete_inode_entry(
         &self,
-        file: &InodeView,
+        inode_entry: &InodeView,
         commit_blocks: &[CommitBlock],
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
-        batch.write_inode(file)?;
+        batch.write_inode(inode_entry)?;
         for commit in commit_blocks {
             for item in &commit.locations {
                 batch.add_location(commit.block_id, item)?;

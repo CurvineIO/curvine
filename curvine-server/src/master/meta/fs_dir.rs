@@ -655,18 +655,25 @@ impl FsDir {
         only_flush: bool,
     ) -> FsResult<bool> {
         let op_ms = LocalTime::mills();
-        let mut inode = try_option!(inp.get_last_inode());
+        let mut inode: orpc::sys::RawPtr<InodeView> = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
         file.complete(len, &commit_block, client_name, only_flush)?;
         println!("DEBUG at FsDir, at complete_container, file: {:?}", file);
         self.evictor.on_access(file.id());
 
         self.store
-            .apply_complete_file(inode.as_ref(), &commit_block)?;
-        self.journal_writer.log_complete_file(
+            .apply_complete_inode_entry(inode.as_ref(), &commit_block)?;
+        // self.journal_writer.log_complete_file(
+        //     op_ms,
+        //     inp.path(),
+        //     inode.as_file_ref()?,
+        //     commit_block,
+        // )?;
+
+        self.journal_writer.log_complete_inode_entry(
             op_ms,
             inp.path(),
-            inode.as_file_ref()?,
+            inode,
             commit_block,
         )?;
 
@@ -694,11 +701,18 @@ impl FsDir {
         self.evictor.on_access(container.id());
 
         self.store
-            .apply_complete_file(inode.as_ref(), &[commit_block.clone()])?;
-        self.journal_writer.log_complete_container(
+            .apply_complete_inode_entry(inode.as_ref(), &[commit_block.clone()])?;
+        // self.journal_writer.log_complete_container(
+        //     op_ms,
+        //     inp.path(),
+        //     inode.as_container_ref()?,
+        //     vec![commit_block.clone()],
+        // )?;
+
+        self.journal_writer.log_complete_inode_entry(
             op_ms,
             inp.path(),
-            inode.as_container_ref()?,
+            inode,
             vec![commit_block.clone()],
         )?;
 
@@ -1190,9 +1204,12 @@ impl FsDir {
             }
         }
 
-        self.store.apply_complete_file(inode.as_ref(), &[])?;
+        self.store.apply_complete_inode_entry(inode.as_ref(), &[])?;
+        // self.journal_writer
+        //     .log_complete_file(op_ms, inp.path(), inode.as_file_ref()?, vec![])?;
+
         self.journal_writer
-            .log_complete_file(op_ms, inp.path(), inode.as_file_ref()?, vec![])?;
+            .log_complete_inode_entry(op_ms, inp.path(), inode, vec![])?;
 
         println!("pass resize");
         Ok(del_res)

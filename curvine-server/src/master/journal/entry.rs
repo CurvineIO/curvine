@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::SmallFileMeta;
+use crate::master::meta::inode::{InodeView, SmallFileMeta};
 use crate::master::meta::inode::{InodeContainer, InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
@@ -70,20 +70,28 @@ pub struct AddBlockEntry {
     pub(crate) commit_block: Vec<CommitBlock>,
 }
 
-// File writing is completed.
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct CompleteFileEntry {
-    pub(crate) op_ms: u64,
-    pub(crate) path: String,
-    pub(crate) file: InodeFile,
-    pub(crate) commit_blocks: Vec<CommitBlock>,
-}
+// // File writing is completed.
+// #[derive(Deserialize, Serialize, Debug, Clone)]
+// pub struct CompleteFileEntry {
+//     pub(crate) op_ms: u64,
+//     pub(crate) path: String,
+//     pub(crate) file: InodeFile,
+//     pub(crate) commit_blocks: Vec<CommitBlock>,
+// }
+
+// #[derive(Deserialize, Serialize, Debug, Clone)]
+// pub struct CompleteContainerEntry {
+//     pub(crate) op_ms: u64,
+//     pub(crate) path: String,
+//     pub(crate) file: InodeContainer,
+//     pub(crate) commit_blocks: Vec<CommitBlock>,
+// }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct CompleteContainer {
+pub struct CompleteInodeEntry {
     pub(crate) op_ms: u64,
     pub(crate) path: String,
-    pub(crate) file: InodeContainer,
+    pub(crate) inode: InodeView,
     pub(crate) commit_blocks: Vec<CommitBlock>,
 }
 // Rename
@@ -157,8 +165,9 @@ pub enum JournalEntry {
     ReopenFile(ReopenFileEntry),
     OverWriteFile(OverWriteFileEntry),
     AddBlock(AddBlockEntry),
-    CompleteFile(CompleteFileEntry),
-    CompleteContainer(CompleteContainer),
+    // CompleteFile(CompleteFileEntry),
+    // CompleteContainer(CompleteContainerEntry),
+    CompleteInode(CompleteInodeEntry),
     Rename(RenameEntry),
     Delete(DeleteEntry),
     Mount(MountEntry),
