@@ -15,7 +15,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::master::journal::*;
-use crate::master::meta::inode::{InodeContainer, InodeDir, InodeFile, InodePath};
+use crate::master::meta::inode::{InodeContainer, InodeDir, InodeFile, InodePath, InodeView};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
@@ -24,6 +24,8 @@ use curvine_common::FsResult;
 use log::info;
 use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
 use std::sync::{mpsc, Mutex};
+use orpc::sys::RawPtr;
+use orpc::{err_box};
 
 enum SenderAdapter {
     Bounded(SyncSender<JournalEntry>),
@@ -128,39 +130,62 @@ impl JournalWriter {
         self.send(JournalEntry::ReopenFile(entry))
     }
 
-    pub fn log_add_block<P: AsRef<str>>(
-        &self,
-        op_ms: u64,
-        path: P,
-        file: &InodeFile,
-        commit_block: Vec<CommitBlock>,
-    ) -> FsResult<()> {
-        let entry = AddBlockEntry {
-            op_ms,
-            path: path.as_ref().to_string(),
-            blocks: file.blocks.clone(),
-            commit_block,
-        };
 
-        self.send(JournalEntry::AddBlock(entry))
+    pub fn log_add_block<P: AsRef<str>>(  
+        &self,  
+        op_ms: u64,  
+        path: P,  
+        inode: RawPtr<InodeView>,  
+        commit_block: Vec<CommitBlock>,  
+    ) -> FsResult<()> {  
+        let blocks = match inode.as_ref() {  
+            InodeView::File(_, file) => file.blocks.clone(),  
+            InodeView::Container(_, container) => container.blocks.clone(),  
+            _ => return err_box!("Cannot add block for non-file/container inode"),  
+        };  
+        
+        let entry = AddBlockEntry {  
+            op_ms,  
+            path: path.as_ref().to_string(),  
+            blocks,  
+            commit_block,  
+        };  
+    
+        self.send(JournalEntry::AddBlock(entry))  
     }
+    // pub fn log_add_block<P: AsRef<str>>(
+    //     &self,
+    //     op_ms: u64,
+    //     path: P,
+    //     file: RawPtr<InodeView>,
+    //     commit_block: Vec<CommitBlock>,
+    // ) -> FsResult<()> {
+    //     let entry = AddBlockEntry {
+    //         op_ms,
+    //         path: path.as_ref().to_string(),
+    //         blocks: file.blocks.clone(),
+    //         commit_block,
+    //     };
 
-    pub fn log_add_block_for_container<P: AsRef<str>>(
-        &self,
-        op_ms: u64,
-        path: P,
-        file: &InodeContainer,
-        commit_block: Vec<CommitBlock>,
-    ) -> FsResult<()> {
-        let entry = AddBlockEntry {
-            op_ms,
-            path: path.as_ref().to_string(),
-            blocks: file.blocks.clone(),
-            commit_block,
-        };
+    //     self.send(JournalEntry::AddBlock(entry))
+    // }
 
-        self.send(JournalEntry::AddBlock(entry))
-    }
+    // pub fn log_add_block_for_container<P: AsRef<str>>(
+    //     &self,
+    //     op_ms: u64,
+    //     path: P,
+    //     file: &InodeContainer,
+    //     commit_block: Vec<CommitBlock>,
+    // ) -> FsResult<()> {
+    //     let entry = AddBlockEntry {
+    //         op_ms,
+    //         path: path.as_ref().to_string(),
+    //         blocks: file.blocks.clone(),
+    //         commit_block,
+    //     };
+
+    //     self.send(JournalEntry::AddBlock(entry))
+    // }
 
     pub fn log_complete_file<P: AsRef<str>>(
         &self,
@@ -298,13 +323,12 @@ impl JournalWriter {
     pub fn log_create_container(
         &self,
         op_ms: u64,
-        parent_path: &str,
-        container_name: &str,
+        inode_path: &InodePath,
         container: &InodeContainer,
     ) -> FsResult<()> {
         let entry = CreateContainerEntry {
             op_ms,
-            path: format!("{}/{}", parent_path, container_name),
+            path: format!("{}/{}", inode_path.path(), inode_path.name()),
             container: container.clone(),
         };
 

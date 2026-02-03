@@ -40,12 +40,12 @@ pub struct CreateContainerEntry {
     pub(crate) container: InodeContainer,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct AddFilesToContainerEntry {
-    pub(crate) op_ms: u64,
-    pub(crate) container_path: String,
-    pub(crate) files: HashMap<String, SmallFileMeta>,
-}
+// #[derive(Deserialize, Serialize, Debug, Clone)]
+// pub struct AddFilesToContainerEntry {
+//     pub(crate) op_ms: u64,
+//     pub(crate) container_path: String,
+//     pub(crate) files: HashMap<String, SmallFileMeta>,
+// }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ReopenFileEntry {
@@ -153,7 +153,7 @@ pub enum JournalEntry {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
     CreateContainer(CreateContainerEntry),
-    AddFilesToContainer(AddFilesToContainerEntry),
+    // AddFilesToContainer(AddFilesToContainerEntry),
     ReopenFile(ReopenFileEntry),
     OverWriteFile(OverWriteFileEntry),
     AddBlock(AddBlockEntry),

@@ -347,83 +347,85 @@ impl FsDir {
             container
         );
         inp = self.add_last_inode(inp, Container(name.clone(), container.clone()))?;
+        // self.journal_writer
+        //     .log_create_container(op_ms, &inp.path(), &name, &container)?;
         self.journal_writer
-            .log_create_container(op_ms, &inp.path(), &name, &container)?;
+            .log_create_container(op_ms, &inp, &container)?;
 
         Ok(inp)
     }
 
-    pub fn add_files_to_container(
-        &mut self,
-        parent_path: InodePath,
-        files: Vec<(String, Vec<u8>)>,
-    ) -> FsResult<InodePath> {
-        let op_ms = LocalTime::mills();
+    // pub fn add_files_to_container(
+    //     &mut self,
+    //     parent_path: InodePath,
+    //     files: Vec<(String, Vec<u8>)>,
+    // ) -> FsResult<InodePath> {
+    //     let op_ms: u64 = LocalTime::mills();
 
-        // Check if parent exists and is a directory
-        let mut parent = match parent_path.get_inode(-1) {
-            Some(v) if v.is_dir() => v,
-            Some(_) => return err_box!("Parent is not a directory: {}", parent_path.path()),
-            None => return err_box!("Parent does not exist: {}", parent_path.path()),
-        };
+    //     // Check if parent exists and is a directory
+    //     let mut parent = match parent_path.get_inode(-1) {
+    //         Some(v) if v.is_dir() => v,
+    //         Some(_) => return err_box!("Parent is not a directory: {}", parent_path.path()),
+    //         None => return err_box!("Parent does not exist: {}", parent_path.path()),
+    //     };
 
-        // Create container name and check if it already exists
-        let container_name = format!("container_{}", Utils::unique_id());
+    //     // Create container name and check if it already exists
+    //     let container_name = format!("container_{}", Utils::unique_id());
 
-        // Create new container inode
-        let mut container = InodeContainer::new(self.next_inode_id()?, LocalTime::mills() as i64);
+    //     // Create new container inode
+    //     let mut container = InodeContainer::new(self.next_inode_id()?, LocalTime::mills() as i64);
 
-        // Add files to container
-        let mut offset = 0i64;
-        for (name, data) in files {
-            let file_meta = SmallFileMeta {
-                offset,
-                len: data.len() as i64,
-                block_index: 0,
-                mtime: op_ms as i64,
-            };
-            container.files.insert(name, file_meta);
-            offset += data.len() as i64;
-        }
+    //     // Add files to container
+    //     let mut offset = 0i64;
+    //     for (name, data) in files {
+    //         let file_meta = SmallFileMeta {
+    //             offset,
+    //             len: data.len() as i64,
+    //             block_index: 0,
+    //             mtime: op_ms as i64,
+    //         };
+    //         container.files.insert(name, file_meta);
+    //         offset += data.len() as i64;
+    //     }
 
-        // Update container total size
-        let mut container = container;
-        container.total_size = offset;
+    //     // Update container total size
+    //     let mut container = container;
+    //     container.total_size = offset;
 
-        // Add container to parent directory
-        parent.update_mtime(op_ms as i64);
+    //     // Add container to parent directory
+    //     parent.update_mtime(op_ms as i64);
 
-        println!(
-            "DEBUG at FsDir, at add_files_to_container, container before insert: {:?}",
-            container
-        );
-        let container_inode = InodeView::Container(container_name.clone(), container.clone());
-        let added = parent.add_child(container_inode)?;
-        println!("DEBUG at FsDir, at add_files_to_container, done add_child");
-        self.store.apply_add(parent.as_ref(), added.as_ref())?;
+    //     println!(
+    //         "DEBUG at FsDir, at add_files_to_container, container before insert: {:?}",
+    //         container
+    //     );
+    //     let container_inode = InodeView::Container(container_name.clone(), container.clone());
+    //     let added = parent.add_child(container_inode)?;
+    //     println!("DEBUG at FsDir, at add_files_to_container, done add_child");
+    //     self.store.apply_add(parent.as_ref(), added.as_ref())?;
 
-        // Log the operation
-        self.journal_writer.log_create_container(
-            op_ms,
-            &parent_path.path(),
-            &container_name,
-            &container,
-        )?;
+    //     // Log the operation
+    //     self.journal_writer.log_create_container(
+    //         op_ms,
+    //         &parent_path.path(),
+    //         &container_name,
+    //         &container,
+    //     )?;
 
-        let mut result_path = parent_path;
-        result_path.append(added)?;
+    //     let mut result_path = parent_path;
+    //     result_path.append(added)?;
 
-        Ok(result_path)
-    }
+    //     Ok(result_path)
+    // }
 
-    pub fn create_small_file_batch(
-        &mut self,
-        parent_path: InodePath,
-        files: Vec<(String, Vec<u8>)>,
-    ) -> FsResult<InodePath> {
-        // Check if files are small enough for container
-        self.add_files_to_container(parent_path, files)
-    }
+    // pub fn create_small_file_batch(
+    //     &mut self,
+    //     parent_path: InodePath,
+    //     files: Vec<(String, Vec<u8>)>,
+    // ) -> FsResult<InodePath> {
+    //     // Check if files are small enough for container
+    //     self.add_files_to_container(parent_path, files)
+    // }
 
     pub(crate) fn add_last_inode(
         &mut self,
@@ -564,10 +566,10 @@ impl FsDir {
                     "DEBUG at FsDir, start with Container, create block={:?}",
                     block
                 );
-                self.journal_writer.log_add_block_for_container(
+                self.journal_writer.log_add_block(
                     op_ms,
                     inp.path(),
-                    inode.as_container_mut()?,
+                    inode,
                     commit_blocks.clone(),
                 )?;
                 println!("pass acquire_new_block");
@@ -593,10 +595,17 @@ impl FsDir {
                 };
 
                 self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
+                // self.journal_writer.log_add_block(
+                //     op_ms,
+                //     inp.path(),
+                //     inode.as_file_ref()?,
+                //     commit_blocks,
+                // )?;
+
                 self.journal_writer.log_add_block(
                     op_ms,
                     inp.path(),
-                    inode.as_file_ref()?,
+                    inode,
                     commit_blocks,
                 )?;
                 println!("pass acquire_new_block");
@@ -1212,8 +1221,10 @@ impl FsDir {
 
         if res {
             self.store.apply_new_block(inode.as_ref(), &[])?;
+            // self.journal_writer
+            //     .log_add_block(op_ms, inp.path(), inode.as_file_ref()?, vec![])?;
             self.journal_writer
-                .log_add_block(op_ms, inp.path(), inode.as_file_ref()?, vec![])?;
+                .log_add_block(op_ms, inp.path(), inode, vec![])?;
         }
 
         Ok(block)

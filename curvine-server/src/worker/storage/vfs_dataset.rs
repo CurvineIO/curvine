@@ -133,14 +133,14 @@ impl VfsDataset {
         }
         vec
     }
-    pub fn create_container_block(
-        &mut self,
-        container_path: &str,
-        total_size: i64,
-    ) -> CommonResult<BlockMeta> {
-        let dir = self.dir_list.choose_dir_for_container(total_size)?;
-        dir.create_container_block(container_path, total_size)
-    }
+    // pub fn create_container_block(
+    //     &mut self,
+    //     container_path: &str,
+    //     total_size: i64,
+    // ) -> CommonResult<BlockMeta> {
+    //     let dir = self.dir_list.choose_dir_for_container(total_size)?;
+    //     dir.create_container_block(container_path, total_size)
+    // }
 }
 
 impl Dataset for VfsDataset {
