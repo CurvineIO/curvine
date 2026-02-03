@@ -236,7 +236,7 @@ cp "$FS_HOME"/etc/* "$DIST_DIR"/conf
 cp "$FS_HOME"/build/bin/* "$DIST_DIR"/bin
 chmod +x "$DIST_DIR"/bin/*
 
-cp "$FS_HOME"/build/tests/* "$DIST_DIR"/tests
+cp -r "$FS_HOME"/build/tests/* "$DIST_DIR"/tests
 chmod +x "$DIST_DIR"/tests/*
 
 
