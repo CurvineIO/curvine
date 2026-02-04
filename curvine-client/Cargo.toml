@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 orpc = { workspace = true }
-curvine-common = { workspace = true }
+curvine-common = { workspace = true, default-features = false }
 curvine-ufs = { workspace = true, optional = true }
 once_cell = { workspace = true }
 hyper = { workspace = true }

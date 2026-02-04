@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::fs::RpcCode;
+#[cfg(feature = "raft")]
 use crate::raft::RaftError;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -334,6 +335,7 @@ impl From<CommonError> for FsError {
     }
 }
 
+#[cfg(feature = "raft")]
 impl From<RaftError> for FsError {
     fn from(value: RaftError) -> Self {
         Self::Raft(ErrorImpl::with_source(value.to_string().into()))

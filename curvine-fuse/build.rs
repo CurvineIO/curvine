@@ -13,7 +13,10 @@
 // limitations under the License.
 
 fn main() {
-    #[cfg(target_os = "linux")]
+    // Skip FUSE library check when building statically.
+    // curvine-fuse uses pure Rust FUSE implementation with direct syscalls,
+    // it does NOT link against libfuse at runtime.
+    #[cfg(all(target_os = "linux", not(feature = "static")))]
     {
         use pkg_config::Config;
 

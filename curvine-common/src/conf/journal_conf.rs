@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::conf::ClusterConf;
-use crate::raft::RaftPeer;
+use crate::conf::RaftPeer;
 use orpc::client::ClientConf;
 use orpc::common::Utils;
 use orpc::io::net::{InetAddr, NetUtils};
@@ -153,6 +153,7 @@ impl JournalConf {
         }
     }
 
+    #[cfg(feature = "raft")]
     pub fn new_raft_conf(&self, id: u64, applied: u64) -> raft::Config {
         raft::Config {
             id,

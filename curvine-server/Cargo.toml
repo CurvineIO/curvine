@@ -12,7 +12,7 @@ jni = ["curvine-ufs/jni"]
 
 [dependencies]
 orpc = { workspace = true }
-curvine-common = { workspace = true }
+curvine-common = { workspace = true, features = ["raft"] }
 curvine-client = { workspace = true }
 curvine-ufs = { workspace = true }
 curvine-web = { workspace = true }
