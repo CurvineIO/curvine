@@ -99,22 +99,22 @@ impl JournalWriter {
         self.send(JournalEntry::Mkdir(entry))
     }
 
-    pub fn log_create_file(&self, op_ms: u64, inp: &InodePath) -> FsResult<()> {
-        println!(
-            "DEBUG at JournalWriter, at log_create_file start with inp: {:?}",
-            inp
-        );
-        let entry = CreateFileEntry {
-            op_ms,
-            path: inp.path().to_string(),
-            file: inp.clone_last_file()?,
-        };
-        println!(
-            "DEBUG at JournalWriter, at log_create_file end with inp: {:?}",
-            inp
-        );
-        self.send(JournalEntry::CreateFile(entry))
-    }
+    // pub fn log_create_file(&self, op_ms: u64, inp: &InodePath) -> FsResult<()> {
+    //     println!(
+    //         "DEBUG at JournalWriter, at log_create_file start with inp: {:?}",
+    //         inp
+    //     );
+    //     let entry = CreateFileEntry {
+    //         op_ms,
+    //         path: inp.path().to_string(),
+    //         file: inp.clone_last_file()?,
+    //     };
+    //     println!(
+    //         "DEBUG at JournalWriter, at log_create_file end with inp: {:?}",
+    //         inp
+    //     );
+    //     self.send(JournalEntry::CreateFile(entry))
+    // }
 
     pub fn log_reopen_file<P: AsRef<str>>(
         &self,
@@ -338,20 +338,41 @@ impl JournalWriter {
         }
         entries
     }
-    pub fn log_create_container(
+    // pub fn log_create_container(
+    //     &self,
+    //     op_ms: u64,
+    //     inode_path: &InodePath,
+    //     container: &InodeContainer,
+    // ) -> FsResult<()> {
+    //     let entry = CreateContainerEntry {
+    //         op_ms,
+    //         path: format!("{}/{}", inode_path.path(), inode_path.name()),
+    //         container: container.clone(),
+    //     };
+
+    //     let _ = self.sender.send(JournalEntry::CreateContainer(entry));
+
+    //     Ok(())
+    // }
+
+
+    pub fn log_create_inode_entry(
         &self,
         op_ms: u64,
         inode_path: &InodePath,
-        container: &InodeContainer,
+        // inode_entry: RawPtr<InodeView>,
     ) -> FsResult<()> {
-        let entry = CreateContainerEntry {
+        let inode_entry = inode_path.get_last_inode().unwrap();
+        let entry = CreateInodeEntry {
             op_ms,
             path: format!("{}/{}", inode_path.path(), inode_path.name()),
-            container: container.clone(),
+            inode_entry: inode_entry.as_ref().clone(),
         };
 
-        let _ = self.sender.send(JournalEntry::CreateContainer(entry));
+        let _ = self.sender.send(JournalEntry::CreateInode(entry));
 
         Ok(())
     }
+
+    
 }

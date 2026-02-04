@@ -318,7 +318,7 @@ impl FsDir {
         // Create an inode file node.
         let file = InodeFile::with_opts(self.inode_id.next()?, LocalTime::mills() as i64, opts);
         inp = self.add_last_inode(inp, File(name, file))?;
-        self.journal_writer.log_create_file(op_ms, &inp)?;
+        self.journal_writer.log_create_inode_entry(op_ms, &inp)?;
 
         Ok(inp)
     }
@@ -350,7 +350,7 @@ impl FsDir {
         // self.journal_writer
         //     .log_create_container(op_ms, &inp.path(), &name, &container)?;
         self.journal_writer
-            .log_create_container(op_ms, &inp, &container)?;
+            .log_create_inode_entry(op_ms, &inp)?;
 
         Ok(inp)
     }

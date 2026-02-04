@@ -63,6 +63,8 @@ impl JournalLoader {
 
             JournalEntry::CreateContainer(e) => self.create_container(e),
 
+            JournalEntry::CreateInode(e) => self.create_inode(e),
+
             // JournalEntry::AddFilesToContainer(e) => self.add_files_to_container(e),
 
             JournalEntry::OverWriteFile(e) => self.overwrite_file(e),
@@ -110,6 +112,23 @@ impl JournalLoader {
         let name = inp.name().to_string();
         let _ = fs_dir.add_last_inode(inp, File(name, entry.file))?;
         Ok(())
+    }
+    
+    fn create_inode(&self, entry: CreateInodeEntry) -> CommonResult<()> {  
+        let mut fs_dir = self.fs_dir.write();  
+        fs_dir.update_last_inode_id(entry.inode_entry.id())?;  
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;  
+        let name = inp.name().to_string();  
+        
+        // Pattern match to handle File vs Container explicitly  
+        let inode_to_add = match entry.inode_entry {  
+            InodeView::File(_, file) => InodeView::File(name, file),  
+            InodeView::Container(_, container) => InodeView::Container(name, container),
+            _ => return err_box!("Only Expect File and Container for adding inode"),  
+        };  
+        
+        let _ = fs_dir.add_last_inode(inp, inode_to_add)?;  
+        Ok(())  
     }
 
     fn reopen_file(&self, entry: ReopenFileEntry) -> CommonResult<()> {
