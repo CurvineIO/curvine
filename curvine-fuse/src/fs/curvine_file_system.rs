@@ -279,6 +279,19 @@ impl CurvineFileSystem {
         Ok(res)
     }
 
+    async fn check_permissions(
+        &self,
+        path: &Path,
+        header: &fuse_in_header,
+        mask: u32,
+    ) -> FuseResult<()> {
+        if header.uid == 0 || !self.conf.check_permission {
+            return Ok(());
+        }
+        let status = self.get_cached_status(path).await?;
+        self.check_access_permissions(&status, header, mask)
+    }
+
     /// Check if the current user has the requested access permissions
     fn check_access_permissions(
         &self,
@@ -286,11 +299,6 @@ impl CurvineFileSystem {
         header: &fuse_in_header,
         mask: u32,
     ) -> FuseResult<()> {
-        // Root (uid=0) bypasses permission checks
-        if header.uid == 0 {
-            return Ok(());
-        }
-
         let file_uid = self.resolve_file_uid(&status.owner);
         let file_gid = self.resolve_file_gid(&status.group);
         let permission_bits = self.get_effective_permission_bits(
@@ -644,8 +652,8 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let parent_path = self.state.get_path(parent)?;
-        let parent_status = self.get_cached_status(&parent_path).await?;
-        self.check_access_permissions(&parent_status, op.header, libc::X_OK as u32)?;
+        self.check_permissions(&parent_path, op.header, libc::X_OK as u32)
+            .await?;
 
         // Get the path.
         let path = self.state.get_path_common(parent, name.as_deref())?;
@@ -954,14 +962,14 @@ impl fs::FileSystem for CurvineFileSystem {
             // Skip when parent_id is invalid (e.g., root has no parent). Inode 0 is invalid.
             if parent_id != 0 {
                 let parent_path = self.state.get_path(parent_id)?;
-                let parent_status = self.get_cached_status(&parent_path).await?;
-                self.check_access_permissions(&parent_status, op.header, libc::X_OK as u32)?;
+                self.check_permissions(&parent_path, op.header, libc::X_OK as u32)
+                    .await?;
             }
         }
 
         // Get file status to check permissions
-        let status = self.get_cached_status(&path).await?;
-        self.check_access_permissions(&status, op.header, op.arg.mask)?;
+        self.check_permissions(&path, op.header, op.arg.mask)
+            .await?;
 
         Ok(())
     }
@@ -972,10 +980,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Check directory permissions based on open action
         let dir_path = self.state.get_path(op.header.nodeid)?;
-        let dir_status = self.get_cached_status(&dir_path).await?;
-
-        // Use existing permission check function to verify access
-        self.check_access_permissions(&dir_status, op.header, action.acl_mask())?;
+        self.check_permissions(&dir_path, op.header, action.acl_mask())
+            .await?;
 
         let list = self.get_cached_list(&dir_path).await?;
         let handle = self.state.new_dir_handle(op.header.nodeid, list).await?;
@@ -1088,15 +1094,16 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn open(&self, op: Open<'_>, reply: &FuseResponse) -> FuseResult<fuse_open_out> {
         let path = self.state.get_path(op.header.nodeid)?;
+        // Check file access permissions before opening
+        let action = OpenAction::try_from(op.arg.flags)?;
+        self.check_permissions(&path, op.header, action.acl_mask())
+            .await?;
+
         let opts = CreateFileOptsBuilder::with_conf(&self.fs.conf().client);
         let handle = self
             .state
             .new_handle(op.header.nodeid, &path, op.arg.flags, opts.build())
             .await?;
-
-        // Check file access permissions before opening
-        let action = OpenAction::try_from(op.arg.flags)?;
-        self.check_access_permissions(handle.status(), op.header, action.acl_mask())?;
 
         let mut open_flags = op.arg.flags;
         if self.conf.direct_io {
