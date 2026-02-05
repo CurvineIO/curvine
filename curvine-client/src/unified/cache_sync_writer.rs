@@ -30,7 +30,7 @@ pub struct CacheSyncWriter {
     job_client: JobMasterClient,
     inner: FsWriter,
     write_type: WriteType,
-    job_res: LoadJobResult,
+    job_res: Option<LoadJobResult>,
     has_rand_write: bool,
 }
 
@@ -52,28 +52,26 @@ impl CacheSyncWriter {
         let conf = &fs.conf().client;
         let opts = mnt.info.get_create_opts(conf);
         let inner = fs.cv().open_with_opts(cv_path, opts, flags).await?;
-
         let job_client = JobMasterClient::with_context(fs.fs_context());
-        let job_res = job_client.submit_load(cv_path.clone_uri()).await?;
-        info!(
-            "submit(init) job successfully for {}, job id {}, target_path {}",
-            cv_path, job_res.job_id, job_res.target_path
-        );
 
         let writer = Self {
             job_client,
             inner,
             write_type,
-            job_res,
+            job_res: None,
             has_rand_write: false,
         };
         Ok(writer)
     }
 
     pub async fn wait_job_complete(&self) -> FsResult<()> {
-        self.job_client
-            .wait_job_complete(&self.job_res.job_id, "cache-sync")
-            .await
+        if let Some(job_res) = &self.job_res {
+            self.job_client
+                .wait_job_complete(&job_res.job_id, "cache-sync")
+                .await
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -103,6 +101,20 @@ impl Writer for CacheSyncWriter {
     }
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
+        if self.job_res.is_none() {
+            let job_res = self
+                .job_client
+                .submit_load(self.inner.path().clone_uri())
+                .await?;
+            info!(
+                "submit(init) job successfully for {}, job id {}, target_path {}",
+                self.inner.path(),
+                job_res.job_id,
+                job_res.target_path
+            );
+
+            self.job_res.replace(job_res);
+        }
         self.inner.write_chunk(chunk).await
     }
 
@@ -115,14 +127,15 @@ impl Writer for CacheSyncWriter {
 
         if self.has_rand_write {
             let job_res = self.job_client.submit_load(self.path().clone_uri()).await?;
-            self.job_res = job_res;
-            self.has_rand_write = false;
             info!(
                 "resubmit(rand_write) job successfully for {}, job id {}, target_path {}",
                 self.path(),
-                self.job_res.job_id,
-                self.job_res.target_path
+                job_res.job_id,
+                job_res.target_path
             );
+
+            self.job_res.replace(job_res);
+            self.has_rand_write = false;
         }
 
         if matches!(self.write_type, WriteType::CacheThrough) {
@@ -139,13 +152,12 @@ impl Writer for CacheSyncWriter {
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if self.pos() != pos && !self.has_rand_write {
             self.has_rand_write = true;
-            if let Err(e) = self.job_client.cancel_job(&self.job_res.job_id).await {
-                warn!("cancel job {} failed: {}", self.job_res.job_id, e);
-            } else {
-                info!(
-                    "cancel(rand_write) job {} successfully",
-                    self.job_res.job_id
-                );
+            if let Some(job_res) = &self.job_res {
+                if let Err(e) = self.job_client.cancel_job(&job_res.job_id).await {
+                    warn!("cancel job {} failed: {}", job_res.job_id, e);
+                } else {
+                    info!("cancel(rand_write) job {} successfully", job_res.job_id);
+                }
             }
         }
 
@@ -156,10 +168,13 @@ impl Writer for CacheSyncWriter {
         // Cancel and resubmit the sync job since file size is changing
         if !self.has_rand_write {
             self.has_rand_write = true;
-            if let Err(e) = self.job_client.cancel_job(&self.job_res.job_id).await {
-                warn!("cancel job {} failed: {}", self.job_res.job_id, e);
-            } else {
-                info!("cancel(resize) job {} successfully", self.job_res.job_id);
+
+            if let Some(job_res) = &self.job_res {
+                if let Err(e) = self.job_client.cancel_job(&job_res.job_id).await {
+                    warn!("cancel job {} failed: {}", job_res.job_id, e);
+                } else {
+                    info!("cancel(resize) job {} successfully", job_res.job_id);
+                }
             }
         }
 

@@ -539,7 +539,10 @@ impl MasterFilesystem {
         let path = path.as_ref();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
-        let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(path)),
+        };
         let file = inode.as_file_ref()?;
         let block_locs = self.get_block_locs(path, &fs_dir, file)?;
         let locate_blocks = FileBlocks {

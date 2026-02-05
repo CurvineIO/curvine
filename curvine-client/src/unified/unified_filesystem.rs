@@ -27,11 +27,18 @@ use curvine_common::state::{
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{error, info, warn};
 use orpc::common::TimeSpent;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
+enum CacheValidity {
+    Valid,
+    Invalid(Option<FileStatus>),
+}
 
 #[derive(Clone)]
 pub struct UnifiedFileSystem {
@@ -101,36 +108,6 @@ impl UnifiedFileSystem {
 
     pub async fn get_master_info_bytes(&self) -> FsResult<BytesMut> {
         self.cv.get_master_info_bytes().await
-    }
-
-    // Get the file status in curvine. If it does not exist or expired, return None
-    pub async fn get_cv_status(&self, path: &Path) -> FsResult<Option<FileStatus>> {
-        let status = match self.cv.get_status(path).await {
-            Ok(v) => v,
-
-            Err(e) => {
-                return if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
-                    err_box!("failed to get status file {}: {}", path, e)
-                } else {
-                    Ok(None)
-                }
-            }
-        };
-
-        // Return None if expired
-        if status.is_expired() {
-            return Ok(None);
-        }
-
-        // Return Some if:
-        // 1. File only exists in Curvine (cv_only), or
-        // 2. File is complete (cached from UFS and ready to use)
-        if status.is_cv_only() || status.is_complete {
-            Ok(Some(status))
-        } else {
-            // File is being cached but not complete yet
-            Ok(None)
-        }
     }
 
     pub async fn mount(&self, ufs_path: &Path, cv_path: &Path, opts: MountOptions) -> FsResult<()> {
@@ -208,6 +185,31 @@ impl UnifiedFileSystem {
         }
     }
 
+    async fn check_cache_validity(
+        &self,
+        cv_status: &FileStatus,
+        ufs_path: &Path,
+        mount: &MountValue,
+    ) -> FsResult<CacheValidity> {
+        if cv_status.is_expired() {
+            return Ok(CacheValidity::Invalid(None));
+        }
+
+        if cv_status.is_cv_only() || mount.info.consistency_strategy == ConsistencyStrategy::None {
+            return Ok(CacheValidity::Valid);
+        }
+
+        let ufs_status = mount.ufs.get_status(ufs_path).await?;
+        if cv_status.len == ufs_status.len
+            && cv_status.storage_policy.ufs_mtime != 0
+            && cv_status.storage_policy.ufs_mtime == ufs_status.mtime
+        {
+            Ok(CacheValidity::Valid)
+        } else {
+            Ok(CacheValidity::Invalid(Some(ufs_status)))
+        }
+    }
+
     async fn get_cv_reader(
         &self,
         cv_path: &Path,
@@ -217,27 +219,19 @@ impl UnifiedFileSystem {
         let reader = match self.cv().open(cv_path).await {
             Ok(reader) => reader,
             Err(e) => {
-                return if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
-                    err_box!("failed to open curvine file {}: {}", cv_path, e)
-                } else {
-                    Ok(None)
+                if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
+                    error!("failed to open curvine file {}: {}", cv_path, e)
                 }
+                return Ok(None);
             }
         };
 
-        let cv_status = reader.status();
-        if cv_status.is_cv_only() || mount.info.consistency_strategy == ConsistencyStrategy::None {
-            Ok(Some(reader))
-        } else {
-            let ufs_status = mount.ufs.get_status(ufs_path).await?;
-            if cv_status.len == ufs_status.len
-                && cv_status.storage_policy.ufs_mtime != 0
-                && cv_status.storage_policy.ufs_mtime == ufs_status.mtime
-            {
-                Ok(Some(reader))
-            } else {
-                Ok(None)
-            }
+        match self
+            .check_cache_validity(reader.status(), ufs_path, mount)
+            .await?
+        {
+            CacheValidity::Valid => Ok(Some(reader)),
+            CacheValidity::Invalid(_) => Ok(None),
         }
     }
 
@@ -308,9 +302,9 @@ impl UnifiedFileSystem {
                 }
 
                 _ => {
-                    // ufs creates an empty file to prevent errors when accessing metadata.
-                    mount.ufs.create(&ufs_path, flags.overwrite()).await?;
-
+                    if flags.overwrite() {
+                        mount.ufs.create(&ufs_path, true).await?;
+                    }
                     let writer = CacheSyncWriter::new(self, path, &mount, flags).await?;
                     Ok(UnifiedWriter::CacheSync(writer))
                 }
@@ -527,14 +521,24 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
             vec!["get_status".to_string()],
         );
-        match self.get_mount(path).await? {
-            None => self.cv.get_status(path).await,
-            Some((ufs_path, mount)) => {
-                if let Some(v) = self.get_cv_status(path).await? {
-                    Ok(v)
-                } else {
-                    mount.ufs.get_status(&ufs_path).await
-                }
+
+        let (ufs_path, mount) = match self.get_mount(path).await? {
+            None => return self.cv.get_status(path).await,
+            Some(v) => v,
+        };
+
+        match self.cv.get_status(path).await {
+            Ok(v) => match self.check_cache_validity(&v, &ufs_path, &mount).await? {
+                CacheValidity::Valid => Ok(v),
+                CacheValidity::Invalid(Some(ufs_status)) => Ok(ufs_status),
+                CacheValidity::Invalid(None) => mount.ufs.get_status(&ufs_path).await,
+            },
+
+            Err(e) => {
+                if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
+                    warn!("failed to get status file {}: {}", path, e);
+                };
+                mount.ufs.get_status(&ufs_path).await
             }
         }
     }
