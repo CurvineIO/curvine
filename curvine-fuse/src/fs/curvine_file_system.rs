@@ -657,10 +657,21 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Get the path.
         let path = self.state.get_path_common(parent, name.as_deref())?;
-        let res = self.lookup_path(parent, name.as_deref(), &path).await;
+        let status = self.get_cached_status(&path).await?;
+        let res = self.lookup_status(parent, name.as_deref(), &status);
 
         let entry = match res {
-            Ok(attr) => Self::create_entry_out(&self.conf, attr),
+            Ok(attr) => {
+                let mut entry = Self::create_entry_out(&self.conf, attr);
+                let keep_attr = self.state.should_keep_attr(entry.nodeid, &status)?;
+                if !keep_attr {
+                    entry.entry_valid = 0;
+                    entry.attr_valid = 0;
+                    entry.entry_valid_nsec = 0;
+                    entry.attr_valid_nsec = 0;
+                }
+                entry
+            }
 
             Err(e) if e.errno == libc::ENOENT && !self.conf.negative_ttl.is_zero() => {
                 fuse_entry_out {
@@ -862,7 +873,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut fuse_attr = Self::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
 
-        let keep_cache = self.state.should_keep_cache(op.header.nodeid, &status)?;
+        let keep_cache = self.state.should_keep_attr(op.header.nodeid, &status)?;
         let (attr_valid, attr_valid_nsec) = if keep_cache {
             (
                 self.conf.attr_ttl.as_secs(),
@@ -1092,7 +1103,7 @@ impl fs::FileSystem for CurvineFileSystem {
         handle.read(&self.state, op, reply).await
     }
 
-    async fn open(&self, op: Open<'_>, reply: &FuseResponse) -> FuseResult<fuse_open_out> {
+    async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
         let path = self.state.get_path(op.header.nodeid)?;
         // Check file access permissions before opening
         let action = OpenAction::try_from(op.arg.flags)?;
@@ -1115,10 +1126,7 @@ impl fs::FileSystem for CurvineFileSystem {
             if keep_cache {
                 open_flags |= FUSE_FOPEN_KEEP_CACHE;
             } else {
-                let flag = reply.send_inode_out(handle.ino, -1, 0).await?;
-                if !flag {
-                    open_flags |= FUSE_FOPEN_DIRECT_IO;
-                }
+                open_flags |= FUSE_FOPEN_DIRECT_IO;
             }
         }
 
@@ -1234,6 +1242,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let path = Path::from_str(&handle.status.path)?;
         self.invalidate_cache(&path)?;
+
         complete_result
     }
 
