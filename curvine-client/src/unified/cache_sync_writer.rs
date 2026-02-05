@@ -31,7 +31,8 @@ pub struct CacheSyncWriter {
     inner: FsWriter,
     write_type: WriteType,
     job_res: Option<LoadJobResult>,
-    has_rand_write: bool,
+    /// Whether seek or resize operations have been performed
+    has_random_access: bool,
 }
 
 impl CacheSyncWriter {
@@ -59,7 +60,7 @@ impl CacheSyncWriter {
             inner,
             write_type,
             job_res: None,
-            has_rand_write: false,
+            has_random_access: false,
         };
         Ok(writer)
     }
@@ -101,7 +102,7 @@ impl Writer for CacheSyncWriter {
     }
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
-        if self.job_res.is_none() {
+        if self.job_res.is_none() && !self.has_random_access {
             let job_res = self
                 .job_client
                 .submit_load(self.inner.path().clone_uri())
@@ -125,17 +126,16 @@ impl Writer for CacheSyncWriter {
     async fn complete(&mut self) -> FsResult<()> {
         self.inner.complete().await?;
 
-        if self.has_rand_write {
+        if self.job_res.is_none() {
             let job_res = self.job_client.submit_load(self.path().clone_uri()).await?;
             info!(
-                "resubmit(rand_write) job successfully for {}, job id {}, target_path {}",
+                "resubmit job successfully for {}, job id {}, target_path {}",
                 self.path(),
                 job_res.job_id,
                 job_res.target_path
             );
 
             self.job_res.replace(job_res);
-            self.has_rand_write = false;
         }
 
         if matches!(self.write_type, WriteType::CacheThrough) {
@@ -150,8 +150,7 @@ impl Writer for CacheSyncWriter {
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        if self.pos() != pos && !self.has_rand_write {
-            self.has_rand_write = true;
+        if self.pos() != pos {
             if let Some(job_res) = &self.job_res {
                 if let Err(e) = self.job_client.cancel_job(&job_res.job_id).await {
                     warn!("cancel job {} failed: {}", job_res.job_id, e);
@@ -159,24 +158,24 @@ impl Writer for CacheSyncWriter {
                     info!("cancel(rand_write) job {} successfully", job_res.job_id);
                 }
             }
+
+            self.job_res.take();
+            self.has_random_access = true;
         }
 
         self.inner.seek(pos).await
     }
 
     async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
-        // Cancel and resubmit the sync job since file size is changing
-        if !self.has_rand_write {
-            self.has_rand_write = true;
-
-            if let Some(job_res) = &self.job_res {
-                if let Err(e) = self.job_client.cancel_job(&job_res.job_id).await {
-                    warn!("cancel job {} failed: {}", job_res.job_id, e);
-                } else {
-                    info!("cancel(resize) job {} successfully", job_res.job_id);
-                }
+        if let Some(job_res) = &self.job_res {
+            if let Err(e) = self.job_client.cancel_job(&job_res.job_id).await {
+                warn!("cancel job {} failed: {}", job_res.job_id, e);
+            } else {
+                info!("cancel(resize) job {} successfully", job_res.job_id);
             }
+            self.job_res.take();
         }
+        self.has_random_access = true;
 
         self.inner.resize(opts).await
     }

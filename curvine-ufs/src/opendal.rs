@@ -92,7 +92,7 @@ impl Reader for OpendalReader {
 
             self.byte_stream = Some(
                 reader
-                    .into_bytes_stream(..self.length as u64)
+                    .into_bytes_stream(self.pos as u64..self.length as u64)
                     .await
                     .map_err(|e| FsError::common(format!("Failed to create stream: {}", e)))?,
             );
@@ -210,17 +210,7 @@ impl Writer for OpendalWriter {
             );
         }
 
-        let data = match chunk {
-            DataSlice::Empty => return Ok(0),
-            DataSlice::Bytes(bytes) => bytes,
-            DataSlice::Buffer(buf) => buf.freeze(),
-            DataSlice::IOSlice(_) | DataSlice::MemSlice(_) => {
-                // For IOSlice and MemSlice, we need to copy the data
-                // This is acceptable since OpenDAL will handle the actual I/O efficiently
-                let slice = chunk.as_slice();
-                bytes::Bytes::copy_from_slice(slice)
-            }
-        };
+        let data = bytes::Bytes::copy_from_slice(chunk.as_slice());
         let len = data.len() as i64;
 
         let writer = try_option_mut!(self.writer);
