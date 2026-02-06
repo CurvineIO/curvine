@@ -522,96 +522,171 @@ pub fn get_device_id(path: &Path) -> u64 {
     }
 }
 
-/// Get UID by username using getpwnam system call
+// ============================================================================
+// User/Group lookup functions
+// ============================================================================
+//
+// When the `static` feature is enabled, these functions parse /etc/passwd and
+// /etc/group directly to avoid NSS (Name Service Switch) dynamic loading,
+// which causes assertion failures with statically linked glibc.
+//
+// When the `static` feature is disabled (default), these functions use the
+// standard libc calls (getpwnam, getpwuid, getgrnam, getgrgid) which support
+// NSS and can resolve users/groups from LDAP, NIS, SSSD, etc.
+// ============================================================================
+
+/// Helper function to parse colon-separated files like /etc/passwd and /etc/group.
+#[cfg(feature = "static")]
+fn parse_colon_file<F, T>(path: &str, matcher: F) -> Option<T>
+where
+    F: Fn(&[&str]) -> Option<T>,
+{
+    use std::io::{BufRead, BufReader};
+
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines().map_while(Result::ok) {
+        let fields: Vec<&str> = line.split(':').collect();
+        if let Some(result) = matcher(&fields) {
+            return Some(result);
+        }
+    }
+    None
+}
+
+/// Get UID by username.
+#[cfg(feature = "static")]
 pub fn get_uid_by_name(username: &str) -> Option<u32> {
-    #[cfg(target_os = "linux")]
-    {
-        let c_username = match CString::new(username) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-
-        unsafe {
-            let passwd = libc::getpwnam(c_username.as_ptr());
-            if passwd.is_null() {
-                None
-            } else {
-                Some((*passwd).pw_uid)
-            }
+    // Format: username:password:uid:gid:gecos:home:shell
+    parse_colon_file("/etc/passwd", |fields| {
+        if fields.len() >= 3 && fields[0] == username {
+            fields[2].parse().ok()
+        } else {
+            None
         }
-    }
+    })
+}
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
+/// Get UID by username using getpwnam system call.
+#[cfg(all(target_os = "linux", not(feature = "static")))]
+pub fn get_uid_by_name(username: &str) -> Option<u32> {
+    let c_username = CString::new(username).ok()?;
+    unsafe {
+        let passwd = libc::getpwnam(c_username.as_ptr());
+        if passwd.is_null() {
+            None
+        } else {
+            Some((*passwd).pw_uid)
+        }
     }
 }
 
-/// Get username by UID using getpwuid system call  
+#[cfg(all(not(target_os = "linux"), not(feature = "static")))]
+pub fn get_uid_by_name(_username: &str) -> Option<u32> {
+    None
+}
+
+/// Get username by UID.
+#[cfg(feature = "static")]
 pub fn get_username_by_uid(uid: u32) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        unsafe {
-            let passwd = libc::getpwuid(uid);
-            if passwd.is_null() {
-                None
-            } else {
-                let c_str = CStr::from_ptr((*passwd).pw_name);
-                c_str.to_string_lossy().into_owned().into()
+    // Format: username:password:uid:gid:gecos:home:shell
+    parse_colon_file("/etc/passwd", |fields| {
+        if fields.len() >= 3 {
+            if let Ok(file_uid) = fields[2].parse::<u32>() {
+                if file_uid == uid {
+                    return Some(fields[0].to_string());
+                }
             }
         }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
         None
+    })
+}
+
+/// Get username by UID using getpwuid system call.
+#[cfg(all(target_os = "linux", not(feature = "static")))]
+pub fn get_username_by_uid(uid: u32) -> Option<String> {
+    unsafe {
+        let passwd = libc::getpwuid(uid);
+        if passwd.is_null() {
+            None
+        } else {
+            let c_str = CStr::from_ptr((*passwd).pw_name);
+            Some(c_str.to_string_lossy().into_owned())
+        }
     }
 }
 
-/// Get GID by group name using getgrnam system call
+#[cfg(all(not(target_os = "linux"), not(feature = "static")))]
+pub fn get_username_by_uid(_uid: u32) -> Option<String> {
+    None
+}
+
+/// Get GID by group name.
+#[cfg(feature = "static")]
 pub fn get_gid_by_name(groupname: &str) -> Option<u32> {
-    #[cfg(target_os = "linux")]
-    {
-        let c_groupname = match CString::new(groupname) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-
-        unsafe {
-            let group = libc::getgrnam(c_groupname.as_ptr());
-            if group.is_null() {
-                None
-            } else {
-                Some((*group).gr_gid)
-            }
+    // Format: groupname:password:gid:members
+    parse_colon_file("/etc/group", |fields| {
+        if fields.len() >= 3 && fields[0] == groupname {
+            fields[2].parse().ok()
+        } else {
+            None
         }
-    }
+    })
+}
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
+/// Get GID by group name using getgrnam system call.
+#[cfg(all(target_os = "linux", not(feature = "static")))]
+pub fn get_gid_by_name(groupname: &str) -> Option<u32> {
+    let c_groupname = CString::new(groupname).ok()?;
+    unsafe {
+        let group = libc::getgrnam(c_groupname.as_ptr());
+        if group.is_null() {
+            None
+        } else {
+            Some((*group).gr_gid)
+        }
     }
 }
 
-/// Get group name by GID using getgrgid system call
+#[cfg(all(not(target_os = "linux"), not(feature = "static")))]
+pub fn get_gid_by_name(_groupname: &str) -> Option<u32> {
+    None
+}
+
+/// Get group name by GID.
+#[cfg(feature = "static")]
 pub fn get_groupname_by_gid(gid: u32) -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        unsafe {
-            let group = libc::getgrgid(gid);
-            if group.is_null() {
-                None
-            } else {
-                let c_str = CStr::from_ptr((*group).gr_name);
-                c_str.to_string_lossy().into_owned().into()
+    // Format: groupname:password:gid:members
+    parse_colon_file("/etc/group", |fields| {
+        if fields.len() >= 3 {
+            if let Ok(file_gid) = fields[2].parse::<u32>() {
+                if file_gid == gid {
+                    return Some(fields[0].to_string());
+                }
             }
         }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
         None
+    })
+}
+
+/// Get group name by GID using getgrgid system call.
+#[cfg(all(target_os = "linux", not(feature = "static")))]
+pub fn get_groupname_by_gid(gid: u32) -> Option<String> {
+    unsafe {
+        let group = libc::getgrgid(gid);
+        if group.is_null() {
+            None
+        } else {
+            let c_str = CStr::from_ptr((*group).gr_name);
+            Some(c_str.to_string_lossy().into_owned())
+        }
     }
+}
+
+#[cfg(all(not(target_os = "linux"), not(feature = "static")))]
+pub fn get_groupname_by_gid(_gid: u32) -> Option<String> {
+    None
 }
 
 /// pub unsafe extern "C" fn ftruncate64(

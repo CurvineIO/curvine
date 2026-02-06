@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 orpc = { workspace = true }
-curvine-common = { workspace = true }
+curvine-common = { workspace = true, default-features = false }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }

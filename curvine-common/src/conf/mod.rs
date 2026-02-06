@@ -30,6 +30,9 @@ pub use self::fuse_conf::FuseConf;
 mod journal_conf;
 pub use self::journal_conf::JournalConf;
 
+mod raft_peer;
+pub use self::raft_peer::{NodeId, RaftPeer};
+
 mod size_string;
 pub use self::size_string::SizeString;
 

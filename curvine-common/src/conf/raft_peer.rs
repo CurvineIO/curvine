@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::raft::NodeId;
 use orpc::common::Utils;
 use orpc::io::net::InetAddr;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
-// Represents a raft address
+/// Node ID type for raft peers
+pub type NodeId = u64;
+
+/// Represents a raft peer address
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct RaftPeer {
