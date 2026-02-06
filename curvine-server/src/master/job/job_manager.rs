@@ -144,12 +144,17 @@ impl JobManager {
                     || state == JobTaskState::Failed
                     || state == JobTaskState::Canceled
                 {
-                    return err_box!("Cannot cancel job in state {:?}", state);
+                    info!(
+                        "job {} is already in final state {:?}, source_path: {}, target_path: {}",
+                        job_id, state, job.info.source_path, job.info.target_path
+                    );
+                    self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user");
+                    return Ok(());
                 }
 
                 job.assigned_workers.clone()
             } else {
-                return err_box!("Job {} not found", job_id);
+                return err_ext!(FsError::job_not_found(job_id));
             }
         };
 
