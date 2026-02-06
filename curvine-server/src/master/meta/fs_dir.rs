@@ -700,6 +700,31 @@ impl FsDir {
         println!("DEBUG at FsDir, at complete_container, container: {:?}", container);
         self.evictor.on_access(container.id());
 
+        let container_name = inp.name().to_string();  
+        if let Some(parent) = inp.get_inode(-2) {  
+                match parent.as_mut() {  
+                InodeView::Dir(_, dir) => {  
+    
+                    if let InodeView::Container(_, container) = inode.as_ref() {  
+                        // Now dir is &mut InodeDir, so we can access container_index  
+                        dir.container_index.retain(|_, v| v != &container_name);  
+                        
+                        // Add new entries for all files in container  
+                        for file_name in container.files.keys() {  
+                            dir.add_to_container_index(file_name.clone(), container_name.clone());  
+                        }  
+                        
+                        // Persist updated parent directory  
+                        println!("parent of container when complete: {:?}", parent);
+                        self.store.apply_complete_inode_entry(parent.as_ref(), &[])?;  
+                    }  
+                }  
+                _ => {  
+                    // Parent is not a directory - this shouldn't happen  
+                    return err_box!("Parent is not a directory");  
+                }  
+            }  
+        }  
         self.store
             .apply_complete_inode_entry(inode.as_ref(), &[commit_block.clone()])?;
         // self.journal_writer.log_complete_container(

@@ -235,7 +235,7 @@ impl JournalWriter {
             inode: inode.as_ref().clone(),
             commit_blocks,
         };
-
+        println!("DEBUG at JournalWriter, at log_complete_inode_entry, entry: {:?}",entry);
         self.send(JournalEntry::CompleteInode(entry))
     }
 

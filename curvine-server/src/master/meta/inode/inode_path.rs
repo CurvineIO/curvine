@@ -54,8 +54,10 @@ impl InodePath {
         while index < components.len() {
             //make sure resolved_inode is not a FileEntry
             //if it is a FileEntry, load the complete file data from store
+            println!("DEBUG at InodePath, at resolve, inodes {:?}", inodes);
             let resolved_inode = match cur_inode.as_ref() {
                 FileEntry(name, id) => {
+                    println!("DEBUG at InodePath, at resolve, resolve inode {:?} with id {:?} is file_entry", name, id);
                     // If it is a FileEntry, load the complete object from store
                     match store.get_inode(*id, Some(name))? {
                         Some(full_inode) => InodePtr::from_owned(full_inode),
@@ -63,13 +65,15 @@ impl InodePath {
                     }
                 }
                 Container(name, id) => {
-                    println!("DEBUG at InodePath, at resolve, name={:?}", name);
+                    println!("DEBUG at InodePath, at resolve, resolve inode {:?} with id {:?} is container", name, id);
                     cur_inode.clone()
                 }
                 _ => cur_inode.clone(),
             };
 
+            println!("DEBUG at InodePath, at resolve, resolved_inode: {:?}", resolved_inode);
             inodes.push(resolved_inode);
+            println!("DEBUG at InodePath, at resolve ,after append inode, inodes: {:?}", inodes);
 
             if index == components.len() - 1 {
                 break;
@@ -94,6 +98,7 @@ impl InodePath {
                             println!("DEBUG at InodePath,at resolve, child of child name, search file in container branch, {:?} is directory: {:?}", child_name, cur_inode);
                         } else {
                             // The directory has not been created, so there is no need to search again.
+                            println!("DEBUG at InodePath,at resolve, The directory has not been created, so there is no need to search again.");
                             break;
                         }
                     }
@@ -120,7 +125,7 @@ impl InodePath {
             components,
             inodes,
         };
-        println!("DEBUG at InodePath, at resolve, done.");
+        println!("DEBUG at InodePath, at resolve, done. {:?}", inode_path);
         Ok(inode_path)
     }
 
