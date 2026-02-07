@@ -495,3 +495,18 @@ impl SetAttrOptsBuilder {
         }
     }
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct ListOptions {
+    pub limit: Option<usize>,
+    pub start_after: Option<String>,
+}
+
+impl ListOptions {
+    pub fn from_status(limit: usize, status: &FileStatus) -> Self {
+        Self {
+            limit: Some(limit),
+            start_after: Some(status.name.to_owned()),
+        }
+    }
+}

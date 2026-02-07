@@ -520,6 +520,20 @@ impl ProtoUtils {
         }
     }
 
+    pub fn list_options_from_pb(opts: ListOptionsProto) -> ListOptions {
+        ListOptions {
+            limit: opts.limit.map(|v| v as usize),
+            start_after: opts.start_after,
+        }
+    }
+
+    pub fn list_options_to_pb(opts: ListOptions) -> ListOptionsProto {
+        ListOptionsProto {
+            limit: opts.limit.map(|v| v as i32),
+            start_after: opts.start_after,
+        }
+    }
+
     pub fn mount_info_to_pb(info: MountInfo) -> MountInfoProto {
         MountInfoProto {
             cv_path: info.cv_path,

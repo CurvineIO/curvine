@@ -461,6 +461,19 @@ macro_rules! impl_filesystem_for_enum {
                 }
             }
 
+            async fn list_options(
+                &self,
+                path: &::curvine_common::fs::Path,
+                opts: ::curvine_common::state::ListOptions,
+            ) -> ::curvine_common::FsResult<Vec<::curvine_common::state::FileStatus>> {
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.list_options(path, opts).await,
+                    )+
+                }
+            }
+
             async fn set_attr(
                 &self,
                 path: &::curvine_common::fs::Path,

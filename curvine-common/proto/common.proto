@@ -191,3 +191,8 @@ message FileLockProto {
     required uint64 start = 7;
     required uint64 end = 8;
 }
+
+message ListOptionsProto {
+    optional int32 limit = 1;
+    optional string start_after = 2;
+}

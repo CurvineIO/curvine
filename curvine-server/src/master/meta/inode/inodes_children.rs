@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use crate::master::meta::inode::{InodePtr, InodeView};
+use curvine_common::state::ListOptions;
 use glob::Pattern;
 use orpc::{err_box, CommonResult};
 use std::collections::btree_map::{Entry, Values};
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::slice::Iter;
 use std::vec;
 
@@ -123,6 +125,33 @@ impl InodeChildren {
         }
     }
 
+    pub fn list_options(&self, opts: &ListOptions) -> Vec<&InodeView> {
+        match self {
+            InodeChildren::List(list) => {
+                let start = opts
+                    .start_after
+                    .as_ref()
+                    .map(|a| match Self::search_by_name(list, a) {
+                        Ok(i) => i + 1,
+                        Err(i) => i,
+                    })
+                    .unwrap_or(0);
+                let slice = &list[start..];
+                let n = opts.limit.unwrap_or(slice.len());
+                slice.iter().take(n).map(|b| b.as_ref()).collect()
+            }
+
+            InodeChildren::Map(map) => {
+                let range = opts.start_after.as_ref().map_or(
+                    map.range::<str, _>((Bound::Unbounded, Bound::Unbounded)),
+                    |a| map.range::<str, _>((Bound::Excluded(a.as_str()), Bound::Unbounded)),
+                );
+                let n = opts.limit.unwrap_or(usize::MAX);
+                range.take(n).map(|(_, v)| v.as_ref()).collect()
+            }
+        }
+    }
+
     pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
         let inode = Box::new(inode);
         // Assert that it should not be FileEntry
@@ -172,7 +201,6 @@ impl InodeChildren {
                 len: list.len(),
                 inner: InnerIter::List(list.iter()),
             },
-
             InodeChildren::Map(map) => ChildrenIter {
                 len: map.len(),
                 inner: InnerIter::Map(map.values()),

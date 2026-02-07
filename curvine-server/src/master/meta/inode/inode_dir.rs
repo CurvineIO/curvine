@@ -18,7 +18,7 @@ use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::{
     ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
 };
-use curvine_common::state::{MkdirOpts, StoragePolicy};
+use curvine_common::state::{ListOptions, MkdirOpts, StoragePolicy};
 use glob::Pattern;
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
@@ -114,6 +114,10 @@ impl InodeDir {
 
     pub fn children_iter(&self) -> ChildrenIter<'_> {
         self.children.iter()
+    }
+
+    pub fn list_options(&self, options: &ListOptions) -> Vec<&InodeView> {
+        self.children.list_options(options)
     }
 
     pub fn children_vec(&self) -> Vec<InodeView> {

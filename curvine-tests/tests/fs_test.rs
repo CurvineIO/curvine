@@ -18,7 +18,7 @@ use curvine_client::ClientMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOptsBuilder, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
+    CreateFileOptsBuilder, ListOptions, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
 };
 use curvine_common::state::{FileLock, LockFlags, LockType};
 use curvine_common::FsResult;
@@ -84,6 +84,9 @@ fn run_filesystem_end_to_end_operations_on_cluster(
 
         list_status(&fs).await?;
         println!("list_status done");
+
+        list_options(&fs).await?;
+        println!("list_options done");
 
         list_files(&fs).await?;
         println!("list_files done");
@@ -432,6 +435,62 @@ async fn list_status(fs: &CurvineFileSystem) -> CommonResult<()> {
     }
 
     assert_eq!(list.len(), 3);
+    Ok(())
+}
+
+async fn list_options(fs: &CurvineFileSystem) -> CommonResult<()> {
+    for i in 0..5 {
+        let path = Path::from_str(format!("/fs_test/list_options/{}.log", i))?;
+        let _ = fs.create(&path, true).await?;
+    }
+
+    let dir = Path::from_str("/fs_test/list_options")?;
+    let full = fs.list_status(&dir).await?;
+    assert_eq!(full.len(), 5, "full list should have 5 entries");
+
+    // limit only
+    let opts = ListOptions {
+        limit: Some(2),
+        start_after: None,
+    };
+    let list = fs.list_options(&dir, opts).await?;
+    assert_eq!(list.len(), 2, "limit=2 should return 2 entries");
+    assert_eq!(list[0].name, "0.log");
+    assert_eq!(list[1].name, "1.log");
+
+    // start_after only (exclusive)
+    let opts = ListOptions {
+        limit: None,
+        start_after: Some("1.log".to_string()),
+    };
+    let list = fs.list_options(&dir, opts).await?;
+    assert_eq!(
+        list.len(),
+        3,
+        "start_after 1.log should return 3 entries (2,3,4)"
+    );
+    assert_eq!(list[0].name, "2.log");
+    assert_eq!(list[1].name, "3.log");
+    assert_eq!(list[2].name, "4.log");
+
+    // limit + start_after
+    let opts = ListOptions {
+        limit: Some(2),
+        start_after: Some("1.log".to_string()),
+    };
+    let list = fs.list_options(&dir, opts).await?;
+    assert_eq!(list.len(), 2, "limit=2 after 1.log should return 2 entries");
+    assert_eq!(list[0].name, "2.log");
+    assert_eq!(list[1].name, "3.log");
+
+    // from_status style pagination: first page
+    let first = &full[0];
+    let opts = ListOptions::from_status(2, first);
+    let page1 = fs.list_options(&dir, opts).await?;
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1[0].name, "1.log");
+    assert_eq!(page1[1].name, "2.log");
+
     Ok(())
 }
 

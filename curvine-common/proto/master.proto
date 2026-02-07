@@ -320,3 +320,12 @@ message SetLockRequest {
 message SetLockResponse {
     optional FileLockProto conflict = 1;
 }
+
+message ListOptionsRequest {
+    required string path = 1;
+    required ListOptionsProto options = 2;
+}
+
+message ListOptionsResponse {
+    repeated FileStatusProto statuses = 1;
+}

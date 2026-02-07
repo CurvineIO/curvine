@@ -330,6 +330,37 @@ impl MasterFilesystem {
         }
     }
 
+    pub fn list_options<T: AsRef<str>>(
+        &self,
+        path: T,
+        opts: ListOptions,
+    ) -> FsResult<Vec<FileStatus>> {
+        let fs_dir = self.fs_dir.read();
+        let (is_glob_pattern, _) = parse_glob_pattern(path.as_ref());
+        if is_glob_pattern {
+            let paths = Self::resolve_path_by_glob_pattern(&fs_dir, path.as_ref())?;
+            let mut all_statuses = Vec::new();
+            for p in &paths {
+                all_statuses.extend(fs_dir.list_status(p)?);
+            }
+            if let Some(after) = &opts.start_after {
+                let pos = all_statuses
+                    .iter()
+                    .position(|s| s.name.as_str() == after.as_str());
+                if let Some(i) = pos {
+                    all_statuses = all_statuses.into_iter().skip(i + 1).collect();
+                }
+            }
+            if let Some(limit) = opts.limit {
+                all_statuses.truncate(limit);
+            }
+            Ok(all_statuses)
+        } else {
+            let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+            fs_dir.list_options(&inp, &opts)
+        }
+    }
+
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
     }

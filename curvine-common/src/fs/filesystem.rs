@@ -14,9 +14,10 @@
 
 use crate::fs::Path;
 use crate::proto::{GetFileStatusResponse, ListStatusResponse};
-use crate::state::{FileStatus, SetAttrOpts};
+use crate::state::{FileStatus, ListOptions, SetAttrOpts};
 use crate::utils::ProtoUtils;
 use crate::FsResult;
+use orpc::err_box;
 use prost::bytes::BytesMut;
 use std::future::Future;
 
@@ -63,4 +64,29 @@ pub trait FileSystem<Writer, Reader> {
     }
 
     fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> impl Future<Output = FsResult<()>>;
+
+    fn list_options(
+        &self,
+        _path: &Path,
+        _opts: ListOptions,
+    ) -> impl Future<Output = FsResult<Vec<FileStatus>>> {
+        async move { err_box!("not supported list_options") }
+    }
+
+    fn list_options_bytes(
+        &self,
+        path: &Path,
+        opts: ListOptions,
+    ) -> impl Future<Output = FsResult<BytesMut>> {
+        async move {
+            let statuses = self.list_options(path, opts).await?;
+            let statuses = statuses
+                .into_iter()
+                .map(ProtoUtils::file_status_to_pb)
+                .collect::<Vec<_>>();
+
+            let rep = ListStatusResponse { statuses };
+            Ok(ProtoUtils::encode(rep)?)
+        }
+    }
 }

@@ -197,6 +197,40 @@ impl FsClient {
         Ok(res)
     }
 
+    pub async fn list_options(
+        &self,
+        path: &Path,
+        options: ListOptions,
+    ) -> FsResult<Vec<FileStatus>> {
+        let header = ListOptionsRequest {
+            path: path.encode(),
+            options: ProtoUtils::list_options_to_pb(options),
+        };
+
+        let rep_header: ListOptionsResponse = self.rpc(RpcCode::ListOptions, header).await?;
+
+        let res = rep_header
+            .statuses
+            .into_iter()
+            .map(ProtoUtils::file_status_from_pb)
+            .collect();
+
+        Ok(res)
+    }
+
+    pub async fn list_options_bytes(
+        &self,
+        path: &Path,
+        options: ListOptions,
+    ) -> FsResult<BytesMut> {
+        let header = ListOptionsRequest {
+            path: path.encode(),
+            options: ProtoUtils::list_options_to_pb(options),
+        };
+
+        self.rpc_bytes(RpcCode::ListOptions, header).await
+    }
+
     pub async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         let header = ListStatusRequest {
             path: path.encode(),

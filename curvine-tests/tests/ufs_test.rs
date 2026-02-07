@@ -43,8 +43,8 @@
 //!
 //! #### S3:
 //! ```bash
-//! export UFS_TEST_PATH=s3://my-bucket/test
-//! export UFS_TEST_PROPERTIES="s3.access_key_id=xxx,s3.secret_access_key=yyy,s3.region=us-east-1,s3.endpoint=https://s3.amazonaws.com"
+//! export UFS_TEST_PATH=s3://cv-test/ufs-test
+//! export UFS_TEST_PROPERTIES="s3.credentials.access=access,s3.credentials.secret=secret,s3.region_name=cn,s3.endpoint_url=http://192.168.108.129:9000"
 //! ```
 //!
 //! #### OSS (Aliyun):
@@ -61,7 +61,7 @@
 
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{MountOptions, MountType, WriteType};
+use curvine_common::state::{ListOptions, MountOptions, MountType, WriteType};
 use curvine_tests::Testing;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
@@ -147,6 +147,7 @@ fn ufs_test() -> CommonResult<()> {
         test_exists(&fs, &config_clone).await?;
         test_get_status(&fs, &config_clone).await?;
         test_list_status(&fs, &config_clone).await?;
+        test_list_options(&fs, &config_clone).await?;
 
         // 4. Test file write operations
         println!("\n=== Testing File Write Operations ===");
@@ -163,10 +164,6 @@ fn ufs_test() -> CommonResult<()> {
         test_rename(&fs, &config_clone).await?;
         test_delete_file(&fs, &config_clone).await?;
 
-        // 7. Final cleanup
-        cleanup_test_dir(&fs, &config_clone).await?;
-
-        println!("\n=== All Tests Passed! ===");
         Ok(())
     })
 }
@@ -193,6 +190,12 @@ async fn mount_storage(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonRes
 /// Cleanup test directory
 async fn cleanup_test_dir(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonResult<()> {
     let test_path: Path = config.test_base_dir().into();
+    let test_opts: Path = format!("{}/list_opts", config.test_base_dir()).into();
+
+    if fs.exists(&test_opts).await? {
+        fs.delete(&test_opts, true).await?;
+    }
+
     if fs.exists(&test_path).await? {
         fs.delete(&test_path, true).await?;
         println!("✓ Test directory cleaned: {}", config.test_base_dir());
@@ -309,6 +312,196 @@ async fn test_list_status(fs: &UnifiedFileSystem, config: &TestConfig) -> Common
     assert!(dir_names.contains(&"dir1"), "dir1 should be in the list");
     assert!(dir_names.contains(&"dir2"), "dir2 should be in the list");
 
+    Ok(())
+}
+
+/// Test listing directory contents with ListOptions
+async fn test_list_options(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonResult<()> {
+    let base_dir = config.test_base_dir();
+    let test_dir: Path = format!("{}/list_opts", base_dir).into();
+
+    println!("\n=== Testing ListOptions ===");
+
+    // Setup: Create test directory structure (交叉创建目录和文件)
+    println!("Setting up test data...");
+
+    // Create main test directory
+    fs.mkdir(&test_dir, false).await?;
+    println!("✓ Created test directory: {}", test_dir);
+
+    // 交叉创建：目录1 -> 文件1 -> 目录2 -> 文件2 -> 文件3
+    let subdir1: Path = format!("{}/subdir1", test_dir).into();
+    let file1: Path = format!("{}/file1.txt", test_dir).into();
+    let subdir2: Path = format!("{}/subdir2", test_dir).into();
+    let file2: Path = format!("{}/file2.txt", test_dir).into();
+    let file3: Path = format!("{}/file3.txt", test_dir).into();
+
+    // 创建顺序：目录1 -> 文件1 -> 目录2 -> 文件2 -> 文件3
+    fs.mkdir(&subdir1, false).await?;
+    println!("✓ Created subdirectory: subdir1");
+
+    let mut writer1 = fs.create(&file1, false).await?;
+    writer1.complete().await?;
+    println!("✓ Created file: file1.txt");
+
+    fs.mkdir(&subdir2, false).await?;
+    println!("✓ Created subdirectory: subdir2");
+
+    let mut writer2 = fs.create(&file2, false).await?;
+    writer2.complete().await?;
+    println!("✓ Created file: file2.txt");
+
+    let mut writer3 = fs.create(&file3, false).await?;
+    writer3.complete().await?;
+    println!("✓ Created file: file3.txt");
+
+    // Verify setup: should have 5 entries total (2 dirs + 3 files)
+    let all_statuses = fs.list_status(&test_dir).await?;
+    assert_eq!(
+        all_statuses.len(),
+        5,
+        "Test directory should contain 5 entries (2 dirs + 3 files), got {}",
+        all_statuses.len()
+    );
+    println!("✓ Verified test data: {} entries total", all_statuses.len());
+
+    // Test 1: List with limit=1
+    println!("\nTest 1: List with limit=1");
+    let opts = ListOptions {
+        limit: Some(1),
+        start_after: None,
+    };
+    let limited_statuses = fs.list_options(&test_dir, opts).await?;
+    println!("{:?}", all_statuses);
+    println!("{:?}", limited_statuses);
+    assert_eq!(
+        limited_statuses.len(),
+        1,
+        "Limited list should return exactly 1 entry, got {}",
+        limited_statuses.len()
+    );
+    println!("✓ Limited list returned {} entry", limited_statuses.len());
+
+    // Test 2: List with limit=3
+    println!("\nTest 2: List with limit=3");
+    let opts = ListOptions {
+        limit: Some(3),
+        start_after: None,
+    };
+    let limited_statuses = fs.list_options(&test_dir, opts).await?;
+    assert_eq!(
+        limited_statuses.len(),
+        3,
+        "Limited list should return exactly 3 entries, got {}",
+        limited_statuses.len()
+    );
+    println!("✓ Limited list returned {} entries", limited_statuses.len());
+
+    // Test 3: List with start_after (starting after first entry)
+    println!("\nTest 3: List with start_after");
+    let first_status = &all_statuses[0];
+    let opts = ListOptions {
+        limit: None,
+        start_after: Some(first_status.name.clone()),
+    };
+    let after_statuses = fs.list_options(&test_dir, opts).await?;
+    assert_eq!(
+        after_statuses.len(),
+        4,
+        "List after '{}' should return 4 entries, got {}",
+        first_status.name,
+        after_statuses.len()
+    );
+    println!(
+        "✓ List after '{}' returned {} entries",
+        first_status.name,
+        after_statuses.len()
+    );
+
+    // Verify that the first entry is not in the result
+    let after_names: Vec<&str> = after_statuses.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        !after_names.contains(&first_status.name.as_str()),
+        "First entry '{}' should not be in the result",
+        first_status.name
+    );
+
+    // Test 4: List with limit and start_after
+    println!("\nTest 4: List with limit=2 and start_after");
+    let first_status = &all_statuses[0];
+    let opts = ListOptions {
+        limit: Some(2),
+        start_after: Some(first_status.name.clone()),
+    };
+    let limited_after_statuses = fs.list_options(&test_dir, opts).await?;
+    assert_eq!(
+        limited_after_statuses.len(),
+        2,
+        "Limited list with start_after should return exactly 2 entries, got {}",
+        limited_after_statuses.len()
+    );
+    println!(
+        "✓ Limited list after '{}' returned {} entries",
+        first_status.name,
+        limited_after_statuses.len()
+    );
+
+    // Test 5: Using from_status helper method
+    println!("\nTest 5: Using from_status helper method");
+    let first_status = &all_statuses[0];
+    let opts = ListOptions::from_status(2, first_status);
+    let from_status_result = fs.list_options(&test_dir, opts).await?;
+    assert_eq!(
+        from_status_result.len(),
+        2,
+        "List using from_status should return 2 entries, got {}",
+        from_status_result.len()
+    );
+    println!(
+        "✓ List using from_status returned {} entries",
+        from_status_result.len()
+    );
+
+    // Test 6: List with start_after pointing to a directory
+    println!("\nTest 6: List with start_after pointing to a directory");
+    let subdir_status = fs.get_status(&subdir1).await?;
+    let opts = ListOptions {
+        limit: None,
+        start_after: Some(subdir_status.name.clone()),
+    };
+    let after_dir_statuses = fs.list_options(&test_dir, opts).await?;
+    println!(
+        "✓ List after directory '{}' returned {} entries",
+        subdir_status.name,
+        after_dir_statuses.len()
+    );
+
+    // Verify that subdir1 is not in the result
+    let after_dir_names: Vec<&str> = after_dir_statuses.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        !after_dir_names.contains(&subdir_status.name.as_str()),
+        "Directory '{}' should not be in the result",
+        subdir_status.name
+    );
+
+    // Test 7: Default options (should return all entries)
+    println!("\nTest 7: Default options (should return all entries)");
+    let opts = ListOptions::default();
+    let default_statuses = fs.list_options(&test_dir, opts).await?;
+    assert_eq!(
+        default_statuses.len(),
+        5,
+        "Default list should return all 5 entries, got {}",
+        default_statuses.len()
+    );
+    println!("✓ Default list returned {} entries", default_statuses.len());
+
+    // Cleanup
+    println!("\nCleaning up test data...");
+    fs.delete(&test_dir, true).await?;
+    println!("✓ Test directory cleaned up: {}", test_dir);
+
+    println!("\n✓ All ListOptions tests passed!");
     Ok(())
 }
 

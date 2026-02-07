@@ -19,13 +19,13 @@ use crate::{err_ufs, FOLDER_SUFFIX};
 use bytes::BytesMut;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
+use curvine_common::state::{FileStatus, FileType, ListOptions, SetAttrOpts};
 use curvine_common::FsResult;
 use futures::StreamExt;
 use opendal::services::*;
 use opendal::{
     layers::{LoggingLayer, RetryLayer, TimeoutLayer},
-    Metadata, Operator,
+    Entry, Metadata, Operator,
 };
 use orpc::sys::DataSlice;
 use orpc::{err_box, err_ext, try_option_mut};
@@ -691,6 +691,34 @@ impl OpendalFileSystem {
 
         Ok(metadata.map(|m| Self::read_status(path, &m)))
     }
+
+    fn process_list(&self, path: &Path, list: Vec<Entry>) -> FsResult<Vec<FileStatus>> {
+        let mut statuses = Vec::new();
+        for entry in list {
+            let raw_path = format!(
+                "{}://{}/{}",
+                self.scheme,
+                self.bucket_or_container,
+                entry.path().trim_end_matches('/')
+            );
+            let entry_path = Path::from_str(&raw_path).map_err(|e| {
+                FsError::common(format!("Failed to parse path '{}': {}", raw_path, e))
+            })?;
+
+            // Filter out the directory itself by comparing full paths
+            // This ensures we only return children of the directory, not the directory itself
+            // Similar to Alluxio's approach: compare full paths for accurate filtering
+            if entry_path.full_path() == path.full_path() {
+                continue;
+            }
+
+            let metadata = entry.metadata();
+            let status = Self::read_status(&entry_path, metadata);
+            statuses.push(status);
+        }
+
+        Ok(statuses)
+    }
 }
 
 impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
@@ -880,29 +908,37 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             .await
             .map_err(|e| FsError::common(format!("Failed to list directory: {}", e)))?;
 
-        let mut statuses = Vec::new();
-        for entry in list_result {
-            let raw_path = format!(
-                "{}://{}/{}",
-                self.scheme,
-                self.bucket_or_container,
-                entry.path().trim_end_matches('/')
-            );
-            let entry_path = Path::from_str(&raw_path)?;
-
-            if entry_path.path() == path.path() {
-                continue;
-            }
-
-            let metadata = entry.metadata();
-            let status = Self::read_status(&entry_path, metadata);
-            statuses.push(status);
-        }
-
-        Ok(statuses)
+        self.process_list(path, list_result)
     }
 
     async fn set_attr(&self, _path: &Path, _opts: SetAttrOpts) -> FsResult<()> {
         err_ufs!("SetAttr operation is not supported by OpenDAL file system")
+    }
+
+    async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {
+        let dir_path = self.get_dir_path(path)?;
+
+        let (start_after, limit) = if let Some(name) = opts.start_after {
+            let start_after = Some(format!("{}/{}", dir_path, name));
+            (start_after, opts.limit)
+        } else {
+            (None, opts.limit.map(|v| v + 1))
+        };
+
+        let opts = opendal::options::ListOptions {
+            limit,
+            start_after,
+            ..Default::default()
+        };
+
+        println!("opts {:?}", opts);
+
+        let list_result = self
+            .operator
+            .list_options(&dir_path, opts)
+            .await
+            .map_err(|e| FsError::common(format!("failed to list options: {}", e)))?;
+
+        self.process_list(path, list_result)
     }
 }

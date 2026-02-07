@@ -47,6 +47,7 @@ pub enum RpcCode {
     CreateFilesBatch = 23,
     AddBlocksBatch = 24,
     CompleteFilesBatch = 25,
+    ListOptions = 26,
 
     // manager interface.
     Mount = 30,

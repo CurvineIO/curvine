@@ -588,6 +588,20 @@ impl MasterHandler {
         };
         ctx.response(rep_header)
     }
+
+    pub fn list_options(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ListOptionsRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+
+        let opts = ProtoUtils::list_options_from_pb(header.options);
+        let list = self.fs.list_options(&header.path, opts)?;
+        let res = list
+            .into_iter()
+            .map(ProtoUtils::file_status_to_pb)
+            .collect();
+        let rep_header = ListOptionsResponse { statuses: res };
+        ctx.response(rep_header)
+    }
 }
 
 impl MessageHandler for MasterHandler {
@@ -619,6 +633,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::Delete => self.retry_check_delete(ctx),
             RpcCode::Rename => self.retry_check_rename(ctx),
             RpcCode::ListStatus => self.list_status(ctx),
+            RpcCode::ListOptions => self.list_options(ctx),
             RpcCode::GetBlockLocations => self.get_block_locations(ctx),
             RpcCode::SetAttr => self.set_attr_retry_check(ctx),
             RpcCode::Symlink => self.symlink_retry_check(ctx),

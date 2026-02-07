@@ -21,9 +21,9 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader};
 use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, LoadJobCommand,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
-    WriteType,
+    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, ListOptions,
+    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
+    SetAttrOpts, WriteType,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -576,6 +576,30 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 Ok(())
             }
             Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
+        }
+    }
+
+    async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["list_options".to_string()],
+        );
+
+        match self.get_mount(path).await? {
+            None => self.cv.list_options(path, opts).await,
+            Some((ufs_path, mount)) => mount.ufs.list_options(&ufs_path, opts).await,
+        }
+    }
+
+    async fn list_options_bytes(&self, path: &Path, opts: ListOptions) -> FsResult<BytesMut> {
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["list_status".to_string()],
+        );
+
+        match self.get_mount(path).await? {
+            None => self.cv.list_options_bytes(path, opts).await,
+            Some((ufs_path, mount)) => mount.ufs.list_options_bytes(&ufs_path, opts).await,
         }
     }
 }
