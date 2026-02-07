@@ -169,7 +169,10 @@ impl InodeStore {
         batch.write_inode(file)?;
         for commit in commit_blocks {
             for item in &commit.locations {
-                println!("DEBUG at InodeStore, at apply_new_block, location: {:?}", item);
+                println!(
+                    "DEBUG at InodeStore, at apply_new_block, location: {:?}",
+                    item
+                );
                 batch.add_location(commit.block_id, item)?;
             }
         }
@@ -207,7 +210,10 @@ impl InodeStore {
             for item in &commit.locations {
                 batch.add_location(commit.block_id, item)?;
             }
-            println!("DEBUG at InodeStore, at apply_complete_file, commit: {:?}", commit);
+            println!(
+                "DEBUG at InodeStore, at apply_complete_file, commit: {:?}",
+                commit
+            );
         }
 
         batch.commit()
@@ -503,7 +509,10 @@ impl InodeStore {
     }
 
     pub fn add_block_location(&self, block_id: i64, location: BlockLocation) -> CommonResult<()> {
-        println!("DEBUG at InodeStore, at add_block_location, location: {:?}", location);
+        println!(
+            "DEBUG at InodeStore, at add_block_location, location: {:?}",
+            location
+        );
         let mut batch = self.store.new_batch();
         batch.add_location(block_id, &location)?;
         batch.commit()?;

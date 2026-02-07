@@ -15,6 +15,7 @@
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
 use crate::master::meta::inode::SmallFileMeta;
+use crate::master::meta::inode::{InodeView, PATH_SEPARATOR};
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MountManager;
@@ -36,7 +37,6 @@ use orpc::io::net::ConnState;
 use orpc::message::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::master::meta::inode::{InodeView, PATH_SEPARATOR};
 struct ContainerBatchResult {
     container_status: FileStatus,
     container_meta: ContainerMetadataProto,
@@ -329,8 +329,14 @@ impl MasterHandler {
 
         // Create single container for all files
         let container_result = self.create_container_batch(ctx, &header.requests)?;
-        println!("DEBUG at MasterHandler, at create_container, container_result {:?}", container_result.container_status);
-        println!("DEBUG at MasterHandler, at create_container, container_meta {:?}", container_result.container_meta);
+        println!(
+            "DEBUG at MasterHandler, at create_container, container_result {:?}",
+            container_result.container_status
+        );
+        println!(
+            "DEBUG at MasterHandler, at create_container, container_meta {:?}",
+            container_result.container_meta
+        );
         // Create individual FileStatus objects for each file in container
         let mut container_files = Vec::new();
 
@@ -344,10 +350,12 @@ impl MasterHandler {
             file_status.len = container_result.container_meta.files[i].len;
             file_status.file_type = FileType::File; // Individual files, not Container
             file_status.id = ctx.msg.req_id() + i as i64;
-            println!("DEBUG at MasterHandler, at create_container, file_status {:?}", file_status);
+            println!(
+                "DEBUG at MasterHandler, at create_container, file_status {:?}",
+                file_status
+            );
             container_files.push(ProtoUtils::file_status_to_pb(file_status));
         }
-        
 
         let container_status_response = ContainerStatusReponse {
             container_id: container_result.container_meta.container_block_id,
@@ -385,7 +393,7 @@ impl MasterHandler {
         let container_path_len = container_path_components.len();
         let container_uuid_suffix = ctx.msg.req_id().to_string();
         let container_name = format!("container_{container_uuid_suffix}");
-        container_path_components[container_path_len -1] = container_name.clone();
+        container_path_components[container_path_len - 1] = container_name.clone();
         let container_path = container_path_components.join(PATH_SEPARATOR);
 
         // initialize container_opts
@@ -401,7 +409,10 @@ impl MasterHandler {
             OpenFlags::new_create(),
         )?;
 
-        println!("DEBUG at MasterHandler, at create_container_batch, container_status: {:?}", container_status);
+        println!(
+            "DEBUG at MasterHandler, at create_container_batch, container_status: {:?}",
+            container_status
+        );
         let container_meta = ContainerMetadataProto {
             container_block_id: container_status.id,
             container_path: container_path.clone(),
@@ -420,7 +431,10 @@ impl MasterHandler {
                 })
                 .collect(),
         };
-        println!("DEBUG at MasterHandler, at create_container_batch, container_meta: {:?}", container_meta);
+        println!(
+            "DEBUG at MasterHandler, at create_container_batch, container_meta: {:?}",
+            container_meta
+        );
         Ok(ContainerBatchResult {
             container_status,
             container_meta,
@@ -429,7 +443,7 @@ impl MasterHandler {
 
     // pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
     //     let header: AddBlocksBatchRequest = ctx.parse_header()?;
-        
+
     //     let mut results = Vec::with_capacity(header.requests.len());
     //     for req in header.requests {
     //         let path = req.path;

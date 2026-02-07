@@ -29,7 +29,7 @@ impl ContainerBlockWriterLocal {
         worker_address: WorkerAddress,
         pos: i64,
         container_status: ContainerStatus,
-        small_files_metadata: Vec<SmallFileMetaProto>
+        small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let block_size = fs_context.block_size();
@@ -46,7 +46,7 @@ impl ContainerBlockWriterLocal {
                 fs_context.write_chunk_size() as i32,
                 true,
                 container_status,
-                small_files_metadata
+                small_files_metadata,
             )
             .await?;
 

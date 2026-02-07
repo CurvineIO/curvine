@@ -272,10 +272,7 @@ impl FsClient {
         Ok(locate_block)
     }
 
-    pub async fn add_container_block(
-        &self,
-        container_path: String,
-    ) -> FsResult<LocatedBlock> {
+    pub async fn add_container_block(&self, container_path: String) -> FsResult<LocatedBlock> {
         let commit_blocks: Vec<CommitBlockProto> = Vec::new();
         let pb_request = AddBlockRequest {
             path: container_path,
@@ -313,7 +310,7 @@ impl FsClient {
             only_flush,
         };
 
-    let rep: CompleteFileResponse = self.rpc(RpcCode::CompleteFile, header).await?;
+        let rep: CompleteFileResponse = self.rpc(RpcCode::CompleteFile, header).await?;
 
         Ok(rep.file_blocks.map(ProtoUtils::file_blocks_from_pb))
     }
@@ -324,18 +321,18 @@ impl FsClient {
         client_name: String,
         commit_block: CommitBlock,
         only_flush: bool,
-        small_files_metadata: Vec<SmallFileMetaProto>
+        small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<bool> {
         let block_len = commit_block.block_len;
         let commit_block_proto = ProtoUtils::commit_block_to_pb(commit_block);
 
-        let files_index: HashMap<String, SmallFileMetaProto> = container_status  
-            .files  
-            .iter()  
-            .zip(small_files_metadata.iter())  
-            .map(|(file_status, meta)| {  
-                (file_status.name.clone(), meta.clone())  // Use name field as key  
-            })  
+        let files_index: HashMap<String, SmallFileMetaProto> = container_status
+            .files
+            .iter()
+            .zip(small_files_metadata.iter())
+            .map(|(file_status, meta)| {
+                (file_status.name.clone(), meta.clone()) // Use name field as key
+            })
             .collect();
         let pb_requests = CompleteContainerRequest {
             path: container_status.container_path,

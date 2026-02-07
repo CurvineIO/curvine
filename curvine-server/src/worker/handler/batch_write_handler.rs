@@ -22,8 +22,8 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::ExtendedBlockProto;
 use curvine_common::proto::{
     BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
-    BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadataProto, FileWriteDataProto,
-    ContainerWriteRequest, ContainerWriteResponse, SmallFileMetaProto,
+    BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadataProto,
+    ContainerWriteRequest, ContainerWriteResponse, FileWriteDataProto, SmallFileMetaProto,
 };
 use curvine_common::state::ExtendedBlock;
 use curvine_common::state::FileType;
@@ -47,7 +47,7 @@ pub struct BatchWriteHandler {
     pub(crate) container_block_id: i64,
     pub(crate) container_path: String,
     pub(crate) container_files: Vec<SmallFileMetaProto>,
-    pub(crate) container_name: String
+    pub(crate) container_name: String,
 }
 
 impl BatchWriteHandler {
@@ -63,7 +63,7 @@ impl BatchWriteHandler {
             container_block_id: 0,
             container_path: String::new(),
             container_files: Vec::new(),
-            container_name: String::new()
+            container_name: String::new(),
         }
     }
 
@@ -185,7 +185,7 @@ impl BatchWriteHandler {
         let total_size: i64 = block.block_size;
 
         let container_block = ExtendedBlock {
-            id: self.container_block_id ,// Utils::unique_id() as i64,
+            id: self.container_block_id, // Utils::unique_id() as i64,
             len: total_size,
             storage_type: StorageType::default(),
             file_type: FileType::Container, // New file type
@@ -357,7 +357,10 @@ impl BatchWriteHandler {
                 file_type: FileType::Container,
                 ..Default::default()
             };
-            println!("DEBUG at BatchWriteHandler, at complete_container_batch, container_block: {:?}", container_block);
+            println!(
+                "DEBUG at BatchWriteHandler, at complete_container_batch, container_block: {:?}",
+                container_block
+            );
             self.commit_block(&container_block, commit)?;
         }
 
@@ -381,7 +384,10 @@ impl BatchWriteHandler {
         }
 
         if let Some(ref container_meta) = header.container_meta {
-            println!("DEBUG at BatchWriteHandler, at complete_batch, container_meta: {:?}", container_meta);
+            println!(
+                "DEBUG at BatchWriteHandler, at complete_batch, container_meta: {:?}",
+                container_meta
+            );
             self.container_block_id = container_meta.container_block_id;
             self.container_path = container_meta.container_path.clone();
             self.container_files = container_meta.files.clone();
@@ -474,7 +480,10 @@ impl BatchWriteHandler {
             files: self.container_files.clone(),
         };
 
-        println!("DEBUG at BatchWriteHandler, updated_meta {:?}", updated_meta);
+        println!(
+            "DEBUG at BatchWriteHandler, updated_meta {:?}",
+            updated_meta
+        );
 
         let batch_response = ContainerWriteResponse {
             results,
@@ -505,12 +514,12 @@ impl BatchWriteHandler {
 
         // update block len
 
-        if let Some(files) = self.file.as_mut() {  
-            if let Some(first_file) = files.first_mut() {  
-                let current_pos = first_file.pos();  
-                // This will update both the file system and the len field  
-                first_file.resize(true, 0, current_pos, 0)?;  
-            }  
+        if let Some(files) = self.file.as_mut() {
+            if let Some(first_file) = files.first_mut() {
+                let current_pos = first_file.pos();
+                // This will update both the file system and the len field
+                first_file.resize(true, 0, current_pos, 0)?;
+            }
         }
 
         println!(

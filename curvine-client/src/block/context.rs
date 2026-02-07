@@ -56,7 +56,11 @@ impl CreateBatchBlockContext {
         }
     }
 
-    pub fn push(&mut self, context: CreateBlockContext, container_meta: Option<ContainerMetadataProto>) {
+    pub fn push(
+        &mut self,
+        context: CreateBlockContext,
+        container_meta: Option<ContainerMetadataProto>,
+    ) {
         self.contexts.push(context);
         self.container_meta = container_meta;
     }

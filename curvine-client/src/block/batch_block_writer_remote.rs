@@ -40,7 +40,7 @@ impl ContainerBlockWriterRemote {
         worker_address: WorkerAddress,
         pos: i64,
         container_status: ContainerStatus,
-        small_files_metadata: Vec<SmallFileMetaProto>     
+        small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<Self> {
         let req_id = Utils::req_id();
         let seq_id = 0;
@@ -61,7 +61,7 @@ impl ContainerBlockWriterRemote {
                 fs_context.write_chunk_size() as i32,
                 false,
                 container_status,
-                small_files_metadata
+                small_files_metadata,
             )
             .await?;
 
@@ -127,12 +127,18 @@ impl ContainerBlockWriterRemote {
         //         self.blocks[i].len = file_len;
         //     }
         // }
-        let file_len = files.iter().map(| x: &(&Path, &str) |  x.1.len()).sum::<usize>() as i64;
+        let file_len = files
+            .iter()
+            .map(|x: &(&Path, &str)| x.1.len())
+            .sum::<usize>() as i64;
         if self.block.len < file_len {
             self.block.len = file_len
         }
 
-        println!("DEBUG at Batch Block Writer Remote, after: {:?}", self.block);
+        println!(
+            "DEBUG at Batch Block Writer Remote, after: {:?}",
+            self.block
+        );
         Ok(())
     }
 
@@ -147,8 +153,14 @@ impl ContainerBlockWriterRemote {
 
     // Write complete
     pub async fn complete(&mut self) -> FsResult<()> {
-        println!("DEBUG at ContainerBlockWriterRemote, at complte, self.container_meta: {:?}", self.container_meta);
-        println!("DEBUG at ContainerBlockWriterRemote, at complte, self.blocks: {:?}", self.block);
+        println!(
+            "DEBUG at ContainerBlockWriterRemote, at complte, self.container_meta: {:?}",
+            self.container_meta
+        );
+        println!(
+            "DEBUG at ContainerBlockWriterRemote, at complte, self.blocks: {:?}",
+            self.block
+        );
         let next_seq_id = self.next_seq_id();
         self.client
             .write_commit_batch(

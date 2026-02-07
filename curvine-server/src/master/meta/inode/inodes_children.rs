@@ -91,7 +91,10 @@ impl InodeChildren {
     }
 
     pub fn get_child_in_container(&self, name: &str) -> Option<&InodeView> {
-        println!("DEBUG at InodeChildren, at get_child_in_container, name: {:?}", name);
+        println!(
+            "DEBUG at InodeChildren, at get_child_in_container, name: {:?}",
+            name
+        );
         match self {
             InodeChildren::List(list) => {
                 let index = Self::search_by_name(list, name);
@@ -101,11 +104,16 @@ impl InodeChildren {
                 }
             }
             InodeChildren::Map(map) => {
-                println!("DEBUG at InodeChildren, at get_child_in_container, map: {:?}", map);
+                println!(
+                    "DEBUG at InodeChildren, at get_child_in_container, map: {:?}",
+                    map
+                );
                 for child in map.values() {
-
                     if let InodeView::Container(_, container) = child.as_ref() {
-                        println!("DEBUG in InodeChildren, get_child_in_container, container: {:?} ", container);
+                        println!(
+                            "DEBUG in InodeChildren, get_child_in_container, container: {:?} ",
+                            container
+                        );
                         // Check if the file exists in this container's files HashMap
                         if container.files.contains_key(name) {
                             return Some(child.as_ref());

@@ -61,53 +61,53 @@ fn run_filesystem_end_to_end_operations_on_cluster(
         let path = Path::from_str("/fs_test")?;
         let _ = fs.delete(&path, true).await;
 
-        // mkdir(&fs).await?;
-        // println!("mkdir done");
+        mkdir(&fs).await?;
+        println!("mkdir done");
 
-        // create_file(&fs).await?;
-        // println!("create_file done");
+        create_file(&fs).await?;
+        println!("create_file done");
 
-        // test_overwrite(&fs).await?;
-        // println!("test_overwrite done");
+        test_overwrite(&fs).await?;
+        println!("test_overwrite done");
 
         test_batch_writting(&fs).await?;
         println!("test_batch_writting done");
 
-        // file_status(&fs).await?;
-        // println!("file_status done");
+        file_status(&fs).await?;
+        println!("file_status done");
 
-        // delete(&fs).await?;
-        // println!("delete done");
+        delete(&fs).await?;
+        println!("delete done");
 
-        // rename(&fs).await?;
-        // println!("rename done");
+        rename(&fs).await?;
+        println!("rename done");
 
-        // list_status(&fs).await?;
-        // println!("list_status done");
+        list_status(&fs).await?;
+        println!("list_status done");
 
-        // list_files(&fs).await?;
-        // println!("list_files done");
+        list_files(&fs).await?;
+        println!("list_files done");
 
-        // get_master_info(&fs).await?;
-        // println!("get_master_info done");
+        get_master_info(&fs).await?;
+        println!("get_master_info done");
 
-        // add_block(&fs).await?;
-        // println!("add_block done");
+        add_block(&fs).await?;
+        println!("add_block done");
 
-        // rename2(&fs).await?;
-        // println!("rename2 done");
+        rename2(&fs).await?;
+        println!("rename2 done");
 
-        // set_attr_non_recursive(&fs).await?;
-        // println!("set_attr_non_recursive done");
+        set_attr_non_recursive(&fs).await?;
+        println!("set_attr_non_recursive done");
 
-        // set_attr_recursive(&fs).await?;
-        // println!("set_attr_recursive done");
+        set_attr_recursive(&fs).await?;
+        println!("set_attr_recursive done");
 
-        // test_fs_used(&fs).await?;
-        // println!("test_fs_used done");
+        test_fs_used(&fs).await?;
+        println!("test_fs_used done");
 
-        // test_metrics(&fs).await?;
-        // println!("test_metrics done");
+        test_metrics(&fs).await?;
+        println!("test_metrics done");
 
         // symlink(&fs).await?;
         Ok(())
@@ -331,9 +331,15 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     for (i, (path, _)) in batch_files.clone().iter().enumerate() {
         let status = fs.get_status(path).await?;
 
-        println!("DEBUG at test_batch_writting, test_batch_writting, file status: {:?}", status);
+        println!(
+            "DEBUG at test_batch_writting, test_batch_writting, file status: {:?}",
+            status
+        );
         let content = read_file_content(fs, path).await?;
-        println!("DEBUG at test_batch_writting, test_batch_writting, content: {:?}", content);
+        println!(
+            "DEBUG at test_batch_writting, test_batch_writting, content: {:?}",
+            content
+        );
         if i == num_files - 1 {
             assert_eq!(
                 status.len, large_file_size as i64,

@@ -24,7 +24,6 @@ use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeDir {
     pub(crate) id: i64,
@@ -35,8 +34,8 @@ pub struct InodeDir {
     pub(crate) storage_policy: StoragePolicy,
 
     pub(crate) features: DirFeature,
-    
-    pub(crate) container_index: HashMap::<String, String>,
+
+    pub(crate) container_index: HashMap<String, String>,
     #[serde(skip)]
     children: InodeChildren,
 }
@@ -55,26 +54,25 @@ impl InodeDir {
             children: InodeChildren::new_map(),
         }
     }
-    
-    // pub fn remove_from_container_index(&mut self, file_name: &str) {  
-    //     self.children.remove_from_container_index(file_name);  
-    // }  
-      
-    // pub fn add_to_container_index(&mut self, file_name: String, container_name: String) {  
-    //     self.children.add_to_container_index(file_name, container_name);  
-    // } 
-    
 
-   pub fn remove_from_container_index(&mut self, file_name: &str) -> Option<String> {  
-        self.container_index.remove(file_name)  
+    // pub fn remove_from_container_index(&mut self, file_name: &str) {
+    //     self.children.remove_from_container_index(file_name);
+    // }
+
+    // pub fn add_to_container_index(&mut self, file_name: String, container_name: String) {
+    //     self.children.add_to_container_index(file_name, container_name);
+    // }
+
+    pub fn remove_from_container_index(&mut self, file_name: &str) -> Option<String> {
+        self.container_index.remove(file_name)
     }
 
-    pub fn add_to_container_index(&mut self, file_name: String, container_name: String) {  
-        self.container_index.insert(file_name, container_name);  
-    } 
-    pub fn get_container_for_file(&self, file_name: &str) -> Option<&String> {  
-        self.container_index.get(file_name)  
-    } 
+    pub fn add_to_container_index(&mut self, file_name: String, container_name: String) {
+        self.container_index.insert(file_name, container_name);
+    }
+    pub fn get_container_for_file(&self, file_name: &str) -> Option<&String> {
+        self.container_index.get(file_name)
+    }
     pub fn with_opts(id: i64, time: i64, opts: MkdirOpts) -> Self {
         Self {
             id,

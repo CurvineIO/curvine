@@ -16,8 +16,10 @@ use crate::block::batch_block_writer::BatchWriterAdapter::{BatchLocal, BatchRemo
 use crate::block::{ContainerBlockWriterLocal, ContainerBlockWriterRemote};
 use crate::file::FsContext;
 use curvine_common::fs::Path;
-use curvine_common::proto::{SmallFileMetaProto};
-use curvine_common::state::{CommitBlock, ContainerStatus, ExtendedBlock, LocatedBlock, WorkerAddress};
+use curvine_common::proto::SmallFileMetaProto;
+use curvine_common::state::{
+    CommitBlock, ContainerStatus, ExtendedBlock, LocatedBlock, WorkerAddress,
+};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
 use orpc::err_box;
@@ -63,17 +65,30 @@ impl BatchWriterAdapter {
         located_blocks: &LocatedBlock,
         worker_addr: &WorkerAddress,
         container_status: ContainerStatus,
-        small_files_metadata: Vec<SmallFileMetaProto>      
+        small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
         let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
 
-        println!("Debug at BatchWriterAdapter, located_blocks: {:?}", located_blocks);
-        println!("Debug at BatchWriterAdapter, worker_addr: {:?}", worker_addr);
+        println!(
+            "Debug at BatchWriterAdapter, located_blocks: {:?}",
+            located_blocks
+        );
+        println!(
+            "Debug at BatchWriterAdapter, worker_addr: {:?}",
+            worker_addr
+        );
         let block: ExtendedBlock = located_blocks.block.clone();
         let adapter = if short_circuit {
-            let writer =
-                ContainerBlockWriterLocal::new(fs_context, block, worker_addr.clone(), 0, container_status, small_files_metadata).await?;
+            let writer = ContainerBlockWriterLocal::new(
+                fs_context,
+                block,
+                worker_addr.clone(),
+                0,
+                container_status,
+                small_files_metadata,
+            )
+            .await?;
             BatchLocal(writer)
         } else {
             let writer = ContainerBlockWriterRemote::new(
@@ -119,14 +134,17 @@ impl ContainerBlockWriter {
                 &located_blocks,
                 addr,
                 container_status.clone(),
-                small_files_metadata.clone()
+                small_files_metadata.clone(),
             )
             .await?;
             inners.push(adapter);
         }
         let num_of_blocks = 1;
 
-        println!("DEBUG at ContainerBlockWriter, located_blocks: {:?} ",located_blocks);
+        println!(
+            "DEBUG at ContainerBlockWriter, located_blocks: {:?} ",
+            located_blocks
+        );
         Ok(Self {
             inners,
             fs_context,
@@ -196,11 +214,10 @@ impl ContainerBlockWriter {
         //     let mut commit_block = CommitBlock::from(located_block);
 
         //     // if let Some(&length) = self.file_lengths.get(i) {
-                
+
         //     // }
 
         //     commit_block.block_len += self.file_lengths.iter().map(|&len| len).sum::<i64>();
-
 
         //     commit_blocks.push(commit_block);
         // }
@@ -208,7 +225,7 @@ impl ContainerBlockWriter {
         let mut commit_block = CommitBlock::from(&self.located_blocks);
 
         commit_block.block_len = self.file_lengths.iter().map(|&len| len).sum::<i64>();
-            // commit_blocks.push(commit_block);
+        // commit_blocks.push(commit_block);
 
         commit_block
     }

@@ -22,10 +22,10 @@ use curvine_common::raft::RaftClient;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_common::FsResult;
 use log::info;
+use orpc::err_box;
+use orpc::sys::RawPtr;
 use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
 use std::sync::{mpsc, Mutex};
-use orpc::sys::RawPtr;
-use orpc::{err_box};
 
 enum SenderAdapter {
     Bounded(SyncSender<JournalEntry>),
@@ -130,28 +130,27 @@ impl JournalWriter {
         self.send(JournalEntry::ReopenFile(entry))
     }
 
+    pub fn log_add_block<P: AsRef<str>>(
+        &self,
+        op_ms: u64,
+        path: P,
+        inode: RawPtr<InodeView>,
+        commit_block: Vec<CommitBlock>,
+    ) -> FsResult<()> {
+        let blocks = match inode.as_ref() {
+            InodeView::File(_, file) => file.blocks.clone(),
+            InodeView::Container(_, container) => container.blocks.clone(),
+            _ => return err_box!("Cannot add block for non-file/container inode"),
+        };
 
-    pub fn log_add_block<P: AsRef<str>>(  
-        &self,  
-        op_ms: u64,  
-        path: P,  
-        inode: RawPtr<InodeView>,  
-        commit_block: Vec<CommitBlock>,  
-    ) -> FsResult<()> {  
-        let blocks = match inode.as_ref() {  
-            InodeView::File(_, file) => file.blocks.clone(),  
-            InodeView::Container(_, container) => container.blocks.clone(),  
-            _ => return err_box!("Cannot add block for non-file/container inode"),  
-        };  
-        
-        let entry = AddBlockEntry {  
-            op_ms,  
-            path: path.as_ref().to_string(),  
-            blocks,  
-            commit_block,  
-        };  
-    
-        self.send(JournalEntry::AddBlock(entry))  
+        let entry = AddBlockEntry {
+            op_ms,
+            path: path.as_ref().to_string(),
+            blocks,
+            commit_block,
+        };
+
+        self.send(JournalEntry::AddBlock(entry))
     }
     // pub fn log_add_block<P: AsRef<str>>(
     //     &self,
@@ -221,7 +220,6 @@ impl JournalWriter {
     //     self.send(JournalEntry::CompleteContainer(entry))
     // }
 
-
     pub fn log_complete_inode_entry<P: AsRef<str>>(
         &self,
         op_ms: u64,
@@ -235,7 +233,10 @@ impl JournalWriter {
             inode: inode.as_ref().clone(),
             commit_blocks,
         };
-        println!("DEBUG at JournalWriter, at log_complete_inode_entry, entry: {:?}",entry);
+        println!(
+            "DEBUG at JournalWriter, at log_complete_inode_entry, entry: {:?}",
+            entry
+        );
         self.send(JournalEntry::CompleteInode(entry))
     }
 
@@ -355,7 +356,6 @@ impl JournalWriter {
     //     Ok(())
     // }
 
-
     pub fn log_create_inode_entry(
         &self,
         op_ms: u64,
@@ -373,6 +373,4 @@ impl JournalWriter {
 
         Ok(())
     }
-
-    
 }

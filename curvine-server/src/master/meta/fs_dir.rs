@@ -349,8 +349,7 @@ impl FsDir {
         inp = self.add_last_inode(inp, Container(name.clone(), container.clone()))?;
         // self.journal_writer
         //     .log_create_container(op_ms, &inp.path(), &name, &container)?;
-        self.journal_writer
-            .log_create_inode_entry(op_ms, &inp)?;
+        self.journal_writer.log_create_inode_entry(op_ms, &inp)?;
 
         Ok(inp)
     }
@@ -458,7 +457,11 @@ impl FsDir {
         }
 
         let added = parent.add_child(child.clone())?;
-        println!("DEBUG at FsDir, after ad child, parent name is {:?}, with child is {:?}", parent.name(), child);
+        println!(
+            "DEBUG at FsDir, after ad child, parent name is {:?}, with child is {:?}",
+            parent.name(),
+            child
+        );
         self.store.apply_add(parent.as_ref(), added.as_ref())?;
         inp.append(added)?;
 
@@ -553,7 +556,10 @@ impl FsDir {
                 // create block.
                 container.add_block(BlockMeta::with_pre(block_in_container, choose_workers));
 
-                println!("DEBUG at FsDir, start with Container,accquire_new_block, container: {:?}", container);
+                println!(
+                    "DEBUG at FsDir, start with Container,accquire_new_block, container: {:?}",
+                    container
+                );
 
                 let block = ExtendedBlock {
                     id: 0, //always 0 because just exist only one block per container
@@ -602,12 +608,8 @@ impl FsDir {
                 //     commit_blocks,
                 // )?;
 
-                self.journal_writer.log_add_block(
-                    op_ms,
-                    inp.path(),
-                    inode,
-                    commit_blocks,
-                )?;
+                self.journal_writer
+                    .log_add_block(op_ms, inp.path(), inode, commit_blocks)?;
                 println!("pass acquire_new_block");
                 block
             }
@@ -670,12 +672,8 @@ impl FsDir {
         //     commit_block,
         // )?;
 
-        self.journal_writer.log_complete_inode_entry(
-            op_ms,
-            inp.path(),
-            inode,
-            commit_block,
-        )?;
+        self.journal_writer
+            .log_complete_inode_entry(op_ms, inp.path(), inode, commit_block)?;
 
         println!("pass complete file");
         Ok(true)
@@ -694,37 +692,43 @@ impl FsDir {
         let mut inode = try_option!(inp.get_last_inode());
         let container = inode.as_container_mut()?;
 
-        println!("DEBUG at MasterFileSystem, at complete_container, len: {:?}, commit_block {:?}", len, commit_block);
+        println!(
+            "DEBUG at MasterFileSystem, at complete_container, len: {:?}, commit_block {:?}",
+            len, commit_block
+        );
         container.complete(len, &commit_block, client_name, only_flush, files)?;
 
-        println!("DEBUG at FsDir, at complete_container, container: {:?}", container);
+        println!(
+            "DEBUG at FsDir, at complete_container, container: {:?}",
+            container
+        );
         self.evictor.on_access(container.id());
 
-        let container_name = inp.name().to_string();  
-        if let Some(parent) = inp.get_inode(-2) {  
-                match parent.as_mut() {  
-                InodeView::Dir(_, dir) => {  
-    
-                    if let InodeView::Container(_, container) = inode.as_ref() {  
-                        // Now dir is &mut InodeDir, so we can access container_index  
-                        dir.container_index.retain(|_, v| v != &container_name);  
-                        
-                        // Add new entries for all files in container  
-                        for file_name in container.files.keys() {  
-                            dir.add_to_container_index(file_name.clone(), container_name.clone());  
-                        }  
-                        
-                        // Persist updated parent directory  
+        let container_name = inp.name().to_string();
+        if let Some(parent) = inp.get_inode(-2) {
+            match parent.as_mut() {
+                InodeView::Dir(_, dir) => {
+                    if let InodeView::Container(_, container) = inode.as_ref() {
+                        // Now dir is &mut InodeDir, so we can access container_index
+                        dir.container_index.retain(|_, v| v != &container_name);
+
+                        // Add new entries for all files in container
+                        for file_name in container.files.keys() {
+                            dir.add_to_container_index(file_name.clone(), container_name.clone());
+                        }
+
+                        // Persist updated parent directory
                         println!("parent of container when complete: {:?}", parent);
-                        self.store.apply_complete_inode_entry(parent.as_ref(), &[])?;  
-                    }  
-                }  
-                _ => {  
-                    // Parent is not a directory - this shouldn't happen  
-                    return err_box!("Parent is not a directory");  
-                }  
-            }  
-        }  
+                        self.store
+                            .apply_complete_inode_entry(parent.as_ref(), &[])?;
+                    }
+                }
+                _ => {
+                    // Parent is not a directory - this shouldn't happen
+                    return err_box!("Parent is not a directory");
+                }
+            }
+        }
         self.store
             .apply_complete_inode_entry(inode.as_ref(), &[commit_block.clone()])?;
         // self.journal_writer.log_complete_container(

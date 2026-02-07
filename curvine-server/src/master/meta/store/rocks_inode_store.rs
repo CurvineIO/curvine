@@ -195,7 +195,10 @@ impl RocksInodeStore {
     }
 
     pub fn set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
-        println!("DEBUG at RocksInodeStorem, id: {:?} and lock: {:?}", id, lock);
+        println!(
+            "DEBUG at RocksInodeStorem, id: {:?} and lock: {:?}",
+            id, lock
+        );
         let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_LOCK, id);
         if lock.is_empty() {
             self.db.delete_cf(RocksInodeStore::CF_COMMON, key)

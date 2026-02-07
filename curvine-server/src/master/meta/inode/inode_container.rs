@@ -21,7 +21,7 @@ pub struct InodeContainer {
     pub(crate) total_size: i64,
     pub(crate) max_file_size: i64, // Threshold for small files
     pub(crate) replicas: u16,
-    pub(crate) len: i64
+    pub(crate) len: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ impl InodeContainer {
             total_size: 0,
             max_file_size: 1024 * 1024, // 1MB default threshold
             replicas: 0,
-            len: 0
+            len: 0,
         }
     }
 
@@ -73,7 +73,7 @@ impl InodeContainer {
             total_size: 0,
             max_file_size: 1024 * 1024, // 1MB default threshold
             replicas: opts.replicas,
-            len: 0
+            len: 0,
         };
         file.features.set_writing(opts.client_name);
         if !opts.x_attr.is_empty() {
@@ -92,7 +92,10 @@ impl InodeContainer {
         only_flush: bool,
         files: HashMap<String, SmallFileMeta>,
     ) -> FsResult<()> {
-        println!("DEBUG at InodeContainer, at complete, len: {:?}, commit_block {:?}, files {:?}", len, commit_block, files);
+        println!(
+            "DEBUG at InodeContainer, at complete, len: {:?}, commit_block {:?}, files {:?}",
+            len, commit_block, files
+        );
         self.files = files;
         self.mtime = LocalTime::mills() as i64;
         if !only_flush {
@@ -104,7 +107,7 @@ impl InodeContainer {
         );
         //update block meta
         let meta = self.blocks.first_mut().expect("can extract");
-      
+
         println!(
             "DEBUG at inode_container: at complete function, meta before: {:?}",
             meta
@@ -226,7 +229,6 @@ impl SmallFileMeta {
     }
 }
 
-
 // #[derive(Debug, Clone, Serialize, Deserialize)]
 // pub struct ContainerMetadata {
 //     pub(crate) container_block_id: i64,
@@ -235,22 +237,22 @@ impl SmallFileMeta {
 //     pub(crate) files: Vec<SmallFileMeta>,
 // }
 
-// impl ContainerMetadata {  
-//     pub fn from_proto(meta: curvine_common::proto::ContainerMetadataProto) -> Self {  
-//         Self {  
-//             container_block_id: meta.container_block_id,  
-//             container_path: meta.container_path,  
-//             container_name: meta.container_name,  
-//             files: meta.files.into_iter().map(SmallFileMeta::from_proto).collect(),  
-//         }  
-//     }  
-      
-//     pub fn to_proto(&self) -> curvine_common::proto::ContainerMetadataProto {  
-//         curvine_common::proto::ContainerMetadataProto {  
-//             container_block_id: self.container_block_id,  
-//             container_path: self.container_path.clone(),  
-//             container_name: self.container_name.clone(),  
-//             files: self.files.iter().map(|f| f.to_proto()).collect(),  
-//         }  
-//     }  
+// impl ContainerMetadata {
+//     pub fn from_proto(meta: curvine_common::proto::ContainerMetadataProto) -> Self {
+//         Self {
+//             container_block_id: meta.container_block_id,
+//             container_path: meta.container_path,
+//             container_name: meta.container_name,
+//             files: meta.files.into_iter().map(SmallFileMeta::from_proto).collect(),
+//         }
+//     }
+
+//     pub fn to_proto(&self) -> curvine_common::proto::ContainerMetadataProto {
+//         curvine_common::proto::ContainerMetadataProto {
+//             container_block_id: self.container_block_id,
+//             container_path: self.container_path.clone(),
+//             container_name: self.container_name.clone(),
+//             files: self.files.iter().map(|f| f.to_proto()).collect(),
+//         }
+//     }
 // }

@@ -413,7 +413,10 @@ impl CurvineFileSystem {
             create_requests.push((path.encode(), opts, flags));
         }
 
-        println!("DEBUG at handle_batch_files, create_requests: {:?}", create_requests);
+        println!(
+            "DEBUG at handle_batch_files, create_requests: {:?}",
+            create_requests
+        );
         let container_status = self.fs_client().create_container(create_requests).await?;
 
         println!(
@@ -423,14 +426,15 @@ impl CurvineFileSystem {
 
         // Step 2: Container Block allocation
         let container_path = container_status.container_path.clone();
-        let allocated_blocks: curvine_common::state::LocatedBlock = self
-            .fs_client()
-            .add_container_block(container_path)
-            .await?;
-        println!("at CurvineFileSystem: done add_container_block {:?}", allocated_blocks);
+        let allocated_blocks: curvine_common::state::LocatedBlock =
+            self.fs_client().add_container_block(container_path).await?;
+        println!(
+            "at CurvineFileSystem: done add_container_block {:?}",
+            allocated_blocks
+        );
 
         // Compute small files metadata for containerization
-        let small_files_metadata  = self.compute_container_metadata(files, &allocated_blocks)?;
+        let small_files_metadata = self.compute_container_metadata(files, &allocated_blocks)?;
         println!(
             "at CurvineFileSystem, add_block_requests: {:?}",
             allocated_blocks
@@ -454,9 +458,12 @@ impl CurvineFileSystem {
         // Step 4: Complete all files at worker side
         let commit_blocks = container_writer.complete().await?;
 
-        println!("DEBUG at CurvineFileSystem, commit_blocks: {:?}", commit_blocks);
+        println!(
+            "DEBUG at CurvineFileSystem, commit_blocks: {:?}",
+            commit_blocks
+        );
         // // Step 5: Batch complete at master side
-        
+
         self.fs_client()
             .complete_container(
                 container_status,

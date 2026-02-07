@@ -61,7 +61,7 @@ pub trait Dataset {
             Some(v) => {
                 println!("DEBUG at Dataset, get block_id: {:?}", id);
                 Ok(v)
-            },
+            }
         }
     }
 }

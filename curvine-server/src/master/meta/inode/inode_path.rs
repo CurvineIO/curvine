@@ -15,7 +15,7 @@
 use crate::master::meta::glob_utils::parse_glob_pattern;
 use crate::master::meta::inode::InodeView::{self, Container, Dir, File, FileEntry};
 use crate::master::meta::inode::{
-    EMPTY_PARENT_ID, InodeContainer, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID
+    InodeContainer, InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::meta::store::InodeStore;
 use orpc::{err_box, try_option, CommonResult};
@@ -71,9 +71,15 @@ impl InodePath {
                 _ => cur_inode.clone(),
             };
 
-            println!("DEBUG at InodePath, at resolve, resolved_inode: {:?}", resolved_inode);
+            println!(
+                "DEBUG at InodePath, at resolve, resolved_inode: {:?}",
+                resolved_inode
+            );
             inodes.push(resolved_inode);
-            println!("DEBUG at InodePath, at resolve ,after append inode, inodes: {:?}", inodes);
+            println!(
+                "DEBUG at InodePath, at resolve ,after append inode, inodes: {:?}",
+                inodes
+            );
 
             if index == components.len() - 1 {
                 break;

@@ -509,10 +509,18 @@ impl InodeView {
                 panic!("FileEntry does not support to_file_status");
             }
             Container(_, c) => {
-                println!("DEBUG at InodeView, file: {:?}, container c= {:?}", self.name(), c);
-                let file_name = Path::new(path).expect("Failed to parse path").name().to_owned();
+                println!(
+                    "DEBUG at InodeView, file: {:?}, container c= {:?}",
+                    self.name(),
+                    c
+                );
+                let file_name = Path::new(path)
+                    .expect("Failed to parse path")
+                    .name()
+                    .to_owned();
                 status.is_complete = true; // will update
-                status.len = c.files
+                status.len = c
+                    .files
                     .get(&file_name)
                     .map(|meta| meta.len as i64)
                     .unwrap_or(0);
@@ -525,7 +533,10 @@ impl InodeView {
             }
         }
 
-        println!("DEBUG at InodeView, at to_file_status, status: {:?}", status);
+        println!(
+            "DEBUG at InodeView, at to_file_status, status: {:?}",
+            status
+        );
         status
     }
 

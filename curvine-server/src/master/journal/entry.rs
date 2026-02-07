@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::{InodeView, SmallFileMeta};
 use crate::master::meta::inode::{InodeContainer, InodeDir, InodeFile};
+use crate::master::meta::inode::{InodeView, SmallFileMeta};
 use crate::master::meta::BlockMeta;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,6 @@ pub struct CreateContainerEntry {
     pub(crate) path: String,
     pub(crate) container: InodeContainer,
 }
-
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct CreateInodeEntry {
