@@ -19,7 +19,7 @@ use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::CommitBlock;
+use curvine_common::state::{CommitBlock, ListOptions};
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags,
@@ -445,5 +445,9 @@ impl CurvineFileSystem {
             .complete_files_batch(complete_requests)
             .await?;
         Ok(())
+    }
+
+    pub async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {
+        todo!()
     }
 }

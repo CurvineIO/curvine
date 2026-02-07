@@ -26,7 +26,8 @@ cc = "1.1"
 
 
 [features]
-# Storage backend implementations
+default = ["opendal-s3"]
+#Storage backend implementations
 ## OpenDAL implementations for various storage services
 opendal = ["dep:opendal"]
 opendal-s3 = ["opendal", "opendal/services-s3"]        # Amazon S3

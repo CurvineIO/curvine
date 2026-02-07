@@ -14,11 +14,13 @@
 
 use crate::fs::Path;
 use crate::proto::{GetFileStatusResponse, ListStatusResponse};
-use crate::state::{FileStatus, SetAttrOpts};
+use crate::state::{FileStatus, ListOptions, SetAttrOpts};
 use crate::utils::ProtoUtils;
 use crate::FsResult;
 use prost::bytes::BytesMut;
 use std::future::Future;
+use log::error;
+use orpc::err_box;
 
 pub trait FileSystem<Writer, Reader> {
     fn mkdir(&self, path: &Path, create_parent: bool) -> impl Future<Output = FsResult<bool>>;
@@ -63,4 +65,10 @@ pub trait FileSystem<Writer, Reader> {
     }
 
     fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> impl Future<Output = FsResult<()>>;
+
+    fn list_options(&self, _path: &Path, _opts: ListOptions) -> impl Future<Output = FsResult<Vec<FileStatus>>> {
+        async move {
+            err_box!("not supported list_options")
+        }
+    }
 }

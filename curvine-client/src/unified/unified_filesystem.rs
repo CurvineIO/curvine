@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::future::Future;
 use crate::file::{CurvineFileSystem, FsClient, FsContext, FsReader};
 use crate::rpc::JobMasterClient;
 use crate::unified::{CacheSyncWriter, MountCache, MountValue, UnifiedReader, UnifiedWriter};
@@ -20,11 +21,7 @@ use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader};
-use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, LoadJobCommand,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
-    WriteType,
-};
+use curvine_common::state::{ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, ListOptions, LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts, WriteType};
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use log::{error, info, warn};
@@ -576,6 +573,24 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 Ok(())
             }
             Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
+        }
+    }
+
+    async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["list_options".to_string()],
+        );
+
+        match self.get_mount(path).await? {
+            None => {
+                info!("xxx");
+                self.cv.list_options(path, opts).await
+            },
+            Some((ufs_path, mount)) => {
+                info!("xxx");
+                mount.ufs.list_options(&ufs_path, opts).await
+            },
         }
     }
 }
