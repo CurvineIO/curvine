@@ -499,7 +499,6 @@ impl CurvineFileSystem {
             }
         }
 
-
         Ok(metadata)
     }
 }

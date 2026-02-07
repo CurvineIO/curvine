@@ -509,11 +509,7 @@ impl InodeView {
                     .name()
                     .to_owned();
                 status.is_complete = true; // will update
-                status.len = c
-                    .files
-                    .get(&file_name)
-                    .map(|meta| meta.len)
-                    .unwrap_or(0);
+                status.len = c.files.get(&file_name).map(|meta| meta.len).unwrap_or(0);
                 status.replicas = 0; //will update
                 status.block_size = c.max_file_size; // will update
                 status.file_type = FileType::Container;

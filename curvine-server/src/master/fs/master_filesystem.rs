@@ -553,7 +553,6 @@ impl MasterFilesystem {
                     block,
                     locs: choose_workers,
                 }
-
             } // Err::<(), Box<dyn std::error::Error + Send + Sync>>(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path is not a file"))  ),
         };
 
