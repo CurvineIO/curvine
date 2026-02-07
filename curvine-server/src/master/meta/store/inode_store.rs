@@ -19,10 +19,8 @@ use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
 use curvine_common::state::{BlockLocation, CommitBlock, FileLock, MountInfo};
-use curvine_common::utils::SerdeUtils as Serde;
 use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, try_option, CommonResult};
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
 

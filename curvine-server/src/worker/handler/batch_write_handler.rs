@@ -16,33 +16,28 @@
 use crate::worker::block::BlockStore;
 use crate::worker::handler::WriteContext;
 use crate::worker::handler::WriteHandler;
-use curvine_client::block;
 use curvine_common::error::FsError;
-use curvine_common::fs::RpcCode;
 use curvine_common::proto::ExtendedBlockProto;
 use curvine_common::proto::{
-    BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
+    BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
     BlocksBatchWriteRequest, BlocksBatchWriteResponse, ContainerMetadataProto,
     ContainerWriteRequest, ContainerWriteResponse, FileWriteDataProto, SmallFileMetaProto,
 };
 use curvine_common::state::ExtendedBlock;
 use curvine_common::state::FileType;
 use curvine_common::state::StorageType;
-use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use orpc::common::Utils;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::DataSlice;
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
-    pub(crate) context: Option<Vec<WriteContext>>,
+    pub(crate) _context: Option<Vec<WriteContext>>,
     pub(crate) file: Option<Vec<LocalFile>>,
     pub(crate) is_commit: bool,
-    pub(crate) write_handler: WriteHandler,
+    pub(crate) _write_handler: WriteHandler,
     // for small file containerization
     pub(crate) container_block_id: i64,
     pub(crate) container_path: String,
@@ -56,10 +51,10 @@ impl BatchWriteHandler {
         println!("DEBUG at BatchWriteHandler, call new:()");
         Self {
             store,
-            context: None,
+            _context: None,
             file: None,
             is_commit: false,
-            write_handler: WriteHandler::new(store_clone),
+            _write_handler: WriteHandler::new(store_clone),
             container_block_id: 0,
             container_path: String::new(),
             container_files: Vec::new(),
@@ -67,7 +62,7 @@ impl BatchWriteHandler {
         }
     }
 
-    fn check_context(context: &WriteContext, msg: &Message) -> FsResult<()> {
+    fn _check_context(context: &WriteContext, msg: &Message) -> FsResult<()> {
         if context.req_id != msg.req_id() {
             return err_box!(
                 "Request id mismatch, expected {}, actual {}",
@@ -159,13 +154,13 @@ impl BatchWriteHandler {
             id: self.container_block_id,
             path: Some(self.container_path.clone()),
             off: 0,
-            block_size: block_size,
+            block_size,
             storage_type: StorageType::default() as i32,
         };
 
         let batch_response = BlocksBatchWriteResponse {
             responses: vec![container_response],
-            container_meta: container_meta,
+            container_meta,
         };
 
         Ok(Builder::success(msg).proto_header(batch_response).build())
@@ -199,7 +194,7 @@ impl BatchWriteHandler {
 
         // Use existing open_block method like WriteHandler
         let container_meta = self.store.open_block(&container_block)?;
-        let mut container_file = container_meta.create_writer(0, false)?;
+        let container_file = container_meta.create_writer(0, false)?;
 
         self.container_block_id = container_meta.id();
         self.container_path = container_file.path().to_string();
@@ -315,7 +310,7 @@ impl BatchWriteHandler {
 
     fn complete_container_batch(
         &mut self,
-        block: &ExtendedBlockProto,
+        _block: &ExtendedBlockProto,
         commit: bool,
     ) -> FsResult<()> {
         println!(
@@ -456,7 +451,6 @@ impl BatchWriteHandler {
     // }
     pub fn write_batch(&mut self, msg: &Message) -> FsResult<Message> {
         let header: ContainerWriteRequest = msg.parse_header()?;
-        let mut results = Vec::new();
 
         if let Some(ref container_meta) = header.container_meta {
             println!(
@@ -471,7 +465,7 @@ impl BatchWriteHandler {
         // Container optimization: write all files to single container
         self.write_container_batch(&header.files)?;
 
-        results = vec![true; header.files.len()];
+        let results = vec![true; header.files.len()];
 
         let updated_meta = ContainerMetadataProto {
             container_block_id: self.container_block_id,

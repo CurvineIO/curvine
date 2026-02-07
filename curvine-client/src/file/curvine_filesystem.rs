@@ -13,14 +13,13 @@
 // limitations under the License.
 
 use crate::block::ContainerBlockWriter;
-use crate::file::{self, FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
+use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::proto::SmallFileMetaProto;
-use curvine_common::state::CommitBlock;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags,
@@ -34,7 +33,6 @@ use log::warn;
 use orpc::client::ClientConf;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, err_ext};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -479,14 +477,14 @@ impl CurvineFileSystem {
     fn compute_container_metadata(
         &self,
         files: &[(&Path, &str)],
-        allocated_blocks: &curvine_common::state::LocatedBlock,
+        _allocated_blocks: &curvine_common::state::LocatedBlock,
     ) -> FsResult<Vec<SmallFileMetaProto>> {
         const SMALL_FILE_THRESHOLD: i64 = 64 * 1024; // 64KB
 
         let mut metadata = Vec::new();
         let mut offset = 0;
 
-        for (i, (path, content)) in files.iter().enumerate() {
+        for (_path, content) in files.iter() {
             let file_size = content.len() as i64;
 
             // Only include small files in container metadata
@@ -500,6 +498,7 @@ impl CurvineFileSystem {
                 offset += file_size;
             }
         }
+
 
         Ok(metadata)
     }

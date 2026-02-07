@@ -18,7 +18,6 @@ use curvine_common::fs::Path;
 use curvine_common::proto::{ContainerMetadataProto, SmallFileMetaProto};
 use curvine_common::state::{ContainerStatus, ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
-use moka::ops::compute::Op;
 use orpc::common::Utils;
 use orpc::err_box;
 

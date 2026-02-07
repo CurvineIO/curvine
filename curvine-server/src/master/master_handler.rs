@@ -365,7 +365,7 @@ impl MasterHandler {
             mtime: container_result.container_status.mtime,
             block_size: container_result.container_status.block_size,
             file_type: FileType::Container.into(),
-            replicas: container_result.container_status.replicas as i32,
+            replicas: container_result.container_status.replicas,
             storage_policy: ProtoUtils::storage_policy_to_pb(
                 container_result.container_status.storage_policy,
             ),
@@ -416,7 +416,7 @@ impl MasterHandler {
         let container_meta = ContainerMetadataProto {
             container_block_id: container_status.id,
             container_path: container_path.clone(),
-            container_name: container_name,
+            container_name,
             files: requests
                 .iter()
                 .enumerate()

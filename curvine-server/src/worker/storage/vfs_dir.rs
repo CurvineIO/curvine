@@ -14,12 +14,9 @@
 
 use crate::worker::block::{BlockMeta, BlockState};
 use crate::worker::storage::{DirState, StorageVersion, ACTIVE_DIR, STAGING_DIR};
-use byteorder::{BigEndian, WriteBytesExt};
 use curvine_common::conf::WorkerDataDir;
-use curvine_common::state::FileType;
 use curvine_common::state::{ExtendedBlock, StorageType};
 use log::*;
-use orpc::common::Utils;
 use orpc::common::{ByteUnit, FileUtils};
 use orpc::io::LocalFile;
 use orpc::sync::AtomicLong;

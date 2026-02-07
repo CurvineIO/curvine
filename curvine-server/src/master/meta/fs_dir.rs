@@ -29,7 +29,6 @@ use curvine_common::state::{
 };
 use curvine_common::FsResult;
 use log::{info, warn};
-use orpc::common::Utils;
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
@@ -550,7 +549,7 @@ impl FsDir {
                 println!("DEBUG at FsDir, start with Container");
                 let container = inode.as_container_mut()?;
 
-                let block_in_container = 0 as i64;
+                let block_in_container = 0;
 
                 println!("DEBUG at FsDir, start with Container, before add_block, with curr_block_id: {:?} curr_block_id, and choose_workers: {:?}", block_in_container, choose_workers);
                 // create block.
@@ -729,8 +728,10 @@ impl FsDir {
                 }
             }
         }
+        // self.store
+        //     .apply_complete_inode_entry(inode.as_ref(), &[commit_block.clone()])?;
         self.store
-            .apply_complete_inode_entry(inode.as_ref(), &[commit_block.clone()])?;
+            .apply_complete_inode_entry(inode.as_ref(), std::slice::from_ref(&commit_block))?;
         // self.journal_writer.log_complete_container(
         //     op_ms,
         //     inp.path(),

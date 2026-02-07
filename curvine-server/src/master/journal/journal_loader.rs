@@ -221,7 +221,7 @@ impl JournalLoader {
                 InodeView::Container(_, new_container),
             ) => {
                 // Get parent directory using get_inode(-2)
-                if let Some(mut parent) = inp.get_inode(-2) {
+                if let Some(parent) = inp.get_inode(-2) {
                     println!(
                         "DEBUG at JournalLoader, before update container index for {:?}",
                         parent

@@ -44,25 +44,15 @@ pub enum InodeView {
 
 impl InodeView {
     pub fn is_dir(&self) -> bool {
-        match self {
-            Dir(_, _) => true,
-            _ => false,
-        }
+        matches!(self, Dir(_, _))
     }
 
     pub fn is_file(&self) -> bool {
-        match self {
-            File(_, _) => true,
-            FileEntry(_, _) => true,
-            _ => false,
-        }
+        matches!(self, File(_, _) | FileEntry(_, _))
     }
 
     pub fn is_container(&self) -> bool {
-        match self {
-            Container(_, _) => true,
-            _ => false,
-        }
+        matches!(self, Container(_, _))
     }
 
     pub fn is_file_entry(&self) -> bool {
@@ -78,7 +68,7 @@ impl InodeView {
             File(_, f) => f.id(),
             Dir(_, d) => d.id(),
             FileEntry(_, id) => *id,
-            Container(_, c) => c.id as i64, // will update
+            Container(_, c) => c.id, // will update
         }
     }
     pub fn ttl_config(&self) -> Option<TtlConfig> {
@@ -86,7 +76,7 @@ impl InodeView {
             File(_, f) => TtlConfig::from_storage_policy(&f.storage_policy),
             Dir(_, d) => TtlConfig::from_storage_policy(&d.storage_policy),
             FileEntry(_, _) => None,
-            Container(_, c) => None, // will update
+            Container(_, _c) => None, // will update
         }
     }
     pub fn name(&self) -> &str {
@@ -132,7 +122,7 @@ impl InodeView {
             File(_, _) => None,
             Dir(_, d) => d.get_child(name),
             FileEntry(..) => None,
-            Container(_, c) => None, // will update
+            Container(_, _c) => None, // will update
         }
     }
 
@@ -141,7 +131,7 @@ impl InodeView {
             File(_, _) => None,
             Dir(_, d) => d.get_child_ptr(name, false),
             FileEntry(..) => None,
-            Container(_, c) => None,
+            Container(_, _c) => None,
         }
     }
 
@@ -162,7 +152,7 @@ impl InodeView {
             File(_, _) => 0,
             Dir(_, d) => d.children_iter().len(),
             FileEntry(..) => 0,
-            Container(_, c) => 0, // will update
+            Container(_, _c) => 0, // will update
         }
     }
 
@@ -189,7 +179,7 @@ impl InodeView {
             File(_, f) => f.mtime(),
             Dir(_, d) => d.mtime(),
             FileEntry(..) => 0,
-            Container(_, c) => 0, // will update
+            Container(_, _c) => 0, // will update
         }
     }
 
@@ -259,7 +249,7 @@ impl InodeView {
             File(_, f) => f.atime(),
             Dir(_, d) => d.atime(),
             FileEntry(..) => 0,
-            Container(_, c) => 0, // will update
+            Container(_, _c) => 0, // will update
         }
     }
 
@@ -336,7 +326,7 @@ impl InodeView {
             FileEntry(..) => {
                 panic!("FileEntry does not support mutable ACL access")
             }
-            Container(_, c) => {
+            Container(_, _c) => {
                 panic!("FileEntry does not support mutable ACL access")
             } // will update
         }
@@ -349,7 +339,7 @@ impl InodeView {
             FileEntry(..) => {
                 panic!("FileEntry does not support storage policy access")
             }
-            Container(_, c) => {
+            Container(_, _c) => {
                 panic!("FileEntry does not support storage policy access")
             } // will update
         }
@@ -362,7 +352,7 @@ impl InodeView {
             FileEntry(..) => {
                 panic!("FileEntry does not support mutable storage policy access")
             }
-            Container(_, c) => {
+            Container(_, _c) => {
                 panic!("FileEntry does not support mutable storage policy access")
             } // will update
         }
@@ -375,7 +365,7 @@ impl InodeView {
             FileEntry(..) => {
                 panic!("FileEntry does not support x_attr access")
             }
-            Container(_, c) => {
+            Container(_, _c) => {
                 panic!("FileEntry does not support x_attr access")
             } // will update
         }
@@ -388,7 +378,7 @@ impl InodeView {
             FileEntry(..) => {
                 panic!("FileEntry does not support mutable x_attr access")
             }
-            Container(_, c) => {
+            Container(_, _c) => {
                 panic!("FileEntry does not support mutable x_attr access")
             } // will update
         }
@@ -522,7 +512,7 @@ impl InodeView {
                 status.len = c
                     .files
                     .get(&file_name)
-                    .map(|meta| meta.len as i64)
+                    .map(|meta| meta.len)
                     .unwrap_or(0);
                 status.replicas = 0; //will update
                 status.block_size = c.max_file_size; // will update

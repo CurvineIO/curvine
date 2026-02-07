@@ -28,7 +28,6 @@ use orpc::runtime::RpcRuntime;
 use prost::Message as PMessage;
 use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
-use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct FsClient {
@@ -109,8 +108,8 @@ impl FsClient {
                     container_path: container.container_path,
                     container_name: container.container_name,
                     files: individual_files,
-                    total_size: total_size,
-                    file_count: file_count,
+                    total_size,
+                    file_count,
                 })
             }
             _ => Err(FsError::common("No result in batch response")),
@@ -337,9 +336,9 @@ impl FsClient {
         let pb_requests = CompleteContainerRequest {
             path: container_status.container_path,
             len: block_len,
-            client_name: client_name,
+            client_name,
             commit_block: commit_block_proto,
-            only_flush: only_flush,
+            only_flush,
             files: files_index,
         };
 

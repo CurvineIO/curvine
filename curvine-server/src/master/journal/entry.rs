@@ -13,11 +13,10 @@
 // limitations under the License.
 
 use crate::master::meta::inode::{InodeContainer, InodeDir, InodeFile};
-use crate::master::meta::inode::{InodeView, SmallFileMeta};
+use crate::master::meta::inode::InodeView;
 use crate::master::meta::BlockMeta;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct MkdirEntry {

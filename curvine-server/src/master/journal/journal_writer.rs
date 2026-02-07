@@ -15,7 +15,7 @@
 #![allow(clippy::result_large_err)]
 
 use crate::master::journal::*;
-use crate::master::meta::inode::{InodeContainer, InodeDir, InodeFile, InodePath, InodeView};
+use crate::master::meta::inode::{InodeDir, InodeFile, InodePath, InodeView};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;

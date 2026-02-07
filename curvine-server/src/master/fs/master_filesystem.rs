@@ -525,8 +525,8 @@ impl MasterFilesystem {
             InodeView::File(_, _) => {
                 let file = inode.as_file_ref()?;
                 if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
-                    let locs = fs_dir.get_block_locations(next.id)?;
-                    let extend_block = ExtendedBlock {
+                    let _locs = fs_dir.get_block_locations(next.id)?;
+                    let _extend_block = ExtendedBlock {
                         id: next.id,
                         len: next.len,
                         storage_type: file.storage_policy.storage_type,
@@ -539,24 +539,21 @@ impl MasterFilesystem {
                 let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
                 let block =
                     fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
-                let located = LocatedBlock {
+                LocatedBlock {
                     block,
                     locs: choose_workers,
-                };
-
-                located
+                }
                 // Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
             }
             _ => {
                 let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
                 let block =
                     fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
-                let located = LocatedBlock {
+                LocatedBlock {
                     block,
                     locs: choose_workers,
-                };
+                }
 
-                located
             } // Err::<(), Box<dyn std::error::Error + Send + Sync>>(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path is not a file"))  ),
         };
 
@@ -791,13 +788,13 @@ impl MasterFilesystem {
         // };
 
         let locate_blocks: FileBlocks = match inode.as_ref() {
-            InodeView::File(_, file) => FileBlocks {
+            InodeView::File(_, _file) => FileBlocks {
                 status: inode.to_file_status(path),
                 block_locs: block_locs.clone(),
             },
-            InodeView::Container(_, container) => FileBlocks {
+            InodeView::Container(_, _container) => FileBlocks {
                 status: inode.to_file_status(path),
-                block_locs: block_locs,
+                block_locs,
             },
             _ => return err_box!("Path must be a file or container"),
         };

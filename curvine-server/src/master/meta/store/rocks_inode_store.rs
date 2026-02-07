@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::{Inode, InodeContainer, InodeView, SmallFileMeta};
+use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
 use curvine_common::state::{BlockLocation, FileLock, MountInfo};

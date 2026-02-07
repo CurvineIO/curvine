@@ -30,7 +30,6 @@ use curvine_common::proto::{
 use curvine_common::state::{ContainerStatus, ExtendedBlock, StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
-use moka::ops::compute::Op;
 use orpc::client::RpcClient;
 use orpc::common::LocalTime;
 use orpc::message::{Builder, Message, RequestStatus};

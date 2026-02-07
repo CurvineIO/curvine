@@ -22,7 +22,6 @@ use curvine_common::state::{
 };
 use curvine_common::FsResult;
 use futures::future::try_join_all;
-use orpc::err_box;
 use std::sync::Arc;
 
 enum BatchWriterAdapter {
@@ -224,7 +223,8 @@ impl ContainerBlockWriter {
 
         let mut commit_block = CommitBlock::from(&self.located_blocks);
 
-        commit_block.block_len = self.file_lengths.iter().map(|&len| len).sum::<i64>();
+        commit_block.block_len = self.file_lengths.iter().copied().sum::<i64>();
+
         // commit_blocks.push(commit_block);
 
         commit_block
