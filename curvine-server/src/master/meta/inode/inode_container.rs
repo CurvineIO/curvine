@@ -17,7 +17,7 @@ pub struct InodeContainer {
     pub(crate) storage_policy: StoragePolicy,
     pub(crate) features: FileFeature,
     pub(crate) files: HashMap<String, SmallFileMeta>,
-    pub(crate) blocks: Vec<BlockMeta>, // convert to only one block
+    pub(crate) block: BlockMeta, // convert to only one block
     pub(crate) total_size: i64,
     pub(crate) max_file_size: i64, // Threshold for small files
     pub(crate) replicas: u16,
@@ -43,7 +43,7 @@ impl InodeContainer {
             storage_policy: Default::default(),
             features: FileFeature::new(),
             files: HashMap::new(),
-            blocks: Vec::new(),
+            block: BlockMeta::new(id, 0),
             total_size: 0,
             max_file_size: 1024 * 1024, // 1MB default threshold
             replicas: 0,
@@ -69,7 +69,7 @@ impl InodeContainer {
                 },
             },
             files: HashMap::new(),
-            blocks: Vec::new(),
+            block: BlockMeta::new(id, 0),
             total_size: 0,
             max_file_size: 1024 * 1024, // 1MB default threshold
             replicas: opts.replicas,
@@ -103,24 +103,25 @@ impl InodeContainer {
         }
         println!(
             "DEBUG at Inode_Container: at complete function, block: {:?}",
-            self.blocks
+            self.block
         );
         //update block meta
-        let meta = self.blocks.first_mut().expect("can extract");
+        self.block.commit(commit_block);
+        // let mut meta = self.block;
 
-        println!(
-            "DEBUG at inode_container: at complete function, meta before: {:?}",
-            meta
-        );
-        meta.commit(commit_block);
+        // println!(
+        //     "DEBUG at inode_container: at complete function, meta before: {:?}",
+        //     meta
+        // );
+        // meta.commit(commit_block);
 
-        println!(
-            "DEBUG at inode_container: at complete function, meta after: {:?}",
-            meta
-        );
-        //update Inode container len
-        // self.len = self.len.max(len);
-        println!("DEBUG at InodeContainer, meta: {:?}", meta);
+        // println!(
+        //     "DEBUG at inode_container: at complete function, meta after: {:?}",
+        //     meta
+        // );
+        // //update Inode container len
+        // // self.len = self.len.max(len);
+        // println!("DEBUG at InodeContainer, meta: {:?}", meta);
         Ok(())
     }
 
@@ -153,11 +154,11 @@ impl InodeContainer {
     }
 
     pub fn add_block(&mut self, block: BlockMeta) {
-        self.blocks.push(block);
+        self.block = block;
     }
 
     pub fn block_ids(&self) -> Vec<i64> {
-        self.blocks.iter().map(|x| x.id).collect()
+        vec![self.block.id]
     }
 
     pub fn is_complete(&self) -> bool {

@@ -139,7 +139,7 @@ impl JournalWriter {
     ) -> FsResult<()> {
         let blocks = match inode.as_ref() {
             InodeView::File(_, file) => file.blocks.clone(),
-            InodeView::Container(_, container) => container.blocks.clone(),
+            InodeView::Container(_, container) => vec![container.block.clone()],
             _ => return err_box!("Cannot add block for non-file/container inode"),
         };
 

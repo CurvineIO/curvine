@@ -311,10 +311,6 @@ impl BlockClient {
         small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<CreateBatchBlockContext> {
         println!("Debug, at BlockClient: blocks={:?}", block);
-        // let blocks_pb: Vec<_> = blocks
-        //     .iter()
-        //     .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
-        //     .collect();
         let block_pb = ProtoUtils::extend_block_to_pb(block.clone());
 
         let req_header = BlocksBatchWriteRequest {
@@ -330,7 +326,7 @@ impl BlockClient {
                 container_block_id: 0, // will be set by worker
                 container_path: container_status.container_path.clone(),
                 container_name: container_status.container_name.clone(),
-                files: small_files_metadata, // All files in one metadata
+                files: small_files_metadata,
             },
         };
 

@@ -479,8 +479,6 @@ impl CurvineFileSystem {
         files: &[(&Path, &str)],
         _allocated_blocks: &curvine_common::state::LocatedBlock,
     ) -> FsResult<Vec<SmallFileMetaProto>> {
-        const SMALL_FILE_THRESHOLD: i64 = 64 * 1024; // 64KB
-
         let mut metadata = Vec::new();
         let mut offset = 0;
 
@@ -488,15 +486,13 @@ impl CurvineFileSystem {
             let file_size = content.len() as i64;
 
             // Only include small files in container metadata
-            if file_size <= SMALL_FILE_THRESHOLD {
-                metadata.push(SmallFileMetaProto {
-                    offset,
-                    len: file_size,
-                    block_index: 0,
-                    mtime: 0, // Will be set during write
-                });
-                offset += file_size;
-            }
+            metadata.push(SmallFileMetaProto {
+                offset,
+                len: file_size,
+                block_index: 0,
+                mtime: 0, // Will be set during write
+            });
+            offset += file_size;
         }
 
         Ok(metadata)
