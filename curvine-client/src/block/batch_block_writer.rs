@@ -61,7 +61,7 @@ impl BatchWriterAdapter {
     // Create new WriterAdapter
     async fn new(
         fs_context: Arc<FsContext>,
-        located_blocks: &LocatedBlock,
+        located_block: &LocatedBlock,
         worker_addr: &WorkerAddress,
         container_status: ContainerStatus,
         small_files_metadata: Vec<SmallFileMetaProto>,
@@ -70,14 +70,14 @@ impl BatchWriterAdapter {
         let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
 
         println!(
-            "Debug at BatchWriterAdapter, located_blocks: {:?}",
-            located_blocks
+            "Debug at BatchWriterAdapter, located_block: {:?}",
+            located_block
         );
         println!(
             "Debug at BatchWriterAdapter, worker_addr: {:?}",
             worker_addr
         );
-        let block: ExtendedBlock = located_blocks.block.clone();
+        let block: ExtendedBlock = located_block.block.clone();
         let adapter = if short_circuit {
             let writer = ContainerBlockWriterLocal::new(
                 fs_context,
@@ -109,7 +109,7 @@ impl BatchWriterAdapter {
 pub struct ContainerBlockWriter {
     inners: Vec<BatchWriterAdapter>,
     fs_context: Arc<FsContext>,
-    located_blocks: LocatedBlock,
+    located_block: LocatedBlock,
     file_lengths: Vec<i64>,
 }
 impl ContainerBlockWriter {
@@ -117,20 +117,16 @@ impl ContainerBlockWriter {
     pub async fn new(
         fs_context: Arc<FsContext>,
         container_status: ContainerStatus,
-        located_blocks: LocatedBlock, // all blocks have the same worker information
+        located_block: LocatedBlock,
         small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<Self> {
-        // if located_blocks.is_empty() {
-        //     return err_box!("No blocks provided");
-        // }
-
         // Create adapters for each worker (same workers for all blocks)
-        let mut inners = Vec::with_capacity(located_blocks.locs.len());
-        for addr in &located_blocks.locs {
+        let mut inners = Vec::with_capacity(located_block.locs.len());
+        for addr in &located_block.locs {
             // Create a batch adapter that can handle multiple blocks
             let adapter = BatchWriterAdapter::new(
                 fs_context.clone(),
-                &located_blocks,
+                &located_block,
                 addr,
                 container_status.clone(),
                 small_files_metadata.clone(),
@@ -141,13 +137,13 @@ impl ContainerBlockWriter {
         let num_of_blocks = 1;
 
         println!(
-            "DEBUG at ContainerBlockWriter, located_blocks: {:?} ",
-            located_blocks
+            "DEBUG at ContainerBlockWriter, located_block: {:?} ",
+            located_block
         );
         Ok(Self {
             inners,
             fs_context,
-            located_blocks,
+            located_block,
             file_lengths: Vec::with_capacity(num_of_blocks),
         })
     }
@@ -206,10 +202,10 @@ impl ContainerBlockWriter {
     }
 
     pub fn to_commit_blocks(&self) -> CommitBlock {
-        // let mut commit_blocks = Vec::with_capacity(self.located_blocks.len());
+        // let mut commit_blocks = Vec::with_capacity(self.located_block.len());
 
-        // println!("DEBUG at ContainerBlockWriter, at to_commit_blocks, located_blocks {:?}", self.located_blocks);
-        // for (i, located_block) in self.located_blocks.iter().enumerate() {
+        // println!("DEBUG at ContainerBlockWriter, at to_commit_blocks, located_block {:?}", self.located_block);
+        // for (i, located_block) in self.located_block.iter().enumerate() {
         //     let mut commit_block = CommitBlock::from(located_block);
 
         //     // if let Some(&length) = self.file_lengths.get(i) {
@@ -221,7 +217,7 @@ impl ContainerBlockWriter {
         //     commit_blocks.push(commit_block);
         // }
 
-        let mut commit_block = CommitBlock::from(&self.located_blocks);
+        let mut commit_block = CommitBlock::from(&self.located_block);
 
         commit_block.block_len = self.file_lengths.iter().copied().sum::<i64>();
 
