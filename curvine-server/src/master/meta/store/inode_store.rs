@@ -422,6 +422,7 @@ impl InodeStore {
 
     // Restore to a directory tree from rocksdb
     pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
+        println!("DEBUG at inode_store, at create_tree, start create_tree");
         let mut root = FsDir::create_root();
         let mut stack = LinkedList::new();
         stack.push_back((
@@ -469,7 +470,24 @@ impl InodeStore {
                     let (_, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
                     let child_id = RocksUtils::i64_from_bytes(&value)?;
                     let file_entry = InodeView::FileEntry(child_name.to_string(), child_id);
-
+                    
+                    if let Some(child_inode) = self.store.get_inode(child_id)? {  
+                        if matches!(child_inode, InodeView::Container(_, _)) {  
+                            // This is a container - update parent's container_index  
+                            if let InodeView::Dir(_, ref mut parent_dir) = next_parent.as_mut() {  
+                                // For each file in the container, add to parent's index  
+                                if let InodeView::Container(container_name, container) = &child_inode {  
+                                    for file_name in container.files.keys() {  
+                                        parent_dir.container_index.insert(  
+                                            file_name.clone(),  
+                                            container_name.clone()  
+                                        );  
+                                    }  
+                                }  
+                                println!("DEBUG at inode_store, at create_tree, parent_dir.container_index {:?}", parent_dir.container_index)
+                            }  
+                        }  
+                    }  
                     stack.push_back((next_parent.clone(), child_id, file_entry))
                 }
                 if let Some(ttl_config) = next_parent.ttl_config() {

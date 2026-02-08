@@ -316,61 +316,61 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     }
 
     fs.write_batch_string(&batch_files).await?;
-    // println!("at fs_tests, complete the write_batch_string process");
-    // // Using batch
-    // // Get block locations for all files
-    // let mut results = Vec::new();
-    // for (path, _) in batch_files.clone() {
-    //     let blocks = fs.get_block_locations(&path).await?;
-    //     println!("DEBUG block location for path: {:?} is {:?}", path, blocks);
-    //     results.push(blocks);
-    // }
-    // println!("results: {:?}", results);
+    println!("at fs_tests, complete the write_batch_string process");
+    // Using batch
+    // Get block locations for all files
+    let mut results = Vec::new();
+    for (path, _) in batch_files.clone() {
+        let blocks = fs.get_block_locations(&path).await?;
+        println!("DEBUG block location for path: {:?} is {:?}", path, blocks);
+        results.push(blocks);
+    }
+    println!("results: {:?}", results);
 
-    // // // 2. Verify all files exist and have correct content
-    // for (i, (path, _)) in batch_files.clone().iter().enumerate() {
-    //     let status = fs.get_status(path).await?;
+    // // 2. Verify all files exist and have correct content
+    for (i, (path, _)) in batch_files.clone().iter().enumerate() {
+        let status = fs.get_status(path).await?;
 
-    //     println!(
-    //         "DEBUG at test_batch_writting, test_batch_writting, file status: {:?}",
-    //         status
-    //     );
-    //     let content = read_file_content(fs, path).await?;
-    //     println!(
-    //         "DEBUG at test_batch_writting, test_batch_writting, content: {:?}",
-    //         content
-    //     );
-    //     if i == num_files - 1 {
-    //         assert_eq!(
-    //             status.len, large_file_size as i64,
-    //             "File {} length mismatch",
-    //             i
-    //         );
-    //         assert_eq!(
-    //             content.len(),
-    //             large_file_size,
-    //             "File {} content length mismatch",
-    //             i
-    //         );
-    //         assert_eq!(content, test_large_data, "File {} content mismatch", i);
-    //     } else {
-    //         assert_eq!(
-    //             status.len, small_file_size as i64,
-    //             "File {} length mismatch",
-    //             i
-    //         );
-    //         assert_eq!(
-    //             content.len(),
-    //             small_file_size,
-    //             "File {} content length mismatch",
-    //             i
-    //         );
-    //         assert_eq!(content, test_small_data, "File {} content mismatch", i);
-    //     }
+        println!(
+            "DEBUG at test_batch_writting, test_batch_writting, file status: {:?}",
+            status
+        );
+        let content = read_file_content(fs, path).await?;
+        println!(
+            "DEBUG at test_batch_writting, test_batch_writting, content: {:?}",
+            content
+        );
+        if i == num_files - 1 {
+            assert_eq!(
+                status.len, large_file_size as i64,
+                "File {} length mismatch",
+                i
+            );
+            assert_eq!(
+                content.len(),
+                large_file_size,
+                "File {} content length mismatch",
+                i
+            );
+            assert_eq!(content, test_large_data, "File {} content mismatch", i);
+        } else {
+            assert_eq!(
+                status.len, small_file_size as i64,
+                "File {} length mismatch",
+                i
+            );
+            assert_eq!(
+                content.len(),
+                small_file_size,
+                "File {} content length mismatch",
+                i
+            );
+            assert_eq!(content, test_small_data, "File {} content mismatch", i);
+        }
 
-    //     println!("Verified file_{}: len={}, content matches", i, status.len);
-    // }
-    // println!("✓ All {} files written and verified correctly", num_files);
+        println!("Verified file_{}: len={}, content matches", i, status.len);
+    }
+    println!("✓ All {} files written and verified correctly", num_files);
     Ok(())
 }
 

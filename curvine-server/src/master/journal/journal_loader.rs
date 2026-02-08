@@ -174,30 +174,30 @@ impl JournalLoader {
                 InodeView::Container(_, new_container),
             ) => {
                 // Get parent directory using get_inode(-2)
-                if let Some(parent) = inp.get_inode(-2) {
-                    println!(
-                        "DEBUG at JournalLoader, before update container index for {:?}",
-                        parent
-                    );
-                    if let InodeView::Dir(_, dir) = parent.as_mut() {
-                        // Remove old file mappings from container_index
-                        for old_file_name in container.files.keys() {
-                            dir.remove_from_container_index(old_file_name);
-                        }
+                // if let Some(parent) = inp.get_inode(-2) {
+                //     println!(
+                //         "DEBUG at JournalLoader, before update container index for {:?}",
+                //         parent
+                //     );
+                //     if let InodeView::Dir(_, dir) = parent.as_mut() {
+                //         // Remove old file mappings from container_index
+                //         for old_file_name in container.files.keys() {
+                //             dir.remove_from_container_index(old_file_name);
+                //         }
 
-                        // Add new file mappings to container_index
-                        for new_file_name in new_container.files.keys() {
-                            dir.add_to_container_index(
-                                new_file_name.clone(),
-                                container_name.clone(),
-                            );
-                        }
-                    }
-                    println!(
-                        "DEBUG at JournalLoader, after update container index for {:?}",
-                        parent
-                    );
-                }
+                //         // Add new file mappings to container_index
+                //         for new_file_name in new_container.files.keys() {
+                //             dir.add_to_container_index(
+                //                 new_file_name.clone(),
+                //                 container_name.clone(),
+                //             );
+                //         }
+                //     }
+                //     println!(
+                //         "DEBUG at JournalLoader, after update container index for {:?}",
+                //         parent
+                //     );
+                // }
 
                 let _ = mem::replace(container, new_container);
             }

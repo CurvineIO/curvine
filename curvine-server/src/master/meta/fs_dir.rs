@@ -711,18 +711,18 @@ impl FsDir {
         );
         self.evictor.on_access(container.id());
 
-        let container_name = inp.name().to_string();
+        // let container_name = inp.name().to_string();
         if let Some(parent) = inp.get_inode(-2) {
             match parent.as_mut() {
                 InodeView::Dir(_, dir) => {
                     if let InodeView::Container(_, container) = inode.as_ref() {
                         // Now dir is &mut InodeDir, so we can access container_index
-                        dir.container_index.retain(|_, v| v != &container_name);
+                        // dir.container_index.retain(|_, v| v != &container_name);
 
-                        // Add new entries for all files in container
-                        for file_name in container.files.keys() {
-                            dir.add_to_container_index(file_name.clone(), container_name.clone());
-                        }
+                        // // Add new entries for all files in container
+                        // for file_name in container.files.keys() {
+                        //     dir.add_to_container_index(file_name.clone(), container_name.clone());
+                        // }
 
                         // Persist updated parent directory
                         println!("parent of container when complete: {:?}", parent);
