@@ -54,7 +54,6 @@ pub enum RequestStatus {
     Running = 3,  //Streaming request data delivery
     Cancel = 4,   //Cancel request
     Complete = 5, //Request complete
-
 }
 
 #[repr(i8)]
