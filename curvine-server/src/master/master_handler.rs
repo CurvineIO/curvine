@@ -441,45 +441,10 @@ impl MasterHandler {
         })
     }
 
-    // pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-    //     let header: AddBlocksBatchRequest = ctx.parse_header()?;
-
-    //     let mut results = Vec::with_capacity(header.requests.len());
-    //     for req in header.requests {
-    //         let path = req.path;
-    //         let client_addr = ProtoUtils::client_address_from_pb(req.client_address);
-    //         let commit_blocks = req
-    //             .commit_blocks
-    //             .into_iter()
-    //             .map(ProtoUtils::commit_block_from_pb)
-    //             .collect();
-
-    //         let located_block = self.fs.add_block(
-    //             path,
-    //             client_addr,
-    //             commit_blocks,
-    //             req.exclude_workers,
-    //             req.file_len,
-    //             req.last_block.map(ProtoUtils::extend_block_from_pb),
-    //         )?;
-    //         println!("DEBUG at MasterHandler, at add_blocks_batch, located_block {:?}", located_block);
-    //         results.push(ProtoUtils::located_block_to_pb(located_block));
-    //     }
-
-    //     let rep_header = AddBlocksBatchResponse { blocks: results };
-    //     ctx.response(rep_header)
-    // }
-
     pub fn complete_container(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: CompleteContainerRequest = ctx.parse_header()?;
         println!("DEBUG at MasterHandler, at complete_container, starting");
-        // let mut results = Vec::new();
         let req = header;
-        // let commit_blocks = req
-        //         .commit_block
-        //         .into_iter()
-        //         .map(ProtoUtils::commit_block_from_pb)
-        //         .collect();
         let commit_block = ProtoUtils::commit_block_from_pb(req.commit_block);
 
         println!(
@@ -754,7 +719,6 @@ impl MessageHandler for MasterHandler {
             RpcCode::AddBlock => self.add_block(ctx),
             RpcCode::CompleteFile => self.complete_file(ctx),
             RpcCode::CreateContainer => self.create_container(ctx),
-            // RpcCode::AddContainer => self.add_container(ctx),
             RpcCode::CompleteContainer => self.complete_container(ctx),
             RpcCode::Exists => self.exists(ctx),
             RpcCode::Delete => self.retry_check_delete(ctx),

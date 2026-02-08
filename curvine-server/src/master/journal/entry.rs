@@ -46,13 +46,6 @@ pub struct CreateInodeEntry {
     pub(crate) inode_entry: InodeView,
 }
 
-// #[derive(Deserialize, Serialize, Debug, Clone)]
-// pub struct AddFilesToContainerEntry {
-//     pub(crate) op_ms: u64,
-//     pub(crate) container_path: String,
-//     pub(crate) files: HashMap<String, SmallFileMeta>,
-// }
-
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ReopenFileEntry {
     pub(crate) op_ms: u64,
@@ -75,23 +68,6 @@ pub struct AddBlockEntry {
     pub(crate) blocks: Vec<BlockMeta>,
     pub(crate) commit_block: Vec<CommitBlock>,
 }
-
-// // File writing is completed.
-// #[derive(Deserialize, Serialize, Debug, Clone)]
-// pub struct CompleteFileEntry {
-//     pub(crate) op_ms: u64,
-//     pub(crate) path: String,
-//     pub(crate) file: InodeFile,
-//     pub(crate) commit_blocks: Vec<CommitBlock>,
-// }
-
-// #[derive(Deserialize, Serialize, Debug, Clone)]
-// pub struct CompleteContainerEntry {
-//     pub(crate) op_ms: u64,
-//     pub(crate) path: String,
-//     pub(crate) file: InodeContainer,
-//     pub(crate) commit_blocks: Vec<CommitBlock>,
-// }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct CompleteInodeEntry {
@@ -165,15 +141,10 @@ pub struct SetLocksEntry {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
-    CreateFile(CreateFileEntry),
-    CreateContainer(CreateContainerEntry),
     CreateInode(CreateInodeEntry),
-    // AddFilesToContainer(AddFilesToContainerEntry),
     ReopenFile(ReopenFileEntry),
     OverWriteFile(OverWriteFileEntry),
     AddBlock(AddBlockEntry),
-    // CompleteFile(CompleteFileEntry),
-    // CompleteContainer(CompleteContainerEntry),
     CompleteInode(CompleteInodeEntry),
     Rename(RenameEntry),
     Delete(DeleteEntry),

@@ -59,21 +59,14 @@ impl JournalLoader {
         match entry {
             JournalEntry::Mkdir(e) => self.mkdir(e),
 
-            JournalEntry::CreateFile(e) => self.create_file(e),
-
-            JournalEntry::CreateContainer(e) => self.create_container(e),
-
             JournalEntry::CreateInode(e) => self.create_inode(e),
 
-            // JournalEntry::AddFilesToContainer(e) => self.add_files_to_container(e),
             JournalEntry::OverWriteFile(e) => self.overwrite_file(e),
 
             JournalEntry::AddBlock(e) => self.add_block(e),
 
             JournalEntry::CompleteInode(e) => self.complete_inode_entry(e),
 
-            // JournalEntry::CompleteFile(e) => self.complete_file(e),
-            // JournalEntry::CompleteContainer(e) => self.complete_container(e),
             JournalEntry::Rename(e) => self.rename(e),
 
             JournalEntry::Delete(e) => self.delete(e),
@@ -103,22 +96,13 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn create_file(&self, entry: CreateFileEntry) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.write();
-        fs_dir.update_last_inode_id(entry.file.id)?;
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
-        let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, File(name, entry.file))?;
-        Ok(())
-    }
-
     fn create_inode(&self, entry: CreateInodeEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         fs_dir.update_last_inode_id(entry.inode_entry.id())?;
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
         let name = inp.name().to_string();
 
-        // Pattern match to handle File vs Container explicitly
+        // handle inode File and
         let inode_to_add = match entry.inode_entry {
             InodeView::File(_, file) => InodeView::File(name, file),
             InodeView::Container(_, container) => InodeView::Container(name, container),
@@ -170,38 +154,7 @@ impl JournalLoader {
         Ok(())
     }
 
-    // fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
-    //     let fs_dir = self.fs_dir.write();
-    //     let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
-
-    //     let mut inode = try_option!(inp.get_last_inode());
-    //     let file = inode.as_file_mut()?;
-
-    //     let _ = mem::replace(file, entry.file);
-    //     // Update block location
-    //     fs_dir
-    //         .store
-    //         .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
-
-    //     Ok(())
-    // }
-
-    // fn complete_container(&self, entry: CompleteContainerEntry) -> CommonResult<()> {
-    //     let fs_dir = self.fs_dir.write();
-    //     let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
-
-    //     let mut inode = try_option!(inp.get_last_inode());
-    //     let file = inode.as_container_mut()?;
-
-    //     let _ = mem::replace(file, entry.file);
-    //     // Update block location
-    //     fs_dir
-    //         .store
-    //         .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
-
-    //     Ok(())
-    // }
-
+    
     fn complete_inode_entry(&self, entry: CompleteInodeEntry) -> CommonResult<()> {
         println!(
             "DEBUG at JournalLoader, at complete_inode_entry, complete for: {:?}",
@@ -385,35 +338,6 @@ impl JournalLoader {
 
         Ok(())
     }
-
-    fn create_container(&self, entry: CreateContainerEntry) -> CommonResult<()> {
-        let mut fs_dir = self.fs_dir.write();
-        fs_dir.update_last_inode_id(entry.container.id)?;
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
-        let name = inp.name().to_string();
-        println!(
-            "DEBUG at JounalLoader, at create_container, entry.container: {:?}",
-            entry.container
-        );
-        let _ = fs_dir.add_last_inode(inp, Container(name, entry.container))?;
-        Ok(())
-    }
-
-    // fn add_files_to_container(&self, entry: AddFilesToContainerEntry) -> CommonResult<()> {
-    //     let fs_dir = self.fs_dir.write();
-    //     let inp = InodePath::resolve(fs_dir.root_ptr(), entry.container_path, &fs_dir.store)?;
-
-    //     let mut inode = try_option!(inp.get_last_inode());
-    //     let container = inode.as_mut().as_container_mut()?;
-
-    //     // Add new files to existing container
-    //     for (file_name, file_meta) in entry.files {
-    //         container.files.insert(file_name, file_meta);
-    //     }
-
-    //     fs_dir.store.apply_add_files_to_container(inode.as_ref())?;
-    //     Ok(())
-    // }
 }
 
 impl AppStorage for JournalLoader {
