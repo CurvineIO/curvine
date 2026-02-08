@@ -1021,7 +1021,7 @@ impl FsDir {
 
         // set current inode
         inode.as_mut().set_attr(opts);
-        change_inodes.push(inode.clone());
+        change_inodes.push(inode.as_ref().clone());
 
         // recursive set child inode
         if recursive {
