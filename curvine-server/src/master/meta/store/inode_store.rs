@@ -229,10 +229,10 @@ impl InodeStore {
         batch.commit()
     }
 
-    pub fn apply_set_attr(&self, inodes: Vec<InodePtr>) -> CommonResult<()> {
+    pub fn apply_set_attr(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         for inode in &inodes {
-            batch.write_inode(inode.as_ref())?;
+            batch.write_inode(inode)?;
         }
         batch.commit()?;
 
