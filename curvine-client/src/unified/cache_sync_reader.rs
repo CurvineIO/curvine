@@ -52,7 +52,7 @@ impl CacheSyncReader {
                 ticks += 1;
                 let file_blocks = self.fs.get_block_locations(self.path()).await?;
 
-                if file_blocks.len != self.len() {
+                if file_blocks.len != self.len() || file_blocks.status.is_complete {
                     let mut reader = FsReader::new(
                         self.path().clone(),
                         self.fs.fs_context.clone(),
@@ -61,10 +61,11 @@ impl CacheSyncReader {
                     reader.seek(self.inner.pos()).await?;
 
                     info!(
-                        "file {} len change {} -> {}",
+                        "file {} len change {} -> {}, complete: {}",
                         self.path(),
                         self.len(),
-                        reader.len()
+                        reader.len(),
+                        reader.status().is_complete
                     );
                     self.inner = reader;
                     break;

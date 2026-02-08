@@ -118,7 +118,7 @@ impl OssHdfsFileSystem {
         }
 
         let config_handle = JindoConfigHandle::from_raw(config_handle_ptr);
-        // Set configuration parameters
+        // Set configuration parameters using JindoSDK internal keys (with fs. prefix)
         unsafe {
             set_config_string(
                 config_handle.as_raw(),
@@ -293,6 +293,7 @@ impl OssHdfsFileSystem {
             } else {
                 FileType::File
             },
+            mode: 0o777,
             ..Default::default()
         }
     }

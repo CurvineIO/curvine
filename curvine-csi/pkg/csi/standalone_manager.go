@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -309,7 +310,12 @@ func (m *standaloneMountManagerImpl) EnsureStandalone(ctx context.Context, opts 
 		return "", fmt.Errorf("failed to get Standalone %s: %v", podName, err)
 	}
 
-	// Create host mount directory
+	// Ensure mount path is clean and ready (handles stale mount points)
+	if err := m.ensureCleanMountPath(ctx, hostMountPath, podName); err != nil {
+		return "", fmt.Errorf("failed to ensure clean mount path %s: %v", hostMountPath, err)
+	}
+
+	// Create host mount directory if it doesn't exist
 	if err := os.MkdirAll(hostMountPath, 0755); err != nil {
 		return "", fmt.Errorf("failed to create host mount directory %s: %v", hostMountPath, err)
 	}
@@ -444,8 +450,9 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 			TerminationGracePeriodSeconds: &terminationGracePeriod,
 			Containers: []corev1.Container{
 				{
-					Name:  "curvine-fuse",
-					Image: image,
+					Name:            "curvine-fuse",
+					Image:           image,
+					ImagePullPolicy: corev1.PullNever,
 					Command: []string{
 						"/opt/curvine/curvine-fuse",
 					},
@@ -926,4 +933,137 @@ func (m *standaloneMountManagerImpl) GetState() *StandaloneState {
 	}
 
 	return stateCopy
+}
+
+// isMountPoint checks if a path is a mount point
+// Uses /proc/mounts for reliable detection without requiring special permissions
+func isMountPoint(path string) (bool, error) {
+	// First check if path exists
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil // Path doesn't exist, not a mount point
+		}
+		return false, err // Other stat error
+	}
+	
+	// Read /proc/mounts to check if path is mounted
+	// This is more reliable than mountpoint command in containers
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return false, fmt.Errorf("failed to read /proc/mounts: %v", err)
+	}
+	
+	// Normalize path for comparison
+	cleanPath := filepath.Clean(path)
+	
+	// Check each mount point in /proc/mounts
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		mountPoint := fields[1]
+		if mountPoint == cleanPath {
+			return true, nil
+		}
+	}
+	
+	return false, nil // Not found in /proc/mounts, not a mount point
+}
+
+// cleanupStaleMountPoint safely cleans up a stale mount point
+// Returns error if cleanup fails - caller should not proceed with Pod creation
+func (m *standaloneMountManagerImpl) cleanupStaleMountPoint(hostMountPath string) error {
+	klog.Warningf("Detected stale mount point at %s, attempting cleanup", hostMountPath)
+	
+	// Try lazy unmount first (handles broken/stale mounts)
+	umountCmd := exec.Command("umount", "-l", hostMountPath)
+	if output, err := umountCmd.CombinedOutput(); err != nil {
+		// Check if already unmounted
+		outputStr := string(output)
+		if !strings.Contains(outputStr, "not mounted") && !strings.Contains(outputStr, "not found") {
+			return fmt.Errorf("failed to unmount stale mount point %s: %v, output: %s", 
+				hostMountPath, err, outputStr)
+		}
+		klog.Infof("Path %s already unmounted or not a mount point", hostMountPath)
+	} else {
+		klog.Infof("Successfully unmounted stale mount point: %s", hostMountPath)
+	}
+	
+	// Remove the directory completely
+	if err := os.RemoveAll(hostMountPath); err != nil {
+		return fmt.Errorf("failed to remove directory %s after unmount: %v", hostMountPath, err)
+	}
+	
+	klog.Infof("Successfully cleaned up stale mount point: %s", hostMountPath)
+	return nil
+}
+
+// ensureCleanMountPath ensures the mount path is clean and ready to use
+// It detects and cleans up stale mount points left by previous Standalone pods
+// Returns error if path is unsafe or cleanup fails
+func (m *standaloneMountManagerImpl) ensureCleanMountPath(ctx context.Context, hostMountPath, podName string) error {
+	// Check directory status
+	_, statErr := os.Stat(hostMountPath)
+	
+	// Case 1: Directory doesn't exist - this is normal, will be created later
+	if os.IsNotExist(statErr) {
+		klog.V(4).Infof("Mount path %s does not exist, will create", hostMountPath)
+		return nil
+	}
+	
+	// Case 2: Stat failed with error other than "not exist" 
+	// This usually indicates a stale mount point (e.g., "transport endpoint is not connected")
+	if statErr != nil {
+		klog.Warningf("Stat failed for %s: %v - likely a stale mount point", hostMountPath, statErr)
+		
+		// Double-check: verify the corresponding Pod doesn't exist
+		if _, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{}); err == nil {
+			// Pod exists! This mount might be valid, don't clean it
+			return fmt.Errorf("mount path %s has errors but Pod %s exists - manual intervention required", 
+				hostMountPath, podName)
+		}
+		
+		// Pod doesn't exist, safe to clean up stale mount
+		return m.cleanupStaleMountPoint(hostMountPath)
+	}
+	
+	// Case 3: Directory exists and Stat succeeded - check if it's a mount point
+	klog.V(4).Infof("Mount path %s exists, checking if it's a mount point", hostMountPath)
+	
+	isMounted, err := isMountPoint(hostMountPath)
+	if err != nil {
+		return fmt.Errorf("failed to check if %s is a mount point: %v", hostMountPath, err)
+	}
+	
+	if !isMounted {
+		// Not a mount point, safe to reuse the directory
+		klog.V(4).Infof("Mount path %s exists but is not a mount point, will reuse", hostMountPath)
+		return nil
+	}
+	
+	// It IS a mount point - verify if it's stale (Pod should not exist)
+	klog.Infof("Mount path %s is a mount point, verifying if Pod %s exists", hostMountPath, podName)
+	
+	pod, err := m.client.CoreV1().Pods(m.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err == nil {
+		// Pod exists - check if it's healthy
+		if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending {
+			// Pod is running/pending, this is likely a valid mount, don't touch it
+			klog.Infof("Mount point %s is valid (Pod %s is %s), will reuse", 
+				hostMountPath, podName, pod.Status.Phase)
+			return nil
+		}
+		// Pod exists but in bad state (Failed, Unknown, etc.)
+		klog.Warningf("Pod %s exists but in phase %s, treating mount as stale", podName, pod.Status.Phase)
+	} else if !errors.IsNotFound(err) {
+		// Error checking Pod (not NotFound)
+		return fmt.Errorf("failed to check Pod %s status: %v", podName, err)
+	}
+	
+	// Pod doesn't exist or is in bad state - mount point is stale, clean it up
+	klog.Warningf("Mount point %s is stale (Pod %s not found or unhealthy), cleaning up", 
+		hostMountPath, podName)
+	return m.cleanupStaleMountPoint(hostMountPath)
 }

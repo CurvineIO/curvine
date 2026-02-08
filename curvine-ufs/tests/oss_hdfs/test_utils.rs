@@ -26,13 +26,13 @@ pub fn create_test_conf() -> Option<HashMap<String, String>> {
 
     let mut config = HashMap::new();
     let endpoint_clone = endpoint.clone();
-    config.insert(OssHdfsConf::ENDPOINT.to_string(), endpoint);
-    config.insert(OssHdfsConf::ACCESS_KEY_ID.to_string(), access_key_id);
+    config.insert(OssHdfsConf::USER_ENDPOINT.to_string(), endpoint);
+    config.insert(OssHdfsConf::USER_ACCESS_KEY_ID.to_string(), access_key_id);
     config.insert(
-        OssHdfsConf::ACCESS_KEY_SECRET.to_string(),
+        OssHdfsConf::USER_ACCESS_KEY_SECRET.to_string(),
         access_key_secret,
     );
-    config.insert(OssHdfsConf::REGION.to_string(), region);
+    config.insert(OssHdfsConf::USER_REGION.to_string(), region);
 
     // Use OSS_DATA_ENDPOINT if provided, otherwise derive from endpoint
     let data_endpoint = std::env::var("OSS_DATA_ENDPOINT").unwrap_or_else(|_| {
@@ -40,7 +40,7 @@ pub fn create_test_conf() -> Option<HashMap<String, String>> {
         // This is a fallback, but still better than hardcoding credentials
         endpoint_clone.replace(".oss-dls.", "-vpc.oss.")
     });
-    config.insert(OssHdfsConf::DATA_ENDPOINT.to_string(), data_endpoint);
+    config.insert(OssHdfsConf::USER_DATA_ENDPOINT.to_string(), data_endpoint);
 
     Some(config)
 }

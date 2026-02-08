@@ -41,12 +41,12 @@ impl UfsClient {
         match context.path().scheme() {
             Some("s3") => {
                 let s3_fs =
-                    UfsFileSystem::new(context.path(), context.conf().get_config().clone())?;
+                    UfsFileSystem::new(context.path(), context.conf().get_config().clone(), None)?;
                 Ok(Arc::new(s3_fs))
             }
             Some("oss") => {
                 let oss_fs =
-                    UfsFileSystem::new(context.path(), context.conf().get_config().clone())?;
+                    UfsFileSystem::new(context.path(), context.conf().get_config().clone(), None)?;
                 Ok(Arc::new(oss_fs))
             }
             Some("file") => Err(FsError::unsupported("Local filesystem")),

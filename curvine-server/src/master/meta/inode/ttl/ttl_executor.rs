@@ -17,7 +17,6 @@ use crate::master::fs::MasterFilesystem;
 use crate::master::job::JobManager;
 use crate::master::meta::inode::ttl_types::{TtlError, TtlResult};
 use crate::master::meta::inode::{Inode, InodeView, ROOT_INODE_ID};
-use crate::master::meta::store::InodeStore;
 use crate::master::mount::MountManager;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{LoadJobCommand, TtlAction};
@@ -42,7 +41,6 @@ use std::sync::{Arc, RwLock};
 #[derive(Clone)]
 pub struct InodeTtlExecutor {
     filesystem: MasterFilesystem,
-    inode_store: InodeStore,
     path_cache: Arc<RwLock<HashMap<u64, String>>>,
     mount_manager: Arc<MountManager>,
     factory: Arc<UfsFactory>,
@@ -56,16 +54,8 @@ impl InodeTtlExecutor {
         factory: Arc<UfsFactory>,
         job_manager: Arc<JobManager>,
     ) -> Self {
-        let fs_dir = filesystem.fs_dir();
-
-        let inode_store = {
-            let fs_dir_guard = fs_dir.read();
-            fs_dir_guard.inode_store()
-        };
-
         Self {
             filesystem,
-            inode_store,
             path_cache: Arc::new(RwLock::new(HashMap::new())),
             mount_manager,
             factory,
@@ -100,7 +90,9 @@ impl InodeTtlExecutor {
             return Ok("/".to_string());
         }
 
-        if let Ok(Some(inode_view)) = self.inode_store.get_inode(inode_id, None) {
+        let fs_dir = self.filesystem.fs_dir();
+        let fs_dir_guard = fs_dir.read();
+        if let Ok(Some(inode_view)) = fs_dir_guard.store.get_inode(inode_id, None) {
             match &inode_view {
                 InodeView::File(name, file) => {
                     let parent_path = self.build_path_recursive(file.parent_id())?;
@@ -138,7 +130,10 @@ impl InodeTtlExecutor {
     }
 
     pub fn get_inode_from_store(&self, inode_id: u64) -> TtlResult<Option<InodeView>> {
-        self.inode_store
+        let fs_dir = self.filesystem.fs_dir();
+        let fs_dir_guard = fs_dir.read();
+        fs_dir_guard
+            .store
             .get_inode(inode_id as i64, None)
             .map_err(|e| TtlError::ServiceError(format!("Failed to get inode from store: {}", e)))
     }

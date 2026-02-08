@@ -25,14 +25,19 @@ import (
 )
 
 var (
-	endpoint = flag.String("endpoint", "unix://tmp/csi.sock", "CSI Endpoint")
-	version  = flag.Bool("version", false, "Print the version and exit.")
-	nodeID   = flag.String("nodeid", "", "Node ID")
+	endpoint    = flag.String("endpoint", "unix://tmp/csi.sock", "CSI Endpoint")
+	version     = flag.Bool("version", false, "Print the version and exit.")
+	versionJSON = flag.Bool("version-json", false, "Print the version in JSON format and exit.")
+	nodeID      = flag.String("nodeid", "", "Node ID")
 )
 
 func main() {
 	flag.Parse()
 	if *version {
+		fmt.Printf("curvine-csi %s\n", csi.GetVersionString())
+		os.Exit(0)
+	}
+	if *versionJSON {
 		info, err := csi.GetVersionJSON()
 		if err != nil {
 			klog.Fatalln(err)

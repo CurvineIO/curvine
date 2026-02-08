@@ -38,8 +38,8 @@ public class FilesystemConf {
     public int read_chunk_num = 8;
     public int read_parallel = 1;
     public String read_slice_size = "0";
-    public int close_reader_limit = 7;
-    public int close_writer_limit = 7;
+
+    public int max_cache_block_handles = 10;
 
     public String storage_type = "disk";
     public String ttl_ms = "0";
@@ -81,7 +81,29 @@ public class FilesystemConf {
 
     public int umask = 022;
 
-    public String mount_update_ttl = "10m";
+    public String mount_update_ttl = "10s";
+
+    public String sync_check_interval_min = "100ms";
+
+    public String sync_check_interval_max = "1s";
+
+    public String max_sync_wait_timeout = "5m";
+
+    public int sync_check_log_tick = 3;
+
+    public boolean enable_block_conn_pool = true;
+    public int block_conn_idle_size = 128;
+    public String block_conn_idle_time = "60s";
+
+    public String small_file_size = "4MB";
+
+    public boolean enable_smart_prefetch = true;
+
+    public String large_file_size = "10GB";
+
+    public int max_read_parallel = 8;
+
+    public long sequential_read_threshold = 7;
 
     // Log configuration, default to standard output.
     public String log_level = "info";
@@ -202,8 +224,7 @@ public class FilesystemConf {
                 ", read_chunk_num=" + read_chunk_num +
                 ", read_parallel=" + read_parallel +
                 ", read_slice_size='" + read_slice_size + '\'' +
-                ", close_reader_limit=" + close_reader_limit +
-                ", close_writer_limit=" + close_writer_limit +
+                ", max_cache_block_handles=" + max_cache_block_handles +
                 ", storage_type='" + storage_type + '\'' +
                 ", ttl_ms=" + ttl_ms +
                 ", ttl_action='" + ttl_action + '\'' +
@@ -227,6 +248,18 @@ public class FilesystemConf {
                 ", enable_fallback_read_ufs=" + enable_fallback_read_ufs +
                 ", umask=" + umask +
                 ", mount_update_ttl='" + mount_update_ttl + '\'' +
+                ", sync_check_interval_min='" + sync_check_interval_min + '\'' +
+                ", sync_check_interval_max='" + sync_check_interval_max + '\'' +
+                ", max_sync_wait_timeout='" + max_sync_wait_timeout + '\'' +
+                ", sync_check_log_tick=" + sync_check_log_tick +
+                ", enable_block_conn_pool=" + enable_block_conn_pool +
+                ", block_conn_idle_size=" + block_conn_idle_size +
+                ", block_conn_idle_time='" + block_conn_idle_time + '\'' +
+                ", small_file_size='" + small_file_size + '\'' +
+                ", enable_smart_prefetch=" + enable_smart_prefetch +
+                ", large_file_size='" + large_file_size + '\'' +
+                ", max_read_parallel=" + max_read_parallel +
+                ", sequential_read_threshold=" + sequential_read_threshold +
                 ", log_level='" + log_level + '\'' +
                 ", log_dir='" + log_dir + '\'' +
                 ", log_file_name='" + log_file_name + '\'' +

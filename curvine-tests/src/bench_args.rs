@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use clap::Parser;
+use curvine_common::version;
 
 #[derive(Debug, Parser, Clone, Default)]
-#[command(arg_required_else_help = true)]
+#[command(arg_required_else_help = true, version = version::VERSION)]
 pub struct BenchArgs {
     #[arg(short, long, default_value = "")]
     pub action: String,

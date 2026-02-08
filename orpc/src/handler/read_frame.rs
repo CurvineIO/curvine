@@ -49,10 +49,7 @@ impl ReadFrame {
         loop {
             match state {
                 FrameSate::Head => {
-                    let mut buf = match self.read_full(message::PROTOCOL_SIZE).await {
-                        Ok(v) => v,
-                        Err(_) => return Ok(Message::empty()),
-                    };
+                    let mut buf = self.read_full(message::PROTOCOL_SIZE).await?;
 
                     let (protocol, header_size, data_size) = Message::decode_protocol(&mut buf)?;
                     let _ = mem::replace(

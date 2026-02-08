@@ -17,9 +17,12 @@ use crate::file::{FsClient, FsContext};
 use curvine_common::fs::Path;
 use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus, WriteFileBlocks};
 use curvine_common::FsResult;
+use fxhash::FxHasher;
+use linked_hash_map::LinkedHashMap;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use orpc::{err_box, try_option_mut};
+use std::hash::BuildHasherDefault;
 use std::mem;
 use std::sync::Arc;
 
@@ -31,13 +34,22 @@ pub struct FsWriterBase {
     len: i64,
     file_blocks: WriteFileBlocks,
     cur_writer: Option<BlockWriter>,
+
+    cache_limit: usize,
+    cache_writers: LinkedHashMap<i64, BlockWriter, BuildHasherDefault<FxHasher>>,
 }
 
 impl FsWriterBase {
     pub fn new(fs_context: Arc<FsContext>, path: Path, status: FileBlocks, pos: i64) -> Self {
         let fs_client = FsClient::new(fs_context.clone());
+        let cache_limit = fs_context.conf.client.max_cache_block_handles;
         let len = status.len;
         let file_blocks = WriteFileBlocks::new(status);
+
+        let cache_writers = LinkedHashMap::with_capacity_and_hasher(
+            cache_limit,
+            BuildHasherDefault::<FxHasher>::default(),
+        );
         Self {
             fs_context,
             fs_client,
@@ -46,6 +58,8 @@ impl FsWriterBase {
             file_blocks,
             path,
             cur_writer: None,
+            cache_limit,
+            cache_writers,
         }
     }
 
@@ -145,18 +159,23 @@ impl FsWriterBase {
     }
 
     async fn complete0(&mut self, only_flush: bool) -> FsResult<Option<FileBlocks>> {
-        if let Some(writer) = &mut self.cur_writer {
+        if let Some(writer) = self.cur_writer.take() {
+            self.cache_writers.insert(writer.block_id(), writer);
+        };
+
+        for (_, writer) in self.cache_writers.iter_mut() {
             let commit_block = if only_flush {
                 writer.flush().await?;
                 writer.to_commit_block()
             } else {
                 writer.complete().await?
             };
+
             self.file_blocks.add_commit(commit_block)?;
-        };
+        }
 
         if !only_flush {
-            let _ = self.cur_writer.take();
+            self.cache_writers.clear();
         }
 
         let commits_blocks = self.file_blocks.take_commit_blocks();
@@ -175,24 +194,34 @@ impl FsWriterBase {
                     // step1: If block already exists, seek operation exists, need to overwrite previous block.
                     // Multiple seek operations will automatically cache block writer, so need to check block writer cache.
                     Some((off, lb)) => {
-                        let lb = if lb.should_assign() {
-                            let assign_lb = self
-                                .fs_client
-                                .assign_worker(&self.path, lb.block.clone())
-                                .await?;
+                        let writer = match self.cache_writers.remove(&lb.id) {
+                            Some(mut v) => {
+                                // Writer from cache may have a different position, seek to correct offset
+                                v.seek(off).await?;
+                                v
+                            }
 
-                            self.file_blocks.update_locate(&assign_lb)?;
-                            assign_lb
-                        } else {
-                            lb
+                            None => {
+                                let lb = if lb.should_assign() {
+                                    let assign_lb = self
+                                        .fs_client
+                                        .assign_worker(&self.path, lb.block.clone())
+                                        .await?;
+
+                                    self.file_blocks.update_locate(&assign_lb)?;
+                                    assign_lb
+                                } else {
+                                    lb
+                                };
+                                BlockWriter::new(self.fs_context.clone(), lb, off).await?
+                            }
                         };
 
-                        let writer = BlockWriter::new(self.fs_context.clone(), lb, off).await?;
-                        self.update_writer(Some(writer)).await?;
+                        self.update_writer(Some(writer), true).await?;
                     }
 
                     None => {
-                        self.update_writer(None).await?;
+                        self.update_writer(None, false).await?;
 
                         let commit_blocks = self.file_blocks.take_commit_blocks();
                         let last_block = self.file_blocks.last_block();
@@ -221,7 +250,7 @@ impl FsWriterBase {
             return Ok(());
         } else if pos > self.len {
             self.pos = pos;
-            self.update_writer(None).await?;
+            self.update_writer(None, true).await?;
             return Ok(());
         }
 
@@ -231,7 +260,7 @@ impl FsWriterBase {
             if writer.block_id() == seek_block.block.id {
                 writer.seek(block_off).await?;
             } else {
-                self.update_writer(None).await?;
+                self.update_writer(None, true).await?;
             }
         }
 
@@ -239,10 +268,23 @@ impl FsWriterBase {
         Ok(())
     }
 
-    async fn update_writer(&mut self, cur: Option<BlockWriter>) -> FsResult<()> {
-        if let Some(mut old) = mem::replace(&mut self.cur_writer, cur) {
-            let commit_block = old.complete().await?;
-            self.file_blocks.add_commit(commit_block)?;
+    async fn update_writer(&mut self, cur: Option<BlockWriter>, cache: bool) -> FsResult<()> {
+        let mut old = match mem::replace(&mut self.cur_writer, cur) {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        if cache && self.cache_limit > 0 {
+            if self.cache_writers.len() >= self.cache_limit {
+                if let Some((_, mut removed)) = self.cache_writers.pop_front() {
+                    let commit_blocks = removed.complete().await?;
+                    self.file_blocks.add_commit(commit_blocks)?;
+                }
+            }
+            self.cache_writers.insert(old.block_id(), old);
+        } else {
+            let commit_blocks = old.complete().await?;
+            self.file_blocks.add_commit(commit_blocks)?;
         }
 
         Ok(())
@@ -271,7 +313,7 @@ impl FsWriterBase {
 
         // Step 1: Submit all blocks before resize
         if self.len > 0 {
-            self.complete0(true).await?;
+            self.complete().await?;
         }
 
         // Step 2: Execute resize operation

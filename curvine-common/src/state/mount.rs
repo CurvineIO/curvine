@@ -89,6 +89,42 @@ impl TryFrom<&str> for ConsistencyStrategy {
     }
 }
 
+#[repr(i32)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    FromPrimitive,
+    IntoPrimitive,
+    Default,
+    Deserialize,
+    Serialize,
+)]
+pub enum Provider {
+    #[default]
+    Auto,
+    OssHdfs,
+    Opendal,
+}
+
+impl TryFrom<&str> for Provider {
+    type Error = CommonError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let typ = match value.to_lowercase().as_str() {
+            "auto" => Provider::Auto,
+            "oss-hdfs" => Provider::OssHdfs,
+            "opendal" => Provider::Opendal,
+            _ => return err_box!("invalid provider: {}", value),
+        };
+
+        Ok(typ)
+    }
+}
+
 /// Mount information structure
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq, Default)]
 pub struct MountInfo {
@@ -104,6 +140,7 @@ pub struct MountInfo {
     pub replicas: Option<i32>,
     pub mount_type: MountType,
     pub write_type: WriteType,
+    pub provider: Option<Provider>,
 }
 
 impl MountInfo {
@@ -155,6 +192,20 @@ impl MountInfo {
             .ttl_action(self.ttl_action)
             .build()
     }
+
+    pub fn is_write_through(&self) -> bool {
+        matches!(
+            self.write_type,
+            WriteType::CacheThrough | WriteType::AsyncThrough
+        )
+    }
+
+    /// Check if this write type stores data in UFS
+    /// Cache mode only stores data in Curvine, not in UFS
+    /// Other modes (Through/AsyncThrough/CacheThrough) store data in UFS
+    pub fn has_ufs_data(&self) -> bool {
+        !matches!(self.write_type, WriteType::Cache)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +221,7 @@ pub struct MountOptions {
     pub mount_type: MountType,
     pub remove_properties: Vec<String>,
     pub write_type: WriteType,
+    pub provider: Option<Provider>,
 }
 
 impl MountOptions {
@@ -194,6 +246,7 @@ impl MountOptions {
             replicas: self.replicas,
             mount_type: self.mount_type,
             write_type: self.write_type,
+            provider: self.provider,
         }
     }
 }
@@ -211,6 +264,7 @@ pub struct MountOptionsBuilder {
     mount_type: MountType,
     remove_properties: Vec<String>,
     write_type: WriteType,
+    provider: Option<Provider>,
 }
 
 impl MountOptionsBuilder {
@@ -292,6 +346,11 @@ impl MountOptionsBuilder {
         self
     }
 
+    pub fn provider(mut self, provider: Provider) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
     pub fn build(self) -> MountOptions {
         MountOptions {
             update: self.update,
@@ -305,6 +364,7 @@ impl MountOptionsBuilder {
             mount_type: self.mount_type,
             remove_properties: self.remove_properties,
             write_type: self.write_type,
+            provider: self.provider,
         }
     }
 }

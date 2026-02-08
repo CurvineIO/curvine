@@ -26,9 +26,9 @@ use curvine_common::state::{
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::LocalTime;
-use orpc::err_box;
 use orpc::runtime::{LoopTask, RpcRuntime, Runtime};
 use orpc::sync::channel::BlockingChannel;
+use orpc::{err_box, err_ext};
 use std::sync::Arc;
 
 /// Load the Task Manager
@@ -95,7 +95,7 @@ impl JobManager {
                 progress: job.progress.clone(),
             })
         } else {
-            err_box!("Not fond job {}", job_id)
+            err_ext!(FsError::job_not_found(job_id))
         }
     }
 
@@ -144,12 +144,17 @@ impl JobManager {
                     || state == JobTaskState::Failed
                     || state == JobTaskState::Canceled
                 {
-                    return err_box!("Cannot cancel job in state {:?}", state);
+                    info!(
+                        "job {} is already in final state {:?}, source_path: {}, target_path: {}",
+                        job_id, state, job.info.source_path, job.info.target_path
+                    );
+                    self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user");
+                    return Ok(());
                 }
 
                 job.assigned_workers.clone()
             } else {
-                return err_box!("Job {} not found", job_id);
+                return err_ext!(FsError::job_not_found(job_id));
             }
         };
 

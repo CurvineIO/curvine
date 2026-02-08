@@ -22,7 +22,7 @@ use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path};
+use curvine_common::fs::{FileSystem, Path, StateReader, StateWriter};
 use curvine_common::state::{
     CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileLock, FileStatus, LockFlags, LockType,
     MkdirOptsBuilder, OpenFlags, SetAttrOpts,
@@ -81,16 +81,14 @@ impl CurvineFileSystem {
     pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
         let blocks = ((status.len + 511) / 512) as u64;
 
-        let ctime_sec = if status.atime > 0 {
-            (status.atime / 1000) as u64
-        } else {
-            (status.mtime / 1000) as u64
-        };
-        let ctime_nsec = if status.atime > 0 {
-            ((status.atime % 1000) * 1000) as u32
-        } else {
-            ((status.mtime % 1000) * 1000) as u32
-        };
+        let mtime_sec = (status.mtime.max(0) / 1000) as u64;
+        let mtime_nsec = ((status.mtime.max(0) % 1000) * 1_000_000) as u32;
+
+        let atime_sec = (status.atime.max(0) / 1000) as u64;
+        let atime_nsec = ((status.atime.max(0) % 1000) * 1_000_000) as u32;
+
+        let ctime_sec = mtime_sec;
+        let ctime_nsec = mtime_nsec;
 
         let uid = if status.owner.is_empty() {
             conf.uid
@@ -129,11 +127,11 @@ impl CurvineFileSystem {
             ino: status.id as u64,
             size,
             blocks,
-            atime: ctime_sec,
-            mtime: ctime_sec,
+            atime: atime_sec,
+            mtime: mtime_sec,
             ctime: ctime_sec,
-            atimensec: ctime_nsec,
-            mtimensec: ctime_nsec,
+            atimensec: atime_nsec,
+            mtimensec: mtime_nsec,
             ctimensec: ctime_nsec,
             mode,
             nlink,
@@ -260,6 +258,10 @@ impl CurvineFileSystem {
         let mut res = FuseDirentList::new(arg);
         for (index, status) in handle.get_list(arg.offset as usize) {
             let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
+                if self.conf.enable_meta_cache {
+                    let path = Path::from_str(&status.path)?;
+                    self.state.meta_cache().put_status(&path, status.clone());
+                }
                 map.do_lookup(header.nodeid, Some(&status.name), status)?
             } else {
                 Self::status_to_attr(&self.conf, status)?
@@ -277,6 +279,19 @@ impl CurvineFileSystem {
         Ok(res)
     }
 
+    async fn check_permissions(
+        &self,
+        path: &Path,
+        header: &fuse_in_header,
+        mask: u32,
+    ) -> FuseResult<()> {
+        if header.uid == 0 || !self.conf.check_permission {
+            return Ok(());
+        }
+        let status = self.get_cached_status(path).await?;
+        self.check_access_permissions(&status, header, mask)
+    }
+
     /// Check if the current user has the requested access permissions
     fn check_access_permissions(
         &self,
@@ -284,11 +299,6 @@ impl CurvineFileSystem {
         header: &fuse_in_header,
         mask: u32,
     ) -> FuseResult<()> {
-        // Root (uid=0) bypasses permission checks
-        if header.uid == 0 {
-            return Ok(());
-        }
-
         let file_uid = self.resolve_file_uid(&status.owner);
         let file_gid = self.resolve_file_gid(&status.group);
         let permission_bits = self.get_effective_permission_bits(
@@ -504,14 +514,6 @@ impl CurvineFileSystem {
         fh: u64,
         opts: FileAllocOpts,
     ) -> FuseResult<()> {
-        if let Some((ufs_path, _)) = self.fs.get_mount(path).await? {
-            warn!(
-                "ufs {} -> {} does not support resize, will ignore",
-                path, ufs_path
-            );
-            return Ok(());
-        }
-
         opts.validate()?;
         if fh != 0 {
             let handle = self.state.find_handle(ino, fh)?;
@@ -650,15 +652,26 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let parent_path = self.state.get_path(parent)?;
-        let parent_status = self.get_cached_status(&parent_path).await?;
-        self.check_access_permissions(&parent_status, op.header, libc::X_OK as u32)?;
+        self.check_permissions(&parent_path, op.header, libc::X_OK as u32)
+            .await?;
 
         // Get the path.
         let path = self.state.get_path_common(parent, name.as_deref())?;
-        let res = self.lookup_path(parent, name.as_deref(), &path).await;
+        let status = self.get_cached_status(&path).await?;
+        let res = self.lookup_status(parent, name.as_deref(), &status);
 
         let entry = match res {
-            Ok(attr) => Self::create_entry_out(&self.conf, attr),
+            Ok(attr) => {
+                let mut entry = Self::create_entry_out(&self.conf, attr);
+                let keep_attr = self.state.should_keep_attr(entry.nodeid, &status)?;
+                if !keep_attr {
+                    entry.entry_valid = 0;
+                    entry.attr_valid = 0;
+                    entry.entry_valid_nsec = 0;
+                    entry.attr_valid_nsec = 0;
+                }
+                entry
+            }
 
             Err(e) if e.errno == libc::ENOENT && !self.conf.negative_ttl.is_zero() => {
                 fuse_entry_out {
@@ -860,9 +873,19 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut fuse_attr = Self::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
 
+        let keep_cache = self.state.should_keep_attr(op.header.nodeid, &status)?;
+        let (attr_valid, attr_valid_nsec) = if keep_cache {
+            (
+                self.conf.attr_ttl.as_secs(),
+                self.conf.attr_ttl.subsec_nanos(),
+            )
+        } else {
+            (0, 0)
+        };
+
         let attr = fuse_attr_out {
-            attr_valid: self.conf.attr_ttl.as_secs(),
-            attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
+            attr_valid,
+            attr_valid_nsec,
             dummy: 0,
             attr: fuse_attr,
         };
@@ -950,14 +973,14 @@ impl fs::FileSystem for CurvineFileSystem {
             // Skip when parent_id is invalid (e.g., root has no parent). Inode 0 is invalid.
             if parent_id != 0 {
                 let parent_path = self.state.get_path(parent_id)?;
-                let parent_status = self.get_cached_status(&parent_path).await?;
-                self.check_access_permissions(&parent_status, op.header, libc::X_OK as u32)?;
+                self.check_permissions(&parent_path, op.header, libc::X_OK as u32)
+                    .await?;
             }
         }
 
         // Get file status to check permissions
-        let status = self.get_cached_status(&path).await?;
-        self.check_access_permissions(&status, op.header, op.arg.mask)?;
+        self.check_permissions(&path, op.header, op.arg.mask)
+            .await?;
 
         Ok(())
     }
@@ -968,10 +991,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Check directory permissions based on open action
         let dir_path = self.state.get_path(op.header.nodeid)?;
-        let dir_status = self.get_cached_status(&dir_path).await?;
-
-        // Use existing permission check function to verify access
-        self.check_access_permissions(&dir_status, op.header, action.acl_mask())?;
+        self.check_permissions(&dir_path, op.header, action.acl_mask())
+            .await?;
 
         let list = self.get_cached_list(&dir_path).await?;
         let handle = self.state.new_dir_handle(op.header.nodeid, list).await?;
@@ -1028,7 +1049,7 @@ impl fs::FileSystem for CurvineFileSystem {
             )
         }
 
-        let status = match self.fs.fuse_mkdir(&path, opts.build()).await {
+        let status = match self.fs.mkdir_with_opts(&path, opts.build()).await {
             Ok(status) => match status {
                 Some(v) => v,
                 None => self.fs.get_status(&path).await?,
@@ -1082,17 +1103,18 @@ impl fs::FileSystem for CurvineFileSystem {
         handle.read(&self.state, op, reply).await
     }
 
-    async fn open(&self, op: Open<'_>, reply: &FuseResponse) -> FuseResult<fuse_open_out> {
+    async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
         let path = self.state.get_path(op.header.nodeid)?;
+        // Check file access permissions before opening
+        let action = OpenAction::try_from(op.arg.flags)?;
+        self.check_permissions(&path, op.header, action.acl_mask())
+            .await?;
+
         let opts = CreateFileOptsBuilder::with_conf(&self.fs.conf().client);
         let handle = self
             .state
             .new_handle(op.header.nodeid, &path, op.arg.flags, opts.build())
             .await?;
-
-        // Check file access permissions before opening
-        let action = OpenAction::try_from(op.arg.flags)?;
-        self.check_access_permissions(handle.status(), op.header, action.acl_mask())?;
 
         let mut open_flags = op.arg.flags;
         if self.conf.direct_io {
@@ -1104,10 +1126,7 @@ impl fs::FileSystem for CurvineFileSystem {
             if keep_cache {
                 open_flags |= FUSE_FOPEN_KEEP_CACHE;
             } else {
-                let flag = reply.send_inode_out(handle.ino, -1, 0).await?;
-                if !flag {
-                    open_flags |= FUSE_FOPEN_DIRECT_IO;
-                }
+                open_flags |= FUSE_FOPEN_DIRECT_IO;
             }
         }
 
@@ -1223,6 +1242,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let path = Path::from_str(&handle.status.path)?;
         self.invalidate_cache(&path)?;
+
         complete_result
     }
 
@@ -1502,5 +1522,13 @@ impl fs::FileSystem for CurvineFileSystem {
                 info!("waiting lock for {}, elapsed: {} ms", path, time.used_ms());
             }
         }
+    }
+
+    async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
+        self.state.persist(writer).await
+    }
+
+    async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
+        self.state.restore(reader).await
     }
 }

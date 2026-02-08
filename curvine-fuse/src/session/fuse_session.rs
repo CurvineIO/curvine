@@ -21,14 +21,22 @@ use crate::session::channel::{FuseChannel, FuseReceiver, FuseSender};
 use crate::session::FuseRequest;
 use crate::session::{FuseMnt, FuseResponse};
 use crate::{err_fuse, FuseResult};
-use curvine_common::conf::FuseConf;
+use curvine_common::conf::{ClusterConf, FuseConf};
+use curvine_common::fs::{StateReader, StateWriter};
+use curvine_common::utils::CommonUtils;
 use curvine_common::version::GIT_VERSION;
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
+use orpc::common::{ByteUnit, TimeSpent};
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::CommonResult;
+use orpc::sys::{RawIO, SignalKind, SignalWatch};
+use orpc::{err_box, err_msg, sys, CommonResult};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 
 pub struct FuseSession<T> {
@@ -37,39 +45,33 @@ pub struct FuseSession<T> {
     mnts: Vec<FuseMnt>,
     channels: Vec<FuseChannel<T>>,
     shutdown_tx: watch::Sender<bool>,
+    conf: FuseConf,
 }
 
 impl<T: FileSystem> FuseSession<T> {
+    pub const STATE_PATH: &'static str = "CURVINE_FUSE_STATE_PATH";
+
     pub async fn new(rt: Arc<Runtime>, fs: T, conf: FuseConf) -> FuseResult<Self> {
-        let all_mnt_paths = conf.get_all_mnt_path()?;
-
-        // Analyze the mount parameters.
-        let fuse_opts = conf.parse_fuse_opts();
-
-        // Create all mount points.
-        let mut mnts = vec![];
-        for path in all_mnt_paths {
-            mnts.push(FuseMnt::new(path, &conf));
-        }
+        let mnts = Self::setup_mnts(&conf, &fs).await?;
 
         let fs = Arc::new(fs);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+
         let mut channels = vec![];
-        for mnt in &mut mnts {
+        for mnt in &mnts {
             let channel = FuseChannel::new(fs.clone(), rt.clone(), mnt, &conf)?;
             channels.push(channel);
         }
 
         info!(
             "Create fuse session, git version: {}, mnt number: {}, loop task number: {},\
-         io threads: {}, worker threads: {}, fuse channel size: {}, fuse opts: {:?}",
+         io threads: {}, worker threads: {}, fuse channel size: {}",
             GIT_VERSION,
             conf.mnt_number,
-            channels.len(),
+            channels[0].senders.len(),
             rt.io_threads(),
             rt.worker_threads(),
             conf.fuse_channel_size,
-            fuse_opts
         );
 
         let session = Self {
@@ -78,62 +80,81 @@ impl<T: FileSystem> FuseSession<T> {
             mnts,
             channels,
             shutdown_tx,
+            conf,
         };
         Ok(session)
     }
 
+    pub fn state_file(&self) -> String {
+        let pid = std::process::id();
+        format!("{}/curvine_fuse_state_{}.data", self.conf.state_dir, pid)
+    }
+
     pub async fn run(&mut self) -> CommonResult<()> {
         info!("fuse session started running");
-        let ctrl_c = tokio::signal::ctrl_c();
         let channels = std::mem::take(&mut self.channels);
         let mnts = std::mem::take(&mut self.mnts);
 
         #[cfg(target_os = "linux")]
         {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).unwrap();
-            let mut sigint = signal(SignalKind::interrupt()).unwrap();
-            let mut sighup = signal(SignalKind::hangup()).unwrap();
-            let mut sigquit = signal(SignalKind::quit()).unwrap();
-
             //check umount signal
-            {
-                let watch_fds: Vec<orpc::sys::RawIO> = mnts.iter().map(|m| m.fd).collect();
-                self.spawn_fd_watcher(&watch_fds);
+            let watch_fds: Vec<RawIO> = mnts.iter().map(|m| m.fd).collect();
+            self.spawn_fd_watcher(&watch_fds);
+        }
+
+        let mut run_all_handle = tokio::spawn(Self::run_all(
+            self.rt.clone(),
+            self.fs.clone(),
+            channels,
+            self.shutdown_tx.subscribe(),
+        ));
+
+        tokio::select! {
+            res = &mut run_all_handle => {
+                match res {
+                    Ok(Ok(())) => {
+                        info!("run_all finished (likely due to umount or ENODEV); proceeding to unmount and exit");
+                    }
+                    Ok(Err(err)) => {
+                        error!("fatal error in run_all, cause = {:?}", err);
+                    }
+                    Err(e) => {
+                        error!("run_all task panicked: {:?}", e);
+                    }
+                }
             }
 
-            tokio::select! {
-                res = Self::run_all(self.rt.clone(), self.fs.clone(), channels, self.shutdown_tx.subscribe()) => {
-                    if let Err(err) = res {
-                        error!("fatal error, cause = {:?}", err);
+            signal_result = SignalWatch::wait_quit() => {
+                match signal_result {
+                    Ok(kind) => {
+                        info!("received termination signal {}, initiating graceful shutdown of FUSE session...", kind);
                     }
-                    info!("run_all finished; proceeding to unmount and exit");
+                    Err(e) => {
+                        error!("error waiting for signal: {:?}", e);
+                    }
                 }
 
-                _ = ctrl_c => {
-                    info!("received Ctrl-C (SIGINT via terminal), shutting down fuse");
-                    let _ = self.shutdown_tx.send(true);
+                let _ = self.shutdown_tx.send(true);
+                if let Err(e) = run_all_handle.await {
+                    error!("run_all task panicked during shutdown: {:?}", e);
+                }
+            }
+
+            signal_result = SignalWatch::wait_one(SignalKind::User1) => {
+                 match signal_result {
+                    Ok(kind) => {
+                        info!("received user signal {}, initiating graceful shutdown and persisting FUSE session state...", kind);
+                    }
+                    Err(e) => {
+                        error!("error waiting for signal: {:?}", e);
+                    }
                 }
 
-                _ = sigterm.recv()  => {
-                    info!("received SIGTERM, shutting down fuse gracefully...");
-                    let _ = self.shutdown_tx.send(true);
+                let _ = self.shutdown_tx.send(true);
+                if let Err(e) = run_all_handle.await {
+                    error!("run_all task panicked during shutdown: {:?}", e);
                 }
-
-                _ = sigint.recv()  => {
-                    info!("received SIGINT, shutting down fuse gracefully...");
-                    let _ = self.shutdown_tx.send(true);
-                }
-
-                _ = sighup.recv()  => {
-                    info!("received SIGHUP, shutting down fuse gracefully...");
-                    let _ = self.shutdown_tx.send(true);
-                }
-
-                _ = sigquit.recv()  => {
-                    info!("received SIGQUIT, shutting down fuse gracefully...");
-                    let _ = self.shutdown_tx.send(true);
-                }
+                self.persist(mnts).await?;
             }
         }
 
@@ -211,5 +232,87 @@ impl<T: FileSystem> FuseSession<T> {
         }
 
         Ok(())
+    }
+
+    async fn setup_mnts(conf: &FuseConf, fs: &T) -> CommonResult<Vec<FuseMnt>> {
+        if let Ok(state_file) = std::env::var(Self::STATE_PATH) {
+            Self::restore(&state_file, conf, fs).await
+        } else {
+            let mut mnts = vec![];
+            let all_mnt_paths = conf.get_all_mnt_path()?;
+            for path in all_mnt_paths {
+                mnts.push(FuseMnt::new(path, conf));
+            }
+            Ok(mnts)
+        }
+    }
+
+    async fn persist(&self, mnts: Vec<FuseMnt>) -> CommonResult<()> {
+        let mut writer = StateWriter::new(self.state_file())?;
+        let ts = TimeSpent::new();
+        info!("persist: task started, path={}", writer.path());
+
+        // Handle mount point file descriptors
+        // 1. Set auto_unmount to false to prevent automatic unmounting
+        // 2. Clear FD_CLOEXEC flag to allow child process inheritance
+        let mut fds = HashMap::new();
+        for mut mnt in mnts {
+            mnt.auto_unmount(false);
+
+            let flags = sys::fcntl_get(mnt.fd)?;
+            sys::fcntl_set(mnt.fd, flags & !libc::FD_CLOEXEC);
+
+            fds.insert(mnt.fd, mnt.path.to_string_lossy().to_string());
+        }
+
+        // Save file descriptors and state information to file
+        info!("persist: write mount fds {:?}", fds);
+        writer.write_struct(&fds)?;
+        self.fs.persist(&mut writer).await?;
+
+        info!(
+            "persist: task completed, path={}, size={}, elapsed={}ms",
+            writer.path(),
+            ByteUnit::byte_to_string(writer.len()),
+            ts.used_ms()
+        );
+
+        // Set environment variable to pass state file path and start child process
+        let mut env = HashMap::new();
+        env.insert(Self::STATE_PATH.to_owned(), writer.path().to_owned());
+        CommonUtils::reload_param(env)?;
+
+        Ok(())
+    }
+
+    async fn restore(file: &str, conf: &FuseConf, fs: &T) -> CommonResult<Vec<FuseMnt>> {
+        // If environment variable exists, restore state information from state file
+        let mut mnts = vec![];
+        let mut reader = StateReader::new(file)?;
+        let ts = TimeSpent::new();
+        info!("restore: task started, path={}", reader.path());
+
+        // Read and process mount point file descriptors
+        let fds: HashMap<RawIO, String> = reader.read_struct()?;
+        info!("restore: write mount fds {:?}", fds);
+        if fds.is_empty() {
+            return err_box!("no fd found in state file {}", reader.path());
+        }
+        for (fd, path) in fds {
+            let flags = sys::fcntl_get(fd)?;
+            sys::fcntl_set(fd, flags | libc::FD_CLOEXEC)?;
+
+            let path_buf = PathBuf::from(path);
+            mnts.push(FuseMnt::from_fd(path_buf, conf, fd));
+        }
+
+        fs.restore(&mut reader).await?;
+
+        info!(
+            "restore: task completed, file_path={}, elapsed={}ms",
+            reader.path(),
+            ts.used_ms()
+        );
+        Ok(mnts)
     }
 }

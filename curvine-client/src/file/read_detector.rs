@@ -173,7 +173,7 @@ impl ReadDetector {
         self.last_read_pos = -1;
 
         if self.read_pattern.is_sequential() {
-            log::info!(
+            log::debug!(
                 "file {} read pattern changed: {:?} -> {:?}",
                 path,
                 self.read_pattern,
@@ -203,7 +203,7 @@ impl ReadDetector {
         };
 
         if self.read_pattern != read_pattern {
-            log::info!(
+            log::debug!(
                 "file {} read pattern changed: {:?} -> {:?}",
                 path,
                 self.read_pattern,

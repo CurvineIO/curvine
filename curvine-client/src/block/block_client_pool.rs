@@ -141,7 +141,7 @@ impl BlockClientPool {
                 let addr = client.worker_addr().clone();
 
                 if self.cur_idle_size.get() >= self.max_idle_size {
-                    warn!(
+                    debug!(
                         "pool full(max={}), closing connection for worker {}",
                         self.max_idle_size,
                         client.worker_addr()

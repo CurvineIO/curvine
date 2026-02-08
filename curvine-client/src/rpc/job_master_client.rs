@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use log::info;
 use std::sync::Arc;
+use tokio::time;
 
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
@@ -24,6 +26,8 @@ use curvine_common::state::{
 };
 use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
+use orpc::common::TimeSpent;
+use orpc::err_box;
 
 use crate::file::{FsClient, FsContext};
 
@@ -101,6 +105,55 @@ impl JobMasterClient {
             report: ProtoUtils::work_progress_to_pb(report),
         };
         let _: TaskReportResponse = self.client.rpc(RpcCode::ReportTask, req).await?;
+        Ok(())
+    }
+
+    pub async fn wait_job_complete(&self, job_id: impl AsRef<str>, mark: &str) -> FsResult<()> {
+        let time = self.client.conf().client.max_sync_wait_timeout;
+        time::timeout(time, self.wait_job_complete0(job_id, mark)).await?
+    }
+
+    async fn wait_job_complete0(&self, job_id: impl AsRef<str>, mark: &str) -> FsResult<()> {
+        let mut ticks = 0;
+        let time = TimeSpent::new();
+        let conf = &self.client.conf().client;
+        let job_id = job_id.as_ref();
+
+        loop {
+            let status = self.get_job_status(job_id).await?;
+            match status.state {
+                JobTaskState::Completed => break,
+
+                JobTaskState::Failed | JobTaskState::Canceled => {
+                    return err_box!(
+                        "job {} {:?}: {}",
+                        status.job_id,
+                        status.state,
+                        status.progress.message
+                    )
+                }
+
+                _ => {
+                    ticks += 1;
+
+                    let sleep_time = conf
+                        .sync_check_interval_max
+                        .min(conf.sync_check_interval_min * ticks);
+                    time::sleep(sleep_time).await;
+
+                    if ticks % conf.sync_check_log_tick == 0 {
+                        info!(
+                            "[{}] waiting for job {} to complete, elapsed: {} ms, progress: {}",
+                            mark,
+                            status.job_id,
+                            time.used_ms(),
+                            status.progress_string(false)
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }

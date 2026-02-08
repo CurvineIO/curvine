@@ -16,7 +16,7 @@ use crate::file::{FsReader, FsWriter};
 use crate::impl_filesystem_for_enum;
 use crate::{impl_reader_for_enum, impl_writer_for_enum};
 use curvine_common::fs::Path;
-use curvine_common::state::MountInfo;
+use curvine_common::state::{MountInfo, Provider};
 use curvine_common::FsResult;
 use orpc::err_box;
 use std::collections::HashMap;
@@ -118,35 +118,118 @@ impl_filesystem_for_enum! {
 }
 
 impl UfsFileSystem {
-    pub fn new(path: &Path, conf: HashMap<String, String>) -> FsResult<Self> {
-        match path.scheme() {
-            // Jindo OSS backend (async-only)
-            #[cfg(feature = "oss-hdfs")]
-            Some("oss") => {
-                let fs = OssHdfsFileSystem::new(path, conf)?;
-                Ok(UfsFileSystem::OssHdfs(fs))
+    pub fn new(
+        path: &Path,
+        conf: HashMap<String, String>,
+        provider: Option<Provider>,
+    ) -> FsResult<Self> {
+        let provider = provider.unwrap_or(Provider::Auto);
+
+        match (provider, path.scheme()) {
+            // Explicit provider selection
+            (Provider::OssHdfs, Some("oss")) => {
+                #[cfg(feature = "oss-hdfs")]
+                {
+                    let fs = OssHdfsFileSystem::new(path, conf)?;
+                    Ok(UfsFileSystem::OssHdfs(fs))
+                }
+                #[cfg(not(feature = "oss-hdfs"))]
+                {
+                    err_box!("oss-hdfs provider is not enabled")
+                }
             }
 
-            #[cfg(feature = "opendal")]
-            Some(scheme)
+            (Provider::Opendal, Some(scheme))
                 if [
                     "s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs",
                 ]
                 .contains(&scheme) =>
             {
-                // JVM initialization for HDFS is handled in OpendalFileSystem::new
+                #[cfg(feature = "opendal")]
+                {
+                    // JVM initialization for HDFS is handled in OpendalFileSystem::new
+                    let fs = OpendalFileSystem::new(path, conf)?;
+                    Ok(UfsFileSystem::Opendal(fs))
+                }
+                #[cfg(not(feature = "opendal"))]
+                {
+                    err_box!("opendal provider is not enabled")
+                }
+            }
+
+            // Auto-detect (backward compatible)
+            (Provider::Auto, Some("oss")) => {
+                // Check for provider in config
+                match conf.get("provider").map(|s| s.as_str()) {
+                    Some("oss-hdfs") => {
+                        #[cfg(feature = "oss-hdfs")]
+                        {
+                            let fs = OssHdfsFileSystem::new(path, conf)?;
+                            Ok(UfsFileSystem::OssHdfs(fs))
+                        }
+                        #[cfg(not(feature = "oss-hdfs"))]
+                        {
+                            err_box!("oss-hdfs provider is not enabled")
+                        }
+                    }
+                    Some("opendal") => {
+                        #[cfg(feature = "opendal")]
+                        {
+                            let fs = OpendalFileSystem::new(path, conf)?;
+                            Ok(UfsFileSystem::Opendal(fs))
+                        }
+                        #[cfg(not(feature = "opendal"))]
+                        {
+                            err_box!("opendal provider is not enabled")
+                        }
+                    }
+                    Some(other) => err_box!("invalid provider in config: {}", other),
+                    None => {
+                        // Current default: oss-hdfs takes precedence
+                        #[cfg(feature = "oss-hdfs")]
+                        {
+                            let fs = OssHdfsFileSystem::new(path, conf)?;
+                            Ok(UfsFileSystem::OssHdfs(fs))
+                        }
+                        #[cfg(all(feature = "opendal", not(feature = "oss-hdfs")))]
+                        {
+                            let fs = OpendalFileSystem::new(path, conf)?;
+                            Ok(UfsFileSystem::Opendal(fs))
+                        }
+                        #[cfg(not(any(feature = "oss-hdfs", feature = "opendal")))]
+                        {
+                            err_box!("no OSS provider is enabled")
+                        }
+                    }
+                }
+            }
+
+            // Other schemes with auto provider
+            #[cfg(feature = "opendal")]
+            (Provider::Auto, Some(scheme))
+                if ["s3", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs"].contains(&scheme) =>
+            {
                 let fs = OpendalFileSystem::new(path, conf)?;
                 Ok(UfsFileSystem::Opendal(fs))
             }
 
-            Some(scheme) => err_box!("unsupported scheme: {}", scheme),
+            (Provider::Auto, Some(scheme)) => err_box!("unsupported scheme: {}", scheme),
 
-            None => err_box!("missing scheme"),
+            (Provider::Auto, None) => err_box!("missing scheme"),
+
+            (provider, Some(scheme)) => {
+                err_box!(
+                    "provider {:?} is not compatible with scheme {}",
+                    provider,
+                    scheme
+                )
+            }
+            (_provider, None) => err_box!("missing scheme"),
         }
     }
 
     pub fn with_mount(mnt: &MountInfo) -> FsResult<Self> {
         let path = Path::from_str(&mnt.ufs_path)?;
-        Self::new(&path, mnt.properties.clone())
+        Self::new(&path, mnt.properties.clone(), mnt.provider)
     }
 }

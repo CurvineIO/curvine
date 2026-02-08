@@ -48,27 +48,80 @@ fn main() {
     // Build version number file
     let ver_file = format!("{}/version.rs", base);
     let commit = get_git_head_commit();
-    let commit_str = format!("pub static GIT_VERSION: &str = \"{}\";", commit);
-    fs::write(ver_file, commit_str).unwrap();
+    let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
+    let git_tag = get_git_tag();
+    let git_branch = get_git_branch();
+
+    // Build the source info: prefer tag over branch
+    let source_info = if !git_tag.is_empty() && git_tag != "unknown" {
+        format!("tag: {}", git_tag)
+    } else if !git_branch.is_empty() && git_branch != "unknown" {
+        format!("branch: {}", git_branch)
+    } else {
+        String::new()
+    };
+
+    // Build full version string
+    let full_version = if !source_info.is_empty() {
+        format!("{} (commit: {}, {})", pkg_version, commit, source_info)
+    } else {
+        format!("{} (commit: {})", pkg_version, commit)
+    };
+
+    let version_content = format!(
+        r#"/// Git commit ID (short)
+pub static GIT_VERSION: &str = "{}";
+
+/// Package version from Cargo.toml
+pub static PKG_VERSION: &str = "{}";
+
+/// Git tag (if built from a tag)
+pub static GIT_TAG: &str = "{}";
+
+/// Git branch (if not built from a tag)
+pub static GIT_BRANCH: &str = "{}";
+
+/// Full version string: "version (commit: commit-id, tag/branch: name)"
+pub static VERSION: &str = "{}";
+"#,
+        commit, pkg_version, git_tag, git_branch, full_version
+    );
+
+    fs::write(ver_file, version_content).unwrap();
 }
 
 fn get_git_head_commit() -> String {
-    let output = Command::new("git")
-        .arg("rev-parse")
-        .arg("--short")
-        .arg("HEAD")
-        .output();
+    run_git_command(&["rev-parse", "--short", "HEAD"])
+}
+
+fn get_git_tag() -> String {
+    // Try to get exact tag at HEAD
+    let tag = run_git_command(&["describe", "--tags", "--exact-match", "HEAD"]);
+    if !tag.is_empty() && tag != "unknown" {
+        return tag;
+    }
+    String::new()
+}
+
+fn get_git_branch() -> String {
+    let branch = run_git_command(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    // Skip if it's HEAD (detached HEAD state, like in CI)
+    if branch == "HEAD" {
+        return String::new();
+    }
+    branch
+}
+
+fn run_git_command(args: &[&str]) -> String {
+    let output = Command::new("git").args(args).output();
 
     if let Ok(v) = output {
         if v.status.success() {
-            str::from_utf8(&v.stdout)
+            return str::from_utf8(&v.stdout)
                 .unwrap_or("unknown")
                 .trim()
-                .to_string()
-        } else {
-            "unknown".to_string()
+                .to_string();
         }
-    } else {
-        "unknown".to_string()
     }
+    "unknown".to_string()
 }

@@ -213,7 +213,8 @@ impl Deref for S3Conf {
 /// OSS-HDFS configuration (JindoSDK).
 ///
 /// Notes:
-/// - The underlying JindoSDK configuration keys are prefixed with `fs.oss.*`.
+/// - User-facing configuration keys use `oss.*` format (without `fs.` prefix).
+/// - JindoSDK internal configuration keys use `fs.oss.*` format (with `fs.` prefix).
 /// - This config struct is used by the `oss://` UFS implementation (`oss_hdfs` module).
 #[derive(Debug, Clone)]
 pub struct OssHdfsConf {
@@ -228,7 +229,16 @@ pub struct OssHdfsConf {
 }
 
 impl OssHdfsConf {
-    // Configuration keys
+    // User-facing configuration keys (without fs. prefix)
+    pub const USER_ENDPOINT: &'static str = "oss.endpoint";
+    pub const USER_ACCESS_KEY_ID: &'static str = "oss.accessKeyId";
+    pub const USER_ACCESS_KEY_SECRET: &'static str = "oss.accessKeySecret";
+    pub const USER_REGION: &'static str = "oss.region";
+    pub const USER_DATA_ENDPOINT: &'static str = "oss.data.endpoint";
+    pub const USER_SECOND_LEVEL_DOMAIN_ENABLE: &'static str = "oss.second.level.domain.enable";
+    pub const USER_DATA_LAKE_STORAGE_ENABLE: &'static str = "oss.data.lake.storage.enable";
+
+    // JindoSDK internal configuration keys (with fs. prefix)
     pub const ENDPOINT: &'static str = "fs.oss.endpoint";
     pub const ACCESS_KEY_ID: &'static str = "fs.oss.accessKeyId";
     pub const ACCESS_KEY_SECRET: &'static str = "fs.oss.accessKeySecret";
@@ -242,19 +252,20 @@ impl OssHdfsConf {
     pub const DEFAULT_DATA_LAKE_STORAGE_ENABLE: bool = true;
 
     /// Create OssHdfsConf from configuration map
+    /// Uses user-facing configuration keys (oss.*) for reading from config map
     pub fn with_map(properties: HashMap<String, String>) -> CommonResult<Self> {
         let map = ConfMap::new(properties);
 
-        let endpoint_url = map.get_string(Self::ENDPOINT)?;
-        let access_key = map.get_string(Self::ACCESS_KEY_ID)?;
-        let secret_key = map.get_string(Self::ACCESS_KEY_SECRET)?;
-        let region_name = map.get_string(Self::REGION).ok();
-        let data_endpoint = map.get_string(Self::DATA_ENDPOINT).ok();
+        let endpoint_url = map.get_string(Self::USER_ENDPOINT)?;
+        let access_key = map.get_string(Self::USER_ACCESS_KEY_ID)?;
+        let secret_key = map.get_string(Self::USER_ACCESS_KEY_SECRET)?;
+        let region_name = map.get_string(Self::USER_REGION).ok();
+        let data_endpoint = map.get_string(Self::USER_DATA_ENDPOINT).ok();
         let second_level_domain_enable = map
-            .get_bool(Self::SECOND_LEVEL_DOMAIN_ENABLE)
+            .get_bool(Self::USER_SECOND_LEVEL_DOMAIN_ENABLE)
             .unwrap_or(Self::DEFAULT_SECOND_LEVEL_DOMAIN_ENABLE);
         let data_lake_storage_enable = map
-            .get_bool(Self::DATA_LAKE_STORAGE_ENABLE)
+            .get_bool(Self::USER_DATA_LAKE_STORAGE_ENABLE)
             .unwrap_or(Self::DEFAULT_DATA_LAKE_STORAGE_ENABLE);
 
         Ok(Self {

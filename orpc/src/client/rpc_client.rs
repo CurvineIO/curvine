@@ -222,13 +222,28 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn test1() -> IOResult<()> {
+    fn rpc_client_test() -> IOResult<()> {
         let server = SimpleServer::default();
         let addr = server.bind_addr().clone();
-        server.start(10000);
+        server.start(0);
 
         let conf = ClientConf::default();
         let rt = Arc::new(conf.create_runtime());
+
+        // Wait for server to start
+        rt.block_on(async {
+            use tokio::time::{sleep, Duration};
+            for _ in 0..50 {
+                if RpcClient::new(false, rt.clone(), &addr, &conf)
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            panic!("Server failed to start within 5 seconds");
+        });
 
         rt.block_on(task(&addr, true, true, &conf, rt.clone()));
         rt.block_on(task(&addr, false, true, &conf, rt.clone()));

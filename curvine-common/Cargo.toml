@@ -24,6 +24,7 @@ regex = { workspace = true }
 indexmap = { workspace = true }
 num_enum = { workspace = true }
 hyper = { workspace = true }
+percent-encoding = "2.3"
 bincode = { workspace = true }
 thiserror = { workspace = true }
 crc32fast = { workspace = true }

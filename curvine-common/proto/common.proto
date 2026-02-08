@@ -206,18 +206,9 @@ message BlocksBatchWriteRequest {
     required ContainerMetadataProto files_metadata = 9;
 }  
 
-message BlockWriteResponse {
-    required int64 id = 1;
-    optional string path = 2;
-    required int64 off = 3;
-    required int64 block_size = 4;
-    required StorageTypeProto storage_type = 5;
-}
 
-message BlocksBatchWriteResponse {  
-    repeated BlockWriteResponse responses = 1; 
-    required ContainerMetadataProto container_meta = 2; 
-}
+
+
 
 message BlocksBatchCommitRequest {  
     required ExtendedBlockProto block = 1;  

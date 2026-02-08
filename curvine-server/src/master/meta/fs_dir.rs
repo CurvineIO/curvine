@@ -69,9 +69,11 @@ impl FsDir {
         Ok(fs_dir)
     }
 
-    pub fn inode_store(&self) -> InodeStore {
-        self.store.clone()
-    }
+    // Note: inode_store() method was intentionally removed.
+    // Cloning InodeStore increases Arc<RocksInodeStore> refcount, which prevents
+    // the RocksDB lock from being released during Raft snapshot restore.
+    // Access inode_store via self references instead of cloning.
+
     // Create root directory
     pub fn create_root() -> InodeView {
         Dir(ROOT_INODE_NAME.to_string(), InodeDir::new(ROOT_INODE_ID, 0))
@@ -146,13 +148,19 @@ impl FsDir {
     // Delete files or directories
     pub fn delete(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
         let op_ms = LocalTime::mills();
-        if !inp.is_full() {
-            return err_box!("Path not exists: {}", inp.path());
+
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be deleted");
+        }
+
+        if inp.is_empty() || inp.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(inp.path()));
         }
 
         if !inp.is_empty_dir() && !recursive {
-            return err_box!("{} is non empty", inp.path());
+            return err_ext!(FsError::dir_not_empty(inp.path()));
         }
+
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
         self.journal_writer
             .log_delete(op_ms, inp.path(), op_ms as i64)?;
@@ -238,7 +246,7 @@ impl FsDir {
         flags: RenameFlags,
     ) -> FsResult<Option<DeleteResult>> {
         let src_inode = match src_inp.get_last_inode() {
-            None => return err_box!("File not exists: {}", src_inp.path()),
+            None => return err_ext!(FsError::file_not_found(src_inp.path())),
             Some(v) => v,
         };
         if flags.exchange_mode() {
@@ -893,6 +901,15 @@ impl FsDir {
     // Read data from rocksdb to build a directory tree
     pub fn create_tree(&self) -> CommonResult<InodeView> {
         self.store.create_tree().map(|x| x.1)
+    }
+
+    // Restore in-memory tree from RocksDB without checkpoint (for testing only).
+    // In production, use restore() with checkpoint path via Raft snapshot.
+    pub fn restore_from_rocksdb(&mut self) -> CommonResult<()> {
+        let (last_inode_id, root_dir) = self.store.create_tree()?;
+        self.root_dir = root_dir;
+        self.update_last_inode_id(last_inode_id)?;
+        Ok(())
     }
 
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {

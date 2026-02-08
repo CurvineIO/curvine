@@ -279,7 +279,7 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::Forget(op) => reply.send_none(fs.forget(op).await),
 
-            FuseOperator::Open(op) => reply.send_rep(fs.open(op, reply).await).await,
+            FuseOperator::Open(op) => reply.send_rep(fs.open(op).await).await,
 
             FuseOperator::MkNod(op) => reply.send_rep(fs.mk_nod(op).await).await,
 

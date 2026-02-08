@@ -1,5 +1,6 @@
 curvine-libsdk/java/target/
 **/target/
-**/.git/
+# Keep .git directory for version info during build
+# **/.git/
 **/.staging/
 **/.summary/

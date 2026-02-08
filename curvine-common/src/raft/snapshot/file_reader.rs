@@ -15,6 +15,7 @@
 use crate::raft::{RaftResult, RaftUtils};
 use flate2::read::ZlibEncoder;
 use flate2::Compression;
+use log::warn;
 use orpc::common::Utils;
 use orpc::io::LocalFile;
 use orpc::CommonResult;
@@ -62,12 +63,24 @@ impl FileReader {
         self.checksum += Utils::crc32(&data) as u64;
 
         // Compress data.
-        self.compress_buf.reserve(len);
+        // For small data, zlib compressed size may be larger than original due to header overhead
+        // Allocate extra space: original_len + 256 bytes for zlib overhead
+        let compress_buf_size = len + 256;
+        self.compress_buf.reserve(compress_buf_size);
         unsafe {
-            self.compress_buf.set_len(len);
+            self.compress_buf.set_len(compress_buf_size);
         }
         let mut encoder = ZlibEncoder::new(&data[..], Compression::default());
         let read_len = RaftUtils::zlib_read_full(&mut encoder, &mut self.compress_buf[..])?;
+
+        // Check if buffer was too small
+        if read_len >= compress_buf_size {
+            warn!(
+                "[FileReader] Compression buffer may be too small! \
+                read_len: {}, buf_size: {}, original_len: {}",
+                read_len, compress_buf_size, len
+            );
+        }
 
         Ok(self.compress_buf.split_to(read_len))
     }

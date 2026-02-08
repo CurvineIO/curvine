@@ -14,6 +14,7 @@
 
 use clap::Parser;
 use curvine_common::conf::ClusterConf;
+use curvine_common::version;
 use curvine_fuse::fs::CurvineFileSystem;
 use curvine_fuse::session::FuseSession;
 use curvine_fuse::web_server::WebServer;
@@ -65,21 +66,22 @@ fn main() -> CommonResult<()> {
 
 // Mount command function parameters
 #[derive(Debug, Parser, Clone)]
+#[command(version = version::VERSION)]
 pub struct FuseArgs {
     // Mount the mount point, mount the file system to a directory of the machine.
-    #[arg(long, default_value = "/curvine-fuse")]
-    pub mnt_path: String,
+    #[arg(long, help = "Mount point path (default: /curvine-fuse)")]
+    pub mnt_path: Option<String>,
 
     // Specify the root path of the mount point to access the file system, default "/"
-    #[arg(long, default_value = "/")]
-    pub(crate) fs_path: String,
+    #[arg(long, help = "Remote filesystem path (default: /)")]
+    pub(crate) fs_path: Option<String>,
 
     // Number of mount points
-    #[arg(long, default_value = "1")]
-    pub mnt_number: usize,
+    #[arg(long, help = "Number of mount points (default: 1)")]
+    pub mnt_number: Option<usize>,
 
     // Debug mode
-    #[arg(short, long, action = clap::ArgAction::SetTrue, default_value = "false")]
+    #[arg(short, long, action = clap::ArgAction::SetTrue, help = "Enable debug mode")]
     pub(crate) debug: bool,
 
     // Configuration file path (optional)
@@ -172,12 +174,19 @@ impl FuseArgs {
             }
         };
 
-        // FUSE configuration - override with command line values
-        // These have default values from clap, so always override
-        conf.fuse.mnt_path = self.mnt_path.clone();
-        conf.fuse.fs_path = self.fs_path.clone();
-        conf.fuse.mnt_number = self.mnt_number;
-        conf.fuse.debug = self.debug;
+        // FUSE configuration - only override if command line values are specified
+        if let Some(mnt_path) = &self.mnt_path {
+            conf.fuse.mnt_path = mnt_path.clone();
+        }
+        if let Some(fs_path) = &self.fs_path {
+            conf.fuse.fs_path = fs_path.clone();
+        }
+        if let Some(mnt_number) = self.mnt_number {
+            conf.fuse.mnt_number = mnt_number;
+        }
+        if self.debug {
+            conf.fuse.debug = true;
+        }
 
         // Optional FUSE parameters - only override if specified
         if let Some(io_threads) = self.io_threads {

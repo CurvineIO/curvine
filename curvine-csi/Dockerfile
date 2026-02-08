@@ -41,11 +41,11 @@ RUN echo "Building Curvine from source..." && \
     mkdir -p /workspace/tmp && \
     export TMPDIR=/workspace/tmp && \
     echo "Using TMPDIR=$TMPDIR for compilation temporary files" && \
-    echo "Running 'make all' with retry mechanism..." && \
+    echo "Running 'make all' with --skip-java-sdk (CSI doesn't need Java SDK)..." && \
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all; then \
-            echo "✓ Build succeeded with 'make all'" && \
+        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'; then \
+            echo "✓ Build succeeded" && \
             break; \
         else \
             echo "✗ Build attempt $attempt failed" && \
@@ -63,9 +63,20 @@ RUN echo "Building Curvine from source..." && \
     fi && \
     rm -rf /workspace/tmp
 
-# Build CSI binary
+# Build CSI binary with version info
 RUN cd /workspace/curvine-csi && \
-    go build -o bin/csi main.go
+    VERSION=$(grep '^version =' /workspace/Cargo.toml | head -1 | sed 's/^version = "\(.*\)"/\1/') && \
+    GIT_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown") && \
+    GIT_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "") && \
+    GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "") && \
+    BUILD_DATE=$(date -u '+%Y-%m-%d_%H:%M:%S') && \
+    go build \
+        -ldflags "-X github.com/curvineio/curvine-csi/pkg/csi.driverVersion=${VERSION} \
+                  -X github.com/curvineio/curvine-csi/pkg/csi.gitCommit=${GIT_COMMIT} \
+                  -X github.com/curvineio/curvine-csi/pkg/csi.gitTag=${GIT_TAG} \
+                  -X github.com/curvineio/curvine-csi/pkg/csi.gitBranch=${GIT_BRANCH} \
+                  -X github.com/curvineio/curvine-csi/pkg/csi.buildDate=${BUILD_DATE}" \
+        -o bin/csi main.go
 
 # Create output directory and copy build artifacts
 RUN mkdir -p /build-output && \
@@ -90,6 +101,12 @@ RUN sed -i 's/archive.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/source
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# Copy JindoSDK from builder stage for OSS-HDFS support
+COPY --from=builder /opt/jindosdk /opt/jindosdk
+
+ENV JINDOSDK_HOME=/opt/jindosdk
+ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib/native:${JINDOSDK_HOME}/lib"
 
 # Create curvine directories
 RUN mkdir -p /opt/curvine

@@ -37,7 +37,7 @@ jobs:
       env:
         RELEASE_VERSION: ${{ github.ref_name }}
       run: |
-        make dist
+        make dist ARGS='--ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs --ufs opendal-webhdfs --ufs oss-hdfs'
 
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4

@@ -29,7 +29,7 @@ use orpc::{err_box, CommonResult};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = version::VERSION, about, long_about = None)]
 pub struct CurvineArgs {
     /// Configuration file path (optional)
     #[arg(
@@ -126,7 +126,7 @@ fn main() -> CommonResult<()> {
             Commands::UnMount(cmd) => cmd.execute(fs_client).await,
             Commands::Node(cmd) => cmd.execute(fs_client, conf.clone()).await,
             Commands::Version => {
-                println!("Curvine version: {}", version::GIT_VERSION);
+                println!("curvine-cli {}", version::VERSION);
                 Ok(())
             }
         };

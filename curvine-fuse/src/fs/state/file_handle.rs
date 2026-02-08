@@ -17,12 +17,15 @@ use crate::fs::state::NodeState;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseError, FuseResult};
-use curvine_common::state::{FileStatus, LockFlags};
+use curvine_common::fs::{Path, StateReader, StateWriter};
+use curvine_common::state::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
+use orpc::err_box;
 use orpc::sys::RawPtr;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct HandleLock {
     flock_owner_id: Option<u64>,
     plock_owner_id: Option<u64>,
@@ -152,5 +155,66 @@ impl FileHandle {
 
             LockFlags::Flock => fh_locks.flock_owner_id.take(),
         }
+    }
+
+    pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
+        self.complete(None).await?;
+
+        writer.write_len(self.ino)?;
+        writer.write_len(self.fh)?;
+        writer.write_struct(&self.status)?;
+
+        writer.write_struct(&self.writer.is_some())?;
+        writer.write_struct(&self.reader.is_some())?;
+
+        let locks = self.fh_locks.lock().unwrap();
+        writer.write_struct(&*locks)?;
+
+        Ok(())
+    }
+
+    pub async fn restore(reader: &mut StateReader, state: &NodeState) -> FuseResult<Self> {
+        let ino = reader.read_len()?;
+        let fh = reader.read_len()?;
+        let status: FileStatus = reader.read_struct()?;
+
+        let has_writer: bool = reader.read_struct()?;
+        let has_reader: bool = reader.read_struct()?;
+        if !has_writer && !has_reader {
+            return err_box!(
+                "FileHandle has neither reader nor writer for ino={}, path={}",
+                ino,
+                status.path
+            );
+        }
+        let locks: HandleLock = reader.read_struct()?;
+
+        let path = Path::from_str(&status.path)?;
+        let writer = if has_writer {
+            let opts = CreateFileOptsBuilder::with_conf(state.client_conf()).build();
+            let writer = state
+                .new_writer(ino, &path, OpenFlags::new_write_only(), opts)
+                .await?;
+            Some(writer)
+        } else {
+            None
+        };
+
+        let reader = if has_reader {
+            let reader = state.new_reader(&path).await?;
+            Some(RawPtr::from_owned(reader))
+        } else {
+            None
+        };
+
+        let handle = Self {
+            ino,
+            fh,
+            reader,
+            writer,
+            status,
+            fh_locks: std::sync::Mutex::new(locks),
+        };
+        Ok(handle)
     }
 }

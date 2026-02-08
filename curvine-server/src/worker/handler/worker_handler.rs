@@ -50,7 +50,16 @@ impl MessageHandler for WorkerHandler {
 
             _ => {
                 let h = self.get_handler(msg)?;
-                h.handle(msg)
+                let res = h.handle(msg);
+
+                if matches!(
+                    msg.request_status(),
+                    RequestStatus::Cancel | RequestStatus::Complete
+                ) {
+                    let _ = self.handler.take();
+                };
+
+                res
             }
         }
     }

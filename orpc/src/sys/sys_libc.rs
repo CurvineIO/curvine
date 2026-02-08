@@ -689,3 +689,29 @@ pub fn file_actual_size(metadata: Metadata) -> IOResult<u64> {
         Ok(logical_size)
     }
 }
+
+pub fn fcntl_get(fd: RawIO) -> IOResult<CInt> {
+    #[cfg(target_os = "linux")]
+    {
+        let res = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        err_io!(res)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        err_box!("unsupported operation")
+    }
+}
+
+pub fn fcntl_set(fd: RawIO, flags: CInt) -> IOResult<CInt> {
+    #[cfg(target_os = "linux")]
+    {
+        let res = unsafe { libc::fcntl(fd, libc::F_SETFD, flags) };
+        err_io!(res)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        err_box!("unsupported operation")
+    }
+}

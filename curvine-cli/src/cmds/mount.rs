@@ -17,8 +17,9 @@ use clap::Parser;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    ConsistencyStrategy, MountOptions, MountType, StorageType, TtlAction, WriteType,
+    ConsistencyStrategy, MountOptions, MountType, Provider, StorageType, TtlAction, WriteType,
 };
+use curvine_common::utils::ProtoUtils;
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
@@ -43,7 +44,7 @@ pub struct MountCommand {
     #[arg(long, default_value = "cst")]
     mnt_type: String,
 
-    #[arg(long, default_value = "always")]
+    #[arg(long, default_value = "none")]
     consistency_strategy: String,
 
     #[arg(long, default_value = "7d")]
@@ -72,6 +73,12 @@ pub struct MountCommand {
     )]
     write_type: String,
 
+    #[arg(
+        long,
+        help = "UFS provider: auto, oss-hdfs, opendal. Controls which implementation to use for the given scheme."
+    )]
+    provider: Option<String>,
+
     #[arg(long, default_value_t = false)]
     check: bool,
 }
@@ -88,12 +95,13 @@ impl MountCommand {
                 }
                 let mut status = vec![];
                 let mut max_len = 8;
-                for mnt in &rep.mount_table {
+                for mnt_proto in &rep.mount_table {
+                    let mnt = ProtoUtils::mount_info_from_pb(mnt_proto.clone());
                     let ufs_path = Path::from_str(&mnt.ufs_path)?;
                     max_len = max_len.max(ufs_path.to_string().len());
                     max_len = max_len.max(mnt.cv_path.len());
                     max_len = max_len.max(mnt.mount_id.to_string().len());
-                    let res = UfsFileSystem::new(&ufs_path, mnt.properties.clone());
+                    let res = UfsFileSystem::new(&ufs_path, mnt.properties.clone(), mnt.provider);
                     match res {
                         Err(_) => status.push("Invalid"),
                         Ok(ufs) => {
@@ -203,16 +211,16 @@ impl MountCommand {
         let ufs_path = Path::from_str(&self.ufs_path)?;
         let cv_path = Path::from_str(&self.cv_path)?;
 
-        // Creating a MountOptions Object
         let mnt_opts = self.to_mnt_opts()?;
 
-        // try to create ufsFileSystem
-        if !mnt_opts.update {
-            let ufs = UfsFileSystem::new(&ufs_path, mnt_opts.add_properties.clone())?;
-            if let Err(e) = ufs.list_status(&ufs_path).await {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
+        let ufs = UfsFileSystem::new(
+            &ufs_path,
+            mnt_opts.add_properties.clone(),
+            mnt_opts.provider,
+        )?;
+        if let Err(e) = ufs.list_status(&ufs_path).await {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
         }
 
         handle_rpc_result(fs.mount(&ufs_path, &cv_path, mnt_opts)).await;
@@ -262,6 +270,11 @@ impl MountCommand {
 
         let write_type = WriteType::try_from(self.write_type.as_str())?;
         opts = opts.write_type(write_type);
+
+        if let Some(provider_str) = self.provider.as_ref() {
+            let provider = Provider::try_from(provider_str.as_str())?;
+            opts = opts.provider(provider);
+        }
 
         Ok(opts.build())
     }

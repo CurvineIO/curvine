@@ -27,39 +27,16 @@ permissions:
   packages: write
 
 jobs:
-  build-runtime:
+  # Prepare metadata shared across all jobs
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      push_image: ${{ steps.meta.outputs.push_image }}
+      ghcr_image: ${{ steps.meta.outputs.ghcr_image }}
+      docker_image: ${{ steps.meta.outputs.docker_image }}
+      also_latest: ${{ steps.meta.outputs.also_latest }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64,amd64
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            image=moby/buildkit:latest
-            network=host
-      
-      - name: Login to GitHub Container Registry
-        if: github.event_name == 'push' || inputs.push_image == true
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ secrets.GHCR_USERNAME }}
-          password: ${{ secrets.PAT_GITHUB_TOKEN }}
-      
-      - name: Login to Docker Hub
-        if: github.event_name == 'push' || inputs.push_image == true
-        uses: docker/login-action@v3
-        with:
-          username: curvine
-          password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
-      
       - name: Extract metadata for Docker
         id: meta
         run: |
@@ -96,59 +73,185 @@ jobs:
           else
             echo "also_latest=false" >> $GITHUB_OUTPUT
           fi
+
+  # Build for each architecture on native runners
+  build-arch:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       
-      - name: Build and push Docker image (Rocky Linux 9)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to GitHub Container Registry
+        if: needs.prepare.outputs.push_image == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.PAT_GITHUB_TOKEN }}
+      
+      - name: Login to Docker Hub
+        if: needs.prepare.outputs.push_image == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: curvine
+          password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
+      
+      - name: Build and push Runtime image for ${{ matrix.arch }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./curvine-docker/deploy/Dockerfile_rocky9
-          platforms: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
-          push: ${{ steps.meta.outputs.push_image }}
+          platforms: linux/${{ matrix.arch }}
+          push: ${{ needs.prepare.outputs.push_image == 'true' }}
           tags: |
-            ${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.docker_image }}:${{ steps.meta.outputs.tag }}
-            ${{ steps.meta.outputs.also_latest == 'true' && format('{0}:latest', steps.meta.outputs.ghcr_image) || '' }}
-            ${{ steps.meta.outputs.also_latest == 'true' && format('{0}:latest', steps.meta.outputs.docker_image) || '' }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
+            ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
           shm-size: 2g
           build-args: |
             REPO_URL=https://github.com/${{ github.repository }}
       
-      - name: Image build summary
+      - name: Build summary for ${{ matrix.arch }}
         run: |
-          echo "### Build Summary :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Built Runtime image for ${{ matrix.arch }} architecture" >> $GITHUB_STEP_SUMMARY
+          echo "Image: ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
+
+  # Create multi-arch manifest
+  create-manifest:
+    needs: [prepare, build-arch]
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.push_image == 'true'
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.PAT_GITHUB_TOKEN }}
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: curvine
+          password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
+      
+      - name: Create and push multi-arch manifest for GHCR
+        run: |
+          # Create manifest for version tag
+          docker buildx imagetools create -t ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }} \
+            ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-amd64 \
+            ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-arm64
+          
+          # Create manifest for latest tag if needed
+          if [ "${{ needs.prepare.outputs.also_latest }}" == "true" ]; then
+            docker buildx imagetools create -t ${{ needs.prepare.outputs.ghcr_image }}:latest \
+              ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-amd64 \
+              ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-arm64
+          fi
+      
+      - name: Create and push multi-arch manifest for Docker Hub
+        run: |
+          # Create manifest for version tag
+          docker buildx imagetools create -t ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }} \
+            ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-amd64 \
+            ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-arm64
+          
+          # Create manifest for latest tag if needed
+          if [ "${{ needs.prepare.outputs.also_latest }}" == "true" ]; then
+            docker buildx imagetools create -t ${{ needs.prepare.outputs.docker_image }}:latest \
+              ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-amd64 \
+              ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-arm64
+          fi
+      
+      - name: Manifest creation summary
+        run: |
+          echo "### Multi-arch Manifest Created 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Combined architectures:** amd64, arm64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Manifests created:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.prepare.outputs.also_latest }}" == "true" ]; then
+            echo "- \`${{ needs.prepare.outputs.ghcr_image }}:latest\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${{ needs.prepare.outputs.docker_image }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Final summary
+  summary:
+    needs: [prepare, build-arch, create-manifest]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Final build summary
+        run: |
+          echo "### Runtime Image Build Summary 🚀" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Platform:** Rocky Linux 9" >> $GITHUB_STEP_SUMMARY
-          echo "**Architectures:** ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag:** ${{ steps.meta.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Architectures:** amd64 (native), arm64 (native)" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Components:** curvine-server, curvine-client, curvine-fuse, webui" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Strategy:** Native runners for each architecture" >> $GITHUB_STEP_SUMMARY
+          echo "**UFS Support:** S3, OSS, Azure Blob, GCS, HDFS, WebHDFS, OSS-HDFS (JindoSDK)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [ "${{ steps.meta.outputs.push_image }}" == "true" ]; then
-            echo "**Images pushed to:**" >> $GITHUB_STEP_SUMMARY
-            echo "- \`${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- \`${{ steps.meta.outputs.docker_image }}:${{ steps.meta.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.prepare.outputs.push_image }}" == "true" ]; then
+            echo "**Multi-arch images pushed to:**" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- \`${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
             
-            if [ "${{ steps.meta.outputs.also_latest }}" == "true" ]; then
-              echo "- \`${{ steps.meta.outputs.ghcr_image }}:latest\`" >> $GITHUB_STEP_SUMMARY
-              echo "- \`${{ steps.meta.outputs.docker_image }}:latest\`" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ needs.prepare.outputs.also_latest }}" == "true" ]; then
+              echo "- \`${{ needs.prepare.outputs.ghcr_image }}:latest\`" >> $GITHUB_STEP_SUMMARY
+              echo "- \`${{ needs.prepare.outputs.docker_image }}:latest\`" >> $GITHUB_STEP_SUMMARY
             fi
             
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**Pull commands:**" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-            echo "# Pull specific version" >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ${{ steps.meta.outputs.ghcr_image }}:${{ steps.meta.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
-            echo "# or from Docker Hub" >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ${{ steps.meta.outputs.docker_image }}:${{ steps.meta.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "# Pull from GitHub Container Registry" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "# Pull from Docker Hub" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
             
-            if [ "${{ steps.meta.outputs.also_latest }}" == "true" ]; then
+            if [ "${{ needs.prepare.outputs.also_latest }}" == "true" ]; then
               echo "" >> $GITHUB_STEP_SUMMARY
               echo "# Pull latest version" >> $GITHUB_STEP_SUMMARY
-              echo "docker pull ${{ steps.meta.outputs.docker_image }}:latest" >> $GITHUB_STEP_SUMMARY
+              echo "docker pull ${{ needs.prepare.outputs.ghcr_image }}:latest" >> $GITHUB_STEP_SUMMARY
+              echo "docker pull ${{ needs.prepare.outputs.docker_image }}:latest" >> $GITHUB_STEP_SUMMARY
             fi
             
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Verify multi-arch:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "docker buildx imagetools inspect ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Start Curvine cluster:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "# Start master node" >> $GITHUB_STEP_SUMMARY
+            echo "docker run -d --name curvine-master \\" >> $GITHUB_STEP_SUMMARY
+            echo "  -p 8995:8995 -p 9000:9000 \\" >> $GITHUB_STEP_SUMMARY
+            echo "  ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }} master start" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "# Start worker node" >> $GITHUB_STEP_SUMMARY
+            echo "docker run -d --name curvine-worker \\" >> $GITHUB_STEP_SUMMARY
+            echo "  -p 8997:8997 -p 9001:9001 \\" >> $GITHUB_STEP_SUMMARY
+            echo "  ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }} worker start" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "**Note:** Image was built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY

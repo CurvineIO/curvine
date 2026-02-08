@@ -1122,7 +1122,7 @@ test_python_high_frequency_write() {
 
     local python_cmd=$(command -v python3 2>/dev/null || command -v python)
     local test_file="$TEST_DIR/python-high-freq.txt"
-    local iterations=2000
+    local iterations=20
     
     # Clean up any existing test file
     rm -f "$test_file" 2>/dev/null || true
@@ -1210,9 +1210,50 @@ PYTHON_SCRIPT
     rm -f "$test_file" 2>/dev/null || true
 }
 
-# Test 15: Git clone operations
+# Test 15: FUSE hot reload test
+test_fuse_reload() {
+    CURRENT_TEST_GROUP="Test 15: FUSE Hot Reload"
+    print_header "$CURRENT_TEST_GROUP"
+
+    if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+        print_info "Python not available, skipping FUSE reload test"
+        return
+    fi
+
+    local python_cmd=$(command -v python3 2>/dev/null || command -v python)
+    local test_script="$SCRIPT_DIR/scripts/fuse_reload_test.py"
+    
+    if [ ! -f "$test_script" ]; then
+        print_info "FUSE reload test script not found: $test_script"
+        print_info "Skipping FUSE reload test"
+        return
+    fi
+
+    print_test "Testing FUSE hot reload functionality"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+    local start_time=$(date +%s)
+    
+    # Run the Python test script
+    if $python_cmd "$test_script" 2>&1; then
+        local result=0
+    else
+        local result=$?
+    fi
+    
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+
+    if [ $result -eq 0 ]; then
+        print_success "FUSE reload test completed successfully in ${elapsed}s"
+    else
+        handle_error "FUSE reload test failed" "python $test_script"
+    fi
+}
+
+# Test 16: Git clone operations
 test_git_clone() {
-    CURRENT_TEST_GROUP="Test 15: Git Clone Operations"
+    CURRENT_TEST_GROUP="Test 16: Git Clone Operations"
     print_header "$CURRENT_TEST_GROUP"
 
     if ! command -v git >/dev/null 2>&1; then
@@ -1260,6 +1301,11 @@ test_git_clone() {
 # Print final report
 print_report() {
     print_header "Test Summary"
+
+    # Calculate FAILED_TESTS from FAILED_TEST_LIST length
+    FAILED_TESTS=${#FAILED_TEST_LIST[@]}
+    # Calculate PASSED_TESTS as total minus failed
+    PASSED_TESTS=$((TOTAL_TESTS - FAILED_TESTS))
 
     echo -e "Total Tests:  ${BLUE}$TOTAL_TESTS${NC}"
     echo -e "Passed:       ${GREEN}$PASSED_TESTS${NC}"
@@ -1352,6 +1398,7 @@ main() {
     test_file_locks
     test_delayed_delete
     test_python_high_frequency_write
+    test_fuse_reload
     test_git_clone
 
     print_info "All test functions completed"

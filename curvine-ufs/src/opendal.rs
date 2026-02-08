@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use crate::OpendalConf;
+#[cfg(feature = "opendal-oss")]
+use crate::OssHdfsConf;
 use crate::{err_ufs, FOLDER_SUFFIX};
 use bytes::BytesMut;
 use curvine_common::error::FsError;
@@ -90,7 +92,7 @@ impl Reader for OpendalReader {
 
             self.byte_stream = Some(
                 reader
-                    .into_bytes_stream(..self.length as u64)
+                    .into_bytes_stream(self.pos as u64..self.length as u64)
                     .await
                     .map_err(|e| FsError::common(format!("Failed to create stream: {}", e)))?,
             );
@@ -208,17 +210,7 @@ impl Writer for OpendalWriter {
             );
         }
 
-        let data = match chunk {
-            DataSlice::Empty => return Ok(0),
-            DataSlice::Bytes(bytes) => bytes,
-            DataSlice::Buffer(buf) => buf.freeze(),
-            DataSlice::IOSlice(_) | DataSlice::MemSlice(_) => {
-                // For IOSlice and MemSlice, we need to copy the data
-                // This is acceptable since OpenDAL will handle the actual I/O efficiently
-                let slice = chunk.as_slice();
-                bytes::Bytes::copy_from_slice(slice)
-            }
-        };
+        let data = bytes::Bytes::copy_from_slice(chunk.as_slice());
         let len = data.len() as i64;
 
         let writer = try_option_mut!(self.writer);
@@ -308,8 +300,31 @@ impl OpendalFileSystem {
             .to_string();
 
         let operator = match scheme {
+            // OSS native implementation (higher priority than HDFS-based OSS)
+            #[cfg(feature = "opendal-oss")]
+            "oss" => {
+                let mut builder = Oss::default();
+                builder = builder.bucket(&bucket_or_container);
+
+                if let Some(endpoint) = conf.get(OssHdfsConf::USER_ENDPOINT) {
+                    builder = builder.endpoint(endpoint);
+                }
+                if let Some(access_key) = conf.get(OssHdfsConf::USER_ACCESS_KEY_ID) {
+                    builder = builder.access_key_id(access_key);
+                }
+                if let Some(secret_key) = conf.get(OssHdfsConf::USER_ACCESS_KEY_SECRET) {
+                    builder = builder.access_key_secret(secret_key);
+                }
+
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create OSS operator: {}", e)))?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
             #[cfg(feature = "opendal-hdfs")]
-            "hdfs" | "oss" => {
+            "hdfs" => {
                 use crate::jni::{register_jvm, JVM};
 
                 register_jvm();
@@ -414,28 +429,6 @@ impl OpendalFileSystem {
 
                 let base_op = Operator::new(builder)
                     .map_err(|e| FsError::common(format!("Failed to create S3 operator: {}", e)))?
-                    .finish();
-
-                Self::add_stability_layers(base_op, &conf)?
-            }
-
-            #[cfg(feature = "opendal-oss")]
-            "oss" => {
-                let mut builder = Oss::default();
-                builder = builder.bucket(&bucket_or_container);
-
-                if let Some(endpoint) = conf.get("oss.endpoint_url") {
-                    builder = builder.endpoint(endpoint);
-                }
-                if let Some(access_key) = conf.get("oss.credentials.access") {
-                    builder = builder.access_key_id(access_key);
-                }
-                if let Some(secret_key) = conf.get("oss.credentials.secret") {
-                    builder = builder.secret_access_key(secret_key);
-                }
-
-                let base_op = Operator::new(builder)
-                    .map_err(|e| FsError::common(format!("Failed to create OSS operator: {}", e)))?
                     .finish();
 
                 Self::add_stability_layers(base_op, &conf)?
@@ -620,6 +613,7 @@ impl OpendalFileSystem {
             replicas: 1,
             block_size: 4 * 1024 * 1024,
             file_type: FileType::File,
+            mode: 0o777,
             ..Default::default()
         }
     }
@@ -646,6 +640,7 @@ impl OpendalFileSystem {
             is_complete: true,
             replicas: 1,
             block_size: 4 * 1024 * 1024,
+            mode: 0o777,
             ..Default::default()
         }
     }
@@ -705,11 +700,11 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     }
 
     /// OpenDal only supports overwrite, so the overwrite parameter is ignored here.
-    async fn create(&self, path: &Path, _overwrite: bool) -> FsResult<OpendalWriter> {
+    async fn create(&self, path: &Path, overwrite: bool) -> FsResult<OpendalWriter> {
         let object_path = self.get_object_path(path)?;
 
         let exist = self.get_object_status(&object_path).await?.is_some();
-        if !exist {
+        if !exist || overwrite {
             // If no data is written to OpenDal, no file will be created.
             // This does not conform to POSIX semantics, so an empty file is created.
             self.operator
@@ -839,10 +834,24 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                 Ok(metadata) if metadata.is_dir() => self.operator.remove_all(&object_path).await,
                 _ => self.operator.delete(&object_path).await,
             }
+            .map_err(|e| FsError::common(format!("Failed to delete recursive: {}", e)))?;
         } else {
-            self.operator.delete(&object_path).await
+            // Try to delete as file first
+            self.operator
+                .delete(&object_path)
+                .await
+                .map_err(|e| FsError::common(format!("Failed to delete file: {}", e)))?;
+
+            // Also try to delete as directory marker (with suffix)
+            // S3 delete is idempotent, so it's safe to try deleting the marker even if it doesn't exist
+            // or if we just deleted a file.
+            let dir_path = self.get_dir_path(path)?;
+            if dir_path != object_path {
+                self.operator.delete(&dir_path).await.map_err(|e| {
+                    FsError::common(format!("Failed to delete directory marker: {}", e))
+                })?;
+            }
         }
-        .map_err(|e| FsError::common(format!("Failed to delete: {}", e)))?;
 
         Ok(())
     }

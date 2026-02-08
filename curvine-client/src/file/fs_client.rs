@@ -14,7 +14,7 @@
 
 use crate::file::FsContext;
 use bytes::BytesMut;
-use curvine_common::conf::{ClientConf, UfsConf, UfsConfBuilder};
+use curvine_common::conf::{ClientConf, ClusterConf, UfsConf, UfsConfBuilder};
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, RpcCode};
 use curvine_common::proto::*;
@@ -41,8 +41,12 @@ impl FsClient {
         Self { context, connector }
     }
 
-    pub fn context(&self) -> Arc<FsContext> {
-        self.context.clone()
+    pub fn context(&self) -> &Arc<FsContext> {
+        &self.context
+    }
+
+    pub fn conf(&self) -> &ClusterConf {
+        &self.context.conf
     }
 
     pub async fn mkdir(&self, path: &Path, opts: MkdirOpts) -> FsResult<FileStatus> {

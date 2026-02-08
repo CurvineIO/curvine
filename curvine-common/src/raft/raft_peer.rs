@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::conf::JournalConf;
 use crate::raft::NodeId;
 use orpc::common::Utils;
 use orpc::io::net::InetAddr;
@@ -40,10 +39,6 @@ impl RaftPeer {
     pub fn from_addr<T: AsRef<str>>(hostname: T, port: u16) -> Self {
         let id = Self::create_id(format!("{}{}", hostname.as_ref(), port));
         Self::new(id, hostname, port)
-    }
-
-    pub fn from_conf(conf: &JournalConf) -> Self {
-        Self::from_addr(conf.hostname.clone(), conf.rpc_port)
     }
 
     fn create_id<T: AsRef<str>>(address: T) -> NodeId {

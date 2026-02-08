@@ -20,6 +20,7 @@ use crate::block::{
 use crate::file::FsContext;
 use curvine_common::conf::ClientConf;
 use curvine_common::fs::Path;
+use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
@@ -32,9 +33,10 @@ use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::client::RpcClient;
 use orpc::common::LocalTime;
+use orpc::error::ErrorExt;
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
-use orpc::{err_box, try_option_ref, CommonResult};
+use orpc::{try_option_ref, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
 pub struct BlockClient {
@@ -86,10 +88,9 @@ impl BlockClient {
     pub async fn rpc(&self, msg: Message) -> FsResult<Message> {
         let client = try_option_ref!(self.client);
         let rep_msg = client.timeout_rpc(self.timeout, msg).await?;
-        if !rep_msg.is_success() {
-            err_box!(rep_msg.to_error_msg())
-        } else {
-            Ok(rep_msg)
+        match rep_msg.check_error_ext::<FsError>() {
+            Ok(_) => Ok(rep_msg),
+            Err(e) => Err(e.ctx(format!("rpc failed to worker {}", self.worker_addr))),
         }
     }
 
@@ -102,7 +103,12 @@ impl BlockClient {
         seq_id: i32,
         chunk_size: i32,
         short_circuit: bool,
+        pipeline_stream: Vec<WorkerAddress>,
     ) -> FsResult<CreateBlockContext> {
+        let pipeline_stream = pipeline_stream
+            .iter()
+            .map(ProtoUtils::worker_address_to_pb)
+            .collect();
         let header = BlockWriteRequest {
             block: ProtoUtils::extend_block_to_pb(blk.clone()),
             off,
@@ -110,6 +116,7 @@ impl BlockClient {
             short_circuit,
             client_name: self.client_name.to_string(),
             chunk_size,
+            pipeline_stream,
         };
 
         let msg = Builder::new()

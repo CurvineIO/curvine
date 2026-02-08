@@ -16,6 +16,14 @@ message BlockWriteRequest {
     required bool short_circuit = 4 [default = false];
     required string client_name = 5 [default = ""];
     required int32 chunk_size = 6;
+    repeated WorkerAddressProto pipeline_stream = 7;
+}
+
+message PipelineStatus {
+    required bool success = 1;
+    required int32 established_count = 2;
+    optional WorkerAddressProto failed_worker = 3;
+    optional string error_message = 4;
 }
 
 
@@ -25,8 +33,22 @@ message WriteCommitRequest {
     required int64 pos = 2;  
     required int64 block_size = 3;  
     required bool cancel = 4;  
+    optional PipelineStatus pipeline_status = 6;
 }  
 
+message BlockWriteResponse {
+    required int64 id = 1;
+    optional string path = 2;
+    required int64 off = 3;
+    required int64 block_size = 4;
+    required StorageTypeProto storage_type = 5;
+    optional PipelineStatus pipeline_status = 6;
+}
+
+message BlocksBatchWriteResponse {  
+    repeated BlockWriteResponse responses = 1; 
+    required ContainerMetadataProto container_meta = 2; 
+}
 message BlockReadRequest {
     required int64 id = 1;
     required int64 off = 2;

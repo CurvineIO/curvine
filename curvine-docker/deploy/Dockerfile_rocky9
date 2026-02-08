@@ -54,8 +54,8 @@ RUN echo "Building Curvine from source..." && \
     # Build with retry mechanism
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all ARGS='--skip-java-sdk'; then \
-            echo "✓ Build succeeded with 'make all --skip-java-sdk'" && \
+        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'; then \
+            echo "✓ Build succeeded with 'make all --skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'" && \
             break; \
         else \
             echo "✗ Build attempt $attempt failed" && \
@@ -95,11 +95,17 @@ RUN mkdir -p /build-output && \
 # Runtime stage
 FROM rockylinux:9
 
-RUN dnf install -y \
+RUN dnf install -y --allowerasing \
     fuse3 \
     procps-ng \
     && dnf clean all \
     && rm -rf /var/cache/dnf/*
+
+# Copy JindoSDK from builder stage for OSS-HDFS support
+COPY --from=builder /opt/jindosdk /opt/jindosdk
+
+ENV JINDOSDK_HOME=/opt/jindosdk
+ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib/native:${JINDOSDK_HOME}/lib"
 
 # Create curvine directories
 RUN mkdir -p /app/curvine \

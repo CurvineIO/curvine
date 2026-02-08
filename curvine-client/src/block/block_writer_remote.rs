@@ -53,6 +53,7 @@ impl BlockWriterRemote {
                 seq_id,
                 fs_context.write_chunk_size() as i32,
                 false,
+                Vec::new(),
             )
             .await?;
 

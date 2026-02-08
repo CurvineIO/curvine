@@ -51,6 +51,7 @@ fn main() -> CommonResult<()> {
 }
 
 #[derive(Debug, Parser, Clone)]
+#[command(version = version::VERSION)]
 pub struct ServerArgs {
     // Start the worker or the master
     #[arg(long, default_value = "")]

@@ -49,11 +49,42 @@ ENV PATH="/app/protoc/bin:${PATH}"
 
 # 4. Install Maven
 RUN cd /app && \
-    curl -LO https://downloads.apache.org/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz && \
-    tar -xzf apache-maven-3.9.11-bin.tar.gz && \
-    mv apache-maven-3.9.11 maven && \
-    rm -f *.tar.gz
+    MAVEN_VERSION=3.9.12 && \
+    curl -fL -o apache-maven-${MAVEN_VERSION}-bin.tar.gz https://downloads.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    tar -xzf apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    mv apache-maven-${MAVEN_VERSION} maven && \
+    rm -f *.tar.gz && \
+    echo "✓ Maven ${MAVEN_VERSION} installed successfully"
 ENV PATH="/app/maven/bin:${PATH}"
+
+# 4.1. Install JindoSDK (Alibaba Cloud OSS-HDFS SDK) with multi-arch support
+RUN cd /opt && \
+    JINDOSDK_VERSION=6.10.3 && \
+    ARCH=$(uname -m) && \
+    echo "Installing JindoSDK ${JINDOSDK_VERSION} for ${ARCH}..." && \
+    case "${ARCH}" in \
+        x86_64) \
+            JINDOSDK_FILE="jindosdk-${JINDOSDK_VERSION}-linux.tar.gz" ;; \
+        aarch64) \
+            JINDOSDK_FILE="jindosdk-${JINDOSDK_VERSION}-linux-el7-aarch64.tar.gz" ;; \
+        *) \
+            echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac && \
+    echo "Downloading ${JINDOSDK_FILE}..." && \
+    curl -fL -o ${JINDOSDK_FILE} \
+        https://jindodata-binary.oss-cn-shanghai.aliyuncs.com/release/${JINDOSDK_VERSION}/${JINDOSDK_FILE} && \
+    tar -xzf ${JINDOSDK_FILE} && \
+    echo "Checking extracted directory..." && \
+    ls -la /opt/ && \
+    EXTRACTED_DIR=$(ls -d jindosdk* | head -n1) && \
+    echo "Found directory: ${EXTRACTED_DIR}" && \
+    if [ "$EXTRACTED_DIR" != "jindosdk" ]; then \
+        mv "$EXTRACTED_DIR" jindosdk; \
+    fi && \
+    rm -f ${JINDOSDK_FILE} && \
+    echo "✓ JindoSDK ${JINDOSDK_VERSION} installed successfully for ${ARCH}"
+ENV JINDOSDK_HOME=/opt/jindosdk
+ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib:${LD_LIBRARY_PATH:-}"
 
 # 5. Replace the configuration
 RUN mkdir -p /app/maven/conf

@@ -16,13 +16,13 @@ fastrand = { workspace = true }
 
 opendal = { version = "0.55", optional = true }
 
-[build-dependencies]
-cc = "1.1"
-
 # JNI support for HDFS (moved from curvine-common)
 jni = { version = "0.21.1", features = ["invocation"], optional = true }
-anyhow = { workspace = true }
-tracing = { workspace = true }
+anyhow = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[build-dependencies]
+cc = "1.1"
 
 
 [features]
@@ -38,7 +38,7 @@ opendal-hdfs = ["opendal", "opendal/services-hdfs", "jni"]
 opendal-webhdfs = ["opendal", "opendal/services-webhdfs"]
 opendal-hdfs-native = ["opendal", "opendal/services-hdfs-native"]
 
-jni = ["dep:jni"]  # JNI support (now local to curvine-ufs)
+jni = ["dep:jni", "dep:anyhow", "dep:tracing"]  # JNI support (now local to curvine-ufs)
 
 ## OSS implementation using JindoSDK C++ library (async-only)
 oss-hdfs = []

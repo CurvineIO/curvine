@@ -27,7 +27,7 @@ use orpc::io::net::InetAddr;
 use orpc::message::{Builder, RequestStatus};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::sync::FastDashMap;
-use orpc::{err_box, try_log, try_option, CommonResult};
+use orpc::{err_box, try_option, CommonResult};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -41,7 +41,6 @@ pub struct MasterReplicationManager {
     worker_manager: SyncWorkerManager,
 
     replication_semaphore: Arc<Semaphore>,
-    runtime: Arc<AsyncRuntime>,
 
     staging_queue_sender: Arc<Sender<BlockId>>,
     inflight_blocks: Arc<FastDashMap<BlockId, InflightReplicationJob>>,
@@ -75,7 +74,6 @@ impl MasterReplicationManager {
             worker_manager: worker_manager.clone(),
             replication_semaphore: Arc::new(semaphore),
             staging_queue_sender: Arc::new(send),
-            runtime: rt.clone(),
             inflight_blocks: Default::default(),
             worker_client_factory: Arc::new(Default::default()),
             replication_enabled: conf.master.block_replication_enabled,
@@ -213,14 +211,25 @@ impl MasterReplicationManager {
         if !self.replication_enabled {
             return Ok(());
         }
-        self.runtime.block_on(async move {
-            for block_id in &block_ids {
-                info!("Accepting block {} replication job", block_id);
-                if try_log!(self.staging_queue_sender.send(*block_id).await).is_ok() {
-                    self.metrics.replication_staging_number.inc();
+
+        let sender = self.staging_queue_sender.clone();
+        let metrics = self.metrics;
+
+        for block_id in &block_ids {
+            info!("Accepting block {} replication job", block_id);
+
+            match sender.try_send(*block_id) {
+                Ok(_) => {
+                    metrics.replication_staging_number.inc();
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to queue replication job for block {}: {}. Queue may be full. Will retry on next heartbeat check.",
+                        block_id, e
+                    );
                 }
             }
-        });
+        }
         Ok(())
     }
 

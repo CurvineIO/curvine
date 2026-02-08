@@ -131,6 +131,10 @@ pub struct FuseConf {
 
     pub non_seekable: bool,
 
+    pub check_permission: bool,
+
+    pub state_dir: String,
+
     /// The following are some time types, which are initialized only after init is called.
     #[serde(skip_serializing, skip_deserializing)]
     pub attr_ttl: Duration,
@@ -300,6 +304,9 @@ impl Default for FuseConf {
             write_back_cache: false,
             cache_readdir: false,
             non_seekable: false,
+            check_permission: true,
+
+            state_dir: std::env::temp_dir().to_string_lossy().to_string(),
 
             attr_ttl: Default::default(),
             entry_ttl: Default::default(),
