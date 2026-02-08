@@ -19,8 +19,8 @@ use crate::block::{
 };
 use crate::file::FsContext;
 use curvine_common::conf::ClientConf;
-use curvine_common::fs::Path;
 use curvine_common::error::FsError;
+use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,

@@ -134,7 +134,6 @@ impl ContainerBlockWriter {
             .await?;
             inners.push(adapter);
         }
-        let num_of_blocks = 1;
 
         println!(
             "DEBUG at ContainerBlockWriter, located_block: {:?} ",
@@ -144,7 +143,7 @@ impl ContainerBlockWriter {
             inners,
             fs_context,
             located_block,
-            file_lengths: Vec::with_capacity(num_of_blocks),
+            file_lengths: Vec::with_capacity(small_files_metadata.len()),
         })
     }
 
@@ -202,27 +201,8 @@ impl ContainerBlockWriter {
     }
 
     pub fn to_commit_blocks(&self) -> CommitBlock {
-        // let mut commit_blocks = Vec::with_capacity(self.located_block.len());
-
-        // println!("DEBUG at ContainerBlockWriter, at to_commit_blocks, located_block {:?}", self.located_block);
-        // for (i, located_block) in self.located_block.iter().enumerate() {
-        //     let mut commit_block = CommitBlock::from(located_block);
-
-        //     // if let Some(&length) = self.file_lengths.get(i) {
-
-        //     // }
-
-        //     commit_block.block_len += self.file_lengths.iter().map(|&len| len).sum::<i64>();
-
-        //     commit_blocks.push(commit_block);
-        // }
-
         let mut commit_block = CommitBlock::from(&self.located_block);
-
         commit_block.block_len = self.file_lengths.iter().copied().sum::<i64>();
-
-        // commit_blocks.push(commit_block);
-
         commit_block
     }
 }

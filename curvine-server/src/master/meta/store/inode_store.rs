@@ -14,7 +14,7 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
-use crate::master::meta::inode::{InodeFile, InodePtr, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{InodeFile, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};

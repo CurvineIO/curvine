@@ -156,7 +156,7 @@ impl BatchWriteHandler {
             off: 0,
             block_size,
             storage_type: StorageType::default() as i32,
-            pipeline_status: None
+            pipeline_status: None,
         };
 
         let batch_response = BlocksBatchWriteResponse {
