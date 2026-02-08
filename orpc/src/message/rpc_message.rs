@@ -55,11 +55,6 @@ pub enum RequestStatus {
     Cancel = 4,   //Cancel request
     Complete = 5, //Request complete
 
-    // batch variants
-    OpenBatch = 6,
-    RunningBatch = 7,
-    CompleteBatch = 8,
-    CancelBatch = 9,
 }
 
 #[repr(i8)]
