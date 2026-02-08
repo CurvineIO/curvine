@@ -222,10 +222,10 @@ impl WriteHandler {
     }
 
     pub fn complete(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
-        println!(
-            "DEBUG at BatchWriteHandler, start the complete with file: {:?}",
-            self.file
-        );
+        // println!(
+        //     "DEBUG at BatchWriteHandler, start the complete with file: {:?}",
+        //     self.file
+        // );
         if self.is_commit {
             return if !msg.data.is_empty() {
                 err_box!("The block has been committed and data cannot be written anymore.")

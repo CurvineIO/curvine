@@ -273,32 +273,6 @@ impl VfsDir {
     pub fn set_failed(&self) {
         self.check_failed.store(true, Ordering::SeqCst);
     }
-
-    // pub fn create_container_block(
-    //     &self,
-    //     container_path: &str,
-    //     total_size: i64,
-    // ) -> CommonResult<BlockMeta> {
-    //     // Create a special block marked as container
-    //     let container_block = ExtendedBlock {
-    //         id: Utils::unique_id() as i64,
-    //         len: total_size,
-    //         storage_type: StorageType::default(),
-    //         file_type: FileType::Container, // New file type
-    //         ..Default::default()
-    //     };
-
-    //     let meta = BlockMeta::with_tmp(&container_block, self);
-    //     let file = meta.get_block_path()?;
-
-    //     // Initialize container file with header
-    //     let mut local_file = LocalFile::with_write(file.to_string_lossy().as_ref(), false)?;
-    //     // local_file.write_all(&CONTAINER_MAGIC_BYTES)?;
-    //     // local_file.write_i64::<BigEndian>(total_size)?;
-    //     // local_file.write_i32::<BigEndian>(0)?;
-
-    //     Ok(meta)
-    // }
 }
 
 impl Debug for VfsDir {

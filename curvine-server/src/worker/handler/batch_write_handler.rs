@@ -326,10 +326,10 @@ impl BatchWriteHandler {
             "DEBUG at BatchWriteHanlder, at complete_container_batch, self.container_files: {:?}",
             self.container_files
         );
-        println!(
-            "DEBUG at BatchWriteHanlder, at complete_container_batch, self.file: {:?}",
-            self.file
-        );
+        // println!(
+        //     "DEBUG at BatchWriteHanlder, at complete_container_batch, self.file: {:?}",
+        //     self.file
+        // );
         // Flush the container file
         if let Some(ref mut files) = self.file {
             if let Some(container_file) = files.first_mut() {
@@ -364,10 +364,10 @@ impl BatchWriteHandler {
     }
 
     pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
-        println!(
-            "Debug at BatchWriteHandler,at complete_batch, self.file: {:?}",
-            self.file
-        );
+        // println!(
+        //     "Debug at BatchWriteHandler,at complete_batch, self.file: {:?}",
+        //     self.file
+        // );
         // Parse the flattened batch request
         let header: BlocksBatchCommitRequest = msg.parse_header()?;
 
@@ -517,15 +517,15 @@ impl BatchWriteHandler {
             }
         }
 
-        println!(
-            "DEBUG at BatchWriteHandler, at write_container_batch, self.file.path: {:?}",
-            self.file.as_mut().unwrap().first()
-        );
+        // println!(
+        //     "DEBUG at BatchWriteHandler, at write_container_batch, self.file.path: {:?}",
+        //     self.file.as_mut().unwrap().first()
+        // );
 
-        println!(
-            "DEBUG at BatchWriteHandler, at write_container_batch, self.file.path: {:?}",
-            self.file.as_mut().unwrap().first()
-        );
+        // println!(
+        //     "DEBUG at BatchWriteHandler, at write_container_batch, self.file.path: {:?}",
+        //     self.file.as_mut().unwrap().first()
+        // );
 
         Ok(())
     }

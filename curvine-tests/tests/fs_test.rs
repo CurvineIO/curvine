@@ -38,8 +38,6 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     let mut conf = testing.get_active_cluster_conf()?;
     conf.client.write_chunk_size = 64; // Set to 64 bytes
     conf.client.write_chunk_size_str = "64B".to_string(); // Update string field
-    conf.client.write_chunk_size = 64; // Set to 64 bytes
-    conf.client.write_chunk_size_str = "64B".to_string(); // Update string field
     conf.client.metric_report_enable = true;
 
     // Test short_circuit = false
@@ -71,9 +69,6 @@ fn run_filesystem_end_to_end_operations_on_cluster(
 
         test_overwrite(&fs).await?;
         println!("test_overwrite done");
-
-        test_batch_writting(&fs).await?;
-        println!("test_batch_writting done");
 
         test_batch_writting(&fs).await?;
         println!("test_batch_writting done");
