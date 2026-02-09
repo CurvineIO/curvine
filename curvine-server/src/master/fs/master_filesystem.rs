@@ -733,7 +733,7 @@ impl MasterFilesystem {
             container
         );
         // Containers should have exactly one block
-        let block =  container.block.clone();
+        let block = container.block.clone();
         println!(
             "DEBUG at MasterFileSystem, at get_container_block_locs, block {:?}",
             block

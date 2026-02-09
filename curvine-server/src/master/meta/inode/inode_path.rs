@@ -110,15 +110,9 @@ impl InodePath {
                     }
                 }
 
-                File(_, _) | FileEntry(_, _) => {
+                File(_, _) | FileEntry(_, _) | Container(_, _) => {
                     println!("DEBUG at InodePath,at resolve, child name is file entry");
                     // File or FileEntry nodes cannot have children, stop path resolution
-                    break;
-                }
-
-                Container(_, _) => {
-                    println!("DEBUG at InodePath,at resolve, child name is container");
-                    // Container nodes cannot have children, stop path resolution
                     break;
                 }
             }
@@ -355,8 +349,8 @@ impl InodePath {
     // Convert the last node to InodeFile
     pub fn clone_last_file(&self) -> CommonResult<InodeFile> {
         if let Some(v) = self.get_last_inode() {
-            // Assert that lastnode should not be FileEntry
-            assert!(!v.is_file_entry());
+            // Assert that lastnode must be File
+            assert!(v.is_file());
             Ok(v.as_file_ref()?.clone())
         } else {
             err_box!("status error")
@@ -366,8 +360,8 @@ impl InodePath {
     // Convert the last node to InodeContainer
     pub fn clone_last_container(&self) -> CommonResult<InodeContainer> {
         if let Some(v) = self.get_last_inode() {
-            // Assert that lastnode should not be FileEntry
-            assert!(!v.is_file_entry());
+            // Assert that lastnode must be Container
+            assert!(!v.is_container());
             Ok(v.as_container_ref()?.clone())
         } else {
             err_box!("status error")

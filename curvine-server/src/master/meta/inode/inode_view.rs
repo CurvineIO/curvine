@@ -68,7 +68,7 @@ impl InodeView {
             File(_, f) => f.id(),
             Dir(_, d) => d.id(),
             FileEntry(_, id) => *id,
-            Container(_, c) => c.id, // will update
+            Container(_, c) => c.id(),
         }
     }
     pub fn ttl_config(&self) -> Option<TtlConfig> {
@@ -76,7 +76,7 @@ impl InodeView {
             File(_, f) => TtlConfig::from_storage_policy(&f.storage_policy),
             Dir(_, d) => TtlConfig::from_storage_policy(&d.storage_policy),
             FileEntry(_, _) => None,
-            Container(_, _c) => None, // will update
+            Container(_, c) => TtlConfig::from_storage_policy(&c.storage_policy),
         }
     }
     pub fn name(&self) -> &str {
@@ -122,7 +122,7 @@ impl InodeView {
             File(_, _) => None,
             Dir(_, d) => d.get_child(name),
             FileEntry(..) => None,
-            Container(_, _c) => None, // will update
+            Container(_, _c) => None,
         }
     }
 
@@ -152,7 +152,7 @@ impl InodeView {
             File(_, _) => 0,
             Dir(_, d) => d.children_iter().len(),
             FileEntry(..) => 0,
-            Container(_, _c) => 0, // will update
+            Container(_, _c) => 0,
         }
     }
 
@@ -179,7 +179,7 @@ impl InodeView {
             File(_, f) => f.mtime(),
             Dir(_, d) => d.mtime(),
             FileEntry(..) => 0,
-            Container(_, _c) => 0, // will update
+            Container(_, c) => c.mtime(),
         }
     }
 
@@ -196,7 +196,11 @@ impl InodeView {
                 }
             }
             FileEntry(..) => (),
-            Container(..) => (), // will update
+            Container(_, ref mut c) => {
+                (if time > c.mtime {
+                    c.mtime = time
+                })
+            } // will update
         }
     }
 
@@ -205,7 +209,7 @@ impl InodeView {
             File(_, f) => f.nlink += 1,
             Dir(_, d) => d.nlink += 1,
             FileEntry(..) => (),
-            Container(..) => (), // will update
+            Container(_, c) => c.nlink += 1, // will update
         }
     }
 
@@ -222,7 +226,11 @@ impl InodeView {
                 }
             }
             FileEntry(..) => (),
-            Container(..) => (), // will update
+            Container(_, c) => {
+                if c.nlink > 0 {
+                    c.nlink -= 1
+                }
+            }, // will update
         }
     }
 
@@ -231,7 +239,7 @@ impl InodeView {
             File(_, f) => f.parent_id = parent_id,
             Dir(_, d) => d.parent_id = parent_id,
             FileEntry(..) => (),
-            Container(..) => (), // will update
+            Container(_, c) => c.parent_id = parent_id, // will update
         }
     }
 
@@ -249,64 +257,51 @@ impl InodeView {
             File(_, f) => f.atime(),
             Dir(_, d) => d.atime(),
             FileEntry(..) => 0,
-            Container(_, _c) => 0, // will update
+            Container(_, c) => c.atime(),
         }
     }
 
     pub fn as_dir_mut(&mut self) -> CommonResult<&mut InodeDir> {
         match self {
-            File(_, _) => err_box!("Not a dir"),
             Dir(_, ref mut d) => Ok(d),
-            _ => err_box!("Inode type error: {}", self.name()),
+            _ => err_box!("Not a dir"),
         }
     }
 
     pub fn as_container_mut(&mut self) -> CommonResult<&mut InodeContainer> {
         match self {
             InodeView::Container(_, container) => Ok(container),
-            _ => err_box!("Not a container inode"),
+            _ => err_box!("Not a container"),
         }
     }
 
     pub fn as_dir_ref(&self) -> CommonResult<&InodeDir> {
         match self {
-            File(_, _) => err_box!("Not a dir"),
             Dir(_, ref d) => Ok(d),
-            _ => err_box!("Inode type error: {}", self.name()),
+            _ => err_box!("Not a dir"),
         }
     }
 
     pub fn as_file_ref(&self) -> CommonResult<&InodeFile> {
         match self {
             File(_, f) => Ok(f),
-            Dir(_, _) => err_box!("Not a file"),
-            _ => err_box!("Inode type error: {}", self.name()),
+            _ => err_box!("Not a file"),
         }
     }
 
     pub fn as_container_ref(&self) -> CommonResult<&InodeContainer> {
         match self {
             Container(_, c) => Ok(c),
-            Dir(_, _) => err_box!("Not a container"),
-            _ => err_box!("Inode type error: {}", self.name()),
+            _ => err_box!("Not a container"),
         }
     }
 
     pub fn as_file_mut(&mut self) -> CommonResult<&mut InodeFile> {
         match self {
             File(_, ref mut f) => Ok(f),
-            Dir(_, _) => err_box!("Not a file"),
-            _ => err_box!("FileEntry is cannot be mutated: {}", self.name()),
+            _ => err_box!("Not a file")
         }
     }
-
-    // pub fn as_container_mut(&mut self) -> CommonResult<&mut InodeContainer> {
-    //     match self {
-    //         Container(_, ref mut c) => Ok(c),
-    //         Dir(_, _) => err_box!("Not a Container"),
-    //         _ => err_box!("cannot be mutated: {}", self.name()),
-    //     }
-    // }
 
     pub fn acl(&self) -> &AclFeature {
         match self {
@@ -315,7 +310,7 @@ impl InodeView {
             FileEntry(..) => {
                 panic!("FileEntry does not support ACL access")
             }
-            Container(_, c) => &c.features.acl, // will update
+            Container(_, c) => &c.features.acl,
         }
     }
 
@@ -323,12 +318,10 @@ impl InodeView {
         match self {
             File(_, f) => &mut f.features.acl,
             Dir(_, d) => &mut d.features.acl,
+            Container(_, c) => &mut c.features.acl,
             FileEntry(..) => {
                 panic!("FileEntry does not support mutable ACL access")
             }
-            Container(_, _c) => {
-                panic!("FileEntry does not support mutable ACL access")
-            } // will update
         }
     }
 
@@ -336,12 +329,10 @@ impl InodeView {
         match self {
             File(_, f) => &f.storage_policy,
             Dir(_, d) => &d.storage_policy,
+            Container(_, c) => &c.storage_policy,
             FileEntry(..) => {
                 panic!("FileEntry does not support storage policy access")
             }
-            Container(_, _c) => {
-                panic!("FileEntry does not support storage policy access")
-            } // will update
         }
     }
 
@@ -349,12 +340,10 @@ impl InodeView {
         match self {
             File(_, f) => &mut f.storage_policy,
             Dir(_, d) => &mut d.storage_policy,
+            Container(_, c) => &mut c.storage_policy,
             FileEntry(..) => {
                 panic!("FileEntry does not support mutable storage policy access")
             }
-            Container(_, _c) => {
-                panic!("FileEntry does not support mutable storage policy access")
-            } // will update
         }
     }
 
@@ -362,12 +351,10 @@ impl InodeView {
         match self {
             File(_, f) => &f.features.x_attr,
             Dir(_, d) => &d.features.x_attr,
+            Container(_, c) => &c.features.x_attr,
             FileEntry(..) => {
                 panic!("FileEntry does not support x_attr access")
             }
-            Container(_, _c) => {
-                panic!("FileEntry does not support x_attr access")
-            } // will update
         }
     }
 
@@ -375,12 +362,10 @@ impl InodeView {
         match self {
             File(_, f) => &mut f.features.x_attr,
             Dir(_, d) => &mut d.features.x_attr,
+            Container(_, c) => &mut c.features.x_attr,
             FileEntry(..) => {
                 panic!("FileEntry does not support mutable x_attr access")
             }
-            Container(_, _c) => {
-                panic!("FileEntry does not support mutable x_attr access")
-            } // will update
         }
     }
 
@@ -388,10 +373,10 @@ impl InodeView {
         match self {
             File(_, f) => f.nlink(),
             Dir(_, d) => d.nlink(),
+            Container(_, c) => c.nlink(),
             FileEntry(_, _) => {
                 panic!("FileEntry does not support nlink")
             }
-            Container(_, c) => c.nlink(), // will update
         }
     }
 
@@ -508,14 +493,15 @@ impl InodeView {
                     .expect("Failed to parse path")
                     .name()
                     .to_owned();
-                status.is_complete = true; // will update
+                status.is_complete = c.is_complete();
                 status.len = c.files.get(&file_name).map(|meta| meta.len).unwrap_or(0);
-                status.replicas = 0; //will update
-                status.block_size = c.max_file_size; // will update
+                status.replicas = c.replicas as i32;
+                status.block_size = c.max_file_size;
                 status.file_type = FileType::Container;
-                status.x_attr = HashMap::new(); // will update
-                status.storage_policy = c.storage_policy.clone(); // will update
+                status.x_attr = c.features.x_attr.clone();
+                status.storage_policy = c.storage_policy.clone();
                 status.name = file_name;
+                status.target = None;
             }
         }
 

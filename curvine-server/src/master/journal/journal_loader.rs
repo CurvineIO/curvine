@@ -154,7 +154,6 @@ impl JournalLoader {
         Ok(())
     }
 
-    
     fn complete_inode_entry(&self, entry: CompleteInodeEntry) -> CommonResult<()> {
         println!(
             "DEBUG at JournalLoader, at complete_inode_entry, complete for: {:?}",
@@ -170,7 +169,7 @@ impl JournalLoader {
                 let _ = mem::replace(file, new_file);
             }
             (
-                InodeView::Container(container_name, container),
+                InodeView::Container(_, container),
                 InodeView::Container(_, new_container),
             ) => {
                 // Get parent directory using get_inode(-2)
