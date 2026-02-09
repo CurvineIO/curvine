@@ -38,7 +38,7 @@ use orpc::{err_box, try_option_mut};
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<ContainerWriteContext>,
-    pub(crate) file: Option<Vec<LocalFile>>,
+    pub(crate) file: Option<LocalFile>,
     pub(crate) is_commit: bool,
     pub(crate) metrics: &'static WorkerMetrics,
 }
@@ -95,11 +95,12 @@ impl BatchWriteHandler {
         self.handle_small_files_batch(ProtoUtils::extend_block_to_pb(context.block.clone()))?;
 
         // Update context with actual block ID and path from storage
-        if let Some(ref files) = self.file {
-            if let Some(container_file) = files.first() {
-                context.files_metadata.container_path = container_file.path().to_string();
-                // container_block_id is already set in handle_small_files_batch
-            }
+        if let Some(ref local_file) = self.file {
+            context.files_metadata.container_path = local_file.path().to_string();
+            // if let Some(container_file) = files.first() {
+            //     context.files_metadata.container_path = container_file.path().to_string();
+            //     // container_block_id is already set in handle_small_files_batch
+            // }
         }
 
         let container_meta = context.files_metadata.clone();
@@ -147,7 +148,7 @@ impl BatchWriteHandler {
         let container_file = container_meta.create_writer(0, false)?;
 
         let actual_block_id = container_meta.id();
-        self.file = Some(vec![container_file]);
+        self.file = Some(container_file);
 
         Ok(actual_block_id)
     }
@@ -158,10 +159,8 @@ impl BatchWriteHandler {
         commit: bool,
     ) -> FsResult<()> {
         // Flush the container file
-        if let Some(ref mut files) = self.file {
-            if let Some(container_file) = files.first_mut() {
-                container_file.flush()?;
-            }
+        if let Some(ref mut container_local_file) = self.file {
+            container_local_file.flush()?;
         }
 
         // Commit using context metadata
@@ -233,25 +232,21 @@ impl BatchWriteHandler {
 
         for (i, file_data) in files.iter().enumerate() {
             if let Some(container_file) = &mut self.file {
-                if let Some(file) = container_file.get_mut(0) {
-                    file.write_all(&file_data.content)?;
+                container_file.write_all(&file_data.content)?;
 
-                    // Update metadata in context
-                    if i < container_files_meta.len() {
-                        container_files_meta[i].offset = offset;
-                        container_files_meta[i].len = file_data.content.len() as i64;
-                        offset += file_data.content.len() as i64;
-                    }
+                // Update metadata in context
+                if i < container_files_meta.len() {
+                    container_files_meta[i].offset = offset;
+                    container_files_meta[i].len = file_data.content.len() as i64;
+                    offset += file_data.content.len() as i64;
                 }
             }
         }
 
         // Update block length
-        if let Some(files) = self.file.as_mut() {
-            if let Some(first_file) = files.first_mut() {
-                let current_pos = first_file.pos();
-                first_file.resize(true, 0, current_pos, 0)?;
-            }
+        if let Some(container_local_file) = self.file.as_mut() {
+            let current_pos: i64 = container_local_file.pos();
+            container_local_file.resize(true, 0, current_pos, 0);
         }
 
         Ok(())
