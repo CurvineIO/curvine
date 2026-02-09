@@ -45,7 +45,7 @@ message BlockWriteResponse {
     optional PipelineStatus pipeline_status = 6;
 }
 
-message BlocksBatchWriteResponse {  
+message ContainerBlockWriteResponse {  
     repeated BlockWriteResponse responses = 1; 
     required ContainerMetadataProto container_meta = 2; 
 }

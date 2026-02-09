@@ -29,9 +29,6 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-// Magic bytes to identify container files
-// const CONTAINER_MAGIC_BYTES: &[u8] = b"CMB";
-
 pub struct VfsDir {
     pub(crate) version: StorageVersion,
     pub(crate) stats: FsStats,

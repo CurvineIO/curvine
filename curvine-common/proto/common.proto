@@ -194,7 +194,30 @@ message FileLockProto {
     required uint64 end = 8;
 }
 
-message BlocksBatchWriteRequest {  
+// message BlocksBatchWriteRequest {  
+//     required ExtendedBlockProto block = 1;  
+//     required int64 off = 2;  
+//     required int64 block_size = 3;  
+//     required int64 req_id = 4;  
+//     required int32 seq_id = 5;  
+//     required int32 chunk_size = 6;  
+//     required bool short_circuit = 7;  
+//     required string client_name = 8;  
+//     required ContainerMetadataProto files_metadata = 9;
+// }  
+
+// message BlocksBatchCommitRequest {  
+//     required ExtendedBlockProto block = 1;  
+//     required int64 off = 2;  
+//     required int64 block_size = 3;  
+//     required int64 req_id = 4;  
+//     required int32 seq_id = 5;  
+//     required bool cancel = 6;  
+//     optional ContainerMetadataProto container_meta = 7;
+// }  
+
+
+message ContainerBlockWriteRequest {  
     required ExtendedBlockProto block = 1;  
     required int64 off = 2;  
     required int64 block_size = 3;  
@@ -207,18 +230,18 @@ message BlocksBatchWriteRequest {
 }  
 
 
-
-
-
-message BlocksBatchCommitRequest {  
+message ContainerBlockWriteReponse {  
     required ExtendedBlockProto block = 1;  
     required int64 off = 2;  
     required int64 block_size = 3;  
     required int64 req_id = 4;  
     required int32 seq_id = 5;  
-    required bool cancel = 6;  
-    optional ContainerMetadataProto container_meta = 7;
+    required int32 chunk_size = 6;  
+    required bool short_circuit = 7;  
+    required string client_name = 8;  
+    required ContainerMetadataProto files_metadata = 9;
 }  
+
   
 message BlocksBatchCommitResponse {  
     required bool results = 1;  

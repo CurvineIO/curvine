@@ -172,6 +172,8 @@ impl ContainerBlockWriterRemote {
                 self.container_meta.take(),
             )
             .await?;
+
+        println!("DEBUG at ContainerBlockWriterRemote, at complete, end game");
         Ok(())
     }
 

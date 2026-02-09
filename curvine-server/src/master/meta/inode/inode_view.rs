@@ -484,11 +484,11 @@ impl InodeView {
                 panic!("FileEntry does not support to_file_status");
             }
             Container(_, c) => {
-                println!(
-                    "DEBUG at InodeView, file: {:?}, container c= {:?}",
-                    self.name(),
-                    c
-                );
+                // println!(
+                //     "DEBUG at InodeView, file: {:?}, container c= {:?}",
+                //     self.name(),
+                //     c
+                // );
                 let file_name = Path::new(path)
                     .expect("Failed to parse path")
                     .name()
