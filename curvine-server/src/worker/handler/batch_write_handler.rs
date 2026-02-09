@@ -40,13 +40,11 @@ pub struct BatchWriteHandler {
     pub(crate) context: Option<ContainerWriteContext>,
     pub(crate) file: Option<Vec<LocalFile>>,
     pub(crate) is_commit: bool,
-    pub(crate) _write_handler: WriteHandler,
     pub(crate) metrics: &'static WorkerMetrics,
 }
 
 impl BatchWriteHandler {
     pub fn new(store: BlockStore) -> Self {
-        let store_clone = store.clone();
         println!("DEBUG at BatchWriteHandler, call new:()");
         let metrics = Worker::get_metrics();
         Self {
@@ -54,7 +52,6 @@ impl BatchWriteHandler {
             context: None,
             file: None,
             is_commit: false,
-            _write_handler: WriteHandler::new(store_clone),
             metrics,
         }
     }
