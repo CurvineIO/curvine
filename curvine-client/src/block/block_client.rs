@@ -24,8 +24,8 @@ use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-    ContainerMetadataProto, ContainerWriteRequest, DataHeaderProto, FileWriteDataProto,
-    SmallFileMetaProto, ContainerBlockWriteRequest, ContainerBlockWriteResponse
+    ContainerBlockWriteRequest, ContainerBlockWriteResponse, ContainerMetadataProto,
+    ContainerWriteRequest, DataHeaderProto, FileWriteDataProto, SmallFileMetaProto,
 };
 use curvine_common::state::{ContainerStatus, ExtendedBlock, StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
@@ -329,7 +329,6 @@ impl BlockClient {
         //     },
         // };
 
-
         let req_header = ContainerBlockWriteRequest {
             block: block_pb,
             off,
@@ -347,7 +346,10 @@ impl BlockClient {
             },
         };
 
-        println!("DEBUG at BlockClient, at write_blocks_batch: {:?}", req_header);
+        println!(
+            "DEBUG at BlockClient, at write_blocks_batch: {:?}",
+            req_header
+        );
 
         let msg = Builder::new()
             .code(RpcCode::WriteContainerBlock)
@@ -411,7 +413,6 @@ impl BlockClient {
         //     cancel,
         //     container_meta,
         // };
-
 
         let header = ContainerBlockWriteRequest {
             block: block_pb,

@@ -81,7 +81,8 @@ impl InodeStore {
             InodeView::Container(..) => {
                 // todo: add container count
                 // add file count
-                self.fs_stats.add_file_count(child.as_container_ref().unwrap().files_count() as i64);
+                self.fs_stats
+                    .add_file_count(child.as_container_ref().unwrap().files_count() as i64);
             }
         }
 

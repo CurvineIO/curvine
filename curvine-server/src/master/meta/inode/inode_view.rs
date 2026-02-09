@@ -230,7 +230,7 @@ impl InodeView {
                 if c.nlink > 0 {
                     c.nlink -= 1
                 }
-            }, // will update
+            } // will update
         }
     }
 
@@ -299,7 +299,7 @@ impl InodeView {
     pub fn as_file_mut(&mut self) -> CommonResult<&mut InodeFile> {
         match self {
             File(_, ref mut f) => Ok(f),
-            _ => err_box!("Not a file")
+            _ => err_box!("Not a file"),
         }
     }
 

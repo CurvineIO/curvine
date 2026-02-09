@@ -168,10 +168,7 @@ impl JournalLoader {
             (InodeView::File(_, file), InodeView::File(_, new_file)) => {
                 let _ = mem::replace(file, new_file);
             }
-            (
-                InodeView::Container(_, container),
-                InodeView::Container(_, new_container),
-            ) => {
+            (InodeView::Container(_, container), InodeView::Container(_, new_container)) => {
                 // Get parent directory using get_inode(-2)
                 // if let Some(parent) = inp.get_inode(-2) {
                 //     println!(
