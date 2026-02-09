@@ -14,7 +14,7 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
-use crate::master::meta::inode::{InodeFile, InodePtr, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{InodeFile, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
@@ -205,10 +205,10 @@ impl InodeStore {
         batch.commit()
     }
 
-    pub fn apply_set_attr(&self, inodes: Vec<InodePtr>) -> CommonResult<()> {
+    pub fn apply_set_attr(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         for inode in &inodes {
-            batch.write_inode(inode.as_ref())?;
+            batch.write_inode(inode)?;
         }
         batch.commit()?;
 

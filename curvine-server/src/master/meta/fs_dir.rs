@@ -755,11 +755,11 @@ impl FsDir {
         let child_opts = opts.child_opts();
         let recursive = opts.recursive;
         let parent_inode_id = inode.id();
-        let mut change_inodes: Vec<InodePtr> = vec![];
+        let mut change_inodes: Vec<InodeView> = vec![];
 
         // set current inode
         inode.as_mut().set_attr(opts);
-        change_inodes.push(inode.clone());
+        change_inodes.push(inode.as_ref().clone());
 
         // recursive set child inode
         if recursive {
@@ -768,7 +768,7 @@ impl FsDir {
             while let Some(cur_inode) = stack.pop_front() {
                 if cur_inode.id() != parent_inode_id {
                     cur_inode.as_mut().set_attr(child_opts.clone());
-                    change_inodes.push(cur_inode.clone());
+                    change_inodes.push(cur_inode.as_ref().clone());
                 }
 
                 //children may be FileEntry, so we need to load complete data from store
