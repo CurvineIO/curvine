@@ -78,7 +78,11 @@ impl InodeStore {
                 }
             }
             InodeView::FileEntry(..) => self.fs_stats.increment_file_count(),
-            InodeView::Container(..) => {} // will update
+            InodeView::Container(..) => {
+                // todo: add container count
+                // add file count
+                self.fs_stats.add_file_count(child.as_container_ref().unwrap().files_count() as i64);
+            }
         }
 
         Ok(())
@@ -180,24 +184,6 @@ impl InodeStore {
 
         batch.commit()
     }
-
-    // pub fn apply_complete_file(
-    //     &self,
-    //     file: &InodeView,
-    //     commit_blocks: &[CommitBlock],
-    // ) -> CommonResult<()> {
-    //     let mut batch = self.store.new_batch();
-
-    //     batch.write_inode(file)?;
-    //     for commit in commit_blocks {
-    //         for item in &commit.locations {
-    //             batch.add_location(commit.block_id, item)?;
-    //         }
-    //         println!("DEBUG at InodeStore, at apply_complete_file, commit: {:?}", commit);
-    //     }
-
-    //     batch.commit()
-    // }
 
     pub fn apply_complete_inode_entry(
         &self,
@@ -638,16 +624,4 @@ impl InodeStore {
     pub fn apply_set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
         self.store.set_locks(id, lock)
     }
-    // pub fn apply_add_files_to_container(&self, inode: &InodeView) -> CommonResult<()> {
-    //     match inode {
-    //         InodeView::Container(_, container) => {
-    //             let key = RocksUtils::i64_to_bytes(container.id);
-    //             let value = Serde::serialize(container)?;
-    //             self.store
-    //                 .db
-    //                 .put_cf(&RocksInodeStore::CF_INODES, &key, &value)
-    //         }
-    //         _ => err_box!("Not a container inode"),
-    //     }
-    // }
 }
