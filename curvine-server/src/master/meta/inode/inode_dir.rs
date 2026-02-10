@@ -56,21 +56,6 @@ impl InodeDir {
         }
     }
 
-    // pub fn remove_from_container_index(&mut self, file_name: &str) {
-    //     self.children.remove_from_container_index(file_name);
-    // }
-
-    // pub fn add_to_container_index(&mut self, file_name: String, container_name: String) {
-    //     self.children.add_to_container_index(file_name, container_name);
-    // }
-
-    // pub fn remove_from_container_index(&mut self, file_name: &str) -> Option<String> {
-    //     self.container_index.remove(file_name)
-    // }
-
-    // pub fn add_to_container_index(&mut self, file_name: String, container_name: String) {
-    //     self.container_index.insert(file_name, container_name);
-    // }
     pub fn get_container_for_file(&self, file_name: &str) -> Option<&String> {
         self.container_index.get(file_name)
     }

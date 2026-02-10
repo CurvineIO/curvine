@@ -68,15 +68,7 @@ impl BatchWriterAdapter {
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
         let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
-
-        println!(
-            "Debug at BatchWriterAdapter, located_block: {:?}",
-            located_block
-        );
-        println!(
-            "Debug at BatchWriterAdapter, worker_addr: {:?}",
-            worker_addr
-        );
+        // choose the writer mode: remote or local
         let block: ExtendedBlock = located_block.block.clone();
         let adapter = if short_circuit {
             let writer = ContainerBlockWriterLocal::new(
@@ -135,10 +127,6 @@ impl ContainerBlockWriter {
             inners.push(adapter);
         }
 
-        println!(
-            "DEBUG at ContainerBlockWriter, located_block: {:?} ",
-            located_block
-        );
         Ok(Self {
             inners,
             fs_context,

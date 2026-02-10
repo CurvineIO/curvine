@@ -151,7 +151,6 @@ impl CurvineFileSystem {
 
     pub async fn open(&self, path: &Path) -> FsResult<FsReader> {
         let file_blocks = self.fs_client.get_block_locations(path).await?;
-        println!("DEBUG at CurvineFileSystem: file_blocks {:?}", file_blocks);
         Self::check_read_status(path, &file_blocks)?;
 
         let reader = FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)?;
@@ -370,7 +369,6 @@ impl CurvineFileSystem {
             let content_size: usize = content.len();
 
             if content_size >= chunk_size {
-                println!("large_file_processing");
                 self.write_string(path, content.to_string()).await?;
                 continue;
             }
@@ -394,7 +392,6 @@ impl CurvineFileSystem {
     }
 
     async fn handle_batch_files(&self, files: &[(&Path, &str)]) -> FsResult<()> {
-        println!("handle batch files");
         // currently, this feature support all files in the same last sub-folder inode
         // checking is needed
         if files.is_empty() {
@@ -411,16 +408,7 @@ impl CurvineFileSystem {
             create_requests.push((path.encode(), opts, flags));
         }
 
-        println!(
-            "DEBUG at handle_batch_files, create_requests: {:?}",
-            create_requests
-        );
         let container_status = self.fs_client().create_container(create_requests).await?;
-
-        println!(
-            "DEBUG at handle_batch_files, container_status: {:?}",
-            container_status
-        );
 
         // Step 2: Container Block allocation
         let container_path = container_status.container_path.clone();
@@ -433,14 +421,7 @@ impl CurvineFileSystem {
 
         // Compute small files metadata for containerization
         let small_files_metadata = self.compute_container_metadata(files, &allocated_blocks)?;
-        println!(
-            "at CurvineFileSystem, add_block_requests: {:?}",
-            allocated_blocks
-        );
-        println!(
-            "at CurvineFileSystem, small_files_metadata: {:?}",
-            small_files_metadata
-        );
+
         // assert if allocated_blocks is not smae with add_block_requests
         let mut container_writer = ContainerBlockWriter::new(
             self.fs_context.clone(),
@@ -456,10 +437,6 @@ impl CurvineFileSystem {
         // Step 4: Complete all files at worker side
         let commit_blocks = container_writer.complete().await?;
 
-        println!(
-            "DEBUG at CurvineFileSystem, commit_blocks: {:?}",
-            commit_blocks
-        );
         // // Step 5: Batch complete at master side
 
         self.fs_client()

@@ -80,7 +80,6 @@ impl InodeStore {
             InodeView::FileEntry(..) => self.fs_stats.increment_file_count(),
             InodeView::Container(..) => {
                 // todo: add container count
-                // add file count
                 self.fs_stats
                     .add_file_count(child.as_container_ref().unwrap().files_count() as i64);
             }
@@ -175,10 +174,6 @@ impl InodeStore {
         batch.write_inode(file)?;
         for commit in commit_blocks {
             for item in &commit.locations {
-                println!(
-                    "DEBUG at InodeStore, at apply_new_block, location: {:?}",
-                    item
-                );
                 batch.add_location(commit.block_id, item)?;
             }
         }
@@ -198,10 +193,6 @@ impl InodeStore {
             for item in &commit.locations {
                 batch.add_location(commit.block_id, item)?;
             }
-            println!(
-                "DEBUG at InodeStore, at apply_complete_file, commit: {:?}",
-                commit
-            );
         }
 
         batch.commit()
@@ -409,7 +400,6 @@ impl InodeStore {
 
     // Restore to a directory tree from rocksdb
     pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
-        println!("DEBUG at inode_store, at create_tree, start create_tree");
         let mut root = FsDir::create_root();
         let mut stack = LinkedList::new();
         stack.push_back((
@@ -472,7 +462,6 @@ impl InodeStore {
                                             .insert(file_name.clone(), container_name.clone());
                                     }
                                 }
-                                println!("DEBUG at inode_store, at create_tree, parent_dir.container_index {:?}", parent_dir.container_index)
                             }
                         }
                     }
@@ -516,10 +505,6 @@ impl InodeStore {
     }
 
     pub fn add_block_location(&self, block_id: i64, location: BlockLocation) -> CommonResult<()> {
-        println!(
-            "DEBUG at InodeStore, at add_block_location, location: {:?}",
-            location
-        );
         let mut batch = self.store.new_batch();
         batch.add_location(block_id, &location)?;
         batch.commit()?;

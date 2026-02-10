@@ -304,33 +304,9 @@ impl InodeFile {
     ) -> FsResult<()> {
         for block in commit_blocks {
             let meta = self.search_block_mut_check(block.block_id)?;
-            println!(
-                "DEBUG at inode_file: at complete function, block: {:?}",
-                block
-            );
-            println!(
-                "DEBUG at inode_file: at complete function, meta before: {:?}",
-                meta
-            );
             meta.commit(block);
-            println!(
-                "DEBUG at inode_file: at complete function, meta after: {:?}",
-                meta
-            );
         }
-        println!(
-            "DEBUG at inode_file: at complete function, self.blocks: {:?}",
-            self.blocks
-        );
-        println!(
-            "DEBUG at inode_file: at complete function, self.len before: {:?}",
-            self.len
-        );
         self.len = self.len.max(len);
-        println!(
-            "DEBUG at inode_file: at complete function, self.len after: {:?}",
-            self.len
-        );
         let complete_len = self.compute_len();
         if complete_len != self.len {
             return err_box!(

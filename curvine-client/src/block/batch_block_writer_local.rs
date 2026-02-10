@@ -52,14 +52,7 @@ impl ContainerBlockWriterLocal {
 
         let container_meta = write_context.container_meta.clone();
 
-        // Create multiple files, one for each block context
-        // let mut files = Vec::new();
-        // for context in &write_context.contexts {
-        //     let path = try_option!(&context.path);
-        //     let file = LocalFile::with_write_offset(path, false, pos)?;
-        //     files.push(RawPtr::from_owned(file));
-        // }
-
+        // create local file for storing large of small files
         let path = try_option!(write_context
             .contexts
             .first()

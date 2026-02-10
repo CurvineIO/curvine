@@ -85,12 +85,6 @@ message FileStatusList {
     repeated FileStatusProto statuses = 1;  
 }
 
-
-  
-// message CompleteContainerRequest {  
-//     required CompleteContainerRequest requests = 1;  
-// }  
-  
 message CompleteContainerResponse {  
     required bool result = 1;  
 }

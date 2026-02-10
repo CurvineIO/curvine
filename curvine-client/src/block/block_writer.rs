@@ -272,10 +272,6 @@ impl BlockWriter {
     }
 
     pub fn to_commit_block(&self) -> CommitBlock {
-        println!(
-            "DEBUG at BlockWriter, at to_commit_block, self.locate: {:?}",
-            self.locate
-        );
         let locs = self
             .locate
             .locs

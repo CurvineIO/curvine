@@ -301,42 +301,11 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
-    // pub fn create_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-    //     let header: CreateFilesBatchRequest = ctx.parse_header()?;
-
-    //     let mut results = Vec::with_capacity(header.requests.len());
-    //     for (index, req) in header.requests.into_iter().enumerate() {
-    //         let opts = ProtoUtils::create_opts_from_pb(req.opts);
-    //         let flags = OpenFlags::new(req.flags);
-
-    //         // Generate unique req_id for each file in batch
-    //         let unique_req_id = ctx.msg.req_id() + index as i64;
-    //         let status = self.create_file0(unique_req_id, req.path, opts, flags)?;
-    //         results.push(status);
-    //     }
-
-    //     let rep_header = CreateFilesBatchResponse {
-    //         file_statuses: results
-    //             .into_iter()
-    //             .map(ProtoUtils::file_status_to_pb)
-    //             .collect(),
-    //     };
-    //     ctx.response(rep_header)
-    // }
-
     pub fn create_container(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: CreateContainerRequest = ctx.parse_header()?;
 
         // Create single container for all files
         let container_result = self.create_container_batch(ctx, &header.requests)?;
-        println!(
-            "DEBUG at MasterHandler, at create_container, container_result {:?}",
-            container_result.container_status
-        );
-        println!(
-            "DEBUG at MasterHandler, at create_container, container_meta {:?}",
-            container_result.container_meta
-        );
         // Create individual FileStatus objects for each file in container
         let mut container_files = Vec::new();
 
@@ -350,10 +319,6 @@ impl MasterHandler {
             file_status.len = container_result.container_meta.files[i].len;
             file_status.file_type = FileType::File; // Individual files, not Container
             file_status.id = ctx.msg.req_id() + i as i64;
-            println!(
-                "DEBUG at MasterHandler, at create_container, file_status {:?}",
-                file_status
-            );
             container_files.push(ProtoUtils::file_status_to_pb(file_status));
         }
 
@@ -409,10 +374,6 @@ impl MasterHandler {
             OpenFlags::new_create(),
         )?;
 
-        println!(
-            "DEBUG at MasterHandler, at create_container_batch, container_status: {:?}",
-            container_status
-        );
         let container_meta = ContainerMetadataProto {
             container_block_id: container_status.id,
             container_path: container_path.clone(),
@@ -443,14 +404,9 @@ impl MasterHandler {
 
     pub fn complete_container(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: CompleteContainerRequest = ctx.parse_header()?;
-        println!("DEBUG at MasterHandler, at complete_container, starting");
         let req = header;
         let commit_block = ProtoUtils::commit_block_from_pb(req.commit_block);
 
-        println!(
-            "DEBUG at MasterHandler, at complete_container req.len = {:?}, commit_blocks = {:?}",
-            req.len, commit_block
-        );
         let files_index: HashMap<String, SmallFileMeta> = req
             .files
             .into_iter()
@@ -469,8 +425,6 @@ impl MasterHandler {
             .is_ok();
 
         // should add complete information about files = index and offset of all files
-        // results.push(result);
-
         let rep_header = CompleteContainerResponse { result };
         ctx.response(rep_header)
     }

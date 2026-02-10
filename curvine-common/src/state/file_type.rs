@@ -43,5 +43,5 @@ pub enum FileType {
 
     Object = 5,
 
-    Container = 6, // New file type for small file containers
+    Container = 6, // handle large of small files
 }

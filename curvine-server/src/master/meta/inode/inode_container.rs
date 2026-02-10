@@ -4,6 +4,7 @@ use crate::master::meta::BlockMeta;
 use curvine_common::state::{CommitBlock, CreateFileOpts, StoragePolicy};
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
+use orpc::err_box;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -92,36 +93,22 @@ impl InodeContainer {
         only_flush: bool,
         files: HashMap<String, SmallFileMeta>,
     ) -> FsResult<()> {
-        println!(
-            "DEBUG at InodeContainer, at complete, len: {:?}, commit_block {:?}, files {:?}",
-            len, commit_block, files
-        );
         self.files = files;
         self.mtime = LocalTime::mills() as i64;
+
         if !only_flush {
             self.features.complete_write(client_name);
         }
-        println!(
-            "DEBUG at Inode_Container: at complete function, block: {:?}",
-            self.block
-        );
+        // validate len
+        if self.block.len != self.len {
+            return err_box!(
+                "Block len is not equal to container inode len, block len= {}, container inode len= {}",
+                self.block.len,
+                self.len
+            );
+        }
         //update block meta
         self.block.commit(commit_block);
-        // let mut meta = self.block;
-
-        // println!(
-        //     "DEBUG at inode_container: at complete function, meta before: {:?}",
-        //     meta
-        // );
-        // meta.commit(commit_block);
-
-        // println!(
-        //     "DEBUG at inode_container: at complete function, meta after: {:?}",
-        //     meta
-        // );
-        // //update Inode container len
-        // // self.len = self.len.max(len);
-        // println!("DEBUG at InodeContainer, meta: {:?}", meta);
         Ok(())
     }
 
@@ -229,31 +216,3 @@ impl SmallFileMeta {
         }
     }
 }
-
-// #[derive(Debug, Clone, Serialize, Deserialize)]
-// pub struct ContainerMetadata {
-//     pub(crate) container_block_id: i64,
-//     pub(crate) container_path: String,
-//     pub(crate) container_name: String,
-//     pub(crate) files: Vec<SmallFileMeta>,
-// }
-
-// impl ContainerMetadata {
-//     pub fn from_proto(meta: curvine_common::proto::ContainerMetadataProto) -> Self {
-//         Self {
-//             container_block_id: meta.container_block_id,
-//             container_path: meta.container_path,
-//             container_name: meta.container_name,
-//             files: meta.files.into_iter().map(SmallFileMeta::from_proto).collect(),
-//         }
-//     }
-
-//     pub fn to_proto(&self) -> curvine_common::proto::ContainerMetadataProto {
-//         curvine_common::proto::ContainerMetadataProto {
-//             container_block_id: self.container_block_id,
-//             container_path: self.container_path.clone(),
-//             container_name: self.container_name.clone(),
-//             files: self.files.iter().map(|f| f.to_proto()).collect(),
-//         }
-//     }
-// }

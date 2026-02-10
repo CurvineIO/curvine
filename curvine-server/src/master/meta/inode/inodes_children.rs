@@ -91,10 +91,6 @@ impl InodeChildren {
     }
 
     pub fn get_child_in_container(&self, name: &str) -> Option<&InodeView> {
-        println!(
-            "DEBUG at InodeChildren, at get_child_in_container, name: {:?}",
-            name
-        );
         match self {
             InodeChildren::List(list) => {
                 let index = Self::search_by_name(list, name);
@@ -104,16 +100,8 @@ impl InodeChildren {
                 }
             }
             InodeChildren::Map(map) => {
-                println!(
-                    "DEBUG at InodeChildren, at get_child_in_container, map: {:?}",
-                    map
-                );
                 for child in map.values() {
                     if let InodeView::Container(_, container) = child.as_ref() {
-                        println!(
-                            "DEBUG in InodeChildren, get_child_in_container, container: {:?} ",
-                            container
-                        );
                         // Check if the file exists in this container's files HashMap
                         if container.files.contains_key(name) {
                             return Some(child.as_ref());
@@ -130,7 +118,6 @@ impl InodeChildren {
         if !is_enable_container_search {
             self.get_child(name).map(InodePtr::from_ref)
         } else {
-            println!("DEBUG Inodechildren, at get_child_ptr, search using get_child_in_container ");
             self.get_child_in_container(name).map(InodePtr::from_ref)
         }
     }
@@ -165,12 +152,10 @@ impl InodeChildren {
     }
 
     pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
-        println!("DEBUG at InodeChildren, at add_child, inode: {:?}", inode);
         let inode = Box::new(inode);
         // Assert that it should not be FileEntry
         match self {
             InodeChildren::List(list) => {
-                println!("DEBUG at InodeChildren, at add_child, self is list:");
                 let index = Self::search_by_name(list, inode.name());
                 match index {
                     Err(v) => {
@@ -187,7 +172,6 @@ impl InodeChildren {
 
             InodeChildren::Map(map) => match map.entry(inode.name().to_owned()) {
                 Entry::Vacant(v) => {
-                    println!("DEBUG at InodeChildren, at add_child, self is map:");
                     if inode.is_file() {
                         // Store lightweight FileEntry in map
                         v.insert(Box::new(InodeView::FileEntry(
@@ -197,14 +181,9 @@ impl InodeChildren {
                         // But return owned pointer to complete object
                         Ok(InodePtr::from_owned(*inode))
                     } else {
-                        println!(
-                            "DEBUG at InodeChildren, with child is map and inode: {:?}",
-                            inode
-                        );
                         // Directory directly stores complete object and returns its reference
                         let inserted = v.insert(inode.clone());
                         let return_inode_ptr = InodePtr::from_ref(inserted.as_ref());
-                        println!("DEBUG at InodeChildren, with child is prepare to return return_inode_ptr:");
                         Ok(return_inode_ptr)
                     }
                 }

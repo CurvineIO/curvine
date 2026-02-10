@@ -37,10 +37,6 @@ impl InodePath {
         store: &InodeStore,
     ) -> CommonResult<Self> {
         let components = InodeView::path_components(path.as_ref())?;
-        // println!(
-        //     "DEBUG at InodePath,at resolve, components: {:?}",
-        //     components
-        // );
         let name = try_option!(components.last());
 
         if name.is_empty() {
@@ -54,78 +50,53 @@ impl InodePath {
         while index < components.len() {
             //make sure resolved_inode is not a FileEntry
             //if it is a FileEntry, load the complete file data from store
-            // println!("DEBUG at InodePath, at resolve, inodes {:?}", inodes);
             let resolved_inode = match cur_inode.as_ref() {
                 FileEntry(name, id) => {
-                    // println!("DEBUG at InodePath, at resolve, resolve inode {:?} with id {:?} is file_entry", name, id);
                     // If it is a FileEntry, load the complete object from store
                     match store.get_inode(*id, Some(name))? {
                         Some(full_inode) => InodePtr::from_owned(full_inode),
                         None => return err_box!("Failed to load inode {} from store", id),
                     }
                 }
-                Container(name, id) => {
-                    // println!("DEBUG at InodePath, at resolve, resolve inode {:?} with id {:?} is container", name, id);
-                    cur_inode.clone()
-                }
                 _ => cur_inode.clone(),
             };
 
-            // println!(
-            //     "DEBUG at InodePath, at resolve, resolved_inode: {:?}",
-            //     resolved_inode
-            // );
             inodes.push(resolved_inode);
-            // println!(
-            //     "DEBUG at InodePath, at resolve ,after append inode, inodes: {:?}",
-            //     inodes
-            // );
-
             if index == components.len() - 1 {
                 break;
             }
 
             index += 1;
             let child_name: &str = components[index].as_str();
-            // println!(
-            //     "DEBUG at InodePath,at resolve, at index: {:?}, child_name: {:?}",
-            //     index, child_name
-            // );
             match cur_inode.as_mut() {
                 Dir(_, d) => {
                     // First attempt: search without container lookup
                     if let Some(child) = d.get_child_ptr(child_name, false) {
                         cur_inode = child;
-                        // println!("DEBUG at InodePath,at resolve, child of child name, search only file branch, {:?} is directory: {:?}", child_name, cur_inode);
                     } else {
                         // Second attempt: search in containers
                         if let Some(child) = d.get_child_ptr(child_name, true) {
                             cur_inode = child;
-                            // println!("DEBUG at InodePath,at resolve, child of child name, search file in container branch, {:?} is directory: {:?}", child_name, cur_inode);
                         } else {
                             // The directory has not been created, so there is no need to search again.
-                            // println!("DEBUG at InodePath,at resolve, The directory has not been created, so there is no need to search again.");
                             break;
                         }
                     }
                 }
 
                 File(_, _) | FileEntry(_, _) | Container(_, _) => {
-                    // println!("DEBUG at InodePath,at resolve, child name is file entry");
                     // File or FileEntry nodes cannot have children, stop path resolution
                     break;
                 }
             }
         }
 
-        // println!("DEBUG at InodePath, at resolve, name: {:?}", name);
         let inode_path = Self {
             path: path.as_ref().to_string(),
             name: name.to_string(),
             components,
             inodes,
         };
-        // println!("DEBUG at InodePath, at resolve, done. {:?}", inode_path);
         Ok(inode_path)
     }
 

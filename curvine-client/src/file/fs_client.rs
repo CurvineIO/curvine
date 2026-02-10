@@ -287,9 +287,7 @@ impl FsClient {
             last_block: None,
         };
 
-        println!("DEBUG at FsClient, at add_container_block, before run rpc");
         let rep: LocatedBlockProto = self.rpc(RpcCode::AddBlock, pb_request).await?;
-        println!("DEBUG at FsClient, at add_container_block, before return located_block_from_pb");
         Ok(ProtoUtils::located_block_from_pb(rep))
     }
     // File writing is completed.
@@ -348,13 +346,11 @@ impl FsClient {
 
         let header = pb_requests;
 
-        println!("DEBUG at FsClient, at complete_container, {:?}", header);
         let rep: CompleteContainerResponse = self.rpc(RpcCode::CompleteContainer, header).await?;
         Ok(rep.result)
     }
 
     pub async fn get_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {
-        println!("DEBUG at FsClient, at get_block_locations, start");
         let header = GetBlockLocationsRequest {
             path: path.encode(),
         };

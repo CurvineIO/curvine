@@ -39,7 +39,6 @@ impl FsReader {
         let len = file_blocks.status.len;
         let conf = &fs_context.conf.client;
         let status = file_blocks.status.clone();
-        println!("DEBUG at FsReader files_blocks {:?}", file_blocks);
         let read_detector = ReadDetector::with_conf(conf, len);
 
         info!(

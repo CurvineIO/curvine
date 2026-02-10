@@ -203,10 +203,6 @@ impl Dataset for VfsDataset {
     }
 
     fn finalize_block(&mut self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
-        println!(
-            "DEBUG at VfsDataset: start finalize_block with block {:?}",
-            block
-        );
         let meta = self.get_block_check(block.id)?;
         if meta.state() != &BlockState::Writing {
             return err_box!(

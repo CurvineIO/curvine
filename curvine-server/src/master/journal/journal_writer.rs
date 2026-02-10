@@ -99,23 +99,6 @@ impl JournalWriter {
         self.send(JournalEntry::Mkdir(entry))
     }
 
-    // pub fn log_create_file(&self, op_ms: u64, inp: &InodePath) -> FsResult<()> {
-    //     println!(
-    //         "DEBUG at JournalWriter, at log_create_file start with inp: {:?}",
-    //         inp
-    //     );
-    //     let entry = CreateFileEntry {
-    //         op_ms,
-    //         path: inp.path().to_string(),
-    //         file: inp.clone_last_file()?,
-    //     };
-    //     println!(
-    //         "DEBUG at JournalWriter, at log_create_file end with inp: {:?}",
-    //         inp
-    //     );
-    //     self.send(JournalEntry::CreateFile(entry))
-    // }
-
     pub fn log_reopen_file<P: AsRef<str>>(
         &self,
         op_ms: u64,
@@ -152,73 +135,6 @@ impl JournalWriter {
 
         self.send(JournalEntry::AddBlock(entry))
     }
-    // pub fn log_add_block<P: AsRef<str>>(
-    //     &self,
-    //     op_ms: u64,
-    //     path: P,
-    //     file: RawPtr<InodeView>,
-    //     commit_block: Vec<CommitBlock>,
-    // ) -> FsResult<()> {
-    //     let entry = AddBlockEntry {
-    //         op_ms,
-    //         path: path.as_ref().to_string(),
-    //         blocks: file.blocks.clone(),
-    //         commit_block,
-    //     };
-
-    //     self.send(JournalEntry::AddBlock(entry))
-    // }
-
-    // pub fn log_add_block_for_container<P: AsRef<str>>(
-    //     &self,
-    //     op_ms: u64,
-    //     path: P,
-    //     file: &InodeContainer,
-    //     commit_block: Vec<CommitBlock>,
-    // ) -> FsResult<()> {
-    //     let entry = AddBlockEntry {
-    //         op_ms,
-    //         path: path.as_ref().to_string(),
-    //         blocks: file.blocks.clone(),
-    //         commit_block,
-    //     };
-
-    //     self.send(JournalEntry::AddBlock(entry))
-    // }
-
-    // pub fn log_complete_file<P: AsRef<str>>(
-    //     &self,
-    //     op_ms: u64,
-    //     path: P,
-    //     file: &InodeFile,
-    //     commit_blocks: Vec<CommitBlock>,
-    // ) -> FsResult<()> {
-    //     let entry = CompleteFileEntry {
-    //         op_ms,
-    //         path: path.as_ref().to_string(),
-    //         file: file.clone(),
-    //         commit_blocks,
-    //     };
-
-    //     self.send(JournalEntry::CompleteFile(entry))
-    // }
-
-    // pub fn log_complete_container<P: AsRef<str>>(
-    //     &self,
-    //     op_ms: u64,
-    //     path: P,
-    //     file: &InodeContainer,
-    //     commit_blocks: Vec<CommitBlock>,
-    // ) -> FsResult<()> {
-    //     let entry = CompleteContainerEntry {
-    //         op_ms,
-    //         path: path.as_ref().to_string(),
-    //         file: file.clone(),
-    //         commit_blocks,
-    //     };
-
-    //     self.send(JournalEntry::CompleteContainer(entry))
-    // }
 
     pub fn log_complete_inode_entry<P: AsRef<str>>(
         &self,
@@ -233,10 +149,6 @@ impl JournalWriter {
             inode: inode.as_ref().clone(),
             commit_blocks,
         };
-        println!(
-            "DEBUG at JournalWriter, at log_complete_inode_entry, entry: {:?}",
-            entry
-        );
         self.send(JournalEntry::CompleteInode(entry))
     }
 
@@ -339,29 +251,8 @@ impl JournalWriter {
         }
         entries
     }
-    // pub fn log_create_container(
-    //     &self,
-    //     op_ms: u64,
-    //     inode_path: &InodePath,
-    //     container: &InodeContainer,
-    // ) -> FsResult<()> {
-    //     let entry = CreateContainerEntry {
-    //         op_ms,
-    //         path: format!("{}/{}", inode_path.path(), inode_path.name()),
-    //         container: container.clone(),
-    //     };
 
-    //     let _ = self.sender.send(JournalEntry::CreateContainer(entry));
-
-    //     Ok(())
-    // }
-
-    pub fn log_create_inode_entry(
-        &self,
-        op_ms: u64,
-        inode_path: &InodePath,
-        // inode_entry: RawPtr<InodeView>,
-    ) -> FsResult<()> {
+    pub fn log_create_inode_entry(&self, op_ms: u64, inode_path: &InodePath) -> FsResult<()> {
         let inode_entry = inode_path.get_last_inode().unwrap();
         let entry = CreateInodeEntry {
             op_ms,

@@ -30,9 +30,7 @@ pub struct WriteContext {
 
 impl WriteContext {
     pub fn from_req(msg: &Message) -> FsResult<Self> {
-        println!("DEBUG at context, at WriteContext, msg {:?}", msg);
         let req: BlockWriteRequest = msg.parse_header()?;
-        println!("DEBUG at context, at WriteContext, req {:?}", req);
         let context = Self {
             block: ProtoUtils::extend_block_from_pb(req.block),
             req_id: msg.req_id(),

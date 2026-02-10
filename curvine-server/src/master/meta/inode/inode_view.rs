@@ -197,9 +197,9 @@ impl InodeView {
             }
             FileEntry(..) => (),
             Container(_, ref mut c) => {
-                (if time > c.mtime {
+                if time > c.mtime {
                     c.mtime = time
-                })
+                }
             } // will update
         }
     }

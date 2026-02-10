@@ -309,26 +309,8 @@ impl BlockClient {
         container_status: ContainerStatus,
         small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<CreateBatchBlockContext> {
-        println!("Debug, at BlockClient: blocks={:?}", block);
+        // send request to workers to create a block for container
         let block_pb = ProtoUtils::extend_block_to_pb(block.clone());
-
-        // let req_header = BlocksBatchWriteRequest {
-        //     block: block_pb,
-        //     off,
-        //     block_size,
-        //     req_id,
-        //     seq_id,
-        //     chunk_size,
-        //     short_circuit,
-        //     client_name: self.client_name.to_string(),
-        //     files_metadata: ContainerMetadataProto {
-        //         container_block_id: 0, // will be set by worker
-        //         container_path: container_status.container_path.clone(),
-        //         container_name: container_status.container_name.clone(),
-        //         files: small_files_metadata,
-        //     },
-        // };
-
         let req_header = ContainerBlockWriteRequest {
             block: block_pb,
             off,
@@ -346,11 +328,6 @@ impl BlockClient {
             },
         };
 
-        println!(
-            "DEBUG at BlockClient, at write_blocks_batch: {:?}",
-            req_header
-        );
-
         let msg = Builder::new()
             .code(RpcCode::WriteContainerBlock)
             .request(RequestStatus::Open)
@@ -360,17 +337,10 @@ impl BlockClient {
             .build();
 
         let rep = self.rpc(msg).await?;
-        // println!(
-        //     "DEBUG at BlockClient, at write_blocks_batch,rep: {:?} ",
-        //     rep
-        // );
         let rep_header: ContainerBlockWriteResponse = rep.parse_header()?;
         let mut batch_context = CreateBatchBlockContext::new(req_id);
 
-        // println!(
-        //     "DEBUG at BlockClient, at write_blocks_batch,rep_header: {:?} ",
-        //     rep_header
-        // );
+        // construct batch_context
         let container_meta = rep_header.container_meta;
         for response in rep_header.responses {
             let context = CreateBlockContext {
@@ -380,7 +350,6 @@ impl BlockClient {
                 storage_type: StorageType::from(response.storage_type),
                 path: response.path,
             };
-            println!("DEBUG at BlockClient, at write_blocks_batch,context: {:?}, context.block_size: {:?}",context.path, context.block_size);
             batch_context.push(context, Some(container_meta.clone()));
         }
 
@@ -397,22 +366,7 @@ impl BlockClient {
         cancel: bool,
         container_meta: Option<ContainerMetadataProto>,
     ) -> FsResult<()> {
-        // Convert blocks to protobuf
-        // let blocks_pb: Vec<_> = blocks
-        //     .iter()
-        //     .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
-        //     .collect();
-
         let block_pb = ProtoUtils::extend_block_to_pb(block.clone());
-        // let header = BlocksBatchCommitRequest {
-        //     block: block_pb,
-        //     off,
-        //     block_size,
-        //     req_id,
-        //     seq_id,
-        //     cancel,
-        //     container_meta,
-        // };
 
         let header = ContainerBlockWriteRequest {
             block: block_pb,
@@ -451,6 +405,7 @@ impl BlockClient {
         seq_id: i32,
         container_meta: Option<ContainerMetadataProto>,
     ) -> CommonResult<()> {
+        // prepare data files
         let file_data: Vec<_> = files
             .iter()
             .map(|(path, content)| FileWriteDataProto {
@@ -459,11 +414,6 @@ impl BlockClient {
             })
             .collect();
 
-        // println!("DEBUG at write_container, files: {:?}", file_data);
-        // println!(
-        //     "DEBUG at write_container, container_meta: {:?}",
-        //     container_meta
-        // );
         let header = ContainerWriteRequest {
             files: file_data,
             req_id,

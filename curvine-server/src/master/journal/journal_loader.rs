@@ -17,7 +17,7 @@
 use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
 use crate::master::meta::inode::InodeView;
-use crate::master::meta::inode::InodeView::{Container, Dir, File};
+use crate::master::meta::inode::InodeView::Dir;
 use crate::master::{MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::raft::SnapshotData;
@@ -155,10 +155,6 @@ impl JournalLoader {
     }
 
     fn complete_inode_entry(&self, entry: CompleteInodeEntry) -> CommonResult<()> {
-        println!(
-            "DEBUG at JournalLoader, at complete_inode_entry, complete for: {:?}",
-            entry
-        );
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
@@ -169,32 +165,6 @@ impl JournalLoader {
                 let _ = mem::replace(file, new_file);
             }
             (InodeView::Container(_, container), InodeView::Container(_, new_container)) => {
-                // Get parent directory using get_inode(-2)
-                // if let Some(parent) = inp.get_inode(-2) {
-                //     println!(
-                //         "DEBUG at JournalLoader, before update container index for {:?}",
-                //         parent
-                //     );
-                //     if let InodeView::Dir(_, dir) = parent.as_mut() {
-                //         // Remove old file mappings from container_index
-                //         for old_file_name in container.files.keys() {
-                //             dir.remove_from_container_index(old_file_name);
-                //         }
-
-                //         // Add new file mappings to container_index
-                //         for new_file_name in new_container.files.keys() {
-                //             dir.add_to_container_index(
-                //                 new_file_name.clone(),
-                //                 container_name.clone(),
-                //             );
-                //         }
-                //     }
-                //     println!(
-                //         "DEBUG at JournalLoader, after update container index for {:?}",
-                //         parent
-                //     );
-                // }
-
                 let _ = mem::replace(container, new_container);
             }
             _ => return err_box!("Inode type mismatch during complete"),

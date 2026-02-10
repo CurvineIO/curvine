@@ -15,15 +15,13 @@
 // use crate::master::meta::inode::SmallFileMeta;
 use crate::worker::block::BlockStore;
 use crate::worker::handler::ContainerWriteContext;
-use crate::worker::handler::WriteContext;
-use crate::worker::handler::WriteHandler;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::proto::ExtendedBlockProto;
 use curvine_common::proto::{
-    BlockWriteResponse, BlocksBatchCommitResponse, ContainerBlockWriteRequest,
-    ContainerBlockWriteResponse, ContainerMetadataProto, ContainerWriteRequest,
-    ContainerWriteResponse, FileWriteDataProto, SmallFileMetaProto,
+    BlockWriteResponse,
+    ContainerBlockWriteResponse, ContainerWriteRequest,
+    FileWriteDataProto, SmallFileMetaProto,
 };
 use curvine_common::state::ExtendedBlock;
 use curvine_common::state::FileType;
@@ -33,7 +31,7 @@ use curvine_common::FsResult;
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
-use orpc::{err_box, try_option_mut};
+use orpc::err_box;
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
@@ -88,19 +86,12 @@ impl BatchWriteHandler {
             );
         }
 
-        // Access files from context instead of self
-        // let container_files = context.files_metadata.files.clone();
-
         // Open container block
         self.handle_small_files_batch(ProtoUtils::extend_block_to_pb(context.block.clone()))?;
 
         // Update context with actual block ID and path from storage
         if let Some(ref local_file) = self.file {
             context.files_metadata.container_path = local_file.path().to_string();
-            // if let Some(container_file) = files.first() {
-            //     context.files_metadata.container_path = container_file.path().to_string();
-            //     // container_block_id is already set in handle_small_files_batch
-            // }
         }
 
         let container_meta = context.files_metadata.clone();
@@ -224,7 +215,7 @@ impl BatchWriteHandler {
     }
 
     fn write_container_batch(
-        &mut self, // Changed from &self
+        &mut self,
         files: &[FileWriteDataProto],
         container_files_meta: &mut Vec<SmallFileMetaProto>,
     ) -> FsResult<()> {

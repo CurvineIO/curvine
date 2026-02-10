@@ -41,14 +41,10 @@ impl ContainerBlockWriterRemote {
         container_status: ContainerStatus,
         small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<Self> {
+        // create a container block
         let req_id = Utils::req_id();
         let seq_id = 0;
         let block_size = fs_context.block_size();
-        println!(
-            "DEBUG at ContainerBlockWriterRemote, block_size: {:?}",
-            block_size
-        );
-
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
             .write_blocks_batch(
@@ -66,11 +62,6 @@ impl ContainerBlockWriterRemote {
 
         // Extract container metadata from response
         let container_meta = write_context.container_meta.clone();
-
-        println!(
-            "DEBUG at ContainerBlockWriterRemote, container_meta: {:?}",
-            container_meta
-        );
 
         for context in &write_context.contexts {
             if block_size != context.block_size {
@@ -103,29 +94,13 @@ impl ContainerBlockWriterRemote {
 
     // Write data.
     pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
-        println!(
-            "DEBUG at ContainerBlockWriterRemote, at write, write: {:?}",
-            files
-        );
         let next_seq_id = self.next_seq_id();
-
-        println!(
-            "DEBUG at ContainerBlockWriterRemote, at write, container_meta: {:?}",
-            self.container_meta
-        );
 
         // Send all files in one RPC call
         self.client
             .write_container(files, self.req_id, next_seq_id, self.container_meta.clone())
             .await?;
 
-        // println!("DEBUG at Batch Block Writer Remote, before: {:?}", self.block);
-        // for (i, (_, content)) in files.iter().enumerate() {
-        //     if i < self.blocks.len() {
-        //         let file_len = content.len() as i64;
-        //         self.blocks[i].len = file_len;
-        //     }
-        // }
         let file_len = files
             .iter()
             .map(|x: &(&Path, &str)| x.1.len())
@@ -134,10 +109,6 @@ impl ContainerBlockWriterRemote {
             self.block.len = file_len
         }
 
-        println!(
-            "DEBUG at Batch Block Writer Remote, after: {:?}",
-            self.block
-        );
         Ok(())
     }
 
@@ -152,14 +123,6 @@ impl ContainerBlockWriterRemote {
 
     // Write complete
     pub async fn complete(&mut self) -> FsResult<()> {
-        println!(
-            "DEBUG at ContainerBlockWriterRemote, at complte, self.container_meta: {:?}",
-            self.container_meta
-        );
-        println!(
-            "DEBUG at ContainerBlockWriterRemote, at complte, self.blocks: {:?}",
-            self.block
-        );
         let next_seq_id = self.next_seq_id();
         self.client
             .write_commit_batch(
@@ -173,7 +136,6 @@ impl ContainerBlockWriterRemote {
             )
             .await?;
 
-        println!("DEBUG at ContainerBlockWriterRemote, at complete, end game");
         Ok(())
     }
 

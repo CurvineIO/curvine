@@ -58,10 +58,7 @@ pub trait Dataset {
     fn get_block_check(&self, id: i64) -> CommonResult<&BlockMeta> {
         match self.get_block(id) {
             None => err_box!("block {} not exists", id),
-            Some(v) => {
-                println!("DEBUG at Dataset, get block_id: {:?}", id);
-                Ok(v)
-            }
+            Some(v) => Ok(v),
         }
     }
 }
