@@ -25,16 +25,22 @@ use log::info;
 use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
 use std::sync::{mpsc, Mutex};
 
+pub enum JournalEvent {
+    Entry(Box<JournalEntry>),
+    // None means success, Some(err) means flush failed.
+    Flush(SyncSender<Option<String>>),
+}
+
 enum SenderAdapter {
-    Bounded(SyncSender<JournalEntry>),
-    UnBounded(Sender<JournalEntry>),
+    Bounded(SyncSender<JournalEvent>),
+    UnBounded(Sender<JournalEvent>),
 }
 
 impl SenderAdapter {
-    fn send(&self, entry: JournalEntry) -> Result<(), SendError<JournalEntry>> {
+    fn send(&self, event: JournalEvent) -> Result<(), SendError<JournalEvent>> {
         match self {
-            SenderAdapter::Bounded(s) => s.send(entry),
-            SenderAdapter::UnBounded(s) => s.send(entry),
+            SenderAdapter::Bounded(s) => s.send(event),
+            SenderAdapter::UnBounded(s) => s.send(event),
         }
     }
 }
@@ -45,7 +51,7 @@ pub struct JournalWriter {
     debug: bool,
     sender: SenderAdapter,
     metrics: &'static MasterMetrics,
-    receiver: Option<Mutex<Receiver<JournalEntry>>>,
+    receiver: Option<Mutex<Receiver<JournalEvent>>>,
 }
 
 impl JournalWriter {
@@ -82,10 +88,30 @@ impl JournalWriter {
         }
 
         if self.enable {
-            self.sender.send(entry)?;
+            self.sender.send(JournalEvent::Entry(Box::new(entry)))?;
             self.metrics.journal_queue_len.inc();
         }
         Ok(())
+    }
+
+    pub fn flush(&self) -> FsResult<()> {
+        if !self.enable {
+            return Ok(());
+        }
+
+        // No sender task exists in testing mode.
+        if self.receiver.is_some() {
+            return Ok(());
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.sender.send(JournalEvent::Flush(sender))?;
+
+        match receiver.recv() {
+            Ok(None) => Ok(()),
+            Ok(Some(e)) => orpc::err_box!("flush journal failed: {}", e),
+            Err(e) => orpc::err_box!("flush journal failed: {}", e),
+        }
     }
 
     pub fn log_mkdir(&self, op_ms: u64, path: impl AsRef<str>, dir: &InodeDir) -> FsResult<()> {
@@ -249,7 +275,9 @@ impl JournalWriter {
         let mut entries = vec![];
 
         while let Ok(v) = self.receiver.as_ref().unwrap().lock().unwrap().try_recv() {
-            entries.push(v)
+            if let JournalEvent::Entry(entry) = v {
+                entries.push(*entry);
+            }
         }
         entries
     }

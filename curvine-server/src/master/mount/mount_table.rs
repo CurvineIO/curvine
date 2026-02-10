@@ -102,6 +102,10 @@ impl MountTable {
         inner.mountpath2id.contains_key(cv_path)
     }
 
+    pub fn mount_path_exists(&self, cv_path: &str) -> bool {
+        self.mount_point_inuse(cv_path)
+    }
+
     pub fn unprotected_add_mount(&self, info: MountInfo) -> FsResult<()> {
         info!("add mount: {:?}", info);
 
@@ -244,6 +248,105 @@ impl MountTable {
 
         inner.ufs2mountid.remove(&info.ufs_path);
         inner.mountpath2id.remove(&info.cv_path);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MountTable;
+    use crate::master::fs::MasterFilesystem;
+    use crate::master::journal::JournalSystem;
+    use crate::master::Master;
+    use curvine_common::conf::ClusterConf;
+    use curvine_common::fs::Path;
+    use curvine_common::state::MountOptions;
+    use orpc::common::Utils;
+    use orpc::CommonResult;
+    use std::collections::HashMap;
+
+    struct TableEnv {
+        _conf: ClusterConf,
+        _js: JournalSystem,
+        table: MountTable,
+    }
+
+    fn new_table_env(name: &str, format_master: bool) -> TableEnv {
+        Master::init_test_metrics();
+
+        let mut conf = ClusterConf {
+            testing: true,
+            ..Default::default()
+        };
+        conf.change_test_meta_dir(format!("mount-table-unit-test/{}", name));
+        conf.format_master = format_master;
+        conf.journal.enable = false;
+
+        let js = JournalSystem::from_conf(&conf).unwrap();
+        let fs = MasterFilesystem::with_js(&conf, &js);
+        let table = MountTable::new(fs.fs_dir.clone());
+
+        TableEnv {
+            _conf: conf,
+            _js: js,
+            table,
+        }
+    }
+
+    #[test]
+    fn test_get_ufs_conf_and_lookup_errors() -> CommonResult<()> {
+        let env = new_table_env(&format!("ufs-conf-{}", Utils::rand_str(6)), true);
+
+        let mut props = HashMap::new();
+        props.insert("ak".to_string(), "sk".to_string());
+        let opts = MountOptions::builder().set_properties(props).build();
+        env.table.add_mount(100, "/m", "oss://b/m", &opts)?;
+
+        let conf = env.table.get_ufs_conf(&"oss://b/m".to_string())?;
+        assert_eq!(conf.get("ak"), Some("sk"));
+
+        let err = env
+            .table
+            .get_ufs_conf(&"oss://b/not-exists".to_string())
+            .unwrap_err();
+        assert!(err.to_string().contains("failed found"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_mount_info_none_and_umount_missing() -> CommonResult<()> {
+        let env = new_table_env(&format!("none-{}", Utils::rand_str(6)), true);
+        let opts = MountOptions::builder().build();
+        env.table.add_mount(200, "/cv/x", "oss://bucket/x", &opts)?;
+
+        let not_found = env.table.get_mount_info(&Path::from_str("/other/path")?)?;
+        assert!(not_found.is_none());
+
+        let err = env.table.umount("/cv/not-found").unwrap_err();
+        assert!(err.to_string().contains("failed found"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_mount_info_by_id_error_and_restore() -> CommonResult<()> {
+        let name = format!("restore-{}", Utils::rand_str(6));
+        {
+            let env = new_table_env(&name, true);
+            let opts = MountOptions::builder().build();
+            env.table
+                .add_mount(300, "/restore/a", "oss://restore/a", &opts)?;
+        }
+
+        let env2 = new_table_env(&name, false);
+        assert!(env2.table.get_mount_table()?.is_empty());
+        env2.table.restore();
+        assert_eq!(env2.table.get_mount_table()?.len(), 1);
+
+        let err = env2.table.get_mount_info_by_id(999999).unwrap_err();
+        assert!(err.to_string().contains("failed found"));
+
         Ok(())
     }
 }

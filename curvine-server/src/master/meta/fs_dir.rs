@@ -707,6 +707,7 @@ impl FsDir {
 
         if send_log {
             self.journal_writer.log_mount(op_ms, info)?;
+            self.journal_writer.flush()?;
         }
 
         Ok(())
@@ -722,6 +723,7 @@ impl FsDir {
         let op_ms = LocalTime::mills();
         self.store.store.remove_mountpoint(id)?;
         self.journal_writer.log_unmount(op_ms, id)?;
+        self.journal_writer.flush()?;
         Ok(())
     }
 

@@ -83,8 +83,8 @@ impl MountManager {
         ufs_path: &str,
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
-        if !self.mount_table.exists(cv_path) {
-            return err_box!("update mode: mount point {} does not exist", ufs_path);
+        if !self.mount_table.mount_path_exists(cv_path) {
+            return err_box!("update mode: mount point {} does not exist", cv_path);
         }
 
         self.mount_table.umount(cv_path)?;

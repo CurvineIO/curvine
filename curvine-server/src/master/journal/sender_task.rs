@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::journal::{JournalBatch, JournalEntry};
+use crate::master::journal::{JournalBatch, JournalEvent};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
@@ -49,7 +49,7 @@ impl SenderTask {
     }
 
     // Start a thread to execute sender task
-    pub fn spawn(self, receiver: mpsc::Receiver<JournalEntry>) -> FsResult<()> {
+    pub fn spawn(self, receiver: mpsc::Receiver<JournalEvent>) -> FsResult<()> {
         let poll = Duration::from_millis(self.flush_batch_ms);
         let name = "journal-writer".to_string();
         let task = self;
@@ -62,7 +62,7 @@ impl SenderTask {
     }
 
     fn loop0(
-        receiver: mpsc::Receiver<JournalEntry>,
+        receiver: mpsc::Receiver<JournalEvent>,
         poll: Duration,
         mut task: SenderTask,
     ) -> FsResult<()> {
@@ -77,35 +77,62 @@ impl SenderTask {
         }
     }
 
-    pub fn handle(&mut self, entry: Option<JournalEntry>) -> FsResult<()> {
-        if let Some(v) = entry {
-            self.batch.push(v);
-            self.metrics.journal_queue_len.dec();
-        }
+    fn flush_batch(&mut self) -> FsResult<()> {
+        let spend = TimeSpent::new();
+        let bytes = SerdeUtils::serialize(&self.batch)?;
+        self.client.block_on_send_propose(bytes)?;
 
+        self.metrics.journal_flush_count.inc();
+        self.metrics
+            .journal_flush_time
+            .inc_by(spend.used_us() as i64);
+
+        // Scroll to the next batch.
+        self.batch.next();
+        self.last_flush_ms = LocalTime::mills();
+        Ok(())
+    }
+
+    pub fn handle(&mut self, event: Option<JournalEvent>) -> FsResult<()> {
+        let mut flush_waiter = None;
+        if let Some(v) = event {
+            match v {
+                JournalEvent::Entry(entry) => {
+                    self.batch.push(*entry);
+                    self.metrics.journal_queue_len.dec();
+                }
+                JournalEvent::Flush(waiter) => {
+                    flush_waiter = Some(waiter);
+                }
+            }
+        }
         let len = self.batch.len() as u64;
-        if len == 0 {
+        if len == 0 && flush_waiter.is_none() {
             return Ok(());
         }
 
-        if len >= self.flush_batch_size
+        let flush_now = flush_waiter.is_some()
+            || len >= self.flush_batch_size
             || LocalTime::mills() - self.last_flush_ms >= self.flush_batch_ms
-        {
-            let spend = TimeSpent::new();
+            || len == 0;
 
-            let bytes = SerdeUtils::serialize(&self.batch)?;
-            self.client.block_on_send_propose(bytes)?;
-
-            self.metrics.journal_flush_count.inc();
-            self.metrics
-                .journal_flush_time
-                .inc_by(spend.used_us() as i64);
-
-            // Scroll to the next batch.
-            self.batch.next();
-            self.last_flush_ms = LocalTime::mills();
+        if !flush_now {
+            return Ok(());
         }
 
-        Ok(())
+        let flush_result = if len == 0 { Ok(()) } else { self.flush_batch() };
+
+        if let Some(waiter) = flush_waiter {
+            match &flush_result {
+                Ok(_) => {
+                    let _ = waiter.send(None);
+                }
+                Err(e) => {
+                    let _ = waiter.send(Some(e.to_string()));
+                }
+            }
+        }
+
+        flush_result
     }
 }

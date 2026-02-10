@@ -217,6 +217,13 @@ impl MiniCluster {
             .unwrap()
     }
 
+    pub fn get_standby_master_fs(&self) -> Option<MasterFilesystem> {
+        self.master_entries
+            .iter()
+            .find(|x| !x.0.master_monitor.is_active())
+            .map(|x| x.0.clone())
+    }
+
     pub fn get_active_master_replication_manager(&self) -> Arc<MasterReplicationManager> {
         self.master_entries
             .iter()
