@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use orpc::common::LogConf;
+use orpc::{common::LogConf, CommonResult};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CliConf {
     pub log: LogConf,
+}
+
+impl CliConf {
+    pub fn init(&mut self) -> CommonResult<()> {
+        Ok(())
+    }
 }
 
 impl Default for CliConf {

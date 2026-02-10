@@ -18,6 +18,7 @@ use orpc::client::ClientConf;
 use orpc::common::Utils;
 use orpc::io::net::{InetAddr, NetUtils};
 use orpc::runtime::Runtime;
+use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::vec;
@@ -107,6 +108,10 @@ pub struct JournalConf {
 
 impl JournalConf {
     pub const DEFAULT_NODE_ID: u64 = 0;
+
+    pub fn init(&mut self) -> CommonResult<()> {
+        Ok(())
+    }
 
     // Create a test configuration, which will also randomly select a server port.
     pub fn with_test() -> Self {

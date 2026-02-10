@@ -73,7 +73,9 @@ impl ServerArgs {
     }
 
     pub fn get_conf(&self) -> CommonResult<ClusterConf> {
-        ClusterConf::from(&self.conf)
+        let conf = ClusterConf::from(&self.conf, None);
+        println!("Loaded configuration from {}", &self.conf);
+        conf
     }
 }
 
