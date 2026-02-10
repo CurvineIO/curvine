@@ -41,12 +41,12 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     conf.client.metric_report_enable = true;
 
     // Test short_circuit = false
-    conf.client.short_circuit = false;
-    run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
+    // conf.client.short_circuit = false;
+    // run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
 
     // Test short_circuit = true
-    // conf.client.short_circuit = true;
-    // run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
+    conf.client.short_circuit = true;
+    run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
 
     Ok(())
 }
