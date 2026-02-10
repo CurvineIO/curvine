@@ -63,9 +63,10 @@ fn storage_type_to_str(storage_type: Option<i32>) -> &'static str {
 fn ttl_action_to_str(ttl_action: TtlActionProto) -> &'static str {
     match ttl_action {
         TtlActionProto::None => "none",
-        TtlActionProto::Move => "move",
-        TtlActionProto::Ufs => "ufs",
         TtlActionProto::Delete => "delete",
+        TtlActionProto::Persist => "persist",
+        TtlActionProto::Evict => "evict",
+        TtlActionProto::Flush => "flush",
     }
 }
 

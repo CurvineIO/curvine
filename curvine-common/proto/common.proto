@@ -17,9 +17,10 @@ enum StorageTypeProto {
 // ttl Expiry Strategy.
 enum TtlActionProto {
     TTL_ACTION_PROTO_NONE = 0;
-    TTL_ACTION_PROTO_MOVE = 1;
-    TTL_ACTION_PROTO_UFS = 2;
-    TTL_ACTION_PROTO_DELETE = 3;
+    TTL_ACTION_PROTO_DELETE = 1;
+    TTL_ACTION_PROTO_PERSIST = 2;
+    TTL_ACTION_PROTO_EVICT = 3;
+    TTL_ACTION_PROTO_FLUSH = 4;
 }
 
 enum WriteTypeProto {
