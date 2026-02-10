@@ -198,9 +198,11 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
 
     let initial_status = fs.get_status(&path).await?;
     let initial_inode_id = initial_status.id;
+    let initial_version_epoch = initial_status.version_epoch;
     let initial_content = read_file_content(fs, &path).await?;
     assert_eq!(initial_content, "initial");
     assert_eq!(initial_status.len, 7); // Length of "initial"
+    assert!(initial_version_epoch >= 1);
     println!(
         "Initial file created, inode_id: {}, content: {}",
         initial_inode_id, initial_content
@@ -216,6 +218,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
 
     let overwrite_status = fs.get_status(&path).await?;
     let overwrite_inode_id = overwrite_status.id;
+    let overwrite_version_epoch = overwrite_status.version_epoch;
     println!("x overwrite_inode_id: {}", overwrite_inode_id);
     let overwrite_content = read_file_content(fs, &path).await?;
     println!("y overwrite_content: {}", overwrite_content);
@@ -227,6 +230,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
         initial_inode_id, overwrite_inode_id,
         "Overwrite should preserve inode ID"
     );
+    assert!(overwrite_version_epoch > initial_version_epoch);
     println!(
         "File overwritten successfully, inode_id: {} (preserved), content: {}",
         overwrite_inode_id, overwrite_content
@@ -239,6 +243,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
 
     let final_status = fs.get_status(&path).await?;
     let final_inode_id = final_status.id;
+    let final_version_epoch = final_status.version_epoch;
     let final_content = read_file_content(fs, &path).await?;
 
     // 5. Verify final state
@@ -248,6 +253,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
         initial_inode_id, final_inode_id,
         "Multiple overwrites should preserve inode ID"
     );
+    assert!(final_version_epoch > overwrite_version_epoch);
     println!(
         "File overwritten again, inode_id: {} (preserved), content: {}",
         final_inode_id, final_content
@@ -259,6 +265,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
 
     let empty_status = fs.get_status(&path).await?;
     let empty_inode_id = empty_status.id;
+    let empty_version_epoch = empty_status.version_epoch;
     let empty_content = if empty_status.len > 0 {
         read_file_content(fs, &path).await?
     } else {
@@ -272,6 +279,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
         initial_inode_id, empty_inode_id,
         "Overwrite to empty should preserve inode ID"
     );
+    assert!(empty_version_epoch > final_version_epoch);
     println!(
         "File overwritten to empty, inode_id: {} (preserved), content length: {}",
         empty_inode_id, empty_status.len

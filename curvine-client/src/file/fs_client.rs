@@ -357,6 +357,19 @@ impl FsClient {
         self.rpc_bytes(RpcCode::GetMasterInfo, header).await
     }
 
+    pub async fn get_p2p_runtime_policy(
+        &self,
+    ) -> FsResult<(u64, Vec<String>, Vec<String>, String)> {
+        let header = GetP2pPolicyRequest::default();
+        let rep: GetP2pPolicyResponse = self.rpc(RpcCode::GetP2pPolicy, header).await?;
+        Ok((
+            rep.p2p_policy_version,
+            rep.p2p_peer_whitelist,
+            rep.p2p_tenant_whitelist,
+            rep.p2p_policy_signature.unwrap_or_default(),
+        ))
+    }
+
     pub async fn mount(
         &self,
         ufs_path: &Path,

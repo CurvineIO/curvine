@@ -130,6 +130,12 @@ pub struct MasterConf {
     pub lock_expire_time: String,
     #[serde(skip)]
     pub lock_expire_time_unit: DurationUnit,
+
+    pub p2p_policy_version: u64,
+    pub p2p_policy_signing_key: String,
+    pub p2p_policy_transition_signing_key: String,
+    pub p2p_peer_whitelist: Vec<String>,
+    pub p2p_tenant_whitelist: Vec<String>,
 }
 
 impl MasterConf {
@@ -303,6 +309,12 @@ impl Default for MasterConf {
 
             lock_expire_time: "5m".to_string(),
             lock_expire_time_unit: Default::default(),
+
+            p2p_policy_version: 0,
+            p2p_policy_signing_key: String::new(),
+            p2p_policy_transition_signing_key: String::new(),
+            p2p_peer_whitelist: vec![],
+            p2p_tenant_whitelist: vec![],
         };
 
         conf.init().unwrap();

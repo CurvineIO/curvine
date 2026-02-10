@@ -16,9 +16,11 @@
 
 use crate::master::fs::MasterFilesystem;
 use crate::master::Master;
-use curvine_common::state::MetricValue;
+use curvine_common::state::{MetricType, MetricValue};
 use log::{debug, info, warn};
-use orpc::common::{Counter, CounterVec, Gauge, GaugeVec, HistogramVec, Metrics as m, Metrics};
+use orpc::common::{
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics as m, Metrics,
+};
 use orpc::sync::FastDashMap;
 use orpc::sys::SysUtils;
 use orpc::CommonResult;
@@ -58,6 +60,14 @@ pub struct MasterMetrics {
     pub(crate) eviction_trigger_count: Counter,
     pub(crate) eviction_files_deleted: Counter,
     pub(crate) eviction_bytes_freed: Counter,
+}
+
+enum RegisteredMetric {
+    Counter(Counter),
+    CounterVec(CounterVec),
+    Gauge(Gauge),
+    GaugeVec(GaugeVec),
+    Skip,
 }
 
 impl MasterMetrics {
@@ -180,30 +190,127 @@ impl MasterMetrics {
         Metrics::text_output()
     }
 
-    pub fn get_or_register(&self, value: &MetricValue) -> CommonResult<CounterVec> {
+    fn sorted_label_keys(value: &MetricValue) -> Vec<&str> {
+        let mut keys: Vec<&str> = value.tags.keys().map(|v| v.as_str()).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn sorted_label_values<'a>(value: &'a MetricValue, keys: &[&str]) -> Vec<&'a str> {
+        keys.iter()
+            .filter_map(|k| value.tags.get(*k).map(|v| v.as_str()))
+            .collect()
+    }
+
+    fn get_or_register(
+        &self,
+        value: &MetricValue,
+        label_keys: &[&str],
+    ) -> CommonResult<RegisteredMetric> {
         if let Some(v) = Metrics::get(&value.name) {
-            return v.try_into_counter_vec();
+            return match value.metric_type {
+                MetricType::Gauge => {
+                    if label_keys.is_empty() {
+                        if let Ok(metric) = v.clone().try_into_gauge() {
+                            return Ok(RegisteredMetric::Gauge(metric));
+                        }
+                    }
+                    v.try_into_gauge_vec().map(RegisteredMetric::GaugeVec)
+                }
+                MetricType::Counter => {
+                    if label_keys.is_empty() {
+                        if let Ok(metric) = v.clone().try_into_counter() {
+                            return Ok(RegisteredMetric::Counter(metric));
+                        }
+                    }
+                    v.try_into_counter_vec().map(RegisteredMetric::CounterVec)
+                }
+                MetricType::Histogram => {
+                    if label_keys.is_empty() {
+                        if let Ok(metric) = v.clone().try_into_counter() {
+                            return Ok(RegisteredMetric::Counter(metric));
+                        }
+                        if v.clone().try_into_histogram().is_ok() {
+                            return Ok(RegisteredMetric::Skip);
+                        }
+                    }
+                    if let Ok(metric) = v.clone().try_into_counter_vec() {
+                        return Ok(RegisteredMetric::CounterVec(metric));
+                    }
+                    if v.clone().try_into_histogram_vec().is_ok() {
+                        return Ok(RegisteredMetric::Skip);
+                    }
+                    v.try_into_counter_vec().map(RegisteredMetric::CounterVec)
+                }
+            };
         }
 
-        let label_values: Vec<&str> = value.tags.keys().map(|v| v.as_str()).collect();
-        let metric = m::new_counter_vec(&value.name, &value.name, &label_values)?;
-        Ok(metric)
+        match value.metric_type {
+            MetricType::Gauge => {
+                if label_keys.is_empty() {
+                    let metric = m::new_gauge(&value.name, &value.name)?;
+                    Ok(RegisteredMetric::Gauge(metric))
+                } else {
+                    let metric = m::new_gauge_vec(&value.name, &value.name, label_keys)?;
+                    Ok(RegisteredMetric::GaugeVec(metric))
+                }
+            }
+            MetricType::Counter => {
+                if label_keys.is_empty() {
+                    let metric = m::new_counter(&value.name, &value.name)?;
+                    Ok(RegisteredMetric::Counter(metric))
+                } else {
+                    let metric = m::new_counter_vec(&value.name, &value.name, label_keys)?;
+                    Ok(RegisteredMetric::CounterVec(metric))
+                }
+            }
+            MetricType::Histogram => {
+                if label_keys.is_empty() {
+                    let metric = m::new_counter(&value.name, &value.name)?;
+                    Ok(RegisteredMetric::Counter(metric))
+                } else {
+                    let metric = m::new_counter_vec(&value.name, &value.name, label_keys)?;
+                    Ok(RegisteredMetric::CounterVec(metric))
+                }
+            }
+        }
     }
 
     pub fn metrics_report(&self, metrics: Vec<MetricValue>) -> CommonResult<()> {
         for value in metrics {
-            let counter = match self.get_or_register(&value) {
+            let label_keys = Self::sorted_label_keys(&value);
+            let metric = match self.get_or_register(&value, &label_keys) {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!("Not fond metrics {}: {}", value.name, e);
+                    warn!("Not found metrics {}: {}", value.name, e);
                     continue;
                 }
             };
 
-            let label_values: Vec<&str> = value.tags.values().map(|v| v.as_str()).collect();
-            counter
-                .with_label_values(&label_values)
-                .inc_by(value.value as i64)
+            let label_values = Self::sorted_label_values(&value, &label_keys);
+            match metric {
+                RegisteredMetric::Counter(counter) => {
+                    if value.value > 0f64 {
+                        counter.inc_by(value.value as i64);
+                    }
+                }
+                RegisteredMetric::CounterVec(counter) => {
+                    if value.value > 0f64 {
+                        counter
+                            .with_label_values(&label_values)
+                            .inc_by(value.value as i64);
+                    }
+                }
+                RegisteredMetric::Gauge(gauge) => {
+                    gauge.set(value.value as i64);
+                }
+                RegisteredMetric::GaugeVec(gauge) => {
+                    gauge
+                        .with_label_values(&label_values)
+                        .set(value.value as i64);
+                }
+                RegisteredMetric::Skip => {}
+            };
         }
 
         Ok(())
@@ -213,5 +320,225 @@ impl MasterMetrics {
 impl Debug for MasterMetrics {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "MasterMetrics")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_common::state::{MetricType, MetricValue};
+    use orpc::common::Utils;
+    use std::collections::HashMap;
+
+    fn metric(
+        name: String,
+        metric_type: MetricType,
+        value: f64,
+        tags: HashMap<String, String>,
+    ) -> MetricValue {
+        MetricValue {
+            metric_type,
+            name,
+            value,
+            tags,
+        }
+    }
+
+    #[test]
+    fn gauge_metric_should_overwrite_value() {
+        let metrics = MasterMetrics::new().unwrap();
+        let name = format!("test_client_gauge_{}", Utils::uuid().replace('-', "_"));
+        let mut tags = HashMap::new();
+        tags.insert("a".to_string(), "v1".to_string());
+        tags.insert("b".to_string(), "v2".to_string());
+        metrics
+            .metrics_report(vec![metric(
+                name.clone(),
+                MetricType::Gauge,
+                10.0,
+                tags.clone(),
+            )])
+            .unwrap();
+        metrics
+            .metrics_report(vec![metric(name.clone(), MetricType::Gauge, 3.0, tags)])
+            .unwrap();
+
+        let gauge = Metrics::get(&name).unwrap().try_into_gauge_vec().unwrap();
+        assert_eq!(gauge.with_label_values(&["v1", "v2"]).get(), 3);
+    }
+
+    #[test]
+    fn counter_metric_should_accumulate_value() {
+        let metrics = MasterMetrics::new().unwrap();
+        let name = format!("test_client_counter_{}", Utils::uuid().replace('-', "_"));
+        let mut tags = HashMap::new();
+        tags.insert("a".to_string(), "v1".to_string());
+        tags.insert("b".to_string(), "v2".to_string());
+        metrics
+            .metrics_report(vec![metric(
+                name.clone(),
+                MetricType::Counter,
+                2.0,
+                tags.clone(),
+            )])
+            .unwrap();
+        metrics
+            .metrics_report(vec![metric(name.clone(), MetricType::Counter, 5.0, tags)])
+            .unwrap();
+
+        let counter = Metrics::get(&name).unwrap().try_into_counter_vec().unwrap();
+        assert_eq!(counter.with_label_values(&["v1", "v2"]).get(), 7);
+    }
+
+    #[test]
+    fn gauge_metric_without_labels_should_overwrite_value() {
+        let metrics = MasterMetrics::new().unwrap();
+        let name = format!(
+            "test_client_gauge_plain_{}",
+            Utils::uuid().replace('-', "_")
+        );
+        metrics
+            .metrics_report(vec![metric(
+                name.clone(),
+                MetricType::Gauge,
+                10.0,
+                HashMap::new(),
+            )])
+            .unwrap();
+        metrics
+            .metrics_report(vec![metric(
+                name.clone(),
+                MetricType::Gauge,
+                3.0,
+                HashMap::new(),
+            )])
+            .unwrap();
+
+        let gauge = Metrics::get(&name).unwrap().try_into_gauge().unwrap();
+        assert_eq!(gauge.get(), 3);
+    }
+
+    #[test]
+    fn counter_metric_without_labels_should_accumulate_value() {
+        let metrics = MasterMetrics::new().unwrap();
+        let name = format!(
+            "test_client_counter_plain_{}",
+            Utils::uuid().replace('-', "_")
+        );
+        metrics
+            .metrics_report(vec![metric(
+                name.clone(),
+                MetricType::Counter,
+                2.0,
+                HashMap::new(),
+            )])
+            .unwrap();
+        metrics
+            .metrics_report(vec![metric(
+                name.clone(),
+                MetricType::Counter,
+                5.0,
+                HashMap::new(),
+            )])
+            .unwrap();
+
+        let counter = Metrics::get(&name).unwrap().try_into_counter().unwrap();
+        assert_eq!(counter.get(), 7);
+    }
+
+    #[test]
+    fn histogram_metric_should_reuse_existing_counter_vec_as_count_delta() {
+        let metrics = MasterMetrics::new().unwrap();
+        let name = format!(
+            "test_client_histogram_existing_{}",
+            Utils::uuid().replace('-', "_")
+        );
+        let counter = Metrics::new_counter_vec(&name, &name, &["a", "b"]).unwrap();
+        let mut tags = HashMap::new();
+        tags.insert("a".to_string(), "v1".to_string());
+        tags.insert("b".to_string(), "v2".to_string());
+
+        metrics
+            .metrics_report(vec![metric(name.clone(), MetricType::Histogram, 5.0, tags)])
+            .unwrap();
+
+        assert_eq!(counter.with_label_values(&["v1", "v2"]).get(), 5);
+    }
+
+    #[test]
+    fn histogram_metric_should_skip_existing_histogram_vec() {
+        let metrics = MasterMetrics::new().unwrap();
+        let name = format!(
+            "test_client_histogram_skip_{}",
+            Utils::uuid().replace('-', "_")
+        );
+        let histogram = Metrics::new_histogram_vec(&name, &name, &["a", "b"]).unwrap();
+        let mut tags = HashMap::new();
+        tags.insert("a".to_string(), "v1".to_string());
+        tags.insert("b".to_string(), "v2".to_string());
+
+        metrics
+            .metrics_report(vec![metric(name.clone(), MetricType::Histogram, 5.0, tags)])
+            .unwrap();
+
+        let sample = histogram.with_label_values(&["v1", "v2"]);
+        assert_eq!(sample.get_sample_count(), 0);
+        assert_eq!(sample.get_sample_sum(), 0.0);
+    }
+
+    #[test]
+    fn histogram_metric_should_register_counter_vec_on_first_report() {
+        let metrics = MasterMetrics::new().unwrap();
+        let name = format!(
+            "test_client_histogram_register_{}",
+            Utils::uuid().replace('-', "_")
+        );
+        let mut tags = HashMap::new();
+        tags.insert("a".to_string(), "v1".to_string());
+        tags.insert("b".to_string(), "v2".to_string());
+
+        metrics
+            .metrics_report(vec![metric(
+                name.clone(),
+                MetricType::Histogram,
+                7.0,
+                tags.clone(),
+            )])
+            .unwrap();
+        metrics
+            .metrics_report(vec![metric(name.clone(), MetricType::Histogram, 3.0, tags)])
+            .unwrap();
+
+        let counter = Metrics::get(&name).unwrap().try_into_counter_vec().unwrap();
+        assert_eq!(counter.with_label_values(&["v1", "v2"]).get(), 10);
+    }
+
+    #[test]
+    fn histogram_metric_should_register_counter_on_first_report_without_labels() {
+        let metrics = MasterMetrics::new().unwrap();
+        let name = format!(
+            "test_client_histogram_plain_{}",
+            Utils::uuid().replace('-', "_")
+        );
+
+        metrics
+            .metrics_report(vec![metric(
+                name.clone(),
+                MetricType::Histogram,
+                4.0,
+                HashMap::new(),
+            )])
+            .unwrap();
+        metrics
+            .metrics_report(vec![metric(
+                name.clone(),
+                MetricType::Histogram,
+                6.0,
+                HashMap::new(),
+            )])
+            .unwrap();
+
+        let counter = Metrics::get(&name).unwrap().try_into_counter().unwrap();
+        assert_eq!(counter.get(), 10);
     }
 }

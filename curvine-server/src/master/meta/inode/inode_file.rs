@@ -31,6 +31,8 @@ pub struct InodeFile {
     pub(crate) file_type: FileType,
     pub(crate) mtime: i64,
     pub(crate) atime: i64,
+    #[serde(default)]
+    pub(crate) version_epoch: i64,
 
     pub(crate) len: i64,
     pub(crate) block_size: i64,
@@ -58,6 +60,7 @@ impl InodeFile {
             file_type: FileType::File,
             mtime: time,
             atime: time,
+            version_epoch: 1,
             len: 0,
             block_size: 0,
             replicas: 0,
@@ -79,6 +82,7 @@ impl InodeFile {
             file_type: opts.file_type,
             mtime: time,
             atime: time,
+            version_epoch: 1,
             len: 0,
             block_size: opts.block_size,
             replicas: opts.replicas,
@@ -117,6 +121,7 @@ impl InodeFile {
             file_type: FileType::Link,
             mtime: time,
             atime: time,
+            version_epoch: 1,
             len: 0,
             block_size: 0,
             replicas: 0,
@@ -256,6 +261,7 @@ impl InodeFile {
         // Clear all blocks and reset file size
         self.blocks.clear();
         self.len = 0;
+        self.bump_version_epoch();
 
         // Update file metadata with new options
         self.replicas = opts.replicas;
@@ -302,6 +308,8 @@ impl InodeFile {
         client_name: impl AsRef<str>,
         only_flush: bool,
     ) -> FsResult<()> {
+        let len_changed = len != self.len;
+        let has_commits = !commit_blocks.is_empty();
         for block in commit_blocks {
             let meta = self.search_block_mut_check(block.block_id)?;
             meta.commit(block);
@@ -318,6 +326,9 @@ impl InodeFile {
         }
 
         self.mtime = LocalTime::mills() as i64;
+        if len_changed || has_commits {
+            self.bump_version_epoch();
+        }
         if !only_flush {
             self.features.complete_write(client_name);
         }
@@ -369,11 +380,17 @@ impl InodeFile {
             Ok(vec![])
         } else if opts.len < self.len {
             let del_blocks = self.truncate(opts);
+            self.bump_version_epoch();
             Ok(del_blocks)
         } else {
             self.extend(opts)?;
+            self.bump_version_epoch();
             Ok(vec![])
         }
+    }
+
+    fn bump_version_epoch(&mut self) {
+        self.version_epoch = self.version_epoch.max(1).saturating_add(1);
     }
 
     /// Extend the file to the specified length by allocating new blocks or extending existing ones.

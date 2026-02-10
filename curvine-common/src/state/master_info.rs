@@ -34,6 +34,10 @@ pub struct MasterInfo {
     pub blacklist_workers: Vec<WorkerInfo>,
     pub decommission_workers: Vec<WorkerInfo>,
     pub lost_workers: Vec<WorkerInfo>,
+
+    pub p2p_policy_version: u64,
+    pub p2p_peer_whitelist: Vec<String>,
+    pub p2p_tenant_whitelist: Vec<String>,
 }
 
 impl MasterInfo {
