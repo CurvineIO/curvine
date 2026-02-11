@@ -590,7 +590,7 @@ impl FsDir {
 
     pub fn get_file_locations(
         &self,
-        file: &InodeFile,
+        file: &InodeView,
     ) -> FsResult<HashMap<i64, Vec<BlockLocation>>> {
         let locs = self.store.get_file_locations(file)?;
         self.evictor.on_access(file.id());

@@ -487,17 +487,49 @@ impl InodeStore {
         Ok((last_inode_id, root))
     }
 
-    pub fn get_file_locations(
-        &self,
-        file: &InodeFile,
-    ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
-        let mut res = HashMap::with_capacity(file.blocks.len());
-        for meta in &file.blocks {
-            let locs = self.store.get_locations(meta.id)?;
-            res.insert(meta.id, locs);
-        }
+    // pub fn get_file_locations(
+    //     &self,
+    //     file: &InodeFile,
+    // ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+    //     let mut res = HashMap::with_capacity(file.blocks.len());
+    //     for meta in &file.blocks {
+    //         let locs = self.store.get_locations(meta.id)?;
+    //         res.insert(meta.id, locs);
+    //     }
 
-        Ok(res)
+    //     Ok(res)
+    // }
+
+
+    pub fn get_file_locations(  
+        &self,  
+        inode: &InodeView,  
+    ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {  
+        match inode {  
+            InodeView::File(_, file) => {  
+                // Existing logic for regular files  
+                let mut res = HashMap::with_capacity(file.blocks.len());  
+                for meta in &file.blocks {  
+                    let locs = self.store.get_locations(meta.id)?;  
+                    res.insert(meta.id, locs);  
+                }  
+                Ok(res)  
+            }  
+            InodeView::Container(_, container) => {  
+                // For containers, return the single container block's locations  
+                let mut res = HashMap::with_capacity(1);  
+                let locs = self.store.get_locations(container.block.id)?;
+                println!("DEBUG at InodeStore, at get_file_locations: {:?}", locs);
+                res.insert(container.block.id, locs);  
+                Ok(res)  
+            }  
+            InodeView::Dir(_, _) => {  
+                err_box!("Cannot get block locations for directory inode")  
+            }  
+            InodeView::FileEntry(_, _) => {  
+                err_box!("FileEntry must be resolved to full inode first")  
+            }  
+        }  
     }
 
     pub fn get_block_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {

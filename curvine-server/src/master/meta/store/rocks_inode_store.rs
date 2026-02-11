@@ -265,6 +265,7 @@ impl<'a> InodeWriteBatch<'a> {
     }
 
     pub fn add_location(&mut self, id: i64, loc: &BlockLocation) -> CommonResult<()> {
+        println!("DEBUG at add_location for id: {:?}, loc {:?}", id, loc);
         // store with the key of  (block_id, worker_id)
         let key = RocksUtils::i64_u32_to_bytes(id, loc.worker_id);
         let value = Serde::serialize(loc)?;

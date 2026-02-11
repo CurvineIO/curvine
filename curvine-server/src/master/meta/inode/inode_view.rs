@@ -20,6 +20,7 @@ use crate::master::meta::inode::InodeView::{Container, Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
+use crate::master::meta::BlockMeta;
 
 use crate::master::meta::inode::inode_container::InodeContainer;
 
@@ -572,6 +573,15 @@ impl InodeView {
 
         res
     }
+
+    /// Returns an iterator over block metadata
+    pub fn blocks_iter(&self) -> Box<dyn Iterator<Item = &BlockMeta> + '_> {  
+        match self {  
+            File(_, f) => Box::new(f.blocks.iter()),  
+            Container(_, c) => Box::new(std::iter::once(&c.block)),  
+            _ => Box::new(std::iter::empty()),  
+        }  
+    }  
 }
 
 impl Clone for InodeView {

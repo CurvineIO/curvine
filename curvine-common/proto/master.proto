@@ -85,9 +85,11 @@ message FileStatusList {
     repeated FileStatusProto statuses = 1;  
 }
 
-message CompleteContainerResponse {  
-    required bool result = 1;  
+message CompleteContainerResponse {
+    required bool result = 1;
+    repeated FileBlocksProto file_blocks_vec = 2;
 }
+
 
 message OpenFileRequest {
     required string path = 1;
