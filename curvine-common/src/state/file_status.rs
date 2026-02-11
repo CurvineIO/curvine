@@ -86,4 +86,8 @@ impl FileStatus {
     pub fn is_cv_only(&self) -> bool {
         self.storage_policy.ufs_mtime == 0
     }
+
+    pub fn is_complete(&self) -> bool {
+        self.is_complete
+    }
 }
