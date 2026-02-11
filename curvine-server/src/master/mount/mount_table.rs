@@ -61,40 +61,24 @@ impl MountTable {
         };
 
         let total = mounts.len();
-        info!(
-            "mount restore started: {} entries loaded from metadata store",
-            total
-        );
         if total == 0 {
             info!("mount restore completed: no entries found");
             return;
         }
+        info!(
+            "mount restore started: {} entries loaded from metadata store",
+            total
+        );
 
-        let mut restored = 0usize;
         let mut failed = 0usize;
 
         for mnt in mounts {
-            let mount_id = mnt.mount_id;
-            let cv_path = mnt.cv_path.clone();
-            let ufs_path = mnt.ufs_path.clone();
-
-            match self.unprotected_add_mount(mnt) {
-                Ok(_) => {
-                    restored += 1;
-                    info!(
-                        "mount restore entry succeeded: mount_id={}, cv_path={}, ufs_path={}",
-                        mount_id, cv_path, ufs_path
-                    );
-                }
-                Err(e) => {
-                    failed += 1;
-                    error!(
-                        "mount restore entry failed: mount_id={}, cv_path={}, ufs_path={}, err={}",
-                        mount_id, cv_path, ufs_path, e
-                    );
-                }
+            if let Err(e) = self.unprotected_add_mount(mnt) {
+                failed += 1;
+                error!("mount restore entry failed: err={}", e);
             }
         }
+        let restored = total - failed;
 
         if failed == 0 {
             info!(
