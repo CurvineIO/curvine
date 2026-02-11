@@ -273,7 +273,6 @@ impl MasterHandler {
             req.last_block.map(ProtoUtils::extend_block_from_pb),
         )?;
         let rep_header = ProtoUtils::located_block_to_pb(located_block);
-        println!("DEBUG at MasterHandler, at add_block, convert located_block to located_block_proto, rep_header {:?}", rep_header);
         ctx.response(rep_header)
     }
 
@@ -392,10 +391,7 @@ impl MasterHandler {
                 })
                 .collect(),
         };
-        println!(
-            "DEBUG at MasterHandler, at create_container_batch, container_meta: {:?}",
-            container_meta
-        );
+
         Ok(ContainerBatchResult {
             container_status,
             container_meta,

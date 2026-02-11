@@ -528,7 +528,6 @@ impl MasterFilesystem {
             None => return err_box!("File does not exist: {}", inp.path()),
             Some(v) => v,
         };
-        let file = inode.as_file_ref()?;
         fs_dir.complete_file(&inp, len, commit_blocks, client_name, only_flush)?;
         if only_flush {
             let locs = self.get_block_locs(path, &fs_dir, &inode)?;
@@ -554,7 +553,7 @@ impl MasterFilesystem {
 
         let inode = match inp.get_last_inode() {
             None => {
-                return err_box!("File does not exist: {}", inp.path());
+                return err_box!("Inode does not exist: {}", inp.path());
             }
             Some(v) => v,
         };
@@ -635,10 +634,7 @@ impl MasterFilesystem {
     ) -> FsResult<Vec<LocatedBlock>> {
         let wm: std::sync::RwLockReadGuard<'_, super::WorkerManager> = self.worker_manager.read();
         let file_locs = fs_dir.get_file_locations(inode)?;
-        println!(
-            "DEBUG at MasterFileSystem, at get_block_locs {:?}",
-            file_locs
-        );
+
         let mut block_locs = Vec::new();
 
         for (index, meta) in inode.blocks_iter().enumerate() {
@@ -660,7 +656,7 @@ impl MasterFilesystem {
                 storage_type: inode.storage_policy().storage_type,
                 file_type: match inode {
                     File(_, f) => f.file_type,
-                    Container(_, c) => FileType::Container,
+                    Container(_, c) => c.file_type,
                     _ => continue,
                 },
                 alloc_opts: meta.alloc_opts.clone(),

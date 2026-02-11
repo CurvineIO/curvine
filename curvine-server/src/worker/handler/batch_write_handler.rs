@@ -42,7 +42,6 @@ pub struct BatchWriteHandler {
 
 impl BatchWriteHandler {
     pub fn new(store: BlockStore) -> Self {
-        println!("DEBUG at BatchWriteHandler, call new:()");
         let metrics = Worker::get_metrics();
         Self {
             store,
@@ -65,7 +64,6 @@ impl BatchWriteHandler {
     }
 
     fn commit_block(&self, block: &ExtendedBlock, commit: bool) -> FsResult<()> {
-        println!("DEBUG at BatchWriteHanlder, start commit_block");
         if commit {
             self.store.finalize_block(block)?;
         } else {
@@ -76,10 +74,6 @@ impl BatchWriteHandler {
 
     pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {
         let mut context = ContainerWriteContext::from_req(msg)?;
-        println!(
-            "DEBUG at BatchWriteHandler, at open_batch, context {:?}",
-            context
-        );
 
         if context.off > context.block_size {
             return err_box!(
@@ -220,7 +214,7 @@ impl BatchWriteHandler {
     fn write_container_batch(
         &mut self,
         files: &[FileWriteDataProto],
-        container_files_meta: &mut Vec<SmallFileMetaProto>,
+        container_files_meta: &mut [SmallFileMetaProto],
     ) -> FsResult<()> {
         let mut offset = 0;
 
@@ -240,7 +234,7 @@ impl BatchWriteHandler {
         // Update block length
         if let Some(container_local_file) = self.file.as_mut() {
             let current_pos: i64 = container_local_file.pos();
-            container_local_file.resize(true, 0, current_pos, 0);
+            let _ = container_local_file.resize(true, 0, current_pos, 0);
         }
 
         Ok(())

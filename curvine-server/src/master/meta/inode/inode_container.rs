@@ -1,7 +1,7 @@
 use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::{BlockMeta, InodeId};
-use curvine_common::state::{CommitBlock, CreateFileOpts, StoragePolicy, FileType};
+use curvine_common::state::{CommitBlock, CreateFileOpts, FileType, StoragePolicy};
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
 use orpc::{err_box, CommonResult};
@@ -99,6 +99,8 @@ impl InodeContainer {
         if !only_flush {
             self.features.complete_write(client_name);
         }
+        // update len of inode
+        self.len = self.len.max(len);
         // validate len
         if self.block.len != self.len {
             return err_box!(

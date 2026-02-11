@@ -159,7 +159,6 @@ impl InodeView {
 
     // Add child nodes.
     pub fn add_child(&mut self, child: InodeView) -> CommonResult<InodePtr> {
-        println!("DEBUG at InodeView, at add_child: {:?}", child);
         match self {
             File(name, _) => err_box!("Path not a dir: {}", name),
             Dir(_, d) => d.add_child(child),
@@ -437,7 +436,6 @@ impl InodeView {
     }
 
     pub fn to_file_status(&self, path: &str) -> FileStatus {
-        println!("DEBUG at InodeView, at to_file_status, path: {:?}", path);
         let acl = self.acl();
         let mut status = FileStatus {
             id: self.id(),

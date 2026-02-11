@@ -278,7 +278,6 @@ mod test {
     #[test]
     fn sample() -> CommonResult<()> {
         let mut dataset = create_data_set(true, "sample");
-        // println!("{:#?}", dataset.dir_list.dirs());
 
         let mut block = ExtendedBlock::with_mem(11226688, "100B")?;
         let tmp_meta = dataset.open_block(&block)?;
@@ -361,7 +360,6 @@ mod test {
         drop(dataset);
 
         let dataset = create_data_set(false, "initialize");
-        println!("block_map {:?}", dataset.block_map);
 
         assert_eq!(11, dataset.block_map.len());
         for meta in dataset.block_map.values() {

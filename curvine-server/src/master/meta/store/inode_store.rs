@@ -518,7 +518,6 @@ impl InodeStore {
                 // For containers, return the single container block's locations
                 let mut res = HashMap::with_capacity(1);
                 let locs = self.store.get_locations(container.block.id)?;
-                println!("DEBUG at InodeStore, at get_file_locations: {:?}", locs);
                 res.insert(container.block.id, locs);
                 Ok(res)
             }
