@@ -297,7 +297,7 @@ impl BlockClient {
         let rep = self.rpc(msg).await?;
         Ok(rep.data)
     }
-    pub async fn write_blocks_batch(
+    pub async fn write_container_block(
         &self,
         block: &ExtendedBlock,
         off: i64,

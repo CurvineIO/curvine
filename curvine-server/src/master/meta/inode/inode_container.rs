@@ -1,7 +1,7 @@
 use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::{BlockMeta, InodeId};
-use curvine_common::state::{CommitBlock, CreateFileOpts, StoragePolicy};
+use curvine_common::state::{CommitBlock, CreateFileOpts, StoragePolicy, FileType};
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
 use orpc::{err_box, CommonResult};
@@ -12,6 +12,7 @@ use std::collections::HashMap;
 pub struct InodeContainer {
     pub(crate) id: i64,
     pub(crate) parent_id: i64,
+    pub(crate) file_type: FileType,
     pub(crate) mtime: i64,
     pub(crate) atime: i64,
     pub(crate) nlink: u32,
@@ -37,6 +38,7 @@ impl InodeContainer {
         Self {
             id,
             parent_id: EMPTY_PARENT_ID,
+            file_type: FileType::Container,
             mtime: time,
             atime: time,
             nlink: 1,
@@ -54,6 +56,7 @@ impl InodeContainer {
         let mut file = Self {
             id,
             parent_id: EMPTY_PARENT_ID,
+            file_type: FileType::File,
             mtime: time,
             atime: time,
             nlink: 1,

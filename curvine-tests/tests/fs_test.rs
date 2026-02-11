@@ -45,8 +45,8 @@ fn test_filesystem_end_to_end_operations_on_cluster() -> FsResult<()> {
     run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
 
     // Test short_circuit = true
-    // conf.client.short_circuit = true;
-    // run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
+    conf.client.short_circuit = true;
+    run_filesystem_end_to_end_operations_on_cluster(&testing, &rt, conf.clone())?;
 
     Ok(())
 }

@@ -37,7 +37,7 @@ impl ContainerBlockWriterLocal {
 
         // SINGLE RPC call to setup multiple blocks
         let write_context = client
-            .write_blocks_batch(
+            .write_container_block(
                 &block,
                 0,
                 block_size,

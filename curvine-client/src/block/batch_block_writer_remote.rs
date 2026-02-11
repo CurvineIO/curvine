@@ -47,7 +47,7 @@ impl ContainerBlockWriterRemote {
         let block_size = fs_context.block_size();
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
-            .write_blocks_batch(
+            .write_container_block(
                 &block,
                 0,
                 block_size,
