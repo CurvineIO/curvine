@@ -15,7 +15,9 @@
 use bytes::BytesMut;
 use curvine_client::unified::{UnifiedFileSystem, UnifiedReader, UnifiedWriter};
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{MountOptionsBuilder, WriteType};
+use curvine_common::state::{
+    CreateFileOptsBuilder, MountOptionsBuilder, MountType, OpenFlags, WriteType,
+};
 use curvine_tests::Testing;
 use orpc::common::Utils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -54,6 +56,25 @@ fn test_mount_write_cache() {
         write(&fs, WriteType::AsyncThrough, true).await;
         write(&fs, WriteType::CacheThrough, true).await;
         write(&fs, WriteType::AsyncThrough, true).await;
+    })
+}
+
+#[test]
+fn test_async_through_reopen_truncate_missing_cv_cache() {
+    if env::var("UFS_TEST_PATH").is_err() {
+        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
+        return;
+    }
+
+    let testing = Testing::builder().workers(3).build().unwrap();
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+    let dir = format!("write_cache_AsyncThrough_reopen_{}", Utils::rand_str(8));
+
+    rt.block_on(async move {
+        mount_with_dir(&fs, WriteType::AsyncThrough, &dir).await;
+        reopen_truncate_missing_cv_cache(&fs, &dir).await;
     })
 }
 
@@ -165,13 +186,18 @@ async fn verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) {
 }
 
 async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
-    let ufs_base = env::var("UFS_TEST_PATH").unwrap();
-
     let dir = format!("write_cache_{:?}", write_type);
+    mount_with_dir(fs, write_type, &dir).await;
+}
+
+async fn mount_with_dir(fs: &UnifiedFileSystem, write_type: WriteType, dir: &str) {
+    let ufs_base = env::var("UFS_TEST_PATH").unwrap();
     let ufs_path = Path::from_str(format!("{}/{}", ufs_base, dir)).unwrap();
     let cv_path = Path::from_str(format!("/{}", dir)).unwrap();
 
-    let mut opts_builder = MountOptionsBuilder::new().write_type(write_type);
+    let mut opts_builder = MountOptionsBuilder::new()
+        .mount_type(MountType::Orch)
+        .write_type(write_type);
 
     // Add properties from environment variable if set
     if let Ok(props_str) = env::var("UFS_TEST_PROPERTIES") {
@@ -184,4 +210,45 @@ async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
 
     let opts = opts_builder.build();
     fs.mount(&ufs_path, &cv_path, opts).await.unwrap();
+}
+
+async fn reopen_truncate_missing_cv_cache(fs: &UnifiedFileSystem, dir: &str) {
+    // Regression case:
+    // 1) UFS object exists
+    // 2) CV cache inode is removed
+    // 3) Re-open with WT (truncate, no create bit) should still succeed for mounted async-through path
+    let path = Path::from_str(format!("/{dir}/reopen_missing_cache.log")).unwrap();
+
+    let mut writer = fs.create(&path, true).await.unwrap();
+    writer.write(b"seed-data").await.unwrap();
+    writer.complete().await.unwrap();
+    if let UnifiedWriter::CacheSync(sync_writer) = &writer {
+        sync_writer.wait_job_complete().await.unwrap();
+    }
+
+    let (ufs_path, mount) = fs.get_mount(&path).await.unwrap().unwrap();
+    assert!(
+        mount.ufs.exists(&ufs_path).await.unwrap(),
+        "UFS object must exist before clearing CV cache"
+    );
+
+    fs.cv().delete(&path, false).await.unwrap();
+
+    let opts = CreateFileOptsBuilder::with_conf(&fs.conf().client)
+        .create_parent(true)
+        .build();
+    let flags = OpenFlags::new_write_only().set_overwrite(true);
+
+    let mut writer = fs.open_with_opts(&path, opts, flags).await.unwrap();
+    writer.write(b"rewritten-data").await.unwrap();
+    writer.complete().await.unwrap();
+    if let UnifiedWriter::CacheSync(sync_writer) = &writer {
+        sync_writer.wait_job_complete().await.unwrap();
+    }
+
+    let mut reader = fs.open(&path).await.unwrap();
+    let mut data = BytesMut::zeroed(reader.len() as usize);
+    reader.read_full(&mut data).await.unwrap();
+    reader.complete().await.unwrap();
+    assert_eq!(data.as_ref(), b"rewritten-data");
 }

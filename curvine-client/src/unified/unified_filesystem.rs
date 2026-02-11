@@ -312,10 +312,14 @@ impl UnifiedFileSystem {
                 }
 
                 _ => {
+                    let mut cv_flags = flags;
                     if flags.overwrite() {
                         mount.ufs.create(&ufs_path, true).await?;
+                        if !cv_flags.create() {
+                            cv_flags = cv_flags.set_create(true);
+                        }
                     }
-                    let writer = CacheSyncWriter::new(self, path, &mount, flags).await?;
+                    let writer = CacheSyncWriter::new(self, path, &mount, cv_flags).await?;
                     Ok(UnifiedWriter::CacheSync(writer))
                 }
             },
