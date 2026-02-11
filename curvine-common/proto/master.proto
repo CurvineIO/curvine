@@ -162,16 +162,6 @@ message AddBlockResponse {
     required LocatedBlockProto block = 1;
 }
 
-// apply for allocation of blocks batch
-message AddBlocksBatchRequest {  
-    required AddBlockRequest requests = 1;  
-}  
-  
-message AddBlocksBatchResponse {  
-    required LocatedBlockProto blocks = 1;  
-}
-
-
 message RequestReplacementWorkerRequest {
     required int64 block_id = 1;
     repeated uint32 exclude_workers = 2;
