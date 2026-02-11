@@ -33,13 +33,6 @@ pub struct CreateFileEntry {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct CreateContainerEntry {
-    pub(crate) op_ms: u64,
-    pub(crate) path: String,
-    pub(crate) container: InodeContainer,
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct CreateInodeEntry {
     pub(crate) op_ms: u64,
     pub(crate) path: String,

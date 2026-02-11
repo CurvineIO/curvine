@@ -349,8 +349,6 @@ impl FsDir {
             InodeContainer::with_opts(self.inode_id.next()?, LocalTime::mills() as i64, opts);
 
         inp = self.add_last_inode(inp, Container(name.clone(), container.clone()))?;
-        // self.journal_writer
-        //     .log_create_container(op_ms, &inp.path(), &name, &container)?;
         self.journal_writer.log_create_inode_entry(op_ms, &inp)?;
 
         Ok(inp)
@@ -478,7 +476,7 @@ impl FsDir {
                 container.add_block(BlockMeta::with_pre(block_in_container, choose_workers));
 
                 let block = ExtendedBlock {
-                    id: block_in_container, //always 0 because just exist only one block per container
+                    id: block_in_container,
                     len: 0,
                     storage_type: container.storage_policy.storage_type,
                     file_type: FileType::Container,
@@ -534,7 +532,7 @@ impl FsDir {
         only_flush: bool,
     ) -> FsResult<bool> {
         let op_ms = LocalTime::mills();
-        let mut inode: orpc::sys::RawPtr<InodeView> = try_option!(inp.get_last_inode());
+        let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
         file.complete(len, &commit_block, client_name, only_flush)?;
         self.evictor.on_access(file.id());

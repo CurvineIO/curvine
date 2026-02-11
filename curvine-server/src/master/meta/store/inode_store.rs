@@ -431,7 +431,7 @@ impl InodeStore {
                         }
                     }
                     InodeView::FileEntry(..) => file_count += 1,
-                    InodeView::Container(..) => file_count += 1, //need update count for container
+                    InodeView::Container(_, c) => file_count += c.files_count() as i64,
                 }
 
                 parent.add_child(inode)?
@@ -486,19 +486,6 @@ impl InodeStore {
 
         Ok((last_inode_id, root))
     }
-
-    // pub fn get_file_locations(
-    //     &self,
-    //     file: &InodeFile,
-    // ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
-    //     let mut res = HashMap::with_capacity(file.blocks.len());
-    //     for meta in &file.blocks {
-    //         let locs = self.store.get_locations(meta.id)?;
-    //         res.insert(meta.id, locs);
-    //     }
-
-    //     Ok(res)
-    // }
 
     pub fn get_file_locations(
         &self,

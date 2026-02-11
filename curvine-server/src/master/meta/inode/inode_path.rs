@@ -62,6 +62,7 @@ impl InodePath {
             };
 
             inodes.push(resolved_inode);
+
             if index == components.len() - 1 {
                 break;
             }
@@ -97,6 +98,7 @@ impl InodePath {
             components,
             inodes,
         };
+
         Ok(inode_path)
     }
 

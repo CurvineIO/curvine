@@ -306,6 +306,7 @@ impl InodeFile {
             let meta = self.search_block_mut_check(block.block_id)?;
             meta.commit(block);
         }
+
         self.len = self.len.max(len);
         let complete_len = self.compute_len();
         if complete_len != self.len {

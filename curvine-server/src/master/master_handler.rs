@@ -311,10 +311,7 @@ impl MasterHandler {
         for (i, req) in header.requests.iter().enumerate() {
             let mut file_status = container_result.container_status.clone();
             file_status.path = req.path.clone();
-            file_status.name = Path::new(&req.path)
-                .map(|p| p.name().to_string())
-                // .unwrap_or_else(|_| "unknown".to_string());
-                .unwrap();
+            file_status.name = Path::new(&req.path).map(|p| p.name().to_string()).unwrap();
             file_status.len = container_result.container_meta.files[i].len;
             file_status.file_type = FileType::File; // Individual files, not Container
             file_status.id = ctx.msg.req_id() + i as i64;
@@ -417,7 +414,6 @@ impl MasterHandler {
             files_index,
         )?;
 
-        // should add complete information about files = index and offset of all files
         let file_blocks_vec_proto: Vec<FileBlocksProto> = file_blocks_vec
             .map(|blocks_vec| {
                 blocks_vec

@@ -503,11 +503,6 @@ impl InodeView {
                 panic!("FileEntry does not support to_file_status");
             }
             Container(_, c) => {
-                // println!(
-                //     "DEBUG at InodeView, file: {:?}, container c= {:?}",
-                //     self.name(),
-                //     c
-                // );
                 let file_name = Path::new(path)
                     .expect("Failed to parse path")
                     .name()
@@ -524,10 +519,6 @@ impl InodeView {
             }
         }
 
-        println!(
-            "DEBUG at InodeView, at to_file_status, status: {:?}",
-            status
-        );
         status
     }
 
@@ -608,7 +599,7 @@ impl Clone for InodeView {
             File(name, f) => File(name.clone(), f.clone()),
             Dir(name, d) => Dir(name.clone(), d.clone()),
             FileEntry(name, id) => FileEntry(name.clone(), *id),
-            Container(name, c) => Container(name.clone(), c.clone()), // will update
+            Container(name, c) => Container(name.clone(), c.clone()),
         }
     }
 }
@@ -619,7 +610,7 @@ impl Debug for InodeView {
             File(name, x) => write!(f, "File(name={}, x={:?})", name, x),
             Dir(name, x) => write!(f, "Dir(name={}, x={:?})", name, x),
             FileEntry(name, id) => write!(f, "FileEntry(name={}, id={})", name, id),
-            Container(name, c) => write!(f, "Container(name={}, x={:?})", name, c), // will update
+            Container(name, c) => write!(f, "Container(name={}, x={:?})", name, c),
         }
     }
 }

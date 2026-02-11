@@ -109,7 +109,6 @@ impl InodeChildren {
                     }
                 }
                 None
-                // map.get(name).map(|x| x.as_ref())
             }
         }
     }
