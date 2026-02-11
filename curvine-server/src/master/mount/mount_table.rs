@@ -17,7 +17,7 @@ use curvine_common::conf::{UfsConf, UfsConfBuilder};
 use curvine_common::fs::Path;
 use curvine_common::state::{MountInfo, MountOptions};
 use curvine_common::FsResult;
-use log::info;
+use log::{error, info, warn};
 use orpc::{err_box, try_option};
 use rand::Rng;
 use std::collections::HashMap;
@@ -49,10 +49,63 @@ impl MountTable {
 
     //for new master node
     pub fn restore(&self) {
-        if let Ok(mounts) = self.fs_dir.read().get_mount_table() {
-            for mnt in mounts {
-                self.unprotected_add_mount(mnt).unwrap();
+        let mounts = match self.fs_dir.read().get_mount_table() {
+            Ok(mounts) => mounts,
+            Err(e) => {
+                error!(
+                    "mount restore failed: unable to load mount table from metadata store, err={}",
+                    e
+                );
+                return;
             }
+        };
+
+        let total = mounts.len();
+        info!(
+            "mount restore started: {} entries loaded from metadata store",
+            total
+        );
+        if total == 0 {
+            info!("mount restore completed: no entries found");
+            return;
+        }
+
+        let mut restored = 0usize;
+        let mut failed = 0usize;
+
+        for mnt in mounts {
+            let mount_id = mnt.mount_id;
+            let cv_path = mnt.cv_path.clone();
+            let ufs_path = mnt.ufs_path.clone();
+
+            match self.unprotected_add_mount(mnt) {
+                Ok(_) => {
+                    restored += 1;
+                    info!(
+                        "mount restore entry succeeded: mount_id={}, cv_path={}, ufs_path={}",
+                        mount_id, cv_path, ufs_path
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    error!(
+                        "mount restore entry failed: mount_id={}, cv_path={}, ufs_path={}, err={}",
+                        mount_id, cv_path, ufs_path, e
+                    );
+                }
+            }
+        }
+
+        if failed == 0 {
+            info!(
+                "mount restore completed successfully: restored={}, failed={}",
+                restored, failed
+            );
+        } else {
+            warn!(
+                "mount restore completed with errors: restored={}, failed={}",
+                restored, failed
+            );
         }
     }
 
