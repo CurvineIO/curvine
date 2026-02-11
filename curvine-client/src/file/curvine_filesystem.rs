@@ -392,7 +392,7 @@ impl CurvineFileSystem {
     }
 
     async fn handle_batch_files(&self, files: &[(&Path, &str)]) -> FsResult<()> {
-        // currently, this feature support all files in the same last sub-folder inode
+        // todo: currently, this feature support all files in the same last sub-folder inode
         // checking is needed
         if files.is_empty() {
             return Ok(());

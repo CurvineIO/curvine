@@ -27,7 +27,6 @@ futures = { workspace = true }
 moka = { workspace = true }
 fxhash = { workspace = true }
 prometheus = { workspace = true }
-uuid = { workspace = true }
 linked-hash-map = { workspace = true }
 
 [features]

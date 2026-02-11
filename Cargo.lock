@@ -852,7 +852,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -1037,7 +1036,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "url",
- "uuid",
 ]
 
 [[package]]
