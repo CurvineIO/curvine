@@ -213,7 +213,9 @@ where
 
             let snapshot = app_store.create_snapshot(node_id, last_applied)?;
             let snapshot_id = snapshot.snapshot_id;
-            log_store.create_snapshot(snapshot, last_applied)?;
+            // Use latest committed index when materializing raft snapshot metadata.
+            // This avoids binding snapshot data to a stale request index captured earlier.
+            log_store.create_snapshot(snapshot, u64::MAX)?;
             log_store.compact(compact_id)?;
 
             info!(

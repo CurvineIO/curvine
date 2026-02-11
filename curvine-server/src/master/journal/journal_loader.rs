@@ -132,31 +132,79 @@ impl JournalLoader {
     }
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+        let AddBlockEntry {
+            op_ms: _,
+            path,
+            blocks,
+            commit_block,
+        } = entry;
 
-        let mut inode = try_option!(inp.get_last_inode());
+        let fs_dir = self.fs_dir.write();
+        let inp = InodePath::resolve(fs_dir.root_ptr(), &path, &fs_dir.store)?;
+
+        if !inp.is_full() {
+            warn!(
+                "skip stale AddBlock replay because path not found, path: {}",
+                path
+            );
+            return Ok(());
+        }
+
+        let mut inode = match inp.get_last_inode() {
+            Some(inode) => inode,
+            None => {
+                warn!(
+                    "skip stale AddBlock replay because inode not found, path: {}",
+                    path
+                );
+                return Ok(());
+            }
+        };
         let file = inode.as_file_mut()?;
-        let _ = mem::replace(&mut file.blocks, entry.blocks);
+        let _ = mem::replace(&mut file.blocks, blocks);
         fs_dir
             .store
-            .apply_new_block(inode.as_ref(), &entry.commit_block)?;
+            .apply_new_block(inode.as_ref(), &commit_block)?;
 
         Ok(())
     }
 
     fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
-        let fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+        let CompleteFileEntry {
+            op_ms: _,
+            path,
+            file: entry_file,
+            commit_blocks,
+        } = entry;
 
-        let mut inode = try_option!(inp.get_last_inode());
+        let fs_dir = self.fs_dir.write();
+        let inp = InodePath::resolve(fs_dir.root_ptr(), &path, &fs_dir.store)?;
+
+        if !inp.is_full() {
+            warn!(
+                "skip stale CompleteFile replay because path not found, path: {}",
+                path
+            );
+            return Ok(());
+        }
+
+        let mut inode = match inp.get_last_inode() {
+            Some(inode) => inode,
+            None => {
+                warn!(
+                    "skip stale CompleteFile replay because inode not found, path: {}",
+                    path
+                );
+                return Ok(());
+            }
+        };
         let file = inode.as_file_mut()?;
 
-        let _ = mem::replace(file, entry.file);
+        let _ = mem::replace(file, entry_file);
         // Update block location
         fs_dir
             .store
-            .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
+            .apply_complete_file(inode.as_ref(), &commit_blocks)?;
 
         Ok(())
     }
@@ -177,7 +225,14 @@ impl JournalLoader {
 
     pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
+        if !inp.is_full() {
+            warn!(
+                "skip stale Delete replay because path not found, path: {}",
+                entry.path
+            );
+            return Ok(());
+        }
         fs_dir.unprotected_delete(&inp, entry.mtime)?;
         Ok(())
     }
@@ -310,6 +365,12 @@ impl AppStorage for JournalLoader {
     // Call rocksdb's API to create a snapshot.
     fn create_snapshot(&self, node_id: u64, last_applied: u64) -> RaftResult<SnapshotData> {
         let fs_dir = self.fs_dir.read();
+        // Freeze new metadata writes via read lock and force journal drain, so snapshot
+        // state does not include unflushed mutations.
+        fs_dir
+            .journal_writer
+            .flush()
+            .map_err(|e| curvine_common::raft::RaftError::other(e.into()))?;
         let dir = fs_dir.create_checkpoint(last_applied)?;
         let data = RaftUtils::create_file_snapshot(&dir, node_id, last_applied)?;
 

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 mod journal_writer;
-pub use self::journal_writer::JournalWriter;
+pub use self::journal_writer::{JournalEvent, JournalWriter};
 
 mod journal_loader;
 pub use self::journal_loader::JournalLoader;
