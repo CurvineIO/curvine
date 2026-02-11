@@ -20,6 +20,7 @@ use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult, STATE_FILE_MAGIC, STATE_FILE_VERSION};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
+use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, MetaCache, Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
 use log::{error, info, warn};
@@ -258,9 +259,34 @@ impl NodeState {
             return Ok(writer);
         }
 
-        let writer = self.fs.open_with_opts(path, opts, flags).await?;
+        let writer = match self.fs.open_with_opts(path, opts.clone(), flags).await {
+            Ok(writer) => writer,
+
+            Err(e) if Self::should_retry_open_as_create(flags, &e) => {
+                // Linux may route O_CREAT|O_TRUNC through OPEN (without CREAT bit)
+                // when a stale positive dentry exists. Retry with CREAT to recover.
+                let retry_flags = flags.set_create(true);
+                warn!(
+                    "retry open with O_CREAT for {} (flags={} -> {}) after {:?}",
+                    path,
+                    flags.access_mark(),
+                    retry_flags.access_mark(),
+                    e
+                );
+                self.fs.open_with_opts(path, opts, retry_flags).await?
+            }
+
+            Err(e) => return Err(e.into()),
+        };
         let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
         Ok(Arc::new(Mutex::new(writer)))
+    }
+
+    fn should_retry_open_as_create(flags: OpenFlags, err: &FsError) -> bool {
+        matches!(err, FsError::FileNotFound(_))
+            && flags.write_only()
+            && flags.truncate()
+            && !flags.create()
     }
 
     pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
@@ -622,7 +648,9 @@ mod test {
     use crate::FUSE_ROOT_ID;
     use curvine_client::unified::UnifiedFileSystem;
     use curvine_common::conf::{ClusterConf, FuseConf};
+    use curvine_common::error::FsError;
     use curvine_common::state::FileStatus;
+    use curvine_common::state::OpenFlags;
     use orpc::runtime::AsyncRuntime;
     use orpc::CommonResult;
     use std::sync::Arc;
@@ -688,5 +716,24 @@ mod test {
         assert!(c1.is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn retry_open_as_create_predicate() {
+        let wt = OpenFlags::new_write_only().set_truncate(true);
+        let wct = OpenFlags::new_write_only()
+            .set_truncate(true)
+            .set_create(true);
+        let wa = OpenFlags::new_append();
+        let rd = OpenFlags::new_read_only();
+
+        let not_found = FsError::file_not_found("/lsr-test/file.bin");
+        let exists = FsError::file_exists("/lsr-test/file.bin");
+
+        assert!(NodeState::should_retry_open_as_create(wt, &not_found));
+        assert!(!NodeState::should_retry_open_as_create(wct, &not_found));
+        assert!(!NodeState::should_retry_open_as_create(wa, &not_found));
+        assert!(!NodeState::should_retry_open_as_create(rd, &not_found));
+        assert!(!NodeState::should_retry_open_as_create(wt, &exists));
     }
 }
