@@ -105,7 +105,7 @@ pub struct ContainerBlockWriter {
     file_lengths: Vec<i64>,
 }
 impl ContainerBlockWriter {
-    /// Create multiple BlockWriters for batch operations  
+    /// Create multiple ContainerBlockWriter for the batch writing opertion
     pub async fn new(
         fs_context: Arc<FsContext>,
         container_status: ContainerStatus,

@@ -93,12 +93,12 @@ impl InodeContainer {
         only_flush: bool,
         files: HashMap<String, SmallFileMeta>,
     ) -> FsResult<()> {
+        //update block meta
+        self.block.commit(commit_block);
+
         self.files = files;
         self.mtime = LocalTime::mills() as i64;
 
-        if !only_flush {
-            self.features.complete_write(client_name);
-        }
         // update len of inode
         self.len = self.len.max(len);
         // validate len
@@ -109,8 +109,10 @@ impl InodeContainer {
                 self.len
             );
         }
-        //update block meta
-        self.block.commit(commit_block);
+
+        if !only_flush {
+            self.features.complete_write(client_name);
+        }
         Ok(())
     }
 

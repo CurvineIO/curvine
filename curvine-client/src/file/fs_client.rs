@@ -92,10 +92,6 @@ impl FsClient {
         let rep: CreateContainerResponse = self.rpc(RpcCode::CreateContainer, header).await?;
         match rep.result {
             Some(create_container_response::Result::Container(container)) => {
-                println!(
-                    "Debug at FsClient, create_container, container: {:?}",
-                    container
-                );
                 // get total size
                 let total_size: i64 = container.files.iter().map(|f| f.len).sum();
                 let file_count = container.files.len();

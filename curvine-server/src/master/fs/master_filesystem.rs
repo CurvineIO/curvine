@@ -367,50 +367,24 @@ impl MasterFilesystem {
     }
 
     pub fn validate_add_block(
-        file: &InodeFile,
+        file: &InodeView,
         client_addr: &ClientAddress,
         previous: Option<&CommitBlock>,
     ) -> FsResult<ValidateAddBlock> {
         if let Some(v) = previous {
-            if v.block_len != file.block_size {
+            if v.block_len != file.block_size() {
                 return err_box!(
                     "The block size is incorrect, block size: {}, commit block length: {}",
-                    file.block_size,
+                    file.block_size(),
                     v.block_len
                 );
             }
         }
 
         let res = ValidateAddBlock {
-            replicas: file.replicas,
-            block_size: file.block_size,
-            storage_policy: file.storage_policy.clone(),
-            client_host: client_addr.hostname.clone(),
-        };
-
-        Ok(res)
-    }
-
-    pub fn validate_add_block_for_container(
-        container: &InodeContainer,
-        client_addr: &ClientAddress,
-        previous: Option<&CommitBlock>,
-    ) -> FsResult<ValidateAddBlock> {
-        // For containers, previous should typically be None since they have single blocks
-        if let Some(v) = previous {
-            if v.block_len != container.block_size {
-                return err_box!(
-                    "The block size is incorrect, block size: {}, commit block length: {}",
-                    container.block_size,
-                    v.block_len
-                );
-            }
-        }
-
-        let res = ValidateAddBlock {
-            replicas: container.replicas,
-            block_size: container.block_size,
-            storage_policy: container.storage_policy.clone(),
+            replicas: file.replicas(),
+            block_size: file.block_size(),
+            storage_policy: file.storage_policy().clone(),
             client_host: client_addr.hostname.clone(),
         };
 
@@ -426,13 +400,7 @@ impl MasterFilesystem {
         let wm = self.worker_manager.read();
 
         let inode = try_option!(inp.get_last_inode());
-        let validate_block = match inode.as_ref() {
-            InodeView::File(_, file) => Self::validate_add_block(file, &client_addr, None)?,
-            InodeView::Container(_, container) => {
-                Self::validate_add_block_for_container(container, &client_addr, None)?
-            }
-            _ => return err_box!("Path must be a file or container"),
-        };
+        let validate_block = Self::validate_add_block(inode.as_ref(), &client_addr, None)?;
 
         let choose_ctx = ChooseContext::with_block(validate_block, exclude_workers);
         Ok(wm.choose_worker(choose_ctx)?)
@@ -581,51 +549,6 @@ impl MasterFilesystem {
         Ok(FileBlocks::new(inode.to_file_status(path), blocks))
     }
 
-    // fn get_block_locs(
-    //     &self,
-    //     path: &str,
-    //     fs_dir: &FsDir,
-    //     file: &InodeView,
-    // ) -> FsResult<Vec<LocatedBlock>> {
-    //     let wm = self.worker_manager.read();
-    //     let file_locs = fs_dir.get_file_locations(file)?;
-    //     let mut block_locs = Vec::with_capacity(file_locs.len());
-
-    //     let inode_file = match file {
-    //         InodeView::File(_, f) => f,
-    //         _ => return err_box!("{} should be File", path),
-    //     };
-    //     for (index, meta) in inode_file.blocks.iter().enumerate() {
-    //         if index + 1 < inode_file.blocks.len() && meta.len != inode_file.block_size {
-    //             return err_box!(
-    //                 "block status abnormal, block id {}, block len {}, expected block size {}",
-    //                 meta.id,
-    //                 meta.len,
-    //                 inode_file.block_size
-    //             );
-    //         }
-
-    //         let extend_block = ExtendedBlock {
-    //             id: meta.id,
-    //             len: meta.len,
-    //             storage_type: inode_file.storage_policy.storage_type,
-    //             file_type: inode_file.file_type,
-    //             alloc_opts: meta.alloc_opts.clone(),
-    //         };
-
-    //         let lc = try_option!(
-    //             file_locs.get(&meta.id),
-    //             "File {}, block {} Lost (no worker can read)",
-    //             path,
-    //             meta.id
-    //         );
-    //         let lb = wm.create_locate_block(path, extend_block, lc)?;
-    //         block_locs.push(lb);
-    //     }
-
-    //     Ok(block_locs)
-    // }
-
     fn get_block_locs(
         &self,
         path: &str,
@@ -674,29 +597,6 @@ impl MasterFilesystem {
 
         Ok(block_locs)
     }
-
-    // fn get_container_block_locs(
-    //     &self,
-    //     path: &str,
-    //     fs_dir: &FsDir,
-    //     container: &InodeContainer,
-    // ) -> FsResult<Vec<LocatedBlock>> {
-    //     let wm = self.worker_manager.read();
-    //     // Containers should have exactly one block
-    //     let block = container.block.clone();
-
-    //     let locs = fs_dir.get_block_locations(block.id)?;
-    //     let extend_block = ExtendedBlock {
-    //         id: block.id,
-    //         len: block.len,
-    //         storage_type: container.storage_policy.storage_type,
-    //         file_type: FileType::Container,
-    //         alloc_opts: block.alloc_opts.clone(),
-    //     };
-
-    //     let lb = wm.create_locate_block(path, extend_block, &locs)?;
-    //     Ok(vec![lb])
-    // }
 
     pub fn get_block_locations<T: AsRef<str>>(&self, path: T) -> FsResult<FileBlocks> {
         let fs_dir = self.fs_dir.read();

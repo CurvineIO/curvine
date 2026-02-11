@@ -414,10 +414,6 @@ impl CurvineFileSystem {
         let container_path = container_status.container_path.clone();
         let allocated_blocks: curvine_common::state::LocatedBlock =
             self.fs_client().add_container_block(container_path).await?;
-        println!(
-            "at CurvineFileSystem: done add_container_block {:?}",
-            allocated_blocks
-        );
 
         // Compute small files metadata for containerization
         let small_files_metadata = self.compute_container_metadata(files, &allocated_blocks)?;

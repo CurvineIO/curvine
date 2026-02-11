@@ -347,6 +347,26 @@ impl InodeView {
         }
     }
 
+    pub fn replicas(&self) -> u16 {
+        match self {
+            File(_, f) => f.replicas,
+            Container(_, c) => c.replicas,
+            _ => {
+                panic!("Only File and Container support to get storage policy access")
+            }
+        }
+    }
+
+    pub fn block_size(&self) -> i64 {
+        match self {
+            File(_, f) => f.block_size,
+            Container(_, c) => c.block_size,
+            _ => {
+                panic!("Only File and Container support to get block size")
+            }
+        }
+    }
+
     pub fn x_attr(&self) -> &HashMap<String, Vec<u8>> {
         match self {
             File(_, f) => &f.features.x_attr,
