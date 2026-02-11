@@ -421,7 +421,7 @@ impl MasterHandler {
                     .map(ProtoUtils::file_blocks_to_pb)
                     .collect()
             })
-            .unwrap_or_else(Vec::new);
+            .unwrap_or_default();
 
         let rep_header = CompleteContainerResponse {
             result: true,

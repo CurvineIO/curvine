@@ -153,7 +153,7 @@ impl InodeContainer {
     /// It is composed of the inode id + block number of the file, starting from 1.
     /// inode id + serial number 0, is the file id.
     pub fn next_block_id(&mut self) -> CommonResult<i64> {
-        let seq = 0 as i64;
+        let seq = 0_i64;
         // don't increment seq because InodeContainer has just one block.
         InodeId::create_block_id(self.id, seq)
     }

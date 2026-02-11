@@ -15,12 +15,10 @@
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
-use crate::master::meta::inode::{
-    InodeContainer, InodeFile, InodePath, InodeView, SmallFileMeta, PATH_SEPARATOR,
-};
+use crate::master::meta::inode::{InodePath, InodeView, SmallFileMeta, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
 
-use crate::master::meta::inode::InodeView::{Container, Dir, File, FileEntry};
+use crate::master::meta::inode::InodeView::{Container, File};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
@@ -440,11 +438,10 @@ impl MasterFilesystem {
                 let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
                 let block =
                     fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
-                let located = LocatedBlock {
+                LocatedBlock {
                     block,
                     locs: choose_workers,
-                };
-                located
+                }
             }
             InodeView::File(_, _) => {
                 let file = inode.as_file_ref()?;
@@ -580,7 +577,7 @@ impl MasterFilesystem {
                 file_type: match inode {
                     File(_, f) => f.file_type,
                     Container(_, c) => c.file_type,
-                    _ => continue,
+                    _ => return err_box!("get_block_locs only support for file or container"),
                 },
                 alloc_opts: meta.alloc_opts.clone(),
             };
@@ -604,17 +601,13 @@ impl MasterFilesystem {
         let inp = Self::resolve_path(&fs_dir, path)?;
         let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
 
-        let block_locs = match inode.as_ref() {
-            InodeView::File(_, file) => self.get_block_locs(path, &fs_dir, &inode)?,
-            InodeView::Container(_, container) => self.get_block_locs(path, &fs_dir, &inode)?,
-            _ => return err_box!("Path must be a file or container"),
-        };
+        let block_locs = self.get_block_locs(path, &fs_dir, &inode)?;
         let locate_blocks: FileBlocks = match inode.as_ref() {
-            InodeView::File(_, _file) => FileBlocks {
+            InodeView::File(_, _) => FileBlocks {
                 status: inode.to_file_status(path),
-                block_locs: block_locs.clone(),
+                block_locs,
             },
-            InodeView::Container(_, _container) => FileBlocks {
+            InodeView::Container(_, _) => FileBlocks {
                 status: inode.to_file_status(path),
                 block_locs,
             },
