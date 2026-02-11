@@ -176,6 +176,10 @@ impl Dataset for VfsDataset {
                     // Create a new block meta, where block.len represents the block size
                     let new_meta = BlockMeta::new(meta.id, block.len, dir);
 
+                    // Truncate the old block file to avoid length mismatch when reusing blocks
+                    let file = new_meta.get_block_path()?;
+                    let _ = try_err!(fs::File::create(file));
+
                     dir.release_space(meta.is_final(), meta.actual_len);
                     dir.reserve_space(false, new_meta.len);
                     self.block_map.insert(new_meta.id(), new_meta.clone());
@@ -278,6 +282,7 @@ mod test {
     #[test]
     fn sample() -> CommonResult<()> {
         let mut dataset = create_data_set(true, "sample");
+        // println!("{:#?}", dataset.dir_list.dirs());
 
         let mut block = ExtendedBlock::with_mem(11226688, "100B")?;
         let tmp_meta = dataset.open_block(&block)?;
@@ -360,6 +365,7 @@ mod test {
         drop(dataset);
 
         let dataset = create_data_set(false, "initialize");
+        println!("block_map {:?}", dataset.block_map);
 
         assert_eq!(11, dataset.block_map.len());
         for meta in dataset.block_map.values() {

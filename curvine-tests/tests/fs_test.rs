@@ -310,7 +310,6 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     }
 
     fs.write_batch_string(&batch_files).await?;
-    println!("at fs_tests, complete the write_batch_string process");
     // Using batch
     // Get block locations for all files
     let mut results = Vec::new();
@@ -318,13 +317,11 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
         let blocks = fs.get_block_locations(&path).await?;
         results.push(blocks);
     }
-    println!("results: {:?}", results);
 
     // // 2. Verify all files exist and have correct content
     for (i, (path, _)) in batch_files.clone().iter().enumerate() {
         let status = fs.get_status(path).await?;
         let content = read_file_content(fs, path).await?;
-
         if i == num_files - 1 {
             assert_eq!(
                 status.len, large_file_size as i64,

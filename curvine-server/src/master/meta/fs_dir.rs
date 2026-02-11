@@ -468,10 +468,6 @@ impl FsDir {
 
                 let block_in_container = container.next_block_id()?;
 
-                println!(
-                    "DEBUG at FsDir, at acquire_new_block for container, block_in_container: {:?}",
-                    block_in_container
-                );
                 // create block.
                 container.add_block(BlockMeta::with_pre(block_in_container, choose_workers));
 
