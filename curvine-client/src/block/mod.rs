@@ -15,17 +15,17 @@
 mod block_client;
 pub use self::block_client::BlockClient;
 
-mod block_writer_remote;
-pub use self::block_writer_remote::BlockWriterRemote;
+mod container_block_writer_remote;
+pub use self::container_block_writer_remote::BlockWriterRemote;
 
-mod block_writer_local;
-pub use self::block_writer_local::BlockWriterLocal;
+mod container_block_writer_local;
+pub use self::container_block_writer_local::BlockWriterLocal;
 
 mod batch_block_writer_remote;
 pub use self::batch_block_writer_remote::ContainerBlockWriterRemote;
 
-mod batch_block_writer;
-pub use self::batch_block_writer::ContainerBlockWriter;
+mod container_block_writer;
+pub use self::container_block_writer::ContainerBlockWriter;
 
 mod block_writer;
 pub use self::block_writer::BlockWriter;

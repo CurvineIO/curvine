@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::batch_block_writer::BatchWriterAdapter::{BatchLocal, BatchRemote};
+use crate::block::container_block_writer::ContainerWriterAdapter::{ContainerLocal, ContainerRemote};
 use crate::block::{ContainerBlockWriterLocal, ContainerBlockWriterRemote};
 use crate::file::FsContext;
 use curvine_common::fs::Path;
@@ -24,37 +24,37 @@ use curvine_common::FsResult;
 use futures::future::try_join_all;
 use std::sync::Arc;
 
-enum BatchWriterAdapter {
-    BatchLocal(ContainerBlockWriterLocal),
-    BatchRemote(ContainerBlockWriterRemote),
+enum ContainerWriterAdapter {
+    ContainerLocal(ContainerBlockWriterLocal),
+    ContainerRemote(ContainerBlockWriterRemote),
 }
 
-impl BatchWriterAdapter {
+impl ContainerWriterAdapter {
     fn worker_address(&self) -> &WorkerAddress {
         match self {
-            BatchLocal(f) => f.worker_address(),
-            BatchRemote(f) => f.worker_address(),
+            ContainerLocal(f) => f.worker_address(),
+            ContainerRemote(f) => f.worker_address(),
         }
     }
 
     async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
         match self {
-            BatchLocal(f) => f.write(files).await,
-            BatchRemote(f) => f.write(files).await,
+            ContainerLocal(f) => f.write(files).await,
+            ContainerRemote(f) => f.write(files).await,
         }
     }
 
     async fn flush(&mut self) -> FsResult<()> {
         match self {
-            BatchLocal(f) => f.flush().await,
-            BatchRemote(f) => f.flush().await,
+            ContainerLocal(f) => f.flush().await,
+            ContainerRemote(f) => f.flush().await,
         }
     }
 
     async fn complete(&mut self) -> FsResult<()> {
         match self {
-            BatchLocal(f) => f.complete().await,
-            BatchRemote(f) => f.complete().await,
+            ContainerLocal(f) => f.complete().await,
+            ContainerRemote(f) => f.complete().await,
         }
     }
 
@@ -80,7 +80,7 @@ impl BatchWriterAdapter {
                 small_files_metadata,
             )
             .await?;
-            BatchLocal(writer)
+            ContainerLocal(writer)
         } else {
             let writer = ContainerBlockWriterRemote::new(
                 &fs_context,
@@ -91,7 +91,7 @@ impl BatchWriterAdapter {
                 small_files_metadata,
             )
             .await?;
-            BatchRemote(writer)
+            ContainerRemote(writer)
         };
 
         Ok(adapter)
@@ -99,7 +99,7 @@ impl BatchWriterAdapter {
 }
 
 pub struct ContainerBlockWriter {
-    inners: Vec<BatchWriterAdapter>,
+    inners: Vec<ContainerWriterAdapter>,
     fs_context: Arc<FsContext>,
     located_block: LocatedBlock,
     file_lengths: Vec<i64>,
@@ -116,7 +116,7 @@ impl ContainerBlockWriter {
         let mut inners = Vec::with_capacity(located_block.locs.len());
         for addr in &located_block.locs {
             // Create a batch adapter that can handle multiple blocks
-            let adapter = BatchWriterAdapter::new(
+            let adapter = ContainerWriterAdapter::new(
                 fs_context.clone(),
                 &located_block,
                 addr,
