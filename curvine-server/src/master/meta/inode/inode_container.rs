@@ -19,10 +19,9 @@ pub struct InodeContainer {
     pub(crate) features: FileFeature,
     pub(crate) files: HashMap<String, SmallFileMeta>,
     pub(crate) block: BlockMeta, // convert to only one block
-    pub(crate) total_size: i64,
-    pub(crate) max_file_size: i64, // Threshold for small files
     pub(crate) replicas: u16,
     pub(crate) len: i64,
+    pub(crate) block_size: i64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,10 +44,9 @@ impl InodeContainer {
             features: FileFeature::new(),
             files: HashMap::new(),
             block: BlockMeta::new(id, 0),
-            total_size: 0,
-            max_file_size: 1024 * 1024, // 1MB default threshold
             replicas: 0,
             len: 0,
+            block_size: 0
         }
     }
 
@@ -71,10 +69,9 @@ impl InodeContainer {
             },
             files: HashMap::new(),
             block: BlockMeta::new(id, 0),
-            total_size: 0,
-            max_file_size: 1024 * 1024, // 1MB default threshold
             replicas: opts.replicas,
             len: 0,
+            block_size: opts.block_size
         };
         file.features.set_writing(opts.client_name);
         if !opts.x_attr.is_empty() {
@@ -112,32 +109,12 @@ impl InodeContainer {
         Ok(())
     }
 
-    // Container-specific methods
-    pub fn add_file(&mut self, name: String, meta: SmallFileMeta) {
-        self.files.insert(name, meta);
-        self.update_total_size();
-    }
-
-    pub fn remove_file(&mut self, name: &str) -> Option<SmallFileMeta> {
-        let result = self.files.remove(name);
-        self.update_total_size();
-        result
-    }
-
     pub fn get_file(&self, name: &str) -> Option<&SmallFileMeta> {
         self.files.get(name)
     }
 
     pub fn files_count(&self) -> usize {
         self.files.len()
-    }
-
-    pub fn update_total_size(&mut self) {
-        self.total_size = self.files.values().map(|f| f.len).sum();
-    }
-
-    pub fn should_accept_file(&self, file_size: i64) -> bool {
-        file_size <= self.max_file_size
     }
 
     pub fn add_block(&mut self, block: BlockMeta) {

@@ -399,10 +399,10 @@ impl MasterFilesystem {
     ) -> FsResult<ValidateAddBlock> {
         // For containers, previous should typically be None since they have single blocks
         if let Some(v) = previous {
-            if v.block_len != container.total_size {
+            if v.block_len != container.block_size {
                 return err_box!(
                     "The block size is incorrect, block size: {}, commit block length: {}",
-                    container.total_size,
+                    container.block_size,
                     v.block_len
                 );
             }
@@ -410,7 +410,7 @@ impl MasterFilesystem {
 
         let res = ValidateAddBlock {
             replicas: container.replicas,
-            block_size: container.max_file_size,
+            block_size: container.block_size,
             storage_policy: container.storage_policy.clone(),
             client_host: client_addr.hostname.clone(),
         };

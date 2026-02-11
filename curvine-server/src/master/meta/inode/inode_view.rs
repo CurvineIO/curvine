@@ -497,7 +497,7 @@ impl InodeView {
                 status.is_complete = c.is_complete();
                 status.len = c.files.get(&file_name).map(|meta| meta.len).unwrap_or(0);
                 status.replicas = c.replicas as i32;
-                status.block_size = c.max_file_size;
+                status.block_size = c.block_size;
                 status.file_type = FileType::Container;
                 status.x_attr = c.features.x_attr.clone();
                 status.storage_policy = c.storage_policy.clone();
