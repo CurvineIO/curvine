@@ -46,6 +46,10 @@ impl InodeId {
     }
 
     pub fn create_block_id(id: i64, seq: i64) -> CommonResult<i64> {
+        println!(
+            "DEBUG at InodeId, at create_block_id, id: {:?}, seq: {:?}",
+            id, seq
+        );
         if id > Self::ID_MASK {
             return err_box!("inode id exceeds maximum value {}", Self::ID_MASK);
         }

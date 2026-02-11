@@ -575,13 +575,13 @@ impl InodeView {
     }
 
     /// Returns an iterator over block metadata
-    pub fn blocks_iter(&self) -> Box<dyn Iterator<Item = &BlockMeta> + '_> {  
-        match self {  
-            File(_, f) => Box::new(f.blocks.iter()),  
-            Container(_, c) => Box::new(std::iter::once(&c.block)),  
-            _ => Box::new(std::iter::empty()),  
-        }  
-    }  
+    pub fn blocks_iter(&self) -> Box<dyn Iterator<Item = &BlockMeta> + '_> {
+        match self {
+            File(_, f) => Box::new(f.blocks.iter()),
+            Container(_, c) => Box::new(std::iter::once(&c.block)),
+            _ => Box::new(std::iter::empty()),
+        }
+    }
 }
 
 impl Clone for InodeView {

@@ -19,19 +19,18 @@ use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::proto::ExtendedBlockProto;
 use curvine_common::proto::{
-    BlockWriteResponse,
-    ContainerBlockWriteResponse, ContainerWriteRequest,
-    FileWriteDataProto, SmallFileMetaProto,
+    BlockWriteResponse, ContainerBlockWriteResponse, ContainerWriteRequest, FileWriteDataProto,
+    SmallFileMetaProto,
 };
 use curvine_common::state::ExtendedBlock;
 use curvine_common::state::FileType;
 use curvine_common::state::StorageType;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
+use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
-use orpc::err_box;
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
@@ -77,6 +76,10 @@ impl BatchWriteHandler {
 
     pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {
         let mut context = ContainerWriteContext::from_req(msg)?;
+        println!(
+            "DEBUG at BatchWriteHandler, at open_batch, context {:?}",
+            context
+        );
 
         if context.off > context.block_size {
             return err_box!(
@@ -128,7 +131,7 @@ impl BatchWriteHandler {
         let total_size: i64 = block.block_size;
 
         let container_block = ExtendedBlock {
-            id: 0, // Will be assigned by store
+            id: block.id,
             len: total_size,
             storage_type: StorageType::default(),
             file_type: FileType::Container,

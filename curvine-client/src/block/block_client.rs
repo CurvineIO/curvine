@@ -321,7 +321,7 @@ impl BlockClient {
             short_circuit,
             client_name: self.client_name.to_string(),
             files_metadata: ContainerMetadataProto {
-                container_block_id: 0, // will be set by worker
+                container_block_id: block.id,
                 container_path: container_status.container_path.clone(),
                 container_name: container_status.container_name.clone(),
                 files: small_files_metadata,

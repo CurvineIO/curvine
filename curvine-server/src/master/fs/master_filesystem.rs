@@ -20,6 +20,7 @@ use crate::master::meta::inode::{
 };
 use crate::master::meta::FsDir;
 
+use crate::master::meta::inode::InodeView::{Container, Dir, File, FileEntry};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
@@ -31,8 +32,6 @@ use orpc::sync::ArcRwLock;
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::master::meta::inode::InodeView::{Container, Dir, File, FileEntry};
-
 
 #[derive(Clone)]
 pub struct MasterFilesystem {
@@ -593,11 +592,10 @@ impl MasterFilesystem {
     //     let file_locs = fs_dir.get_file_locations(file)?;
     //     let mut block_locs = Vec::with_capacity(file_locs.len());
 
-
-    //     let inode_file = match file {  
-    //         InodeView::File(_, f) => f,  
-    //         _ => return err_box!("{} should be File", path),  
-    //     };  
+    //     let inode_file = match file {
+    //         InodeView::File(_, f) => f,
+    //         _ => return err_box!("{} should be File", path),
+    //     };
     //     for (index, meta) in inode_file.blocks.iter().enumerate() {
     //         if index + 1 < inode_file.blocks.len() && meta.len != inode_file.block_size {
     //             return err_box!(
@@ -629,50 +627,56 @@ impl MasterFilesystem {
     //     Ok(block_locs)
     // }
 
-    fn get_block_locs(  
-        &self,  
-        path: &str,  
-        fs_dir: &FsDir,  
-        inode: &InodeView,  
-    ) -> FsResult<Vec<LocatedBlock>> {  
-        let wm: std::sync::RwLockReadGuard<'_, super::WorkerManager> = self.worker_manager.read();  
-        let file_locs = fs_dir.get_file_locations(inode)?;  
-        println!("DEBUG at MasterFileSystem, at get_block_locs {:?}", file_locs);
-        let mut block_locs = Vec::new();  
-    
-        for (index, meta) in inode.blocks_iter().enumerate() {  
-            // Validation logic (only for File type with multiple blocks)  
-            if let File(_, f) = inode {  
-                if index + 1 < f.blocks.len() && meta.len != f.block_size {  
-                    return err_box!(  
-                        "block status abnormal, block id {}, block len {}, expected block size {}",  
-                        meta.id, meta.len, f.block_size  
-                    );  
-                }  
-            }  
-    
-            let extend_block = ExtendedBlock {  
-                id: meta.id,  
-                len: meta.len,  
-                storage_type: inode.storage_policy().storage_type,  
-                file_type: match inode {  
-                    File(_, f) => f.file_type,  
-                    Container(_, c) => FileType::Container,  
-                    _ => continue,  
-                },  
-                alloc_opts: meta.alloc_opts.clone(),  
-            };  
-    
-            let lc = try_option!(  
-                file_locs.get(&meta.id),  
-                "File {}, block {} Lost (no worker can read)",  
-                path, meta.id  
-            );  
-            let lb = wm.create_locate_block(path, extend_block, lc)?;  
-            block_locs.push(lb);  
-        }  
-    
-        Ok(block_locs)  
+    fn get_block_locs(
+        &self,
+        path: &str,
+        fs_dir: &FsDir,
+        inode: &InodeView,
+    ) -> FsResult<Vec<LocatedBlock>> {
+        let wm: std::sync::RwLockReadGuard<'_, super::WorkerManager> = self.worker_manager.read();
+        let file_locs = fs_dir.get_file_locations(inode)?;
+        println!(
+            "DEBUG at MasterFileSystem, at get_block_locs {:?}",
+            file_locs
+        );
+        let mut block_locs = Vec::new();
+
+        for (index, meta) in inode.blocks_iter().enumerate() {
+            // Validation logic (only for File type with multiple blocks)
+            if let File(_, f) = inode {
+                if index + 1 < f.blocks.len() && meta.len != f.block_size {
+                    return err_box!(
+                        "block status abnormal, block id {}, block len {}, expected block size {}",
+                        meta.id,
+                        meta.len,
+                        f.block_size
+                    );
+                }
+            }
+
+            let extend_block = ExtendedBlock {
+                id: meta.id,
+                len: meta.len,
+                storage_type: inode.storage_policy().storage_type,
+                file_type: match inode {
+                    File(_, f) => f.file_type,
+                    Container(_, c) => FileType::Container,
+                    _ => continue,
+                },
+                alloc_opts: meta.alloc_opts.clone(),
+            };
+
+            let lc = try_option!(
+                file_locs.get(&meta.id),
+                "File {}, block {} Lost (no worker can read)",
+                path,
+                meta.id
+            );
+            let lb = wm.create_locate_block(path, extend_block, lc)?;
+            block_locs.push(lb);
+        }
+
+        Ok(block_locs)
     }
 
     // fn get_container_block_locs(
@@ -706,9 +710,7 @@ impl MasterFilesystem {
 
         let block_locs = match inode.as_ref() {
             InodeView::File(_, file) => self.get_block_locs(path, &fs_dir, &inode)?,
-            InodeView::Container(_, container) => {
-                self.get_block_locs(path, &fs_dir, &inode)?
-            }
+            InodeView::Container(_, container) => self.get_block_locs(path, &fs_dir, &inode)?,
             _ => return err_box!("Path must be a file or container"),
         };
         let locate_blocks: FileBlocks = match inode.as_ref() {

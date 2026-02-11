@@ -468,13 +468,17 @@ impl FsDir {
             InodeView::Container(_, _) => {
                 let container = inode.as_container_mut()?;
 
-                let block_in_container = 0;
+                let block_in_container = container.next_block_id()?;
 
+                println!(
+                    "DEBUG at FsDir, at acquire_new_block for container, block_in_container: {:?}",
+                    block_in_container
+                );
                 // create block.
                 container.add_block(BlockMeta::with_pre(block_in_container, choose_workers));
 
                 let block = ExtendedBlock {
-                    id: 0, //always 0 because just exist only one block per container
+                    id: block_in_container, //always 0 because just exist only one block per container
                     len: 0,
                     storage_type: container.storage_policy.storage_type,
                     file_type: FileType::Container,

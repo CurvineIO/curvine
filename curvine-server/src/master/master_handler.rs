@@ -412,31 +412,29 @@ impl MasterHandler {
             .into_iter()
             .map(|(k, v)| (k, SmallFileMeta::from_proto(v)))
             .collect();
-        let file_blocks_vec: Option<Vec<FileBlocks>> = self
-            .fs
-            .complete_container(
-                req.path,
-                req.len,
-                commit_block,
-                req.client_name,
-                req.only_flush,
-                files_index,
-            )?;
+        let file_blocks_vec: Option<Vec<FileBlocks>> = self.fs.complete_container(
+            req.path,
+            req.len,
+            commit_block,
+            req.client_name,
+            req.only_flush,
+            files_index,
+        )?;
 
         // should add complete information about files = index and offset of all files
-        let file_blocks_vec_proto: Vec<FileBlocksProto> = file_blocks_vec  
-            .map(|blocks_vec| {  
-                blocks_vec  
-                    .into_iter()  
-                    .map(ProtoUtils::file_blocks_to_pb)  
-                    .collect()  
-            })  
+        let file_blocks_vec_proto: Vec<FileBlocksProto> = file_blocks_vec
+            .map(|blocks_vec| {
+                blocks_vec
+                    .into_iter()
+                    .map(ProtoUtils::file_blocks_to_pb)
+                    .collect()
+            })
             .unwrap_or_else(Vec::new);
-        
-        let rep_header = CompleteContainerResponse {   
-            result: true,  
-            file_blocks_vec: file_blocks_vec_proto,  
-        };  
+
+        let rep_header = CompleteContainerResponse {
+            result: true,
+            file_blocks_vec: file_blocks_vec_proto,
+        };
         ctx.response(rep_header)
     }
 

@@ -1,10 +1,10 @@
 use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
-use crate::master::meta::BlockMeta;
+use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::state::{CommitBlock, CreateFileOpts, StoragePolicy};
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
-use orpc::err_box;
+use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -21,7 +21,7 @@ pub struct InodeContainer {
     pub(crate) block: BlockMeta, // convert to only one block
     pub(crate) replicas: u16,
     pub(crate) len: i64,
-    pub(crate) block_size: i64
+    pub(crate) block_size: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,7 +46,7 @@ impl InodeContainer {
             block: BlockMeta::new(id, 0),
             replicas: 0,
             len: 0,
-            block_size: 0
+            block_size: 0,
         }
     }
 
@@ -71,7 +71,7 @@ impl InodeContainer {
             block: BlockMeta::new(id, 0),
             replicas: opts.replicas,
             len: 0,
-            block_size: opts.block_size
+            block_size: opts.block_size,
         };
         file.features.set_writing(opts.client_name);
         if !opts.x_attr.is_empty() {
@@ -140,6 +140,15 @@ impl InodeContainer {
     // Get current link count
     pub fn nlink(&self) -> u32 {
         self.nlink
+    }
+
+    /// Create a new block id
+    /// It is composed of the inode id + block number of the file, starting from 1.
+    /// inode id + serial number 0, is the file id.
+    pub fn next_block_id(&mut self) -> CommonResult<i64> {
+        let seq = 0 as i64;
+        // don't increment seq because InodeContainer has just one block.
+        InodeId::create_block_id(self.id, seq)
     }
 }
 

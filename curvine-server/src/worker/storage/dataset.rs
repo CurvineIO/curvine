@@ -56,6 +56,7 @@ pub trait Dataset {
     fn remove_block(&mut self, block: &ExtendedBlock) -> CommonResult<()>;
 
     fn get_block_check(&self, id: i64) -> CommonResult<&BlockMeta> {
+        println!("DEBUG at Dataset, at get_block_check, with id {:?}", id);
         match self.get_block(id) {
             None => err_box!("block {} not exists", id),
             Some(v) => Ok(v),
