@@ -84,6 +84,8 @@ impl JobContext {
             mount_info: mnt.clone(),
             create_time: LocalTime::mills() as i64,
             overwrite: job_conf.overwrite,
+            expected_target_mtime: job_conf.expected_target_mtime,
+            expected_target_missing: job_conf.expected_target_missing,
         };
 
         JobContext {

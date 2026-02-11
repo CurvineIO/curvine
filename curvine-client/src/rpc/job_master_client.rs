@@ -48,8 +48,28 @@ impl JobMasterClient {
     }
 
     pub async fn submit_load(&self, path: impl AsRef<str>) -> FsResult<LoadJobResult> {
-        self.submit_load_job(LoadJobCommand::builder(path.as_ref()).build())
+        self.submit_publish(path).await
+    }
+
+    pub async fn submit_publish(&self, path: impl AsRef<str>) -> FsResult<LoadJobResult> {
+        self.submit_load_job(LoadJobCommand::publish_builder(path.as_ref()).build())
             .await
+    }
+
+    pub async fn submit_hydrate(
+        &self,
+        path: impl AsRef<str>,
+        expected_target_mtime: Option<i64>,
+        expected_target_missing: bool,
+    ) -> FsResult<LoadJobResult> {
+        let mut builder = LoadJobCommand::hydrate_builder(path.as_ref());
+        if let Some(mtime) = expected_target_mtime {
+            builder = builder.expected_target_mtime(mtime);
+        }
+        if expected_target_missing {
+            builder = builder.expected_target_missing(true);
+        }
+        self.submit_load_job(builder.build()).await
     }
 
     // Submit loading task

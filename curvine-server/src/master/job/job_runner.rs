@@ -100,6 +100,85 @@ impl LoadJobRunner {
         }
     }
 
+    fn is_hydrate_job(source_path: &Path, target_path: &Path) -> bool {
+        !source_path.is_cv() && target_path.is_cv()
+    }
+
+    fn reject_hydrate_target(target_status: &FileStatus) -> bool {
+        !target_status.is_complete
+    }
+
+    fn has_active_job_touching_path(&self, cv_path: &str) -> bool {
+        for entry in self.jobs.iter() {
+            let job = entry.value();
+            let state: JobTaskState = job.state.state();
+            if matches!(state, JobTaskState::Pending | JobTaskState::Loading)
+                && (job.info.source_path == cv_path || job.info.target_path == cv_path)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn matches_expected_snapshot(
+        target_status: Option<&FileStatus>,
+        expected_target_mtime: Option<i64>,
+        expected_target_missing: bool,
+    ) -> bool {
+        if expected_target_missing && target_status.is_some() {
+            return false;
+        }
+
+        if let Some(expected_mtime) = expected_target_mtime {
+            return matches!(target_status, Some(status) if status.mtime == expected_mtime);
+        }
+
+        true
+    }
+
+    fn validate_hydrate_target(
+        &self,
+        target_path: &Path,
+        command: &LoadJobCommand,
+    ) -> FsResult<()> {
+        let target_uri = target_path.clone_uri();
+        if self.has_active_job_touching_path(&target_uri) {
+            return err_box!(
+                "Reject hydrate load for {} because an active load job is already touching this path",
+                target_uri
+            );
+        }
+
+        let target_status = match self.master_fs.file_status(target_path.path()) {
+            Ok(status) => Some(status),
+            Err(FsError::FileNotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+
+        if !Self::matches_expected_snapshot(
+            target_status.as_ref(),
+            command.expected_target_mtime,
+            command.expected_target_missing.unwrap_or(false),
+        ) {
+            return err_box!(
+                "Reject hydrate load for {} because target metadata no longer matches expected snapshot",
+                target_uri
+            );
+        }
+
+        if let Some(target_status) = target_status {
+            if Self::reject_hydrate_target(&target_status) {
+                return err_box!(
+                    "Reject hydrate load for {} because target cv metadata is incomplete",
+                    target_uri
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn submit_load_task(
         &self,
         command: LoadJobCommand,
@@ -135,6 +214,10 @@ impl LoadJobRunner {
                 source_path.full_path()
             );
             return Ok(result);
+        }
+
+        if Self::is_hydrate_job(&source_path, &target_path) {
+            self.validate_hydrate_target(&target_path, &command)?;
         }
 
         info!("Submitting load job {}", job_id);
@@ -300,5 +383,79 @@ impl LoadJobRunner {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoadJobRunner;
+    use curvine_common::fs::Path;
+    use curvine_common::state::FileStatus;
+
+    #[test]
+    fn detect_hydrate_direction_correctly() {
+        let source = Path::from_str("s3://bucket/a.txt").unwrap();
+        let target = Path::from_str("cv:///mnt/s3/a.txt").unwrap();
+        assert!(LoadJobRunner::is_hydrate_job(&source, &target));
+
+        let source = Path::from_str("cv:///mnt/s3/a.txt").unwrap();
+        let target = Path::from_str("s3://bucket/a.txt").unwrap();
+        assert!(!LoadJobRunner::is_hydrate_job(&source, &target));
+    }
+
+    #[test]
+    fn reject_hydrate_for_incomplete_target_metadata() {
+        let status = FileStatus::default();
+        assert!(LoadJobRunner::reject_hydrate_target(&status));
+    }
+
+    #[test]
+    fn allow_hydrate_for_complete_target_metadata() {
+        let status = FileStatus {
+            is_complete: true,
+            ..Default::default()
+        };
+        assert!(!LoadJobRunner::reject_hydrate_target(&status));
+    }
+
+    #[test]
+    fn snapshot_match_requires_missing_target_when_expected_missing() {
+        let status = FileStatus {
+            is_complete: true,
+            mtime: 10,
+            ..Default::default()
+        };
+
+        assert!(!LoadJobRunner::matches_expected_snapshot(
+            Some(&status),
+            None,
+            true
+        ));
+        assert!(LoadJobRunner::matches_expected_snapshot(None, None, true));
+    }
+
+    #[test]
+    fn snapshot_match_requires_same_mtime_when_expected_mtime_present() {
+        let status = FileStatus {
+            is_complete: true,
+            mtime: 10,
+            ..Default::default()
+        };
+
+        assert!(LoadJobRunner::matches_expected_snapshot(
+            Some(&status),
+            Some(10),
+            false
+        ));
+        assert!(!LoadJobRunner::matches_expected_snapshot(
+            Some(&status),
+            Some(11),
+            false
+        ));
+        assert!(!LoadJobRunner::matches_expected_snapshot(
+            None,
+            Some(10),
+            false
+        ));
     }
 }

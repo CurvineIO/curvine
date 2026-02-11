@@ -92,11 +92,22 @@ pub struct LoadJobCommand {
     pub ttl_ms: Option<i64>,
     pub ttl_action: Option<TtlAction>,
     pub overwrite: Option<bool>,
+    pub expected_target_mtime: Option<i64>,
+    pub expected_target_missing: Option<bool>,
 }
 
 impl LoadJobCommand {
-    pub fn builder(source_path: impl Into<String>) -> LoadJobCommandBuilder {
+    pub fn publish_builder(source_path: impl Into<String>) -> LoadJobCommandBuilder {
         LoadJobCommandBuilder::new(source_path).overwrite(true)
+    }
+
+    pub fn hydrate_builder(source_path: impl Into<String>) -> LoadJobCommandBuilder {
+        LoadJobCommandBuilder::new(source_path).overwrite(false)
+    }
+
+    // Backward-compatible default builder: keep historical overwrite=true behavior.
+    pub fn builder(source_path: impl Into<String>) -> LoadJobCommandBuilder {
+        Self::publish_builder(source_path)
     }
 }
 
@@ -110,6 +121,8 @@ pub struct LoadJobCommandBuilder {
     ttl_ms: Option<i64>,
     ttl_action: Option<TtlAction>,
     overwrite: Option<bool>,
+    expected_target_mtime: Option<i64>,
+    expected_target_missing: Option<bool>,
 }
 
 impl LoadJobCommandBuilder {
@@ -155,6 +168,16 @@ impl LoadJobCommandBuilder {
         self
     }
 
+    pub fn expected_target_mtime(mut self, mtime: i64) -> Self {
+        let _ = self.expected_target_mtime.insert(mtime);
+        self
+    }
+
+    pub fn expected_target_missing(mut self, missing: bool) -> Self {
+        let _ = self.expected_target_missing.insert(missing);
+        self
+    }
+
     pub fn build(self) -> LoadJobCommand {
         LoadJobCommand {
             source_path: self.source_path,
@@ -165,6 +188,8 @@ impl LoadJobCommandBuilder {
             ttl_ms: self.ttl_ms,
             ttl_action: self.ttl_action,
             overwrite: self.overwrite,
+            expected_target_mtime: self.expected_target_mtime,
+            expected_target_missing: self.expected_target_missing,
         }
     }
 }
@@ -182,6 +207,8 @@ pub struct LoadJobInfo {
     pub mount_info: MountInfo,
     pub create_time: i64,
     pub overwrite: Option<bool>,
+    pub expected_target_mtime: Option<i64>,
+    pub expected_target_missing: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,5 +286,28 @@ impl JobTaskProgress {
                 ByteUnit::byte_to_string(total)
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoadJobCommand;
+
+    #[test]
+    fn publish_builder_keeps_overwrite_enabled() {
+        let command = LoadJobCommand::publish_builder("cv:///path/file.txt").build();
+        assert_eq!(command.overwrite, Some(true));
+    }
+
+    #[test]
+    fn hydrate_builder_disables_overwrite_and_supports_snapshot_fields() {
+        let command = LoadJobCommand::hydrate_builder("s3://bucket/file.txt")
+            .expected_target_mtime(123)
+            .expected_target_missing(true)
+            .build();
+
+        assert_eq!(command.overwrite, Some(false));
+        assert_eq!(command.expected_target_mtime, Some(123));
+        assert_eq!(command.expected_target_missing, Some(true));
     }
 }

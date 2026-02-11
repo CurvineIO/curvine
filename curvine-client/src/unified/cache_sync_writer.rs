@@ -105,7 +105,7 @@ impl Writer for CacheSyncWriter {
         if self.job_res.is_none() && !self.has_random_access {
             let job_res = self
                 .job_client
-                .submit_load(self.inner.path().clone_uri())
+                .submit_publish(self.inner.path().clone_uri())
                 .await?;
             info!(
                 "submit(init) job successfully for {}, job id {}, target_path {}",
@@ -127,7 +127,10 @@ impl Writer for CacheSyncWriter {
         self.inner.complete().await?;
 
         if self.job_res.is_none() {
-            let job_res = self.job_client.submit_load(self.path().clone_uri()).await?;
+            let job_res = self
+                .job_client
+                .submit_publish(self.path().clone_uri())
+                .await?;
             info!(
                 "resubmit job successfully for {}, job id {}, target_path {}",
                 self.path(),

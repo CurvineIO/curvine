@@ -17,6 +17,7 @@ use crate::worker::task::TaskContext;
 use curvine_client::file::CurvineFileSystem;
 use curvine_client::rpc::JobMasterClient;
 use curvine_client::unified::{CacheSyncReader, UfsFileSystem, UnifiedReader, UnifiedWriter};
+use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{CreateFileOptsBuilder, JobTaskState, SetAttrOptsBuilder};
 use curvine_common::FsResult;
@@ -177,6 +178,37 @@ impl LoadTaskRunner {
 
     async fn create_unified(&self, path: &Path) -> FsResult<UnifiedWriter> {
         if path.is_cv() {
+            let target_status = match self.fs.get_status(path).await {
+                Ok(status) => Some(status),
+                Err(e) => {
+                    if matches!(e, FsError::FileNotFound(_)) {
+                        None
+                    } else {
+                        return Err(e);
+                    }
+                }
+            };
+
+            if !Self::matches_expected_snapshot(
+                target_status.as_ref(),
+                self.task.info.job.expected_target_mtime,
+                self.task.info.job.expected_target_missing.unwrap_or(false),
+            ) {
+                return err_box!(
+                    "Reject hydrate write to {} because target metadata no longer matches expected snapshot",
+                    path.full_path()
+                );
+            }
+
+            if let Some(status) = target_status {
+                if !status.is_complete {
+                    return err_box!(
+                        "Reject hydrate write to {} because target cv metadata is incomplete",
+                        path.full_path()
+                    );
+                }
+            }
+
             // Curvine path - get source mtime for UFS→Curvine import
             let source_path = Path::from_str(&self.task.info.source_path)?;
             let source_mtime = if !source_path.is_cv() {
@@ -213,6 +245,22 @@ impl LoadTaskRunner {
 
             ufs.create(path, overwrite).await
         }
+    }
+
+    fn matches_expected_snapshot(
+        target_status: Option<&curvine_common::state::FileStatus>,
+        expected_target_mtime: Option<i64>,
+        expected_target_missing: bool,
+    ) -> bool {
+        if expected_target_missing && target_status.is_some() {
+            return false;
+        }
+
+        if let Some(expected_mtime) = expected_target_mtime {
+            return matches!(target_status, Some(status) if status.mtime == expected_mtime);
+        }
+
+        true
     }
 
     pub async fn update_progress(&self, loaded_size: i64, total_size: i64) {
