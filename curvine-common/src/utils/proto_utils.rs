@@ -577,8 +577,11 @@ impl ProtoUtils {
         MountOptions {
             update: opts.update,
             add_properties: opts.add_properties,
-            ttl_ms: opts.ttl_ms,
-            ttl_action: opts.ttl_action.map(TtlAction::from),
+            ttl_ms: opts.ttl_ms.or(Some(DEFAULT_MOUNT_TTL_MS)),
+            ttl_action: opts
+                .ttl_action
+                .map(TtlAction::from)
+                .or(Some(DEFAULT_MOUNT_TTL_ACTION)),
             consistency_strategy: opts.consistency_strategy.map(ConsistencyStrategy::from),
             storage_type: opts.storage_type.map(StorageType::from),
             block_size: opts.block_size,

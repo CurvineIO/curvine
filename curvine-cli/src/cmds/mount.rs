@@ -18,6 +18,7 @@ use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
     ConsistencyStrategy, MountOptions, MountType, Provider, StorageType, TtlAction, WriteType,
+    DEFAULT_MOUNT_TTL_ACTION_STR, DEFAULT_MOUNT_TTL_STR,
 };
 use curvine_common::utils::ProtoUtils;
 use orpc::common::{ByteUnit, DurationUnit};
@@ -47,12 +48,12 @@ pub struct MountCommand {
     #[arg(long, default_value = "none")]
     consistency_strategy: String,
 
-    #[arg(long, default_value = "7d")]
+    #[arg(long, default_value_t = DEFAULT_MOUNT_TTL_STR.to_string())]
     ttl_ms: String,
 
     #[arg(
         long,
-        default_value = "delete",
+        default_value_t = DEFAULT_MOUNT_TTL_ACTION_STR.to_string(),
         help = "TTL expiration action when file expires:\n  none - No action\n  delete - Delete file\n  persist - Export to UFS (skip if exists), keep CV cache\n  evict - Export to UFS (skip if exists), delete CV cache\n  flush - Force export to UFS (overwrite), delete CV cache"
     )]
     ttl_action: String,

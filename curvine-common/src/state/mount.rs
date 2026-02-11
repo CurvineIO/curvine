@@ -21,6 +21,11 @@ use orpc::{err_box, CommonError, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub const DEFAULT_MOUNT_TTL_STR: &str = "7d";
+pub const DEFAULT_MOUNT_TTL_ACTION_STR: &str = "delete";
+pub const DEFAULT_MOUNT_TTL_MS: i64 = 7 * DurationUnit::DAY as i64;
+pub const DEFAULT_MOUNT_TTL_ACTION: TtlAction = TtlAction::Delete;
+
 #[repr(i32)]
 #[derive(
     Debug,
@@ -236,8 +241,8 @@ impl MountOptions {
             ufs_path: ufs_path.to_string(),
             mount_id,
             properties: self.add_properties,
-            ttl_ms: self.ttl_ms.unwrap_or(0),
-            ttl_action: self.ttl_action.unwrap_or(TtlAction::None),
+            ttl_ms: self.ttl_ms.unwrap_or(DEFAULT_MOUNT_TTL_MS),
+            ttl_action: self.ttl_action.unwrap_or(DEFAULT_MOUNT_TTL_ACTION),
             consistency_strategy: self
                 .consistency_strategy
                 .unwrap_or(ConsistencyStrategy::None),
@@ -271,8 +276,8 @@ impl MountOptionsBuilder {
     pub fn new() -> Self {
         Self {
             write_type: WriteType::AsyncThrough,
-            ttl_ms: Some(7 * DurationUnit::DAY as i64),
-            ttl_action: Some(TtlAction::Delete),
+            ttl_ms: Some(DEFAULT_MOUNT_TTL_MS),
+            ttl_action: Some(DEFAULT_MOUNT_TTL_ACTION),
             ..Default::default()
         }
     }

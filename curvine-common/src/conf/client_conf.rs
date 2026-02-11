@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::conf::ClusterConf;
+use crate::state::DEFAULT_MOUNT_TTL_STR;
 use crate::state::{StorageType, TtlAction};
 use orpc::client::ClientConf as RpcConf;
 use orpc::common::{ByteUnit, DurationUnit, Utils};
@@ -347,8 +348,8 @@ impl Default for ClientConf {
             ttl_action_str: "none".to_string(),
 
             auto_cache_enabled: false,
-            auto_cache_ttl: "7d".to_string(),
-            default_cache_ttl: Some("7d".to_string()),
+            auto_cache_ttl: DEFAULT_MOUNT_TTL_STR.to_string(),
+            default_cache_ttl: Some(DEFAULT_MOUNT_TTL_STR.to_string()),
 
             conn_retry_max_duration_ms: 60 * 1000,
             conn_retry_min_sleep_ms: 100,
