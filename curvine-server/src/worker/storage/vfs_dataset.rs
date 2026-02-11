@@ -176,6 +176,10 @@ impl Dataset for VfsDataset {
                     // Create a new block meta, where block.len represents the block size
                     let new_meta = BlockMeta::new(meta.id, block.len, dir);
 
+                    // Truncate the old block file to avoid length mismatch when reusing blocks
+                    let file = new_meta.get_block_path()?;
+                    let _ = try_err!(fs::File::create(file));
+
                     dir.release_space(meta.is_final(), meta.actual_len);
                     dir.reserve_space(false, new_meta.len);
                     self.block_map.insert(new_meta.id(), new_meta.clone());
