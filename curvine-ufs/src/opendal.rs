@@ -170,6 +170,7 @@ pub struct OpendalWriter {
     object_path: String,
     status: FileStatus,
     pos: i64,
+    append_mode: bool,
     chunk: BytesMut,
     chunk_size: usize,
     writer: Option<opendal::Writer>,
@@ -246,6 +247,12 @@ impl Writer for OpendalWriter {
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if self.append_mode {
+            // For O_APPEND writes from FUSE, kernel-provided offsets can be stale across fds.
+            // Keep appending at current writer position instead of rejecting as random write.
+            return Ok(());
+        }
+
         if self.pos != pos {
             err_box!("not support random write")
         } else {
@@ -724,6 +731,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             object_path,
             status,
             pos: 0,
+            append_mode: false,
             chunk: BytesMut::with_capacity(8 * 1024 * 1024),
             chunk_size: 8 * 1024 * 1024,
             writer: None,
@@ -753,6 +761,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                         object_path,
                         pos: s.len,
                         status: s,
+                        append_mode: true,
                         chunk: BytesMut::from(chunk.to_vec().as_slice()),
                         chunk_size: 8 * 1024 * 1024,
                         writer: None,
@@ -894,5 +903,52 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
 
     async fn set_attr(&self, _path: &Path, _opts: SetAttrOpts) -> FsResult<()> {
         err_ufs!("SetAttr operation is not supported by OpenDAL file system")
+    }
+}
+
+#[cfg(all(test, feature = "opendal-s3"))]
+mod tests {
+    use super::*;
+    use opendal::services::S3;
+
+    fn new_test_writer(pos: i64, append_mode: bool) -> OpendalWriter {
+        let mut builder = S3::default();
+        builder = builder.bucket("test-bucket");
+        builder = builder.region("us-east-1");
+        builder = builder.endpoint("http://127.0.0.1:1");
+
+        let operator = Operator::new(builder).unwrap().finish();
+
+        OpendalWriter {
+            operator,
+            path: Path::from_str("s3://test-bucket/test.txt").unwrap(),
+            object_path: "test.txt".to_string(),
+            status: FileStatus::default(),
+            pos,
+            append_mode,
+            chunk: BytesMut::with_capacity(8 * 1024 * 1024),
+            chunk_size: 8 * 1024 * 1024,
+            writer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn append_like_seek_should_tolerate_stale_offset() {
+        let mut writer = new_test_writer(128, true);
+
+        let res = writer.seek(0).await;
+        assert!(
+            res.is_ok(),
+            "append-like write should not fail on stale offset, got: {:?}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    async fn non_append_seek_should_reject_random_offset() {
+        let mut writer = new_test_writer(128, false);
+
+        let res = writer.seek(0).await;
+        assert!(res.is_err(), "non-append random write should fail");
     }
 }
