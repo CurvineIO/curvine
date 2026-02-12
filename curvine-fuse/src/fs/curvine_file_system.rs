@@ -1248,8 +1248,10 @@ impl fs::FileSystem for CurvineFileSystem {
             None => return err_fuse!(libc::EBADF),
         };
         let has_open_handles = self.state.has_open_handles(ino);
+        let has_open_writer_handles = self.state.has_open_writer_handles(ino);
+        let complete_writer = handle.has_writer() && !has_open_writer_handles;
         let complete_result = handle
-            .finalize_for_release(!has_open_handles, Some(reply))
+            .finalize_for_release(complete_writer, Some(reply))
             .await;
 
         if !has_open_handles && self.state.remove_pending_delete(ino) {

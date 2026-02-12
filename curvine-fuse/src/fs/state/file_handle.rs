@@ -146,7 +146,7 @@ impl FileHandle {
 
     /// Finalize this handle for `FUSE_RELEASE`.
     ///
-    /// `complete_writer` is decided by open-handle state in `NodeState`, not by
+    /// `complete_writer` is decided by open-writer-handle state in `NodeState`, not by
     /// `Arc::strong_count`, so transient cloned writer references won't downgrade
     /// a required commit into flush-only.
     pub async fn finalize_for_release(
@@ -165,6 +165,10 @@ impl FileHandle {
             reader.as_mut().complete(reply.take()).await?;
         }
         Ok(())
+    }
+
+    pub fn has_writer(&self) -> bool {
+        self.writer.is_some()
     }
 
     pub fn status(&self) -> &FileStatus {

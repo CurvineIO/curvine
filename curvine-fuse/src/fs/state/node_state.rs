@@ -464,6 +464,15 @@ impl NodeState {
         }
     }
 
+    pub fn has_open_writer_handles(&self, ino: u64) -> bool {
+        let lock = self.handles.read();
+        if let Some(map) = lock.get(&ino) {
+            map.values().any(|handle| handle.has_writer())
+        } else {
+            false
+        }
+    }
+
     pub fn should_delete_now<T: AsRef<str>>(
         &self,
         parent: u64,
