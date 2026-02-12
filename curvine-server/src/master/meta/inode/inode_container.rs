@@ -56,7 +56,7 @@ impl InodeContainer {
         let mut file = Self {
             id,
             parent_id: EMPTY_PARENT_ID,
-            file_type: FileType::File,
+            file_type: FileType::Container,
             mtime: time,
             atime: time,
             nlink: 1,

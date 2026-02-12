@@ -433,48 +433,39 @@ impl MasterFilesystem {
             None => return err_box!("File {} not exists", inp.path()),
         };
 
-        let result_located_block: LocatedBlock = match inode.as_ref() {
+        match inode.as_ref() {
             InodeView::Container(_, _) => {
                 let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
                 let block =
                     fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
-                LocatedBlock {
+                Ok(LocatedBlock {
                     block,
                     locs: choose_workers,
-                }
+                })
             }
             InodeView::File(_, _) => {
                 let file = inode.as_file_ref()?;
                 if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
-                    let _locs = fs_dir.get_block_locations(next.id)?;
-                    let _extend_block = ExtendedBlock {
+                    let locs = fs_dir.get_block_locations(next.id)?;
+                    let extend_block = ExtendedBlock {
                         id: next.id,
                         len: next.len,
                         storage_type: file.storage_policy.storage_type,
                         file_type: file.file_type,
                         alloc_opts: next.alloc_opts.clone(),
                     };
+                    return self.create_locate_block(path, extend_block, &locs);
                 }
                 let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
                 let block =
                     fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
-                LocatedBlock {
+                Ok(LocatedBlock {
                     block,
                     locs: choose_workers,
-                }
+                })
             }
-            _ => {
-                let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
-                let block =
-                    fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
-                LocatedBlock {
-                    block,
-                    locs: choose_workers,
-                }
-            }
-        };
-
-        Ok(result_located_block)
+            _ => err_box!("Only Container and File support the add_block feature"),
+        }
     }
 
     pub fn complete_file<T: AsRef<str>>(

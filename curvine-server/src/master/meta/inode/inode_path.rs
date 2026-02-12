@@ -334,7 +334,7 @@ impl InodePath {
     pub fn clone_last_container(&self) -> CommonResult<InodeContainer> {
         if let Some(v) = self.get_last_inode() {
             // Assert that lastnode must be Container
-            assert!(!v.is_container());
+            assert!(v.is_container());
             Ok(v.as_container_ref()?.clone())
         } else {
             err_box!("status error")
