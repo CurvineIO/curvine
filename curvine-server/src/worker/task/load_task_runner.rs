@@ -17,8 +17,11 @@ use crate::worker::task::TaskContext;
 use curvine_client::file::CurvineFileSystem;
 use curvine_client::rpc::JobMasterClient;
 use curvine_client::unified::{CacheSyncReader, UfsFileSystem, UnifiedReader, UnifiedWriter};
+use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{CreateFileOptsBuilder, JobTaskState, SetAttrOptsBuilder};
+use curvine_common::state::{
+    CreateFileOptsBuilder, FileStatus, JobTaskState, SetAttrOptsBuilder, WriteType,
+};
 use curvine_common::FsResult;
 use log::{error, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
@@ -32,6 +35,13 @@ pub struct LoadTaskRunner {
     master_client: JobMasterClient,
     progress_interval_ms: u64,
     task_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceGuardState {
+    Match,
+    Missing,
+    Changed,
 }
 
 impl LoadTaskRunner {
@@ -55,6 +65,86 @@ impl LoadTaskRunner {
 
     pub fn get_ufs(&self) -> FsResult<UfsFileSystem> {
         self.factory.get_ufs(&self.task.info.job.mount_info)
+    }
+
+    fn should_guard_source_for_async_through(&self, source: &Path, target: &Path) -> bool {
+        source.is_cv()
+            && !target.is_cv()
+            && self.task.info.job.mount_info.write_type == WriteType::AsyncThrough
+    }
+
+    async fn source_guard_state(
+        &self,
+        source: &Path,
+        target: &Path,
+        expected: &FileStatus,
+    ) -> FsResult<SourceGuardState> {
+        if !self.should_guard_source_for_async_through(source, target) {
+            return Ok(SourceGuardState::Match);
+        }
+
+        let current = match self.fs.get_status(source).await {
+            Ok(status) => status,
+            Err(FsError::FileNotFound(_) | FsError::Expired(_)) => {
+                return Ok(SourceGuardState::Missing);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let same_id = if expected.id > 0 && current.id > 0 {
+            current.id == expected.id
+        } else {
+            true
+        };
+        let same_shape = current.len == expected.len && current.mtime == expected.mtime;
+        let state = if same_id && same_shape && current.is_complete() {
+            SourceGuardState::Match
+        } else {
+            SourceGuardState::Changed
+        };
+
+        if state != SourceGuardState::Match {
+            warn!(
+                "task {} source generation changed before commit: source={}, expected(id={},len={},mtime={}), current(id={},len={},mtime={},complete={})",
+                self.task.info.task_id,
+                source,
+                expected.id,
+                expected.len,
+                expected.mtime,
+                current.id,
+                current.len,
+                current.mtime,
+                current.is_complete
+            );
+        }
+
+        Ok(state)
+    }
+
+    async fn cleanup_target_after_abort(&self, target: &Path) {
+        let res = if target.is_cv() {
+            self.fs.delete(target, false).await
+        } else {
+            match self.get_ufs() {
+                Ok(ufs) => ufs.delete(target, false).await,
+                Err(e) => {
+                    warn!(
+                        "task {} failed to get ufs while cleanup target {}: {}",
+                        self.task.info.task_id, target, e
+                    );
+                    return;
+                }
+            }
+        };
+
+        if let Err(e) = res {
+            if !matches!(e, FsError::FileNotFound(_)) {
+                warn!(
+                    "task {} cleanup target {} failed: {}",
+                    self.task.info.task_id, target, e
+                );
+            }
+        }
     }
 
     pub async fn run(&self) {
@@ -117,8 +207,81 @@ impl LoadTaskRunner {
             }
         }
 
+        let source_path = reader.path().clone();
+        let target_path = writer.path().clone();
+        let source_snapshot = reader.status().clone();
+
+        if self.task.is_cancel() {
+            match self
+                .source_guard_state(&source_path, &target_path, &source_snapshot)
+                .await?
+            {
+                SourceGuardState::Match | SourceGuardState::Missing => {
+                    self.cleanup_target_after_abort(&target_path).await;
+                }
+                SourceGuardState::Changed => {
+                    // Replacement generation may already own this target path.
+                    // Never delete on cancel if source has moved to a newer generation.
+                    warn!(
+                        "task {} canceled with source generation changed; skip cleanup for target {}",
+                        self.task.info.task_id, target_path
+                    );
+                }
+            }
+            return err_box!("Task {} canceled before commit", self.task.info.task_id);
+        }
+
+        // Guard async-through replay: if source generation changed or vanished, never commit stale data.
+        match self
+            .source_guard_state(&source_path, &target_path, &source_snapshot)
+            .await?
+        {
+            SourceGuardState::Match => {}
+            SourceGuardState::Missing => {
+                self.cleanup_target_after_abort(&target_path).await;
+                return err_box!(
+                    "Task {} abort commit: source {} missing",
+                    self.task.info.task_id,
+                    source_path
+                );
+            }
+            SourceGuardState::Changed => {
+                // Another generation is active on this path; deleting target here can remove newer data.
+                return err_box!(
+                    "Task {} abort commit: source {} changed",
+                    self.task.info.task_id,
+                    source_path
+                );
+            }
+        }
+
         writer.complete().await?;
         reader.complete().await?;
+
+        // Close the tiny race between pre-complete snapshot check and actual commit.
+        match self
+            .source_guard_state(&source_path, &target_path, &source_snapshot)
+            .await?
+        {
+            SourceGuardState::Match => {}
+            SourceGuardState::Missing => {
+                self.cleanup_target_after_abort(&target_path).await;
+                return err_box!(
+                    "Task {} rolled back commit: source {} missing during commit",
+                    self.task.info.task_id,
+                    source_path
+                );
+            }
+            SourceGuardState::Changed => {
+                // Commit already happened, but source advanced. Do not delete by path to avoid
+                // removing data written by a newer generation task.
+                return err_box!(
+                    "Task {} rolled back commit: source {} changed during commit",
+                    self.task.info.task_id,
+                    source_path
+                );
+            }
+        }
 
         // cv -> ufs
         let ufs_mtime = if reader.path().is_cv() && !writer.path().is_cv() {

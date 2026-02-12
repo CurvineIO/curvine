@@ -732,6 +732,38 @@ impl OpendalFileSystem {
 
         Ok(metadata.map(|m| Self::read_status(path, &m)))
     }
+
+    async fn delete_object_with_verification(
+        &self,
+        object_path: &str,
+        target: &str,
+    ) -> FsResult<()> {
+        match self.operator.delete(object_path).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(()),
+            Err(delete_err) => {
+                // Some S3-compatible stores can return an error even when delete has been applied.
+                // Verify existence once and treat "already gone" as success.
+                match self.operator.stat(object_path).await {
+                    Ok(_) => Err(FsError::common(format!(
+                        "Failed to delete {} {}: {}",
+                        target, object_path, delete_err
+                    ))),
+                    Err(stat_err) if stat_err.kind() == opendal::ErrorKind::NotFound => {
+                        warn!(
+                            "delete {} {} returned error but object is already gone: {}",
+                            target, object_path, delete_err
+                        );
+                        Ok(())
+                    }
+                    Err(stat_err) => Err(FsError::common(format!(
+                        "Failed to delete {} {}: {}; stat after delete also failed: {}",
+                        target, object_path, delete_err, stat_err
+                    ))),
+                }
+            }
+        }
+    }
 }
 
 impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
@@ -880,27 +912,45 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         let object_path = self.get_object_path(path)?;
 
         if recursive {
+            let dir_path = self.get_dir_path(path)?;
             // Check if it's a directory
             match self.operator.stat(&object_path).await {
-                Ok(metadata) if metadata.is_dir() => self.operator.remove_all(&object_path).await,
-                _ => self.operator.delete(&object_path).await,
+                Ok(metadata) if metadata.is_dir() => {
+                    self.operator.remove_all(&object_path).await.map_err(|e| {
+                        FsError::common(format!("Failed to delete recursive: {}", e))
+                    })?
+                }
+                _ => {
+                    self.delete_object_with_verification(&object_path, "file")
+                        .await?
+                }
             }
-            .map_err(|e| FsError::common(format!("Failed to delete recursive: {}", e)))?;
+
+            if dir_path != object_path {
+                // Prefix-only directories may have no marker at object_path.
+                // Ensure recursive delete still clears descendants under `<path>/`.
+                self.operator.remove_all(&dir_path).await.map_err(|e| {
+                    FsError::common(format!(
+                        "Failed to delete recursive directory prefix {}: {}",
+                        dir_path, e
+                    ))
+                })?;
+
+                self.delete_object_with_verification(&dir_path, "directory marker")
+                    .await?;
+            }
         } else {
-            // Try to delete as file first
-            self.operator
-                .delete(&object_path)
-                .await
-                .map_err(|e| FsError::common(format!("Failed to delete file: {}", e)))?;
+            // Try to delete as file first.
+            self.delete_object_with_verification(&object_path, "file")
+                .await?;
 
             // Also try to delete as directory marker (with suffix)
             // S3 delete is idempotent, so it's safe to try deleting the marker even if it doesn't exist
             // or if we just deleted a file.
             let dir_path = self.get_dir_path(path)?;
             if dir_path != object_path {
-                self.operator.delete(&dir_path).await.map_err(|e| {
-                    FsError::common(format!("Failed to delete directory marker: {}", e))
-                })?;
+                self.delete_object_with_verification(&dir_path, "directory marker")
+                    .await?;
             }
         }
 
