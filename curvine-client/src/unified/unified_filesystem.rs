@@ -195,6 +195,10 @@ impl UnifiedFileSystem {
             return Ok(CacheValidity::Invalid(None));
         }
 
+        if cv_status.is_cv_only() {
+            return Ok(CacheValidity::Valid);
+        }
+
         // Cache must be complete to be valid
         if !cv_status.is_complete() {
             log::debug!(
@@ -205,7 +209,7 @@ impl UnifiedFileSystem {
             return Ok(CacheValidity::Invalid(None));
         }
 
-        if cv_status.is_cv_only() || mount.info.consistency_strategy == ConsistencyStrategy::None {
+        if mount.info.consistency_strategy == ConsistencyStrategy::None {
             return Ok(CacheValidity::Valid);
         }
 
