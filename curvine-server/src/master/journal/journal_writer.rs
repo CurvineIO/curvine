@@ -260,7 +260,7 @@ impl JournalWriter {
             inode_entry: inode_entry.as_ref().clone(),
         };
 
-        let _ = self.sender.send(JournalEntry::CreateInode(entry));
+        let _ = self.send(JournalEntry::CreateInode(entry));
 
         Ok(())
     }
