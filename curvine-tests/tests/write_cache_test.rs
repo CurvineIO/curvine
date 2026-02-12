@@ -24,6 +24,8 @@ use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::sys::DataSlice;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::sleep;
 
 #[test]
 fn test_mount_write_cache() {
@@ -121,6 +123,54 @@ fn test_through_read_and_status_ignore_stale_cv_cache() {
         // 4) Through-mode status must also reflect UFS truth.
         let status = fs.get_status(&path).await.unwrap();
         assert_eq!(status.len, b"ufs-data".len() as i64);
+    })
+}
+
+#[test]
+fn test_async_through_delete_should_not_leave_ufs_residue() {
+    if env::var("UFS_TEST_PATH").is_err() {
+        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
+        return;
+    }
+
+    let testing = Testing::builder().workers(3).build().unwrap();
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+    let dir = format!("write_cache_async_delete_residue_{}", Utils::rand_str(8));
+
+    rt.block_on(async move {
+        mount_with_dir(&fs, WriteType::AsyncThrough, &dir).await;
+
+        let loops = 40;
+        for i in 0..loops {
+            let path = Path::from_str(format!("/{dir}/delete_residue_{i:04}.bin")).unwrap();
+            let mut writer = fs.create(&path, true).await.unwrap();
+            writer.write(b"delete-race-data").await.unwrap();
+            writer.complete().await.unwrap();
+
+            // Reproduce user workload: delete immediately after close without waiting async sync.
+            fs.delete(&path, false).await.unwrap();
+        }
+
+        // Give background sync jobs enough time to finish if they were already submitted.
+        sleep(Duration::from_secs(4)).await;
+
+        let mut leaked = vec![];
+        for i in 0..loops {
+            let path = Path::from_str(format!("/{dir}/delete_residue_{i:04}.bin")).unwrap();
+            let (ufs_path, mount) = fs.get_mount(&path).await.unwrap().unwrap();
+            if mount.ufs.exists(&ufs_path).await.unwrap() {
+                leaked.push(ufs_path.full_path().to_string());
+            }
+        }
+
+        assert!(
+            leaked.is_empty(),
+            "async_through delete left {} ufs objects, examples: {:?}",
+            leaked.len(),
+            leaked.iter().take(5).collect::<Vec<_>>()
+        );
     })
 }
 

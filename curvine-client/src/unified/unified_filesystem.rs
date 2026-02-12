@@ -554,6 +554,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         match self.get_mount(path).await? {
             None => self.cv.delete(path, recursive).await,
             Some((ufs_path, mount)) => {
+                // AsyncThrough can still have a background load job for this file.
+                // Wait before deleting UFS object, otherwise the job can recreate the object after delete.
+                if matches!(mount.info.write_type, WriteType::AsyncThrough) {
+                    self.wait_job_complete(path, "delete").await?;
+                }
+
                 // Delete from UFS
                 mount.ufs.delete(&ufs_path, recursive).await?;
 
