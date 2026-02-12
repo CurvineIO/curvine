@@ -479,6 +479,7 @@ impl FsDir {
                     alloc_opts: None,
                 };
 
+                self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
                 self.journal_writer.log_add_block(
                     op_ms,
                     inp.path(),
