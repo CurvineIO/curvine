@@ -319,6 +319,26 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
         results.push(blocks);
     }
 
+    // Count distinct block IDs across all files
+    let mut block_ids = std::collections::HashSet::new();
+    for blocks in &results {
+        for loc_block in blocks.block_locs.iter() {
+            block_ids.insert(loc_block.block.id);
+        }
+    }
+    assert_eq!(
+        block_ids.len(),
+        2,
+        "Expected exactly 2 distinct block IDs, found {}: {:?}",
+        block_ids.len(),
+        block_ids
+    );
+    println!(
+        "✓ Verified {} distinct block IDs: {:?}",
+        block_ids.len(),
+        block_ids
+    );
+
     // 2. Verify all files exist and have correct content
     for (i, (path, _)) in batch_files.clone().iter().enumerate() {
         let status = fs.get_status(path).await?;
