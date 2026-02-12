@@ -161,19 +161,21 @@ impl BatchWriteHandler {
                 ..Default::default()
             };
 
+            if context.block.len > context.block_size {
+                return err_box!(
+                    "Invalid write offset: {}, block size: {}",
+                    context.block.len,
+                    context.block_size
+                );
+            }
             self.commit_block(&container_block, commit)?;
+            self.is_commit = true;
         }
 
         Ok(())
     }
 
     pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
-        if let Some(context) = self.context.take() {
-            Self::check_context(&context, msg)?;
-        }
-
-        let context = ContainerWriteContext::from_req(msg)?;
-
         if self.is_commit {
             return if !msg.data.is_empty() {
                 err_box!("The block has been committed and data cannot be written anymore.")
@@ -181,6 +183,12 @@ impl BatchWriteHandler {
                 Ok(msg.success())
             };
         }
+
+        if let Some(context) = self.context.take() {
+            Self::check_context(&context, msg)?;
+        }
+
+        let context = ContainerWriteContext::from_req(msg)?;
 
         // Use context directly instead of copying to self fields
         self.complete_container_batch(&context, commit)?;
