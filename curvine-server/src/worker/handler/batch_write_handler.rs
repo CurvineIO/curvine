@@ -27,10 +27,12 @@ use curvine_common::state::FileType;
 use curvine_common::state::StorageType;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
+use orpc::common::ByteUnit;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
+use log::info;
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
@@ -94,9 +96,10 @@ impl BatchWriteHandler {
         let container_meta = context.files_metadata.clone();
         let block_size = context.block_size;
 
+        let container_path = container_meta.container_path.clone();
         let container_response = BlockWriteResponse {
             id: container_meta.container_block_id,
-            path: Some(container_meta.container_path.clone()),
+            path: Some(container_path.clone()),
             off: 0,
             block_size,
             storage_type: StorageType::default() as i32,
@@ -115,9 +118,20 @@ impl BatchWriteHandler {
         };
         self.metrics.write_blocks.with_label_values(&[label]).inc();
 
+        let log_msg = format!(
+            "Write {}-block start req_id: {}, path: {:?}, chunk_size: {}, off: {}, block_size: {}, file_count: {}",
+            label,
+            context.req_id,
+            container_path,
+            context.chunk_size,
+            context.off,
+            ByteUnit::byte_to_string(context.block_size as u64),
+            context.files_metadata.files.len()
+        );
         // Store context for later use
         let _ = self.context.replace(context);
 
+        info!("{}", log_msg);
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
 
@@ -190,8 +204,16 @@ impl BatchWriteHandler {
 
         let context = ContainerWriteContext::from_req(msg)?;
 
-        // Use context directly instead of copying to self fields
         self.complete_container_batch(&context, commit)?;
+
+        info!(
+            "write block end for req_id {}, is commit: {}, off: {}, len: {}, file count: {}",
+            msg.req_id(),
+            commit,
+            context.off,
+            context.block.len,
+            context.files_metadata.files.len()
+        );
         Ok(msg.success())
     }
 
