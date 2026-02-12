@@ -141,12 +141,23 @@ impl JournalLoader {
     }
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
+        println!("DEBUG at JournalLoader, add_block with entry: {:?}", entry);
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
-        let mut inode = try_option!(inp.get_last_inode());
-        let file = inode.as_file_mut()?;
-        let _ = mem::replace(&mut file.blocks, entry.blocks);
+        let inode = try_option!(inp.get_last_inode());
+        match inode.as_mut() {
+            InodeView::File(_, file) => {
+                let _ = mem::replace(&mut file.blocks, entry.blocks);
+            }
+            InodeView::Container(_, container) => {
+                // Container has a single block; take the first from the journal entry
+                if let Some(block) = entry.blocks.into_iter().next() {
+                    container.add_block(block);
+                }
+            }
+            _ => return err_box!("add_block only supports File and Container inodes"),
+        }
         fs_dir
             .store
             .apply_new_block(inode.as_ref(), &entry.commit_block)?;

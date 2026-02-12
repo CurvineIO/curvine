@@ -77,7 +77,7 @@ impl ContainerBlockWriterLocal {
         self.flush().await?;
         let client = self.fs_context.block_client(&self.worker_address).await?;
         client
-            .write_commit_batch(
+            .write_commit_container(
                 &self.block,
                 self.pos,
                 self.block_size,

@@ -125,7 +125,7 @@ impl ContainerBlockWriterRemote {
     pub async fn complete(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
         self.client
-            .write_commit_batch(
+            .write_commit_container(
                 &self.block,
                 self.pos,
                 self.block_size,

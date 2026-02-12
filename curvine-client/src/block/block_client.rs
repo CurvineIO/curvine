@@ -356,7 +356,7 @@ impl BlockClient {
         Ok(batch_context)
     }
 
-    pub async fn write_commit_batch(
+    pub async fn write_commit_container(
         &self,
         block: &ExtendedBlock,
         off: i64,
@@ -377,7 +377,9 @@ impl BlockClient {
             chunk_size: 0,
             short_circuit: false,
             client_name: self.client_name.to_string(),
-            files_metadata: container_meta.unwrap(),
+            files_metadata: container_meta.ok_or_else(|| {
+                FsError::common("container_meta is required for write_commit_batch but was None")
+            })?,
         };
 
         let status = if cancel {

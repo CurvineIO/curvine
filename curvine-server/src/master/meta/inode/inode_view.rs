@@ -422,7 +422,7 @@ impl InodeView {
             match self {
                 File(_, f) => f.atime = atime,
                 Dir(_, d) => d.atime = atime,
-                Container(_, c) =>c.atime = atime,
+                Container(_, c) => c.atime = atime,
                 _ => (),
             }
         }
