@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::container_block_writer::ContainerWriterAdapter::{ContainerLocal, ContainerRemote};
+use crate::block::container_block_writer::ContainerWriterAdapter::{
+    ContainerLocal, ContainerRemote,
+};
 use crate::block::{ContainerBlockWriterLocal, ContainerBlockWriterRemote};
 use crate::file::FsContext;
 use curvine_common::fs::Path;

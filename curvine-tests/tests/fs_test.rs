@@ -183,7 +183,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Helper function to read file content
     async fn read_file_content(fs: &CurvineFileSystem, path: &Path) -> CommonResult<String> {
         let status = fs.get_status(path).await?;
-        
+
         let mut reader = fs.open(path).await?;
         let mut buffer = BytesMut::zeroed(status.len as usize);
         let bytes_read = reader.read_full(&mut buffer).await?;

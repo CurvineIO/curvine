@@ -282,7 +282,7 @@ impl<'a> InodeWriteBatch<'a> {
         let value = Serde::serialize(inode)?;
         self.put_cf(RocksInodeStore::CF_INODES, key, value)
     }
-    
+
     // Add an edge to identify the subordinate relationship between inodes
     pub fn add_child(
         &mut self,

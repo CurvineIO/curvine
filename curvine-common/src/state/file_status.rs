@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{FileType, StoragePolicy, TtlAction};
+use crate::state::{FileType, StoragePolicy};
 use orpc::common::LocalTime;
 use orpc::ternary;
 use serde::{Deserialize, Serialize};
@@ -85,7 +85,7 @@ impl FileStatus {
     }
 
     pub fn is_expired(&self) -> bool {
-        self.storage_policy.ttl_action == TtlAction::Delete
+        self.storage_policy.ttl_ms != 0
             && LocalTime::mills() as i64 > self.atime + self.storage_policy.ttl_ms
     }
 
@@ -97,5 +97,9 @@ impl FileStatus {
     /// Returns true if the file exists only in Curvine and not in UFS
     pub fn is_cv_only(&self) -> bool {
         self.storage_policy.ufs_mtime == 0
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.is_complete
     }
 }
