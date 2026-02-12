@@ -23,6 +23,7 @@ pub struct FileStatus {
     pub id: i64,
     pub path: String,
     pub name: String,
+    // todo: add container_id
     pub container_name: Option<String>,
     pub is_dir: bool,
     pub mtime: i64,

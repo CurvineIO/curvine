@@ -320,8 +320,6 @@ impl MasterHandler {
             container_files.push(ProtoUtils::file_status_to_pb(file_status));
         }
 
-        // InodeId::create_block_id
-
         let container_status_response = ContainerStatusReponse {
             container_id: container_result.container_meta.container_block_id,
             container_path: container_result.container_meta.container_path,
