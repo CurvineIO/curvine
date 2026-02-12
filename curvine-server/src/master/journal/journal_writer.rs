@@ -256,7 +256,7 @@ impl JournalWriter {
         let inode_entry = inode_path.get_last_inode().unwrap();
         let entry = CreateInodeEntry {
             op_ms,
-            path: format!("{}/{}", inode_path.path(), inode_path.name()),
+            path: inode_path.path().to_string(),
             inode_entry: inode_entry.as_ref().clone(),
         };
 
