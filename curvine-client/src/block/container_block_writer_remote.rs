@@ -42,6 +42,7 @@ impl BlockWriterRemote {
         let req_id = Utils::req_id();
         let seq_id = 0;
         let block_size = fs_context.block_size();
+        
         let client = fs_context.acquire_write(&worker_address).await?;
         let write_context = client
             .write_block(
