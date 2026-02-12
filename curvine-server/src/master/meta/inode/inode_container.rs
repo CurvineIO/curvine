@@ -169,7 +169,7 @@ impl Inode for InodeContainer {
     }
 
     fn is_dir(&self) -> bool {
-        false // Container is a file-like object
+        false
     }
 
     fn mtime(&self) -> i64 {
