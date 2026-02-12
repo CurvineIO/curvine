@@ -16,6 +16,7 @@ use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
 use crate::master::meta::inode::SmallFileMeta;
 use crate::master::meta::inode::{InodeView, PATH_SEPARATOR};
+use crate::master::meta::InodeId;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MountManager;
@@ -308,15 +309,18 @@ impl MasterHandler {
         // Create individual FileStatus objects for each file in container
         let mut container_files = Vec::new();
 
+        let container_block_id = container_result.container_meta.container_block_id;
         for (i, req) in header.requests.iter().enumerate() {
             let mut file_status = container_result.container_status.clone();
             file_status.path = req.path.clone();
             file_status.name = Path::new(&req.path).map(|p| p.name().to_string()).unwrap();
             file_status.len = container_result.container_meta.files[i].len;
             file_status.file_type = FileType::File; // Individual files, not Container
-            file_status.id = ctx.msg.req_id() + i as i64;
+            file_status.id = InodeId::create_block_id(container_block_id, i as i64 + 1)?;
             container_files.push(ProtoUtils::file_status_to_pb(file_status));
         }
+
+        // InodeId::create_block_id
 
         let container_status_response = ContainerStatusReponse {
             container_id: container_result.container_meta.container_block_id,
