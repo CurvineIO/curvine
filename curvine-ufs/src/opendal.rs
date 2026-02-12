@@ -22,6 +22,7 @@ use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
 use curvine_common::FsResult;
 use futures::StreamExt;
+use log::warn;
 use opendal::services::*;
 use opendal::{
     layers::{LoggingLayer, RetryLayer, TimeoutLayer},
@@ -45,6 +46,61 @@ pub struct OpendalReader {
     chunk_size: usize,
     byte_stream: Option<opendal::FuturesBytesStream>,
     status: FileStatus,
+}
+
+impl OpendalReader {
+    async fn create_stream(&mut self, start: i64) -> FsResult<()> {
+        if start >= self.length {
+            self.byte_stream = None;
+            return Ok(());
+        }
+
+        let reader = self
+            .operator
+            .reader_with(&self.object_path)
+            .chunk(self.chunk_size)
+            .await
+            .map_err(|e| FsError::common(format!("Failed to create reader: {}", e)))?;
+
+        self.byte_stream = Some(
+            reader
+                .into_bytes_stream(start as u64..self.length as u64)
+                .await
+                .map_err(|e| FsError::common(format!("Failed to create stream: {}", e)))?,
+        );
+
+        Ok(())
+    }
+
+    async fn try_recover_shrunk_object(&mut self) -> FsResult<bool> {
+        let latest_len = match self.operator.stat(&self.object_path).await {
+            Ok(metadata) => metadata.content_length() as i64,
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(FsError::common(format!(
+                    "Failed to restat file after read error: {}",
+                    e
+                )));
+            }
+        };
+
+        if latest_len < self.length {
+            warn!(
+                "opendal reader detected shrink during read, path={}, len {} -> {}, pos={}",
+                self.path, self.length, latest_len, self.pos
+            );
+            self.length = latest_len;
+            self.status.len = latest_len;
+            if self.pos > self.length {
+                self.pos = self.length;
+            }
+            self.byte_stream = None;
+            self.chunk = DataSlice::Empty;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
 }
 
 impl Reader for OpendalReader {
@@ -81,65 +137,53 @@ impl Reader for OpendalReader {
             return Ok(DataSlice::Empty);
         }
 
-        // Initialize stream if needed
-        if self.byte_stream.is_none() {
-            let reader = self
-                .operator
-                .reader_with(&self.object_path)
-                .chunk(self.chunk_size)
-                .await
-                .map_err(|e| FsError::common(format!("Failed to create reader: {}", e)))?;
+        let mut recoveries = 0;
+        loop {
+            if self.byte_stream.is_none() {
+                self.create_stream(self.pos).await?;
+            }
 
-            self.byte_stream = Some(
-                reader
-                    .into_bytes_stream(self.pos as u64..self.length as u64)
-                    .await
-                    .map_err(|e| FsError::common(format!("Failed to create stream: {}", e)))?,
-            );
-        }
+            if let Some(stream) = &mut self.byte_stream {
+                match stream.next().await {
+                    Some(Ok(chunk)) => return Ok(DataSlice::Bytes(chunk)),
 
-        if let Some(stream) = &mut self.byte_stream {
-            if let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => Ok(DataSlice::Bytes(chunk)),
-                    Err(e) => Err(FsError::common(format!("Failed to read chunk: {}", e))),
+                    Some(Err(e)) => {
+                        if recoveries < 8 && self.try_recover_shrunk_object().await? {
+                            recoveries += 1;
+                            if !self.has_remaining() {
+                                return Ok(DataSlice::Empty);
+                            }
+                            continue;
+                        }
+
+                        return Err(FsError::common(format!("Failed to read chunk: {}", e)));
+                    }
+
+                    None => return Ok(DataSlice::Empty),
                 }
             } else {
-                Ok(DataSlice::Empty)
+                return Ok(DataSlice::Empty);
             }
-        } else {
-            Ok(DataSlice::Empty)
         }
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        if pos < 0 || pos > self.length {
+        if pos < 0 {
             return Err(FsError::common("Invalid seek position"));
         }
 
+        // For read path, seeking past EOF should behave as EOF instead of error.
+        let target = pos.min(self.length);
+
         // If seeking backward or forward significantly, reset the stream
-        if pos < self.pos || pos > self.pos + (self.chunk_size as i64 * 2) {
+        if target < self.pos || target > self.pos + (self.chunk_size as i64 * 2) {
             self.byte_stream = None;
             self.chunk = DataSlice::Empty;
-
-            // Create new stream starting from the seek position
-            let reader = self
-                .operator
-                .reader_with(&self.object_path)
-                .chunk(self.chunk_size)
-                .await
-                .map_err(|e| FsError::common(format!("Failed to create reader: {}", e)))?;
-
-            self.byte_stream = Some(
-                reader
-                    .into_bytes_stream(pos as u64..self.length as u64)
-                    .await
-                    .map_err(|e| FsError::common(format!("Failed to create stream: {}", e)))?,
-            );
+            self.create_stream(target).await?;
         } else {
             // Skip forward in the current stream
-            while self.pos < pos {
-                let skip_bytes = (pos - self.pos).min(self.chunk_size as i64) as usize;
+            while self.pos < target {
+                let skip_bytes = (target - self.pos).min(self.chunk_size as i64) as usize;
                 if self.chunk.is_empty() {
                     self.chunk = self.read_chunk0().await?;
                 }
@@ -152,7 +196,7 @@ impl Reader for OpendalReader {
             }
         }
 
-        self.pos = pos;
+        self.pos = target;
         Ok(())
     }
 

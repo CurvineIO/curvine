@@ -1211,7 +1211,7 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn flush(&self, op: Flush<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
         self.fs_unlock(&handle, LockFlags::Plock).await?;
-        handle.flush(Some(reply)).await?;
+        handle.flush_for_close(Some(reply)).await?;
 
         let path = Path::from_str(&handle.status.path)?;
         self.invalidate_cache(&path)?;
@@ -1220,17 +1220,39 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
         let ino = op.header.nodeid;
+        let handle = self.state.find_handle(ino, op.arg.fh)?;
+        let path = Path::from_str(&handle.status.path)?;
+
+        if let Err(e) = self.fs_unlock(&handle, LockFlags::Flock).await {
+            warn!(
+                "release ino={} fh={} flock unlock failed: {}",
+                ino, op.arg.fh, e
+            );
+        }
+        if let Err(e) = self.fs_unlock(&handle, LockFlags::Plock).await {
+            warn!(
+                "release ino={} fh={} plock unlock failed: {}",
+                ino, op.arg.fh, e
+            );
+        }
+
+        // Serialize with write-open on the same logical path to avoid
+        // close/open races that can terminate writer channels unexpectedly.
+        let path_lock = self.state.writer_path_lock(&path);
+        let _guard = path_lock.lock().await;
+
+        // Detach current handle first. This prevents concurrent read-open from cloning
+        // this writer and accidentally turning last-release complete into flush-only.
         let handle = match self.state.remove_handle(ino, op.arg.fh) {
             Some(handle) => handle,
             None => return err_fuse!(libc::EBADF),
         };
+        let has_open_handles = self.state.has_open_handles(ino);
+        let complete_result = handle
+            .finalize_for_release(!has_open_handles, Some(reply))
+            .await;
 
-        self.fs_unlock(&handle, LockFlags::Flock).await?;
-        self.fs_unlock(&handle, LockFlags::Plock).await?;
-        let complete_result = handle.complete(Some(reply)).await;
-
-        if !self.state.has_open_handles(ino) && self.state.remove_pending_delete(ino) {
-            let path = Path::from_str(&handle.status.path)?;
+        if !has_open_handles && self.state.remove_pending_delete(ino) {
             info!(
                 "release ino={}: no more open handles, executing delayed deletion of {}",
                 ino, path
@@ -1240,7 +1262,6 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        let path = Path::from_str(&handle.status.path)?;
         self.invalidate_cache(&path)?;
 
         complete_result

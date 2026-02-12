@@ -78,6 +78,52 @@ fn test_async_through_reopen_truncate_missing_cv_cache() {
     })
 }
 
+#[test]
+fn test_through_read_and_status_ignore_stale_cv_cache() {
+    if env::var("UFS_TEST_PATH").is_err() {
+        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
+        return;
+    }
+
+    let testing = Testing::builder().workers(3).build().unwrap();
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+    let dir = format!("write_cache_Through_stale_cv_{}", Utils::rand_str(8));
+
+    rt.block_on(async move {
+        mount_with_dir(&fs, WriteType::Through, &dir).await;
+
+        let path = Path::from_str(format!("/{dir}/through_stale_cache.txt")).unwrap();
+
+        // 1) Write real source data to UFS through mount path.
+        let mut ufs_writer = fs.create(&path, true).await.unwrap();
+        ufs_writer.write(b"ufs-data").await.unwrap();
+        ufs_writer.complete().await.unwrap();
+
+        // 2) Inject stale CV cache content for the same logical path.
+        let mut cv_writer = fs.cv().create(&path, true).await.unwrap();
+        cv_writer.write(b"stale-cv-cache").await.unwrap();
+        cv_writer.complete().await.unwrap();
+
+        // 3) Through-mode open must still read from UFS, not stale CV cache.
+        let mut reader = fs.open(&path).await.unwrap();
+        assert!(
+            matches!(reader, UnifiedReader::Opendal(_)),
+            "through-mode should open UFS reader instead of CV cache reader"
+        );
+
+        let mut read_data = BytesMut::zeroed(reader.len() as usize);
+        reader.read_full(&mut read_data).await.unwrap();
+        reader.complete().await.unwrap();
+        assert_eq!(read_data.as_ref(), b"ufs-data");
+
+        // 4) Through-mode status must also reflect UFS truth.
+        let status = fs.get_status(&path).await.unwrap();
+        assert_eq!(status.len, b"ufs-data".len() as i64);
+    })
+}
+
 async fn write(fs: &UnifiedFileSystem, write_type: WriteType, random_write: bool) {
     let chunk_size = 64 * 1024;
     let total_size = 1024 * 1024;

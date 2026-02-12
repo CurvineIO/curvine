@@ -197,6 +197,16 @@ impl UnifiedFileSystem {
 
         // Cache must be complete to be valid
         if !cv_status.is_complete() {
+            if matches!(
+                mount.info.write_type,
+                WriteType::AsyncThrough | WriteType::CacheThrough
+            ) {
+                // During write-through style writes, readers can race with an unfinished CV inode.
+                // Falling back to UFS here can trigger read-range errors and import jobs that overwrite
+                // in-flight metadata. Prefer CV as source of truth until write completion.
+                return Ok(CacheValidity::Valid);
+            }
+
             log::debug!(
                 "check_cache_validity: INVALID - cache not complete, ufs_path={}, cv_len={}",
                 ufs_path,
@@ -279,6 +289,14 @@ impl UnifiedFileSystem {
         self.cv.cleanup().await
     }
 
+    async fn invalidate_cv_cache_for_mount_write(&self, path: &Path) {
+        if let Err(e) = self.cv.delete(path, false).await {
+            if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
+                warn!("failed to invalidate mount cache file {}: {}", path, e);
+            }
+        }
+    }
+
     pub fn disable_unified(&mut self) {
         self.enable_unified = false
     }
@@ -303,6 +321,10 @@ impl UnifiedFileSystem {
                 }
 
                 WriteType::Through => {
+                    // Through-mode writes bypass Curvine data path, so stale cache must be removed
+                    // before writing to avoid serving outdated cache on subsequent reads.
+                    self.invalidate_cv_cache_for_mount_write(path).await;
+
                     let writer = if flags.append() {
                         mount.ufs.append(&ufs_path).await?
                     } else {
@@ -424,7 +446,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     async fn append(&self, path: &Path) -> FsResult<UnifiedWriter> {
         match self.get_mount(path).await? {
             None => Ok(UnifiedWriter::Cv(self.cv.append(path).await?)),
-            Some((ufs_path, mount)) => mount.ufs.append(&ufs_path).await,
+            Some((ufs_path, mount)) => {
+                if matches!(mount.info.write_type, WriteType::Through) {
+                    self.invalidate_cv_cache_for_mount_write(path).await;
+                }
+                mount.ufs.append(&ufs_path).await
+            }
         }
     }
 
@@ -444,6 +471,19 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             None => return Ok(UnifiedReader::Cv(self.cv.open(path).await?)),
             Some(v) => v,
         };
+
+        if matches!(mount.info.write_type, WriteType::Through) {
+            // Through mode treats UFS as the single source of truth for reads.
+            if self.enable_read_ufs {
+                info!(
+                    "read from ufs(through), ufs path {}, cv path: {}",
+                    ufs_path, path
+                );
+                return mount.ufs.open(&ufs_path).await;
+            } else {
+                return err_ext!(FsError::unsupported_ufs_read(path.path()));
+            }
+        }
 
         if let Some(reader) = self.get_cv_reader(path, &ufs_path, &mount).await? {
             info!(
@@ -476,7 +516,6 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             }
         }
     }
-
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
         let _timer = TimeSpent::timer_counter_vec(
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
@@ -541,6 +580,10 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Some(v) => v,
         };
 
+        if matches!(mount.info.write_type, WriteType::Through) {
+            return mount.ufs.get_status(&ufs_path).await;
+        }
+
         match self.cv.get_status(path).await {
             Ok(v) => match self.check_cache_validity(&v, &ufs_path, &mount).await? {
                 CacheValidity::Valid => Ok(v),
@@ -556,7 +599,6 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             }
         }
     }
-
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
         let _timer = TimeSpent::timer_counter_vec(
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
