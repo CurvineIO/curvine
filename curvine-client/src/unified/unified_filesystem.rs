@@ -21,9 +21,9 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader};
 use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, LoadJobCommand,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
-    WriteType,
+    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, JobTaskState,
+    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
+    SetAttrOpts, WriteType,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -285,6 +285,55 @@ impl UnifiedFileSystem {
         }
     }
 
+    async fn wait_job_complete_for_mount_meta_op(&self, path: &Path, mark: &str) -> FsResult<()> {
+        match self.wait_job_complete(path, mark).await {
+            Ok(()) => Ok(()),
+            Err(wait_err) => {
+                let client = JobMasterClient::new(self.fs_client());
+                let job_id = CommonUtils::create_job_id(path.full_path());
+                match client.get_job_status(&job_id).await {
+                    Ok(status)
+                        if matches!(
+                            status.state,
+                            JobTaskState::Failed | JobTaskState::Canceled
+                        ) =>
+                    {
+                        warn!(
+                            "[{}] ignore stale async-through job {} for {}: {:?}, progress: {}",
+                            mark, status.job_id, path, status.state, status.progress.message
+                        );
+                        Ok(())
+                    }
+                    Ok(_) => Err(wait_err),
+                    Err(FsError::JobNotFound(_)) => Ok(()),
+                    Err(status_err) => {
+                        warn!(
+                            "[{}] failed to inspect async-through job {} for {}: {}, original wait error: {}",
+                            mark, job_id, path, status_err, wait_err
+                        );
+                        Err(wait_err)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn cancel_job_for_mount_meta_op(&self, path: &Path, mark: &str) {
+        let client = JobMasterClient::new(self.fs_client());
+        let job_id = CommonUtils::create_job_id(path.full_path());
+        match client.cancel_job(&job_id).await {
+            Ok(()) => info!(
+                "[{}] canceled async-through job {} for {}",
+                mark, job_id, path
+            ),
+            Err(FsError::JobNotFound(_)) => {}
+            Err(e) => warn!(
+                "[{}] failed to cancel async-through job {} for {}: {}",
+                mark, job_id, path, e
+            ),
+        }
+    }
+
     pub async fn cleanup(&self) {
         self.cv.cleanup().await
     }
@@ -528,7 +577,8 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 // This ensures all data has been fully written to UFS, preventing data loss or inconsistency
                 // that could occur if we rename a file while its data is still being synced.
                 if mount.info.is_write_through() {
-                    self.wait_job_complete(src, "rename").await?;
+                    self.wait_job_complete_for_mount_meta_op(src, "rename")
+                        .await?;
                 }
 
                 let dst_ufs = mount.get_ufs_path(dst)?;
@@ -554,21 +604,29 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         match self.get_mount(path).await? {
             None => self.cv.delete(path, recursive).await,
             Some((ufs_path, mount)) => {
-                // AsyncThrough can still have a background load job for this file.
-                // Wait before deleting UFS object, otherwise the job can recreate the object after delete.
-                if matches!(mount.info.write_type, WriteType::AsyncThrough) {
-                    self.wait_job_complete(path, "delete").await?;
+                let is_async_through = matches!(mount.info.write_type, WriteType::AsyncThrough);
+
+                if is_async_through {
+                    // Invalidate async-through source first so in-flight jobs cannot commit stale data.
+                    self.cancel_job_for_mount_meta_op(path, "delete").await;
+                    if let Err(e) = self.cv.delete(path, recursive).await {
+                        if !matches!(e, FsError::FileNotFound(_)) {
+                            warn!("failed to delete cache for {}: {}", path, e);
+                        }
+                    }
                 }
 
                 // Delete from UFS
                 mount.ufs.delete(&ufs_path, recursive).await?;
 
-                // delete cache
-                if let Err(e) = self.cv.delete(path, recursive).await {
-                    if !matches!(e, FsError::FileNotFound(_)) {
-                        warn!("failed to delete cache for {}: {}", path, e);
-                    }
-                };
+                if !is_async_through {
+                    // delete cache
+                    if let Err(e) = self.cv.delete(path, recursive).await {
+                        if !matches!(e, FsError::FileNotFound(_)) {
+                            warn!("failed to delete cache for {}: {}", path, e);
+                        }
+                    };
+                }
 
                 Ok(())
             }

@@ -13,11 +13,14 @@
 // limitations under the License.
 
 use bytes::BytesMut;
+use curvine_client::rpc::JobMasterClient;
 use curvine_client::unified::{UnifiedFileSystem, UnifiedReader, UnifiedWriter};
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOptsBuilder, MountOptionsBuilder, MountType, OpenFlags, WriteType,
+    CreateFileOptsBuilder, JobTaskProgress, JobTaskState, MountOptionsBuilder, MountType,
+    OpenFlags, WriteType,
 };
+use curvine_common::utils::CommonUtils;
 use curvine_tests::Testing;
 use orpc::common::Utils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -171,6 +174,171 @@ fn test_async_through_delete_should_not_leave_ufs_residue() {
             leaked.len(),
             leaked.iter().take(5).collect::<Vec<_>>()
         );
+    })
+}
+
+#[test]
+fn test_async_through_recreate_after_delete_should_sync_new_generation() {
+    if env::var("UFS_TEST_PATH").is_err() {
+        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
+        return;
+    }
+
+    let testing = Testing::builder().workers(3).build().unwrap();
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+    let dir = format!(
+        "write_cache_async_delete_recreate_gen_{}",
+        Utils::rand_str(8)
+    );
+
+    rt.block_on(async move {
+        mount_with_dir(&fs, WriteType::AsyncThrough, &dir).await;
+
+        let path = Path::from_str(format!("/{dir}/recreate_same_path.txt")).unwrap();
+        let old_data = b"old-generation";
+        let new_data = b"new-generation";
+
+        // Submit generation-1 async-through job.
+        let mut old_writer = fs.create(&path, true).await.unwrap();
+        old_writer.write(old_data).await.unwrap();
+        old_writer.complete().await.unwrap();
+
+        // Delete immediately, then recreate same path with generation-2 content.
+        fs.delete(&path, false).await.unwrap();
+
+        let mut new_writer = fs.create(&path, true).await.unwrap();
+        new_writer.write(new_data).await.unwrap();
+        new_writer.complete().await.unwrap();
+        if let UnifiedWriter::CacheSync(sync_writer) = &new_writer {
+            sync_writer.wait_job_complete().await.unwrap();
+        }
+
+        // UFS must contain only the latest generation data.
+        let (ufs_path, mount) = fs.get_mount(&path).await.unwrap().unwrap();
+        let mut reader = mount.ufs.open(&ufs_path).await.unwrap();
+        let mut data = BytesMut::zeroed(reader.len() as usize);
+        reader.read_full(&mut data).await.unwrap();
+        reader.complete().await.unwrap();
+        assert_eq!(data.as_ref(), new_data);
+    })
+}
+
+#[test]
+fn test_async_through_delete_ignores_stale_failed_job() {
+    if env::var("UFS_TEST_PATH").is_err() {
+        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
+        return;
+    }
+
+    let testing = Testing::builder().workers(3).build().unwrap();
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+    let dir = format!("write_cache_async_delete_failed_job_{}", Utils::rand_str(8));
+
+    rt.block_on(async move {
+        mount_with_dir(&fs, WriteType::AsyncThrough, &dir).await;
+        let path = Path::from_str(format!("/{dir}/delete_failed_job.txt")).unwrap();
+
+        // Seed a normal async-through file so UFS has a real object.
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write(b"delete-after-failed-job").await.unwrap();
+        writer.complete().await.unwrap();
+        if let UnifiedWriter::CacheSync(sync_writer) = &writer {
+            sync_writer.wait_job_complete().await.unwrap();
+        }
+
+        let (ufs_path, mount) = fs.get_mount(&path).await.unwrap().unwrap();
+        assert!(mount.ufs.exists(&ufs_path).await.unwrap());
+
+        // Force path-scoped sync job into a terminal non-completed state.
+        // This mimics stale Failed/Canceled jobs observed in production.
+        let job_client = JobMasterClient::with_context(fs.fs_context());
+        let job_id = CommonUtils::create_job_id(path.full_path());
+        let task_id = format!("{job_id}_task_0");
+        let failed_progress = JobTaskProgress {
+            state: JobTaskState::Failed,
+            loaded_size: 0,
+            total_size: 0,
+            update_time: 0,
+            message: "inject stale failed status for regression".to_string(),
+        };
+        job_client
+            .report_task(&job_id, &task_id, failed_progress)
+            .await
+            .unwrap();
+        assert!(
+            job_client
+                .wait_job_complete(&job_id, "test-delete-failed-job")
+                .await
+                .is_err(),
+            "expected stale sync job to stay non-completed after failure injection"
+        );
+
+        // Deleting mount file should still succeed; stale failed job must not block unlink.
+        fs.delete(&path, false).await.unwrap();
+        assert!(!mount.ufs.exists(&ufs_path).await.unwrap());
+    })
+}
+
+#[test]
+fn test_async_through_rename_ignores_stale_failed_job() {
+    if env::var("UFS_TEST_PATH").is_err() {
+        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
+        return;
+    }
+
+    let testing = Testing::builder().workers(3).build().unwrap();
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+    let dir = format!("write_cache_async_rename_failed_job_{}", Utils::rand_str(8));
+
+    rt.block_on(async move {
+        mount_with_dir(&fs, WriteType::AsyncThrough, &dir).await;
+        let src = Path::from_str(format!("/{dir}/rename_src.txt")).unwrap();
+        let dst = Path::from_str(format!("/{dir}/rename_dst.txt")).unwrap();
+
+        let mut writer = fs.create(&src, true).await.unwrap();
+        writer.write(b"rename-after-failed-job").await.unwrap();
+        writer.complete().await.unwrap();
+        if let UnifiedWriter::CacheSync(sync_writer) = &writer {
+            sync_writer.wait_job_complete().await.unwrap();
+        }
+
+        let (src_ufs_path, mount) = fs.get_mount(&src).await.unwrap().unwrap();
+        let (dst_ufs_path, _) = fs.get_mount(&dst).await.unwrap().unwrap();
+        assert!(mount.ufs.exists(&src_ufs_path).await.unwrap());
+
+        // Inject stale failed state into path-scoped sync job.
+        let job_client = JobMasterClient::with_context(fs.fs_context());
+        let job_id = CommonUtils::create_job_id(src.full_path());
+        let task_id = format!("{job_id}_task_0");
+        let failed_progress = JobTaskProgress {
+            state: JobTaskState::Failed,
+            loaded_size: 0,
+            total_size: 0,
+            update_time: 0,
+            message: "inject stale failed status for rename regression".to_string(),
+        };
+        job_client
+            .report_task(&job_id, &task_id, failed_progress)
+            .await
+            .unwrap();
+        assert!(
+            job_client
+                .wait_job_complete(&job_id, "test-rename-failed-job")
+                .await
+                .is_err(),
+            "expected stale sync job to stay non-completed after failure injection"
+        );
+
+        // Renaming mount file should still succeed; stale failed job must not block rename.
+        fs.rename(&src, &dst).await.unwrap();
+        assert!(!mount.ufs.exists(&src_ufs_path).await.unwrap());
+        assert!(mount.ufs.exists(&dst_ufs_path).await.unwrap());
     })
 }
 

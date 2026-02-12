@@ -1149,7 +1149,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn create(&self, op: Create<'_>) -> FuseResult<fuse_create_out> {
         if !FuseUtils::s_isreg(op.arg.mode) {
-            return err_fuse!(libc::EIO);
+            return err_fuse!(libc::EINVAL);
         }
 
         let id = op.header.nodeid;
@@ -1450,7 +1450,7 @@ impl fs::FileSystem for CurvineFileSystem {
             let res = self.create(op).await?;
             let handle = self.state.remove_handle(res.0.nodeid, res.1.fh);
             if handle.is_none() {
-                return err_fuse!(libc::EIO);
+                return err_fuse!(libc::EBADF);
             }
             let out = fuse_entry_out {
                 nodeid: res.0.nodeid,

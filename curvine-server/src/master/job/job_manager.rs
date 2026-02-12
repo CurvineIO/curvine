@@ -148,7 +148,6 @@ impl JobManager {
                         "job {} is already in final state {:?}, source_path: {}, target_path: {}",
                         job_id, state, job.info.source_path, job.info.target_path
                     );
-                    self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user");
                     return Ok(());
                 }
 

@@ -69,7 +69,7 @@ impl FileHandle {
     ) -> FuseResult<()> {
         let reader = match &self.reader {
             Some(v) => v,
-            None => return err_fuse!(libc::EIO),
+            None => return err_fuse!(libc::EBADF),
         };
 
         if op.arg.offset as i64 >= reader.len() {
@@ -101,7 +101,7 @@ impl FileHandle {
         let lock = if let Some(lock) = &self.writer {
             lock
         } else {
-            return err_fuse!(libc::EIO);
+            return err_fuse!(libc::EBADF);
         };
 
         let mut writer = lock.lock().await;
