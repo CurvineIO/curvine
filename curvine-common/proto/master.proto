@@ -193,7 +193,8 @@ message GetBlockLocationsResponse {
 
 // Request master profile information.
 message GetMasterInfoRequest {
-
+    // Client version (format: "major.minor.patch")
+    optional string client_version = 1 [default = ""];
 }
 
 message GetMasterInfoResponse {
