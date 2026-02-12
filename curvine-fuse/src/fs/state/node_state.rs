@@ -20,6 +20,7 @@ use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult, STATE_FILE_MAGIC, STATE_FILE_VERSION};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
+use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, MetaCache, Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
 use log::{error, info, warn};
@@ -27,13 +28,18 @@ use orpc::common::FastHashMap;
 use orpc::err_box;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::sync::Mutex;
+
+const WRITER_LOCK_STRIPES: usize = 1024;
 
 pub struct NodeState {
     node_map: RwLock<NodeMap>,
     handles: RwLockHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
     dir_handles: RwLockHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
+    writer_locks: Vec<Arc<Mutex<()>>>,
     fh_creator: AtomicCounter,
     meta_cache: MetaCache,
     fs: UnifiedFileSystem,
@@ -45,11 +51,15 @@ impl NodeState {
         let conf = fs.conf().fuse.clone();
         let node_map = NodeMap::new(&conf);
         let meta_cache = MetaCache::new(conf.meta_cache_capacity, conf.meta_cache_ttl_duration);
+        let writer_locks = (0..WRITER_LOCK_STRIPES)
+            .map(|_| Arc::new(Mutex::new(())))
+            .collect();
 
         Self {
             node_map: RwLock::new(node_map),
             handles: RwLockHashMap::default(),
             dir_handles: RwLockHashMap::default(),
+            writer_locks,
             fh_creator: AtomicCounter::new(0),
             meta_cache,
             fs,
@@ -222,6 +232,13 @@ impl NodeState {
         self.node_write().find_link_inode(curvine_ino, fuse_ino)
     }
 
+    pub fn writer_path_lock(&self, path: &Path) -> Arc<Mutex<()>> {
+        let mut hasher = DefaultHasher::new();
+        path.full_path().hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.writer_locks.len();
+        self.writer_locks[idx].clone()
+    }
+
     fn find_writer0(
         map: &FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
         ino: &u64,
@@ -258,9 +275,34 @@ impl NodeState {
             return Ok(writer);
         }
 
-        let writer = self.fs.open_with_opts(path, opts, flags).await?;
+        let writer = match self.fs.open_with_opts(path, opts.clone(), flags).await {
+            Ok(writer) => writer,
+
+            Err(e) if Self::should_retry_open_as_create(flags, &e) => {
+                // Linux may route O_CREAT|O_TRUNC through OPEN (without CREAT bit)
+                // when a stale positive dentry exists. Retry with CREAT to recover.
+                let retry_flags = flags.set_create(true);
+                warn!(
+                    "retry open with O_CREAT for {} (flags={} -> {}) after {:?}",
+                    path,
+                    flags.access_mark(),
+                    retry_flags.access_mark(),
+                    e
+                );
+                self.fs.open_with_opts(path, opts, retry_flags).await?
+            }
+
+            Err(e) => return Err(e.into()),
+        };
         let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
         Ok(Arc::new(Mutex::new(writer)))
+    }
+
+    fn should_retry_open_as_create(flags: OpenFlags, err: &FsError) -> bool {
+        matches!(err, FsError::FileNotFound(_))
+            && flags.write_only()
+            && flags.truncate()
+            && !flags.create()
     }
 
     pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
@@ -277,11 +319,27 @@ impl NodeState {
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
+        if flags.write() {
+            // Serialize write-open paths per logical file (striped lock) to avoid
+            // open/release races that can close writer channels while a new fd is being created.
+            let path_lock = self.writer_path_lock(path);
+            let _guard = path_lock.lock().await;
+            return self.new_handle_inner(ino, path, flags, opts).await;
+        }
+        self.new_handle_inner(ino, path, flags, opts).await
+    }
 
-        // Before creating reader, flush any active writer to ensure reader gets correct file length
-        // This is critical for applications like git clone that read files while they're being written
+    async fn new_handle_inner(
+        &self,
+        ino: u64,
+        path: &Path,
+        flags: OpenFlags,
+        opts: CreateFileOpts,
+    ) -> FuseResult<Arc<FileHandle>> {
+        // Before creating reader, flush any active writer to reduce read-after-write visibility gap.
         if flags.read() {
-            if let Some(existing_writer) = self.find_writer(&ino) {
+            let existing_writer = self.find_writer(&ino);
+            if let Some(existing_writer) = existing_writer {
                 existing_writer.lock().await.flush(None).await?;
             }
         }
@@ -326,7 +384,7 @@ impl NodeState {
             }
         };
 
-        let status = if let Some(writer) = &writer {
+        let mut status = if let Some(writer) = &writer {
             let lock = writer.lock().await;
             lock.status().clone()
         } else if let Some(reader) = &reader {
@@ -335,11 +393,16 @@ impl NodeState {
             return err_fuse!(libc::EINVAL, "Invalid flags: {:?}", flags);
         };
 
+        // FileHandle always keeps logical Curvine path for follow-up FUSE operations.
+        status.path = path.full_path().to_string();
+        status.name = path.name().to_string();
+
         let mut lock = self.handles.write();
 
-        // Check if writer already exists to prevent duplicate creation
+        // Check if writer already exists to prevent duplicate creation.
         let check_writer = if let Some(writer) = writer {
-            if let Some(exist_writer) = Self::find_writer0(&lock, &ino) {
+            let exist_writer = Self::find_writer0(&lock, &ino);
+            if let Some(exist_writer) = exist_writer {
                 Some(exist_writer)
             } else {
                 Some(writer)
@@ -396,6 +459,15 @@ impl NodeState {
         let lock = self.handles.read();
         if let Some(map) = lock.get(&ino) {
             !map.is_empty()
+        } else {
+            false
+        }
+    }
+
+    pub fn has_open_writer_handles(&self, ino: u64) -> bool {
+        let lock = self.handles.read();
+        if let Some(map) = lock.get(&ino) {
+            map.values().any(|handle| handle.has_writer())
         } else {
             false
         }
@@ -622,7 +694,9 @@ mod test {
     use crate::FUSE_ROOT_ID;
     use curvine_client::unified::UnifiedFileSystem;
     use curvine_common::conf::{ClusterConf, FuseConf};
+    use curvine_common::error::FsError;
     use curvine_common::state::FileStatus;
+    use curvine_common::state::OpenFlags;
     use orpc::runtime::AsyncRuntime;
     use orpc::CommonResult;
     use std::sync::Arc;
@@ -688,5 +762,24 @@ mod test {
         assert!(c1.is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn retry_open_as_create_predicate() {
+        let wt = OpenFlags::new_write_only().set_truncate(true);
+        let wct = OpenFlags::new_write_only()
+            .set_truncate(true)
+            .set_create(true);
+        let wa = OpenFlags::new_append();
+        let rd = OpenFlags::new_read_only();
+
+        let not_found = FsError::file_not_found("/lsr-test/file.bin");
+        let exists = FsError::file_exists("/lsr-test/file.bin");
+
+        assert!(NodeState::should_retry_open_as_create(wt, &not_found));
+        assert!(!NodeState::should_retry_open_as_create(wct, &not_found));
+        assert!(!NodeState::should_retry_open_as_create(wa, &not_found));
+        assert!(!NodeState::should_retry_open_as_create(rd, &not_found));
+        assert!(!NodeState::should_retry_open_as_create(wt, &exists));
     }
 }

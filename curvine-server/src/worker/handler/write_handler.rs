@@ -225,19 +225,22 @@ impl WriteHandler {
         }
         let context = WriteContext::from_req(msg)?;
 
-        // flush and close the file.
-        let file = self.file.take();
-        if let Some(mut file) = file {
-            file.flush()?;
-            drop(file);
-        }
-
         if context.block.len > context.block_size {
             return err_box!(
                 "Invalid write offset: {}, block size: {}",
                 context.block.len,
                 context.block_size
             );
+        }
+
+        // flush and close the file.
+        let file = self.file.take();
+        if let Some(mut file) = file {
+            file.flush()?;
+            if file.len() != context.block.len {
+                file.resize(true, 0, context.block.len, 0)?;
+            }
+            drop(file);
         }
 
         // Submit block.

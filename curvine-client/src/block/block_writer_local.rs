@@ -116,7 +116,19 @@ impl BlockWriterLocal {
     }
 
     pub async fn complete(&mut self) -> FsResult<()> {
-        self.flush().await?;
+        let target_len = self.block.len;
+        let file = self.file.clone();
+        self.rt
+            .spawn_blocking(move || {
+                let file = file.as_mut();
+                file.flush()?;
+                if file.len() != target_len {
+                    file.resize(true, 0, target_len, 0)?;
+                }
+                Ok::<(), FsError>(())
+            })
+            .await??;
+
         let next_seq_id = self.next_seq_id();
         let client = self.fs_context.acquire_write(&self.worker_address).await?;
         client

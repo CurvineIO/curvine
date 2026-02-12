@@ -22,6 +22,7 @@ use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
 use curvine_common::FsResult;
 use futures::StreamExt;
+use log::warn;
 use opendal::services::*;
 use opendal::{
     layers::{LoggingLayer, RetryLayer, TimeoutLayer},
@@ -45,6 +46,61 @@ pub struct OpendalReader {
     chunk_size: usize,
     byte_stream: Option<opendal::FuturesBytesStream>,
     status: FileStatus,
+}
+
+impl OpendalReader {
+    async fn create_stream(&mut self, start: i64) -> FsResult<()> {
+        if start >= self.length {
+            self.byte_stream = None;
+            return Ok(());
+        }
+
+        let reader = self
+            .operator
+            .reader_with(&self.object_path)
+            .chunk(self.chunk_size)
+            .await
+            .map_err(|e| FsError::common(format!("Failed to create reader: {}", e)))?;
+
+        self.byte_stream = Some(
+            reader
+                .into_bytes_stream(start as u64..self.length as u64)
+                .await
+                .map_err(|e| FsError::common(format!("Failed to create stream: {}", e)))?,
+        );
+
+        Ok(())
+    }
+
+    async fn try_recover_shrunk_object(&mut self) -> FsResult<bool> {
+        let latest_len = match self.operator.stat(&self.object_path).await {
+            Ok(metadata) => metadata.content_length() as i64,
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(FsError::common(format!(
+                    "Failed to restat file after read error: {}",
+                    e
+                )));
+            }
+        };
+
+        if latest_len < self.length {
+            warn!(
+                "opendal reader detected shrink during read, path={}, len {} -> {}, pos={}",
+                self.path, self.length, latest_len, self.pos
+            );
+            self.length = latest_len;
+            self.status.len = latest_len;
+            if self.pos > self.length {
+                self.pos = self.length;
+            }
+            self.byte_stream = None;
+            self.chunk = DataSlice::Empty;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
 }
 
 impl Reader for OpendalReader {
@@ -81,65 +137,53 @@ impl Reader for OpendalReader {
             return Ok(DataSlice::Empty);
         }
 
-        // Initialize stream if needed
-        if self.byte_stream.is_none() {
-            let reader = self
-                .operator
-                .reader_with(&self.object_path)
-                .chunk(self.chunk_size)
-                .await
-                .map_err(|e| FsError::common(format!("Failed to create reader: {}", e)))?;
+        let mut recoveries = 0;
+        loop {
+            if self.byte_stream.is_none() {
+                self.create_stream(self.pos).await?;
+            }
 
-            self.byte_stream = Some(
-                reader
-                    .into_bytes_stream(self.pos as u64..self.length as u64)
-                    .await
-                    .map_err(|e| FsError::common(format!("Failed to create stream: {}", e)))?,
-            );
-        }
+            if let Some(stream) = &mut self.byte_stream {
+                match stream.next().await {
+                    Some(Ok(chunk)) => return Ok(DataSlice::Bytes(chunk)),
 
-        if let Some(stream) = &mut self.byte_stream {
-            if let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => Ok(DataSlice::Bytes(chunk)),
-                    Err(e) => Err(FsError::common(format!("Failed to read chunk: {}", e))),
+                    Some(Err(e)) => {
+                        if recoveries < 8 && self.try_recover_shrunk_object().await? {
+                            recoveries += 1;
+                            if !self.has_remaining() {
+                                return Ok(DataSlice::Empty);
+                            }
+                            continue;
+                        }
+
+                        return Err(FsError::common(format!("Failed to read chunk: {}", e)));
+                    }
+
+                    None => return Ok(DataSlice::Empty),
                 }
             } else {
-                Ok(DataSlice::Empty)
+                return Ok(DataSlice::Empty);
             }
-        } else {
-            Ok(DataSlice::Empty)
         }
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        if pos < 0 || pos > self.length {
+        if pos < 0 {
             return Err(FsError::common("Invalid seek position"));
         }
 
+        // For read path, seeking past EOF should behave as EOF instead of error.
+        let target = pos.min(self.length);
+
         // If seeking backward or forward significantly, reset the stream
-        if pos < self.pos || pos > self.pos + (self.chunk_size as i64 * 2) {
+        if target < self.pos || target > self.pos + (self.chunk_size as i64 * 2) {
             self.byte_stream = None;
             self.chunk = DataSlice::Empty;
-
-            // Create new stream starting from the seek position
-            let reader = self
-                .operator
-                .reader_with(&self.object_path)
-                .chunk(self.chunk_size)
-                .await
-                .map_err(|e| FsError::common(format!("Failed to create reader: {}", e)))?;
-
-            self.byte_stream = Some(
-                reader
-                    .into_bytes_stream(pos as u64..self.length as u64)
-                    .await
-                    .map_err(|e| FsError::common(format!("Failed to create stream: {}", e)))?,
-            );
+            self.create_stream(target).await?;
         } else {
             // Skip forward in the current stream
-            while self.pos < pos {
-                let skip_bytes = (pos - self.pos).min(self.chunk_size as i64) as usize;
+            while self.pos < target {
+                let skip_bytes = (target - self.pos).min(self.chunk_size as i64) as usize;
                 if self.chunk.is_empty() {
                     self.chunk = self.read_chunk0().await?;
                 }
@@ -152,7 +196,7 @@ impl Reader for OpendalReader {
             }
         }
 
-        self.pos = pos;
+        self.pos = target;
         Ok(())
     }
 
@@ -170,6 +214,7 @@ pub struct OpendalWriter {
     object_path: String,
     status: FileStatus,
     pos: i64,
+    append_mode: bool,
     chunk: BytesMut,
     chunk_size: usize,
     writer: Option<opendal::Writer>,
@@ -246,6 +291,12 @@ impl Writer for OpendalWriter {
     }
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if self.append_mode {
+            // For O_APPEND writes from FUSE, kernel-provided offsets can be stale across fds.
+            // Keep appending at current writer position instead of rejecting as random write.
+            return Ok(());
+        }
+
         if self.pos != pos {
             err_box!("not support random write")
         } else {
@@ -681,6 +732,38 @@ impl OpendalFileSystem {
 
         Ok(metadata.map(|m| Self::read_status(path, &m)))
     }
+
+    async fn delete_object_with_verification(
+        &self,
+        object_path: &str,
+        target: &str,
+    ) -> FsResult<()> {
+        match self.operator.delete(object_path).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(()),
+            Err(delete_err) => {
+                // Some S3-compatible stores can return an error even when delete has been applied.
+                // Verify existence once and treat "already gone" as success.
+                match self.operator.stat(object_path).await {
+                    Ok(_) => Err(FsError::common(format!(
+                        "Failed to delete {} {}: {}",
+                        target, object_path, delete_err
+                    ))),
+                    Err(stat_err) if stat_err.kind() == opendal::ErrorKind::NotFound => {
+                        warn!(
+                            "delete {} {} returned error but object is already gone: {}",
+                            target, object_path, delete_err
+                        );
+                        Ok(())
+                    }
+                    Err(stat_err) => Err(FsError::common(format!(
+                        "Failed to delete {} {}: {}; stat after delete also failed: {}",
+                        target, object_path, delete_err, stat_err
+                    ))),
+                }
+            }
+        }
+    }
 }
 
 impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
@@ -724,6 +807,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             object_path,
             status,
             pos: 0,
+            append_mode: false,
             chunk: BytesMut::with_capacity(8 * 1024 * 1024),
             chunk_size: 8 * 1024 * 1024,
             writer: None,
@@ -753,6 +837,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                         object_path,
                         pos: s.len,
                         status: s,
+                        append_mode: true,
                         chunk: BytesMut::from(chunk.to_vec().as_slice()),
                         chunk_size: 8 * 1024 * 1024,
                         writer: None,
@@ -827,27 +912,45 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         let object_path = self.get_object_path(path)?;
 
         if recursive {
+            let dir_path = self.get_dir_path(path)?;
             // Check if it's a directory
             match self.operator.stat(&object_path).await {
-                Ok(metadata) if metadata.is_dir() => self.operator.remove_all(&object_path).await,
-                _ => self.operator.delete(&object_path).await,
+                Ok(metadata) if metadata.is_dir() => {
+                    self.operator.remove_all(&object_path).await.map_err(|e| {
+                        FsError::common(format!("Failed to delete recursive: {}", e))
+                    })?
+                }
+                _ => {
+                    self.delete_object_with_verification(&object_path, "file")
+                        .await?
+                }
             }
-            .map_err(|e| FsError::common(format!("Failed to delete recursive: {}", e)))?;
+
+            if dir_path != object_path {
+                // Prefix-only directories may have no marker at object_path.
+                // Ensure recursive delete still clears descendants under `<path>/`.
+                self.operator.remove_all(&dir_path).await.map_err(|e| {
+                    FsError::common(format!(
+                        "Failed to delete recursive directory prefix {}: {}",
+                        dir_path, e
+                    ))
+                })?;
+
+                self.delete_object_with_verification(&dir_path, "directory marker")
+                    .await?;
+            }
         } else {
-            // Try to delete as file first
-            self.operator
-                .delete(&object_path)
-                .await
-                .map_err(|e| FsError::common(format!("Failed to delete file: {}", e)))?;
+            // Try to delete as file first.
+            self.delete_object_with_verification(&object_path, "file")
+                .await?;
 
             // Also try to delete as directory marker (with suffix)
             // S3 delete is idempotent, so it's safe to try deleting the marker even if it doesn't exist
             // or if we just deleted a file.
             let dir_path = self.get_dir_path(path)?;
             if dir_path != object_path {
-                self.operator.delete(&dir_path).await.map_err(|e| {
-                    FsError::common(format!("Failed to delete directory marker: {}", e))
-                })?;
+                self.delete_object_with_verification(&dir_path, "directory marker")
+                    .await?;
             }
         }
 
@@ -894,5 +997,52 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
 
     async fn set_attr(&self, _path: &Path, _opts: SetAttrOpts) -> FsResult<()> {
         err_ufs!("SetAttr operation is not supported by OpenDAL file system")
+    }
+}
+
+#[cfg(all(test, feature = "opendal-s3"))]
+mod tests {
+    use super::*;
+    use opendal::services::S3;
+
+    fn new_test_writer(pos: i64, append_mode: bool) -> OpendalWriter {
+        let mut builder = S3::default();
+        builder = builder.bucket("test-bucket");
+        builder = builder.region("us-east-1");
+        builder = builder.endpoint("http://127.0.0.1:1");
+
+        let operator = Operator::new(builder).unwrap().finish();
+
+        OpendalWriter {
+            operator,
+            path: Path::from_str("s3://test-bucket/test.txt").unwrap(),
+            object_path: "test.txt".to_string(),
+            status: FileStatus::default(),
+            pos,
+            append_mode,
+            chunk: BytesMut::with_capacity(8 * 1024 * 1024),
+            chunk_size: 8 * 1024 * 1024,
+            writer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn append_like_seek_should_tolerate_stale_offset() {
+        let mut writer = new_test_writer(128, true);
+
+        let res = writer.seek(0).await;
+        assert!(
+            res.is_ok(),
+            "append-like write should not fail on stale offset, got: {:?}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    async fn non_append_seek_should_reject_random_offset() {
+        let mut writer = new_test_writer(128, false);
+
+        let res = writer.seek(0).await;
+        assert!(res.is_err(), "non-append random write should fail");
     }
 }

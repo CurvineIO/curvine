@@ -69,7 +69,7 @@ pub struct MountCommand {
     #[arg(
         long,
         default_value = "async_through",
-        help = "Write type: cache, through, async_through, cache_through"
+        help = "Write type: cache, through, async_through, cache_through. Note: through writes directly to UFS and concurrent-write behavior depends on UFS capabilities."
     )]
     write_type: String,
 

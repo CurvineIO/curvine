@@ -21,9 +21,9 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader};
 use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, LoadJobCommand,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
-    WriteType,
+    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, JobTaskState,
+    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
+    SetAttrOpts, WriteType,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -201,6 +201,16 @@ impl UnifiedFileSystem {
 
         // Cache must be complete to be valid
         if !cv_status.is_complete() {
+            if matches!(
+                mount.info.write_type,
+                WriteType::AsyncThrough | WriteType::CacheThrough
+            ) {
+                // During write-through style writes, readers can race with an unfinished CV inode.
+                // Falling back to UFS here can trigger read-range errors and import jobs that overwrite
+                // in-flight metadata. Prefer CV as source of truth until write completion.
+                return Ok(CacheValidity::Valid);
+            }
+
             log::debug!(
                 "check_cache_validity: INVALID - cache not complete, ufs_path={}, cv_len={}",
                 ufs_path,
@@ -279,8 +289,65 @@ impl UnifiedFileSystem {
         }
     }
 
+    async fn wait_job_complete_for_mount_meta_op(&self, path: &Path, mark: &str) -> FsResult<()> {
+        match self.wait_job_complete(path, mark).await {
+            Ok(()) => Ok(()),
+            Err(wait_err) => {
+                let client = JobMasterClient::new(self.fs_client());
+                let job_id = CommonUtils::create_job_id(path.full_path());
+                match client.get_job_status(&job_id).await {
+                    Ok(status)
+                        if matches!(
+                            status.state,
+                            JobTaskState::Failed | JobTaskState::Canceled
+                        ) =>
+                    {
+                        warn!(
+                            "[{}] ignore stale async-through job {} for {}: {:?}, progress: {}",
+                            mark, status.job_id, path, status.state, status.progress.message
+                        );
+                        Ok(())
+                    }
+                    Ok(_) => Err(wait_err),
+                    Err(FsError::JobNotFound(_)) => Ok(()),
+                    Err(status_err) => {
+                        warn!(
+                            "[{}] failed to inspect async-through job {} for {}: {}, original wait error: {}",
+                            mark, job_id, path, status_err, wait_err
+                        );
+                        Err(wait_err)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn cancel_job_for_mount_meta_op(&self, path: &Path, mark: &str) {
+        let client = JobMasterClient::new(self.fs_client());
+        let job_id = CommonUtils::create_job_id(path.full_path());
+        match client.cancel_job(&job_id).await {
+            Ok(()) => info!(
+                "[{}] canceled async-through job {} for {}",
+                mark, job_id, path
+            ),
+            Err(FsError::JobNotFound(_)) => {}
+            Err(e) => warn!(
+                "[{}] failed to cancel async-through job {} for {}: {}",
+                mark, job_id, path, e
+            ),
+        }
+    }
+
     pub async fn cleanup(&self) {
         self.cv.cleanup().await
+    }
+
+    async fn invalidate_cv_cache_for_mount_write(&self, path: &Path) {
+        if let Err(e) = self.cv.delete(path, false).await {
+            if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
+                warn!("failed to invalidate mount cache file {}: {}", path, e);
+            }
+        }
     }
 
     pub fn disable_unified(&mut self) {
@@ -307,6 +374,10 @@ impl UnifiedFileSystem {
                 }
 
                 WriteType::Through => {
+                    // Through-mode writes bypass Curvine data path, so stale cache must be removed
+                    // before writing to avoid serving outdated cache on subsequent reads.
+                    self.invalidate_cv_cache_for_mount_write(path).await;
+
                     let writer = if flags.append() {
                         mount.ufs.append(&ufs_path).await?
                     } else {
@@ -316,10 +387,14 @@ impl UnifiedFileSystem {
                 }
 
                 _ => {
+                    let mut cv_flags = flags;
                     if flags.overwrite() {
                         mount.ufs.create(&ufs_path, true).await?;
+                        if !cv_flags.create() {
+                            cv_flags = cv_flags.set_create(true);
+                        }
                     }
-                    let writer = CacheSyncWriter::new(self, path, &mount, flags).await?;
+                    let writer = CacheSyncWriter::new(self, path, &mount, cv_flags).await?;
                     Ok(UnifiedWriter::CacheSync(writer))
                 }
             },
@@ -424,7 +499,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     async fn append(&self, path: &Path) -> FsResult<UnifiedWriter> {
         match self.get_mount(path).await? {
             None => Ok(UnifiedWriter::Cv(self.cv.append(path).await?)),
-            Some((ufs_path, mount)) => mount.ufs.append(&ufs_path).await,
+            Some((ufs_path, mount)) => {
+                if matches!(mount.info.write_type, WriteType::Through) {
+                    self.invalidate_cv_cache_for_mount_write(path).await;
+                }
+                mount.ufs.append(&ufs_path).await
+            }
         }
     }
 
@@ -444,6 +524,19 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             None => return Ok(UnifiedReader::Cv(self.cv.open(path).await?)),
             Some(v) => v,
         };
+
+        if matches!(mount.info.write_type, WriteType::Through) {
+            // Through mode treats UFS as the single source of truth for reads.
+            if self.enable_read_ufs {
+                info!(
+                    "read from ufs(through), ufs path {}, cv path: {}",
+                    ufs_path, path
+                );
+                return mount.ufs.open(&ufs_path).await;
+            } else {
+                return err_ext!(FsError::unsupported_ufs_read(path.path()));
+            }
+        }
 
         if let Some(reader) = self.get_cv_reader(path, &ufs_path, &mount).await? {
             info!(
@@ -476,7 +569,6 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             }
         }
     }
-
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
         let _timer = TimeSpent::timer_counter_vec(
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
@@ -489,7 +581,8 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 // This ensures all data has been fully written to UFS, preventing data loss or inconsistency
                 // that could occur if we rename a file while its data is still being synced.
                 if mount.info.is_write_through() {
-                    self.wait_job_complete(src, "rename").await?;
+                    self.wait_job_complete_for_mount_meta_op(src, "rename")
+                        .await?;
                 }
 
                 let dst_ufs = mount.get_ufs_path(dst)?;
@@ -515,15 +608,29 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         match self.get_mount(path).await? {
             None => self.cv.delete(path, recursive).await,
             Some((ufs_path, mount)) => {
+                let is_async_through = matches!(mount.info.write_type, WriteType::AsyncThrough);
+
+                if is_async_through {
+                    // Invalidate async-through source first so in-flight jobs cannot commit stale data.
+                    self.cancel_job_for_mount_meta_op(path, "delete").await;
+                    if let Err(e) = self.cv.delete(path, recursive).await {
+                        if !matches!(e, FsError::FileNotFound(_)) {
+                            warn!("failed to delete cache for {}: {}", path, e);
+                        }
+                    }
+                }
+
                 // Delete from UFS
                 mount.ufs.delete(&ufs_path, recursive).await?;
 
-                // delete cache
-                if let Err(e) = self.cv.delete(path, recursive).await {
-                    if !matches!(e, FsError::FileNotFound(_)) {
-                        warn!("failed to delete cache for {}: {}", path, e);
-                    }
-                };
+                if !is_async_through {
+                    // delete cache
+                    if let Err(e) = self.cv.delete(path, recursive).await {
+                        if !matches!(e, FsError::FileNotFound(_)) {
+                            warn!("failed to delete cache for {}: {}", path, e);
+                        }
+                    };
+                }
 
                 Ok(())
             }
@@ -541,6 +648,10 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Some(v) => v,
         };
 
+        if matches!(mount.info.write_type, WriteType::Through) {
+            return mount.ufs.get_status(&ufs_path).await;
+        }
+
         match self.cv.get_status(path).await {
             Ok(v) => match self.check_cache_validity(&v, &ufs_path, &mount).await? {
                 CacheValidity::Valid => Ok(v),
@@ -556,7 +667,6 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             }
         }
     }
-
     async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
         let _timer = TimeSpent::timer_counter_vec(
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),

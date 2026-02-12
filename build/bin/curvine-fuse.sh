@@ -18,6 +18,9 @@
 
 # Default mount point
 MNT_PATH=/curvine-fuse
+NEXT_IS_PATH=false
+HAS_ENTRY_TIMEOUT=false
+HAS_ATTR_TIMEOUT=false
 
 # Process arguments in a single loop
 for arg in "$@"; do
@@ -30,18 +33,41 @@ for arg in "$@"; do
     # Extract mount path from arguments if specified
     if [[ "$arg" == --mnt-path=* ]]; then
         MNT_PATH="${arg#*=}"
+    elif [[ "$arg" == --entry-timeout=* ]]; then
+        HAS_ENTRY_TIMEOUT=true
+    elif [[ "$arg" == --attr-timeout=* ]]; then
+        HAS_ATTR_TIMEOUT=true
     elif [[ "$arg" == "--mnt-path" ]]; then
-        next_is_path=true
+        NEXT_IS_PATH=true
         continue
-    elif [[ "$next_is_path" == true ]]; then
+    elif [[ "$arg" == "--entry-timeout" ]]; then
+        HAS_ENTRY_TIMEOUT=true
+        continue
+    elif [[ "$arg" == "--attr-timeout" ]]; then
+        HAS_ATTR_TIMEOUT=true
+        continue
+    elif [[ "$NEXT_IS_PATH" == true ]]; then
         MNT_PATH="$arg"
-        next_is_path=false
+        NEXT_IS_PATH=false
     fi
 done
 
 mkdir -p "$MNT_PATH"
 
-echo "Starting curvine-fuse with arguments: $*"
+EXTRA_ARGS=()
+STRICT_VISIBILITY="${CURVINE_FUSE_STRICT_VISIBILITY:-0}"
+if [[ "$STRICT_VISIBILITY" == "1" ]] || [[ "$STRICT_VISIBILITY" == "true" ]]; then
+    # Optional strict mode for read-after-write visibility tests.
+    # Keep default timeout behavior unchanged unless explicitly enabled.
+    if [[ "$HAS_ENTRY_TIMEOUT" == "false" ]]; then
+        EXTRA_ARGS+=(--entry-timeout 0)
+    fi
+    if [[ "$HAS_ATTR_TIMEOUT" == "false" ]]; then
+        EXTRA_ARGS+=(--attr-timeout 0)
+    fi
+fi
+
+echo "Starting curvine-fuse with arguments: $* ${EXTRA_ARGS[*]}"
 
 # Pass all arguments to launch-process.sh
-"$(cd "$(dirname "$0")"; pwd)"/launch-process.sh fuse "$@"
+"$(cd "$(dirname "$0")"; pwd)"/launch-process.sh fuse "$@" "${EXTRA_ARGS[@]}"

@@ -124,10 +124,16 @@ pub struct FuseArgs {
     pub cache_readdir: Option<bool>,
 
     // Timeout settings
-    #[arg(long, help = "Entry timeout in seconds (optional)")]
+    #[arg(
+        long,
+        help = "Entry timeout in seconds (optional). Use 0 with attr-timeout=0 for strict read-after-write visibility tests."
+    )]
     pub entry_timeout: Option<f64>,
 
-    #[arg(long, help = "Attribute timeout in seconds (optional)")]
+    #[arg(
+        long,
+        help = "Attribute timeout in seconds (optional). Use 0 with entry-timeout=0 for strict read-after-write visibility tests."
+    )]
     pub attr_timeout: Option<f64>,
 
     #[arg(long, help = "Negative timeout in seconds (optional)")]

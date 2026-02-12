@@ -116,6 +116,12 @@ impl JobContext {
         task_id: impl AsRef<str>,
         progress: JobTaskProgress,
     ) -> FsResult<()> {
+        let current_state: JobTaskState = self.state.state();
+        if current_state == JobTaskState::Canceled {
+            // User cancellation is terminal; ignore late task reports.
+            return Ok(());
+        }
+
         let task_id = task_id.as_ref();
         let detail = if let Some(v) = self.tasks.get_mut(task_id) {
             v
