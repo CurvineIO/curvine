@@ -650,11 +650,11 @@ impl FsDir {
         match inode {
             None => Ok(false),
             Some(v) => {
-                if v.is_file() {
+                if v.is_file() || v.is_container() {
                     Ok(true)
                 } else {
                     err_box!(
-                        "block_id {} resolves to inode_id {} which is not a file",
+                        "block_id {} resolves to inode_id {} which is not a file or container",
                         block_id,
                         file_id
                     )
