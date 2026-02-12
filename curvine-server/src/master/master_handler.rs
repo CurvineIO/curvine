@@ -379,16 +379,16 @@ impl MasterHandler {
             files: requests
                 .iter()
                 .enumerate()
-                .map(|(i, req)| {
+                .map(|(i, _)| {
                     SmallFileMeta {
-                        offset: requests[0..i].iter().map(|r| r.opts.block_size).sum(),
-                        len: req.opts.block_size,
+                        offset: requests[0..i].iter().map(|_| 0).sum(),
+                        len: 0,
                         block_index: 0,
                         mtime: container_status.mtime,
                     }
                     .to_proto()
                 })
-                .collect(),
+                .collect(), // initialize with dummy value
         };
 
         Ok(ContainerBatchResult {
