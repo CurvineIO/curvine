@@ -512,7 +512,7 @@ impl FsDir {
                 block
             }
             _ => {
-                panic!("error")
+                return err_box!("acquire_new_block only supports File and Container inodes, got: {}", inode.as_ref().name());
             }
         };
 

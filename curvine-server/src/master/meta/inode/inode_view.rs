@@ -162,7 +162,7 @@ impl InodeView {
         match self {
             File(name, _) => err_box!("Path not a dir: {}", name),
             Dir(_, d) => d.add_child(child),
-            _ => err_box!("Inode type error liuliu: {}", self.name()),
+            _ => err_box!("Inode type error: {}", self.name()),
         }
     }
 
