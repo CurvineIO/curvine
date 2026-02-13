@@ -10,7 +10,9 @@ import argparse
 import multiprocessing as mp
 import os
 import random
+import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -110,6 +112,21 @@ def collect_mp_results(
         except Exception:  # noqa: BLE001
             continue
     return results, expected - len(results)
+
+
+def parse_train_cmd_summary(output: str):
+    pattern = (
+        r"TRAIN_CMD_SUMMARY\s+steps=(?P<steps>\d+)\s+"
+        r"ckpt_renames=(?P<ckpt>\d+)\s+event_renames=(?P<event>\d+)"
+    )
+    match = re.search(pattern, output)
+    if not match:
+        return None
+    return {
+        "steps": int(match.group("steps")),
+        "ckpt_renames": int(match.group("ckpt")),
+        "event_renames": int(match.group("event")),
+    }
 
 
 def ensure_binary_files(
@@ -1219,6 +1236,214 @@ names:
     )
 
 
+def test_minimal_real_training_command(
+    base_path: str,
+    duration_sec: float = 75.0,
+    readers: int = 6,
+    keep_artifacts: bool = False,
+) -> bool:
+    """
+    Run a minimal real training command as a subprocess and verify tmp->rename publish path:
+    - last.pt.tmp -> last.pt
+    - events.out.tfevents.tmp -> events.out.tfevents
+    """
+    root = os.path.join(base_path, "real_train_cmd_rename_publish")
+    script_path = os.path.join(os.path.dirname(__file__), "min_train_cmd.py")
+    yolo_root = os.path.join(root, "yolov5", "code", "yolov5-master")
+    yaml_path = os.path.join(yolo_root, "data", "coco128.yaml")
+    run_dir = os.path.join(root, "runs", "train")
+    ckpt_dir = os.path.join(run_dir, "weights")
+    last_ckpt = os.path.join(ckpt_dir, "last.pt")
+    tb_event = os.path.join(run_dir, "events.out.tfevents")
+    image_dir = os.path.join(root, "yolov5", "code", "datasets", "coco128", "images", "train2017")
+
+    if not keep_artifacts:
+        safe_rmtree(root, retries=4, sleep_sec=0.2)
+    os.makedirs(root, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        script_path,
+        "--root",
+        root,
+        "--duration-sec",
+        f"{duration_sec:.1f}",
+    ]
+    print(
+        f"\n[{ts()}] === Test: Minimal real training command ({duration_sec:.1f}s, readers={readers}) ==="
+    )
+    print(f"[{ts()}]   CMD: {' '.join(cmd)}")
+
+    lock = threading.Lock()
+    stop = [False]
+    errors = []
+    counters = {
+        "yaml_ok": 0,
+        "ckpt_ok": 0,
+        "event_ok": 0,
+        "list_ok": 0,
+    }
+    seen = {
+        "yaml": False,
+        "ckpt": False,
+        "event": False,
+    }
+
+    def yaml_reader() -> None:
+        while not stop[0]:
+            try:
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    data = f.read()
+                if not is_valid_training_yaml(data):
+                    raise AssertionError(f"invalid yaml len={len(data)}")
+                with lock:
+                    seen["yaml"] = True
+                    counters["yaml_ok"] += 1
+            except FileNotFoundError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    errors.append((ts(), "yaml_reader", type(e).__name__, str(e)))
+            time.sleep(0.004)
+
+    def ckpt_reader() -> None:
+        while not stop[0]:
+            try:
+                with open(last_ckpt, "rb") as f:
+                    head = f.read(16)
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                if not head or size <= 0:
+                    raise AssertionError(f"invalid checkpoint size={size}")
+                with lock:
+                    seen["ckpt"] = True
+                    counters["ckpt_ok"] += 1
+            except FileNotFoundError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    errors.append((ts(), "ckpt_reader", type(e).__name__, str(e)))
+            time.sleep(0.004)
+
+    def event_reader() -> None:
+        while not stop[0]:
+            try:
+                with open(tb_event, "r", encoding="utf-8") as f:
+                    data = f.read()
+                if (not data) or ("step=" not in data):
+                    raise AssertionError(f"invalid event content len={len(data)}")
+                with lock:
+                    seen["event"] = True
+                    counters["event_ok"] += 1
+            except FileNotFoundError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    errors.append((ts(), "event_reader", type(e).__name__, str(e)))
+            time.sleep(0.004)
+
+    def list_reader() -> None:
+        while not stop[0]:
+            try:
+                os.listdir(run_dir)
+                names = os.listdir(ckpt_dir)
+                found = 0
+                for _root, _dirs, files in os.walk(image_dir):
+                    found += len(files)
+                if found <= 0:
+                    raise AssertionError("training images missing")
+                # tmp file can appear transiently during publish, but should not accumulate.
+                tmp_count = sum(1 for n in names if n.endswith(".tmp"))
+                if tmp_count > 2:
+                    raise AssertionError(f"too many tmp files: {tmp_count}")
+                with lock:
+                    counters["list_ok"] += 1
+            except FileNotFoundError:
+                pass
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    errors.append((ts(), "list_reader", type(e).__name__, str(e)))
+            time.sleep(0.01)
+
+    threads = [threading.Thread(target=yaml_reader, name="real-cmd-yaml", daemon=True)]
+    threads.extend(
+        threading.Thread(target=ckpt_reader, name=f"real-cmd-ckpt-{i}", daemon=True)
+        for i in range(max(1, readers // 2))
+    )
+    threads.extend(
+        threading.Thread(target=event_reader, name=f"real-cmd-event-{i}", daemon=True)
+        for i in range(max(1, readers // 2))
+    )
+    threads.append(threading.Thread(target=list_reader, name="real-cmd-list", daemon=True))
+    for t in threads:
+        t.start()
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    output = ""
+    try:
+        output, _ = proc.communicate(timeout=duration_sec + 30.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        output, _ = proc.communicate()
+        with lock:
+            errors.append((ts(), "train_cmd", "TimeoutExpired", f"pid={proc.pid}"))
+    finally:
+        stop[0] = True
+        join_threads_with_timeout(threads, errors, "minimal_real_training_command", timeout_sec=30.0)
+
+    if proc.returncode != 0:
+        with lock:
+            errors.append((ts(), "train_cmd", "NonZeroExit", f"rc={proc.returncode}"))
+
+    summary = parse_train_cmd_summary(output)
+    if summary is None:
+        with lock:
+            errors.append((ts(), "train_cmd", "MissingSummary", "TRAIN_CMD_SUMMARY not found"))
+    else:
+        if summary["steps"] <= 0:
+            with lock:
+                errors.append((ts(), "train_cmd", "InvalidSteps", str(summary["steps"])))
+        if summary["ckpt_renames"] <= 0:
+            with lock:
+                errors.append((ts(), "train_cmd", "InvalidCkptRenames", str(summary["ckpt_renames"])))
+        if summary["event_renames"] <= 0:
+            with lock:
+                errors.append((ts(), "train_cmd", "InvalidEventRenames", str(summary["event_renames"])))
+
+    print(f"[{ts()}]   yaml_ok: {counters['yaml_ok']}")
+    print(f"[{ts()}]   ckpt_ok: {counters['ckpt_ok']}")
+    print(f"[{ts()}]   event_ok: {counters['event_ok']}")
+    print(f"[{ts()}]   list_ok: {counters['list_ok']}")
+    print(f"[{ts()}]   Errors: {len(errors)}")
+    if summary is not None:
+        print(
+            f"[{ts()}]   train_cmd_summary: steps={summary['steps']} "
+            f"ckpt_renames={summary['ckpt_renames']} event_renames={summary['event_renames']}"
+        )
+    if errors:
+        print(f"[{ts()}]   Error details:")
+        print_error_items(errors)
+        print(f"[{ts()}]   Train command output tail:")
+        for line in output.splitlines()[-12:]:
+            print(f"    {line}")
+
+    if not keep_artifacts:
+        safe_rmtree(root, retries=8, sleep_sec=0.4)
+    return (
+        len(errors) == 0
+        and seen["yaml"]
+        and seen["ckpt"]
+        and seen["event"]
+        and counters["list_ok"] > 0
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Test concurrent I/O on curvine-fuse")
     parser.add_argument(
@@ -1303,6 +1528,28 @@ def main() -> None:
         action="store_true",
         help="Keep generated test data between rounds for faster repeated stress",
     )
+    parser.add_argument(
+        "--real-train-cmd",
+        action="store_true",
+        help="Run minimal real training subprocess scenario to verify tmp->rename publish path",
+    )
+    parser.add_argument(
+        "--real-train-only",
+        action="store_true",
+        help="Run only minimal real training subprocess scenario",
+    )
+    parser.add_argument(
+        "--real-train-duration",
+        type=float,
+        default=75.0,
+        help="Duration (seconds) for minimal real training subprocess scenario",
+    )
+    parser.add_argument(
+        "--real-train-readers",
+        type=int,
+        default=6,
+        help="Concurrent reader threads for minimal real training subprocess scenario",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.path):
@@ -1312,6 +1559,11 @@ def main() -> None:
     if args.rounds < 1:
         print(f"[{ts()}] [ERROR] --rounds must be >= 1")
         sys.exit(1)
+
+    if args.real_train_only:
+        args.real_train_cmd = True
+        args.stress_only = True
+        args.rounds = 1
 
     if args.aggressive:
         args.workers = max(args.workers, 20)
@@ -1333,7 +1585,8 @@ def main() -> None:
     print(f"[{ts()}] Concurrent I/O Test on: {args.path}")
     print(
         f"[{ts()}] Profile: rounds={args.rounds}, stress_only={args.stress_only}, "
-        f"aggressive={args.aggressive}, keep_artifacts={keep_artifacts}"
+        f"aggressive={args.aggressive}, keep_artifacts={keep_artifacts}, "
+        f"real_train_cmd={args.real_train_cmd}, real_train_only={args.real_train_only}"
     )
     print("=" * 60)
 
@@ -1342,7 +1595,14 @@ def main() -> None:
     for ridx in range(1, args.rounds + 1):
         print(f"\n[{ts()}] ===== Round {ridx}/{args.rounds} =====")
         results = {}
-        if not args.stress_only:
+        if args.real_train_only:
+            results["minimal_real_training_cmd_rename"] = test_minimal_real_training_command(
+                args.path,
+                duration_sec=args.real_train_duration,
+                readers=max(2, args.real_train_readers),
+                keep_artifacts=keep_artifacts,
+            )
+        elif not args.stress_only:
             results["concurrent_append"] = test_concurrent_append(args.path)
             results["concurrent_read_same"] = test_concurrent_read_same_file(args.path)
             results["concurrent_read_diff"] = test_concurrent_read_different_files(args.path)
@@ -1350,50 +1610,58 @@ def main() -> None:
             results["rapid_open_close"] = test_open_close_rapid(args.path)
             results["threadpool_read"] = test_threadpool_read(args.path, max_workers=args.workers)
 
-        results["issue_660_training_read"] = test_issue_660_training_read(
-            args.path,
-            duration_sec=args.issue660_duration,
-            readers=args.workers,
-            images=args.issue660_images,
-            keep_artifacts=keep_artifacts,
-        )
-        results["issue_660_delayed_yaml_publish"] = test_issue_660_delayed_yaml_publish(
-            args.path,
-            duration_sec=args.edge_duration,
-            publish_delay_sec=max(1.0, args.edge_duration / 3.0),
-            readers=max(4, args.workers // 2),
-            keep_artifacts=keep_artifacts,
-        )
-        results["read_delete_recreate_race"] = test_read_delete_recreate_race(
-            args.path,
-            duration_sec=args.edge_duration,
-            readers=max(4, args.workers // 2),
-            keep_artifacts=keep_artifacts,
-        )
-        results["stat_open_storm"] = test_stat_open_storm(
-            args.path,
-            duration_sec=max(4.0, args.edge_duration - 1.0),
-            workers=args.workers,
-            files=max(64, args.storm_files),
-            keep_artifacts=keep_artifacts,
-        )
-        results["multiprocess_dataloader_read"] = test_multiprocess_dataloader_read(
-            args.path,
-            duration_sec=args.edge_duration,
-            processes=max(2, args.workers // 2),
-            files=max(64, args.dataloader_files),
-            keep_artifacts=keep_artifacts,
-        )
-        results["training_mixed_io_soak"] = test_training_mixed_io_soak(
-            args.path,
-            duration_sec=args.training_duration,
-            images=max(64, args.training_images),
-            dataloader_processes=max(2, args.training_procs),
-            yaml_readers=max(2, args.workers // 2),
-            ckpt_readers=max(2, args.workers // 2),
-            ckpt_writers=ckpt_writers,
-            keep_artifacts=keep_artifacts,
-        )
+        if not args.real_train_only:
+            results["issue_660_training_read"] = test_issue_660_training_read(
+                args.path,
+                duration_sec=args.issue660_duration,
+                readers=args.workers,
+                images=args.issue660_images,
+                keep_artifacts=keep_artifacts,
+            )
+            results["issue_660_delayed_yaml_publish"] = test_issue_660_delayed_yaml_publish(
+                args.path,
+                duration_sec=args.edge_duration,
+                publish_delay_sec=max(1.0, args.edge_duration / 3.0),
+                readers=max(4, args.workers // 2),
+                keep_artifacts=keep_artifacts,
+            )
+            results["read_delete_recreate_race"] = test_read_delete_recreate_race(
+                args.path,
+                duration_sec=args.edge_duration,
+                readers=max(4, args.workers // 2),
+                keep_artifacts=keep_artifacts,
+            )
+            results["stat_open_storm"] = test_stat_open_storm(
+                args.path,
+                duration_sec=max(4.0, args.edge_duration - 1.0),
+                workers=args.workers,
+                files=max(64, args.storm_files),
+                keep_artifacts=keep_artifacts,
+            )
+            results["multiprocess_dataloader_read"] = test_multiprocess_dataloader_read(
+                args.path,
+                duration_sec=args.edge_duration,
+                processes=max(2, args.workers // 2),
+                files=max(64, args.dataloader_files),
+                keep_artifacts=keep_artifacts,
+            )
+            results["training_mixed_io_soak"] = test_training_mixed_io_soak(
+                args.path,
+                duration_sec=args.training_duration,
+                images=max(64, args.training_images),
+                dataloader_processes=max(2, args.training_procs),
+                yaml_readers=max(2, args.workers // 2),
+                ckpt_readers=max(2, args.workers // 2),
+                ckpt_writers=ckpt_writers,
+                keep_artifacts=keep_artifacts,
+            )
+            if args.real_train_cmd and ridx == 1:
+                results["minimal_real_training_cmd_rename"] = test_minimal_real_training_command(
+                    args.path,
+                    duration_sec=args.real_train_duration,
+                    readers=max(2, args.real_train_readers),
+                    keep_artifacts=keep_artifacts,
+                )
 
         round_results.append(results)
         for name, ok in results.items():
