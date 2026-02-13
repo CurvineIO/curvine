@@ -39,13 +39,13 @@ dashmap = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
 url = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
+byteorder = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 curvine-s3-gateway = { workspace = true }

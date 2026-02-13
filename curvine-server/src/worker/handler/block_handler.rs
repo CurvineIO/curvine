@@ -35,7 +35,7 @@ impl BlockHandler {
 
             RpcCode::ReadBlock => Reader(ReadHandler::new(store)),
 
-            RpcCode::WriteBlocksBatch => BatchWriter(BatchWriteHandler::new(store)),
+            RpcCode::WriteContainerBlock => BatchWriter(BatchWriteHandler::new(store)),
 
             code => return err_box!("Unsupported request type: {:?}", code),
         };

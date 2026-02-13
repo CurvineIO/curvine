@@ -22,6 +22,7 @@ use curvine_common::state::{MkdirOpts, StoragePolicy};
 use glob::Pattern;
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeDir {
@@ -34,6 +35,8 @@ pub struct InodeDir {
 
     pub(crate) features: DirFeature,
 
+    #[serde(skip)]
+    pub(crate) container_index: HashMap<String, String>,
     #[serde(skip)]
     children: InodeChildren,
 }
@@ -48,10 +51,14 @@ impl InodeDir {
             nlink: 2,
             storage_policy: Default::default(),
             features: Default::default(),
+            container_index: HashMap::new(),
             children: InodeChildren::new_map(),
         }
     }
 
+    pub fn get_container_for_file(&self, file_name: &str) -> Option<&String> {
+        self.container_index.get(file_name)
+    }
     pub fn with_opts(id: i64, time: i64, opts: MkdirOpts) -> Self {
         Self {
             id,
@@ -68,6 +75,7 @@ impl InodeDir {
                 },
                 x_attr: opts.x_attr,
             },
+            container_index: HashMap::new(),
             children: InodeChildren::new_map(),
         }
     }
@@ -83,8 +91,13 @@ impl InodeDir {
         self.children.get_child(name)
     }
 
-    pub fn get_child_ptr(&mut self, name: &str) -> Option<InodePtr> {
-        self.children.get_child_ptr(name)
+    pub fn get_child_ptr(
+        &mut self,
+        name: &str,
+        is_enable_container_search: bool,
+    ) -> Option<InodePtr> {
+        self.children
+            .get_child_ptr(name, is_enable_container_search)
     }
 
     pub fn get_child_ptr_by_glob_pattern(

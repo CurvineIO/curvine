@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::master::meta::glob_utils::parse_glob_pattern;
-use crate::master::meta::inode::InodeView::{self, Dir, File, FileEntry};
+use crate::master::meta::inode::InodeView::{self, Container, Dir, File, FileEntry};
 use crate::master::meta::inode::{
-    InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_ID,
+    InodeContainer, InodeDir, InodeFile, InodePtr, EMPTY_PARENT_ID, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use crate::master::meta::store::InodeStore;
 use orpc::{err_box, try_option, CommonResult};
@@ -71,15 +71,21 @@ impl InodePath {
             let child_name: &str = components[index].as_str();
             match cur_inode.as_mut() {
                 Dir(_, d) => {
-                    if let Some(child) = d.get_child_ptr(child_name) {
+                    // First attempt: search without container lookup
+                    if let Some(child) = d.get_child_ptr(child_name, false) {
                         cur_inode = child;
                     } else {
-                        // The directory has not been created, so there is no need to search again.
-                        break;
+                        // Second attempt: search in containers
+                        if let Some(child) = d.get_child_ptr(child_name, true) {
+                            cur_inode = child;
+                        } else {
+                            // The directory has not been created, so there is no need to search again.
+                            break;
+                        }
                     }
                 }
 
-                File(_, _) | FileEntry(_, _) => {
+                File(_, _) | FileEntry(_, _) | Container(_, _) => {
                     // File or FileEntry nodes cannot have children, stop path resolution
                     break;
                 }
@@ -122,6 +128,7 @@ impl InodePath {
                 };
                 path_inodes_rebuild.push(resolved_leaf_node);
             }
+            Container(_, _) => {} // will update later
         }
 
         // Parents
@@ -228,7 +235,7 @@ impl InodePath {
                                 queue.push_back((curr_index + 1, child_ptr.clone()));
                             }
                         }
-                    } else if let Some(child) = d.get_child_ptr(child_name_str) {
+                    } else if let Some(child) = d.get_child_ptr(child_name_str, false) {
                         parent_map.insert(child.id(), (curr_index + 1, curr_node.id()));
                         queue.push_back((curr_index + 1, child));
                     }
@@ -312,12 +319,23 @@ impl InodePath {
         }
     }
 
-    // Convert the last node to InodeDir
+    // Convert the last node to InodeFile
     pub fn clone_last_file(&self) -> CommonResult<InodeFile> {
         if let Some(v) = self.get_last_inode() {
-            // Assert that lastnode should not be FileEntry
-            assert!(!v.is_file_entry());
+            // Assert that lastnode must be File
+            assert!(v.is_file());
             Ok(v.as_file_ref()?.clone())
+        } else {
+            err_box!("status error")
+        }
+    }
+
+    // Convert the last node to InodeContainer
+    pub fn clone_last_container(&self) -> CommonResult<InodeContainer> {
+        if let Some(v) = self.get_last_inode() {
+            // Assert that lastnode must be Container
+            assert!(v.is_container());
+            Ok(v.as_container_ref()?.clone())
         } else {
             err_box!("status error")
         }

@@ -181,7 +181,6 @@ impl ProtoUtils {
             .iter()
             .map(Self::worker_address_from_pb)
             .collect();
-
         LocatedBlock {
             block: Self::extend_block_from_pb(block.block),
             locs,
@@ -217,6 +216,7 @@ impl ProtoUtils {
             id: status.id,
             path: status.path,
             name: status.name,
+            container_name: status.container_name,
             is_dir: status.is_dir,
             mtime: status.mtime,
             atime: status.atime,
@@ -242,6 +242,7 @@ impl ProtoUtils {
             id: status.id,
             path: status.path,
             name: status.name,
+            container_name: status.container_name,
             is_dir: status.is_dir,
             mtime: status.mtime,
             atime: status.atime,

@@ -42,4 +42,6 @@ pub enum FileType {
     Agg = 4,
 
     Object = 5,
+
+    Container = 6, // handle large of small files
 }

@@ -14,7 +14,7 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
-use crate::master::meta::inode::{InodeFile, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
@@ -78,6 +78,11 @@ impl InodeStore {
                 }
             }
             InodeView::FileEntry(..) => self.fs_stats.increment_file_count(),
+            InodeView::Container(..) => {
+                // todo: add container count
+                self.fs_stats
+                    .add_file_count(child.as_container_ref().unwrap().files_count() as i64);
+            }
         }
 
         Ok(())
@@ -176,14 +181,14 @@ impl InodeStore {
         batch.commit()
     }
 
-    pub fn apply_complete_file(
+    pub fn apply_complete_inode_entry(
         &self,
-        file: &InodeView,
+        inode_entry: &InodeView,
         commit_blocks: &[CommitBlock],
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
-        batch.write_inode(file)?;
+        batch.write_inode(inode_entry)?;
         for commit in commit_blocks {
             for item in &commit.locations {
                 batch.add_location(commit.block_id, item)?;
@@ -426,6 +431,7 @@ impl InodeStore {
                         }
                     }
                     InodeView::FileEntry(..) => file_count += 1,
+                    InodeView::Container(_, c) => file_count += c.files_count() as i64,
                 }
 
                 parent.add_child(inode)?
@@ -442,6 +448,23 @@ impl InodeStore {
                     let child_id = RocksUtils::i64_from_bytes(&value)?;
                     let file_entry = InodeView::FileEntry(child_name.to_string(), child_id);
 
+                    if let Some(child_inode) = self.store.get_inode(child_id)? {
+                        if matches!(child_inode, InodeView::Container(_, _)) {
+                            // This is a container - update parent's container_index
+                            if let InodeView::Dir(_, ref mut parent_dir) = next_parent.as_mut() {
+                                // For each file in the container, add to parent's index
+                                if let InodeView::Container(container_name, container) =
+                                    &child_inode
+                                {
+                                    for file_name in container.files.keys() {
+                                        parent_dir
+                                            .container_index
+                                            .insert(file_name.clone(), container_name.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
                     stack.push_back((next_parent.clone(), child_id, file_entry))
                 }
                 if let Some(ttl_config) = next_parent.ttl_config() {
@@ -466,15 +489,32 @@ impl InodeStore {
 
     pub fn get_file_locations(
         &self,
-        file: &InodeFile,
+        inode: &InodeView,
     ) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
-        let mut res = HashMap::with_capacity(file.blocks.len());
-        for meta in &file.blocks {
-            let locs = self.store.get_locations(meta.id)?;
-            res.insert(meta.id, locs);
+        match inode {
+            InodeView::File(_, file) => {
+                // Existing logic for regular files
+                let mut res = HashMap::with_capacity(file.blocks.len());
+                for meta in &file.blocks {
+                    let locs = self.store.get_locations(meta.id)?;
+                    res.insert(meta.id, locs);
+                }
+                Ok(res)
+            }
+            InodeView::Container(_, container) => {
+                // For containers, return the single container block's locations
+                let mut res = HashMap::with_capacity(1);
+                let locs = self.store.get_locations(container.block.id)?;
+                res.insert(container.block.id, locs);
+                Ok(res)
+            }
+            InodeView::Dir(_, _) => {
+                err_box!("Cannot get block locations for directory inode")
+            }
+            InodeView::FileEntry(_, _) => {
+                err_box!("FileEntry must be resolved to full inode first")
+            }
         }
-
-        Ok(res)
     }
 
     pub fn get_block_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {

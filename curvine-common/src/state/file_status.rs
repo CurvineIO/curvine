@@ -23,6 +23,8 @@ pub struct FileStatus {
     pub id: i64,
     pub path: String,
     pub name: String,
+    // todo: add container_id
+    pub container_name: Option<String>,
     pub is_dir: bool,
     pub mtime: i64,
     pub atime: i64,
@@ -46,11 +48,22 @@ pub struct FileStatus {
     pub target: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContainerStatus {
+    pub container_id: i64,
+    pub container_path: String,
+    pub container_name: String,
+    pub files: Vec<FileStatus>,
+    pub total_size: i64,
+    pub file_count: usize,
+}
+
 impl FileStatus {
     pub fn with_name(id: i64, name: String, is_dir: bool) -> Self {
         FileStatus {
             id,
             name,
+            container_name: None,
             is_dir,
             file_type: ternary!(is_dir, FileType::Dir, FileType::File),
             ..Default::default()

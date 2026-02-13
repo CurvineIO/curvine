@@ -12,112 +12,128 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::batch_block_writer::BatchWriterAdapter::{BatchLocal, BatchRemote};
-use crate::block::{BatchBlockWriterLocal, BatchBlockWriterRemote};
+use crate::block::container_block_writer::ContainerWriterAdapter::{
+    ContainerLocal, ContainerRemote,
+};
+use crate::block::{ContainerBlockWriterLocal, ContainerBlockWriterRemote};
 use crate::file::FsContext;
 use curvine_common::fs::Path;
-use curvine_common::state::{CommitBlock, ExtendedBlock, LocatedBlock, WorkerAddress};
+use curvine_common::proto::SmallFileMetaProto;
+use curvine_common::state::{
+    CommitBlock, ContainerStatus, ExtendedBlock, LocatedBlock, WorkerAddress,
+};
 use curvine_common::FsResult;
 use futures::future::try_join_all;
-use orpc::err_box;
 use std::sync::Arc;
 
-enum BatchWriterAdapter {
-    BatchLocal(BatchBlockWriterLocal),
-    BatchRemote(BatchBlockWriterRemote),
+enum ContainerWriterAdapter {
+    ContainerLocal(ContainerBlockWriterLocal),
+    ContainerRemote(ContainerBlockWriterRemote),
 }
 
-impl BatchWriterAdapter {
+impl ContainerWriterAdapter {
     fn worker_address(&self) -> &WorkerAddress {
         match self {
-            BatchLocal(f) => f.worker_address(),
-            BatchRemote(f) => f.worker_address(),
+            ContainerLocal(f) => f.worker_address(),
+            ContainerRemote(f) => f.worker_address(),
         }
     }
 
     async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
         match self {
-            BatchLocal(f) => f.write(files).await,
-            BatchRemote(f) => f.write(files).await,
+            ContainerLocal(f) => f.write(files).await,
+            ContainerRemote(f) => f.write(files).await,
         }
     }
 
     async fn flush(&mut self) -> FsResult<()> {
         match self {
-            BatchLocal(f) => f.flush().await,
-            BatchRemote(f) => f.flush().await,
+            ContainerLocal(f) => f.flush().await,
+            ContainerRemote(f) => f.flush().await,
         }
     }
 
     async fn complete(&mut self) -> FsResult<()> {
         match self {
-            BatchLocal(f) => f.complete().await,
-            BatchRemote(f) => f.complete().await,
+            ContainerLocal(f) => f.complete().await,
+            ContainerRemote(f) => f.complete().await,
         }
     }
 
     // Create new WriterAdapter
     async fn new(
         fs_context: Arc<FsContext>,
-        located_blocks: &[LocatedBlock],
+        located_block: &LocatedBlock,
         worker_addr: &WorkerAddress,
+        container_status: ContainerStatus,
+        small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<Self> {
         let conf = &fs_context.conf.client;
         let short_circuit = conf.short_circuit && fs_context.is_local_worker(worker_addr);
-
-        let blocks: Vec<ExtendedBlock> = located_blocks.iter().map(|lb| lb.block.clone()).collect();
+        // choose the writer mode: remote or local
+        let block: ExtendedBlock = located_block.block.clone();
         let adapter = if short_circuit {
-            let writer =
-                BatchBlockWriterLocal::new(fs_context, blocks, worker_addr.clone(), 0).await?;
-            BatchLocal(writer)
+            let writer = ContainerBlockWriterLocal::new(
+                fs_context,
+                block,
+                worker_addr.clone(),
+                0,
+                container_status,
+                small_files_metadata,
+            )
+            .await?;
+            ContainerLocal(writer)
         } else {
-            let writer =
-                BatchBlockWriterRemote::new(&fs_context, blocks, worker_addr.clone(), 0).await?;
-            BatchRemote(writer)
+            let writer = ContainerBlockWriterRemote::new(
+                &fs_context,
+                block,
+                worker_addr.clone(),
+                0,
+                container_status,
+                small_files_metadata,
+            )
+            .await?;
+            ContainerRemote(writer)
         };
 
         Ok(adapter)
     }
 }
 
-pub struct BatchBlockWriter {
-    inners: Vec<BatchWriterAdapter>,
+pub struct ContainerBlockWriter {
+    inners: Vec<ContainerWriterAdapter>,
     fs_context: Arc<FsContext>,
-    located_blocks: Vec<LocatedBlock>,
+    located_block: LocatedBlock,
     file_lengths: Vec<i64>,
 }
-impl BatchBlockWriter {
-    /// Create multiple BlockWriters for batch operations  
+impl ContainerBlockWriter {
+    /// Create multiple ContainerBlockWriter for the batch writing opertion
     pub async fn new(
         fs_context: Arc<FsContext>,
-        located_blocks: Vec<LocatedBlock>, // all blocks have the same worker information
+        container_status: ContainerStatus,
+        located_block: LocatedBlock,
+        small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<Self> {
-        if located_blocks.is_empty() {
-            return err_box!("No blocks provided");
-        }
-
-        // Get the first block to extract worker information
-        let first_locate = located_blocks.first().unwrap();
-
-        if first_locate.locs.is_empty() {
-            return err_box!("There is no available worker");
-        }
-
         // Create adapters for each worker (same workers for all blocks)
-        let mut inners = Vec::with_capacity(first_locate.locs.len());
-        for addr in &first_locate.locs {
+        let mut inners = Vec::with_capacity(located_block.locs.len());
+        for addr in &located_block.locs {
             // Create a batch adapter that can handle multiple blocks
-            let adapter =
-                BatchWriterAdapter::new(fs_context.clone(), &located_blocks, addr).await?;
+            let adapter = ContainerWriterAdapter::new(
+                fs_context.clone(),
+                &located_block,
+                addr,
+                container_status.clone(),
+                small_files_metadata.clone(),
+            )
+            .await?;
             inners.push(adapter);
         }
-        let num_of_blocks = located_blocks.len();
 
         Ok(Self {
             inners,
             fs_context,
-            located_blocks,
-            file_lengths: Vec::with_capacity(num_of_blocks),
+            located_block,
+            file_lengths: Vec::with_capacity(small_files_metadata.len()),
         })
     }
 
@@ -158,7 +174,7 @@ impl BatchBlockWriter {
     }
 
     /// Complete all writers and return commit blocks  
-    pub async fn complete(&mut self) -> FsResult<Vec<CommitBlock>> {
+    pub async fn complete(&mut self) -> FsResult<CommitBlock> {
         let futures = self.inners.iter_mut().map(|writer| async move {
             writer
                 .complete()
@@ -174,19 +190,9 @@ impl BatchBlockWriter {
         Ok(self.to_commit_blocks())
     }
 
-    pub fn to_commit_blocks(&self) -> Vec<CommitBlock> {
-        let mut commit_blocks = Vec::with_capacity(self.located_blocks.len());
-
-        for (i, located_block) in self.located_blocks.iter().enumerate() {
-            let mut commit_block = CommitBlock::from(located_block);
-
-            if let Some(&length) = self.file_lengths.get(i) {
-                commit_block.block_len = length;
-            }
-
-            commit_blocks.push(commit_block);
-        }
-
-        commit_blocks
+    pub fn to_commit_blocks(&self) -> CommitBlock {
+        let mut commit_block = CommitBlock::from(&self.located_block);
+        commit_block.block_len = self.file_lengths.iter().copied().sum::<i64>();
+        commit_block
     }
 }
