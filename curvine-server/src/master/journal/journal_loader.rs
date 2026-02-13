@@ -141,7 +141,6 @@ impl JournalLoader {
     }
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
-        println!("DEBUG at JournalLoader, add_block with entry: {:?}", entry);
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 

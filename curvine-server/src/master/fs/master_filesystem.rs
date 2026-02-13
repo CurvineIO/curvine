@@ -532,7 +532,6 @@ impl MasterFilesystem {
         inp: &InodePath,
     ) -> FsResult<FileBlocks> {
         let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
-        // let file = inode.as_file_ref()?;
         let blocks = self.get_block_locs(path, fs_dir, &inode)?;
         Ok(FileBlocks::new(inode.to_file_status(path), blocks))
     }

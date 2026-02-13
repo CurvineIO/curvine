@@ -560,7 +560,6 @@ impl FsDir {
         container.complete(len, &commit_block, client_name, only_flush, files)?;
         self.evictor.on_access(container.id());
 
-        // let container_name = inp.name().to_string();
         if let Some(parent) = inp.get_inode(-2) {
             match parent.as_mut() {
                 InodeView::Dir(_, _) => {

@@ -132,14 +132,6 @@ message WriteContainerBlockRequest {
 message WriteContainerBlockResponse {  
     repeated BlockWriteResponse responses = 1;  
 }  
-  
-// message WriteCommitsBatchRequest {  
-//     repeated WriteCommitRequest requests = 1;  
-// }  
-  
-// message WriteCommitsBatchResponse {  
-//     repeated bool results = 1;  
-// }
 
 message ContainerBlockWriteReponse {  
     required ExtendedBlockProto block = 1;  
