@@ -67,10 +67,13 @@ impl LoadTaskRunner {
         self.factory.get_ufs(&self.task.info.job.mount_info)
     }
 
-    fn should_guard_source_for_async_through(&self, source: &Path, target: &Path) -> bool {
+    fn should_guard_source_for_write_through(&self, source: &Path, target: &Path) -> bool {
         source.is_cv()
             && !target.is_cv()
-            && self.task.info.job.mount_info.write_type == WriteType::AsyncThrough
+            && matches!(
+                self.task.info.job.mount_info.write_type,
+                WriteType::AsyncThrough | WriteType::CacheThrough
+            )
     }
 
     async fn source_guard_state(
@@ -79,7 +82,7 @@ impl LoadTaskRunner {
         target: &Path,
         expected: &FileStatus,
     ) -> FsResult<SourceGuardState> {
-        if !self.should_guard_source_for_async_through(source, target) {
+        if !self.should_guard_source_for_write_through(source, target) {
             return Ok(SourceGuardState::Match);
         }
 
@@ -149,6 +152,14 @@ impl LoadTaskRunner {
 
     pub async fn run(&self) {
         if let Err(e) = self.run0().await {
+            if self.task.is_cancel() {
+                info!(
+                    "task {} canceled, skip failure report: {}",
+                    self.task.info.task_id, e
+                );
+                return;
+            }
+
             // The data replication process fails, set the status and report to the master
             error!("task {} execute failed: {}", self.task.info.task_id, e);
             let progress = self.task.set_failed(e.to_string());
@@ -231,7 +242,7 @@ impl LoadTaskRunner {
             return err_box!("Task {} canceled before commit", self.task.info.task_id);
         }
 
-        // Guard async-through replay: if source generation changed or vanished, never commit stale data.
+        // Guard write-through replay: if source generation changed or vanished, never commit stale data.
         match self
             .source_guard_state(&source_path, &target_path, &source_snapshot)
             .await?

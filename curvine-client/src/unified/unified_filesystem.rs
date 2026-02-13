@@ -40,6 +40,12 @@ enum CacheValidity {
     Invalid(Option<FileStatus>),
 }
 
+#[allow(clippy::large_enum_variant)]
+enum CvReadResult {
+    Hit(FsReader),
+    Miss { allow_async_cache: bool },
+}
+
 #[derive(Clone)]
 pub struct UnifiedFileSystem {
     cv: CurvineFileSystem,
@@ -195,18 +201,10 @@ impl UnifiedFileSystem {
             return Ok(CacheValidity::Invalid(None));
         }
 
-        // Cache must be complete to be valid
+        // Cache must be complete to be valid for generic mounted reads.
+        // Incomplete entries are produced by both local writes and async hydrate jobs;
+        // exposing them here can surface partial/empty data to unrelated readers.
         if !cv_status.is_complete() {
-            if matches!(
-                mount.info.write_type,
-                WriteType::AsyncThrough | WriteType::CacheThrough
-            ) {
-                // During write-through style writes, readers can race with an unfinished CV inode.
-                // Falling back to UFS here can trigger read-range errors and import jobs that overwrite
-                // in-flight metadata. Prefer CV as source of truth until write completion.
-                return Ok(CacheValidity::Valid);
-            }
-
             log::debug!(
                 "check_cache_validity: INVALID - cache not complete, ufs_path={}, cv_len={}",
                 ufs_path,
@@ -235,14 +233,16 @@ impl UnifiedFileSystem {
         cv_path: &Path,
         ufs_path: &Path,
         mount: &MountValue,
-    ) -> FsResult<Option<FsReader>> {
+    ) -> FsResult<CvReadResult> {
         let reader = match self.cv().open(cv_path).await {
             Ok(reader) => reader,
             Err(e) => {
                 if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
                     error!("failed to open curvine file {}: {}", cv_path, e)
                 }
-                return Ok(None);
+                return Ok(CvReadResult::Miss {
+                    allow_async_cache: true,
+                });
             }
         };
 
@@ -250,8 +250,17 @@ impl UnifiedFileSystem {
             .check_cache_validity(reader.status(), ufs_path, mount)
             .await?
         {
-            CacheValidity::Valid => Ok(Some(reader)),
-            CacheValidity::Invalid(_) => Ok(None),
+            CacheValidity::Valid => Ok(CvReadResult::Hit(reader)),
+            CacheValidity::Invalid(_) => Ok(CvReadResult::Miss {
+                allow_async_cache: Self::allow_async_cache_on_miss(Some(reader.status())),
+            }),
+        }
+    }
+
+    fn allow_async_cache_on_miss(cv_status: Option<&FileStatus>) -> bool {
+        match cv_status {
+            Some(status) => status.is_complete(),
+            None => true,
         }
     }
 
@@ -534,34 +543,42 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             }
         }
 
-        if let Some(reader) = self.get_cv_reader(path, &ufs_path, &mount).await? {
-            info!(
-                "read from Curvine(cache), ufs path {}, cv path: {}",
-                ufs_path, path
-            );
+        match self.get_cv_reader(path, &ufs_path, &mount).await? {
+            CvReadResult::Hit(reader) => {
+                info!(
+                    "read from Curvine(cache), ufs path {}, cv path: {}",
+                    ufs_path, path
+                );
 
-            self.metrics
-                .mount_cache_hits
-                .with_label_values(&[mount.mount_id()])
-                .inc();
+                self.metrics
+                    .mount_cache_hits
+                    .with_label_values(&[mount.mount_id()])
+                    .inc();
 
-            Ok(UnifiedReader::Cv(reader))
-        } else {
-            self.metrics
-                .mount_cache_misses
-                .with_label_values(&[mount.mount_id()])
-                .inc();
-
-            if mount.info.auto_cache() {
-                self.async_cache(&ufs_path)?;
+                Ok(UnifiedReader::Cv(reader))
             }
+            CvReadResult::Miss { allow_async_cache } => {
+                self.metrics
+                    .mount_cache_misses
+                    .with_label_values(&[mount.mount_id()])
+                    .inc();
 
-            // Reading from ufs
-            if self.enable_read_ufs {
-                info!("read from ufs, ufs path {}, cv path: {}", ufs_path, path);
-                mount.ufs.open(&ufs_path).await
-            } else {
-                err_ext!(FsError::unsupported_ufs_read(path.path()))
+                if mount.info.auto_cache() && allow_async_cache {
+                    self.async_cache(&ufs_path)?;
+                } else if mount.info.auto_cache() {
+                    info!(
+                        "skip async cache for {}, cv path {} because cache entry is incomplete",
+                        ufs_path, path
+                    );
+                }
+
+                // Reading from ufs
+                if self.enable_read_ufs {
+                    info!("read from ufs, ufs path {}, cv path: {}", ufs_path, path);
+                    mount.ufs.open(&ufs_path).await
+                } else {
+                    err_ext!(FsError::unsupported_ufs_read(path.path()))
+                }
             }
         }
     }
@@ -697,5 +714,29 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             }
             Some((_, _)) => Ok(()), // ignore setting attr on ufs mount paths
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UnifiedFileSystem;
+    use curvine_common::state::FileStatus;
+
+    #[test]
+    fn allow_async_cache_when_cache_status_missing() {
+        assert!(UnifiedFileSystem::allow_async_cache_on_miss(None));
+    }
+
+    #[test]
+    fn reject_async_cache_for_incomplete_cv_only_file() {
+        let status = FileStatus::default();
+        assert!(!UnifiedFileSystem::allow_async_cache_on_miss(Some(&status)));
+    }
+
+    #[test]
+    fn reject_async_cache_for_incomplete_ufs_backed_file() {
+        let mut status = FileStatus::default();
+        status.storage_policy.ufs_mtime = 1;
+        assert!(!UnifiedFileSystem::allow_async_cache_on_miss(Some(&status)));
     }
 }

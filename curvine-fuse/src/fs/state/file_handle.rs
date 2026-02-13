@@ -74,9 +74,11 @@ impl FileHandle {
 
         if op.arg.offset as i64 >= reader.len() {
             if let Some(writer) = state.find_writer(&op.header.nodeid) {
-                {
-                    writer.lock().await.flush(None).await?;
-                }
+                let prefer_cv = {
+                    let mut lock = writer.lock().await;
+                    lock.flush(None).await?;
+                    !lock.is_ufs()
+                };
                 // TODO: Optimize by adding refresh interface to refresh block list.
                 // Reader path may come from UFS backend; always refresh via logical Curvine path.
                 let mut path = Path::from_str(&self.status.path)?;
@@ -84,7 +86,7 @@ impl FileHandle {
                     path = state.get_path(op.header.nodeid)?;
                 }
                 reader.as_mut().complete(None).await?;
-                let new_reader = state.new_reader(&path).await?;
+                let new_reader = state.new_reader_with_hint(&path, prefer_cv).await?;
                 reader.replace(new_reader);
             }
         }

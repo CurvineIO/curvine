@@ -18,7 +18,7 @@ use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult, STATE_FILE_MAGIC, STATE_FILE_VERSION};
-use curvine_client::unified::UnifiedFileSystem;
+use curvine_client::unified::{UnifiedFileSystem, UnifiedReader};
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, MetaCache, Path, StateReader, StateWriter};
@@ -301,14 +301,26 @@ impl NodeState {
     fn should_retry_open_as_create(flags: OpenFlags, err: &FsError) -> bool {
         matches!(err, FsError::FileNotFound(_))
             && flags.write_only()
-            && flags.truncate()
+            && (flags.truncate() || flags.append())
             && !flags.create()
     }
 
-    pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
-        let reader = self.fs.open(path).await?;
+    pub async fn new_reader_with_hint(
+        &self,
+        path: &Path,
+        prefer_cv: bool,
+    ) -> FuseResult<FuseReader> {
+        let reader = if prefer_cv {
+            UnifiedReader::Cv(self.fs.cv().open(path).await?)
+        } else {
+            self.fs.open(path).await?
+        };
         let reader = FuseReader::new(&self.conf, self.fs.clone_runtime(), reader);
         Ok(reader)
+    }
+
+    pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
+        self.new_reader_with_hint(path, false).await
     }
 
     pub async fn new_handle(
@@ -337,16 +349,20 @@ impl NodeState {
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
         // Before creating reader, flush any active writer to reduce read-after-write visibility gap.
+        // If writer backend is Curvine, keep reader on Curvine to avoid exposing incomplete async publish state.
+        let mut prefer_cv_reader = false;
         if flags.read() {
             let existing_writer = self.find_writer(&ino);
             if let Some(existing_writer) = existing_writer {
-                existing_writer.lock().await.flush(None).await?;
+                let mut lock = existing_writer.lock().await;
+                lock.flush(None).await?;
+                prefer_cv_reader = !lock.is_ufs();
             }
         }
 
         let (reader, writer) = match flags.access_mode() {
             mode if mode == OpenFlags::RDONLY => {
-                let reader = self.new_reader(path).await?;
+                let reader = self.new_reader_with_hint(path, prefer_cv_reader).await?;
                 (Some(RawPtr::from_owned(reader)), None)
             }
 
@@ -369,7 +385,7 @@ impl NodeState {
                     );
                     None
                 } else {
-                    let reader = self.new_reader(path).await?;
+                    let reader = self.new_reader_with_hint(path, true).await?;
                     Some(RawPtr::from_owned(reader))
                 };
 
@@ -778,7 +794,7 @@ mod test {
 
         assert!(NodeState::should_retry_open_as_create(wt, &not_found));
         assert!(!NodeState::should_retry_open_as_create(wct, &not_found));
-        assert!(!NodeState::should_retry_open_as_create(wa, &not_found));
+        assert!(NodeState::should_retry_open_as_create(wa, &not_found));
         assert!(!NodeState::should_retry_open_as_create(rd, &not_found));
         assert!(!NodeState::should_retry_open_as_create(wt, &exists));
     }

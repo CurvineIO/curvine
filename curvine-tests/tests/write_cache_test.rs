@@ -130,6 +130,118 @@ fn test_through_read_and_status_ignore_stale_cv_cache() {
 }
 
 #[test]
+fn test_async_through_read_falls_back_when_cv_cache_incomplete() {
+    if env::var("UFS_TEST_PATH").is_err() {
+        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
+        return;
+    }
+
+    let testing = Testing::builder().workers(3).build().unwrap();
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+    let dir = format!("write_cache_async_incomplete_read_{}", Utils::rand_str(8));
+
+    rt.block_on(async move {
+        mount_with_dir(&fs, WriteType::AsyncThrough, &dir).await;
+
+        let path = Path::from_str(format!("/{dir}/dataset.yaml")).unwrap();
+        let expected = b"train: images/train\nval: images/val\n";
+        let (ufs_path, mount) = fs.get_mount(&path).await.unwrap().unwrap();
+
+        // Seed UFS source-of-truth data.
+        let mut ufs_writer = mount.ufs.create(&ufs_path, true).await.unwrap();
+        ufs_writer.write(expected).await.unwrap();
+        ufs_writer.complete().await.unwrap();
+
+        // Simulate a visible but unfinished UFS-backed CV cache entry for the same path.
+        // This matches async hydrate state (target exists but not completed).
+        let ufs_status = mount.ufs.get_status(&ufs_path).await.unwrap();
+        let opts = CreateFileOptsBuilder::with_conf(&fs.conf().client)
+            .create_parent(true)
+            .ufs_mtime(ufs_status.mtime)
+            .build();
+        let mut cv_writer = fs.cv().create_with_opts(&path, opts, true).await.unwrap();
+        cv_writer.write(b"partial").await.unwrap();
+        let cv_status = fs.cv().get_status(&path).await.unwrap();
+        assert!(
+            !cv_status.is_complete && !cv_status.is_cv_only(),
+            "precondition failed: CV entry should be incomplete"
+        );
+
+        // Correct behavior: mounted async-through read must fall back to UFS, not incomplete CV cache.
+        let mut reader = fs.open(&path).await.unwrap();
+        assert!(
+            matches!(reader, UnifiedReader::Opendal(_)),
+            "incomplete CV cache should not be readable for mount path"
+        );
+
+        let mut data = BytesMut::zeroed(reader.len() as usize);
+        reader.read_full(&mut data).await.unwrap();
+        reader.complete().await.unwrap();
+        assert_eq!(data.as_ref(), expected);
+
+        drop(cv_writer);
+    })
+}
+
+#[test]
+fn test_async_through_read_falls_back_when_cv_only_cache_incomplete() {
+    if env::var("UFS_TEST_PATH").is_err() {
+        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
+        return;
+    }
+
+    let testing = Testing::builder().workers(3).build().unwrap();
+    testing.start_cluster().unwrap();
+    let rt = Arc::new(AsyncRuntime::single());
+    let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
+    let dir = format!(
+        "write_cache_async_incomplete_cv_only_{}",
+        Utils::rand_str(8)
+    );
+
+    rt.block_on(async move {
+        mount_with_dir(&fs, WriteType::AsyncThrough, &dir).await;
+
+        let path = Path::from_str(format!("/{dir}/dataset_cv_only.yaml")).unwrap();
+        let expected = b"train: images/train\nval: images/val\n";
+        let (ufs_path, mount) = fs.get_mount(&path).await.unwrap().unwrap();
+
+        // Seed UFS source-of-truth data.
+        let mut ufs_writer = mount.ufs.create(&ufs_path, true).await.unwrap();
+        ufs_writer.write(expected).await.unwrap();
+        ufs_writer.complete().await.unwrap();
+
+        // Simulate an unfinished CV-only cache entry (ufs_mtime == 0).
+        let opts = CreateFileOptsBuilder::with_conf(&fs.conf().client)
+            .create_parent(true)
+            .build();
+        let mut cv_writer = fs.cv().create_with_opts(&path, opts, true).await.unwrap();
+        cv_writer.write(b"partial").await.unwrap();
+        let cv_status = fs.cv().get_status(&path).await.unwrap();
+        assert!(
+            !cv_status.is_complete && cv_status.is_cv_only(),
+            "precondition failed: CV entry should be incomplete and cv-only"
+        );
+
+        // Mounted read must prefer UFS truth until CV cache is complete.
+        let mut reader = fs.open(&path).await.unwrap();
+        assert!(
+            matches!(reader, UnifiedReader::Opendal(_)),
+            "incomplete CV-only cache should not be readable for mount path"
+        );
+
+        let mut data = BytesMut::zeroed(reader.len() as usize);
+        reader.read_full(&mut data).await.unwrap();
+        reader.complete().await.unwrap();
+        assert_eq!(data.as_ref(), expected);
+
+        drop(cv_writer);
+    })
+}
+
+#[test]
 fn test_async_through_delete_should_not_leave_ufs_residue() {
     if env::var("UFS_TEST_PATH").is_err() {
         println!("⚠️  UFS_TEST_PATH is not set, skipping test");
