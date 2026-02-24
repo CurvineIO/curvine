@@ -21,7 +21,6 @@ use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{FileStatus, FileType, ListOptions, SetAttrOpts};
 use curvine_common::FsResult;
-use futures::StreamExt;
 use opendal::services::*;
 use opendal::{
     layers::{LoggingLayer, RetryLayer, TimeoutLayer},
@@ -31,6 +30,7 @@ use orpc::sys::DataSlice;
 use orpc::{err_box, err_ext, try_option_mut};
 use std::collections::HashMap;
 use std::time::Duration;
+use log::info;
 
 pub const HDFS_SCHEMA: &str = "hdfs";
 
@@ -719,6 +719,30 @@ impl OpendalFileSystem {
 
         Ok(statuses)
     }
+
+    pub fn to_status(&self, path: &Path, entry: Entry) -> FsResult<Option<FileStatus>> {
+        let raw_path = format!(
+            "{}://{}/{}",
+            self.scheme,
+            self.bucket_or_container,
+            entry.path().trim_end_matches('/')
+        );
+        let entry_path = Path::from_str(&raw_path).map_err(|e| {
+            FsError::common(format!("Failed to parse path '{}': {}", raw_path, e))
+        })?;
+
+        let entry_path = Path::from_str(&raw_path).map_err(|e| {
+            FsError::common(format!("Failed to parse path '{}': {}", raw_path, e))
+        })?;
+
+        if entry_path.full_path() == path.full_path() {
+            return Ok(None)
+        }
+
+        let metadata = entry.metadata();
+        let status = Self::read_status(&entry_path, metadata);
+        Ok(Some(status))
+    }
 }
 
 impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
@@ -918,27 +942,45 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {
         let dir_path = self.get_dir_path(path)?;
 
-        let (start_after, limit) = if let Some(name) = opts.start_after {
-            let start_after = Some(format!("{}/{}", dir_path, name));
+        // start_after: pass the entry path without trailing slash so backend returns keys strictly after it.
+        // Appending "/" would skip too many entries (e.g. "subdir1/" > "subdir1", so we'd skip subdir1 and all files).
+        let (start_after, limit) = if let Some(ref name) = opts.start_after {
+            let start_after = Some(format!("{}{}", dir_path, name));
             (start_after, opts.limit)
         } else {
-            (None, opts.limit.map(|v| v + 1))
+            (None, opts.limit)
         };
 
-        let opts = opendal::options::ListOptions {
+        let ufs_opts = opendal::options::ListOptions {
             limit,
             start_after,
             ..Default::default()
         };
 
-        println!("opts {:?}", opts);
-
         let list_result = self
             .operator
-            .list_options(&dir_path, opts)
+            .list_options(&dir_path, ufs_opts)
             .await
             .map_err(|e| FsError::common(format!("failed to list options: {}", e)))?;
 
-        self.process_list(path, list_result)
+        let mut res = self.process_list(path, list_result)?;
+
+        // Why limit appears ineffective: In OpenDAL, list_options() creates a Lister and try_collect()'s
+        // the entire stream. The `limit` in ListOptions is passed to the backend as max-keys (per-request
+        // page size), not "total entries to return". So the backend returns one page (e.g. 1 or 1000 keys),
+        // then if is_truncated the Lister fetches the next page, and so on until all pages are collected.
+        // So we always get the full list. Enforce "return at most N entries" by truncating here.
+        if let Some(n) = opts.limit {
+            res.truncate(n);
+        }
+
+        // If backend returned the same entry as start_after (e.g. trailing slash), drop it.
+        if let Some(ref name) = opts.start_after {
+            if res.first().map(|s| s.name.as_str()) == Some(name.as_str()) {
+                res.remove(0);
+            }
+        }
+
+        Ok(res)
     }
 }

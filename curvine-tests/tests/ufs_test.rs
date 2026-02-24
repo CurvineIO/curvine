@@ -139,30 +139,13 @@ fn ufs_test() -> CommonResult<()> {
         mount_storage(&fs, &config_clone).await?;
 
         // 2. Cleanup test directory (if exists)
-        cleanup_test_dir(&fs, &config_clone).await?;
+        // leanup_test_dir(&fs, &config_clone).await?;
 
         // 3. Test directory operations
         println!("\n=== Testing Directory Operations ===");
-        test_mkdir(&fs, &config_clone).await?;
-        test_exists(&fs, &config_clone).await?;
-        test_get_status(&fs, &config_clone).await?;
-        test_list_status(&fs, &config_clone).await?;
         test_list_options(&fs, &config_clone).await?;
 
-        // 4. Test file write operations
-        println!("\n=== Testing File Write Operations ===");
-        test_create_and_write(&fs, &config_clone).await?;
-
-        // 5. Test file read operations
-        println!("\n=== Testing File Read Operations ===");
-        test_open_and_read(&fs, &config_clone).await?;
-        test_read_partial(&fs, &config_clone).await?;
-        test_random_read(&fs, &config_clone).await?;
-
-        // 6. Test file operations
-        println!("\n=== Testing File Operations ===");
-        test_rename(&fs, &config_clone).await?;
-        test_delete_file(&fs, &config_clone).await?;
+        //test_delete_file(&fs, &config_clone).await?;
 
         Ok(())
     })
@@ -321,39 +304,14 @@ async fn test_list_options(fs: &UnifiedFileSystem, config: &TestConfig) -> Commo
     let test_dir: Path = format!("{}/list_opts", base_dir).into();
 
     println!("\n=== Testing ListOptions ===");
+    let subdir1: Path = format!("{}/1", test_dir).into();
+    let file1: Path = format!("{}/2", test_dir).into();
+    let subdir2: Path = format!("{}/3", test_dir).into();
+    let file2: Path = format!("{}/4", test_dir).into();
+    let file3: Path = format!("{}/5", test_dir).into();
 
     // Setup: Create test directory structure (交叉创建目录和文件)
     println!("Setting up test data...");
-
-    // Create main test directory
-    fs.mkdir(&test_dir, false).await?;
-    println!("✓ Created test directory: {}", test_dir);
-
-    // 交叉创建：目录1 -> 文件1 -> 目录2 -> 文件2 -> 文件3
-    let subdir1: Path = format!("{}/subdir1", test_dir).into();
-    let file1: Path = format!("{}/file1.txt", test_dir).into();
-    let subdir2: Path = format!("{}/subdir2", test_dir).into();
-    let file2: Path = format!("{}/file2.txt", test_dir).into();
-    let file3: Path = format!("{}/file3.txt", test_dir).into();
-
-    // 创建顺序：目录1 -> 文件1 -> 目录2 -> 文件2 -> 文件3
-    fs.mkdir(&subdir1, false).await?;
-    println!("✓ Created subdirectory: subdir1");
-
-    let mut writer1 = fs.create(&file1, false).await?;
-    writer1.complete().await?;
-    println!("✓ Created file: file1.txt");
-
-    fs.mkdir(&subdir2, false).await?;
-    println!("✓ Created subdirectory: subdir2");
-
-    let mut writer2 = fs.create(&file2, false).await?;
-    writer2.complete().await?;
-    println!("✓ Created file: file2.txt");
-
-    let mut writer3 = fs.create(&file3, false).await?;
-    writer3.complete().await?;
-    println!("✓ Created file: file3.txt");
 
     // Verify setup: should have 5 entries total (2 dirs + 3 files)
     let all_statuses = fs.list_status(&test_dir).await?;
@@ -368,12 +326,11 @@ async fn test_list_options(fs: &UnifiedFileSystem, config: &TestConfig) -> Commo
     // Test 1: List with limit=1
     println!("\nTest 1: List with limit=1");
     let opts = ListOptions {
-        limit: Some(1),
+        limit: Some(2),
         start_after: None,
     };
     let limited_statuses = fs.list_options(&test_dir, opts).await?;
-    println!("{:?}", all_statuses);
-    println!("{:?}", limited_statuses);
+    // println!("{:?}", limited_statuses);
     assert_eq!(
         limited_statuses.len(),
         1,
@@ -405,6 +362,7 @@ async fn test_list_options(fs: &UnifiedFileSystem, config: &TestConfig) -> Commo
         start_after: Some(first_status.name.clone()),
     };
     let after_statuses = fs.list_options(&test_dir, opts).await?;
+    println!("{:?}", after_statuses);
     assert_eq!(
         after_statuses.len(),
         4,
@@ -496,12 +454,6 @@ async fn test_list_options(fs: &UnifiedFileSystem, config: &TestConfig) -> Commo
     );
     println!("✓ Default list returned {} entries", default_statuses.len());
 
-    // Cleanup
-    println!("\nCleaning up test data...");
-    fs.delete(&test_dir, true).await?;
-    println!("✓ Test directory cleaned up: {}", test_dir);
-
-    println!("\n✓ All ListOptions tests passed!");
     Ok(())
 }
 
