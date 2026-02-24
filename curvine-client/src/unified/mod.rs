@@ -31,6 +31,9 @@ use curvine_ufs::oss_hdfs::*;
 pub const S3_SCHEME: &str = "s3";
 
 pub mod macros;
+pub mod pdpc;
+
+pub use self::pdpc::{PdpcController, RouteIndexSnapshot};
 
 mod unified_filesystem;
 pub use self::unified_filesystem::UnifiedFileSystem;

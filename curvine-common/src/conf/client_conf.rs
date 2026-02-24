@@ -146,6 +146,14 @@ pub struct ClientConf {
     // If the cache hits, read data from Curvine.
     // If the cache misses, determine whether to allow Curvine to directly read data from the unified file system (UFS).
     pub enable_rust_read_ufs: bool,
+    // Metadata Decision Gate negative-cache TTL in milliseconds.
+    pub pdpc_negative_cache_ttl_ms: u64,
+    // Metadata Decision Gate negative-cache capacity.
+    pub pdpc_negative_cache_capacity: u64,
+    // Hydrate Admission Controller stale in-flight reclaim ttl (milliseconds).
+    pub pdpc_singleflight_stale_ttl_ms: u64,
+    // Hydrate Admission Controller max tracked in-flight keys.
+    pub pdpc_singleflight_max_entries: u64,
 
     // Mount information update interval
     #[serde(skip)]
@@ -376,6 +384,10 @@ impl Default for ClientConf {
 
             enable_unified_fs: true,
             enable_rust_read_ufs: true,
+            pdpc_negative_cache_ttl_ms: 800,
+            pdpc_negative_cache_capacity: 200_000,
+            pdpc_singleflight_stale_ttl_ms: 120_000,
+            pdpc_singleflight_max_entries: 200_000,
 
             mount_update_ttl: Default::default(),
             mount_update_ttl_str: "10s".to_string(),

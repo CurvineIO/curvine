@@ -19,7 +19,7 @@ use curvine_common::error::FsError;
 use curvine_common::proto::{BlockWriteResponse, DataHeaderProto};
 use curvine_common::state::{ExtendedBlock, FileAllocMode};
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{debug, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
@@ -134,7 +134,7 @@ impl WriteHandler {
 
         self.metrics.write_blocks.with_label_values(&[label]).inc();
 
-        info!("{}", log_msg);
+        debug!("{}", log_msg);
         Ok(Builder::success(msg).proto_header(response).build())
     }
 
@@ -225,13 +225,6 @@ impl WriteHandler {
         }
         let context = WriteContext::from_req(msg)?;
 
-        // flush and close the file.
-        let file = self.file.take();
-        if let Some(mut file) = file {
-            file.flush()?;
-            drop(file);
-        }
-
         if context.block.len > context.block_size {
             return err_box!(
                 "Invalid write offset: {}, block size: {}",
@@ -240,11 +233,21 @@ impl WriteHandler {
             );
         }
 
+        // flush and close the file.
+        let file = self.file.take();
+        if let Some(mut file) = file {
+            file.flush()?;
+            if file.len() != context.block.len {
+                file.resize(true, 0, context.block.len, 0)?;
+            }
+            drop(file);
+        }
+
         // Submit block.
         self.commit_block(&context.block, commit)?;
         self.is_commit = true;
 
-        info!(
+        debug!(
             "write block end for req_id {}, is commit: {}, off: {}, len: {}",
             msg.req_id(),
             commit,

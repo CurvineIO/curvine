@@ -19,7 +19,10 @@ use crate::master::meta::inode::{InodeDir, InodeFile, InodePath};
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
-use curvine_common::state::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
+use curvine_common::state::{
+    CommitBlock, FileLock, JobTaskProgress, JobTaskState, MountInfo, PersistedLoadJobSnapshot,
+    RenameFlags, SetAttrOpts,
+};
 use curvine_common::FsResult;
 use log::info;
 use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
@@ -242,6 +245,43 @@ impl JournalWriter {
     pub fn log_set_locks(&self, op_ms: u64, ino: i64, locks: Vec<FileLock>) -> FsResult<()> {
         let entry = SetLocksEntry { op_ms, ino, locks };
         self.send(JournalEntry::SetLocks(entry))
+    }
+
+    pub fn log_store_job_snapshot(
+        &self,
+        op_ms: u64,
+        snapshot: PersistedLoadJobSnapshot,
+    ) -> FsResult<()> {
+        let entry = StoreJobSnapshotEntry { op_ms, snapshot };
+        self.send(JournalEntry::StoreJobSnapshot(entry))
+    }
+
+    pub fn log_remove_job_snapshot(&self, op_ms: u64, job_id: impl AsRef<str>) -> FsResult<()> {
+        let entry = RemoveJobSnapshotEntry {
+            op_ms,
+            job_id: job_id.as_ref().to_string(),
+        };
+        self.send(JournalEntry::RemoveJobSnapshot(entry))
+    }
+
+    pub fn log_update_job_task_progress(
+        &self,
+        op_ms: u64,
+        job_id: impl AsRef<str>,
+        task_id: impl AsRef<str>,
+        task_progress: JobTaskProgress,
+        job_state: JobTaskState,
+        job_progress: JobTaskProgress,
+    ) -> FsResult<()> {
+        let entry = UpdateJobTaskProgressEntry {
+            op_ms,
+            job_id: job_id.as_ref().to_string(),
+            task_id: task_id.as_ref().to_string(),
+            task_progress,
+            job_state,
+            job_progress,
+        };
+        self.send(JournalEntry::UpdateJobTaskProgress(entry))
     }
 
     // for testing

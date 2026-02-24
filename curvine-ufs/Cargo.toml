@@ -13,6 +13,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 fastrand = { workspace = true }
+moka = { workspace = true }
 
 opendal = { version = "0.55", optional = true }
 

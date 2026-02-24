@@ -24,7 +24,7 @@ use curvine_common::proto::{
 use curvine_common::state::{
     JobStatus, JobTaskProgress, JobTaskState, JobTaskType, LoadJobCommand, LoadJobResult,
 };
-use curvine_common::utils::{ProtoUtils, SerdeUtils};
+use curvine_common::utils::{CommonUtils, ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
 use orpc::common::TimeSpent;
 use orpc::err_box;
@@ -48,8 +48,55 @@ impl JobMasterClient {
     }
 
     pub async fn submit_load(&self, path: impl AsRef<str>) -> FsResult<LoadJobResult> {
-        self.submit_load_job(LoadJobCommand::builder(path.as_ref()).build())
+        self.submit_publish(path).await
+    }
+
+    pub async fn submit_publish(&self, path: impl AsRef<str>) -> FsResult<LoadJobResult> {
+        self.submit_load_job(LoadJobCommand::publish_builder(path.as_ref()).build())
             .await
+    }
+
+    pub async fn submit_hydrate(
+        &self,
+        path: impl AsRef<str>,
+        expected_target_mtime: Option<i64>,
+        expected_target_missing: bool,
+    ) -> FsResult<LoadJobResult> {
+        let mut builder = LoadJobCommand::hydrate_builder(path.as_ref());
+        if let Some(mtime) = expected_target_mtime {
+            builder = builder.expected_target_mtime(mtime);
+        }
+        if expected_target_missing {
+            builder = builder.expected_target_missing(true);
+        }
+        self.submit_load_job(builder.build()).await
+    }
+
+    pub async fn submit_hydrate_with_source(
+        &self,
+        path: impl AsRef<str>,
+        source_id: i64,
+        source_len: i64,
+        source_mtime: i64,
+        expected_target_mtime: Option<i64>,
+        expected_target_missing: bool,
+    ) -> FsResult<LoadJobResult> {
+        let mut builder = LoadJobCommand::hydrate_builder(path.as_ref())
+            .source_generation(CommonUtils::source_generation(
+                source_id,
+                source_len,
+                source_mtime,
+            ))
+            .expected_source_id(source_id)
+            .expected_source_len(source_len)
+            .expected_source_mtime(source_mtime);
+        if let Some(mtime) = expected_target_mtime {
+            builder = builder.expected_target_mtime(mtime);
+        }
+        if expected_target_missing {
+            builder = builder.expected_target_missing(true);
+        }
+        self.submit_load_job(builder.build()).await
     }
 
     // Submit loading task
@@ -81,6 +128,10 @@ impl JobMasterClient {
             source_path: status.source_path,
             target_path: status.target_path,
             progress: ProtoUtils::work_progress_from_pb(status.progress),
+            source_generation: status.source_generation,
+            expected_source_id: status.expected_source_id,
+            expected_source_len: status.expected_source_len,
+            expected_source_mtime: status.expected_source_mtime,
         })
     }
 

@@ -62,6 +62,10 @@ message GetJobStatusResponse {
   required string source_path = 3;
   required string target_path = 4;
   required JobTaskProgressProto progress = 5;
+  optional int64 expected_source_id = 6;
+  optional int64 expected_source_len = 7;
+  optional int64 expected_source_mtime = 8;
+  optional string source_generation = 9;
 
 }
 

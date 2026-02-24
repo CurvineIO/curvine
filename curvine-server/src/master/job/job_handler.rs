@@ -74,6 +74,10 @@ impl JobHandler {
             source_path: status.source_path,
             target_path: status.target_path,
             progress: ProtoUtils::work_progress_to_pb(status.progress),
+            expected_source_id: status.expected_source_id,
+            expected_source_len: status.expected_source_len,
+            expected_source_mtime: status.expected_source_mtime,
+            source_generation: status.source_generation,
         };
 
         ctx.response(response)

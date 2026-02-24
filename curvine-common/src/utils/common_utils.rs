@@ -28,6 +28,29 @@ impl CommonUtils {
         format!("{}{}", Self::JOB_ID_PREFIX, Utils::md5(source))
     }
 
+    pub fn create_job_id_with_generation(
+        source: impl AsRef<str>,
+        source_generation: impl AsRef<str>,
+    ) -> String {
+        format!(
+            "{}{}",
+            Self::JOB_ID_PREFIX,
+            Utils::md5(format!(
+                "{}#{}",
+                source.as_ref(),
+                source_generation.as_ref()
+            ))
+        )
+    }
+
+    pub fn source_generation(
+        id: impl std::fmt::Display,
+        len: impl std::fmt::Display,
+        mtime: impl std::fmt::Display,
+    ) -> String {
+        Utils::md5(format!("{}:{}:{}", id, len, mtime))
+    }
+
     pub fn reload_param(env: HashMap<String, String>) -> CommonResult<()> {
         let exe_path = std::env::current_exe()
             .map_err(|e| err_msg!("failed to get current executable path: {}", e))?;

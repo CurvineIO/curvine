@@ -195,26 +195,7 @@ impl MasterFilesystem {
         }
         let path = path.as_ref();
 
-        // Check the path length
-        self.check_path_length(path)?;
-
-        if opts.replicas < self.conf.min_replication || opts.replicas >= self.conf.max_replication {
-            return err_box!(
-                "The replica number {} needs to be between {} and {}",
-                opts.replicas,
-                self.conf.min_replication,
-                self.conf.max_replication
-            );
-        }
-
-        if opts.block_size < self.conf.min_block_size || opts.block_size >= self.conf.max_block_size
-        {
-            return err_box!(
-                "Block size needs to be between {} and {}",
-                self.conf.min_block_size,
-                self.conf.max_block_size
-            );
-        }
+        self.validate_create_opts(path, &opts)?;
 
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
@@ -266,19 +247,28 @@ impl MasterFilesystem {
             return self.get_block_locations(path);
         }
 
-        if flags.create() {
-            let status = self.create_with_opts(path, opts, flags)?;
-            return Ok(FileBlocks::new(status, vec![]));
-        }
-
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
-            None => return err_ext!(FsError::file_not_found(inp.path())),
+            None => {
+                if !flags.create() {
+                    return err_ext!(FsError::file_not_found(inp.path()));
+                }
+                self.validate_create_opts(inp.path(), &opts)?;
+                if !opts.create_parent {
+                    Self::check_parent(&inp)?;
+                }
+                let created = fs_dir.create_file(inp, opts)?;
+                let status = fs_dir.file_status(&created)?;
+                return Ok(FileBlocks::new(status, vec![]));
+            }
             Some(inode) => {
                 if inode.is_dir() {
                     return err_box!("{} is a directory", inp.path());
+                }
+                if flags.create() && flags.exclusive() {
+                    return err_ext!(FsError::file_exists(inp.path()));
                 }
                 inode
             }
@@ -336,6 +326,30 @@ impl MasterFilesystem {
 
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
         InodePath::resolve_for_glob_pattern(fs_dir.root_ptr(), path, &fs_dir.store)
+    }
+
+    fn validate_create_opts(&self, path: &str, opts: &CreateFileOpts) -> CommonResult<()> {
+        self.check_path_length(path)?;
+
+        if opts.replicas < self.conf.min_replication || opts.replicas >= self.conf.max_replication {
+            return err_box!(
+                "The replica number {} needs to be between {} and {}",
+                opts.replicas,
+                self.conf.min_replication,
+                self.conf.max_replication
+            );
+        }
+
+        if opts.block_size < self.conf.min_block_size || opts.block_size >= self.conf.max_block_size
+        {
+            return err_box!(
+                "Block size needs to be between {} and {}",
+                self.conf.min_block_size,
+                self.conf.max_block_size
+            );
+        }
+
+        Ok(())
     }
 
     pub fn check_path_length(&self, path: &str) -> CommonResult<()> {

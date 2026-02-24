@@ -12,20 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod node_attr;
-pub use self::node_attr::NodeAttr;
+use curvine_common::state::FileStatus;
 
-mod node_state;
-pub use self::node_state::NodeState;
+#[derive(Clone, Debug)]
+pub struct OpenSnapshot {
+    status: FileStatus,
+}
 
-mod node_map;
-pub use self::node_map::NodeMap;
+impl OpenSnapshot {
+    pub fn new(status: FileStatus) -> Self {
+        Self { status }
+    }
 
-mod file_handle;
-pub use self::file_handle::FileHandle;
-
-mod dir_handle;
-pub use self::dir_handle::DirHandle;
-
-mod open_snapshot;
-pub use self::open_snapshot::OpenSnapshot;
+    pub fn status(&self) -> &FileStatus {
+        &self.status
+    }
+}

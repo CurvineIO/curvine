@@ -128,17 +128,21 @@ pub struct ReadDetector {
 
 impl ReadDetector {
     pub fn with_conf(conf: &ClientConf, file_size: i64) -> Self {
-        let mut read_parallel = conf.read_parallel;
+        let mut read_parallel = conf.read_parallel.max(1);
+        let check_threshold = conf.sequential_read_threshold;
         if conf.enable_smart_prefetch && file_size >= conf.large_file_size {
             let calculated_parallel = (file_size + conf.large_file_size - 1) / conf.large_file_size;
-            read_parallel = conf.max_read_parallel.min(1.max(calculated_parallel));
+            read_parallel = conf
+                .max_read_parallel
+                .max(1)
+                .min(1.max(calculated_parallel));
         }
 
         Self {
             enabled: conf.enable_smart_prefetch,
             last_read_pos: -1,
             seq_count: 0,
-            check_threshold: conf.sequential_read_threshold,
+            check_threshold,
             read_parallel,
             read_pattern: ReadPattern::Sequential,
         }

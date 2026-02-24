@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::fs::operator::*;
-use crate::fs::state::{FileHandle, NodeState};
+use crate::fs::state::{FileHandle, NodeState, OpenSnapshot};
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
 use crate::session::{FuseBuf, FuseResponse};
@@ -34,6 +34,7 @@ use orpc::sys::FFIUtils;
 use orpc::{sys, ternary, try_option};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_util::bytes::BytesMut;
 
 pub struct CurvineFileSystem {
@@ -209,6 +210,173 @@ impl CurvineFileSystem {
         Ok(status)
     }
 
+    fn can_retry_stale_write_open(flags: OpenFlags, err: &FuseError) -> bool {
+        err.errno == libc::ENOENT
+            && flags.write_only()
+            && (flags.truncate() || flags.append())
+            && !flags.create()
+    }
+
+    fn can_retry_stale_create_open(flags: OpenFlags, err: &FuseError) -> bool {
+        err.errno == libc::ENOENT && flags.write() && flags.create()
+    }
+
+    fn can_retry_stale_open(flags: OpenFlags, err: &FuseError) -> bool {
+        Self::can_retry_stale_write_open(flags, err)
+            || Self::can_retry_stale_create_open(flags, err)
+    }
+
+    fn should_force_create_for_namespace_stale_open(
+        flags: OpenFlags,
+        err: &FuseError,
+        namespace_entry_matches_ino: bool,
+    ) -> bool {
+        err.errno == libc::ENOENT
+            && namespace_entry_matches_ino
+            && flags.write_only()
+            && (flags.truncate() || flags.append())
+            && !flags.create()
+    }
+
+    fn namespace_entry_matches_ino(&self, ino: u64, path: &Path) -> bool {
+        let parent_ino = match self.state.get_parent_id(ino) {
+            Ok(v) if v != 0 => v,
+            _ => return false,
+        };
+
+        self.state.lookup_node_id(parent_ino, Some(path.name())) == Some(ino)
+    }
+
+    async fn wait_read_visibility_barrier(&self, ino: u64, path: &Path) {
+        if !self.state.has_open_writer_handles(ino) && !self.state.is_writer_closing(ino) {
+            return;
+        }
+
+        self.state.wait_no_open_writer_handles(ino).await;
+        self.state.wait_writer_release_barrier(ino).await;
+        if let Err(e) = self.invalidate_cache(path) {
+            warn!(
+                "failed to invalidate cache for {} after read barrier: {}",
+                path, e
+            );
+        }
+    }
+
+    async fn wait_lookup_visibility_barrier<T: AsRef<str>>(&self, parent: u64, name: Option<T>) {
+        if let Some(ino) = self.state.lookup_node_id(parent, name) {
+            let path = match self.state.get_path(ino) {
+                Ok(path) => path,
+                Err(_) => return,
+            };
+            self.wait_read_visibility_barrier(ino, &path).await;
+        }
+    }
+
+    async fn lookup_status_hint(
+        &self,
+        parent: u64,
+        name: Option<&str>,
+    ) -> Option<(u64, FileStatus)> {
+        let ino = self.state.lookup_node_id(parent, name)?;
+        if let Some(status) = self.state.writer_status_snapshot(ino).await {
+            return Some((ino, status));
+        }
+        self.state
+            .handle_status_snapshot(ino)
+            .map(|status| (ino, status))
+    }
+
+    fn lookup_retry_window(&self) -> Duration {
+        let mut retry_window = self.conf.negative_ttl;
+        let min_window = Duration::from_millis(30);
+        let max_window = Duration::from_millis(200);
+        if retry_window < min_window {
+            retry_window = min_window;
+        }
+        if retry_window > max_window {
+            retry_window = max_window;
+        }
+        retry_window
+    }
+
+    async fn retry_lookup_status_after_enoent(
+        &self,
+        ino: u64,
+        path: &Path,
+    ) -> FuseResult<FileStatus> {
+        let retry_window = self.lookup_retry_window();
+        let start = Instant::now();
+        let mut retries = 0u32;
+
+        loop {
+            if !self.namespace_entry_matches_ino(ino, path) {
+                return err_fuse!(
+                    libc::ENOENT,
+                    "lookup namespace entry disappeared for {}",
+                    path
+                );
+            }
+
+            if let Some(status) = self.state.writer_status_snapshot(ino).await {
+                return Ok(status);
+            }
+            if let Some(status) = self.state.handle_status_snapshot(ino) {
+                return Ok(status);
+            }
+
+            self.wait_read_visibility_barrier(ino, path).await;
+            self.invalidate_cache(path)?;
+
+            match self.get_cached_status(path).await {
+                Ok(status) => return Ok(status),
+                Err(e) if e.errno == libc::ENOENT && start.elapsed() < retry_window => {}
+                Err(e) => return Err(e),
+            }
+
+            retries += 1;
+            if start.elapsed() >= retry_window {
+                return err_fuse!(
+                    libc::ENOENT,
+                    "lookup visibility not ready for {} after {} retries",
+                    path,
+                    retries
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn load_lookup_status(
+        &self,
+        parent: u64,
+        name: Option<&str>,
+        path: &Path,
+    ) -> FuseResult<FileStatus> {
+        if let Some((_, status)) = self.lookup_status_hint(parent, name).await {
+            return Ok(status);
+        }
+
+        match self.get_cached_status(path).await {
+            Ok(status) => Ok(status),
+            Err(e) if e.errno == libc::ENOENT => {
+                if let Some((ino, status)) = self.lookup_status_hint(parent, name).await {
+                    return if self.namespace_entry_matches_ino(ino, path) {
+                        Ok(status)
+                    } else {
+                        Err(e)
+                    };
+                }
+
+                if let Some(ino) = self.state.lookup_node_id(parent, name) {
+                    return self.retry_lookup_status_after_enoent(ino, path).await;
+                }
+
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn fs_set_attr(
         &self,
         path: &Path,
@@ -288,8 +456,246 @@ impl CurvineFileSystem {
         if header.uid == 0 || !self.conf.check_permission {
             return Ok(());
         }
+        if self.open_snapshot_contract_enabled() {
+            let snapshot = self.load_open_snapshot(path).await?;
+            self.check_permissions_with_snapshot(&snapshot, header, mask)
+        } else {
+            let status = self.get_cached_status(path).await?;
+            self.check_access_permissions(&status, header, mask)
+        }
+    }
+
+    fn open_snapshot_contract_enabled(&self) -> bool {
+        true
+    }
+
+    async fn load_open_snapshot(&self, path: &Path) -> FuseResult<OpenSnapshot> {
         let status = self.get_cached_status(path).await?;
-        self.check_access_permissions(&status, header, mask)
+        Ok(OpenSnapshot::new(status))
+    }
+
+    fn check_permissions_with_snapshot(
+        &self,
+        snapshot: &OpenSnapshot,
+        header: &fuse_in_header,
+        mask: u32,
+    ) -> FuseResult<()> {
+        if header.uid == 0 || !self.conf.check_permission {
+            return Ok(());
+        }
+        self.check_access_permissions(snapshot.status(), header, mask)
+    }
+
+    async fn resolve_open_snapshot(
+        &self,
+        ino: u64,
+        path: &Path,
+        header: &fuse_in_header,
+        action: OpenAction,
+        flags: OpenFlags,
+    ) -> FuseResult<(Option<OpenSnapshot>, bool)> {
+        if !self.open_snapshot_contract_enabled() {
+            let fallback_create_open = self
+                .resolve_open_legacy(ino, path, header, action, flags)
+                .await?;
+            return Ok((None, fallback_create_open));
+        }
+
+        if action.read() {
+            self.wait_read_visibility_barrier(ino, path).await;
+        }
+
+        if header.uid == 0 || !self.conf.check_permission {
+            return Ok((None, false));
+        }
+
+        let attempt = self.load_open_snapshot(path).await;
+        match attempt {
+            Ok(snapshot) => {
+                if let Err(e) =
+                    self.check_permissions_with_snapshot(&snapshot, header, action.acl_mask())
+                {
+                    if action.read() && e.errno == libc::ENOENT {
+                        let snapshot = self
+                            .retry_read_open_snapshot_after_enoent(ino, path, header, action)
+                            .await?;
+                        return Ok((Some(snapshot), false));
+                    } else if !Self::can_retry_stale_open(flags, &e) {
+                        return Err(e);
+                    }
+
+                    let fallback_create_open = self
+                        .allow_stale_write_open_fallback(ino, path, header, action, flags)
+                        .await?;
+                    Ok((None, fallback_create_open))
+                } else {
+                    Ok((Some(snapshot), false))
+                }
+            }
+            Err(e) => {
+                if action.read() && e.errno == libc::ENOENT {
+                    let snapshot = self
+                        .retry_read_open_snapshot_after_enoent(ino, path, header, action)
+                        .await?;
+                    Ok((Some(snapshot), false))
+                } else if !Self::can_retry_stale_open(flags, &e) {
+                    Err(e)
+                } else {
+                    let fallback_create_open = self
+                        .allow_stale_write_open_fallback(ino, path, header, action, flags)
+                        .await?;
+                    Ok((None, fallback_create_open))
+                }
+            }
+        }
+    }
+
+    async fn retry_read_open_snapshot_after_enoent(
+        &self,
+        ino: u64,
+        path: &Path,
+        header: &fuse_in_header,
+        action: OpenAction,
+    ) -> FuseResult<OpenSnapshot> {
+        let retry_window = self.conf.negative_ttl.max(Duration::from_millis(20));
+        let start = Instant::now();
+        let mut retries = 0u32;
+
+        loop {
+            self.wait_read_visibility_barrier(ino, path).await;
+            self.invalidate_cache(path)?;
+
+            match self.load_open_snapshot(path).await {
+                Ok(snapshot) => {
+                    match self.check_permissions_with_snapshot(&snapshot, header, action.acl_mask())
+                    {
+                        Ok(()) => return Ok(snapshot),
+                        Err(e) if e.errno == libc::ENOENT && start.elapsed() < retry_window => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) if e.errno == libc::ENOENT && start.elapsed() < retry_window => {}
+                Err(e) => return Err(e),
+            }
+
+            retries += 1;
+            if start.elapsed() >= retry_window {
+                return err_fuse!(
+                    libc::ENOENT,
+                    "stale read-open visibility not ready for {} after {} retries",
+                    path,
+                    retries
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn resolve_open_legacy(
+        &self,
+        ino: u64,
+        path: &Path,
+        header: &fuse_in_header,
+        action: OpenAction,
+        flags: OpenFlags,
+    ) -> FuseResult<bool> {
+        let mut fallback_create_open = false;
+        if action.read() {
+            self.wait_read_visibility_barrier(ino, path).await;
+        }
+        if let Err(e) = self
+            .check_permissions(path, header, action.acl_mask())
+            .await
+        {
+            if action.read() && e.errno == libc::ENOENT {
+                self.wait_read_visibility_barrier(ino, path).await;
+                self.invalidate_cache(path)?;
+                self.check_permissions(path, header, action.acl_mask())
+                    .await?;
+            } else if !Self::can_retry_stale_open(flags, &e) {
+                return Err(e);
+            }
+
+            if action.read() {
+                fallback_create_open = false;
+            } else {
+                fallback_create_open = self
+                    .allow_stale_write_open_fallback(ino, path, header, action, flags)
+                    .await?;
+            }
+        }
+
+        Ok(fallback_create_open)
+    }
+
+    async fn allow_stale_write_open_fallback(
+        &self,
+        ino: u64,
+        path: &Path,
+        header: &fuse_in_header,
+        action: OpenAction,
+        flags: OpenFlags,
+    ) -> FuseResult<bool> {
+        if action.read() {
+            return Ok(false);
+        }
+
+        if let Ok(parent_id) = self.state.get_parent_id(ino) {
+            if parent_id != 0 {
+                let parent_path = self.state.get_path(parent_id)?;
+                if let Err(parent_err) = self
+                    .check_permissions(&parent_path, header, (libc::W_OK | libc::X_OK) as u32)
+                    .await
+                {
+                    if parent_err.errno != libc::ENOENT {
+                        return Err(parent_err);
+                    }
+                }
+            }
+        }
+
+        self.wait_read_visibility_barrier(ino, path).await;
+        self.invalidate_cache(path)?;
+        if flags.create() {
+            debug!(
+                "allow stale create-open fallback for {} with flags={} and O_CREAT",
+                path,
+                flags.access_mark()
+            );
+            return Ok(true);
+        }
+        match self
+            .check_permissions(path, header, action.acl_mask())
+            .await
+        {
+            Ok(()) => {
+                debug!(
+                    "allow stale write-open fallback for {} with flags={} without O_CREAT",
+                    path,
+                    flags.access_mark()
+                );
+                Ok(false)
+            }
+
+            Err(e)
+                if Self::should_force_create_for_namespace_stale_open(
+                    flags,
+                    &e,
+                    self.namespace_entry_matches_ino(ino, path),
+                ) =>
+            {
+                warn!(
+                    "force O_CREAT for stale namespace entry ino={} path={} flags={} after {}",
+                    ino,
+                    path,
+                    flags.access_mark(),
+                    e
+                );
+                Ok(true)
+            }
+
+            Err(e) => Err(e),
+        }
     }
 
     /// Check if the current user has the requested access permissions
@@ -657,7 +1063,11 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Get the path.
         let path = self.state.get_path_common(parent, name.as_deref())?;
-        let status = self.get_cached_status(&path).await?;
+        self.wait_lookup_visibility_barrier(parent, name.as_deref())
+            .await;
+        let status = self
+            .load_lookup_status(parent, name.as_deref(), &path)
+            .await?;
         let res = self.lookup_status(parent, name.as_deref(), &status);
 
         let entry = match res {
@@ -867,8 +1277,31 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn get_attr(&self, op: GetAttr<'_>) -> FuseResult<fuse_attr_out> {
         let path = self.state.get_path(op.header.nodeid)?;
-
-        let status = self.get_cached_status(&path).await?;
+        let status = match self.get_cached_status(&path).await {
+            Ok(status) => status,
+            Err(e) if e.errno == libc::ENOENT => {
+                if let Some(status) = self.state.writer_status_snapshot(op.header.nodeid).await {
+                    status
+                } else if self.namespace_entry_matches_ino(op.header.nodeid, &path) {
+                    if let Some(status) = self.state.handle_status_snapshot(op.header.nodeid) {
+                        status
+                    } else if self.state.is_writer_closing(op.header.nodeid) {
+                        self.wait_read_visibility_barrier(op.header.nodeid, &path)
+                            .await;
+                        self.get_cached_status(&path).await?
+                    } else {
+                        return Err(e);
+                    }
+                } else if self.state.is_writer_closing(op.header.nodeid) {
+                    self.wait_read_visibility_barrier(op.header.nodeid, &path)
+                        .await;
+                    self.get_cached_status(&path).await?
+                } else {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        };
 
         let mut fuse_attr = Self::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
@@ -1105,24 +1538,46 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
         let path = self.state.get_path(op.header.nodeid)?;
-        // Check file access permissions before opening
         let action = OpenAction::try_from(op.arg.flags)?;
-        self.check_permissions(&path, op.header, action.acl_mask())
+        let flags = OpenFlags::new(op.arg.flags);
+        let (open_snapshot, fallback_create_open) = self
+            .resolve_open_snapshot(op.header.nodeid, &path, op.header, action, flags)
             .await?;
 
         let opts = CreateFileOptsBuilder::with_conf(&self.fs.conf().client);
-        let handle = self
-            .state
-            .new_handle(op.header.nodeid, &path, op.arg.flags, opts.build())
-            .await?;
-
         let mut open_flags = op.arg.flags;
+        if fallback_create_open {
+            open_flags |= libc::O_CREAT as u32;
+        }
+        let handle = match self
+            .state
+            .new_handle(op.header.nodeid, &path, open_flags, opts.build())
+            .await
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                warn!(
+                    "open failed ino={} path={} req_flags={} effective_flags={} err={}",
+                    op.header.nodeid,
+                    path,
+                    OpenFlags::new(op.arg.flags).access_mark(),
+                    OpenFlags::new(open_flags).access_mark(),
+                    e
+                );
+                return Err(e);
+            }
+        };
+
         if self.conf.direct_io {
             open_flags |= FUSE_FOPEN_DIRECT_IO;
         } else {
+            let keep_status = open_snapshot
+                .as_ref()
+                .map(OpenSnapshot::status)
+                .unwrap_or_else(|| handle.status());
             let keep_cache = self
                 .state
-                .should_keep_cache(op.header.nodeid, handle.status())?;
+                .should_keep_cache(op.header.nodeid, keep_status)?;
             if keep_cache {
                 open_flags |= FUSE_FOPEN_KEEP_CACHE;
             } else {
@@ -1149,7 +1604,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn create(&self, op: Create<'_>) -> FuseResult<fuse_create_out> {
         if !FuseUtils::s_isreg(op.arg.mode) {
-            return err_fuse!(libc::EIO);
+            return err_fuse!(libc::EINVAL);
         }
 
         let id = op.header.nodeid;
@@ -1176,10 +1631,24 @@ impl fs::FileSystem for CurvineFileSystem {
                 op.arg.mode & 0o7777 & !op.arg.umask,
             )
         }
-        let handle = self
+        let handle = match self
             .state
             .new_handle(node.id, &path, flags, opts.build())
-            .await?;
+            .await
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                warn!(
+                    "create failed parent_ino={} node_ino={} path={} flags={} err={}",
+                    id,
+                    node.id,
+                    path,
+                    OpenFlags::new(flags).access_mark(),
+                    e
+                );
+                return Err(e);
+            }
+        };
 
         let attr = self.lookup_status(id, Some(name), handle.status())?;
         self.invalidate_cache(&path)?;
@@ -1211,7 +1680,7 @@ impl fs::FileSystem for CurvineFileSystem {
     async fn flush(&self, op: Flush<'_>, reply: FuseResponse) -> FuseResult<()> {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
         self.fs_unlock(&handle, LockFlags::Plock).await?;
-        handle.flush(Some(reply)).await?;
+        handle.flush_for_close(Some(reply)).await?;
 
         let path = Path::from_str(&handle.status.path)?;
         self.invalidate_cache(&path)?;
@@ -1220,17 +1689,50 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
         let ino = op.header.nodeid;
-        let handle = match self.state.remove_handle(ino, op.arg.fh) {
-            Some(handle) => handle,
-            None => return err_fuse!(libc::EBADF),
-        };
+        let handle = self.state.find_handle(ino, op.arg.fh)?;
+        let path = Path::from_str(&handle.status.path)?;
 
-        self.fs_unlock(&handle, LockFlags::Flock).await?;
-        self.fs_unlock(&handle, LockFlags::Plock).await?;
-        let complete_result = handle.complete(Some(reply)).await;
+        if let Err(e) = self.fs_unlock(&handle, LockFlags::Flock).await {
+            warn!(
+                "release ino={} fh={} flock unlock failed: {}",
+                ino, op.arg.fh, e
+            );
+        }
+        if let Err(e) = self.fs_unlock(&handle, LockFlags::Plock).await {
+            warn!(
+                "release ino={} fh={} plock unlock failed: {}",
+                ino, op.arg.fh, e
+            );
+        }
 
-        if !self.state.has_open_handles(ino) && self.state.remove_pending_delete(ino) {
-            let path = Path::from_str(&handle.status.path)?;
+        // Serialize with write-open on the same logical path to avoid
+        // close/open races that can terminate writer channels unexpectedly.
+        let path_lock = self.state.writer_path_lock(&path);
+        let _guard = path_lock.lock().await;
+
+        let mark_writer_closing = handle.has_writer();
+        if mark_writer_closing {
+            self.state.mark_writer_closing(ino);
+        }
+
+        let complete_writer =
+            handle.has_writer() && !self.state.has_other_writer_handles(ino, op.arg.fh);
+        let complete_result = handle
+            .finalize_for_release(complete_writer, Some(reply))
+            .await;
+        if self.state.remove_handle(ino, op.arg.fh).is_none() {
+            if mark_writer_closing {
+                self.state.clear_writer_closing(ino);
+            }
+            return err_fuse!(libc::EBADF);
+        }
+        if mark_writer_closing {
+            self.state.clear_writer_closing(ino);
+        }
+
+        let has_open_handles = self.state.has_open_handles(ino);
+
+        if !has_open_handles && self.state.remove_pending_delete(ino) {
             info!(
                 "release ino={}: no more open handles, executing delayed deletion of {}",
                 ino, path
@@ -1240,7 +1742,6 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        let path = Path::from_str(&handle.status.path)?;
         self.invalidate_cache(&path)?;
 
         complete_result
@@ -1307,6 +1808,16 @@ impl fs::FileSystem for CurvineFileSystem {
         let new_name = try_option!(op.new_name.to_str());
         if new_name.len() > FUSE_MAX_NAME_LENGTH {
             return err_fuse!(libc::ENAMETOOLONG);
+        }
+
+        if let Some(old_ino) = self.state.lookup_node_id(op.header.nodeid, Some(old_name)) {
+            self.state.wait_no_open_writer_handles(old_ino).await;
+            self.state.wait_writer_release_barrier(old_ino).await;
+        }
+
+        if let Some(dst_ino) = self.state.lookup_node_id(op.arg.newdir, Some(new_name)) {
+            self.state.wait_no_open_writer_handles(dst_ino).await;
+            self.state.wait_writer_release_barrier(dst_ino).await;
         }
 
         let (old_path, new_path) =
@@ -1427,7 +1938,7 @@ impl fs::FileSystem for CurvineFileSystem {
             let res = self.create(op).await?;
             let handle = self.state.remove_handle(res.0.nodeid, res.1.fh);
             if handle.is_none() {
-                return err_fuse!(libc::EIO);
+                return err_fuse!(libc::EBADF);
             }
             let out = fuse_entry_out {
                 nodeid: res.0.nodeid,

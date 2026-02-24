@@ -73,6 +73,10 @@ pub struct JobStatus {
     pub source_path: String,
     pub target_path: String,
     pub progress: JobTaskProgress,
+    pub source_generation: Option<String>,
+    pub expected_source_id: Option<i64>,
+    pub expected_source_len: Option<i64>,
+    pub expected_source_mtime: Option<i64>,
 }
 
 impl JobStatus {
@@ -82,7 +86,7 @@ impl JobStatus {
     }
 }
 
-#[derive(Default, Debug, Deserialize, Serialize)]
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
 pub struct LoadJobCommand {
     pub source_path: String,
     pub target_path: Option<String>,
@@ -92,11 +96,26 @@ pub struct LoadJobCommand {
     pub ttl_ms: Option<i64>,
     pub ttl_action: Option<TtlAction>,
     pub overwrite: Option<bool>,
+    pub source_generation: Option<String>,
+    pub expected_source_id: Option<i64>,
+    pub expected_source_len: Option<i64>,
+    pub expected_source_mtime: Option<i64>,
+    pub expected_target_mtime: Option<i64>,
+    pub expected_target_missing: Option<bool>,
 }
 
 impl LoadJobCommand {
-    pub fn builder(source_path: impl Into<String>) -> LoadJobCommandBuilder {
+    pub fn publish_builder(source_path: impl Into<String>) -> LoadJobCommandBuilder {
         LoadJobCommandBuilder::new(source_path).overwrite(true)
+    }
+
+    pub fn hydrate_builder(source_path: impl Into<String>) -> LoadJobCommandBuilder {
+        LoadJobCommandBuilder::new(source_path).overwrite(true)
+    }
+
+    // Backward-compatible default builder: keep historical overwrite=true behavior.
+    pub fn builder(source_path: impl Into<String>) -> LoadJobCommandBuilder {
+        Self::publish_builder(source_path)
     }
 }
 
@@ -110,6 +129,12 @@ pub struct LoadJobCommandBuilder {
     ttl_ms: Option<i64>,
     ttl_action: Option<TtlAction>,
     overwrite: Option<bool>,
+    source_generation: Option<String>,
+    expected_source_id: Option<i64>,
+    expected_source_len: Option<i64>,
+    expected_source_mtime: Option<i64>,
+    expected_target_mtime: Option<i64>,
+    expected_target_missing: Option<bool>,
 }
 
 impl LoadJobCommandBuilder {
@@ -155,6 +180,36 @@ impl LoadJobCommandBuilder {
         self
     }
 
+    pub fn source_generation(mut self, source_generation: impl Into<String>) -> Self {
+        let _ = self.source_generation.insert(source_generation.into());
+        self
+    }
+
+    pub fn expected_source_id(mut self, id: i64) -> Self {
+        let _ = self.expected_source_id.insert(id);
+        self
+    }
+
+    pub fn expected_source_len(mut self, len: i64) -> Self {
+        let _ = self.expected_source_len.insert(len);
+        self
+    }
+
+    pub fn expected_source_mtime(mut self, mtime: i64) -> Self {
+        let _ = self.expected_source_mtime.insert(mtime);
+        self
+    }
+
+    pub fn expected_target_mtime(mut self, mtime: i64) -> Self {
+        let _ = self.expected_target_mtime.insert(mtime);
+        self
+    }
+
+    pub fn expected_target_missing(mut self, missing: bool) -> Self {
+        let _ = self.expected_target_missing.insert(missing);
+        self
+    }
+
     pub fn build(self) -> LoadJobCommand {
         LoadJobCommand {
             source_path: self.source_path,
@@ -165,6 +220,12 @@ impl LoadJobCommandBuilder {
             ttl_ms: self.ttl_ms,
             ttl_action: self.ttl_action,
             overwrite: self.overwrite,
+            source_generation: self.source_generation,
+            expected_source_id: self.expected_source_id,
+            expected_source_len: self.expected_source_len,
+            expected_source_mtime: self.expected_source_mtime,
+            expected_target_mtime: self.expected_target_mtime,
+            expected_target_missing: self.expected_target_missing,
         }
     }
 }
@@ -182,6 +243,12 @@ pub struct LoadJobInfo {
     pub mount_info: MountInfo,
     pub create_time: i64,
     pub overwrite: Option<bool>,
+    pub source_generation: Option<String>,
+    pub expected_source_id: Option<i64>,
+    pub expected_source_len: Option<i64>,
+    pub expected_source_mtime: Option<i64>,
+    pub expected_target_mtime: Option<i64>,
+    pub expected_target_missing: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +259,50 @@ pub struct LoadTaskInfo {
     pub source_path: String,
     pub target_path: String,
     pub create_time: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedLoadTaskProgress {
+    pub task_id: String,
+    pub worker: WorkerAddress,
+    pub source_path: String,
+    pub target_path: String,
+    pub create_time: i64,
+    pub progress: JobTaskProgress,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedLoadJobMeta {
+    pub info: LoadJobInfo,
+    pub state: JobTaskState,
+    pub progress: JobTaskProgress,
+}
+
+impl PersistedLoadJobMeta {
+    pub fn from_snapshot(snapshot: &PersistedLoadJobSnapshot) -> Self {
+        Self {
+            info: snapshot.info.clone(),
+            state: snapshot.state,
+            progress: snapshot.progress.clone(),
+        }
+    }
+
+    pub fn into_snapshot(self, tasks: Vec<PersistedLoadTaskProgress>) -> PersistedLoadJobSnapshot {
+        PersistedLoadJobSnapshot {
+            info: self.info,
+            state: self.state,
+            progress: self.progress,
+            tasks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedLoadJobSnapshot {
+    pub info: LoadJobInfo,
+    pub state: JobTaskState,
+    pub progress: JobTaskProgress,
+    pub tasks: Vec<PersistedLoadTaskProgress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

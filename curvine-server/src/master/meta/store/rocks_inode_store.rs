@@ -15,10 +15,14 @@
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
-use curvine_common::state::{BlockLocation, FileLock, MountInfo};
+use curvine_common::state::{
+    BlockLocation, FileLock, JobTaskProgress, JobTaskState, MountInfo, PersistedLoadJobMeta,
+    PersistedLoadJobSnapshot, PersistedLoadTaskProgress,
+};
 use curvine_common::utils::SerdeUtils as Serde;
-use orpc::CommonResult;
+use orpc::{err_box, CommonResult};
 use rocksdb::{DBIteratorWithThreadMode, WriteBatchWithTransaction, DB};
+use std::collections::HashSet;
 
 pub struct RocksInodeStore {
     pub(crate) db: DBEngine,
@@ -33,6 +37,9 @@ impl RocksInodeStore {
 
     pub const PREFIX_MOUNT: u8 = 0x01;
     pub const PREFIX_LOCK: u8 = 0x02;
+    pub const PREFIX_JOB_SNAPSHOT_LEGACY: u8 = 0x03;
+    pub const PREFIX_JOB_META: u8 = 0x04;
+    pub const PREFIX_JOB_TASK: u8 = 0x05;
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
@@ -202,6 +209,236 @@ impl RocksInodeStore {
             let value = Serde::serialize(&lock)?;
             self.db.put_cf(RocksInodeStore::CF_COMMON, key, value)
         }
+    }
+
+    fn legacy_job_snapshot_key(job_id: &str) -> Vec<u8> {
+        RocksUtils::prefix_to_bytes([Self::PREFIX_JOB_SNAPSHOT_LEGACY], job_id.as_bytes())
+    }
+
+    fn job_meta_key(job_id: &str) -> Vec<u8> {
+        RocksUtils::prefix_to_bytes([Self::PREFIX_JOB_META], job_id.as_bytes())
+    }
+
+    fn job_task_prefix(job_id: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(2 + job_id.len());
+        key.push(Self::PREFIX_JOB_TASK);
+        key.extend_from_slice(job_id.as_bytes());
+        key.push(0);
+        key
+    }
+
+    fn job_task_key(job_id: &str, task_id: &str) -> Vec<u8> {
+        let mut key = Self::job_task_prefix(job_id);
+        key.extend_from_slice(task_id.as_bytes());
+        key
+    }
+
+    fn decode_prefixed_job_id(key: &[u8], prefix: u8) -> CommonResult<String> {
+        if key.first().copied() != Some(prefix) {
+            return err_box!("invalid prefix key for job id decode");
+        }
+        let bytes = &key[1..];
+        match String::from_utf8(bytes.to_vec()) {
+            Ok(v) => Ok(v),
+            Err(e) => err_box!("decode job id utf8 failed: {}", e),
+        }
+    }
+
+    fn list_job_task_keys(&self, job_id: &str) -> CommonResult<Vec<Vec<u8>>> {
+        let iter = self
+            .db
+            .prefix_scan(Self::CF_COMMON, Self::job_task_prefix(job_id))?;
+        let mut keys = Vec::with_capacity(8);
+        for item in iter {
+            let bytes = item?;
+            keys.push(bytes.0.to_vec());
+        }
+        Ok(keys)
+    }
+
+    fn load_job_tasks(&self, job_id: &str) -> CommonResult<Vec<PersistedLoadTaskProgress>> {
+        let iter = self
+            .db
+            .prefix_scan(Self::CF_COMMON, Self::job_task_prefix(job_id))?;
+        let mut tasks = Vec::with_capacity(8);
+        for item in iter {
+            let bytes = item?;
+            let task = Serde::deserialize::<PersistedLoadTaskProgress>(&bytes.1)?;
+            tasks.push(task);
+        }
+        Ok(tasks)
+    }
+
+    fn get_job_meta(&self, job_id: &str) -> CommonResult<Option<PersistedLoadJobMeta>> {
+        let key = Self::job_meta_key(job_id);
+        let bytes = self.db.get_cf(Self::CF_COMMON, key)?;
+        match bytes {
+            Some(v) => Ok(Some(Serde::deserialize::<PersistedLoadJobMeta>(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn get_legacy_job_snapshot(
+        &self,
+        job_id: &str,
+    ) -> CommonResult<Option<PersistedLoadJobSnapshot>> {
+        let key = Self::legacy_job_snapshot_key(job_id);
+        let bytes = self.db.get_cf(Self::CF_COMMON, key)?;
+        match bytes {
+            Some(v) => Ok(Some(Serde::deserialize(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn migrate_legacy_job_snapshot(
+        &self,
+        job_id: &str,
+    ) -> CommonResult<Option<PersistedLoadJobSnapshot>> {
+        if let Some(snapshot) = self.get_legacy_job_snapshot(job_id)? {
+            self.set_job_snapshot(&snapshot)?;
+            Ok(Some(snapshot))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_job_snapshot(&self, snapshot: &PersistedLoadJobSnapshot) -> CommonResult<()> {
+        let job_id = snapshot.info.job_id.as_str();
+        let common_cf = self.db.cf(Self::CF_COMMON)?;
+        let mut batch = WriteBatchWithTransaction::<false>::default();
+        let meta = PersistedLoadJobMeta::from_snapshot(snapshot);
+        batch.put_cf(
+            common_cf,
+            Self::job_meta_key(job_id),
+            Serde::serialize(&meta)?,
+        );
+        batch.delete_cf(common_cf, Self::legacy_job_snapshot_key(job_id));
+
+        for key in self.list_job_task_keys(job_id)? {
+            batch.delete_cf(common_cf, key);
+        }
+
+        for task in &snapshot.tasks {
+            batch.put_cf(
+                common_cf,
+                Self::job_task_key(job_id, &task.task_id),
+                Serde::serialize(task)?,
+            );
+        }
+
+        self.db.write_batch(batch)
+    }
+
+    pub fn remove_job_snapshot(&self, job_id: &str) -> CommonResult<()> {
+        let common_cf = self.db.cf(Self::CF_COMMON)?;
+        let mut batch = WriteBatchWithTransaction::<false>::default();
+        batch.delete_cf(common_cf, Self::job_meta_key(job_id));
+        batch.delete_cf(common_cf, Self::legacy_job_snapshot_key(job_id));
+        for key in self.list_job_task_keys(job_id)? {
+            batch.delete_cf(common_cf, key);
+        }
+        self.db.write_batch(batch)
+    }
+
+    pub fn get_job_snapshot(&self, job_id: &str) -> CommonResult<Option<PersistedLoadJobSnapshot>> {
+        if let Some(meta) = self.get_job_meta(job_id)? {
+            let tasks = self.load_job_tasks(job_id)?;
+            return Ok(Some(meta.into_snapshot(tasks)));
+        }
+
+        if let Some(snapshot) = self.get_legacy_job_snapshot(job_id)? {
+            return Ok(Some(snapshot));
+        }
+        Ok(None)
+    }
+
+    pub fn get_job_snapshots(&self) -> CommonResult<Vec<PersistedLoadJobSnapshot>> {
+        let meta_iter = self
+            .db
+            .prefix_scan(Self::CF_COMMON, [Self::PREFIX_JOB_META])?;
+        let mut vec = Vec::with_capacity(16);
+        let mut seen = HashSet::new();
+        for item in meta_iter {
+            let bytes = item?;
+            let job_id = Self::decode_prefixed_job_id(&bytes.0, Self::PREFIX_JOB_META)?;
+            let meta = Serde::deserialize::<PersistedLoadJobMeta>(&bytes.1)?;
+            let tasks = self.load_job_tasks(&job_id)?;
+            seen.insert(job_id);
+            vec.push(meta.into_snapshot(tasks));
+        }
+
+        let legacy_iter = self
+            .db
+            .prefix_scan(Self::CF_COMMON, [Self::PREFIX_JOB_SNAPSHOT_LEGACY])?;
+        for item in legacy_iter {
+            let bytes = item?;
+            let snapshot = Serde::deserialize::<PersistedLoadJobSnapshot>(&bytes.1)?;
+            if seen.contains(&snapshot.info.job_id) {
+                continue;
+            }
+            seen.insert(snapshot.info.job_id.clone());
+            vec.push(snapshot);
+        }
+
+        Ok(vec)
+    }
+
+    fn ensure_job_meta_for_update(&self, job_id: &str) -> CommonResult<PersistedLoadJobMeta> {
+        if let Some(meta) = self.get_job_meta(job_id)? {
+            return Ok(meta);
+        }
+
+        if let Some(snapshot) = self.migrate_legacy_job_snapshot(job_id)? {
+            return Ok(PersistedLoadJobMeta::from_snapshot(&snapshot));
+        }
+
+        err_box!("job snapshot not found: {}", job_id)
+    }
+
+    fn get_task_progress_entry(
+        &self,
+        job_id: &str,
+        task_id: &str,
+    ) -> CommonResult<PersistedLoadTaskProgress> {
+        let key = Self::job_task_key(job_id, task_id);
+        let bytes = self.db.get_cf(Self::CF_COMMON, key)?;
+        match bytes {
+            Some(v) => Ok(Serde::deserialize::<PersistedLoadTaskProgress>(&v)?),
+            None => err_box!("task {} not found in job snapshot {}", task_id, job_id),
+        }
+    }
+
+    pub fn update_job_task_progress(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        task_progress: &JobTaskProgress,
+        job_state: JobTaskState,
+        job_progress: &JobTaskProgress,
+    ) -> CommonResult<()> {
+        let mut task_entry = self.get_task_progress_entry(job_id, task_id).or_else(|_| {
+            let _ = self.ensure_job_meta_for_update(job_id)?;
+            self.get_task_progress_entry(job_id, task_id)
+        })?;
+
+        let mut meta = self.ensure_job_meta_for_update(job_id)?;
+        task_entry.progress = task_progress.clone();
+        meta.state = job_state;
+        meta.progress = job_progress.clone();
+
+        let common_cf = self.db.cf(Self::CF_COMMON)?;
+        let mut batch = WriteBatchWithTransaction::<false>::default();
+        batch.put_cf(
+            common_cf,
+            Self::job_meta_key(job_id),
+            Serde::serialize(&meta)?,
+        );
+        batch.put_cf(
+            common_cf,
+            Self::job_task_key(job_id, task_id),
+            Serde::serialize(&task_entry)?,
+        );
+        self.db.write_batch(batch)
     }
 
     pub fn get_rocksdb_memory(&self) -> CommonResult<Vec<(String, u64)>> {

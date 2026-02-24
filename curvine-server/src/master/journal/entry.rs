@@ -14,7 +14,10 @@
 
 use crate::master::meta::inode::{InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
-use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
+use curvine_common::state::{
+    CommitBlock, FileLock, JobTaskProgress, JobTaskState, MountInfo, PersistedLoadJobSnapshot,
+    SetAttrOpts,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -126,6 +129,28 @@ pub struct SetLocksEntry {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct StoreJobSnapshotEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) snapshot: PersistedLoadJobSnapshot,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct RemoveJobSnapshotEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) job_id: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct UpdateJobTaskProgressEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) job_id: String,
+    pub(crate) task_id: String,
+    pub(crate) task_progress: JobTaskProgress,
+    pub(crate) job_state: JobTaskState,
+    pub(crate) job_progress: JobTaskProgress,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
@@ -141,6 +166,9 @@ pub enum JournalEntry {
     Symlink(SymlinkEntry),
     Link(LinkEntry),
     SetLocks(SetLocksEntry),
+    StoreJobSnapshot(StoreJobSnapshotEntry),
+    RemoveJobSnapshot(RemoveJobSnapshotEntry),
+    UpdateJobTaskProgress(UpdateJobTaskProgressEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

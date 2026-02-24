@@ -96,6 +96,18 @@ impl FuseResponse {
         self.unique
     }
 
+    fn should_warn_for_error(&self, error: &FuseError) -> bool {
+        if self.debug {
+            return true;
+        }
+
+        if matches!(error.errno, libc::ENOENT | libc::ENODATA) {
+            return false;
+        }
+
+        !(error.errno == libc::ENOSYS && error.error.to_string().contains("FUSE_IOCTL"))
+    }
+
     pub async fn send_rep<T: Debug, E: Into<FuseError> + Debug>(
         &self,
         res: Result<T, E>,
@@ -116,7 +128,7 @@ impl FuseResponse {
 
             Err(e) => {
                 let e = e.into();
-                if self.debug || (e.errno != libc::ENOENT && e.errno != libc::ENODATA) {
+                if self.should_warn_for_error(&e) {
                     warn!("send_rep unique {}: {:?}", self.unique, e);
                 }
                 ResponseData::create(self.unique, e.errno, vec![])
@@ -156,7 +168,7 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                if self.debug || (e.errno != libc::ENOENT && e.errno != libc::ENODATA) {
+                if self.should_warn_for_error(&e) {
                     warn!("send_buf unique {}: {}", self.unique, e);
                 }
                 ResponseData::create(self.unique, e.errno, vec![])
@@ -177,7 +189,7 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                if self.debug || (e.errno != libc::ENOENT && e.errno != libc::ENODATA) {
+                if self.should_warn_for_error(&e) {
                     warn!("send_data unique {}: {}", self.unique, e);
                 }
                 ResponseData::create(self.unique, e.errno, vec![])

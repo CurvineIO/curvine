@@ -24,7 +24,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
+    JobTaskProgress, JobTaskState, MkdirOpts, MountInfo, PersistedLoadJobSnapshot, RenameFlags,
+    SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
 use log::{info, warn};
@@ -738,6 +739,102 @@ impl FsDir {
         self.store.get_mount_point(id)
     }
 
+    pub fn store_job_snapshot(
+        &mut self,
+        snapshot: PersistedLoadJobSnapshot,
+        send_log: bool,
+    ) -> FsResult<()> {
+        let op_ms = LocalTime::mills();
+        self.store.apply_store_job_snapshot(&snapshot)?;
+
+        if send_log {
+            self.journal_writer
+                .log_store_job_snapshot(op_ms, snapshot)?;
+        }
+        Ok(())
+    }
+
+    pub fn unprotected_store_job_snapshot(
+        &mut self,
+        snapshot: PersistedLoadJobSnapshot,
+    ) -> FsResult<()> {
+        self.store.apply_store_job_snapshot(&snapshot)?;
+        Ok(())
+    }
+
+    pub fn remove_job_snapshot(&mut self, job_id: impl AsRef<str>) -> FsResult<()> {
+        let op_ms = LocalTime::mills();
+        self.store.apply_remove_job_snapshot(job_id.as_ref())?;
+        self.journal_writer
+            .log_remove_job_snapshot(op_ms, job_id.as_ref())?;
+        Ok(())
+    }
+
+    pub fn unprotected_remove_job_snapshot(&mut self, job_id: impl AsRef<str>) -> FsResult<()> {
+        self.store.apply_remove_job_snapshot(job_id.as_ref())?;
+        Ok(())
+    }
+
+    pub fn update_job_task_progress(
+        &mut self,
+        job_id: impl AsRef<str>,
+        task_id: impl AsRef<str>,
+        task_progress: JobTaskProgress,
+        job_state: JobTaskState,
+        job_progress: JobTaskProgress,
+        send_log: bool,
+    ) -> FsResult<()> {
+        let op_ms = LocalTime::mills();
+        self.store.apply_update_job_task_progress(
+            job_id.as_ref(),
+            task_id.as_ref(),
+            &task_progress,
+            job_state,
+            &job_progress,
+        )?;
+
+        if send_log {
+            self.journal_writer.log_update_job_task_progress(
+                op_ms,
+                job_id.as_ref(),
+                task_id.as_ref(),
+                task_progress,
+                job_state,
+                job_progress,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn unprotected_update_job_task_progress(
+        &mut self,
+        job_id: impl AsRef<str>,
+        task_id: impl AsRef<str>,
+        task_progress: JobTaskProgress,
+        job_state: JobTaskState,
+        job_progress: JobTaskProgress,
+    ) -> FsResult<()> {
+        self.store.apply_update_job_task_progress(
+            job_id.as_ref(),
+            task_id.as_ref(),
+            &task_progress,
+            job_state,
+            &job_progress,
+        )?;
+        Ok(())
+    }
+
+    pub fn get_job_snapshot(
+        &self,
+        job_id: impl AsRef<str>,
+    ) -> CommonResult<Option<PersistedLoadJobSnapshot>> {
+        self.store.get_job_snapshot(job_id.as_ref())
+    }
+
+    pub fn get_job_snapshots(&self) -> CommonResult<Vec<PersistedLoadJobSnapshot>> {
+        self.store.get_job_snapshots()
+    }
+
     pub fn set_attr(&mut self, inp: InodePath, opts: SetAttrOpts) -> FsResult<FileStatus> {
         let op_ms = LocalTime::mills();
 
@@ -756,6 +853,22 @@ impl FsDir {
         let recursive = opts.recursive;
         let parent_inode_id = inode.id();
         let mut change_inodes: Vec<InodeView> = vec![];
+
+        if !opts.expect_x_attr.is_empty() {
+            let attrs = inode.as_ref().x_attr();
+            for (key, expect) in &opts.expect_x_attr {
+                match attrs.get(key) {
+                    Some(current) if current == expect => {}
+                    _ => {
+                        return err_box!(
+                            "set_attr compare-and-set failed for inode {} key {}",
+                            parent_inode_id,
+                            key
+                        );
+                    }
+                }
+            }
+        }
 
         // set current inode
         inode.as_mut().set_attr(opts);

@@ -15,12 +15,11 @@
 use curvine_common::conf::ClientConf;
 use curvine_common::state::{
     JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobInfo, LoadTaskInfo, MountInfo,
-    WorkerAddress,
+    PersistedLoadJobSnapshot, PersistedLoadTaskProgress, WorkerAddress,
 };
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{debug, info, warn};
 use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
-use orpc::err_box;
 use orpc::sync::StateCtl;
 
 #[derive(Debug, Clone)]
@@ -48,6 +47,12 @@ pub struct JobContext {
 }
 
 impl JobContext {
+    fn is_expected_competition_failure(message: &str) -> bool {
+        message.contains("owned by another lease")
+            || message.contains("source") && message.contains("changed during commit")
+            || message.contains("lost ownership before commit finalize")
+    }
+
     pub fn with_conf(
         job_conf: &LoadJobCommand,
         job_id: String,
@@ -84,6 +89,12 @@ impl JobContext {
             mount_info: mnt.clone(),
             create_time: LocalTime::mills() as i64,
             overwrite: job_conf.overwrite,
+            source_generation: job_conf.source_generation.clone(),
+            expected_source_id: job_conf.expected_source_id,
+            expected_source_len: job_conf.expected_source_len,
+            expected_source_mtime: job_conf.expected_source_mtime,
+            expected_target_mtime: job_conf.expected_target_mtime,
+            expected_target_missing: job_conf.expected_target_missing,
         };
 
         JobContext {
@@ -115,13 +126,34 @@ impl JobContext {
         &mut self,
         task_id: impl AsRef<str>,
         progress: JobTaskProgress,
-    ) -> FsResult<()> {
+    ) -> FsResult<bool> {
+        let current_state: JobTaskState = self.state.state();
+        if current_state == JobTaskState::Canceled {
+            // User cancellation is terminal; ignore late task reports.
+            return Ok(false);
+        }
+
         let task_id = task_id.as_ref();
         let detail = if let Some(v) = self.tasks.get_mut(task_id) {
             v
+        } else if self.allow_legacy_task_alias() {
+            if let Some(v) = self.resolve_legacy_task_alias(task_id) {
+                v
+            } else {
+                warn!(
+                    "Ignore stale task report for job {}, unknown task_id {}",
+                    self.info.job_id, task_id
+                );
+                return Ok(false);
+            }
         } else {
-            return err_box!("Not fond task {}", task_id);
+            warn!(
+                "Ignore stale task report for generation job {}, unknown task_id {}",
+                self.info.job_id, task_id
+            );
+            return Ok(false);
         };
+        let task_state_changed = detail.progress.state != progress.state;
         // set task progress
         detail.progress = progress;
 
@@ -159,20 +191,99 @@ impl JobContext {
                 LocalTime::mills() as i64 - self.info.create_time
             )
         } else if job_state == JobTaskState::Failed {
-            warn!(
+            let log_msg = format!(
                 "job {} execute failed, tasks {}, len = {}, cost {} ms, error {}",
                 self.info.job_id,
                 self.tasks.len(),
                 ByteUnit::byte_to_string(loaded_size as u64),
                 LocalTime::mills() as i64 - self.info.create_time,
                 message
-            )
+            );
+            if Self::is_expected_competition_failure(&message) {
+                debug!("{}", log_msg);
+            } else {
+                warn!("{}", log_msg);
+            }
         }
 
         self.update_state(job_state, message);
         self.progress.loaded_size = loaded_size;
         self.progress.total_size = total_size;
 
-        Ok(())
+        Ok(task_state_changed)
+    }
+
+    fn allow_legacy_task_alias(&self) -> bool {
+        self.info.source_generation.is_none()
+    }
+
+    fn resolve_legacy_task_alias(&mut self, task_id: &str) -> Option<&mut TaskDetail> {
+        // Backward compatibility: allow manual reports using legacy "<old_job_id>_task_<idx>"
+        // while current task ids may include generation tags and a different canonical job id.
+        let (_prefix, idx) = task_id.rsplit_once("_task_")?;
+        if idx.is_empty() || !idx.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+
+        let suffix = format!("_task_{}", idx);
+        let mut matched_key: Option<String> = None;
+        for key in self.tasks.keys() {
+            if key.ends_with(&suffix) {
+                if matched_key.is_some() {
+                    return None;
+                }
+                matched_key = Some(key.clone());
+            }
+        }
+
+        matched_key.and_then(|key| self.tasks.get_mut(&key))
+    }
+
+    pub fn to_snapshot(&self) -> PersistedLoadJobSnapshot {
+        let tasks = self
+            .tasks
+            .values()
+            .map(|detail| PersistedLoadTaskProgress {
+                task_id: detail.task.task_id.clone(),
+                worker: detail.task.worker.clone(),
+                source_path: detail.task.source_path.clone(),
+                target_path: detail.task.target_path.clone(),
+                create_time: detail.task.create_time,
+                progress: detail.progress.clone(),
+            })
+            .collect();
+
+        PersistedLoadJobSnapshot {
+            info: self.info.clone(),
+            state: self.state.state(),
+            progress: self.progress.clone(),
+            tasks,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: PersistedLoadJobSnapshot) -> Self {
+        let mut tasks = FastHashMap::default();
+        let mut assigned_workers = FastHashSet::default();
+        for task in snapshot.tasks {
+            assigned_workers.insert(task.worker.clone());
+            let mut detail = TaskDetail::new(LoadTaskInfo {
+                job: snapshot.info.clone(),
+                task_id: task.task_id.clone(),
+                worker: task.worker,
+                source_path: task.source_path,
+                target_path: task.target_path,
+                create_time: task.create_time,
+            });
+            detail.progress = task.progress;
+            tasks.insert(detail.task.task_id.clone(), detail);
+        }
+
+        Self {
+            info: snapshot.info,
+            state: StateCtl::new(snapshot.state.into()),
+            progress: snapshot.progress,
+            assigned_workers,
+            tasks,
+        }
     }
 }

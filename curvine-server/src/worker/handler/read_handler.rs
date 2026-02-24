@@ -18,7 +18,7 @@ use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::proto::{BlockReadResponse, DataHeaderProto};
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{debug, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
@@ -119,7 +119,7 @@ impl ReadHandler {
         let _ = self.context.replace(context);
 
         self.metrics.read_blocks.with_label_values(&[label]).inc();
-        info!("{}", log_msg);
+        debug!("{}", log_msg);
 
         Ok(Builder::success(msg).proto_header(response).build())
     }
@@ -187,7 +187,7 @@ impl ReadHandler {
         let file = self.file.take();
         drop(file);
 
-        info!("Read block end for req_id {}", msg.req_id());
+        debug!("Read block end for req_id {}", msg.req_id());
         Ok(msg.success())
     }
 }

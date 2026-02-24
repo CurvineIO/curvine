@@ -62,7 +62,9 @@ High-performance caching layer for filesystem mount information with bidirection
 ```
 */
 
+use crate::unified::pdpc::RouteIndexSnapshot;
 use crate::unified::{UfsFileSystem, UnifiedFileSystem};
+use arc_swap::ArcSwap;
 use curvine_common::fs::Path;
 use curvine_common::state::MountInfo;
 use curvine_common::FsResult;
@@ -144,25 +146,14 @@ impl InnerMap {
         }
     }
 
-    pub fn get(&self, is_cv: bool, path: &str) -> Option<Arc<MountValue>> {
-        if is_cv {
-            self.cv_map.get(path).cloned()
-        } else {
-            self.ufs_map.get(path).cloned()
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.cv_map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
 pub struct MountCache {
     mounts: RwLock<InnerMap>,
+    route_index: ArcSwap<RouteIndexSnapshot<MountValue>>,
     update_interval: u64,
     last_update: AtomicCounter,
 }
@@ -171,6 +162,7 @@ impl MountCache {
     pub fn new(update_interval: u64) -> Self {
         Self {
             mounts: RwLock::new(InnerMap::default()),
+            route_index: ArcSwap::from_pointee(RouteIndexSnapshot::default()),
             update_interval,
             last_update: AtomicCounter::new(0),
         }
@@ -191,6 +183,9 @@ impl MountCache {
                 state.insert(item)?;
             }
 
+            let snapshot = Arc::new(RouteIndexSnapshot::from_maps(&state.cv_map, &state.ufs_map));
+            self.route_index.store(snapshot);
+
             debug!("update mounts {:?}", state.len());
             self.last_update.set(LocalTime::mills());
         }
@@ -207,22 +202,18 @@ impl MountCache {
     ) -> FsResult<Option<Arc<MountValue>>> {
         self.check_update(fs, false).await?;
 
-        let state = self.mounts.read().unwrap();
-        if state.is_empty() {
+        let snapshot = self.route_index.load();
+        if snapshot.is_empty() {
             return Ok(None);
         }
 
-        for mount_path in path.get_possible_mounts() {
-            if let Some(mount) = state.get(path.is_cv(), &mount_path) {
-                return Ok(Some(mount));
-            }
-        }
-
-        Ok(None)
+        Ok(snapshot.lookup(path))
     }
 
     pub fn remove(&self, path: &Path) {
         let mut state = self.mounts.write().unwrap();
         state.remove(path);
+        let snapshot = Arc::new(RouteIndexSnapshot::from_maps(&state.cv_map, &state.ufs_map));
+        self.route_index.store(snapshot);
     }
 }

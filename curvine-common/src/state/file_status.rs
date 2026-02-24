@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::state::{FileType, StoragePolicy};
+use crate::state::{SyncLifecycleMarker, SyncLifecycleState};
 use orpc::common::LocalTime;
 use orpc::ternary;
 use serde::{Deserialize, Serialize};
@@ -89,5 +90,13 @@ impl FileStatus {
 
     pub fn is_complete(&self) -> bool {
         self.is_complete
+    }
+
+    pub fn sync_marker(&self) -> Option<SyncLifecycleMarker> {
+        SyncLifecycleMarker::from_status(self)
+    }
+
+    pub fn sync_state(&self) -> Option<SyncLifecycleState> {
+        self.sync_marker().map(|marker| marker.state)
     }
 }

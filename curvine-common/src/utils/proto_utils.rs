@@ -444,6 +444,7 @@ impl ProtoUtils {
             add_x_attr: opts.add_x_attr,
             remove_x_attr: opts.remove_x_attr,
             ufs_mtime: opts.ufs_mtime,
+            expect_x_attr: opts.expect_x_attr,
         }
     }
 
@@ -461,6 +462,7 @@ impl ProtoUtils {
             add_x_attr: opts.add_x_attr,
             remove_x_attr: opts.remove_x_attr,
             ufs_mtime: opts.ufs_mtime,
+            expect_x_attr: opts.expect_x_attr,
         }
     }
 

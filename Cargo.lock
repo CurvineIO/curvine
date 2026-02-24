@@ -831,6 +831,7 @@ dependencies = [
 name = "curvine-client"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "curvine-common",
  "curvine-tracing-appender",
@@ -1085,6 +1086,7 @@ dependencies = [
  "futures",
  "jni",
  "log",
+ "moka",
  "opendal",
  "orpc",
  "tokio",

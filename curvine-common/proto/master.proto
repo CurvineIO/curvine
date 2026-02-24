@@ -228,6 +228,7 @@ message SetAttrOptsProto {
     map<string, bytes> add_x_attr = 10;
     repeated string remove_x_attr = 11;
     optional int64 ufs_mtime = 12;
+    map<string, bytes> expect_x_attr = 13;
 }
 
 message SetAttrRequest {

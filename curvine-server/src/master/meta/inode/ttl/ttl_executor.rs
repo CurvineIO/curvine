@@ -331,6 +331,12 @@ impl InodeTtlExecutor {
             storage_type: None,
             ttl_ms: None,
             ttl_action: None,
+            expected_source_id: None,
+            expected_source_len: None,
+            expected_source_mtime: None,
+            source_generation: None,
+            expected_target_mtime: None,
+            expected_target_missing: None,
         };
 
         let job_result = self.job_manager.submit_load_job(command).map_err(|e| {

@@ -18,22 +18,31 @@ use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult, STATE_FILE_MAGIC, STATE_FILE_VERSION};
-use curvine_client::unified::UnifiedFileSystem;
+use curvine_client::unified::{UnifiedFileSystem, UnifiedReader};
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
+use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, MetaCache, Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use orpc::common::FastHashMap;
 use orpc::err_box;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use tokio::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::{Mutex, Notify};
+
+const WRITER_LOCK_STRIPES: usize = 1024;
 
 pub struct NodeState {
     node_map: RwLock<NodeMap>,
     handles: RwLockHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
     dir_handles: RwLockHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
+    writer_locks: Vec<Arc<Mutex<()>>>,
+    writer_closing_barrier: RwLock<FastHashMap<u64, Arc<Notify>>>,
     fh_creator: AtomicCounter,
     meta_cache: MetaCache,
     fs: UnifiedFileSystem,
@@ -45,11 +54,16 @@ impl NodeState {
         let conf = fs.conf().fuse.clone();
         let node_map = NodeMap::new(&conf);
         let meta_cache = MetaCache::new(conf.meta_cache_capacity, conf.meta_cache_ttl_duration);
+        let writer_locks = (0..WRITER_LOCK_STRIPES)
+            .map(|_| Arc::new(Mutex::new(())))
+            .collect();
 
         Self {
             node_map: RwLock::new(node_map),
             handles: RwLockHashMap::default(),
             dir_handles: RwLockHashMap::default(),
+            writer_locks,
+            writer_closing_barrier: RwLock::new(FastHashMap::default()),
             fh_creator: AtomicCounter::new(0),
             meta_cache,
             fs,
@@ -98,13 +112,9 @@ impl NodeState {
     ///    - We don't use kernel notification (FUSE_NOTIFY_INVAL_INODE) as it causes deadlocks in practice
     ///
     /// 2. For attr cache (should_keep_attr):
-    ///    - Cache is valid if: !is_first_access || !is_changed
-    ///    - Non-first access OR unchanged mtime/len → cache is valid
-    ///    - First access AND changed → cache is invalid (returns false)
-    ///    - Note: Non-first access always keeps cache (returns true), but mtime/len changes invalidate it
-    ///    - This helps prevent reading outdated attributes in time-sensitive scenarios (e.g., git clone)
-    ///    - The logic ensures that once a file is accessed, subsequent lookups with unchanged attributes
-    ///      can use cached values, but any change to mtime/len will force cache invalidation
+    ///    - Cache is valid only when mtime/len is unchanged
+    ///    - Any mtime/len change forces attr_valid=0 on this reply
+    ///    - This prevents stale st_size/st_mtime after overwrite-heavy workloads
     fn update_cache_state(&self, id: u64, status: &FileStatus) -> FuseResult<(bool, bool)> {
         let mut lock = self.node_write();
         let attr = lock.get_mut_check(id)?;
@@ -125,8 +135,8 @@ impl NodeState {
     }
 
     pub fn should_keep_attr(&self, id: u64, status: &FileStatus) -> FuseResult<bool> {
-        let (is_first_access, is_changed) = self.update_cache_state(id, status)?;
-        Ok(!is_first_access || !is_changed)
+        let (_, is_changed) = self.update_cache_state(id, status)?;
+        Ok(!is_changed)
     }
 
     pub fn get_path_common<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> FuseResult<Path> {
@@ -152,6 +162,12 @@ impl NodeState {
         let path1 = map.get_path_name(id1, name1)?;
         let path2 = map.get_path_name(id2, name2)?;
         Ok((path1, path2))
+    }
+
+    pub fn lookup_node_id<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> Option<u64> {
+        self.node_read()
+            .lookup_node(parent, name.as_ref())
+            .map(|node| node.id)
     }
 
     pub fn get_parent_id(&self, id: u64) -> FuseResult<u64> {
@@ -222,6 +238,13 @@ impl NodeState {
         self.node_write().find_link_inode(curvine_ino, fuse_ino)
     }
 
+    pub fn writer_path_lock(&self, path: &Path) -> Arc<Mutex<()>> {
+        let mut hasher = DefaultHasher::new();
+        path.full_path().hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.writer_locks.len();
+        self.writer_locks[idx].clone()
+    }
+
     fn find_writer0(
         map: &FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
         ino: &u64,
@@ -258,15 +281,62 @@ impl NodeState {
             return Ok(writer);
         }
 
-        let writer = self.fs.open_with_opts(path, opts, flags).await?;
+        let writer = match self.fs.open_with_opts(path, opts.clone(), flags).await {
+            Ok(writer) => writer,
+
+            Err(e) if Self::should_retry_open_as_create(flags, &e) => {
+                let exists = self.fs.exists(path).await?;
+                if !Self::should_retry_open_as_create_with_existence(flags, &e, exists) {
+                    return Err(e.into());
+                }
+                let retry_flags = flags.set_create(true);
+                debug!(
+                    "retry open with O_CREAT for {} (flags={} -> {}) after {:?}",
+                    path,
+                    flags.access_mark(),
+                    retry_flags.access_mark(),
+                    e
+                );
+                self.fs.open_with_opts(path, opts, retry_flags).await?
+            }
+
+            Err(e) => return Err(e.into()),
+        };
         let writer = FuseWriter::new(&self.conf, self.fs.clone_runtime(), writer);
         Ok(Arc::new(Mutex::new(writer)))
     }
 
-    pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
-        let reader = self.fs.open(path).await?;
+    fn should_retry_open_as_create(flags: OpenFlags, err: &FsError) -> bool {
+        matches!(err, FsError::FileNotFound(_))
+            && flags.write_only()
+            && (flags.truncate() || flags.append())
+            && !flags.create()
+    }
+
+    fn should_retry_open_as_create_with_existence(
+        flags: OpenFlags,
+        err: &FsError,
+        exists: bool,
+    ) -> bool {
+        Self::should_retry_open_as_create(flags, err) && exists
+    }
+
+    pub async fn new_reader_with_hint(
+        &self,
+        path: &Path,
+        prefer_cv: bool,
+    ) -> FuseResult<FuseReader> {
+        let reader = if prefer_cv {
+            UnifiedReader::Cv(self.fs.cv().open(path).await?)
+        } else {
+            self.fs.open(path).await?
+        };
         let reader = FuseReader::new(&self.conf, self.fs.clone_runtime(), reader);
         Ok(reader)
+    }
+
+    pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
+        self.new_reader_with_hint(path, false).await
     }
 
     pub async fn new_handle(
@@ -277,18 +347,61 @@ impl NodeState {
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
+        let strict_write_open = flags.write() && (flags.truncate() || flags.create());
 
-        // Before creating reader, flush any active writer to ensure reader gets correct file length
-        // This is critical for applications like git clone that read files while they're being written
-        if flags.read() {
-            if let Some(existing_writer) = self.find_writer(&ino) {
-                existing_writer.lock().await.flush(None).await?;
+        if flags.read() || strict_write_open {
+            self.wait_no_open_writer_handles(ino).await;
+            self.wait_writer_release_barrier(ino).await;
+        }
+
+        if flags.read() || flags.write() {
+            loop {
+                // Serialize open paths per logical file (striped lock) to provide
+                // close->open visibility guarantees while release finalization is in-flight.
+                let path_lock = self.writer_path_lock(path);
+                let _guard = path_lock.lock().await;
+                if (flags.read() || strict_write_open)
+                    && (self.has_open_writer_handles(ino) || self.is_writer_closing(ino))
+                {
+                    drop(_guard);
+                    self.wait_no_open_writer_handles(ino).await;
+                    self.wait_writer_release_barrier(ino).await;
+                    continue;
+                }
+                return self.new_handle_inner(ino, path, flags, opts).await;
             }
         }
+        self.new_handle_inner(ino, path, flags, opts).await
+    }
+
+    async fn new_handle_inner(
+        &self,
+        ino: u64,
+        path: &Path,
+        flags: OpenFlags,
+        opts: CreateFileOpts,
+    ) -> FuseResult<Arc<FileHandle>> {
+        // Flush active writer before creating reader to reduce stale reads.
+        // If a CV-backed writer is still active, prefer CV reader to preserve
+        // close->open visibility while writer finalization is still in-flight.
+        let active_writer_prefer_cv = if flags.read() {
+            match self.find_writer(&ino) {
+                Some(existing_writer) => {
+                    let mut lock = existing_writer.lock().await;
+                    lock.flush(None).await?;
+                    Some(!lock.is_ufs())
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
 
         let (reader, writer) = match flags.access_mode() {
             mode if mode == OpenFlags::RDONLY => {
-                let reader = self.new_reader(path).await?;
+                let reader = self
+                    .new_reader_with_hint(path, active_writer_prefer_cv.unwrap_or(false))
+                    .await?;
                 (Some(RawPtr::from_owned(reader)), None)
             }
 
@@ -311,7 +424,7 @@ impl NodeState {
                     );
                     None
                 } else {
-                    let reader = self.new_reader(path).await?;
+                    let reader = self.new_reader_with_hint(path, true).await?;
                     Some(RawPtr::from_owned(reader))
                 };
 
@@ -326,7 +439,7 @@ impl NodeState {
             }
         };
 
-        let status = if let Some(writer) = &writer {
+        let mut status = if let Some(writer) = &writer {
             let lock = writer.lock().await;
             lock.status().clone()
         } else if let Some(reader) = &reader {
@@ -335,11 +448,16 @@ impl NodeState {
             return err_fuse!(libc::EINVAL, "Invalid flags: {:?}", flags);
         };
 
+        // FileHandle always keeps logical Curvine path for follow-up FUSE operations.
+        status.path = path.full_path().to_string();
+        status.name = path.name().to_string();
+
         let mut lock = self.handles.write();
 
-        // Check if writer already exists to prevent duplicate creation
+        // Check if writer already exists to prevent duplicate creation.
         let check_writer = if let Some(writer) = writer {
-            if let Some(exist_writer) = Self::find_writer0(&lock, &ino) {
+            let exist_writer = Self::find_writer0(&lock, &ino);
+            if let Some(exist_writer) = exist_writer {
                 Some(exist_writer)
             } else {
                 Some(writer)
@@ -401,6 +519,41 @@ impl NodeState {
         }
     }
 
+    pub fn has_open_writer_handles(&self, ino: u64) -> bool {
+        self.open_writer_handle_count(ino) > 0
+    }
+
+    pub async fn writer_status_snapshot(&self, ino: u64) -> Option<FileStatus> {
+        let writer = self.find_writer(&ino)?;
+        let lock = writer.lock().await;
+        Some(lock.status().clone())
+    }
+
+    pub fn handle_status_snapshot(&self, ino: u64) -> Option<FileStatus> {
+        let lock = self.handles.read();
+        let map = lock.get(&ino)?;
+        map.values().next().map(|handle| handle.status.clone())
+    }
+
+    pub fn open_writer_handle_count(&self, ino: u64) -> usize {
+        let lock = self.handles.read();
+        if let Some(map) = lock.get(&ino) {
+            map.values().filter(|handle| handle.has_writer()).count()
+        } else {
+            0
+        }
+    }
+
+    pub fn has_other_writer_handles(&self, ino: u64, exclude_fh: u64) -> bool {
+        let lock = self.handles.read();
+        if let Some(map) = lock.get(&ino) {
+            map.iter()
+                .any(|(fh, handle)| *fh != exclude_fh && handle.has_writer())
+        } else {
+            false
+        }
+    }
+
     pub fn should_delete_now<T: AsRef<str>>(
         &self,
         parent: u64,
@@ -436,6 +589,84 @@ impl NodeState {
 
     pub fn is_pending_delete(&self, ino: u64) -> bool {
         self.node_read().is_pending_delete(ino)
+    }
+
+    pub fn mark_writer_closing(&self, ino: u64) {
+        let mut map = self.writer_closing_barrier.write().unwrap();
+        map.entry(ino).or_insert_with(|| Arc::new(Notify::new()));
+    }
+
+    pub fn clear_writer_closing(&self, ino: u64) {
+        let notify = {
+            let mut map = self.writer_closing_barrier.write().unwrap();
+            map.remove(&ino)
+        };
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+
+    pub fn is_writer_closing(&self, ino: u64) -> bool {
+        self.writer_closing_barrier
+            .read()
+            .unwrap()
+            .contains_key(&ino)
+    }
+
+    pub async fn wait_writer_release_barrier(&self, ino: u64) {
+        let timeout = Duration::from_secs(self.fs.conf().client.close_timeout_secs.max(1));
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let notify = {
+                self.writer_closing_barrier
+                    .read()
+                    .unwrap()
+                    .get(&ino)
+                    .cloned()
+            };
+            let Some(notify) = notify else {
+                return;
+            };
+
+            let notified = notify.notified();
+            if !self.is_writer_closing(ino) {
+                return;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                warn!(
+                    "timed out waiting for writer-release barrier, ino={}, timeout={:?}",
+                    ino, timeout
+                );
+                return;
+            }
+
+            let wait_timeout = deadline.saturating_duration_since(now);
+            if tokio::time::timeout(wait_timeout, notified).await.is_ok() {
+                return;
+            }
+        }
+    }
+
+    pub async fn wait_no_open_writer_handles(&self, ino: u64) {
+        if !self.has_open_writer_handles(ino) {
+            return;
+        }
+
+        let timeout = Duration::from_secs(self.fs.conf().client.close_timeout_secs.max(1));
+        let start = Instant::now();
+        while self.has_open_writer_handles(ino) {
+            if start.elapsed() >= timeout {
+                warn!(
+                    "timed out waiting for open writer handles to close, ino={}, timeout={:?}",
+                    ino, timeout
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 
     pub fn find_dir_handle(&self, ino: u64, fh: u64) -> FuseResult<Arc<DirHandle>> {

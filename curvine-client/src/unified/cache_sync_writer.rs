@@ -17,22 +17,42 @@ use log::info;
 use tracing::warn;
 
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileAllocOpts, FileStatus, LoadJobResult, OpenFlags, WriteType};
+use curvine_common::state::{
+    FileAllocOpts, FileStatus, LoadJobCommand, LoadJobResult, OpenFlags, SetAttrOptsBuilder,
+    SyncLifecycleMarker, SyncLifecycleOwner, SyncLifecycleState, WriteType,
+};
+use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::sys::DataSlice;
 
-use crate::file::FsWriter;
+use crate::file::{CurvineFileSystem, FsWriter};
 use crate::rpc::JobMasterClient;
 use crate::unified::{MountValue, UnifiedFileSystem};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceSnapshot {
+    id: i64,
+    len: i64,
+    mtime: i64,
+}
+
+impl SourceSnapshot {
+    fn from_status(status: &FileStatus) -> Self {
+        Self {
+            id: status.id,
+            len: status.len,
+            mtime: status.mtime,
+        }
+    }
+}
+
 pub struct CacheSyncWriter {
     job_client: JobMasterClient,
+    cv: CurvineFileSystem,
     inner: FsWriter,
     write_type: WriteType,
     job_res: Option<LoadJobResult>,
-    /// Whether seek or resize operations have been performed
-    has_random_access: bool,
 }
 
 impl CacheSyncWriter {
@@ -57,10 +77,10 @@ impl CacheSyncWriter {
 
         let writer = Self {
             job_client,
+            cv: fs.cv().clone(),
             inner,
             write_type,
             job_res: None,
-            has_random_access: false,
         };
         Ok(writer)
     }
@@ -73,6 +93,105 @@ impl CacheSyncWriter {
         } else {
             Ok(())
         }
+    }
+
+    async fn latest_source_snapshot(&self) -> FsResult<SourceSnapshot> {
+        let status = self.cv.get_status(self.inner.path()).await?;
+        Ok(SourceSnapshot::from_status(&status))
+    }
+
+    async fn submit_publish_with_snapshot(
+        &mut self,
+        mark: &str,
+        snapshot: SourceSnapshot,
+    ) -> FsResult<()> {
+        let source_generation =
+            CommonUtils::source_generation(snapshot.id, snapshot.len, snapshot.mtime);
+        let expected_job_id = CommonUtils::create_job_id_with_generation(
+            self.inner.path().full_path(),
+            &source_generation,
+        );
+        let pending_marker = SyncLifecycleMarker::with_owner(
+            SyncLifecycleState::Pending,
+            source_generation.clone(),
+            expected_job_id.clone(),
+            SyncLifecycleOwner::Publish,
+        );
+        self.set_sync_marker(&pending_marker, None).await?;
+        let job_res = match self
+            .job_client
+            .submit_load_job(
+                LoadJobCommand::publish_builder(self.inner.path().clone_uri())
+                    .source_generation(source_generation.clone())
+                    .expected_source_id(snapshot.id)
+                    .expected_source_len(snapshot.len)
+                    .expected_source_mtime(snapshot.mtime)
+                    .build(),
+            )
+            .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                let aborted_marker = SyncLifecycleMarker::with_owner(
+                    SyncLifecycleState::Aborted,
+                    source_generation.clone(),
+                    expected_job_id.clone(),
+                    SyncLifecycleOwner::Publish,
+                );
+                if let Err(mark_err) = self
+                    .set_sync_marker(&aborted_marker, Some(&pending_marker))
+                    .await
+                {
+                    warn!(
+                        "mark aborted sync state failed for {}: {}",
+                        self.inner.path(),
+                        mark_err
+                    );
+                }
+                return Err(e);
+            }
+        };
+        if job_res.job_id != expected_job_id {
+            let marker = SyncLifecycleMarker::with_owner(
+                SyncLifecycleState::Pending,
+                source_generation.clone(),
+                job_res.job_id.clone(),
+                SyncLifecycleOwner::Publish,
+            );
+            self.set_sync_marker(&marker, Some(&pending_marker)).await?;
+        }
+        info!(
+            "submit({}) job for {}, job id {}, target_path {}, generation={}, source(id={},len={},mtime={})",
+            mark,
+            self.inner.path(),
+            job_res.job_id,
+            job_res.target_path,
+            source_generation,
+            snapshot.id,
+            snapshot.len,
+            snapshot.mtime
+        );
+
+        self.job_res.replace(job_res);
+        Ok(())
+    }
+
+    async fn set_sync_marker(
+        &self,
+        marker: &SyncLifecycleMarker,
+        expect: Option<&SyncLifecycleMarker>,
+    ) -> FsResult<()> {
+        let mut builder = SetAttrOptsBuilder::new();
+        for (k, v) in marker.as_expect_map() {
+            builder = builder.add_x_attr(k, v);
+        }
+        if let Some(expect_marker) = expect {
+            for (k, v) in expect_marker.as_expect_map() {
+                builder = builder.expect_x_attr(k, v);
+            }
+        }
+        let _ = self.cv.set_attr(self.inner.path(), builder.build()).await?;
+        Ok(())
     }
 }
 
@@ -102,20 +221,6 @@ impl Writer for CacheSyncWriter {
     }
 
     async fn write_chunk(&mut self, chunk: DataSlice) -> FsResult<i64> {
-        if self.job_res.is_none() && !self.has_random_access {
-            let job_res = self
-                .job_client
-                .submit_load(self.inner.path().clone_uri())
-                .await?;
-            info!(
-                "submit(init) job successfully for {}, job id {}, target_path {}",
-                self.inner.path(),
-                job_res.job_id,
-                job_res.target_path
-            );
-
-            self.job_res.replace(job_res);
-        }
         self.inner.write_chunk(chunk).await
     }
 
@@ -127,15 +232,9 @@ impl Writer for CacheSyncWriter {
         self.inner.complete().await?;
 
         if self.job_res.is_none() {
-            let job_res = self.job_client.submit_load(self.path().clone_uri()).await?;
-            info!(
-                "resubmit job successfully for {}, job id {}, target_path {}",
-                self.path(),
-                job_res.job_id,
-                job_res.target_path
-            );
-
-            self.job_res.replace(job_res);
+            let current_snapshot = self.latest_source_snapshot().await?;
+            self.submit_publish_with_snapshot("complete", current_snapshot)
+                .await?;
         }
 
         if matches!(self.write_type, WriteType::CacheThrough) {
@@ -160,7 +259,6 @@ impl Writer for CacheSyncWriter {
             }
 
             self.job_res.take();
-            self.has_random_access = true;
         }
 
         self.inner.seek(pos).await
@@ -175,7 +273,6 @@ impl Writer for CacheSyncWriter {
             }
             self.job_res.take();
         }
-        self.has_random_access = true;
 
         self.inner.resize(opts).await
     }

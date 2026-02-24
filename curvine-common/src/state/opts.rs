@@ -357,6 +357,8 @@ pub struct SetAttrOpts {
     pub add_x_attr: HashMap<String, Vec<u8>>,
     pub remove_x_attr: Vec<String>,
     pub ufs_mtime: Option<i64>,
+    #[serde(default)]
+    pub expect_x_attr: HashMap<String, Vec<u8>>,
 }
 
 impl SetAttrOpts {
@@ -375,6 +377,7 @@ impl SetAttrOpts {
             add_x_attr: HashMap::default(),
             remove_x_attr: vec![],
             ufs_mtime: None,
+            expect_x_attr: HashMap::default(),
         }
     }
 }
@@ -392,6 +395,7 @@ pub struct SetAttrOptsBuilder {
     add_x_attr: HashMap<String, Vec<u8>>,
     remove_x_attr: Vec<String>,
     ufs_mtime: Option<i64>,
+    expect_x_attr: HashMap<String, Vec<u8>>,
 }
 
 impl Default for SetAttrOptsBuilder {
@@ -415,6 +419,7 @@ impl SetAttrOptsBuilder {
             add_x_attr: HashMap::new(),
             remove_x_attr: vec![],
             ufs_mtime: None,
+            expect_x_attr: HashMap::new(),
         }
     }
 
@@ -478,6 +483,11 @@ impl SetAttrOptsBuilder {
         self
     }
 
+    pub fn expect_x_attr(mut self, key: impl Into<String>, value: Vec<u8>) -> Self {
+        self.expect_x_attr.insert(key.into(), value);
+        self
+    }
+
     pub fn build(self) -> SetAttrOpts {
         SetAttrOpts {
             recursive: self.recursive,
@@ -492,6 +502,7 @@ impl SetAttrOptsBuilder {
             add_x_attr: self.add_x_attr,
             remove_x_attr: self.remove_x_attr,
             ufs_mtime: self.ufs_mtime,
+            expect_x_attr: self.expect_x_attr,
         }
     }
 }

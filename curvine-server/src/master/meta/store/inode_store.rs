@@ -18,7 +18,10 @@ use crate::master::meta::inode::{InodeFile, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
-use curvine_common::state::{BlockLocation, CommitBlock, FileLock, MountInfo};
+use curvine_common::state::{
+    BlockLocation, CommitBlock, FileLock, JobTaskProgress, JobTaskState, MountInfo,
+    PersistedLoadJobSnapshot,
+};
 use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
@@ -586,5 +589,36 @@ impl InodeStore {
 
     pub fn apply_set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
         self.store.set_locks(id, lock)
+    }
+
+    pub fn apply_store_job_snapshot(
+        &self,
+        snapshot: &PersistedLoadJobSnapshot,
+    ) -> CommonResult<()> {
+        self.store.set_job_snapshot(snapshot)
+    }
+
+    pub fn apply_remove_job_snapshot(&self, job_id: &str) -> CommonResult<()> {
+        self.store.remove_job_snapshot(job_id)
+    }
+
+    pub fn get_job_snapshot(&self, job_id: &str) -> CommonResult<Option<PersistedLoadJobSnapshot>> {
+        self.store.get_job_snapshot(job_id)
+    }
+
+    pub fn get_job_snapshots(&self) -> CommonResult<Vec<PersistedLoadJobSnapshot>> {
+        self.store.get_job_snapshots()
+    }
+
+    pub fn apply_update_job_task_progress(
+        &self,
+        job_id: &str,
+        task_id: &str,
+        task_progress: &JobTaskProgress,
+        job_state: JobTaskState,
+        job_progress: &JobTaskProgress,
+    ) -> CommonResult<()> {
+        self.store
+            .update_job_task_progress(job_id, task_id, task_progress, job_state, job_progress)
     }
 }

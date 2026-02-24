@@ -83,6 +83,12 @@ impl JournalLoader {
             JournalEntry::Link(e) => self.link(e),
 
             JournalEntry::SetLocks(e) => self.set_locks(e),
+
+            JournalEntry::StoreJobSnapshot(e) => self.store_job_snapshot(e),
+
+            JournalEntry::RemoveJobSnapshot(e) => self.remove_job_snapshot(e),
+
+            JournalEntry::UpdateJobTaskProgress(e) => self.update_job_task_progress(e),
         }
     }
 
@@ -230,6 +236,30 @@ impl JournalLoader {
     pub fn set_locks(&self, entry: SetLocksEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
         fs_dir.store.apply_set_locks(entry.ino, &entry.locks)
+    }
+
+    pub fn store_job_snapshot(&self, entry: StoreJobSnapshotEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.unprotected_store_job_snapshot(entry.snapshot)?;
+        Ok(())
+    }
+
+    pub fn remove_job_snapshot(&self, entry: RemoveJobSnapshotEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.unprotected_remove_job_snapshot(entry.job_id)?;
+        Ok(())
+    }
+
+    pub fn update_job_task_progress(&self, entry: UpdateJobTaskProgressEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.unprotected_update_job_task_progress(
+            entry.job_id,
+            entry.task_id,
+            entry.task_progress,
+            entry.job_state,
+            entry.job_progress,
+        )?;
+        Ok(())
     }
 
     // Clean up expired checkpoints.

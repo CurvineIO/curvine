@@ -19,6 +19,7 @@ use crate::session::FuseResponse;
 use crate::{err_fuse, FuseError, FuseResult};
 use curvine_common::fs::{Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
+use log::warn;
 use orpc::err_box;
 use orpc::sys::RawPtr;
 use serde::{Deserialize, Serialize};
@@ -68,18 +69,24 @@ impl FileHandle {
     ) -> FuseResult<()> {
         let reader = match &self.reader {
             Some(v) => v,
-            None => return err_fuse!(libc::EIO),
+            None => return err_fuse!(libc::EBADF),
         };
 
         if op.arg.offset as i64 >= reader.len() {
             if let Some(writer) = state.find_writer(&op.header.nodeid) {
-                {
-                    writer.lock().await.flush(None).await?;
+                let prefer_cv = {
+                    let mut lock = writer.lock().await;
+                    lock.flush(None).await?;
+                    !lock.is_ufs()
+                };
+                // TODO: Optimize by adding refresh interface to refresh block list.
+                // Reader path may come from UFS backend; always refresh via logical Curvine path.
+                let mut path = Path::from_str(&self.status.path)?;
+                if !path.is_cv() {
+                    path = state.get_path(op.header.nodeid)?;
                 }
-                // TODO: Optimize by adding refresh interface to refresh block list
-                let path = reader.path().clone();
                 reader.as_mut().complete(None).await?;
-                let new_reader = state.new_reader(&path).await?;
+                let new_reader = state.new_reader_with_hint(&path, prefer_cv).await?;
                 reader.replace(new_reader);
             }
         }
@@ -96,7 +103,7 @@ impl FileHandle {
         let lock = if let Some(lock) = &self.writer {
             lock
         } else {
-            return err_fuse!(libc::EIO);
+            return err_fuse!(libc::EBADF);
         };
 
         let mut writer = lock.lock().await;
@@ -105,6 +112,18 @@ impl FileHandle {
     }
 
     pub async fn flush(&self, reply: Option<FuseResponse>) -> FuseResult<()> {
+        if let Some(writer) = &self.writer {
+            writer.lock().await.flush(reply).await?;
+        } else if let Some(reply) = reply {
+            reply.send_rep(Ok::<(), FuseError>(())).await?;
+        }
+        Ok(())
+    }
+
+    /// Flush path for `close(2)` (`FUSE_FLUSH`):
+    /// - `FUSE_FLUSH` may run multiple times for dup/forked descriptors.
+    /// - Never complete here; finalization belongs to `FUSE_RELEASE` on last reference.
+    pub async fn flush_for_close(&self, reply: Option<FuseResponse>) -> FuseResult<()> {
         if let Some(writer) = &self.writer {
             writer.lock().await.flush(reply).await?;
         } else if let Some(reply) = reply {
@@ -125,6 +144,33 @@ impl FileHandle {
             reader.as_mut().complete(reply.take()).await?;
         }
         Ok(())
+    }
+
+    /// Finalize this handle for `FUSE_RELEASE`.
+    ///
+    /// `complete_writer` is decided by open-writer-handle state in `NodeState`, not by
+    /// `Arc::strong_count`, so transient cloned writer references won't downgrade
+    /// a required commit into flush-only.
+    pub async fn finalize_for_release(
+        &self,
+        complete_writer: bool,
+        mut reply: Option<FuseResponse>,
+    ) -> FuseResult<()> {
+        if let Some(writer) = &self.writer {
+            if complete_writer {
+                writer.lock().await.complete(reply.take()).await?;
+            } else {
+                writer.lock().await.flush(reply.take()).await?;
+            }
+        }
+        if let Some(reader) = &self.reader {
+            reader.as_mut().complete(reply.take()).await?;
+        }
+        Ok(())
+    }
+
+    pub fn has_writer(&self) -> bool {
+        self.writer.is_some()
     }
 
     pub fn status(&self) -> &FileStatus {
@@ -176,7 +222,7 @@ impl FileHandle {
     pub async fn restore(reader: &mut StateReader, state: &NodeState) -> FuseResult<Self> {
         let ino = reader.read_len()?;
         let fh = reader.read_len()?;
-        let status: FileStatus = reader.read_struct()?;
+        let mut status: FileStatus = reader.read_struct()?;
 
         let has_writer: bool = reader.read_struct()?;
         let has_reader: bool = reader.read_struct()?;
@@ -189,7 +235,23 @@ impl FileHandle {
         }
         let locks: HandleLock = reader.read_struct()?;
 
-        let path = Path::from_str(&status.path)?;
+        // Backward compatibility: old snapshots may carry backend(UFS) path in status.path.
+        // Rebuild logical Curvine path from inode map to keep FUSE path domain consistent.
+        let mut path = match Path::from_str(&status.path) {
+            Ok(p) => p,
+            Err(_) => state.get_path(ino)?,
+        };
+        if !path.is_cv() {
+            let recovered = state.get_path(ino)?;
+            warn!(
+                "restore handle ino={} path={} is not cv path, fallback to {}",
+                ino, status.path, recovered
+            );
+            path = recovered;
+        }
+        status.path = path.full_path().to_string();
+        status.name = path.name().to_string();
+
         let writer = if has_writer {
             let opts = CreateFileOptsBuilder::with_conf(state.client_conf()).build();
             let writer = state

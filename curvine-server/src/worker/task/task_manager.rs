@@ -24,6 +24,9 @@ use orpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
+const LOAD_TASK_MIN_IO_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+const LOAD_TASK_MIN_IO_CHUNK_SIZE_STR: &str = "8MB";
+
 pub struct TaskManager {
     rt: Arc<Runtime>,
     fs: CurvineFileSystem,
@@ -35,6 +38,27 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
+    fn tune_load_task_io(conf: &mut ClusterConf) -> (usize, usize) {
+        let old_read = conf.client.read_chunk_size;
+        let old_write = conf.client.write_chunk_size;
+        if conf.client.read_chunk_size < LOAD_TASK_MIN_IO_CHUNK_SIZE {
+            conf.client.read_chunk_size = LOAD_TASK_MIN_IO_CHUNK_SIZE;
+            conf.client.read_chunk_size_str = LOAD_TASK_MIN_IO_CHUNK_SIZE_STR.to_string();
+        }
+        if conf.client.write_chunk_size < LOAD_TASK_MIN_IO_CHUNK_SIZE {
+            conf.client.write_chunk_size = LOAD_TASK_MIN_IO_CHUNK_SIZE;
+            conf.client.write_chunk_size_str = LOAD_TASK_MIN_IO_CHUNK_SIZE_STR.to_string();
+        }
+        let read_chunk_size = conf.client.read_chunk_size as i64;
+        let mut read_slice_size = conf.client.read_slice_size.max(read_chunk_size);
+        let rem = read_slice_size % read_chunk_size;
+        if rem != 0 {
+            read_slice_size += read_chunk_size - rem;
+        }
+        conf.client.read_slice_size = read_slice_size;
+        (old_read, old_write)
+    }
+
     /// Creates a new TaskManager with an existing runtime.
     ///
     /// This method initializes a task manager that handles load tasks execution
@@ -71,6 +95,18 @@ impl TaskManager {
     pub fn with_rt(rt: Arc<Runtime>, conf: &ClusterConf) -> FsResult<Self> {
         let mut new_conf = conf.clone();
         new_conf.client.hostname = "localhost".to_string();
+        let (old_read_chunk, old_write_chunk) = Self::tune_load_task_io(&mut new_conf);
+        if old_read_chunk != new_conf.client.read_chunk_size
+            || old_write_chunk != new_conf.client.write_chunk_size
+        {
+            info!(
+                "TaskManager load-task io chunk tuned: read {} -> {}, write {} -> {}",
+                old_read_chunk,
+                new_conf.client.read_chunk_size,
+                old_write_chunk,
+                new_conf.client.write_chunk_size
+            );
+        }
 
         let fs = CurvineFileSystem::with_rt(new_conf, rt.clone())?;
         let factory = Arc::new(UfsFactory::with_rt(&conf.client, rt.clone()));

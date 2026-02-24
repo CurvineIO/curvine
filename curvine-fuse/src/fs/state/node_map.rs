@@ -33,11 +33,15 @@ pub struct NodeMap {
     // record curvine inode ID to FUSE inode ID for hard link detection when fuse restart
     linked_inode_map: FastHashMap<i64, u64>,
     pending_deletes: FastHashSet<u64>,
+    forgotten_nodes: FastHashMap<u64, u64>,
     id_creator: AtomicCounter,
     cache_ttl: u64,
+    forget_grace_ms: u64,
     last_clean: u64,
     conf: FuseConf,
 }
+
+const FORGET_OPEN_RACE_GRACE_MS: u64 = 1500;
 
 impl NodeMap {
     pub fn new(conf: &FuseConf) -> Self {
@@ -48,8 +52,10 @@ impl NodeMap {
             names: FastHashMap::default(),
             linked_inode_map: FastHashMap::default(),
             pending_deletes: FastHashSet::default(),
+            forgotten_nodes: FastHashMap::default(),
             id_creator: AtomicCounter::new(FUSE_ROOT_ID),
             cache_ttl: conf.node_cache_ttl.as_millis() as u64,
+            forget_grace_ms: FORGET_OPEN_RACE_GRACE_MS,
             last_clean: LocalTime::mills(),
             conf: conf.clone(),
         }
@@ -73,7 +79,7 @@ impl NodeMap {
 
     pub fn get_check(&self, id: u64) -> FuseResult<&NodeAttr> {
         match self.nodes.get(&id) {
-            None => err_fuse!(libc::ENOMEM, "inode {} not exists", id),
+            None => err_fuse!(libc::ENOENT, "inode {} not exists", id),
             Some(v) => Ok(v),
         }
     }
@@ -84,7 +90,7 @@ impl NodeMap {
 
     pub fn get_mut_check(&mut self, id: u64) -> FuseResult<&mut NodeAttr> {
         match self.nodes.get_mut(&id) {
-            None => err_fuse!(libc::ENOMEM, "inode {} not exists", id),
+            None => err_fuse!(libc::ENOENT, "inode {} not exists", id),
             Some(v) => Ok(v),
         }
     }
@@ -129,10 +135,7 @@ impl NodeMap {
         name: Option<T>,
         status: &FileStatus,
     ) -> FuseResult<fuse_attr> {
-        let ino = match self.find_node(parent, name) {
-            Ok(v) => v.id,
-            Err(e) => return err_fuse!(libc::ENOMEM, "{}", e),
-        };
+        let ino = self.find_node(parent, name)?.id;
 
         let mut attr = CurvineFileSystem::status_to_attr(&self.conf, status)?;
         attr.ino = if status.exists_links() {
@@ -172,6 +175,7 @@ impl NodeMap {
             }
         };
 
+        self.clear_forgotten_node(ino);
         let node = self.get_mut_check(ino)?;
         node.add_lookup(1);
         node.stat_updated = Duration::from_millis(LocalTime::mills());
@@ -249,6 +253,7 @@ impl NodeMap {
     }
 
     pub fn delete_node(&mut self, node: &NodeAttr) -> FuseResult<()> {
+        self.clear_forgotten_node(node.id);
         self.delete_name(node)?;
         self.nodes.remove(&node.id);
 
@@ -285,15 +290,29 @@ impl NodeMap {
     }
 
     pub fn forget_node(&mut self, id: u64, n_lookup: u64) -> FuseResult<()> {
-        let node = match self.get_mut(id) {
-            None => return Ok(()),
-            Some(v) => v,
-        };
+        let now = LocalTime::mills();
+        let mut should_defer_delete = false;
 
-        let cur_lookup = node.sub_lookup(n_lookup);
-        if cur_lookup == 0 {
-            self.unref_node(id)?;
-        };
+        {
+            let node = match self.get_mut(id) {
+                None => return Ok(()),
+                Some(v) => v,
+            };
+
+            let cur_lookup = node.sub_lookup(n_lookup);
+            if cur_lookup == 0 && node.ref_ctr == 0 {
+                node.stat_updated = Duration::from_millis(now);
+                should_defer_delete = true;
+            }
+        }
+
+        if should_defer_delete {
+            self.mark_forgotten_node(id, now);
+            self.prune_forgotten_nodes(now)?;
+            return Ok(());
+        }
+
+        self.clear_forgotten_node(id);
 
         Ok(())
     }
@@ -420,6 +439,10 @@ impl NodeMap {
 
     pub fn clean_cache(&mut self) {
         let now = LocalTime::mills();
+        if let Err(e) = self.prune_forgotten_nodes(now) {
+            error!("clean_cache: prune_forgotten_nodes failed: {}", e);
+        }
+
         if self.last_clean + self.cache_ttl > now {
             return;
         }
@@ -471,6 +494,34 @@ impl NodeMap {
         self.pending_deletes.contains(&ino)
     }
 
+    fn mark_forgotten_node(&mut self, id: u64, now: u64) {
+        self.forgotten_nodes.insert(id, now);
+    }
+
+    fn clear_forgotten_node(&mut self, id: u64) {
+        self.forgotten_nodes.remove(&id);
+    }
+
+    fn prune_forgotten_nodes(&mut self, now: u64) -> FuseResult<()> {
+        let mut expired = Vec::new();
+        for (id, ts) in self.forgotten_nodes.iter() {
+            if now.saturating_sub(*ts) >= self.forget_grace_ms {
+                expired.push(*id);
+            }
+        }
+
+        for id in expired {
+            self.forgotten_nodes.remove(&id);
+            if let Some(node) = self.nodes.get(&id).cloned() {
+                if node.n_lookup == 0 && node.ref_ctr == 0 {
+                    self.delete_node(&node)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create snapshot of NodeMap state (stream-based, memory-efficient)
     /// Serializes: nodes, names, linked_inode_map, pending_deletes, id_creator
     pub fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
@@ -517,6 +568,7 @@ impl NodeMap {
 
         self.linked_inode_map = reader.read_struct()?;
         self.pending_deletes = reader.read_struct()?;
+        self.forgotten_nodes.clear();
 
         Ok(())
     }

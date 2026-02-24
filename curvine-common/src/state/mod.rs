@@ -83,3 +83,6 @@ pub use self::file_alloc::*;
 
 mod file_lock;
 pub use self::file_lock::*;
+
+mod sync_state;
+pub use self::sync_state::*;
