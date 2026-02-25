@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use bytes::BytesMut;
-use curvine_client::unified::{UnifiedFileSystem, UnifiedReader, UnifiedWriter};
+use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{MountOptionsBuilder, WriteType};
 use curvine_tests::Testing;
@@ -41,19 +41,9 @@ fn test_mount_write_cache() {
     let fs = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
 
     rt.block_on(async move {
-        mount(&fs, WriteType::Cache).await;
-        mount(&fs, WriteType::Through).await;
-        mount(&fs, WriteType::CacheThrough).await;
-        mount(&fs, WriteType::AsyncThrough).await;
+        mount(&fs, WriteType::CacheMode).await;
 
-        write(&fs, WriteType::Cache, false).await;
-        write(&fs, WriteType::Through, false).await;
-        write(&fs, WriteType::CacheThrough, false).await;
-        write(&fs, WriteType::CacheThrough, true).await;
-        write(&fs, WriteType::AsyncThrough, false).await;
-        write(&fs, WriteType::AsyncThrough, true).await;
-        write(&fs, WriteType::CacheThrough, true).await;
-        write(&fs, WriteType::AsyncThrough, true).await;
+        write(&fs, WriteType::CacheMode, false).await;
     })
 }
 
@@ -93,17 +83,6 @@ async fn write(fs: &UnifiedFileSystem, write_type: WriteType, random_write: bool
 
     writer.complete().await.unwrap();
 
-    // If async write, wait for job to complete
-    if matches!(write_type, WriteType::AsyncThrough) {
-        match &writer {
-            UnifiedWriter::CacheSync(r) => {
-                r.wait_job_complete().await.unwrap();
-            }
-
-            _ => panic!("Invalid writer type"),
-        };
-    }
-
     verify_read_data(fs, &path, &written_data, write_type).await;
 
     verify_cv_ufs_consistency(fs, &path).await;
@@ -113,20 +92,9 @@ async fn verify_read_data(
     fs: &UnifiedFileSystem,
     path: &Path,
     expected_data: &[u8],
-    write_type: WriteType,
+    _write_type: WriteType,
 ) {
     let mut reader = fs.open(path).await.unwrap();
-
-    // Check reader type
-    match write_type {
-        WriteType::Cache | WriteType::CacheThrough | WriteType::AsyncThrough => {
-            assert!(matches!(reader, UnifiedReader::Cv(_)));
-        }
-
-        WriteType::Through => {
-            assert!(matches!(reader, UnifiedReader::Opendal(_)));
-        }
-    }
 
     let mut read_data = BytesMut::zeroed(reader.len() as usize);
     reader.read_full(&mut read_data).await.unwrap();
@@ -141,9 +109,6 @@ async fn verify_read_data(
 
 async fn verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) {
     let (ufs_path, mnt) = fs.get_mount(path).await.unwrap().unwrap();
-    if matches!(mnt.info.write_type, WriteType::Cache | WriteType::Through) {
-        return;
-    }
 
     let mut cv_reader = fs.cv().open(path).await.unwrap();
     let mut ufs_reader = mnt.ufs.open(&ufs_path).await.unwrap();

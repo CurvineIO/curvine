@@ -68,8 +68,8 @@ pub struct MountCommand {
 
     #[arg(
         long,
-        default_value = "async_through",
-        help = "Write type: cache, through, async_through, cache_through"
+        default_value = "fs_mode",
+        help = "Write type: cache_mode, fs_mode"
     )]
     write_type: String,
 

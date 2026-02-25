@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::future::Future;
 use crate::proto::raft::SnapshotData;
 use crate::raft::RaftResult;
 
 /// Application layer storage.
 /// Replay raft log
 pub trait AppStorage: Clone + Send + Sync + 'static {
-    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()>;
+    fn apply(&self, is_leader: bool, message: &[u8]) -> impl Future<Output = RaftResult<()>> + Send;
 
     fn create_snapshot(&self, node_id: u64, last_applied: u64) -> RaftResult<SnapshotData>;
 

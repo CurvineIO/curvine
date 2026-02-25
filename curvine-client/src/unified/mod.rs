@@ -38,17 +38,12 @@ pub use self::unified_filesystem::UnifiedFileSystem;
 mod mount_cache;
 pub use self::mount_cache::*;
 
-mod cache_sync_writer;
-pub use self::cache_sync_writer::CacheSyncWriter;
-
 mod cache_sync_reader;
 pub use self::cache_sync_reader::CacheSyncReader;
 
 #[allow(clippy::large_enum_variant)]
 pub enum UnifiedWriter {
     Cv(FsWriter),
-
-    CacheSync(CacheSyncWriter),
 
     #[cfg(feature = "opendal")]
     Opendal(OpendalWriter),
@@ -60,8 +55,6 @@ pub enum UnifiedWriter {
 impl_writer_for_enum! {
     enum UnifiedWriter {
         Cv(FsWriter),
-
-        CacheSync(CacheSyncWriter),
 
         #[cfg(feature = "opendal")]
         Opendal(OpendalWriter),
