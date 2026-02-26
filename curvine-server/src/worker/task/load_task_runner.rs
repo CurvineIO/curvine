@@ -16,7 +16,7 @@ use crate::common::UfsFactory;
 use crate::worker::task::TaskContext;
 use curvine_client::file::CurvineFileSystem;
 use curvine_client::rpc::JobMasterClient;
-use curvine_client::unified::{CacheSyncReader, UfsFileSystem, UnifiedReader, UnifiedWriter};
+use curvine_client::unified::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{CreateFileOptsBuilder, JobTaskState, SetAttrOptsBuilder};
 use curvine_common::FsResult;
@@ -165,9 +165,8 @@ impl LoadTaskRunner {
 
     async fn open_unified(&self, path: &Path) -> FsResult<UnifiedReader> {
         if path.is_cv() {
-            // Curvine path
-            let reader = CacheSyncReader::new(&self.fs, path).await?;
-            Ok(UnifiedReader::CacheSync(reader))
+            let reader = self.fs.open(path).await?;
+            Ok(UnifiedReader::Cv(reader))
         } else {
             // UFS path
             let ufs = self.get_ufs()?;

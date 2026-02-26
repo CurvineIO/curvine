@@ -15,6 +15,7 @@
 use crate::err_box;
 use crate::io::IOResult;
 use std::sync::mpsc as block_mpsc;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::mpsc::Permit;
@@ -188,7 +189,7 @@ pub enum BlockingReceiver<T> {
 }
 
 impl<T> BlockingReceiver<T> {
-    pub fn recv(&mut self) -> Option<T> {
+    pub fn recv(&self) -> Option<T> {
         let res = match self {
             BlockingReceiver::Unbounded(s) => s.recv(),
             BlockingReceiver::Bounded(s) => s.recv(),
@@ -196,10 +197,17 @@ impl<T> BlockingReceiver<T> {
         res.ok()
     }
 
-    pub fn recv_check(&mut self) -> IOResult<T> {
+    pub fn recv_check(&self) -> IOResult<T> {
         match self.recv() {
             Some(v) => Ok(v),
             None => err_box!("the sender dropped"),
+        }
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
+        match self {
+            BlockingReceiver::Unbounded(s) => s.recv_timeout(timeout),
+            BlockingReceiver::Bounded(s) => s.recv_timeout(timeout),
         }
     }
 }

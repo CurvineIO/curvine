@@ -16,6 +16,7 @@ use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
 use crate::master::{JobStore, LoadJobRunner, MountManager};
 use core::time::Duration;
+use curvine_client::unified::MountValue;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::executor::ScheduledExecutor;
@@ -108,6 +109,21 @@ impl JobManager {
         )
     }
 
+    pub fn get_mnt(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
+        if let Some(mnt) = self.mount_manager.get_mount_info(path)? {
+            let mnt_value = self.factory.get_mnt(&mnt)?;
+            let ufs_path = mnt_value.get_ufs_path(path)?;
+
+            Ok(Some((ufs_path, mnt_value)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn rt(&self) -> &Runtime {
+        &self.rt
+    }
+
     pub fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
         let source_path = Path::from_str(&command.source_path)?;
 
@@ -122,7 +138,7 @@ impl JobManager {
 
         let job_runner = self.create_runner();
 
-        let (tx, mut rx) = BlockingChannel::new(1).split();
+        let (tx, rx) = BlockingChannel::new(1).split();
         self.rt.spawn(async move {
             let res = job_runner.submit_load_task(command, mnt).await;
             if let Err(e) = tx.send(res) {

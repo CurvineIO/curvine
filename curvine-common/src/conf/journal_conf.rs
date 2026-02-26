@@ -103,6 +103,8 @@ pub struct JournalConf {
 
     // Whether to ignore errors in the log replay process.
     pub ignore_replay_error: bool,
+
+    pub ignore_ufs_replay_error: bool,
 }
 
 impl JournalConf {
@@ -229,6 +231,7 @@ impl Default for JournalConf {
 
             retain_checkpoint_num: 3,
             ignore_replay_error: false,
+            ignore_ufs_replay_error: true,
         }
     }
 }

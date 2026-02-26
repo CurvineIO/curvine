@@ -17,7 +17,7 @@
 use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
 use crate::master::meta::inode::InodeView::{Dir, File};
-use crate::master::{MountManager, SyncFsDir};
+use crate::master::{JobManager, MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
@@ -37,16 +37,24 @@ use std::{fs, mem};
 pub struct JournalLoader {
     fs_dir: SyncFsDir,
     mnt_mgr: Arc<MountManager>,
+    ufs_loader: UfsLoader,
     seq_id: Arc<AtomicCounter>,
     retain_checkpoint_num: usize,
     ignore_replay_error: bool,
 }
 
 impl JournalLoader {
-    pub fn new(fs_dir: SyncFsDir, mnt_mgr: Arc<MountManager>, conf: &JournalConf) -> Self {
+    pub fn new(
+        fs_dir: SyncFsDir,
+        mnt_mgr: Arc<MountManager>,
+        conf: &JournalConf,
+        job_manager: Arc<JobManager>,
+    ) -> Self {
+        let ufs_loader = UfsLoader::new(job_manager, conf);
         Self {
             fs_dir,
             mnt_mgr,
+            ufs_loader,
             seq_id: Arc::new(AtomicCounter::new(0)),
             retain_checkpoint_num: 3.max(conf.retain_checkpoint_num),
             ignore_replay_error: conf.ignore_replay_error,
@@ -270,6 +278,7 @@ impl JournalLoader {
         // The leader node ignores all logs because they have been applied to the master node before synchronization via raft.
         if is_leader {
             self.seq_id.set(batch.seq_id + 1);
+            self.ufs_loader.apply_batch(batch)?;
             return Ok(());
         }
 

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(clippy::too_many_arguments)]
+
 use crate::master::fs::{MasterFilesystem, WorkerManager};
 use crate::master::journal::{JournalLoader, JournalWriter};
 use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
@@ -20,7 +22,8 @@ use crate::master::quota::eviction::evictor::{Evictor, LFUEvictor, LRUEvictor};
 use crate::master::quota::eviction::types::EvictionPolicy;
 use crate::master::quota::eviction::EvictionConf;
 use crate::master::{
-    MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncFsDir, SyncWorkerManager,
+    JobManager, MasterMonitor, MetaRaftJournal, MountManager, QuotaManager, SyncFsDir,
+    SyncWorkerManager,
 };
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::raft::SnapshotData;
@@ -45,6 +48,7 @@ pub struct JournalSystem {
     master_monitor: MasterMonitor,
     mount_manager: Arc<MountManager>,
     quota_manager: Arc<QuotaManager>,
+    job_manager: Arc<JobManager>,
 }
 
 impl JournalSystem {
@@ -56,6 +60,7 @@ impl JournalSystem {
         master_monitor: MasterMonitor,
         mount_manager: Arc<MountManager>,
         quota_manager: Arc<QuotaManager>,
+        job_manager: Arc<JobManager>,
     ) -> Self {
         Self {
             rt,
@@ -65,6 +70,7 @@ impl JournalSystem {
             master_monitor,
             mount_manager,
             quota_manager,
+            job_manager,
         }
     }
 
@@ -122,10 +128,22 @@ impl JournalSystem {
         let quota_manager =
             QuotaManager::new(eviction_conf, fs.clone(), evictor.clone(), rt.clone());
 
+        let job_manager = Arc::new(JobManager::from_cluster_conf(
+            fs.clone(),
+            mount_manager.clone(),
+            rt.clone(),
+            conf,
+        ));
+
         let raft_journal = MetaRaftJournal::new(
             rt.clone(),
             log_store,
-            JournalLoader::new(fs_dir.clone(), mount_manager.clone(), &conf.journal),
+            JournalLoader::new(
+                fs_dir.clone(),
+                mount_manager.clone(),
+                &conf.journal,
+                job_manager.clone(),
+            ),
             conf.journal.clone(),
             role_monitor,
         );
@@ -138,6 +156,7 @@ impl JournalSystem {
             master_monitor,
             mount_manager,
             quota_manager,
+            job_manager,
         );
 
         Ok(js)
@@ -176,6 +195,10 @@ impl JournalSystem {
 
     pub fn quota_manager(&self) -> Arc<QuotaManager> {
         self.quota_manager.clone()
+    }
+
+    pub fn job_manager(&self) -> Arc<JobManager> {
+        self.job_manager.clone()
     }
 
     // Create a snapshot manually, dedicated for testing.
