@@ -40,6 +40,7 @@ wait_for_process() {
     return 1
 }
 
+umount -l /curvine-fuse
 pkill -9 -f "curvine"
 
 # Wait a moment for processes to be killed
