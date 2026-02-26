@@ -71,6 +71,28 @@
         .test-item-status.fail { background: #f8d7da; color: #721c24; }
         .test-item-command { font-size: 0.85em; color: #666; margin-top: 5px; font-family: monospace; }
         .test-item-error { font-size: 0.85em; color: #e74c3c; margin-top: 5px; }
+        /* Dashboard: current date and test module status */
+        .dashboard { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .dashboard h3 { margin-bottom: 12px; color: #2c3e50; }
+        .dashboard-date { font-size: 1em; color: #666; margin-bottom: 15px; }
+        .dashboard-table { width: 100%; border-collapse: collapse; }
+        .dashboard-table th, .dashboard-table td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eee; }
+        .dashboard-table th { background: #f8f9fa; color: #495057; font-weight: 600; }
+        .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: middle; }
+        .status-dot.idle { background: #95a5a6; }
+        .status-dot.testing { background: #27ae60; box-shadow: 0 0 0 2px rgba(39, 174, 96, 0.4); animation: pulse 1.2s ease-in-out infinite; }
+        .status-dot.completed { background: #27ae60; }
+        .status-dot.failed { background: #e74c3c; }
+        .status-dot.cancelled { background: #f39c12; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .dashboard-msg { font-size: 0.9em; color: #666; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .dashboard-actions { white-space: nowrap; }
+        .btn-run { padding: 6px 14px; background: #3498db; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9em; }
+        .btn-run:hover { background: #2980b9; }
+        .btn-run:disabled { background: #bdc3c7; cursor: not-allowed; }
+        .btn-cancel { padding: 6px 14px; background: #e74c3c; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9em; margin-left: 8px; }
+        .btn-cancel:hover { background: #c0392b; }
+        .btn-cancel:disabled { background: #bdc3c7; cursor: not-allowed; }
     </style>
 </head>
 <body>
@@ -92,6 +114,24 @@
                     {% endfor %}
                 </select>
             </div>
+        </div>
+
+        <div class="dashboard">
+            <h3>📋 Daily Test Status <span style="font-size:0.75em;font-weight:normal;color:#888;">（实时状态，与下方日期选择无关；执行结果写入最新目录）</span></h3>
+            <div class="dashboard-date" id="dashboard-current-date">Current: --</div>
+            <table class="dashboard-table">
+                <thead>
+                    <tr>
+                        <th>Module</th>
+                        <th>Status</th>
+                        <th>Message</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="dashboard-tbody">
+                    <tr><td colspan="4">Loading...</td></tr>
+                </tbody>
+            </table>
         </div>
 
         {% if test_summary %}
@@ -204,6 +244,11 @@
         {% if fuse_results %}
         <div class="coverage-section">
             <div class="coverage-title">🔧 FUSE Filesystem Test Results</div>
+            {% if fuse_results.error and fuse_results.summary.total_tests == 0 %}
+            <div style="padding: 12px; background: #fff3cd; border-radius: 6px; color: #856404; margin-bottom: 10px;">
+                <strong>Status:</strong> {{ fuse_results.status or 'FAILED' }} &nbsp;|&nbsp; <strong>Error:</strong> {{ fuse_results.error }}
+            </div>
+            {% else %}
             <div class="coverage-grid">
                 <div class="coverage-card">
                     <h4>Total Tests</h4>
@@ -223,12 +268,18 @@
                 <a href="/fuse-test-details/{{ selected_date }}" class="coverage-link" target="_blank">View Detailed FUSE Test Results →</a>
             </div>
             {% endif %}
+            {% endif %}
         </div>
         {% endif %}
 
         {% if fio_results %}
         <div class="coverage-section">
             <div class="coverage-title">⚡ FIO Performance Test Results</div>
+            {% if fio_results.error and fio_results.summary.total_tests == 0 %}
+            <div style="padding: 12px; background: #fff3cd; border-radius: 6px; color: #856404; margin-bottom: 10px;">
+                <strong>Status:</strong> {{ fio_results.status or 'FAILED' }} &nbsp;|&nbsp; <strong>Error:</strong> {{ fio_results.error }}
+            </div>
+            {% else %}
             <div class="coverage-grid">
                 <div class="coverage-card">
                     <h4>Total Tests</h4>
@@ -247,6 +298,7 @@
             <div style="text-align: center;">
                 <a href="/fio-test-details/{{ selected_date }}" class="coverage-link" target="_blank">View Detailed FIO Test Results →</a>
             </div>
+            {% endif %}
             {% endif %}
         </div>
         {% endif %}
@@ -274,6 +326,90 @@
                 title.classList.add('collapsed');
             }
         }
+
+        var dashboardPollTimer = null;
+        var MODULES = [
+            { key: 'dailytest', name: 'Daily Test (Full)', runUrl: '/dailytest', runMethod: 'POST', runBody: null, cancelUrl: '/dailytest/cancel' },
+            { key: 'regression', name: 'Regression (Unittest)', runUrl: '/regression/run', runMethod: 'POST', runBody: null, cancelUrl: '/regression/cancel' },
+            { key: 'coverage', name: 'Coverage', runUrl: '/coverage/run', runMethod: 'POST', runBody: null, cancelUrl: '/coverage/cancel' },
+            { key: 'fuse', name: 'FUSE', runUrl: '/fuse/run', runMethod: 'POST', runBody: null, cancelUrl: '/fuse/cancel' },
+            { key: 'fio', name: 'FIO', runUrl: '/fio/run', runMethod: 'POST', runBody: null, cancelUrl: '/fio/cancel' },
+            { key: 'ltp', name: 'LTP', runUrl: '/ltp/run', runMethod: 'POST', runBody: {}, cancelUrl: '/ltp/cancel' }
+        ];
+        function renderDashboard(data) {
+            document.getElementById('dashboard-current-date').textContent = 'Current: ' + (data.current_date || '--');
+            var tbody = document.getElementById('dashboard-tbody');
+            var html = '';
+            MODULES.forEach(function(m) {
+                var s = data[m.key] || {};
+                var status = s.status || 'idle';
+                var msg = (s.message || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                // Extra escaping for HTML attribute context: double-quotes must become &quot;
+                // to prevent breaking out of title="..." and injecting event handlers (XSS).
+                var msgAttr = msg.replace(/"/g, '&quot;');
+                var isTesting = status === 'testing';
+                var reportUrl = s.report_url || '';
+                // Show a "View Report" link when there is a report to navigate to
+                var reportLink = (reportUrl && status !== 'testing')
+                    ? ' <a href="' + reportUrl + '" style="font-size:12px;color:#667eea;">View Report</a>'
+                    : '';
+                html += '<tr><td>' + m.name + '</td><td><span class="status-dot ' + status + '"></span>' + status + '</td>';
+                html += '<td class="dashboard-msg" title="' + msgAttr + '">' + msg + reportLink + '</td><td class="dashboard-actions">';
+                html += '<button type="button" class="btn-run" data-key="' + m.key + '" data-run="' + m.runUrl + '" data-method="' + m.runMethod + '" data-body="' + (m.runBody ? encodeURIComponent(JSON.stringify(m.runBody)) : '') + '"' + (isTesting ? ' disabled' : '') + '>Run</button>';
+                html += '<button type="button" class="btn-cancel" data-key="' + m.key + '" data-cancel="' + m.cancelUrl + '"' + (!isTesting ? ' disabled' : '') + '>Cancel</button>';
+                html += '</td></tr>';
+            });
+            tbody.innerHTML = html;
+            tbody.querySelectorAll('.btn-run').forEach(function(btn) {
+                btn.onclick = function() {
+                    var key = btn.getAttribute('data-key');
+                    var url = btn.getAttribute('data-run');
+                    var method = btn.getAttribute('data-method');
+                    var bodyStr = btn.getAttribute('data-body');
+                    var bodyObj = bodyStr ? JSON.parse(decodeURIComponent(bodyStr)) : {};
+                    // Include the currently selected date so results are written to that directory
+                    var selectedDate = (document.getElementById('date-select') || {}).value;
+                    if (selectedDate) bodyObj.target_date = selectedDate;
+                    btn.disabled = true;
+                    var opts = { method: method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyObj) };
+                    fetch(url, opts).then(function(r) { return r.json().then(function(j) { return { ok: r.ok, status: r.status, json: j }; }); })
+                        .then(function(res) {
+                            if (!res.ok) alert(res.json.error || 'Request failed');
+                            refreshDashboard();
+                        }).catch(function() { btn.disabled = false; refreshDashboard(); });
+                };
+            });
+            tbody.querySelectorAll('.btn-cancel').forEach(function(btn) {
+                btn.onclick = function() {
+                    var url = btn.getAttribute('data-cancel');
+                    btn.disabled = true;
+                    fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+                        .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, status: r.status, json: j }; }); })
+                        .then(function(res) {
+                            if (!res.ok) alert(res.json.error || 'Cancel failed');
+                            refreshDashboard();
+                        })
+                        .catch(function(err) { btn.disabled = false; refreshDashboard(); });
+                };
+            });
+        }
+        function refreshDashboard() {
+            fetch('/api/all-test-status').then(function(r) { return r.json(); })
+                .then(function(data) {
+                    renderDashboard(data);
+                    var anyTesting = MODULES.some(function(m) { return (data[m.key] || {}).status === 'testing'; });
+                    if (anyTesting) {
+                        if (!dashboardPollTimer) dashboardPollTimer = setInterval(refreshDashboard, 2000);
+                    } else {
+                        if (dashboardPollTimer) { clearInterval(dashboardPollTimer); dashboardPollTimer = null; }
+                    }
+                })
+                .catch(function() {
+                    document.getElementById('dashboard-tbody').innerHTML = '<tr><td colspan="4">Failed to load status.</td></tr>';
+                });
+        }
+        refreshDashboard();
+
         setTimeout(function() { location.reload(); }, 30000);
     </script>
 </body>

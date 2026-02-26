@@ -355,9 +355,6 @@ test_vi_editor() {
     local cmd="sed -i 's/Original content/Modified by sed/' $test_file 2>/dev/null"
     print_command "$cmd"
     if eval "$cmd"; then
-        sync
-        sleep 2
-        
         if grep -q "Modified by sed" "$test_file"; then
             print_success "Sed editor operations successful"
         else
@@ -373,9 +370,6 @@ test_vi_editor() {
     cmd="sed -i '\$a Line 2: Appended content' $test_file 2>/dev/null"
     print_command "$cmd"
     if eval "$cmd"; then
-        sync
-        sleep 2
-        
         line_count=$(wc -l < "$test_file")
         if [ "$line_count" -ge 2 ]; then
             if grep -q "Appended content" "$test_file"; then

@@ -38,3 +38,5 @@ curvine-libsdk/java/target/
 .summary/
 .claude/
 docs
+
+__pycache__
