@@ -364,6 +364,13 @@ impl MountCommand {
                     continue;
                 }
 
+                // Complete as an empty metadata placeholder.
+                if let Err(e) = client.complete_file(&cv_path, 0, Vec::new(), false).await {
+                    stats.failed += 1;
+                    eprintln!("[resync] failed to complete {}: {}", cv_path, e);
+                    continue;
+                }
+
                 let attr_opts = SetAttrOptsBuilder::new()
                     .mtime(ufs_mtime)
                     .ufs_mtime(ufs_mtime)
