@@ -15,6 +15,7 @@
 use crate::util::*;
 use clap::Parser;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
+use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
     ConsistencyStrategy, MountOptions, MountType, Provider, SetAttrOptsBuilder, StorageType,
@@ -269,106 +270,111 @@ impl MountCommand {
         let ufs = UfsFileSystem::new(&ufs_root, mount.properties.clone(), mount.provider)?;
 
         let mut stats = ResyncStats::default();
-        let mut queue = VecDeque::from([cv_root.clone()]);
+        let mut queue = VecDeque::from([ufs_root.clone()]);
 
-        while let Some(path) = queue.pop_front() {
-            let status = match fs.cv().get_status(&path).await {
+        while let Some(dir) = queue.pop_front() {
+            let entries = match ufs.list_status(&dir).await {
                 Ok(v) => v,
                 Err(e) => {
                     stats.failed += 1;
-                    eprintln!("[resync] failed to get cv status {}: {}", path, e);
+                    eprintln!("[resync] failed to list ufs dir {}: {}", dir, e);
                     continue;
                 }
             };
 
-            if status.is_dir {
-                if self.recursive || path == cv_root {
-                    let children = match fs.cv().list_status(&path).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            stats.failed += 1;
-                            eprintln!("[resync] failed to list {}: {}", path, e);
-                            continue;
+            for entry in entries {
+                let ufs_path = Path::from_str(entry.path)?;
+                if entry.is_dir {
+                    if self.recursive {
+                        queue.push_back(ufs_path);
+                    }
+                    continue;
+                }
+
+                stats.scanned += 1;
+                let ufs_mtime = entry.mtime;
+                let cv_path = mount.get_cv_path(&ufs_path)?;
+
+                let cv_status = match fs.cv().get_status(&cv_path).await {
+                    Ok(v) => Some(v),
+                    Err(FsError::FileNotFound(_) | FsError::Expired(_)) => None,
+                    Err(e) => {
+                        stats.failed += 1;
+                        eprintln!("[resync] failed to get cv status {}: {}", cv_path, e);
+                        continue;
+                    }
+                };
+
+                if let Some(cv_status) = cv_status {
+                    let cv_ufs_mtime = cv_status.storage_policy.ufs_mtime;
+
+                    if cv_ufs_mtime == 0 {
+                        stats.skip_ufs_time_zero += 1;
+                        if self.verbose {
+                            println!("[resync] skip (ufs_time=0): {}", cv_path);
                         }
-                    };
-
-                    for child in children {
-                        queue.push_back(Path::from_str(child.path)?);
+                        continue;
                     }
-                }
-                continue;
-            }
 
-            stats.scanned += 1;
-            let cv_ufs_mtime = status.storage_policy.ufs_mtime;
-
-            if cv_ufs_mtime == 0 {
-                stats.skip_ufs_time_zero += 1;
-                if self.verbose {
-                    println!("[resync] skip (ufs_time=0): {}", path);
-                }
-                continue;
-            }
-
-            let ufs_path = mount.get_ufs_path(&path)?;
-            let ufs_status = match ufs.get_status(&ufs_path).await {
-                Ok(v) => v,
-                Err(e) => {
-                    stats.ufs_missing += 1;
-                    if self.verbose {
-                        eprintln!("[resync] ufs missing or unavailable {}: {}", ufs_path, e);
+                    if cv_ufs_mtime == ufs_mtime {
+                        stats.skip_same_mtime += 1;
+                        if self.verbose {
+                            println!("[resync] skip (same mtime): {}", cv_path);
+                        }
+                        continue;
                     }
+
+                    if self.verbose || self.dry_run {
+                        println!(
+                            "[resync] recreate {} (cv_ufs_mtime={}, ufs_mtime={})",
+                            cv_path, cv_ufs_mtime, ufs_mtime
+                        );
+                    }
+
+                    if self.dry_run {
+                        stats.recreated += 1;
+                        continue;
+                    }
+
+                    if let Err(e) = fs.cv().delete(&cv_path, false).await {
+                        stats.failed += 1;
+                        eprintln!("[resync] failed to delete {}: {}", cv_path, e);
+                        continue;
+                    }
+                } else if self.verbose || self.dry_run {
+                    println!(
+                        "[resync] create metadata {} (ufs_mtime={})",
+                        cv_path, ufs_mtime
+                    );
+                }
+
+                if self.dry_run {
+                    stats.recreated += 1;
                     continue;
                 }
-            };
 
-            if cv_ufs_mtime == ufs_status.mtime {
-                stats.skip_same_mtime += 1;
-                if self.verbose {
-                    println!("[resync] skip (same mtime): {}", path);
+                let mut create_opts = mount.get_create_opts(&fs.conf().client);
+                create_opts.storage_policy.ufs_mtime = ufs_mtime;
+
+                if let Err(e) = fs.cv().create_with_opts(&cv_path, create_opts, true).await {
+                    stats.failed += 1;
+                    eprintln!("[resync] failed to create {}: {}", cv_path, e);
+                    continue;
                 }
-                continue;
-            }
 
-            if self.verbose || self.dry_run {
-                println!(
-                    "[resync] recreate {} (cv_ufs_mtime={}, ufs_mtime={})",
-                    path, cv_ufs_mtime, ufs_status.mtime
-                );
-            }
+                let attr_opts = SetAttrOptsBuilder::new()
+                    .mtime(ufs_mtime)
+                    .ufs_mtime(ufs_mtime)
+                    .build();
 
-            if self.dry_run {
+                if let Err(e) = fs.cv().set_attr(&cv_path, attr_opts).await {
+                    stats.failed += 1;
+                    eprintln!("[resync] failed to set attr {}: {}", cv_path, e);
+                    continue;
+                }
+
                 stats.recreated += 1;
-                continue;
             }
-
-            if let Err(e) = fs.cv().delete(&path, false).await {
-                stats.failed += 1;
-                eprintln!("[resync] failed to delete {}: {}", path, e);
-                continue;
-            }
-
-            let mut create_opts = mount.get_create_opts(&fs.conf().client);
-            create_opts.storage_policy.ufs_mtime = ufs_status.mtime;
-
-            if let Err(e) = fs.cv().create_with_opts(&path, create_opts, true).await {
-                stats.failed += 1;
-                eprintln!("[resync] failed to create {}: {}", path, e);
-                continue;
-            }
-
-            let attr_opts = SetAttrOptsBuilder::new()
-                .mtime(ufs_status.mtime)
-                .ufs_mtime(ufs_status.mtime)
-                .build();
-
-            if let Err(e) = fs.cv().set_attr(&path, attr_opts).await {
-                stats.failed += 1;
-                eprintln!("[resync] failed to set attr {}: {}", path, e);
-                continue;
-            }
-
-            stats.recreated += 1;
         }
 
         println!(
