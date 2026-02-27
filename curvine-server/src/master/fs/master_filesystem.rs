@@ -712,13 +712,14 @@ impl MasterFilesystem {
         opts.validate()?;
 
         let path = path.as_ref();
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let del_res = {
+            let mut fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            fs_dir.resize(&inp, opts)?
+        };
 
-        let del_res = fs_dir.resize(&inp, opts)?;
         self.worker_manager.write().remove_blocks(&del_res);
-
-        self.get_file_blocks(path, &fs_dir, &inp)
+        self.get_block_locations(path)
     }
 
     pub fn assign_worker<T: AsRef<str>>(
