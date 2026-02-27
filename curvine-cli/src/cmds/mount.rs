@@ -270,38 +270,45 @@ impl MountCommand {
         let mut stats = ResyncStats::default();
         let mut queue = VecDeque::from([ufs_root.clone()]);
 
-        while let Some(dir) = queue.pop_front() {
-            let entries = match ufs.list_status(&dir).await {
+        while let Some(ufs_dir) = queue.pop_front() {
+            let ufs_entries = match ufs.list_status(&ufs_dir).await {
                 Ok(v) => v,
                 Err(e) => {
                     stats.failed += 1;
-                    eprintln!("[resync] failed to list ufs dir {}: {}", dir, e);
+                    eprintln!("[resync] failed to list ufs dir {}: {}", ufs_dir, e);
                     continue;
                 }
             };
 
-            for entry in entries {
-                let ufs_path = Path::from_str(entry.path)?;
-                if entry.is_dir {
+            let cv_dir = mount.get_cv_path(&ufs_dir)?;
+            let cv_entries = match fs.cv().list_status(&cv_dir).await {
+                Ok(v) => v,
+                Err(FsError::FileNotFound(_) | FsError::Expired(_)) => vec![],
+                Err(e) => {
+                    stats.failed += 1;
+                    eprintln!("[resync] failed to list cv dir {}: {}", cv_dir, e);
+                    continue;
+                }
+            };
+
+            let mut cv_map = HashMap::new();
+            for entry in cv_entries {
+                cv_map.insert(entry.path.to_string(), entry);
+            }
+
+            for ufs_entry in ufs_entries {
+                let ufs_path = Path::from_str(ufs_entry.path)?;
+                if ufs_entry.is_dir {
                     queue.push_back(ufs_path);
                     continue;
                 }
 
                 stats.scanned += 1;
-                let ufs_mtime = entry.mtime;
+                let ufs_mtime = ufs_entry.mtime;
                 let cv_path = mount.get_cv_path(&ufs_path)?;
+                let cv_key = cv_path.full_path().to_string();
 
-                let cv_status = match client.file_status(&cv_path).await {
-                    Ok(v) => Some(v),
-                    Err(FsError::FileNotFound(_) | FsError::Expired(_)) => None,
-                    Err(e) => {
-                        stats.failed += 1;
-                        eprintln!("[resync] failed to get cv status {}: {}", cv_path, e);
-                        continue;
-                    }
-                };
-
-                if let Some(cv_status) = cv_status {
+                if let Some(cv_status) = cv_map.get(&cv_key) {
                     let cv_ufs_mtime = cv_status.storage_policy.ufs_mtime;
 
                     if cv_ufs_mtime == 0 {
