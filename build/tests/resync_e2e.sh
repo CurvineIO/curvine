@@ -9,6 +9,10 @@ MC_ALIAS="${MC_ALIAS:-local}"
 BUCKET="${BUCKET:-miniocluster}"
 UFS_PREFIX="${UFS_PREFIX:-curvine-test}"
 CV_PATH="${CV_PATH:-/miniocluster/curvine-test}"
+S3_ENDPOINT_URL="${S3_ENDPOINT_URL:-http://127.0.0.1:9009}"
+S3_ACCESS_KEY="${S3_ACCESS_KEY:-minio}"
+S3_SECRET_KEY="${S3_SECRET_KEY:-minio123}"
+S3_FORCE_PATH_STYLE="${S3_FORCE_PATH_STYLE:-true}"
 
 run_cv() {
   "$CV_BIN" --conf "$CV_CONF" "$@"
@@ -44,14 +48,15 @@ need_cmd "$CV_BIN"
 log "using CV_BIN=$CV_BIN"
 log "using CV_CONF=$CV_CONF"
 log "using MC_ALIAS=$MC_ALIAS BUCKET=$BUCKET UFS_PREFIX=$UFS_PREFIX"
+log "using S3_ENDPOINT_URL=$S3_ENDPOINT_URL S3_FORCE_PATH_STYLE=$S3_FORCE_PATH_STYLE"
 
 if ! run_cv mount | grep -q "$CV_PATH"; then
   log "mount not found, creating mount for $CV_PATH"
   run_cv mount "s3://$BUCKET/$UFS_PREFIX" "$CV_PATH" \
-    --config s3.endpoint_url=http://127.0.0.1:9009 \
-    --config s3.credentials.access=minio \
-    --config s3.credentials.secret=minio123 \
-    --config s3.force.path.style=true
+    --config s3.endpoint_url="$S3_ENDPOINT_URL" \
+    --config s3.credentials.access="$S3_ACCESS_KEY" \
+    --config s3.credentials.secret="$S3_SECRET_KEY" \
+    --config s3.force.path.style="$S3_FORCE_PATH_STYLE"
 fi
 
 TMP_DIR="$(mktemp -d)"
