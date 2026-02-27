@@ -418,7 +418,7 @@ impl CurvineFileSystem {
         // Compute small files metadata for containerization
         let small_files_metadata = self.compute_container_metadata(files, &allocated_blocks)?;
 
-        // assert if allocated_blocks is not smae with add_block_requests
+        // allocated_blocks returned above is used for all files in this container
         let mut container_writer = ContainerBlockWriter::new(
             self.fs_context.clone(),
             container_status.clone(),
