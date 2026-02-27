@@ -76,7 +76,7 @@ mc cp "$TMP_DIR/b.txt" "$b_mc_path" >/dev/null
 mc cp "$TMP_DIR/c.txt" "$c_mc_path" >/dev/null
 
 log "scenario A: initial resync"
-out_a="$(run_cv mount resync "$CV_PATH" --recursive --verbose 2>&1)"
+out_a="$(run_cv mount resync "$CV_PATH" --verbose 2>&1)"
 echo "$out_a"
 assert_not_contains "$out_a" "sender dropped|buffer writer error| ERROR " "resync output contains unexpected ERROR"
 
@@ -85,21 +85,21 @@ assert_contains "$cache_ls" "a.txt" "cache-only should include a.txt"
 assert_contains "$cache_ls" "b.txt|dir1" "cache-only should include nested entries"
 
 log "scenario B: same mtime -> skip"
-out_b="$(run_cv mount resync "$CV_PATH" --recursive --verbose 2>&1)"
+out_b="$(run_cv mount resync "$CV_PATH" --verbose 2>&1)"
 echo "$out_b"
 assert_contains "$out_b" "skip \(same mtime\)" "expected same-mtime skips"
 
 log "scenario C: cv ufs_mtime=0 -> skip"
 run_cv fs rm --cache-only "$CV_PATH/a.txt" >/dev/null || true
 run_cv fs touch --cache-only "$CV_PATH/a.txt" >/dev/null
-out_c="$(run_cv mount resync "$CV_PATH" --recursive --verbose 2>&1)"
+out_c="$(run_cv mount resync "$CV_PATH" --verbose 2>&1)"
 echo "$out_c"
 assert_contains "$out_c" "skip \(ufs_time=0\): $CV_PATH/a.txt" "expected ufs_time=0 skip for a.txt"
 
 log "scenario D: mtime mismatch -> recreate"
 echo "b2-mod" > "$TMP_DIR/b.txt"
 mc cp "$TMP_DIR/b.txt" "$b_mc_path" >/dev/null
-out_d="$(run_cv mount resync "$CV_PATH" --recursive --verbose 2>&1)"
+out_d="$(run_cv mount resync "$CV_PATH" --verbose 2>&1)"
 echo "$out_d"
 assert_contains "$out_d" "recreate $CV_PATH/dir1/b.txt" "expected recreate for dir1/b.txt"
 
