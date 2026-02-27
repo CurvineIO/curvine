@@ -34,8 +34,8 @@ pub use self::raft_journal::RaftJournal;
 mod raft_group;
 pub use self::raft_group::RaftGroup;
 
-mod raft_peer;
-pub use self::raft_peer::RaftPeer;
+// Re-export RaftPeer from conf module for backward compatibility
+pub use crate::conf::{NodeId, RaftPeer};
 
 mod raft_error;
 pub use self::raft_error::RaftError;
@@ -47,8 +47,6 @@ pub mod snapshot;
 
 mod raft_utils;
 pub use self::raft_utils::RaftUtils;
-
-pub type NodeId = u64;
 
 pub type RaftResult<T> = Result<T, RaftError>;
 

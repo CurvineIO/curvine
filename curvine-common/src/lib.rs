@@ -18,7 +18,9 @@ pub mod conf;
 pub mod error;
 pub mod executor;
 pub mod fs;
+#[cfg(feature = "raft")]
 pub mod raft;
+#[cfg(feature = "raft")]
 pub mod rocksdb;
 pub mod state;
 pub mod utils;
@@ -27,6 +29,7 @@ pub mod version;
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/protos/proto.rs"));
 
+    #[cfg(feature = "raft")]
     pub mod raft {
         include!(concat!(env!("OUT_DIR"), "/protos/raft.rs"));
     }

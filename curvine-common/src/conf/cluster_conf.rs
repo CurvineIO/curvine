@@ -14,6 +14,7 @@
 
 use crate::conf::CliConf;
 use crate::conf::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf};
+#[cfg(feature = "raft")]
 use crate::rocksdb::DBConf;
 use crate::version;
 use log::info;
@@ -239,6 +240,7 @@ impl ClusterConf {
     }
 
     // Get the rocksdb configuration used to obtain metadata
+    #[cfg(feature = "raft")]
     pub fn meta_rocks_conf(&self) -> DBConf {
         DBConf::new(&self.master.meta_dir)
             .set_compress_type(&self.master.meta_compression_type)
