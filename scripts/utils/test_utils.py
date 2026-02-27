@@ -32,8 +32,10 @@ def find_latest_test_dir(test_results_dir):
     if not test_dirs:
         return None
     
-    # Sort by modification time, get latest
-    test_dirs.sort(key=lambda x: x[1], reverse=True)
+    # Sort by folder name (YYYYMMDD_HHMMSS timestamp string), get latest.
+    # Using folder name rather than mtime avoids returning a stale directory
+    # whose mtime was recently bumped by an unrelated write.
+    test_dirs.sort(key=lambda x: x[0], reverse=True)
     return os.path.join(test_results_dir, test_dirs[0][0])
 
 
