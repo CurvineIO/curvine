@@ -88,14 +88,6 @@ pub struct MountCommand {
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 
-    /// Traverse directories recursively in resync mode
-    #[arg(long, default_value_t = true)]
-    recursive: bool,
-
-    /// Disable recursive traversal in resync mode
-    #[arg(long, default_value_t = false)]
-    no_recursive: bool,
-
     #[arg(long, default_value_t = false)]
     verbose: bool,
 }
@@ -275,8 +267,6 @@ impl MountCommand {
         let ufs_root = Path::from_str(&mount.ufs_path)?;
         let ufs = UfsFileSystem::new(&ufs_root, mount.properties.clone(), mount.provider)?;
 
-        let effective_recursive = self.recursive && !self.no_recursive;
-
         let mut stats = ResyncStats::default();
         let mut queue = VecDeque::from([ufs_root.clone()]);
 
@@ -293,9 +283,7 @@ impl MountCommand {
             for entry in entries {
                 let ufs_path = Path::from_str(entry.path)?;
                 if entry.is_dir {
-                    if effective_recursive {
-                        queue.push_back(ufs_path);
-                    }
+                    queue.push_back(ufs_path);
                     continue;
                 }
 
