@@ -261,7 +261,9 @@ impl MountCommand {
             return err_box!("resync requires a curvine path, got: {}", self.cv_path);
         }
 
-        let mount = match fs.fs_client().get_mount_info(&cv_root).await? {
+        let client = fs.fs_client();
+
+        let mount = match client.get_mount_info(&cv_root).await? {
             Some(v) => v,
             None => return err_box!("mount info not found for {}", self.cv_path),
         };
@@ -295,7 +297,7 @@ impl MountCommand {
                 let ufs_mtime = entry.mtime;
                 let cv_path = mount.get_cv_path(&ufs_path)?;
 
-                let cv_status = match fs.cv().get_status(&cv_path).await {
+                let cv_status = match client.file_status(&cv_path).await {
                     Ok(v) => Some(v),
                     Err(FsError::FileNotFound(_) | FsError::Expired(_)) => None,
                     Err(e) => {
@@ -336,7 +338,7 @@ impl MountCommand {
                         continue;
                     }
 
-                    if let Err(e) = fs.cv().delete(&cv_path, false).await {
+                    if let Err(e) = client.delete(&cv_path, false).await {
                         stats.failed += 1;
                         eprintln!("[resync] failed to delete {}: {}", cv_path, e);
                         continue;
@@ -356,7 +358,7 @@ impl MountCommand {
                 let mut create_opts = mount.get_create_opts(&fs.conf().client);
                 create_opts.storage_policy.ufs_mtime = ufs_mtime;
 
-                if let Err(e) = fs.cv().create_with_opts(&cv_path, create_opts, true).await {
+                if let Err(e) = client.create_with_opts(&cv_path, create_opts, true).await {
                     stats.failed += 1;
                     eprintln!("[resync] failed to create {}: {}", cv_path, e);
                     continue;
@@ -367,7 +369,7 @@ impl MountCommand {
                     .ufs_mtime(ufs_mtime)
                     .build();
 
-                if let Err(e) = fs.cv().set_attr(&cv_path, attr_opts).await {
+                if let Err(e) = client.set_attr(&cv_path, attr_opts).await {
                     stats.failed += 1;
                     eprintln!("[resync] failed to set attr {}: {}", cv_path, e);
                     continue;
