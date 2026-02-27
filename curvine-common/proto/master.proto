@@ -58,7 +58,7 @@ message CreateContainerRequest {
     repeated CreateFileRequest requests = 1;  
 }  
   
-message ContainerStatusReponse {  
+message ContainerStatusResponse {  
     required int64 container_id = 1;  
     required string container_path = 2;
     required string container_name = 3;
@@ -77,7 +77,7 @@ message ContainerStatusReponse {
 message CreateContainerResponse {  
     oneof result {  
         FileStatusList file_statuses = 1;   
-        ContainerStatusReponse container = 2;  
+        ContainerStatusResponse container = 2;  
     }  
 }  
   

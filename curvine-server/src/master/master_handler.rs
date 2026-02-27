@@ -320,7 +320,7 @@ impl MasterHandler {
             container_files.push(ProtoUtils::file_status_to_pb(file_status));
         }
 
-        let container_status_response = ContainerStatusReponse {
+        let container_status_response = ContainerStatusResponse {
             container_id: container_result.container_meta.container_block_id,
             container_path: container_result.container_meta.container_path,
             container_name: container_result.container_meta.container_name,
