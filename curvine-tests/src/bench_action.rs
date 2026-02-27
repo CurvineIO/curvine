@@ -111,7 +111,7 @@ impl BenchAction {
     }
 
     pub fn get_fs(&self, rt: Arc<Runtime>) -> CurvineFileSystem {
-        let conf = ClusterConf::from(&self.args.conf).unwrap();
+        let conf = ClusterConf::from(&self.args.conf, None).unwrap();
         CurvineFileSystem::with_rt(conf, rt).unwrap()
     }
 }
