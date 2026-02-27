@@ -14,74 +14,66 @@
 
 use crate::block::block_client::BlockClient;
 use crate::file::FsContext;
-use curvine_common::fs::Path;
-use curvine_common::proto::{ContainerMetadataProto, SmallFileMetaProto};
-use curvine_common::state::{ContainerStatus, ExtendedBlock, WorkerAddress};
+use curvine_common::proto::DataHeaderProto;
+use curvine_common::state::{ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
 use orpc::err_box;
+use orpc::sys::DataSlice;
 
-pub struct ContainerBlockWriterRemote {
+pub struct BlockWriterRemote {
     block: ExtendedBlock,
     worker_address: WorkerAddress,
     client: BlockClient,
     pos: i64,
     seq_id: i32,
     req_id: i64,
+    pending_header: Option<DataHeaderProto>,
     block_size: i64,
-    container_meta: Option<ContainerMetadataProto>,
 }
 
-impl ContainerBlockWriterRemote {
+impl BlockWriterRemote {
     pub async fn new(
         fs_context: &FsContext,
         block: ExtendedBlock,
         worker_address: WorkerAddress,
         pos: i64,
-        container_status: ContainerStatus,
-        small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<Self> {
-        // create a container block
         let req_id = Utils::req_id();
         let seq_id = 0;
         let block_size = fs_context.block_size();
-        let client = fs_context.block_client(&worker_address).await?;
+
+        let client = fs_context.acquire_write(&worker_address).await?;
         let write_context = client
-            .write_container_block(
+            .write_block(
                 &block,
-                0,
+                pos,
                 block_size,
                 req_id,
-                fs_context.write_chunk_size() as i32,
+                seq_id,
                 fs_context.write_chunk_size() as i32,
                 false,
-                container_status,
-                small_files_metadata,
+                Vec::new(),
             )
             .await?;
 
-        // Extract container metadata from response
-        let container_meta = write_context.container_meta.clone();
-
-        for context in &write_context.contexts {
-            if block_size != context.block_size {
-                return err_box!(
-                    "Abnormal block size, expected length {}, actual length {}",
-                    block_size,
-                    context.block_size
-                );
-            }
+        if block_size != write_context.block_size {
+            return err_box!(
+                "Abnormal block size, expected length {}, actual length {}",
+                block_size,
+                write_context.block_size
+            );
         }
 
         let writer = Self {
             block,
-            worker_address,
             client,
             pos,
             seq_id,
             req_id,
+            worker_address,
+            pending_header: None,
             block_size,
-            container_meta,
         };
 
         Ok(writer)
@@ -93,25 +85,24 @@ impl ContainerBlockWriterRemote {
     }
 
     // Write data.
-    pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
+    pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
+        let len = chunk.len() as i64;
         let next_seq_id = self.next_seq_id();
 
-        // Send all files in one RPC call
+        let header = self.pending_header.take();
+
         self.client
-            .write_container(files, self.req_id, next_seq_id, self.container_meta.clone())
+            .write_data(chunk, self.req_id, next_seq_id, header)
             .await?;
 
-        let file_len = files
-            .iter()
-            .map(|x: &(&Path, &str)| x.1.len())
-            .sum::<usize>() as i64;
-        if self.block.len < file_len {
-            self.block.len = file_len
+        self.pos += len;
+        if self.pos > self.block.len {
+            self.block.len = self.pos;
         }
-
         Ok(())
     }
 
+    // refresh.
     pub async fn flush(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
         self.client
@@ -125,21 +116,72 @@ impl ContainerBlockWriterRemote {
     pub async fn complete(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
         self.client
-            .write_commit_container(
+            .write_commit(
                 &self.block,
                 self.pos,
                 self.block_size,
                 self.req_id,
                 next_seq_id,
                 false,
-                self.container_meta.take(),
             )
             .await?;
-
         Ok(())
+    }
+
+    pub async fn cancel(&mut self) -> FsResult<()> {
+        let next_seq_id = self.next_seq_id();
+        self.client
+            .write_commit(
+                &self.block,
+                self.pos,
+                self.block_size,
+                self.req_id,
+                next_seq_id,
+                true,
+            )
+            .await
+    }
+
+    // Get the number of bytes left to writable in the current block.
+    pub fn remaining(&self) -> i64 {
+        self.block_size - self.pos
+    }
+
+    pub fn pos(&self) -> i64 {
+        self.pos
     }
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+
+    pub fn len(&self) -> i64 {
+        self.block.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
+        if pos < 0 {
+            return err_box!("Cannot seek to negative position: {}", pos);
+        } else if pos > self.block_size {
+            return err_box!(
+                "Seek position {} exceeds block capacity {}",
+                pos,
+                self.block_size
+            );
+        }
+
+        // Set new position and pending header
+        self.pos = pos;
+        self.pending_header = Some(DataHeaderProto {
+            offset: pos,
+            flush: false,
+            is_last: false,
+        });
+
+        Ok(())
     }
 }

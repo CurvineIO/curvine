@@ -1,188 +1,129 @@
-// Copyright 2025 OPPO.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 use crate::file::FsContext;
 use curvine_common::error::FsError;
-use curvine_common::state::{ExtendedBlock, WorkerAddress};
+use curvine_common::fs::Path;
+use curvine_common::proto::{ContainerMetadataProto, SmallFileMetaProto};
+use curvine_common::state::{ContainerStatus, ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
 use orpc::io::LocalFile;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sys::{DataSlice, RawPtr};
-use orpc::{err_box, try_option};
+use orpc::sys::RawPtr;
+use orpc::try_option;
 use std::sync::Arc;
 
-pub struct BlockWriterLocal {
+pub struct ContainerBlockWriterLocal {
     rt: Arc<Runtime>,
     fs_context: Arc<FsContext>,
     block: ExtendedBlock,
     worker_address: WorkerAddress,
     file: RawPtr<LocalFile>,
     block_size: i64,
-    seq_id: i32,
-    req_id: i64,
+    pos: i64,
+    container_meta: Option<ContainerMetadataProto>,
 }
 
-impl BlockWriterLocal {
+impl ContainerBlockWriterLocal {
     pub async fn new(
         fs_context: Arc<FsContext>,
         block: ExtendedBlock,
         worker_address: WorkerAddress,
         pos: i64,
+        container_status: ContainerStatus,
+        small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<Self> {
         let req_id = Utils::req_id();
-        let seq_id = 0;
-
         let block_size = fs_context.block_size();
-        let client = fs_context.acquire_write(&worker_address).await?;
+        let client = fs_context.block_client(&worker_address).await?;
+
+        // SINGLE RPC call to setup multiple blocks
         let write_context = client
-            .write_block(
+            .write_container_block(
                 &block,
-                pos,
+                0,
                 block_size,
                 req_id,
-                seq_id,
+                0_i32,
                 fs_context.write_chunk_size() as i32,
                 true,
-                Vec::new(),
+                container_status,
+                small_files_metadata,
             )
             .await?;
 
-        let path = try_option!(write_context.path);
-        let file = LocalFile::with_write_offset(path, false, pos)?;
+        let container_meta = write_context.container_meta.clone();
 
-        let writer = Self {
+        // create local file for storing large of small files
+        let path = try_option!(write_context
+            .contexts
+            .first()
+            .and_then(|ctx| ctx.path.as_ref()));
+        let file = RawPtr::from_owned(LocalFile::with_write_offset(path, false, pos)?);
+
+        Ok(Self {
             rt: fs_context.clone_runtime(),
             fs_context,
             block,
             worker_address,
-            file: RawPtr::from_owned(file),
+            file,
             block_size,
-            seq_id,
-            req_id,
-        };
-
-        Ok(writer)
+            pos: 0,
+            container_meta,
+        })
     }
 
-    fn next_seq_id(&mut self) -> i32 {
-        self.seq_id += 1;
-        self.seq_id
-    }
-
-    pub async fn write(&mut self, chunk: DataSlice) -> FsResult<()> {
-        let file = self.file.clone();
-        self.rt
-            .spawn_blocking(move || {
-                file.as_mut().write_all(chunk.as_slice())?;
-                Ok::<(), FsError>(())
-            })
-            .await??;
-
-        if self.pos() > self.block.len {
-            self.block.len = self.pos();
-        }
-        Ok(())
-    }
-
-    // Block write data.
-    pub fn blocking_write(&mut self, chunk: DataSlice) -> FsResult<()> {
-        self.file.as_mut().write_all(chunk.as_slice())?;
-        if self.pos() > self.block.len {
-            self.block.len = self.pos();
-        }
-        Ok(())
+    // SINGLE RPC call to complete all blocks
+    pub async fn complete(&mut self) -> FsResult<()> {
+        // flush before commit
+        self.flush().await?;
+        let client = self.fs_context.block_client(&self.worker_address).await?;
+        client
+            .write_commit_container(
+                &self.block,
+                self.pos,
+                self.block_size,
+                Utils::req_id(),
+                0,
+                false,
+                self.container_meta.clone(),
+            )
+            .await
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        let file = self.file.clone();
+        let file_clone = self.file.clone();
         self.rt
             .spawn_blocking(move || {
-                file.as_mut().flush()?;
-                Ok(())
+                file_clone.as_mut().flush()?;
+                Ok::<(), FsError>(())
             })
-            .await?
-    }
-
-    pub async fn complete(&mut self) -> FsResult<()> {
-        self.flush().await?;
-        let next_seq_id = self.next_seq_id();
-        let client = self.fs_context.acquire_write(&self.worker_address).await?;
-        client
-            .write_commit(
-                &self.block,
-                self.pos(),
-                self.block_size,
-                self.req_id,
-                next_seq_id,
-                false,
-            )
-            .await
-    }
-
-    pub async fn cancel(&mut self) -> FsResult<()> {
-        let next_seq_id = self.next_seq_id();
-        let client = self.fs_context.acquire_write(&self.worker_address).await?;
-        client
-            .write_commit(
-                &self.block,
-                self.pos(),
-                self.block_size,
-                self.req_id,
-                next_seq_id,
-                true,
-            )
-            .await
-    }
-
-    pub fn remaining(&self) -> i64 {
-        self.block_size - self.pos()
-    }
-
-    pub fn pos(&self) -> i64 {
-        self.file.pos()
-    }
-
-    pub fn len(&self) -> i64 {
-        self.block.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+            .await??;
+        Ok(())
     }
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
     }
 
-    pub async fn seek(&mut self, pos: i64) -> FsResult<()> {
-        if pos < 0 {
-            return err_box!("Cannot seek to negative position: {}", pos);
-        } else if pos > self.block_size {
-            return err_box!(
-                "Seek position {} exceeds block capacity {}",
-                pos,
-                self.block_size
-            );
+    pub async fn write(&mut self, files: &[(&Path, &str)]) -> FsResult<()> {
+        for (_, content) in files.iter() {
+            let file_clone = self.file.clone();
+            let content_owned = content.to_string();
+            let handle = self.rt.spawn_blocking(move || {
+                let bytes_content = bytes::Bytes::copy_from_slice(content_owned.as_bytes());
+                file_clone.as_mut().write_all(&bytes_content)?;
+                Ok::<(), FsError>(())
+            });
+            handle.await??;
+
+            // Update position after each write
+            self.pos += content.len() as i64;
         }
 
-        let file = self.file.clone();
-        self.rt
-            .spawn_blocking(move || {
-                file.as_mut().seek(pos)?;
-                Ok(())
-            })
-            .await?
+        // Update block length to reflect total written data
+        if self.pos > self.block.len {
+            self.block.len = self.pos;
+        }
+
+        Ok(())
     }
 }
