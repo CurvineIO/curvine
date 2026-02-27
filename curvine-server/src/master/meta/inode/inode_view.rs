@@ -462,7 +462,6 @@ impl InodeView {
         let mut status = FileStatus {
             id: self.id(),
             path: path.to_owned(),
-            container_name: self.container_name(),
             name: self.name().to_owned(),
             is_dir: self.is_dir(),
             mtime: self.mtime(),
@@ -480,6 +479,7 @@ impl InodeView {
             mode: acl.mode,
             nlink: self.nlink(),
             target: None,
+            container_name: self.container_name(),
         };
 
         match self {

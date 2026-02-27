@@ -23,8 +23,6 @@ pub struct FileStatus {
     pub id: i64,
     pub path: String,
     pub name: String,
-    // todo: add container_id
-    pub container_name: Option<String>,
     pub is_dir: bool,
     pub mtime: i64,
     pub atime: i64,
@@ -46,6 +44,9 @@ pub struct FileStatus {
     pub nlink: u32,
 
     pub target: Option<String>,
+
+    // todo: add container_id
+    pub container_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -216,7 +216,6 @@ impl ProtoUtils {
             id: status.id,
             path: status.path,
             name: status.name,
-            container_name: status.container_name,
             is_dir: status.is_dir,
             mtime: status.mtime,
             atime: status.atime,
@@ -234,6 +233,7 @@ impl ProtoUtils {
             mode: status.mode,
             target: status.target,
             nlink: status.nlink,
+            container_name: status.container_name,
         }
     }
 
@@ -242,7 +242,6 @@ impl ProtoUtils {
             id: status.id,
             path: status.path,
             name: status.name,
-            container_name: status.container_name,
             is_dir: status.is_dir,
             mtime: status.mtime,
             atime: status.atime,
@@ -259,6 +258,7 @@ impl ProtoUtils {
             mode: status.mode,
             nlink: status.nlink,
             target: status.target,
+            container_name: status.container_name,
         }
     }
 
