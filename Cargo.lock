@@ -1002,7 +1002,6 @@ version = "0.2.0"
 dependencies = [
  "axum 0.7.9",
  "bincode",
- "byteorder",
  "bytes",
  "chrono",
  "clap",
