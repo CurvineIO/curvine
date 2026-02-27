@@ -3,8 +3,10 @@
 set -euo pipefail
 
 # E2E test for: `cv mount resync`
-CV_BIN="${CV_BIN:-/data/CodeSpace/curvine/build/dist/bin/cv}"
-CV_CONF="${CV_CONF:-/data/CodeSpace/curvine/build/dist/conf/curvine-cluster.toml}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." >/dev/null 2>&1 && pwd)"
+CV_BIN="${CV_BIN:-$REPO_ROOT/build/dist/bin/cv}"
+CV_CONF="${CV_CONF:-$REPO_ROOT/build/dist/conf/curvine-cluster.toml}"
 MC_ALIAS="${MC_ALIAS:-local}"
 BUCKET="${BUCKET:-miniocluster}"
 UFS_PREFIX="${UFS_PREFIX:-curvine-test}"

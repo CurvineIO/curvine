@@ -84,7 +84,7 @@ pub struct MountCommand {
     #[arg(long, default_value_t = false)]
     check: bool,
 
-    /// Metadata-only resync mode: `curvine mount resync <cv_path>`
+    /// Perform a dry run: scan and report differences without create/delete/set_attr changes.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 
@@ -98,7 +98,6 @@ struct ResyncStats {
     skip_same_mtime: usize,
     skip_ufs_time_zero: usize,
     recreated: usize,
-    ufs_missing: usize,
     failed: usize,
 }
 
@@ -381,12 +380,11 @@ impl MountCommand {
         }
 
         println!(
-            "resync summary: scanned={}, skip_same_mtime={}, skip_ufs_time_zero={}, recreated={}, ufs_missing={}, failed={}",
+            "resync summary: scanned={}, skip_same_mtime={}, skip_ufs_time_zero={}, recreated={}, failed={}",
             stats.scanned,
             stats.skip_same_mtime,
             stats.skip_ufs_time_zero,
             stats.recreated,
-            stats.ufs_missing,
             stats.failed
         );
 
