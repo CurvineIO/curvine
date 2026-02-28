@@ -649,10 +649,8 @@ impl MasterFilesystem {
         }
 
         //(Whether to increase, block id, block location)
-        let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
-        let mut wm = self.worker_manager.write();
+        let mut checked = Vec::with_capacity(list.blocks.len());
         for item in list.blocks {
-            let loc = BlockLocation::new(list.worker_id, item.storage_type);
             match item.status {
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
                     let exists = match self.block_exists(item.id) {
@@ -662,15 +660,35 @@ impl MasterFilesystem {
                             continue;
                         }
                     };
+                    checked.push((item, Some(exists)));
+                }
+                BlockReportStatus::Deleted => checked.push((item, None)),
+            }
+        }
+
+        let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
+        let mut wm = self.worker_manager.write();
+        for (item, exists) in checked {
+            let loc = BlockLocation::new(list.worker_id, item.storage_type);
+            match item.status {
+                BlockReportStatus::Finalized | BlockReportStatus::Writing => {
+                    let exists = match exists {
+                        Some(v) => v,
+                        None => {
+                            warn!(
+                                "block_report invariant violated: missing existence flag for block {}",
+                                item.id
+                            );
+                            continue;
+                        }
+                    };
 
                     if exists {
                         batch.push((true, item.id, loc));
                     } else {
-                        // The block does not exist, and the mark block needs to be deleted.
                         wm.remove_block(list.worker_id, item.id);
                     }
                 }
-
                 BlockReportStatus::Deleted => {
                     batch.push((false, item.id, loc));
                     wm.deleted_block(list.worker_id, item.id);
