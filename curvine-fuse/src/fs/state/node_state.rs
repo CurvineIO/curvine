@@ -105,16 +105,36 @@ impl NodeState {
     ///    - This helps prevent reading outdated attributes in time-sensitive scenarios (e.g., git clone)
     ///    - The logic ensures that once a file is accessed, subsequent lookups with unchanged attributes
     ///      can use cached values, but any change to mtime/len will force cache invalidation
+    /// Note: Since the cache is expected to change infrequently and have a high hit rate, we need a separate fast path for checking cache validity and a slow path for updates.
     fn update_cache_state(&self, id: u64, status: &FileStatus) -> FuseResult<(bool, bool)> {
+        // Fast path: read lock to check if anything needs updating
+        {
+            // Initialize read_lock and keep it live in this scope block
+            let read_lock = self.node_read();
+            let read_lock_attr = read_lock.get_check(id)?;
+
+            let is_first_access = !read_lock_attr.cache_valid;
+            let is_changed =
+                status.mtime != read_lock_attr.mtime || status.len != read_lock_attr.len;
+
+            // If cache is already valid and nothing changed, no write needed
+            if read_lock_attr.cache_valid && !is_changed {
+                return Ok((is_first_access, is_changed));
+            }
+        }
+
+        // Slow path: write lock to update state
+        // TODO: consider supporting lock upgrade
         let mut lock = self.node_write();
-        let attr = lock.get_mut_check(id)?;
 
-        let is_first_access = !attr.cache_valid;
-        let is_changed = status.mtime != attr.mtime || status.len != attr.len;
+        let write_lock_attr = lock.get_mut_check(id)?;
+        // Re-check under write lock (another thread may have updated between locks)
+        let is_first_access = !write_lock_attr.cache_valid;
+        let is_changed = status.mtime != write_lock_attr.mtime || status.len != write_lock_attr.len;
 
-        attr.cache_valid = true;
-        attr.mtime = status.mtime;
-        attr.len = status.len;
+        write_lock_attr.cache_valid = true;
+        write_lock_attr.mtime = status.mtime;
+        write_lock_attr.len = status.len;
 
         Ok((is_first_access, is_changed))
     }
