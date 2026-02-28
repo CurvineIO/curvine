@@ -107,6 +107,10 @@ impl NodeState {
     ///      can use cached values, but any change to mtime/len will force cache invalidation
     /// 3. Note: Since the cache is expected to change infrequently and have a high hit rate, we need a separate fast path for checking cache validity and a slow path for updates.
     fn update_cache_state(&self, id: u64, status: &FileStatus) -> FuseResult<(bool, bool)> {
+        fn check_is_changed(attr: &NodeAttr, status: &FileStatus) -> bool {
+            status.mtime != attr.mtime || status.len != attr.len
+        }
+
         // Fast path: read lock to check if anything needs updating
         {
             // Initialize read_lock and keep it live in this scope block
@@ -114,9 +118,8 @@ impl NodeState {
             let read_lock_attr = read_lock.get_check(id)?;
 
             let is_first_access = !read_lock_attr.cache_valid;
-            let is_changed =
-                status.mtime != read_lock_attr.mtime || status.len != read_lock_attr.len;
 
+            let is_changed = check_is_changed(read_lock_attr, status);
             // If cache is already valid and nothing changed, no write needed
             if read_lock_attr.cache_valid && !is_changed {
                 return Ok((is_first_access, is_changed));
@@ -129,7 +132,7 @@ impl NodeState {
         let write_lock_attr = lock.get_mut_check(id)?;
         // Re-check under write lock (another thread may have updated between locks)
         let is_first_access = !write_lock_attr.cache_valid;
-        let is_changed = status.mtime != write_lock_attr.mtime || status.len != write_lock_attr.len;
+        let is_changed = check_is_changed(write_lock_attr, status);
 
         write_lock_attr.cache_valid = true;
         write_lock_attr.mtime = status.mtime;
