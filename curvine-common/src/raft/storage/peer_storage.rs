@@ -24,7 +24,7 @@ use orpc::runtime::{GroupExecutor, JobCtl, JobState};
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{GetEntriesContext, RaftState, Storage};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 // raft log packaging class
 // Unify the access interfaces of app_store and log_store. Convenient to code use.

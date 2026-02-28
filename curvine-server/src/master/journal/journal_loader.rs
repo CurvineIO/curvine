@@ -50,7 +50,7 @@ impl JournalLoader {
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
     ) -> Self {
-        let ufs_loader = UfsLoader::new(job_manager, conf);
+        let ufs_loader = UfsLoader::new(job_manager);
         Self {
             fs_dir,
             mnt_mgr,
@@ -267,7 +267,7 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn apply0(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
+    async fn apply0(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
         // The raft log has logs that do not contain referenced data.
         if message.is_empty() {
             return Ok(());
@@ -278,7 +278,7 @@ impl JournalLoader {
         // The leader node ignores all logs because they have been applied to the master node before synchronization via raft.
         if is_leader {
             self.seq_id.set(batch.seq_id + 1);
-            self.ufs_loader.apply_batch(batch)?;
+            self.ufs_loader.apply_batch(batch).await?;
             return Ok(());
         }
 
@@ -301,8 +301,8 @@ impl JournalLoader {
 }
 
 impl AppStorage for JournalLoader {
-    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
-        match self.apply0(is_leader, message) {
+    async fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
+        match self.apply0(is_leader, message).await {
             Ok(_) => Ok(()),
 
             Err(e) => {

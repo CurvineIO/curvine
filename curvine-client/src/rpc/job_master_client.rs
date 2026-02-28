@@ -15,6 +15,7 @@
 use log::info;
 use std::sync::Arc;
 use tokio::time;
+use curvine_common::error::FsError;
 
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
@@ -108,19 +109,37 @@ impl JobMasterClient {
         Ok(())
     }
 
-    pub async fn wait_job_complete(&self, job_id: impl AsRef<str>, mark: &str) -> FsResult<()> {
+    pub async fn wait_job_complete(
+        &self,
+        job_id: impl AsRef<str>,
+        fail_if_not_found: bool,
+    ) -> FsResult<()> {
         let time = self.client.conf().client.max_sync_wait_timeout;
-        time::timeout(time, self.wait_job_complete0(job_id, mark)).await?
+        time::timeout(time, self.wait_job_complete0(job_id, fail_if_not_found)).await?
     }
 
-    async fn wait_job_complete0(&self, job_id: impl AsRef<str>, mark: &str) -> FsResult<()> {
+    async fn wait_job_complete0(
+        &self,
+        job_id: impl AsRef<str>,
+        fail_if_not_found: bool,
+    ) -> FsResult<()> {
         let mut ticks = 0;
         let time = TimeSpent::new();
         let conf = &self.client.conf().client;
         let job_id = job_id.as_ref();
 
         loop {
-            let status = self.get_job_status(job_id).await?;
+            let status = match self.get_job_status(job_id).await {
+                Ok(status) => status,
+                Err(err) => {
+                    if matches!(err, FsError::JobNotFound(_)) && fail_if_not_found {
+                        return Err(err);
+                    }
+                    time::sleep(conf.sync_check_interval_min).await;
+                    continue;
+                }
+            };
+
             match status.state {
                 JobTaskState::Completed => break,
 
@@ -143,8 +162,7 @@ impl JobMasterClient {
 
                     if ticks % conf.sync_check_log_tick == 0 {
                         info!(
-                            "[{}] waiting for job {} to complete, elapsed: {} ms, progress: {}",
-                            mark,
+                            "waiting for job {} to complete, elapsed: {} ms, progress: {}",
                             status.job_id,
                             time.used_ms(),
                             status.progress_string(false)

@@ -67,6 +67,7 @@ pub enum JobTaskType {
     Load = 1,
 }
 
+#[derive(Debug, Clone)]
 pub struct JobStatus {
     pub job_id: String,
     pub state: JobTaskState,

@@ -13,77 +13,80 @@
 //  limitations under the License.
 
 use crate::master::journal::{
-    CompleteFileEntry, DeleteEntry, JournalBatch, JournalEntry, MkdirEntry, OverWriteFileEntry,
-    RenameEntry, ReopenFileEntry,
+    CompleteFileEntry, DeleteEntry, JournalBatch, JournalEntry, MkdirEntry,
+    RenameEntry,
 };
 use crate::master::JobManager;
-use curvine_common::conf::JournalConf;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::LoadJobCommand;
-use curvine_common::utils::CommonUtils;
+use curvine_common::state::{JobTaskState, LoadJobCommand};
 use curvine_common::FsResult;
-use log::error;
-use orpc::runtime::RpcRuntime;
-use orpc::sync::channel::BlockingChannel;
-use orpc::CommonResult;
+use log::warn;
+use orpc::{CommonResult, err_box};
 use std::sync::Arc;
+use std::time::Duration;
+use curvine_client::unified::MountValue;
+use curvine_common::error::FsError;
 
 #[derive(Clone)]
 pub struct UfsLoader {
     job_manager: Arc<JobManager>,
-    ignore_replay_error: bool,
 }
 
 impl UfsLoader {
-    pub fn new(job_manager: Arc<JobManager>, conf: &JournalConf) -> Self {
-        UfsLoader {
-            job_manager,
-            ignore_replay_error: conf.ignore_ufs_replay_error,
-        }
+    pub fn new(job_manager: Arc<JobManager>) -> Self {
+        Self { job_manager }
     }
 
-    pub fn cancel_job(&self, path: &Path) -> FsResult<()> {
-        if self.job_manager.get_mnt(path)?.is_some() {
-            let job_id = CommonUtils::create_job_id(path.full_path());
-            self.job_manager.cancel_job(job_id)
-        } else {
-            Ok(())
+    pub async fn apply_batch(&self, batch: JournalBatch) -> CommonResult<()> {
+        for entry in batch.batch {
+            self.apply_entry(&entry).await?;
         }
+        Ok(())
     }
 
-    pub fn apply_batch(&self, batch: JournalBatch) -> CommonResult<()> {
-        let (tx, rx) = BlockingChannel::new(1).split();
+    pub async fn wait_job_complete(&self, job_id: impl AsRef<str>) -> FsResult<()> {
+        let job_id = job_id.as_ref();
+        loop {
+            let res = self.job_manager.get_job_status(job_id)?;
+            match res.state {
+                JobTaskState::Failed | JobTaskState::Canceled => {
+                    return err_box!("load job failed: {}", res.progress.message);
+                }
 
-        let loader = self.clone();
-        self.job_manager.rt().spawn(async move {
-            let mut res: CommonResult<()> = Ok(());
-            for entry in batch.batch {
-                if let Err(e) = loader.apply_entry(&entry).await {
-                    error!("apply ufs: {}", e);
+                JobTaskState::Completed => {
+                    return Ok(());
+                }
 
-                    if !loader.ignore_replay_error {
-                        res = Err(e.into());
-                        break;
-                    }
+                _ => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
+        }
+    }
 
-            if let Err(e) = tx.send(res) {
-                error!("send apply_entry result: {}", e);
+    pub async fn submit_load_task(&self, path: &Path, mnt: &MountValue) -> FsResult<()> {
+        let command = LoadJobCommand::builder(path.clone_uri()).build();
+        let runner = self.job_manager.create_runner();
+        let _ = match runner.submit_load_task(command, mnt.info.clone()).await {
+            Ok(res) => res,
+            Err(e) => {
+                return if matches!(e, FsError::FileNotFound(_)) {
+                    // File may have been renamed
+                    Ok(())
+                } else {
+                    err_box!("load job failed: {}", e)
+                }
             }
-        });
-
-        rx.recv_check()?
+        };
+        Ok(())
     }
 
     pub async fn apply_entry(&self, entry: &JournalEntry) -> FsResult<()> {
         match entry {
             JournalEntry::Mkdir(e) => self.mkdir(e).await,
-            JournalEntry::OverWriteFile(e) => self.overwrite_file(e).await,
             JournalEntry::CompleteFile(e) => self.complete_file(e).await,
             JournalEntry::Rename(e) => self.rename(e).await,
             JournalEntry::Delete(e) => self.delete(e).await,
-            JournalEntry::ReopenFile(e) => self.reopen_file(e).await,
             _ => Ok(()),
         }
     }
@@ -98,21 +101,14 @@ impl UfsLoader {
         }
     }
 
-    pub async fn overwrite_file(&self, e: &OverWriteFileEntry) -> FsResult<()> {
-        let path = Path::from_str(&e.path)?;
-        self.cancel_job(&path)
-    }
-
     pub async fn complete_file(&self, e: &CompleteFileEntry) -> FsResult<()> {
         if !e.file.is_complete() {
             return Ok(());
         }
 
         let path = Path::from_str(&e.path)?;
-        if self.job_manager.get_mnt(&path)?.is_some() {
-            let command = LoadJobCommand::builder(path.clone_uri()).build();
-            let _ = self.job_manager.submit_load_job(command)?;
-            Ok(())
+        if let Some((_, mnt)) = self.job_manager.get_mnt(&path)? {
+            self.submit_load_task(&path, &mnt).await
         } else {
             Ok(())
         }
@@ -122,9 +118,10 @@ impl UfsLoader {
         let src = Path::from_str(&e.src)?;
         let dst = Path::from_str(&e.dst)?;
         if let Some((src_ufs_path, mnt)) = self.job_manager.get_mnt(&src)? {
-            let dst_ufs_path = mnt.get_ufs_path(&dst)?;
-            mnt.ufs.rename(&src_ufs_path, &dst_ufs_path).await?;
-            Ok(())
+            if mnt.ufs.exists(&src_ufs_path).await? {
+                mnt.ufs.delete(&src_ufs_path,true).await?;
+            }
+            self.submit_load_task(&dst, &mnt).await
         } else {
             Ok(())
         }
@@ -133,14 +130,14 @@ impl UfsLoader {
     pub async fn delete(&self, e: &DeleteEntry) -> FsResult<()> {
         let path = Path::from_str(&e.path)?;
         if let Some((ufs_path, mnt)) = self.job_manager.get_mnt(&path)? {
-            mnt.ufs.delete(&ufs_path, true).await
+            if mnt.ufs.exists(&ufs_path).await? {
+                mnt.ufs.delete(&ufs_path, true).await?;
+            } else {
+                warn!("delete: src file not exists: {}", ufs_path);
+            }
+            Ok(())
         } else {
             Ok(())
         }
-    }
-
-    pub async fn reopen_file(&self, e: &ReopenFileEntry) -> FsResult<()> {
-        let path = Path::from_str(&e.path)?;
-        self.cancel_job(&path)
     }
 }

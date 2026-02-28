@@ -20,7 +20,7 @@ use curvine_common::conf::ClientConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    FileStatus, JobTaskState, LoadJobCommand, LoadJobResult, LoadTaskInfo, MountInfo, WorkerAddress,
+    JobTaskState, LoadJobCommand, LoadJobResult, LoadTaskInfo, MountInfo, WorkerAddress,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -30,6 +30,7 @@ use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use orpc::err_box;
 use std::collections::LinkedList;
 use std::sync::Arc;
+use curvine_client::unified::UfsFileSystem;
 
 pub struct LoadJobRunner {
     jobs: JobStore,
@@ -64,39 +65,49 @@ impl LoadJobRunner {
         }
     }
 
-    fn check_job_exists(
+    /// Returns true if we should skip submitting the load task (data already synced or job in progress).
+    async fn check_job_exists(
         &self,
         job_id: &str,
-        source_status: &FileStatus,
+        ufs: UfsFileSystem,
+        source_path: &Path,
         target_path: &Path,
-    ) -> bool {
-        let job = if let Some(job) = self.jobs.get(job_id) {
-            job
-        } else {
-            return false;
-        };
-
-        let state: JobTaskState = job.state.state();
-        if state == JobTaskState::Pending || state == JobTaskState::Loading {
-            return true;
+    ) -> FsResult<bool> {
+        // Job in progress: skip submit
+        if let Some(job) = self.jobs.get(job_id) {
+            let state: JobTaskState = job.state.state();
+            if state == JobTaskState::Pending || state == JobTaskState::Loading {
+                return Ok(true);
+            }
         }
 
-        if !source_status.is_dir {
-            // Files are generally auto-loaded and executed in parallel.
-            // Validate ufs_mtime to prevent distributing a large number of duplicate tasks.
-            if let Ok(cv_status) = self.master_fs.file_status(target_path.path()) {
-                if cv_status.is_expired() || !cv_status.is_complete {
-                    false
-                } else {
-                    source_status.len == cv_status.len
-                        && cv_status.storage_policy.ufs_mtime != 0
-                        && cv_status.storage_policy.ufs_mtime == source_status.mtime
-                }
+        // Skip based on data state (even when job is None, e.g. after job cleanup)
+        if source_path.is_cv() {
+            // cv -> ufs: if CV's ufs_mtime already set, data already copied to UFS, skip
+            let source_status = self.master_fs.file_status(source_path.path())?;
+            if source_status.is_dir {
+                Ok(false)
+            } else if source_status.ufs_exists() {
+                Ok(true)
             } else {
-                false
+                Ok(false)
             }
         } else {
-            true
+            // ufs -> cv: if CV exists and ufs_mtime matches UFS mtime, data already synced, skip
+            let source_status = ufs.get_status(source_path).await?;
+            if source_status.is_dir {
+                Ok(false)
+            } else if let Ok(cv_status) = self.master_fs.file_status(target_path.path()) {
+                if cv_status.is_expired() || !cv_status.is_complete {
+                    Ok(false)
+                } else {
+                    Ok(source_status.len == cv_status.len
+                        && cv_status.storage_policy.ufs_mtime != 0
+                        && cv_status.storage_policy.ufs_mtime == source_status.mtime)
+                }
+            } else {
+                Ok(false)
+            }
         }
     }
 
@@ -107,9 +118,7 @@ impl LoadJobRunner {
     ) -> FsResult<LoadJobResult> {
         let source_path = Path::from_str(&command.source_path)?;
 
-        let target_path = if let Some(ref target) = command.target_path {
-            Path::from_str(target)?
-        } else if source_path.is_cv() {
+        let target_path = if source_path.is_cv() {
             mnt.get_ufs_path(&source_path)?
         } else {
             mnt.get_cv_path(&source_path)?
@@ -121,14 +130,8 @@ impl LoadJobRunner {
             target_path: target_path.clone_uri(),
         };
 
-        let source_status = if source_path.is_cv() {
-            self.master_fs.file_status(source_path.path())?
-        } else {
-            let ufs = self.factory.get_ufs(&mnt)?;
-            ufs.get_status(&source_path).await?
-        };
-
-        if self.check_job_exists(&job_id, &source_status, &target_path) {
+        let ufs = self.factory.get_ufs(&mnt)?;
+        if self.check_job_exists(&job_id, ufs, &source_path, &target_path).await? {
             info!(
                 "job {}, source_path {} already exists",
                 job_id,
@@ -136,6 +139,8 @@ impl LoadJobRunner {
             );
             return Ok(result);
         }
+
+        self.jobs.remove(&job_id);
 
         info!("Submitting load job {}", job_id);
         let mut job_context = JobContext::with_conf(
@@ -148,7 +153,7 @@ impl LoadJobRunner {
         );
 
         let res = self
-            .create_all_tasks(&mut job_context, source_status, &mnt)
+            .create_all_tasks(&mut job_context, &source_path, &mnt)
             .await;
 
         match res {
@@ -194,9 +199,16 @@ impl LoadJobRunner {
     async fn create_all_tasks(
         &self,
         job: &mut JobContext,
-        source_status: FileStatus,
+        source_path: &Path,
         mnt: &MountInfo,
     ) -> FsResult<i64> {
+        let source_status = if source_path.is_cv() {
+            self.master_fs.file_status(source_path.path())?
+        } else {
+            let ufs = self.factory.get_ufs(mnt)?;
+            ufs.get_status(source_path).await?
+        };
+
         job.update_state(JobTaskState::Pending, "Assigning workers");
         let block_size = job.info.block_size;
 

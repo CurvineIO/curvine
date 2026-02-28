@@ -23,6 +23,7 @@ use curvine_common::utils::ProtoUtils;
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
+use bigdecimal::Zero;
 
 #[derive(Parser, Debug)]
 pub struct MountCommand {
@@ -49,13 +50,6 @@ pub struct MountCommand {
 
     #[arg(long, default_value = "7d")]
     ttl_ms: String,
-
-    #[arg(
-        long,
-        default_value = "delete",
-        help = "TTL expiration action when file expires:\n  none - No action\n  delete - Delete file\n  persist - Export to UFS (skip if exists), keep CV cache\n  evict - Export to UFS (skip if exists), delete CV cache\n  flush - Force export to UFS (overwrite), delete CV cache"
-    )]
-    ttl_action: String,
 
     #[arg(long)]
     replicas: Option<i32>,
@@ -243,17 +237,28 @@ impl MountCommand {
     }
 
     pub fn to_mnt_opts(&self) -> CommonResult<MountOptions> {
+        let write_type = WriteType::try_from(self.write_type.as_str())?;
         let mnt_type = MountType::try_from(self.mnt_type.as_str())?;
         let consistency_strategy =
             ConsistencyStrategy::try_from(self.consistency_strategy.as_str())?;
         let ttl_ms = DurationUnit::from_str(self.ttl_ms.as_str())?.as_millis() as i64;
-        let ttl_action = TtlAction::try_from(self.ttl_action.as_str())?;
         let conf_map = self.get_config_map()?;
+
+        if ttl_ms.is_zero() {
+            return err_box!("an expiration time must be set.")
+        }
+
+        let ttl_action = if matches!(write_type, WriteType::FsMode) {
+            TtlAction::Free
+        } else {
+            TtlAction::Delete
+        };
 
         let mut opts = MountOptions::builder()
             .update(self.update)
             .set_properties(conf_map)
             .mount_type(mnt_type)
+            .write_type(write_type)
             .consistency_strategy(consistency_strategy)
             .ttl_ms(ttl_ms)
             .ttl_action(ttl_action);
@@ -267,9 +272,6 @@ impl MountCommand {
         if let Some(storage_type) = self.storage_type.as_ref() {
             opts = opts.storage_type(StorageType::try_from(storage_type.as_str())?);
         }
-
-        let write_type = WriteType::try_from(self.write_type.as_str())?;
-        opts = opts.write_type(write_type);
 
         if let Some(provider_str) = self.provider.as_ref() {
             let provider = Provider::try_from(provider_str.as_str())?;

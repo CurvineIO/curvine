@@ -67,9 +67,7 @@ impl_writer_for_enum! {
 #[allow(clippy::large_enum_variant)]
 pub enum UnifiedReader {
     Cv(FsReader),
-
-    CacheSync(CacheSyncReader),
-
+    
     #[cfg(feature = "opendal")]
     Opendal(OpendalReader),
 
@@ -80,8 +78,6 @@ pub enum UnifiedReader {
 impl_reader_for_enum! {
     enum UnifiedReader {
         Cv(FsReader),
-
-        CacheSync(CacheSyncReader),
 
         #[cfg(feature = "opendal")]
         Opendal(OpendalReader),

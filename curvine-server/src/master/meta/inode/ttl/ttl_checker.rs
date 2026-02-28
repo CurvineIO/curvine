@@ -211,7 +211,7 @@ impl InodeTtlChecker {
                     result.failed_cleanups = 1;
                 }
             },
-            TtlAction::Persist | TtlAction::Evict | TtlAction::Flush => {
+            TtlAction::Persist | TtlAction::Evict | TtlAction::Free => {
                 match self.action_executor.free_inode(inode_id) {
                     Ok(()) => {
                         info!(

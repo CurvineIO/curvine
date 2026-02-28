@@ -20,15 +20,12 @@ use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, LoadJobCommand,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
-};
+use curvine_common::state::{ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, JobStatus, LoadJobCommand, LoadJobResult, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts};
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use log::{error, info, warn};
 use orpc::common::TimeSpent;
-use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::runtime::Runtime;
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
 
@@ -243,12 +240,10 @@ impl UnifiedFileSystem {
             if blocks.cv_exists() {
                 let cv_reader = Some(FsReader::new(cv_path.clone(), self.cv.fs_context(), blocks)?);
                 Ok(cv_reader)
-            } else{
-                if blocks.ufs_exists() {
-                   Ok(None)
-                } else {
-                    err_box!("path {} data lost", cv_path)
-                }
+            } else if blocks.ufs_exists() {
+               Ok(None)
+            } else {
+                err_box!("path {} data lost", cv_path)
             }
         } else {
             match self
@@ -264,34 +259,23 @@ impl UnifiedFileSystem {
         }
     }
 
-    pub fn async_cache(&self, source_path: &Path) -> FsResult<()> {
+    pub async fn async_cache(&self, source_path: &Path) -> FsResult<LoadJobResult> {
         let client = JobMasterClient::new(self.fs_client());
         let source_path = source_path.clone_uri();
-
-        self.fs_context().rt().spawn(async move {
-            let command = LoadJobCommand::builder(source_path.clone()).build();
-            let res = client.submit_load_job(command).await;
-            match res {
-                Err(e) => warn!("submit async cache error for {}: {}", source_path, e),
-                Ok(res) => info!(
-                    "submit async cache successfully for {}, job id {}, target_path {}",
-                    source_path, res.job_id, res.target_path
-                ),
-            }
-        });
-
-        Ok(())
+        let command = LoadJobCommand::builder(source_path.clone()).build();
+        client.submit_load_job(command).await
     }
 
-    pub async fn wait_job_complete(&self, path: &Path, mark: &str) -> FsResult<()> {
+    pub async fn wait_job_complete(&self, path: &Path, fail_if_not_found: bool) -> FsResult<()> {
         let client = JobMasterClient::new(self.fs_client());
         let job_id = CommonUtils::create_job_id(path.full_path());
+        client.wait_job_complete(job_id, fail_if_not_found).await
+    }
 
-        let res = client.wait_job_complete(job_id, mark).await;
-        match res {
-            Ok(_) | Err(FsError::JobNotFound(_)) => Ok(()),
-            Err(e) => Err(e),
-        }
+    pub async fn get_job_status(&self, path: &Path) -> FsResult<JobStatus> {
+        let client = JobMasterClient::new(self.fs_client());
+        let job_id = CommonUtils::create_job_id(path.full_path());
+        client.get_job_status(job_id).await
     }
 
     pub async fn cleanup(&self) {
@@ -450,7 +434,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 .inc();
 
             if mount.info.auto_cache() {
-                self.async_cache(&ufs_path)?;
+                match self.async_cache(&ufs_path).await {
+                    Err(e) => warn!("submit async cache error for {}: {}", ufs_path, e),
+                    Ok(res) => info!(
+                    "submit async cache successfully for {}, job id {}, target_path {}",
+                    path, res.job_id, res.target_path),
+                }
             }
 
             // Reading from ufs

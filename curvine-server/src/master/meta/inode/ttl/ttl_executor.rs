@@ -325,7 +325,7 @@ impl InodeTtlExecutor {
         let command = LoadJobCommand {
             source_path: cv_path.to_string(),
             target_path: Some(ufs_path.full_path().to_string()),
-            overwrite: Some(matches!(action, TtlAction::Flush)),
+            overwrite: Some(matches!(action, TtlAction::Free)),
             replicas: None,
             block_size: None,
             storage_type: None,
@@ -386,9 +386,9 @@ impl InodeTtlExecutor {
                                 resource_type, cv_path
                             );
                         }
-                        TtlAction::Evict | TtlAction::Flush => {
+                        TtlAction::Evict | TtlAction::Free => {
                             info!(
-                                "Evict/Flush completed, deleting Curvine {}: {}",
+                                "Evict/Free completed, deleting Curvine {}: {}",
                                 resource_type, cv_path
                             );
                             // Use recursive=true for directories, false for files

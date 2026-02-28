@@ -64,7 +64,7 @@ fn ttl_action_to_str(ttl_action: TtlActionProto) -> &'static str {
         TtlActionProto::Delete => "delete",
         TtlActionProto::Persist => "persist",
         TtlActionProto::Evict => "evict",
-        TtlActionProto::Flush => "flush",
+        TtlActionProto::Free => "free",
     }
 }
 

@@ -68,7 +68,7 @@ impl CacheSyncWriter {
     pub async fn wait_job_complete(&self) -> FsResult<()> {
         if let Some(job_res) = &self.job_res {
             self.job_client
-                .wait_job_complete(&job_res.job_id, "cache-sync")
+                .wait_job_complete(&job_res.job_id, true)
                 .await
         } else {
             Ok(())

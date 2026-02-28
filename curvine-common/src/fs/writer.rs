@@ -114,4 +114,10 @@ pub trait Writer {
     fn resize(&mut self, _opts: FileAllocOpts) -> impl Future<Output = FsResult<()>> {
         async move { err_box!("Not support") }
     }
+
+    fn write_string(&mut self, str: impl AsRef<str>) -> impl Future<Output = FsResult<()>> {
+        async move {
+            self.write(str.as_ref().as_bytes()).await
+        }
+    }
 }

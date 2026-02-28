@@ -147,7 +147,7 @@ pub fn fill_ttl_info(head: &mut HeadObjectResult, file_status: &FileStatus) {
                 TtlAction::Delete => "expiry-date=\"{}\" rule-id=\"ttl-delete\"",
                 TtlAction::Persist => "expiry-date=\"{}\" rule-id=\"ttl-persist\"",
                 TtlAction::Evict => "expiry-date=\"{}\" rule-id=\"ttl-evict\"",
-                TtlAction::Flush => "expiry-date=\"{}\" rule-id=\"ttl-flush\"",
+                TtlAction::Free => "expiry-date=\"{}\" rule-id=\"ttl-free\"",
                 _ => "rule-id=\"no-expiry\"",
             }
             .to_string(),

@@ -67,14 +67,14 @@ impl TaskContext {
         lock.update_time = LocalTime::mills() as i64;
     }
 
-    pub fn update_progress(&self, loaded_size: i64, total_size: i64) -> JobTaskProgress {
+    pub fn update_progress(&self, loaded_size: i64, total_size: i64, is_last: bool) -> JobTaskProgress {
         let mut lock = self.progress.lock().unwrap();
 
         lock.loaded_size = loaded_size;
         lock.total_size = total_size;
         lock.update_time = LocalTime::mills() as i64;
 
-        if loaded_size >= total_size {
+        if is_last {
             lock.message = "task completed successfully".into();
             self.state.set_state(JobTaskState::Completed);
         }
