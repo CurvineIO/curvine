@@ -113,7 +113,6 @@ impl NodeState {
 
         // Fast path: read lock to check if anything needs updating
         {
-            // Initialize read_lock and keep it live in this scope block
             let read_lock = self.node_read();
             let read_lock_attr = read_lock.get_check(id)?;
 
@@ -744,7 +743,7 @@ mod test {
         // Test: after first access, mtime changes => is_changed=true => check keep_cache => check keep_attr
         // Result:
         //   should_keep_cache: false
-        //   should_keep_attr:  false
+        //   should_keep_attr:  true
         let mut conf = ClusterConf::default();
         conf.fuse.init()?;
         let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
@@ -811,7 +810,7 @@ mod test {
     pub fn update_cache_state_no_change_after_first_access() -> CommonResult<()> {
         // Test: after first access, same mtime/len => is_changed=false => check keep_cache => check keep_cache => check keep_attr
         // Result:
-        //   should_keep_cache = false
+        //   should_keep_cache = true
         //   should_keep_attr  = true
         let mut conf = ClusterConf::default();
         conf.fuse.init()?;
