@@ -33,6 +33,10 @@ impl RocksInodeStore {
 
     pub const PREFIX_MOUNT: u8 = 0x01;
     pub const PREFIX_LOCK: u8 = 0x02;
+    pub const PREFIX_REQ_ID: u8 = 0x03;
+
+    /// Marker value stored in CF_COMMON to indicate a req_id has been applied.  
+    pub const REQ_ID_APPLIED: [u8; 1] = [1u8];
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
@@ -206,6 +210,17 @@ impl RocksInodeStore {
 
     pub fn get_rocksdb_memory(&self) -> CommonResult<Vec<(String, u64)>> {
         self.db.get_rocksdb_memory()
+    }
+
+    pub fn has_req_id(&self, req_id: i64) -> CommonResult<bool> {
+        let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_REQ_ID, req_id);
+        let bytes = self.db.get_cf(Self::CF_COMMON, key)?;
+        Ok(bytes.is_some())
+    }
+
+    pub fn set_req_id(&self, req_id: i64) -> CommonResult<()> {
+        let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_REQ_ID, req_id);
+        self.db.put_cf(Self::CF_COMMON, key, Self::REQ_ID_APPLIED)
     }
 }
 

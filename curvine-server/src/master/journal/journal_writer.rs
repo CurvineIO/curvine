@@ -182,11 +182,18 @@ impl JournalWriter {
         self.send(JournalEntry::Rename(entry))
     }
 
-    pub fn log_delete<P: AsRef<str>>(&self, op_ms: u64, path: P, mtime: i64) -> FsResult<()> {
+    pub fn log_delete<P: AsRef<str>>(
+        &self,
+        op_ms: u64,
+        path: P,
+        mtime: i64,
+        req_id: i64,
+    ) -> FsResult<()> {
         let entry = DeleteEntry {
             op_ms,
             path: path.as_ref().to_string(),
             mtime,
+            req_id,
         };
         self.send(JournalEntry::Delete(entry))
     }

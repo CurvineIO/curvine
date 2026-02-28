@@ -21,6 +21,7 @@ use crate::master::mount::MountManager;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{LoadJobCommand, TtlAction};
 use log::{debug, error, info, warn};
+use orpc::message::EMPTY_REQ_ID;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -137,7 +138,7 @@ impl InodeTtlExecutor {
     pub fn delete_inode(&self, inode_id: u64) -> TtlResult<()> {
         debug!("Deleting inode: {}", inode_id);
         let path = self.get_inode_path(inode_id)?;
-        match self.filesystem.delete(&path, true) {
+        match self.filesystem.delete(&path, true, EMPTY_REQ_ID) {
             Ok(_) => {
                 info!("Successfully deleted file(dir): {}", path);
 
@@ -304,9 +305,14 @@ impl InodeTtlExecutor {
                     "Evict: UFS {} exists, deleting Curvine {}: {}",
                     resource_type, resource_type, cv_path
                 );
-                self.filesystem.delete(cv_path, is_directory).map_err(|e| {
-                    TtlError::ActionExecutionError(format!("Failed to delete {}: {}", cv_path, e))
-                })?;
+                self.filesystem
+                    .delete(cv_path, is_directory, EMPTY_REQ_ID)
+                    .map_err(|e| {
+                        TtlError::ActionExecutionError(format!(
+                            "Failed to delete {}: {}",
+                            cv_path, e
+                        ))
+                    })?;
             }
             _ => {}
         }
@@ -392,7 +398,8 @@ impl InodeTtlExecutor {
                                 resource_type, cv_path
                             );
                             // Use recursive=true for directories, false for files
-                            if let Err(e) = filesystem.delete(&cv_path, is_directory) {
+                            if let Err(e) = filesystem.delete(&cv_path, is_directory, EMPTY_REQ_ID)
+                            {
                                 error!(
                                     "Failed to delete Curvine {} after export: {}",
                                     resource_type, e

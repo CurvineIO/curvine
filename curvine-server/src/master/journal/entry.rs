@@ -78,6 +78,7 @@ pub struct DeleteEntry {
     pub(crate) op_ms: u64,
     pub(crate) path: String,
     pub(crate) mtime: i64,
+    pub(crate) req_id: i64,
 }
 
 // mount

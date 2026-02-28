@@ -587,4 +587,10 @@ impl InodeStore {
     pub fn apply_set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
         self.store.set_locks(id, lock)
     }
+    pub fn has_req_id(&self, req_id: i64) -> CommonResult<bool> {
+        self.store.has_req_id(req_id)
+    }
+    pub fn set_req_id(&self, req_id: i64) -> CommonResult<()> {
+        self.store.set_req_id(req_id)
+    }
 }
