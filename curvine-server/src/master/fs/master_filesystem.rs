@@ -666,7 +666,18 @@ impl MasterFilesystem {
             let loc = BlockLocation::new(list.worker_id, item.storage_type);
             match item.status {
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
-                    if exists.unwrap_or(false) {
+                    let exists = match exists {
+                        Some(v) => v,
+                        None => {
+                            warn!(
+                                "block_report invariant violated: missing existence flag for block {}",
+                                item.id
+                            );
+                            continue;
+                        }
+                    };
+
+                    if exists {
                         batch.push((true, item.id, loc));
                     } else {
                         wm.remove_block(list.worker_id, item.id);
