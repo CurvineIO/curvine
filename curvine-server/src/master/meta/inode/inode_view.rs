@@ -413,7 +413,7 @@ impl InodeView {
                 status.is_complete = f.is_complete();
                 status.len = f.len;
                 status.replicas = f.replicas as i32;
-                status.block_size = f.block_size;
+                status.block_size = f.block_size as i64;
                 status.file_type = f.file_type;
                 status.x_attr = f.features.x_attr.clone();
                 status.storage_policy = f.storage_policy.clone();

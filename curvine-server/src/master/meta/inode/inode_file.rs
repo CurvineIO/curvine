@@ -33,8 +33,8 @@ pub struct InodeFile {
     pub(crate) atime: i64,
 
     pub(crate) len: i64,
-    pub(crate) block_size: i64,
-    pub(crate) replicas: u16,
+    pub(crate) block_size: u32,
+    pub(crate) replicas: u8,
 
     pub(crate) storage_policy: StoragePolicy,
 
@@ -80,8 +80,8 @@ impl InodeFile {
             mtime: time,
             atime: time,
             len: 0,
-            block_size: opts.block_size,
-            replicas: opts.replicas,
+            block_size: opts.block_size as u32,
+            replicas: opts.replicas as u8,
 
             storage_policy: opts.storage_policy,
             features: FileFeature {
@@ -157,7 +157,7 @@ impl InodeFile {
     }
 
     pub fn compute_len(&self) -> i64 {
-        self.blocks.iter().map(|x| x.len).sum()
+        self.blocks.iter().map(|x| x.len as i64).sum()
     }
 
     pub fn commit_len(&self, last: Option<&CommitBlock>) -> i64 {
@@ -202,7 +202,7 @@ impl InodeFile {
         if let Some(last_block) = self.get_block_mut(-1) {
             let blk = ExtendedBlock {
                 id: last_block.id,
-                len: last_block.len,
+                len: last_block.len as i64,
                 alloc_opts: last_block.alloc_opts.clone(),
                 storage_type: self.storage_policy.storage_type,
                 file_type: self.file_type,
@@ -258,8 +258,8 @@ impl InodeFile {
         self.len = 0;
 
         // Update file metadata with new options
-        self.replicas = opts.replicas;
-        self.block_size = opts.block_size;
+        self.replicas = opts.replicas as u8;
+        self.block_size = opts.block_size as u32;
         self.storage_policy = opts.storage_policy;
         self.mtime = mtime;
 
@@ -333,7 +333,7 @@ impl InodeFile {
 
         let mut current = 0i64;
         for block in &mut self.blocks {
-            let block_end = current + block.len;
+            let block_end = current + block.len as i64;
             if file_pos >= current && file_pos < block_end {
                 return Some(block);
             }
@@ -348,7 +348,7 @@ impl InodeFile {
         }
         self.blocks[..self.blocks.len() - 1]
             .iter()
-            .map(|block| block.len)
+            .map(|block| block.len as i64)
             .sum()
     }
 
@@ -387,7 +387,7 @@ impl InodeFile {
     /// * `opts` - File allocation options containing the target length
     fn extend(&mut self, opts: FileAllocOpts) -> FsResult<()> {
         let expect_len = opts.len;
-        let block_size = self.block_size;
+        let block_size = self.block_size as i64;
         let mut start = self.last_block_start_off();
 
         // Start from the last block's start position, process each block until expect_len
@@ -397,7 +397,7 @@ impl InodeFile {
 
             if let Some(block) = self.search_block_mut_by_pos(start) {
                 // Found existing block, extend its length
-                block.len = resize_len;
+                block.len = resize_len as u32;
                 block.alloc_opts.replace(block_opts);
             } else {
                 // No block found, create new block
@@ -427,9 +427,9 @@ impl InodeFile {
         let expect_len = opts.len;
         let mut remove_start = None;
 
-        let mut start = 0;
+        let mut start = 0i64;
         for (idx, block) in self.blocks.iter_mut().enumerate() {
-            let end = start + block.len;
+            let end = start + block.len as i64;
 
             if start >= expect_len {
                 // Current block's start position exceeds expect_len, delete all blocks starting from current block
@@ -440,7 +440,7 @@ impl InodeFile {
                 let new_len = expect_len - start;
                 if new_len > 0 {
                     // Truncate current block, keep first new_len bytes
-                    block.len = new_len;
+                    block.len = new_len as u32;
                     block.alloc_opts.replace(opts.clone_with_len(new_len));
                     remove_start.replace(idx + 1); // Delete subsequent blocks
                 } else {
