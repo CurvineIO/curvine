@@ -369,7 +369,7 @@ impl MasterFilesystem {
         previous: Option<&CommitBlock>,
     ) -> FsResult<ValidateAddBlock> {
         if let Some(v) = previous {
-            if v.block_len != file.block_size {
+            if v.block_len != file.block_size as i64 {
                 return err_box!(
                     "The block size is incorrect, block size: {}, commit block length: {}",
                     file.block_size,
@@ -379,8 +379,8 @@ impl MasterFilesystem {
         }
 
         let res = ValidateAddBlock {
-            replicas: file.replicas,
-            block_size: file.block_size,
+            replicas: file.replicas as u16,
+            block_size: file.block_size as i64,
             storage_policy: file.storage_policy.clone(),
             client_host: client_addr.hostname.clone(),
         };
@@ -441,7 +441,7 @@ impl MasterFilesystem {
             let locs = fs_dir.get_block_locations(next.id)?;
             let extend_block = ExtendedBlock {
                 id: next.id,
-                len: next.len,
+                len: next.len(),
                 storage_type: file.storage_policy.storage_type,
                 file_type: file.file_type,
                 alloc_opts: next.alloc_opts.clone(),
@@ -510,18 +510,18 @@ impl MasterFilesystem {
         let mut block_locs = Vec::with_capacity(file_locs.len());
 
         for (index, meta) in file.blocks.iter().enumerate() {
-            if index + 1 < file.blocks.len() && meta.len != file.block_size {
+            if index + 1 < file.blocks.len() && meta.len() != file.block_size as i64 {
                 return err_box!(
                     "block status abnormal, block id {}, block len {}, expected block size {}",
                     meta.id,
-                    meta.len,
+                    meta.len(),
                     file.block_size
                 );
             }
 
             let extend_block = ExtendedBlock {
                 id: meta.id,
-                len: meta.len,
+                len: meta.len(),
                 storage_type: file.storage_policy.storage_type,
                 file_type: file.file_type,
                 alloc_opts: meta.alloc_opts.clone(),
