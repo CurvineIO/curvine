@@ -237,6 +237,8 @@ impl MasterFilesystem {
         let inp = if last_inode.is_some() {
             if flags.overwrite() {
                 self.truncate(&mut fs_dir, &inp, opts)?;
+            } else {
+                return err_ext!(FsError::file_exists(inp.path()));
             }
             inp
         } else {
@@ -266,16 +268,20 @@ impl MasterFilesystem {
             return self.get_block_locations(path);
         }
 
-        if flags.create() {
-            let status = self.create_with_opts(path, opts, flags)?;
-            return Ok(FileBlocks::new(status, vec![]));
-        }
-
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
-            None => return err_ext!(FsError::file_not_found(inp.path())),
+            None => {
+                return if flags.create() {
+                    drop(fs_dir);
+                    let status = self.create_with_opts(path, opts, flags)?;
+                    Ok(FileBlocks::new(status, vec![]))
+                } else {
+                    err_ext!(FsError::file_not_found(inp.path()))
+                }
+            }
+
             Some(inode) => {
                 if inode.is_dir() {
                     return err_box!("{} is a directory", inp.path());
