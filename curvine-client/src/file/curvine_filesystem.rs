@@ -47,6 +47,10 @@ impl CurvineFileSystem {
     pub fn with_rt(conf: ClusterConf, rt: Arc<Runtime>) -> FsResult<Self> {
         let fs_context = Arc::new(FsContext::with_rt(conf, rt.clone())?);
         let fs_client = FsClient::new(fs_context.clone());
+
+        // Perform version handshake with master
+        rt.block_on(fs_client.handshake())?;
+
         let fs = Self {
             fs_context,
             fs_client: Arc::new(fs_client),

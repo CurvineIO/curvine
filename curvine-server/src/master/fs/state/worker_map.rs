@@ -38,7 +38,12 @@ impl WorkerMap {
         }
     }
 
-    pub fn insert(&mut self, addr: WorkerAddress, storages: Vec<StorageInfo>) -> FsResult<()> {
+    pub fn insert(
+        &mut self,
+        addr: WorkerAddress,
+        storages: Vec<StorageInfo>,
+        version: curvine_common::version::Version,
+    ) -> FsResult<()> {
         // Check whether the address and worker id conflict.
         if let Some(v) = self.workers.get(&addr.worker_id) {
             if v.address != addr {
@@ -57,6 +62,9 @@ impl WorkerMap {
         for item in storages {
             info.add_storage(item);
         }
+
+        // Set version information
+        info.version = Some(version);
 
         // The worker dcm state does not change
         info.status = match self.workers.get(&worker_id) {

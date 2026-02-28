@@ -135,6 +135,7 @@ pub struct WorkerConf {
     pub scheduler_threads: usize,
 
     pub log: LogConf,
+    // Protocol version for compatibility checking
 
     // Number of asynchronous task threads
     pub executor_threads: usize,

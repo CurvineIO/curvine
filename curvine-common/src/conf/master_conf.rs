@@ -92,6 +92,8 @@ pub struct MasterConf {
     pub block_replication_retry_interval_unit: DurationUnit,
 
     pub log: LogConf,
+    pub min_worker_version: String,
+    pub min_client_version: String,
 
     pub ttl_checker_retry_attempts: u32,
 
@@ -276,6 +278,8 @@ impl Default for MasterConf {
             block_replication_retry_interval: "5s".to_string(),
             block_replication_retry_interval_unit: Default::default(),
             log: Default::default(),
+            min_worker_version: "0.1.0".to_string(),
+            min_client_version: "0.1.0".to_string(),
 
             ttl_checker_retry_attempts: 3,
 

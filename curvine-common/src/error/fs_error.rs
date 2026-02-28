@@ -60,6 +60,7 @@ pub enum ErrorKind {
     JobNotFound = 23,
     Pipeline = 24,
     MinReplicasNotMet = 25,
+    VersionIncompatible = 26,
 
     #[num_enum(default)]
     Common = 10000,
@@ -163,6 +164,10 @@ pub enum FsError {
     // Job not found
     #[error("{0}")]
     JobNotFound(ErrorImpl<StringError>),
+
+    // Version incompatibility error
+    #[error("{0}")]
+    VersionIncompatible(ErrorImpl<StringError>),
 
     // Other errors that are not defined.
     #[error("{0}")]
@@ -273,6 +278,11 @@ impl FsError {
         }
     }
 
+    pub fn version_incompatible(reason: impl std::fmt::Display) -> Self {
+        let msg = format!("Version incompatible: {}", reason);
+        Self::VersionIncompatible(ErrorImpl::with_source(msg.into()))
+    }
+
     // Determine whether the current error allows retry.
     // NotLeaderMaster error indicates that a master switch has occurred and you need to retry access to the next master
     pub fn retry_master(&self) -> bool {
@@ -313,6 +323,7 @@ impl FsError {
             FsError::Pipeline(_) => ErrorKind::Pipeline,
             FsError::MinReplicasNotMet(_) => ErrorKind::MinReplicasNotMet,
             FsError::JobNotFound(_) => ErrorKind::JobNotFound,
+            FsError::VersionIncompatible(_) => ErrorKind::VersionIncompatible,
             FsError::Common(_) => ErrorKind::Common,
         }
     }
@@ -429,6 +440,7 @@ impl ErrorExt for FsError {
             FsError::Pipeline(e) => FsError::Pipeline(e.ctx(ctx)),
             FsError::MinReplicasNotMet(e) => FsError::MinReplicasNotMet(e.ctx(ctx)),
             FsError::JobNotFound(e) => FsError::JobNotFound(e.ctx(ctx)),
+            FsError::VersionIncompatible(e) => FsError::VersionIncompatible(e.ctx(ctx)),
             FsError::Common(e) => FsError::Common(e.ctx(ctx)),
         }
     }
@@ -460,6 +472,7 @@ impl ErrorExt for FsError {
             FsError::Pipeline(e) => e.encode(ErrorKind::Pipeline),
             FsError::MinReplicasNotMet(e) => e.encode(ErrorKind::MinReplicasNotMet),
             FsError::JobNotFound(e) => e.encode(ErrorKind::JobNotFound),
+            FsError::VersionIncompatible(e) => e.encode(ErrorKind::VersionIncompatible),
             FsError::Common(e) => e.encode(ErrorKind::Common),
         }
     }
@@ -494,6 +507,7 @@ impl ErrorExt for FsError {
             ErrorKind::Pipeline => FsError::Pipeline(de.into_string()),
             ErrorKind::MinReplicasNotMet => FsError::MinReplicasNotMet(de.into_string()),
             ErrorKind::JobNotFound => FsError::JobNotFound(de.into_string()),
+            ErrorKind::VersionIncompatible => FsError::VersionIncompatible(de.into_string()),
             ErrorKind::Common => FsError::Common(de.into_string()),
         }
     }
