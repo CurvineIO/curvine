@@ -124,7 +124,6 @@ impl NodeState {
         }
 
         // Slow path: write lock to update state
-        // TODO: consider supporting lock upgrade
         let mut lock = self.node_write();
 
         let write_lock_attr = lock.get_mut_check(id)?;
