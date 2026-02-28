@@ -177,6 +177,8 @@ impl JournalLoader {
     }
 
     pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
+        // Pre-check whether the req_id has already been applied.
+        // When called internally, req_id is set to EMPTY_REQ_ID.
         let mut fs_dir = self.fs_dir.write();
 
         // Idempotency: skip if this req_id was already applied
