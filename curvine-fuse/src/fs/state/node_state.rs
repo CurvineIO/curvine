@@ -711,12 +711,10 @@ mod test {
 
     #[test]
     pub fn update_cache_state_first_access() -> CommonResult<()> {
-        // Test: first access (cache_valid == false) → is_first_access=true, is_changed=false
-        // should_keep_cache: true (is_first_access || !is_changed → true || true → true)
-        // should_keep_attr:  false (!is_first_access || !is_changed → false || true → true)
-        // Wait — first access with same mtime/len:
-        //   should_keep_cache → true
-        //   should_keep_attr  → true (non-first access is false, but !is_changed is true)
+        // Test: First access and keep the attr unchanged
+        // Result:
+        //   should_keep_cache => true
+        //   should_keep_attr  => true
         let mut conf = ClusterConf::default();
         conf.fuse.init()?;
         let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
@@ -725,22 +723,25 @@ mod test {
         let status = FileStatus::with_name(2, "foo.txt".to_string(), false);
         let attr = state.do_lookup(FUSE_ROOT_ID, Some("foo.txt"), &status)?;
 
-        // First call to should_keep_cache: cache_valid was false → is_first_access=true
-        // status has same mtime/len as what was stored → is_changed=false
-        // should_keep_cache = is_first_access || !is_changed = true || true = true
+        // First access
         let keep_cache = state.should_keep_cache(attr.ino, &status)?;
         assert!(keep_cache, "first access should keep page cache");
 
+        // Second access
+        let keep_attr = state.should_keep_attr(attr.ino, &status)?;
+        assert!(
+            keep_attr,
+            "non-first access with unchanged attrs should keep attr cache"
+        );
         Ok(())
     }
 
     #[test]
     pub fn update_cache_state_mtime_changed() -> CommonResult<()> {
-        // Test: after first access, mtime changes → is_changed=true
-        // should_keep_cache: false (!is_first_access=true, is_changed=true → false || false → false)
-        // should_keep_attr:  false (!is_first_access=true, is_changed=true → true || false → true)
-        // Actually: should_keep_attr = !is_first_access || !is_changed = true || false = true
-        // should_keep_cache = is_first_access || !is_changed = false || false = false
+        // Test: after first access, mtime changes => is_changed=true => check keep_cache => check keep_attr
+        // Result:
+        //   should_keep_cache: false
+        //   should_keep_attr:  false
         let mut conf = ClusterConf::default();
         conf.fuse.init()?;
         let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
@@ -754,12 +755,12 @@ mod test {
 
         // Now simulate mtime change
         status.mtime += 1000;
-        // is_first_access=false (cache_valid=true), is_changed=true
-        // should_keep_cache = false || false = false
+
+        // Second access
         let keep_cache = state.should_keep_cache(attr.ino, &status)?;
         assert!(!keep_cache, "changed mtime should invalidate page cache");
 
-        // should_keep_attr = true || false = true
+        // Third access
         let keep_attr = state.should_keep_attr(attr.ino, &status)?;
         assert!(
             keep_attr,
@@ -771,8 +772,10 @@ mod test {
 
     #[test]
     pub fn update_cache_state_len_changed() -> CommonResult<()> {
-        // Test: after first access, len changes → is_changed=true
-        // should_keep_cache = false, should_keep_attr = true (non-first access)
+        // Test: after first access, len changes => is_changed=true => check keep_cache => check keep_attr
+        // Result:
+        //   should_keep_cache = false,
+        //   should_keep_attr = true
         let mut conf = ClusterConf::default();
         conf.fuse.init()?;
         let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
@@ -786,9 +789,12 @@ mod test {
 
         // Simulate file size change
         status.len += 4096;
+
+        // Second access
         let keep_cache = state.should_keep_cache(attr.ino, &status)?;
         assert!(!keep_cache, "changed len should invalidate page cache");
 
+        // Third access
         let keep_attr = state.should_keep_attr(attr.ino, &status)?;
         assert!(
             keep_attr,
@@ -800,9 +806,10 @@ mod test {
 
     #[test]
     pub fn update_cache_state_no_change_after_first_access() -> CommonResult<()> {
-        // Test: after first access, same mtime/len → is_changed=false
-        // should_keep_cache = false || true = true
-        // should_keep_attr  = true  || true = true
+        // Test: after first access, same mtime/len => is_changed=false => check keep_cache => check keep_cache => check keep_attr
+        // Result:
+        //   should_keep_cache = false
+        //   should_keep_attr  = true
         let mut conf = ClusterConf::default();
         conf.fuse.init()?;
         let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
@@ -814,13 +821,14 @@ mod test {
         // First access
         let _ = state.should_keep_cache(attr.ino, &status)?;
 
-        // Second access with same status → is_first_access=false, is_changed=false
+        // Second access with same status
         let keep_cache = state.should_keep_cache(attr.ino, &status)?;
         assert!(
             keep_cache,
             "unchanged file should keep page cache on second access"
         );
 
+        // Third access
         let keep_attr = state.should_keep_attr(attr.ino, &status)?;
         assert!(
             keep_attr,
