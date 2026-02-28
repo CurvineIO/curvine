@@ -60,7 +60,7 @@ fn measure_resize_blocks_fs_read_latency() {
         let b2 = b.clone();
         let resize_t = thread::spawn(move || {
             b2.wait();
-            let _ = fs_resize.resize("/resize/file.log", FileAllocOpts::with_truncate(0));
+            fs_resize.resize("/resize/file.log", FileAllocOpts::with_truncate(0))
         });
 
         b.wait();
@@ -72,8 +72,13 @@ fn measure_resize_blocks_fs_read_latency() {
         drop(g);
         waits_us.push(elapsed);
 
-        let _ = holder.join();
-        let _ = resize_t.join();
+        holder.join().unwrap();
+        let resize_res = resize_t.join().unwrap();
+        assert!(
+            resize_res.is_ok(),
+            "resize should succeed, got {:?}",
+            resize_res
+        );
     }
 
     let mut cp = waits_us.clone();
@@ -86,5 +91,13 @@ fn measure_resize_blocks_fs_read_latency() {
         p95,
         p99,
         waits_us.len()
+    );
+
+    let hold_us = hold_ms as u128 * 1000;
+    assert!(
+        p95 < hold_us,
+        "p95 fs_dir.read wait too high under resize contention: p95={}us, hold={}us",
+        p95,
+        hold_us
     );
 }

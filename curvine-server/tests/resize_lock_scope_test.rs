@@ -1,5 +1,5 @@
 use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
-use curvine_common::state::{FileAllocOpts, WorkerInfo};
+use curvine_common::state::{ClientAddress, FileAllocOpts, WorkerInfo};
 use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::Master;
@@ -37,20 +37,40 @@ fn resize_does_not_hold_fs_lock_while_waiting_worker_manager() {
     let (fs, _js) = new_fs("scope");
     fs.create("/resize/file.log", true).unwrap();
 
+    let client = ClientAddress {
+        client_name: "resize-lock-scope".into(),
+        hostname: "localhost".into(),
+        ip_addr: "127.0.0.1".into(),
+        port: 0,
+    };
+    fs.add_block("/resize/file.log", client, vec![], vec![], 0, None)
+        .unwrap();
+
     let fs = Arc::new(fs);
 
+    let fs_guard = fs.fs_dir.write();
     let wm_guard = fs.worker_manager.write();
 
     let fs_resize = fs.clone();
-    let (tx, rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
     let t = thread::spawn(move || {
+        started_tx.send(()).unwrap();
         let res = fs_resize.resize("/resize/file.log", FileAllocOpts::with_truncate(0));
-        tx.send(res.is_ok()).unwrap();
+        done_tx.send(res.is_ok()).unwrap();
     });
 
-    thread::sleep(Duration::from_millis(80));
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     assert!(
-        rx.try_recv().is_err(),
+        done_rx.try_recv().is_err(),
+        "resize should not complete before fs_dir/worker_manager locks are released"
+    );
+
+    drop(fs_guard);
+    thread::sleep(Duration::from_millis(80));
+
+    assert!(
+        done_rx.try_recv().is_err(),
         "resize should still be blocked while worker_manager write lock is held"
     );
 
@@ -62,7 +82,7 @@ fn resize_does_not_hold_fs_lock_while_waiting_worker_manager() {
     drop(wm_guard);
 
     assert!(
-        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
         "resize should complete after worker_manager lock is released"
     );
     t.join().unwrap();
