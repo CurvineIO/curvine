@@ -712,13 +712,29 @@ impl MasterFilesystem {
         opts.validate()?;
 
         let path = path.as_ref();
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let (del_res, inode_id) = {
+            let mut fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let inode_id = try_option!(inp.get_last_inode(), "File {} not exists", path).id();
+            let del_res = fs_dir.resize(&inp, opts)?;
+            (del_res, inode_id)
+        };
 
-        let del_res = fs_dir.resize(&inp, opts)?;
-        self.worker_manager.write().remove_blocks(&del_res);
+        if !del_res.blocks.is_empty() {
+            self.worker_manager.write().remove_blocks(&del_res);
+        }
 
-        self.get_file_blocks(path, &fs_dir, &inp)
+        let blocks = self.get_block_locations(path)?;
+        if blocks.status.id != inode_id {
+            return err_box!(
+                "Path {} resolved to different inode after resize, expected {}, got {}",
+                path,
+                inode_id,
+                blocks.status.id
+            );
+        }
+
+        Ok(blocks)
     }
 
     pub fn assign_worker<T: AsRef<str>>(
