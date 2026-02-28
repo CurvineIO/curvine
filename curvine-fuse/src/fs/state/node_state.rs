@@ -105,36 +105,16 @@ impl NodeState {
     ///    - This helps prevent reading outdated attributes in time-sensitive scenarios (e.g., git clone)
     ///    - The logic ensures that once a file is accessed, subsequent lookups with unchanged attributes
     ///      can use cached values, but any change to mtime/len will force cache invalidation
-    /// Note: Since the cache is expected to change infrequently and have a high hit rate, we need a separate fast path for checking cache validity and a slow path for updates.
     fn update_cache_state(&self, id: u64, status: &FileStatus) -> FuseResult<(bool, bool)> {
-        // Fast path: read lock to check if anything needs updating
-        {
-            // Initialize read_lock and keep it live in this scope block
-            let read_lock = self.node_read();
-            let read_lock_attr = read_lock.get_check(id)?;
-
-            let is_first_access = !read_lock_attr.cache_valid;
-            let is_changed =
-                status.mtime != read_lock_attr.mtime || status.len != read_lock_attr.len;
-
-            // If cache is already valid and nothing changed, no write needed
-            if read_lock_attr.cache_valid && !is_changed {
-                return Ok((is_first_access, is_changed));
-            }
-        }
-
-        // Slow path: write lock to update state
-        // TODO: consider supporting lock upgrade
         let mut lock = self.node_write();
+        let attr = lock.get_mut_check(id)?;
 
-        let write_lock_attr = lock.get_mut_check(id)?;
-        // Re-check under write lock (another thread may have updated between locks)
-        let is_first_access = !write_lock_attr.cache_valid;
-        let is_changed = status.mtime != write_lock_attr.mtime || status.len != write_lock_attr.len;
+        let is_first_access = !attr.cache_valid;
+        let is_changed = status.mtime != attr.mtime || status.len != attr.len;
 
-        write_lock_attr.cache_valid = true;
-        write_lock_attr.mtime = status.mtime;
-        write_lock_attr.len = status.len;
+        attr.cache_valid = true;
+        attr.mtime = status.mtime;
+        attr.len = status.len;
 
         Ok((is_first_access, is_changed))
     }
@@ -706,6 +686,127 @@ mod test {
 
         let c1 = state.get_path_common(c.ino, Some("1.log"));
         assert!(c1.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn update_cache_state_first_access() -> CommonResult<()> {
+        // Test: first access (cache_valid == false) → is_first_access=true, is_changed=false
+        // should_keep_cache: true (is_first_access || !is_changed → true || true → true)
+        // should_keep_attr:  false (!is_first_access || !is_changed → false || true → true)
+        // Wait — first access with same mtime/len:
+        //   should_keep_cache → true
+        //   should_keep_attr  → true (non-first access is false, but !is_changed is true)
+        let mut conf = ClusterConf::default();
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        let status = FileStatus::with_name(2, "foo.txt".to_string(), false);
+        let attr = state.do_lookup(FUSE_ROOT_ID, Some("foo.txt"), &status)?;
+
+        // First call to should_keep_cache: cache_valid was false → is_first_access=true
+        // status has same mtime/len as what was stored → is_changed=false
+        // should_keep_cache = is_first_access || !is_changed = true || true = true
+        let keep_cache = state.should_keep_cache(attr.ino, &status)?;
+        assert!(keep_cache, "first access should keep page cache");
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn update_cache_state_mtime_changed() -> CommonResult<()> {
+        // Test: after first access, mtime changes → is_changed=true
+        // should_keep_cache: false (!is_first_access=true, is_changed=true → false || false → false)
+        // should_keep_attr:  false (!is_first_access=true, is_changed=true → true || false → true)
+        // Actually: should_keep_attr = !is_first_access || !is_changed = true || false = true
+        // should_keep_cache = is_first_access || !is_changed = false || false = false
+        let mut conf = ClusterConf::default();
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        let mut status = FileStatus::with_name(2, "foo.txt".to_string(), false);
+        let attr = state.do_lookup(FUSE_ROOT_ID, Some("foo.txt"), &status)?;
+
+        // First access: sets cache_valid=true, records mtime/len
+        let _ = state.should_keep_cache(attr.ino, &status)?;
+
+        // Now simulate mtime change
+        status.mtime += 1000;
+        // is_first_access=false (cache_valid=true), is_changed=true
+        // should_keep_cache = false || false = false
+        let keep_cache = state.should_keep_cache(attr.ino, &status)?;
+        assert!(!keep_cache, "changed mtime should invalidate page cache");
+
+        // should_keep_attr = true || false = true
+        let keep_attr = state.should_keep_attr(attr.ino, &status)?;
+        assert!(
+            keep_attr,
+            "non-first access keeps attr cache even if changed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn update_cache_state_len_changed() -> CommonResult<()> {
+        // Test: after first access, len changes → is_changed=true
+        // should_keep_cache = false, should_keep_attr = true (non-first access)
+        let mut conf = ClusterConf::default();
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        let mut status = FileStatus::with_name(3, "bar.txt".to_string(), false);
+        let attr = state.do_lookup(FUSE_ROOT_ID, Some("bar.txt"), &status)?;
+
+        // First access
+        let _ = state.should_keep_cache(attr.ino, &status)?;
+
+        // Simulate file size change
+        status.len += 4096;
+        let keep_cache = state.should_keep_cache(attr.ino, &status)?;
+        assert!(!keep_cache, "changed len should invalidate page cache");
+
+        let keep_attr = state.should_keep_attr(attr.ino, &status)?;
+        assert!(
+            keep_attr,
+            "non-first access keeps attr cache even if len changed"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn update_cache_state_no_change_after_first_access() -> CommonResult<()> {
+        // Test: after first access, same mtime/len → is_changed=false
+        // should_keep_cache = false || true = true
+        // should_keep_attr  = true  || true = true
+        let mut conf = ClusterConf::default();
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        let status = FileStatus::with_name(4, "baz.txt".to_string(), false);
+        let attr = state.do_lookup(FUSE_ROOT_ID, Some("baz.txt"), &status)?;
+
+        // First access
+        let _ = state.should_keep_cache(attr.ino, &status)?;
+
+        // Second access with same status → is_first_access=false, is_changed=false
+        let keep_cache = state.should_keep_cache(attr.ino, &status)?;
+        assert!(
+            keep_cache,
+            "unchanged file should keep page cache on second access"
+        );
+
+        let keep_attr = state.should_keep_attr(attr.ino, &status)?;
+        assert!(
+            keep_attr,
+            "unchanged file should keep attr cache on second access"
+        );
 
         Ok(())
     }
