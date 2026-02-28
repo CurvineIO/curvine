@@ -15,6 +15,7 @@
 use log::info;
 use orpc::common::Utils;
 use orpc::{err_msg, CommonResult};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
 
@@ -55,5 +56,117 @@ impl CommonUtils {
 
         info!("reload: new process spawned successfully");
         Ok(())
+    }
+
+    pub fn sign_p2p_policy(
+        secret: &str,
+        version: u64,
+        peer_whitelist: &[String],
+        tenant_whitelist: &[String],
+    ) -> String {
+        if secret.trim().is_empty() {
+            return String::new();
+        }
+        let mut hasher = Sha256::new();
+        Self::update_signing_segment(&mut hasher, secret);
+        Self::update_signing_segment(&mut hasher, &version.to_string());
+        Self::update_signing_segment(&mut hasher, &peer_whitelist.len().to_string());
+        for peer in peer_whitelist {
+            Self::update_signing_segment(&mut hasher, peer);
+        }
+        Self::update_signing_segment(&mut hasher, &tenant_whitelist.len().to_string());
+        for tenant in tenant_whitelist {
+            Self::update_signing_segment(&mut hasher, tenant);
+        }
+        let digest = hasher.finalize();
+        digest.iter().map(|v| format!("{:02x}", v)).collect()
+    }
+
+    pub fn verify_p2p_policy_signature(
+        secret: &str,
+        version: u64,
+        peer_whitelist: &[String],
+        tenant_whitelist: &[String],
+        signature: &str,
+    ) -> bool {
+        if secret.trim().is_empty() {
+            return true;
+        }
+        let signed = Self::sign_p2p_policy(secret, version, peer_whitelist, tenant_whitelist);
+        !signed.is_empty() && !signature.is_empty() && signed == signature
+    }
+
+    pub fn verify_p2p_policy_signatures(
+        secret: &str,
+        version: u64,
+        peer_whitelist: &[String],
+        tenant_whitelist: &[String],
+        signatures: &str,
+    ) -> bool {
+        if secret.trim().is_empty() {
+            return true;
+        }
+        signatures
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .any(|signature| {
+                Self::verify_p2p_policy_signature(
+                    secret,
+                    version,
+                    peer_whitelist,
+                    tenant_whitelist,
+                    signature,
+                )
+            })
+    }
+
+    fn update_signing_segment(hasher: &mut Sha256, value: &str) {
+        hasher.update(value.len().to_string().as_bytes());
+        hasher.update(b":");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommonUtils;
+
+    #[test]
+    fn p2p_policy_signature_roundtrip() {
+        let peers = vec!["peer-a".to_string()];
+        let tenants = vec!["tenant-a".to_string(), "tenant-b".to_string()];
+        let signature = CommonUtils::sign_p2p_policy("secret", 7, &peers, &tenants);
+        assert!(!signature.is_empty());
+        assert!(CommonUtils::verify_p2p_policy_signature(
+            "secret", 7, &peers, &tenants, &signature
+        ));
+        assert!(!CommonUtils::verify_p2p_policy_signature(
+            "secret", 8, &peers, &tenants, &signature
+        ));
+    }
+
+    #[test]
+    fn p2p_policy_rotation_signatures_roundtrip() {
+        let peers = vec!["peer-a".to_string()];
+        let tenants = vec!["tenant-a".to_string()];
+        let old_signature = CommonUtils::sign_p2p_policy("old-secret", 7, &peers, &tenants);
+        let new_signature = CommonUtils::sign_p2p_policy("new-secret", 7, &peers, &tenants);
+        let signatures = format!("{},{}", new_signature, old_signature);
+        assert!(CommonUtils::verify_p2p_policy_signatures(
+            "old-secret",
+            7,
+            &peers,
+            &tenants,
+            &signatures
+        ));
+        assert!(CommonUtils::verify_p2p_policy_signatures(
+            "new-secret",
+            7,
+            &peers,
+            &tenants,
+            &signatures
+        ));
     }
 }

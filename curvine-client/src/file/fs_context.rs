@@ -14,7 +14,9 @@
 
 use crate::block::{BlockClient, BlockClientPool};
 use crate::file::CurvineFileSystem;
+use crate::p2p::P2pService;
 use crate::ClientMetrics;
+use bytes::Bytes;
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::ClientAddressProto;
 use curvine_common::state::{ClientAddress, WorkerAddress};
@@ -30,11 +32,32 @@ use orpc::common::Utils;
 use orpc::io::net::NetUtils;
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::sync::FastDashMap;
 use orpc::sys::CacheManager;
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 
 static CLIENT_METRICS: OnceCell<ClientMetrics> = OnceCell::new();
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub(crate) struct ReadChunkKey {
+    pub(crate) file_id: i64,
+    pub(crate) version_epoch: i64,
+    pub(crate) block_id: i64,
+    pub(crate) off: i64,
+}
+
+impl ReadChunkKey {
+    pub(crate) fn new(file_id: i64, version_epoch: i64, block_id: i64, off: i64) -> Self {
+        Self {
+            file_id,
+            version_epoch,
+            block_id,
+            off,
+        }
+    }
+}
 
 // The core feature of the file system is thread-safe, which can be shared between multiple threads through Arc.
 // 1. The cluster configuration file is saved.
@@ -46,6 +69,9 @@ pub struct FsContext {
     pub(crate) client_addr: ClientAddress,
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
+    pub(crate) read_chunk_cache: Cache<ReadChunkKey, Bytes, BuildHasherDefault<FxHasher>>,
+    pub(crate) read_chunk_flights: FastDashMap<ReadChunkKey, Arc<AsyncMutex<()>>>,
+    pub(crate) p2p_service: Option<Arc<P2pService>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
 }
 
@@ -67,6 +93,10 @@ impl FsContext {
 
         CLIENT_METRICS
             .get_or_init(|| ClientMetrics::new(&conf.client.metadata_operation_buckets).unwrap());
+        Self::get_metrics().set_read_label_policy(
+            conf.client.p2p.metrics_label_series_cap,
+            conf.client.p2p.metrics_hash_job_id,
+        );
 
         let connector = ClusterConnector::with_rt(conf.client_rpc_conf(), rt.clone());
         for node in conf.master_nodes() {
@@ -85,6 +115,28 @@ impl FsContext {
             .eviction_policy(EvictionPolicy::lru())
             .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
 
+        let read_chunk_cache = CacheBuilder::default()
+            .max_capacity(conf.client.read_chunk_cache_capacity.max(1))
+            .time_to_live(conf.client.read_chunk_cache_ttl)
+            .eviction_policy(EvictionPolicy::lru())
+            .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
+
+        let read_chunk_flights =
+            FastDashMap::with_capacity(conf.client.read_chunk_cache_capacity.min(65536) as usize);
+
+        let p2p_service = if conf.client.p2p.enable {
+            let service = Arc::new(P2pService::new_with_runtime(
+                conf.client.p2p.clone(),
+                Some(rt.clone()),
+            ));
+            if service.is_enabled() {
+                service.start();
+            }
+            Some(service)
+        } else {
+            None
+        };
+
         let block_pool = Arc::new(BlockClientPool::new(
             conf.client.enable_block_conn_pool,
             conf.client.block_conn_idle_size,
@@ -97,6 +149,9 @@ impl FsContext {
             client_addr,
             os_cache,
             failed_workers: exclude_workers,
+            read_chunk_cache,
+            read_chunk_flights,
+            p2p_service,
             block_pool,
         };
         Ok(context)
@@ -174,6 +229,41 @@ impl FsContext {
         self.os_cache.clone()
     }
 
+    pub fn p2p_service(&self) -> Option<Arc<P2pService>> {
+        self.p2p_service.clone()
+    }
+
+    pub fn read_chunk_cache_enabled(&self) -> bool {
+        self.conf.client.enable_read_chunk_cache
+    }
+
+    pub(crate) fn get_read_chunk_cache(&self, key: &ReadChunkKey) -> Option<Bytes> {
+        if !self.read_chunk_cache_enabled() {
+            return None;
+        }
+        self.read_chunk_cache.get(key)
+    }
+
+    pub(crate) fn put_read_chunk_cache(&self, key: ReadChunkKey, data: Bytes) {
+        if !self.read_chunk_cache_enabled() || data.is_empty() {
+            return;
+        }
+        self.read_chunk_cache.insert(key, data);
+    }
+
+    pub(crate) fn read_chunk_flight_lock(&self, key: ReadChunkKey) -> Arc<AsyncMutex<()>> {
+        self.read_chunk_flights
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    pub(crate) fn cleanup_read_chunk_flight(&self, key: &ReadChunkKey, lock: &Arc<AsyncMutex<()>>) {
+        let _ = self.read_chunk_flights.remove_if(key, |_, current| {
+            Arc::ptr_eq(current, lock) && Arc::strong_count(current) == 2
+        });
+    }
+
     pub fn get_metrics<'a>() -> &'a ClientMetrics {
         CLIENT_METRICS.get().expect("client get metrics error!")
     }
@@ -214,6 +304,14 @@ impl FsContext {
                 interval.tick().await;
 
                 pool.clear_idle_conn();
+                fs.sync_p2p_metrics();
+                if let Some(p2p_service) = fs.fs_context.p2p_service() {
+                    if p2p_service.is_enabled() {
+                        if let Err(e) = fs.sync_p2p_runtime_policy().await {
+                            warn!("sync p2p runtime policy: {}", e)
+                        }
+                    }
+                }
 
                 if metric_report_enable {
                     if let Err(e) = fs.metrics_report().await {
@@ -222,5 +320,60 @@ impl FsContext {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_read_chunk_flight_removes_entry_when_only_map_and_caller_ref_remain() {
+        let conf = ClusterConf::default();
+        let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+        let context = FsContext::with_rt(conf, rt).unwrap();
+        let key = ReadChunkKey::new(1, 1, 1, 0);
+
+        let lock = context.read_chunk_flight_lock(key.clone());
+        assert!(context.read_chunk_flights.contains_key(&key));
+        assert_eq!(Arc::strong_count(&lock), 2);
+
+        context.cleanup_read_chunk_flight(&key, &lock);
+
+        assert!(!context.read_chunk_flights.contains_key(&key));
+    }
+
+    #[test]
+    fn cleanup_read_chunk_flight_keeps_entry_when_other_readers_still_hold_refs() {
+        let conf = ClusterConf::default();
+        let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+        let context = FsContext::with_rt(conf, rt).unwrap();
+        let key = ReadChunkKey::new(2, 1, 1, 0);
+
+        let lock = context.read_chunk_flight_lock(key.clone());
+        let sibling_reader_ref = lock.clone();
+        assert!(Arc::strong_count(&lock) >= 3);
+
+        context.cleanup_read_chunk_flight(&key, &lock);
+        assert!(context.read_chunk_flights.contains_key(&key));
+
+        drop(sibling_reader_ref);
+        context.cleanup_read_chunk_flight(&key, &lock);
+        assert!(!context.read_chunk_flights.contains_key(&key));
+    }
+
+    #[test]
+    fn disabled_p2p_should_not_create_cache_dir() {
+        let mut conf = ClusterConf::default();
+        conf.client.p2p.enable = false;
+        let cache_dir =
+            std::env::temp_dir().join(format!("curvine-p2p-disabled-cache-{}", Utils::uuid()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let _ = std::fs::remove_file(&cache_dir);
+        conf.client.p2p.cache_dir = cache_dir.to_string_lossy().to_string();
+        let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+        let context = FsContext::with_rt(conf, rt).unwrap();
+        assert!(context.p2p_service().is_none());
+        assert!(!cache_dir.exists());
     }
 }

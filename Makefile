@@ -1,4 +1,4 @@
-.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid all dist dist-only
+.PHONY: help check-env format format-csi build cargo docker-build docker-build-compile docker-compile docker-build-fluid-cache docker-build-fluid-thin docker-build-fluid p2p-prod-gate all dist dist-only
 
 # Default target when running 'make' without arguments
 .DEFAULT_GOAL := help
@@ -42,6 +42,7 @@ help:
 	@echo ""
 	@echo "Other:"
 	@echo "  make cargo ARGS='<args>'         - Run arbitrary cargo commands"
+	@echo "  make p2p-prod-gate               - Run required P2P production release gate tests"
 	@echo "  make help                        - Show this help message"
 	@echo ""
 	@echo "Parameters:"
@@ -86,6 +87,10 @@ build: check-env
 # 4. Other modules through cargo command
 cargo:
 	cargo $(ARGS)
+
+# 4.1 Required P2P production gate
+p2p-prod-gate:
+	bash scripts/tests/p2p-production-gate.sh
 
 # 5. Build runtime Docker image from source (compile + package into image)
 docker-build:

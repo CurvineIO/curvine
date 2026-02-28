@@ -17,6 +17,7 @@ use orpc::sys::DataSlice;
 
 pub mod block;
 pub mod file;
+pub mod p2p;
 pub mod rpc;
 pub mod unified;
 

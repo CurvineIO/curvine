@@ -22,12 +22,15 @@ log = { workspace = true }
 bytes = { workspace = true }
 pin-project-lite = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 dashmap = { workspace = true }
 futures = { workspace = true }
 moka = { workspace = true }
 fxhash = { workspace = true }
 prometheus = { workspace = true }
 linked-hash-map = { workspace = true }
+libp2p = { version = "0.56.0", default-features = false, features = ["tokio", "tcp", "quic", "noise", "yamux", "request-response", "cbor", "mdns", "kad", "macros"] }
+sha2 = "0.10"
 
 [features]
 default = ["opendal-s3"]

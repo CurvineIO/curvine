@@ -213,6 +213,21 @@ message GetMasterInfoResponse {
     repeated WorkerInfoProto blacklist_workers = 12;
     repeated WorkerInfoProto decommission_workers = 13;
     repeated WorkerInfoProto lost_workers = 14;
+
+    required uint64 p2p_policy_version = 15 [default = 0];
+    repeated string p2p_peer_whitelist = 16;
+    repeated string p2p_tenant_whitelist = 17;
+}
+
+message GetP2pPolicyRequest {
+
+}
+
+message GetP2pPolicyResponse {
+    required uint64 p2p_policy_version = 1 [default = 0];
+    repeated string p2p_peer_whitelist = 2;
+    repeated string p2p_tenant_whitelist = 3;
+    optional string p2p_policy_signature = 4;
 }
 
 message SetAttrOptsProto {

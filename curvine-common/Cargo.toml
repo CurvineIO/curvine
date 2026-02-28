@@ -40,6 +40,7 @@ slog = { workspace = true }
 slog-stdlog  = { workspace = true }
 chrono = { workspace = true }
 trait-variant = { workspace = true }
+sha2 = "0.10"
 
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -14,6 +14,7 @@
 
 use crate::block::BatchBlockWriter;
 use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
+use crate::p2p::P2pStatsSnapshot;
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
@@ -221,6 +222,12 @@ impl CurvineFileSystem {
         self.fs_client.get_master_info_bytes().await
     }
 
+    pub async fn get_p2p_runtime_policy(
+        &self,
+    ) -> FsResult<(u64, Vec<String>, Vec<String>, String)> {
+        self.fs_client.get_p2p_runtime_policy().await
+    }
+
     pub async fn get_mount_table(&self) -> FsResult<Vec<MountInfo>> {
         let res = self.fs_client.get_mount_table().await?;
         let table = res
@@ -332,6 +339,34 @@ impl CurvineFileSystem {
     pub async fn metrics_report(&self) -> FsResult<()> {
         let metrics = ClientMetrics::encode()?;
         self.fs_client.metrics_report(metrics).await
+    }
+
+    pub async fn sync_p2p_runtime_policy(&self) -> FsResult<()> {
+        let Some(p2p_service) = self.fs_context.p2p_service() else {
+            return Ok(());
+        };
+        if !p2p_service.is_enabled() {
+            return Ok(());
+        }
+
+        let (version, peer_whitelist, tenant_whitelist, signature) =
+            self.fs_client.get_p2p_runtime_policy().await?;
+        if !p2p_service
+            .sync_runtime_policy_from_master(version, peer_whitelist, tenant_whitelist, signature)
+            .await
+        {
+            return err_box!("failed to apply p2p runtime policy from master");
+        }
+        Ok(())
+    }
+
+    pub fn sync_p2p_metrics(&self) {
+        let (service_id, snapshot) = if let Some(p2p_service) = self.fs_context.p2p_service() {
+            (p2p_service.peer_id().to_string(), p2p_service.snapshot())
+        } else {
+            ("disabled".to_string(), P2pStatsSnapshot::default())
+        };
+        FsContext::get_metrics().sync_p2p_snapshot(&service_id, &snapshot);
     }
 
     pub async fn write_string(&self, path: &Path, str: impl AsRef<str>) -> FsResult<()> {
