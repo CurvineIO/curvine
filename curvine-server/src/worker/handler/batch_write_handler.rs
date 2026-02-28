@@ -12,46 +12,49 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// use crate::master::meta::inode::SmallFileMeta;
 use crate::worker::block::BlockStore;
-use crate::worker::handler::WriteContext;
-use crate::worker::handler::WriteHandler;
+use crate::worker::handler::ContainerWriteContext;
+use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
-use curvine_common::fs::RpcCode;
+use curvine_common::proto::ExtendedBlockProto;
 use curvine_common::proto::{
-    BlockWriteRequest, BlockWriteResponse, BlocksBatchCommitRequest, BlocksBatchCommitResponse,
-    BlocksBatchWriteRequest, BlocksBatchWriteResponse, FilesBatchWriteRequest,
-    FilesBatchWriteResponse,
+    BlockWriteResponse, ContainerBlockWriteResponse, ContainerWriteRequest, FileWriteDataProto,
+    SmallFileMetaProto,
 };
 use curvine_common::state::ExtendedBlock;
+use curvine_common::state::FileType;
+use curvine_common::state::StorageType;
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
+use log::info;
+use orpc::common::ByteUnit;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::LocalFile;
 use orpc::message::{Builder, Message, RequestStatus};
-use orpc::sys::DataSlice;
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
-    pub(crate) context: Option<Vec<WriteContext>>,
-    pub(crate) file: Option<Vec<LocalFile>>,
+    pub(crate) context: Option<ContainerWriteContext>,
+    pub(crate) file: Option<LocalFile>,
     pub(crate) is_commit: bool,
-    pub(crate) write_handler: WriteHandler,
+    pub(crate) metrics: &'static WorkerMetrics,
 }
 
 impl BatchWriteHandler {
     pub fn new(store: BlockStore) -> Self {
-        let store_clone = store.clone();
+        let metrics = Worker::get_metrics();
         Self {
             store,
             context: None,
             file: None,
             is_commit: false,
-            write_handler: WriteHandler::new(store_clone),
+            metrics,
         }
     }
 
-    fn check_context(context: &WriteContext, msg: &Message) -> FsResult<()> {
+    fn check_context(context: &ContainerWriteContext, msg: &Message) -> FsResult<()> {
         if context.req_id != msg.req_id() {
             return err_box!(
                 "Request id mismatch, expected {}, actual {}",
@@ -72,57 +75,121 @@ impl BatchWriteHandler {
     }
 
     pub fn open_batch(&mut self, msg: &Message) -> FsResult<Message> {
-        let header: BlocksBatchWriteRequest = msg.parse_header()?;
-        let mut responses = Vec::with_capacity(header.blocks.len());
+        let mut context = ContainerWriteContext::from_req(msg)?;
 
-        // Initialize ONCE with capacity
-        self.file = Some(Vec::with_capacity(header.blocks.len()));
-        self.context = Some(Vec::with_capacity(header.blocks.len()));
-
-        for (i, block_proto) in header.blocks.into_iter().enumerate() {
-            let unique_req_id = msg.req_id() + i as i64;
-            // Create a single BlockWriteRequest from the block
-            let header = BlockWriteRequest {
-                block: block_proto,
-                off: header.off,
-                block_size: header.block_size,
-                short_circuit: header.short_circuit,
-                client_name: header.client_name.clone(),
-                chunk_size: header.chunk_size,
-                pipeline_stream: Vec::new(),
-            };
-
-            // Create single request message for each block
-            let single_msg_req = Builder::new()
-                .code(msg.code())
-                .request(RequestStatus::Open)
-                .req_id(unique_req_id)
-                .seq_id(msg.seq_id())
-                .proto_header(header)
-                .build();
-
-            let response = self.write_handler.open(&single_msg_req)?;
-            let block_response: BlockWriteResponse = response.parse_header()?;
-            responses.push(block_response);
-
-            // Extract file and context from handler and store in batch vectors
-            if let Some(file) = self.write_handler.file.take() {
-                self.file.as_mut().unwrap().push(file);
-            }
-            if let Some(context) = self.write_handler.context.take() {
-                self.context.as_mut().unwrap().push(context);
-            }
+        if context.off > context.block_size {
+            return err_box!(
+                "Invalid write offset: {}, block size: {}",
+                context.off,
+                context.block_size
+            );
         }
-        let batch_response = BlocksBatchWriteResponse { responses };
 
+        // Open container block
+        self.handle_small_files_batch(ProtoUtils::extend_block_to_pb(context.block.clone()))?;
+
+        // Update context with actual block ID and path from storage
+        if let Some(ref local_file) = self.file {
+            context.files_metadata.container_path = local_file.path().to_string();
+        }
+
+        let container_meta = context.files_metadata.clone();
+        let block_size = context.block_size;
+
+        let container_path = container_meta.container_path.clone();
+        let container_response = BlockWriteResponse {
+            id: container_meta.container_block_id,
+            path: Some(container_path.clone()),
+            off: 0,
+            block_size,
+            storage_type: StorageType::default() as i32,
+            pipeline_status: None,
+        };
+
+        let batch_response = ContainerBlockWriteResponse {
+            responses: vec![container_response],
+            container_meta,
+        };
+
+        let label = if context.short_circuit {
+            "local"
+        } else {
+            "remote"
+        };
+        self.metrics.write_blocks.with_label_values(&[label]).inc();
+
+        let log_msg = format!(
+            "Write {}-block start req_id: {}, path: {:?}, chunk_size: {}, off: {}, block_size: {}, file_count: {}",
+            label,
+            context.req_id,
+            container_path,
+            context.chunk_size,
+            context.off,
+            ByteUnit::byte_to_string(context.block_size as u64),
+            context.files_metadata.files.len()
+        );
+        // Store context for later use
+        let _ = self.context.replace(context);
+
+        info!("{}", log_msg);
         Ok(Builder::success(msg).proto_header(batch_response).build())
     }
 
-    pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
-        // Parse the flattened batch request
-        let header: BlocksBatchCommitRequest = msg.parse_header()?;
-        let mut results = Vec::new();
+    fn handle_small_files_batch(&mut self, block: ExtendedBlockProto) -> FsResult<i64> {
+        let total_size: i64 = block.block_size;
 
+        let container_block = ExtendedBlock {
+            id: block.id,
+            len: total_size,
+            storage_type: StorageType::default(),
+            file_type: FileType::Container,
+            ..Default::default()
+        };
+
+        let container_meta = self.store.open_block(&container_block)?;
+        let container_file = container_meta.create_writer(0, false)?;
+
+        let actual_block_id = container_meta.id();
+        self.file = Some(container_file);
+
+        Ok(actual_block_id)
+    }
+
+    fn complete_container_batch(
+        &mut self,
+        context: &ContainerWriteContext,
+        commit: bool,
+    ) -> FsResult<()> {
+        // Flush the container file
+        if let Some(ref mut container_local_file) = self.file {
+            container_local_file.flush()?;
+        }
+
+        // Commit using context metadata
+        if let Some(container_file_meta) = context.files_metadata.files.last() {
+            let container_block = ExtendedBlock {
+                id: context.files_metadata.container_block_id,
+                len: container_file_meta.offset + container_file_meta.len,
+                storage_type: StorageType::default(),
+                file_type: FileType::Container,
+                ..Default::default()
+            };
+
+            if context.block.len > context.block_size {
+                return err_box!(
+                    "Invalid write offset: {}, block size: {}",
+                    context.block.len,
+                    context.block_size
+                );
+            }
+            self.commit_block(&container_block, commit)?;
+            self.is_commit = true;
+        }
+
+        Ok(())
+    }
+
+    pub fn complete_batch(&mut self, msg: &Message, commit: bool) -> FsResult<Message> {
         if self.is_commit {
             return if !msg.data.is_empty() {
                 err_box!("The block has been committed and data cannot be written anymore.")
@@ -131,104 +198,76 @@ impl BatchWriteHandler {
             };
         }
 
-        // Process each block independently
-        for (i, block_proto) in header.blocks.into_iter().enumerate() {
-            if let Some(context) = self.context.take() {
-                if context.len() > 1 {
-                    Self::check_context(&context[i], msg)?;
-                }
-            }
-
-            // Flush and close the file (same as complete)
-            let file = self.file.take();
-            if let Some(mut file) = file {
-                if file.len() > 1 {
-                    file[i].flush()?;
-                    drop(file);
-                }
-            }
-
-            // Create context manually for each block from block_proto
-            let unique_req_id = msg.req_id() + i as i64;
-            let context = WriteContext {
-                block: ProtoUtils::extend_block_from_pb(block_proto),
-                req_id: unique_req_id,
-                chunk_size: header.block_size as i32,
-                short_circuit: false,
-                off: header.off,
-                block_size: header.block_size,
-            };
-
-            // Validate block length (same as complete)
-            if context.block.len > context.block_size {
-                return err_box!(
-                    "Invalid write offset: {}, block size: {}",
-                    context.block.len,
-                    context.block_size
-                );
-            }
-
-            // Commit the block
-            self.commit_block(&context.block, commit)?;
-            results.push(true);
+        if let Some(context) = self.context.take() {
+            Self::check_context(&context, msg)?;
         }
-        self.is_commit = true;
-        let batch_response = BlocksBatchCommitResponse { results };
 
-        Ok(Builder::success(msg).proto_header(batch_response).build())
+        let context = ContainerWriteContext::from_req(msg)?;
+
+        self.complete_container_batch(&context, commit)?;
+
+        info!(
+            "write block end for req_id {}, is commit: {}, off: {}, len: {}, file count: {}",
+            msg.req_id(),
+            commit,
+            context.off,
+            context.block.len,
+            context.files_metadata.files.len()
+        );
+        Ok(msg.success())
     }
 
     pub fn write_batch(&mut self, msg: &Message) -> FsResult<Message> {
-        let header: FilesBatchWriteRequest = msg.parse_header()?;
-        let mut results = Vec::new();
+        let mut context = self.context.take().ok_or_else(|| -> FsError {
+            FsError::Common(orpc::error::ErrorImpl::with_source(
+                "Container context not initialized".into(),
+            ))
+        })?;
 
-        // Use drain to extract elements while preserving the vector's allocated memory
-        let files_vec = self.file.as_mut().unwrap();
-        let contexts_vec = self.context.as_mut().unwrap();
+        Self::check_context(&context, msg)?;
 
-        let files_drain: Vec<_> = std::mem::take(files_vec);
-        let contexts_drain: Vec<_> = std::mem::take(contexts_vec);
+        let header: ContainerWriteRequest = msg.parse_header()?;
 
-        // Process each file in order
-        let mut files_iter = files_drain.into_iter();
-        let mut contexts_iter = contexts_drain.into_iter();
-
-        for (i, file_data) in header.files.iter().enumerate() {
-            // Convert bytes to DataSlice
-            let data_slice = DataSlice::Bytes(bytes::Bytes::from(file_data.clone().content));
-
-            let unique_req_id = header.req_id + i as i64;
-            // Create a temporary message for each file
-            let single_msg = Builder::new()
-                .code(RpcCode::WriteBlock)
-                .request(RequestStatus::Running)
-                .req_id(unique_req_id)
-                .seq_id(header.seq_id)
-                .data(data_slice)
-                .build();
-
-            // Get the next file and context from iterators (preserves original order)
-            let file = files_iter.next().unwrap();
-            let context = contexts_iter.next().unwrap();
-
-            self.write_handler.file = Some(file);
-            self.write_handler.context = Some(context);
-
-            let response = self.write_handler.write(&single_msg);
-
-            // Collect processed file and context back into the original vectors
-            let file = self.write_handler.file.take().unwrap();
-            let context = self.write_handler.context.take().unwrap();
-
-            // Push back to reuse the pre-allocated capacity from open_batch
-            files_vec.push(file);
-            contexts_vec.push(context);
-
-            results.push(response.is_ok());
+        // Update context metadata if provided in header
+        if let Some(ref container_meta) = header.container_meta {
+            context.files_metadata = container_meta.clone();
         }
 
-        let batch_response = FilesBatchWriteResponse { results };
-        Ok(Builder::success(msg).proto_header(batch_response).build())
+        // Write files using context metadata
+        self.write_container_batch(&header.files, &mut context.files_metadata.files)?;
+
+        self.context = Some(context);
+
+        Ok(msg.success())
+    }
+
+    fn write_container_batch(
+        &mut self,
+        files: &[FileWriteDataProto],
+        container_files_meta: &mut [SmallFileMetaProto],
+    ) -> FsResult<()> {
+        let mut offset = 0;
+
+        for (i, file_data) in files.iter().enumerate() {
+            if let Some(container_file) = &mut self.file {
+                container_file.write_all(&file_data.content)?;
+
+                // Update metadata in context
+                if i < container_files_meta.len() {
+                    container_files_meta[i].offset = offset;
+                    container_files_meta[i].len = file_data.content.len() as i64;
+                    offset += file_data.content.len() as i64;
+                }
+            }
+        }
+
+        // Update block length
+        if let Some(container_local_file) = self.file.as_mut() {
+            let current_pos: i64 = container_local_file.pos();
+            let _ = container_local_file.resize(true, 0, current_pos, 0);
+        }
+
+        Ok(())
     }
 }
 

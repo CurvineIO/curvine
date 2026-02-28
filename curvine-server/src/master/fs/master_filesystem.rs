@@ -15,9 +15,10 @@
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
-use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR};
+use crate::master::meta::inode::{InodePath, InodeView, SmallFileMeta, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
 
+use crate::master::meta::inode::InodeView::{Container, File};
 use crate::master::meta::parse_glob_pattern;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
@@ -27,6 +28,7 @@ use curvine_common::FsResult;
 use log::warn;
 use orpc::sync::ArcRwLock;
 use orpc::{err_box, err_ext, try_option, CommonResult};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -242,7 +244,12 @@ impl MasterFilesystem {
             }
             inp
         } else {
-            fs_dir.create_file(inp, opts)?
+            // If the file does not exist, create a new file
+            if opts.file_type == FileType::File {
+                fs_dir.create_file(inp, opts)?
+            } else {
+                fs_dir.create_container(inp, opts)?
+            }
         };
 
         let status = fs_dir.file_status(&inp)?;
@@ -299,7 +306,7 @@ impl MasterFilesystem {
         let status = fs_dir.reopen_file(&inp, opts.client_name)?;
         let file = inode.as_file_ref()?;
         let blocks = if !file.blocks.is_empty() {
-            self.get_block_locs(path, &fs_dir, file)?
+            self.get_block_locs(path, &fs_dir, &inode)?
         } else {
             vec![]
         };
@@ -364,24 +371,24 @@ impl MasterFilesystem {
     }
 
     pub fn validate_add_block(
-        file: &InodeFile,
+        file: &InodeView,
         client_addr: &ClientAddress,
         previous: Option<&CommitBlock>,
     ) -> FsResult<ValidateAddBlock> {
         if let Some(v) = previous {
-            if v.block_len != file.block_size {
+            if v.block_len != file.block_size() {
                 return err_box!(
                     "The block size is incorrect, block size: {}, commit block length: {}",
-                    file.block_size,
+                    file.block_size(),
                     v.block_len
                 );
             }
         }
 
         let res = ValidateAddBlock {
-            replicas: file.replicas,
-            block_size: file.block_size,
-            storage_policy: file.storage_policy.clone(),
+            replicas: file.replicas(),
+            block_size: file.block_size(),
+            storage_policy: file.storage_policy().clone(),
             client_host: client_addr.hostname.clone(),
         };
 
@@ -396,9 +403,8 @@ impl MasterFilesystem {
     ) -> FsResult<Vec<WorkerAddress>> {
         let wm = self.worker_manager.read();
 
-        let mut inode = try_option!(inp.get_last_inode());
-        let file = inode.as_file_mut()?;
-        let validate_block = Self::validate_add_block(file, &client_addr, None)?;
+        let inode = try_option!(inp.get_last_inode());
+        let validate_block = Self::validate_add_block(inode.as_ref(), &client_addr, None)?;
 
         let choose_ctx = ChooseContext::with_block(validate_block, exclude_workers);
         Ok(wm.choose_worker(choose_ctx)?)
@@ -432,32 +438,40 @@ impl MasterFilesystem {
             Some(v) => v,
             None => return err_box!("File {} not exists", inp.path()),
         };
-        let file = inode.as_file_ref()?;
 
-        // File allows concurrent writes, 'previous' is the previous block,
-        // need to check if the next block has already been allocated。
-        // If it has been allocated, return that block
-        if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
-            let locs = fs_dir.get_block_locations(next.id)?;
-            let extend_block = ExtendedBlock {
-                id: next.id,
-                len: next.len,
-                storage_type: file.storage_policy.storage_type,
-                file_type: file.file_type,
-                alloc_opts: next.alloc_opts.clone(),
-            };
-
-            return self.create_locate_block(path, extend_block, &locs);
+        match inode.as_ref() {
+            InodeView::Container(_, _) => {
+                let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
+                let block =
+                    fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
+                Ok(LocatedBlock {
+                    block,
+                    locs: choose_workers,
+                })
+            }
+            InodeView::File(_, _) => {
+                let file = inode.as_file_ref()?;
+                if let Some(next) = file.search_next_block(last_block.map(|v| v.id)) {
+                    let locs = fs_dir.get_block_locations(next.id)?;
+                    let extend_block = ExtendedBlock {
+                        id: next.id,
+                        len: next.len,
+                        storage_type: file.storage_policy.storage_type,
+                        file_type: file.file_type,
+                        alloc_opts: next.alloc_opts.clone(),
+                    };
+                    return self.create_locate_block(path, extend_block, &locs);
+                }
+                let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
+                let block =
+                    fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
+                Ok(LocatedBlock {
+                    block,
+                    locs: choose_workers,
+                })
+            }
+            _ => err_box!("Only Container and File support the add_block feature"),
         }
-
-        let choose_workers = self.choose_worker(&inp, client_addr, exclude_workers)?;
-        let block = fs_dir.acquire_new_block(&inp, commit_blocks, &choose_workers, file_len)?;
-        let located = LocatedBlock {
-            block,
-            locs: choose_workers,
-        };
-
-        Ok(located)
     }
 
     pub fn complete_file<T: AsRef<str>>(
@@ -476,12 +490,42 @@ impl MasterFilesystem {
             None => return err_box!("File does not exist: {}", inp.path()),
             Some(v) => v,
         };
-        let file = inode.as_file_ref()?;
         fs_dir.complete_file(&inp, len, commit_blocks, client_name, only_flush)?;
         if only_flush {
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
+            let locs = self.get_block_locs(path, &fs_dir, &inode)?;
             let status = inode.to_file_status(path);
             Ok(Some(FileBlocks::new(status, locs)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn complete_container<T: AsRef<str>>(
+        &self,
+        path: T,
+        len: i64,
+        commit_block: CommitBlock,
+        client_name: T,
+        only_flush: bool,
+        files: HashMap<String, SmallFileMeta>,
+    ) -> FsResult<Option<Vec<FileBlocks>>> {
+        let path = path.as_ref();
+        let mut fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path)?;
+
+        let inode = match inp.get_last_inode() {
+            None => {
+                return err_box!("Inode does not exist: {}", inp.path());
+            }
+            Some(v) => v,
+        };
+        // let container = inode.as_container_ref();
+        fs_dir.complete_container(&inp, len, commit_block, client_name, only_flush, files)?;
+
+        if only_flush {
+            let locs = self.get_block_locs(path, &fs_dir, &inode)?;
+            let status = inode.to_file_status(path);
+            Ok(Some(vec![FileBlocks::new(status, locs)]))
         } else {
             Ok(None)
         }
@@ -494,8 +538,7 @@ impl MasterFilesystem {
         inp: &InodePath,
     ) -> FsResult<FileBlocks> {
         let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
-        let file = inode.as_file_ref()?;
-        let blocks = self.get_block_locs(path, fs_dir, file)?;
+        let blocks = self.get_block_locs(path, fs_dir, &inode)?;
         Ok(FileBlocks::new(inode.to_file_status(path), blocks))
     }
 
@@ -503,27 +546,35 @@ impl MasterFilesystem {
         &self,
         path: &str,
         fs_dir: &FsDir,
-        file: &InodeFile,
+        inode: &InodeView,
     ) -> FsResult<Vec<LocatedBlock>> {
-        let wm = self.worker_manager.read();
-        let file_locs = fs_dir.get_file_locations(file)?;
-        let mut block_locs = Vec::with_capacity(file_locs.len());
+        let wm: std::sync::RwLockReadGuard<'_, super::WorkerManager> = self.worker_manager.read();
+        let file_locs = fs_dir.get_file_locations(inode)?;
 
-        for (index, meta) in file.blocks.iter().enumerate() {
-            if index + 1 < file.blocks.len() && meta.len != file.block_size {
-                return err_box!(
-                    "block status abnormal, block id {}, block len {}, expected block size {}",
-                    meta.id,
-                    meta.len,
-                    file.block_size
-                );
+        let mut block_locs = Vec::new();
+
+        for (index, meta) in inode.blocks_iter().enumerate() {
+            // Validation logic (only for File type with multiple blocks)
+            if let File(_, f) = inode {
+                if index + 1 < f.blocks.len() && meta.len != f.block_size {
+                    return err_box!(
+                        "block status abnormal, block id {}, block len {}, expected block size {}",
+                        meta.id,
+                        meta.len,
+                        f.block_size
+                    );
+                }
             }
 
             let extend_block = ExtendedBlock {
                 id: meta.id,
                 len: meta.len,
-                storage_type: file.storage_policy.storage_type,
-                file_type: file.file_type,
+                storage_type: inode.storage_policy().storage_type,
+                file_type: match inode {
+                    File(_, f) => f.file_type,
+                    Container(_, c) => c.file_type,
+                    _ => return err_box!("get_block_locs only support for file or container"),
+                },
                 alloc_opts: meta.alloc_opts.clone(),
             };
 
@@ -544,16 +595,19 @@ impl MasterFilesystem {
         let fs_dir = self.fs_dir.read();
         let path = path.as_ref();
         let inp = Self::resolve_path(&fs_dir, path)?;
+        let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
 
-        let inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => return err_ext!(FsError::file_not_found(path)),
-        };
-        let file = inode.as_file_ref()?;
-        let block_locs = self.get_block_locs(path, &fs_dir, file)?;
-        let locate_blocks = FileBlocks {
-            status: inode.to_file_status(path),
-            block_locs,
+        let block_locs = self.get_block_locs(path, &fs_dir, &inode)?;
+        let locate_blocks: FileBlocks = match inode.as_ref() {
+            InodeView::File(_, _) => FileBlocks {
+                status: inode.to_file_status(path),
+                block_locs,
+            },
+            InodeView::Container(_, _) => FileBlocks {
+                status: inode.to_file_status(path),
+                block_locs,
+            },
+            _ => return err_box!("Path must be a file or container"),
         };
 
         Ok(locate_blocks)

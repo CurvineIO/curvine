@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::master::meta::inode::InodeView;
 use crate::master::meta::inode::{InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
@@ -29,6 +30,13 @@ pub struct CreateFileEntry {
     pub(crate) op_ms: u64,
     pub(crate) path: String,
     pub(crate) file: InodeFile,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CreateInodeEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) path: String,
+    pub(crate) inode_entry: InodeView,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -54,15 +62,13 @@ pub struct AddBlockEntry {
     pub(crate) commit_block: Vec<CommitBlock>,
 }
 
-// File writing is completed.
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct CompleteFileEntry {
+pub struct CompleteInodeEntry {
     pub(crate) op_ms: u64,
     pub(crate) path: String,
-    pub(crate) file: InodeFile,
+    pub(crate) inode: InodeView,
     pub(crate) commit_blocks: Vec<CommitBlock>,
 }
-
 // Rename
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct RenameEntry {
@@ -128,11 +134,11 @@ pub struct SetLocksEntry {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
-    CreateFile(CreateFileEntry),
+    CreateInode(CreateInodeEntry),
     ReopenFile(ReopenFileEntry),
     OverWriteFile(OverWriteFileEntry),
     AddBlock(AddBlockEntry),
-    CompleteFile(CompleteFileEntry),
+    CompleteInode(CompleteInodeEntry),
     Rename(RenameEntry),
     Delete(DeleteEntry),
     Mount(MountEntry),

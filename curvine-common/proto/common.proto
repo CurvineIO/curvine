@@ -38,6 +38,7 @@ enum FileTypeProto {
     FILE_TYPE_PROTO_STREAM = 3;
     FILE_TYPE_PROTO_AGG = 4;
     FILE_TYPE_PROTO_OBJECT = 5;
+    FILE_TYPE_PROTO_CONTAINER = 6;
 }
 
 // File storage policy
@@ -61,7 +62,6 @@ message FileStatusProto {
     required int32 replicas = 10;
     required int64 block_size = 11;
     required FileTypeProto file_type = 12 [default = FILE_TYPE_PROTO_FILE];
-
     map<string, bytes> x_attr = 13;
     required StoragePolicyProto storage_policy = 14;
     required string owner = 15;
@@ -69,6 +69,7 @@ message FileStatusProto {
     required uint32 mode = 17;
     optional string target = 18;
     required uint32 nlink = 19;
+    optional string container_name = 20;
 }
 
 // Describe the worker address information.
@@ -192,3 +193,20 @@ message FileLockProto {
     required uint64 start = 7;
     required uint64 end = 8;
 }
+
+message ContainerMetadataProto {  
+    required int64 container_block_id = 1;  
+    required string container_path = 2;  
+    required string container_name = 3;   
+    repeated SmallFileMetaProto files = 4;  
+}  
+
+message SmallFileMetaProto {  
+    required int64 offset = 1;  
+    required int64 len = 2;  
+    required int32 block_index = 3;  
+    required int64 mtime = 4;  
+}
+
+
+

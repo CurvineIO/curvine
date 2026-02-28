@@ -16,7 +16,8 @@
 
 use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
-use crate::master::meta::inode::InodeView::{Dir, File};
+use crate::master::meta::inode::InodeView;
+use crate::master::meta::inode::InodeView::Dir;
 use crate::master::{MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::raft::SnapshotData;
@@ -58,13 +59,13 @@ impl JournalLoader {
         match entry {
             JournalEntry::Mkdir(e) => self.mkdir(e),
 
-            JournalEntry::CreateFile(e) => self.create_file(e),
+            JournalEntry::CreateInode(e) => self.create_inode(e),
 
             JournalEntry::OverWriteFile(e) => self.overwrite_file(e),
 
             JournalEntry::AddBlock(e) => self.add_block(e),
 
-            JournalEntry::CompleteFile(e) => self.complete_file(e),
+            JournalEntry::CompleteInode(e) => self.complete_inode_entry(e),
 
             JournalEntry::Rename(e) => self.rename(e),
 
@@ -95,12 +96,20 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn create_file(&self, entry: CreateFileEntry) -> CommonResult<()> {
+    fn create_inode(&self, entry: CreateInodeEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        fs_dir.update_last_inode_id(entry.file.id)?;
+        fs_dir.update_last_inode_id(entry.inode_entry.id())?;
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
         let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, File(name, entry.file))?;
+
+        // handle inode File and
+        let inode_to_add = match entry.inode_entry {
+            InodeView::File(_, file) => InodeView::File(name, file),
+            InodeView::Container(_, container) => InodeView::Container(name, container),
+            _ => return err_box!("Only Expect File and Container for adding inode"),
+        };
+
+        let _ = fs_dir.add_last_inode(inp, inode_to_add)?;
         Ok(())
     }
 
@@ -135,9 +144,19 @@ impl JournalLoader {
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
-        let mut inode = try_option!(inp.get_last_inode());
-        let file = inode.as_file_mut()?;
-        let _ = mem::replace(&mut file.blocks, entry.blocks);
+        let inode = try_option!(inp.get_last_inode());
+        match inode.as_mut() {
+            InodeView::File(_, file) => {
+                let _ = mem::replace(&mut file.blocks, entry.blocks);
+            }
+            InodeView::Container(_, container) => {
+                // Container has a single block; take the first from the journal entry
+                if let Some(block) = entry.blocks.into_iter().next() {
+                    container.add_block(block);
+                }
+            }
+            _ => return err_box!("add_block only supports File and Container inodes"),
+        }
         fs_dir
             .store
             .apply_new_block(inode.as_ref(), &entry.commit_block)?;
@@ -145,19 +164,25 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
+    fn complete_inode_entry(&self, entry: CompleteInodeEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
-        let mut inode = try_option!(inp.get_last_inode());
-        let file = inode.as_file_mut()?;
+        let inode = try_option!(inp.get_last_inode());
 
-        let _ = mem::replace(file, entry.file);
-        // Update block location
+        match (inode.as_mut(), entry.inode) {
+            (InodeView::File(_, file), InodeView::File(_, new_file)) => {
+                let _ = mem::replace(file, new_file);
+            }
+            (InodeView::Container(_, container), InodeView::Container(_, new_container)) => {
+                let _ = mem::replace(container, new_container);
+            }
+            _ => return err_box!("Inode type mismatch during complete"),
+        }
+
         fs_dir
             .store
-            .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
-
+            .apply_complete_inode_entry(inode.as_ref(), &entry.commit_blocks)?;
         Ok(())
     }
 

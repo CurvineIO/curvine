@@ -14,6 +14,9 @@
 
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
+use crate::master::meta::inode::SmallFileMeta;
+use crate::master::meta::inode::{InodeView, PATH_SEPARATOR};
+use crate::master::meta::InodeId;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MountManager;
@@ -23,6 +26,7 @@ use curvine_common::error::FsError;
 use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
+use curvine_common::state::FileType;
 use curvine_common::state::{
     CreateFileOpts, FileBlocks, FileStatus, HeartbeatStatus, OpenFlags, RenameFlags,
 };
@@ -32,7 +36,12 @@ use orpc::err_box;
 use orpc::handler::MessageHandler;
 use orpc::io::net::ConnState;
 use orpc::message::Message;
+use std::collections::HashMap;
 use std::sync::Arc;
+struct ContainerBatchResult {
+    container_status: FileStatus,
+    container_meta: ContainerMetadataProto,
+}
 
 pub struct MasterHandler {
     pub(crate) fs: MasterFilesystem,
@@ -292,80 +301,134 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
-    pub fn create_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: CreateFilesBatchRequest = ctx.parse_header()?;
+    pub fn create_container(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: CreateContainerRequest = ctx.parse_header()?;
 
-        let mut results = Vec::with_capacity(header.requests.len());
-        for (index, req) in header.requests.into_iter().enumerate() {
-            let opts = ProtoUtils::create_opts_from_pb(req.opts);
-            let flags = OpenFlags::new(req.flags);
+        // Create single container for all files
+        let container_result = self.create_container_batch(ctx, &header.requests)?;
+        // Create individual FileStatus objects for each file in container
+        let mut container_files = Vec::new();
 
-            // Generate unique req_id for each file in batch
-            let unique_req_id = ctx.msg.req_id() + index as i64;
-            let status = self.create_file0(unique_req_id, req.path, opts, flags)?;
-            results.push(status);
+        let container_block_id = container_result.container_meta.container_block_id;
+        for (i, req) in header.requests.iter().enumerate() {
+            let mut file_status = container_result.container_status.clone();
+            file_status.path = req.path.clone();
+            file_status.name = Path::new(&req.path).map(|p| p.name().to_string()).unwrap();
+            file_status.len = container_result.container_meta.files[i].len;
+            file_status.file_type = FileType::File; // Individual files, not Container
+            file_status.id = InodeId::create_block_id(container_block_id, i as i64 + 1)?;
+            container_files.push(ProtoUtils::file_status_to_pb(file_status));
         }
 
-        let rep_header = CreateFilesBatchResponse {
-            file_statuses: results
-                .into_iter()
-                .map(ProtoUtils::file_status_to_pb)
-                .collect(),
+        let container_status_response = ContainerStatusResponse {
+            container_id: container_result.container_meta.container_block_id,
+            container_path: container_result.container_meta.container_path,
+            container_name: container_result.container_meta.container_name,
+            files: container_files,
+            mtime: container_result.container_status.mtime,
+            block_size: container_result.container_status.block_size,
+            file_type: FileType::Container.into(),
+            replicas: container_result.container_status.replicas,
+            storage_policy: ProtoUtils::storage_policy_to_pb(
+                container_result.container_status.storage_policy,
+            ),
+            owner: container_result.container_status.owner,
+            group: container_result.container_status.group,
+            mode: container_result.container_status.mode,
+            nlink: container_result.container_status.nlink,
+        };
+
+        let rep_header = CreateContainerResponse {
+            result: Some(create_container_response::Result::Container(
+                container_status_response,
+            )),
         };
         ctx.response(rep_header)
     }
 
-    pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: AddBlocksBatchRequest = ctx.parse_header()?;
-        let mut results = Vec::with_capacity(header.requests.len());
-        for req in header.requests {
-            let path = req.path;
-            let client_addr = ProtoUtils::client_address_from_pb(req.client_address);
-            let commit_blocks = req
-                .commit_blocks
-                .into_iter()
-                .map(ProtoUtils::commit_block_from_pb)
-                .collect();
+    fn create_container_batch(
+        &mut self,
+        ctx: &mut RpcContext<'_>,
+        requests: &[CreateFileRequest],
+    ) -> FsResult<ContainerBatchResult> {
+        // Create container inode with first file's path as container path
+        let mut container_path_components = InodeView::path_components(requests[0].path.as_ref())?;
+        let container_path_len = container_path_components.len();
+        let container_uuid_suffix = ctx.msg.req_id().to_string();
+        let container_name = format!("container_{container_uuid_suffix}");
+        container_path_components[container_path_len - 1] = container_name.clone();
+        let container_path = container_path_components.join(PATH_SEPARATOR);
 
-            let located_block = self.fs.add_block(
-                path,
-                client_addr,
-                commit_blocks,
-                req.exclude_workers,
-                req.file_len,
-                req.last_block.map(ProtoUtils::extend_block_from_pb),
-            )?;
-            results.push(ProtoUtils::located_block_to_pb(located_block));
-        }
+        // initialize container_opts
+        let mut container_opts = CreateFileOpts::with_create(true);
+        container_opts.file_type = FileType::Container;
+        container_opts.block_size = requests.iter().map(|r| r.opts.block_size).sum();
+        container_opts.replicas = requests[0].opts.replicas as u16;
 
-        let rep_header = AddBlocksBatchResponse { blocks: results };
-        ctx.response(rep_header)
+        let container_status = self.create_file0(
+            ctx.msg.req_id(),
+            container_path.clone(),
+            container_opts,
+            OpenFlags::new_create(),
+        )?;
+
+        let container_meta = ContainerMetadataProto {
+            container_block_id: container_status.id,
+            container_path: container_path.clone(),
+            container_name,
+            files: requests
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    SmallFileMeta {
+                        offset: requests[0..i].iter().map(|_| 0).sum(),
+                        len: 0,
+                        block_index: 0,
+                        mtime: container_status.mtime,
+                    }
+                    .to_proto()
+                })
+                .collect(), // initialize with dummy value
+        };
+
+        Ok(ContainerBatchResult {
+            container_status,
+            container_meta,
+        })
     }
 
-    pub fn complete_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        let header: CompleteFilesBatchRequest = ctx.parse_header()?;
+    pub fn complete_container(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: CompleteContainerRequest = ctx.parse_header()?;
+        let req = header;
+        let commit_block = ProtoUtils::commit_block_from_pb(req.commit_block);
 
-        let mut results = Vec::new();
-        for req in header.requests {
-            let commit_blocks = req
-                .commit_blocks
-                .into_iter()
-                .map(ProtoUtils::commit_block_from_pb)
-                .collect();
-            let result = self
-                .fs
-                .complete_file(
-                    req.path,
-                    req.len,
-                    commit_blocks,
-                    req.client_name,
-                    req.only_flush,
-                )
-                .is_ok();
-            results.push(result);
-        }
+        let files_index: HashMap<String, SmallFileMeta> = req
+            .files
+            .into_iter()
+            .map(|(k, v)| (k, SmallFileMeta::from_proto(v)))
+            .collect();
+        let file_blocks_vec: Option<Vec<FileBlocks>> = self.fs.complete_container(
+            req.path,
+            req.len,
+            commit_block,
+            req.client_name,
+            req.only_flush,
+            files_index,
+        )?;
 
-        let rep_header = CompleteFilesBatchResponse { results };
+        let file_blocks_vec_proto: Vec<FileBlocksProto> = file_blocks_vec
+            .map(|blocks_vec| {
+                blocks_vec
+                    .into_iter()
+                    .map(ProtoUtils::file_blocks_to_pb)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let rep_header = CompleteContainerResponse {
+            result: true,
+            file_blocks_vec: file_blocks_vec_proto,
+        };
         ctx.response(rep_header)
     }
 
@@ -612,9 +675,8 @@ impl MessageHandler for MasterHandler {
             RpcCode::FileStatus => self.file_status(ctx),
             RpcCode::AddBlock => self.add_block(ctx),
             RpcCode::CompleteFile => self.complete_file(ctx),
-            RpcCode::CreateFilesBatch => self.create_files_batch(ctx),
-            RpcCode::AddBlocksBatch => self.add_blocks_batch(ctx),
-            RpcCode::CompleteFilesBatch => self.complete_files_batch(ctx),
+            RpcCode::CreateContainer => self.create_container(ctx),
+            RpcCode::CompleteContainer => self.complete_container(ctx),
             RpcCode::Exists => self.exists(ctx),
             RpcCode::Delete => self.retry_check_delete(ctx),
             RpcCode::Rename => self.retry_check_rename(ctx),

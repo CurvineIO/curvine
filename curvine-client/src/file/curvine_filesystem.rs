@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::BatchBlockWriter;
+use crate::block::ContainerBlockWriter;
 use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::CommitBlock;
+use curvine_common::proto::SmallFileMetaProto;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags,
@@ -392,6 +392,8 @@ impl CurvineFileSystem {
     }
 
     async fn handle_batch_files(&self, files: &[(&Path, &str)]) -> FsResult<()> {
+        // todo: currently, this feature support all files in the same last sub-folder inode
+        // checking is needed
         if files.is_empty() {
             return Ok(());
         }
@@ -406,44 +408,66 @@ impl CurvineFileSystem {
             create_requests.push((path.encode(), opts, flags));
         }
 
-        let file_statuses = self.fs_client().create_files_batch(create_requests).await?;
+        let container_status = self.fs_client().create_container(create_requests).await?;
 
-        // Step 2: Batch allocate blocks
-        let mut add_block_requests = Vec::with_capacity(file_statuses.len());
-        for ((path, _content), _status) in files.iter().zip(file_statuses.iter()) {
-            add_block_requests.push(path.encode());
-        }
+        // Step 2: Container Block allocation
+        let container_path = container_status.container_path.clone();
+        let allocated_blocks: curvine_common::state::LocatedBlock =
+            self.fs_client().add_container_block(container_path).await?;
 
-        let allocated_blocks: Vec<curvine_common::state::LocatedBlock> = self
-            .fs_client()
-            .add_blocks_batch(add_block_requests)
-            .await?;
+        // Compute small files metadata for containerization
+        let small_files_metadata = self.compute_container_metadata(files, &allocated_blocks)?;
 
-        // assert if allocated_blocks is not smae with add_block_requests
-        let mut batch_writer =
-            BatchBlockWriter::new(self.fs_context.clone(), allocated_blocks).await?;
+        // allocated_blocks returned above is used for all files in this container
+        let mut container_writer = ContainerBlockWriter::new(
+            self.fs_context.clone(),
+            container_status.clone(),
+            allocated_blocks,
+            small_files_metadata.clone(),
+        )
+        .await?;
 
         // Write all data (no flushing yet)
-        batch_writer.write(files).await?;
+        container_writer.write(files).await?;
 
         // Step 4: Complete all files at worker side
-        let commit_blocks = batch_writer.complete().await?;
+        let commit_blocks = container_writer.complete().await?;
 
-        // Step 5: Batch complete at master side
-        let mut complete_requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)> =
-            Vec::with_capacity(files.len());
-        for ((path, content), commit_block) in files.iter().zip(commit_blocks.iter()) {
-            complete_requests.push((
-                path.encode(),
-                content.len() as i64,
-                vec![commit_block.clone()],
-                self.fs_context().clone_client_name(),
-                false,
-            ));
-        }
+        // // Step 5: Batch complete at master side
+
         self.fs_client()
-            .complete_files_batch(complete_requests)
+            .complete_container(
+                container_status,
+                self.fs_context().clone_client_name(),
+                commit_blocks,
+                false,
+                small_files_metadata,
+            )
             .await?;
         Ok(())
+    }
+
+    fn compute_container_metadata(
+        &self,
+        files: &[(&Path, &str)],
+        _allocated_blocks: &curvine_common::state::LocatedBlock,
+    ) -> FsResult<Vec<SmallFileMetaProto>> {
+        let mut metadata = Vec::new();
+        let mut offset = 0;
+
+        for (_path, content) in files.iter() {
+            let file_size = content.len() as i64;
+
+            // Only include small files in container metadata
+            metadata.push(SmallFileMetaProto {
+                offset,
+                len: file_size,
+                block_index: 0,
+                mtime: 0, // Will be set during write
+            });
+            offset += file_size;
+        }
+
+        Ok(metadata)
     }
 }

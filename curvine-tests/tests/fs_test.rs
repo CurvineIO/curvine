@@ -183,6 +183,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Helper function to read file content
     async fn read_file_content(fs: &CurvineFileSystem, path: &Path) -> CommonResult<String> {
         let status = fs.get_status(path).await?;
+
         let mut reader = fs.open(path).await?;
         let mut buffer = BytesMut::zeroed(status.len as usize);
         let bytes_read = reader.read_full(&mut buffer).await?;
@@ -318,10 +319,29 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
         results.push(blocks);
     }
 
+    // Count distinct block IDs across all files
+    let mut block_ids = std::collections::HashSet::new();
+    for blocks in &results {
+        for loc_block in blocks.block_locs.iter() {
+            block_ids.insert(loc_block.block.id);
+        }
+    }
+    assert_eq!(
+        block_ids.len(),
+        2,
+        "Expected exactly 2 distinct block IDs, found {}: {:?}",
+        block_ids.len(),
+        block_ids
+    );
+    println!(
+        "✓ Verified {} distinct block IDs: {:?}",
+        block_ids.len(),
+        block_ids
+    );
+
     // 2. Verify all files exist and have correct content
     for (i, (path, _)) in batch_files.clone().iter().enumerate() {
         let status = fs.get_status(path).await?;
-
         let content = read_file_content(fs, path).await?;
         if i == num_files - 1 {
             assert_eq!(

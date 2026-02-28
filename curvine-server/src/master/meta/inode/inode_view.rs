@@ -16,11 +16,16 @@
 
 use crate::master::meta::feature::AclFeature;
 use crate::master::meta::inode::ttl_types::TtlConfig;
-use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
+use crate::master::meta::inode::InodeView::{Container, Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
+use crate::master::meta::BlockMeta;
+
+use crate::master::meta::inode::inode_container::InodeContainer;
+
 use core::panic;
+use curvine_common::fs::Path;
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy};
 use curvine_common::utils::SerdeUtils;
 use orpc::common::Utils;
@@ -35,19 +40,20 @@ pub enum InodeView {
     File(String, InodeFile) = 1,
     Dir(String, InodeDir) = 2,
     FileEntry(String, i64) = 3,
+    Container(String, InodeContainer) = 4,
 }
 
 impl InodeView {
     pub fn is_dir(&self) -> bool {
-        match self {
-            File(_, _) => false,
-            Dir(_, _) => true,
-            _ => false,
-        }
+        matches!(self, Dir(_, _))
     }
 
     pub fn is_file(&self) -> bool {
-        !self.is_dir()
+        matches!(self, File(_, _) | FileEntry(_, _))
+    }
+
+    pub fn is_container(&self) -> bool {
+        matches!(self, Container(_, _))
     }
 
     pub fn is_file_entry(&self) -> bool {
@@ -63,6 +69,7 @@ impl InodeView {
             File(_, f) => f.id(),
             Dir(_, d) => d.id(),
             FileEntry(_, id) => *id,
+            Container(_, c) => c.id(),
         }
     }
     pub fn ttl_config(&self) -> Option<TtlConfig> {
@@ -70,6 +77,7 @@ impl InodeView {
             File(_, f) => TtlConfig::from_storage_policy(&f.storage_policy),
             Dir(_, d) => TtlConfig::from_storage_policy(&d.storage_policy),
             FileEntry(_, _) => None,
+            Container(_, c) => TtlConfig::from_storage_policy(&c.storage_policy),
         }
     }
     pub fn name(&self) -> &str {
@@ -77,6 +85,14 @@ impl InodeView {
             File(name, _) => name,
             Dir(name, _) => name,
             FileEntry(name, _) => name,
+            Container(name, _) => name,
+        }
+    }
+
+    pub fn container_name(&self) -> Option<String> {
+        match self {
+            Container(name, _) => Some(name.clone()),
+            _ => None,
         }
     }
 
@@ -107,14 +123,16 @@ impl InodeView {
             File(_, _) => None,
             Dir(_, d) => d.get_child(name),
             FileEntry(..) => None,
+            Container(_, _c) => None,
         }
     }
 
     pub fn get_child_ptr(&mut self, name: &str) -> Option<InodePtr> {
         match self {
             File(_, _) => None,
-            Dir(_, d) => d.get_child_ptr(name),
+            Dir(_, d) => d.get_child_ptr(name, false),
             FileEntry(..) => None,
+            Container(_, _c) => None,
         }
     }
 
@@ -135,6 +153,7 @@ impl InodeView {
             File(_, _) => 0,
             Dir(_, d) => d.children_iter().len(),
             FileEntry(..) => 0,
+            Container(_, _c) => 0,
         }
     }
 
@@ -160,6 +179,7 @@ impl InodeView {
             File(_, f) => f.mtime(),
             Dir(_, d) => d.mtime(),
             FileEntry(..) => 0,
+            Container(_, c) => c.mtime(),
         }
     }
 
@@ -176,6 +196,11 @@ impl InodeView {
                 }
             }
             FileEntry(..) => (),
+            Container(_, ref mut c) => {
+                if time > c.mtime {
+                    c.mtime = time
+                }
+            } // will update
         }
     }
 
@@ -184,6 +209,7 @@ impl InodeView {
             File(_, f) => f.nlink += 1,
             Dir(_, d) => d.nlink += 1,
             FileEntry(..) => (),
+            Container(_, c) => c.nlink += 1, // will update
         }
     }
 
@@ -200,6 +226,11 @@ impl InodeView {
                 }
             }
             FileEntry(..) => (),
+            Container(_, c) => {
+                if c.nlink > 0 {
+                    c.nlink -= 1
+                }
+            } // will update
         }
     }
 
@@ -208,6 +239,7 @@ impl InodeView {
             File(_, f) => f.parent_id = parent_id,
             Dir(_, d) => d.parent_id = parent_id,
             FileEntry(..) => (),
+            Container(_, c) => c.parent_id = parent_id, // will update
         }
     }
 
@@ -216,6 +248,7 @@ impl InodeView {
             File(name, _) => *name = new_name,
             Dir(name, _) => *name = new_name,
             FileEntry(name, _) => *name = new_name,
+            Container(name, _) => *name = new_name, // will update
         }
     }
 
@@ -224,38 +257,49 @@ impl InodeView {
             File(_, f) => f.atime(),
             Dir(_, d) => d.atime(),
             FileEntry(..) => 0,
+            Container(_, c) => c.atime(),
         }
     }
 
     pub fn as_dir_mut(&mut self) -> CommonResult<&mut InodeDir> {
         match self {
-            File(_, _) => err_box!("Not a dir"),
             Dir(_, ref mut d) => Ok(d),
-            _ => err_box!("Inode type error: {}", self.name()),
+            _ => err_box!("Not a dir"),
+        }
+    }
+
+    pub fn as_container_mut(&mut self) -> CommonResult<&mut InodeContainer> {
+        match self {
+            InodeView::Container(_, container) => Ok(container),
+            _ => err_box!("Not a container"),
         }
     }
 
     pub fn as_dir_ref(&self) -> CommonResult<&InodeDir> {
         match self {
-            File(_, _) => err_box!("Not a dir"),
             Dir(_, ref d) => Ok(d),
-            _ => err_box!("Inode type error: {}", self.name()),
+            _ => err_box!("Not a dir"),
         }
     }
 
     pub fn as_file_ref(&self) -> CommonResult<&InodeFile> {
         match self {
             File(_, f) => Ok(f),
-            Dir(_, _) => err_box!("Not a file"),
-            _ => err_box!("Inode type error: {}", self.name()),
+            _ => err_box!("Not a file"),
+        }
+    }
+
+    pub fn as_container_ref(&self) -> CommonResult<&InodeContainer> {
+        match self {
+            Container(_, c) => Ok(c),
+            _ => err_box!("Not a container"),
         }
     }
 
     pub fn as_file_mut(&mut self) -> CommonResult<&mut InodeFile> {
         match self {
             File(_, ref mut f) => Ok(f),
-            Dir(_, _) => err_box!("Not a file"),
-            _ => err_box!("FileEntry is cannot be mutated: {}", self.name()),
+            _ => err_box!("Not a file"),
         }
     }
 
@@ -266,6 +310,7 @@ impl InodeView {
             FileEntry(..) => {
                 panic!("FileEntry does not support ACL access")
             }
+            Container(_, c) => &c.features.acl,
         }
     }
 
@@ -273,6 +318,7 @@ impl InodeView {
         match self {
             File(_, f) => &mut f.features.acl,
             Dir(_, d) => &mut d.features.acl,
+            Container(_, c) => &mut c.features.acl,
             FileEntry(..) => {
                 panic!("FileEntry does not support mutable ACL access")
             }
@@ -283,6 +329,7 @@ impl InodeView {
         match self {
             File(_, f) => &f.storage_policy,
             Dir(_, d) => &d.storage_policy,
+            Container(_, c) => &c.storage_policy,
             FileEntry(..) => {
                 panic!("FileEntry does not support storage policy access")
             }
@@ -293,8 +340,29 @@ impl InodeView {
         match self {
             File(_, f) => &mut f.storage_policy,
             Dir(_, d) => &mut d.storage_policy,
+            Container(_, c) => &mut c.storage_policy,
             FileEntry(..) => {
                 panic!("FileEntry does not support mutable storage policy access")
+            }
+        }
+    }
+
+    pub fn replicas(&self) -> u16 {
+        match self {
+            File(_, f) => f.replicas,
+            Container(_, c) => c.replicas,
+            _ => {
+                panic!("Only File and Container support to get storage policy access")
+            }
+        }
+    }
+
+    pub fn block_size(&self) -> i64 {
+        match self {
+            File(_, f) => f.block_size,
+            Container(_, c) => c.block_size,
+            _ => {
+                panic!("Only File and Container support to get block size")
             }
         }
     }
@@ -303,6 +371,7 @@ impl InodeView {
         match self {
             File(_, f) => &f.features.x_attr,
             Dir(_, d) => &d.features.x_attr,
+            Container(_, c) => &c.features.x_attr,
             FileEntry(..) => {
                 panic!("FileEntry does not support x_attr access")
             }
@@ -313,6 +382,7 @@ impl InodeView {
         match self {
             File(_, f) => &mut f.features.x_attr,
             Dir(_, d) => &mut d.features.x_attr,
+            Container(_, c) => &mut c.features.x_attr,
             FileEntry(..) => {
                 panic!("FileEntry does not support mutable x_attr access")
             }
@@ -323,6 +393,7 @@ impl InodeView {
         match self {
             File(_, f) => f.nlink(),
             Dir(_, d) => d.nlink(),
+            Container(_, c) => c.nlink(),
             FileEntry(_, _) => {
                 panic!("FileEntry does not support nlink")
             }
@@ -351,6 +422,7 @@ impl InodeView {
             match self {
                 File(_, f) => f.atime = atime,
                 Dir(_, d) => d.atime = atime,
+                Container(_, c) => c.atime = atime,
                 _ => (),
             }
         }
@@ -359,6 +431,7 @@ impl InodeView {
             match self {
                 File(_, f) => f.mtime = mtime,
                 Dir(_, d) => d.mtime = mtime,
+                Container(_, c) => c.mtime = mtime,
                 _ => (),
             }
         }
@@ -406,6 +479,7 @@ impl InodeView {
             mode: acl.mode,
             nlink: self.nlink(),
             target: None,
+            container_name: self.container_name(),
         };
 
         match self {
@@ -429,6 +503,21 @@ impl InodeView {
 
             FileEntry(_, _inode_id) => {
                 panic!("FileEntry does not support to_file_status");
+            }
+            Container(_, c) => {
+                let file_name = Path::new(path)
+                    .expect("Failed to parse path")
+                    .name()
+                    .to_owned();
+                status.is_complete = c.is_complete();
+                status.len = c.files.get(&file_name).map(|meta| meta.len).unwrap_or(0);
+                status.replicas = c.replicas as i32;
+                status.block_size = c.block_size;
+                status.file_type = FileType::Container;
+                status.x_attr = c.features.x_attr.clone();
+                status.storage_policy = c.storage_policy.clone();
+                status.name = file_name;
+                status.target = None;
             }
         }
 
@@ -495,6 +584,15 @@ impl InodeView {
 
         res
     }
+
+    /// Returns an iterator over block metadata
+    pub fn blocks_iter(&self) -> Box<dyn Iterator<Item = &BlockMeta> + '_> {
+        match self {
+            File(_, f) => Box::new(f.blocks.iter()),
+            Container(_, c) => Box::new(std::iter::once(&c.block)),
+            _ => Box::new(std::iter::empty()),
+        }
+    }
 }
 
 impl Clone for InodeView {
@@ -503,6 +601,7 @@ impl Clone for InodeView {
             File(name, f) => File(name.clone(), f.clone()),
             Dir(name, d) => Dir(name.clone(), d.clone()),
             FileEntry(name, id) => FileEntry(name.clone(), *id),
+            Container(name, c) => Container(name.clone(), c.clone()),
         }
     }
 }
@@ -513,6 +612,7 @@ impl Debug for InodeView {
             File(name, x) => write!(f, "File(name={}, x={:?})", name, x),
             Dir(name, x) => write!(f, "Dir(name={}, x={:?})", name, x),
             FileEntry(name, id) => write!(f, "FileEntry(name={}, id={})", name, id),
+            Container(name, c) => write!(f, "Container(name={}, x={:?})", name, c),
         }
     }
 }

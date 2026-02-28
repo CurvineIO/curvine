@@ -54,21 +54,42 @@ message CreateFileResponse {
     required FileStatusProto file_status = 1;
 }
 
-message CreateFilesBatchRequest {  
+message CreateContainerRequest {  
     repeated CreateFileRequest requests = 1;  
 }  
   
-message CreateFilesBatchResponse {  
-    repeated FileStatusProto file_statuses = 1;  
+message ContainerStatusResponse {  
+    required int64 container_id = 1;  
+    required string container_path = 2;
+    required string container_name = 3;
+    repeated FileStatusProto files = 4;  // Compose FileStatus objects  
+    required int64 mtime = 5;  
+    required int64 block_size = 6;  
+    required FileTypeProto file_type = 7;  
+    required int32 replicas = 8;  
+    required StoragePolicyProto storage_policy = 9;  
+    required string owner = 10;  
+    required string group = 11;  
+    required uint32 mode = 12;  
+    required uint32 nlink = 13;  
 }  
   
-message CompleteFilesBatchRequest {  
-    repeated CompleteFileRequest requests = 1;  
+message CreateContainerResponse {  
+    oneof result {  
+        FileStatusList file_statuses = 1;   
+        ContainerStatusResponse container = 2;  
+    }  
 }  
   
-message CompleteFilesBatchResponse {  
-    repeated bool results = 1;  
+message FileStatusList {  
+    repeated FileStatusProto statuses = 1;  
 }
+
+message CompleteContainerResponse {
+    required bool result = 1;
+    repeated FileBlocksProto file_blocks_vec = 2;
+}
+
 
 message OpenFileRequest {
     required string path = 1;
@@ -141,15 +162,6 @@ message AddBlockResponse {
     required LocatedBlockProto block = 1;
 }
 
-// apply for allocation of blocks batch
-message AddBlocksBatchRequest {  
-    repeated AddBlockRequest requests = 1;  
-}  
-  
-message AddBlocksBatchResponse {  
-    repeated LocatedBlockProto blocks = 1;  
-}
-
 message RequestReplacementWorkerRequest {
     required int64 block_id = 1;
     repeated uint32 exclude_workers = 2;
@@ -175,6 +187,17 @@ message CompleteFileRequest {
     required string client_name = 3;
     repeated CommitBlockProto commit_blocks = 4;
     required bool only_flush = 5 [default = false];
+}
+
+
+// File writing is completed.
+message CompleteContainerRequest {
+    required string path = 1;
+    required int64 len = 2;
+    required string client_name = 3;
+    required CommitBlockProto commit_block = 4;
+    required bool only_flush = 5 [default = false];
+    map<string, SmallFileMetaProto> files = 6;
 }
 
 message CompleteFileResponse {

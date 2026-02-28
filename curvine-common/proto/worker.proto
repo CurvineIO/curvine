@@ -26,6 +26,16 @@ message PipelineStatus {
     optional string error_message = 4;
 }
 
+
+
+message WriteCommitRequest {  
+    required ExtendedBlockProto block = 1;  
+    required int64 pos = 2;  
+    required int64 block_size = 3;  
+    required bool cancel = 4;  
+    optional PipelineStatus pipeline_status = 6;
+}  
+
 message BlockWriteResponse {
     required int64 id = 1;
     optional string path = 2;
@@ -35,6 +45,10 @@ message BlockWriteResponse {
     optional PipelineStatus pipeline_status = 6;
 }
 
+message ContainerBlockWriteResponse {  
+    repeated BlockWriteResponse responses = 1; 
+    required ContainerMetadataProto container_meta = 2; 
+}
 message BlockReadRequest {
     required int64 id = 1;
     required int64 off = 2;
@@ -111,70 +125,39 @@ message BlockReportListResponse {
     repeated WorkerCommandProto cmds = 1;
 }
 
-message WriteCommitRequest {
-    required ExtendedBlockProto block = 1;
-    required int64 pos = 2;
-    required int64 block_size = 3;
-    required bool cancel = 4;
-}
-
-message WriteBlocksBatchRequest {  
+message WriteContainerBlockRequest {  
     repeated BlockWriteRequest requests = 1;  
 }  
   
-message WriteBlocksBatchResponse {  
+message WriteContainerBlockResponse {  
     repeated BlockWriteResponse responses = 1;  
 }  
-  
-message WriteCommitsBatchRequest {  
-    repeated WriteCommitRequest requests = 1;  
+
+message ContainerBlockWriteRequest {  
+    required ExtendedBlockProto block = 1;  
+    required int64 off = 2;  
+    required int64 block_size = 3;  
+    required int64 req_id = 4;  
+    required int32 seq_id = 5;  
+    required int32 chunk_size = 6;  
+    required bool short_circuit = 7;  
+    required string client_name = 8;  
+    required ContainerMetadataProto files_metadata = 9;
 }  
-  
-message WriteCommitsBatchResponse {  
-    repeated bool results = 1;  
-}
 
-message BlocksBatchWriteRequest {
-    repeated ExtendedBlockProto blocks = 1;
-    required int64 off = 2;
-    required int64 block_size = 3;
-    required int64 req_id = 4;
-    required int32 seq_id = 5;
-    required int32 chunk_size = 6;
-    required bool short_circuit = 7;
-    required string client_name = 8;
-}
+message ContainerWriteRequest {  
+    repeated FileWriteDataProto files = 1;  
+    required int64 req_id = 2;  
+    required int32 seq_id = 3;  
+    optional ContainerMetadataProto container_meta = 4;
+}  
 
-
-
-message BlocksBatchWriteResponse {
-    repeated BlockWriteResponse responses = 1;
-}
-
-message BlocksBatchCommitRequest {
-    repeated ExtendedBlockProto blocks = 1;
-    required int64 off = 2;
-    required int64 block_size = 3;
-    required int64 req_id = 4;
-    required int32 seq_id = 5;
-    required bool cancel = 6;
-}
-
-message BlocksBatchCommitResponse {
+message ContainerWriteResponse {  
     repeated bool results = 1;
+    optional ContainerMetadataProto container_meta = 2;
 }
 
-message FilesBatchWriteRequest {
-    repeated FileWriteData files = 1;
-    required int64 req_id = 2;
-    required int32 seq_id = 3;
-}
-
-message FileWriteData {
-    required string path = 1;
-    required bytes content = 2;
-}
-
-message FilesBatchWriteResponse {
-    repeated bool results = 1;
-}
+message FileWriteDataProto {  
+    required string path = 1;  
+    required bytes content = 2;  
+} 

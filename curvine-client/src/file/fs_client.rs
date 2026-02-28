@@ -26,7 +26,7 @@ use orpc::err_box;
 use orpc::message::MessageBuilder;
 use orpc::runtime::RpcRuntime;
 use prost::Message as PMessage;
-use std::collections::LinkedList;
+use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -72,10 +72,10 @@ impl FsClient {
         self.create_with_opts(path, opts, overwrite).await
     }
 
-    pub async fn create_files_batch(
+    pub async fn create_container(
         &self,
         requests: Vec<(String, CreateFileOpts, OpenFlags)>,
-    ) -> FsResult<Vec<FileStatus>> {
+    ) -> FsResult<ContainerStatus> {
         let pb_requests: Vec<CreateFileRequest> = requests
             .into_iter()
             .map(|(path, opts, flags)| CreateFileRequest {
@@ -85,16 +85,35 @@ impl FsClient {
             })
             .collect();
 
-        let header = CreateFilesBatchRequest {
+        let header = CreateContainerRequest {
             requests: pb_requests,
         };
 
-        let rep: CreateFilesBatchResponse = self.rpc(RpcCode::CreateFilesBatch, header).await?;
-        Ok(rep
-            .file_statuses
-            .into_iter()
-            .map(ProtoUtils::file_status_from_pb)
-            .collect())
+        let rep: CreateContainerResponse = self.rpc(RpcCode::CreateContainer, header).await?;
+        match rep.result {
+            Some(create_container_response::Result::Container(container)) => {
+                // get total size
+                let total_size: i64 = container.files.iter().map(|f| f.len).sum();
+                let file_count = container.files.len();
+
+                // Handle container - extract composed FileStatus objects
+                let individual_files: Vec<FileStatus> = container
+                    .files
+                    .into_iter()
+                    .map(ProtoUtils::file_status_from_pb)
+                    .collect();
+
+                Ok(ContainerStatus {
+                    container_id: container.container_id,
+                    container_path: container.container_path,
+                    container_name: container.container_name,
+                    files: individual_files,
+                    total_size,
+                    file_count,
+                })
+            }
+            _ => Err(FsError::common("No result in batch response")),
+        }
     }
 
     pub async fn create_with_opts(
@@ -252,32 +271,20 @@ impl FsClient {
         Ok(locate_block)
     }
 
-    pub async fn add_blocks_batch(&self, requests: Vec<String>) -> FsResult<Vec<LocatedBlock>> {
-        let pb_requests: Vec<AddBlockRequest> = requests
-            .into_iter()
-            .map(|path| {
-                let commit_blocks: Vec<CommitBlockProto> = Vec::new();
-                AddBlockRequest {
-                    path,
-                    commit_blocks,
-                    exclude_workers: self.context.exclude_workers(),
-                    located: true,
-                    client_address: self.context.client_addr_pb(),
-                    file_len: 0,
-                    last_block: None,
-                }
-            })
-            .collect();
-
-        let header = AddBlocksBatchRequest {
-            requests: pb_requests,
+    pub async fn add_container_block(&self, container_path: String) -> FsResult<LocatedBlock> {
+        let commit_blocks: Vec<CommitBlockProto> = Vec::new();
+        let pb_request = AddBlockRequest {
+            path: container_path,
+            commit_blocks,
+            exclude_workers: self.context.exclude_workers(),
+            located: true,
+            client_address: self.context.client_addr_pb(),
+            file_len: 0,
+            last_block: None,
         };
-        let rep: AddBlocksBatchResponse = self.rpc(RpcCode::AddBlocksBatch, header).await?;
-        Ok(rep
-            .blocks
-            .into_iter()
-            .map(ProtoUtils::located_block_from_pb)
-            .collect())
+
+        let rep: LocatedBlockProto = self.rpc(RpcCode::AddBlock, pb_request).await?;
+        Ok(ProtoUtils::located_block_from_pb(rep))
     }
     // File writing is completed.
     pub async fn complete_file(
@@ -305,33 +312,38 @@ impl FsClient {
         Ok(rep.file_blocks.map(ProtoUtils::file_blocks_from_pb))
     }
 
-    pub async fn complete_files_batch(
+    pub async fn complete_container(
         &self,
-        requests: Vec<(String, i64, Vec<CommitBlock>, String, bool)>,
-    ) -> FsResult<Vec<bool>> {
-        let pb_requests: Vec<CompleteFileRequest> = requests
-            .into_iter()
-            .map(|(path, len, commit_blocks, client_name, only_flush)| {
-                let commit_blocks = commit_blocks
-                    .into_iter()
-                    .map(ProtoUtils::commit_block_to_pb)
-                    .collect();
-                CompleteFileRequest {
-                    path,
-                    len,
-                    client_name,
-                    commit_blocks,
-                    only_flush,
-                }
+        container_status: ContainerStatus,
+        client_name: String,
+        commit_block: CommitBlock,
+        only_flush: bool,
+        small_files_metadata: Vec<SmallFileMetaProto>,
+    ) -> FsResult<bool> {
+        let block_len = commit_block.block_len;
+        let commit_block_proto = ProtoUtils::commit_block_to_pb(commit_block);
+
+        let files_index: HashMap<String, SmallFileMetaProto> = container_status
+            .files
+            .iter()
+            .zip(small_files_metadata.iter())
+            .map(|(file_status, meta)| {
+                (file_status.name.clone(), meta.clone()) // Use name field as key
             })
             .collect();
-
-        let header = CompleteFilesBatchRequest {
-            requests: pb_requests,
+        let pb_requests = CompleteContainerRequest {
+            path: container_status.container_path,
+            len: block_len,
+            client_name,
+            commit_block: commit_block_proto,
+            only_flush,
+            files: files_index,
         };
 
-        let rep: CompleteFilesBatchResponse = self.rpc(RpcCode::CompleteFilesBatch, header).await?;
-        Ok(rep.results)
+        let header = pb_requests;
+
+        let rep: CompleteContainerResponse = self.rpc(RpcCode::CompleteContainer, header).await?;
+        Ok(rep.result)
     }
 
     pub async fn get_block_locations(&self, path: &Path) -> FsResult<FileBlocks> {

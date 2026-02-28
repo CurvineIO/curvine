@@ -90,8 +90,35 @@ impl InodeChildren {
         }
     }
 
-    pub fn get_child_ptr(&self, name: &str) -> Option<InodePtr> {
-        self.get_child(name).map(InodePtr::from_ref)
+    pub fn get_child_in_container(&self, name: &str) -> Option<&InodeView> {
+        match self {
+            InodeChildren::List(list) => {
+                let index = Self::search_by_name(list, name);
+                match index {
+                    Err(_) => None,
+                    Ok(v) => Some(&list[v]),
+                }
+            }
+            InodeChildren::Map(map) => {
+                for child in map.values() {
+                    if let InodeView::Container(_, container) = child.as_ref() {
+                        // Check if the file exists in this container's files HashMap
+                        if container.files.contains_key(name) {
+                            return Some(child.as_ref());
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    pub fn get_child_ptr(&self, name: &str, is_enable_container_search: bool) -> Option<InodePtr> {
+        if !is_enable_container_search {
+            self.get_child(name).map(InodePtr::from_ref)
+        } else {
+            self.get_child_in_container(name).map(InodePtr::from_ref)
+        }
     }
 
     pub fn delete_child(&mut self, child_id: i64, child_name: &str) -> CommonResult<InodeView> {
@@ -155,7 +182,8 @@ impl InodeChildren {
                     } else {
                         // Directory directly stores complete object and returns its reference
                         let inserted = v.insert(inode.clone());
-                        Ok(InodePtr::from_ref(inserted.as_ref()))
+                        let return_inode_ptr = InodePtr::from_ref(inserted.as_ref());
+                        Ok(return_inode_ptr)
                     }
                 }
 

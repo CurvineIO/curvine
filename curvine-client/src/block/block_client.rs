@@ -24,10 +24,10 @@ use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     BlockReadRequest, BlockReadResponse, BlockWriteRequest, BlockWriteResponse,
-    BlocksBatchCommitRequest, BlocksBatchWriteRequest, BlocksBatchWriteResponse, DataHeaderProto,
-    FileWriteData, FilesBatchWriteRequest,
+    ContainerBlockWriteRequest, ContainerBlockWriteResponse, ContainerMetadataProto,
+    ContainerWriteRequest, DataHeaderProto, FileWriteDataProto, SmallFileMetaProto,
 };
-use curvine_common::state::{ExtendedBlock, StorageType, WorkerAddress};
+use curvine_common::state::{ContainerStatus, ExtendedBlock, StorageType, WorkerAddress};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::client::RpcClient;
@@ -38,7 +38,6 @@ use orpc::sys::DataSlice;
 use orpc::{try_option_ref, CommonResult};
 use std::sync::Arc;
 use std::time::Duration;
-
 pub struct BlockClient {
     client: Option<RpcClient>,
     client_name: String,
@@ -298,23 +297,22 @@ impl BlockClient {
         let rep = self.rpc(msg).await?;
         Ok(rep.data)
     }
-    pub async fn write_blocks_batch(
+    pub async fn write_container_block(
         &self,
-        blocks: &[ExtendedBlock],
+        block: &ExtendedBlock,
         off: i64,
         block_size: i64,
         req_id: i64,
         seq_id: i32,
         chunk_size: i32,
         short_circuit: bool,
+        container_status: ContainerStatus,
+        small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<CreateBatchBlockContext> {
-        let blocks_pb: Vec<_> = blocks
-            .iter()
-            .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
-            .collect();
-
-        let req_header = BlocksBatchWriteRequest {
-            blocks: blocks_pb,
+        // send request to workers to create a block for container
+        let block_pb = ProtoUtils::extend_block_to_pb(block.clone());
+        let req_header = ContainerBlockWriteRequest {
+            block: block_pb,
             off,
             block_size,
             req_id,
@@ -322,10 +320,16 @@ impl BlockClient {
             chunk_size,
             short_circuit,
             client_name: self.client_name.to_string(),
+            files_metadata: ContainerMetadataProto {
+                container_block_id: block.id,
+                container_path: container_status.container_path.clone(),
+                container_name: container_status.container_name.clone(),
+                files: small_files_metadata,
+            },
         };
 
         let msg = Builder::new()
-            .code(RpcCode::WriteBlocksBatch)
+            .code(RpcCode::WriteContainerBlock)
             .request(RequestStatus::Open)
             .req_id(req_id)
             .seq_id(seq_id)
@@ -333,9 +337,11 @@ impl BlockClient {
             .build();
 
         let rep = self.rpc(msg).await?;
-        let rep_header: BlocksBatchWriteResponse = rep.parse_header()?;
+        let rep_header: ContainerBlockWriteResponse = rep.parse_header()?;
         let mut batch_context = CreateBatchBlockContext::new(req_id);
 
+        // construct batch_context
+        let container_meta = rep_header.container_meta;
         for response in rep_header.responses {
             let context = CreateBlockContext {
                 id: response.id,
@@ -344,34 +350,36 @@ impl BlockClient {
                 storage_type: StorageType::from(response.storage_type),
                 path: response.path,
             };
-            batch_context.push(context);
+            batch_context.push(context, Some(container_meta.clone()));
         }
 
         Ok(batch_context)
     }
 
-    pub async fn write_commit_batch(
+    pub async fn write_commit_container(
         &self,
-        blocks: &[ExtendedBlock],
+        block: &ExtendedBlock,
         off: i64,
         block_size: i64,
         req_id: i64,
         seq_id: i32,
         cancel: bool,
+        container_meta: Option<ContainerMetadataProto>,
     ) -> FsResult<()> {
-        // Convert blocks to protobuf
-        let blocks_pb: Vec<_> = blocks
-            .iter()
-            .map(|block| ProtoUtils::extend_block_to_pb(block.clone()))
-            .collect();
+        let block_pb = ProtoUtils::extend_block_to_pb(block.clone());
 
-        let header = BlocksBatchCommitRequest {
-            blocks: blocks_pb,
+        let header = ContainerBlockWriteRequest {
+            block: block_pb,
             off,
             block_size,
             req_id,
             seq_id,
-            cancel,
+            chunk_size: 0,
+            short_circuit: false,
+            client_name: self.client_name.to_string(),
+            files_metadata: container_meta.ok_or_else(|| {
+                FsError::common("container_meta is required for write_commit_batch but was None")
+            })?,
         };
 
         let status = if cancel {
@@ -381,7 +389,7 @@ impl BlockClient {
         };
 
         let msg = Builder::new()
-            .code(RpcCode::WriteBlocksBatch)
+            .code(RpcCode::WriteContainerBlock)
             .request(status)
             .req_id(req_id)
             .seq_id(seq_id)
@@ -392,28 +400,31 @@ impl BlockClient {
         Ok(())
     }
 
-    pub async fn write_files_batch(
+    pub async fn write_container(
         &self,
         files: &[(&Path, &str)],
         req_id: i64,
         seq_id: i32,
+        container_meta: Option<ContainerMetadataProto>,
     ) -> CommonResult<()> {
+        // prepare data files
         let file_data: Vec<_> = files
             .iter()
-            .map(|(path, content)| FileWriteData {
+            .map(|(path, content)| FileWriteDataProto {
                 path: path.to_string(),
                 content: content.as_bytes().to_vec(),
             })
             .collect();
 
-        let header = FilesBatchWriteRequest {
+        let header = ContainerWriteRequest {
             files: file_data,
             req_id,
             seq_id,
+            container_meta,
         };
 
         let msg = Builder::new()
-            .code(RpcCode::WriteBlocksBatch)
+            .code(RpcCode::WriteContainerBlock)
             .request(RequestStatus::Running)
             .req_id(req_id)
             .seq_id(seq_id)
