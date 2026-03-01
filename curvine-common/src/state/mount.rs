@@ -193,18 +193,12 @@ impl MountInfo {
             .build()
     }
 
-    pub fn is_write_through(&self) -> bool {
-        matches!(
-            self.write_type,
-            WriteType::CacheThrough | WriteType::AsyncThrough
-        )
+    pub fn is_cache_mode(&self) -> bool {
+        self.write_type == WriteType::CacheMode
     }
 
-    /// Check if this write type stores data in UFS
-    /// Cache mode only stores data in Curvine, not in UFS
-    /// Other modes (Through/AsyncThrough/CacheThrough) store data in UFS
-    pub fn has_ufs_data(&self) -> bool {
-        !matches!(self.write_type, WriteType::Cache)
+    pub fn is_fs_mode(&self) -> bool {
+        self.write_type == WriteType::FsMode
     }
 }
 
@@ -270,7 +264,7 @@ pub struct MountOptionsBuilder {
 impl MountOptionsBuilder {
     pub fn new() -> Self {
         Self {
-            write_type: WriteType::AsyncThrough,
+            write_type: WriteType::CacheMode,
             ttl_ms: Some(7 * DurationUnit::DAY as i64),
             ttl_action: Some(TtlAction::Delete),
             ..Default::default()
@@ -369,15 +363,9 @@ impl MountOptionsBuilder {
     }
 }
 
-/// Write type for cache write operations, corresponding to Alluxio write types:
-/// - Cache (MUST_CACHE): Write data only to cache, not to the underlying storage.
-///   This mode provides the fastest write performance but data may be lost if cache is evicted.
-/// - Through (THROUGH): Write data directly to the underlying storage (UFS), bypassing cache.
-///   This mode ensures data persistence but may be slower than cache writes.
-/// - AsyncThrough (ASYNC_THROUGH): Write data to cache first, then asynchronously write to underlying storage (UFS).
-///   This mode balances performance and durability.
-/// - CacheThrough (CACHE_THROUGH): Write data synchronously to both cache and underlying storage (UFS).
-///   This mode provides the best durability guarantee but may be slower.
+/// Write type for mount operations:
+/// - CacheMode: Write data directly to the underlying storage (UFS), bypassing cache.
+/// - FsMode: Write data to Curvine filesystem (cache) only.
 #[repr(i32)]
 #[derive(
     Debug,
@@ -393,11 +381,9 @@ impl MountOptionsBuilder {
     Serialize,
 )]
 pub enum WriteType {
-    Cache = 0,
-    Through = 1,
     #[default]
-    AsyncThrough = 2,
-    CacheThrough = 3,
+    CacheMode = 0,
+    FsMode = 1,
 }
 
 impl TryFrom<&str> for WriteType {
@@ -405,10 +391,8 @@ impl TryFrom<&str> for WriteType {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let typ = match value {
-            "cache" => WriteType::Cache,
-            "through" => WriteType::Through,
-            "async_through" => WriteType::AsyncThrough,
-            "cache_through" => WriteType::CacheThrough,
+            "cache_mode" => WriteType::CacheMode,
+            "fs_mode" => WriteType::FsMode,
             _ => return err_box!("invalid write type: {}", value),
         };
 

@@ -163,19 +163,8 @@ impl FileBlocks {
         Self { status, block_locs }
     }
 
-    // According to the file reading location, get the block that needs to be read and the offset in the block.
-    pub fn get_read_block(&self, file_pos: i64) -> FsResult<(i64, LocatedBlock)> {
-        let mut start_pos = 0;
-        for block in &self.block_locs {
-            let end_pos = start_pos + block.block.len;
-            if file_pos >= start_pos && file_pos < end_pos {
-                let block_off = file_pos - start_pos;
-                return Ok((block_off, block.clone()));
-            }
-            start_pos = end_pos;
-        }
-
-        err_box!("Not found block for pos {}", file_pos)
+    pub fn cv_exists(&self) -> bool {
+        !self.block_locs.is_empty()
     }
 }
 
