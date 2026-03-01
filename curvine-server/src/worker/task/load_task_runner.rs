@@ -16,7 +16,7 @@ use crate::common::UfsFactory;
 use crate::worker::task::TaskContext;
 use curvine_client::file::CurvineFileSystem;
 use curvine_client::rpc::JobMasterClient;
-use curvine_client::unified::{CacheSyncReader, UfsFileSystem, UnifiedReader, UnifiedWriter};
+use curvine_client::unified::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{CreateFileOptsBuilder, JobTaskState, SetAttrOptsBuilder};
 use curvine_common::FsResult;
@@ -105,7 +105,8 @@ impl LoadTaskRunner {
 
             if LocalTime::mills() > last_progress_time + self.progress_interval_ms {
                 last_progress_time = LocalTime::mills();
-                self.update_progress(writer.pos(), reader.len()).await;
+                self.update_progress(writer.pos(), reader.len(), false)
+                    .await;
             }
 
             if total_cost_ms > self.task_timeout_ms {
@@ -134,7 +135,7 @@ impl LoadTaskRunner {
             reader.status().storage_policy.ufs_mtime
         };
 
-        self.update_progress(writer.pos(), reader.len()).await;
+        self.update_progress(writer.pos(), reader.len(), true).await;
 
         info!(
             "task {} completed, source_path {}, target_path {}, ufs_mtime:{}, copy bytes {}, read cost {} ms, task cost {} ms",
@@ -165,9 +166,8 @@ impl LoadTaskRunner {
 
     async fn open_unified(&self, path: &Path) -> FsResult<UnifiedReader> {
         if path.is_cv() {
-            // Curvine path
-            let reader = CacheSyncReader::new(&self.fs, path).await?;
-            Ok(UnifiedReader::CacheSync(reader))
+            let reader = self.fs.open(path).await?;
+            Ok(UnifiedReader::Cv(reader))
         } else {
             // UFS path
             let ufs = self.get_ufs()?;
@@ -215,14 +215,22 @@ impl LoadTaskRunner {
         }
     }
 
-    pub async fn update_progress(&self, loaded_size: i64, total_size: i64) {
-        if let Err(e) = self.update_progress0(loaded_size, total_size).await {
+    pub async fn update_progress(&self, loaded_size: i64, total_size: i64, is_last: bool) {
+        if let Err(e) = self
+            .update_progress0(loaded_size, total_size, is_last)
+            .await
+        {
             warn!("update progress failed, err: {:?}", e);
         }
     }
 
-    pub async fn update_progress0(&self, loaded_size: i64, total_size: i64) -> FsResult<()> {
-        let progress = self.task.update_progress(loaded_size, total_size);
+    pub async fn update_progress0(
+        &self,
+        loaded_size: i64,
+        total_size: i64,
+        is_last: bool,
+    ) -> FsResult<()> {
+        let progress = self.task.update_progress(loaded_size, total_size, is_last);
         let task = &self.task;
 
         self.master_client
