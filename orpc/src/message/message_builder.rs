@@ -55,6 +55,17 @@ impl MessageBuilder {
         }
     }
 
+    pub fn new_rpc_with_req_id<T: Into<i8>>(code: T, req_id: i64) -> Self {
+        Builder {
+            code: code.into(),
+            status: Status(RequestStatus::Rpc, ResponseStatus::Undefined),
+            req_id,
+            seq_id: INIT_SEQ_ID,
+            header: None,
+            data: DataSlice::Empty,
+        }
+    }
+
     pub fn success(req: &Message) -> Self {
         Builder {
             code: req.code(),

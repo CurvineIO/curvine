@@ -31,6 +31,7 @@ use curvine_common::FsResult;
 use log::info;
 use log::warn;
 use orpc::client::ClientConf;
+use orpc::common::Utils;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
@@ -186,7 +187,9 @@ impl CurvineFileSystem {
     }
 
     pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
-        self.fs_client.delete(path, recursive).await
+        self.fs_client
+            .delete(path, recursive, Utils::req_id())
+            .await
     }
 
     pub async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {

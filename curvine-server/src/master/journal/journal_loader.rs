@@ -176,9 +176,26 @@ impl JournalLoader {
     }
 
     pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
+        // Pre-check whether the req_id has already been applied.
+        // When called internally, req_id is set to EMPTY_REQ_ID.
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+
+        // Idempotency: skip if this req_id was already applied
+        if fs_dir.store.is_duplicate_req(entry.req_id)? {
+            return Ok(());
+        }
+
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path.clone(), &fs_dir.store)?;
+        if inp.get_last_inode().is_none() {
+            // Path already gone — still mark req_id as applied and return Ok
+            fs_dir.store.mark_req_applied(entry.req_id)?;
+            return Ok(());
+        }
+
         fs_dir.unprotected_delete(&inp, entry.mtime)?;
+
+        // Persist req_id so future replays are skipped
+        fs_dir.store.mark_req_applied(entry.req_id)?;
         Ok(())
     }
 

@@ -340,6 +340,29 @@ impl ClusterConnector {
         }
     }
 
+    pub async fn proto_rpc_with_req_id<T, R, E>(
+        &self,
+        code: impl Into<i8>,
+        header: T,
+        req_id: i64,
+    ) -> Result<R, E>
+    where
+        T: PMessage + Default,
+        R: PMessage + Default,
+        E: ErrorExt + From<IOError> + From<CommonError>,
+    {
+        let msg = MessageBuilder::new_rpc_with_req_id(code.into(), req_id)
+            .proto_header(header)
+            .build();
+
+        let rep = self.rpc::<E>(msg).await?;
+
+        match rep.parse_header() {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn rpc_timeout(&self) -> Duration {
         self.rpc_timeout
     }

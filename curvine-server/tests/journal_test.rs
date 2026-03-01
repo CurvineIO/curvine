@@ -23,7 +23,7 @@ use curvine_server::master::fs::MasterFilesystem;
 use curvine_server::master::journal::{JournalLoader, JournalSystem};
 use curvine_server::master::{Master, MountManager};
 use log::info;
-use orpc::common::{Logger, TimeSpent};
+use orpc::common::{Logger, TimeSpent, Utils};
 use orpc::io::net::NetUtils;
 use orpc::{err_box, CommonResult};
 use std::collections::HashMap;
@@ -192,7 +192,7 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
     )?;
 
     // delete
-    fs_leader.delete("/journal_2", true)?;
+    fs_leader.delete("/journal_2", true, Utils::req_id())?;
 
     let path = "/journal/append.log";
     fs_leader.create(path, true)?;

@@ -18,7 +18,7 @@ use curvine_common::fs::Path;
 use curvine_common::state::{CreateFileOptsBuilder, MkdirOptsBuilder, StoragePolicy, TtlAction};
 use curvine_tests::Testing;
 use log::info;
-use orpc::common::{DurationUnit, LogConf, Logger};
+use orpc::common::{DurationUnit, LogConf, Logger, Utils};
 use orpc::runtime::RpcRuntime;
 use orpc::CommonResult;
 use std::sync::Arc;
@@ -115,7 +115,7 @@ async fn test_ttl_file_not_expired_before_time(
     info!("File correctly exists before TTL expiration");
 
     // Clean up manually for this test
-    let _ = fs.delete(&file_path, true).await;
+    let _ = fs.delete(&file_path, true, Utils::req_id()).await;
 
     Ok(())
 }

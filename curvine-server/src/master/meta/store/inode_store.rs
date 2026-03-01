@@ -20,6 +20,7 @@ use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
 use curvine_common::state::{BlockLocation, CommitBlock, FileLock, MountInfo};
 use orpc::common::{FileUtils, Utils};
+use orpc::message::EMPTY_REQ_ID;
 use orpc::{err_box, try_err, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
@@ -586,5 +587,22 @@ impl InodeStore {
 
     pub fn apply_set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
         self.store.set_locks(id, lock)
+    }
+
+    /// Returns true if the req_id has already been applied (idempotency check).
+    /// Returns false for EMPTY_REQ_ID (internal or non-client-originated operations).
+    pub fn is_duplicate_req(&self, req_id: i64) -> CommonResult<bool> {
+        if req_id == EMPTY_REQ_ID {
+            return Ok(false);
+        }
+        self.store.has_req_id(req_id)
+    }
+
+    /// Persists req_id to RocksDB if it is a client-originated request.
+    pub fn mark_req_applied(&self, req_id: i64) -> CommonResult<()> {
+        if req_id != EMPTY_REQ_ID {
+            self.store.set_req_id(req_id)?;
+        }
+        Ok(())
     }
 }

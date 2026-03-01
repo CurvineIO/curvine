@@ -145,7 +145,12 @@ impl FsDir {
     }
 
     // Delete files or directories
-    pub fn delete(&mut self, inp: &InodePath, recursive: bool) -> FsResult<DeleteResult> {
+    pub fn delete(
+        &mut self,
+        inp: &InodePath,
+        recursive: bool,
+        req_id: i64,
+    ) -> FsResult<DeleteResult> {
         let op_ms = LocalTime::mills();
 
         if inp.is_root() {
@@ -160,9 +165,18 @@ impl FsDir {
             return err_ext!(FsError::dir_not_empty(inp.path()));
         }
 
+        if self.store.is_duplicate_req(req_id)? {
+            // Already applied, so return a default result.
+            return Ok(DeleteResult::default());
+        }
+
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
+
+        // Also persist req_id on the master path
+        self.store.mark_req_applied(req_id)?;
+
         self.journal_writer
-            .log_delete(op_ms, inp.path(), op_ms as i64)?;
+            .log_delete(op_ms, inp.path(), op_ms as i64, req_id)?;
 
         Ok(del_res)
     }

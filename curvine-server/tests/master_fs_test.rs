@@ -22,6 +22,7 @@ use curvine_common::state::{
 };
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
+use curvine_server::master::journal::JournalLoader;
 use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
@@ -92,6 +93,102 @@ fn new_handler() -> MasterHandler {
         JobHandler::new(job_manager),
         replication_manager,
     )
+}
+
+#[test]
+fn test_delete_duplicate_journal_on_leader_crash_retry() -> CommonResult<()> {
+    Master::init_test_metrics();
+
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    let worker = WorkerInfo::default();
+
+    // node1 (initial leader)
+    conf.change_test_meta_dir("raft-delete-idem-1");
+    let js1 = JournalSystem::from_conf(&conf)?;
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    fs1.add_test_worker(worker.clone());
+
+    // node1: mkdir /data => capture MkdirEntry
+    fs1.mkdir("/data", false)?;
+    let mkdir_entries = js1.fs().fs_dir.read().take_entries();
+    assert_eq!(mkdir_entries.len(), 1, "Expected 1 mkdir entry from node1");
+    let mkdir_entry_from_node1 = mkdir_entries.into_iter().next().unwrap();
+
+    let shared_delete_req_id: i64 = Utils::req_id();
+
+    // node1: delete /data => capture DeleteEntry
+    fs1.delete("/data", false, shared_delete_req_id)?;
+    let delete_entries1 = js1.fs().fs_dir.read().take_entries();
+    assert_eq!(
+        delete_entries1.len(),
+        1,
+        "Expected 1 delete entry from node1"
+    );
+    let delete_entry_from_node1 = delete_entries1.into_iter().next().unwrap();
+
+    //  node2 (new leader after node1 crash)
+    // node2 received node1's mkdir but NOT node1's delete
+    conf.change_test_meta_dir("raft-delete-idem-2");
+    let js2 = JournalSystem::from_conf(&conf)?;
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    fs2.add_test_worker(worker.clone());
+    let mnt_mgr2 = js2.mount_manager();
+
+    let loader2 = JournalLoader::new(fs2.fs_dir(), mnt_mgr2.clone(), &conf.journal);
+    loader2.apply_entry(mkdir_entry_from_node1.clone())?;
+    println!("node2 state after receiving node1's mkdir:");
+    fs2.print_tree();
+
+    // node2 (new leader) receives client retry: delete("/data")
+    // node2 has no knowledge of node1's req_id => executes delete => produces new DeleteEntry
+    fs2.delete("/data", false, shared_delete_req_id)?;
+    let delete_entries2 = js2.fs().fs_dir.read().take_entries();
+    assert_eq!(
+        delete_entries2.len(),
+        1,
+        "Expected 1 delete entry from node2"
+    );
+    let delete_entry_from_node2 = delete_entries2.into_iter().next().unwrap();
+
+    println!("delete_entry_from_node1: {:?}", delete_entry_from_node1);
+    println!("delete_entry_from_node2: {:?}", delete_entry_from_node2);
+
+    //  node3 as a follower and applies both delete operations from node1 and node2
+    conf.change_test_meta_dir("raft-delete-idem-3");
+    let js3 = JournalSystem::from_conf(&conf)?;
+    let fs3 = MasterFilesystem::with_js(&conf, &js3);
+    fs3.add_test_worker(worker.clone());
+    let mnt_mgr3 = js3.mount_manager();
+    let loader3 = JournalLoader::new(fs3.fs_dir(), mnt_mgr3.clone(), &conf.journal);
+
+    // Step 1: node3 receives node1's mkdir (normal Raft replication from node1)
+    loader3.apply_entry(mkdir_entry_from_node1.clone())?;
+    println!("node3 after node1 mkdir replication — /data should exist");
+    fs3.print_tree();
+
+    // Step 2: node3 receives node1's delete (normal Raft replication from node1)
+    loader3.apply_entry(delete_entry_from_node1.clone())?;
+    println!("node3 after node1 delete replication — /data should be gone");
+    fs3.print_tree();
+
+    // Step 3: node3 receives node2's delete (client retry to new leader)
+    // BUG: /data is already gone on node3 => should skip.
+
+    let result = loader3.apply_entry(delete_entry_from_node2.clone());
+
+    // Without idempotency handling, it raises error.
+    println!("node2's delete apply result on node3: {:?}", result);
+
+    assert!(
+        result.is_ok(),
+        "BUG: duplicate delete entry not handled idempotently — got: {:?}",
+        result
+    );
+
+    Ok(())
 }
 
 #[test]
@@ -174,7 +271,7 @@ fn mkdir(fs: &MasterFilesystem) -> CommonResult<()> {
 }
 
 fn delete(fs: &MasterFilesystem) -> CommonResult<()> {
-    let res1 = fs.delete("/a", false);
+    let res1 = fs.delete("/a", false, Utils::req_id());
     assert!(res1.is_err());
 
     fs.mkdir("/a/b/c/d", true)?;
@@ -185,7 +282,7 @@ fn delete(fs: &MasterFilesystem) -> CommonResult<()> {
     assert!(fs.exists("/a/b/c")?);
     assert!(fs.exists("/a/b/c/d")?);
 
-    fs.delete("/a/b/c", true)?;
+    fs.delete("/a/b/c", true, Utils::req_id())?;
 
     // Verify deletion results
     assert!(!fs.exists("/a/b/c")?);
@@ -451,7 +548,7 @@ fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
     let nlink_t = fs.file_status("/a/d/file.log")?.nlink;
     assert_eq!(nlink_t, 3);
 
-    fs.delete("/a/b/file.log", true)?;
+    fs.delete("/a/b/file.log", true, Utils::req_id())?;
     assert!(!fs.exists("/a/b/file.log")?);
     assert!(fs.exists("/a/b/file2.log")?);
     assert!(fs.exists("/a/d/file.log")?);
@@ -482,7 +579,7 @@ fn state(fs: &MasterFilesystem) -> CommonResult<()> {
 
     fs.create("/a/rename/old.log", true)?;
     fs.rename("/a/rename/old.log", "/a/c/new.log", RenameFlags::empty())?;
-    fs.delete("/a/file/2.log", true)?;
+    fs.delete("/a/file/2.log", true, Utils::req_id())?;
 
     fs.print_tree();
     let fs_dir = fs.fs_dir.read();
