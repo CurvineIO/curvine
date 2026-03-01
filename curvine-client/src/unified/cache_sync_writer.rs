@@ -19,7 +19,6 @@ use tracing::warn;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileAllocOpts, FileStatus, LoadJobResult, OpenFlags, WriteType};
 use curvine_common::FsResult;
-use orpc::err_box;
 use orpc::sys::DataSlice;
 
 use crate::file::FsWriter;
@@ -43,12 +42,6 @@ impl CacheSyncWriter {
         flags: OpenFlags,
     ) -> FsResult<Self> {
         let write_type = mnt.info.write_type;
-        if !matches!(
-            write_type,
-            WriteType::AsyncThrough | WriteType::CacheThrough
-        ) {
-            return err_box!("write type must be either AsyncThrough or CacheThrough");
-        }
 
         let conf = &fs.conf().client;
         let opts = mnt.info.get_create_opts(conf);
@@ -68,7 +61,7 @@ impl CacheSyncWriter {
     pub async fn wait_job_complete(&self) -> FsResult<()> {
         if let Some(job_res) = &self.job_res {
             self.job_client
-                .wait_job_complete(&job_res.job_id, "cache-sync")
+                .wait_job_complete(&job_res.job_id, true)
                 .await
         } else {
             Ok(())
@@ -138,7 +131,7 @@ impl Writer for CacheSyncWriter {
             self.job_res.replace(job_res);
         }
 
-        if matches!(self.write_type, WriteType::CacheThrough) {
+        if matches!(self.write_type, WriteType::FsMode) {
             self.wait_job_complete().await?;
         }
 
