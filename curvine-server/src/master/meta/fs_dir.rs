@@ -166,6 +166,11 @@ impl FsDir {
             return err_ext!(FsError::dir_not_empty(inp.path()));
         }
 
+        if req_id != EMPTY_REQ_ID && self.store.has_req_id(req_id)? {
+            // Already applied, so return a default result.
+            return Ok(DeleteResult::default());
+        }
+
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
         self.journal_writer
             .log_delete(op_ms, inp.path(), op_ms as i64, req_id)?;
