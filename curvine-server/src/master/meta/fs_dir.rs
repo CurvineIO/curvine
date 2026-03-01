@@ -172,13 +172,15 @@ impl FsDir {
         }
 
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
-        self.journal_writer
-            .log_delete(op_ms, inp.path(), op_ms as i64, req_id)?;
 
         // Also persist req_id on the master path
         if req_id != EMPTY_REQ_ID {
             self.store.set_req_id(req_id)?;
         }
+
+        self.journal_writer
+            .log_delete(op_ms, inp.path(), op_ms as i64, req_id)?;
+
         Ok(del_res)
     }
 
