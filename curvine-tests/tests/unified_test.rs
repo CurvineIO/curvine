@@ -15,7 +15,7 @@
 use bytes::BytesMut;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{MountOptions, MountType, TtlAction};
+use curvine_common::state::{MountOptions, TtlAction};
 use curvine_common::FsResult;
 use curvine_tests::Testing;
 use orpc::common::{DurationUnit, Logger};
@@ -85,7 +85,6 @@ async fn mount(fs: &UnifiedFileSystem, s3_conf: Option<HashMap<String, String>>)
     let opts = opts_builder
         .ttl_ms(ttl_ms)
         .ttl_action(TtlAction::Delete)
-        .mount_type(MountType::Orch)
         .build();
 
     let ufs_path = "s3://curvine-test/xuen-test".into();

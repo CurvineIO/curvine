@@ -61,7 +61,7 @@
 
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{MountOptions, MountType, WriteType};
+use curvine_common::state::{MountOptions, WriteType};
 use curvine_tests::Testing;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
@@ -175,7 +175,6 @@ fn ufs_test() -> CommonResult<()> {
 async fn mount_storage(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonResult<()> {
     let opts = MountOptions::builder()
         .set_properties(config.properties.clone())
-        .mount_type(MountType::Orch)
         .write_type(WriteType::CacheMode)
         .build();
 
