@@ -29,6 +29,7 @@ use curvine_common::state::{
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{LocalTime, TimeSpent};
+use orpc::message::EMPTY_REQ_ID;
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::mem;
@@ -169,6 +170,10 @@ impl FsDir {
         self.journal_writer
             .log_delete(op_ms, inp.path(), op_ms as i64, req_id)?;
 
+        // Also persist req_id on the master path
+        if req_id != EMPTY_REQ_ID {
+            self.store.set_req_id(req_id)?;
+        }
         Ok(del_res)
     }
 

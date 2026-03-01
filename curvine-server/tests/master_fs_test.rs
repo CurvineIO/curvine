@@ -117,8 +117,10 @@ fn test_delete_duplicate_journal_on_leader_crash_retry() -> CommonResult<()> {
     assert_eq!(mkdir_entries.len(), 1, "Expected 1 mkdir entry from node1");
     let mkdir_entry_from_node1 = mkdir_entries.into_iter().next().unwrap();
 
+    let shared_delete_req_id: i64 = Utils::req_id();
+
     // node1: delete /data => capture DeleteEntry
-    fs1.delete("/data", false, Utils::req_id())?;
+    fs1.delete("/data", false, shared_delete_req_id)?;
     let delete_entries1 = js1.fs().fs_dir.read().take_entries();
     assert_eq!(
         delete_entries1.len(),
@@ -142,7 +144,7 @@ fn test_delete_duplicate_journal_on_leader_crash_retry() -> CommonResult<()> {
 
     // node2 (new leader) receives client retry: delete("/data")
     // node2 has no knowledge of node1's req_id => executes delete => produces new DeleteEntry
-    fs2.delete("/data", false, Utils::req_id())?;
+    fs2.delete("/data", false, shared_delete_req_id)?;
     let delete_entries2 = js2.fs().fs_dir.read().take_entries();
     assert_eq!(
         delete_entries2.len(),
