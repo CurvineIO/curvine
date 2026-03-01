@@ -159,13 +159,15 @@ impl FsClient {
         Ok(rep_header.exists)
     }
 
-    pub async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+    pub async fn delete(&self, path: &Path, recursive: bool, req_id: i64) -> FsResult<()> {
         let header = DeleteRequest {
             path: path.encode(),
             recursive,
         };
 
-        let _: DeleteResponse = self.rpc(RpcCode::Delete, header).await?;
+        let _: DeleteResponse = self
+            .rpc_with_req_id(RpcCode::Delete, header, req_id)
+            .await?;
         Ok(())
     }
 
@@ -511,6 +513,16 @@ impl FsClient {
     {
         self.connector
             .proto_rpc::<T, R, FsError>(code, header)
+            .await
+    }
+
+    pub async fn rpc_with_req_id<T, R>(&self, code: RpcCode, header: T, req_id: i64) -> FsResult<R>
+    where
+        T: PMessage + Default,
+        R: PMessage + Default,
+    {
+        self.connector
+            .proto_rpc_with_req_id::<T, R, FsError>(code, header, req_id)
             .await
     }
 
