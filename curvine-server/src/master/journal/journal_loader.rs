@@ -26,7 +26,6 @@ use curvine_common::state::RenameFlags;
 use curvine_common::utils::SerdeUtils;
 use log::{debug, error, info, warn};
 use orpc::common::FileUtils;
-use orpc::message::EMPTY_REQ_ID;
 use orpc::sync::AtomicCounter;
 use orpc::{err_box, try_option, try_option_ref, CommonResult};
 use std::path::Path;
@@ -182,25 +181,21 @@ impl JournalLoader {
         let mut fs_dir = self.fs_dir.write();
 
         // Idempotency: skip if this req_id was already applied
-        if entry.req_id != EMPTY_REQ_ID && fs_dir.store.has_req_id(entry.req_id)? {
+        if fs_dir.store.is_duplicate_req(entry.req_id)? {
             return Ok(());
         }
 
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path.clone(), &fs_dir.store)?;
         if inp.get_last_inode().is_none() {
             // Path already gone — still mark req_id as applied and return Ok
-            if entry.req_id != EMPTY_REQ_ID {
-                fs_dir.store.set_req_id(entry.req_id)?;
-            }
+            fs_dir.store.mark_req_applied(entry.req_id)?;
             return Ok(());
         }
 
         fs_dir.unprotected_delete(&inp, entry.mtime)?;
 
         // Persist req_id so future replays are skipped
-        if entry.req_id != EMPTY_REQ_ID {
-            fs_dir.store.set_req_id(entry.req_id)?;
-        }
+        fs_dir.store.mark_req_applied(entry.req_id)?;
         Ok(())
     }
 

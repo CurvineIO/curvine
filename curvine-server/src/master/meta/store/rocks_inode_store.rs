@@ -17,6 +17,7 @@ use crate::master::meta::LockMeta;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
 use curvine_common::state::{BlockLocation, FileLock, MountInfo};
 use curvine_common::utils::SerdeUtils as Serde;
+use orpc::message::EMPTY_REQ_ID;
 use orpc::CommonResult;
 use rocksdb::{DBIteratorWithThreadMode, WriteBatchWithTransaction, DB};
 
@@ -221,6 +222,23 @@ impl RocksInodeStore {
     pub fn set_req_id(&self, req_id: i64) -> CommonResult<()> {
         let key = RocksUtils::u8_i64_to_bytes(Self::PREFIX_REQ_ID, req_id);
         self.db.put_cf(Self::CF_COMMON, key, Self::REQ_ID_APPLIED)
+    }
+
+    /// Returns true if the req_id has already been applied (idempotency check).
+    /// Returns false for EMPTY_REQ_ID (internal or non-client-originated operations).
+    pub fn is_duplicate_req(&self, req_id: i64) -> CommonResult<bool> {
+        if req_id == EMPTY_REQ_ID {
+            return Ok(false);
+        }
+        self.has_req_id(req_id)
+    }
+
+    /// Persists req_id to RocksDB if it is a client-originated request.
+    pub fn mark_req_applied(&self, req_id: i64) -> CommonResult<()> {
+        if req_id != EMPTY_REQ_ID {
+            self.set_req_id(req_id)?;
+        }
+        Ok(())
     }
 }
 
