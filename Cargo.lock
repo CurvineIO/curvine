@@ -1104,6 +1104,7 @@ dependencies = [
  "crossbeam",
  "dashmap",
  "flate2",
+ "hmac",
  "hyper 1.7.0",
  "indexmap 2.11.0",
  "linked-hash-map",

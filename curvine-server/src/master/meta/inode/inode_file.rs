@@ -390,7 +390,11 @@ impl InodeFile {
     }
 
     fn bump_version_epoch(&mut self) {
-        self.version_epoch = self.version_epoch.max(1).saturating_add(1);
+        self.version_epoch = if self.version_epoch <= 0 {
+            1
+        } else {
+            self.version_epoch.saturating_add(1)
+        };
     }
 
     /// Extend the file to the specified length by allocating new blocks or extending existing ones.
@@ -513,5 +517,25 @@ impl Inode for InodeFile {
 impl PartialEq for InodeFile {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InodeFile;
+
+    #[test]
+    fn bump_version_epoch_should_increment_normal_epoch() {
+        let mut inode = InodeFile::new(1, 1);
+        inode.bump_version_epoch();
+        assert_eq!(inode.version_epoch, 2);
+    }
+
+    #[test]
+    fn bump_version_epoch_should_recover_legacy_zero_epoch() {
+        let mut inode = InodeFile::new(1, 1);
+        inode.version_epoch = 0;
+        inode.bump_version_epoch();
+        assert_eq!(inode.version_epoch, 1);
     }
 }

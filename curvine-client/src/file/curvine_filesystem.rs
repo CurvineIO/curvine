@@ -351,12 +351,9 @@ impl CurvineFileSystem {
 
         let (version, peer_whitelist, tenant_whitelist, signature) =
             self.fs_client.get_p2p_runtime_policy().await?;
-        if !p2p_service
+        let _ = p2p_service
             .sync_runtime_policy_from_master(version, peer_whitelist, tenant_whitelist, signature)
-            .await
-        {
-            return err_box!("failed to apply p2p runtime policy from master");
-        }
+            .await;
         Ok(())
     }
 

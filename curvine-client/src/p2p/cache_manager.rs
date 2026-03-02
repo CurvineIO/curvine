@@ -186,9 +186,10 @@ impl CacheManager {
         let (path, stored_len, mtime, entry_checksum) = match self.entries.get_mut(&chunk_id) {
             Some(mut entry) => {
                 if entry.expire_at_ms <= now_ms {
-                    self.expired_chunks.fetch_add(1, Ordering::Relaxed);
                     drop(entry);
-                    self.invalidate(chunk_id);
+                    if self.invalidate(chunk_id) {
+                        self.expired_chunks.fetch_add(1, Ordering::Relaxed);
+                    }
                     return CacheGetResult {
                         tag: CacheGetResultTag::Miss,
                         chunk: None,
@@ -280,10 +281,15 @@ impl CacheManager {
             .filter_map(|v| (v.value().expire_at_ms <= now_ms).then_some(*v.key()))
             .collect();
         if !expired.is_empty() {
-            self.expired_chunks
-                .fetch_add(expired.len() as u64, Ordering::Relaxed);
+            let mut newly_expired = 0u64;
             for chunk_id in expired {
-                self.invalidate(chunk_id);
+                if self.invalidate(chunk_id) {
+                    newly_expired += 1;
+                }
+            }
+            if newly_expired > 0 {
+                self.expired_chunks
+                    .fetch_add(newly_expired, Ordering::Relaxed);
             }
         }
     }
@@ -310,12 +316,14 @@ impl CacheManager {
         }
     }
 
-    fn invalidate(&self, chunk_id: ChunkId) {
+    fn invalidate(&self, chunk_id: ChunkId) -> bool {
         if let Some((_, entry)) = self.entries.remove(&chunk_id) {
             self.usage_bytes.fetch_sub(entry.len, Ordering::Relaxed);
             self.invalidations.fetch_add(1, Ordering::Relaxed);
             let _ = fs::remove_file(entry.path);
+            return true;
         }
+        false
     }
 
     fn evict_until_fit(&self) {

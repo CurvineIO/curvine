@@ -12,12 +12,15 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use hmac::{Hmac, Mac};
 use log::info;
 use orpc::common::Utils;
 use orpc::{err_msg, CommonResult};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
+
+type PolicyHmac = Hmac<Sha256>;
 
 pub struct CommonUtils;
 
@@ -67,18 +70,19 @@ impl CommonUtils {
         if secret.trim().is_empty() {
             return String::new();
         }
-        let mut hasher = Sha256::new();
-        Self::update_signing_segment(&mut hasher, secret);
-        Self::update_signing_segment(&mut hasher, &version.to_string());
-        Self::update_signing_segment(&mut hasher, &peer_whitelist.len().to_string());
+        let Ok(mut mac) = PolicyHmac::new_from_slice(secret.as_bytes()) else {
+            return String::new();
+        };
+        Self::update_signing_segment(&mut mac, &version.to_string());
+        Self::update_signing_segment(&mut mac, &peer_whitelist.len().to_string());
         for peer in peer_whitelist {
-            Self::update_signing_segment(&mut hasher, peer);
+            Self::update_signing_segment(&mut mac, peer);
         }
-        Self::update_signing_segment(&mut hasher, &tenant_whitelist.len().to_string());
+        Self::update_signing_segment(&mut mac, &tenant_whitelist.len().to_string());
         for tenant in tenant_whitelist {
-            Self::update_signing_segment(&mut hasher, tenant);
+            Self::update_signing_segment(&mut mac, tenant);
         }
-        let digest = hasher.finalize();
+        let digest = mac.finalize().into_bytes();
         digest.iter().map(|v| format!("{:02x}", v)).collect()
     }
 
@@ -121,17 +125,48 @@ impl CommonUtils {
             })
     }
 
-    fn update_signing_segment(hasher: &mut Sha256, value: &str) {
-        hasher.update(value.len().to_string().as_bytes());
-        hasher.update(b":");
-        hasher.update(value.as_bytes());
-        hasher.update(b"\n");
+    fn update_signing_segment(mac: &mut PolicyHmac, value: &str) {
+        mac.update(value.len().to_string().as_bytes());
+        mac.update(b":");
+        mac.update(value.as_bytes());
+        mac.update(b"\n");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::CommonUtils;
+    use sha2::{Digest, Sha256};
+
+    fn legacy_prefix_signature(
+        secret: &str,
+        version: u64,
+        peer_whitelist: &[String],
+        tenant_whitelist: &[String],
+    ) -> String {
+        fn update_segment(hasher: &mut Sha256, value: &str) {
+            hasher.update(value.len().to_string().as_bytes());
+            hasher.update(b":");
+            hasher.update(value.as_bytes());
+            hasher.update(b"\n");
+        }
+        let mut hasher = Sha256::new();
+        update_segment(&mut hasher, secret);
+        update_segment(&mut hasher, &version.to_string());
+        update_segment(&mut hasher, &peer_whitelist.len().to_string());
+        for peer in peer_whitelist {
+            update_segment(&mut hasher, peer);
+        }
+        update_segment(&mut hasher, &tenant_whitelist.len().to_string());
+        for tenant in tenant_whitelist {
+            update_segment(&mut hasher, tenant);
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|v| format!("{:02x}", v))
+            .collect()
+    }
 
     #[test]
     fn p2p_policy_signature_roundtrip() {
@@ -168,5 +203,14 @@ mod tests {
             &tenants,
             &signatures
         ));
+    }
+
+    #[test]
+    fn p2p_policy_signature_should_not_use_legacy_prefix_hash() {
+        let peers = vec!["peer-a".to_string()];
+        let tenants = vec!["tenant-a".to_string(), "tenant-b".to_string()];
+        let hmac_signature = CommonUtils::sign_p2p_policy("secret", 7, &peers, &tenants);
+        let legacy_signature = legacy_prefix_signature("secret", 7, &peers, &tenants);
+        assert_ne!(hmac_signature, legacy_signature);
     }
 }

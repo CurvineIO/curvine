@@ -121,8 +121,7 @@ impl FsContext {
             .eviction_policy(EvictionPolicy::lru())
             .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
 
-        let read_chunk_flights =
-            FastDashMap::with_capacity(conf.client.read_chunk_cache_capacity.min(65536) as usize);
+        let read_chunk_flights = FastDashMap::default();
 
         let p2p_service = if conf.client.p2p.enable {
             let service = Arc::new(P2pService::new_with_runtime(

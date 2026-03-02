@@ -113,6 +113,13 @@ impl ClientP2pConf {
             )
             .into());
         }
+        if self.provider_ttl.is_zero() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.provider_ttl must be greater than 0",
+            )
+            .into());
+        }
         if self.max_inflight_per_peer > 0 && self.min_inflight_per_peer > self.max_inflight_per_peer
         {
             return Err(Error::new(
@@ -648,6 +655,16 @@ mod tests {
     fn client_p2p_conf_rejects_zero_cache_ttl() {
         let mut conf = ClientP2pConf {
             cache_ttl_str: "0s".to_string(),
+            ..ClientP2pConf::default()
+        };
+        assert!(conf.init().is_err());
+    }
+
+    #[test]
+    fn client_p2p_conf_rejects_zero_provider_ttl() {
+        let mut conf = ClientP2pConf {
+            provider_ttl_str: "0s".to_string(),
+            provider_publish_interval_str: "1s".to_string(),
             ..ClientP2pConf::default()
         };
         assert!(conf.init().is_err());

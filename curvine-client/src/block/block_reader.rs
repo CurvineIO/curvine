@@ -28,7 +28,9 @@ use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::time::timeout;
 
 enum ReaderAdapter {
     Local(BlockReaderLocal),
@@ -303,7 +305,10 @@ impl BlockReader {
             return None;
         }
         let lock = self.fs_context.read_chunk_flight_lock(read_key.clone());
-        let guard = lock.clone().lock_owned().await;
+        let timeout_ms = self.fs_context.conf.client.p2p.transfer_timeout_ms.max(1);
+        let guard = timeout(Duration::from_millis(timeout_ms), lock.clone().lock_owned())
+            .await
+            .ok()?;
         Some((lock, guard))
     }
 
