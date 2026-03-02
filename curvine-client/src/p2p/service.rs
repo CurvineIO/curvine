@@ -2524,11 +2524,6 @@ fn provider_cache_ttl(conf: &ClientP2pConf) -> Duration {
     )
 }
 
-#[cfg(test)]
-fn negative_provider_cache_ttl(conf: &ClientP2pConf) -> Duration {
-    discovery_timeout(conf)
-}
-
 fn discovery_timeout(conf: &ClientP2pConf) -> Duration {
     Duration::from_millis(conf.discovery_timeout_ms.max(1))
 }
