@@ -28,8 +28,8 @@ pub enum BlockState {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BlockMeta {
     pub(crate) id: i64,
-    pub(crate) len: i64,
-    pub(crate) replicas: u16,
+    pub(crate) len: u32,
+    pub(crate) replicas: u8,
     // The pre-assigned worker id is required when deleting.
     pub(crate) locs: Option<Vec<BlockLocation>>,
     pub(crate) alloc_opts: Option<FileAllocOpts>,
@@ -39,7 +39,7 @@ impl BlockMeta {
     pub fn new(id: i64, len: i64) -> Self {
         Self {
             id,
-            len,
+            len: len as u32,
             replicas: 1,
             locs: None,
             alloc_opts: None,
@@ -64,7 +64,7 @@ impl BlockMeta {
     pub fn with_alloc(id: i64, alloc_opts: FileAllocOpts) -> Self {
         Self {
             id,
-            len: alloc_opts.len,
+            len: alloc_opts.len as u32,
             replicas: 0,
             locs: None,
             alloc_opts: Some(alloc_opts),
@@ -72,7 +72,7 @@ impl BlockMeta {
     }
 
     pub fn len(&self) -> i64 {
-        self.len
+        self.len as i64
     }
 
     pub fn is_empty(&self) -> bool {
@@ -80,7 +80,7 @@ impl BlockMeta {
     }
 
     pub fn commit(&mut self, commit: &CommitBlock) {
-        self.len = self.len.max(commit.block_len);
+        self.len = (self.len as i64).max(commit.block_len) as u32;
         let _ = self.locs.take();
         let _ = self.alloc_opts.take();
     }

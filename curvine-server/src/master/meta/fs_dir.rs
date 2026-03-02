@@ -991,7 +991,7 @@ impl FsDir {
         let res = block.assign_worker(workers);
         let block = ExtendedBlock {
             id: block.id,
-            len: block.len,
+            len: block.len as i64,
             alloc_opts: block.alloc_opts.clone(),
             storage_type: file.storage_policy.storage_type,
             file_type: file.file_type,
