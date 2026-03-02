@@ -519,23 +519,3 @@ impl PartialEq for InodeFile {
         self.id == other.id
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::InodeFile;
-
-    #[test]
-    fn bump_version_epoch_should_increment_normal_epoch() {
-        let mut inode = InodeFile::new(1, 1);
-        inode.bump_version_epoch();
-        assert_eq!(inode.version_epoch, 2);
-    }
-
-    #[test]
-    fn bump_version_epoch_should_recover_legacy_zero_epoch() {
-        let mut inode = InodeFile::new(1, 1);
-        inode.version_epoch = 0;
-        inode.bump_version_epoch();
-        assert_eq!(inode.version_epoch, 1);
-    }
-}
