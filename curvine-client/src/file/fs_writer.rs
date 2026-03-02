@@ -69,6 +69,10 @@ impl FsWriter {
     pub fn append(fs_context: Arc<FsContext>, path: Path, file_blocks: FileBlocks) -> Self {
         Self::new(fs_context, path, file_blocks, true)
     }
+
+    pub fn file_blocks(&self) -> &FileBlocks {
+        self.inner.file_blocks()
+    }
 }
 
 impl Writer for FsWriter {

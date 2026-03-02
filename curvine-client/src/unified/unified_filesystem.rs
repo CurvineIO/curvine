@@ -19,7 +19,7 @@ use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path};
+use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{
     CreateFileOpts, FileAllocOpts, FileLock, FileStatus, JobStatus, LoadJobCommand, LoadJobResult,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
@@ -306,16 +306,80 @@ impl UnifiedFileSystem {
         self.enable_unified = false
     }
 
+    pub async fn copy_ufs_file(
+        &self,
+        path: &Path,
+        mnt: &MountValue,
+        opts: CreateFileOpts,
+        cv_len: i64,
+    ) -> FsResult<()> {
+        let ufs_path = mnt.get_ufs_path(path)?;
+        let mut reader = mnt.ufs.open(&ufs_path).await?;
+        if reader.len() != cv_len {
+            return err_box!(
+                "file length mismatch: cv_path={:?}, ufs_path={:?}, ufs_len={}, cv_len={}",
+                path,
+                ufs_path,
+                reader.len(),
+                cv_len
+            );
+        }
+
+        let flags = OpenFlags::new_create().set_overwrite(true);
+        let mut writer = self.cv.open_with_opts(path, opts, flags).await?;
+
+        loop {
+            let data = reader.async_read(None).await?;
+            if data.is_empty() {
+                break;
+            }
+            writer.async_write(data).await?;
+        }
+        reader.complete().await?;
+        writer.complete().await?;
+
+        Ok(())
+    }
+
+    pub async fn open_for_write(&self, path: &Path) -> FsResult<UnifiedWriter> {
+        let opts = self.cv().create_opts_builder().create_parent(true).build();
+        let flags = OpenFlags::new_write_only().set_create(true);
+        self.open_with_opts(path, opts, flags).await
+    }
+
     pub async fn open_with_opts(
         &self,
         path: &Path,
         opts: CreateFileOpts,
         flags: OpenFlags,
     ) -> FsResult<UnifiedWriter> {
-        match self.get_mount_checked(path).await? {
+        match self.get_mount(path).await? {
             None => {
                 let writer = self.cv.open_with_opts(path, opts, flags).await?;
                 Ok(UnifiedWriter::Cv(writer))
+            }
+
+            Some((_, mount)) if mount.info.is_fs_mode() => {
+                let mut writer = self.cv.open_with_opts(path, opts.clone(), flags).await?;
+                if writer.file_blocks().cv_exists()
+                    || flags.overwrite()
+                    || !writer.status().ufs_exists()
+                {
+                    Ok(UnifiedWriter::Cv(writer))
+                } else {
+                    writer.complete().await?;
+
+                    info!(
+                        "copying data from UFS to CV, path={}, len={}",
+                        path,
+                        writer.status().len
+                    );
+                    self.copy_ufs_file(path, &mount, opts.clone(), writer.status().len)
+                        .await?;
+
+                    let writer = self.cv.open_with_opts(path, opts, flags).await?;
+                    Ok(UnifiedWriter::Cv(writer))
+                }
             }
 
             Some((ufs_path, mount)) => {
@@ -412,10 +476,9 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn append(&self, path: &Path) -> FsResult<UnifiedWriter> {
-        match self.get_mount_checked(path).await? {
-            None => Ok(UnifiedWriter::Cv(self.cv.append(path).await?)),
-            Some((ufs_path, mount)) => mount.ufs.append(&ufs_path).await,
-        }
+        let flags = OpenFlags::new_append().set_create(true);
+        let opts = self.cv.create_opts_builder().build();
+        self.open_with_opts(path, opts, flags).await
     }
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {

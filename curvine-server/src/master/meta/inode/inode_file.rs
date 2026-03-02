@@ -163,7 +163,11 @@ impl InodeFile {
     }
 
     pub fn compute_len(&self) -> i64 {
-        self.blocks.iter().map(|x| x.len as i64).sum()
+        if self.cv_exists() {
+            self.blocks.iter().map(|x| x.len as i64).sum()
+        } else {
+            self.len
+        }
     }
 
     pub fn commit_len(&self, last: Option<&CommitBlock>) -> i64 {
@@ -504,6 +508,10 @@ impl InodeFile {
 
     pub fn ufs_exists(&self) -> bool {
         self.storage_policy.ufs_mtime > 0
+    }
+
+    pub fn cv_exists(&self) -> bool {
+        self.len > 0 && !self.blocks.is_empty()
     }
 }
 
