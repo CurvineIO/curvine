@@ -168,10 +168,19 @@ impl UnifiedFileSystem {
         self.cv.clone_runtime()
     }
 
-    // If the path lies outside the mount point, the operation behaves as a full delete.
-    // If it's within the mount point, only the associated cache files will be removed. (ufs will be ignored)
-    pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<()> {
-        self.cv.delete(path, recursive).await
+    pub async fn free(&self, path: &Path) -> FsResult<()> {
+        match self.get_mount(path).await? {
+            None => err_box!(
+                "the current file is not mounted to ufs, so the `free` command cannot be executed."
+            ),
+            Some((_, mnt)) => {
+                if mnt.info.is_fs_mode() {
+                    self.cv.free(path).await
+                } else {
+                    self.cv.delete(path, false).await
+                }
+            }
+        }
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {

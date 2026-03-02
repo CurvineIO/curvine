@@ -78,6 +78,8 @@ impl JournalLoader {
 
             JournalEntry::Delete(e) => self.delete(e),
 
+            JournalEntry::Free(e) => self.free(e),
+
             JournalEntry::ReopenFile(e) => self.reopen_file(e),
 
             JournalEntry::Mount(e) => self.mount(e),
@@ -187,6 +189,13 @@ impl JournalLoader {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
         fs_dir.unprotected_delete(&inp, entry.mtime)?;
+        Ok(())
+    }
+
+    pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+        fs_dir.unprotected_free(&inp, entry.mtime)?;
         Ok(())
     }
 

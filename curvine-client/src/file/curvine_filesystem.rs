@@ -189,6 +189,10 @@ impl CurvineFileSystem {
         self.fs_client.delete(path, recursive).await
     }
 
+    pub async fn free(&self, path: &Path) -> FsResult<()> {
+        self.fs_client.free(path).await
+    }
+
     pub async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
         self.fs_client.file_status(path).await
     }

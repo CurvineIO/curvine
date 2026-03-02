@@ -134,6 +134,15 @@ impl InodeStore {
         Ok(del_res)
     }
 
+    pub fn apply_free(&self, inodes: &[&InodeView]) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+        for inode in inodes {
+            batch.write_inode(inode)?;
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
     pub fn apply_rename(
         &self,
         src_parent: &InodeView,
@@ -356,16 +365,7 @@ impl InodeStore {
                         batch.delete_inode(inode_id)?;
 
                         // Collect block info
-                        for meta in &file.blocks {
-                            if let Some(locs) = &meta.locs {
-                                del_res.blocks.insert(meta.id, locs.clone());
-                            } else {
-                                let locs = self.store.get_locations(meta.id)?;
-                                if !locs.is_empty() {
-                                    del_res.blocks.insert(meta.id, locs);
-                                }
-                            }
-                        }
+                        del_res.blocks.extend(file.get_locs(self)?);
 
                         // Remove from TTL
                         if let Err(e) = self.ttl_bucket_list.remove_inode(inode_id as u64) {

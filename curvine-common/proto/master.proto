@@ -89,6 +89,12 @@ message DeleteRequest {
 
 message DeleteResponse {}
 
+message FreeRequest {
+    required string path = 1;
+}
+
+message FreeResponse {}
+
 message GetFileStatusRequest {
     required string path = 1;
 }
