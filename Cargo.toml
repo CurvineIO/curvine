@@ -30,7 +30,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 orpc = { path = "orpc" }
-curvine-common = { path = "curvine-common" }
+curvine-common = { path = "curvine-common", default-features = false }
 curvine-client = { path = "curvine-client" }
 curvine-libsdk = { path = "curvine-libsdk" }
 curvine-server = { path = "curvine-server" }

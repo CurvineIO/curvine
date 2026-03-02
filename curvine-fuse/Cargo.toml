@@ -7,8 +7,8 @@ license.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-orpc = { workspace = true}
-curvine-common = { workspace = true }
+orpc = { workspace = true }
+curvine-common = { workspace = true, default-features = false }
 curvine-client = { workspace = true }
 log = { workspace = true }
 clap = { workspace = true }
@@ -37,6 +37,10 @@ serde = { workspace = true }
 default = ["fuse3"]
 fuse2 = []
 fuse3 = []
+# Enable static linking support:
+# - Skips pkg-config FUSE library check in build.rs
+# - Enables file-based user/group lookup instead of NSS in orpc
+static = ["orpc/static"]
 
 [build-dependencies]
 bindgen = { workspace = true }

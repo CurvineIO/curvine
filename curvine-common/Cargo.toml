@@ -11,7 +11,7 @@ orpc = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 log = { workspace = true }
-raft = { workspace = true }
+raft = { workspace = true, optional = true }
 prost = { workspace = true }
 prost-build = { workspace = true }
 serde = { workspace = true }
@@ -28,7 +28,7 @@ percent-encoding = "2.3"
 bincode = { workspace = true }
 thiserror = { workspace = true }
 crc32fast = { workspace = true }
-rocksdb = { workspace = true }
+rocksdb = { workspace = true, optional = true }
 byteorder = { workspace = true }
 flate2 = { workspace = true }
 dashmap = { workspace = true }
@@ -46,7 +46,8 @@ tracing = { workspace = true }
 bitflags = { workspace = true }
 
 [features]
-default = []
+default = ["raft"]
+raft = ["dep:raft", "dep:rocksdb"]
 
 [build-dependencies]
 prost-build = { workspace = true }

@@ -43,3 +43,9 @@ tracing-log = { workspace = true }
 fxhash = { workspace = true }
 moka = { workspace = true }
 md-5 = { workspace = true }
+
+[features]
+default = []
+# Use direct file parsing instead of NSS for user/group lookups.
+# Required for static linking with glibc to avoid NSS dynamic loading issues.
+static = []

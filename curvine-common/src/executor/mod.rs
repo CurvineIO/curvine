@@ -15,5 +15,7 @@
 mod scheduled_executor;
 pub use self::scheduled_executor::ScheduledExecutor;
 
+#[cfg(feature = "raft")]
 mod event_loop;
+#[cfg(feature = "raft")]
 pub use self::event_loop::EventLoop;
