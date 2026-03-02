@@ -69,6 +69,7 @@ pub enum RpcCode {
     ReportUnderReplicatedBlocks = 45,
 
     MetricsReport = 60,
+    GetP2pPolicy = 61,
 
     // block interface.
     WriteBlock = 80,

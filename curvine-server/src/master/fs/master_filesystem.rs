@@ -23,6 +23,7 @@ use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
 use curvine_common::state::*;
+use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use log::warn;
 use orpc::sync::ArcRwLock;
@@ -595,7 +596,28 @@ impl MasterFilesystem {
             info.lost_workers.push(worker.clone());
         }
 
+        info.p2p_policy_version = self.conf.p2p_policy_version;
+        info.p2p_peer_whitelist = self.conf.p2p_peer_whitelist.clone();
+        info.p2p_tenant_whitelist = self.conf.p2p_tenant_whitelist.clone();
+
         Ok(info)
+    }
+
+    pub fn p2p_runtime_policy(&self) -> (u64, Vec<String>, Vec<String>, String) {
+        let version = self.conf.p2p_policy_version;
+        let peers = self.conf.p2p_peer_whitelist.clone();
+        let tenants = self.conf.p2p_tenant_whitelist.clone();
+        let mut signatures = Vec::with_capacity(2);
+        for key in [
+            &self.conf.p2p_policy_signing_key,
+            &self.conf.p2p_policy_transition_signing_key,
+        ] {
+            let signature = CommonUtils::sign_p2p_policy(key, version, &peers, &tenants);
+            if !signature.is_empty() && !signatures.iter().any(|existing| existing == &signature) {
+                signatures.push(signature);
+            }
+        }
+        (version, peers, tenants, signatures.join(","))
     }
 
     pub fn fs_dir(&self) -> ArcRwLock<FsDir> {

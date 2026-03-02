@@ -22,6 +22,7 @@ use linked_hash_map::LinkedHashMap;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
 use orpc::{err_box, try_option_mut};
+use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::mem;
 use std::sync::Arc;
@@ -32,6 +33,8 @@ pub struct FsReaderBase {
     file_blocks: SearchFileBlocks,
     pos: i64,
     len: i64,
+    tenant_id: Option<String>,
+    job_id: Option<String>,
 
     // The block that is currently being read
     cur_reader: Option<BlockReader>,
@@ -44,6 +47,11 @@ pub struct FsReaderBase {
 impl FsReaderBase {
     pub fn new(path: Path, fs_context: Arc<FsContext>, file_blocks: FileBlocks) -> Self {
         let len = file_blocks.status.len;
+        let tenant_id = Self::extract_read_label(
+            &file_blocks.status.x_attr,
+            &["tenant_id", "tenantId", "tenant"],
+        );
+        let job_id = Self::extract_read_label(&file_blocks.status.x_attr, &["job_id", "jobId"]);
         let cache_limit = fs_context.conf.client.max_cache_block_handles;
 
         let cache_readers = LinkedHashMap::with_capacity_and_hasher(
@@ -56,10 +64,26 @@ impl FsReaderBase {
             file_blocks: SearchFileBlocks::new(file_blocks),
             pos: 0,
             len,
+            tenant_id,
+            job_id,
             cur_reader: None,
             cache_limit,
             cache_readers,
         }
+    }
+
+    fn extract_read_label(attrs: &HashMap<String, Vec<u8>>, keys: &[&str]) -> Option<String> {
+        for key in keys {
+            if let Some(value) = attrs.get(*key) {
+                if let Ok(text) = std::str::from_utf8(value) {
+                    let value = text.trim();
+                    if !value.is_empty() {
+                        return Some(value.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn disable_cache_handles(&mut self) {
@@ -193,7 +217,17 @@ impl FsReaderBase {
 
                     None => {
                         // Create a new block reader
-                        BlockReader::new(self.fs_context.clone(), loc.clone(), block_off).await?
+                        BlockReader::new(
+                            self.fs_context.clone(),
+                            loc.clone(),
+                            block_off,
+                            self.file_blocks.status.id,
+                            self.file_blocks.status.version_epoch,
+                            self.file_blocks.status.mtime,
+                            self.tenant_id.clone(),
+                            self.job_id.clone(),
+                        )
+                        .await?
                     }
                 };
                 self.update_reader(Some(new_reader), false).await?;

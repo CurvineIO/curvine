@@ -388,6 +388,18 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    pub fn get_p2p_policy(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let _: GetP2pPolicyRequest = ctx.parse_header()?;
+        let (version, peer_whitelist, tenant_whitelist, signature) = self.fs.p2p_runtime_policy();
+        let rep_header = GetP2pPolicyResponse {
+            p2p_policy_version: version,
+            p2p_peer_whitelist: peer_whitelist,
+            p2p_tenant_whitelist: tenant_whitelist,
+            p2p_policy_signature: (!signature.is_empty()).then_some(signature),
+        };
+        ctx.response(rep_header)
+    }
+
     pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
         let mut wm = self.fs.worker_manager.write();
@@ -639,6 +651,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),
             RpcCode::WorkerBlockReport => self.block_report(ctx),
             RpcCode::GetMasterInfo => self.get_master_info(ctx),
+            RpcCode::GetP2pPolicy => self.get_p2p_policy(ctx),
 
             // Load task related requests
             RpcCode::SubmitJob

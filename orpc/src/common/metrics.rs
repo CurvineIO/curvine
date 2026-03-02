@@ -187,10 +187,38 @@ impl Metrics {
         }
     }
 
+    pub fn try_into_counter(self) -> CommonResult<Counter> {
+        match self {
+            Metrics::Counter(v) => Ok(v),
+            _ => err_box!("Not Counter"),
+        }
+    }
+
+    pub fn try_into_gauge(self) -> CommonResult<Gauge> {
+        match self {
+            Metrics::Gauge(v) => Ok(v),
+            _ => err_box!("Not Gauge"),
+        }
+    }
+
+    pub fn try_into_gauge_vec(self) -> CommonResult<GaugeVec> {
+        match self {
+            Metrics::GaugeVec(v) => Ok(v),
+            _ => err_box!("Not GaugeVec"),
+        }
+    }
+
     pub fn try_into_histogram_vec(self) -> CommonResult<HistogramVec> {
         match self {
             Metrics::HistogramVec(v) => Ok(v),
             _ => err_box!("Not HistogramVec"),
+        }
+    }
+
+    pub fn try_into_histogram(self) -> CommonResult<Histogram> {
+        match self {
+            Metrics::Histogram(v) => Ok(v),
+            _ => err_box!("Not Histogram"),
         }
     }
 }

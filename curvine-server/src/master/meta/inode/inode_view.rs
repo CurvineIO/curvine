@@ -388,6 +388,7 @@ impl InodeView {
         let acl = self.acl();
         let mut status = FileStatus {
             id: self.id(),
+            version_epoch: 1,
             path: path.to_owned(),
             name: self.name().to_owned(),
             is_dir: self.is_dir(),
@@ -410,6 +411,7 @@ impl InodeView {
 
         match self {
             File(_, f) => {
+                status.version_epoch = f.version_epoch;
                 status.is_complete = f.is_complete();
                 status.len = f.len;
                 status.replicas = f.replicas as i32;
@@ -520,5 +522,18 @@ impl Debug for InodeView {
 impl PartialEq for InodeView {
     fn eq(&self, other: &Self) -> bool {
         self.id() == other.id()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_status_uses_non_zero_version_epoch() {
+        let inode = InodeView::Dir("dir".to_string(), InodeDir::new(7, 100));
+        let status = inode.to_file_status("/dir");
+        assert!(status.is_dir);
+        assert_eq!(status.version_epoch, 1);
     }
 }

@@ -215,6 +215,7 @@ impl ProtoUtils {
     pub fn file_status_to_pb(status: FileStatus) -> FileStatusProto {
         FileStatusProto {
             id: status.id,
+            version_epoch: status.version_epoch,
             path: status.path,
             name: status.name,
             is_dir: status.is_dir,
@@ -240,6 +241,7 @@ impl ProtoUtils {
     pub fn file_status_from_pb(status: FileStatusProto) -> FileStatus {
         FileStatus {
             id: status.id,
+            version_epoch: status.version_epoch,
             path: status.path,
             name: status.name,
             is_dir: status.is_dir,
@@ -299,6 +301,9 @@ impl ProtoUtils {
             fs_used: src.fs_used,
             non_fs_used: src.non_fs_used,
             reserved_bytes: src.reserved_bytes,
+            p2p_policy_version: src.p2p_policy_version,
+            p2p_peer_whitelist: src.p2p_peer_whitelist,
+            p2p_tenant_whitelist: src.p2p_tenant_whitelist,
             ..Default::default()
         };
 
@@ -357,6 +362,9 @@ impl ProtoUtils {
             blacklist_workers: Self::worker_info_from_pb(src.blacklist_workers),
             decommission_workers: Self::worker_info_from_pb(src.decommission_workers),
             lost_workers: Self::worker_info_from_pb(src.lost_workers),
+            p2p_policy_version: src.p2p_policy_version,
+            p2p_peer_whitelist: src.p2p_peer_whitelist,
+            p2p_tenant_whitelist: src.p2p_tenant_whitelist,
         }
     }
 
@@ -676,5 +684,43 @@ impl ProtoUtils {
             start: lock.start,
             end: lock.end,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProtoUtils;
+    use crate::state::{FileStatus, MasterInfo};
+
+    #[test]
+    fn file_status_proto_roundtrip_keeps_version_epoch() {
+        let status = FileStatus {
+            id: 7,
+            path: "/tmp/a".to_string(),
+            name: "a".to_string(),
+            version_epoch: 42,
+            ..Default::default()
+        };
+        let pb = ProtoUtils::file_status_to_pb(status.clone());
+        let decoded = ProtoUtils::file_status_from_pb(pb);
+        assert_eq!(decoded.version_epoch, 42);
+    }
+
+    #[test]
+    fn master_info_proto_roundtrip_keeps_p2p_runtime_policy() {
+        let src = MasterInfo {
+            p2p_policy_version: 7,
+            p2p_peer_whitelist: vec![
+                "12D3KooWJ8v1tDU6yE2y9JAzobYjGg9VG7z6gK5yR2rKfZ9W8f2A".to_string()
+            ],
+            p2p_tenant_whitelist: vec!["tenant-a".to_string(), "tenant-b".to_string()],
+            ..Default::default()
+        };
+        let pb = ProtoUtils::master_info_to_pb(src);
+        let decoded = ProtoUtils::master_info_from_pb(pb);
+        assert_eq!(decoded.p2p_policy_version, 7);
+        assert_eq!(decoded.p2p_peer_whitelist.len(), 1);
+        assert_eq!(decoded.p2p_tenant_whitelist.len(), 2);
+        assert_eq!(decoded.p2p_tenant_whitelist[0], "tenant-a");
     }
 }

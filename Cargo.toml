@@ -46,7 +46,7 @@ libc = "0.2.167"
 tokio = { version = "1.42.0", features = ["full"] }
 futures = "0.3.31"
 tokio-util = { version = "0.7.12", features = ["full"] }
-bytes = "1.9.0"
+bytes = { version = "1.9.0", features = ["serde"] }
 serde = { version = "1.0.215", features = ["derive"] }
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
 raft = { version = "0.7.0", features = ["prost-codec"], default-features = false }

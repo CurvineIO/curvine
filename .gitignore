@@ -37,6 +37,6 @@ curvine-libsdk/java/target/
 .staging/
 .summary/
 .claude/
-docs
+docs/
 
 __pycache__
