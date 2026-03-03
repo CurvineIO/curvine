@@ -211,23 +211,18 @@ impl InodeTtlChecker {
                     result.failed_cleanups = 1;
                 }
             },
-            TtlAction::Persist | TtlAction::Evict | TtlAction::Flush => {
-                match self.action_executor.free_inode(inode_id) {
-                    Ok(()) => {
-                        info!(
-                            "Successfully executed {:?} action for inode {}",
-                            action, inode_id
-                        );
-                        result.successful_frees.push(inode_id);
-                        result.successful_cleanups = 1;
-                    }
-                    Err(e) => {
-                        error!("{:?} action failed for inode {}: {}", action, inode_id, e);
-                        result.failed_inodes.push(inode_id);
-                        result.failed_cleanups = 1;
-                    }
+            TtlAction::Free => match self.action_executor.free_inode(inode_id) {
+                Ok(()) => {
+                    info!("Successfully executed Free action for inode {}", inode_id);
+                    result.successful_frees.push(inode_id);
+                    result.successful_cleanups = 1;
                 }
-            }
+                Err(e) => {
+                    error!("Free action failed for inode {}: {}", inode_id, e);
+                    result.failed_inodes.push(inode_id);
+                    result.failed_cleanups = 1;
+                }
+            },
             TtlAction::None => {
                 warn!("No ttl action defined for inode {}, skipping", inode_id);
                 result.skipped_inodes = 1;

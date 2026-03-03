@@ -18,9 +18,7 @@ enum StorageTypeProto {
 enum TtlActionProto {
     TTL_ACTION_PROTO_NONE = 0;
     TTL_ACTION_PROTO_DELETE = 1;
-    TTL_ACTION_PROTO_PERSIST = 2;
-    TTL_ACTION_PROTO_EVICT = 3;
-    TTL_ACTION_PROTO_FLUSH = 4;
+    TTL_ACTION_PROTO_FREE = 2;
 }
 
 enum WriteTypeProto {
