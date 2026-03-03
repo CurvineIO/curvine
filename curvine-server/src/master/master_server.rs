@@ -141,6 +141,7 @@ impl Master {
         let worker_manager = journal_system.worker_manager();
         let mount_manager = journal_system.mount_manager();
         let quota_manager = journal_system.quota_manager();
+        let job_manager = journal_system.job_manager();
 
         let rt = Arc::new(conf.master_server_conf().create_runtime());
 
@@ -153,13 +154,6 @@ impl Master {
             &replication_manager,
             quota_manager,
         );
-
-        let job_manager = Arc::new(JobManager::from_cluster_conf(
-            fs.clone(),
-            mount_manager.clone(),
-            rt.clone(),
-            &conf,
-        ));
 
         // step3: Create rpc server.
         let retry_cache = FsRetryCache::with_conf(&conf.master);
