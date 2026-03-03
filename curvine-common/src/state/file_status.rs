@@ -82,12 +82,11 @@ impl FileStatus {
         !self.is_dir && self.nlink > 1 && self.id > 0
     }
 
-    /// Returns true if the file exists only in Curvine and not in UFS
-    pub fn is_cv_only(&self) -> bool {
-        self.storage_policy.ufs_mtime == 0
-    }
-
     pub fn is_complete(&self) -> bool {
         self.is_complete
+    }
+
+    pub fn ufs_exists(&self) -> bool {
+        self.storage_policy.ufs_mtime > 0
     }
 }

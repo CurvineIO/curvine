@@ -176,7 +176,7 @@ async fn mount_storage(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonRes
     let opts = MountOptions::builder()
         .set_properties(config.properties.clone())
         .mount_type(MountType::Orch)
-        .write_type(WriteType::Through)
+        .write_type(WriteType::CacheMode)
         .build();
 
     let ufs_path: Path = Path::from_str(&config.ufs_path).unwrap();

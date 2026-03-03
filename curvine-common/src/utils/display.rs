@@ -24,10 +24,8 @@ use std::fmt::Display;
 /// Convert WriteTypeProto to a readable string
 fn write_type_to_str(write_type: WriteTypeProto) -> &'static str {
     match write_type {
-        WriteTypeProto::Cache => "cache",
-        WriteTypeProto::Through => "through",
-        WriteTypeProto::AsyncThrough => "async_through",
-        WriteTypeProto::CacheThrough => "cache_through",
+        WriteTypeProto::CacheMode => "cache_mode",
+        WriteTypeProto::FsMode => "fs_mode",
     }
 }
 
