@@ -24,8 +24,7 @@ use orpc::runtime::{GroupExecutor, JobCtl, JobState};
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{GetEntriesContext, RaftState, Storage};
-use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // raft log packaging class
 // Unify the access interfaces of app_store and log_store. Convenient to code use.
@@ -35,7 +34,7 @@ pub struct PeerStorage<A, B> {
     app_store: B,
     conf: JournalConf,
     executor: Arc<GroupExecutor>,
-    snap_state: RefCell<SnapshotState>,
+    snap_state: Arc<Mutex<SnapshotState>>,
     client: RaftClient,
 }
 
@@ -52,7 +51,7 @@ where
             app_store,
             conf: conf.clone(),
             executor: Arc::new(executor),
-            snap_state: Default::default(),
+            snap_state: Arc::new(Mutex::new(SnapshotState::Relax)),
             client,
         }
     }
@@ -77,12 +76,12 @@ where
         self.log_store.set_conf_state(conf_state)
     }
 
-    pub fn apply_propose(&self, is_leader: bool, data: &[u8]) -> RaftResult<()> {
-        self.app_store.apply(is_leader, data)
+    pub async fn apply_propose(&self, is_leader: bool, data: &[u8]) -> RaftResult<()> {
+        self.app_store.apply(is_leader, data).await
     }
 
-    fn check_snapshot_state(&self) {
-        let mut snap_state = self.snap_state.borrow_mut();
+    fn check_snapshot_state(&self) -> SnapshotState {
+        let mut snap_state = self.snap_state.lock().unwrap();
 
         match &*snap_state {
             SnapshotState::Relax => {
@@ -115,15 +114,15 @@ where
                 }
             }
         }
+
+        snap_state.clone()
     }
 
     // Is it possible to create a snapshot currently?
     // The previous snapshot is being created and the storage is applying the snapshot, so the snapshot cannot be created at present.
     pub fn can_generate_snapshot(&self) -> bool {
-        self.check_snapshot_state();
-
         // Snapshot cannot be created during application.
-        match &*self.snap_state.borrow() {
+        match self.check_snapshot_state() {
             SnapshotState::Relax => true,
             SnapshotState::Generating(_) => false,
             SnapshotState::Applying(_) => false,
@@ -131,9 +130,7 @@ where
     }
 
     pub fn is_snapshot_applying(&self) -> bool {
-        self.check_snapshot_state();
-
-        match &*self.snap_state.borrow() {
+        match self.check_snapshot_state() {
             SnapshotState::Relax => false,
             SnapshotState::Generating(_) => false,
             SnapshotState::Applying(_) => true,
@@ -149,7 +146,7 @@ where
         let app_store = self.app_store.clone();
 
         let job_ctl = JobCtl::new();
-        let mut snap_state = self.snap_state.borrow_mut();
+        let mut snap_state = self.snap_state.lock().unwrap();
         *snap_state = SnapshotState::Applying(job_ctl.clone());
 
         let client = self.client.clone();
@@ -205,7 +202,7 @@ where
         let app_store = self.app_store.clone();
 
         let job_ctl = JobCtl::new();
-        let mut snap_state = self.snap_state.borrow_mut();
+        let mut snap_state = self.snap_state.lock().unwrap();
         *snap_state = SnapshotState::Generating(job_ctl.clone());
 
         let job = move || {

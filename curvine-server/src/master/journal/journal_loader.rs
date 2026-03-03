@@ -292,7 +292,7 @@ impl JournalLoader {
 }
 
 impl AppStorage for JournalLoader {
-    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
+    async fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
         match self.apply0(is_leader, message) {
             Ok(_) => Ok(()),
 
