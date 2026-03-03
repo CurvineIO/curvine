@@ -302,6 +302,12 @@ impl InodeFile {
         client_name: impl AsRef<str>,
         only_flush: bool,
     ) -> FsResult<()> {
+        // If commit_blocks contains data, it means the curvine file has been updated.
+        // The corresponding ufs_mtime is set to 0, indicating that the relationship with ufs has been severed.
+        if !commit_blocks.is_empty() {
+            self.storage_policy.ufs_mtime = 0
+        }
+
         for block in commit_blocks {
             let meta = self.search_block_mut_check(block.block_id)?;
             meta.commit(block);

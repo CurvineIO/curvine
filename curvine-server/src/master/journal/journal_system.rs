@@ -137,7 +137,12 @@ impl JournalSystem {
         let raft_journal = MetaRaftJournal::new(
             rt.clone(),
             log_store,
-            JournalLoader::new(fs_dir.clone(), mount_manager.clone(), &conf.journal),
+            JournalLoader::new(
+                fs_dir.clone(),
+                mount_manager.clone(),
+                &conf.journal,
+                job_manager.clone(),
+            ),
             conf.journal.clone(),
             role_monitor,
         );

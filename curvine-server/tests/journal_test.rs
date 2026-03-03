@@ -56,7 +56,12 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
     let follower_journal_system = JournalSystem::from_conf(&conf)?;
     let fs_follower = MasterFilesystem::with_js(&conf, &follower_journal_system);
     let mnt_mgr2 = follower_journal_system.mount_manager();
-    let journal_loader = JournalLoader::new(fs_follower.fs_dir(), mnt_mgr2.clone(), &conf.journal);
+    let journal_loader = JournalLoader::new(
+        fs_follower.fs_dir(),
+        mnt_mgr2.clone(),
+        &conf.journal,
+        follower_journal_system.job_manager(),
+    );
 
     let entries = journal_system.fs().fs_dir.read().take_entries();
     info!("entries size {}", entries.len());
