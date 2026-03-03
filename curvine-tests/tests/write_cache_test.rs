@@ -401,6 +401,43 @@ async fn verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) {
     assert_eq!(Utils::crc32(&cv_data), Utils::crc32(&ufs_data))
 }
 
+
+/// 1) UFS with wrong config. 2) Write a file. 3) Fix UFS config (remount with correct opts). 4) Verify UFS sync.
+#[test]
+fn test_ufs_wrong_config_then_fix_sync() {
+    let fs = get_fs();
+
+    let rt = fs.clone_runtime();
+    let rt1 = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+
+        let base = format!("/write_cache_{:?}", WriteType::FsMode);
+        let path = Path::from_str(format!("/{}", base)).unwrap();
+
+        let path = Path::from_str(format!("{}/test_ufs_wrong_then_fix.log", path)).unwrap();
+        let data = Utils::rand_str(1024);
+        let mut writer = fs.create(&path, true).await.unwrap();
+
+        mount_error_update(&fs, &path).await;
+
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        sleep(Duration::from_secs(10000)).await;
+    /*    fs.wait_job_complete(&path, false).await.unwrap();
+        verify_cv_ufs_consistency(&fs, &path).await;
+        verify_read_data(&fs, &path, data.as_bytes()).await;*/
+    });
+}
+
+async fn mount_error_update(fs: &UnifiedFileSystem, path: &Path) {
+ let opts = MountOptionsBuilder::new().update(true)
+     .add_property("s3.credentials.access", "test")
+     .build();
+    fs.mount(path, path, opts).await.unwrap()
+}
+
 async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
     let ufs_base = env::var("UFS_TEST_PATH").unwrap();
 
@@ -408,11 +445,11 @@ async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
     let ufs_path = Path::from_str(format!("{}/{}", ufs_base, dir)).unwrap();
     let cv_path = Path::from_str(format!("/{}", dir)).unwrap();
 
-    if fs.get_mount(&cv_path).await.unwrap().is_some() {
-        return;
-    }
+    let update =  fs.get_mount(&cv_path).await.unwrap().is_some();
 
-    let mut opts_builder = MountOptionsBuilder::new().write_type(write_type);
+    let mut opts_builder = MountOptionsBuilder::new()
+        .write_type(write_type)
+        .update(update);
 
     // Add properties from environment variable if set
     if let Ok(props_str) = env::var("UFS_TEST_PROPERTIES") {

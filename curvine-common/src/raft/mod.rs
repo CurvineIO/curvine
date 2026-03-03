@@ -40,6 +40,9 @@ pub use self::raft_peer::RaftPeer;
 mod raft_error;
 pub use self::raft_error::RaftError;
 
+mod fsm_state_map;
+pub use self::fsm_state_map::FsmStateMap;
+
 mod role_monitor;
 pub use self::role_monitor::*;
 

@@ -19,46 +19,178 @@ use crate::master::meta::inode::InodePath;
 use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::{JobManager, MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
-use curvine_common::error::FsError;
-use curvine_common::proto::raft::SnapshotData;
-use curvine_common::raft::storage::AppStorage;
-use curvine_common::raft::{RaftResult, RaftUtils};
+use curvine_common::proto::raft::{FsmState, SnapshotData};
+use curvine_common::raft::storage::{ApplyEntry, ApplyMsg, ApplyScan, AppStorage, LogStorage, RocksLogStorage};
+use curvine_common::raft::{FsmStateMap, NodeId, RaftError, RaftResult, RaftUtils};
 use curvine_common::state::RenameFlags;
 use curvine_common::utils::SerdeUtils;
 use log::{debug, error, info, warn};
 use orpc::common::FileUtils;
-use orpc::sync::AtomicCounter;
-use orpc::{err_box, try_option, try_option_ref, CommonResult};
+use orpc::sync::{AtomicCounter, ErrorMonitor};
+use orpc::{err_box, try_option, try_option_ref, CommonResult, CommonError};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::{fs, mem};
+use std::collections::HashMap;
+use std::time::Duration;
+use axum::handler::HandlerWithoutStateExt;
+use futures::future::{lazy, ok};
+use raft::eraftpb::Entry;
+use curvine_common::error::FsError;
+use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender};
+
 // Replay the master metadata operation log.
 #[derive(Clone)]
 pub struct JournalLoader {
     fs_dir: SyncFsDir,
     mnt_mgr: Arc<MountManager>,
     ufs_loader: UfsLoader,
-    seq_id: Arc<AtomicCounter>,
+    sender: AsyncSender<ApplyMsg>,
+    applied: Arc<Mutex<u64>>,
+    error_monitor: Arc<ErrorMonitor<RaftError>>,
     retain_checkpoint_num: usize,
-    ignore_replay_error: bool,
+    cv_error_retry: bool,
+    ufs_error_retry: bool,
+    max_retry_num: u64,
+    batch_size: u64,
+    retry_interval: Duration,
 }
 
 impl JournalLoader {
+    pub const BATCH_SIZE: u64 = 1000;
+    pub const RETRY_INTERVAL: u64 = 1;
+
     pub fn new(
+        rt: Arc<Runtime>,
         fs_dir: SyncFsDir,
         mnt_mgr: Arc<MountManager>,
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
     ) -> Self {
         let ufs_loader = UfsLoader::new(job_manager, conf);
-        Self {
+        let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
+        let loader = Self {
             fs_dir,
             mnt_mgr,
             ufs_loader,
-            seq_id: Arc::new(AtomicCounter::new(0)),
+            sender,
+            applied: Arc::new(Mutex::new(0)),
+            error_monitor: Arc::new(ErrorMonitor::new()),
             retain_checkpoint_num: 3.max(conf.retain_checkpoint_num),
-            ignore_replay_error: conf.ignore_replay_error,
+            cv_error_retry: conf.cv_error_retry,
+            max_retry_num: conf.max_retry_num,
+            ufs_error_retry: conf.ufs_error_retry,
+            batch_size: conf.scan_batch_size,
+            retry_interval: Duration::from_secs(conf.retry_interval_secs),
+        };
+
+        let loader1 = loader.clone();
+        rt.spawn(async move {
+           Self::run_apply(loader1, receiver).await;
+        });
+
+        loader
+    }
+
+    async fn apply_batch(&self, is_leader: bool, data: &[u8]) -> CommonResult<()> {
+        if data.is_empty() {
+            return Ok(());
         }
+
+        let entry: JournalEntry = SerdeUtils::deserialize(data)?;
+        if is_leader {
+            self.ufs_loader.apply_entry(&entry).await?;
+        } else {
+            self.apply_entry(entry)?;
+        }
+
+        Ok(())
+    }
+
+    async fn apply0(&self, msg: &ApplyMsg) -> CommonResult<()> {
+        match msg {
+            ApplyMsg::Entry(msg) => {
+                self.apply_batch(msg.is_leader, &msg.data).await?;
+                self.set_applied(msg.index);
+                Ok(())
+            }
+
+            ApplyMsg::Scan(scan) => {
+                let mut last_applied = scan.last_applied;
+                loop {
+                    let list = scan.get_entries(last_applied + 1, last_applied + self.batch_size)?;
+
+                    if list.is_empty() {
+                        return Ok(())
+                    };
+
+                    for entry in list {
+                        self.apply_batch(scan.is_leader, &entry.data).await?;
+                        self.set_applied(entry.index);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_apply(self: Self, mut receiver: AsyncReceiver<ApplyMsg>) {
+        let mut error_apply: Option<ApplyMsg> = None;
+        let mut retry_num: u64 = 0;
+
+        loop {
+            let msg = match error_apply.take() {
+                Some(entry_type) => {
+                    tokio::time::sleep(self.retry_interval).await;
+                    entry_type
+                }
+
+                None => match receiver.recv().await {
+                    Some(entry_type) => entry_type,
+                    None => break,
+                }
+            };
+
+            let error = if let Err(e) = self.apply0(&msg).await {
+                e
+            } else {
+                continue;
+            };
+
+            retry_num += 1;
+            warn!("apply entry retry {} times", retry_num);
+            if retry_num >= self.max_retry_num {
+                self.error_monitor.set_error(error.to_string().into());
+                panic!("apply entry failed: {}", error);
+            }
+
+            let can_retry = (msg.is_leader() && self.ufs_error_retry) || (!msg.is_leader() && self.cv_error_retry);
+            if can_retry {
+                error!("apply entry failed: {}", error);
+            } else {
+                self.error_monitor.set_error(error.to_string().into());
+                panic!("apply entry failed: {}", error);
+            }
+
+            match msg {
+                ApplyMsg::Entry(entry) => {
+                    error_apply.replace(ApplyMsg::Entry(entry));
+                }
+
+                ApplyMsg::Scan(scan) => {
+                    let err_scan = ApplyMsg::Scan(ApplyScan {
+                        is_leader: scan.is_leader,
+                        last_applied: self.get_applied(),
+                        log_store: scan.log_store,
+                    });
+                    error_apply.replace(err_scan);
+                }
+            }
+        }
+    }
+
+    fn set_applied(&self, applied: u64) {
+        *self.applied.lock().unwrap() = applied
     }
 
     pub fn apply_entry(&self, entry: JournalEntry) -> CommonResult<()> {
@@ -319,62 +451,30 @@ impl JournalLoader {
 
         Ok(())
     }
-
-    async fn apply0(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
-        // The raft log has logs that do not contain referenced data.
-        if message.is_empty() {
-            return Ok(());
-        }
-
-        let batch: JournalBatch = SerdeUtils::deserialize(message)?;
-
-        // The leader node ignores all logs because they have been applied to the master node before synchronization via raft.
-        if is_leader {
-            let seq_id = batch.seq_id + 1;
-            self.ufs_loader.apply_batch(batch).await?;
-            self.seq_id.set(seq_id);
-            return Ok(());
-        }
-
-        self.seq_id.incr();
-        for entry in batch.batch {
-            match self.apply_entry(entry.clone()) {
-                Ok(_) => (),
-                Err(e) => {
-                    return err_box!(
-                        "Failed to apply journal entry to master, entry: {:?}: {}",
-                        entry,
-                        e
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl AppStorage for JournalLoader {
-    async fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
-        match self.apply0(is_leader, message).await {
-            Ok(_) => Ok(()),
-
-            Err(e) => {
-                if self.ignore_replay_error {
-                    error!("journal apply {}", e);
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            }
+    async fn apply(&self, wait_for_apply: bool, msg: ApplyMsg) -> RaftResult<()> {
+        if wait_for_apply {
+            self.apply0(&msg).await?;
+        } else {
+            self.error_monitor.check_error()?;
+            self.sender.send(msg).await?;
         }
+        Ok(())
+    }
+
+    fn get_applied(&self) -> u64 {
+        *self.applied.lock().unwrap()
     }
 
     // Call rocksdb's API to create a snapshot.
-    fn create_snapshot(&self, node_id: u64, last_applied: u64) -> RaftResult<SnapshotData> {
+    fn create_snapshot(&self, node_id: u64, last_applied: u64, fsm_state_map: FsmStateMap) -> RaftResult<SnapshotData> {
         let fs_dir = self.fs_dir.read();
         let dir = fs_dir.create_checkpoint(last_applied)?;
-        let data = RaftUtils::create_file_snapshot(&dir, node_id, last_applied)?;
+
+        let mut data = RaftUtils::create_file_snapshot(&dir, node_id, last_applied)?;
+        fsm_state_map.set_snapshot(&mut data);
 
         // Delete historical snapshots.
         if let Err(e) = self.purge_checkpoint(&dir) {
@@ -387,7 +487,6 @@ impl AppStorage for JournalLoader {
         {
             let mut fs_dir = self.fs_dir.write();
             let data = try_option_ref!(snapshot.files_data);
-            self.seq_id.set(snapshot.snapshot_id + 1);
             fs_dir.restore(&data.dir)?;
         }
         {

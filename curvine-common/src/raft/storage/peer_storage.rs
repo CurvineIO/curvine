@@ -15,8 +15,8 @@
 use crate::conf::JournalConf;
 use crate::proto::raft::SnapshotData;
 use crate::raft::snapshot::{DownloadJob, SnapshotState};
-use crate::raft::storage::{AppStorage, LogStorage};
-use crate::raft::{LibRaftResult, RaftClient, RaftError, RaftResult};
+use crate::raft::storage::{ApplyMsg, AppStorage, LogStorage};
+use crate::raft::{FsmStateMap, LibRaftResult, RaftClient, RaftError, RaftResult};
 use log::{error, info, warn};
 use orpc::common::{TimeSpent, Utils};
 use orpc::err_box;
@@ -76,8 +76,13 @@ where
         self.log_store.set_conf_state(conf_state)
     }
 
-    pub async fn apply_propose(&self, is_leader: bool, data: &[u8]) -> RaftResult<()> {
-        self.app_store.apply(is_leader, data).await
+    pub async fn apply_propose(&self, wait_for_apply: bool, apply_msg: ApplyMsg) -> RaftResult<()> {
+        self.app_store.apply(wait_for_apply, apply_msg).await
+    }
+
+    /// Scan log entries in [low, high). Used to get committed-but-not-applied entries for replay.
+    pub fn scan_entries(&self, low: u64, high: u64) -> RaftResult<Vec<Entry>> {
+        self.log_store.scan_entries(low, high)
     }
 
     fn check_snapshot_state(&self) -> SnapshotState {
@@ -135,6 +140,10 @@ where
             SnapshotState::Generating(_) => false,
             SnapshotState::Applying(_) => true,
         }
+    }
+
+    pub fn get_applied(&self) -> u64 {
+        self.app_store.get_applied()
     }
 
     pub fn gen_apply_snapshot_job(&self, snapshot: Snapshot) -> RaftResult<()> {
@@ -201,7 +210,7 @@ where
         &self,
         node_id: u64,
         last_applied: u64,
-        compact_id: u64,
+        fsm_state_map: FsmStateMap,
     ) -> RaftResult<()> {
         if !self.can_generate_snapshot() {
             return err_box!("Currently creating snapshot");
@@ -217,7 +226,8 @@ where
         let job = move || {
             let cost = TimeSpent::new();
 
-            let snapshot = app_store.create_snapshot(node_id, last_applied)?;
+            let compact_id = fsm_state_map.min_applied();
+            let snapshot = app_store.create_snapshot(node_id, last_applied, fsm_state_map)?;
             let snapshot_id = snapshot.snapshot_id;
             log_store.create_snapshot(snapshot, last_applied)?;
             log_store.compact(compact_id)?;

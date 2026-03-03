@@ -13,16 +13,20 @@
 // limitations under the License.
 
 use crate::proto::raft::SnapshotData;
-use crate::raft::RaftResult;
+use crate::raft::{FsmStateMap, RaftResult};
 use std::future::Future;
+use crate::raft::storage::ApplyMsg;
+
 
 /// Application layer storage.
 /// Replay raft log
 pub trait AppStorage: Clone + Send + Sync + 'static {
-    fn apply(&self, is_leader: bool, message: &[u8])
+    fn apply(&self, wait_for_apply: bool, msg: ApplyMsg)
         -> impl Future<Output = RaftResult<()>> + Send;
 
-    fn create_snapshot(&self, node_id: u64, last_applied: u64) -> RaftResult<SnapshotData>;
+    fn get_applied(&self) -> u64;
+
+    fn create_snapshot(&self, node_id: u64, last_applied: u64, fsm_state_map: FsmStateMap) -> RaftResult<SnapshotData>;
 
     fn apply_snapshot(&self, snapshot: &SnapshotData) -> RaftResult<()>;
 

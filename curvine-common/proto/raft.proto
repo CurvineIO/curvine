@@ -21,6 +21,11 @@ message SnapshotFileList {
     repeated SnapshotFileInfo files = 2;
 }
 
+message FsmState {
+    required uint64 committed = 1;
+    required uint64 applied = 2;
+}
+
 // Describe a snapshot.
 message SnapshotData {
     // Snapshot id
@@ -35,6 +40,10 @@ message SnapshotData {
     optional bytes bytes_data = 4;
 
     optional SnapshotFileList files_data = 5;
+
+    map<uint64, FsmState> fsm_state_map = 6;
+
+    required FsmState fsm_state_leader = 7;
 }
 
 
@@ -72,6 +81,7 @@ message ProposeResponse {
 
 message RaftRequest {
     required eraftpb.Message message = 1;
+    required uint64 applied = 2;
 }
 
 message RaftResponse {

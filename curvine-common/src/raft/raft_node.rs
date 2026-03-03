@@ -17,12 +17,12 @@
 use crate::conf::JournalConf;
 use crate::proto::raft::*;
 use crate::raft::raft_error::RaftError;
-use crate::raft::storage::{AppStorage, LogStorage, PeerStorage};
+use crate::raft::storage::{ApplyMsg, AppStorage, LogStorage, PeerStorage};
 use crate::raft::*;
 use crate::utils::SerdeUtils;
 use log::{error, info, warn};
 use orpc::client::dispatch::{Callback, Envelope};
-use orpc::common::{DurationUnit, LocalTime, TimeSpent};
+use orpc::common::{DurationUnit, FastHashMap, LocalTime, TimeSpent};
 use orpc::io::net::InetAddr;
 use orpc::message::{Builder, RefMessage, ResponseStatus};
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -30,7 +30,7 @@ use orpc::try_err;
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
-use raft::RawNode;
+use raft::{RawNode, StateRole};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,8 +73,7 @@ where
 
     last_snapshot_index: u64,
 
-    // Index of each node commit
-    commit_info: HashMap<NodeId, u64>,
+    fsm_state_map: FsmStateMap,
 }
 
 impl<A, B> RaftNode<A, B>
@@ -105,7 +104,8 @@ where
         let tick_interval = Duration::from_millis(conf.raft_tick_interval_ms);
         let poll_interval = Duration::from_millis(conf.raft_poll_interval_ms);
 
-        let last_applied = Self::install_snapshot(&log_store, &app_store, voters).await?;
+        let (last_applied, mut fsm_state_map) = Self::install_snapshot(&log_store, &app_store, voters).await?;
+        fsm_state_map.update(id, DEFAULT_LEADER_ID, last_applied, last_applied);
         let config = conf.new_raft_conf(id, last_applied);
         config.validate()?;
 
@@ -128,7 +128,7 @@ where
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
             last_snapshot_index: 0,
-            commit_info: Default::default(),
+            fsm_state_map,
         };
 
         Ok(node)
@@ -177,7 +177,7 @@ where
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
             last_snapshot_index: 0,
-            commit_info: Default::default(),
+            fsm_state_map: Default::default(),
         };
 
         Ok(node)
@@ -188,16 +188,16 @@ where
         log_store: &A,
         app_store: &B,
         voters: Vec<u64>,
-    ) -> RaftResult<u64> {
+    ) -> RaftResult<(u64, FsmStateMap)> {
         let spend = TimeSpent::new();
 
-        let snapshot = match log_store.latest_snapshot()? {
+        let (snapshot, fsm_state_map) = match log_store.latest_snapshot()? {
             None => {
                 let mut snapshot = Snapshot::default();
                 snapshot.mut_metadata().mut_conf_state().voters = voters;
 
                 log_store.apply_snapshot(snapshot.clone())?;
-                snapshot
+                (snapshot, FsmStateMap::new())
             }
 
             Some(mut snapshot) => {
@@ -205,7 +205,7 @@ where
                 // log store application snapshot.
                 log_store.apply_snapshot(snapshot.clone())?;
                 // app store app snapshot.
-                let snapshot_data = SnapshotData::decode(snapshot.get_data())?;
+                let snapshot_data: SnapshotData = SnapshotData::decode(snapshot.get_data())?;
                 info!(
                     "install snapshot start, meta: {:?}, snapshot data {:?}",
                     snapshot.get_metadata(),
@@ -213,7 +213,7 @@ where
                 );
                 app_store.apply_snapshot(&snapshot_data)?;
 
-                snapshot
+                (snapshot, FsmStateMap::from_snapshot(&snapshot_data))
             }
         };
 
@@ -231,14 +231,14 @@ where
                 entries.len()
             );
 
-            for entry in &entries {
-                app_store.apply(false, &entry.data).await?;
+            let last_entry = entries.last().unwrap().clone();
+
+            for entry in entries {
+                app_store.apply(true, ApplyMsg::new_entry(false, entry)).await?;
             }
 
-            let last_entry = entries.last().unwrap();
-            last_applied = last_entry.index;
-
             // After log replay, set index and term.
+            last_applied = last_entry.index;
             reply_state.commit = last_entry.index;
             reply_state.term = last_entry.term;
         }
@@ -247,7 +247,7 @@ where
         log_store.set_hard_state(&reply_state)?;
 
         info!("install snapshot end, cost {} ms", spend.used_ms());
-        Ok(last_applied)
+        Ok((last_applied, fsm_state_map))
     }
 
     pub fn is_leader(&self) -> bool {
@@ -344,8 +344,10 @@ where
     // Handle raft internal messages, such as elections, heartbeats, voting, etc.
     fn handle_raft(&mut self, env: Envelope) -> RaftResult<()> {
         let raft: RaftRequest = try_err!(env.msg.parse_header());
-        self.commit_info
-            .insert(raft.message.from, raft.message.commit);
+
+        self.fsm_state_map
+            .update(raft.message.from, self.leader(), raft.message.commit, raft.applied);
+
         self.raw.step(raft.message)?;
         let rep_msg = Builder::success(&env.msg)
             .proto_header(RaftResponse::default())
@@ -417,6 +419,8 @@ where
     }
 
     async fn on_ready(&mut self, promise: &mut HashMap<i64, Callback>) -> RaftResult<()> {
+        self.raw.advance_apply_to(self.storage.get_applied());
+
         // Snapshot is being applied and messages are not processed.
         if self.storage.is_snapshot_applying() {
             return Ok(());
@@ -444,9 +448,7 @@ where
 
         // Get the committed log entries, that is, the messages confirmed by most nodes.
         // Only the leader will run.
-        let mut apply_res = self
-            .apply_committed_entries(ready.take_committed_entries(), promise)
-            .await;
+        self.apply_committed_entries(ready.take_committed_entries(), promise).await?;
 
         // Get the normal log entries of the ready structure and save it.
         if !ready.entries().is_empty() {
@@ -460,11 +462,17 @@ where
         }
 
         if let Some(ss) = ready.ss() {
+            let was_leader = self.role_monitor.state() == RoleState::Leader;
+            let became_leader = !was_leader && ss.raft_state == StateRole::Leader;
+
             info!(
                 "Raft soft state change, node id {}, current leader {}",
                 self.id(),
                 self.leader()
             );
+            if became_leader {
+                info!("node {} became leader", self.id());
+            }
             self.role_monitor.advance_role(ss);
         }
 
@@ -485,26 +493,7 @@ where
         self.send_messages(light_rd.take_messages()).await?;
 
         // The advance interface will return a new committed entries.
-        if apply_res.is_ok() {
-            apply_res = self
-                .apply_committed_entries(light_rd.take_committed_entries(), promise)
-                .await;
-        }
-
-        match apply_res {
-            Err(e) => {
-                if self.is_leader() {
-                    // The leader replays the UFS logs. If it fails, it logs a warning and doesn't execute `advance_apply`
-                    // in this run. The committed entries remain committed and will be re-applied on the next `on_ready`.
-                    // `advance_apply` is only called after a successful apply, which ensures idempotency across retries.
-                    warn!("apply_committed_entries err {}", e)
-                } else {
-                    return Err(e);
-                }
-            }
-
-            Ok(()) => self.raw.advance_apply(),
-        }
+        self.apply_committed_entries(light_rd.take_committed_entries(), promise).await?;
 
         // Determine whether a snapshot is needed.
         self.apply_create_snapshot()?;
@@ -520,6 +509,7 @@ where
             let send_msg = Builder::new_rpc(RaftCode::Raft)
                 .proto_header(RaftRequest {
                     message: message.clone(),
+                    applied: self.raw.raft.raft_log.applied,
                 })
                 .build();
 
@@ -584,9 +574,9 @@ where
         Ok(ConfChangeResponse::default())
     }
 
-    async fn apply_propose(&mut self, entry: &Entry) -> RaftResult<ProposeResponse> {
+    async fn apply_propose(&mut self, entry: Entry) -> RaftResult<ProposeResponse> {
         self.storage
-            .apply_propose(self.is_leader(), &entry.data)
+            .apply_propose(false, ApplyMsg::new_entry(self.is_leader(), entry))
             .await?;
         Ok(ProposeResponse::default())
     }
@@ -603,15 +593,11 @@ where
         if (LocalTime::mills() - self.last_snapshot_ms > self.snapshot_interval_ms && diff > 0)
             || diff > self.snapshot_entries
         {
-            if self.is_leader() {
-                self.commit_info
-                    .insert(self.id(), self.raw.raft.raft_log.committed);
-            }
+            let log = &self.raw.raft.raft_log;
+            self.fsm_state_map.update(self.id(), self.leader(), log.committed, log.applied);
 
-            let raw_compact = *(self.commit_info.values().min().unwrap_or(&0));
-            let compact_id = raw_compact.min(last_applied);
             self.storage
-                .gen_create_snapshot_job(self.id(), last_applied, compact_id)?;
+                .gen_create_snapshot_job(self.id(), last_applied, self.fsm_state_map.clone())?;
 
             self.last_snapshot_ms = LocalTime::mills();
             self.last_snapshot_index = last_applied;
@@ -639,7 +625,7 @@ where
                     .proto_header(rep)
                     .build()
             } else {
-                let rep = self.apply_propose(&entry).await?;
+                let rep = self.apply_propose(entry).await?;
                 Builder::new_rpc(RaftCode::Propose)
                     .response(ResponseStatus::Success)
                     .req_id(req_id)

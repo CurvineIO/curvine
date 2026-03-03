@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::raft::SnapshotData;
-use crate::raft::storage::AppStorage;
-use crate::raft::{RaftResult, RaftUtils};
+use crate::proto::raft::{FsmState, SnapshotData};
+use crate::raft::storage::{ApplyMsg, AppStorage};
+use crate::raft::{FsmStateMap, RaftResult, RaftUtils};
 use crate::rocksdb::DBEngine;
 use crate::utils::SerdeUtils;
 use orpc::common::LocalTime;
@@ -25,10 +25,12 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use raft::eraftpb::Entry;
 
 #[derive(Clone)]
 pub struct HashAppStorage<K, V> {
     map: Arc<RwLock<HashMap<K, V>>>,
+    applied: Arc<Mutex<u64>>,
 }
 
 impl<K, V> Default for HashAppStorage<K, V>
@@ -49,6 +51,7 @@ where
     pub fn new() -> Self {
         Self {
             map: Arc::new(RwLock::new(HashMap::new())),
+            applied: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -82,23 +85,32 @@ where
     K: DeserializeOwned + Sized + Serialize + Clone + Hash + Eq + Send + Sync + 'static,
     V: DeserializeOwned + Sized + Serialize + Clone + Send + Sync + 'static,
 {
-    async fn apply(&self, _: bool, message: &[u8]) -> RaftResult<()> {
+    async fn apply(&self, _: bool, msg: ApplyMsg) -> RaftResult<()> {
+        let entry = msg.take_entry();
         let mut map = self.write()?;
-        let pairs: (K, V) = SerdeUtils::deserialize(message)?;
+        let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
         map.insert(pairs.0, pairs.1);
+        *self.applied.lock().unwrap() = entry.index;
         Ok(())
     }
 
-    fn create_snapshot(&self, node_id: u64, snapshot_id: u64) -> RaftResult<SnapshotData> {
+    fn get_applied(&self) -> u64 {
+        *self.applied.lock().unwrap()
+    }
+
+    fn create_snapshot(&self, node_id: u64, snapshot_id: u64, fsm_state_map: FsmStateMap) -> RaftResult<SnapshotData> {
         let map = self.read()?;
         let bytes = SerdeUtils::serialize(&*map)?;
-        let data = SnapshotData {
+        let mut data = SnapshotData {
             snapshot_id,
             node_id,
             create_time: LocalTime::mills(),
             bytes_data: Some(bytes),
             files_data: None,
+            ..Default::default()
         };
+        fsm_state_map.set_snapshot(&mut data);
+
         Ok(data)
     }
 
@@ -118,6 +130,7 @@ where
 #[derive(Clone)]
 pub struct RocksAppStorage<K, V> {
     db: Arc<Mutex<DBEngine>>,
+    applied: Arc<Mutex<u64>>,
     _k: PhantomData<K>,
     _v: PhantomData<V>,
 }
@@ -131,6 +144,7 @@ where
         let db = DBEngine::from_dir(dir, true).unwrap();
         Self {
             db: Arc::new(Mutex::new(db)),
+            applied: Arc::new(Mutex::new(0)),
             _k: Default::default(),
             _v: Default::default(),
         }
@@ -161,17 +175,23 @@ where
     K: Serialize + DeserializeOwned + Clone + Sync + Send + 'static,
     V: Serialize + DeserializeOwned + Clone + Sync + Send + 'static,
 {
-    async fn apply(&self, _: bool, message: &[u8]) -> RaftResult<()> {
+    async fn apply(&self, _: bool, msg: ApplyMsg) -> RaftResult<()> {
+        let entry = msg.take_entry();
         let db = self.lock()?;
-        let pairs: (K, V) = SerdeUtils::deserialize(message)?;
+        let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
         let k = SerdeUtils::serialize(&pairs.0)?;
         let v = SerdeUtils::serialize(&pairs.1)?;
         db.put(k, v)?;
+        *self.applied.lock().unwrap() = entry.index;
         Ok(())
     }
 
+    fn get_applied(&self) -> u64 {
+        *self.applied.lock().unwrap()
+    }
+
     // Create a snapshot.
-    fn create_snapshot(&self, node_id: u64, snapshot_id: u64) -> RaftResult<SnapshotData> {
+    fn create_snapshot(&self, node_id: u64, snapshot_id: u64, _state_map: FsmStateMap) -> RaftResult<SnapshotData> {
         let db = self.lock()?;
         let dir = db.create_checkpoint(snapshot_id)?;
         let data = RaftUtils::create_file_snapshot(dir, node_id, snapshot_id)?;

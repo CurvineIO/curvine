@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod log_storage;
+
 pub use self::log_storage::LogStorage;
 
 mod mem_log_storage;
@@ -32,3 +33,6 @@ pub use self::rocks_log_storage::RocksLogStorage;
 
 mod peer_storage;
 pub use self::peer_storage::PeerStorage;
+
+mod apply_msg;
+pub use self::apply_msg::*;

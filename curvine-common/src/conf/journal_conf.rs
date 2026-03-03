@@ -101,8 +101,11 @@ pub struct JournalConf {
     // The number of checkpoints saved.
     pub retain_checkpoint_num: usize,
 
-    // Whether to ignore errors in the log replay process.
-    pub ignore_replay_error: bool,
+    pub cv_error_retry: bool,
+    pub ufs_error_retry: bool,
+    pub max_retry_num: u64,
+    pub scan_batch_size: u64,
+    pub retry_interval_secs: u64,
 
     // Max timeout for copying data to UFS, expressed as a duration string (e.g. "20m").
     // Default: 20 minutes.
@@ -232,8 +235,12 @@ impl Default for JournalConf {
             raft_retry_cache_ttl: "10m".to_string(),
 
             retain_checkpoint_num: 3,
-            ignore_replay_error: false,
 
+            ufs_error_retry: true,
+            cv_error_retry: false,
+            max_retry_num: 1000,
+            scan_batch_size: 1000,
+            retry_interval_secs: 10,
             ufs_copy_timeout: "20m".to_owned(), // 20 minutes
         }
     }

@@ -26,7 +26,7 @@ use crate::master::{
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
-use curvine_common::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
+use curvine_common::raft::{FsmStateMap, RaftClient, RaftResult, RoleMonitor, RoleStateListener};
 use curvine_common::FsResult;
 use log::info;
 use orpc::common::FileUtils;
@@ -138,6 +138,7 @@ impl JournalSystem {
             rt.clone(),
             log_store,
             JournalLoader::new(
+                rt.clone(),
                 fs_dir.clone(),
                 mount_manager.clone(),
                 &conf.journal,
@@ -202,7 +203,7 @@ impl JournalSystem {
 
     // Create a snapshot manually, dedicated for testing.
     pub fn create_snapshot(&self) -> RaftResult<()> {
-        let data = self.raft_journal.app_store().create_snapshot(1, 1)?;
+        let data = self.raft_journal.app_store().create_snapshot(1, 1, FsmStateMap::default())?;
 
         // The test will not generate a raft log. Please modify the status here.
         let entry = Entry {

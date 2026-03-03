@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::raft::{
-    SnapshotData, SnapshotDownloadRequest, SnapshotFileInfo, SnapshotFileList,
-};
+use std::collections::HashMap;
+use crate::proto::raft::{FsmState, SnapshotData, SnapshotDownloadRequest, SnapshotFileInfo, SnapshotFileList};
 use crate::raft::RaftResult;
 use crate::rocksdb::DBEngine;
 use orpc::common::{FileUtils, LocalTime};
@@ -54,6 +53,7 @@ impl RaftUtils {
             create_time: LocalTime::mills(),
             bytes_data: None,
             files_data: Some(list),
+            ..Default::default()
         };
 
         Ok(data)
