@@ -212,3 +212,26 @@ Curvine is licensed under the ​**​[Apache License 2.0](LICENSE)​**.
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=CurvineIO/curvine&type=Date)](https://www.star-history.com/#CurvineIO/curvine&Date)
+
+
+## 安装
+
+```bash
+pip install package-name
+```
+
+或使用conda:
+
+```bash
+conda install -c conda-forge package-name
+```
+
+## 使用示例
+
+```python
+import package_name
+
+# 基本用法
+result = package_name.do_something()
+print(result)
+```
