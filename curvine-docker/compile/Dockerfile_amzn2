@@ -26,8 +26,8 @@ RUN yum install -y \
 
 # 2. Install the Rust toolchain
 # uncomment the following two lines if you met network problem
-ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
-ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
+#ENV RUSTUP_UPDATE_ROOT=https://mirrors.aliyun.com/rustup/rustup
+#ENV RUSTUP_DIST_SERVER=https://mirrors.aliyun.com/rustup
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
     source $HOME/.cargo/env && \

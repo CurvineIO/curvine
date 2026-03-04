@@ -21,11 +21,14 @@ from utils import cluster_utils, test_utils
 script_dir = os.path.dirname(os.path.abspath(__file__))
 template_dir = os.path.join(script_dir, 'templates')
 app = Flask(__name__, template_folder=template_dir)
+# Always reload templates from disk so changes take effect without server restart
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 # Build status storage
 build_status = {
     'status': 'idle',  # idle, building, completed, failed
-    'message': ''
+    'message': '',
+    'build_args': ''
 }
 
 # Daily test status storage
@@ -91,8 +94,9 @@ PROJECT_PATH = None
 # Test results directory (global)
 TEST_RESULTS_DIR = None
 
-# Current subprocess per test (for cancel). Keys: dailytest, regression, coverage, fuse, fio, ltp
+# Current subprocess per test (for cancel). Keys: build, dailytest, regression, coverage, fuse, fio, ltp
 test_processes = {
+    'build': None,
     'dailytest': None,
     'regression': None,
     'coverage': None,
@@ -102,6 +106,8 @@ test_processes = {
 }
 # Cancel requested flag for dailytest (checked between steps)
 dailytest_cancel_requested = False
+# Cancel requested flag for build
+build_cancel_requested = False
 
 
 def _kill_process(p):
@@ -133,36 +139,54 @@ def _handle_sigterm(signum, frame):
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
-def run_build_script(date, commit):
-    global build_status
+# Default make all arguments - can be overridden via POST /build body
+DEFAULT_BUILD_ARGS = (
+    '--skip-java-sdk '
+    '--ufs opendal-s3 '
+    '--ufs opendal-oss '
+    '--ufs opendal-azblob '
+    '--ufs opendal-gcs '
+    '--ufs opendal-hdfs-native'
+)
+
+
+def run_build_script(make_args=None):
+    """Run 'make all ARGS=...' in PROJECT_PATH and stream output."""
+    global build_status, build_cancel_requested
     with build_lock:  # Ensure only one build instance at a time
+        build_cancel_requested = False
+        args_str = make_args if make_args else DEFAULT_BUILD_ARGS
         build_status['status'] = 'building'
-        build_status['message'] = f'Starting build for date: {date}, commit: {commit}'
+        build_status['message'] = f'Starting build: make all ARGS="{args_str}"'
+        build_status['build_args'] = args_str
 
+        project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
         try:
-            # Use Popen to run build script and stream logs
             process = subprocess.Popen(
-                [os.path.join(script_dir, 'build.sh'), date, commit],
+                ['make', 'all', f'ARGS={args_str}'],
+                cwd=project_path,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
+                stderr=subprocess.STDOUT,  # merge stderr into stdout for live log
+                universal_newlines=True,
+                start_new_session=True,
             )
+            test_processes['build'] = process
+            try:
+                for line in process.stdout:
+                    print(line, end='')
+                process.wait()
+            finally:
+                test_processes['build'] = None
 
-            # Stream output in real time
-            for line in process.stdout:
-                print(line, end='')  # Print to console
-
-            # Wait for process to finish
-            process.wait()
-
-            if process.returncode == 0:
+            if build_cancel_requested:
+                build_status['status'] = 'cancelled'
+                build_status['message'] = 'Build cancelled by user.'
+            elif process.returncode == 0:
                 build_status['status'] = 'completed'
                 build_status['message'] = 'Build completed successfully.'
             else:
                 build_status['status'] = 'failed'
-                # Print error output
-                stderr_output = process.stderr.read()
-                build_status['message'] = f'Build failed. Error: {stderr_output}'
+                build_status['message'] = f'Build failed (return code: {process.returncode}).'
 
         except Exception as e:
             build_status['status'] = 'failed'
@@ -174,7 +198,7 @@ DAILYTEST_CONFIG = {
     'coverage': True,
     'fio': True,
     'fuse': True,
-    'ltp': True
+    'ltp': False
 }
 
 def run_dailytest_script():
@@ -652,12 +676,8 @@ def run_dailytest_script():
 
 @app.route('/build', methods=['POST'])
 def build():
-    data = request.json
-    date = data.get('date')
-    commit = data.get('commit')
-
-    if not date or not commit:
-        return jsonify({'error': 'Missing date or commit parameter.'}), 400
+    """Trigger a build: POST {} to use default args, or {"args": "..."} to override."""
+    data = request.json or {}
 
     # Check current build status
     if build_status['status'] == 'building':
@@ -666,9 +686,10 @@ def build():
             'current_status': build_status
         }), 409
 
-    # Start a new thread to run build script
-    threading.Thread(target=run_build_script, args=(date, commit)).start()
-    return jsonify({'message': 'Build started.'}), 202
+    make_args = data.get('args') or None
+    threading.Thread(target=run_build_script, args=(make_args,)).start()
+    effective_args = make_args if make_args else DEFAULT_BUILD_ARGS
+    return jsonify({'message': 'Build started.', 'args': effective_args}), 202
 
 @app.route('/build/status', methods=['GET'])
 def status():
@@ -873,6 +894,7 @@ def get_all_test_status():
     current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return jsonify({
         'current_date': current_date,
+        'build': _status_for_api(build_status),
         'dailytest': _status_for_api(dailytest_status),
         'regression': _status_for_api(regression_status),
         'coverage': _status_for_api(coverage_status),
@@ -880,6 +902,18 @@ def get_all_test_status():
         'fio': _status_for_api(fio_status),
         'ltp': _status_for_api(ltp_status),
     })
+
+
+@app.route('/build/cancel', methods=['POST'])
+def cancel_build():
+    """Cancel a running build."""
+    global build_cancel_requested
+    if build_status['status'] != 'building':
+        return jsonify({'error': 'No build is running.', 'current_status': _status_for_api(build_status)}), 400
+    build_cancel_requested = True
+    build_status['message'] = 'Cancellation requested, stopping...'
+    _kill_process(test_processes.get('build'))
+    return jsonify({'message': 'Build cancel requested.'}), 200
 
 
 @app.route('/dailytest/cancel', methods=['POST'])
@@ -1635,7 +1669,19 @@ Examples:
         '--results-dir', '-r',
         type=str,
         default=None,
-        help='Test results directory (defaults to <project_path>/result)'
+        help='Test results directory (defaults to <project_path>/curvine-tests/regression_result)'
+    )
+    
+    parser.add_argument(
+        '--update-code', '-u',
+        action='store_true',
+        help='Run git fetch and git pull in project path before starting (current branch)'
+    )
+    
+    parser.add_argument(
+        '--run-once',
+        action='store_true',
+        help='Trigger one dailytest run, wait for completion, then exit (for CI one-shot)'
     )
     
     return parser.parse_args()
@@ -1656,17 +1702,54 @@ def validate_project_path(project_path):
     if not os.path.exists(cargo_toml):
         print(f"Warning: Specified path may not be a curvine project (Cargo.toml not found): {project_path}")
     
-    # Check if build/tests directory exists (preferred location)
+    # Check curvine-tests/regression (canonical location for regression scripts)
+    regression_dir = os.path.join(project_path, 'curvine-tests', 'regression')
+    if not os.path.exists(regression_dir):
+        print(f"Info: curvine-tests/regression not found: {regression_dir}")
+    
+    # Check if build/tests directory exists (alternative)
     build_tests_dir = os.path.join(project_path, 'build', 'tests')
     if not os.path.exists(build_tests_dir):
         print(f"Warning: build/tests directory not found in project path: {build_tests_dir}")
     
-    # Check if scripts directory exists (legacy location)
-    scripts_dir = os.path.join(project_path, 'scripts')
-    if not os.path.exists(scripts_dir):
-        print(f"Info: scripts directory not found in project path (legacy location): {scripts_dir}")
-    
     return project_path
+
+
+def try_update_repo(project_path):
+    """Run git fetch and git pull in project_path (current branch). Log and continue on failure."""
+    if not project_path or not os.path.isdir(project_path):
+        return
+    git_dir = os.path.join(project_path, '.git')
+    if not os.path.isdir(git_dir):
+        print(f"Info: Not a git repository, skipping update: {project_path}")
+        return
+    try:
+        subprocess.run(
+            ['git', 'fetch', 'origin'],
+            cwd=project_path,
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+        print("Git fetch completed.")
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: git fetch failed: {e.stderr.decode() if e.stderr else e}")
+    except Exception as e:
+        print(f"Warning: git fetch error: {e}")
+    try:
+        subprocess.run(
+            ['git', 'pull'],
+            cwd=project_path,
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+        print("Git pull completed.")
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: git pull failed: {e.stderr.decode() if e.stderr else e}")
+    except Exception as e:
+        print(f"Warning: git pull error: {e}")
+
 
 if __name__ == '__main__':
     # Parse command-line arguments
@@ -1680,9 +1763,14 @@ if __name__ == '__main__':
         PROJECT_PATH = os.getcwd()
         print(f"Using current working directory as project path: {PROJECT_PATH}")
     
-    # Set test results directory: prefer argument, otherwise default <project_path>/result
-    TEST_RESULTS_DIR = args.results_dir if args.results_dir else os.path.join(PROJECT_PATH, 'result')
+    # Set test results directory: prefer argument, otherwise default <project_path>/curvine-tests/regression_result
+    TEST_RESULTS_DIR = args.results_dir if args.results_dir else os.path.join(PROJECT_PATH, 'curvine-tests', 'regression_result')
     print(f"Using test results directory: {TEST_RESULTS_DIR}")
+    
+    # Optional: update repo to latest on current branch
+    if getattr(args, 'update_code', False):
+        print("Updating repository (git fetch + git pull)...")
+        try_update_repo(PROJECT_PATH)
     
     # Auto-detect script path
     script_path = test_utils.find_script_path(project_path=PROJECT_PATH)
@@ -1691,11 +1779,11 @@ if __name__ == '__main__':
     else:
         print("Warning: Could not auto-detect daily_regression_test.sh")
         print("Please ensure the script is in one of the following locations:")
-        print("  - build/tests/ subdirectory (preferred)")
+        print("  - curvine-tests/regression/ (canonical)")
+        print("  - build/tests/ subdirectory")
         print("  - Current directory")
         print("  - scripts subdirectory (legacy)")
         print("  - In system PATH")
-        print("  - /usr/local/bin, /usr/bin, /opt/curvine/bin, /home/curvine/bin")
     
     # Start server
     print(f"Starting server: http://{args.host}:{args.port}")
@@ -1703,4 +1791,39 @@ if __name__ == '__main__':
     print(f"Results directory: {TEST_RESULTS_DIR}")
     if script_path:
         print(f"Script path: {script_path}")
-    app.run(host=args.host, port=args.port)
+
+    if getattr(args, 'run_once', False):
+        import urllib.request
+        import ssl
+        server_port = args.port
+        base_url = f"http://127.0.0.1:{server_port}"
+        def run_server():
+            app.run(host=args.host, port=server_port, use_reloader=False, threaded=True)
+        t = threading.Thread(target=run_server, daemon=True)
+        t.start()
+        time.sleep(2)
+        try:
+            req = urllib.request.Request(
+                f"{base_url}/dailytest",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"Failed to trigger dailytest: {e}")
+            os._exit(1)
+        print("Dailytest triggered, waiting for completion...")
+        while True:
+            time.sleep(10)
+            try:
+                with urllib.request.urlopen(f"{base_url}/dailytest/status", timeout=5) as r:
+                    data = json.loads(r.read().decode())
+                    status = data.get("status", "")
+                    if status in ("completed", "failed", "cancelled"):
+                        print(f"Dailytest finished with status: {status}")
+                        os._exit(0 if status == "completed" else 1)
+            except Exception as e:
+                print(f"Poll status error: {e}")
+    else:
+        app.run(host=args.host, port=args.port)
