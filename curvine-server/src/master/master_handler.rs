@@ -610,6 +610,14 @@ impl MasterHandler {
 impl MessageHandler for MasterHandler {
     type Error = FsError;
 
+    fn is_sync(&self, msg: &Message) -> bool {
+        let code = RpcCode::from(msg.code());
+        !matches!(
+            code,
+            RpcCode::SubmitJob | RpcCode::GetJobStatus | RpcCode::CancelJob | RpcCode::ReportTask
+        )
+    }
+
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let mut rpc_context = RpcContext::new(msg);
         let ctx = &mut rpc_context;
@@ -658,12 +666,6 @@ impl MessageHandler for MasterHandler {
             RpcCode::WorkerBlockReport => self.block_report(ctx),
             RpcCode::GetMasterInfo => self.get_master_info(ctx),
 
-            // Load task related requests
-            RpcCode::SubmitJob
-            | RpcCode::GetJobStatus
-            | RpcCode::CancelJob
-            | RpcCode::ReportTask => self.job_handler.handle(ctx),
-
             RpcCode::ReportBlockReplicationResult => {
                 if let Some(ref mut replication_service) = self.replication_handler {
                     return replication_service.handle(msg);
@@ -696,6 +698,26 @@ impl MessageHandler for MasterHandler {
         match response {
             Ok(v) => Ok(v),
             Err(e) => Ok(msg.error_ext(&e)),
+        }
+    }
+
+    async fn async_handle(&mut self, msg: Message) -> FsResult<Message> {
+        let mut rpc_context = RpcContext::new(&msg);
+        let ctx = &mut rpc_context;
+        let code = RpcCode::from(msg.code());
+
+        // Check whether the master is active
+        if !self.fs.master_monitor.is_active() {
+            return Err(FsError::not_leader_master(ctx.code, self.client_ip()));
+        }
+
+        match code {
+            RpcCode::SubmitJob => self.job_handler.submit_load_job(ctx).await,
+            RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
+            RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
+            RpcCode::ReportTask => self.job_handler.task_report(ctx),
+
+            v => err_box!("unsupported operation {:?}", v),
         }
     }
 }

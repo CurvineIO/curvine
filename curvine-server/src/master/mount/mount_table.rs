@@ -142,6 +142,19 @@ impl MountTable {
         Ok(())
     }
 
+    pub fn update_mount(&self, info: MountInfo) -> FsResult<()> {
+        let old = self.get_mount_info_by_id(info.mount_id)?;
+        if old.cv_path != info.cv_path || old.ufs_path != info.ufs_path {
+            return err_box!("cannot change mount path");
+        }
+
+        self.unprotected_add_mount(info.clone())?;
+
+        let mut fs_dir = self.fs_dir.write();
+        fs_dir.store_mount(info, true)?;
+        Ok(())
+    }
+
     pub fn assign_mount_id(&self) -> FsResult<u32> {
         let mut rng = rand::thread_rng();
         for _ in 0..10 {

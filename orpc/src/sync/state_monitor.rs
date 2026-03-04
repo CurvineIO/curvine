@@ -14,6 +14,7 @@
 
 use crate::{err_box, CommonResult};
 use log::error;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicI8, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -128,6 +129,14 @@ impl StateMonitor {
 
     pub fn value(&self) -> i8 {
         self.ctl.value()
+    }
+}
+
+impl Deref for StateMonitor {
+    type Target = StateCtl;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ctl
     }
 }
 

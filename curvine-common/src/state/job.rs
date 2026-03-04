@@ -42,6 +42,15 @@ pub enum JobTaskState {
     Canceled = 5,
 }
 
+impl JobTaskState {
+    pub fn is_finish(&self) -> bool {
+        matches!(
+            self,
+            JobTaskState::Completed | JobTaskState::Failed | JobTaskState::Canceled
+        )
+    }
+}
+
 pub struct LoadJobResult {
     pub job_id: String,
     pub target_path: String,
