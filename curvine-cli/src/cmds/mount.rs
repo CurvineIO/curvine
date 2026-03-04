@@ -420,7 +420,7 @@ impl MountCommand {
         let conf_map = self.get_config_map()?;
 
         let ttl_action = if matches!(write_type, WriteType::FsMode) {
-            TtlAction::Flush
+            TtlAction::Free
         } else {
             TtlAction::Delete
         };
