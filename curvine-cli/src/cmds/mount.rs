@@ -18,8 +18,7 @@ use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    ConsistencyStrategy, MountOptions, MountType, Provider, SetAttrOptsBuilder, StorageType,
-    TtlAction, WriteType,
+    MountOptions, Provider, SetAttrOptsBuilder, StorageType, TtlAction, WriteType,
 };
 use curvine_common::utils::ProtoUtils;
 use orpc::common::{ByteUnit, DurationUnit};
@@ -43,11 +42,13 @@ pub struct MountCommand {
     #[arg(long, default_value_t = false)]
     update: bool,
 
-    #[arg(long, default_value = "cst")]
-    mnt_type: String,
+    /// Check that cv_path and ufs_path are consistent
+    #[arg(long = "check-path-consist", default_value_t = true, action = clap::ArgAction::Set)]
+    check_path_consist: bool,
 
-    #[arg(long, default_value = "none")]
-    consistency_strategy: String,
+    /// When reading, verify cache against UFS (mtime and len)
+    #[arg(long = "read-verify-ufs", default_value_t = false)]
+    read_verify_ufs: bool,
 
     #[arg(long, default_value = "7d")]
     ttl_ms: String,
@@ -225,6 +226,14 @@ impl MountCommand {
 
         let ufs_path = Path::from_str(&self.ufs_path)?;
         let cv_path = Path::from_str(&self.cv_path)?;
+
+        if !self.update && self.check_path_consist && ufs_path.authority_path() != cv_path.path() {
+            return err_box!(
+                "with --check-path, ufs path and cv path must be consistent. ufs: {}, cv: {}",
+                ufs_path.authority_path(),
+                cv_path.path()
+            );
+        }
 
         let mnt_opts = self.to_mnt_opts()?;
 
@@ -407,9 +416,6 @@ impl MountCommand {
 
     pub fn to_mnt_opts(&self) -> CommonResult<MountOptions> {
         let write_type = WriteType::try_from(self.write_type.as_str())?;
-        let mnt_type = MountType::try_from(self.mnt_type.as_str())?;
-        let consistency_strategy =
-            ConsistencyStrategy::try_from(self.consistency_strategy.as_str())?;
         let ttl_ms = DurationUnit::from_str(self.ttl_ms.as_str())?.as_millis() as i64;
         let conf_map = self.get_config_map()?;
 
@@ -422,9 +428,8 @@ impl MountCommand {
         let mut opts = MountOptions::builder()
             .update(self.update)
             .set_properties(conf_map)
-            .mount_type(mnt_type)
             .write_type(write_type)
-            .consistency_strategy(consistency_strategy)
+            .read_verify_ufs(self.read_verify_ufs)
             .ttl_ms(ttl_ms)
             .ttl_action(ttl_action);
 

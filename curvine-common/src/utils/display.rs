@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use crate::proto::{
-    ConsistencyStrategyProto, GetMountTableResponse, MountResponse, MountTypeProto, TtlActionProto,
-    UnMountResponse, WriteTypeProto,
+    GetMountTableResponse, MountResponse, TtlActionProto, UnMountResponse, WriteTypeProto,
 };
 use crate::state::{JobStatus, JobTaskState, LoadJobResult};
 use chrono::DateTime;
@@ -26,22 +25,6 @@ fn write_type_to_str(write_type: WriteTypeProto) -> &'static str {
     match write_type {
         WriteTypeProto::CacheMode => "cache_mode",
         WriteTypeProto::FsMode => "fs_mode",
-    }
-}
-
-/// Convert MountTypeProto to a readable string
-fn mount_type_to_str(mount_type: MountTypeProto) -> &'static str {
-    match mount_type {
-        MountTypeProto::Cst => "cst",
-        MountTypeProto::Orch => "orch",
-    }
-}
-
-/// Convert ConsistencyStrategyProto to a readable string
-fn consistency_strategy_to_str(strategy: ConsistencyStrategyProto) -> &'static str {
-    match strategy {
-        ConsistencyStrategyProto::None => "none",
-        ConsistencyStrategyProto::Always => "always",
     }
 }
 
@@ -270,8 +253,7 @@ impl Display for GetMountTableResponse {
         let mut curvine_width = 12; // "Curvine Path"
         let mut ufs_width = 8; // "UFS Path"
         let mut write_type_width = 10; // "Write Type"
-        let mut mount_type_width = 10; // "Mount Type"
-        let mut consistency_width = 11; // "Consistency"
+        let mut read_verify_ufs_width = 14; // "Read Verify UFS"
         let mut storage_width = 7; // "Storage"
         let mut ttl_action_width = 10; // "TTL Action"
         let mut provider_width = 8; // "Provider"
@@ -281,9 +263,8 @@ impl Display for GetMountTableResponse {
             curvine_width = curvine_width.max(mnt.cv_path.len());
             ufs_width = ufs_width.max(mnt.ufs_path.len());
             write_type_width = write_type_width.max(write_type_to_str(mnt.write_type()).len());
-            mount_type_width = mount_type_width.max(mount_type_to_str(mnt.mount_type()).len());
-            consistency_width = consistency_width
-                .max(consistency_strategy_to_str(mnt.consistency_strategy()).len());
+            read_verify_ufs_width =
+                read_verify_ufs_width.max(if mnt.read_verify_ufs { "yes" } else { "no" }.len());
             storage_width = storage_width.max(storage_type_to_str(mnt.storage_type).len());
             ttl_action_width = ttl_action_width.max(ttl_action_to_str(mnt.ttl_action()).len());
             provider_width = provider_width.max(provider_to_str(mnt.provider).len());
@@ -294,8 +275,7 @@ impl Display for GetMountTableResponse {
         curvine_width += 2;
         ufs_width += 2;
         write_type_width += 2;
-        mount_type_width += 2;
-        consistency_width += 2;
+        read_verify_ufs_width += 2;
         storage_width += 2;
         ttl_action_width += 2;
         provider_width += 2;
@@ -309,8 +289,7 @@ impl Display for GetMountTableResponse {
         write!(f, "{:-^width$}+", "", width = curvine_width)?;
         write!(f, "{:-^width$}+", "", width = ufs_width)?;
         write!(f, "{:-^width$}+", "", width = write_type_width)?;
-        write!(f, "{:-^width$}+", "", width = mount_type_width)?;
-        write!(f, "{:-^width$}+", "", width = consistency_width)?;
+        write!(f, "{:-^width$}+", "", width = read_verify_ufs_width)?;
         write!(f, "{:-^width$}+", "", width = storage_width)?;
         write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
         writeln!(f, "{:-^width$}+", "", width = provider_width)?;
@@ -329,14 +308,8 @@ impl Display for GetMountTableResponse {
         write!(
             f,
             " {:<width$}|",
-            "Mount Type",
-            width = mount_type_width - 1
-        )?;
-        write!(
-            f,
-            " {:<width$}|",
-            "Consistency",
-            width = consistency_width - 1
+            "Read Verify UFS",
+            width = read_verify_ufs_width - 1
         )?;
         write!(f, " {:<width$}|", "Storage", width = storage_width - 1)?;
         write!(
@@ -353,8 +326,7 @@ impl Display for GetMountTableResponse {
         write!(f, "{:-^width$}+", "", width = curvine_width)?;
         write!(f, "{:-^width$}+", "", width = ufs_width)?;
         write!(f, "{:-^width$}+", "", width = write_type_width)?;
-        write!(f, "{:-^width$}+", "", width = mount_type_width)?;
-        write!(f, "{:-^width$}+", "", width = consistency_width)?;
+        write!(f, "{:-^width$}+", "", width = read_verify_ufs_width)?;
         write!(f, "{:-^width$}+", "", width = storage_width)?;
         write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
         writeln!(f, "{:-^width$}+", "", width = provider_width)?;
@@ -374,14 +346,8 @@ impl Display for GetMountTableResponse {
             write!(
                 f,
                 " {:<width$}|",
-                mount_type_to_str(mnt.mount_type()),
-                width = mount_type_width - 1
-            )?;
-            write!(
-                f,
-                " {:<width$}|",
-                consistency_strategy_to_str(mnt.consistency_strategy()),
-                width = consistency_width - 1
+                if mnt.read_verify_ufs { "yes" } else { "no" },
+                width = read_verify_ufs_width - 1
             )?;
             write!(
                 f,
@@ -409,8 +375,7 @@ impl Display for GetMountTableResponse {
         write!(f, "{:-^width$}+", "", width = curvine_width)?;
         write!(f, "{:-^width$}+", "", width = ufs_width)?;
         write!(f, "{:-^width$}+", "", width = write_type_width)?;
-        write!(f, "{:-^width$}+", "", width = mount_type_width)?;
-        write!(f, "{:-^width$}+", "", width = consistency_width)?;
+        write!(f, "{:-^width$}+", "", width = read_verify_ufs_width)?;
         write!(f, "{:-^width$}+", "", width = storage_width)?;
         write!(f, "{:-^width$}+", "", width = ttl_action_width)?;
         writeln!(f, "{:-^width$}+", "", width = provider_width)?;

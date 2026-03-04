@@ -15,7 +15,7 @@
 use bytes::BytesMut;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem, UnifiedReader};
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{MountOptionsBuilder, MountType, WriteType};
+use curvine_common::state::{MountOptionsBuilder, WriteType};
 use curvine_tests::Testing;
 use orpc::common::Utils;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -240,7 +240,7 @@ async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
         }
     }
 
-    let opts = opts_builder.mount_type(MountType::Orch).build();
+    let opts = opts_builder.build();
     let ufs = UfsFileSystem::new(&ufs_path, opts.add_properties.clone(), None).unwrap();
     if ufs.exists(&ufs_path).await.unwrap() {
         ufs.delete(&ufs_path, true).await.unwrap();

@@ -21,9 +21,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, JobStatus,
-    LoadJobCommand, LoadJobResult, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo,
-    MountOptions, OpenFlags, SetAttrOpts,
+    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, JobStatus, LoadJobCommand, LoadJobResult,
+    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -209,7 +208,7 @@ impl UnifiedFileSystem {
             return Ok(CacheValidity::Invalid);
         }
 
-        if mount.info.consistency_strategy == ConsistencyStrategy::None {
+        if !mount.info.read_verify_ufs {
             return Ok(CacheValidity::Valid);
         }
 

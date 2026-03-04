@@ -35,74 +35,6 @@ use std::collections::HashMap;
     Deserialize,
     Serialize,
 )]
-pub enum MountType {
-    #[default]
-    Cst = 0,
-    Orch = 1,
-}
-
-impl TryFrom<&str> for MountType {
-    type Error = CommonError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let typ = match value.to_uppercase().as_str() {
-            "CST" => MountType::Cst,
-            "ORCH" => MountType::Orch,
-            _ => return err_box!("invalid mount type: {}", value),
-        };
-
-        Ok(typ)
-    }
-}
-
-#[repr(i32)]
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    FromPrimitive,
-    IntoPrimitive,
-    Default,
-    Deserialize,
-    Serialize,
-)]
-pub enum ConsistencyStrategy {
-    #[default]
-    None = 0,
-    Always = 1,
-}
-
-impl TryFrom<&str> for ConsistencyStrategy {
-    type Error = CommonError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let typ = match value.to_uppercase().as_str() {
-            "NONE" => ConsistencyStrategy::None,
-            "ALWAYS" => ConsistencyStrategy::Always,
-            _ => return err_box!("invalid strategy type: {}", value),
-        };
-
-        Ok(typ)
-    }
-}
-
-#[repr(i32)]
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    FromPrimitive,
-    IntoPrimitive,
-    Default,
-    Deserialize,
-    Serialize,
-)]
 pub enum Provider {
     #[default]
     Auto,
@@ -134,11 +66,10 @@ pub struct MountInfo {
     pub properties: HashMap<String, String>,
     pub ttl_ms: i64,
     pub ttl_action: TtlAction,
-    pub consistency_strategy: ConsistencyStrategy,
+    pub read_verify_ufs: bool,
     pub storage_type: Option<StorageType>,
     pub block_size: Option<i64>,
     pub replicas: Option<i32>,
-    pub mount_type: MountType,
     pub write_type: WriteType,
     pub provider: Option<Provider>,
 }
@@ -208,11 +139,10 @@ pub struct MountOptions {
     pub add_properties: HashMap<String, String>,
     pub ttl_ms: Option<i64>,
     pub ttl_action: Option<TtlAction>,
-    pub consistency_strategy: Option<ConsistencyStrategy>,
+    pub read_verify_ufs: bool,
     pub storage_type: Option<StorageType>,
     pub block_size: Option<i64>,
     pub replicas: Option<i32>,
-    pub mount_type: MountType,
     pub remove_properties: Vec<String>,
     pub write_type: WriteType,
     pub provider: Option<Provider>,
@@ -232,13 +162,10 @@ impl MountOptions {
             properties: self.add_properties,
             ttl_ms: self.ttl_ms.unwrap_or(0),
             ttl_action: self.ttl_action.unwrap_or(TtlAction::None),
-            consistency_strategy: self
-                .consistency_strategy
-                .unwrap_or(ConsistencyStrategy::None),
+            read_verify_ufs: self.read_verify_ufs,
             storage_type: self.storage_type,
             block_size: self.block_size,
             replicas: self.replicas,
-            mount_type: self.mount_type,
             write_type: self.write_type,
             provider: self.provider,
         }
@@ -251,11 +178,10 @@ pub struct MountOptionsBuilder {
     add_properties: HashMap<String, String>,
     ttl_ms: Option<i64>,
     ttl_action: Option<TtlAction>,
-    consistency_strategy: Option<ConsistencyStrategy>,
+    read_verify_ufs: bool,
     storage_type: Option<StorageType>,
     block_size: Option<i64>,
     replicas: Option<i32>,
-    mount_type: MountType,
     remove_properties: Vec<String>,
     write_type: WriteType,
     provider: Option<Provider>,
@@ -305,8 +231,8 @@ impl MountOptionsBuilder {
         self
     }
 
-    pub fn consistency_strategy(mut self, strategy: ConsistencyStrategy) -> Self {
-        self.consistency_strategy = Some(strategy);
+    pub fn read_verify_ufs(mut self, read_verify_ufs: bool) -> Self {
+        self.read_verify_ufs = read_verify_ufs;
         self
     }
 
@@ -322,11 +248,6 @@ impl MountOptionsBuilder {
 
     pub fn replicas(mut self, replicas: i32) -> Self {
         self.replicas = Some(replicas);
-        self
-    }
-
-    pub fn mount_type(mut self, mount_type: MountType) -> Self {
-        self.mount_type = mount_type;
         self
     }
 
@@ -351,11 +272,10 @@ impl MountOptionsBuilder {
             add_properties: self.add_properties,
             ttl_ms: self.ttl_ms,
             ttl_action: self.ttl_action,
-            consistency_strategy: self.consistency_strategy,
+            read_verify_ufs: self.read_verify_ufs,
             storage_type: self.storage_type,
             block_size: self.block_size,
             replicas: self.replicas,
-            mount_type: self.mount_type,
             remove_properties: self.remove_properties,
             write_type: self.write_type,
             provider: self.provider,
