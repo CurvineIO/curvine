@@ -146,6 +146,67 @@ fn test_fs_mode() {
     });
 }
 
+#[test]
+fn test_cache_mode_free() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::CacheMode).await;
+
+        let data = Utils::rand_str(1024);
+
+        let path = format!(
+            "/write_cache_{:?}/test_cache_mode_free.log",
+            WriteType::CacheMode
+        )
+        .into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let _ = fs.open(&path).await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+
+        fs.free(&path).await.unwrap();
+
+        // Check cache file exists
+        assert!(!fs.cv().exists(&path).await.unwrap());
+
+        let reader = fs.open(&path).await.unwrap();
+        assert!(!matches!(reader, UnifiedReader::Cv(_)));
+    });
+}
+
+#[test]
+fn test_fs_mode_free() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+
+        let data = Utils::rand_str(1024);
+
+        let path = format!("/write_cache_{:?}/test_fs_mode_free.log", WriteType::FsMode).into();
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let _ = fs.open(&path).await.unwrap();
+        let (ufs_path, _) = fs.get_mount(&path).await.unwrap().unwrap();
+        fs.wait_job_complete(&ufs_path, false).await.unwrap();
+
+        fs.free(&path).await.unwrap();
+
+        let file_blocks = fs.cv().get_block_locations(&path).await.unwrap();
+        println!("test_fs_mode_free status {:?}", file_blocks);
+        assert_eq!(file_blocks.len, data.len() as i64);
+        assert_eq!(file_blocks.block_locs.len(), 0);
+
+        let reader = fs.open(&path).await.unwrap();
+        assert!(!matches!(reader, UnifiedReader::Cv(_)));
+    });
+}
+
 async fn write(fs: &UnifiedFileSystem, path: &Path, random_write: bool) {
     let chunk_size = 64 * 1024;
     let total_size = 1024 * 1024;
@@ -228,6 +289,10 @@ async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {
     let dir = format!("write_cache_{:?}", write_type);
     let ufs_path = Path::from_str(format!("{}/{}", ufs_base, dir)).unwrap();
     let cv_path = Path::from_str(format!("/{}", dir)).unwrap();
+
+    if fs.get_mount(&cv_path).await.unwrap().is_some() {
+        return;
+    }
 
     let mut opts_builder = MountOptionsBuilder::new().write_type(write_type);
 

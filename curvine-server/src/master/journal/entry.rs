@@ -126,6 +126,13 @@ pub struct SetLocksEntry {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct FreeEntry {
+    pub(crate) op_ms: u64,
+    pub(crate) path: String,
+    pub(crate) mtime: i64,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
     CreateFile(CreateFileEntry),
@@ -141,6 +148,7 @@ pub enum JournalEntry {
     Symlink(SymlinkEntry),
     Link(LinkEntry),
     SetLocks(SetLocksEntry),
+    Free(FreeEntry),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

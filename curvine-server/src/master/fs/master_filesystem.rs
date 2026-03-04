@@ -135,6 +135,19 @@ impl MasterFilesystem {
         Ok(true)
     }
 
+    pub fn free<T: AsRef<str>>(&self, path: T) -> FsResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+
+        let free_res = fs_dir.free(&inp)?;
+        drop(fs_dir);
+
+        let mut worker_manager = self.worker_manager.write();
+        worker_manager.remove_blocks(&free_res);
+
+        Ok(())
+    }
+
     pub fn rename<T: AsRef<str>>(&self, src: T, dst: T, flags: RenameFlags) -> FsResult<bool> {
         let src = src.as_ref();
         let dst = dst.as_ref();

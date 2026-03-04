@@ -211,6 +211,23 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    pub fn retry_check_free(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: FreeRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+
+        self.free0(ctx.msg.req_id(), header)?;
+        ctx.response(FreeResponse::default())
+    }
+
+    pub fn free0(&self, req_id: i64, header: FreeRequest) -> FsResult<()> {
+        if self.check_is_retry(req_id)? {
+            return Ok(());
+        }
+
+        let res = self.fs.free(&header.path);
+        self.set_req_cache(req_id, res)
+    }
+
     pub fn rename0(&mut self, req_id: i64, header: RenameRequest) -> FsResult<bool> {
         if self.check_is_retry(req_id)? {
             return Ok(true);
@@ -617,6 +634,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::CompleteFilesBatch => self.complete_files_batch(ctx),
             RpcCode::Exists => self.exists(ctx),
             RpcCode::Delete => self.retry_check_delete(ctx),
+            RpcCode::Free => self.retry_check_free(ctx),
             RpcCode::Rename => self.retry_check_rename(ctx),
             RpcCode::ListStatus => self.list_status(ctx),
             RpcCode::GetBlockLocations => self.get_block_locations(ctx),

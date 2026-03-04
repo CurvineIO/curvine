@@ -191,6 +191,15 @@ impl JournalWriter {
         self.send(JournalEntry::Delete(entry))
     }
 
+    pub fn log_free<P: AsRef<str>>(&self, op_ms: u64, path: P, mtime: i64) -> FsResult<()> {
+        let entry = FreeEntry {
+            op_ms,
+            path: path.as_ref().to_string(),
+            mtime,
+        };
+        self.send(JournalEntry::Free(entry))
+    }
+
     pub fn log_mount(&self, op_ms: u64, info: MountInfo) -> FsResult<()> {
         let entry = MountEntry { op_ms, info };
 

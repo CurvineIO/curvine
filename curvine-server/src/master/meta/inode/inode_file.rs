@@ -14,14 +14,17 @@
 
 use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
+use crate::master::meta::store::InodeStore;
 use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::state::{
-    CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileType, StoragePolicy,
+    BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileType,
+    StoragePolicy,
 };
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
 use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Debug;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +86,10 @@ impl InodeFile {
             block_size: opts.block_size as u32,
             replicas: opts.replicas as u8,
 
-            storage_policy: opts.storage_policy,
+            storage_policy: StoragePolicy {
+                ufs_mtime: 0,
+                ..opts.storage_policy
+            },
             features: FileFeature {
                 x_attr: Default::default(),
                 file_write: None,
@@ -260,7 +266,10 @@ impl InodeFile {
         // Update file metadata with new options
         self.replicas = opts.replicas as u8;
         self.block_size = opts.block_size as u32;
-        self.storage_policy = opts.storage_policy;
+        self.storage_policy = StoragePolicy {
+            ufs_mtime: 0,
+            ..opts.storage_policy
+        };
         self.mtime = mtime;
 
         // Reset file writing state for new write operation
@@ -328,6 +337,11 @@ impl InodeFile {
             self.features.complete_write(client_name);
         }
         Ok(())
+    }
+
+    pub fn free(&mut self, mtime: i64) {
+        self.mtime = mtime;
+        self.blocks.clear();
     }
 
     /// Search for block by file position
@@ -470,6 +484,26 @@ impl InodeFile {
 
         self.len = expect_len;
         del_blocks
+    }
+
+    pub fn get_locs(&self, store: &InodeStore) -> CommonResult<HashMap<i64, Vec<BlockLocation>>> {
+        let mut res = HashMap::new();
+        for meta in &self.blocks {
+            if let Some(locs) = &meta.locs {
+                res.insert(meta.id, locs.clone());
+            } else {
+                let locs = store.get_locations(meta.id)?;
+                if !locs.is_empty() {
+                    res.insert(meta.id, locs);
+                }
+            }
+        }
+
+        Ok(res)
+    }
+
+    pub fn ufs_exists(&self) -> bool {
+        self.storage_policy.ufs_mtime > 0
     }
 }
 
