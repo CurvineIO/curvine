@@ -131,6 +131,33 @@ impl MountInfo {
     pub fn is_fs_mode(&self) -> bool {
         self.write_type == WriteType::FsMode
     }
+
+    pub fn merge_with(self, mnt_opt: MountOptions) -> MountInfo {
+        let mut properties = self.properties;
+
+        for (k, v) in mnt_opt.add_properties {
+            properties.insert(k, v);
+        }
+
+        for k in &mnt_opt.remove_properties {
+            properties.remove(k);
+        }
+
+        MountInfo {
+            cv_path: self.cv_path,
+            ufs_path: self.ufs_path,
+            mount_id: self.mount_id,
+            properties,
+            ttl_ms: mnt_opt.ttl_ms.unwrap_or(self.ttl_ms),
+            ttl_action: mnt_opt.ttl_action.unwrap_or(self.ttl_action),
+            read_verify_ufs: mnt_opt.read_verify_ufs,
+            storage_type: mnt_opt.storage_type.or(self.storage_type),
+            block_size: mnt_opt.block_size.or(self.block_size),
+            replicas: mnt_opt.replicas.or(self.replicas),
+            write_type: self.write_type,
+            provider: mnt_opt.provider.or(self.provider),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

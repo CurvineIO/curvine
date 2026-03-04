@@ -19,7 +19,7 @@ use crate::master::meta::inode::ttl_types::{TtlError, TtlResult};
 use crate::master::meta::inode::{Inode, InodeView, ROOT_INODE_ID};
 use crate::master::mount::MountManager;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{LoadJobCommand, TtlAction};
+use curvine_common::state::TtlAction;
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -246,49 +246,6 @@ impl InodeTtlExecutor {
             }
             _ => {}
         }
-        Ok(())
-    }
-
-    pub fn submit_export_job(
-        &self,
-        inode_id: u64,
-        cv_path: &str,
-        ufs_path: &Path,
-        action: TtlAction,
-        is_directory: bool,
-        _mount_info: curvine_common::state::MountInfo,
-    ) -> TtlResult<()> {
-        let command = LoadJobCommand {
-            source_path: cv_path.to_string(),
-            target_path: Some(ufs_path.full_path().to_string()),
-            overwrite: Some(matches!(action, TtlAction::Free)),
-            replicas: None,
-            block_size: None,
-            storage_type: None,
-            ttl_ms: None,
-            ttl_action: None,
-        };
-
-        let job_result = self.job_manager.submit_load_job(command).map_err(|e| {
-            TtlError::ActionExecutionError(format!("Failed to submit export job: {}", e))
-        })?;
-
-        info!(
-            "Export job submitted for {}: job_id={}, inode={}, action={:?}",
-            self.resource_type(is_directory),
-            job_result.job_id,
-            inode_id,
-            action
-        );
-
-        self.register_export_callback(
-            job_result.job_id,
-            inode_id,
-            action,
-            cv_path.to_string(),
-            is_directory,
-        )?;
-
         Ok(())
     }
 

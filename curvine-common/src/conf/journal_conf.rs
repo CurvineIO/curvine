@@ -103,6 +103,10 @@ pub struct JournalConf {
 
     // Whether to ignore errors in the log replay process.
     pub ignore_replay_error: bool,
+
+    // Max timeout for copying data to UFS, expressed as a duration string (e.g. "20m").
+    // Default: 20 minutes.
+    pub ufs_copy_timeout: String,
 }
 
 impl JournalConf {
@@ -229,6 +233,8 @@ impl Default for JournalConf {
 
             retain_checkpoint_num: 3,
             ignore_replay_error: false,
+
+            ufs_copy_timeout: "20m".to_owned(), // 20 minutes
         }
     }
 }

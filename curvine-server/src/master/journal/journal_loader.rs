@@ -50,7 +50,7 @@ impl JournalLoader {
         conf: &JournalConf,
         job_manager: Arc<JobManager>,
     ) -> Self {
-        let ufs_loader = UfsLoader::new(job_manager);
+        let ufs_loader = UfsLoader::new(job_manager, conf);
         Self {
             fs_dir,
             mnt_mgr,

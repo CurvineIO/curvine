@@ -17,22 +17,40 @@ use crate::master::journal::{
 };
 use crate::master::JobManager;
 use curvine_client::unified::MountValue;
+use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::LoadJobCommand;
+use curvine_common::state::{JobTaskState, LoadJobCommand};
 use curvine_common::FsResult;
 use log::warn;
+use orpc::common::DurationUnit;
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct UfsLoader {
     job_manager: Arc<JobManager>,
+    copy_timeout: Duration,
 }
 
 impl UfsLoader {
-    pub fn new(job_manager: Arc<JobManager>) -> Self {
-        Self { job_manager }
+    pub fn new(job_manager: Arc<JobManager>, conf: &JournalConf) -> Self {
+        let copy_timeout = match DurationUnit::from_str(&conf.ufs_copy_timeout) {
+            Ok(unit) => unit.as_duration(),
+            Err(e) => {
+                warn!(
+                    "Invalid ufs_copy_timeout value '{}': {}. Falling back to default 20min",
+                    conf.ufs_copy_timeout, e
+                );
+                Duration::from_secs(20 * 60)
+            }
+        };
+
+        Self {
+            job_manager,
+            copy_timeout,
+        }
     }
 
     pub async fn apply_batch(&self, batch: JournalBatch) -> CommonResult<()> {
@@ -45,7 +63,7 @@ impl UfsLoader {
     pub async fn submit_load_task(&self, path: &Path, mnt: &MountValue) -> FsResult<()> {
         let command = LoadJobCommand::builder(path.clone_uri()).build();
         let runner = self.job_manager.create_runner();
-        let _ = match runner.submit_load_task(command, mnt.info.clone()).await {
+        let res = match runner.submit_load_task(command, mnt.info.clone()).await {
             Ok(res) => res,
             Err(e) => {
                 return if matches!(e, FsError::FileNotFound(_)) {
@@ -56,7 +74,20 @@ impl UfsLoader {
                 };
             }
         };
-        Ok(())
+
+        let status = self
+            .job_manager
+            .wait_job_complete(res.job_id, self.copy_timeout)
+            .await?;
+        if matches!(status.state, JobTaskState::Completed) {
+            Ok(())
+        } else {
+            err_box!(
+                "load job failed: {} {}",
+                status.state,
+                status.progress.message
+            )
+        }
     }
 
     pub async fn apply_entry(&self, entry: &JournalEntry) -> FsResult<()> {
