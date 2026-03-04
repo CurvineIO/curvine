@@ -223,12 +223,8 @@ impl JournalLoader {
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
-        // need ensure log warn if unprotected_umount_by_id fail
         if !self.mnt_mgr.has_mounted(entry.id) {
             warn!("Unmount: id already unmounted: {}", entry.id);
-            // Still clean RocksDB (idempotent)
-            let mut fs_dir = self.fs_dir.write();
-            fs_dir.unprotected_unmount(entry.id)?;
             return Ok(());
         }
         self.mnt_mgr.unprotected_umount_by_id(entry.id)?;

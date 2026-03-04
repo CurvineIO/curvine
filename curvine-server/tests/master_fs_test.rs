@@ -135,7 +135,12 @@ fn test_delete_duplicate_journal_on_leader_crash_retry() -> CommonResult<()> {
     fs2.add_test_worker(worker.clone());
     let mnt_mgr2 = js2.mount_manager();
 
-    let loader2 = JournalLoader::new(fs2.fs_dir(), mnt_mgr2.clone(), &conf.journal,js2.job_manager());
+    let loader2 = JournalLoader::new(
+        fs2.fs_dir(),
+        mnt_mgr2.clone(),
+        &conf.journal,
+        js2.job_manager(),
+    );
     loader2.apply_entry(mkdir_entry_from_node1.clone())?;
     println!("node2 state after receiving node1's mkdir:");
     fs2.print_tree();
@@ -160,7 +165,12 @@ fn test_delete_duplicate_journal_on_leader_crash_retry() -> CommonResult<()> {
     let fs3 = MasterFilesystem::with_js(&conf, &js3);
     fs3.add_test_worker(worker.clone());
     let mnt_mgr3 = js3.mount_manager();
-    let loader3 = JournalLoader::new(fs3.fs_dir(), mnt_mgr3.clone(), &conf.journal, js3.job_manager());
+    let loader3 = JournalLoader::new(
+        fs3.fs_dir(),
+        mnt_mgr3.clone(),
+        &conf.journal,
+        js3.job_manager(),
+    );
 
     // Step 1: node3 receives node1's mkdir (normal Raft replication from node1)
     loader3.apply_entry(mkdir_entry_from_node1.clone())?;
