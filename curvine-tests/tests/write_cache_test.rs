@@ -23,6 +23,7 @@ use orpc::sys::DataSlice;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::sleep;
 
 fn get_fs() -> UnifiedFileSystem {
     // Check if UFS configuration is available, if not, skip the test
@@ -204,6 +205,123 @@ fn test_fs_mode_free() {
 
         let reader = fs.open(&path).await.unwrap();
         assert!(!matches!(reader, UnifiedReader::Cv(_)));
+    });
+}
+
+async fn prepare_fs_mode_file_then_free(fs: &UnifiedFileSystem, path: &Path, data: &str) {
+    let mut writer = fs.create(path, true).await.unwrap();
+    writer.write_string(data).await.unwrap();
+    writer.complete().await.unwrap();
+    let _ = fs.open(path).await.unwrap();
+    fs.wait_job_complete(path, false).await.unwrap();
+    fs.free(path).await.unwrap();
+}
+
+#[test]
+fn test_fs_mode_ufs_write_overwrite() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+        let base = format!("/write_cache_{:?}", WriteType::FsMode);
+        let path =
+            Path::from_str(format!("{}/test_fs_mode_ufs_write_overwrite.log", base)).unwrap();
+
+        let data_initial = Utils::rand_str(1024);
+        prepare_fs_mode_file_then_free(&fs, &path, &data_initial).await;
+
+        let data_overwrite = Utils::rand_str(2048);
+        let mut writer = fs.create(&path, true).await.unwrap();
+        writer.write_string(&data_overwrite).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let reader = fs.open(&path).await.unwrap();
+        assert!(
+            matches!(reader, UnifiedReader::Cv(_)),
+            "read should return CV reader after overwrite and sync"
+        );
+
+        verify_read_data(&fs, &path, data_overwrite.as_bytes()).await;
+
+        sleep(Duration::from_secs(3)).await;
+        verify_cv_ufs_consistency(&fs, &path).await;
+    });
+}
+
+#[test]
+fn test_fs_mode_ufs_write_append() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+        let base = format!("/write_cache_{:?}", WriteType::FsMode);
+        let path = Path::from_str(format!("{}/test_fs_mode_ufs_write_append.log", base)).unwrap();
+
+        let data_initial = Utils::rand_str(1024);
+        prepare_fs_mode_file_then_free(&fs, &path, &data_initial).await;
+
+        let data_append_extra = Utils::rand_str(512);
+        let mut writer = fs.append(&path).await.unwrap();
+        writer.write_string(&data_append_extra).await.unwrap();
+        writer.complete().await.unwrap();
+
+        let reader = fs.open(&path).await.unwrap();
+        assert!(
+            matches!(reader, UnifiedReader::Cv(_)),
+            "read should return CV reader after append and sync"
+        );
+        let expected_append = format!("{}{}", data_initial, data_append_extra);
+
+        verify_read_data(&fs, &path, expected_append.as_bytes()).await;
+
+        sleep(Duration::from_secs(3)).await;
+        verify_cv_ufs_consistency(&fs, &path).await;
+    });
+}
+
+#[test]
+fn test_fs_mode_ufs_write_random() {
+    let fs = get_fs();
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        mount(&fs, WriteType::FsMode).await;
+        let base = format!("/write_cache_{:?}", WriteType::FsMode);
+        let path = Path::from_str(format!("{}/test_fs_mode_ufs_write_random.log", base)).unwrap();
+
+        let data_initial = Utils::rand_str(1024);
+        prepare_fs_mode_file_then_free(&fs, &path, &data_initial).await;
+
+        let chunk_size = 64 * 1024;
+        let total_size = 256 * 1024;
+        let num_chunks = total_size / chunk_size;
+        let mut writer = fs.open_for_write(&path).await.unwrap();
+        let mut expected = vec![0u8; total_size];
+        for _ in 0..num_chunks {
+            let data_str = Utils::rand_str(chunk_size);
+            let data = DataSlice::from_str(data_str.clone()).freeze();
+            let write_pos = writer.pos() as usize;
+            writer.async_write(data.clone()).await.unwrap();
+            expected[write_pos..write_pos + chunk_size].copy_from_slice(data_str.as_bytes());
+        }
+        let random_pos = (num_chunks / 2 * chunk_size) as i64;
+        writer.seek(random_pos).await.unwrap();
+        let random_chunk = Utils::rand_str(chunk_size);
+        let random_data = DataSlice::from_str(random_chunk.clone()).freeze();
+        let write_pos = writer.pos() as usize;
+        writer.async_write(random_data).await.unwrap();
+        expected[write_pos..write_pos + chunk_size].copy_from_slice(random_chunk.as_bytes());
+        writer.complete().await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
+        let reader = fs.open(&path).await.unwrap();
+        assert!(
+            matches!(reader, UnifiedReader::Cv(_)),
+            "read should return CV reader after random write and sync"
+        );
+
+        verify_read_data(&fs, &path, &expected).await;
+
+        sleep(Duration::from_secs(3)).await;
+        verify_cv_ufs_consistency(&fs, &path).await;
     });
 }
 

@@ -104,7 +104,7 @@ impl BufferChannel {
 // Reader with buffer.
 pub struct FsWriterBuffer {
     path: Path,
-    status: FileStatus,
+    file_blocks: FileBlocks,
     writer: BufferChannel,
     pos: i64,
 }
@@ -113,7 +113,7 @@ impl FsWriterBuffer {
     pub fn new(writer: FsWriterBase, chunk_num: usize) -> Self {
         let err_monitor = Arc::new(ErrorMonitor::new());
         let path = writer.path().clone();
-        let status = writer.status().clone();
+        let file_blocks = writer.file_blocks();
         let pos = writer.pos();
 
         let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
@@ -140,7 +140,7 @@ impl FsWriterBuffer {
 
         Self {
             path,
-            status,
+            file_blocks,
             writer,
             pos,
         }
@@ -155,7 +155,11 @@ impl FsWriterBuffer {
     }
 
     pub fn status(&self) -> &FileStatus {
-        &self.status
+        &self.file_blocks.status
+    }
+
+    pub fn file_blocks(&self) -> &FileBlocks {
+        &self.file_blocks
     }
 
     pub fn pos(&self) -> i64 {

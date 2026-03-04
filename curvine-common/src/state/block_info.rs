@@ -164,7 +164,7 @@ impl FileBlocks {
     }
 
     pub fn cv_exists(&self) -> bool {
-        !self.block_locs.is_empty()
+        self.len > 0 && !self.block_locs.is_empty()
     }
 }
 
