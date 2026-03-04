@@ -471,13 +471,13 @@ impl P2pService {
             return true;
         }
         let current_version = self.runtime_policy_version.load(Ordering::Relaxed);
-        if policy_version < current_version {
+        let runtime_policy_applied = self.runtime_policy_applied.load(Ordering::Relaxed);
+        if policy_version < current_version && runtime_policy_applied {
             self.runtime_policy_rollback_ignored
                 .fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        if policy_version == current_version && self.runtime_policy_applied.load(Ordering::Relaxed)
-        {
+        if policy_version == current_version && runtime_policy_applied {
             return true;
         }
         if self
@@ -686,9 +686,14 @@ impl P2pService {
         }
 
         let flight_lock = self.fetch_flight_lock(chunk_id);
-        let flight_guard = timeout(self.transfer_timeout(), flight_lock.clone().lock_owned())
-            .await
-            .ok()?;
+        let flight_guard =
+            match timeout(self.transfer_timeout(), flight_lock.clone().lock_owned()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.cleanup_fetch_flight(&chunk_id, &flight_lock);
+                    return None;
+                }
+            };
 
         if let Some(chunk) = self
             .cache_manager
@@ -712,8 +717,13 @@ impl P2pService {
             self.inflight.clone().acquire_owned(),
         )
         .await
-        .ok()?
-        .ok()?;
+        .ok()
+        .and_then(|permit| permit.ok());
+        let Some(permit) = permit else {
+            drop(flight_guard);
+            self.cleanup_fetch_flight(&chunk_id, &flight_lock);
+            return None;
+        };
         let fetch_token = self.next_fetch_token();
         let trace = TraceLabels::from_context(fetch_token, context, &self.conf);
         emit_p2p_trace(
@@ -1180,8 +1190,6 @@ fn handle_network_command(
                         None,
                         Some("provider_empty"),
                     );
-                    let _ = response.send(None);
-                    return true;
                 }
                 let candidates = build_candidates(
                     cached.peers,
@@ -1292,36 +1300,45 @@ fn handle_network_command(
             tenant_whitelist: updated_tenant_whitelist,
             response,
         } => {
+            let mut accepted = true;
             if let Some(updated_peer_whitelist) = updated_peer_whitelist {
-                let mut next_peer_whitelist = parse_peer_whitelist(&updated_peer_whitelist);
-                next_peer_whitelist.extend(init.bootstrap_peer_ids.iter().copied());
-                init.peer_whitelist = next_peer_whitelist;
+                if let Some(parsed_peer_whitelist) = parse_peer_whitelist(&updated_peer_whitelist) {
+                    init.peer_whitelist = build_effective_peer_whitelist(
+                        parsed_peer_whitelist,
+                        &init.bootstrap_peer_ids,
+                    );
 
-                let to_disconnect: Vec<PeerId> = loop_state
-                    .connected_peers
-                    .iter()
-                    .copied()
-                    .filter(|peer| {
-                        !is_peer_allowed(*peer, init.local_peer_id, &init.peer_whitelist)
-                    })
-                    .collect();
-                for peer in to_disconnect {
-                    loop_state.connected_peers.remove(&peer);
-                    loop_state.mdns_peers.remove(&peer);
-                    loop_state.dht_peers.remove(&peer);
-                    loop_state.bootstrap_connected.remove(&peer);
-                    loop_state.inflight_per_peer.remove(&peer);
-                    loop_state.peer_ewma.remove(&peer);
-                    for providers in loop_state.provider_cache.values_mut() {
-                        providers.peers.remove(&peer);
+                    let to_disconnect: Vec<PeerId> = loop_state
+                        .connected_peers
+                        .iter()
+                        .copied()
+                        .filter(|peer| {
+                            !is_peer_allowed(*peer, init.local_peer_id, &init.peer_whitelist)
+                        })
+                        .collect();
+                    for peer in to_disconnect {
+                        loop_state.connected_peers.remove(&peer);
+                        loop_state.mdns_peers.remove(&peer);
+                        loop_state.dht_peers.remove(&peer);
+                        loop_state.bootstrap_connected.remove(&peer);
+                        loop_state.inflight_per_peer.remove(&peer);
+                        loop_state.peer_ewma.remove(&peer);
+                        for providers in loop_state.provider_cache.values_mut() {
+                            providers.peers.remove(&peer);
+                        }
+                        let _ = swarm.disconnect_peer_id(peer);
                     }
-                    let _ = swarm.disconnect_peer_id(peer);
+                } else {
+                    accepted = false;
                 }
             }
-            if let Some(updated_tenant_whitelist) = updated_tenant_whitelist {
-                init.tenant_whitelist = Arc::new(parse_tenant_whitelist(&updated_tenant_whitelist));
+            if accepted {
+                if let Some(updated_tenant_whitelist) = updated_tenant_whitelist {
+                    init.tenant_whitelist =
+                        Arc::new(parse_tenant_whitelist(&updated_tenant_whitelist));
+                }
             }
-            let _ = response.send(true);
+            let _ = response.send(accepted);
         }
         NetworkCommand::Stop => {
             if conf.enable_dht {
@@ -1629,6 +1646,8 @@ struct NetworkLoopState {
     provider_cache_ttl: Duration,
     discovery_timeout: Duration,
     transfer_timeout: Duration,
+    cache_cleanup_interval: Duration,
+    next_cache_cleanup_at: Instant,
     published_chunks: HashSet<ChunkId>,
     pending_queries: HashMap<kad::QueryId, PendingProviderQuery>,
     pending_requests: HashMap<request_response::OutboundRequestId, PendingFetchRequest>,
@@ -1640,6 +1659,7 @@ struct NetworkLoopState {
 
 impl NetworkLoopState {
     fn new(conf: &ClientP2pConf) -> Self {
+        let cache_cleanup_interval = cache_cleanup_interval(conf);
         Self {
             connected_peers: HashSet::new(),
             mdns_peers: HashSet::new(),
@@ -1649,6 +1669,8 @@ impl NetworkLoopState {
             provider_cache_ttl: provider_cache_ttl(conf),
             discovery_timeout: discovery_timeout(conf),
             transfer_timeout: transfer_timeout(conf),
+            cache_cleanup_interval,
+            next_cache_cleanup_at: Instant::now() + cache_cleanup_interval,
             published_chunks: HashSet::new(),
             pending_queries: HashMap::new(),
             pending_requests: HashMap::new(),
@@ -1669,8 +1691,11 @@ fn init_network_identity_and_policy(
     let _ = network_state.local_peer_id.set(local_peer_id.to_string());
     let bootstrap_peers = parse_bootstrap_peers(&conf.bootstrap_peers);
     let bootstrap_peer_ids: HashSet<PeerId> = bootstrap_peers.iter().map(|v| v.0).collect();
-    let mut peer_whitelist = parse_peer_whitelist(&conf.peer_whitelist);
-    peer_whitelist.extend(bootstrap_peer_ids.iter().copied());
+    let peer_whitelist = parse_peer_whitelist(&conf.peer_whitelist)
+        .map(|parsed_peer_whitelist| {
+            build_effective_peer_whitelist(parsed_peer_whitelist, &bootstrap_peer_ids)
+        })
+        .unwrap_or_else(|| HashSet::from([local_peer_id]));
     let tenant_whitelist = Arc::new(parse_tenant_whitelist(&conf.tenant_whitelist));
     NetworkInitState {
         local_peer_id,
@@ -1748,7 +1773,8 @@ async fn run_network_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                expire_pending_queries(&mut loop_state.pending_queries);
+                maybe_cleanup_expired_cache(cache_manager.as_ref(), &mut loop_state, Instant::now());
+                expire_pending_queries(&mut swarm, &conf, &init, &mut loop_state);
                 expire_pending_requests(&mut loop_state.pending_requests, &mut loop_state.inflight_per_peer);
                 expire_pending_incoming(&mut loop_state.pending_incoming);
                 expire_provider_cache(&mut loop_state.provider_cache, Instant::now());
@@ -1806,7 +1832,7 @@ fn build_swarm(
     conf: &ClientP2pConf,
 ) -> Result<libp2p::Swarm<P2pNetworkBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
     let req_config = request_response::Config::default()
-        .with_request_timeout(transfer_timeout(conf))
+        .with_request_timeout(request_timeout(conf))
         .with_max_concurrent_streams(conf.max_inflight_requests.max(1));
     let identity = load_or_generate_identity(conf)?;
 
@@ -1950,11 +1976,30 @@ fn should_accept_peer(
     max_active_peers == 0 || connected_peers.len() < max_active_peers
 }
 
-fn parse_peer_whitelist(peers: &[String]) -> HashSet<PeerId> {
-    peers
-        .iter()
-        .filter_map(|entry| PeerId::from_str(entry).ok())
-        .collect()
+fn parse_peer_whitelist(peers: &[String]) -> Option<HashSet<PeerId>> {
+    let mut parsed = HashSet::new();
+    for entry in peers {
+        match PeerId::from_str(entry) {
+            Ok(peer_id) => {
+                parsed.insert(peer_id);
+            }
+            Err(e) => {
+                warn!("invalid p2p peer whitelist entry '{}': {}", entry, e);
+                return None;
+            }
+        }
+    }
+    Some(parsed)
+}
+
+fn build_effective_peer_whitelist(
+    mut peer_whitelist: HashSet<PeerId>,
+    bootstrap_peer_ids: &HashSet<PeerId>,
+) -> HashSet<PeerId> {
+    if !peer_whitelist.is_empty() {
+        peer_whitelist.extend(bootstrap_peer_ids.iter().copied());
+    }
+    peer_whitelist
 }
 
 fn parse_tenant_whitelist(tenants: &[String]) -> HashSet<String> {
@@ -2271,7 +2316,7 @@ fn prepare_incoming_fetch_response(
     let expected_mtime = (request.expected_mtime > 0).then_some(request.expected_mtime);
     let (found, data, mtime, checksum) = if is_tenant_allowed(&request.tenant_id, tenant_whitelist)
     {
-        let cache = cache_manager.get(chunk_id, request.len, expected_mtime);
+        let cache = cache_manager.get_for_remote(chunk_id, request.len, expected_mtime);
         match cache.chunk {
             Some(chunk) => (true, chunk.data, chunk.mtime, chunk.checksum),
             None => (false, Bytes::new(), 0, Bytes::new()),
@@ -2451,14 +2496,20 @@ fn cancel_pending_by_token(
     }
 }
 
-fn expire_pending_queries(pending_queries: &mut HashMap<kad::QueryId, PendingProviderQuery>) {
+fn expire_pending_queries(
+    swarm: &mut libp2p::Swarm<P2pNetworkBehaviour>,
+    conf: &ClientP2pConf,
+    init: &NetworkInitState,
+    loop_state: &mut NetworkLoopState,
+) {
     let now = Instant::now();
-    let expired_ids: Vec<kad::QueryId> = pending_queries
+    let expired_ids: Vec<kad::QueryId> = loop_state
+        .pending_queries
         .iter()
         .filter_map(|(id, pending)| (pending.deadline <= now).then_some(*id))
         .collect();
     for query_id in expired_ids {
-        if let Some(pending) = pending_queries.remove(&query_id) {
+        if let Some(pending) = loop_state.pending_queries.remove(&query_id) {
             emit_p2p_trace(
                 "discover",
                 "timeout",
@@ -2469,7 +2520,32 @@ fn expire_pending_queries(pending_queries: &mut HashMap<kad::QueryId, PendingPro
                 None,
                 Some("discover_timeout"),
             );
-            let _ = pending.response.send(None);
+            let candidates = build_candidates(
+                std::iter::empty::<PeerId>(),
+                &loop_state.connected_peers,
+                &loop_state.bootstrap_connected,
+                init.local_peer_id,
+                &loop_state.peer_ewma,
+                &loop_state.inflight_per_peer,
+            );
+            dispatch_fetch_request(
+                swarm,
+                PendingFetchRequest {
+                    fetch_token: pending.fetch_token,
+                    chunk_id: pending.chunk_id,
+                    max_len: pending.max_len,
+                    expected_mtime: pending.expected_mtime,
+                    trace: pending.trace,
+                    response: pending.response,
+                    candidates,
+                    active_peer: None,
+                    started_at: now,
+                    deadline: now + loop_state.transfer_timeout,
+                },
+                init,
+                loop_state,
+                conf,
+            );
         }
     }
 }
@@ -2516,6 +2592,17 @@ fn ewma(current: f64, observed: f64, alpha: f64) -> f64 {
     current * (1.0 - alpha) + observed * alpha
 }
 
+fn maybe_cleanup_expired_cache(
+    cache_manager: &CacheManager,
+    loop_state: &mut NetworkLoopState,
+    now: Instant,
+) {
+    if now >= loop_state.next_cache_cleanup_at {
+        cache_manager.cleanup_expired();
+        loop_state.next_cache_cleanup_at = now + loop_state.cache_cleanup_interval;
+    }
+}
+
 fn provider_cache_ttl(conf: &ClientP2pConf) -> Duration {
     let min_ttl = discovery_timeout(conf);
     std::cmp::max(
@@ -2536,6 +2623,10 @@ fn transfer_timeout(conf: &ClientP2pConf) -> Duration {
     Duration::from_millis(conf.transfer_timeout_ms.max(1))
 }
 
+fn request_timeout(conf: &ClientP2pConf) -> Duration {
+    Duration::from_millis(conf.request_timeout_ms.max(1))
+}
+
 fn hedge_delay(conf: &ClientP2pConf) -> Option<Duration> {
     (conf.hedge_delay_ms > 0).then(|| Duration::from_millis(conf.hedge_delay_ms))
 }
@@ -2547,6 +2638,11 @@ fn maintenance_tick_interval(conf: &ClientP2pConf) -> Duration {
     Duration::from_millis(min_timeout_ms.clamp(100, 1000) as u64)
 }
 
+fn cache_cleanup_interval(conf: &ClientP2pConf) -> Duration {
+    let ttl_ms = conf.cache_ttl.as_millis();
+    Duration::from_millis(ttl_ms.clamp(1000, 60_000) as u64)
+}
+
 fn expire_provider_cache(provider_cache: &mut HashMap<ChunkId, CachedProviders>, now: Instant) {
     let expired_ids: Vec<ChunkId> = provider_cache
         .iter()
@@ -2554,5 +2650,202 @@ fn expire_provider_cache(provider_cache: &mut HashMap<ChunkId, CachedProviders>,
         .collect();
     for chunk_id in expired_ids {
         provider_cache.remove(&chunk_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    fn new_peer_id() -> PeerId {
+        identity::Keypair::generate_ed25519().public().to_peer_id()
+    }
+
+    fn test_conf(case: &str) -> ClientP2pConf {
+        ClientP2pConf {
+            enable_mdns: false,
+            enable_dht: true,
+            request_timeout_ms: 200,
+            discovery_timeout_ms: 200,
+            connect_timeout_ms: 200,
+            transfer_timeout_ms: 200,
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_string()],
+            cache_dir: std::env::temp_dir()
+                .join(format!("curvine-p2p-service-{case}-{}", new_peer_id()))
+                .to_string_lossy()
+                .to_string(),
+            ..ClientP2pConf::default()
+        }
+    }
+
+    fn test_runtime() -> Arc<Runtime> {
+        static TEST_RT: Lazy<Arc<Runtime>> =
+            Lazy::new(|| Arc::new(Runtime::new("p2p-service-test", 2, 2)));
+        TEST_RT.clone()
+    }
+
+    #[test]
+    fn empty_peer_whitelist_remains_open_after_bootstrap_merge() {
+        let bootstrap_peer_ids = HashSet::from([new_peer_id()]);
+        let effective = build_effective_peer_whitelist(HashSet::new(), &bootstrap_peer_ids);
+        assert!(effective.is_empty());
+    }
+
+    #[test]
+    fn explicit_peer_whitelist_keeps_bootstrap_peers_allowed() {
+        let allowed_peer = new_peer_id();
+        let bootstrap_peer = new_peer_id();
+        let effective = build_effective_peer_whitelist(
+            HashSet::from([allowed_peer]),
+            &HashSet::from([bootstrap_peer]),
+        );
+        assert!(effective.contains(&allowed_peer));
+        assert!(effective.contains(&bootstrap_peer));
+    }
+
+    #[test]
+    fn invalid_peer_whitelist_entry_is_rejected() {
+        assert!(parse_peer_whitelist(&["invalid-peer-id".to_string()]).is_none());
+    }
+
+    #[test]
+    fn invalid_startup_peer_whitelist_fails_closed() {
+        let local_peer_id = new_peer_id();
+        let whitelist = parse_peer_whitelist(&["invalid-peer-id".to_string()])
+            .map(|parsed_peer_whitelist| {
+                build_effective_peer_whitelist(parsed_peer_whitelist, &HashSet::new())
+            })
+            .unwrap_or_else(|| HashSet::from([local_peer_id]));
+        assert_eq!(whitelist, HashSet::from([local_peer_id]));
+    }
+
+    #[test]
+    fn request_timeout_uses_dedicated_config() {
+        let conf = ClientP2pConf {
+            request_timeout_ms: 1234,
+            ..ClientP2pConf::default()
+        };
+        assert_eq!(request_timeout(&conf), Duration::from_millis(1234));
+    }
+
+    #[test]
+    fn cache_cleanup_interval_is_clamped() {
+        let short_ttl = ClientP2pConf {
+            cache_ttl: Duration::from_millis(10),
+            ..ClientP2pConf::default()
+        };
+        assert_eq!(cache_cleanup_interval(&short_ttl), Duration::from_secs(1));
+
+        let long_ttl = ClientP2pConf {
+            cache_ttl: Duration::from_secs(120),
+            ..ClientP2pConf::default()
+        };
+        assert_eq!(cache_cleanup_interval(&long_ttl), Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn expire_pending_query_timeout_falls_back_to_connected_peers() {
+        let conf = test_conf("query-timeout-fallback");
+        let mut swarm = build_swarm(&conf).expect("swarm should build");
+        let local_peer_id = *swarm.local_peer_id();
+        let connected_peer = new_peer_id();
+        let init = NetworkInitState {
+            local_peer_id,
+            bootstrap_peer_ids: HashSet::new(),
+            peer_whitelist: HashSet::new(),
+            tenant_whitelist: Arc::new(HashSet::new()),
+        };
+        let mut loop_state = NetworkLoopState::new(&conf);
+        loop_state.connected_peers.insert(connected_peer);
+        let chunk_id = ChunkId::new(1, 0);
+        let query_id = swarm
+            .behaviour_mut()
+            .kad
+            .get_providers(chunk_record_key(chunk_id));
+        let (response_tx, mut response_rx) = oneshot::channel();
+        loop_state.pending_queries.insert(
+            query_id,
+            PendingProviderQuery {
+                fetch_token: 1,
+                chunk_id,
+                max_len: 1024,
+                expected_mtime: None,
+                trace: TraceLabels {
+                    trace_id: "trace".to_string(),
+                    tenant_id: "tenant".to_string(),
+                    job_id: "job".to_string(),
+                    sampled: false,
+                },
+                response: response_tx,
+                deadline: Instant::now() - Duration::from_millis(1),
+            },
+        );
+
+        expire_pending_queries(&mut swarm, &conf, &init, &mut loop_state);
+
+        assert!(loop_state.pending_queries.is_empty());
+        assert_eq!(loop_state.pending_requests.len(), 1);
+        assert!(matches!(response_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn stale_local_policy_version_does_not_block_lower_master_version() {
+        let mut conf = test_conf("stale-policy-version");
+        conf.enable = true;
+        conf.enable_dht = false;
+        conf.policy_hmac_key = "policy-secret".to_string();
+        let version_path = runtime_policy_version_path(&conf);
+        fs::create_dir_all(version_path.parent().unwrap()).expect("policy dir should exist");
+        fs::write(&version_path, "10").expect("stale version should be persisted");
+
+        let service = P2pService::new_with_runtime(conf.clone(), Some(test_runtime()));
+        service.start();
+
+        let peer_whitelist = vec![new_peer_id().to_string()];
+        let tenant_whitelist = vec!["tenant-a".to_string()];
+        let signature = CommonUtils::sign_p2p_policy(
+            &conf.policy_hmac_key,
+            5,
+            &peer_whitelist,
+            &tenant_whitelist,
+        );
+        let updated = service
+            .sync_runtime_policy_from_master(5, peer_whitelist, tenant_whitelist, signature)
+            .await;
+
+        assert!(updated);
+        assert_eq!(service.runtime_policy_version(), 5);
+        assert!(service.runtime_policy_applied.load(Ordering::Relaxed));
+        let persisted = fs::read_to_string(version_path).expect("policy version should exist");
+        assert_eq!(persisted.trim(), "5");
+        service.stop();
+    }
+
+    #[tokio::test]
+    async fn invalid_runtime_peer_whitelist_update_is_rejected() {
+        let mut conf = test_conf("invalid-runtime-peer-whitelist");
+        conf.enable = true;
+        conf.enable_dht = false;
+        conf.policy_hmac_key = "policy-secret".to_string();
+
+        let service = P2pService::new_with_runtime(conf.clone(), Some(test_runtime()));
+        service.start();
+
+        let peer_whitelist = vec!["invalid-peer-id".to_string()];
+        let tenant_whitelist = vec!["tenant-a".to_string()];
+        let signature = CommonUtils::sign_p2p_policy(
+            &conf.policy_hmac_key,
+            1,
+            &peer_whitelist,
+            &tenant_whitelist,
+        );
+        let updated = service
+            .sync_runtime_policy_from_master(1, peer_whitelist, tenant_whitelist, signature)
+            .await;
+
+        assert!(!updated);
+        assert_eq!(service.runtime_policy_version(), 0);
+        service.stop();
     }
 }

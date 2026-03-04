@@ -182,6 +182,25 @@ impl CacheManager {
         max_len: usize,
         expected_mtime: Option<i64>,
     ) -> CacheGetResult {
+        self.get_internal(chunk_id, max_len, expected_mtime, true)
+    }
+
+    pub fn get_for_remote(
+        &self,
+        chunk_id: ChunkId,
+        max_len: usize,
+        expected_mtime: Option<i64>,
+    ) -> CacheGetResult {
+        self.get_internal(chunk_id, max_len, expected_mtime, false)
+    }
+
+    fn get_internal(
+        &self,
+        chunk_id: ChunkId,
+        max_len: usize,
+        expected_mtime: Option<i64>,
+        invalidate_on_mtime_mismatch: bool,
+    ) -> CacheGetResult {
         let now_ms = LocalTime::mills() as i64;
         let (path, stored_len, mtime, entry_checksum) = match self.entries.get_mut(&chunk_id) {
             Some(mut entry) => {
@@ -197,8 +216,10 @@ impl CacheManager {
                 }
                 if expected_mtime.is_some_and(|expected| expected > 0 && entry.mtime != expected) {
                     self.mtime_mismatches.fetch_add(1, Ordering::Relaxed);
-                    drop(entry);
-                    self.invalidate(chunk_id);
+                    if invalidate_on_mtime_mismatch {
+                        drop(entry);
+                        self.invalidate(chunk_id);
+                    }
                     return CacheGetResult {
                         tag: CacheGetResultTag::MtimeMismatch,
                         chunk: None,
@@ -327,10 +348,10 @@ impl CacheManager {
     }
 
     fn evict_until_fit(&self) {
+        self.compact_eviction_queue_if_needed();
         if self.usage_bytes.load(Ordering::Relaxed) <= self.capacity_bytes {
             return;
         }
-        self.compact_eviction_queue_if_needed();
         while self.usage_bytes.load(Ordering::Relaxed) > self.capacity_bytes {
             let Some(token) = self.pop_oldest_access() else {
                 break;
@@ -348,11 +369,18 @@ impl CacheManager {
     }
 
     fn record_access(&self, chunk_id: ChunkId, last_access_ms: i64) {
-        let mut queue = self
-            .eviction_queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        queue.push(Reverse(EvictionToken::new(chunk_id, last_access_ms)));
+        let should_compact = {
+            let mut queue = self
+                .eviction_queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.push(Reverse(EvictionToken::new(chunk_id, last_access_ms)));
+            let entries_len = self.entries.len();
+            entries_len > 0 && queue.len() > entries_len.saturating_mul(8)
+        };
+        if should_compact {
+            self.compact_eviction_queue_if_needed();
+        }
     }
 
     fn pop_oldest_access(&self) -> Option<EvictionToken> {
@@ -366,6 +394,11 @@ impl CacheManager {
     fn compact_eviction_queue_if_needed(&self) {
         let entries_len = self.entries.len();
         if entries_len == 0 {
+            let mut queue = self
+                .eviction_queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.clear();
             return;
         }
         let queue_len = self
@@ -408,5 +441,84 @@ impl CacheManager {
             "{}_{}_{}_{}.bin",
             chunk_id.file_id, chunk_id.version_epoch, chunk_id.block_id, chunk_id.off
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn new_cache_manager() -> CacheManager {
+        let mut conf = ClientP2pConf::default();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        conf.cache_dir = std::env::temp_dir()
+            .join(format!("curvine-p2p-cache-{}-{}", std::process::id(), ts))
+            .to_string_lossy()
+            .into_owned();
+        CacheManager::new(&conf)
+    }
+
+    #[test]
+    fn remote_mtime_mismatch_keeps_provider_cache_entry() {
+        let cache_manager = new_cache_manager();
+        let chunk_id = ChunkId::with_version(1, 1, 1, 0);
+        let data = Bytes::from_static(b"p2p-test-data");
+        assert!(cache_manager.put(chunk_id, data.clone(), 100));
+
+        let mismatch = cache_manager.get_for_remote(chunk_id, data.len(), Some(101));
+        assert_eq!(mismatch.tag, CacheGetResultTag::MtimeMismatch);
+        assert!(mismatch.chunk.is_none());
+
+        let hit = cache_manager.get(chunk_id, data.len(), Some(100));
+        assert_eq!(hit.tag, CacheGetResultTag::Hit);
+        let hit_chunk = hit.chunk.expect("cache hit expected");
+        assert_eq!(hit_chunk.data, data);
+
+        let _ = fs::remove_dir_all(cache_manager.root_dir.clone());
+    }
+
+    #[test]
+    fn local_mtime_mismatch_invalidates_cache_entry() {
+        let cache_manager = new_cache_manager();
+        let chunk_id = ChunkId::with_version(2, 1, 1, 0);
+        let data = Bytes::from_static(b"p2p-test-data");
+        assert!(cache_manager.put(chunk_id, data.clone(), 100));
+
+        let mismatch = cache_manager.get(chunk_id, data.len(), Some(101));
+        assert_eq!(mismatch.tag, CacheGetResultTag::MtimeMismatch);
+        assert!(mismatch.chunk.is_none());
+
+        let miss = cache_manager.get(chunk_id, data.len(), Some(100));
+        assert_eq!(miss.tag, CacheGetResultTag::Miss);
+        assert!(miss.chunk.is_none());
+
+        let _ = fs::remove_dir_all(cache_manager.root_dir.clone());
+    }
+
+    #[test]
+    fn read_heavy_access_compacts_eviction_queue() {
+        let cache_manager = new_cache_manager();
+        let chunk_id = ChunkId::with_version(3, 1, 1, 0);
+        let data = Bytes::from_static(b"p2p-test-data");
+        assert!(cache_manager.put(chunk_id, data.clone(), 100));
+
+        for _ in 0..2000 {
+            let hit = cache_manager.get(chunk_id, data.len(), Some(100));
+            assert_eq!(hit.tag, CacheGetResultTag::Hit);
+        }
+
+        let queue_len = cache_manager
+            .eviction_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert!(queue_len <= cache_manager.entries.len().saturating_mul(8));
+
+        let _ = fs::remove_dir_all(cache_manager.root_dir.clone());
     }
 }

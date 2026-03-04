@@ -276,8 +276,17 @@ impl MasterFilesystem {
             None => {
                 return if flags.create() {
                     drop(fs_dir);
-                    let status = self.create_with_opts(path, opts, flags)?;
-                    Ok(FileBlocks::new(status, vec![]))
+                    match self.create_with_opts(path, opts.clone(), flags) {
+                        Ok(status) => Ok(FileBlocks::new(status, vec![])),
+                        Err(e @ FsError::FileAlreadyExists(_)) => {
+                            if flags.exclusive() {
+                                Err(e)
+                            } else {
+                                self.open_file(path, opts, flags)
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
                 } else {
                     err_ext!(FsError::file_not_found(inp.path()))
                 }
@@ -286,6 +295,9 @@ impl MasterFilesystem {
             Some(inode) => {
                 if inode.is_dir() {
                     return err_box!("{} is a directory", inp.path());
+                }
+                if flags.create() && flags.exclusive() {
+                    return err_ext!(FsError::file_exists(inp.path()));
                 }
                 inode
             }

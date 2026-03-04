@@ -130,3 +130,30 @@ async fn e2e_mtime_mismatch_is_detected() {
     assert!(mismatch.is_none());
     assert!(snapshot.mtime_mismatches >= 1);
 }
+
+#[tokio::test]
+async fn e2e_negative_provider_cache_still_uses_connected_peer() {
+    let mut provider_conf = build_conf("provider-negative-cache");
+    provider_conf.enable_dht = true;
+    let provider = P2pService::new_with_runtime(provider_conf, Some(test_runtime()));
+    provider.start();
+
+    let bootstrap = wait_bootstrap_addr(&provider)
+        .await
+        .expect("provider bootstrap address should be ready");
+
+    let mut consumer_conf = build_conf("consumer-negative-cache");
+    consumer_conf.enable_dht = true;
+    consumer_conf.bootstrap_peers = vec![bootstrap];
+    let consumer = P2pService::new_with_runtime(consumer_conf, Some(test_runtime()));
+    consumer.start();
+
+    let chunk = ChunkId::new(303, 0);
+    let first = consumer.fetch_chunk(chunk, 1024, Some(9000)).await;
+    assert!(first.is_none());
+
+    assert!(provider.publish_chunk(chunk, Bytes::from_static(b"late-publish"), 9000));
+    let second = wait_fetch(&consumer, chunk, 1024, Some(9000)).await;
+
+    assert_eq!(second, Some(Bytes::from_static(b"late-publish")));
+}

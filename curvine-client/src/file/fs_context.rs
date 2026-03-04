@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
+use crate::client_metrics::ReadSource;
 use crate::file::CurvineFileSystem;
+use crate::p2p::ChunkId;
 use crate::p2p::P2pService;
 use crate::ClientMetrics;
 use bytes::Bytes;
@@ -236,6 +238,10 @@ impl FsContext {
         self.conf.client.enable_read_chunk_cache
     }
 
+    pub(crate) fn read_chunk_flight_timeout_ms(&self) -> u64 {
+        self.conf.client.read_chunk_flight_timeout_ms.max(1)
+    }
+
     pub(crate) fn get_read_chunk_cache(&self, key: &ReadChunkKey) -> Option<Bytes> {
         if !self.read_chunk_cache_enabled() {
             return None;
@@ -248,6 +254,28 @@ impl FsContext {
             return;
         }
         self.read_chunk_cache.insert(key, data);
+    }
+
+    pub(crate) fn on_worker_chunk_read(
+        &self,
+        source: ReadSource,
+        read_key: ReadChunkKey,
+        chunk_id: ChunkId,
+        data: Bytes,
+        mtime: i64,
+    ) {
+        if source == ReadSource::Hole {
+            return;
+        }
+        self.put_read_chunk_cache(read_key, data.clone());
+        if let Some(p2p_service) = self.p2p_service.as_ref() {
+            if !p2p_service.publish_chunk(chunk_id, data, mtime) {
+                warn!(
+                    "publish chunk to p2p failed, chunk=({}, {}, {}, {})",
+                    chunk_id.file_id, chunk_id.version_epoch, chunk_id.block_id, chunk_id.off
+                );
+            }
+        }
     }
 
     pub(crate) fn read_chunk_flight_lock(&self, key: ReadChunkKey) -> Arc<AsyncMutex<()>> {
@@ -297,27 +325,43 @@ impl FsContext {
         let metric_report_enable = fs.conf().client.metric_report_enable;
         let interval = fs.conf().client.clean_task_interval;
 
-        fs.clone_runtime().spawn(async move {
+        let rt = fs.clone_runtime();
+        let fs_for_pool = fs.clone();
+        let pool_for_task = pool.clone();
+        rt.spawn(async move {
             let mut interval = tokio::time::interval(interval);
             loop {
                 interval.tick().await;
+                pool_for_task.clear_idle_conn();
+                fs_for_pool.sync_p2p_metrics();
+            }
+        });
 
-                pool.clear_idle_conn();
-                fs.sync_p2p_metrics();
-                if let Some(p2p_service) = fs.fs_context.p2p_service() {
+        let fs_for_policy = fs.clone();
+        rt.spawn(async move {
+            let mut interval = tokio::time::interval(interval);
+            loop {
+                interval.tick().await;
+                if let Some(p2p_service) = fs_for_policy.fs_context.p2p_service() {
                     if p2p_service.is_enabled() {
-                        if let Err(e) = fs.sync_p2p_runtime_policy().await {
+                        if let Err(e) = fs_for_policy.sync_p2p_runtime_policy().await {
                             warn!("sync p2p runtime policy: {}", e)
                         }
                     }
                 }
+            }
+        });
 
-                if metric_report_enable {
+        if metric_report_enable {
+            rt.spawn(async move {
+                let mut interval = tokio::time::interval(interval);
+                loop {
+                    interval.tick().await;
                     if let Err(e) = fs.metrics_report().await {
                         warn!("metrics report: {}", e)
                     }
                 }
-            }
-        });
+            });
+        }
     }
 }

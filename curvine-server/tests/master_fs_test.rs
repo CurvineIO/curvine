@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
+use curvine_common::error::FsError;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
@@ -30,7 +31,8 @@ use orpc::common::Utils;
 use orpc::message::Builder;
 use orpc::runtime::AsyncRuntime;
 use orpc::CommonResult;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+use std::thread;
 // Test the master filesystem function separately.
 // This test does not require a cluster startup.
 // Returns (MasterFilesystem, JournalSystem) to ensure proper resource cleanup.
@@ -145,6 +147,80 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
     let hash2 = fs.sum_hash();
     assert_eq!(hash1, hash2);
 
+    Ok(())
+}
+
+#[test]
+fn test_open_file_create_race_returns_existing_file() -> CommonResult<()> {
+    let (fs, _js) = new_fs(true, "open-create-race");
+    let path = "/open-create-race.log";
+    let shared_fs = Arc::new(fs);
+    let start = Arc::new(Barrier::new(17));
+    let mut handles = Vec::with_capacity(16);
+
+    for _ in 0..16 {
+        let fs = shared_fs.clone();
+        let barrier = start.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            fs.open_file(
+                path,
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_create(),
+            )
+        }));
+    }
+
+    start.wait();
+
+    for handle in handles {
+        let result = handle.join().expect("open_file worker should not panic");
+        assert!(
+            result.is_ok(),
+            "concurrent open_file(create) should succeed"
+        );
+    }
+
+    assert!(shared_fs.exists(path)?);
+    Ok(())
+}
+
+#[test]
+fn test_open_file_create_exclusive_race_keeps_eexist() -> CommonResult<()> {
+    let (fs, _js) = new_fs(true, "open-create-race-exclusive");
+    let path = "/open-create-race-exclusive.log";
+    let shared_fs = Arc::new(fs);
+    let start = Arc::new(Barrier::new(17));
+    let mut handles = Vec::with_capacity(16);
+
+    for _ in 0..16 {
+        let fs = shared_fs.clone();
+        let barrier = start.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            fs.open_file(
+                path,
+                CreateFileOpts::with_create(false),
+                OpenFlags::new_create().set_exclusive(true),
+            )
+        }));
+    }
+
+    start.wait();
+
+    let mut success = 0usize;
+    let mut eexist = 0usize;
+    for handle in handles {
+        match handle.join().expect("open_file worker should not panic") {
+            Ok(_) => success += 1,
+            Err(FsError::FileAlreadyExists(_)) => eexist += 1,
+            Err(e) => panic!("unexpected error: {}", e),
+        }
+    }
+
+    assert_eq!(success, 1);
+    assert_eq!(eexist, 15);
+    assert!(shared_fs.exists(path)?);
     Ok(())
 }
 

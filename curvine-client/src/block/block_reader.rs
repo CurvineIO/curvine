@@ -135,6 +135,21 @@ pub struct BlockReader {
 
 type ReadChunkFlight = (Arc<AsyncMutex<()>>, OwnedMutexGuard<()>);
 
+struct ReadPipelineInput {
+    source: ReadSource,
+    read_key: ReadChunkKey,
+    chunk_id: ChunkId,
+    expect_len: usize,
+    version_epoch: i64,
+    block_id: i64,
+    read_off: i64,
+}
+
+enum ReadPipelineOutcome {
+    Data(DataSlice),
+    Retry,
+}
+
 impl BlockReader {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -305,10 +320,15 @@ impl BlockReader {
             return None;
         }
         let lock = self.fs_context.read_chunk_flight_lock(read_key.clone());
-        let timeout_ms = self.fs_context.conf.client.p2p.transfer_timeout_ms.max(1);
-        let guard = timeout(Duration::from_millis(timeout_ms), lock.clone().lock_owned())
-            .await
-            .ok()?;
+        let timeout_ms = self.fs_context.read_chunk_flight_timeout_ms();
+        let guard =
+            match timeout(Duration::from_millis(timeout_ms), lock.clone().lock_owned()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.fs_context.cleanup_read_chunk_flight(read_key, &lock);
+                    return None;
+                }
+            };
         Some((lock, guard))
     }
 
@@ -380,18 +400,13 @@ impl BlockReader {
     ) -> FsResult<DataSlice> {
         let start = LocalTime::nanos();
         let bytes = Self::normalize_worker_chunk(self.inner.read().await?);
-        if source != ReadSource::Hole {
-            self.fs_context
-                .put_read_chunk_cache(read_key.clone(), bytes.clone());
-            if let Some(p2p_service) = self.fs_context.p2p_service() {
-                if !p2p_service.publish_chunk(chunk_id, bytes.clone(), self.file_mtime) {
-                    warn!(
-                        "publish chunk to p2p failed, chunk=({}, {}, {}, {})",
-                        chunk_id.file_id, chunk_id.version_epoch, chunk_id.block_id, chunk_id.off
-                    );
-                }
-            }
-        }
+        self.fs_context.on_worker_chunk_read(
+            source,
+            read_key.clone(),
+            chunk_id,
+            bytes.clone(),
+            self.file_mtime,
+        );
         self.observe_read_source_metric(source, bytes.len(), start);
         Ok(DataSlice::bytes(bytes))
     }
@@ -431,6 +446,79 @@ impl BlockReader {
         Ok(())
     }
 
+    fn build_read_pipeline_input(&self) -> ReadPipelineInput {
+        let read_off = self.pos();
+        let block_id = self.block_id();
+        let version_epoch = self.file_version_epoch.max(0);
+        ReadPipelineInput {
+            source: self.inner.source_tag(),
+            read_key: ReadChunkKey::new(self.file_id, version_epoch, block_id, read_off),
+            chunk_id: ChunkId::with_version(self.file_id, version_epoch, block_id, read_off),
+            expect_len: self
+                .remaining()
+                .max(0)
+                .min(self.fs_context.read_chunk_size() as i64) as usize,
+            version_epoch,
+            block_id,
+            read_off,
+        }
+    }
+
+    async fn execute_read_pipeline(
+        &mut self,
+        input: &ReadPipelineInput,
+    ) -> FsResult<ReadPipelineOutcome> {
+        if let Some(data) = self.try_read_chunk_cache(&input.read_key)? {
+            return Ok(ReadPipelineOutcome::Data(data));
+        }
+
+        let mut flight = self.acquire_read_chunk_flight(&input.read_key).await;
+        if flight.is_some() {
+            if let Some(data) = self.try_read_chunk_cache(&input.read_key)? {
+                self.release_read_chunk_flight(&input.read_key, &mut flight);
+                return Ok(ReadPipelineOutcome::Data(data));
+            }
+        }
+
+        match self
+            .try_read_from_p2p(
+                input.source,
+                input.chunk_id,
+                input.expect_len,
+                &input.read_key,
+                input.version_epoch,
+                input.block_id,
+                input.read_off,
+            )
+            .await
+        {
+            Ok(Some(data)) => {
+                self.release_read_chunk_flight(&input.read_key, &mut flight);
+                return Ok(ReadPipelineOutcome::Data(data));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.release_read_chunk_flight(&input.read_key, &mut flight);
+                return Err(e);
+            }
+        }
+
+        match self
+            .read_from_worker(input.source, &input.read_key, input.chunk_id)
+            .await
+        {
+            Ok(v) => {
+                self.release_read_chunk_flight(&input.read_key, &mut flight);
+                Ok(ReadPipelineOutcome::Data(v))
+            }
+            Err(e) => {
+                self.release_read_chunk_flight(&input.read_key, &mut flight);
+                self.handle_worker_read_error(e).await?;
+                Ok(ReadPipelineOutcome::Retry)
+            }
+        }
+    }
+
     // Based on network transmission efficiency considerations, the data size of the underlying tcp is fixed each time.
     pub async fn read(&mut self) -> FsResult<DataSlice> {
         if !self.has_remaining() {
@@ -438,60 +526,11 @@ impl BlockReader {
         }
 
         loop {
-            let read_off = self.pos();
-            let block_id = self.block_id();
-            let version_epoch = self.file_version_epoch.max(0);
-            let read_key = ReadChunkKey::new(self.file_id, version_epoch, block_id, read_off);
-            let chunk_id = ChunkId::with_version(self.file_id, version_epoch, block_id, read_off);
-            let source = self.inner.source_tag();
-            let expect_len =
-                self.remaining()
-                    .max(0)
-                    .min(self.fs_context.read_chunk_size() as i64) as usize;
-
-            if let Some(data) = self.try_read_chunk_cache(&read_key)? {
-                return Ok(data);
-            }
-
-            let mut flight = self.acquire_read_chunk_flight(&read_key).await;
-            if flight.is_some() {
-                if let Some(data) = self.try_read_chunk_cache(&read_key)? {
-                    self.release_read_chunk_flight(&read_key, &mut flight);
-                    return Ok(data);
-                }
-            }
-
-            match self
-                .try_read_from_p2p(
-                    source,
-                    chunk_id,
-                    expect_len,
-                    &read_key,
-                    version_epoch,
-                    block_id,
-                    read_off,
-                )
-                .await
-            {
-                Ok(Some(data)) => {
-                    self.release_read_chunk_flight(&read_key, &mut flight);
-                    return Ok(data);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    self.release_read_chunk_flight(&read_key, &mut flight);
-                    return Err(e);
-                }
-            }
-
-            match self.read_from_worker(source, &read_key, chunk_id).await {
-                Ok(v) => {
-                    self.release_read_chunk_flight(&read_key, &mut flight);
-                    return Ok(v);
-                }
-                Err(e) => {
-                    self.release_read_chunk_flight(&read_key, &mut flight);
-                    self.handle_worker_read_error(e).await?;
+            let input = self.build_read_pipeline_input();
+            match self.execute_read_pipeline(&input).await? {
+                ReadPipelineOutcome::Data(data) => return Ok(data),
+                ReadPipelineOutcome::Retry => {
+                    continue;
                 }
             }
         }

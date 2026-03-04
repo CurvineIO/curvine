@@ -235,6 +235,7 @@ pub struct ClientConf {
     pub read_chunk_cache_ttl: Duration,
     #[serde(alias = "read_chunk_cache_ttl")]
     pub read_chunk_cache_ttl_str: String,
+    pub read_chunk_flight_timeout_ms: u64,
 
     // These 2 parameters are used to improve the speed of reading a single file.
     // Read the parallelism of a file, default is 1
@@ -525,6 +526,7 @@ impl Default for ClientConf {
             read_chunk_cache_capacity: 32768,
             read_chunk_cache_ttl: Duration::default(),
             read_chunk_cache_ttl_str: "10m".to_string(),
+            read_chunk_flight_timeout_ms: 800,
             read_parallel: 1,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
