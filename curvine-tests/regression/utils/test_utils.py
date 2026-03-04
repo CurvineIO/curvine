@@ -118,40 +118,46 @@ def find_script_path(script_name="daily_regression_test.sh", project_path=None):
     Returns:
         str: Path to script, or None if not found
     """
-    # 1. First check build/tests directory relative to project_path (if provided)
+    # 1. First check curvine-tests/regression (canonical location for regression scripts)
+    if project_path:
+        script_in_regression = os.path.join(project_path, 'curvine-tests', 'regression', script_name)
+        if os.path.exists(script_in_regression):
+            return script_in_regression
+    
+    # 2. Check build/tests directory relative to project_path (if provided)
     if project_path:
         script_in_project_build_tests = os.path.join(project_path, 'build', 'tests', script_name)
         if os.path.exists(script_in_project_build_tests):
             return script_in_project_build_tests
     
-    # 2. Check build/tests directory in current working directory (new location)
+    # 3. Check build/tests directory in current working directory
     current_dir = os.getcwd()
     script_in_build_tests = os.path.join(current_dir, 'build', 'tests', script_name)
     if os.path.exists(script_in_build_tests):
         return script_in_build_tests
     
-    # 3. Check current directory
+    # 4. Check current directory (e.g. when run from curvine-tests/regression/)
     script_in_current = os.path.join(current_dir, script_name)
     if os.path.exists(script_in_current):
         return script_in_current
     
-    # 4. Check scripts subdirectory of current directory (legacy location)
+    # 5. Check scripts subdirectory of current directory (legacy location)
     script_in_scripts = os.path.join(current_dir, 'scripts', script_name)
     if os.path.exists(script_in_scripts):
         return script_in_scripts
     
-    # 5. Check scripts subdirectory relative to project_path (legacy location)
+    # 6. Check scripts subdirectory relative to project_path (legacy location)
     if project_path:
         script_in_project_scripts = os.path.join(project_path, 'scripts', script_name)
         if os.path.exists(script_in_project_scripts):
             return script_in_project_scripts
     
-    # 6. Check PATH environment variable
+    # 7. Check PATH environment variable
     script_in_path = shutil.which(script_name)
     if script_in_path:
         return script_in_path
     
-    # 7. Check common locations
+    # 8. Check common locations
     common_paths = [
         '/usr/local/bin',
         '/usr/bin',
