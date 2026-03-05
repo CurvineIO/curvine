@@ -238,7 +238,7 @@ impl UnifiedFileSystem {
         ufs_path: &Path,
         mount: &MountValue,
     ) -> FsResult<Option<FsReader>> {
-        let blocks = match self.cv.get_block_locations(cv_path).await {
+        let mut blocks = match self.cv.get_block_locations(cv_path).await {
             Ok(blocks) => blocks,
             Err(e) => {
                 if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
@@ -267,6 +267,7 @@ impl UnifiedFileSystem {
                 .await?
             {
                 CacheValidity::Valid => {
+                    blocks.status.mtime = blocks.status.storage_policy.ufs_mtime;
                     let cv_reader = Some(FsReader::new(
                         cv_path.clone(),
                         self.cv.fs_context(),

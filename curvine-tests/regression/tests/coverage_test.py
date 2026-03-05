@@ -52,15 +52,11 @@ def run_coverage_test(project_path, test_results_dir, test_dir=None, update_stat
                 print(f"Created new test directory: {test_dir}")
         
         try:
-            # Check if cargo llvm-cov is available
-            check_process = subprocess.Popen(
-                ['cargo', 'llvm-cov', '--version'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-            check_process.wait()
-            if check_process.returncode != 0:
+            # Check if cargo-llvm-cov binary is available via PATH lookup.
+            # Avoid running `cargo llvm-cov --version` here: in a non-TTY subprocess
+            # it may prompt to install llvm-tools-preview and return non-zero even
+            # when the binary is correctly installed, causing a false-negative.
+            if not shutil.which('cargo-llvm-cov'):
                 error_msg = "cargo llvm-cov is not installed. Please install it with: cargo install cargo-llvm-cov"
                 print(f"Error: {error_msg}")
                 if status:

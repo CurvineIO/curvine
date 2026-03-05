@@ -77,3 +77,31 @@ docker run \
 |-------|---------|
 | `~/.cargo/registry` | Reuse downloaded Rust crates across builds |
 | `~/.m2` | Reuse downloaded Maven JARs across builds |
+
+**If running FUSE tests**, the container needs privileged mode to perform FUSE mounts:
+
+```bash
+docker run \
+  -v "$(pwd)":/workspace \
+  --privileged \
+  --device /dev/fuse \
+  -p 5002:5002 \
+  curvine-tests
+```
+
+| Flag | Why it's needed |
+|------|----------------|
+| `--privileged` | Grants all capabilities required for `mount` (FUSE needs more than just `SYS_ADMIN` on some kernels) |
+| `--device /dev/fuse` | Expose the host FUSE device to the container |
+
+> Without `--privileged`, FUSE mount fails with `Operation not permitted (os error 1)` even if `--cap-add SYS_ADMIN` is set. This is a known limitation of running FUSE inside Docker.
+
+**`CURVINE_MASTER_HOSTNAME`**: the hostname tests use to connect to the Curvine master. Defaults to `localhost`. Must match the `journal_addr` host in `curvine-cluster.toml`.
+
+```bash
+docker run \
+  -v "$(pwd)":/workspace \
+  -e CURVINE_MASTER_HOSTNAME=192.168.1.100 \
+  -p 5002:5002 \
+  curvine-tests
+```
