@@ -17,7 +17,7 @@ use crate::proto::raft::SnapshotData;
 use crate::raft::snapshot::{DownloadJob, SnapshotState};
 use crate::raft::storage::{AppStorage, LogStorage};
 use crate::raft::{LibRaftResult, RaftClient, RaftError, RaftResult};
-use log::{error, info};
+use log::{error, info, warn};
 use orpc::common::{TimeSpent, Utils};
 use orpc::err_box;
 use orpc::runtime::{GroupExecutor, JobCtl, JobState};
@@ -173,8 +173,17 @@ where
 
             // Install snapshot.
             let snapshot_meta = snapshot.metadata.clone();
+
+            if let Err(e) = log_store.apply_snapshot(snapshot) {
+                return if e.is_snapshot_out_of_date() {
+                    warn!("{}, skip apply; local state is already newer", e);
+                    Ok(())
+                } else {
+                    Err(e)
+                };
+            }
+
             app_store.apply_snapshot(&data)?;
-            log_store.apply_snapshot(snapshot)?;
             let apply_ms = spend.used_ms();
 
             info!(
