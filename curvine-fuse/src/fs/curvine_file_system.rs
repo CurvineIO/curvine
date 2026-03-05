@@ -1214,7 +1214,9 @@ impl fs::FileSystem for CurvineFileSystem {
         handle.flush(Some(reply)).await?;
 
         let path = Path::from_str(&handle.status.path)?;
-        self.invalidate_cache(&path)?;
+        if handle.writer.is_some() {
+            self.invalidate_cache(&path)?;
+        }
         Ok(())
     }
 
@@ -1241,7 +1243,9 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         let path = Path::from_str(&handle.status.path)?;
-        self.invalidate_cache(&path)?;
+        if handle.writer.is_some() {
+            self.invalidate_cache(&path)?;
+        }
 
         complete_result
     }
