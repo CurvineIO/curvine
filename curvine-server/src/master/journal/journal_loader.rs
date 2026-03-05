@@ -28,7 +28,7 @@ use curvine_common::utils::SerdeUtils;
 use log::{debug, error, info, warn};
 use orpc::common::FileUtils;
 use orpc::sync::AtomicCounter;
-use orpc::{err_box, try_option_ref, CommonResult};
+use orpc::{err_box, try_option, try_option_ref, CommonResult};
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs, mem};
@@ -116,16 +116,9 @@ impl JournalLoader {
 
     fn reopen_file(&self, entry: ReopenFileEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let entry_path = entry.path;
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry_path.clone(), &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
-        let mut inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("ReOpenFile: path not found: {}", entry_path);
-                return Ok(());
-            }
-        };
+        let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
         let _ = mem::replace(file, entry.file);
 
@@ -136,17 +129,10 @@ impl JournalLoader {
 
     fn overwrite_file(&self, entry: OverWriteFileEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let entry_path = entry.path;
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry_path.clone(), &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
         // For journal replay, we directly update the file with the entry's file data
-        let mut inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("OverWriteFile: path not found: {}", entry_path);
-                return Ok(());
-            }
-        };
+        let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
         let _ = mem::replace(file, entry.file);
 
@@ -157,16 +143,9 @@ impl JournalLoader {
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let entry_path = entry.path;
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry_path.clone(), &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
-        let mut inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("OverWriteFile: path not found: {}", entry_path);
-                return Ok(());
-            }
-        };
+        let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
         let _ = mem::replace(&mut file.blocks, entry.blocks);
         fs_dir
@@ -178,16 +157,9 @@ impl JournalLoader {
 
     fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let entry_path = entry.path;
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry_path.clone(), &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
 
-        let mut inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("OverWriteFile: path not found: {}", entry_path);
-                return Ok(());
-            }
-        };
+        let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
 
         let _ = mem::replace(file, entry.file);
@@ -198,7 +170,6 @@ impl JournalLoader {
 
         Ok(())
     }
-
     pub fn rename(&self, entry: RenameEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let entry_src = entry.src;

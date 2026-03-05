@@ -13,13 +13,16 @@
 // limitations under the License.
 
 use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
+use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
 };
+use curvine_common::state::MountOptions;
 use curvine_common::state::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, WorkerInfo,
 };
+
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use curvine_server::master::journal::JournalLoader;
@@ -32,6 +35,7 @@ use orpc::message::Builder;
 use orpc::runtime::AsyncRuntime;
 use orpc::CommonResult;
 use std::sync::Arc;
+
 // Test the master filesystem function separately.
 // This test does not require a cluster startup.
 // Returns (MasterFilesystem, JournalSystem) to ensure proper resource cleanup.
@@ -93,110 +97,6 @@ fn new_handler() -> MasterHandler {
         JobHandler::new(job_manager),
         replication_manager,
     )
-}
-
-#[test]
-fn test_delete_duplicate_journal_on_leader_crash_retry() -> CommonResult<()> {
-    Master::init_test_metrics();
-
-    let mut conf = ClusterConf {
-        testing: true,
-        ..Default::default()
-    };
-    let worker = WorkerInfo::default();
-
-    // node1 (initial leader)
-    conf.change_test_meta_dir("raft-delete-idem-1");
-    let js1 = JournalSystem::from_conf(&conf)?;
-    let fs1 = MasterFilesystem::with_js(&conf, &js1);
-    fs1.add_test_worker(worker.clone());
-
-    // node1: mkdir /data => capture MkdirEntry
-    fs1.mkdir("/data", false)?;
-    let mkdir_entries = js1.fs().fs_dir.read().take_entries();
-    assert_eq!(mkdir_entries.len(), 1, "Expected 1 mkdir entry from node1");
-    let mkdir_entry_from_node1 = mkdir_entries.into_iter().next().unwrap();
-
-    // node1: delete /data => capture DeleteEntry
-    fs1.delete("/data", false)?;
-    let delete_entries1 = js1.fs().fs_dir.read().take_entries();
-    assert_eq!(
-        delete_entries1.len(),
-        1,
-        "Expected 1 delete entry from node1"
-    );
-    let delete_entry_from_node1 = delete_entries1.into_iter().next().unwrap();
-
-    //  node2 (new leader after node1 crash)
-    // node2 received node1's mkdir but NOT node1's delete
-    conf.change_test_meta_dir("raft-delete-idem-2");
-    let js2 = JournalSystem::from_conf(&conf)?;
-    let fs2 = MasterFilesystem::with_js(&conf, &js2);
-    fs2.add_test_worker(worker.clone());
-    let mnt_mgr2 = js2.mount_manager();
-
-    let loader2 = JournalLoader::new(
-        fs2.fs_dir(),
-        mnt_mgr2.clone(),
-        &conf.journal,
-        js2.job_manager(),
-    );
-    loader2.apply_entry(mkdir_entry_from_node1.clone())?;
-    println!("node2 state after receiving node1's mkdir:");
-    fs2.print_tree();
-
-    // node2 (new leader) receives client retry: delete("/data")
-    // node2 has no knowledge of node1's req_id => executes delete => produces new DeleteEntry
-    fs2.delete("/data", false)?;
-    let delete_entries2 = js2.fs().fs_dir.read().take_entries();
-    assert_eq!(
-        delete_entries2.len(),
-        1,
-        "Expected 1 delete entry from node2"
-    );
-    let delete_entry_from_node2 = delete_entries2.into_iter().next().unwrap();
-
-    println!("delete_entry_from_node1: {:?}", delete_entry_from_node1);
-    println!("delete_entry_from_node2: {:?}", delete_entry_from_node2);
-
-    //  node3 as a follower and applies both delete operations from node1 and node2
-    conf.change_test_meta_dir("raft-delete-idem-3");
-    let js3 = JournalSystem::from_conf(&conf)?;
-    let fs3 = MasterFilesystem::with_js(&conf, &js3);
-    fs3.add_test_worker(worker.clone());
-    let mnt_mgr3 = js3.mount_manager();
-    let loader3 = JournalLoader::new(
-        fs3.fs_dir(),
-        mnt_mgr3.clone(),
-        &conf.journal,
-        js3.job_manager(),
-    );
-
-    // Step 1: node3 receives node1's mkdir (normal Raft replication from node1)
-    loader3.apply_entry(mkdir_entry_from_node1.clone())?;
-    println!("node3 after node1 mkdir replication — /data should exist");
-    fs3.print_tree();
-
-    // Step 2: node3 receives node1's delete (normal Raft replication from node1)
-    loader3.apply_entry(delete_entry_from_node1.clone())?;
-    println!("node3 after node1 delete replication — /data should be gone");
-    fs3.print_tree();
-
-    // Step 3: node3 receives node2's delete (client retry to new leader)
-    // BUG: /data is already gone on node3 => should skip.
-
-    let result = loader3.apply_entry(delete_entry_from_node2.clone());
-
-    // Without idempotency handling, it raises error.
-    println!("node2's delete apply result on node3: {:?}", result);
-
-    assert!(
-        result.is_ok(),
-        "BUG: duplicate delete entry not handled idempotently — got: {:?}",
-        result
-    );
-
-    Ok(())
 }
 
 #[test]
@@ -793,5 +693,194 @@ fn rename_retry(handler: &mut MasterHandler) -> CommonResult<()> {
     println!("f2: {:?}", f2);
     assert!(f2);
 
+    Ok(())
+}
+
+// Helper: creates a leader + follower pair, returns (leader_fs, leader_js, loader, follower_js)
+fn setup_pair(
+    name: &str,
+) -> (
+    MasterFilesystem,
+    JournalSystem,
+    JournalLoader,
+    JournalSystem,
+    MasterFilesystem,
+) {
+    Master::init_test_metrics();
+    let mut conf = ClusterConf {
+        testing: true,
+        ..Default::default()
+    };
+    let worker = WorkerInfo::default();
+
+    conf.change_test_meta_dir(&format!("idem-{}-leader", name));
+    let js1 = JournalSystem::from_conf(&conf).unwrap();
+    let fs1 = MasterFilesystem::with_js(&conf, &js1);
+    fs1.add_test_worker(worker.clone());
+
+    conf.change_test_meta_dir(&format!("idem-{}-follower", name));
+    let js2 = JournalSystem::from_conf(&conf).unwrap();
+    let fs2 = MasterFilesystem::with_js(&conf, &js2);
+    fs2.add_test_worker(worker);
+    let loader = JournalLoader::new(
+        fs2.fs_dir(),
+        js2.mount_manager(),
+        &conf.journal,
+        js2.job_manager(),
+    );
+
+    (fs1, js1, loader, js2, fs2)
+}
+
+/// Simulate the entry replaying at the follower
+fn replay_all_then_duplicate_last(js: &JournalSystem, loader: &JournalLoader) {
+    let entries = js.fs().fs_dir.read().take_entries();
+    assert!(!entries.is_empty());
+
+    // First: replay all entries
+    for e in entries.iter() {
+        loader.apply_entry(e.clone()).unwrap();
+    }
+
+    // Second: replay last entry again
+    let dup_start = entries.len() - 1;
+    for e in &entries[dup_start..] {
+        let result = loader.apply_entry(e.clone());
+        assert!(
+            result.is_ok(),
+            "duplicate entry should be idempotent: {:?}",
+            result
+        );
+    }
+}
+
+#[test]
+fn test_idempotent_mkdir() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("mkdir");
+    fs.mkdir("/data", false)?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_create_file() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("create-file");
+    fs.create("/file.log", true)?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_delete() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("delete");
+    fs.mkdir("/data", false)?;
+    fs.delete("/data", true)?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_rename() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("rename");
+    fs.mkdir("/src", false)?;
+    fs.rename("/src", "/dst", RenameFlags::empty())?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_free() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("free");
+    fs.create("/file.log", true)?;
+    // Set ufs_mtime > 0 so the free function passes the ufs_exists() check
+    let set_opts = SetAttrOptsBuilder::new().ufs_mtime(1).build();
+    fs.set_attr("/file.log", set_opts)?;
+    fs.free("/file.log")?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_set_attr() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("set-attr");
+    fs.mkdir("/data", false)?;
+    let opts = SetAttrOptsBuilder::new().owner("test_owner").build();
+    fs.set_attr("/data", opts)?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_unmount() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("unmount");
+    let mnt_mgr = js.mount_manager();
+    let mnt_opt = MountOptions::builder().build();
+    mnt_mgr.mount(None, "/mnt/test", "oss://bucket/", &mnt_opt)?;
+    mnt_mgr.umount("/mnt/test")?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_symlink() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("symlink");
+    fs.mkdir("/dir", false)?;
+    fs.symlink("/target", "/dir/link", false, 0o777)?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_link() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("link");
+    fs.create("/original.txt", true)?;
+    fs.link("/original.txt", "/hardlink.txt")?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_mount() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("mount");
+    let mnt_mgr = js.mount_manager();
+    let mount_uri = CurvineURI::new("/mnt/test")?;
+    let ufs_uri = CurvineURI::new("oss://bucket1/")?;
+    let mnt_opt = MountOptions::builder().build();
+    mnt_mgr.mount(
+        None,
+        mount_uri.path(),
+        ufs_uri.encode_uri().as_ref(),
+        &mnt_opt,
+    )?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    Ok(())
+}
+
+#[test]
+fn test_idempotent_set_locks() -> CommonResult<()> {
+    let (fs, js, loader, _js2, fs2) = setup_pair("set-locks");
+    fs.create("/lockfile.log", true)?;
+    let lock = curvine_common::state::FileLock {
+        client_id: "client1".to_string(),
+        owner_id: 1,
+        lock_type: curvine_common::state::LockType::WriteLock,
+        lock_flags: curvine_common::state::LockFlags::Plock,
+        start: 0,
+        end: 100,
+        ..Default::default()
+    };
+    fs.set_lock("/lockfile.log", lock)?;
+    replay_all_then_duplicate_last(&js, &loader);
+    assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
