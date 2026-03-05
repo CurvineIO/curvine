@@ -91,7 +91,7 @@ impl MountTable {
     }
 
     // mountid maybe occupied
-    fn has_mounted(&self, mount_id: u32) -> bool {
+    pub fn has_mounted(&self, mount_id: u32) -> bool {
         let inner = self.inner.read().unwrap();
         inner.mountid2entry.contains_key(&mount_id)
     }

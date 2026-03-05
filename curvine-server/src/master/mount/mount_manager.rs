@@ -119,6 +119,10 @@ impl MountManager {
         self.mount_table.unprotected_umount_by_id(id)
     }
 
+    pub fn has_mounted(&self, id: u32) -> bool {
+        self.mount_table.has_mounted(id)
+    }
+
     /**
      * use ufs_uri to find mount entry
      */
