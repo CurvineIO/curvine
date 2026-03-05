@@ -198,6 +198,13 @@ impl MasterHandler {
             return Ok(true);
         }
 
+        let path = Path::from_str(&header.path)?;
+        if let Some(info) = self.mount_manager.get_mount_info(&path)? {
+            if path.path() == info.cv_path {
+                return err_box!("cannot delete mount point root: {}", info.cv_path);
+            }
+        }
+
         let res = self.fs.delete(&header.path, header.recursive);
         self.set_req_cache(req_id, res)
     }

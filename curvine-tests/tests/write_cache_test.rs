@@ -59,7 +59,7 @@ fn test_cache_mode() {
         let mtime_before = ufs_reader_before.status().mtime;
         drop(ufs_reader_before);
 
-        fs.async_cache(&path).await.unwrap();
+        fs.async_cache(&path).unwrap();
         fs.wait_job_complete(&path, false).await.unwrap();
 
         let ufs_reader_after = mnt.ufs.open(&ufs_path).await.unwrap();
