@@ -713,12 +713,12 @@ fn setup_pair(
     };
     let worker = WorkerInfo::default();
 
-    conf.change_test_meta_dir(&format!("idem-{}-leader", name));
+    conf.change_test_meta_dir(format!("idem-{}-leader", name));
     let js1 = JournalSystem::from_conf(&conf).unwrap();
     let fs1 = MasterFilesystem::with_js(&conf, &js1);
     fs1.add_test_worker(worker.clone());
 
-    conf.change_test_meta_dir(&format!("idem-{}-follower", name));
+    conf.change_test_meta_dir(format!("idem-{}-follower", name));
     let js2 = JournalSystem::from_conf(&conf).unwrap();
     let fs2 = MasterFilesystem::with_js(&conf, &js2);
     fs2.add_test_worker(worker);
