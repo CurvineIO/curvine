@@ -92,6 +92,16 @@ impl RaftError {
             Some(e) => e.ctx(msg),
         }
     }
+
+    pub fn is_snapshot_out_of_date(&self) -> bool {
+        match self {
+            Raft(e) => matches!(
+                &e.source,
+                raft::Error::Store(raft::StorageError::SnapshotOutOfDate)
+            ),
+            _ => false,
+        }
+    }
 }
 
 impl ErrorExt for RaftError {
