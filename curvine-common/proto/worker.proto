@@ -75,7 +75,9 @@ message WorkerHeartbeatRequest {
     required WorkerAddressProto address = 4;
     required int32 failed_dirs = 5;
     required HeartbeatStatusProto status = 6;
-    required string software_version = 7 [default = ""];
+    
+    // Worker version (format: "major.minor.patch", e.g. "1.2.3")
+    required string version = 7 [default = ""];
 
     repeated StorageInfoProto storages = 8;
     repeated BlockReportInfoProto blocks = 9;

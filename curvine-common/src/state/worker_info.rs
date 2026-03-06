@@ -32,6 +32,7 @@ pub struct WorkerInfo {
     pub block_num: i64,
     pub storage_map: HashMap<String, StorageInfo>,
     pub status: WorkerStatus,
+    pub version: Option<crate::version::Version>,
 }
 
 impl WorkerInfo {
@@ -46,6 +47,7 @@ impl WorkerInfo {
             block_num: 0,
             last_update: LocalTime::mills(),
             storage_map: Default::default(),
+            version: None,
             status: WorkerStatus::Live,
         }
     }
@@ -117,6 +119,7 @@ impl Default for WorkerInfo {
             last_update: 0,
             block_num: 0,
             storage_map: Default::default(),
+            version: None,
             status: WorkerStatus::Live,
         }
     }
