@@ -363,7 +363,7 @@ impl Default for ClientConf {
             rpc_timeout_ms: 120 * 1000,
             data_timeout_ms: 120 * 1000,
             pipeline_timeout_ms: 120 * 1000,
-            master_conn_pool_size: 1,
+            master_conn_pool_size: 3,
 
             enable_read_ahead: true,
             read_ahead_len: 0,
