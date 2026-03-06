@@ -71,6 +71,7 @@ use orpc::common::{FastHashMap, LocalTime};
 use orpc::sync::AtomicCounter;
 use orpc::CommonResult;
 use std::sync::{Arc, RwLock};
+use tokio::sync::Mutex;
 
 /// Represents a single mount point with its filesystem handler.
 /// Contains mount metadata, UFS handler, and path conversion utilities.
@@ -165,6 +166,8 @@ pub struct MountCache {
     mounts: RwLock<InnerMap>,
     update_interval: u64,
     last_update: AtomicCounter,
+    /// Single-flight lock: only one task performs full refresh when TTL expires.
+    refresh_lock: Mutex<()>,
 }
 
 impl MountCache {
@@ -173,6 +176,7 @@ impl MountCache {
             mounts: RwLock::new(InnerMap::default()),
             update_interval,
             last_update: AtomicCounter::new(0),
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -181,20 +185,25 @@ impl MountCache {
     }
 
     pub async fn check_update(&self, fs: &UnifiedFileSystem, force: bool) -> FsResult<()> {
-        if self.need_update() || force {
-            let mounts = fs.get_mount_table().await?;
-
-            let mut state = self.mounts.write().unwrap();
-            state.clear();
-
-            for item in mounts {
-                state.insert(item)?;
-            }
-
-            debug!("update mounts {:?}", state.len());
-            self.last_update.set(LocalTime::mills());
+        if !self.need_update() && !force {
+            return Ok(());
         }
 
+        let _guard = self.refresh_lock.lock().await;
+        if !self.need_update() && !force {
+            return Ok(());
+        }
+
+        let mounts = fs.get_mount_table().await?;
+        let mut state = self.mounts.write().unwrap();
+
+        state.clear();
+        for item in mounts {
+            state.insert(item)?;
+        }
+
+        debug!("update mounts {:?}", state.len());
+        self.last_update.set(LocalTime::mills());
         Ok(())
     }
 
