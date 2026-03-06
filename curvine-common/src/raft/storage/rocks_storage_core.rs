@@ -15,6 +15,7 @@
 use crate::proto::raft::RaftStateStoreProto;
 use crate::raft::{RaftError, RaftResult, LOG_START_INDEX};
 use crate::rocksdb::{DBConf, DBEngine, RocksUtils, WriteBatch};
+use log::warn;
 use orpc::{err_box, err_ext, CommonResult};
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
@@ -149,6 +150,11 @@ impl RocksStorageCore {
 
         // Index is 0, indicating that there is no snapshot, but there may be log entry
         if index > LOG_START_INDEX && self.first_index() > index {
+            warn!(
+                "snapshot out of date: snapshot_index={}, first_index={}, skip apply",
+                index,
+                self.first_index()
+            );
             return err_ext!(RaftError::raft(raft::Error::Store(
                 raft::StorageError::SnapshotOutOfDate
             )));
@@ -188,8 +194,11 @@ impl RocksStorageCore {
         };
 
         meta.set_conf_state(self.raft_state.conf_state.clone());
-        self.db
-            .put_cf(Self::CF_META, Self::SNAP_KEY, snapshot.encode_to_vec())?;
+
+        let mut batch = StoreWriteBatch::new(&self.db);
+        batch.append_index_range(self.first_index(), self.last_index())?;
+        batch.append_snapshot(&snapshot)?;
+        batch.commit()?;
 
         Ok(snapshot)
     }
@@ -235,14 +244,16 @@ impl RocksStorageCore {
             );
         }
 
-        let mut batch = StoreWriteBatch::new(&self.db);
-        if let Some(v) = self.first_index {
-            batch.delete_entry(v, compact_index - 1)?;
-        }
-        batch.append_index_range(self.first_index(), self.last_index())?;
+        let start = self.first_index();
 
+        let mut batch = StoreWriteBatch::new(&self.db);
+        // delete_entry(start, end) deletes [start, end); remove all index < compact_index
+        batch.delete_entry(start, compact_index)?;
+        batch.append_index_range(compact_index, self.last_index())?;
         batch.commit()?;
+
         let _ = self.first_index.replace(compact_index);
+
         Ok(())
     }
 
@@ -380,6 +391,15 @@ impl<'a> StoreWriteBatch<'a> {
             RocksStorageCore::CF_META,
             RocksStorageCore::INDEX_KEY,
             bytes,
+        )?;
+        Ok(())
+    }
+
+    fn append_snapshot(&mut self, snapshot: &Snapshot) -> CommonResult<()> {
+        self.0.put_cf(
+            RocksStorageCore::CF_META,
+            RocksStorageCore::SNAP_KEY,
+            snapshot.encode_to_vec(),
         )?;
         Ok(())
     }
