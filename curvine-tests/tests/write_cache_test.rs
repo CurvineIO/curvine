@@ -100,8 +100,8 @@ async fn test_cache_read(fs: &UnifiedFileSystem, path: &Path) {
 
     let mut reader2 = fs.open(path).await.unwrap();
     assert!(
-        matches!(reader2, UnifiedReader::Cv(_)),
-        "second read should be from curvine"
+        matches!(reader2, UnifiedReader::Fallback(_)),
+        "second read should be from curvine via FallbackFsReader"
     );
 
     let str2 = reader2.read_as_string().await.unwrap();
@@ -237,8 +237,8 @@ fn test_fs_mode_ufs_write_overwrite() {
 
         let reader = fs.open(&path).await.unwrap();
         assert!(
-            matches!(reader, UnifiedReader::Cv(_)),
-            "read should return CV reader after overwrite and sync"
+            matches!(reader, UnifiedReader::Fallback(_)),
+            "read should return Fallback reader after overwrite and sync"
         );
 
         verify_read_data(&fs, &path, data_overwrite.as_bytes()).await;
@@ -267,8 +267,8 @@ fn test_fs_mode_ufs_write_append() {
 
         let reader = fs.open(&path).await.unwrap();
         assert!(
-            matches!(reader, UnifiedReader::Cv(_)),
-            "read should return CV reader after append and sync"
+            matches!(reader, UnifiedReader::Fallback(_)),
+            "read should return Fallback reader after append and sync"
         );
         let expected_append = format!("{}{}", data_initial, data_append_extra);
 
@@ -314,8 +314,8 @@ fn test_fs_mode_ufs_write_random() {
         fs.wait_job_complete(&path, false).await.unwrap();
         let reader = fs.open(&path).await.unwrap();
         assert!(
-            matches!(reader, UnifiedReader::Cv(_)),
-            "read should return CV reader after random write and sync"
+            matches!(reader, UnifiedReader::Fallback(_)),
+            "read should return Fallback reader after random write and sync"
         );
 
         verify_read_data(&fs, &path, &expected).await;

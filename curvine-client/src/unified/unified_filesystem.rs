@@ -14,7 +14,7 @@
 
 use crate::file::{CurvineFileSystem, FsClient, FsContext, FsReader};
 use crate::rpc::JobMasterClient;
-use crate::unified::{MountCache, MountValue, UnifiedReader, UnifiedWriter};
+use crate::unified::{FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
@@ -237,7 +237,7 @@ impl UnifiedFileSystem {
         cv_path: &Path,
         ufs_path: &Path,
         mount: &MountValue,
-    ) -> FsResult<Option<FsReader>> {
+    ) -> FsResult<Option<FallbackFsReader>> {
         let blocks = match self.cv.get_block_locations(cv_path).await {
             Ok(blocks) => blocks,
             Err(e) => {
@@ -250,12 +250,12 @@ impl UnifiedFileSystem {
 
         if mount.info.is_fs_mode() {
             if blocks.cv_exists() {
-                let cv_reader = Some(FsReader::new(
-                    cv_path.clone(),
-                    self.cv.fs_context(),
-                    blocks,
-                )?);
-                Ok(cv_reader)
+                let cv_reader = FsReader::new(cv_path.clone(), self.cv.fs_context(), blocks)?;
+                Ok(Some(FallbackFsReader::new(
+                    cv_reader,
+                    ufs_path.clone(),
+                    mount.ufs.clone(),
+                )))
             } else if blocks.ufs_exists() {
                 Ok(None)
             } else {
@@ -267,12 +267,12 @@ impl UnifiedFileSystem {
                 .await?
             {
                 CacheValidity::Valid => {
-                    let cv_reader = Some(FsReader::new(
-                        cv_path.clone(),
-                        self.cv.fs_context(),
-                        blocks,
-                    )?);
-                    Ok(cv_reader)
+                    let cv_reader = FsReader::new(cv_path.clone(), self.cv.fs_context(), blocks)?;
+                    Ok(Some(FallbackFsReader::new(
+                        cv_reader,
+                        ufs_path.clone(),
+                        mount.ufs.clone(),
+                    )))
                 }
                 CacheValidity::Invalid => Ok(None),
             }
@@ -509,7 +509,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 .with_label_values(&[mount.mount_id()])
                 .inc();
 
-            Ok(UnifiedReader::Cv(reader))
+            Ok(UnifiedReader::Fallback(reader))
         } else {
             self.metrics
                 .mount_cache_misses
