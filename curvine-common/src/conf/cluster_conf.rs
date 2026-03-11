@@ -233,7 +233,14 @@ impl ClusterConf {
 
     // Test and modify the metadata-related path.
     pub fn change_test_meta_dir<T: AsRef<str>>(&mut self, name: T) {
-        let base = Utils::cur_dir_sub(format!("../testing/{}", name.as_ref()));
+        let pid = std::process::id();
+        let rand = Utils::rand_str(6);
+        let base = Utils::cur_dir_sub(format!(
+            "../target/testing/{}_{}_{}",
+            name.as_ref(),
+            pid,
+            rand
+        ));
         self.master.meta_dir = format!("{}/meta", base);
         self.journal.journal_dir = format!("{}/journal", base);
     }
