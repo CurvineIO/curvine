@@ -72,8 +72,8 @@ impl LogStorage for MemLogStorage {
         Ok(())
     }
 
-    fn create_snapshot(&self, data: SnapshotData, request_index: u64) -> RaftResult<()> {
-        let mut snapshot = self.core.snapshot(request_index, 0)?;
+    fn create_snapshot(&self, data: SnapshotData) -> RaftResult<()> {
+        let mut snapshot = self.core.snapshot(data.fsm_state.applied.index, 0)?;
         snapshot.set_data(data.encode_to_vec());
 
         let mut sn = self.snapshot.lock().unwrap();

@@ -13,23 +13,24 @@
 // limitations under the License.
 
 use crate::conf::JournalConf;
-use crate::proto::raft::SnapshotData;
+use crate::proto::raft::{FsmState, SnapshotData};
 use crate::raft::snapshot::{DownloadJob, SnapshotState};
-use crate::raft::storage::{AppStorage, LogStorage};
+use crate::raft::storage::{AppStorage, ApplyMsg, LogStorage};
 use crate::raft::{LibRaftResult, RaftClient, RaftError, RaftResult};
 use log::{error, info, warn};
 use orpc::common::{TimeSpent, Utils};
 use orpc::err_box;
-use orpc::runtime::{GroupExecutor, JobCtl, JobState};
+use orpc::runtime::{GroupExecutor, JobCtl, JobState, RpcRuntime, Runtime};
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
-use raft::{GetEntriesContext, RaftState, Storage};
+use raft::{GetEntriesContext, RaftState, StateRole, Storage};
 use std::sync::{Arc, Mutex};
 
 // raft log packaging class
 // Unify the access interfaces of app_store and log_store. Convenient to code use.
 #[derive(Clone)]
 pub struct PeerStorage<A, B> {
+    rt: Arc<Runtime>,
     log_store: A,
     app_store: B,
     conf: JournalConf,
@@ -43,10 +44,17 @@ where
     A: LogStorage,
     B: AppStorage,
 {
-    pub fn new(log_store: A, app_store: B, client: RaftClient, conf: &JournalConf) -> Self {
+    pub fn new(
+        rt: Arc<Runtime>,
+        log_store: A,
+        app_store: B,
+        client: RaftClient,
+        conf: &JournalConf,
+    ) -> Self {
         let executor = GroupExecutor::new("raft-job-executor", conf.worker_threads, 10);
 
         Self {
+            rt,
             log_store,
             app_store,
             conf: conf.clone(),
@@ -64,6 +72,14 @@ where
         self.log_store.set_entries(entries)
     }
 
+    pub fn get_fsm_state(&self) -> FsmState {
+        self.app_store.get_fsm_state()
+    }
+
+    pub fn get_applied(&self) -> u64 {
+        self.get_fsm_state().applied.index
+    }
+
     pub fn set_hard_state(&self, hard_state: &HardState) -> RaftResult<()> {
         self.log_store.set_hard_state(hard_state)
     }
@@ -76,8 +92,13 @@ where
         self.log_store.set_conf_state(conf_state)
     }
 
-    pub async fn apply_propose(&self, is_leader: bool, data: &[u8]) -> RaftResult<()> {
-        self.app_store.apply(is_leader, data).await
+    pub async fn apply_propose(&self, wait: bool, apply_msg: ApplyMsg) -> RaftResult<()> {
+        self.app_store.apply(wait, apply_msg).await
+    }
+
+    /// Scan log entries in [low, high). Used to get committed-but-not-applied entries for replay.
+    pub fn scan_entries(&self, low: u64, high: u64) -> RaftResult<Vec<Entry>> {
+        self.log_store.scan_entries(low, high)
     }
 
     fn check_snapshot_state(&self) -> SnapshotState {
@@ -137,6 +158,10 @@ where
         }
     }
 
+    pub async fn role_change(&self, role: StateRole) -> RaftResult<()> {
+        self.app_store.role_change(role).await
+    }
+
     pub fn gen_apply_snapshot_job(&self, snapshot: Snapshot) -> RaftResult<()> {
         if self.is_snapshot_applying() {
             return err_box!("Currently applying snapshot");
@@ -144,6 +169,7 @@ where
 
         let log_store = self.log_store.clone();
         let app_store = self.app_store.clone();
+        let rt = self.rt.clone();
 
         let job_ctl = JobCtl::new();
         let mut snap_state = self.snap_state.lock().unwrap();
@@ -153,16 +179,22 @@ where
         let conf = self.conf.clone();
         let executor = self.executor.clone();
         let job = move || {
-            let mut data = SnapshotData::decode(snapshot.get_data())?;
+            let mut snap_data = SnapshotData::decode(snapshot.get_data())?;
             let mut spend = TimeSpent::new();
 
             // Start downloading the snapshot.
-            match data.files_data {
+            match snap_data.files_data {
                 None => panic!("Not found snapshot data"),
                 Some(ref mut files) => {
                     let dir = app_store.snapshot_dir(Utils::rand_id())?;
-                    let mut download_job =
-                        DownloadJob::new(executor, data.node_id, dir, files.clone(), &conf, client);
+                    let mut download_job = DownloadJob::new(
+                        executor,
+                        snap_data.node_id,
+                        dir,
+                        files.clone(),
+                        &conf,
+                        client,
+                    );
 
                     // Modify the data in the local directory.
                     files.dir = download_job.run()?;
@@ -170,9 +202,6 @@ where
             }
             let download_ms = spend.used_ms();
             spend.reset();
-
-            // Install snapshot.
-            let snapshot_meta = snapshot.metadata.clone();
 
             if let Err(e) = log_store.apply_snapshot(snapshot) {
                 return if e.is_snapshot_out_of_date() {
@@ -183,12 +212,12 @@ where
                 };
             }
 
-            app_store.apply_snapshot(&data)?;
+            rt.block_on(app_store.apply_snapshot(snap_data.clone()))?;
             let apply_ms = spend.used_ms();
 
             info!(
-                "Apply snapshot, meta: {:?}, download used {} ms, apply used {} ms",
-                snapshot_meta, download_ms, apply_ms
+                "Apply snapshot, snap_data: {:?}, download used {} ms, apply used {} ms",
+                snap_data, download_ms, apply_ms
             );
 
             Ok::<(), RaftError>(())
@@ -197,18 +226,14 @@ where
         self.spawn_job(job, job_ctl)
     }
 
-    pub fn gen_create_snapshot_job(
-        &self,
-        node_id: u64,
-        last_applied: u64,
-        compact_id: u64,
-    ) -> RaftResult<()> {
+    pub fn gen_create_snapshot_job(&self) -> RaftResult<()> {
         if !self.can_generate_snapshot() {
             return err_box!("Currently creating snapshot");
         }
 
         let log_store = self.log_store.clone();
         let app_store = self.app_store.clone();
+        let rt = self.rt.clone();
 
         let job_ctl = JobCtl::new();
         let mut snap_state = self.snap_state.lock().unwrap();
@@ -217,16 +242,13 @@ where
         let job = move || {
             let cost = TimeSpent::new();
 
-            let snapshot = app_store.create_snapshot(node_id, last_applied)?;
-            let snapshot_id = snapshot.snapshot_id;
-            log_store.create_snapshot(snapshot, last_applied)?;
-            log_store.compact(compact_id)?;
+            let snap_data = rt.block_on(app_store.create_snapshot())?;
+            log_store.create_snapshot(snap_data.clone())?;
+            log_store.compact(snap_data.fsm_state.compact())?;
 
             info!(
-                "Create new snapshot, snapshot_id {}, last_applied {}, compact_id {}, used {} ms",
-                snapshot_id,
-                last_applied,
-                compact_id,
+                "create new snapshot, snap_data {:?}, used {} ms",
+                snap_data,
                 cost.used_ms()
             );
             Ok::<(), RaftError>(())
