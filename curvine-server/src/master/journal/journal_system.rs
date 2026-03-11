@@ -202,7 +202,9 @@ impl JournalSystem {
 
     // Create a snapshot manually, dedicated for testing.
     pub fn create_snapshot(&self) -> RaftResult<()> {
-        let data = self.raft_journal.app_store().create_snapshot(1, 1)?;
+        let data = self
+            .rt
+            .block_on(self.raft_journal.app_store().create_snapshot())?;
 
         // The test will not generate a raft log. Please modify the status here.
         let entry = Entry {
@@ -213,13 +215,14 @@ impl JournalSystem {
         self.raft_journal.log_store().append(&[entry])?;
         self.raft_journal.log_store().set_hard_state_commit(1)?;
 
-        self.raft_journal.log_store().create_snapshot(data, 0)
+        self.raft_journal.log_store().create_snapshot(data)
     }
 
     // Manually apply a snapshot, dedicated for testing.
     pub fn apply_snapshot(&self) -> RaftResult<()> {
         let snapshot = self.raft_journal.log_store().snapshot(0, 0)?;
         let data = SnapshotData::decode(snapshot.get_data())?;
-        self.raft_journal.app_store().apply_snapshot(&data)
+        self.rt
+            .block_on(self.raft_journal.app_store().apply_snapshot(data))
     }
 }

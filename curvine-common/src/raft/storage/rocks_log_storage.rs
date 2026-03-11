@@ -16,7 +16,6 @@ use crate::conf::JournalConf;
 use crate::proto::raft::SnapshotData;
 use crate::raft::storage::{LogStorage, RocksStorageCore};
 use crate::raft::{LibRaftResult, RaftError, RaftResult};
-use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::util::limit_size;
 use raft::{GetEntriesContext, RaftState, Storage};
@@ -58,6 +57,10 @@ impl RocksLogStorage {
     pub fn clone_store(&self) -> Arc<RwLock<RocksStorageCore>> {
         self.core.clone()
     }
+
+    pub fn hard_state(&self) -> HardState {
+        self.core.read().unwrap().hard_state().clone()
+    }
 }
 
 impl LogStorage for RocksLogStorage {
@@ -91,9 +94,9 @@ impl LogStorage for RocksLogStorage {
         store.set_conf_state(conf_state.clone())
     }
 
-    fn create_snapshot(&self, data: SnapshotData, request_index: u64) -> RaftResult<()> {
+    fn create_snapshot(&self, data: SnapshotData) -> RaftResult<()> {
         let store = self.read();
-        let _ = store.create_snapshot(data.encode_to_vec(), request_index)?;
+        let _ = store.create_snapshot(data)?;
         Ok(())
     }
 
