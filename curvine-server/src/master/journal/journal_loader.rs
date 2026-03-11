@@ -20,7 +20,7 @@ use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::{JobManager, MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
-use curvine_common::proto::raft::SnapshotData;
+use curvine_common::proto::raft::{FsmState, SnapshotData};
 use curvine_common::raft::storage::AppStorage;
 use curvine_common::raft::{RaftResult, RaftUtils};
 use curvine_common::state::RenameFlags;
@@ -57,7 +57,7 @@ impl JournalLoader {
             ufs_loader,
             seq_id: Arc::new(AtomicCounter::new(0)),
             retain_checkpoint_num: 3.max(conf.retain_checkpoint_num),
-            ignore_replay_error: conf.ignore_replay_error,
+            ignore_replay_error: conf.cv_error_retry,
         }
     }
 
@@ -374,7 +374,7 @@ impl AppStorage for JournalLoader {
     fn create_snapshot(&self, node_id: u64, last_applied: u64) -> RaftResult<SnapshotData> {
         let fs_dir = self.fs_dir.read();
         let dir = fs_dir.create_checkpoint(last_applied)?;
-        let data = RaftUtils::create_file_snapshot(&dir, node_id, last_applied)?;
+        let data = RaftUtils::create_file_snapshot(&dir, node_id, FsmState::default())?;
 
         // Delete historical snapshots.
         if let Err(e) = self.purge_checkpoint(&dir) {

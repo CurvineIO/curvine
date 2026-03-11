@@ -21,7 +21,7 @@ use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_common::FsResult;
-use log::info;
+use log::debug;
 use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
 use std::sync::{mpsc, Mutex};
 
@@ -42,7 +42,6 @@ impl SenderAdapter {
 // Write metadata operation logs.
 pub struct JournalWriter {
     enable: bool,
-    debug: bool,
     sender: SenderAdapter,
     metrics: &'static MasterMetrics,
     receiver: Option<Mutex<Receiver<JournalEntry>>>,
@@ -69,7 +68,6 @@ impl JournalWriter {
 
         Self {
             enable: conf.enable,
-            debug: conf.writer_debug,
             sender,
             metrics: Master::get_metrics(),
             receiver,
@@ -77,9 +75,7 @@ impl JournalWriter {
     }
 
     fn send(&self, entry: JournalEntry) -> FsResult<()> {
-        if self.debug {
-            info!("send {:?}", entry);
-        }
+        debug!("send {:?}", entry);
 
         if self.enable {
             self.sender.send(entry)?;
@@ -208,9 +204,6 @@ impl JournalWriter {
 
     pub fn log_unmount(&self, op_ms: u64, id: u32) -> FsResult<()> {
         let entry = UnMountEntry { op_ms, id };
-        if self.debug {
-            info!("send {:?}", entry);
-        }
         self.send(JournalEntry::UnMount(entry))
     }
 

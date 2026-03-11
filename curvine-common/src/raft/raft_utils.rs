@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::proto::raft::{
-    SnapshotData, SnapshotDownloadRequest, SnapshotFileInfo, SnapshotFileList,
+    FsmState, SnapshotData, SnapshotDownloadRequest, SnapshotFileInfo, SnapshotFileList,
 };
 use crate::raft::RaftResult;
 use crate::rocksdb::DBEngine;
@@ -28,7 +28,7 @@ impl RaftUtils {
     pub fn create_file_snapshot(
         dir: impl AsRef<str>,
         node_id: u64,
-        snapshot_id: u64,
+        fsm_state: FsmState,
     ) -> RaftResult<SnapshotData> {
         let dir = dir.as_ref();
         let files = FileUtils::list_files(dir, false)?;
@@ -49,11 +49,12 @@ impl RaftUtils {
         }
 
         let data = SnapshotData {
-            snapshot_id,
+            snapshot_id: fsm_state.applied.index,
             node_id,
             create_time: LocalTime::mills(),
             bytes_data: None,
             files_data: Some(list),
+            fsm_state,
         };
 
         Ok(data)

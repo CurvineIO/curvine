@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::raft::RaftStateStoreProto;
 use crate::raft::{RaftError, RaftResult, LOG_START_INDEX};
 use crate::rocksdb::{DBConf, DBEngine, RocksUtils, WriteBatch};
 use log::warn;
@@ -111,14 +110,6 @@ impl RocksStorageCore {
 
     pub fn hard_state(&self) -> &HardState {
         &self.raft_state.hard_state
-    }
-
-    pub fn create_proto_state(&self) -> RaftStateStoreProto {
-        RaftStateStoreProto {
-            hard_state: self.raft_state.hard_state.clone(),
-            conf_state: self.raft_state.conf_state.clone(),
-            snapshot: self.snapshot_metadata.clone(),
-        }
     }
 
     pub fn mut_hard_state(&mut self) -> &mut HardState {
