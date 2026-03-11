@@ -519,12 +519,6 @@ impl InodeStore {
         // Check if there are other references to the Arc, which would prevent the lock from being released
         let ref_count = Arc::strong_count(&self.store);
         if ref_count > 1 {
-            log::error!(
-                "cannot restore: RocksInodeStore has {} references (expected 1). \
-                Other components are still holding clones of InodeStore, \
-                which prevents RocksDB lock from being released.",
-                ref_count
-            );
             return err_box!(
                 "cannot restore: RocksInodeStore has {} references (expected 1). \
                 Other components are still holding clones of InodeStore, \

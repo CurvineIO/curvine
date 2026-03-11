@@ -56,7 +56,7 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
     let follower_journal_system = JournalSystem::from_conf(&conf)?;
     let fs_follower = MasterFilesystem::with_js(&conf, &follower_journal_system);
     let mnt_mgr2 = follower_journal_system.mount_manager();
-    let journal_loader = JournalLoader::new(
+    let journal_loader = JournalLoader::new_replay_loader(
         fs_follower.fs_dir(),
         mnt_mgr2.clone(),
         &conf.journal,

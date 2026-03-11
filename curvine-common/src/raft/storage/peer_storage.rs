@@ -31,8 +31,8 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub struct PeerStorage<A, B> {
     rt: Arc<Runtime>,
-    log_store: A,
-    app_store: B,
+    pub(crate) log_store: A,
+    pub(crate) app_store: B,
     conf: JournalConf,
     executor: Arc<GroupExecutor>,
     snap_state: Arc<Mutex<SnapshotState>>,
@@ -247,8 +247,9 @@ where
             log_store.compact(snap_data.fsm_state.compact())?;
 
             info!(
-                "create new snapshot, snap_data {:?}, used {} ms",
-                snap_data,
+                "create new snapshot, dir {}, fsm_state: {:?}, used {} ms",
+                snap_data.data_dir(),
+                snap_data.fsm_state,
                 cost.used_ms()
             );
             Ok::<(), RaftError>(())

@@ -21,7 +21,8 @@ use raft::StateRole;
 pub enum ApplyMsg {
     Entry(Entry),
     Scan(AppliedIndex),
-    Snapshot(CallSender<RaftResult<SnapshotData>>),
+    CreateSnapshot(CallSender<RaftResult<SnapshotData>>),
+    ApplySnapshot((CallSender<RaftResult<()>>, SnapshotData)),
     RoleChange(StateRole),
 }
 

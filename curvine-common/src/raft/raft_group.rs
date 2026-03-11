@@ -45,6 +45,17 @@ impl RaftGroup {
         Self::new(conf.group_name.as_str(), peers)
     }
 
+    pub fn get_addr_string(&self, id: u64) -> String {
+        match self.peers.get(&id) {
+            None => format!("{}", id),
+            Some(v) => format!("{}", v),
+        }
+    }
+
+    pub fn voters(&self) -> Vec<u64> {
+        self.peers.iter().map(|x| *x.0).collect()
+    }
+
     pub fn from_proto<T: AsRef<str>>(name: T, list: Vec<RaftPeerProto>) -> Self {
         let mut peers = HashMap::new();
         for item in list {
