@@ -30,7 +30,7 @@ use orpc::try_err;
 use prost::Message as PMessage;
 use raft::eraftpb::{ConfChange, Entry, EntryType, MessageType, Snapshot};
 use raft::prelude::ConfChangeType;
-use raft::RawNode;
+use raft::{RawNode, SoftState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -92,7 +92,6 @@ where
     ) -> RaftResult<Self> {
         let group = RaftGroup::from_conf(conf);
         let id = group.get_node_id(&conf.local_addr())?;
-        let voters = group.peers.iter().map(|x| *x.0).collect();
 
         let client = RaftClient::new(rt.clone(), &group, conf.new_client_conf());
         let snapshot_interval_ms = DurationUnit::from_str(&conf.snapshot_interval)
@@ -102,7 +101,7 @@ where
         let tick_interval = Duration::from_millis(conf.raft_tick_interval_ms);
         let poll_interval = Duration::from_millis(conf.raft_poll_interval_ms);
 
-        let last_applied = Self::install_snapshot(&log_store, &app_store, voters).await?;
+        let last_applied = Self::install_snapshot(&log_store, &app_store, group.voters()).await?;
         let config = conf.new_raft_conf(id, last_applied);
         config.validate()?;
 
@@ -186,13 +185,13 @@ where
     ) -> RaftResult<u64> {
         let spend = TimeSpent::new();
 
-        let fsm_state: FsmState = match log_store.latest_snapshot()? {
+        match log_store.latest_snapshot()? {
             None => {
                 let mut snapshot = Snapshot::default();
                 snapshot.mut_metadata().mut_conf_state().voters = voters;
 
                 log_store.apply_snapshot(snapshot.clone())?;
-                FsmState::default()
+                app_store.apply_snapshot(SnapshotData::default()).await?;
             }
 
             Some(mut snapshot) => {
@@ -202,16 +201,18 @@ where
                 // app store app snapshot.
                 let snapshot_data: SnapshotData = SnapshotData::decode(snapshot.get_data())?;
                 info!(
-                    "install snapshot start, meta: {:?}, snapshot data {:?}",
-                    snapshot.get_metadata(),
+                    "install snapshot start, dir: {},  fsm_state {:?}",
                     snapshot_data
+                        .files_data
+                        .as_ref()
+                        .map_or("", |v| v.dir.as_str()),
+                    snapshot_data.fsm_state
                 );
                 app_store.apply_snapshot(snapshot_data).await?;
-
-                app_store.get_fsm_state()
             }
         };
 
+        let fsm_state = app_store.get_fsm_state();
         app_store
             .apply(true, ApplyMsg::new_scan(fsm_state.applied))
             .await?;
@@ -404,15 +405,10 @@ where
             store.set_hard_state(hs)?;
         }
 
-        if let Some(ss) = ready.ss() {
-            info!(
-                "Raft soft state change, node id {}, current leader {}",
-                self.id(),
-                self.leader()
-            );
-            self.role_monitor.advance_role(ss);
-            self.storage.role_change(ss.raft_state).await?;
-        }
+        let soft_state = ready.ss().map(|ss| SoftState {
+            leader_id: ss.leader_id,
+            raft_state: ss.raft_state,
+        });
 
         // Get the message that needs to be sent to other nodes.
         // Only the leader call returns true.
@@ -456,9 +452,29 @@ where
         self.apply_committed_entries(light_rd.take_committed_entries(), promise)
             .await?;
 
-        // Determine whether a snapshot is needed.
-        self.apply_create_snapshot()?;
+        if let Some(ss) = soft_state {
+            info!(
+                "Raft soft state change, node id {}, current leader {}",
+                self.id(),
+                self.leader()
+            );
 
+            self.storage.role_change(ss.raft_state).await?;
+            let to_follower = self.role_monitor.is_leader() && !self.is_leader();
+            if to_follower {
+                Self::install_snapshot(
+                    &self.storage.log_store,
+                    &self.storage.app_store,
+                    self.group.voters(),
+                )
+                .await?;
+            }
+
+            self.role_monitor.advance_role(&ss);
+        } else {
+            // Determine whether a snapshot is needed.
+            self.apply_create_snapshot()?;
+        }
         Ok(())
     }
 

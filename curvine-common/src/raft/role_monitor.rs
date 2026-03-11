@@ -55,6 +55,10 @@ impl RoleMonitor {
         }
     }
 
+    pub fn is_leader(&self) -> bool {
+        self.state() == RoleState::Leader
+    }
+
     pub fn advance_exit(&self) {
         self.0.advance_state(RoleState::Exit, true);
     }

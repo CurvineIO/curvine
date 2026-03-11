@@ -31,8 +31,8 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub struct PeerStorage<A, B> {
     rt: Arc<Runtime>,
-    log_store: A,
-    app_store: B,
+    pub(crate) log_store: A,
+    pub(crate) app_store: B,
     conf: JournalConf,
     executor: Arc<GroupExecutor>,
     snap_state: Arc<Mutex<SnapshotState>>,

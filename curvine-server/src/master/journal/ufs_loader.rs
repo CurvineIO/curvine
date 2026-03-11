@@ -13,7 +13,7 @@
 //  limitations under the License.
 
 use crate::master::journal::{
-    CompleteFileEntry, DeleteEntry, JournalBatch, JournalEntry, MkdirEntry, RenameEntry,
+    CompleteFileEntry, DeleteEntry, JournalEntry, MkdirEntry, RenameEntry,
 };
 use crate::master::JobManager;
 use curvine_client::unified::MountValue;
@@ -53,13 +53,6 @@ impl UfsLoader {
         }
     }
 
-    pub async fn apply_batch(&self, batch: JournalBatch) -> CommonResult<()> {
-        for entry in batch.batch {
-            self.apply_entry(&entry).await?;
-        }
-        Ok(())
-    }
-
     pub async fn submit_load_task(&self, path: &Path, mnt: &MountValue) -> FsResult<()> {
         let command = LoadJobCommand::builder(path.clone_uri()).build();
         let runner = self.job_manager.create_runner();
@@ -90,7 +83,7 @@ impl UfsLoader {
         }
     }
 
-    pub async fn apply_entry(&self, entry: &JournalEntry) -> FsResult<()> {
+    pub async fn apply_entry(&self, entry: &JournalEntry) -> CommonResult<()> {
         match entry {
             JournalEntry::Mkdir(e) => self.mkdir(e).await,
             JournalEntry::CompleteFile(e) => self.complete_file(e).await,
@@ -100,7 +93,7 @@ impl UfsLoader {
         }
     }
 
-    pub async fn mkdir(&self, e: &MkdirEntry) -> FsResult<()> {
+    pub async fn mkdir(&self, e: &MkdirEntry) -> CommonResult<()> {
         let path = Path::from_str(&e.path)?;
         if let Some((ufs_path, mnt)) = self.job_manager.get_mnt(&path)? {
             mnt.ufs.mkdir(&ufs_path, false).await?;
@@ -110,20 +103,20 @@ impl UfsLoader {
         }
     }
 
-    pub async fn complete_file(&self, e: &CompleteFileEntry) -> FsResult<()> {
+    pub async fn complete_file(&self, e: &CompleteFileEntry) -> CommonResult<()> {
         if !e.file.is_complete() {
             return Ok(());
         }
 
         let path = Path::from_str(&e.path)?;
         if let Some((_, mnt)) = self.job_manager.get_mnt(&path)? {
-            self.submit_load_task(&path, &mnt).await
+            self.submit_load_task(&path, &mnt).await.map_err(Into::into)
         } else {
             Ok(())
         }
     }
 
-    pub async fn rename(&self, e: &RenameEntry) -> FsResult<()> {
+    pub async fn rename(&self, e: &RenameEntry) -> CommonResult<()> {
         let src = Path::from_str(&e.src)?;
         let dst = Path::from_str(&e.dst)?;
         if let Some((src_ufs_path, mnt)) = self.job_manager.get_mnt(&src)? {
@@ -132,13 +125,13 @@ impl UfsLoader {
             } else {
                 warn!("rename: src file not exists: {}", src_ufs_path);
             }
-            self.submit_load_task(&dst, &mnt).await
+            self.submit_load_task(&dst, &mnt).await.map_err(Into::into)
         } else {
             Ok(())
         }
     }
 
-    pub async fn delete(&self, e: &DeleteEntry) -> FsResult<()> {
+    pub async fn delete(&self, e: &DeleteEntry) -> CommonResult<()> {
         let path = Path::from_str(&e.path)?;
         if let Some((ufs_path, mnt)) = self.job_manager.get_mnt(&path)? {
             if mnt.ufs.exists(&ufs_path).await? {

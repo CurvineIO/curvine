@@ -722,7 +722,7 @@ fn setup_pair(
     let js2 = JournalSystem::from_conf(&conf).unwrap();
     let fs2 = MasterFilesystem::with_js(&conf, &js2);
     fs2.add_test_worker(worker);
-    let loader = JournalLoader::new(
+    let loader = JournalLoader::new_replay_loader(
         fs2.fs_dir(),
         js2.mount_manager(),
         &conf.journal,
