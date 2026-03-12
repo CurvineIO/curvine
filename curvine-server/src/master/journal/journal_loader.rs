@@ -646,26 +646,37 @@ impl JournalLoader {
 
     // Clean up expired checkpoints.
     pub fn purge_checkpoint(&self, current_ck: impl AsRef<str>) -> CommonResult<()> {
-        let ck_dir = match Path::new(current_ck.as_ref()).parent() {
+        let current_ck = current_ck.as_ref();
+        let ck_dir = match Path::new(current_ck).parent() {
             None => return Ok(()),
             Some(v) => v,
+        };
+
+        let current_mtime = match Path::new(current_ck).metadata() {
+            Ok(meta) => FileUtils::mtime(&meta)?,
+            Err(_) => return Ok(()),
         };
 
         let mut vec = vec![];
         for entry in fs::read_dir(ck_dir)? {
             let entry = entry?;
             let meta = entry.metadata()?;
-            vec.push((FileUtils::mtime(&meta)?, entry.path()));
+            let mtime = FileUtils::mtime(&meta)?;
+            if mtime < current_mtime {
+                vec.push((mtime, entry.path()));
+            }
         }
 
-        // Sort by modification time
+        // Sort oldest-first and keep at most (retain_checkpoint_num - 1) older
+        // checkpoints so that together with current_ck the total is retain_checkpoint_num.
         vec.sort_by_key(|x| x.0);
-        let del_num = vec.len().saturating_sub(self.retain_checkpoint_num);
+        let keep = self.retain_checkpoint_num.saturating_sub(1);
+        let del_num = vec.len().saturating_sub(keep);
 
         for i in 0..del_num {
             let path = vec[i].1.as_path();
             FileUtils::delete_path(path, true)?;
-            info!("delete expired checkpoint, dir: {}", path.to_string_lossy())
+            info!("delete expired checkpoint: {}", path.to_string_lossy());
         }
 
         Ok(())
