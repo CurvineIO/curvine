@@ -204,6 +204,8 @@ impl DBEngine {
 
     // Create a checkpoint.
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
+        self.flush(true)?;
+
         let checkpoint_path = self.get_checkpoint_path(id);
         let existed = FileUtils::exists(&checkpoint_path);
 
@@ -246,14 +248,24 @@ impl DBEngine {
         &self.db
     }
 
-    pub fn flush(&self) -> CommonResult<()> {
-        self.db.flush()?;
+    pub fn flush_mem(&self, sync: bool) -> CommonResult<()> {
+        let mut opts = FlushOptions::default();
+        opts.set_wait(sync);
+        self.db.flush_opt(&opts)?;
         Ok(())
     }
 
     pub fn flush_wal(&self, sync: bool) -> CommonResult<()> {
         self.db.flush_wal(sync)?;
         Ok(())
+    }
+
+    pub fn flush(&self, sync: bool) -> CommonResult<()> {
+        if self.conf.disable_wal {
+            self.flush_mem(sync)
+        } else {
+            self.flush_wal(sync)
+        }
     }
 
     pub fn write_batch(&self, batch: WriteBatchWithTransaction<false>) -> CommonResult<()> {

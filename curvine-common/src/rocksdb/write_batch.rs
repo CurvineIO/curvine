@@ -52,9 +52,13 @@ impl<'a> WriteBatch<'a> {
         self.db.write_batch(self.batch)
     }
 
-    pub fn commit_wal(self, sync: bool) -> CommonResult<()> {
+    pub fn commit_flush(self, sync: bool) -> CommonResult<()> {
         self.db.write_batch(self.batch)?;
-        self.db.flush_wal(sync)?;
+        self.db.flush(sync)?;
         Ok(())
+    }
+
+    pub fn commit_sync(self) -> CommonResult<()> {
+        self.commit_flush(true)
     }
 }

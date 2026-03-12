@@ -75,9 +75,11 @@ impl WriteHandler {
 
         if opts.len != file.len() {
             return err_box!(
-                "invalid resize operation: resize {} != actual {}",
+                "invalid resize file {} operation: resize {} != actual {}, opts={:?}",
+                file.path(),
                 opts.len,
-                file.len()
+                file.len(),
+                opts
             );
         }
 

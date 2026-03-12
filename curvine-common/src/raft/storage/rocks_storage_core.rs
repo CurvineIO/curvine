@@ -105,13 +105,21 @@ impl RocksStorageCore {
 
     pub fn set_hard_state(&mut self, hs: HardState) -> RaftResult<()> {
         self.raft_state.hard_state = hs.clone();
-        self.db
-            .put_cf(Self::CF_META, Self::STATE_KEY, hs.encode_to_vec())?;
+
+        let mut batch = StoreWriteBatch::new(&self.db);
+        batch.set_state(&hs)?;
+        batch.commit()?;
+
         Ok(())
     }
 
     pub fn set_hard_state_commit(&mut self, commit: u64) -> RaftResult<()> {
         self.mut_hard_state().set_commit(commit);
+
+        let mut batch = StoreWriteBatch::new(&self.db);
+        batch.set_state(&self.raft_state.hard_state)?;
+        batch.commit()?;
+
         Ok(())
     }
 
@@ -414,7 +422,16 @@ impl<'a> StoreWriteBatch<'a> {
         Ok(())
     }
 
+    fn set_state(&mut self, state: &HardState) -> CommonResult<()> {
+        self.0.put_cf(
+            RocksStorageCore::CF_META,
+            RocksStorageCore::STATE_KEY,
+            state.encode_to_vec(),
+        )?;
+        Ok(())
+    }
+
     fn commit(self) -> CommonResult<()> {
-        self.0.commit()
+        self.0.commit_sync()
     }
 }
