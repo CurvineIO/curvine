@@ -108,4 +108,24 @@ assert_contains "$out_d" "recreate $CV_PATH/dir1/b.txt" "expected recreate for d
 stat_b="$(run_cv fs stat --cache-only "$CV_PATH/dir1/b.txt" 2>&1)"
 assert_contains "$stat_b" "ufs_mtime: [1-9][0-9]+" "expected non-zero ufs_mtime in cache-only stat"
 
+# Scenario E: resync on cache_mode mount must fail with clear error
+CACHE_MODE_CV_PATH="${CV_PATH}-cache-mode"
+CACHE_MODE_UFS_PREFIX="${UFS_PREFIX}-cache-mode"
+if run_cv mount | grep -q "$CACHE_MODE_CV_PATH"; then
+  run_cv umount "$CACHE_MODE_CV_PATH" >/dev/null 2>&1 || true
+fi
+log "creating cache_mode mount at $CACHE_MODE_CV_PATH for resync rejection test"
+run_cv mount "s3://$BUCKET/$CACHE_MODE_UFS_PREFIX" "$CACHE_MODE_CV_PATH" \
+  --write-type cache_mode \
+  --config s3.endpoint_url="$S3_ENDPOINT_URL" \
+  --config s3.credentials.access="$S3_ACCESS_KEY" \
+  --config s3.credentials.secret="$S3_SECRET_KEY" \
+  --config s3.force.path.style="$S3_FORCE_PATH_STYLE" \
+  >/dev/null 2>&1
+out_resync_reject="$(run_cv mount resync "$CACHE_MODE_CV_PATH" 2>&1)" || true
+assert_contains "$out_resync_reject" "resync is only allowed for fs_mode" "resync on cache_mode mount must report fs_mode-only error"
+assert_contains "$out_resync_reject" "cache_mode" "error message must mention current write_type cache_mode"
+run_cv umount "$CACHE_MODE_CV_PATH" >/dev/null 2>&1 || true
+log "scenario E: resync correctly rejected for cache_mode mount"
+
 pass "all resync scenarios passed"

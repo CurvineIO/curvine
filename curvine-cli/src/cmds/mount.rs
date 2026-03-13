@@ -265,6 +265,20 @@ impl MountCommand {
             None => return err_box!("mount info not found for {}", self.cv_path),
         };
 
+        if !mount.is_fs_mode() {
+            let write_type_str = match mount.write_type {
+                WriteType::CacheMode => "cache_mode",
+                WriteType::FsMode => "fs_mode",
+            };
+            return err_box!(
+                "resync is only allowed for fs_mode mount; mount point \"{}\" (requested path \"{}\") has write_type \"{}\". \
+                Create the mount with --write-type fs_mode to use resync.",
+                mount.cv_path,
+                self.cv_path,
+                write_type_str
+            );
+        }
+
         let ufs_root = Path::from_str(&mount.ufs_path)?;
         let ufs = UfsFileSystem::new(&ufs_root, mount.properties.clone(), mount.provider)?;
 
