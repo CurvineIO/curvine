@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::raft::SnapshotData;
+use crate::proto::raft::{FsmState, SnapshotData};
 use crate::raft::storage::AppStorage;
 use crate::raft::{RaftResult, RaftUtils};
 use crate::rocksdb::DBEngine;
@@ -98,6 +98,7 @@ where
             create_time: LocalTime::mills(),
             bytes_data: Some(bytes),
             files_data: None,
+            fsm_state: Default::default(),
         };
         Ok(data)
     }
@@ -174,7 +175,7 @@ where
     fn create_snapshot(&self, node_id: u64, snapshot_id: u64) -> RaftResult<SnapshotData> {
         let db = self.lock()?;
         let dir = db.create_checkpoint(snapshot_id)?;
-        let data = RaftUtils::create_file_snapshot(dir, node_id, snapshot_id)?;
+        let data = RaftUtils::create_file_snapshot(dir, node_id, FsmState::default())?;
         Ok(data)
     }
 
