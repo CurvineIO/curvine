@@ -39,6 +39,10 @@ pub struct MasterMetrics {
     pub(crate) journal_queue_len: Gauge,
     pub(crate) journal_flush_count: Counter,
     pub(crate) journal_flush_time: Counter,
+    pub(crate) journal_committed: Gauge,
+    pub(crate) journal_term: Gauge,
+    pub(crate) journal_applied: Gauge,
+    pub(crate) journal_ufs_applied: Gauge,
 
     pub(crate) used_memory_bytes: Gauge,
     pub(crate) rocksdb_used_memory_bytes: GaugeVec,
@@ -88,6 +92,19 @@ impl MasterMetrics {
                 "Number of flushes of log entries",
             )?,
             journal_flush_time: m::new_counter("journal_flush_time", "Log entry flush time")?,
+            journal_committed: m::new_gauge(
+                "journal_committed",
+                "Raft commit index of the journal",
+            )?,
+            journal_term: m::new_gauge("journal_term", "Current Raft term of the journal")?,
+            journal_applied: m::new_gauge(
+                "journal_applied",
+                "Last applied index of the journal state machine",
+            )?,
+            journal_ufs_applied: m::new_gauge(
+                "journal_ufs_applied",
+                "Last UFS-applied index of the journal state machine",
+            )?,
 
             used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
             rocksdb_used_memory_bytes: m::new_gauge_vec(

@@ -100,8 +100,6 @@ pub struct JournalConf {
     pub retain_checkpoint_num: usize,
 
     pub ignore_reply_error: bool,
-    pub cv_error_retry: bool,
-    pub ufs_error_retry: bool,
     pub max_retry_num: u64,
     pub scan_batch_size: u64,
     pub retry_interval_secs: u64,
@@ -241,8 +239,6 @@ impl Default for JournalConf {
             retain_checkpoint_num: 3,
 
             ignore_reply_error: false,
-            ufs_error_retry: true,
-            cv_error_retry: false,
             max_retry_num: 1000,
             scan_batch_size: 1000,
             retry_interval_secs: 10,

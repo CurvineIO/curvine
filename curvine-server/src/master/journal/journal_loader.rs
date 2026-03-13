@@ -17,7 +17,7 @@
 use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
 use crate::master::meta::inode::InodeView::{Dir, File};
-use crate::master::{JobManager, MountManager, SyncFsDir};
+use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
 use curvine_common::proto::raft::{AppliedIndex, FsmState, SnapshotData};
@@ -53,6 +53,7 @@ pub struct JournalLoader {
     max_retry_num: u64,
     batch_size: u64,
     retry_interval: Duration,
+    metrics: &'static MasterMetrics,
 }
 
 impl JournalLoader {
@@ -102,6 +103,7 @@ impl JournalLoader {
             max_retry_num: conf.max_retry_num,
             batch_size: conf.scan_batch_size,
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
+            metrics: Master::get_metrics(),
         };
 
         let loader1 = loader.clone();
@@ -116,14 +118,36 @@ impl JournalLoader {
         self.fsm_state.lock().unwrap().ufs_applied.clone()
     }
 
-    fn set_follower_applied(&self, applied: AppliedIndex) {
-        self.fsm_state.lock().unwrap().applied = applied;
-    }
+    fn set_applied(
+        &self,
+        is_leader: bool,
+        applied: AppliedIndex,
+        has_ufs_affecting: bool,
+    ) -> CommonResult<()> {
+        if is_leader && has_ufs_affecting {
+            self.journal_writer
+                .log_ufs_applied(applied.op_id, applied.term, applied.index)?;
+        }
 
-    fn set_leader_applied(&self, applied: AppliedIndex) {
-        let mut lock = self.fsm_state.lock().unwrap();
-        lock.ufs_applied = applied.clone();
-        lock.applied = applied;
+        let mut state = self.fsm_state.lock().unwrap();
+        if is_leader {
+            state.ufs_applied = applied.clone();
+            state.applied = applied;
+        } else {
+            state.applied = applied;
+        }
+
+        self.metrics.journal_applied.set(state.applied.index as i64);
+        self.metrics
+            .journal_ufs_applied
+            .set(state.ufs_applied.index as i64);
+        drop(state);
+
+        let state = self.log_store.hard_state();
+        self.metrics.journal_committed.set(state.commit as i64);
+        self.metrics.journal_term.set(state.term as i64);
+
+        Ok(())
     }
 
     fn build_applied(entry: &Entry) -> AppliedIndex {
@@ -182,15 +206,7 @@ impl JournalLoader {
             }
         }
 
-        if is_leader {
-            if has_ufs_affecting {
-                self.journal_writer
-                    .log_ufs_applied(applied.op_id, applied.term, applied.index)?;
-            }
-            self.set_leader_applied(applied);
-        } else {
-            self.set_follower_applied(applied);
-        }
+        self.set_applied(is_leader, applied, has_ufs_affecting)?;
 
         if let Some(e) = snapshot {
             let snap_data = self.create_snapshot0(Some(e.dir.to_string()))?;
