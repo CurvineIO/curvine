@@ -271,8 +271,9 @@ impl MountCommand {
                 WriteType::FsMode => "fs_mode",
             };
             return err_box!(
-                "resync is only allowed for fs_mode mount; mount point \"{}\" has write_type \"{}\". \
+                "resync is only allowed for fs_mode mount; mount point \"{}\" (requested path \"{}\") has write_type \"{}\". \
                 Create the mount with --write-type fs_mode to use resync.",
+                mount.cv_path,
                 self.cv_path,
                 write_type_str
             );
