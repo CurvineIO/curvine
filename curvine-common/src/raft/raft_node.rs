@@ -183,6 +183,8 @@ where
         app_store: &B,
         voters: Vec<u64>,
     ) -> RaftResult<u64> {
+        info!("init raft state: {:?}", log_store.initial_state()?);
+
         let spend = TimeSpent::new();
 
         match log_store.latest_snapshot()? {

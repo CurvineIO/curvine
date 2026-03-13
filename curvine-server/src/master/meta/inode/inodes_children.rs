@@ -153,8 +153,8 @@ impl InodeChildren {
                         // But return owned pointer to complete object
                         Ok(InodePtr::from_owned(*inode))
                     } else {
-                        // Directory directly stores complete object and returns its reference
-                        let inserted = v.insert(inode.clone());
+                        // Directory: move ownership into the map and return a reference.
+                        let inserted = v.insert(inode);
                         Ok(InodePtr::from_ref(inserted.as_ref()))
                     }
                 }

@@ -27,7 +27,7 @@ use curvine_common::state::{
     MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{debug, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::sync::AtomicCounter;
 use orpc::{err_box, err_ext, try_option, CommonResult};
@@ -94,7 +94,9 @@ impl FsDir {
     }
 
     pub fn update_op_id(&self, op_id: u64) {
-        self.op_id.set(op_id);
+        if op_id > self.op_id.get() {
+            self.op_id.set(op_id);
+        }
     }
 
     pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
@@ -362,7 +364,7 @@ impl FsDir {
         let name = inp.name().to_string();
 
         // Create an inode file node.
-        let file = InodeFile::with_opts(self.inode_id.next()?, LocalTime::mills() as i64, opts);
+        let file = InodeFile::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
         inp = self.add_last_inode(inp, File(name, file))?;
         self.journal_writer.log_create_file(self, &inp)?;
 
@@ -582,9 +584,9 @@ impl FsDir {
                     Ok(true)
                 } else {
                     err_box!(
-                        "block_id {} resolves to inode_id {} which is not a file",
+                        "block_id {} resolves to inode {:?} which is not a file",
                         block_id,
-                        file_id
+                        v
                     )
                 }
             }
@@ -676,7 +678,7 @@ impl FsDir {
         let mut spend = TimeSpent::new();
         let path = path.as_ref();
 
-        // Set to other values ​​first to facilitate memory recycling.
+        // Set to other value first to facilitate memory recycling.
         self.root_dir = Self::create_root();
 
         // Reset rocksdb
@@ -691,10 +693,10 @@ impl FsDir {
         let time2 = spend.used_ms();
 
         info!(
-            "Restore from {}, restore rocksdb used {} ms, \
+            "restore from {}, restore rocksdb used {} ms, \
         build in-memory directory tree used {} ms, \
-        statistics updated during tree reconstruction",
-            path, time1, time2
+        statistics updated during tree reconstruction, last_inode_id {}",
+            path, time1, time2, last_inode_id
         );
         Ok(())
     }
@@ -985,7 +987,7 @@ impl FsDir {
             return Ok(DeleteResult::new());
         }
         let del_blocks = file.resize(opts.clone())?;
-        info!("resize file {} success, opts: {:?}", inp.path(), opts);
+        debug!("resize file {} success, opts: {:?}", inp.path(), opts);
 
         file.complete(file.len, &[], "", true)?;
         let mut del_res = DeleteResult::new();

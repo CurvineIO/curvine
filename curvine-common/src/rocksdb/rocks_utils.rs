@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use byteorder::{BigEndian, ByteOrder};
+use orpc::io::IOResult;
 use orpc::{err_box, CommonResult};
 use prost::bytes::BufMut;
+use std::fs;
 
 // A utility class that converts some types to bytes.
 pub struct RocksUtils;
@@ -180,6 +182,35 @@ impl RocksUtils {
 
         end
     }
+
+    pub fn link_dir<P: AsRef<std::path::Path>>(src: P, dst: P) -> IOResult<()> {
+        let src = src.as_ref();
+        let dst = dst.as_ref();
+        if !dst.exists() {
+            fs::create_dir_all(dst)?;
+        }
+
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if src_path.is_dir() {
+                Self::link_dir(&src_path, &dst_path)?;
+            } else if Self::is_sst_file(&src_path) {
+                fs::hard_link(&src_path, &dst_path)?;
+            } else {
+                fs::copy(&src_path, &dst_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_sst_file(path: &std::path::Path) -> bool {
+        matches!(
+            path.extension().and_then(|e: &std::ffi::OsStr| e.to_str()),
+            Some("sst") | Some("ldb")
+        )
+    }
 }
 
 #[cfg(test)]
@@ -233,5 +264,126 @@ mod tests {
         let (c_id, c_name) = RocksUtils::i64_str_from_bytes(&bytes).unwrap();
         assert_eq!(id, c_id);
         assert_eq!(name, c_name);
+    }
+
+    mod tests_link_dir {
+        use super::*;
+        use std::fs;
+        use std::io::Write;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        use std::path::{Path, PathBuf};
+        fn unique_test_dir(name: &str) -> PathBuf {
+            let mut dir = std::env::temp_dir();
+            // Use high-resolution time and thread id to avoid collisions without extra deps.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let tid = format!("{:?}", std::thread::current().id());
+            dir.push(format!("rocks_utils_{}_{}_{}", name, nanos, tid));
+            dir
+        }
+        fn write_file(path: &Path, contents: &str) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let mut file = fs::File::create(path).unwrap();
+            file.write_all(contents.as_bytes()).unwrap();
+        }
+        #[test]
+        fn link_dir_hardlinks_sst_and_ldb_and_copies_other_files() {
+            let src_root = unique_test_dir("src");
+            let dst_root = unique_test_dir("dst");
+            // Build source directory structure.
+            let sst_file = src_root.join("file1.sst");
+            let ldb_file = src_root.join("file2.ldb");
+            let txt_file = src_root.join("other.txt");
+            let nested_dir = src_root.join("nested");
+            let nested_sst = nested_dir.join("nested.sst");
+            let nested_txt = nested_dir.join("nested.txt");
+            write_file(&sst_file, "sst data");
+            write_file(&ldb_file, "ldb data");
+            write_file(&txt_file, "text data");
+            write_file(&nested_sst, "nested sst");
+            write_file(&nested_txt, "nested text");
+            fs::create_dir_all(&dst_root).unwrap();
+            // Exercise link_dir.
+            RocksUtils::link_dir(&src_root, &dst_root).unwrap();
+            // Destination paths.
+            let dst_sst = dst_root.join("file1.sst");
+            let dst_ldb = dst_root.join("file2.ldb");
+            let dst_txt = dst_root.join("other.txt");
+            let dst_nested_dir = dst_root.join("nested");
+            let dst_nested_sst = dst_nested_dir.join("nested.sst");
+            let dst_nested_txt = dst_nested_dir.join("nested.txt");
+            // Ensure all files and dirs exist.
+            assert!(dst_root.is_dir());
+            assert!(dst_sst.is_file());
+            assert!(dst_ldb.is_file());
+            assert!(dst_txt.is_file());
+            assert!(dst_nested_dir.is_dir());
+            assert!(dst_nested_sst.is_file());
+            assert!(dst_nested_txt.is_file());
+            // Helper to read all bytes and compare contents.
+            fn assert_same_contents(a: &Path, b: &Path) {
+                let ca = fs::read(a).unwrap();
+                let cb = fs::read(b).unwrap();
+                assert_eq!(ca, cb, "file contents differ for {:?} and {:?}", a, b);
+            }
+            assert_same_contents(&sst_file, &dst_sst);
+            assert_same_contents(&ldb_file, &dst_ldb);
+            assert_same_contents(&txt_file, &dst_txt);
+            assert_same_contents(&nested_sst, &dst_nested_sst);
+            assert_same_contents(&nested_txt, &dst_nested_txt);
+            // On Unix, verify hard links for .sst/.ldb and copies for others using inode/link count.
+            #[cfg(unix)]
+            {
+                fn assert_hard_link(src: &Path, dst: &Path) {
+                    let m_src = fs::metadata(src).unwrap();
+                    let m_dst = fs::metadata(dst).unwrap();
+                    assert_eq!(
+                        m_src.ino(),
+                        m_dst.ino(),
+                        "expected hard link between {:?} and {:?}",
+                        src,
+                        dst
+                    );
+                    assert!(
+                        m_src.nlink() >= 2,
+                        "expected src link count >= 2 for {:?}",
+                        src
+                    );
+                    assert!(
+                        m_dst.nlink() >= 2,
+                        "expected dst link count >= 2 for {:?}",
+                        dst
+                    );
+                }
+                fn assert_copied(src: &Path, dst: &Path) {
+                    let m_src = fs::metadata(src).unwrap();
+                    let m_dst = fs::metadata(dst).unwrap();
+                    // Same size but different inode indicates copy (not hard link).
+                    assert_eq!(
+                        m_src.len(),
+                        m_dst.len(),
+                        "expected same length for copied files"
+                    );
+                    assert_ne!(
+                        m_src.ino(),
+                        m_dst.ino(),
+                        "expected different inodes for copied files"
+                    );
+                }
+                assert_hard_link(&sst_file, &dst_sst);
+                assert_hard_link(&ldb_file, &dst_ldb);
+                assert_hard_link(&nested_sst, &dst_nested_sst);
+                assert_copied(&txt_file, &dst_txt);
+                assert_copied(&nested_txt, &dst_nested_txt);
+            }
+            // Cleanup.
+            let _ = fs::remove_dir_all(&src_root);
+            let _ = fs::remove_dir_all(&dst_root);
+        }
     }
 }
