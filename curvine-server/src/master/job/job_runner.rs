@@ -26,7 +26,7 @@ use curvine_common::state::{
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use futures::future;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use orpc::err_box;
 use std::collections::LinkedList;
@@ -124,23 +124,6 @@ impl LoadJobRunner {
             job_id: job_id.clone(),
             target_path: target_path.clone_uri(),
         };
-
-        let mnt_value = self.factory.get_mnt(&mnt)?;
-        if self
-            .check_job_exists(&job_id, &mnt_value, &source_path, &target_path)
-            .await?
-        {
-            info!(
-                "job {}, source_path {} already exists",
-                job_id,
-                source_path.full_path()
-            );
-            return Ok(result);
-        }
-
-        self.jobs.remove(&job_id);
-
-        info!("Submitting load job {}", job_id);
         let mut job_context = JobContext::with_conf(
             &command,
             job_id.clone(),
@@ -150,20 +133,47 @@ impl LoadJobRunner {
             &ClientConf::default(),
         );
 
+        let mnt_value = self.factory.get_mnt(&mnt)?;
+        if self
+            .check_job_exists(&job_id, &mnt_value, &source_path, &target_path)
+            .await?
+        {
+            debug!(
+                "skip load job {}: source_path {} already loaded or in progress",
+                job_id,
+                source_path.full_path()
+            );
+
+            job_context.update_state(JobTaskState::Completed, "exists tasks");
+            self.jobs.insert(job_id, job_context);
+            return Ok(result);
+        }
+
+        self.jobs.remove(&job_id);
+
+        debug!(
+            "submitting load job {}: {} -> {}",
+            job_id,
+            source_path.full_path(),
+            target_path.full_path()
+        );
+
         let res = self
             .create_all_tasks(&mut job_context, &source_path, &mnt)
             .await;
 
         match res {
             Err(e) => {
-                warn!("Create load job {} failed: {}", job_id, e);
+                warn!("create load job {} failed: {}", job_id, e);
                 Err(e)
             }
 
             Ok(size) => {
                 info!(
-                    "Submit load job {} success, tasks {}, total_size {}",
+                    "load job {} submitted: {} -> {}, tasks {}, total_size {}",
                     job_id,
+                    source_path.full_path(),
+                    target_path.full_path(),
                     job_context.tasks.len(),
                     ByteUnit::byte_to_string(size as u64)
                 );
@@ -183,9 +193,10 @@ impl LoadJobRunner {
             .take()
             .into_iter()
             .map(|(id, task)| async move {
-                let client = self.factory.get_worker_client(&task.task.worker).await?;
+                let worker = task.task.worker.clone();
+                let client = self.factory.get_worker_client(&worker).await?;
                 client.submit_load_task(task.task).await?;
-                info!("Submit sub-task {}", id);
+                debug!("dispatched sub-task {} to worker {}", id, worker);
                 Ok::<(), FsError>(())
             })
             .collect();
@@ -276,7 +287,12 @@ impl LoadJobRunner {
                         self.job_max_files
                     );
                 }
-                info!("Added sub-task {}", task_id);
+                debug!(
+                    "created sub-task {} ({} -> {})",
+                    task_id,
+                    source_path.full_path(),
+                    target_path.full_path()
+                );
             }
         }
 
@@ -294,17 +310,11 @@ impl LoadJobRunner {
             let res = client.cancel_job(job_id).await;
 
             if let Err(e) = res {
-                error!(
-                    "Failed to send cancel load request to worker{}: {}",
-                    worker, e
-                );
+                error!("failed to send cancel request to worker {}: {}", worker, e);
                 self.jobs.update_state(
                     job_id,
                     JobTaskState::Canceled,
-                    format!(
-                        "Failed to send cancel load request to worker {}: {}",
-                        worker, e
-                    ),
+                    format!("failed to send cancel request to worker {}: {}", worker, e),
                 );
             }
         }
