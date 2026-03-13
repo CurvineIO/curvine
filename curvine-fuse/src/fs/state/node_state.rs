@@ -283,10 +283,17 @@ impl NodeState {
                 let reader = self.fs.open(path).await?;
 
                 if self.conf.enable_meta_cache {
-                    if let UnifiedReader::Cv(cv_reader) = &reader {
-                        self.meta_cache
-                            .put_open(path, cv_reader.file_blocks().clone());
-                    }
+                    match &reader {
+                        UnifiedReader::Cv(cv_reader) => {
+                            self.meta_cache
+                                .put_open(path, cv_reader.file_blocks().clone());
+                        }
+                        UnifiedReader::Fallback(fallback_reader) => {
+                            self.meta_cache
+                                .put_open(path, fallback_reader.file_blocks().clone());
+                        }
+                        _ => {}
+                    };
                 }
 
                 reader
