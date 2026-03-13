@@ -28,7 +28,6 @@ use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
 use curvine_common::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
 use curvine_common::FsResult;
-use log::info;
 use orpc::common::FileUtils;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::StateCtl;
@@ -81,17 +80,10 @@ impl JournalSystem {
         let worker_manager = SyncWorkerManager::new(WorkerManager::new(conf));
 
         let client = RaftClient::from_conf(rt.clone(), &conf.journal);
-        let journal_writer = JournalWriter::new(conf.testing, client, &conf.journal);
+        let journal_writer = Arc::new(JournalWriter::new(conf.testing, client, &conf.journal));
 
-        // If a snapshot exists in the current system, fs_dir will be restored based on the snapshot.
-        // Here we will first delete the rocksdb data directory, which is to prevent the creation of the memory directory tree twice.
         let db_conf = conf.meta_rocks_conf();
-        if !conf.format_master && log_store.has_snapshot() {
-            info!(
-                "There is a snapshot currently, the original data directory {} will be \
-            deleted and restored based on the snapshot later",
-                db_conf.data_dir
-            );
+        if FileUtils::exists(&db_conf.data_dir) {
             FileUtils::delete_path(&db_conf.data_dir, true)?;
         }
 
@@ -110,7 +102,7 @@ impl JournalSystem {
 
         let fs_dir = SyncFsDir::new(FsDir::new(
             conf,
-            journal_writer,
+            journal_writer.clone(),
             ttl_bucket_list,
             evictor.clone(),
         )?);
@@ -136,12 +128,15 @@ impl JournalSystem {
 
         let raft_journal = MetaRaftJournal::new(
             rt.clone(),
-            log_store,
+            log_store.clone(),
             JournalLoader::new(
+                rt.clone(),
                 fs_dir.clone(),
                 mount_manager.clone(),
                 &conf.journal,
                 job_manager.clone(),
+                log_store,
+                journal_writer.clone(),
             ),
             conf.journal.clone(),
             role_monitor,

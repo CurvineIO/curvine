@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::raft::FsmState;
+use crate::proto::raft::{FsmState, SnapshotData};
 use raft::eraftpb;
 
 mod raft_node;
@@ -75,5 +75,14 @@ impl FsmState {
 
     pub fn op_id(&self) -> u64 {
         self.applied.op_id.max(self.ufs_applied.op_id)
+    }
+}
+
+impl SnapshotData {
+    pub fn data_dir(&self) -> String {
+        match &self.files_data {
+            Some(files_data) => files_data.dir.clone(),
+            None => "".to_string(),
+        }
     }
 }
