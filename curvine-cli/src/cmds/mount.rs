@@ -24,6 +24,8 @@ use curvine_common::utils::ProtoUtils;
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
 use std::collections::{HashMap, VecDeque};
+use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 pub struct MountCommand {
@@ -93,6 +95,64 @@ struct ResyncStats {
     skip_ufs_time_zero: usize,
     recreated: usize,
     failed: usize,
+}
+
+struct ResyncProgress {
+    label: String,
+    start: Instant,
+    last_print: Instant,
+    interval: Duration,
+}
+
+impl ResyncProgress {
+    fn new(label: impl Into<String>) -> Self {
+        let now = Instant::now();
+        Self {
+            label: label.into(),
+            start: now,
+            last_print: now.checked_sub(Duration::from_millis(500)).unwrap_or(now),
+            interval: Duration::from_millis(500),
+        }
+    }
+
+    fn tick(&mut self, stats: &ResyncStats, pending_dirs: usize) {
+        let now = Instant::now();
+        if now.duration_since(self.last_print) < self.interval {
+            return;
+        }
+        self.last_print = now;
+        self.render(stats, pending_dirs, false);
+    }
+
+    fn finish(&mut self, stats: &ResyncStats) {
+        self.render(stats, 0, true);
+    }
+
+    fn render(&self, stats: &ResyncStats, pending_dirs: usize, done: bool) {
+        let elapsed = self.start.elapsed().as_secs_f32();
+        let status = if done { "done" } else { "running" };
+        eprint!(
+            "\r[resync:{}] status={} elapsed={:.1}s scanned={} recreated={} skipped={} failed={} pending_dirs={}",
+            self.label,
+            status,
+            elapsed,
+            stats.scanned,
+            stats.recreated,
+            stats.skip_same_mtime + stats.skip_ufs_time_zero,
+            stats.failed,
+            pending_dirs
+        );
+        let _ = io::stderr().flush();
+        if done {
+            eprintln!();
+        }
+    }
+}
+
+fn is_cv_dir_missing(err: &FsError) -> bool {
+    matches!(err, FsError::FileNotFound(_) | FsError::Expired(_))
+        || err.to_string().contains("not exists")
+        || err.to_string().contains("not found")
 }
 
 impl MountCommand {
@@ -236,6 +296,9 @@ impl MountCommand {
         }
 
         let mnt_opts = self.to_mnt_opts()?;
+        let should_auto_resync = !self.update
+            && matches!(mnt_opts.write_type, WriteType::FsMode)
+            && fs.fs_client().get_mount_info(&cv_path).await?.is_none();
 
         let ufs = UfsFileSystem::new(
             &ufs_path,
@@ -249,20 +312,32 @@ impl MountCommand {
 
         handle_rpc_result(fs.mount(&ufs_path, &cv_path, mnt_opts)).await;
         println!("│ ✅️ mount success.");
+        if should_auto_resync {
+            println!("│ 🔄 first mount detected, start resync...");
+            self.run_resync(&fs, &cv_path, "auto").await?;
+        }
         Ok(())
     }
 
     async fn execute_resync(&self, fs: UnifiedFileSystem) -> CommonResult<()> {
-        let cv_root = Path::from_str(&self.cv_path)?;
-        if !cv_root.is_cv() {
+        let cv_path = Path::from_str(&self.cv_path)?;
+        if !cv_path.is_cv() {
             return err_box!("resync requires a curvine path, got: {}", self.cv_path);
         }
+        self.run_resync(&fs, &cv_path, "manual").await
+    }
 
+    async fn run_resync(
+        &self,
+        fs: &UnifiedFileSystem,
+        cv_path: &Path,
+        trigger: &str,
+    ) -> CommonResult<()> {
         let client = fs.fs_client();
 
-        let mount = match client.get_mount_info(&cv_root).await? {
+        let mount = match client.get_mount_info(cv_path).await? {
             Some(v) => v,
-            None => return err_box!("mount info not found for {}", self.cv_path),
+            None => return err_box!("mount info not found for {}", cv_path),
         };
 
         if !mount.is_fs_mode() {
@@ -274,7 +349,7 @@ impl MountCommand {
                 "resync is only allowed for fs_mode mount; mount point \"{}\" (requested path \"{}\") has write_type \"{}\". \
                 Create the mount with --write-type fs_mode to use resync.",
                 mount.cv_path,
-                self.cv_path,
+                cv_path,
                 write_type_str
             );
         }
@@ -284,6 +359,8 @@ impl MountCommand {
 
         let mut stats = ResyncStats::default();
         let mut queue = VecDeque::from([ufs_root.clone()]);
+        let mut progress = ResyncProgress::new(trigger);
+        progress.tick(&stats, queue.len());
 
         while let Some(ufs_dir) = queue.pop_front() {
             let ufs_entries = match ufs.list_status(&ufs_dir).await {
@@ -291,17 +368,26 @@ impl MountCommand {
                 Err(e) => {
                     stats.failed += 1;
                     eprintln!("[resync] failed to list ufs dir {}: {}", ufs_dir, e);
+                    progress.tick(&stats, queue.len());
                     continue;
                 }
             };
 
             let cv_dir = mount.get_cv_path(&ufs_dir)?;
+            if let Err(e) = fs.cv().mkdir(&cv_dir, true).await {
+                stats.failed += 1;
+                eprintln!("[resync] failed to create cv dir {}: {}", cv_dir, e);
+                progress.tick(&stats, queue.len());
+                continue;
+            }
+
             let cv_entries = match fs.cv().list_status(&cv_dir).await {
                 Ok(v) => v,
-                Err(FsError::FileNotFound(_) | FsError::Expired(_)) => vec![],
+                Err(e) if is_cv_dir_missing(&e) => vec![],
                 Err(e) => {
                     stats.failed += 1;
                     eprintln!("[resync] failed to list cv dir {}: {}", cv_dir, e);
+                    progress.tick(&stats, queue.len());
                     continue;
                 }
             };
@@ -315,6 +401,7 @@ impl MountCommand {
                 let ufs_path = Path::from_str(ufs_entry.path)?;
                 if ufs_entry.is_dir {
                     queue.push_back(ufs_path);
+                    progress.tick(&stats, queue.len());
                     continue;
                 }
 
@@ -331,6 +418,7 @@ impl MountCommand {
                         if self.verbose {
                             println!("[resync] skip (ufs_time=0): {}", cv_path);
                         }
+                        progress.tick(&stats, queue.len());
                         continue;
                     }
 
@@ -339,6 +427,7 @@ impl MountCommand {
                         if self.verbose {
                             println!("[resync] skip (same mtime): {}", cv_path);
                         }
+                        progress.tick(&stats, queue.len());
                         continue;
                     }
 
@@ -351,12 +440,14 @@ impl MountCommand {
 
                     if self.dry_run {
                         stats.recreated += 1;
+                        progress.tick(&stats, queue.len());
                         continue;
                     }
 
                     if let Err(e) = client.delete(&cv_path, false).await {
                         stats.failed += 1;
                         eprintln!("[resync] failed to delete {}: {}", cv_path, e);
+                        progress.tick(&stats, queue.len());
                         continue;
                     }
                 } else if self.verbose || self.dry_run {
@@ -368,6 +459,7 @@ impl MountCommand {
 
                 if self.dry_run {
                     stats.recreated += 1;
+                    progress.tick(&stats, queue.len());
                     continue;
                 }
 
@@ -377,6 +469,7 @@ impl MountCommand {
                 if let Err(e) = client.create_with_opts(&cv_path, create_opts, true).await {
                     stats.failed += 1;
                     eprintln!("[resync] failed to create {}: {}", cv_path, e);
+                    progress.tick(&stats, queue.len());
                     continue;
                 }
 
@@ -384,6 +477,7 @@ impl MountCommand {
                 if let Err(e) = client.complete_file(&cv_path, 0, Vec::new(), false).await {
                     stats.failed += 1;
                     eprintln!("[resync] failed to complete {}: {}", cv_path, e);
+                    progress.tick(&stats, queue.len());
                     continue;
                 }
 
@@ -395,13 +489,16 @@ impl MountCommand {
                 if let Err(e) = client.set_attr(&cv_path, attr_opts).await {
                     stats.failed += 1;
                     eprintln!("[resync] failed to set attr {}: {}", cv_path, e);
+                    progress.tick(&stats, queue.len());
                     continue;
                 }
 
                 stats.recreated += 1;
+                progress.tick(&stats, queue.len());
             }
         }
 
+        progress.finish(&stats);
         println!(
             "resync summary: scanned={}, skip_same_mtime={}, skip_ufs_time_zero={}, recreated={}, failed={}",
             stats.scanned,
