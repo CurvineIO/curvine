@@ -76,7 +76,7 @@ fn rocks_snap_test() -> CommonResult<()> {
     let snap = core.write().unwrap().last_snapshot()?;
     let store_snap: HashAppStorage<String, String> = HashAppStorage::new();
     let data: SnapshotData = SnapshotData::decode(snap.get_data())?;
-    store_snap.apply_snapshot(&data)?;
+    rt.block_on(store_snap.apply_snapshot(data))?;
     assert_eq!(store_snap.len(), 10);
 
     Ok(())

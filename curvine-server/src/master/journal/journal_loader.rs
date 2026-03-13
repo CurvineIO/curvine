@@ -21,7 +21,7 @@ use crate::master::{JobManager, MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
 use curvine_common::proto::raft::{FsmState, SnapshotData};
-use curvine_common::raft::storage::AppStorage;
+use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::raft::{RaftResult, RaftUtils};
 use curvine_common::state::RenameFlags;
 use curvine_common::utils::SerdeUtils;
@@ -29,9 +29,11 @@ use log::{debug, error, info, warn};
 use orpc::common::FileUtils;
 use orpc::sync::AtomicCounter;
 use orpc::{err_box, try_option, try_option_ref, CommonResult};
+use raft::StateRole;
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs, mem};
+
 // Replay the master metadata operation log.
 #[derive(Clone)]
 pub struct JournalLoader {
@@ -355,8 +357,8 @@ impl JournalLoader {
 }
 
 impl AppStorage for JournalLoader {
-    async fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
-        match self.apply0(is_leader, message).await {
+    async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
+        match self.apply0(wait, &msg.take_entry().data[..]).await {
             Ok(_) => Ok(()),
 
             Err(e) => {
@@ -370,11 +372,19 @@ impl AppStorage for JournalLoader {
         }
     }
 
+    fn get_fsm_state(&self) -> FsmState {
+        FsmState::default()
+    }
+
+    async fn role_change(&self, _: StateRole) -> RaftResult<()> {
+        Ok(())
+    }
+
     // Call rocksdb's API to create a snapshot.
-    fn create_snapshot(&self, node_id: u64, last_applied: u64) -> RaftResult<SnapshotData> {
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
         let fs_dir = self.fs_dir.read();
-        let dir = fs_dir.create_checkpoint(last_applied)?;
-        let data = RaftUtils::create_file_snapshot(&dir, node_id, FsmState::default())?;
+        let dir = fs_dir.create_checkpoint(0)?;
+        let data = RaftUtils::create_file_snapshot(&dir, 0, FsmState::default())?;
 
         // Delete historical snapshots.
         if let Err(e) = self.purge_checkpoint(&dir) {
@@ -383,7 +393,7 @@ impl AppStorage for JournalLoader {
         Ok(data)
     }
 
-    fn apply_snapshot(&self, snapshot: &SnapshotData) -> RaftResult<()> {
+    async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
         {
             let mut fs_dir = self.fs_dir.write();
             let data = try_option_ref!(snapshot.files_data);

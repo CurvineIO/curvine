@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::proto::raft::SnapshotData;
 use crate::raft::{RaftError, RaftResult, LOG_START_INDEX};
 use crate::rocksdb::{DBConf, DBEngine, RocksUtils, WriteBatch};
 use log::warn;
@@ -40,6 +41,7 @@ impl RocksStorageCore {
     pub const SNAP_KEY: &'static [u8] = &[0x01u8];
     // Save index range。
     pub const INDEX_KEY: &'static [u8] = &[0x02u8];
+    pub const STATE_KEY: &'static [u8] = &[0x03u8];
 
     pub fn new<T: AsRef<str>>(dir: T, format: bool) -> Self {
         let conf = DBConf::new(dir)
@@ -59,10 +61,13 @@ impl RocksStorageCore {
             get_entries_context: None,
         };
 
-        // Readfirst_index，last_index
         if let Some((first, last)) = core.get_index_range().unwrap() {
             core.first_index = Some(first);
             core.last_index = Some(last);
+        }
+
+        if let Some(data) = core.db.get_cf(Self::CF_META, Self::STATE_KEY).unwrap() {
+            core.raft_state.hard_state = HardState::decode(data.as_ref()).unwrap_or_default();
         }
 
         core
@@ -99,7 +104,9 @@ impl RocksStorageCore {
     }
 
     pub fn set_hard_state(&mut self, hs: HardState) -> RaftResult<()> {
-        self.raft_state.hard_state = hs;
+        self.raft_state.hard_state = hs.clone();
+        self.db
+            .put_cf(Self::CF_META, Self::STATE_KEY, hs.encode_to_vec())?;
         Ok(())
     }
 
@@ -159,27 +166,39 @@ impl RocksStorageCore {
 
         self.snapshot_metadata = meta.clone();
         self.raft_state.hard_state.term = cmp::max(self.raft_state.hard_state.term, meta.term);
-        self.raft_state.hard_state.commit = index;
+        self.raft_state.hard_state.commit = cmp::max(self.raft_state.hard_state.commit, index);
         self.raft_state.conf_state = meta.get_conf_state().clone();
 
         Ok(())
     }
 
-    pub fn create_snapshot(&self, data: Vec<u8>, request_index: u64) -> RaftResult<Snapshot> {
+    pub fn create_snapshot(&self, data: SnapshotData) -> RaftResult<Snapshot> {
+        let request_index = data.fsm_state.applied.index;
+
         let mut snapshot = Snapshot::default();
-        snapshot.set_data(data);
+        snapshot.set_data(data.encode_to_vec());
         let meta = snapshot.mut_metadata();
-        meta.index = self.raft_state.hard_state.commit.min(request_index);
+
+        if request_index > self.raft_state.hard_state.commit {
+            return err_box!(
+                "snapshot temporarily unavailable: request_index {}, hard_state {:?}",
+                request_index,
+                self.raft_state.hard_state
+            );
+        }
+
+        meta.index = request_index;
         meta.term = match meta.index.cmp(&self.snapshot_metadata.index) {
             cmp::Ordering::Equal => self.snapshot_metadata.term,
             cmp::Ordering::Greater => {
-                let entry = self.get_check(meta.index).unwrap();
+                let entry = self.get_check(meta.index)?;
                 entry.term
             }
             cmp::Ordering::Less => {
-                panic!(
+                return err_box!(
                     "commit {} < snapshot_metadata.index {}",
-                    meta.index, self.snapshot_metadata.index
+                    meta.index,
+                    self.snapshot_metadata.index
                 );
             }
         };

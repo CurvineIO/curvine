@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::raft::{FsmState, SnapshotData};
-use crate::raft::storage::AppStorage;
+use crate::proto::raft::{AppliedIndex, FsmState, SnapshotData};
+use crate::raft::storage::{AppStorage, ApplyMsg};
 use crate::raft::{RaftResult, RaftUtils};
 use crate::rocksdb::DBEngine;
 use crate::utils::SerdeUtils;
 use orpc::common::LocalTime;
 use orpc::{try_err, try_option_ref, CommonResult};
+use raft::StateRole;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 #[derive(Clone)]
 pub struct HashAppStorage<K, V> {
     map: Arc<RwLock<HashMap<K, V>>>,
+    fsm_state: Arc<Mutex<FsmState>>,
 }
 
 impl<K, V> Default for HashAppStorage<K, V>
@@ -49,6 +51,7 @@ where
     pub fn new() -> Self {
         Self {
             map: Arc::new(RwLock::new(HashMap::new())),
+            fsm_state: Arc::new(Mutex::new(FsmState::default())),
         }
     }
 
@@ -82,32 +85,52 @@ where
     K: DeserializeOwned + Sized + Serialize + Clone + Hash + Eq + Send + Sync + 'static,
     V: DeserializeOwned + Sized + Serialize + Clone + Send + Sync + 'static,
 {
-    async fn apply(&self, _: bool, message: &[u8]) -> RaftResult<()> {
+    async fn apply(&self, _: bool, msg: ApplyMsg) -> RaftResult<()> {
+        let entry = msg.take_entry();
         let mut map = self.write()?;
-        let pairs: (K, V) = SerdeUtils::deserialize(message)?;
+        let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
         map.insert(pairs.0, pairs.1);
+
+        self.fsm_state.lock().unwrap().applied = AppliedIndex {
+            term: entry.term,
+            index: entry.index,
+            op_id: 0,
+            rpc_id: 0,
+        };
+
         Ok(())
     }
 
-    fn create_snapshot(&self, node_id: u64, snapshot_id: u64) -> RaftResult<SnapshotData> {
+    fn get_fsm_state(&self) -> FsmState {
+        self.fsm_state.lock().unwrap().clone()
+    }
+
+    async fn role_change(&self, _: StateRole) -> RaftResult<()> {
+        Ok(())
+    }
+
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
         let map = self.read()?;
+        let fsm_state = self.get_fsm_state();
         let bytes = SerdeUtils::serialize(&*map)?;
         let data = SnapshotData {
-            snapshot_id,
-            node_id,
+            snapshot_id: fsm_state.applied.index,
+            node_id: 0,
             create_time: LocalTime::mills(),
             bytes_data: Some(bytes),
             files_data: None,
-            fsm_state: Default::default(),
+            fsm_state,
         };
+
         Ok(data)
     }
 
-    fn apply_snapshot(&self, data: &SnapshotData) -> RaftResult<()> {
-        let data = try_option_ref!(data.bytes_data);
+    async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        let data = try_option_ref!(snapshot.bytes_data);
         let new: HashMap<K, V> = SerdeUtils::deserialize(data)?;
         let mut map = self.write()?;
         let _ = std::mem::replace(&mut *map, new);
+        *self.fsm_state.lock().unwrap() = snapshot.fsm_state;
         Ok(())
     }
 
@@ -119,6 +142,7 @@ where
 #[derive(Clone)]
 pub struct RocksAppStorage<K, V> {
     db: Arc<Mutex<DBEngine>>,
+    fsm_state: Arc<Mutex<FsmState>>,
     _k: PhantomData<K>,
     _v: PhantomData<V>,
 }
@@ -132,6 +156,7 @@ where
         let db = DBEngine::from_dir(dir, true).unwrap();
         Self {
             db: Arc::new(Mutex::new(db)),
+            fsm_state: Arc::new(Mutex::new(FsmState::default())),
             _k: Default::default(),
             _v: Default::default(),
         }
@@ -162,27 +187,47 @@ where
     K: Serialize + DeserializeOwned + Clone + Sync + Send + 'static,
     V: Serialize + DeserializeOwned + Clone + Sync + Send + 'static,
 {
-    async fn apply(&self, _: bool, message: &[u8]) -> RaftResult<()> {
+    async fn apply(&self, _: bool, msg: ApplyMsg) -> RaftResult<()> {
+        let entry = msg.take_entry();
         let db = self.lock()?;
-        let pairs: (K, V) = SerdeUtils::deserialize(message)?;
+        let pairs: (K, V) = SerdeUtils::deserialize(&entry.data)?;
         let k = SerdeUtils::serialize(&pairs.0)?;
         let v = SerdeUtils::serialize(&pairs.1)?;
         db.put(k, v)?;
+
+        self.fsm_state.lock().unwrap().applied = AppliedIndex {
+            term: entry.term,
+            index: entry.index,
+            op_id: 0,
+            rpc_id: 0,
+        };
+
+        Ok(())
+    }
+
+    fn get_fsm_state(&self) -> FsmState {
+        self.fsm_state.lock().unwrap().clone()
+    }
+
+    async fn role_change(&self, _role: StateRole) -> RaftResult<()> {
         Ok(())
     }
 
     // Create a snapshot.
-    fn create_snapshot(&self, node_id: u64, snapshot_id: u64) -> RaftResult<SnapshotData> {
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
         let db = self.lock()?;
-        let dir = db.create_checkpoint(snapshot_id)?;
-        let data = RaftUtils::create_file_snapshot(dir, node_id, FsmState::default())?;
+        let fsm_state = self.get_fsm_state();
+        let dir = db.create_checkpoint(fsm_state.applied.index)?;
+        let data = RaftUtils::create_file_snapshot(dir, 0, fsm_state)?;
         Ok(data)
     }
 
-    fn apply_snapshot(&self, data: &SnapshotData) -> RaftResult<()> {
+    async fn apply_snapshot(&self, data: SnapshotData) -> RaftResult<()> {
         let mut db = self.lock()?;
         let files = try_option_ref!(data.files_data);
-        RaftUtils::apply_rocks_snapshot(&mut db, files)
+        RaftUtils::apply_rocks_snapshot(&mut db, files)?;
+        *self.fsm_state.lock().unwrap() = data.fsm_state;
+        Ok(())
     }
 
     fn snapshot_dir(&self, snapshot_id: u64) -> RaftResult<String> {
