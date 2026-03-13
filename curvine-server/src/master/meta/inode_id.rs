@@ -50,7 +50,7 @@ impl InodeId {
             return err_box!("inode id exceeds maximum value {}", Self::ID_MASK);
         }
         if seq > Self::SEQ_MASK {
-            return err_box!("seq id exceeds maximum value {}", Self::ID_MASK);
+            return err_box!("seq id exceeds maximum value {}", Self::SEQ_MASK);
         }
 
         let block_id = ((id & Self::ID_MASK) << Self::SEQ_BYTES) | (seq & Self::SEQ_MASK);
