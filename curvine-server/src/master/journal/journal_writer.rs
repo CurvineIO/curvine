@@ -73,8 +73,6 @@ impl JournalWriter {
     }
 
     fn send(&self, fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
-        debug!("send_entry {:?}", entry);
-
         if self.enable {
             self.send_inner(entry)?;
             self.maybe_emit_snapshot(fs_dir)?;
@@ -102,10 +100,11 @@ impl JournalWriter {
         };
 
         info!(
-            "create leader snapshot, dir {}, entries {}, cost {} ms",
+            "create leader snapshot, dir {}, entries {}, cost {} ms, inode_id {}",
             dir,
             entries,
-            LocalTime::mills() - now
+            LocalTime::mills() - now,
+            fs_dir.inode_id.current()
         );
 
         self.send_inner(JournalEntry::Snapshot(SnapshotEntry {

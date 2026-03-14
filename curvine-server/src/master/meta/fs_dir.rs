@@ -413,7 +413,6 @@ impl FsDir {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
-        assert!(!inode.is_file_entry());
 
         let status = match inode.as_ref() {
             File(..) | Dir(..) => inode.to_file_status(inp.path()),
@@ -548,7 +547,6 @@ impl FsDir {
             None => return err_ext!(FsError::file_not_found(inp.path())),
             Some(v) => v,
         };
-        assert!(!inode_ptr.is_file_entry());
 
         let mut inode = match inode_ptr.as_ref() {
             File(..) => inode_ptr.as_ref().clone(),

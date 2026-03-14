@@ -81,7 +81,6 @@ pub struct JournalConf {
     pub conn_size: usize,
 
     // raft related configuration
-    pub raft_poll_interval_ms: u64,
     pub raft_tick_interval_ms: u64,
     pub raft_election_tick: usize,
     pub raft_heartbeat_tick: usize,
@@ -91,6 +90,7 @@ pub struct JournalConf {
     pub raft_max_size_per_msg: u64,
     pub raft_max_inflight_msgs: usize,
     pub raft_max_committed_size_per_ready: u64,
+    pub raft_batch_size: usize,
 
     // Raft requests to retry the cache configuration to prevent duplicate requests.
     pub raft_retry_cache_size: u64,
@@ -178,6 +178,7 @@ impl JournalConf {
             check_quorum: self.raft_check_quorum,
             skip_bcast_commit: true,
             pre_vote: true,
+            batch_append: true,
             ..Default::default()
         }
     }
@@ -203,7 +204,7 @@ impl Default for JournalConf {
             journal_dir,
             writer_channel_size: 0,
             writer_flush_batch_size: 1000,
-            writer_flush_batch_ms: 100,
+            writer_flush_batch_ms: 10,
             snapshot_interval: "6h".to_string(),
             snapshot_entries: 1000000,
             snapshot_read_chunk_size: 1024 * 1024,
@@ -222,7 +223,6 @@ impl Default for JournalConf {
 
             conn_size: 1,
 
-            raft_poll_interval_ms: 100,
             raft_tick_interval_ms: 1000,
             raft_election_tick: 10,
             raft_heartbeat_tick: 3,
@@ -232,6 +232,7 @@ impl Default for JournalConf {
             raft_max_size_per_msg: 1024 * 1024,
             raft_max_inflight_msgs: 256,
             raft_max_committed_size_per_ready: 16 * 1024 * 1024,
+            raft_batch_size: 8,
 
             raft_retry_cache_size: 100_000,
             raft_retry_cache_ttl: "10m".to_string(),
