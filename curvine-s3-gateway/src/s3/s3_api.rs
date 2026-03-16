@@ -492,7 +492,7 @@ pub async fn handle_get_list_object<
             .get_query("max-keys")
             .and_then(|v| v.parse::<i32>().ok()),
         optional_object_attributes: None,
-        request_payer: req.get_header("x-amz-request-layer"),
+        request_payer: req.get_header("x-amz-request-payer"),
         start_after: req.get_query("start-after"),
         encoding_type: req.get_query("encoding-type"),
         fetch_owner: req.get_query("fetch-owner").and_then(|v| {
@@ -668,7 +668,7 @@ pub async fn handle_get_list_buckets<
         }
 
         Err(e) => {
-            log::info!("listbucket handle error: {e}");
+            log::info!("list buckets handle error: {e}");
             resp.set_status(500);
             resp.send_header();
         }
@@ -771,7 +771,7 @@ pub async fn handle_put_object<
         checksum_sha1: req.get_header("x-amz-checksum-sha1"),
         checksum_sha256: req.get_header("x-amz-checksum-sha256"),
         content_disposition: req.get_header("content-disposition"),
-        content_encoding: req.get_header("cotent-encoding"),
+        content_encoding: req.get_header("content-encoding"),
         content_language: req.get_header("content-language"),
         content_length: req
             .get_header("content-length")
