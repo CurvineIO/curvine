@@ -27,9 +27,6 @@ use curvine_ufs::opendal::*;
 #[cfg(feature = "oss-hdfs")]
 use curvine_ufs::oss_hdfs::*;
 
-// Storage schemes
-pub const S3_SCHEME: &str = "s3";
-
 pub mod macros;
 
 mod unified_filesystem;

@@ -225,6 +225,16 @@ impl DataSlice {
             Bytes(s) => s.as_ptr(),
         }
     }
+
+    pub fn to_bytes(self) -> TBytes {
+        match self {
+            Empty => TBytes::new(),
+            Bytes(bytes) => bytes,
+            Buffer(buf) => buf.freeze(),
+            MemSlice(buf) => TBytes::copy_from_slice(buf.as_slice()),
+            IOSlice(buf) => TBytes::copy_from_slice(buf.as_slice()),
+        }
+    }
 }
 
 impl Clone for DataSlice {

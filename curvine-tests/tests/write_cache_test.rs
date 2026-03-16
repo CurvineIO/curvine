@@ -37,7 +37,8 @@ fn get_fs() -> UnifiedFileSystem {
         panic!("UFS_TEST_PATH is not set")
     }
 
-    let testing = Testing::default();
+    let testing = Testing::builder().workers(1).build().unwrap();
+    testing.start_cluster().unwrap();
     let rt = Arc::new(AsyncRuntime::single());
     testing.get_unified_fs_with_rt(rt.clone()).unwrap()
 }
@@ -95,8 +96,7 @@ async fn test_cache_read(fs: &UnifiedFileSystem, path: &Path) {
 
     let str1 = reader1.read_as_string().await.unwrap();
 
-    let (ufs_path, _) = fs.get_mount(path).await.unwrap().unwrap();
-    fs.wait_job_complete(&ufs_path, false).await.unwrap();
+    fs.wait_job_complete(path, false).await.unwrap();
 
     let mut reader2 = fs.open(path).await.unwrap();
     assert!(
@@ -124,6 +124,7 @@ fn test_fs_mode() {
         let mut writer = fs.create(&path, true).await.unwrap();
         writer.write_string(Utils::rand_str(1024)).await.unwrap();
         writer.complete().await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
 
         let dst_path = format!("/write_cache_{:?}/meta_rename.log", WriteType::FsMode).into();
         fs.rename(&path, &dst_path).await.unwrap();
@@ -193,8 +194,7 @@ fn test_fs_mode_free() {
         writer.complete().await.unwrap();
 
         let _ = fs.open(&path).await.unwrap();
-        let (ufs_path, _) = fs.get_mount(&path).await.unwrap().unwrap();
-        fs.wait_job_complete(&ufs_path, false).await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
 
         fs.free(&path).await.unwrap();
 

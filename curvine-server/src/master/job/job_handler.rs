@@ -53,6 +53,7 @@ impl JobHandler {
         let response = SubmitJobResponse {
             job_id: res.job_id,
             target_path: res.target_path,
+            state: res.state as i32,
         };
 
         ctx.response(response)

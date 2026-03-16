@@ -163,6 +163,15 @@ impl JournalLoader {
             return Ok(());
         }
 
+        let cur = self.get_fsm_state();
+        if entry.index <= cur.applied.index {
+            info!(
+                "skip entry index {}, term {}, fsm_state {:?}",
+                entry.index, entry.term, cur
+            );
+            return Ok(());
+        }
+
         let batch: JournalBatch = SerdeUtils::deserialize(&entry.data)?;
         let batch_len = batch.len();
         let mut snapshot = None;
