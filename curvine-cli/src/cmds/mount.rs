@@ -15,7 +15,7 @@
 use crate::util::*;
 use clap::Parser;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
-use curvine_common::error::FsError;
+use curvine_common::error::{ErrorKind, FsError};
 use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{
     MountOptions, Provider, SetAttrOptsBuilder, StorageType, TtlAction, WriteType,
@@ -150,9 +150,7 @@ impl ResyncProgress {
 }
 
 fn is_cv_dir_missing(err: &FsError) -> bool {
-    matches!(err, FsError::FileNotFound(_) | FsError::Expired(_))
-        || err.to_string().contains("not exists")
-        || err.to_string().contains("not found")
+    matches!(err.kind(), ErrorKind::FileNotFound | ErrorKind::Expired)
 }
 
 impl MountCommand {

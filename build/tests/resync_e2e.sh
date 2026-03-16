@@ -12,7 +12,7 @@ BUCKET="${BUCKET:-miniocluster}"
 UFS_PREFIX="${UFS_PREFIX:-curvine-test}"
 CV_PATH="${CV_PATH:-/miniocluster/curvine-test}"
 S3_ENDPOINT_URL="${S3_ENDPOINT_URL:-http://127.0.0.1:9009}"
-S3_REGION="${S3_REGION:-cn-beigjing}"
+S3_REGION="${S3_REGION:-cn-beijing}"
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-minio}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-minio123}"
 S3_FORCE_PATH_STYLE="${S3_FORCE_PATH_STYLE:-true}"
@@ -225,7 +225,7 @@ if ! run_cv mount | grep -q "$CV_PATH"; then
 fi
 
 TMP_DIR="$(mktemp -d)"
-trap 'cleanup_base_test_data; rm -rf "$TMP_DIR"' EXIT
+trap 'cleanup_previous_test_prefixes; cleanup_base_test_data; rm -rf "$TMP_DIR"' EXIT
 
 echo "a1" > "$TMP_DIR/a.txt"
 echo "b1" > "$TMP_DIR/b.txt"
@@ -284,6 +284,7 @@ fi
 log "creating cache_mode mount at $CACHE_MODE_CV_PATH for resync rejection test"
 run_cv mount "s3://$BUCKET/$CACHE_MODE_UFS_PREFIX" "$CACHE_MODE_CV_PATH" \
   --write-type cache_mode \
+  --config s3.region_name="$S3_REGION" \
   --config s3.endpoint_url="$S3_ENDPOINT_URL" \
   --config s3.credentials.access="$S3_ACCESS_KEY" \
   --config s3.credentials.secret="$S3_SECRET_KEY" \
@@ -308,6 +309,7 @@ mc cp "$TMP_DIR/auto-a.txt" "$auto_a_mc_path" >/dev/null
 mc cp "$TMP_DIR/auto-b.txt" "$auto_b_mc_path" >/dev/null
 log "scenario F: first mount auto-resync should not fail on missing cv dirs"
 out_f="$(run_cv mount "s3://$BUCKET/$AUTO_UFS_PREFIX" "$AUTO_CV_PATH" \
+  --config s3.region_name="$S3_REGION" \
   --config s3.endpoint_url="$S3_ENDPOINT_URL" \
   --config s3.credentials.access="$S3_ACCESS_KEY" \
   --config s3.credentials.secret="$S3_SECRET_KEY" \
@@ -328,6 +330,7 @@ log "scenario G: creating $STRESS_FILE_COUNT nested files in UFS for stress test
 create_nested_stress_files "$STRESS_UFS_PREFIX" "$STRESS_FILE_COUNT" "$TMP_DIR/stress-seed.txt"
 log "scenario G: mount and trigger auto resync for stress path"
 out_g_mount="$(run_cv mount "s3://$BUCKET/$STRESS_UFS_PREFIX" "$STRESS_CV_PATH" \
+  --config s3.region_name="$S3_REGION" \
   --config s3.endpoint_url="$S3_ENDPOINT_URL" \
   --config s3.credentials.access="$S3_ACCESS_KEY" \
   --config s3.credentials.secret="$S3_SECRET_KEY" \
