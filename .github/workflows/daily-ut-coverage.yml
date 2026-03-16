@@ -1,0 +1,82 @@
+# Daily full UT + coverage only (no FIO/FUSE/LTP). Uses build-server --run-once-ut-cov;
+# results in test_summary.json, converted to Markdown table for Step Summary.
+name: Daily UT and Coverage
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  daily-ut-coverage:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/curvineio/curvine-tests:rocky9
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        run: |
+          export PATH="/root/.cargo/bin:$PATH"
+          unset RUSTUP_UPDATE_ROOT
+          unset RUSTUP_DIST_SERVER
+          rustup default stable
+          cargo --version
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "curvine-daily-ut-coverage"
+          cache-all-crates: false
+          cache-targets: true
+
+      - name: Run UT + coverage (build-server)
+        id: utcov
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          RESULTS_DIR="$GITHUB_WORKSPACE/curvine-tests/regression_result"
+          mkdir -p "$RESULTS_DIR"
+          if python3 curvine-tests/regression/build-server.py \
+            --project-path "$GITHUB_WORKSPACE" \
+            --results-dir "$RESULTS_DIR" \
+            --nextest-profile ci-no-ufs \
+            --run-once-ut-cov; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Write Step Summary from test_summary.json
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          RESULTS_DIR="curvine-tests/regression_result"
+          LATEST=$(ls -t "$RESULTS_DIR" 2>/dev/null | grep -E '^[0-9]{8}_[0-9]{6}$' | head -1)
+          if [ -n "$LATEST" ] && [ -f "$RESULTS_DIR/$LATEST/test_summary.json" ]; then
+            python3 curvine-tests/regression/build-server.py --summary-to-markdown "$RESULTS_DIR/$LATEST" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Daily UT and Coverage" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No structured result found (missing or invalid test dir). See artifacts for logs." >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Full artifacts: \`daily-ut-coverage-artifacts\`." >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload daily UT + coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-ut-coverage-artifacts
+          path: curvine-tests/regression_result
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Fail job if UT+cov failed
+        if: steps.utcov.outputs.passed != 'true'
+        run: exit 1

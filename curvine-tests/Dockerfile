@@ -4,10 +4,16 @@
 # One-shot run:              docker run -v $(pwd):/workspace curvine-tests --run-once
 FROM ghcr.io/curvineio/curvine-compile:rocky9
 
-# Install Python Flask and test utilities via EPEL (avoids PyPI network issues entirely)
+# Python + Flask + Werkzeug (build-server) and regression helpers; use dnf (no pip at runtime in CI)
 RUN dnf install -y epel-release && \
-    dnf install -y python3 python3-flask jq fio && \
-    dnf clean all
+    dnf install -y \
+        python3 \
+        python3-pip \
+        python3-flask \
+        python3-werkzeug \
+        jq \
+        fio \
+    && dnf clean all
 
 # Rust proxy (rsproxy.cn) for rustup updates and cargo crate downloads
 ENV RUSTUP_DIST_SERVER="https://rsproxy.cn"
