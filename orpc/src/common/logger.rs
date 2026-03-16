@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::common::LogFormatter;
+use crate::CommonResult;
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -42,6 +43,12 @@ pub struct LogConf {
     pub display_position: bool,
 
     pub targets: Vec<String>,
+}
+
+impl LogConf {
+    pub fn init(&mut self) -> CommonResult<()> {
+        Ok(())
+    }
 }
 
 impl Default for LogConf {
