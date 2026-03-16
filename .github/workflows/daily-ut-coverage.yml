@@ -1,0 +1,131 @@
+# Daily full UT + coverage only (no FIO/FUSE/LTP). Report via Step Summary + Artifacts (no build-server).
+name: Daily UT and Coverage
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  daily-ut-coverage:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/curvineio/curvine-tests:rocky9
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        run: |
+          export PATH="/root/.cargo/bin:$PATH"
+          unset RUSTUP_UPDATE_ROOT
+          unset RUSTUP_DIST_SERVER
+          rustup default stable
+          cargo --version
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "curvine-build"
+          cache-all-crates: false
+          cache-targets: false
+
+      - name: Run full UT
+        id: ut
+        run: |
+          set -o pipefail
+          mkdir -p daily-artifacts
+          if cargo test --workspace --all-targets -- --nocapture 2>&1 | tee daily-artifacts/ut.log; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: UT summary
+        if: always()
+        run: |
+          LOG="daily-artifacts/ut.log"
+          echo "### Daily UT (workspace)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "$LOG" ]; then
+            if grep -q "test result: ok" "$LOG"; then
+              echo "**Result:** OK" >> $GITHUB_STEP_SUMMARY
+              grep "test result: ok" "$LOG" | tail -5 >> $GITHUB_STEP_SUMMARY
+            elif grep -q "test result: FAILED" "$LOG"; then
+              echo "**Result:** FAILED" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Failed tests:**" >> $GITHUB_STEP_SUMMARY
+              sed -n '/^failures:/,/^[^[:space:]]/p' "$LOG" | grep -E "^\s+[a-z_]" | head -30 | sed 's/^/  - /' >> $GITHUB_STEP_SUMMARY || true
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Full log: see Artifacts \`daily-ut-log\`." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload UT log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-ut-log
+          path: daily-artifacts/ut.log
+          retention-days: 30
+
+      - name: Run coverage
+        id: cov
+        run: |
+          mkdir -p daily-artifacts
+          cargo llvm-cov --ignore-run-fail test --workspace --json 2>&1 | tee daily-artifacts/coverage.json.log > daily-artifacts/coverage.json
+          cargo llvm-cov --ignore-run-fail test --workspace --html 2>&1 | tee -a daily-artifacts/coverage-html.log || true
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Coverage" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "daily-artifacts/coverage.json" ]; then
+            PERC=$(python3 -c "
+          import json,sys
+          try:
+              d=json.load(open('daily-artifacts/coverage.json'))
+              data=d.get('data',[])
+              if not data: sys.exit(1)
+              total_cov=0
+              total_cnt=0
+              for x in data:
+                  totals=x.get('totals',{})
+                  lines=totals.get('lines',totals)
+                  if isinstance(lines,dict):
+                      total_cov+=int(lines.get('covered',lines.get('count',0)))
+                      total_cnt+=int(lines.get('count',lines.get('total',1)))
+                  else:
+                      total_cnt+=1
+              print(f'{100*total_cov/total_cnt:.1f}' if total_cnt else '0')
+          except Exception: print('?')
+          " 2>/dev/null || echo "?")
+            if [ "$PERC" != "?" ]; then
+              echo "**Lines coverage:** ${PERC}%" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          echo "Full report: see Artifacts \`daily-coverage\` (coverage.json, coverage-html.zip)." >> $GITHUB_STEP_SUMMARY
+
+      - name: Package coverage HTML
+        if: always()
+        run: |
+          if [ -d "target/llvm-cov/html" ]; then
+            zip -r daily-artifacts/coverage-html.zip target/llvm-cov/html
+          fi
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-coverage
+          path: |
+            daily-artifacts/coverage.json
+            daily-artifacts/coverage.json.log
+            daily-artifacts/coverage-html.log
+            daily-artifacts/coverage-html.zip
+          retention-days: 30
+          if-no-files-found: ignore

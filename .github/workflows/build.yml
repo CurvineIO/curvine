@@ -1,4 +1,4 @@
-name: Compile and Test
+name: Compile and Smoke Test
 
 on:
   push:
@@ -12,8 +12,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Tune build parallelism: 4 uses more CPU on standard 4-vCPU runner; set to 2 if OOM
+  CARGO_BUILD_JOBS: 4
 
 jobs:
+  # Speed note: slowness is from runner CPU/RAM (standard = 4 vCPU, ~16GB), not container size.
+  # Containers share the runner; you cannot set CPU/memory in workflow. Options: use larger
+  # runners (org enables "larger runners", then runs-on: labels: ubuntu-24.04-8core etc.), or
+  # self-hosted runners with more cores.
   cleanup:
     runs-on: ubuntu-latest
     steps:
@@ -51,7 +57,8 @@ jobs:
         with:
           shared-key: "curvine-build"
           cache-all-crates: false
-          cache-targets: false
+          # Cache target/ so release build and smoke tests can reuse artifacts (much faster on cache hit)
+          cache-targets: true
       
       - name: Run fmt
         run: |
@@ -67,18 +74,16 @@ jobs:
         run: |
           echo "Running clippy (static code analysis)"
           # Run clippy in debug mode to match build
-          cargo clippy --all-targets --jobs 2 -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
+          cargo clippy --all-targets --jobs ${{ env.CARGO_BUILD_JOBS }} -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
           
           echo "After clippy, disk usage:"
           df -h
       
       - name: Clean after clippy
         run: |
-          # Clean clippy artifacts to save space
-          find target -name "*.rlib" -delete || true
-          find target -name "*.rmeta" -delete || true
+          # Free disk by removing only clippy's incremental data; keep .rlib/.rmeta so
+          # Rust Cache (cache-targets) can reuse them for the release build
           rm -rf target/debug/incremental || true
-          
           echo "After clippy cleanup, disk usage:"
           df -h
         
@@ -87,11 +92,54 @@ jobs:
           echo "Starting final build, disk usage:"
           df -h
           
-          # Build with limited parallelism to save memory  
-          cargo build --verbose --jobs 2
+          cargo build --verbose --jobs ${{ env.CARGO_BUILD_JOBS }}
           
           echo "After build, disk usage:"
           df -h
+
+      - name: Run smoke tests (curvine-tests)
+        id: smoke
+        run: |
+          set -o pipefail
+          mkdir -p smoke-artifacts
+          cargo test -p curvine-tests --all-targets -- --nocapture 2>&1 | tee smoke-artifacts/smoke-test.log
+          EXIT_CODE=${PIPESTATUS[0]}
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Smoke test summary
+        run: |
+          LOG="smoke-artifacts/smoke-test.log"
+          echo "### Smoke test (curvine-tests)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "$LOG" ]; then
+            if grep -q "test result: ok" "$LOG"; then
+              LINE=$(grep "test result: ok" "$LOG" | tail -1)
+              echo "**Result:** $LINE" >> $GITHUB_STEP_SUMMARY
+            elif grep -q "test result: FAILED" "$LOG"; then
+              echo "**Result:** FAILED" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**Failed tests:**" >> $GITHUB_STEP_SUMMARY
+              sed -n '/^failures:/,/^[^[:space:]]/p' "$LOG" | grep -E "^\s+[a-z_]" | sed 's/^/  - /' >> $GITHUB_STEP_SUMMARY || true
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Full log: see Artifacts \`smoke-test-log\`." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload smoke test log
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-log
+          path: smoke-artifacts/smoke-test.log
+          retention-days: 30
+
+      - name: Fail job if smoke tests failed
+        if: steps.smoke.outputs.passed != 'true'
+        run: exit 1
       
       - name: Final cleanup before cache save
         run: |
