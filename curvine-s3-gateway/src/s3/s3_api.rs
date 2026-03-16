@@ -668,7 +668,7 @@ pub async fn handle_get_list_buckets<
         }
 
         Err(e) => {
-            log::info!("list buckets handle error: {e}");
+            log::error!("list buckets handle error: {e}");
             resp.set_status(500);
             resp.send_header();
         }
