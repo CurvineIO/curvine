@@ -33,9 +33,9 @@ use raft::prelude::ConfChangeType;
 use raft::{RawNode, SoftState};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::timeout;
+use tokio::time::{interval, MissedTickBehavior};
 
 pub struct RaftNode<A, B>
 where
@@ -63,7 +63,7 @@ where
 
     tick_interval: Duration,
 
-    poll_interval: Duration,
+    max_batch_size: usize,
 
     snapshot_interval_ms: u64,
 
@@ -71,7 +71,7 @@ where
 
     last_snapshot_ms: u64,
 
-    last_snapshot_applied: u64,
+    last_snapshot_op_id: u64,
 }
 
 impl<A, B> RaftNode<A, B>
@@ -99,7 +99,7 @@ where
             .as_millis();
         let snapshot_entries = conf.snapshot_entries;
         let tick_interval = Duration::from_millis(conf.raft_tick_interval_ms);
-        let poll_interval = Duration::from_millis(conf.raft_poll_interval_ms);
+        let max_batch_size = conf.raft_batch_size.max(1);
 
         let last_applied = Self::install_snapshot(&log_store, &app_store, group.voters()).await?;
         let config = conf.new_raft_conf(id, last_applied);
@@ -119,11 +119,11 @@ where
             group,
             role_monitor,
             tick_interval,
-            poll_interval,
+            max_batch_size,
             snapshot_interval_ms,
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
-            last_snapshot_applied: 0,
+            last_snapshot_op_id: 0,
         };
 
         Ok(node)
@@ -148,7 +148,7 @@ where
             .as_millis();
         let snapshot_entries = conf.snapshot_entries;
         let tick_interval = Duration::from_millis(conf.raft_tick_interval_ms);
-        let poll_interval = Duration::from_millis(conf.raft_poll_interval_ms);
+        let max_batch_size = conf.raft_batch_size.max(1);
 
         // raft basic configuration.
         let config = conf.new_raft_conf(id, 0);
@@ -167,11 +167,11 @@ where
             group,
             role_monitor,
             tick_interval,
-            poll_interval,
+            max_batch_size,
             snapshot_interval_ms,
             snapshot_entries,
             last_snapshot_ms: LocalTime::mills(),
-            last_snapshot_applied: 0,
+            last_snapshot_op_id: 0,
         };
 
         Ok(node)
@@ -255,21 +255,27 @@ where
     }
 
     async fn run0(&mut self) -> RaftResult<()> {
-        let mut now = Instant::now();
         let mut promise = HashMap::new();
+        let mut ticker = interval(self.tick_interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         while self.role_monitor.is_running() {
-            loop {
-                match timeout(self.poll_interval, self.receiver.recv()).await {
-                    Ok(Some(env)) => self.handle(env, &mut promise)?,
-                    Ok(None) => unreachable!(),
-                    Err(_) => break,
-                };
-            }
+            tokio::select! {
+                biased;
 
-            if now.elapsed() >= self.tick_interval {
-                now = Instant::now();
-                self.raw.tick();
+                _ = ticker.tick() => {
+                    self.raw.tick();
+                }
+
+                result = self.receiver.recv() => {
+                    let Some(env) = result else { break };
+                    self.handle(env, &mut promise)?;
+
+                    for _ in 1..self.max_batch_size {
+                        let Ok(env) = self.receiver.try_recv() else { break };
+                        self.handle(env, &mut promise)?;
+                    }
+                }
             }
 
             // The raft state processing failed and the node directly reported an error.
@@ -424,12 +430,9 @@ where
                 .gen_apply_snapshot_job(ready.snapshot().clone())?;
         }
 
-        // Get the committed log entries, that is, the messages confirmed by most nodes.
-        // Only the leader will run.
-        self.apply_committed_entries(ready.take_committed_entries(), promise)
-            .await?;
-
-        // Get the normal log entries of the ready structure and save it.
+        // Persist new log entries first so followers can be notified immediately
+        // via persisted_messages.  FSM apply of already-committed entries can
+        // happen afterwards without blocking the persistence pipeline.
         if !ready.entries().is_empty() {
             self.storage.append(&ready.entries()[..])?;
         }
@@ -439,6 +442,11 @@ where
             // Send out the persisted messages come from the node.
             self.send_messages(ready.take_persisted_messages()).await?;
         }
+
+        // Get the committed log entries, that is, the messages confirmed by most nodes.
+        // Only the leader will run.
+        self.apply_committed_entries(ready.take_committed_entries(), promise)
+            .await?;
 
         // Execute advance to update the raft module status.
         let mut light_rd = self.raw.advance(ready);
@@ -567,15 +575,15 @@ where
             return Ok(());
         }
 
-        let last_applied = self.storage.get_applied();
-        let diff = last_applied.saturating_sub(self.last_snapshot_applied);
+        let last_op_id = self.storage.get_fsm_state().op_id();
+        let diff = last_op_id.saturating_sub(self.last_snapshot_op_id);
         if (LocalTime::mills() - self.last_snapshot_ms > self.snapshot_interval_ms && diff > 0)
             || diff > self.snapshot_entries
         {
             self.storage.gen_create_snapshot_job()?;
 
             self.last_snapshot_ms = LocalTime::mills();
-            self.last_snapshot_applied = last_applied;
+            self.last_snapshot_op_id = last_op_id;
         }
 
         Ok(())

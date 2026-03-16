@@ -263,15 +263,15 @@ impl DBEngine {
     }
 
     pub fn flush(&self, sync: bool) -> CommonResult<()> {
-        self.flush_mem(sync)?;
         if !self.conf.disable_wal {
             self.flush_wal(sync)?;
         }
+        self.flush_mem(sync)?;
         Ok(())
     }
 
     pub fn write_batch(&self, batch: WriteBatchWithTransaction<false>) -> CommonResult<()> {
-        try_err!(self.db.write(batch));
+        try_err!(self.db.write_opt(batch, &self.write_opt));
         Ok(())
     }
 

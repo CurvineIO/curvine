@@ -315,8 +315,6 @@ impl InodePath {
     // Convert the last node to InodeDir
     pub fn clone_last_file(&self) -> CommonResult<InodeFile> {
         if let Some(v) = self.get_last_inode() {
-            // Assert that lastnode should not be FileEntry
-            assert!(!v.is_file_entry());
             Ok(v.as_file_ref()?.clone())
         } else {
             err_box!("status error")

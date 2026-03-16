@@ -254,9 +254,9 @@ impl RocksStorageCore {
             return Ok(());
         }
 
-        if compact_index > self.last_index() + 1 {
-            panic!(
-                "compact not received raft logs: {}, last index: {}",
+        if compact_index > self.last_index() {
+            return err_box!(
+                "compact index {} exceeds last index {}, cannot compact past last log entry",
                 compact_index,
                 self.last_index()
             );
@@ -386,11 +386,14 @@ impl<'a> StoreWriteBatch<'a> {
     }
 
     fn delete_entry(&mut self, start: u64, end: u64) -> CommonResult<()> {
-        for index in start..end {
-            let key = RocksUtils::u64_to_bytes(index);
-            self.0.delete_cf(RocksStorageCore::CF_ENTRIES, key)?;
+        if start >= end {
+            return Ok(());
         }
-        Ok(())
+        self.0.delete_range_cf(
+            RocksStorageCore::CF_ENTRIES,
+            RocksUtils::u64_to_bytes(start),
+            RocksUtils::u64_to_bytes(end),
+        )
     }
 
     fn append_entry(&mut self, entries: &[Entry]) -> CommonResult<()> {
@@ -432,6 +435,6 @@ impl<'a> StoreWriteBatch<'a> {
     }
 
     fn commit(self) -> CommonResult<()> {
-        self.0.commit_sync()
+        self.0.commit_and_flush_wal(true)
     }
 }

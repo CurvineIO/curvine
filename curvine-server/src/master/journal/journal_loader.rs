@@ -170,6 +170,9 @@ impl JournalLoader {
         let mut has_ufs_affecting = false;
 
         for (seq, op_entry) in batch.batch.into_iter().enumerate() {
+            applied.op_id = op_entry.op_id();
+            applied.rpc_id = op_entry.rpc_id();
+
             match op_entry {
                 JournalEntry::Snapshot(e) if is_leader && e.node_id == self.node_id => {
                     if seq + 1 != batch_len {
@@ -183,9 +186,6 @@ impl JournalLoader {
 
                 _ => has_ufs_affecting = true,
             }
-
-            applied.op_id = op_entry.op_id();
-            applied.rpc_id = op_entry.rpc_id();
 
             {
                 let fs_dir = self.fs_dir.read();
@@ -428,7 +428,12 @@ impl JournalLoader {
 
     fn create_file(&self, entry: CreateFileEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
+
+        if inp.is_full() {
+            warn!("create_file: file already exists: {:?}", entry);
+            return Ok(());
+        }
         let name = inp.name().to_string();
         let _ = fs_dir.add_last_inode(inp, File(name, entry.file))?;
         Ok(())

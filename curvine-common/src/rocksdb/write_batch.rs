@@ -48,17 +48,28 @@ impl<'a> WriteBatch<'a> {
         Ok(())
     }
 
+    pub fn delete_range_cf<K>(&mut self, cf: &str, from: K, to: K) -> CommonResult<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        let cf = self.db.cf(cf)?;
+        self.batch.delete_range_cf(cf, from, to);
+        Ok(())
+    }
+
     pub fn commit(self) -> CommonResult<()> {
         self.db.write_batch(self.batch)
     }
 
-    pub fn commit_flush(self, sync: bool) -> CommonResult<()> {
+    pub fn commit_and_flush_mem(self, sync: bool) -> CommonResult<()> {
         self.db.write_batch(self.batch)?;
-        self.db.flush(sync)?;
+        self.db.flush_mem(sync)?;
         Ok(())
     }
 
-    pub fn commit_sync(self) -> CommonResult<()> {
-        self.commit_flush(true)
+    pub fn commit_and_flush_wal(self, sync: bool) -> CommonResult<()> {
+        self.db.write_batch(self.batch)?;
+        self.db.flush_wal(sync)?;
+        Ok(())
     }
 }
