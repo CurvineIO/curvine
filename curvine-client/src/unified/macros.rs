@@ -340,6 +340,15 @@ macro_rules! impl_filesystem_for_enum {
                 $crate::unified::UnifiedReader,
             > for $enum_name
         {
+            fn fs_kind(&self) -> ::curvine_common::fs::FsKind {
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.fs_kind(),
+                    )+
+                }
+            }
+
             async fn mkdir(
                 &self,
                 path: &::curvine_common::fs::Path,

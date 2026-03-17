@@ -15,7 +15,7 @@
 use bytes::BytesMut;
 use curvine_common::conf::UfsConf;
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path};
+use curvine_common::fs::{FileSystem, FsKind, Path};
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
@@ -341,6 +341,10 @@ impl OssHdfsFileSystem {
 }
 
 impl FileSystem<OssHdfsWriter, OssHdfsReader> for OssHdfsFileSystem {
+    fn fs_kind(&self) -> FsKind {
+        FsKind::OssHdfs
+    }
+
     async fn mkdir(&self, path: &Path, create_parent: bool) -> FsResult<bool> {
         let path_cstr = self.path_to_cstring(path)?;
         let ctx = Box::new(CallbackCtx::<(JindoStatus, Option<String>)>::default());

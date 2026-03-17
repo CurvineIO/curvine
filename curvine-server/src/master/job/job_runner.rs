@@ -83,15 +83,7 @@ impl LoadJobRunner {
 
         // Skip based on data state (even when job is None, e.g. after job cleanup)
         if source_path.is_cv() {
-            // cv -> ufs: if CV's ufs_mtime already set, data already copied to UFS, skip
-            let source_status = self.master_fs.file_status(source_path.path())?;
-            if source_status.is_dir {
-                Ok(false)
-            } else if source_status.ufs_exists() {
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+            Ok(false)
         } else {
             // ufs -> cv: if CV exists and ufs_mtime matches UFS mtime, data already synced, skip
             let source_status = mnt.ufs.get_status(source_path).await?;
@@ -120,10 +112,6 @@ impl LoadJobRunner {
         let target_path = mnt.toggle_path(&source_path)?;
 
         let job_id = CommonUtils::create_job_id(source_path.full_path());
-        let result = LoadJobResult {
-            job_id: job_id.clone(),
-            target_path: target_path.clone_uri(),
-        };
         let mut job_context = JobContext::with_conf(
             &command,
             job_id.clone(),
@@ -138,15 +126,22 @@ impl LoadJobRunner {
             .check_job_exists(&job_id, &mnt_value, &source_path, &target_path)
             .await?
         {
-            debug!(
+            info!(
                 "skip load job {}: source_path {} already loaded or in progress",
                 job_id,
                 source_path.full_path()
             );
-
-            job_context.update_state(JobTaskState::Completed, "exists tasks");
-            self.jobs.insert(job_id, job_context);
-            return Ok(result);
+            return if let Some(existing_ctx) = self.jobs.get(&job_id) {
+                Ok(LoadJobResult::with_state(
+                    &existing_ctx.info,
+                    existing_ctx.state.state(),
+                ))
+            } else {
+                Ok(LoadJobResult::with_state(
+                    &job_context.info,
+                    JobTaskState::Completed,
+                ))
+            };
         }
 
         self.jobs.remove(&job_id);
@@ -179,11 +174,12 @@ impl LoadJobRunner {
                 );
 
                 let tasks = job_context.tasks.clone();
+                let res = LoadJobResult::with_job(&job_context.info);
                 self.jobs.insert(job_id, job_context);
                 // @todo Whether to cancel some tasks that may have been dispatched.
                 self.submit_all_task(tasks).await?;
 
-                Ok(result)
+                Ok(res)
             }
         }
     }

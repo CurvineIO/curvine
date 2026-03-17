@@ -19,7 +19,7 @@ use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path, Reader, Writer};
+use curvine_common::fs::{FileSystem, FsKind, Path, Reader, Writer};
 use curvine_common::state::{
     CreateFileOpts, FileAllocOpts, FileLock, FileStatus, JobStatus, LoadJobCommand, MasterInfo,
     MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
@@ -213,7 +213,7 @@ impl UnifiedFileSystem {
             return Ok(CacheValidity::Invalid(None));
         }
 
-        if !cv_status.is_complete() {
+        if !cv_status.is_complete() || !cv_status.ufs_exists() {
             return Ok(CacheValidity::Invalid(None));
         }
 
@@ -302,8 +302,20 @@ impl UnifiedFileSystem {
     }
 
     pub async fn wait_job_complete(&self, path: &Path, fail_if_not_found: bool) -> FsResult<()> {
+        if !path.is_cv() {
+            return err_box!("the current file {} is not a cache file", path);
+        }
+        let (ufs_path, mnt) = match self.get_mount(path).await? {
+            Some((ufs_path, mnt)) => (ufs_path, mnt),
+            None => return err_box!("the current file {} is not mounted to ufs", path),
+        };
+
+        let job_id = if mnt.info.is_fs_mode() {
+            CommonUtils::create_job_id(path.full_path())
+        } else {
+            CommonUtils::create_job_id(ufs_path.full_path())
+        };
         let client = JobMasterClient::new(self.fs_client());
-        let job_id = CommonUtils::create_job_id(path.full_path());
         client.wait_job_complete(job_id, fail_if_not_found).await
     }
 
@@ -376,10 +388,7 @@ impl UnifiedFileSystem {
 
             Some((_, mount)) if mount.info.is_fs_mode() => {
                 let mut writer = self.cv.open_with_opts(path, opts.clone(), flags).await?;
-                if writer.file_blocks().cv_exists()
-                    || flags.overwrite()
-                    || !writer.status().ufs_exists()
-                {
+                if writer.file_blocks().cv_exists() || flags.overwrite() {
                     Ok(UnifiedWriter::Cv(writer))
                 } else {
                     writer.complete().await?;
@@ -467,6 +476,10 @@ impl UnifiedFileSystem {
 }
 
 impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
+    fn fs_kind(&self) -> FsKind {
+        FsKind::Cv
+    }
+
     async fn mkdir(&self, path: &Path, create_parent: bool) -> FsResult<bool> {
         let _timer = TimeSpent::timer_counter_vec(
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),

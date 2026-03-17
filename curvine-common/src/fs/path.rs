@@ -261,6 +261,11 @@ impl Path {
     pub fn clone_display_path(&self) -> String {
         self.display_path().to_string()
     }
+
+    pub fn likely_file(&self) -> bool {
+        let name = self.name();
+        !name.is_empty() && name.contains('.') && !name.starts_with('.')
+    }
 }
 
 impl Display for Path {

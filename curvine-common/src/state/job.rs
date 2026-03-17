@@ -30,10 +30,11 @@ use serde::{Deserialize, Serialize};
     FromPrimitive,
     Serialize,
     Deserialize,
+    Default,
 )]
 #[repr(i8)]
 pub enum JobTaskState {
-    #[num_enum(default)]
+    #[default]
     UNKNOWN = 0,
     Pending = 1,
     Loading = 2,
@@ -51,9 +52,29 @@ impl JobTaskState {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct LoadJobResult {
     pub job_id: String,
     pub target_path: String,
+    pub state: JobTaskState,
+}
+
+impl LoadJobResult {
+    pub fn with_job(job: &LoadJobInfo) -> Self {
+        Self {
+            job_id: job.job_id.to_owned(),
+            target_path: job.target_path.to_owned(),
+            state: JobTaskState::Pending,
+        }
+    }
+
+    pub fn with_state(job: &LoadJobInfo, state: JobTaskState) -> Self {
+        Self {
+            job_id: job.job_id.to_owned(),
+            target_path: job.target_path.to_owned(),
+            state,
+        }
+    }
 }
 
 #[derive(
@@ -76,6 +97,7 @@ pub enum JobTaskType {
     Load = 1,
 }
 
+#[derive(Default)]
 pub struct JobStatus {
     pub job_id: String,
     pub state: JobTaskState,

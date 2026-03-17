@@ -37,7 +37,7 @@ pub trait Writer {
     fn flush_chunk(&mut self) -> impl Future<Output = FsResult<i64>> {
         async move {
             if !self.chunk_mut().is_empty() {
-                let chunk = DataSlice::Bytes(self.chunk_mut().split().freeze());
+                let chunk = DataSlice::Buffer(self.chunk_mut().split());
                 self.write_chunk(chunk).await
             } else {
                 Ok(0)

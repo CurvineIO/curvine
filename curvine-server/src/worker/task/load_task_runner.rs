@@ -18,7 +18,7 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_client::rpc::JobMasterClient;
 use curvine_client::unified::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{CreateFileOptsBuilder, JobTaskState, SetAttrOptsBuilder};
+use curvine_common::state::{CreateFileOptsBuilder, FileStatus, JobTaskState, SetAttrOptsBuilder};
 use curvine_common::FsResult;
 use log::{error, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
@@ -159,7 +159,7 @@ impl LoadTaskRunner {
         let reader = self.open_unified(&source_path).await?;
 
         // Create writer (automatically selects filesystem based on scheme)
-        let writer = self.create_unified(&target_path).await?;
+        let writer = self.create_unified(&target_path, reader.status()).await?;
 
         Ok((reader, writer))
     }
@@ -175,15 +175,17 @@ impl LoadTaskRunner {
         }
     }
 
-    async fn create_unified(&self, path: &Path) -> FsResult<UnifiedWriter> {
+    async fn create_unified(
+        &self,
+        path: &Path,
+        read_status: &FileStatus,
+    ) -> FsResult<UnifiedWriter> {
         if path.is_cv() {
             // Curvine path - get source mtime for UFS→Curvine import
             let source_path = Path::from_str(&self.task.info.source_path)?;
             let source_mtime = if !source_path.is_cv() {
                 // Import from UFS, get source mtime
-                let ufs = self.get_ufs()?;
-                let source_status = ufs.get_status(&source_path).await?;
-                source_status.mtime
+                read_status.mtime
             } else {
                 // Curvine→Curvine (not supported yet), use 0
                 0

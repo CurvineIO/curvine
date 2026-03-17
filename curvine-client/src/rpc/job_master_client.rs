@@ -64,6 +64,7 @@ impl JobMasterClient {
         Ok(LoadJobResult {
             job_id: rep.job_id,
             target_path: rep.target_path,
+            state: JobTaskState::from(rep.state as i8),
         })
     }
 
@@ -137,7 +138,10 @@ impl JobMasterClient {
                             return Err(err);
                         } else {
                             time::sleep(conf.sync_check_interval_min).await;
-                            continue;
+                            JobStatus {
+                                job_id: job_id.to_string(),
+                                ..Default::default()
+                            }
                         }
                     }
                     _ => return Err(err),

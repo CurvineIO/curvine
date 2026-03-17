@@ -175,6 +175,10 @@ impl FsError {
         Self::Common(ErrorImpl::with_source(str.into()))
     }
 
+    pub fn from_error<E: std::error::Error>(e: E) -> Self {
+        Self::Common(ErrorImpl::with_source(e.to_string().into()))
+    }
+
     pub fn not_leader_master(code: RpcCode, client_ip: &str) -> Self {
         let error = format!(
             "Not a leader master, code={:?}, client_ip={}",

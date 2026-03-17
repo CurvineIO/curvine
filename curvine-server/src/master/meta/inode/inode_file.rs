@@ -86,10 +86,7 @@ impl InodeFile {
             block_size: opts.block_size as u32,
             replicas: opts.replicas as u8,
 
-            storage_policy: StoragePolicy {
-                ufs_mtime: 0,
-                ..opts.storage_policy
-            },
+            storage_policy: opts.storage_policy,
             features: FileFeature {
                 x_attr: Default::default(),
                 file_write: None,
@@ -209,6 +206,7 @@ impl InodeFile {
 
     pub fn reopen(&mut self, client_name: impl AsRef<str>) -> Option<ExtendedBlock> {
         self.features.set_writing(client_name.as_ref().to_string());
+        self.invalid_cache();
         if let Some(last_block) = self.get_block_mut(-1) {
             let blk = ExtendedBlock {
                 id: last_block.id,
@@ -315,12 +313,6 @@ impl InodeFile {
         client_name: impl AsRef<str>,
         only_flush: bool,
     ) -> FsResult<()> {
-        // If commit_blocks contains data, it means the curvine file has been updated.
-        // The corresponding ufs_mtime is set to 0, indicating that the relationship with ufs has been severed.
-        if !commit_blocks.is_empty() {
-            self.storage_policy.ufs_mtime = 0
-        }
-
         for block in commit_blocks {
             let meta = self.search_block_mut_check(block.block_id)?;
             meta.commit(block);
@@ -393,9 +385,11 @@ impl InodeFile {
             Ok(vec![])
         } else if opts.len < self.len {
             let del_blocks = self.truncate(opts);
+            self.invalid_cache();
             Ok(del_blocks)
         } else {
             self.extend(opts)?;
+            self.invalid_cache();
             Ok(vec![])
         }
     }
@@ -512,6 +506,10 @@ impl InodeFile {
 
     pub fn cv_exists(&self) -> bool {
         self.len > 0 && !self.blocks.is_empty()
+    }
+
+    pub fn invalid_cache(&mut self) {
+        self.storage_policy.ufs_mtime = 0;
     }
 }
 

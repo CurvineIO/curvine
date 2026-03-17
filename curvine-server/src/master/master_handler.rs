@@ -718,13 +718,18 @@ impl MessageHandler for MasterHandler {
             return Err(FsError::not_leader_master(ctx.code, self.client_ip()));
         }
 
-        match code {
+        let res = match code {
             RpcCode::SubmitJob => self.job_handler.submit_load_job(ctx).await,
             RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
             RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
             RpcCode::ReportTask => self.job_handler.task_report(ctx),
 
             v => err_box!("unsupported operation {:?}", v),
+        };
+
+        match res {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(msg.error_ext(&e)),
         }
     }
 }

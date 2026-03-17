@@ -15,6 +15,9 @@
 mod path;
 pub use self::path::Path;
 
+mod fs_kind;
+pub use self::fs_kind::FsKind;
+
 mod rpc_code;
 pub use self::rpc_code::RpcCode;
 
