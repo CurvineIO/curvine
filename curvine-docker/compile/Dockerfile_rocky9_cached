@@ -20,6 +20,8 @@ RUN dnf install -y \
     wget \
     zip \
     unzip \
+    jq \
+    python3 \
     java-1.8.0-openjdk-devel \
     openssl-devel \
     zlib-devel \

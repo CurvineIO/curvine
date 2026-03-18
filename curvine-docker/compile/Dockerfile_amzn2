@@ -16,6 +16,8 @@ RUN yum install -y \
     wget \
     zip \
     unzip \
+    jq \
+    python3 \
     nodejs \
     npm \
     java-1.8.0-openjdk-devel \

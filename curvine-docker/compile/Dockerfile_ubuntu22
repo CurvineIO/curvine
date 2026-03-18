@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y \
     curl \
     zip \
     unzip \
+    jq \
+    python3 \
     openjdk-8-jdk \
     libssl-dev \
     zlib1g-dev \

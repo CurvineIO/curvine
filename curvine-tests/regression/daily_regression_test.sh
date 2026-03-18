@@ -83,6 +83,12 @@ check_environment() {
         log_error "jq is not installed"
         exit 1
     fi
+
+    # Check python3 (required for nextest JUnit-to-summary conversion)
+    if ! command -v python3 &> /dev/null; then
+        log_error "python3 is not installed (required for test summary conversion)"
+        exit 1
+    fi
     
     log_success "Environment checks passed"
 }
@@ -139,29 +145,27 @@ run_tests_nextest() {
     local pkg_filter="${1:-}"
     log_step "Running tests with cargo nextest..."
     set +e
+    set -o pipefail
     mkdir -p "$TEST_DIR/logs"
     local nextest_log="$TEST_DIR/nextest_run.log"
-    local profile_arg=""
     local nextest_profile_dir="default"
-    if [ -n "${NEXTEST_CI_NO_UFS}" ]; then
-        profile_arg="--profile ci-no-ufs"
+    # Include skipped count in final summary (default is fail-only, so "N skipped" is hidden)
+    local nextest_args=(--config-file "$SCRIPT_DIR/nextest.toml" --no-fail-fast --workspace --final-status-level=skip)
+    if [ -n "${NEXTEST_PROFILE}" ]; then
+        nextest_profile_dir="${NEXTEST_PROFILE}"
+        nextest_args+=(--profile "$NEXTEST_PROFILE")
+        log_info "Using nextest profile: $NEXTEST_PROFILE"
+    elif [ -n "${NEXTEST_CI_NO_UFS}" ]; then
         nextest_profile_dir="ci-no-ufs"
+        nextest_args+=(--profile ci-no-ufs)
+        log_info "Using nextest profile: ci-no-ufs (NEXTEST_CI_NO_UFS)"
     fi
-    local filter_arg=""
-    if [ -n "$pkg_filter" ]; then
-        filter_arg="-E 'package($pkg_filter)'"
-        log_info "Filtering to package: $pkg_filter"
-    fi
-    log_info "Using nextest config: $SCRIPT_DIR/nextest.toml ${profile_arg}"
+    [ -n "$pkg_filter" ] && nextest_args+=(-E "package($pkg_filter)") && log_info "Filtering to package: $pkg_filter"
+    log_info "Using nextest config: $SCRIPT_DIR/nextest.toml"
     cd "$PROJECT_ROOT"
-    eval cargo nextest run \
-        --config-file "$SCRIPT_DIR/nextest.toml" \
-        $profile_arg \
-        --no-fail-fast \
-        --workspace \
-        $filter_arg \
-        2>&1 | tee "$nextest_log"
-    local nextest_exit=$?
+    cargo nextest run "${nextest_args[@]}" 2>&1 | tee "$nextest_log"
+    local nextest_exit=${PIPESTATUS[0]}
+    set +o pipefail
     set -e
 
     # Copy JUnit from nextest store (target/nextest/<profile>/junit.xml)
@@ -173,19 +177,35 @@ run_tests_nextest() {
         return 1
     fi
 
-    # Parse skipped count from nextest summary line (e.g. "12 passed, 3 skipped")
+    # Skipped count and list: when using a non-default profile, tests filtered by profile are not in "tests run"
+    # summary. Use nextest list to get default vs current profile and write skipped list for the UI.
     local skipped_count=0
-    if grep -qE "[0-9]+ skipped" "$nextest_log"; then
-        skipped_count=$(grep -oE "[0-9]+ skipped" "$nextest_log" | tail -1 | grep -oE "[0-9]+" || echo 0)
+    local skipped_list_file="$TEST_DIR/skipped_tests.txt"
+    rm -f "$skipped_list_file"
+    if [ "$nextest_profile_dir" != "default" ]; then
+        comm -23 \
+            <(cd "$PROJECT_ROOT" && cargo nextest list --config-file "$SCRIPT_DIR/nextest.toml" --profile default 2>/dev/null | sort) \
+            <(cd "$PROJECT_ROOT" && cargo nextest list --config-file "$SCRIPT_DIR/nextest.toml" --profile "$nextest_profile_dir" 2>/dev/null | sort) \
+            > "$skipped_list_file"
+        skipped_count=$(wc -l < "$skipped_list_file")
+        [ "$skipped_count" -lt 0 ] && skipped_count=0
+        log_info "Skipped (profile filter): $skipped_count (list written to skipped_tests.txt)"
+    elif grep -qE "[0-9]+ (tests? )?skipped" "$nextest_log"; then
+        skipped_count=$(grep -oE "[0-9]+ (tests? )?skipped" "$nextest_log" | tail -1 | grep -oE "[0-9]+" | head -1)
     fi
+    [ -z "$skipped_count" ] || ! [[ "$skipped_count" =~ ^[0-9]+$ ]] 2>/dev/null && skipped_count=0
 
-    # Convert JUnit to test_summary.json and per-test logs
+    # Convert JUnit to test_summary.json and per-test logs (optionally merge skipped list)
     local converter="$SCRIPT_DIR/nextest_junit_to_summary.py"
     if [ ! -f "$converter" ]; then
         log_error "Converter script not found: $converter"
         return 1
     fi
-    python3 "$converter" "$TEST_DIR" --skipped-count "$skipped_count"
+    if [ -s "$skipped_list_file" ]; then
+        python3 "$converter" "$TEST_DIR" --skipped-count "$skipped_count" --skipped-list "$skipped_list_file"
+    else
+        python3 "$converter" "$TEST_DIR" --skipped-count "$skipped_count"
+    fi
     local conv_exit=$?
     if [ $conv_exit -ne 0 ]; then
         log_error "Failed to convert JUnit to test_summary.json"
