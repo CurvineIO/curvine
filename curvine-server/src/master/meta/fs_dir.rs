@@ -24,7 +24,7 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
+    FreeResult, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
 use log::{debug, info, warn};
@@ -224,43 +224,65 @@ impl FsDir {
         Ok(del_res)
     }
 
-    pub fn free(&mut self, inp: &InodePath) -> FsResult<DeleteResult> {
-        let op_ms = LocalTime::mills();
+    pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {
+        let op_ms = LocalTime::mills() as i64;
 
-        let del_res = self.unprotected_free(inp, op_ms as i64)?;
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be free");
+        }
+
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        let free_res = self.unprotected_free(inode, op_ms, recursive)?;
         self.journal_writer
-            .log_free(self, inp.path(), op_ms as i64)?;
+            .log_free(self, inp.path(), op_ms, recursive)?;
 
-        Ok(del_res)
+        Ok(free_res)
     }
 
     pub(crate) fn unprotected_free(
         &mut self,
-        inp: &InodePath,
+        inode: InodePtr,
         mtime: i64,
-    ) -> FsResult<DeleteResult> {
-        let mut inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => return err_ext!(FsError::file_not_found(inp.path())),
-        };
-        let file = inode.as_file_mut()?;
-        if !file.ufs_exists() {
-            return err_box!("path {} data not synchronized to ufs", inp.path());
+        recursive: bool,
+    ) -> FsResult<FreeResult> {
+        let mut free_res = FreeResult::default();
+        let mut change_inodes = vec![];
+
+        let mut stack = LinkedList::new();
+        stack.push_back(inode);
+        while let Some(inode) = stack.pop_front() {
+            match inode.as_mut() {
+                FileEntry(name, id) => {
+                    if let Some(store_inode) = self.store.get_inode(*id, Some(name))? {
+                        stack.push_back(InodePtr::from_owned(store_inode));
+                    }
+                }
+
+                Dir(_, dir) => {
+                    if recursive {
+                        for child in dir.children_iter() {
+                            stack.push_back(InodePtr::from_ref(child));
+                        }
+                    }
+                }
+
+                File(_, file) => {
+                    let locs = file.get_locs(&self.store)?;
+                    let len = file.len;
+                    if file.free(mtime) {
+                        free_res.add(len, locs);
+                        change_inodes.push(inode.as_ref().clone());
+                    }
+                }
+            }
         }
 
-        if file.blocks.is_empty() {
-            return Ok(DeleteResult::default());
-        }
-
-        let del_res = DeleteResult {
-            inodes: 0,
-            blocks: file.get_locs(&self.store)?,
-        };
-
-        file.free(mtime);
-        self.store.apply_free(&[&inode])?;
-
-        Ok(del_res)
+        self.store.apply_free(change_inodes)?;
+        Ok(free_res)
     }
 
     pub fn rename(

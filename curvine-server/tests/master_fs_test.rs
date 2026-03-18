@@ -799,7 +799,7 @@ fn test_idempotent_free() -> CommonResult<()> {
     // Set ufs_mtime > 0 so the free function passes the ufs_exists() check
     let set_opts = SetAttrOptsBuilder::new().ufs_mtime(1).build();
     fs.set_attr("/file.log", set_opts)?;
-    fs.free("/file.log")?;
+    fs.free("/file.log", false)?;
     replay_all_then_duplicate_last(&js, &loader);
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())

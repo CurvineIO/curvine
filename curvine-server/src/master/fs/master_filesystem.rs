@@ -18,6 +18,7 @@ use crate::master::journal::JournalSystem;
 use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
 
+use crate::master::fs::DeleteResult;
 use crate::master::meta::parse_glob_pattern;
 use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
@@ -135,17 +136,20 @@ impl MasterFilesystem {
         Ok(true)
     }
 
-    pub fn free<T: AsRef<str>>(&self, path: T) -> FsResult<()> {
+    pub fn free<T: AsRef<str>>(&self, path: T, recursive: bool) -> FsResult<FreeResult> {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
 
-        let free_res = fs_dir.free(&inp)?;
+        let mut free_res = fs_dir.free(&inp, recursive)?;
         drop(fs_dir);
 
         let mut worker_manager = self.worker_manager.write();
-        worker_manager.remove_blocks(&free_res);
+        worker_manager.remove_blocks(&DeleteResult {
+            inodes: 0,
+            blocks: std::mem::take(&mut free_res.blocks),
+        });
 
-        Ok(())
+        Ok(free_res)
     }
 
     pub fn rename<T: AsRef<str>>(&self, src: T, dst: T, flags: RenameFlags) -> FsResult<bool> {

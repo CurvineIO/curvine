@@ -148,6 +148,8 @@ pub struct FreeEntry {
     pub(crate) rpc_id: i64,
     pub(crate) path: String,
     pub(crate) mtime: i64,
+    #[serde(default)]
+    pub(crate) recursive: bool,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

@@ -24,7 +24,7 @@ use curvine_common::fs::Path;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::state::{
-    CreateFileOpts, FileBlocks, FileStatus, HeartbeatStatus, OpenFlags, RenameFlags,
+    CreateFileOpts, FileBlocks, FileStatus, FreeResult, HeartbeatStatus, OpenFlags, RenameFlags,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
@@ -222,16 +222,18 @@ impl MasterHandler {
         let header: FreeRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        self.free0(ctx.msg.req_id(), header)?;
-        ctx.response(FreeResponse::default())
+        let res = self.free0(ctx.msg.req_id(), header)?;
+        ctx.response(FreeResponse {
+            res: ProtoUtils::free_res_to_pb(res),
+        })
     }
 
-    pub fn free0(&self, req_id: i64, header: FreeRequest) -> FsResult<()> {
+    pub fn free0(&self, req_id: i64, header: FreeRequest) -> FsResult<FreeResult> {
         if self.check_is_retry(req_id)? {
-            return Ok(());
+            return Ok(FreeResult::default());
         }
 
-        let res = self.fs.free(&header.path);
+        let res = self.fs.free(&header.path, header.recursive);
         self.set_req_cache(req_id, res)
     }
 
