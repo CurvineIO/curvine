@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use crate::cmds::fs::{
     blocks::BlocksCommand, cat::CatCommand, chmod::ChmodCommand, chown::ChownCommand,
-    count::CountCommand, df::DfCommand, du::DuCommand, get::GetCommand, ls::LsCommand,
-    mkdir::MkdirCommand, mv::MvCommand, put::PutCommand, rm::RmCommand, stat::StatCommand,
-    touch::TouchCommand,
+    count::CountCommand, df::DfCommand, du::DuCommand, free::FreeCommand, get::GetCommand,
+    ls::LsCommand, mkdir::MkdirCommand, mv::MvCommand, put::PutCommand, rm::RmCommand,
+    stat::StatCommand, touch::TouchCommand,
 };
 
 #[derive(Parser, Debug)]
@@ -205,6 +205,14 @@ pub enum FsSubCommand {
         #[clap(long, default_value = "table")]
         format: String,
     },
+
+    /// Free path: release Curvine cache for UFS-synced data (outputs inode count and released bytes)
+    Free {
+        #[clap(help = "Path of the file or directory to free")]
+        path: String,
+        #[clap(short, long, help = "Recursively free all files under the directory")]
+        recursive: bool,
+    },
 }
 
 impl FsCommand {
@@ -360,6 +368,14 @@ impl FsCommand {
                     format: format.clone(),
                 };
                 blocks_cmd.execute(client).await
+            }
+
+            FsSubCommand::Free { path, recursive } => {
+                let free_cmd = FreeCommand::Free {
+                    path: path.clone(),
+                    recursive: *recursive,
+                };
+                free_cmd.execute(client).await
             }
         }
     }
