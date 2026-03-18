@@ -170,16 +170,9 @@ impl UnifiedFileSystem {
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         match self.get_mount(path).await? {
             None => err_box!(
-                "the current file is not mounted to ufs, so the `free` command cannot be executed."
+                "the current path is not mounted to ufs, so the `free` command cannot be executed."
             ),
-            Some((_, mnt)) => {
-                if mnt.info.is_fs_mode() {
-                    self.cv.free(path, recursive).await
-                } else {
-                    self.cv.delete(path, false).await?;
-                    Ok(FreeResult::default())
-                }
-            }
+            Some(_) => self.cv.free(path, recursive).await,
         }
     }
 
@@ -263,6 +256,10 @@ impl UnifiedFileSystem {
                 err_box!("path {} data lost", cv_path)
             }
         } else {
+            if !blocks.cv_exists() {
+                return Ok(None);
+            }
+
             match self
                 .check_cache_validity(&blocks.status, ufs_path, mount)
                 .await?
