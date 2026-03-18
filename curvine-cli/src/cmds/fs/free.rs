@@ -35,10 +35,11 @@ impl FreeCommand {
                 let path = Path::from_str(path)?;
                 let res = handle_rpc_result(client.free(&path, *recursive)).await;
 
+                let bytes = u64::try_from(res.bytes).unwrap_or(0);
                 println!(
                     "inodes: {}, space: {}",
                     res.inodes,
-                    ByteUnit::byte_to_string(res.bytes as u64),
+                    ByteUnit::byte_to_string(bytes),
                 );
                 Ok(())
             }
