@@ -44,6 +44,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
     rustup component add clippy rustfmt rust-src rust-analyzer && \
     rustup target add x86_64-unknown-linux-gnu && \
     cargo install --force cargo-cache && \
+    cargo install cargo-nextest --locked && \
     echo "Rust toolchain and components installed successfully"
 
 # 3. Install protoc with multi-arch support
@@ -65,7 +66,7 @@ ENV PATH="/app/protoc/bin:${PATH}"
 
 # 4. Install Maven
 RUN cd /app && \
-    MAVEN_VERSION=3.9.12 && \
+    MAVEN_VERSION=3.9.14 && \
     curl -fL -o apache-maven-${MAVEN_VERSION}-bin.tar.gz https://downloads.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
     tar -xzf apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
     mv apache-maven-${MAVEN_VERSION} maven && \

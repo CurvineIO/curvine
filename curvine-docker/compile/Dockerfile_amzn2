@@ -33,6 +33,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
     source $HOME/.cargo/env && \
     rustup default stable
 
+# 2.1. Install cargo-nextest for fast test runs (used by CI and regression script)
+RUN cargo install cargo-nextest --locked
+
 # 3. Install protoc (auto-detect architecture)
 RUN mkdir -p /app/protoc && cd /app/protoc && \
     ARCH=$(uname -m) && \
@@ -49,7 +52,7 @@ ENV PATH="/app/protoc/bin:${PATH}"
 
 # 4. Install Maven
 RUN cd /app && \
-    MAVEN_VERSION=3.9.12 && \
+    MAVEN_VERSION=3.9.14 && \
     curl -fL -o apache-maven-${MAVEN_VERSION}-bin.tar.gz https://downloads.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
     tar -xzf apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
     mv apache-maven-${MAVEN_VERSION} maven && \
