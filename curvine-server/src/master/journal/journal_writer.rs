@@ -224,12 +224,19 @@ impl JournalWriter {
         self.send(fs_dir, JournalEntry::Delete(entry))
     }
 
-    pub fn log_free<P: AsRef<str>>(&self, fs_dir: &FsDir, path: P, mtime: i64) -> FsResult<()> {
+    pub fn log_free<P: AsRef<str>>(
+        &self,
+        fs_dir: &FsDir,
+        path: P,
+        mtime: i64,
+        recursive: bool,
+    ) -> FsResult<()> {
         let entry = FreeEntry {
             op_id: fs_dir.next_op_id(),
             rpc_id: 0,
             path: path.as_ref().to_string(),
             mtime,
+            recursive,
         };
         self.send(fs_dir, JournalEntry::Free(entry))
     }

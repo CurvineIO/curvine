@@ -673,4 +673,19 @@ impl ProtoUtils {
             end: lock.end,
         }
     }
+
+    pub fn free_res_from_pb(res: FreeResultProto) -> FreeResult {
+        FreeResult {
+            inodes: res.inodes,
+            bytes: res.bytes,
+            ..Default::default()
+        }
+    }
+
+    pub fn free_res_to_pb(res: FreeResult) -> FreeResultProto {
+        FreeResultProto {
+            inodes: res.inodes,
+            bytes: res.bytes,
+        }
+    }
 }

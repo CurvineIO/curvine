@@ -21,8 +21,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, FsKind, Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, JobStatus, LoadJobCommand, MasterInfo,
-    MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
+    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, LoadJobCommand,
+    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -167,16 +167,17 @@ impl UnifiedFileSystem {
         self.cv.clone_runtime()
     }
 
-    pub async fn free(&self, path: &Path) -> FsResult<()> {
+    pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         match self.get_mount(path).await? {
             None => err_box!(
                 "the current file is not mounted to ufs, so the `free` command cannot be executed."
             ),
             Some((_, mnt)) => {
                 if mnt.info.is_fs_mode() {
-                    self.cv.free(path).await
+                    self.cv.free(path, recursive).await
                 } else {
-                    self.cv.delete(path, false).await
+                    self.cv.delete(path, false).await?;
+                    Ok(FreeResult::default())
                 }
             }
         }

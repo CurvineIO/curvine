@@ -169,7 +169,7 @@ fn test_cache_mode_free() {
         let _ = fs.open(&path).await.unwrap();
         fs.wait_job_complete(&path, false).await.unwrap();
 
-        fs.free(&path).await.unwrap();
+        fs.free(&path, false).await.unwrap();
 
         // Check cache file exists
         assert!(!fs.cv().exists(&path).await.unwrap());
@@ -196,7 +196,7 @@ fn test_fs_mode_free() {
         let _ = fs.open(&path).await.unwrap();
         fs.wait_job_complete(&path, false).await.unwrap();
 
-        fs.free(&path).await.unwrap();
+        fs.free(&path, false).await.unwrap();
 
         let file_blocks = fs.cv().get_block_locations(&path).await.unwrap();
         println!("test_fs_mode_free status {:?}", file_blocks);
@@ -214,7 +214,7 @@ async fn prepare_fs_mode_file_then_free(fs: &UnifiedFileSystem, path: &Path, dat
     writer.complete().await.unwrap();
     let _ = fs.open(path).await.unwrap();
     fs.wait_job_complete(path, false).await.unwrap();
-    fs.free(path).await.unwrap();
+    fs.free(path, false).await.unwrap();
 }
 
 #[test]

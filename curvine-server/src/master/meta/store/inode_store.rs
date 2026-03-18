@@ -134,10 +134,10 @@ impl InodeStore {
         Ok(del_res)
     }
 
-    pub fn apply_free(&self, inodes: &[&InodeView]) -> CommonResult<()> {
+    pub fn apply_free(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         for inode in inodes {
-            batch.write_inode(inode)?;
+            batch.write_inode(&inode)?;
         }
         batch.commit()?;
         Ok(())

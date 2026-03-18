@@ -560,13 +560,12 @@ impl JournalLoader {
 
     pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let entry_path = entry.path;
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry_path, &fs_dir.store)?;
-        if inp.get_last_inode().is_none() {
-            warn!("Free: path not found: {}", entry_path);
+        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
+        let Some(inode) = inp.get_last_inode() else {
+            warn!("Free: path not found: {:?}", entry);
             return Ok(());
-        }
-        fs_dir.unprotected_free(&inp, entry.mtime)?;
+        };
+        fs_dir.unprotected_free(inode, entry.mtime, entry.recursive)?;
         Ok(())
     }
 

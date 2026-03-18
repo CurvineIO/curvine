@@ -185,7 +185,7 @@ impl InodeTtlExecutor {
             action
         );
 
-        self.filesystem.free(path)?;
+        self.filesystem.free(path, false)?;
         Ok(())
     }
 
@@ -240,7 +240,7 @@ impl InodeTtlExecutor {
                     "Free: UFS {} exists, freeing Curvine {}: {}",
                     resource_type, resource_type, cv_path
                 );
-                self.filesystem.free(cv_path).map_err(|e| {
+                self.filesystem.free(cv_path, false).map_err(|e| {
                     TtlError::ActionExecutionError(format!("Failed to free {}: {}", cv_path, e))
                 })?;
             }
@@ -278,7 +278,7 @@ impl InodeTtlExecutor {
                             resource_type, cv_path
                         );
                         if !is_directory {
-                            if let Err(e) = filesystem.free(&cv_path) {
+                            if let Err(e) = filesystem.free(&cv_path, false) {
                                 error!(
                                     "Failed to free Curvine {} after export: {}",
                                     resource_type, e

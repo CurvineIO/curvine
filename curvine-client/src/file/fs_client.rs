@@ -169,13 +169,14 @@ impl FsClient {
         Ok(())
     }
 
-    pub async fn free(&self, path: &Path) -> FsResult<()> {
+    pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         let header = FreeRequest {
             path: path.encode(),
+            recursive,
         };
 
-        let _: FreeResponse = self.rpc(RpcCode::Free, header).await?;
-        Ok(())
+        let rep: FreeResponse = self.rpc(RpcCode::Free, header).await?;
+        Ok(ProtoUtils::free_res_from_pb(rep.res))
     }
 
     pub async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {

@@ -18,7 +18,7 @@ use crate::master::meta::store::InodeStore;
 use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileType,
-    StoragePolicy,
+    StoragePolicy, TtlAction,
 };
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
@@ -335,9 +335,18 @@ impl InodeFile {
         Ok(())
     }
 
-    pub fn free(&mut self, mtime: i64) {
-        self.mtime = mtime;
-        self.blocks.clear();
+    pub fn free(&mut self, mtime: i64) -> bool {
+        if self.storage_policy.ttl_action != TtlAction::Free {
+            return false;
+        };
+
+        if self.ufs_exists() && self.cv_exists() {
+            self.mtime = mtime;
+            self.blocks.clear();
+            true
+        } else {
+            false
+        }
     }
 
     /// Search for block by file position
