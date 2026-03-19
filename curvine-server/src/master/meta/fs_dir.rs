@@ -803,42 +803,44 @@ impl FsDir {
     }
 
     pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {
+        if inode.is_file_entry() {
+            return err_box!("set_attr is not supported on unresolved FileEntry inodes; resolve/load the full inode before calling set_attr");
+        }
+
+        let mut change_inodes = vec![];
+        let mut stack = LinkedList::new();
+        stack.push_back(inode.clone());
         let child_opts = opts.child_opts();
-        let recursive = opts.recursive;
-        let parent_inode_id = inode.id();
-        let mut change_inodes: Vec<InodeView> = vec![];
+        while let Some(cur_inode) = stack.pop_front() {
+            if !cur_inode.is_file_entry() {
+                let set_opts = if cur_inode.id() != inode.id() {
+                    child_opts.clone()
+                } else {
+                    opts.clone()
+                };
+                cur_inode.as_mut().set_attr(set_opts);
+                change_inodes.push(cur_inode.as_ref().clone());
+            }
 
-        // set current inode
-        inode.as_mut().set_attr(opts);
-        change_inodes.push(inode.as_ref().clone());
-
-        // recursive set child inode
-        if recursive {
-            let mut stack = LinkedList::new();
-            stack.push_back(inode);
-            while let Some(cur_inode) = stack.pop_front() {
-                if cur_inode.id() != parent_inode_id {
-                    cur_inode.as_mut().set_attr(child_opts.clone());
-                    change_inodes.push(cur_inode.as_ref().clone());
+            match cur_inode.as_mut() {
+                Dir(_, dir) if opts.recursive => {
+                    for child in dir.children_iter() {
+                        stack.push_back(InodePtr::from_ref(child));
+                    }
                 }
 
-                //children may be FileEntry, so we need to load complete data from store
-                for child in cur_inode.children() {
-                    let resolved_child = match child {
-                        FileEntry(name, id) => match self.store.get_inode(*id, Some(name))? {
-                            Some(full_inode) => InodePtr::from_owned(full_inode),
-                            None => {
-                                warn!(
-                                    "Failed to load child inode {} from store during set_attr",
-                                    id
-                                );
-                                continue;
-                            }
-                        },
-                        _ => InodePtr::from_ref(child),
-                    };
-                    stack.push_back(resolved_child);
+                FileEntry(name, id) => {
+                    if let Some(store_inode) = self.store.get_inode(*id, Some(name))? {
+                        stack.push_back(InodePtr::from_owned(store_inode));
+                    } else {
+                        warn!(
+                            "unprotected_set_attr: missing inode {} for FileEntry '{}'",
+                            id, name
+                        );
+                    }
                 }
+
+                _ => (),
             }
         }
 
