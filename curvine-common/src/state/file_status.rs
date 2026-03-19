@@ -87,6 +87,34 @@ impl FileStatus {
     }
 
     pub fn ufs_exists(&self) -> bool {
-        self.storage_policy.ufs_mtime > 0
+        self.storage_policy.ufs_exists()
+    }
+
+    pub fn cv_exists(&self) -> bool {
+        self.storage_policy.cv_exists()
+    }
+
+    /// Returns true if CV data is valid and usable: CV exists, not expired, UFS exists;
+    /// when `ufs_status` is provided, also checks len and mtime match UFS.
+    pub fn cv_valid(&self, ufs_status: Option<&FileStatus>) -> bool {
+        if !self.cv_exists() {
+            return false;
+        }
+        if self.is_expired() || !self.ufs_exists() {
+            return false;
+        }
+        if let Some(ufs_status) = ufs_status {
+            self.len == ufs_status.len && self.storage_policy.ufs_mtime == ufs_status.mtime
+        } else {
+            true
+        }
+    }
+
+    pub fn ufs_valid(&self, ufs_status: &FileStatus) -> bool {
+        if self.ufs_exists() {
+            self.len == ufs_status.len && self.storage_policy.ufs_mtime == ufs_status.mtime
+        } else {
+            false
+        }
     }
 }

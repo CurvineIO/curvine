@@ -36,12 +36,19 @@ enum FileTypeProto {
     FILE_TYPE_PROTO_OBJECT = 5;
 }
 
+enum StorageStateProto {
+    STORAGE_STATE_PROTO_CV = 1;
+    STORAGE_STATE_PROTO_UFS = 2;
+    STORAGE_STATE_PROTO_BOTH = 3;
+}
+
 // File storage policy
 message StoragePolicyProto {
     required StorageTypeProto storage_type = 1 [default = STORAGE_TYPE_PROTO_DISK];
     required int64 ttl_ms = 2 [default = 0];
     required TtlActionProto ttl_action = 3 [default = TTL_ACTION_PROTO_NONE];
     required int64 ufs_mtime = 4;
+    required StorageStateProto state = 5 [default = STORAGE_STATE_PROTO_CV];
 }
 
 message FileStatusProto {

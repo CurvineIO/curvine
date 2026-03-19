@@ -30,8 +30,8 @@ use curvine_common::FsResult;
 use log::info;
 use log::warn;
 use orpc::client::ClientConf;
+use orpc::err_box;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::{err_box, err_ext};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -136,21 +136,8 @@ impl CurvineFileSystem {
         self.fs_client.exists(path).await
     }
 
-    fn check_read_status(path: &Path, file_blocks: &FileBlocks) -> FsResult<()> {
-        // if !file_blocks.status.is_complete {
-        //     return err_box!("Cannot read from {} because it is incomplete.", path);
-        // }
-
-        if file_blocks.status.is_expired() {
-            return err_ext!(FsError::file_expired(path.path()));
-        }
-
-        Ok(())
-    }
-
     pub async fn open(&self, path: &Path) -> FsResult<FsReader> {
         let file_blocks = self.fs_client.get_block_locations(path).await?;
-        Self::check_read_status(path, &file_blocks)?;
 
         let reader = FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)?;
         Ok(reader)
