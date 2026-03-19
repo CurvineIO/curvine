@@ -480,6 +480,8 @@ impl InodeView {
             nlink: self.nlink(),
             target: None,
             container_name: self.container_name(),
+            container_offset: None,
+            container_len: None,
         };
 
         match self {
@@ -510,7 +512,14 @@ impl InodeView {
                     .name()
                     .to_owned();
                 status.is_complete = c.is_complete();
-                status.len = c.files.get(&file_name).map(|meta| meta.len).unwrap_or(0);
+                if let Some(meta) = c.files.get(&file_name) {
+                    status.len = meta.len;
+                    status.container_offset = Some(meta.offset);
+                    status.container_len = Some(meta.len);
+                } else {
+                    // Path refers to the container itself, not a file within it
+                    status.len = c.len;
+                }
                 status.replicas = c.replicas as i32;
                 status.block_size = c.block_size;
                 status.file_type = FileType::Container;

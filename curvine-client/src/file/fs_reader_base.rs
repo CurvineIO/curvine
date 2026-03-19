@@ -33,6 +33,9 @@ pub struct FsReaderBase {
     pos: i64,
     len: i64,
 
+    // For files inside a container block, this is the byte offset within the shared block where this file's data begins.
+    container_offset: i64,
+
     // The block that is currently being read
     cur_reader: Option<BlockReader>,
 
@@ -43,7 +46,11 @@ pub struct FsReaderBase {
 
 impl FsReaderBase {
     pub fn new(path: Path, fs_context: Arc<FsContext>, file_blocks: FileBlocks) -> Self {
-        let len = file_blocks.status.len;
+        let container_offset = file_blocks.status.container_offset.unwrap_or(0);
+        let len = file_blocks
+            .status
+            .container_len
+            .unwrap_or(file_blocks.status.len);
         let cache_limit = fs_context.conf.client.max_cache_block_handles;
 
         let cache_readers = LinkedHashMap::with_capacity_and_hasher(
@@ -56,6 +63,7 @@ impl FsReaderBase {
             file_blocks: SearchFileBlocks::new(file_blocks),
             pos: 0,
             len,
+            container_offset,
             cur_reader: None,
             cache_limit,
             cache_readers,
@@ -131,7 +139,8 @@ impl FsReaderBase {
             return err_box!("seek position {} can not exceed file len {}", pos, self.len);
         }
 
-        let (block_off, loc) = self.file_blocks.get_read_block(pos)?;
+        let physical_pos = pos + self.container_offset;
+        let (block_off, loc) = self.file_blocks.get_read_block(physical_pos)?;
         if let Some(reader) = &mut self.cur_reader {
             // Check if the target position is in the current block
             if reader.block_id() == loc.block.id {
@@ -183,7 +192,8 @@ impl FsReaderBase {
             Some(v) if v.has_remaining() => (),
 
             _ => {
-                let (block_off, loc) = self.file_blocks.get_read_block(self.pos)?;
+                let physical_pos = self.pos + self.container_offset;
+                let (block_off, loc) = self.file_blocks.get_read_block(physical_pos)?;
                 let new_reader = match self.cache_readers.remove(&loc.block.id) {
                     Some(mut v) => {
                         // Use the existing block reader

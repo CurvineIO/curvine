@@ -608,6 +608,8 @@ impl OpendalFileSystem {
             path: path.full_path().to_owned(),
             name: path.name().to_owned(),
             container_name: None, // will update
+            container_offset: None,
+            container_len: None,
             is_dir: false,
             is_complete: false,
             replicas: 1,
@@ -629,6 +631,8 @@ impl OpendalFileSystem {
             path: path.full_path().to_owned(),
             name: path.name().to_owned(),
             container_name: None, // will update
+            container_offset: None,
+            container_len: None,
             is_dir: metadata.is_dir(),
             file_type: if metadata.is_dir() {
                 FileType::Dir

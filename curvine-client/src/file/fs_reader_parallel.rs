@@ -71,7 +71,11 @@ impl FsReaderParallel {
         }
 
         let ino = file_blocks.status.id;
-        let slices = Self::split(file_blocks.status.len, slice_size, read_parallel);
+        let file_len = file_blocks
+            .status
+            .container_len
+            .unwrap_or(file_blocks.status.len);
+        let slices = Self::split(file_len, slice_size, read_parallel);
 
         let mut readers = Vec::with_capacity(read_parallel as usize);
         for (parallel_id, slice) in slices.into_iter().enumerate() {

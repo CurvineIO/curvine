@@ -294,10 +294,14 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     }
 
     let num_files = 5;
-    let small_file_size = 10; // 1KB per file
-    let large_file_size = 65; // 1KB per file
-    let test_small_data = "x".repeat(small_file_size);
-    let test_large_data = "x".repeat(large_file_size);
+    let large_file_size = 65;
+    let small_file_contents: Vec<String> = (0..num_files - 1)
+        .map(|i| {
+            let ch = (b'A' + i as u8) as char; // A, B, C, D
+            format!("file{}_{}", i, ch.to_string().repeat(6)) // example: "file0_AAAAAAA"
+        })
+        .collect();
+    let test_large_data = "L".repeat(large_file_size);
 
     let mut batch_files = Vec::with_capacity(num_files);
     for i in 0..num_files {
@@ -307,7 +311,7 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
             batch_files.push((path.clone(), test_large_data.as_str()));
             continue;
         }
-        batch_files.push((path, test_small_data.as_str()));
+        batch_files.push((path, small_file_contents[i].as_str()));
     }
 
     fs.write_batch_string(&batch_files).await?;
@@ -340,38 +344,38 @@ async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
     );
 
     // 2. Verify all files exist and have correct content
-    for (i, (path, _)) in batch_files.clone().iter().enumerate() {
+    for (i, (path, expected_content)) in batch_files.clone().iter().enumerate() {
         let status = fs.get_status(path).await?;
+        println!("status: {:?}", status);
         let content = read_file_content(fs, path).await?;
-        if i == num_files - 1 {
-            assert_eq!(
-                status.len, large_file_size as i64,
-                "File {} length mismatch",
-                i
-            );
-            assert_eq!(
-                content.len(),
-                large_file_size,
-                "File {} content length mismatch",
-                i
-            );
-            assert_eq!(content, test_large_data, "File {} content mismatch", i);
-        } else {
-            assert_eq!(
-                status.len, small_file_size as i64,
-                "File {} length mismatch",
-                i
-            );
-            assert_eq!(
-                content.len(),
-                small_file_size,
-                "File {} content length mismatch",
-                i
-            );
-            assert_eq!(content, test_small_data, "File {} content mismatch", i);
-        }
 
-        println!("Verified file_{}: len={}, content matches", i, status.len);
+        let expected_len = expected_content.len() as i64;
+        assert_eq!(
+            status.len, expected_len,
+            "File {} length mismatch: expected {}, got {}",
+            i, expected_len, status.len
+        );
+        assert_eq!(
+            content.len(),
+            expected_content.len(),
+            "File {} content length mismatch",
+            i
+        );
+        assert_eq!(
+            content, *expected_content,
+            "File {} content mismatch: expected '{}', got '{}' — \
+             reader may not be applying container_offset correctly",
+            i, expected_content, content
+        );
+
+        if i < num_files - 1 {
+            println!(
+                "Verified file_{}: len={}, container_offset={:?}, container_len={:?}, content='{}'",
+                i, status.len, status.container_offset, status.container_len, content
+            );
+        } else {
+            println!("Verified file_{}: len={}, content matches", i, status.len);
+        }
     }
     println!("✓ All {} files written and verified correctly", num_files);
     Ok(())

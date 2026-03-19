@@ -234,6 +234,8 @@ impl ProtoUtils {
             target: status.target,
             nlink: status.nlink,
             container_name: status.container_name,
+            container_offset: status.container_offset,
+            container_len: status.container_len,
         }
     }
 
@@ -259,6 +261,8 @@ impl ProtoUtils {
             nlink: status.nlink,
             target: status.target,
             container_name: status.container_name,
+            container_offset: status.container_offset,
+            container_len: status.container_len,
         }
     }
 

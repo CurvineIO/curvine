@@ -47,6 +47,13 @@ pub struct FileStatus {
 
     // todo: add container_id
     pub container_name: Option<String>,
+
+    /// For files inside a container: the byte offset within the shared block
+    /// where this file's data starts.
+    pub container_offset: Option<i64>,
+    /// For files inside a container: the byte length of this file's data
+    /// within the shared block.
+    pub container_len: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -65,6 +72,8 @@ impl FileStatus {
             id,
             name,
             container_name: None,
+            container_offset: None,
+            container_len: None,
             is_dir,
             file_type: ternary!(is_dir, FileType::Dir, FileType::File),
             ..Default::default()

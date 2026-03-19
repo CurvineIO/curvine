@@ -70,6 +70,8 @@ message FileStatusProto {
     optional string target = 18;
     required uint32 nlink = 19;
     optional string container_name = 20;
+    optional int64 container_offset = 21;
+    optional int64 container_len = 22;
 }
 
 // Describe the worker address information.
