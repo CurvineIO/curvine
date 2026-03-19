@@ -92,7 +92,15 @@ jobs:
           
           echo "After build, disk usage:"
           df -h
-      
+
+      - name: Run unit tests (skip UFS-dependent tests in CI)
+        env:
+          NEXTEST_CI_NO_UFS: "1"
+        run: |
+          export PATH="/root/.cargo/bin:$PATH"
+          cd "$GITHUB_WORKSPACE"
+          bash curvine-tests/regression/daily_regression_test.sh "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/test_results"
+
       - name: Final cleanup before cache save
         run: |
           echo "Final cleanup before cache save"

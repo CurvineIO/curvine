@@ -18,8 +18,24 @@ Open the Portal: **http://localhost:5002/result**
 | `--port 5002` | Server port (default 5002) |
 | `--project-path /path` | Override project root (default: current dir) |
 | `--results-dir /path` | Override results dir (default: `curvine-tests/regression_result/`) |
+| `--nextest-profile NAME` | Nextest profile for unittest (e.g. `ci-no-ufs`). See [Nextest profile](#nextest-profile) below. |
 | `--update-code` | Run `git pull` on current branch before starting |
 | `--run-once` | Trigger one dailytest, wait for it to finish, then exit |
+
+#### Nextest profile
+
+Unit tests are run with `cargo nextest`. You can choose which tests run by setting a **nextest profile**:
+
+| How to set | Example | Use case |
+|------------|---------|----------|
+| `--nextest-profile NAME` | `--nextest-profile ci-no-ufs` | Use profile when starting build-server |
+| Env `NEXTEST_PROFILE` | `NEXTEST_PROFILE=ci-no-ufs python3 build-server.py` | Same as above (also applies when running `daily_regression_test.sh` directly) |
+| Env `NEXTEST_CI_NO_UFS=1` | `NEXTEST_CI_NO_UFS=1 python3 build-server.py` | Shortcut for profile `ci-no-ufs` (skip UFS-dependent tests, e.g. CI without MinIO) |
+
+Profiles are defined in `curvine-tests/regression/nextest.toml`. Built-in:
+
+- **default** – run all tests (requires UFS/MinIO for some tests).
+- **ci-no-ufs** – skip UFS-dependent tests (`write_cache_test`, `ufs_test`, `fallback_read_test`), for CI without MinIO.
 
 ## Portal Dashboard
 
@@ -61,6 +77,8 @@ One-shot: trigger dailytest once and exit (e.g. for CI):
 ```bash
 docker run -v "$(pwd)":/workspace curvine-tests --run-once
 ```
+
+To use a nextest profile (e.g. skip UFS tests in CI): `--nextest-profile ci-no-ufs` or `-e NEXTEST_PROFILE=ci-no-ufs`.
 
 **Optional: mount dependency caches** to avoid re-downloading on every build:
 

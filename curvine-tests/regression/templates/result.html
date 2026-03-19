@@ -156,12 +156,19 @@
                     <h4>Success Rate</h4>
                     <div class="number" style="color: #f39c12;">{{ success_rate }}%</div>
                 </div>
+                <div class="coverage-card">
+                    <h4>Skipped <span style="font-size: 0.75em; color: #888;">(e.g. UFS not available)</span></h4>
+                    <div class="number" style="color: #95a5a6;">{{ test_summary.get('skipped_tests', 0) }}</div>
+                </div>
             </div>
-            {% if packages|length > 0 %}
             <div style="text-align: center;">
+                {% if packages|length > 0 %}
                 <a href="/unit-tests/{{ selected_date }}" class="coverage-link" target="_blank">View Detailed Unit Test Results →</a>
+                {% endif %}
+                {% if test_summary.get('skipped_tests', 0) > 0 and test_summary.get('skipped_test_cases') %}
+                &nbsp;|&nbsp;<a href="/unit-tests/{{ selected_date }}#skipped-tests" class="coverage-link" target="_blank">View Skipped Test List ({{ test_summary.skipped_tests }}) →</a>
+                {% endif %}
             </div>
-            {% endif %}
         </div>
         {% endif %}
 

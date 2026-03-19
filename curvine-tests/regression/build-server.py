@@ -94,6 +94,9 @@ PROJECT_PATH = None
 # Test results directory (global)
 TEST_RESULTS_DIR = None
 
+# Nextest profile for unittest (e.g. ci-no-ufs), set from --nextest-profile
+NEXTEST_PROFILE = None
+
 # Current subprocess per test (for cancel). Keys: build, dailytest, regression, coverage, fuse, fio, ltp
 test_processes = {
     'build': None,
@@ -250,6 +253,10 @@ def run_dailytest_script():
                     print(f"⚠ Step {current_step}/{total_steps}: Test script not found: {script_path}, skipping unittest")
                 else:
                     print(f"Using script path: {script_path}")
+                    run_env = os.environ.copy()
+                    if NEXTEST_PROFILE:
+                        run_env['NEXTEST_PROFILE'] = NEXTEST_PROFILE
+                        print(f"Nextest profile: {NEXTEST_PROFILE}")
 
                     process = subprocess.Popen(
                         [script_path, project_path, TEST_RESULTS_DIR],
@@ -257,6 +264,7 @@ def run_dailytest_script():
                         stderr=subprocess.PIPE,
                         universal_newlines=True,
                         start_new_session=True,
+                        env=run_env,
                     )
                     test_processes['dailytest'] = process
                     try:
@@ -1474,7 +1482,9 @@ def view_unit_tests(date):
     
     # Get available dates for navigation
     available_dates = get_available_test_dates()
-    
+    skipped_tests = test_summary.get('skipped_tests', 0) if test_summary else 0
+    skipped_test_cases = test_summary.get('skipped_test_cases', []) if test_summary else []
+
     return render_template(
         'unit_test_details.html',
         date=date,
@@ -1483,6 +1493,8 @@ def view_unit_tests(date):
         total_tests=total_tests,
         passed_tests=passed_tests,
         failed_tests=failed_tests,
+        skipped_tests=skipped_tests,
+        skipped_test_cases=skipped_test_cases,
         success_rate=success_rate,
         current_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     )
@@ -1679,6 +1691,12 @@ Examples:
     )
     
     parser.add_argument(
+        '--nextest-profile',
+        type=str,
+        default=None,
+        help='Nextest profile for unittest (e.g. ci-no-ufs). Passed to daily_regression_test.sh via NEXTEST_PROFILE env.'
+    )
+    parser.add_argument(
         '--run-once',
         action='store_true',
         help='Trigger one dailytest run, wait for completion, then exit (for CI one-shot)'
@@ -1766,7 +1784,12 @@ if __name__ == '__main__':
     # Set test results directory: prefer argument, otherwise default <project_path>/curvine-tests/regression_result
     TEST_RESULTS_DIR = args.results_dir if args.results_dir else os.path.join(PROJECT_PATH, 'curvine-tests', 'regression_result')
     print(f"Using test results directory: {TEST_RESULTS_DIR}")
-    
+
+    # Nextest profile for unittest (passed to daily_regression_test.sh via env)
+    NEXTEST_PROFILE = getattr(args, 'nextest_profile', None)
+    if NEXTEST_PROFILE:
+        print(f"Nextest profile for unittest: {NEXTEST_PROFILE}")
+
     # Optional: update repo to latest on current branch
     if getattr(args, 'update_code', False):
         print("Updating repository (git fetch + git pull)...")

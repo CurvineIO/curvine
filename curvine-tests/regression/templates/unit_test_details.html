@@ -19,6 +19,7 @@
         .total { color: #3498db; }
         .passed { color: #27ae60; }
         .failed { color: #e74c3c; }
+        .skipped { color: #95a5a6; }
         .success-rate { color: #f39c12; }
         .package-section { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); margin-bottom: 30px; }
         .package-title { font-size: 1.3em; font-weight: bold; color: #2c3e50; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #3498db; }
@@ -27,6 +28,8 @@
         .test-table th { background-color: #f8f9fa; font-weight: bold; color: #495057; }
         .status-passed { background: #d4edda; color: #155724; padding: 3px 6px; border-radius: 4px; font-weight: bold; }
         .status-failed { background: #f8d7da; color: #721c24; padding: 3px 6px; border-radius: 4px; font-weight: bold; }
+        .status-skipped { background: #e2e3e5; color: #383d41; padding: 3px 6px; border-radius: 4px; font-weight: bold; }
+        .test-row-skipped { background: #f8f9fa; }
         .log-link { color: #007bff; text-decoration: none; font-size: 0.9em; }
         .log-link:hover { text-decoration: underline; }
         .file-block { margin: 18px 0; padding: 14px; border: 1px solid #e0e0e0; border-radius: 8px; background: #fafafa; }
@@ -36,6 +39,8 @@
         .filter-btn { padding: 10px 20px; margin: 0 5px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 0.9em; font-weight: bold; }
         .filter-btn:hover { background: #5568d3; }
         .test-row-hidden { display: none; }
+        .skipped-section { background: #f8f9fa; border-radius: 10px; padding: 20px; margin-bottom: 30px; border-left: 4px solid #95a5a6; }
+        .skipped-section-title { font-size: 1.2em; font-weight: bold; color: #383d41; margin-bottom: 12px; }
     </style>
 </head>
 <body>
@@ -55,13 +60,38 @@
             <div class="summary-card"><h3>Total Tests</h3><div class="number total">{{ total_tests }}</div></div>
             <div class="summary-card"><h3>Passed</h3><div class="number passed">{{ passed_tests }}</div></div>
             <div class="summary-card"><h3>Failed</h3><div class="number failed">{{ failed_tests }}</div></div>
+            <div class="summary-card"><h3>Skipped</h3><div class="number skipped">{{ skipped_tests|default(0) }}</div></div>
             <div class="summary-card"><h3>Success Rate</h3><div class="number success-rate">{{ success_rate }}%</div></div>
         </div>
+
+        {% if skipped_test_cases %}
+        <div id="skipped-tests" class="skipped-section">
+            <div class="skipped-section-title">⏭️ Skipped tests ({{ skipped_test_cases|length }}) <span style="font-size: 0.85em; color: #888;">e.g. excluded by profile (UFS not available)</span></div>
+            <table class="test-table">
+                <thead>
+                    <tr>
+                        <th>Package</th>
+                        <th>TestFile</th>
+                        <th>TestCase</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for s in skipped_test_cases %}
+                    <tr class="test-row test-row-skipped">
+                        <td>{{ s.package }}</td>
+                        <td>{{ s.test_file }}</td>
+                        <td>{{ s.test_case }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
         
         {% if packages|length > 0 %}
         {% for pkg in packages %}
         <div class="package-section">
-            <div class="package-title">📦 Package: {{ pkg.name }} (Total: {{ pkg.total }}, Passed: {{ pkg.passed }}, Failed: {{ pkg.failed }}, Success Rate: {{ pkg.success_rate }}%)</div>
+            <div class="package-title">📦 Package: {{ pkg.name }} (Total: {{ pkg.total }}, Passed: {{ pkg.passed }}, Failed: {{ pkg.failed }}{% if pkg.get('skipped', 0) %}, Skipped: {{ pkg.skipped }}{% endif %}, Success Rate: {{ pkg.success_rate }}%)</div>
             {% for test_file, file_cases in cases_by_package_file.get(pkg.name, {}).items() %}
             <div class="file-block">
                 <div class="file-block-title">{{ test_file }}</div>
@@ -82,11 +112,17 @@
                     </thead>
                     <tbody>
                         {% for c in file_cases %}
-                        <tr class="test-row {% if c.status == 'PASSED' %}test-row-passed{% else %}test-row-failed{% endif %}">
+                        <tr class="test-row {% if c.status == 'PASSED' %}test-row-passed{% elif c.status == 'SKIPPED' %}test-row-skipped{% else %}test-row-failed{% endif %}">
                             <td>{{ test_file }}</td>
                             <td>{{ c.test_case }}</td>
                             <td>
-                                <span class="{% if c.status == 'PASSED' %}status-passed{% else %}status-failed{% endif %}">{{ 'PASS' if c.status == 'PASSED' else 'FAIL' }}</span>
+                                {% if c.status == 'PASSED' %}
+                                <span class="status-passed">PASS</span>
+                                {% elif c.status == 'SKIPPED' %}
+                                <span class="status-skipped">SKIPPED</span>
+                                {% else %}
+                                <span class="status-failed">FAILED</span>
+                                {% endif %}
                             </td>
                             <td>
                                 <a class="log-link" href="/logs/{{ date }}/{{ c.log }}?referrer=/unit-tests/{{ date }}" target="_blank">View Log</a>
