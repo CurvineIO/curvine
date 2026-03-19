@@ -26,22 +26,17 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 fn get_fs() -> UnifiedFileSystem {
+    let testing = Testing::builder().workers(1).build().unwrap();
     // Check if UFS configuration is available, if not, skip the test
     if env::var("UFS_TEST_PATH").is_err() {
-        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
-        println!(
-            "   Set UFS_TEST_PATH and UFS_TEST_PROPERTIES environment variables to run this test"
-        );
-        println!("   Example: export UFS_TEST_PATH=hdfs://127.0.0.1:9000");
-        println!("   Example: export UFS_TEST_PROPERTIES=\"hdfs.namenode=hdfs://127.0.0.1:9000,hdfs.user=root\"");
-        panic!("UFS_TEST_PATH is not set")
+        env::set_var("UFS_TEST_PATH", testing.ufs_path.clone());
     }
 
-    let testing = Testing::builder().workers(1).build().unwrap();
     testing.start_cluster().unwrap();
     let rt = Arc::new(AsyncRuntime::single());
     testing.get_unified_fs_with_rt(rt.clone()).unwrap()
 }
+
 #[test]
 fn test_cache_mode() {
     let fs = get_fs();

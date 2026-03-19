@@ -25,6 +25,7 @@ pub enum FsKind {
     Azblob,
     Cos,
     Unknown,
+    File,
 }
 
 impl FsKind {
@@ -39,6 +40,7 @@ impl FsKind {
     pub const SCHEME_AZBLOB: &'static str = "azblob";
     pub const SCHEME_COS: &'static str = "cos";
     pub const SCHEME_UNKNOWN: &'static str = "unknown";
+    pub const SCHEME_FILE: &'static str = "file";
 
     /// Returns the filesystem kind for the given scheme string (e.g. from `Path::scheme()`).
     pub fn from_scheme(scheme: &str) -> Self {
@@ -51,6 +53,7 @@ impl FsKind {
             Self::SCHEME_GCS | Self::SCHEME_GS => Self::Gcs,
             Self::SCHEME_AZBLOB => Self::Azblob,
             Self::SCHEME_COS => Self::Cos,
+            Self::SCHEME_FILE => Self::File,
             _ => Self::Unknown,
         }
     }
@@ -80,10 +83,11 @@ impl FsKind {
             Self::Azblob => Self::SCHEME_AZBLOB,
             Self::Cos => Self::SCHEME_COS,
             Self::Unknown => Self::SCHEME_UNKNOWN,
+            Self::File => Self::SCHEME_FILE,
         }
     }
 
     pub fn support_rename(&self) -> bool {
-        matches!(self, Self::Cv | Self::Hdfs | Self::OssHdfs)
+        matches!(self, Self::Cv | Self::Hdfs | Self::OssHdfs | Self::File)
     }
 }
