@@ -276,6 +276,15 @@ impl OpendalFileSystem {
             .to_string();
 
         let operator = match scheme {
+            FsKind::SCHEME_FILE => {
+                let builder = Fs::default().root("/");
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create FS operator: {}", e)))?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
             // OSS native implementation (higher priority than HDFS-based OSS)
             #[cfg(feature = "opendal-oss")]
             "oss" => {
@@ -563,7 +572,7 @@ impl OpendalFileSystem {
     fn get_object_path(&self, path: &Path) -> FsResult<String> {
         match path.path().strip_prefix('/') {
             Some(v) => Ok(v.to_string()),
-            None => err_box!("path {} invalid", path),
+            None => Ok(path.path().to_string()),
         }
     }
 

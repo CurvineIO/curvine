@@ -15,13 +15,14 @@
 use curvine_client::file::CurvineFileSystem;
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
+use curvine_common::fs::Path;
 use curvine_server::test::MiniCluster;
 use once_cell::sync::OnceCell;
 use orpc::common::{FileUtils, Logger, Utils};
 use orpc::io::LocalFile;
 use orpc::runtime::Runtime;
 use orpc::CommonResult;
-use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,7 +30,7 @@ type ConfMutator = Arc<dyn Fn(&mut ClusterConf) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Testing {
-    pub s3_conf_path: String,
+    pub ufs_path: String,
     pub master_num: u16,
     pub worker_num: u16,
     // Absolute path to the active cluster configuration file for this Testing instance
@@ -40,7 +41,7 @@ pub struct Testing {
 }
 
 impl Testing {
-    /// Create a unique temp config file path under /tmp for this Testing instance.
+    /// Create a unique temp config file path (absolute) for this Testing instance.
     fn new_tmp_path() -> String {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -48,7 +49,16 @@ impl Testing {
             .as_millis();
         let pid = std::process::id();
         let rand = Utils::rand_str(6);
-        format!("../testing/curvine-tests/{}-{}-{}", ts, pid, rand)
+        let base = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let path = base
+            .join("testing")
+            .join("curvine-tests")
+            .join(format!("{}-{}-{}", ts, pid, rand));
+        path.display().to_string()
     }
 
     /// Start the cluster using the prepared configuration, and persist to active_cluster_conf.
@@ -127,14 +137,6 @@ impl Testing {
         let fs = CurvineFileSystem::with_rt(conf, rt)?;
         Ok(fs)
     }
-
-    pub fn get_s3_conf(&self) -> Option<HashMap<String, String>> {
-        let path = &self.s3_conf_path;
-        if !FileUtils::exists(path) {
-            return None;
-        }
-        Some(FileUtils::read_toml_as_map(path).unwrap())
-    }
 }
 
 static DEFAULT: OnceCell<Testing> = OnceCell::new();
@@ -164,7 +166,6 @@ pub struct TestingBuilder {
     base_conf_path: Option<String>,
     #[allow(clippy::type_complexity)]
     options: Option<ConfMutator>,
-    s3_conf_path: Option<String>,
 }
 
 impl Default for TestingBuilder {
@@ -181,7 +182,6 @@ impl TestingBuilder {
             base_conf: None,
             base_conf_path: None,
             options: None,
-            s3_conf_path: None,
         }
     }
 
@@ -190,9 +190,6 @@ impl TestingBuilder {
     pub fn default(mut self) -> Self {
         if self.base_conf.is_none() && self.base_conf_path.is_none() {
             self.base_conf_path = Some("../etc/curvine-cluster.toml".to_string());
-        }
-        if self.s3_conf_path.is_none() {
-            self.s3_conf_path = Some("../testing/s3.toml".to_string());
         }
         self
     }
@@ -216,10 +213,6 @@ impl TestingBuilder {
         self.options = Some(Arc::new(f));
         self
     }
-    pub fn with_s3_conf_path<S: Into<String>>(mut self, path: S) -> Self {
-        self.s3_conf_path = Some(path.into());
-        self
-    }
 
     pub fn build(self) -> CommonResult<Testing> {
         let mut conf = if let Some(c) = self.base_conf {
@@ -237,11 +230,12 @@ impl TestingBuilder {
         conf.worker.data_dir = vec![format!("{}/data", base_path)];
         conf.master.min_block_size = 1;
         conf.journal.raft_tick_interval_ms = 100;
-        let s3_conf_path = self
-            .s3_conf_path
-            .unwrap_or_else(|| "../testing/s3.toml".to_string());
+
+        let ufs_path = Path::from_str(format!("file://{}/{}", base_path, "ufs")).unwrap();
+        FileUtils::create_dir(ufs_path.path(), true).unwrap();
+
         Ok(Testing {
-            s3_conf_path,
+            ufs_path: ufs_path.clone_uri(),
             master_num: self.master_num,
             worker_num: self.worker_num,
             active_cluster_conf_path,
