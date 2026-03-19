@@ -172,7 +172,7 @@ fn test_cache_mode_free() {
         fs.free(&path, false).await.unwrap();
 
         // Check cache file exists
-        assert!(!fs.cv().exists(&path).await.unwrap());
+        assert!(fs.cv().exists(&path).await.unwrap());
 
         let reader = fs.open(&path).await.unwrap();
         assert!(!matches!(reader, UnifiedReader::Cv(_)));

@@ -336,7 +336,7 @@ impl InodeFile {
     }
 
     pub fn free(&mut self, mtime: i64) -> bool {
-        if self.storage_policy.ttl_action != TtlAction::Free {
+        if self.storage_policy.ttl_action == TtlAction::None {
             return false;
         };
 
