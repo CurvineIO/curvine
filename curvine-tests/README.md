@@ -18,8 +18,26 @@ Open the Portal: **http://localhost:5002/result**
 | `--port 5002` | Server port (default 5002) |
 | `--project-path /path` | Override project root (default: current dir) |
 | `--results-dir /path` | Override results dir (default: `curvine-tests/regression_result/`) |
+| `--nextest-profile NAME` | Nextest profile for unittest (e.g. `ci-no-ufs`). See [Nextest profile](#nextest-profile) below. |
 | `--update-code` | Run `git pull` on current branch before starting |
 | `--run-once` | Trigger one dailytest, wait for it to finish, then exit |
+| `--run-once-ut-cov` | Trigger one UT + coverage run only (no FIO/FUSE/LTP), then exit (for CI) |
+| `--summary-to-markdown PATH` | Load `test_summary.json` from PATH, print Markdown table to stdout and exit |
+
+#### Nextest profile
+
+Unit tests are run with `cargo nextest`. You can choose which tests run by setting a **nextest profile**:
+
+| How to set | Example | Use case |
+|------------|---------|----------|
+| `--nextest-profile NAME` | `--nextest-profile ci-no-ufs` | Use profile when starting build-server |
+| Env `NEXTEST_PROFILE` | `NEXTEST_PROFILE=ci-no-ufs python3 build-server.py` | Same as above (also applies when running `daily_regression_test.sh` directly) |
+| Env `NEXTEST_CI_NO_UFS=1` | `NEXTEST_CI_NO_UFS=1 python3 build-server.py` | Shortcut for profile `ci-no-ufs` (skip UFS-dependent tests, e.g. CI without MinIO) |
+
+Profiles are defined in `curvine-tests/regression/nextest.toml`. Built-in:
+
+- **default** – run all tests (requires UFS/MinIO for some tests).
+- **ci-no-ufs** – skip UFS-dependent tests (`write_cache_test`, `ufs_test`, `fallback_read_test`), for CI without MinIO.
 
 ## Portal Dashboard
 
@@ -62,6 +80,15 @@ One-shot: trigger dailytest once and exit (e.g. for CI):
 docker run -v "$(pwd)":/workspace curvine-tests --run-once
 ```
 
+To use a nextest profile (e.g. skip UFS tests in CI): `--nextest-profile ci-no-ufs` or `-e NEXTEST_PROFILE=ci-no-ufs`.
+CI one-shot (UT + coverage only, no FIO/FUSE/LTP):
+
+```bash
+docker run -v "$(pwd)":/workspace curvine-tests --run-once-ut-cov
+```
+
+Results are written to `curvine-tests/regression_result/<timestamp>/` (e.g. `test_summary.json`). To render the JSON as a Markdown table for GitHub Step Summary: `python3 curvine-tests/regression/build-server.py --summary-to-markdown <path-to-test-dir>`.
+
 **Optional: mount dependency caches** to avoid re-downloading on every build:
 
 ```bash
@@ -77,3 +104,31 @@ docker run \
 |-------|---------|
 | `~/.cargo/registry` | Reuse downloaded Rust crates across builds |
 | `~/.m2` | Reuse downloaded Maven JARs across builds |
+
+**If running FUSE tests**, the container needs privileged mode to perform FUSE mounts:
+
+```bash
+docker run \
+  -v "$(pwd)":/workspace \
+  --privileged \
+  --device /dev/fuse \
+  -p 5002:5002 \
+  curvine-tests
+```
+
+| Flag | Why it's needed |
+|------|----------------|
+| `--privileged` | Grants all capabilities required for `mount` (FUSE needs more than just `SYS_ADMIN` on some kernels) |
+| `--device /dev/fuse` | Expose the host FUSE device to the container |
+
+> Without `--privileged`, FUSE mount fails with `Operation not permitted (os error 1)` even if `--cap-add SYS_ADMIN` is set. This is a known limitation of running FUSE inside Docker.
+
+**`CURVINE_MASTER_HOSTNAME`**: the hostname tests use to connect to the Curvine master. Defaults to `localhost`. Must match the `journal_addr` host in `curvine-cluster.toml`.
+
+```bash
+docker run \
+  -v "$(pwd)":/workspace \
+  -e CURVINE_MASTER_HOSTNAME=192.168.1.100 \
+  -p 5002:5002 \
+  curvine-tests
+```

@@ -18,10 +18,11 @@ use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult, STATE_FILE_MAGIC, STATE_FILE_VERSION};
-use curvine_client::unified::UnifiedFileSystem;
+use curvine_client::file::FsReader;
+use curvine_client::unified::{UnifiedFileSystem, UnifiedReader};
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
 use curvine_common::fs::{FileSystem, MetaCache, Path, StateReader, StateWriter};
-use curvine_common::state::{CreateFileOpts, FileStatus, OpenFlags};
+use curvine_common::state::{CreateFileOpts, FileBlocks, FileStatus, OpenFlags};
 use log::{error, info, warn};
 use orpc::common::FastHashMap;
 use orpc::err_box;
@@ -263,8 +264,42 @@ impl NodeState {
         Ok(Arc::new(Mutex::new(writer)))
     }
 
+    fn get_cached_blocks(&self, path: &Path) -> Option<FileBlocks> {
+        if self.conf.enable_meta_cache {
+            self.meta_cache.get_blocks(path)
+        } else {
+            None
+        }
+    }
+
     pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
-        let reader = self.fs.open(path).await?;
+        let reader = match self.get_cached_blocks(path) {
+            Some(blocks) => {
+                let reader = FsReader::new(path.clone(), self.fs.fs_context().clone(), blocks)?;
+                UnifiedReader::Cv(reader)
+            }
+
+            None => {
+                let reader = self.fs.open(path).await?;
+
+                if self.conf.enable_meta_cache {
+                    match &reader {
+                        UnifiedReader::Cv(cv_reader) => {
+                            self.meta_cache
+                                .put_open(path, cv_reader.file_blocks().clone());
+                        }
+                        UnifiedReader::Fallback(fallback_reader) => {
+                            self.meta_cache
+                                .put_open(path, fallback_reader.file_blocks().clone());
+                        }
+                        _ => {}
+                    };
+                }
+
+                reader
+            }
+        };
+
         let reader = FuseReader::new(&self.conf, self.fs.clone_runtime(), reader);
         Ok(reader)
     }

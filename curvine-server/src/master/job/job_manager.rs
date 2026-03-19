@@ -25,7 +25,7 @@ use curvine_common::state::{
     JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult,
 };
 use curvine_common::FsResult;
-use log::info;
+use log::{debug, info};
 use orpc::common::LocalTime;
 use orpc::runtime::{LoopTask, Runtime};
 use orpc::{err_box, err_ext};
@@ -241,7 +241,7 @@ impl LoopTask for JobCleanupTask {
 
         for job_id in jobs_to_remove {
             if let Some(v) = self.jobs.remove(&job_id) {
-                info!("Removing expired job: {:?}", v.1.info);
+                debug!("Removing expired job: {:?}", v.1.info);
             }
         }
 

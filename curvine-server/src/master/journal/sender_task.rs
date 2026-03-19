@@ -20,7 +20,7 @@ use curvine_common::utils::SerdeUtils;
 use curvine_common::FsResult;
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::err_box;
-use std::sync::mpsc;
+use orpc::sync::channel::BlockingReceiver;
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
@@ -49,7 +49,7 @@ impl SenderTask {
     }
 
     // Start a thread to execute sender task
-    pub fn spawn(self, receiver: mpsc::Receiver<JournalEntry>) -> FsResult<()> {
+    pub fn spawn(self, receiver: BlockingReceiver<JournalEntry>) -> FsResult<()> {
         let poll = Duration::from_millis(self.flush_batch_ms);
         let name = "journal-writer".to_string();
         let task = self;
@@ -62,7 +62,7 @@ impl SenderTask {
     }
 
     fn loop0(
-        receiver: mpsc::Receiver<JournalEntry>,
+        receiver: BlockingReceiver<JournalEntry>,
         poll: Duration,
         mut task: SenderTask,
     ) -> FsResult<()> {
@@ -78,17 +78,22 @@ impl SenderTask {
     }
 
     pub fn handle(&mut self, entry: Option<JournalEntry>) -> FsResult<()> {
-        if let Some(v) = entry {
+        let force = if let Some(v) = entry {
+            let force = matches!(v, JournalEntry::Snapshot(_));
             self.batch.push(v);
             self.metrics.journal_queue_len.dec();
-        }
+            force
+        } else {
+            false
+        };
 
         let len = self.batch.len() as u64;
         if len == 0 {
             return Ok(());
         }
 
-        if len >= self.flush_batch_size
+        if force
+            || len >= self.flush_batch_size
             || LocalTime::mills() - self.last_flush_ms >= self.flush_batch_ms
         {
             let spend = TimeSpent::new();

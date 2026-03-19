@@ -55,21 +55,23 @@ impl DBEngine {
     }
 
     pub fn restore<T: AsRef<str>>(&mut self, checkpoint: T) -> CommonResult<()> {
-        let db_path = &self.conf.data_dir;
+        let db_path = self.conf.data_dir.clone();
         let db_opt = self.conf.create_db_opt();
         let cfs = self.conf.create_cf_opt();
+        let checkpoint = checkpoint.as_ref();
 
-        //The database points to a temporary directory.
+        // The database points to a temporary directory while we prepare the restore.
         let tmp_path = Utils::temp_file();
         self.db = try_err!(DB::open(&db_opt, &tmp_path));
+        // Remove the original database directory before linking the checkpoint.
+        FileUtils::delete_path(&db_path, true)?;
 
-        // Delete the original file and move the checkpoint to the data directory.
-        FileUtils::delete_path(db_path, true)?;
-        FileUtils::rename(checkpoint.as_ref(), db_path)?;
+        try_err!(RocksUtils::link_dir(checkpoint, &db_path));
+        self.db = try_err!(DB::open_cf_with_opts(&db_opt, &db_path, cfs));
 
-        // Retry instantiating db and delete the temporary directory.
-        self.db = try_err!(DB::open_cf_with_opts(&db_opt, db_path, cfs));
-        let _ = FileUtils::delete_path(tmp_path, true);
+        // Now that self.db points to the restored DB and the temporary DB handle is dropped,
+        // it is safe to delete the temporary directory. Propagate any deletion error.
+        FileUtils::delete_path(&tmp_path, true)?;
 
         Ok(())
     }
@@ -204,6 +206,8 @@ impl DBEngine {
 
     // Create a checkpoint.
     pub fn create_checkpoint(&self, id: u64) -> CommonResult<String> {
+        self.flush(true)?;
+
         let checkpoint_path = self.get_checkpoint_path(id);
         let existed = FileUtils::exists(&checkpoint_path);
 
@@ -246,8 +250,10 @@ impl DBEngine {
         &self.db
     }
 
-    pub fn flush(&self) -> CommonResult<()> {
-        self.db.flush()?;
+    pub fn flush_mem(&self, sync: bool) -> CommonResult<()> {
+        let mut opts = FlushOptions::default();
+        opts.set_wait(sync);
+        self.db.flush_opt(&opts)?;
         Ok(())
     }
 
@@ -256,8 +262,16 @@ impl DBEngine {
         Ok(())
     }
 
+    pub fn flush(&self, sync: bool) -> CommonResult<()> {
+        if !self.conf.disable_wal {
+            self.flush_wal(sync)?;
+        }
+        self.flush_mem(sync)?;
+        Ok(())
+    }
+
     pub fn write_batch(&self, batch: WriteBatchWithTransaction<false>) -> CommonResult<()> {
-        try_err!(self.db.write(batch));
+        try_err!(self.db.write_opt(batch, &self.write_opt));
         Ok(())
     }
 

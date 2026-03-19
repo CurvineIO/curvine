@@ -102,7 +102,7 @@ impl BlockStore {
         // Update disk space.
         let state = self.read();
         let dir = state.find_dir(meta.dir_id())?;
-        dir.release_space(meta.is_final(), meta.len);
+        dir.release_space(meta.is_final(), meta.actual_len);
         drop(state);
 
         Ok(meta)

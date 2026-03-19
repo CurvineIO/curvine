@@ -21,9 +21,21 @@ message SnapshotFileList {
     repeated SnapshotFileInfo files = 2;
 }
 
+message AppliedIndex {
+    required uint64 term = 1;
+    required uint64 index = 2;
+    required uint64 op_id = 3;
+    required int64 rpc_id = 4;
+}
+
+message FsmState {
+    required AppliedIndex applied = 1;
+    required AppliedIndex ufs_applied = 2;
+}
+
 // Describe a snapshot.
 message SnapshotData {
-    // Snapshot id
+    // Snapshot id / applied index of the snapshot.
     required uint64 snapshot_id = 1;
 
     // Which node is the snapshot created.
@@ -35,6 +47,8 @@ message SnapshotData {
     optional bytes bytes_data = 4;
 
     optional SnapshotFileList files_data = 5;
+
+    required FsmState fsm_state = 6;
 }
 
 
@@ -75,12 +89,6 @@ message RaftRequest {
 }
 
 message RaftResponse {
-}
-
-message RaftStateStoreProto {
-    required eraftpb.HardState hard_state = 1;
-    required eraftpb.ConfState conf_state = 2;
-    required eraftpb.SnapshotMetadata snapshot = 3;
 }
 
 // Download snapshot request.

@@ -26,21 +26,17 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 fn get_fs() -> UnifiedFileSystem {
+    let testing = Testing::builder().workers(1).build().unwrap();
     // Check if UFS configuration is available, if not, skip the test
     if env::var("UFS_TEST_PATH").is_err() {
-        println!("⚠️  UFS_TEST_PATH is not set, skipping test");
-        println!(
-            "   Set UFS_TEST_PATH and UFS_TEST_PROPERTIES environment variables to run this test"
-        );
-        println!("   Example: export UFS_TEST_PATH=hdfs://127.0.0.1:9000");
-        println!("   Example: export UFS_TEST_PROPERTIES=\"hdfs.namenode=hdfs://127.0.0.1:9000,hdfs.user=root\"");
-        panic!("UFS_TEST_PATH is not set")
+        env::set_var("UFS_TEST_PATH", testing.ufs_path.clone());
     }
 
-    let testing = Testing::default();
+    testing.start_cluster().unwrap();
     let rt = Arc::new(AsyncRuntime::single());
     testing.get_unified_fs_with_rt(rt.clone()).unwrap()
 }
+
 #[test]
 fn test_cache_mode() {
     let fs = get_fs();
@@ -59,7 +55,7 @@ fn test_cache_mode() {
         let mtime_before = ufs_reader_before.status().mtime;
         drop(ufs_reader_before);
 
-        fs.async_cache(&path).await.unwrap();
+        fs.async_cache(&path).unwrap();
         fs.wait_job_complete(&path, false).await.unwrap();
 
         let ufs_reader_after = mnt.ufs.open(&ufs_path).await.unwrap();
@@ -95,13 +91,12 @@ async fn test_cache_read(fs: &UnifiedFileSystem, path: &Path) {
 
     let str1 = reader1.read_as_string().await.unwrap();
 
-    let (ufs_path, _) = fs.get_mount(path).await.unwrap().unwrap();
-    fs.wait_job_complete(&ufs_path, false).await.unwrap();
+    fs.wait_job_complete(path, false).await.unwrap();
 
     let mut reader2 = fs.open(path).await.unwrap();
     assert!(
-        matches!(reader2, UnifiedReader::Cv(_)),
-        "second read should be from curvine"
+        matches!(reader2, UnifiedReader::Fallback(_)),
+        "second read should be from curvine via FallbackFsReader"
     );
 
     let str2 = reader2.read_as_string().await.unwrap();
@@ -124,6 +119,7 @@ fn test_fs_mode() {
         let mut writer = fs.create(&path, true).await.unwrap();
         writer.write_string(Utils::rand_str(1024)).await.unwrap();
         writer.complete().await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
 
         let dst_path = format!("/write_cache_{:?}/meta_rename.log", WriteType::FsMode).into();
         fs.rename(&path, &dst_path).await.unwrap();
@@ -168,10 +164,10 @@ fn test_cache_mode_free() {
         let _ = fs.open(&path).await.unwrap();
         fs.wait_job_complete(&path, false).await.unwrap();
 
-        fs.free(&path).await.unwrap();
+        fs.free(&path, false).await.unwrap();
 
         // Check cache file exists
-        assert!(!fs.cv().exists(&path).await.unwrap());
+        assert!(fs.cv().exists(&path).await.unwrap());
 
         let reader = fs.open(&path).await.unwrap();
         assert!(!matches!(reader, UnifiedReader::Cv(_)));
@@ -193,10 +189,9 @@ fn test_fs_mode_free() {
         writer.complete().await.unwrap();
 
         let _ = fs.open(&path).await.unwrap();
-        let (ufs_path, _) = fs.get_mount(&path).await.unwrap().unwrap();
-        fs.wait_job_complete(&ufs_path, false).await.unwrap();
+        fs.wait_job_complete(&path, false).await.unwrap();
 
-        fs.free(&path).await.unwrap();
+        fs.free(&path, false).await.unwrap();
 
         let file_blocks = fs.cv().get_block_locations(&path).await.unwrap();
         println!("test_fs_mode_free status {:?}", file_blocks);
@@ -214,7 +209,7 @@ async fn prepare_fs_mode_file_then_free(fs: &UnifiedFileSystem, path: &Path, dat
     writer.complete().await.unwrap();
     let _ = fs.open(path).await.unwrap();
     fs.wait_job_complete(path, false).await.unwrap();
-    fs.free(path).await.unwrap();
+    fs.free(path, false).await.unwrap();
 }
 
 #[test]
@@ -237,8 +232,8 @@ fn test_fs_mode_ufs_write_overwrite() {
 
         let reader = fs.open(&path).await.unwrap();
         assert!(
-            matches!(reader, UnifiedReader::Cv(_)),
-            "read should return CV reader after overwrite and sync"
+            matches!(reader, UnifiedReader::Fallback(_)),
+            "read should return Fallback reader after overwrite and sync"
         );
 
         verify_read_data(&fs, &path, data_overwrite.as_bytes()).await;
@@ -267,8 +262,8 @@ fn test_fs_mode_ufs_write_append() {
 
         let reader = fs.open(&path).await.unwrap();
         assert!(
-            matches!(reader, UnifiedReader::Cv(_)),
-            "read should return CV reader after append and sync"
+            matches!(reader, UnifiedReader::Fallback(_)),
+            "read should return Fallback reader after append and sync"
         );
         let expected_append = format!("{}{}", data_initial, data_append_extra);
 
@@ -314,8 +309,8 @@ fn test_fs_mode_ufs_write_random() {
         fs.wait_job_complete(&path, false).await.unwrap();
         let reader = fs.open(&path).await.unwrap();
         assert!(
-            matches!(reader, UnifiedReader::Cv(_)),
-            "read should return CV reader after random write and sync"
+            matches!(reader, UnifiedReader::Fallback(_)),
+            "read should return Fallback reader after random write and sync"
         );
 
         verify_read_data(&fs, &path, &expected).await;

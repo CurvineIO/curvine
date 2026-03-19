@@ -15,7 +15,7 @@
 use crate::file::{FsReader, FsWriter};
 use crate::impl_filesystem_for_enum;
 use crate::{impl_reader_for_enum, impl_writer_for_enum};
-use curvine_common::fs::Path;
+use curvine_common::fs::{FileSystem, Path};
 use curvine_common::state::{MountInfo, Provider};
 use curvine_common::FsResult;
 use orpc::err_box;
@@ -26,9 +26,6 @@ use curvine_ufs::opendal::*;
 
 #[cfg(feature = "oss-hdfs")]
 use curvine_ufs::oss_hdfs::*;
-
-// Storage schemes
-pub const S3_SCHEME: &str = "s3";
 
 pub mod macros;
 
@@ -43,6 +40,9 @@ pub use self::cache_sync_writer::CacheSyncWriter;
 
 mod cache_sync_reader;
 pub use self::cache_sync_reader::CacheSyncReader;
+
+mod fallback_fs_reader;
+pub use self::fallback_fs_reader::FallbackFsReader;
 
 #[allow(clippy::large_enum_variant)]
 pub enum UnifiedWriter {
@@ -77,6 +77,8 @@ pub enum UnifiedReader {
 
     CacheSync(CacheSyncReader),
 
+    Fallback(FallbackFsReader),
+
     #[cfg(feature = "opendal")]
     Opendal(OpendalReader),
 
@@ -90,6 +92,30 @@ impl_reader_for_enum! {
 
         CacheSync(CacheSyncReader),
 
+        Fallback(FallbackFsReader),
+
+        #[cfg(feature = "opendal")]
+        Opendal(OpendalReader),
+
+        #[cfg(feature = "oss-hdfs")]
+        OssHdfs(OssHdfsReader),
+    }
+}
+
+/// A non-recursive UFS-only reader used inside FallbackFsReader.
+/// Unlike UnifiedReader, this never contains FallbackFsReader, which
+/// breaks the recursive type/async-fn cycle.
+#[allow(clippy::large_enum_variant)]
+pub enum UfsReader {
+    #[cfg(feature = "opendal")]
+    Opendal(OpendalReader),
+
+    #[cfg(feature = "oss-hdfs")]
+    OssHdfs(OssHdfsReader),
+}
+
+impl_reader_for_enum! {
+    enum UfsReader {
         #[cfg(feature = "opendal")]
         Opendal(OpendalReader),
 
@@ -141,7 +167,7 @@ impl UfsFileSystem {
 
             (Provider::Opendal, Some(scheme))
                 if [
-                    "s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs",
+                    "s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs", "file",
                 ]
                 .contains(&scheme) =>
             {
@@ -207,7 +233,10 @@ impl UfsFileSystem {
             // Other schemes with auto provider
             #[cfg(feature = "opendal")]
             (Provider::Auto, Some(scheme))
-                if ["s3", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs"].contains(&scheme) =>
+                if [
+                    "s3", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs", "file",
+                ]
+                .contains(&scheme) =>
             {
                 let fs = OpendalFileSystem::new(path, conf)?;
                 Ok(UfsFileSystem::Opendal(fs))
@@ -231,5 +260,17 @@ impl UfsFileSystem {
     pub fn with_mount(mnt: &MountInfo) -> FsResult<Self> {
         let path = Path::from_str(&mnt.ufs_path)?;
         Self::new(&path, mnt.properties.clone(), mnt.provider)
+    }
+
+    /// Opens a UFS reader without wrapping it in UnifiedReader.
+    /// Used by FallbackFsReader to avoid a recursive type cycle.
+    pub async fn open_ufs(&self, path: &Path) -> FsResult<UfsReader> {
+        match self {
+            #[cfg(feature = "opendal")]
+            UfsFileSystem::Opendal(fs) => Ok(UfsReader::Opendal(fs.open(path).await?)),
+
+            #[cfg(feature = "oss-hdfs")]
+            UfsFileSystem::OssHdfs(fs) => Ok(UfsReader::OssHdfs(fs.open(path).await?)),
+        }
     }
 }

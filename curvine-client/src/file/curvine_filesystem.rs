@@ -19,6 +19,7 @@ use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
+use curvine_common::state::FreeResult;
 use curvine_common::proto::SmallFileMetaProto;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
@@ -188,8 +189,8 @@ impl CurvineFileSystem {
         self.fs_client.delete(path, recursive).await
     }
 
-    pub async fn free(&self, path: &Path) -> FsResult<()> {
-        self.fs_client.free(path).await
+    pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
+        self.fs_client.free(path, recursive).await
     }
 
     pub async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {

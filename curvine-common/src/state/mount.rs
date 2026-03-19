@@ -350,7 +350,29 @@ impl TryFrom<&str> for WriteType {
 #[cfg(test)]
 mod tests {
     use crate::fs::Path;
-    use crate::state::MountInfo;
+    use crate::state::{MountInfo, WriteType};
+
+    #[test]
+    fn test_is_fs_mode_resync_guard() {
+        // resync is only allowed when mount is fs_mode
+        let fs_mode_mount = MountInfo {
+            cv_path: "/mnt/fs".to_string(),
+            ufs_path: "s3://b/k".to_string(),
+            write_type: WriteType::FsMode,
+            ..Default::default()
+        };
+        assert!(fs_mode_mount.is_fs_mode());
+        assert!(!fs_mode_mount.is_cache_mode());
+
+        let cache_mode_mount = MountInfo {
+            cv_path: "/mnt/cache".to_string(),
+            ufs_path: "s3://b/k".to_string(),
+            write_type: WriteType::CacheMode,
+            ..Default::default()
+        };
+        assert!(!cache_mode_mount.is_fs_mode());
+        assert!(cache_mode_mount.is_cache_mode());
+    }
 
     #[test]
     fn test_path_cst() {

@@ -18,21 +18,20 @@ use crate::OssHdfsConf;
 use crate::{err_ufs, FOLDER_SUFFIX};
 use bytes::BytesMut;
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path, Reader, Writer};
+use curvine_common::fs::{FileSystem, FsKind, Path, Reader, Writer};
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
 use curvine_common::FsResult;
 use futures::StreamExt;
+use opendal::options::ListOptions;
 use opendal::services::*;
 use opendal::{
     layers::{LoggingLayer, RetryLayer, TimeoutLayer},
-    Metadata, Operator,
+    ErrorKind, Metadata, Operator,
 };
 use orpc::sys::DataSlice;
 use orpc::{err_box, err_ext, try_option_mut};
 use std::collections::HashMap;
 use std::time::Duration;
-
-pub const HDFS_SCHEMA: &str = "hdfs";
 
 /// OpenDAL Reader implementation
 pub struct OpendalReader {
@@ -102,7 +101,7 @@ impl Reader for OpendalReader {
             if let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => Ok(DataSlice::Bytes(chunk)),
-                    Err(e) => Err(FsError::common(format!("Failed to read chunk: {}", e))),
+                    Err(e) => err_box!("Failed to read chunk: {}", e),
                 }
             } else {
                 Ok(DataSlice::Empty)
@@ -114,42 +113,19 @@ impl Reader for OpendalReader {
 
     async fn seek(&mut self, pos: i64) -> FsResult<()> {
         if pos < 0 || pos > self.length {
-            return Err(FsError::common("Invalid seek position"));
+            return err_box!("Invalid seek position");
         }
 
-        // If seeking backward or forward significantly, reset the stream
-        if pos < self.pos || pos > self.pos + (self.chunk_size as i64 * 2) {
-            self.byte_stream = None;
-            self.chunk = DataSlice::Empty;
+        if pos == self.pos {
+            return Ok(());
+        }
 
-            // Create new stream starting from the seek position
-            let reader = self
-                .operator
-                .reader_with(&self.object_path)
-                .chunk(self.chunk_size)
-                .await
-                .map_err(|e| FsError::common(format!("Failed to create reader: {}", e)))?;
-
-            self.byte_stream = Some(
-                reader
-                    .into_bytes_stream(pos as u64..self.length as u64)
-                    .await
-                    .map_err(|e| FsError::common(format!("Failed to create stream: {}", e)))?,
-            );
+        let to_skip = pos - self.pos;
+        if to_skip >= 0 && to_skip <= self.chunk.len() as i64 {
+            self.chunk.advance(to_skip as usize);
         } else {
-            // Skip forward in the current stream
-            while self.pos < pos {
-                let skip_bytes = (pos - self.pos).min(self.chunk_size as i64) as usize;
-                if self.chunk.is_empty() {
-                    self.chunk = self.read_chunk0().await?;
-                }
-                if self.chunk.is_empty() {
-                    break;
-                }
-                let actual_skip = skip_bytes.min(self.chunk.len());
-                self.chunk.advance(actual_skip);
-                self.pos += actual_skip as i64;
-            }
+            self.chunk.clear();
+            self.byte_stream = None;
         }
 
         self.pos = pos;
@@ -210,8 +186,8 @@ impl Writer for OpendalWriter {
             );
         }
 
-        let data = bytes::Bytes::copy_from_slice(chunk.as_slice());
-        let len = data.len() as i64;
+        let data = chunk.to_bytes();
+        let len = data.len();
 
         let writer = try_option_mut!(self.writer);
         writer
@@ -219,7 +195,7 @@ impl Writer for OpendalWriter {
             .await
             .map_err(|e| FsError::common(format!("Failed to write: {}", e)))?;
 
-        Ok(len)
+        Ok(len as i64)
     }
 
     async fn flush(&mut self) -> FsResult<()> {
@@ -300,6 +276,15 @@ impl OpendalFileSystem {
             .to_string();
 
         let operator = match scheme {
+            FsKind::SCHEME_FILE => {
+                let builder = Fs::default().root("/");
+                let base_op = Operator::new(builder)
+                    .map_err(|e| FsError::common(format!("Failed to create FS operator: {}", e)))?
+                    .finish();
+
+                Self::add_stability_layers(base_op, &conf)?
+            }
+
             // OSS native implementation (higher priority than HDFS-based OSS)
             #[cfg(feature = "opendal-oss")]
             "oss" => {
@@ -499,7 +484,7 @@ impl OpendalFileSystem {
                 Self::add_stability_layers(base_op, &conf)?
             }
 
-            #[cfg(feature = "opendal-hdfs-native")]
+            #[cfg(all(feature = "opendal-hdfs-native", not(feature = "opendal-hdfs")))]
             "hdfs" => Self::create_hdfs_native_operator(&bucket_or_container, &conf)?,
 
             _ => {
@@ -587,7 +572,7 @@ impl OpendalFileSystem {
     fn get_object_path(&self, path: &Path) -> FsResult<String> {
         match path.path().strip_prefix('/') {
             Some(v) => Ok(v.to_string()),
-            None => err_box!("path {} invalid", path),
+            None => Ok(path.path().to_string()),
         }
     }
 
@@ -653,7 +638,7 @@ impl OpendalFileSystem {
         match self.operator.stat(object_path).await {
             Ok(m) => Ok(Some(m)),
             Err(e) => {
-                if e.kind() == opendal::ErrorKind::NotFound {
+                if e.kind() == ErrorKind::NotFound {
                     Ok(None)
                 } else {
                     err_box!(format!("failed to stat: {}", e))
@@ -663,20 +648,10 @@ impl OpendalFileSystem {
     }
 
     pub async fn get_file_status(&self, path: &Path) -> FsResult<Option<FileStatus>> {
-        let path_str = path.full_path();
-
-        let likely_dir = if path_str.ends_with('/') {
-            true
-        } else {
-            let name = path.name();
-            let has_extension = name.contains('.') && !name.starts_with('.');
-            !has_extension
-        };
-
-        let (first_path, second_path) = if likely_dir {
-            (self.get_dir_path(path)?, self.get_object_path(path)?)
-        } else {
+        let (first_path, second_path) = if path.likely_file() {
             (self.get_object_path(path)?, self.get_dir_path(path)?)
+        } else {
+            (self.get_dir_path(path)?, self.get_object_path(path)?)
         };
 
         let mut metadata = self.get_object_status(&first_path).await?;
@@ -690,6 +665,10 @@ impl OpendalFileSystem {
 }
 
 impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
+    fn fs_kind(&self) -> FsKind {
+        FsKind::from_scheme(&self.scheme)
+    }
+
     // Creates a directory; the directory must end with "/".
     // OpenDal always creates directories recursively.
     async fn mkdir(&self, path: &Path, _create_parent: bool) -> FsResult<bool> {
@@ -703,12 +682,18 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
         Ok(true)
     }
 
-    /// OpenDal only supports overwrite, so the overwrite parameter is ignored here.
+    /// Create a new file or open for overwrite. When overwrite is false and the path exists, returns file_exists.
+    /// Empty file is written only when the path does not exist (POSIX-like); when overwrite is true we defer to the first write.
     async fn create(&self, path: &Path, overwrite: bool) -> FsResult<OpendalWriter> {
         let object_path = self.get_object_path(path)?;
 
         let exist = self.get_object_status(&object_path).await?.is_some();
-        if !exist || overwrite {
+
+        if exist && !overwrite {
+            return err_ext!(FsError::file_exists(path.full_path()));
+        }
+
+        if !exist {
             // If no data is written to OpenDal, no file will be created.
             // This does not conform to POSIX semantics, so an empty file is created.
             self.operator
@@ -737,8 +722,9 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     }
 
     async fn append(&self, path: &Path) -> FsResult<OpendalWriter> {
-        // OpenDAL doesn't support append for most backends
-        // For now, return an error
+        // Most OpenDAL backends do not support true append; large files return unsupported.
+        // For small files we return a Writer with existing content in chunk, but write_chunk uses operator.writer() which overwrites instead of appending,
+        // so the current behavior is semantically wrong and only safe for "read existing, do not write"; real append would need read-all + concat + write in complete().
         let object_path = self.get_object_path(path)?;
         let status = self.get_file_status(path).await?;
 
@@ -803,58 +789,95 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
     }
 
     async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
-        let src_path = self.get_object_path(src)?;
-        let dst_path = self.get_object_path(dst)?;
-
-        // Try direct rename first
-        match self.operator.rename(&src_path, &dst_path).await {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
-                self.operator
-                    .copy(&src_path, &dst_path)
-                    .await
-                    .map_err(|e| {
-                        FsError::common(format!("failed to copy source file for rename: {}", e))
-                    })?;
-
-                // Delete source file
-                self.operator.delete(&src_path).await.map_err(|e| {
-                    FsError::common(format!("failed to delete source file after rename: {}", e))
-                })?;
-
-                Ok(true)
-            }
-
-            Err(e) => Err(FsError::common(format!("failed to rename: {}", e))),
+        if dst.is_root() {
+            return err_box!("cannot rename to root directory");
         }
+
+        if src.full_path() == dst.full_path() {
+            return Ok(false);
+        }
+
+        let Some(src_status) = self.get_file_status(src).await? else {
+            return err_ext!(FsError::file_not_found(src.full_path()));
+        };
+
+        if src_status.is_dir {
+            let src_path = self.get_dir_path(src)?;
+            let dst_path = self.get_dir_path(dst)?;
+            if let Err(e) = self.operator.rename(&src_path, &dst_path).await {
+                if matches!(e.kind(), ErrorKind::Unsupported | ErrorKind::IsADirectory) {
+                    return err_ext!(FsError::unsupported(
+                        "rename directory on this backend (e.g. S3)"
+                    ));
+                }
+                return Err(FsError::from_error(e));
+            }
+        } else {
+            let src_path = self.get_object_path(src)?;
+            let dst_path = self.get_object_path(dst)?;
+            if let Err(e) = self.operator.rename(&src_path, &dst_path).await {
+                if e.kind() == ErrorKind::Unsupported {
+                    self.operator
+                        .copy(&src_path, &dst_path)
+                        .await
+                        .map_err(FsError::from_error)?;
+                    self.operator
+                        .delete(&src_path)
+                        .await
+                        .map_err(FsError::from_error)?;
+                } else {
+                    return Err(FsError::from_error(e));
+                }
+            }
+        }
+
+        Ok(true)
     }
 
     async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
-        let object_path = self.get_object_path(path)?;
+        if path.is_root() {
+            return err_box!("cannot delete root directory");
+        }
 
-        if recursive {
-            // Check if it's a directory
-            match self.operator.stat(&object_path).await {
-                Ok(metadata) if metadata.is_dir() => self.operator.remove_all(&object_path).await,
-                _ => self.operator.delete(&object_path).await,
+        let Some(status) = self.get_file_status(path).await? else {
+            return err_ext!(FsError::file_not_found(path.full_path()));
+        };
+
+        if status.is_dir {
+            let dir_path = self.get_dir_path(path)?;
+            if recursive {
+                self.operator
+                    .remove_all(&dir_path)
+                    .await
+                    .map_err(FsError::from_error)?;
+            } else {
+                let opts = ListOptions {
+                    limit: Some(2),
+                    ..Default::default()
+                };
+                let mut list = self
+                    .operator
+                    .lister_options(&dir_path, opts)
+                    .await
+                    .map_err(FsError::from_error)?;
+
+                if let Some(result) = list.next().await {
+                    // Propagate any error from listing instead of treating it as a non-empty directory.
+                    result.map_err(FsError::from_error)?;
+                    // If we successfully retrieved an entry, the directory is not empty.
+                    return err_ext!(FsError::dir_not_empty(path.full_path()));
+                }
+                self.operator
+                    .delete(&dir_path)
+                    .await
+                    .map_err(FsError::from_error)?;
             }
-            .map_err(|e| FsError::common(format!("Failed to delete recursive: {}", e)))?;
         } else {
-            // Try to delete as file first
+            let object_path = self.get_object_path(path)?;
             self.operator
                 .delete(&object_path)
                 .await
-                .map_err(|e| FsError::common(format!("Failed to delete file: {}", e)))?;
-
-            // Also try to delete as directory marker (with suffix)
-            // S3 delete is idempotent, so it's safe to try deleting the marker even if it doesn't exist
-            // or if we just deleted a file.
-            let dir_path = self.get_dir_path(path)?;
-            if dir_path != object_path {
-                self.operator.delete(&dir_path).await.map_err(|e| {
-                    FsError::common(format!("Failed to delete directory marker: {}", e))
-                })?;
-            }
+                .map_err(FsError::from_error)?;
         }
 
         Ok(())

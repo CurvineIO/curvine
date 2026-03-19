@@ -26,7 +26,7 @@ use curvine_common::state::{
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use futures::future;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use orpc::err_box;
 use std::collections::LinkedList;
@@ -83,15 +83,7 @@ impl LoadJobRunner {
 
         // Skip based on data state (even when job is None, e.g. after job cleanup)
         if source_path.is_cv() {
-            // cv -> ufs: if CV's ufs_mtime already set, data already copied to UFS, skip
-            let source_status = self.master_fs.file_status(source_path.path())?;
-            if source_status.is_dir {
-                Ok(false)
-            } else if source_status.ufs_exists() {
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+            Ok(false)
         } else {
             // ufs -> cv: if CV exists and ufs_mtime matches UFS mtime, data already synced, skip
             let source_status = mnt.ufs.get_status(source_path).await?;
@@ -120,27 +112,6 @@ impl LoadJobRunner {
         let target_path = mnt.toggle_path(&source_path)?;
 
         let job_id = CommonUtils::create_job_id(source_path.full_path());
-        let result = LoadJobResult {
-            job_id: job_id.clone(),
-            target_path: target_path.clone_uri(),
-        };
-
-        let mnt_value = self.factory.get_mnt(&mnt)?;
-        if self
-            .check_job_exists(&job_id, &mnt_value, &source_path, &target_path)
-            .await?
-        {
-            info!(
-                "job {}, source_path {} already exists",
-                job_id,
-                source_path.full_path()
-            );
-            return Ok(result);
-        }
-
-        self.jobs.remove(&job_id);
-
-        info!("Submitting load job {}", job_id);
         let mut job_context = JobContext::with_conf(
             &command,
             job_id.clone(),
@@ -150,30 +121,65 @@ impl LoadJobRunner {
             &ClientConf::default(),
         );
 
+        let mnt_value = self.factory.get_mnt(&mnt)?;
+        if self
+            .check_job_exists(&job_id, &mnt_value, &source_path, &target_path)
+            .await?
+        {
+            info!(
+                "skip load job {}: source_path {} already loaded or in progress",
+                job_id,
+                source_path.full_path()
+            );
+            return if let Some(existing_ctx) = self.jobs.get(&job_id) {
+                Ok(LoadJobResult::with_state(
+                    &existing_ctx.info,
+                    existing_ctx.state.state(),
+                ))
+            } else {
+                Ok(LoadJobResult::with_state(
+                    &job_context.info,
+                    JobTaskState::Completed,
+                ))
+            };
+        }
+
+        self.jobs.remove(&job_id);
+
+        debug!(
+            "submitting load job {}: {} -> {}",
+            job_id,
+            source_path.full_path(),
+            target_path.full_path()
+        );
+
         let res = self
             .create_all_tasks(&mut job_context, &source_path, &mnt)
             .await;
 
         match res {
             Err(e) => {
-                warn!("Create load job {} failed: {}", job_id, e);
+                warn!("create load job {} failed: {}", job_id, e);
                 Err(e)
             }
 
             Ok(size) => {
                 info!(
-                    "Submit load job {} success, tasks {}, total_size {}",
+                    "load job {} submitted: {} -> {}, tasks {}, total_size {}",
                     job_id,
+                    source_path.full_path(),
+                    target_path.full_path(),
                     job_context.tasks.len(),
                     ByteUnit::byte_to_string(size as u64)
                 );
 
                 let tasks = job_context.tasks.clone();
+                let res = LoadJobResult::with_job(&job_context.info);
                 self.jobs.insert(job_id, job_context);
                 // @todo Whether to cancel some tasks that may have been dispatched.
                 self.submit_all_task(tasks).await?;
 
-                Ok(result)
+                Ok(res)
             }
         }
     }
@@ -183,9 +189,10 @@ impl LoadJobRunner {
             .take()
             .into_iter()
             .map(|(id, task)| async move {
-                let client = self.factory.get_worker_client(&task.task.worker).await?;
+                let worker = task.task.worker.clone();
+                let client = self.factory.get_worker_client(&worker).await?;
                 client.submit_load_task(task.task).await?;
-                info!("Submit sub-task {}", id);
+                debug!("dispatched sub-task {} to worker {}", id, worker);
                 Ok::<(), FsError>(())
             })
             .collect();
@@ -276,7 +283,12 @@ impl LoadJobRunner {
                         self.job_max_files
                     );
                 }
-                info!("Added sub-task {}", task_id);
+                debug!(
+                    "created sub-task {} ({} -> {})",
+                    task_id,
+                    source_path.full_path(),
+                    target_path.full_path()
+                );
             }
         }
 
@@ -294,17 +306,11 @@ impl LoadJobRunner {
             let res = client.cancel_job(job_id).await;
 
             if let Err(e) = res {
-                error!(
-                    "Failed to send cancel load request to worker{}: {}",
-                    worker, e
-                );
+                error!("failed to send cancel request to worker {}: {}", worker, e);
                 self.jobs.update_state(
                     job_id,
                     JobTaskState::Canceled,
-                    format!(
-                        "Failed to send cancel load request to worker {}: {}",
-                        worker, e
-                    ),
+                    format!("failed to send cancel request to worker {}: {}", worker, e),
                 );
             }
         }

@@ -112,9 +112,12 @@ message DeleteResponse {}
 
 message FreeRequest {
     required string path = 1;
+    required bool recursive = 2;
 }
 
-message FreeResponse {}
+message FreeResponse {
+    required FreeResultProto res = 1;
+}
 
 message GetFileStatusRequest {
     required string path = 1;

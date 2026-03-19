@@ -16,49 +16,35 @@
 
 use crate::master::journal::*;
 use crate::master::meta::inode::{InodeDir, InodeFile, InodePath, InodeView};
+use crate::master::meta::FsDir;
 use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::raft::RaftClient;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, RenameFlags, SetAttrOpts};
 use curvine_common::FsResult;
-use log::info;
+use log::{debug, info};
+use orpc::common::LocalTime;
 use orpc::err_box;
+use orpc::sync::channel::{BlockingChannel, BlockingReceiver, BlockingSender};
+use orpc::sync::AtomicCounter;
 use orpc::sys::RawPtr;
-use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
-use std::sync::{mpsc, Mutex};
-
-enum SenderAdapter {
-    Bounded(SyncSender<JournalEntry>),
-    UnBounded(Sender<JournalEntry>),
-}
-
-impl SenderAdapter {
-    fn send(&self, entry: JournalEntry) -> Result<(), SendError<JournalEntry>> {
-        match self {
-            SenderAdapter::Bounded(s) => s.send(entry),
-            SenderAdapter::UnBounded(s) => s.send(entry),
-        }
-    }
-}
+use std::sync::Mutex;
 
 // Write metadata operation logs.
 pub struct JournalWriter {
     enable: bool,
-    debug: bool,
-    sender: SenderAdapter,
+    node_id: u64,
+    sender: BlockingSender<JournalEntry>,
     metrics: &'static MasterMetrics,
-    receiver: Option<Mutex<Receiver<JournalEntry>>>,
+    receiver: Option<Mutex<BlockingReceiver<JournalEntry>>>,
+
+    snapshot_entries: u64,
+    entries_since_snapshot: AtomicCounter,
 }
 
 impl JournalWriter {
     pub fn new(testing: bool, client: RaftClient, conf: &JournalConf) -> Self {
-        let (sender, receiver) = if conf.writer_channel_size == 0 {
-            let (sender, receiver) = mpsc::channel();
-            (SenderAdapter::UnBounded(sender), receiver)
-        } else {
-            let (sender, receiver) = mpsc::sync_channel(conf.writer_channel_size);
-            (SenderAdapter::Bounded(sender), receiver)
-        };
+        let (sender, receiver) = BlockingChannel::new(conf.writer_channel_size).split();
 
         let receiver = if !testing {
             // Start the send log thread.
@@ -71,51 +57,94 @@ impl JournalWriter {
 
         Self {
             enable: conf.enable,
-            debug: conf.writer_debug,
+            node_id: conf.node_id().unwrap(),
             sender,
             metrics: Master::get_metrics(),
             receiver,
+            snapshot_entries: conf.snapshot_entries,
+            entries_since_snapshot: AtomicCounter::new(0),
         }
     }
 
-    fn send(&self, entry: JournalEntry) -> FsResult<()> {
-        if self.debug {
-            info!("send {:?}", entry);
-        }
+    fn send_inner(&self, entry: JournalEntry) -> FsResult<()> {
+        debug!("send_entry {:?}", entry);
+        self.sender.send(entry)?;
+        self.metrics.journal_queue_len.inc();
+        Ok(())
+    }
 
+    fn send(&self, fs_dir: &FsDir, entry: JournalEntry) -> FsResult<()> {
         if self.enable {
-            self.sender.send(entry)?;
-            self.metrics.journal_queue_len.inc();
+            self.send_inner(entry)?;
+            self.maybe_emit_snapshot(fs_dir)?;
         }
         Ok(())
     }
 
-    pub fn log_mkdir(&self, op_ms: u64, path: impl AsRef<str>, dir: &InodeDir) -> FsResult<()> {
+    fn maybe_emit_snapshot(&self, fs_dir: &FsDir) -> FsResult<()> {
+        if self.snapshot_entries == 0 {
+            return Ok(());
+        }
+
+        let entries = self.entries_since_snapshot.add_and_get(1);
+        if entries < self.snapshot_entries {
+            return Ok(());
+        }
+
+        let now = LocalTime::mills();
+        self.entries_since_snapshot.set(0);
+        let dir = match fs_dir.store.create_checkpoint(now) {
+            Ok(d) => d,
+            Err(e) => {
+                return err_box!("leaderSnapshot: create_checkpoint failed: {}", e);
+            }
+        };
+
+        info!(
+            "create leader snapshot, dir {}, entries {}, cost {} ms, inode_id {}",
+            dir,
+            entries,
+            LocalTime::mills() - now,
+            fs_dir.inode_id.current()
+        );
+
+        self.send_inner(JournalEntry::Snapshot(SnapshotEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            node_id: self.node_id,
+            dir,
+        }))?;
+        Ok(())
+    }
+
+    pub fn log_mkdir(&self, fs_dir: &FsDir, path: impl AsRef<str>, dir: &InodeDir) -> FsResult<()> {
         let entry = MkdirEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             path: path.as_ref().to_string(),
             dir: dir.clone(),
         };
-        self.send(JournalEntry::Mkdir(entry))
+        self.send(fs_dir, JournalEntry::Mkdir(entry))
     }
 
     pub fn log_reopen_file<P: AsRef<str>>(
         &self,
-        op_ms: u64,
+        fs_dir: &FsDir,
         path: P,
         file: &InodeFile,
     ) -> FsResult<()> {
         let entry = ReopenFileEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             path: path.as_ref().to_string(),
             file: file.clone(),
         };
-        self.send(JournalEntry::ReopenFile(entry))
+        self.send(fs_dir, JournalEntry::ReopenFile(entry))
     }
 
     pub fn log_add_block<P: AsRef<str>>(
         &self,
-        op_ms: u64,
+        fs_dir: &FsDir,
         path: P,
         inode: RawPtr<InodeView>,
         commit_block: Vec<CommitBlock>,
@@ -127,141 +156,187 @@ impl JournalWriter {
         };
 
         let entry = AddBlockEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             path: path.as_ref().to_string(),
             blocks,
             commit_block,
         };
-
-        self.send(JournalEntry::AddBlock(entry))
+        self.send(fs_dir, JournalEntry::AddBlock(entry))
     }
 
     pub fn log_complete_inode_entry<P: AsRef<str>>(
         &self,
-        op_ms: u64,
+        fs_dir: &FsDir,
         path: P,
         inode: RawPtr<InodeView>,
         commit_blocks: Vec<CommitBlock>,
     ) -> FsResult<()> {
         let entry = CompleteInodeEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             path: path.as_ref().to_string(),
             inode: inode.as_ref().clone(),
             commit_blocks,
         };
-        self.send(JournalEntry::CompleteInode(entry))
+        self.send(fs_dir, JournalEntry::CompleteInode(entry))
     }
 
-    pub fn log_overwrite_file(&self, op_ms: u64, inp: &InodePath) -> FsResult<()> {
+    pub fn log_overwrite_file(&self, fs_dir: &FsDir, inp: &InodePath) -> FsResult<()> {
         let entry = OverWriteFileEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             path: inp.path().to_string(),
             file: inp.clone_last_file()?,
         };
-        self.send(JournalEntry::OverWriteFile(entry))
+        self.send(fs_dir, JournalEntry::OverWriteFile(entry))
     }
 
     pub fn log_rename<P: AsRef<str>>(
         &self,
-        op_ms: u64,
+        fs_dir: &FsDir,
         src: P,
         dst: P,
         mtime: i64,
         flags: RenameFlags,
     ) -> FsResult<()> {
         let entry = RenameEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             src: src.as_ref().to_string(),
             dst: dst.as_ref().to_string(),
             mtime,
             flags: flags.value(),
         };
-
-        self.send(JournalEntry::Rename(entry))
+        self.send(fs_dir, JournalEntry::Rename(entry))
     }
 
-    pub fn log_delete<P: AsRef<str>>(&self, op_ms: u64, path: P, mtime: i64) -> FsResult<()> {
+    pub fn log_delete<P: AsRef<str>>(&self, fs_dir: &FsDir, path: P, mtime: i64) -> FsResult<()> {
         let entry = DeleteEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             path: path.as_ref().to_string(),
             mtime,
         };
-        self.send(JournalEntry::Delete(entry))
+        self.send(fs_dir, JournalEntry::Delete(entry))
     }
 
-    pub fn log_free<P: AsRef<str>>(&self, op_ms: u64, path: P, mtime: i64) -> FsResult<()> {
+    pub fn log_free<P: AsRef<str>>(
+        &self,
+        fs_dir: &FsDir,
+        path: P,
+        mtime: i64,
+        recursive: bool,
+    ) -> FsResult<()> {
         let entry = FreeEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             path: path.as_ref().to_string(),
             mtime,
+            recursive,
         };
-        self.send(JournalEntry::Free(entry))
+        self.send(fs_dir, JournalEntry::Free(entry))
     }
 
-    pub fn log_mount(&self, op_ms: u64, info: MountInfo) -> FsResult<()> {
-        let entry = MountEntry { op_ms, info };
-
-        self.send(JournalEntry::Mount(entry))
+    pub fn log_mount(&self, fs_dir: &FsDir, info: MountInfo) -> FsResult<()> {
+        let entry = MountEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            info,
+        };
+        self.send(fs_dir, JournalEntry::Mount(entry))
     }
 
-    pub fn log_unmount(&self, op_ms: u64, id: u32) -> FsResult<()> {
-        let entry = UnMountEntry { op_ms, id };
-        if self.debug {
-            info!("send {:?}", entry);
-        }
-        self.send(JournalEntry::UnMount(entry))
+    pub fn log_unmount(&self, fs_dir: &FsDir, id: u32) -> FsResult<()> {
+        let entry = UnMountEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            id,
+        };
+        self.send(fs_dir, JournalEntry::UnMount(entry))
     }
 
-    pub fn log_set_attr(&self, op_ms: u64, inp: &InodePath, opts: SetAttrOpts) -> FsResult<()> {
+    pub fn log_set_attr(&self, fs_dir: &FsDir, inp: &InodePath, opts: SetAttrOpts) -> FsResult<()> {
         let entry = SetAttrEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             path: inp.path().to_string(),
             opts,
         };
-        self.send(JournalEntry::SetAttr(entry))
+        self.send(fs_dir, JournalEntry::SetAttr(entry))
     }
 
     pub fn log_symlink<P: AsRef<str>>(
         &self,
-        op_ms: u64,
+        fs_dir: &FsDir,
         link: P,
         new_inode: InodeFile,
         force: bool,
     ) -> FsResult<()> {
         let entry = SymlinkEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             link: link.as_ref().to_string(),
             new_inode,
             force,
         };
-        self.send(JournalEntry::Symlink(entry))
+        self.send(fs_dir, JournalEntry::Symlink(entry))
     }
 
-    pub fn log_link<P: AsRef<str>>(&self, op_ms: u64, src_path: P, dst_path: P) -> FsResult<()> {
+    pub fn log_link<P: AsRef<str>>(
+        &self,
+        fs_dir: &FsDir,
+        src_path: P,
+        dst_path: P,
+    ) -> FsResult<()> {
         let entry = LinkEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            mtime: LocalTime::mills() as i64,
             src_path: src_path.as_ref().to_string(),
             dst_path: dst_path.as_ref().to_string(),
         };
-        self.send(JournalEntry::Link(entry))
+        self.send(fs_dir, JournalEntry::Link(entry))
     }
 
-    pub fn log_set_locks(&self, op_ms: u64, ino: i64, locks: Vec<FileLock>) -> FsResult<()> {
-        let entry = SetLocksEntry { op_ms, ino, locks };
-        self.send(JournalEntry::SetLocks(entry))
+    pub fn log_ufs_applied(&self, op_id: u64, term: u64, index: u64) -> FsResult<()> {
+        if !self.enable {
+            return Ok(());
+        }
+
+        let entry = UfsAppliedEntry {
+            op_id,
+            rpc_id: 0,
+            term,
+            index,
+        };
+        self.metrics.journal_queue_len.inc();
+        self.sender.send(JournalEntry::UfsApplied(entry))?;
+
+        Ok(())
+    }
+
+    pub fn log_set_locks(&self, fs_dir: &FsDir, ino: i64, locks: Vec<FileLock>) -> FsResult<()> {
+        let entry = SetLocksEntry {
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
+            ino,
+            locks,
+        };
+        self.send(fs_dir, JournalEntry::SetLocks(entry))
     }
 
     // for testing
     pub fn take_entries(&self) -> Vec<JournalEntry> {
         let mut entries = vec![];
-
-        while let Ok(v) = self.receiver.as_ref().unwrap().lock().unwrap().try_recv() {
+        let receiver = self.receiver.as_ref().unwrap().lock().unwrap();
+        while let Ok(v) = receiver.recv_check() {
             entries.push(v)
         }
         entries
     }
 
-    pub fn log_create_inode_entry(&self, op_ms: u64, inode_path: &InodePath) -> FsResult<()> {
+    pub fn log_create_inode_entry(&self,fs_dir: &FsDir, op_ms: u64, inode_path: &InodePath) -> FsResult<()> {
         let inode_entry = inode_path.get_last_inode().unwrap();
         let entry = CreateInodeEntry {
             op_ms,
@@ -269,7 +344,7 @@ impl JournalWriter {
             inode_entry: inode_entry.as_ref().clone(),
         };
 
-        let _ = self.send(JournalEntry::CreateInode(entry));
+        let _ = self.send(fs_dir, JournalEntry::CreateInode(entry));
 
         Ok(())
     }

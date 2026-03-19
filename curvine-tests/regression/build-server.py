@@ -79,9 +79,23 @@ ltp_status = {
     'report_url': ''
 }
 
+# UT + Coverage only (for CI one-shot, no FIO/FUSE/LTP)
+utcov_status = {
+    'status': 'idle',  # idle, testing, completed, failed
+    'message': '',
+    'test_dir': '',
+    'report_url': ''
+}
+
+# Run-once mode: main thread waits on this instead of polling HTTP status
+run_once_done_event = threading.Event()
+run_once_final_status = None
+run_once_final_data = None
+
 # Create lock objects
 build_lock = threading.Lock()
 dailytest_lock = threading.Lock()
+utcov_lock = threading.Lock()
 coverage_lock = threading.Lock()
 regression_lock = threading.Lock()
 fuse_lock = threading.Lock()
@@ -93,6 +107,9 @@ PROJECT_PATH = None
 
 # Test results directory (global)
 TEST_RESULTS_DIR = None
+
+# Nextest profile for unittest (e.g. ci-no-ufs), set from --nextest-profile
+NEXTEST_PROFILE = None
 
 # Current subprocess per test (for cancel). Keys: build, dailytest, regression, coverage, fuse, fio, ltp
 test_processes = {
@@ -204,6 +221,7 @@ DAILYTEST_CONFIG = {
 def run_dailytest_script():
     """Run unittest, coverage, fio, fuse, and ltp tests in sequence"""
     global dailytest_status, dailytest_cancel_requested, test_processes
+    global run_once_final_status, run_once_final_data, run_once_done_event
     with dailytest_lock:  # Ensure only one test instance at a time
         dailytest_cancel_requested = False
         dailytest_status['status'] = 'testing'
@@ -250,18 +268,29 @@ def run_dailytest_script():
                     print(f"⚠ Step {current_step}/{total_steps}: Test script not found: {script_path}, skipping unittest")
                 else:
                     print(f"Using script path: {script_path}")
+                    run_env = os.environ.copy()
+                    if NEXTEST_PROFILE:
+                        run_env['NEXTEST_PROFILE'] = NEXTEST_PROFILE
+                        print(f"Nextest profile: {NEXTEST_PROFILE}")
 
                     process = subprocess.Popen(
                         [script_path, project_path, TEST_RESULTS_DIR],
                         stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
                         universal_newlines=True,
                         start_new_session=True,
+                        env=run_env,
                     )
                     test_processes['dailytest'] = process
                     try:
+                        # Merge stderr into stdout so draining one pipe cannot deadlock the child
+                        _tail_lines = []
+                        _max_tail = 80
                         for line in process.stdout:
                             print(line, end='')
+                            _tail_lines.append(line)
+                            if len(_tail_lines) > _max_tail:
+                                _tail_lines.pop(0)
                         process.wait()
                     finally:
                         test_processes['dailytest'] = None
@@ -279,14 +308,14 @@ def run_dailytest_script():
                     _r1url = f"/result?date={os.path.basename(latest_test_dir)}" if latest_test_dir else ''
                     if process.returncode != 0:
                         unittest_failed = True
-                        stderr_output = process.stderr.read()
+                        stderr_output = ''.join(_tail_lines)
                         regression_status.update({'status': 'failed', 'message': f'Failed (return code: {process.returncode}).', 'test_dir': latest_test_dir or '', 'report_url': _r1url})
                         print(f"\n⚠ Step {current_step}/{total_steps}: Unittest completed with failures (return code: {process.returncode})")
-                        print(f"Error output: {stderr_output}")
+                        print(f"Error output (tail): {stderr_output}")
                         if latest_test_dir:
                             test_utils.update_test_summary(latest_test_dir, {
                                 'unittest_status': 'failed',
-                                'unittest_error': stderr_output[:500] if stderr_output else 'Unknown error'
+                                'unittest_error': (stderr_output[-500:] if stderr_output else 'Unknown error')
                             })
                     else:
                         regression_status.update({'status': 'completed', 'message': 'Completed successfully (via daily test).', 'test_dir': latest_test_dir or '', 'report_url': _r1url})
@@ -673,6 +702,128 @@ def run_dailytest_script():
                     })
                 except Exception as save_error:
                     print(f"Warning: Failed to save partial results: {save_error}")
+        finally:
+            # Signal run-once waiter so it does not need to poll /dailytest/status
+            run_once_final_status = dailytest_status.get('status')
+            run_once_final_data = dict(dailytest_status)
+            run_once_done_event.set()
+
+
+def run_utcov_script():
+    """Run only unittest + coverage (no FIO/FUSE/LTP). For CI one-shot."""
+    global utcov_status, test_processes
+    global run_once_final_status, run_once_final_data, run_once_done_event
+    with utcov_lock:
+        utcov_status['status'] = 'testing'
+        utcov_status['message'] = 'Starting UT + coverage...'
+        utcov_status['test_dir'] = ''
+        utcov_status['report_url'] = ''
+        project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
+        latest_test_dir = None
+        unittest_failed = False
+        coverage_failed = False
+        try:
+            # Step 1: Unittest (daily_regression_test.sh)
+            utcov_status['message'] = 'Step 1/2: Running unittest...'
+            print("="*80)
+            print("Step 1/2: Running unittest (regression)...")
+            print("="*80)
+            script_path = test_utils.find_script_path(project_path=project_path)
+            if not script_path or not os.path.exists(script_path):
+                unittest_failed = True
+                utcov_status['message'] = 'Cannot find daily_regression_test.sh'
+                print("Cannot find daily_regression_test.sh, skipping unittest")
+            else:
+                run_env = os.environ.copy()
+                if NEXTEST_PROFILE:
+                    run_env['NEXTEST_PROFILE'] = NEXTEST_PROFILE
+                    print(f"Nextest profile for UT+cov: {NEXTEST_PROFILE}")
+                process = subprocess.Popen(
+                    [script_path, project_path, TEST_RESULTS_DIR],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True,
+                    start_new_session=True,
+                    env=run_env,
+                )
+                test_processes['regression'] = process
+                try:
+                    # Merge stderr into stdout so draining one pipe cannot deadlock the child
+                    _tail_lines = []
+                    _max_tail = 80
+                    for line in process.stdout:
+                        print(line, end='')
+                        _tail_lines.append(line)
+                        if len(_tail_lines) > _max_tail:
+                            _tail_lines.pop(0)
+                    process.wait()
+                finally:
+                    test_processes['regression'] = None
+                latest_test_dir = test_utils.find_latest_test_dir(TEST_RESULTS_DIR)
+                if latest_test_dir:
+                    test_utils.ensure_test_summary(latest_test_dir)
+                if process.returncode != 0:
+                    unittest_failed = True
+                    if latest_test_dir:
+                        _merged_tail = ''.join(_tail_lines)
+                        test_utils.update_test_summary(latest_test_dir, {
+                            'unittest_status': 'failed',
+                            'unittest_error': (_merged_tail[-500:] if _merged_tail else 'Unknown error')
+                        })
+                    print("Unittest completed with failures")
+                else:
+                    if latest_test_dir:
+                        test_utils.update_test_summary(latest_test_dir, {'unittest_status': 'completed'})
+                    print("Unittest completed successfully")
+
+            # Step 2: Coverage
+            utcov_status['message'] = 'Step 2/2: Running coverage...'
+            print("="*80)
+            print("Step 2/2: Running coverage...")
+            print("="*80)
+            if latest_test_dir:
+                test_utils.ensure_test_summary(latest_test_dir)
+                coverage_success = coverage_test.run_coverage_test(
+                    project_path, TEST_RESULTS_DIR, latest_test_dir,
+                    update_status=utcov_status,
+                    process_holder=test_processes, process_key='coverage',
+                )
+                if not coverage_success:
+                    coverage_failed = True
+                    test_utils.update_test_summary(latest_test_dir, {'coverage_status': 'failed'})
+            else:
+                coverage_failed = True
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                latest_test_dir = os.path.join(TEST_RESULTS_DIR, timestamp)
+                os.makedirs(latest_test_dir, exist_ok=True)
+                test_utils.ensure_test_summary(latest_test_dir)
+                utcov_status['message'] = 'No test directory for coverage, skipped.'
+
+            utcov_status['test_dir'] = latest_test_dir or ''
+            utcov_status['report_url'] = f"/result?date={os.path.basename(latest_test_dir)}" if latest_test_dir else ''
+            if unittest_failed or coverage_failed:
+                utcov_status['status'] = 'failed'
+                utcov_status['message'] = 'UT + coverage completed with failures.'
+            else:
+                utcov_status['status'] = 'completed'
+                utcov_status['message'] = 'UT + coverage completed successfully.'
+        except Exception as e:
+            utcov_status['status'] = 'failed'
+            utcov_status['message'] = str(e)
+            import traceback
+            traceback.print_exc()
+            if latest_test_dir:
+                try:
+                    test_utils.ensure_test_summary(latest_test_dir)
+                    test_utils.update_test_summary(latest_test_dir, {'error': str(e), 'error_type': type(e).__name__})
+                except Exception as save_error:
+                    print(f"Warning: Failed to save partial results: {save_error}")
+        finally:
+            # Signal run-once waiter so it does not need to poll /utcov/status
+            run_once_final_status = utcov_status.get('status')
+            run_once_final_data = dict(utcov_status)
+            run_once_done_event.set()
+
 
 @app.route('/build', methods=['POST'])
 def build():
@@ -713,6 +864,25 @@ def dailytest():
 def get_dailytest_status():
     """Get daily test status (regression + coverage)"""
     return jsonify(dailytest_status)
+
+
+@app.route('/utcov/run', methods=['POST'])
+def run_utcov():
+    """Start UT + coverage only (unittest then coverage, no FIO/FUSE/LTP). For CI."""
+    if utcov_status['status'] == 'testing':
+        return jsonify({
+            'error': 'UT+cov test is already in progress.',
+            'current_status': utcov_status
+        }), 409
+    threading.Thread(target=run_utcov_script).start()
+    return jsonify({'message': 'UT + coverage test started.'}), 202
+
+
+@app.route('/utcov/status', methods=['GET'])
+def get_utcov_status():
+    """Get UT + coverage test status"""
+    return jsonify(utcov_status)
+
 
 # Only allow YYYYMMDD_HHMMSS to prevent path-traversal via user-supplied folder names.
 _DATE_FOLDER_RE = re.compile(r'^\d{8}_\d{6}$')
@@ -1051,6 +1221,87 @@ def get_fio_test_results(date_folder):
         import traceback
         traceback.print_exc()
         return None
+
+def summary_json_to_markdown(summary):
+    """Convert test_summary.json dict to Markdown table for CI Step Summary.
+    Supports both formats: packages+test_cases and modules+results.
+    """
+    if not summary or not isinstance(summary, dict):
+        return ""
+    lines = []
+    total = summary.get('total_tests', 0)
+    passed = summary.get('passed_tests', 0)
+    failed = summary.get('failed_tests', 0)
+    rate = summary.get('success_rate', 0)
+    lines.append("### Unit test summary")
+    lines.append("")
+    lines.append("| Total | Passed | Failed | Success rate |")
+    lines.append("|-------|--------|--------|--------------|")
+    lines.append(f"| {total} | {passed} | {failed} | {rate}% |")
+    lines.append("")
+
+    # Packages or modules table
+    packages = summary.get('packages') or summary.get('modules') or []
+    if packages:
+        lines.append("#### By package")
+        lines.append("")
+        lines.append("| Package | Total | Passed | Failed | Success rate |")
+        lines.append("|---------|-------|--------|--------|--------------|")
+        for p in packages:
+            name = p.get('name', '')
+            t = p.get('total', 0)
+            pa = p.get('passed', 0)
+            fa = p.get('failed', 0)
+            r = p.get('success_rate', 0)
+            lines.append(f"| {name} | {t} | {pa} | {fa} | {r}% |")
+        lines.append("")
+
+    # Failed test cases (test_cases or results), sorted by Package, Test file, Test case
+    test_cases = summary.get('test_cases') or summary.get('results') or []
+    failed_cases = [c for c in test_cases if c.get('status') == 'failed' or c.get('status') == 'FAILED']
+    if test_cases and test_cases[0].get('test_case') is not None:
+        failed_cases.sort(key=lambda c: (c.get('package', ''), c.get('test_file', ''), c.get('test_case', '')))
+    else:
+        failed_cases.sort(key=lambda c: c.get('test', c.get('test_case', '')))
+    if failed_cases:
+        lines.append("#### Failed tests")
+        lines.append("")
+        if test_cases and 'test_case' in test_cases[0]:
+            lines.append("| Package | Test file | Test case | Status |")
+            lines.append("|---------|-----------|-----------|--------|")
+            for c in failed_cases:
+                pkg = c.get('package', '')
+                tf = c.get('test_file', '')
+                tc = c.get('test_case', '')
+                st = c.get('status', 'failed')
+                lines.append(f"| {pkg} | {tf} | {tc} | {st} |")
+        else:
+            lines.append("| Test | Status |")
+            lines.append("|------|--------|")
+            for c in failed_cases:
+                test_name = c.get('test', c.get('test_case', ''))
+                st = c.get('status', 'failed')
+                lines.append(f"| {test_name} | {st} |")
+        lines.append("")
+
+    # Coverage
+    cov = summary.get('coverage')
+    if cov and isinstance(cov, dict):
+        lines.append("### Coverage")
+        lines.append("")
+        lines.append("| Metric | Covered | Total | Percent |")
+        lines.append("|--------|---------|-------|---------|")
+        for key, label in [('lines', 'Lines'), ('functions', 'Functions'), ('regions', 'Regions')]:
+            v = cov.get(key)
+            if isinstance(v, dict):
+                c = v.get('covered', 0)
+                t = v.get('total', 0)
+                pct = v.get('percent', (100 * c / t) if t else 0)
+                lines.append(f"| {label} | {c} | {t} | {pct:.1f}% |")
+        lines.append("")
+
+    return "\n".join(lines)
+
 
 def get_test_result_summary(date_folder):
     """Get test result summary for a given date"""
@@ -1474,7 +1725,9 @@ def view_unit_tests(date):
     
     # Get available dates for navigation
     available_dates = get_available_test_dates()
-    
+    skipped_tests = test_summary.get('skipped_tests', 0) if test_summary else 0
+    skipped_test_cases = test_summary.get('skipped_test_cases', []) if test_summary else []
+
     return render_template(
         'unit_test_details.html',
         date=date,
@@ -1483,6 +1736,8 @@ def view_unit_tests(date):
         total_tests=total_tests,
         passed_tests=passed_tests,
         failed_tests=failed_tests,
+        skipped_tests=skipped_tests,
+        skipped_test_cases=skipped_test_cases,
         success_rate=success_rate,
         current_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     )
@@ -1679,11 +1934,36 @@ Examples:
     )
     
     parser.add_argument(
+        '--nextest-profile',
+        type=str,
+        default=None,
+        help='Nextest profile for unittest (e.g. ci-no-ufs). Passed to daily_regression_test.sh via NEXTEST_PROFILE env.'
+    )
+    parser.add_argument(
         '--run-once',
         action='store_true',
         help='Trigger one dailytest run, wait for completion, then exit (for CI one-shot)'
     )
-    
+    parser.add_argument(
+        '--run-once-ut-cov',
+        action='store_true',
+        dest='run_once_ut_cov',
+        help='Trigger one UT + coverage run (no FIO/FUSE/LTP), wait for completion, then exit (for CI)'
+    )
+    parser.add_argument(
+        '--summary-to-markdown',
+        dest='summary_to_markdown',
+        metavar='PATH',
+        type=str,
+        default=None,
+        help='With --run-once: write test result markdown to PATH after run (e.g. GITHUB_STEP_SUMMARY). '
+             'Without --run-once: load test_summary.json from PATH (or PATH/test_summary.json if PATH is a dir), print markdown to stdout and exit.'
+    )
+    parser.add_argument(
+        '--unit-only',
+        action='store_true',
+        help='With --run-once: run only unittest step (no coverage, fio, fuse, ltp). Ignored without --run-once.'
+    )
     return parser.parse_args()
 
 
@@ -1766,12 +2046,50 @@ if __name__ == '__main__':
     # Set test results directory: prefer argument, otherwise default <project_path>/curvine-tests/regression_result
     TEST_RESULTS_DIR = args.results_dir if args.results_dir else os.path.join(PROJECT_PATH, 'curvine-tests', 'regression_result')
     print(f"Using test results directory: {TEST_RESULTS_DIR}")
-    
+
+    # --summary-to-markdown without --run-once: load test_summary.json from PATH and print Markdown, then exit (no server)
+    # With --run-once, summary_path is used later as output file after dailytest completes
+    summary_path = getattr(args, 'summary_to_markdown', None)
+    if summary_path and not getattr(args, 'run_once', False):
+        path = os.path.abspath(summary_path)
+        if os.path.isdir(path):
+            summary_file = os.path.join(path, 'test_summary.json')
+        else:
+            summary_file = path
+        if not os.path.exists(summary_file):
+            print(f"Error: not found: {summary_file}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            with open(summary_file, 'r', encoding='utf-8') as f:
+                summary = json.load(f)
+        except Exception as e:
+            print(f"Error: failed to load {summary_file}: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(summary_json_to_markdown(summary))
+        sys.exit(0)
+
+    # Nextest profile for unittest (passed to daily_regression_test.sh via env)
+    NEXTEST_PROFILE = getattr(args, 'nextest_profile', None)
+    if NEXTEST_PROFILE:
+        print(f"Nextest profile for unittest: {NEXTEST_PROFILE}")
+
     # Optional: update repo to latest on current branch
     if getattr(args, 'update_code', False):
         print("Updating repository (git fetch + git pull)...")
         try_update_repo(PROJECT_PATH)
-    
+
+    # With --run-once --unit-only: run only unittest (no coverage, fio, fuse, ltp)
+    if getattr(args, 'run_once', False) and getattr(args, 'unit_only', False):
+        DAILYTEST_CONFIG.clear()
+        DAILYTEST_CONFIG.update({
+            'unittest': True,
+            'coverage': False,
+            'fio': False,
+            'fuse': False,
+            'ltp': False,
+        })
+        print("Unit-only mode: only unittest step will run.")
+
     # Auto-detect script path
     script_path = test_utils.find_script_path(project_path=PROJECT_PATH)
     if script_path:
@@ -1792,9 +2110,39 @@ if __name__ == '__main__':
     if script_path:
         print(f"Script path: {script_path}")
 
-    if getattr(args, 'run_once', False):
+    if getattr(args, 'run_once_ut_cov', False):
         import urllib.request
-        import ssl
+        run_once_done_event.clear()
+        run_once_final_status = None
+        run_once_final_data = None
+        server_port = args.port
+        base_url = f"http://127.0.0.1:{server_port}"
+        def run_server():
+            app.run(host=args.host, port=server_port, use_reloader=False, threaded=True)
+        t = threading.Thread(target=run_server, daemon=True)
+        t.start()
+        time.sleep(2)
+        try:
+            req = urllib.request.Request(
+                f"{base_url}/utcov/run",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"Failed to trigger UT+cov: {e}")
+            os._exit(1)
+        print("UT+cov triggered, waiting for completion...")
+        run_once_done_event.wait()
+        final_status = run_once_final_status
+        print(f"UT+cov finished with status: {final_status}")
+        os._exit(0 if final_status == "completed" else 1)
+    elif getattr(args, 'run_once', False):
+        import urllib.request
+        run_once_done_event.clear()
+        run_once_final_status = None
+        run_once_final_data = None
         server_port = args.port
         base_url = f"http://127.0.0.1:{server_port}"
         def run_server():
@@ -1814,16 +2162,24 @@ if __name__ == '__main__':
             print(f"Failed to trigger dailytest: {e}")
             os._exit(1)
         print("Dailytest triggered, waiting for completion...")
-        while True:
-            time.sleep(10)
-            try:
-                with urllib.request.urlopen(f"{base_url}/dailytest/status", timeout=5) as r:
-                    data = json.loads(r.read().decode())
-                    status = data.get("status", "")
-                    if status in ("completed", "failed", "cancelled"):
-                        print(f"Dailytest finished with status: {status}")
-                        os._exit(0 if status == "completed" else 1)
-            except Exception as e:
-                print(f"Poll status error: {e}")
+        run_once_done_event.wait()
+        final_status = run_once_final_status
+        final_data = run_once_final_data
+        print(f"Dailytest finished with status: {final_status}")
+        summary_out_path = getattr(args, 'summary_to_markdown', None)
+        if summary_out_path and final_data:
+            test_dir = final_data.get("test_dir", "")
+            date_folder = os.path.basename(test_dir) if test_dir else ""
+            if date_folder:
+                summary = get_test_result_summary(date_folder)
+                if summary:
+                    try:
+                        with open(summary_out_path, "w", encoding="utf-8") as f:
+                            f.write(summary_json_to_markdown(summary))
+                        print(f"Wrote test summary to {summary_out_path}")
+                    except Exception as e:
+                        print(f"Failed to write summary to {summary_out_path}: {e}")
+        exit_code = 0 if final_status == "completed" else 1
+        os._exit(exit_code)
     else:
         app.run(host=args.host, port=args.port)

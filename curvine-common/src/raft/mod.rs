@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::proto::raft::{FsmState, SnapshotData};
 use raft::eraftpb;
 
 mod raft_node;
@@ -60,3 +61,28 @@ pub type LibRaftMessage = eraftpb::Message;
 pub const DEFAULT_LEADER_ID: u64 = 0;
 
 pub const LOG_START_INDEX: u64 = 0;
+
+impl FsmState {
+    pub fn compact(&self) -> u64 {
+        let applied = if self.applied.index <= self.ufs_applied.index {
+            &self.applied
+        } else {
+            &self.ufs_applied
+        };
+
+        applied.index.saturating_sub(1)
+    }
+
+    pub fn op_id(&self) -> u64 {
+        self.applied.op_id.max(self.ufs_applied.op_id)
+    }
+}
+
+impl SnapshotData {
+    pub fn data_dir(&self) -> String {
+        match &self.files_data {
+            Some(files_data) => files_data.dir.clone(),
+            None => "".to_string(),
+        }
+    }
+}

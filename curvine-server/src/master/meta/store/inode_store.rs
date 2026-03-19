@@ -20,7 +20,7 @@ use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
 use curvine_common::state::{BlockLocation, CommitBlock, FileLock, MountInfo};
 use orpc::common::{FileUtils, Utils};
-use orpc::{err_box, try_err, try_option, CommonResult};
+use orpc::{err_box, try_err, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
 
@@ -121,7 +121,7 @@ impl InodeStore {
 
                 _ => {
                     deleted_files += 1;
-                    let res = self.decrement_inode_nlink(inode.id())?;
+                    let res = self.decrement_inode_nlink(inode.id(), &mut batch)?;
                     del_res.blocks.extend(res.blocks);
                 }
             }
@@ -139,10 +139,10 @@ impl InodeStore {
         Ok(del_res)
     }
 
-    pub fn apply_free(&self, inodes: &[&InodeView]) -> CommonResult<()> {
+    pub fn apply_free(&self, inodes: Vec<InodeView>) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
         for inode in inodes {
-            batch.write_inode(inode)?;
+            batch.write_inode(&inode)?;
         }
         batch.commit()?;
         Ok(())
@@ -269,8 +269,8 @@ impl InodeStore {
         //link is a edge, link to same inode
         batch.add_child(parent.id(), new_entry.name(), original_inode_id)?;
 
-        // Increment nlink count of the original inode
-        self.increment_inode_nlink(original_inode_id)?;
+        // Increment nlink count of the original inode (in the same batch for atomicity)
+        self.increment_inode_nlink(original_inode_id, &mut batch)?;
 
         batch.commit()?;
 
@@ -279,14 +279,16 @@ impl InodeStore {
         Ok(())
     }
 
-    fn increment_inode_nlink(&self, inode_id: i64) -> CommonResult<()> {
+    fn increment_inode_nlink(
+        &self,
+        inode_id: i64,
+        batch: &mut InodeWriteBatch<'_>,
+    ) -> CommonResult<()> {
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {
                 InodeView::File(_, _) => {
                     inode_view.incr_nlink();
-                    let mut batch = self.store.new_batch();
                     batch.write_inode(&inode_view)?;
-                    batch.commit()?;
                 }
                 _ => {
                     return err_box!("Cannot increment nlink for non-file inode {}", inode_id);
@@ -311,21 +313,19 @@ impl InodeStore {
         // Remove the child from the parent's children list
         batch.delete_child(parent.id(), child.name())?;
 
-        // Decrement nlink count of the file being unlinked
-        if let InodeView::File(_, _) = child {
-            self.decrement_inode_nlink(child.id())?;
-        }
+        // Decrement nlink count of the file being unlinked.
+        // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
+        let del_res = if let InodeView::File(_, _) = child {
+            self.decrement_inode_nlink(child.id(), &mut batch)?
+        } else {
+            DeleteResult::new()
+        };
 
         batch.commit()?;
 
         self.fs_stats.decrement_file_count();
 
-        // Create a delete result indicating only the directory entry was removed
-        // For unlink operations, we don't delete blocks since the inode still exists
-        Ok(DeleteResult {
-            inodes: 0,                  // No inodes actually deleted
-            blocks: Default::default(), // No blocks deleted for unlink
-        })
+        Ok(del_res)
     }
 
     pub fn apply_unlink_file_entry(
@@ -342,29 +342,28 @@ impl InodeStore {
         // Remove the FileEntry from the parent's children list
         batch.delete_child(parent.id(), child.name())?;
 
-        // Decrement nlink count of the original inode
-        self.decrement_inode_nlink(inode_id)?;
+        // Decrement nlink count of the original inode.
+        // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
+        let del_res = self.decrement_inode_nlink(inode_id, &mut batch)?;
 
         batch.commit()?;
 
         self.fs_stats.decrement_file_count();
 
-        // Create a delete result indicating only the directory entry was removed
-        Ok(DeleteResult {
-            inodes: 0,                  // No inodes actually deleted
-            blocks: Default::default(), // No blocks deleted for unlink
-        })
+        Ok(del_res)
     }
 
     // Helper method to decrement nlink count of an inode
-    fn decrement_inode_nlink(&self, inode_id: i64) -> CommonResult<DeleteResult> {
+    fn decrement_inode_nlink(
+        &self,
+        inode_id: i64,
+        batch: &mut InodeWriteBatch<'_>,
+    ) -> CommonResult<DeleteResult> {
         let mut del_res = DeleteResult::new();
         // Load the inode from storage
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {
                 InodeView::File(_, file) => {
-                    let mut batch = self.store.new_batch();
-
                     let remaining_links = file.decrement_nlink();
                     if remaining_links == 0 {
                         batch.delete_inode(inode_id)?;
@@ -380,7 +379,6 @@ impl InodeStore {
                         // Write the updated inode back to storage
                         batch.write_inode(&inode_view)?;
                     }
-                    batch.commit()?;
                 }
                 _ => {
                     return err_box!("Cannot decrement nlink for non-file inode {}", inode_id);
@@ -400,7 +398,13 @@ impl InodeStore {
 
     // Restore to a directory tree from rocksdb
     pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
-        let mut root = FsDir::create_root();
+        // Load root metadata from DB to preserve mtime, nlink, and other attributes
+        // that have been updated since the root was first created.
+        let mut root = self
+            .store
+            .get_inode(ROOT_INODE_ID)?
+            .unwrap_or_else(FsDir::create_root);
+
         let mut stack = LinkedList::new();
         stack.push_back((
             root.as_ptr(),
@@ -414,7 +418,19 @@ impl InodeStore {
             last_inode_id = last_inode_id.max(child_id);
 
             let next_parent = if child_id != ROOT_INODE_ID {
-                let store_inode = try_option!(self.store.get_inode(child_id)?);
+                let store_inode = match self.store.get_inode(child_id)? {
+                    Some(v) => v,
+                    None => {
+                        // Orphaned edge: inode was deleted but edge was not cleaned up
+                        // (can happen after a crash between two non-atomic batch commits).
+                        // Skip this entry to keep the tree consistent.
+                        log::warn!(
+                            "create_tree: orphaned edge detected, child_id={} has no inode, skipping",
+                            child_id
+                        );
+                        continue;
+                    }
+                };
                 let inode = if matches!(store_inode, InodeView::Dir(_, _)) {
                     store_inode
                 } else {
@@ -559,12 +575,6 @@ impl InodeStore {
         // Check if there are other references to the Arc, which would prevent the lock from being released
         let ref_count = Arc::strong_count(&self.store);
         if ref_count > 1 {
-            log::error!(
-                "cannot restore: RocksInodeStore has {} references (expected 1). \
-                Other components are still holding clones of InodeStore, \
-                which prevents RocksDB lock from being released.",
-                ref_count
-            );
             return err_box!(
                 "cannot restore: RocksInodeStore has {} references (expected 1). \
                 Other components are still holding clones of InodeStore, \

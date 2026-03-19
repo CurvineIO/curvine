@@ -8,6 +8,7 @@ mod content_summary;
 mod count;
 mod df;
 mod du;
+mod free;
 mod get;
 mod ls;
 mod mkdir;

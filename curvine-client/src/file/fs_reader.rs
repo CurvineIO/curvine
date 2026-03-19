@@ -30,7 +30,7 @@ pub struct FsReader {
     chunk_size: usize,
     pos: i64,
     len: i64,
-    status: FileStatus,
+    file_blocks: FileBlocks,
 }
 
 impl FsReader {
@@ -56,22 +56,26 @@ impl FsReader {
             status.container_offset
         );
 
-        let inner = FsReaderBuffer::new(path, fs_context, file_blocks, read_detector)?;
+        let inner = FsReaderBuffer::new(path, fs_context, file_blocks.clone(), read_detector)?;
         let reader = Self {
             inner,
             chunk: DataSlice::Empty,
             chunk_size,
             pos: 0,
             len,
-            status,
+            file_blocks,
         };
         Ok(reader)
+    }
+
+    pub fn file_blocks(&self) -> &FileBlocks {
+        &self.file_blocks
     }
 }
 
 impl Reader for FsReader {
     fn status(&self) -> &FileStatus {
-        &self.status
+        &self.file_blocks.status
     }
 
     fn path(&self) -> &Path {

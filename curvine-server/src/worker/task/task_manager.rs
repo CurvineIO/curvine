@@ -19,7 +19,7 @@ use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::LoadTaskInfo;
 use curvine_common::FsResult;
-use log::info;
+use log::debug;
 use orpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -134,7 +134,7 @@ impl TaskManager {
             self.task_timeout_ms,
         );
 
-        info!("submit task {}", task_id);
+        debug!("submit task {}", task_id);
 
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
@@ -162,7 +162,7 @@ impl TaskManager {
         let job_id = job_id.as_ref();
         let all_task = self.tasks.cancel(job_id);
 
-        info!(
+        debug!(
             "Successfully canceled {} tasks for job {}",
             all_task.len(),
             job_id

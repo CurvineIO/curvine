@@ -46,7 +46,7 @@ pub trait LogStorage: Storage + Clone + Send + Sync + 'static {
     fn set_conf_state(&self, conf_state: &ConfState) -> RaftResult<()>;
 
     /// Create a new snapshot.
-    fn create_snapshot(&self, data: SnapshotData, request_index: u64) -> RaftResult<()>;
+    fn create_snapshot(&self, data: SnapshotData) -> RaftResult<()>;
 
     /// The state machine used to apply snapshots to nodes.
     /// When the node needs to restore state from the snapshot, it calls this method.

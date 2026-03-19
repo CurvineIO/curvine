@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::proto::raft::RaftStateStoreProto;
+use crate::proto::raft::SnapshotData;
 use crate::raft::{RaftError, RaftResult, LOG_START_INDEX};
 use crate::rocksdb::{DBConf, DBEngine, RocksUtils, WriteBatch};
+use log::warn;
 use orpc::{err_box, err_ext, CommonResult};
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot, SnapshotMetadata};
@@ -40,6 +41,7 @@ impl RocksStorageCore {
     pub const SNAP_KEY: &'static [u8] = &[0x01u8];
     // Save index range。
     pub const INDEX_KEY: &'static [u8] = &[0x02u8];
+    pub const STATE_KEY: &'static [u8] = &[0x03u8];
 
     pub fn new<T: AsRef<str>>(dir: T, format: bool) -> Self {
         let conf = DBConf::new(dir)
@@ -59,10 +61,13 @@ impl RocksStorageCore {
             get_entries_context: None,
         };
 
-        // Readfirst_index，last_index
         if let Some((first, last)) = core.get_index_range().unwrap() {
             core.first_index = Some(first);
             core.last_index = Some(last);
+        }
+
+        if let Some(data) = core.db.get_cf(Self::CF_META, Self::STATE_KEY).unwrap() {
+            core.raft_state.hard_state = HardState::decode(data.as_ref()).unwrap_or_default();
         }
 
         core
@@ -99,25 +104,27 @@ impl RocksStorageCore {
     }
 
     pub fn set_hard_state(&mut self, hs: HardState) -> RaftResult<()> {
-        self.raft_state.hard_state = hs;
+        self.raft_state.hard_state = hs.clone();
+
+        let mut batch = StoreWriteBatch::new(&self.db);
+        batch.set_state(&hs)?;
+        batch.commit()?;
+
         Ok(())
     }
 
     pub fn set_hard_state_commit(&mut self, commit: u64) -> RaftResult<()> {
         self.mut_hard_state().set_commit(commit);
+
+        let mut batch = StoreWriteBatch::new(&self.db);
+        batch.set_state(&self.raft_state.hard_state)?;
+        batch.commit()?;
+
         Ok(())
     }
 
     pub fn hard_state(&self) -> &HardState {
         &self.raft_state.hard_state
-    }
-
-    pub fn create_proto_state(&self) -> RaftStateStoreProto {
-        RaftStateStoreProto {
-            hard_state: self.raft_state.hard_state.clone(),
-            conf_state: self.raft_state.conf_state.clone(),
-            snapshot: self.snapshot_metadata.clone(),
-        }
     }
 
     pub fn mut_hard_state(&mut self) -> &mut HardState {
@@ -149,6 +156,11 @@ impl RocksStorageCore {
 
         // Index is 0, indicating that there is no snapshot, but there may be log entry
         if index > LOG_START_INDEX && self.first_index() > index {
+            warn!(
+                "snapshot out of date: snapshot_index={}, first_index={}, skip apply",
+                index,
+                self.first_index()
+            );
             return err_ext!(RaftError::raft(raft::Error::Store(
                 raft::StorageError::SnapshotOutOfDate
             )));
@@ -162,34 +174,49 @@ impl RocksStorageCore {
 
         self.snapshot_metadata = meta.clone();
         self.raft_state.hard_state.term = cmp::max(self.raft_state.hard_state.term, meta.term);
-        self.raft_state.hard_state.commit = index;
+        self.raft_state.hard_state.commit = cmp::max(self.raft_state.hard_state.commit, index);
         self.raft_state.conf_state = meta.get_conf_state().clone();
 
         Ok(())
     }
 
-    pub fn create_snapshot(&self, data: Vec<u8>, request_index: u64) -> RaftResult<Snapshot> {
+    pub fn create_snapshot(&self, data: SnapshotData) -> RaftResult<Snapshot> {
+        let request_index = data.fsm_state.applied.index;
+
         let mut snapshot = Snapshot::default();
-        snapshot.set_data(data);
+        snapshot.set_data(data.encode_to_vec());
         let meta = snapshot.mut_metadata();
-        meta.index = self.raft_state.hard_state.commit.min(request_index);
+
+        if request_index > self.raft_state.hard_state.commit {
+            return err_box!(
+                "snapshot temporarily unavailable: request_index {}, hard_state {:?}",
+                request_index,
+                self.raft_state.hard_state
+            );
+        }
+
+        meta.index = request_index;
         meta.term = match meta.index.cmp(&self.snapshot_metadata.index) {
             cmp::Ordering::Equal => self.snapshot_metadata.term,
             cmp::Ordering::Greater => {
-                let entry = self.get_check(meta.index).unwrap();
+                let entry = self.get_check(meta.index)?;
                 entry.term
             }
             cmp::Ordering::Less => {
-                panic!(
+                return err_box!(
                     "commit {} < snapshot_metadata.index {}",
-                    meta.index, self.snapshot_metadata.index
+                    meta.index,
+                    self.snapshot_metadata.index
                 );
             }
         };
 
         meta.set_conf_state(self.raft_state.conf_state.clone());
-        self.db
-            .put_cf(Self::CF_META, Self::SNAP_KEY, snapshot.encode_to_vec())?;
+
+        let mut batch = StoreWriteBatch::new(&self.db);
+        batch.append_index_range(self.first_index(), self.last_index())?;
+        batch.append_snapshot(&snapshot)?;
+        batch.commit()?;
 
         Ok(snapshot)
     }
@@ -227,22 +254,24 @@ impl RocksStorageCore {
             return Ok(());
         }
 
-        if compact_index > self.last_index() + 1 {
-            panic!(
-                "compact not received raft logs: {}, last index: {}",
+        if compact_index > self.last_index() {
+            return err_box!(
+                "compact index {} exceeds last index {}, cannot compact past last log entry",
                 compact_index,
                 self.last_index()
             );
         }
 
-        let mut batch = StoreWriteBatch::new(&self.db);
-        if let Some(v) = self.first_index {
-            batch.delete_entry(v, compact_index - 1)?;
-        }
-        batch.append_index_range(self.first_index(), self.last_index())?;
+        let start = self.first_index();
 
+        let mut batch = StoreWriteBatch::new(&self.db);
+        // delete_entry(start, end) deletes [start, end); remove all index < compact_index
+        batch.delete_entry(start, compact_index)?;
+        batch.append_index_range(compact_index, self.last_index())?;
         batch.commit()?;
+
         let _ = self.first_index.replace(compact_index);
+
         Ok(())
     }
 
@@ -357,11 +386,14 @@ impl<'a> StoreWriteBatch<'a> {
     }
 
     fn delete_entry(&mut self, start: u64, end: u64) -> CommonResult<()> {
-        for index in start..end {
-            let key = RocksUtils::u64_to_bytes(index);
-            self.0.delete_cf(RocksStorageCore::CF_ENTRIES, key)?;
+        if start >= end {
+            return Ok(());
         }
-        Ok(())
+        self.0.delete_range_cf(
+            RocksStorageCore::CF_ENTRIES,
+            RocksUtils::u64_to_bytes(start),
+            RocksUtils::u64_to_bytes(end),
+        )
     }
 
     fn append_entry(&mut self, entries: &[Entry]) -> CommonResult<()> {
@@ -384,7 +416,25 @@ impl<'a> StoreWriteBatch<'a> {
         Ok(())
     }
 
+    fn append_snapshot(&mut self, snapshot: &Snapshot) -> CommonResult<()> {
+        self.0.put_cf(
+            RocksStorageCore::CF_META,
+            RocksStorageCore::SNAP_KEY,
+            snapshot.encode_to_vec(),
+        )?;
+        Ok(())
+    }
+
+    fn set_state(&mut self, state: &HardState) -> CommonResult<()> {
+        self.0.put_cf(
+            RocksStorageCore::CF_META,
+            RocksStorageCore::STATE_KEY,
+            state.encode_to_vec(),
+        )?;
+        Ok(())
+    }
+
     fn commit(self) -> CommonResult<()> {
-        self.0.commit()
+        self.0.commit_and_flush_wal(true)
     }
 }

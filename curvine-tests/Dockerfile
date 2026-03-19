@@ -4,18 +4,31 @@
 # One-shot run:              docker run -v $(pwd):/workspace curvine-tests --run-once
 FROM ghcr.io/curvineio/curvine-compile:rocky9
 
-# Install Python Flask and test utilities via EPEL (avoids PyPI network issues entirely)
+# Python + Flask + Werkzeug (build-server) and regression helpers; use dnf (no pip at runtime in CI)
 RUN dnf install -y epel-release && \
-    dnf install -y python3 python3-flask jq && \
-    dnf clean all
+    dnf install -y \
+        python3 \
+        python3-pip \
+        python3-flask \
+        python3-werkzeug \
+        jq \
+        fio \
+    && dnf clean all
 
 # Rust proxy (rsproxy.cn) for rustup updates and cargo crate downloads
 ENV RUSTUP_DIST_SERVER="https://rsproxy.cn"
 ENV RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
 RUN mkdir -p /root/.cargo && printf '[source.crates-io]\nreplace-with = "rsproxy"\n[source.rsproxy]\nregistry = "sparse+https://rsproxy.cn/index/"\n' > /root/.cargo/config.toml
 
-# Install cargo-llvm-cov for coverage reports (uses rsproxy mirror above)
-RUN source $HOME/.cargo/env && cargo install cargo-llvm-cov
+# Install cargo-llvm-cov and its required llvm-tools-preview component.
+# Pre-installing the component avoids an interactive [Y/n] prompt at runtime
+# that would corrupt the JSON coverage output and cause parse failures.
+RUN source $HOME/.cargo/env && \
+    cargo install cargo-llvm-cov && \
+    rustup component add llvm-tools-preview
+
+# Default master hostname for tests (override with -e CURVINE_MASTER_HOSTNAME=<host>)
+ENV CURVINE_MASTER_HOSTNAME=localhost
 
 # Project code is mounted at /workspace at runtime; no need to copy scripts into the image.
 WORKDIR /workspace

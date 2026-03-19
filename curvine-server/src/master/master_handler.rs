@@ -28,7 +28,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::*;
 use curvine_common::state::FileType;
 use curvine_common::state::{
-    CreateFileOpts, FileBlocks, FileStatus, HeartbeatStatus, OpenFlags, RenameFlags,
+    CreateFileOpts, FileBlocks, FileStatus, FreeResult, HeartbeatStatus, OpenFlags, RenameFlags,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
@@ -207,6 +207,13 @@ impl MasterHandler {
             return Ok(true);
         }
 
+        let path = Path::from_str(&header.path)?;
+        if let Some(info) = self.mount_manager.get_mount_info(&path)? {
+            if path.path() == info.cv_path {
+                return err_box!("cannot delete mount point root: {}", info.cv_path);
+            }
+        }
+
         let res = self.fs.delete(&header.path, header.recursive);
         self.set_req_cache(req_id, res)
     }
@@ -224,16 +231,18 @@ impl MasterHandler {
         let header: FreeRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
-        self.free0(ctx.msg.req_id(), header)?;
-        ctx.response(FreeResponse::default())
+        let res = self.free0(ctx.msg.req_id(), header)?;
+        ctx.response(FreeResponse {
+            res: ProtoUtils::free_res_to_pb(res),
+        })
     }
 
-    pub fn free0(&self, req_id: i64, header: FreeRequest) -> FsResult<()> {
+    pub fn free0(&self, req_id: i64, header: FreeRequest) -> FsResult<FreeResult> {
         if self.check_is_retry(req_id)? {
-            return Ok(());
+            return Ok(FreeResult::default());
         }
 
-        let res = self.fs.free(&header.path);
+        let res = self.fs.free(&header.path, header.recursive);
         self.set_req_cache(req_id, res)
     }
 
@@ -773,13 +782,18 @@ impl MessageHandler for MasterHandler {
             return Err(FsError::not_leader_master(ctx.code, self.client_ip()));
         }
 
-        match code {
+        let res = match code {
             RpcCode::SubmitJob => self.job_handler.submit_load_job(ctx).await,
             RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
             RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
             RpcCode::ReportTask => self.job_handler.task_report(ctx),
 
             v => err_box!("unsupported operation {:?}", v),
+        };
+
+        match res {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(msg.error_ext(&e)),
         }
     }
 }

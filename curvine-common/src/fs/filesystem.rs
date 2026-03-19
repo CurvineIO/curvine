@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::Path;
+use crate::fs::{FsKind, Path};
 use crate::proto::{GetFileStatusResponse, ListStatusResponse};
 use crate::state::{FileStatus, SetAttrOpts};
 use crate::utils::ProtoUtils;
@@ -21,6 +21,8 @@ use prost::bytes::BytesMut;
 use std::future::Future;
 
 pub trait FileSystem<Writer, Reader> {
+    fn fs_kind(&self) -> FsKind;
+
     fn mkdir(&self, path: &Path, create_parent: bool) -> impl Future<Output = FsResult<bool>>;
 
     fn create(&self, path: &Path, overwrite: bool) -> impl Future<Output = FsResult<Writer>>;

@@ -25,11 +25,12 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FileType, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
+    FileType, FreeResult, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::{debug, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
+use orpc::sync::AtomicCounter;
 use orpc::{err_box, err_ext, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::mem;
@@ -40,14 +41,15 @@ pub struct FsDir {
     pub(crate) root_dir: InodeView,
     pub(crate) inode_id: InodeId,
     pub(crate) store: InodeStore,
-    pub(crate) journal_writer: JournalWriter,
+    pub(crate) journal_writer: Arc<JournalWriter>,
     pub(crate) evictor: Arc<dyn Evictor>,
+    pub(crate) op_id: AtomicCounter,
 }
 
 impl FsDir {
     pub fn new(
         conf: &ClusterConf,
-        journal_writer: JournalWriter,
+        journal_writer: Arc<JournalWriter>,
         ttl_bucket_list: Arc<TtlBucketList>,
         evictor: Arc<dyn Evictor>,
     ) -> FsResult<Self> {
@@ -63,16 +65,12 @@ impl FsDir {
             store: state,
             journal_writer,
             evictor,
+            op_id: AtomicCounter::new(0),
         };
         fs_dir.update_last_inode_id(last_inode_id)?;
 
         Ok(fs_dir)
     }
-
-    // Note: inode_store() method was intentionally removed.
-    // Cloning InodeStore increases Arc<RocksInodeStore> refcount, which prevents
-    // the RocksDB lock from being released during Raft snapshot restore.
-    // Access inode_store via self references instead of cloning.
 
     // Create root directory
     pub fn create_root() -> InodeView {
@@ -92,6 +90,16 @@ impl FsDir {
         Ok(id)
     }
 
+    pub fn next_op_id(&self) -> u64 {
+        self.op_id.next()
+    }
+
+    pub fn update_op_id(&self, op_id: u64) {
+        if op_id > self.op_id.get() {
+            self.op_id.set(op_id);
+        }
+    }
+
     pub fn get_ttl_bucket_list(&self) -> Arc<TtlBucketList> {
         self.store.get_ttl_bucket_list()
     }
@@ -109,8 +117,6 @@ impl FsDir {
     // 1. If all directories on the path already exist, skip and return successful.
     // 2. If the parent directory does not exist, an error is returned.
     fn create_single_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
-        let op_ms = LocalTime::mills();
-
         if inp.is_full() || inp.is_root() {
             return Ok(inp);
         }
@@ -123,7 +129,7 @@ impl FsDir {
         inp = self.add_last_inode(inp, Dir(name.clone(), dir.clone()))?;
 
         let parent_path = inp.get_valid_parent_path();
-        self.journal_writer.log_mkdir(op_ms, &parent_path, &dir)?;
+        self.journal_writer.log_mkdir(self, &parent_path, &dir)?;
 
         Ok(inp)
     }
@@ -163,7 +169,7 @@ impl FsDir {
 
         let del_res = self.unprotected_delete(inp, op_ms as i64)?;
         self.journal_writer
-            .log_delete(op_ms, inp.path(), op_ms as i64)?;
+            .log_delete(self, inp.path(), op_ms as i64)?;
 
         Ok(del_res)
     }
@@ -220,43 +226,68 @@ impl FsDir {
         Ok(del_res)
     }
 
-    pub fn free(&mut self, inp: &InodePath) -> FsResult<DeleteResult> {
-        let op_ms = LocalTime::mills();
+    pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {
+        let op_ms = LocalTime::mills() as i64;
 
-        let del_res = self.unprotected_free(inp, op_ms as i64)?;
+        if inp.is_root() {
+            return err_box!("The root is not allowed to be free");
+        }
+
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+
+        let free_res = self.unprotected_free(inode, op_ms, recursive)?;
         self.journal_writer
-            .log_free(op_ms, inp.path(), op_ms as i64)?;
+            .log_free(self, inp.path(), op_ms, recursive)?;
 
-        Ok(del_res)
+        Ok(free_res)
     }
 
     pub(crate) fn unprotected_free(
         &mut self,
-        inp: &InodePath,
+        inode: InodePtr,
         mtime: i64,
-    ) -> FsResult<DeleteResult> {
-        let mut inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => return err_ext!(FsError::file_not_found(inp.path())),
-        };
-        let file = inode.as_file_mut()?;
-        if !file.ufs_exists() {
-            return err_box!("path {} data not synchronized to ufs", inp.path());
+        recursive: bool,
+    ) -> FsResult<FreeResult> {
+        let mut free_res = FreeResult::default();
+        let mut change_inodes = vec![];
+
+        let mut stack = LinkedList::new();
+        stack.push_back(inode);
+        while let Some(inode) = stack.pop_front() {
+            match inode.as_mut() {
+                FileEntry(name, id) => {
+                    if let Some(store_inode) = self.store.get_inode(*id, Some(name))? {
+                        stack.push_back(InodePtr::from_owned(store_inode));
+                    }
+                }
+
+                Dir(_, dir) => {
+                    if recursive {
+                        for child in dir.children_iter() {
+                            stack.push_back(InodePtr::from_ref(child));
+                        }
+                    }
+                }
+
+                File(_, file) => {
+                    let locs = file.get_locs(&self.store)?;
+                    let len = file.len;
+                    if file.free(mtime) {
+                        free_res.add(len, locs);
+                        change_inodes.push(inode.as_ref().clone());
+                    }
+                }
+                Container(_, _container) => {
+                    // will update
+                }
+            }
         }
 
-        if file.blocks.is_empty() {
-            return Ok(DeleteResult::default());
-        }
-
-        let del_res = DeleteResult {
-            inodes: 0,
-            blocks: file.get_locs(&self.store)?,
-        };
-
-        file.free(mtime);
-        self.store.apply_free(&[&inode])?;
-
-        Ok(del_res)
+        self.store.apply_free(change_inodes)?;
+        Ok(free_res)
     }
 
     pub fn rename(
@@ -268,7 +299,7 @@ impl FsDir {
         let op_ms = LocalTime::mills();
         let res = self.unprotected_rename(src_inp, dst_inp, op_ms as i64, flags)?;
         self.journal_writer.log_rename(
-            op_ms,
+            self,
             src_inp.path(),
             dst_inp.path(),
             op_ms as i64,
@@ -361,9 +392,9 @@ impl FsDir {
         let name = inp.name().to_string();
 
         // Create an inode file node.
-        let file = InodeFile::with_opts(self.inode_id.next()?, LocalTime::mills() as i64, opts);
+        let file = InodeFile::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
         inp = self.add_last_inode(inp, File(name, file))?;
-        self.journal_writer.log_create_inode_entry(op_ms, &inp)?;
+        self.journal_writer.log_create_inode_entry(self, op_ms, &inp)?;
 
         Ok(inp)
     }
@@ -388,7 +419,7 @@ impl FsDir {
             InodeContainer::with_opts(self.inode_id.next()?, LocalTime::mills() as i64, opts);
 
         inp = self.add_last_inode(inp, Container(name.clone(), container.clone()))?;
-        self.journal_writer.log_create_inode_entry(op_ms, &inp)?;
+        self.journal_writer.log_create_inode_entry(self, op_ms, &inp)?;
 
         Ok(inp)
     }
@@ -435,7 +466,6 @@ impl FsDir {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
-        assert!(!inode.is_file_entry());
 
         let status = match inode.as_ref() {
             File(..) | Dir(..) => inode.to_file_status(inp.path()),
@@ -497,7 +527,6 @@ impl FsDir {
         choose_workers: &[WorkerAddress],
         file_len: i64,
     ) -> FsResult<ExtendedBlock> {
-        let op_ms = LocalTime::mills();
         let mut inode = try_option!(inp.get_last_inode());
 
         // update
@@ -520,7 +549,7 @@ impl FsDir {
 
                 self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
                 self.journal_writer.log_add_block(
-                    op_ms,
+                    self,
                     inp.path(),
                     inode,
                     commit_blocks.clone(),
@@ -548,7 +577,7 @@ impl FsDir {
 
                 self.store.apply_new_block(inode.as_ref(), &commit_blocks)?;
                 self.journal_writer
-                    .log_add_block(op_ms, inp.path(), inode, commit_blocks)?;
+                    .log_add_block(self, inp.path(), inode, commit_blocks)?;
                 block
             }
             _ => {
@@ -570,7 +599,6 @@ impl FsDir {
         client_name: impl AsRef<str>,
         only_flush: bool,
     ) -> FsResult<bool> {
-        let op_ms = LocalTime::mills();
         let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
         file.complete(len, &commit_block, client_name, only_flush)?;
@@ -580,7 +608,7 @@ impl FsDir {
             .apply_complete_inode_entry(inode.as_ref(), &commit_block)?;
 
         self.journal_writer
-            .log_complete_inode_entry(op_ms, inp.path(), inode, commit_block)?;
+            .log_complete_inode_entry(self, inp.path(), inode, commit_block)?;
         Ok(true)
     }
 
@@ -593,7 +621,7 @@ impl FsDir {
         only_flush: bool,
         files: HashMap<String, SmallFileMeta>,
     ) -> FsResult<bool> {
-        let op_ms = LocalTime::mills();
+        // let op_ms = LocalTime::mills(); // need to research why op_ms don't use
         let mut inode = try_option!(inp.get_last_inode());
         let container = inode.as_container_mut()?;
         container.complete(len, &commit_block, client_name, only_flush, files)?;
@@ -619,7 +647,7 @@ impl FsDir {
             .apply_complete_inode_entry(inode.as_ref(), std::slice::from_ref(&commit_block))?;
 
         self.journal_writer.log_complete_inode_entry(
-            op_ms,
+            self,
             inp.path(),
             inode,
             vec![commit_block.clone()],
@@ -651,12 +679,10 @@ impl FsDir {
         inp: &InodePath,
         client_name: impl AsRef<str>,
     ) -> FsResult<FileStatus> {
-        let op_ms = LocalTime::mills();
         let inode_ptr = match inp.get_last_inode() {
             None => return err_ext!(FsError::file_not_found(inp.path())),
             Some(v) => v,
         };
-        assert!(!inode_ptr.is_file_entry());
 
         let mut inode = match inode_ptr.as_ref() {
             File(..) => inode_ptr.as_ref().clone(),
@@ -679,7 +705,7 @@ impl FsDir {
 
         self.store.apply_reopen_file(&inode)?;
         self.journal_writer
-            .log_reopen_file(op_ms, inp.path(), inode.as_file_ref()?)?;
+            .log_reopen_file(self, inp.path(), inode.as_file_ref()?)?;
 
         Ok(status)
     }
@@ -696,9 +722,9 @@ impl FsDir {
                     Ok(true)
                 } else {
                     err_box!(
-                        "block_id {} resolves to inode_id {} which is not a file or container",
+                        "block_id {} resolves to inode_id {:?} which is not a file or container",
                         block_id,
-                        file_id
+                        v
                     )
                 }
             }
@@ -738,7 +764,7 @@ impl FsDir {
         }
 
         // Log the operation
-        self.journal_writer.log_overwrite_file(op_ms, inp)?;
+        self.journal_writer.log_overwrite_file(self, inp)?;
 
         Ok(delete_result)
     }
@@ -790,7 +816,7 @@ impl FsDir {
         let mut spend = TimeSpent::new();
         let path = path.as_ref();
 
-        // Set to other values ​​first to facilitate memory recycling.
+        // Set to other value first to facilitate memory recycling.
         self.root_dir = Self::create_root();
 
         // Reset rocksdb
@@ -805,10 +831,10 @@ impl FsDir {
         let time2 = spend.used_ms();
 
         info!(
-            "Restore from {}, restore rocksdb used {} ms, \
+            "restore from {}, restore rocksdb used {} ms, \
         build in-memory directory tree used {} ms, \
-        statistics updated during tree reconstruction",
-            path, time1, time2
+        statistics updated during tree reconstruction, last_inode_id {}",
+            path, time1, time2, last_inode_id
         );
         Ok(())
     }
@@ -850,12 +876,10 @@ impl FsDir {
     }
 
     pub fn store_mount(&mut self, info: MountInfo, send_log: bool) -> FsResult<()> {
-        // Create parent directory
-        let op_ms = LocalTime::mills();
         self.store.store.add_mountpoint(info.mount_id, &info)?;
 
         if send_log {
-            self.journal_writer.log_mount(op_ms, info)?;
+            self.journal_writer.log_mount(self, info)?;
         }
 
         Ok(())
@@ -867,10 +891,8 @@ impl FsDir {
     }
 
     pub fn unmount(&mut self, id: u32) -> FsResult<()> {
-        // Create parent directory
-        let op_ms = LocalTime::mills();
         self.store.store.remove_mountpoint(id)?;
-        self.journal_writer.log_unmount(op_ms, id)?;
+        self.journal_writer.log_unmount(self, id)?;
         Ok(())
     }
 
@@ -888,55 +910,55 @@ impl FsDir {
     }
 
     pub fn set_attr(&mut self, inp: InodePath, opts: SetAttrOpts) -> FsResult<FileStatus> {
-        let op_ms = LocalTime::mills();
-
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
         self.unprotected_set_attr(inode.clone(), opts.clone())?;
-        self.journal_writer.log_set_attr(op_ms, &inp, opts)?;
+        self.journal_writer.log_set_attr(self, &inp, opts)?;
         Ok(inode.to_file_status(inp.path()))
     }
 
     pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {
+        if inode.is_file_entry() {
+            return err_box!("set_attr is not supported on unresolved FileEntry inodes; resolve/load the full inode before calling set_attr");
+        }
+
+        let mut change_inodes = vec![];
+        let mut stack = LinkedList::new();
+        stack.push_back(inode.clone());
         let child_opts = opts.child_opts();
-        let recursive = opts.recursive;
-        let parent_inode_id = inode.id();
-        let mut change_inodes: Vec<InodeView> = vec![];
+        while let Some(cur_inode) = stack.pop_front() {
+            if !cur_inode.is_file_entry() {
+                let set_opts = if cur_inode.id() != inode.id() {
+                    child_opts.clone()
+                } else {
+                    opts.clone()
+                };
+                cur_inode.as_mut().set_attr(set_opts);
+                change_inodes.push(cur_inode.as_ref().clone());
+            }
 
-        // set current inode
-        inode.as_mut().set_attr(opts);
-        change_inodes.push(inode.as_ref().clone());
-
-        // recursive set child inode
-        if recursive {
-            let mut stack = LinkedList::new();
-            stack.push_back(inode);
-            while let Some(cur_inode) = stack.pop_front() {
-                if cur_inode.id() != parent_inode_id {
-                    cur_inode.as_mut().set_attr(child_opts.clone());
-                    change_inodes.push(cur_inode.as_ref().clone());
+            match cur_inode.as_mut() {
+                Dir(_, dir) if opts.recursive => {
+                    for child in dir.children_iter() {
+                        stack.push_back(InodePtr::from_ref(child));
+                    }
                 }
 
-                //children may be FileEntry, so we need to load complete data from store
-                for child in cur_inode.children() {
-                    let resolved_child = match child {
-                        FileEntry(name, id) => match self.store.get_inode(*id, Some(name))? {
-                            Some(full_inode) => InodePtr::from_owned(full_inode),
-                            None => {
-                                warn!(
-                                    "Failed to load child inode {} from store during set_attr",
-                                    id
-                                );
-                                continue;
-                            }
-                        },
-                        _ => InodePtr::from_ref(child),
-                    };
-                    stack.push_back(resolved_child);
+                FileEntry(name, id) => {
+                    if let Some(store_inode) = self.store.get_inode(*id, Some(name))? {
+                        stack.push_back(InodePtr::from_owned(store_inode));
+                    } else {
+                        warn!(
+                            "unprotected_set_attr: missing inode {} for FileEntry '{}'",
+                            id, name
+                        );
+                    }
                 }
+
+                _ => (),
             }
         }
 
@@ -957,7 +979,7 @@ impl FsDir {
 
         let link = self.unprotected_symlink(link, new_inode.clone(), force)?;
         self.journal_writer
-            .log_symlink(op_ms, link.path(), new_inode, force)?;
+            .log_symlink(self, link.path(), new_inode, force)?;
         Ok(())
     }
 
@@ -1038,7 +1060,7 @@ impl FsDir {
 
         // Log the operation
         self.journal_writer
-            .log_link(op_ms, src_path.path(), &dst_path_str)?;
+            .log_link(self, src_path.path(), &dst_path_str)?;
 
         Ok(())
     }
@@ -1098,8 +1120,6 @@ impl FsDir {
     /// 3. Collect locations of blocks to be deleted
     /// 4. Persist changes to store and write journal entry
     pub fn resize(&mut self, inp: &InodePath, opts: FileAllocOpts) -> FsResult<DeleteResult> {
-        let op_ms = LocalTime::mills();
-
         let mut inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
@@ -1110,7 +1130,7 @@ impl FsDir {
             return Ok(DeleteResult::new());
         }
         let del_blocks = file.resize(opts.clone())?;
-        info!("resize file {} success, opts: {:?}", inp.path(), opts);
+        debug!("resize file {} success, opts: {:?}", inp.path(), opts);
 
         file.complete(file.len, &[], "", true)?;
         let mut del_res = DeleteResult::new();
@@ -1123,7 +1143,7 @@ impl FsDir {
 
         self.store.apply_complete_inode_entry(inode.as_ref(), &[])?;
         self.journal_writer
-            .log_complete_inode_entry(op_ms, inp.path(), inode, vec![])?;
+            .log_complete_inode_entry(self, inp.path(), inode, vec![])?;
 
         Ok(del_res)
     }
@@ -1134,8 +1154,6 @@ impl FsDir {
         block_id: i64,
         workers: &[WorkerAddress],
     ) -> FsResult<ExtendedBlock> {
-        let op_ms = LocalTime::mills();
-
         let mut inode = try_option!(inp.get_last_inode());
         let file = inode.as_file_mut()?;
 
@@ -1152,7 +1170,7 @@ impl FsDir {
         if res {
             self.store.apply_new_block(inode.as_ref(), &[])?;
             self.journal_writer
-                .log_add_block(op_ms, inp.path(), inode, vec![])?;
+                .log_add_block(self, inp.path(), inode, vec![])?;
         }
 
         Ok(block)
@@ -1188,7 +1206,6 @@ impl FsDir {
         lock: FileLock,
         expire_ms: u64,
     ) -> FsResult<Option<FileLock>> {
-        let op_ms = LocalTime::mills();
         let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => return err_ext!(FsError::file_not_found(inp.path())),
@@ -1199,8 +1216,7 @@ impl FsDir {
 
         let locks = meta.to_vec();
         self.store.apply_set_locks(inode.id(), &locks)?;
-        self.journal_writer
-            .log_set_locks(op_ms, inode.id(), locks)?;
+        self.journal_writer.log_set_locks(self, inode.id(), locks)?;
 
         Ok(conflict)
     }

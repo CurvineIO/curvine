@@ -208,3 +208,10 @@ message SmallFileMetaProto {
 
 
 
+
+
+message FreeResultProto {
+    required int64 inodes = 2;
+    required int64 bytes = 3;
+}
+

@@ -14,6 +14,7 @@
 
 #![allow(clippy::should_implement_trait)]
 
+use crate::fs::FsKind;
 use hyper::Uri;
 use once_cell::sync::Lazy;
 use orpc::CommonResult;
@@ -49,8 +50,9 @@ impl Path {
             let after_scheme = &input[scheme_end + Self::SCHEME_DELIMITER_LEN..];
 
             // Parse authority and path
-            let (authority_str, path) = if let Some(path_start) = after_scheme.find(Self::SEPARATOR)
-            {
+            let (authority_str, path) = if scheme_str == FsKind::SCHEME_FILE {
+                (String::new(), Self::normalize_path(after_scheme))
+            } else if let Some(path_start) = after_scheme.find(Self::SEPARATOR) {
                 // "bucket/path///" -> authority="bucket", path="/path"
                 let authority_str = after_scheme[..path_start].to_string();
                 let path = Self::normalize_path(&after_scheme[path_start..]);
@@ -104,7 +106,12 @@ impl Path {
 
         let auth_path = if let Some(scheme_end) = full_path.find(Self::SCHEME_DELIMITER) {
             let start_index = scheme_end + 2;
-            &full_path[start_index..]
+            let s = &full_path[start_index..];
+            if s.starts_with("//") {
+                &s[1..]
+            } else {
+                s
+            }
         } else {
             full_path
         };
@@ -204,6 +211,20 @@ impl Path {
         }
 
         let mut current_path = match self.scheme() {
+            Some(FsKind::SCHEME_FILE) => {
+                let sp = if self.path.starts_with(Self::SEPARATOR) {
+                    Self::SEPARATOR
+                } else {
+                    ""
+                };
+                format!(
+                    "{}{}{}{}",
+                    FsKind::SCHEME_FILE,
+                    Self::SCHEME_DELIMITER,
+                    sp,
+                    self.authority().unwrap_or("")
+                )
+            }
             Some(v) => format!(
                 "{}{}{}",
                 v,
@@ -260,6 +281,11 @@ impl Path {
 
     pub fn clone_display_path(&self) -> String {
         self.display_path().to_string()
+    }
+
+    pub fn likely_file(&self) -> bool {
+        let name = self.name();
+        !name.is_empty() && name.contains('.') && !name.starts_with('.')
     }
 }
 
@@ -355,6 +381,17 @@ mod tests {
             mnts,
             Vec::from(["s3://bucket/", "s3://bucket/a", "s3://bucket/a/b"])
         );
+
+        let p1 = Path::from_str("file:///test/a")?;
+        let mnts = p1.get_possible_mounts();
+        println!("{:?}", mnts);
+        assert_eq!(mnts, ["file:///", "file:///test", "file:///test/a"]);
+
+        let p1 = Path::from_str("file://../a")?;
+        let mnts = p1.get_possible_mounts();
+        println!("{:?}", mnts);
+        assert_eq!(mnts, ["file://..", "file://../a"]);
+
         Ok(())
     }
 
@@ -553,6 +590,9 @@ mod tests {
         let p4 = Path::from_str("s3://my-bucket/path/file.txt")?;
         assert_eq!(p4.authority_path(), "/my-bucket/path/file.txt");
 
+        let p4 = Path::from_str("file:///my-bucket/path/file.txt")?;
+        assert_eq!(p4.authority_path(), "/my-bucket/path/file.txt");
+
         Ok(())
     }
 
@@ -714,6 +754,39 @@ mod tests {
         assert_eq!(p3.scheme(), Some("file"));
         assert_eq!(p3.authority(), Some(""));
         assert_eq!(p3.path(), "/local/path");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_url() -> CommonResult<()> {
+        let p1 = Path::from_str("file:///local/path")?;
+        assert_eq!(p1.scheme(), Some("file"));
+        assert_eq!(p1.authority(), Some(""));
+        assert_eq!(p1.path(), "/local/path");
+        assert_eq!(p1.full_path(), "file:///local/path");
+
+        let p2 = Path::from_str("file:///")?;
+        assert_eq!(p2.path(), "/");
+        assert_eq!(p2.full_path(), "file:///");
+
+        let p3 = Path::from_str("file://./a")?;
+        assert_eq!(p3.path(), "./a");
+        assert_eq!(p3.full_path(), "file://./a");
+
+        let p3b = Path::from_str("file://./a/b")?;
+        assert_eq!(p3b.path(), "./a/b");
+
+        let p4 = Path::from_str("file://../parent")?;
+        assert_eq!(p4.path(), "../parent");
+        assert_eq!(p4.full_path(), "file://../parent");
+
+        let p5 = Path::from_str("file://rel/path")?;
+        assert_eq!(p5.scheme(), Some("file"));
+        assert_eq!(p5.authority(), Some(""));
+        assert!(p5.path().contains("rel"));
+        assert!(p5.path().contains("path"));
+        assert_eq!(p5.full_path(), format!("file://{}", p5.path()));
 
         Ok(())
     }

@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::conf::ClusterConf;
-use crate::raft::RaftPeer;
+use crate::raft::{RaftGroup, RaftPeer};
+use crate::FsResult;
 use orpc::client::ClientConf;
 use orpc::common::Utils;
 use orpc::io::net::{InetAddr, NetUtils};
@@ -42,9 +43,6 @@ pub struct JournalConf {
 
     // raft log storage configuration
     pub journal_dir: String,
-
-    // Write enables debug and will print every log.
-    pub writer_debug: bool,
 
     // The buffer queue size when journal is written, default is 200_000
     // The queue size is high in concurrency, which has a great impact on metadata performance. It can be set to 0 and use an unbounded queue.
@@ -83,7 +81,6 @@ pub struct JournalConf {
     pub conn_size: usize,
 
     // raft related configuration
-    pub raft_poll_interval_ms: u64,
     pub raft_tick_interval_ms: u64,
     pub raft_election_tick: usize,
     pub raft_heartbeat_tick: usize,
@@ -93,6 +90,7 @@ pub struct JournalConf {
     pub raft_max_size_per_msg: u64,
     pub raft_max_inflight_msgs: usize,
     pub raft_max_committed_size_per_ready: u64,
+    pub raft_batch_size: usize,
 
     // Raft requests to retry the cache configuration to prevent duplicate requests.
     pub raft_retry_cache_size: u64,
@@ -101,8 +99,10 @@ pub struct JournalConf {
     // The number of checkpoints saved.
     pub retain_checkpoint_num: usize,
 
-    // Whether to ignore errors in the log replay process.
-    pub ignore_replay_error: bool,
+    pub ignore_reply_error: bool,
+    pub max_retry_num: u64,
+    pub scan_batch_size: u64,
+    pub retry_interval_secs: u64,
 
     // Max timeout for copying data to UFS, expressed as a duration string (e.g. "20m").
     // Default: 20 minutes.
@@ -128,6 +128,12 @@ impl JournalConf {
 
     pub fn local_addr(&self) -> InetAddr {
         InetAddr::new(self.hostname.clone(), self.rpc_port)
+    }
+
+    pub fn node_id(&self) -> FsResult<u64> {
+        let group = RaftGroup::from_conf(self);
+        let id = group.get_node_id(&self.local_addr())?;
+        Ok(id)
     }
 
     pub fn new_client_conf(&self) -> ClientConf {
@@ -172,6 +178,7 @@ impl JournalConf {
             check_quorum: self.raft_check_quorum,
             skip_bcast_commit: true,
             pre_vote: true,
+            batch_append: true,
             ..Default::default()
         }
     }
@@ -195,12 +202,11 @@ impl Default for JournalConf {
             message_size: 200,
             journal_addrs,
             journal_dir,
-            writer_debug: false,
             writer_channel_size: 0,
             writer_flush_batch_size: 1000,
-            writer_flush_batch_ms: 100,
+            writer_flush_batch_ms: 10,
             snapshot_interval: "6h".to_string(),
-            snapshot_entries: 100_000,
+            snapshot_entries: 1000000,
             snapshot_read_chunk_size: 1024 * 1024,
 
             conn_retry_max_duration_ms: 0,
@@ -217,7 +223,6 @@ impl Default for JournalConf {
 
             conn_size: 1,
 
-            raft_poll_interval_ms: 100,
             raft_tick_interval_ms: 1000,
             raft_election_tick: 10,
             raft_heartbeat_tick: 3,
@@ -227,13 +232,17 @@ impl Default for JournalConf {
             raft_max_size_per_msg: 1024 * 1024,
             raft_max_inflight_msgs: 256,
             raft_max_committed_size_per_ready: 16 * 1024 * 1024,
+            raft_batch_size: 8,
 
             raft_retry_cache_size: 100_000,
             raft_retry_cache_ttl: "10m".to_string(),
 
             retain_checkpoint_num: 3,
-            ignore_replay_error: false,
 
+            ignore_reply_error: false,
+            max_retry_num: 1000,
+            scan_batch_size: 1000,
+            retry_interval_secs: 10,
             ufs_copy_timeout: "20m".to_owned(), // 20 minutes
         }
     }

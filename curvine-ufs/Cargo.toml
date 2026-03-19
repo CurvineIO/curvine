@@ -28,7 +28,7 @@ cc = "1.1"
 [features]
 # Storage backend implementations
 ## OpenDAL implementations for various storage services
-opendal = ["dep:opendal"]
+opendal = ["dep:opendal", "opendal/services-fs"]  # local Fs for file://
 opendal-s3 = ["opendal", "opendal/services-s3"]        # Amazon S3
 opendal-oss = ["opendal", "opendal/services-oss"]      # Alibaba Cloud OSS
 opendal-cos = ["opendal", "opendal/services-cos"]      # Tencent Cloud COS
