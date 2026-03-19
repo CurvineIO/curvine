@@ -102,7 +102,7 @@ impl InodeContainer {
         // update len of inode
         self.len = self.len.max(len);
         // validate len
-        if self.block.len != self.len {
+        if self.block.len != self.len as u32 {
             return err_box!(
                 "Block len is not equal to container inode len, block len= {}, container inode len= {}",
                 self.block.len,

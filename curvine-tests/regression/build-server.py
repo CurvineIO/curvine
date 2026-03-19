@@ -1,7 +1,9 @@
 from flask import Flask, request, jsonify, render_template, Response
+from werkzeug.utils import secure_filename
 import subprocess
 import threading
 import os
+import signal
 import json
 import glob
 import sys
@@ -19,11 +21,14 @@ from utils import cluster_utils, test_utils
 script_dir = os.path.dirname(os.path.abspath(__file__))
 template_dir = os.path.join(script_dir, 'templates')
 app = Flask(__name__, template_folder=template_dir)
+# Always reload templates from disk so changes take effect without server restart
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 # Build status storage
 build_status = {
     'status': 'idle',  # idle, building, completed, failed
-    'message': ''
+    'message': '',
+    'build_args': ''
 }
 
 # Daily test status storage
@@ -89,36 +94,99 @@ PROJECT_PATH = None
 # Test results directory (global)
 TEST_RESULTS_DIR = None
 
-def run_build_script(date, commit):
-    global build_status
-    with build_lock:  # Ensure only one build instance at a time
-        build_status['status'] = 'building'
-        build_status['message'] = f'Starting build for date: {date}, commit: {commit}'
+# Current subprocess per test (for cancel). Keys: build, dailytest, regression, coverage, fuse, fio, ltp
+test_processes = {
+    'build': None,
+    'dailytest': None,
+    'regression': None,
+    'coverage': None,
+    'fuse': None,
+    'fio': None,
+    'ltp': None
+}
+# Cancel requested flag for dailytest (checked between steps)
+dailytest_cancel_requested = False
+# Cancel requested flag for build
+build_cancel_requested = False
 
+
+def _kill_process(p):
+    """Kill a process and all its children by killing the process group.
+    Using os.killpg instead of p.terminate() because bash scripts spawn
+    child processes; p.terminate() only kills bash, children stay alive
+    and keep stdout open, blocking 'for line in process.stdout' forever.
+    start_new_session=True in Popen ensures the child is a process group leader.
+    """
+    if p is None or p.poll() is not None:
+        return
+    try:
+        import signal as _signal
+        os.killpg(os.getpgid(p.pid), _signal.SIGTERM)
+    except Exception:
         try:
-            # Use Popen to run build script and stream logs
+            p.terminate()
+        except Exception:
+            pass
+
+
+def _handle_sigterm(signum, frame):
+    """On SIGTERM (e.g. systemctl stop): kill all test subprocesses and exit immediately."""
+    for key in list(test_processes):
+        _kill_process(test_processes.get(key))
+    os._exit(0)
+
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
+# Default make all arguments - can be overridden via POST /build body
+DEFAULT_BUILD_ARGS = (
+    '--skip-java-sdk '
+    '--ufs opendal-s3 '
+    '--ufs opendal-oss '
+    '--ufs opendal-azblob '
+    '--ufs opendal-gcs '
+    '--ufs opendal-hdfs-native'
+)
+
+
+def run_build_script(make_args=None):
+    """Run 'make all ARGS=...' in PROJECT_PATH and stream output."""
+    global build_status, build_cancel_requested
+    with build_lock:  # Ensure only one build instance at a time
+        build_cancel_requested = False
+        args_str = make_args if make_args else DEFAULT_BUILD_ARGS
+        build_status['status'] = 'building'
+        build_status['message'] = f'Starting build: make all ARGS="{args_str}"'
+        build_status['build_args'] = args_str
+
+        project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
+        try:
             process = subprocess.Popen(
-                ['./build.sh', date, commit],
+                ['make', 'all', f'ARGS={args_str}'],
+                cwd=project_path,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
+                stderr=subprocess.STDOUT,  # merge stderr into stdout for live log
+                universal_newlines=True,
+                start_new_session=True,
             )
+            test_processes['build'] = process
+            try:
+                for line in process.stdout:
+                    print(line, end='')
+                process.wait()
+            finally:
+                test_processes['build'] = None
 
-            # Stream output in real time
-            for line in process.stdout:
-                print(line, end='')  # Print to console
-
-            # Wait for process to finish
-            process.wait()
-
-            if process.returncode == 0:
+            if build_cancel_requested:
+                build_status['status'] = 'cancelled'
+                build_status['message'] = 'Build cancelled by user.'
+            elif process.returncode == 0:
                 build_status['status'] = 'completed'
                 build_status['message'] = 'Build completed successfully.'
             else:
                 build_status['status'] = 'failed'
-                # Print error output
-                stderr_output = process.stderr.read()
-                build_status['message'] = f'Build failed. Error: {stderr_output}'
+                build_status['message'] = f'Build failed (return code: {process.returncode}).'
 
         except Exception as e:
             build_status['status'] = 'failed'
@@ -130,13 +198,14 @@ DAILYTEST_CONFIG = {
     'coverage': True,
     'fio': True,
     'fuse': True,
-    'ltp': True
+    'ltp': False
 }
 
 def run_dailytest_script():
     """Run unittest, coverage, fio, fuse, and ltp tests in sequence"""
-    global dailytest_status
+    global dailytest_status, dailytest_cancel_requested, test_processes
     with dailytest_lock:  # Ensure only one test instance at a time
+        dailytest_cancel_requested = False
         dailytest_status['status'] = 'testing'
         dailytest_status['message'] = 'Starting daily test (unittest + coverage + fio + fuse + ltp)...'
         dailytest_status['test_dir'] = ''
@@ -160,162 +229,178 @@ def run_dailytest_script():
             
             # Step 1: Run unittest (regression test)
             if DAILYTEST_CONFIG.get('unittest', True):
+                if dailytest_cancel_requested:
+                    dailytest_status.update({'status': 'cancelled', 'message': 'Daily test was cancelled by user.'})
+                    return
                 current_step += 1
                 dailytest_status['message'] = f'Step {current_step}/{total_steps}: Running unittest...'
+                regression_status.update({'status': 'testing', 'message': f'Step {current_step}/{total_steps}: Running regression test...', 'test_dir': '', 'report_url': ''})
                 print("="*80)
                 print(f"Step {current_step}/{total_steps}: Running unittest (regression test)...")
                 print("="*80)
-                
+
                 script_path = test_utils.find_script_path(project_path=project_path)
                 if not script_path:
                     unittest_failed = True
+                    regression_status.update({'status': 'failed', 'message': 'Cannot find daily_regression_test.sh script.'})
                     print(f"⚠ Step {current_step}/{total_steps}: Cannot find daily_regression_test.sh script, skipping unittest")
-                    # Continue to next step
                 elif not os.path.exists(script_path):
                     unittest_failed = True
+                    regression_status.update({'status': 'failed', 'message': f'Test script not found: {script_path}.'})
                     print(f"⚠ Step {current_step}/{total_steps}: Test script not found: {script_path}, skipping unittest")
-                    # Continue to next step
                 else:
                     print(f"Using script path: {script_path}")
-                    
+
                     process = subprocess.Popen(
                         [script_path, project_path, TEST_RESULTS_DIR],
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
-                        universal_newlines=True
+                        universal_newlines=True,
+                        start_new_session=True,
                     )
-                    
-                    # Stream output in real time
-                    for line in process.stdout:
-                        print(line, end='')
-                    
-                    process.wait()
-                    
+                    test_processes['dailytest'] = process
+                    try:
+                        for line in process.stdout:
+                            print(line, end='')
+                        process.wait()
+                    finally:
+                        test_processes['dailytest'] = None
+
+                    if dailytest_cancel_requested:
+                        regression_status.update({'status': 'cancelled', 'message': 'Cancelled (daily test was cancelled).', 'test_dir': latest_test_dir or '', 'report_url': ''})
+                        dailytest_status.update({'status': 'cancelled', 'message': 'Daily test was cancelled by user.'})
+                        return
+
                     latest_test_dir = test_utils.find_latest_test_dir(TEST_RESULTS_DIR)
                     if latest_test_dir:
                         dailytest_status['test_dir'] = latest_test_dir
-                        # Ensure test_summary.json exists after unittest (even if it failed)
                         test_utils.ensure_test_summary(latest_test_dir)
-                    
+
+                    _r1url = f"/result?date={os.path.basename(latest_test_dir)}" if latest_test_dir else ''
                     if process.returncode != 0:
                         unittest_failed = True
                         stderr_output = process.stderr.read()
+                        regression_status.update({'status': 'failed', 'message': f'Failed (return code: {process.returncode}).', 'test_dir': latest_test_dir or '', 'report_url': _r1url})
                         print(f"\n⚠ Step {current_step}/{total_steps}: Unittest completed with failures (return code: {process.returncode})")
                         print(f"Error output: {stderr_output}")
-                        # Save results but continue to next step
                         if latest_test_dir:
                             test_utils.update_test_summary(latest_test_dir, {
                                 'unittest_status': 'failed',
                                 'unittest_error': stderr_output[:500] if stderr_output else 'Unknown error'
                             })
                     else:
+                        regression_status.update({'status': 'completed', 'message': 'Completed successfully (via daily test).', 'test_dir': latest_test_dir or '', 'report_url': _r1url})
                         print(f"\n✓ Step {current_step}/{total_steps}: Unittest completed successfully\n")
-                        # Mark unittest as completed in summary
                         if latest_test_dir:
-                            test_utils.update_test_summary(latest_test_dir, {
-                                'unittest_status': 'completed'
-                            })
+                            test_utils.update_test_summary(latest_test_dir, {'unittest_status': 'completed'})
             
             # Step 2: Run coverage test
             if DAILYTEST_CONFIG.get('coverage', True):
+                if dailytest_cancel_requested:
+                    dailytest_status.update({'status': 'cancelled', 'message': 'Daily test was cancelled by user.'})
+                    return
                 current_step += 1
                 dailytest_status['message'] = f'Step {current_step}/{total_steps}: Running coverage test...'
+                coverage_status.update({'status': 'testing', 'message': f'Step {current_step}/{total_steps}: Running coverage test...', 'test_dir': '', 'report_url': ''})
                 print("="*80)
                 print(f"Step {current_step}/{total_steps}: Running coverage test...")
                 print("="*80)
-                
+
                 if latest_test_dir:
-                    # Ensure test_summary.json exists before coverage test
                     test_utils.ensure_test_summary(latest_test_dir)
-                    coverage_success = coverage_test.run_coverage_test(project_path, TEST_RESULTS_DIR, latest_test_dir, update_status=dailytest_status)
+                    # Pass coverage_status so it gets per-step updates directly
+                    coverage_success = coverage_test.run_coverage_test(
+                        project_path, TEST_RESULTS_DIR, latest_test_dir,
+                        update_status=coverage_status,
+                        process_holder=test_processes, process_key='coverage',
+                    )
                     if not coverage_success:
                         coverage_failed = True
                         print(f"\n⚠ Step {current_step}/{total_steps}: Coverage test completed with failures")
-                        # Mark coverage test as failed in summary but continue
-                        test_utils.update_test_summary(latest_test_dir, {
-                            'coverage_status': 'failed'
-                        })
+                        test_utils.update_test_summary(latest_test_dir, {'coverage_status': 'failed'})
                     else:
                         print(f"\n✓ Step {current_step}/{total_steps}: Coverage test completed successfully\n")
                 else:
                     coverage_failed = True
                     print(f"⚠ Step {current_step}/{total_steps}: Could not find test directory for coverage test, skipping")
-                    # Create test directory if it doesn't exist
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     latest_test_dir = os.path.join(TEST_RESULTS_DIR, timestamp)
                     os.makedirs(latest_test_dir, exist_ok=True)
                     dailytest_status['test_dir'] = latest_test_dir
                     test_utils.ensure_test_summary(latest_test_dir)
+                    coverage_status.update({'status': 'failed', 'message': 'No test directory available, skipped.'})
             
             # Step 3: Run FIO test
             if DAILYTEST_CONFIG.get('fio', True):
+                if dailytest_cancel_requested:
+                    dailytest_status.update({'status': 'cancelled', 'message': 'Daily test was cancelled by user.'})
+                    return
                 current_step += 1
                 dailytest_status['message'] = f'Step {current_step}/{total_steps}: Ensuring cluster is ready for FIO test...'
+                fio_status.update({'status': 'testing', 'message': f'Step {current_step}/{total_steps}: Ensuring cluster...', 'test_dir': '', 'report_url': ''})
                 print("="*80)
                 print(f"Step {current_step}/{total_steps}: Ensuring cluster is ready for FIO test...")
                 print("="*80)
-                
-                # Ensure cluster is ready before running FIO test
+
                 success, error_msg = cluster_utils.ensure_cluster_ready(project_path, test_path='/curvine-fuse')
                 if not success:
                     fio_test_failed = True
+                    fio_status.update({'status': 'failed', 'message': f'Cluster preparation failed: {error_msg}', 'test_dir': latest_test_dir or '', 'report_url': ''})
                     print(f"⚠ Step {current_step}/{total_steps}: Failed to prepare cluster for FIO test: {error_msg}, skipping FIO test")
-                    # Save partial results but continue
                     if latest_test_dir:
                         test_utils.ensure_test_summary(latest_test_dir)
-                        test_utils.update_test_summary(latest_test_dir, {
-                            'fio_test': {
-                                'status': 'skipped',
-                                'reason': f'Cluster preparation failed: {error_msg}'
-                            }
-                        })
+                        test_utils.update_test_summary(latest_test_dir, {'fio_test': {'status': 'skipped', 'reason': f'Cluster preparation failed: {error_msg}'}})
                 else:
                     dailytest_status['message'] = f'Step {current_step}/{total_steps}: Running FIO test...'
+                    fio_status['message'] = f'Step {current_step}/{total_steps}: Running FIO test...'
                     print("="*80)
                     print(f"Step {current_step}/{total_steps}: Running FIO test...")
                     print("="*80)
-                    
-                    # Ensure we have the latest test directory
+
                     latest_test_dir = test_utils.find_latest_test_dir(TEST_RESULTS_DIR)
                     if not latest_test_dir:
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         latest_test_dir = os.path.join(TEST_RESULTS_DIR, timestamp)
                         os.makedirs(latest_test_dir, exist_ok=True)
                         dailytest_status['test_dir'] = latest_test_dir
-                    
+                    fio_status['test_dir'] = latest_test_dir
+
                     original_cwd = os.getcwd()
                     os.chdir(project_path)
-                    
+
                     fio_script = os.path.join(project_path, 'build', 'dist', 'tests', 'fio-test.sh')
                     if not os.path.exists(fio_script):
                         fio_test_failed = True
+                        fio_status.update({'status': 'failed', 'message': f'Script not found: {fio_script}'})
                         print(f"⚠ Step {current_step}/{total_steps}: FIO test script not found: {fio_script}, skipping FIO test")
                         os.chdir(original_cwd)
-                        # Save partial results but continue
                         if latest_test_dir:
                             test_utils.ensure_test_summary(latest_test_dir)
-                            test_utils.update_test_summary(latest_test_dir, {
-                                'fio_test': {
-                                    'status': 'skipped',
-                                    'reason': f'Script not found: {fio_script}'
-                                }
-                            })
+                            test_utils.update_test_summary(latest_test_dir, {'fio_test': {'status': 'skipped', 'reason': f'Script not found: {fio_script}'}})
                     else:
                         json_output = os.path.join(latest_test_dir, 'fio-test-results.json')
                         fio_process = subprocess.Popen(
                             ['bash', fio_script, '--json-output', json_output],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            universal_newlines=True
+                            universal_newlines=True,
+                            start_new_session=True,
                         )
-                        
-                        for line in fio_process.stdout:
-                            print(line, end='')
-                        
-                        fio_process.wait()
+                        test_processes['dailytest'] = fio_process
+                        try:
+                            for line in fio_process.stdout:
+                                print(line, end='')
+                            fio_process.wait()
+                        finally:
+                            test_processes['dailytest'] = None
                         os.chdir(original_cwd)
-                        
-                        # Update test_summary.json with FIO test results (regardless of success/failure)
+
+                        if dailytest_cancel_requested:
+                            _f3url = f"/result?date={os.path.basename(latest_test_dir)}" if latest_test_dir else ''
+                            fio_status.update({'status': 'cancelled', 'message': 'Cancelled (daily test was cancelled).', 'report_url': _f3url})
+                            dailytest_status.update({'status': 'cancelled', 'message': 'Daily test was cancelled by user.'})
+                            return
+
                         if latest_test_dir:
                             test_utils.ensure_test_summary(latest_test_dir)
                             fio_json_file = os.path.join(latest_test_dir, 'fio-test-results.json')
@@ -326,7 +411,7 @@ def run_dailytest_script():
                                         fio_test_data = json.load(f)
                                 except Exception as e:
                                     print(f"Warning: Failed to read FIO test results: {e}")
-                            
+
                             fio_summary = {
                                 'fio_test': {
                                     'status': 'completed' if fio_process.returncode == 0 else 'failed',
@@ -334,97 +419,99 @@ def run_dailytest_script():
                                     'results_file': 'fio-test-results.json' if os.path.exists(fio_json_file) else None
                                 }
                             }
-                            
-                            # Add test statistics if available
                             if fio_test_data and 'tests' in fio_test_data:
-                                total_tests = len(fio_test_data['tests'])
-                                passed_tests = sum(1 for t in fio_test_data['tests'] if t.get('status') == 'PASSED')
-                                failed_tests = total_tests - passed_tests
+                                _ftotal = len(fio_test_data['tests'])
+                                _fpassed = sum(1 for t in fio_test_data['tests'] if t.get('status') == 'PASSED')
                                 fio_summary['fio_test'].update({
-                                    'total_tests': total_tests,
-                                    'passed_tests': passed_tests,
-                                    'failed_tests': failed_tests,
-                                    'success_rate': round((passed_tests / total_tests * 100) if total_tests > 0 else 0, 2)
+                                    'total_tests': _ftotal,
+                                    'passed_tests': _fpassed,
+                                    'failed_tests': _ftotal - _fpassed,
+                                    'success_rate': round((_fpassed / _ftotal * 100) if _ftotal > 0 else 0, 2)
                                 })
-                            
                             test_utils.update_test_summary(latest_test_dir, fio_summary)
-                        
+
+                        _f3url = f"/result?date={os.path.basename(latest_test_dir)}" if latest_test_dir else ''
                         if fio_process.returncode != 0:
                             fio_test_failed = True
                             stderr_output = fio_process.stderr.read()
+                            fio_status.update({'status': 'failed', 'message': f'Failed (return code: {fio_process.returncode}).', 'report_url': _f3url})
                             print(f"\n⚠ Step {current_step}/{total_steps}: FIO test completed with failures (return code: {fio_process.returncode})")
                             print(f"Error output: {stderr_output}")
                         else:
+                            fio_status.update({'status': 'completed', 'message': 'Completed successfully (via daily test).', 'report_url': _f3url})
                             print(f"\n✓ Step {current_step}/{total_steps}: FIO test completed successfully\n")
             
             # Step 4: Run FUSE test
             if DAILYTEST_CONFIG.get('fuse', True):
+                if dailytest_cancel_requested:
+                    dailytest_status.update({'status': 'cancelled', 'message': 'Daily test was cancelled by user.'})
+                    return
                 current_step += 1
                 dailytest_status['message'] = f'Step {current_step}/{total_steps}: Ensuring cluster is ready for FUSE test...'
+                fuse_status.update({'status': 'testing', 'message': f'Step {current_step}/{total_steps}: Ensuring cluster...', 'test_dir': '', 'report_url': ''})
                 print("="*80)
                 print(f"Step {current_step}/{total_steps}: Ensuring cluster is ready for FUSE test...")
                 print("="*80)
-                
-                # Ensure cluster is ready before running FUSE test
+
                 success, error_msg = cluster_utils.ensure_cluster_ready(project_path, test_path='/curvine-fuse')
                 if not success:
                     fuse_test_failed = True
+                    fuse_status.update({'status': 'failed', 'message': f'Cluster preparation failed: {error_msg}', 'test_dir': latest_test_dir or '', 'report_url': ''})
                     print(f"⚠ Step {current_step}/{total_steps}: Failed to prepare cluster for FUSE test: {error_msg}, skipping FUSE test")
-                    # Save partial results but continue
                     if latest_test_dir:
                         test_utils.ensure_test_summary(latest_test_dir)
-                        test_utils.update_test_summary(latest_test_dir, {
-                            'fuse_test': {
-                                'status': 'skipped',
-                                'reason': f'Cluster preparation failed: {error_msg}'
-                            }
-                        })
+                        test_utils.update_test_summary(latest_test_dir, {'fuse_test': {'status': 'skipped', 'reason': f'Cluster preparation failed: {error_msg}'}})
                 else:
                     dailytest_status['message'] = f'Step {current_step}/{total_steps}: Running FUSE test...'
+                    fuse_status['message'] = f'Step {current_step}/{total_steps}: Running FUSE test...'
                     print("="*80)
                     print(f"Step {current_step}/{total_steps}: Running FUSE test...")
                     print("="*80)
-                    
+
                     latest_test_dir = test_utils.find_latest_test_dir(TEST_RESULTS_DIR)
                     if not latest_test_dir:
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         latest_test_dir = os.path.join(TEST_RESULTS_DIR, timestamp)
                         os.makedirs(latest_test_dir, exist_ok=True)
                         dailytest_status['test_dir'] = latest_test_dir
-                    
+                    fuse_status['test_dir'] = latest_test_dir
+
                     original_cwd = os.getcwd()
                     os.chdir(project_path)
-                    
+
                     fuse_script = os.path.join(project_path, 'build', 'dist', 'tests', 'fuse-test.sh')
                     if not os.path.exists(fuse_script):
                         fuse_test_failed = True
+                        fuse_status.update({'status': 'failed', 'message': f'Script not found: {fuse_script}'})
                         print(f"⚠ Step {current_step}/{total_steps}: FUSE test script not found: {fuse_script}, skipping FUSE test")
                         os.chdir(original_cwd)
-                        # Save partial results but continue
                         if latest_test_dir:
                             test_utils.ensure_test_summary(latest_test_dir)
-                            test_utils.update_test_summary(latest_test_dir, {
-                                'fuse_test': {
-                                    'status': 'skipped',
-                                    'reason': f'Script not found: {fuse_script}'
-                                }
-                            })
+                            test_utils.update_test_summary(latest_test_dir, {'fuse_test': {'status': 'skipped', 'reason': f'Script not found: {fuse_script}'}})
                     else:
                         json_output = os.path.join(latest_test_dir, 'fuse-test-results.json')
                         fuse_process = subprocess.Popen(
                             ['bash', fuse_script, '--json-output', json_output],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            universal_newlines=True
+                            universal_newlines=True,
+                            start_new_session=True,
                         )
-                        
-                        for line in fuse_process.stdout:
-                            print(line, end='')
-                        
-                        fuse_process.wait()
+                        test_processes['dailytest'] = fuse_process
+                        try:
+                            for line in fuse_process.stdout:
+                                print(line, end='')
+                            fuse_process.wait()
+                        finally:
+                            test_processes['dailytest'] = None
                         os.chdir(original_cwd)
-                        
-                        # Update test_summary.json with FUSE test results (regardless of success/failure)
+
+                        if dailytest_cancel_requested:
+                            _f4url = f"/result?date={os.path.basename(latest_test_dir)}" if latest_test_dir else ''
+                            fuse_status.update({'status': 'cancelled', 'message': 'Cancelled (daily test was cancelled).', 'report_url': _f4url})
+                            dailytest_status.update({'status': 'cancelled', 'message': 'Daily test was cancelled by user.'})
+                            return
+
                         if latest_test_dir:
                             test_utils.ensure_test_summary(latest_test_dir)
                             fuse_json_file = os.path.join(latest_test_dir, 'fuse-test-results.json')
@@ -435,7 +522,7 @@ def run_dailytest_script():
                                         fuse_test_data = json.load(f)
                                 except Exception as e:
                                     print(f"Warning: Failed to read FUSE test results: {e}")
-                            
+
                             fuse_summary = {
                                 'fuse_test': {
                                     'status': 'completed' if fuse_process.returncode == 0 else 'failed',
@@ -443,35 +530,37 @@ def run_dailytest_script():
                                     'results_file': 'fuse-test-results.json' if os.path.exists(fuse_json_file) else None
                                 }
                             }
-                            
-                            # Add test statistics if available
                             if fuse_test_data and 'tests' in fuse_test_data:
-                                total_tests = len(fuse_test_data['tests'])
-                                passed_tests = sum(1 for t in fuse_test_data['tests'] if t.get('status') == 'PASSED')
-                                failed_tests = total_tests - passed_tests
+                                _fstotal = len(fuse_test_data['tests'])
+                                _fspassed = sum(1 for t in fuse_test_data['tests'] if t.get('status') == 'PASSED')
                                 fuse_summary['fuse_test'].update({
-                                    'total_tests': total_tests,
-                                    'passed_tests': passed_tests,
-                                    'failed_tests': failed_tests,
-                                    'success_rate': round((passed_tests / total_tests * 100) if total_tests > 0 else 0, 2)
+                                    'total_tests': _fstotal,
+                                    'passed_tests': _fspassed,
+                                    'failed_tests': _fstotal - _fspassed,
+                                    'success_rate': round((_fspassed / _fstotal * 100) if _fstotal > 0 else 0, 2)
                                 })
-                            
                             test_utils.update_test_summary(latest_test_dir, fuse_summary)
-                        
-                        # Check FUSE test result but continue to next step even if failed
+
+                        _f4url = f"/result?date={os.path.basename(latest_test_dir)}" if latest_test_dir else ''
                         if fuse_process.returncode != 0:
                             fuse_test_failed = True
                             stderr_output = fuse_process.stderr.read()
+                            fuse_status.update({'status': 'failed', 'message': f'Failed (return code: {fuse_process.returncode}).', 'report_url': _f4url})
                             print(f"\n⚠ Step {current_step}/{total_steps}: FUSE test completed with failures (return code: {fuse_process.returncode})")
                             print(f"Error output: {stderr_output}")
                         else:
+                            fuse_status.update({'status': 'completed', 'message': 'Completed successfully (via daily test).', 'report_url': _f4url})
                             print(f"\n✓ Step {current_step}/{total_steps}: FUSE test completed successfully\n")
                 sys.stdout.flush()
             
             # Step 5: Run LTP test
             if DAILYTEST_CONFIG.get('ltp', True):
+                if dailytest_cancel_requested:
+                    dailytest_status.update({'status': 'cancelled', 'message': 'Daily test was cancelled by user.'})
+                    return
                 current_step += 1
                 dailytest_status['message'] = f'Step {current_step}/{total_steps}: Ensuring cluster is ready for LTP test...'
+                ltp_status.update({'status': 'testing', 'message': f'Step {current_step}/{total_steps}: Ensuring cluster...', 'test_dir': '', 'report_url': ''})
                 print("="*80)
                 print(f"Step {current_step}/{total_steps}: Ensuring cluster is ready for LTP test...")
                 print("="*80)
@@ -488,49 +577,46 @@ def run_dailytest_script():
                 sys.stdout.flush()
                 if not success:
                     ltp_test_failed = True
+                    ltp_status.update({'status': 'failed', 'message': f'Cluster preparation failed: {error_msg}', 'test_dir': latest_test_dir or '', 'report_url': ''})
                     print(f"⚠ Step {current_step}/{total_steps}: Failed to prepare cluster for LTP test: {error_msg}, skipping LTP test")
-                    # Save partial results but continue
                     if latest_test_dir:
                         test_utils.ensure_test_summary(latest_test_dir)
-                        test_utils.update_test_summary(latest_test_dir, {
-                            'ltp_test': {
-                                'status': 'skipped',
-                                'reason': f'Cluster preparation failed: {error_msg}'
-                            }
-                        })
+                        test_utils.update_test_summary(latest_test_dir, {'ltp_test': {'status': 'skipped', 'reason': f'Cluster preparation failed: {error_msg}'}})
                 else:
                     dailytest_status['message'] = f'Step {current_step}/{total_steps}: Running LTP test...'
+                    ltp_status['message'] = f'Step {current_step}/{total_steps}: Running LTP test...'
                     print("="*80)
                     print(f"Step {current_step}/{total_steps}: Running LTP test...")
                     print("="*80)
-                    
+
                     latest_test_dir = test_utils.find_latest_test_dir(TEST_RESULTS_DIR)
                     if not latest_test_dir:
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         latest_test_dir = os.path.join(TEST_RESULTS_DIR, timestamp)
                         os.makedirs(latest_test_dir, exist_ok=True)
                         dailytest_status['test_dir'] = latest_test_dir
-                    
-                    # Ensure test_summary.json exists before LTP test
+                    ltp_status['test_dir'] = latest_test_dir
+
                     if latest_test_dir:
                         test_utils.ensure_test_summary(latest_test_dir)
-                    
-                    # Run LTP test with default test suites
+
                     try:
                         ltp_success = ltp_test.run_ltp_test(
                             ltp_path='/opt/ltp',
                             test_path='/curvine-fuse',
                             test_results_dir=TEST_RESULTS_DIR,
                             test_dir=latest_test_dir,
-                            test_suites=None,  # Use default test suites
+                            test_suites=None,
                             project_path=project_path,
-                            ltp_status=None  # Don't update global status in dailytest
+                            ltp_status=ltp_status,       # now reflects in /ltp/status
+                            process_holder=test_processes,
+                            process_key='dailytest',
                         )
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
                         ltp_success = False
-                    
+
                     if not ltp_success:
                         ltp_test_failed = True
                         print(f"\n⚠ Step {current_step}/{total_steps}: LTP test completed with failures\n")
@@ -538,7 +624,7 @@ def run_dailytest_script():
                         print(f"\n✓ Step {current_step}/{total_steps}: LTP test completed successfully\n")
                 sys.stdout.flush()
             
-            # Update final status based on all test results
+            # Update final status atomically to avoid a race window between status and message
             failed_tests = []
             if unittest_failed:
                 failed_tests.append('unittest')
@@ -550,18 +636,21 @@ def run_dailytest_script():
                 failed_tests.append('fuse')
             if ltp_test_failed:
                 failed_tests.append('ltp')
-            
+
+            report_url = (f"/result?date={os.path.basename(dailytest_status['test_dir'])}"
+                          if dailytest_status['test_dir'] else '')
             if failed_tests:
-                dailytest_status['status'] = 'failed'
-                failed_list = ', '.join(failed_tests)
-                dailytest_status['message'] = f'Daily test completed with failures: {failed_list} test(s) failed.'
+                dailytest_status.update({
+                    'status': 'failed',
+                    'message': f'Daily test completed with failures: {", ".join(failed_tests)} test(s) failed.',
+                    'report_url': report_url,
+                })
             else:
-                dailytest_status['status'] = 'completed'
-                dailytest_status['message'] = 'Daily test (unittest + coverage + fio + fuse + ltp) completed successfully.'
-            
-            # Generate report URL
-            if dailytest_status['test_dir']:
-                dailytest_status['report_url'] = f"http://localhost:5002/result?date={dailytest_status['test_dir'].split('/')[-1]}"
+                dailytest_status.update({
+                    'status': 'completed',
+                    'message': 'Daily test (unittest + coverage + fio + fuse + ltp) completed successfully.',
+                    'report_url': report_url,
+                })
             
             print("="*80)
             if failed_tests:
@@ -571,8 +660,7 @@ def run_dailytest_script():
             print("="*80)
 
         except Exception as e:
-            dailytest_status['status'] = 'failed'
-            dailytest_status['message'] = f'An error occurred: {str(e)}'
+            dailytest_status.update({'status': 'failed', 'message': f'An error occurred: {str(e)}'})
             import traceback
             traceback.print_exc()
             # Try to save partial results if we have a test directory
@@ -588,12 +676,8 @@ def run_dailytest_script():
 
 @app.route('/build', methods=['POST'])
 def build():
-    data = request.json
-    date = data.get('date')
-    commit = data.get('commit')
-
-    if not date or not commit:
-        return jsonify({'error': 'Missing date or commit parameter.'}), 400
+    """Trigger a build: POST {} to use default args, or {"args": "..."} to override."""
+    data = request.json or {}
 
     # Check current build status
     if build_status['status'] == 'building':
@@ -602,9 +686,10 @@ def build():
             'current_status': build_status
         }), 409
 
-    # Start a new thread to run build script
-    threading.Thread(target=run_build_script, args=(date, commit)).start()
-    return jsonify({'message': 'Build started.'}), 202
+    make_args = data.get('args') or None
+    threading.Thread(target=run_build_script, args=(make_args,)).start()
+    effective_args = make_args if make_args else DEFAULT_BUILD_ARGS
+    return jsonify({'message': 'Build started.', 'args': effective_args}), 202
 
 @app.route('/build/status', methods=['GET'])
 def status():
@@ -629,19 +714,56 @@ def get_dailytest_status():
     """Get daily test status (regression + coverage)"""
     return jsonify(dailytest_status)
 
+# Only allow YYYYMMDD_HHMMSS to prevent path-traversal via user-supplied folder names.
+_DATE_FOLDER_RE = re.compile(r'^\d{8}_\d{6}$')
+
+
+def _validate_date_folder(date_folder):
+    """Return True only if date_folder is a safe, expected timestamp directory name."""
+    if not date_folder or not _DATE_FOLDER_RE.match(date_folder):
+        return False
+    # werkzeug.secure_filename is a CodeQL-recognised sanitizer: it strips path
+    # separators and special characters.  A valid YYYYMMDD_HHMMSS name is
+    # unchanged, so this acts as both a sanitiser and an extra safety net.
+    if secure_filename(date_folder) != date_folder:
+        return False
+    if not TEST_RESULTS_DIR:
+        return False
+    # Resolve both paths to catch any remaining symlink / normalisation tricks.
+    base = os.path.realpath(TEST_RESULTS_DIR)
+    full = os.path.realpath(os.path.join(TEST_RESULTS_DIR, date_folder))
+    return os.path.commonpath([base, full]) == base
+
+
+def _resolve_target_dir(date_folder):
+    """Resolve a date folder name to a full path. Returns None if not provided or invalid."""
+    if not _validate_date_folder(date_folder):
+        return None
+    # Use the sanitised name (identical to date_folder for valid input) so
+    # the path passed to os.makedirs is derived from a known-safe value.
+    safe_name = secure_filename(date_folder)
+    full = os.path.join(TEST_RESULTS_DIR, safe_name)
+    if not os.path.isdir(full):
+        os.makedirs(full, exist_ok=True)
+    return full
+
+
 @app.route('/regression/run', methods=['POST'])
 def run_regression():
     """Run regression test independently"""
-    # Check current regression test status
     if regression_status['status'] == 'testing':
         return jsonify({
             'error': 'A regression test is already in progress.',
             'current_status': regression_status
         }), 409
-    
-    # Start a new thread to run regression test
+    data = request.json or {}
+    target_dir = _resolve_target_dir(data.get('target_date'))
     project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
-    threading.Thread(target=unittest_test.run_regression_test_independent, args=(project_path, TEST_RESULTS_DIR, regression_status, regression_lock)).start()
+    threading.Thread(
+        target=unittest_test.run_regression_test_independent,
+        args=(project_path, TEST_RESULTS_DIR, regression_status, regression_lock),
+        kwargs={'test_processes': test_processes, 'process_key': 'regression', 'target_test_dir': target_dir}
+    ).start()
     return jsonify({'message': 'Regression test started.'}), 202
 
 @app.route('/regression/status', methods=['GET'])
@@ -652,16 +774,19 @@ def get_regression_status():
 @app.route('/coverage/run', methods=['POST'])
 def run_coverage():
     """Run coverage test independently"""
-    # Check current coverage test status
     if coverage_status['status'] == 'testing':
         return jsonify({
             'error': 'A coverage test is already in progress.',
             'current_status': coverage_status
         }), 409
-    
-    # Start a new thread to run coverage test
+    data = request.json or {}
+    target_dir = _resolve_target_dir(data.get('target_date'))
     project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
-    threading.Thread(target=coverage_test.run_coverage_test_independent, args=(project_path, TEST_RESULTS_DIR, coverage_status, coverage_lock)).start()
+    threading.Thread(
+        target=coverage_test.run_coverage_test_independent,
+        args=(project_path, TEST_RESULTS_DIR, coverage_status, coverage_lock),
+        kwargs={'test_processes': test_processes, 'process_key': 'coverage', 'target_test_dir': target_dir}
+    ).start()
     return jsonify({'message': 'Coverage test started.'}), 202
 
 @app.route('/coverage/status', methods=['GET'])
@@ -674,16 +799,19 @@ def get_coverage_status():
 @app.route('/fuse/run', methods=['POST'])
 def run_fuse():
     """Run FUSE test independently"""
-    # Check current FUSE test status
     if fuse_status['status'] == 'testing':
         return jsonify({
             'error': 'A FUSE test is already in progress.',
             'current_status': fuse_status
         }), 409
-    
-    # Start a new thread to run FUSE test
+    data = request.json or {}
+    target_dir = _resolve_target_dir(data.get('target_date'))
     project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
-    threading.Thread(target=fuse_test.run_fuse_test_independent, args=(project_path, TEST_RESULTS_DIR, fuse_status, fuse_lock)).start()
+    threading.Thread(
+        target=fuse_test.run_fuse_test_independent,
+        args=(project_path, TEST_RESULTS_DIR, fuse_status, fuse_lock),
+        kwargs={'test_processes': test_processes, 'process_key': 'fuse', 'target_test_dir': target_dir}
+    ).start()
     return jsonify({'message': 'FUSE test started.'}), 202
 
 @app.route('/fuse/status', methods=['GET'])
@@ -694,16 +822,19 @@ def get_fuse_status():
 @app.route('/fio/run', methods=['POST'])
 def run_fio():
     """Run FIO test independently"""
-    # Check current FIO test status
     if fio_status['status'] == 'testing':
         return jsonify({
             'error': 'A FIO test is already in progress.',
             'current_status': fio_status
         }), 409
-    
-    # Start a new thread to run FIO test
+    data = request.json or {}
+    target_dir = _resolve_target_dir(data.get('target_date'))
     project_path = PROJECT_PATH if PROJECT_PATH else os.getcwd()
-    threading.Thread(target=fio_test.run_fio_test_independent, args=(project_path, TEST_RESULTS_DIR, fio_status, fio_lock)).start()
+    threading.Thread(
+        target=fio_test.run_fio_test_independent,
+        args=(project_path, TEST_RESULTS_DIR, fio_status, fio_lock),
+        kwargs={'test_processes': test_processes, 'process_key': 'fio', 'target_test_dir': target_dir}
+    ).start()
     return jsonify({'message': 'FIO test started.'}), 202
 
 @app.route('/fio/status', methods=['GET'])
@@ -714,23 +845,22 @@ def get_fio_status():
 @app.route('/ltp/run', methods=['POST'])
 def run_ltp():
     """Run LTP test independently"""
-    # Check current LTP test status
     if ltp_status['status'] == 'testing':
         return jsonify({
             'error': 'An LTP test is already in progress.',
             'current_status': ltp_status
         }), 409
-    
-    # Get parameters from request
     data = request.json or {}
     ltp_path = data.get('ltp_path', '/opt/ltp')
     test_path = data.get('test_path', '/curvine-fuse')
-    # Always use LTP_TEST_SUITES list, no test_suites parameter needed
     test_suites = ltp_test.LTP_TEST_SUITES
-    project_path = data.get('project_path', PROJECT_PATH)  # Use global PROJECT_PATH if not provided
-    
-    # Start a new thread to run LTP test
-    threading.Thread(target=ltp_test.run_ltp_test_independent, args=(ltp_path, test_path, TEST_RESULTS_DIR, test_suites, project_path, ltp_status, ltp_lock)).start()
+    project_path = data.get('project_path', PROJECT_PATH)
+    target_dir = _resolve_target_dir(data.get('target_date'))
+    threading.Thread(
+        target=ltp_test.run_ltp_test_independent,
+        args=(ltp_path, test_path, TEST_RESULTS_DIR, test_suites, project_path, ltp_status, ltp_lock),
+        kwargs={'test_processes': test_processes, 'process_key': 'ltp', 'target_test_dir': target_dir}
+    ).start()
     return jsonify({
         'message': 'LTP test started.',
         'ltp_path': ltp_path,
@@ -751,6 +881,102 @@ def get_ltp_test_suites():
 def get_ltp_status():
     """Get LTP test status"""
     return jsonify(ltp_status)
+
+
+def _status_for_api(status_dict):
+    """Return a JSON-serializable copy of status (exclude any non-serializable keys)."""
+    return {k: v for k, v in status_dict.items() if not k.startswith('_')}
+
+
+@app.route('/api/all-test-status', methods=['GET'])
+def get_all_test_status():
+    """Get current date and all test module statuses for dashboard."""
+    current_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify({
+        'current_date': current_date,
+        'build': _status_for_api(build_status),
+        'dailytest': _status_for_api(dailytest_status),
+        'regression': _status_for_api(regression_status),
+        'coverage': _status_for_api(coverage_status),
+        'fuse': _status_for_api(fuse_status),
+        'fio': _status_for_api(fio_status),
+        'ltp': _status_for_api(ltp_status),
+    })
+
+
+@app.route('/build/cancel', methods=['POST'])
+def cancel_build():
+    """Cancel a running build."""
+    global build_cancel_requested
+    if build_status['status'] != 'building':
+        return jsonify({'error': 'No build is running.', 'current_status': _status_for_api(build_status)}), 400
+    build_cancel_requested = True
+    build_status['message'] = 'Cancellation requested, stopping...'
+    _kill_process(test_processes.get('build'))
+    return jsonify({'message': 'Build cancel requested.'}), 200
+
+
+@app.route('/dailytest/cancel', methods=['POST'])
+def cancel_dailytest():
+    """Request cancel of running daily test."""
+    global dailytest_cancel_requested
+    if dailytest_status['status'] != 'testing':
+        return jsonify({'error': 'No daily test is running.', 'current_status': _status_for_api(dailytest_status)}), 400
+    dailytest_cancel_requested = True
+    dailytest_status['message'] = 'Cancellation requested, stopping...'
+    _kill_process(test_processes.get('dailytest'))
+    return jsonify({'message': 'Cancel requested for daily test.'}), 200
+
+
+@app.route('/regression/cancel', methods=['POST'])
+def cancel_regression():
+    """Cancel running regression test."""
+    if regression_status['status'] != 'testing':
+        return jsonify({'error': 'No regression test is running.', 'current_status': _status_for_api(regression_status)}), 400
+    regression_status['message'] = 'Cancellation requested, stopping...'
+    _kill_process(test_processes.get('regression'))
+    return jsonify({'message': 'Cancel requested for regression test.'}), 200
+
+
+@app.route('/coverage/cancel', methods=['POST'])
+def cancel_coverage():
+    """Cancel running coverage test."""
+    if coverage_status['status'] != 'testing':
+        return jsonify({'error': 'No coverage test is running.', 'current_status': _status_for_api(coverage_status)}), 400
+    coverage_status['message'] = 'Cancellation requested, stopping...'
+    _kill_process(test_processes.get('coverage'))
+    return jsonify({'message': 'Cancel requested for coverage test.'}), 200
+
+
+@app.route('/fuse/cancel', methods=['POST'])
+def cancel_fuse():
+    """Cancel running FUSE test."""
+    if fuse_status['status'] != 'testing':
+        return jsonify({'error': 'No FUSE test is running.', 'current_status': _status_for_api(fuse_status)}), 400
+    fuse_status['message'] = 'Cancellation requested, stopping...'
+    _kill_process(test_processes.get('fuse'))
+    return jsonify({'message': 'Cancel requested for FUSE test.'}), 200
+
+
+@app.route('/fio/cancel', methods=['POST'])
+def cancel_fio():
+    """Cancel running FIO test."""
+    if fio_status['status'] != 'testing':
+        return jsonify({'error': 'No FIO test is running.', 'current_status': _status_for_api(fio_status)}), 400
+    fio_status['message'] = 'Cancellation requested, stopping...'
+    _kill_process(test_processes.get('fio'))
+    return jsonify({'message': 'Cancel requested for FIO test.'}), 200
+
+
+@app.route('/ltp/cancel', methods=['POST'])
+def cancel_ltp():
+    """Cancel running LTP test."""
+    if ltp_status['status'] != 'testing':
+        return jsonify({'error': 'No LTP test is running.', 'current_status': _status_for_api(ltp_status)}), 400
+    ltp_status['message'] = 'Cancellation requested, stopping...'
+    _kill_process(test_processes.get('ltp'))
+    return jsonify({'message': 'Cancel requested for LTP test.'}), 200
+
 
 def get_available_test_dates():
     """List available test dates"""
@@ -782,7 +1008,7 @@ def get_available_test_dates():
 
 def get_fuse_test_results(date_folder):
     """Get FUSE test results from JSON file"""
-    if not TEST_RESULTS_DIR:
+    if not _validate_date_folder(date_folder):
         return None
     
     test_dir = os.path.join(TEST_RESULTS_DIR, date_folder)
@@ -805,7 +1031,7 @@ def get_fuse_test_results(date_folder):
 
 def get_fio_test_results(date_folder):
     """Get FIO test results from JSON file"""
-    if not TEST_RESULTS_DIR:
+    if not _validate_date_folder(date_folder):
         return None
     
     test_dir = os.path.join(TEST_RESULTS_DIR, date_folder)
@@ -828,6 +1054,8 @@ def get_fio_test_results(date_folder):
 
 def get_test_result_summary(date_folder):
     """Get test result summary for a given date"""
+    if not _validate_date_folder(date_folder):
+        return None
     test_dir = os.path.join(TEST_RESULTS_DIR, date_folder)
     summary_file = os.path.join(test_dir, "test_summary.json")
     coverage_json_log = os.path.join(test_dir, "coverage.json.log")
@@ -1441,7 +1669,19 @@ Examples:
         '--results-dir', '-r',
         type=str,
         default=None,
-        help='Test results directory (defaults to <project_path>/result)'
+        help='Test results directory (defaults to <project_path>/curvine-tests/regression_result)'
+    )
+    
+    parser.add_argument(
+        '--update-code', '-u',
+        action='store_true',
+        help='Run git fetch and git pull in project path before starting (current branch)'
+    )
+    
+    parser.add_argument(
+        '--run-once',
+        action='store_true',
+        help='Trigger one dailytest run, wait for completion, then exit (for CI one-shot)'
     )
     
     return parser.parse_args()
@@ -1462,17 +1702,54 @@ def validate_project_path(project_path):
     if not os.path.exists(cargo_toml):
         print(f"Warning: Specified path may not be a curvine project (Cargo.toml not found): {project_path}")
     
-    # Check if build/tests directory exists (preferred location)
+    # Check curvine-tests/regression (canonical location for regression scripts)
+    regression_dir = os.path.join(project_path, 'curvine-tests', 'regression')
+    if not os.path.exists(regression_dir):
+        print(f"Info: curvine-tests/regression not found: {regression_dir}")
+    
+    # Check if build/tests directory exists (alternative)
     build_tests_dir = os.path.join(project_path, 'build', 'tests')
     if not os.path.exists(build_tests_dir):
         print(f"Warning: build/tests directory not found in project path: {build_tests_dir}")
     
-    # Check if scripts directory exists (legacy location)
-    scripts_dir = os.path.join(project_path, 'scripts')
-    if not os.path.exists(scripts_dir):
-        print(f"Info: scripts directory not found in project path (legacy location): {scripts_dir}")
-    
     return project_path
+
+
+def try_update_repo(project_path):
+    """Run git fetch and git pull in project_path (current branch). Log and continue on failure."""
+    if not project_path or not os.path.isdir(project_path):
+        return
+    git_dir = os.path.join(project_path, '.git')
+    if not os.path.isdir(git_dir):
+        print(f"Info: Not a git repository, skipping update: {project_path}")
+        return
+    try:
+        subprocess.run(
+            ['git', 'fetch', 'origin'],
+            cwd=project_path,
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+        print("Git fetch completed.")
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: git fetch failed: {e.stderr.decode() if e.stderr else e}")
+    except Exception as e:
+        print(f"Warning: git fetch error: {e}")
+    try:
+        subprocess.run(
+            ['git', 'pull'],
+            cwd=project_path,
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+        print("Git pull completed.")
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: git pull failed: {e.stderr.decode() if e.stderr else e}")
+    except Exception as e:
+        print(f"Warning: git pull error: {e}")
+
 
 if __name__ == '__main__':
     # Parse command-line arguments
@@ -1486,9 +1763,14 @@ if __name__ == '__main__':
         PROJECT_PATH = os.getcwd()
         print(f"Using current working directory as project path: {PROJECT_PATH}")
     
-    # Set test results directory: prefer argument, otherwise default <project_path>/result
-    TEST_RESULTS_DIR = args.results_dir if args.results_dir else os.path.join(PROJECT_PATH, 'result')
+    # Set test results directory: prefer argument, otherwise default <project_path>/curvine-tests/regression_result
+    TEST_RESULTS_DIR = args.results_dir if args.results_dir else os.path.join(PROJECT_PATH, 'curvine-tests', 'regression_result')
     print(f"Using test results directory: {TEST_RESULTS_DIR}")
+    
+    # Optional: update repo to latest on current branch
+    if getattr(args, 'update_code', False):
+        print("Updating repository (git fetch + git pull)...")
+        try_update_repo(PROJECT_PATH)
     
     # Auto-detect script path
     script_path = test_utils.find_script_path(project_path=PROJECT_PATH)
@@ -1497,11 +1779,11 @@ if __name__ == '__main__':
     else:
         print("Warning: Could not auto-detect daily_regression_test.sh")
         print("Please ensure the script is in one of the following locations:")
-        print("  - build/tests/ subdirectory (preferred)")
+        print("  - curvine-tests/regression/ (canonical)")
+        print("  - build/tests/ subdirectory")
         print("  - Current directory")
         print("  - scripts subdirectory (legacy)")
         print("  - In system PATH")
-        print("  - /usr/local/bin, /usr/bin, /opt/curvine/bin, /home/curvine/bin")
     
     # Start server
     print(f"Starting server: http://{args.host}:{args.port}")
@@ -1509,4 +1791,39 @@ if __name__ == '__main__':
     print(f"Results directory: {TEST_RESULTS_DIR}")
     if script_path:
         print(f"Script path: {script_path}")
-    app.run(host=args.host, port=args.port)
+
+    if getattr(args, 'run_once', False):
+        import urllib.request
+        import ssl
+        server_port = args.port
+        base_url = f"http://127.0.0.1:{server_port}"
+        def run_server():
+            app.run(host=args.host, port=server_port, use_reloader=False, threaded=True)
+        t = threading.Thread(target=run_server, daemon=True)
+        t.start()
+        time.sleep(2)
+        try:
+            req = urllib.request.Request(
+                f"{base_url}/dailytest",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"Failed to trigger dailytest: {e}")
+            os._exit(1)
+        print("Dailytest triggered, waiting for completion...")
+        while True:
+            time.sleep(10)
+            try:
+                with urllib.request.urlopen(f"{base_url}/dailytest/status", timeout=5) as r:
+                    data = json.loads(r.read().decode())
+                    status = data.get("status", "")
+                    if status in ("completed", "failed", "cancelled"):
+                        print(f"Dailytest finished with status: {status}")
+                        os._exit(0 if status == "completed" else 1)
+            except Exception as e:
+                print(f"Poll status error: {e}")
+    else:
+        app.run(host=args.host, port=args.port)

@@ -34,9 +34,7 @@ pub enum TtlAction {
     #[default]
     None = 0,
     Delete = 1,
-    Persist = 2,
-    Evict = 3,
-    Flush = 4,
+    Free = 2,
 }
 
 impl TryFrom<&str> for TtlAction {
@@ -46,9 +44,7 @@ impl TryFrom<&str> for TtlAction {
         let action = match value.to_uppercase().as_str() {
             "NONE" => TtlAction::None,
             "DELETE" => TtlAction::Delete,
-            "PERSIST" => TtlAction::Persist,
-            "EVICT" => TtlAction::Evict,
-            "FLUSH" => TtlAction::Flush,
+            "FREE" => TtlAction::Free,
             _ => return err_box!("invalid ttl action: {}", value),
         };
 

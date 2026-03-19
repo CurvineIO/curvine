@@ -38,3 +38,8 @@ curvine-libsdk/java/target/
 .summary/
 .claude/
 docs
+
+__pycache__
+
+# Regression test results (build-server / curvine-tests)
+curvine-tests/regression_result

@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use curvine_client::file::{FsClient, FsContext};
+use curvine_client::file::{FsClient, FsContext, FsWriter};
 use curvine_common::conf::ClientConf;
-use curvine_common::fs::Path;
-use curvine_common::state::{CreateFileOptsBuilder, MkdirOptsBuilder, StoragePolicy, TtlAction};
+use curvine_common::fs::{Path, Writer};
+use curvine_common::state::{
+    CreateFileOptsBuilder, FileBlocks, MkdirOptsBuilder, SetAttrOptsBuilder, StoragePolicy,
+    TtlAction,
+};
 use curvine_tests::Testing;
 use log::info;
 use orpc::common::{DurationUnit, LogConf, Logger};
@@ -70,8 +73,11 @@ fn test_ttl_cleanup() -> CommonResult<()> {
         // Test 4: Test TTL cleanup timing
         test_ttl_cleanup_timing(&client, &conf.client).await?;
 
-        // Test 5: Test multiple files cleanupFix TTL test failures and improve test coverage
+        // Test 5: Test multiple files cleanup. Fix TTL test failures and improve test coverage
         test_ttl_multiple_files_cleanup(&client, &conf.client).await?;
+
+        // Test 6: TTL Free
+        test_ttl_free_cleanup(&client, &conf.client).await?;
 
         info!("Inode ttl cleanup test completed successfully");
         Ok(())
@@ -159,6 +165,71 @@ async fn test_ttl_file_cleanup(fs: &FsClient, conf: &ClientConf) -> CommonResult
     assert!(!exists, "File should be deleted after TTL expiration");
     info!("File successfully deleted after TTL expiration");
 
+    Ok(())
+}
+
+/// TTL Free background automatic cleanup: after expiration, free is executed;
+/// data (blocks) are deleted but the file still exists.
+async fn test_ttl_free_cleanup(fs: &FsClient, conf: &ClientConf) -> CommonResult<()> {
+    info!("Testing TTL Free cleanup: data deleted, file still exists");
+
+    let file_path = Path::from("/test_ttl_free.txt");
+    let ttl_ms = 3000u64; // 3 seconds TTL
+    let data = "ttl_free_test_data";
+
+    let opts = CreateFileOptsBuilder::with_conf(conf)
+        .create_parent(true)
+        .ttl_ms(ttl_ms as i64)
+        .ttl_action(TtlAction::Free)
+        .build();
+
+    let status = fs.create_with_opts(&file_path, opts, true).await?;
+    let mut writer = FsWriter::create(
+        fs.context().clone(),
+        file_path.clone(),
+        FileBlocks::new(status, vec![]),
+    );
+    writer.write_string(data).await?;
+    writer.complete().await?;
+    info!("Created file with TTL Free: {}", file_path);
+
+    let set_opts = SetAttrOptsBuilder::new().ufs_mtime(1).build();
+    fs.set_attr(&file_path, set_opts).await?;
+    info!("Set ufs_mtime so Free can run (ufs_exists)");
+
+    assert!(fs.exists(&file_path).await?);
+    let blocks_before = fs.get_block_locations(&file_path).await?;
+    assert!(
+        !blocks_before.block_locs.is_empty(),
+        "file should have blocks before TTL free"
+    );
+
+    info!("Waiting for TTL Free to run (blocks cleared)...");
+    awaitility::at_most(Duration::from_secs(12))
+        .poll_interval(Duration::from_millis(200))
+        .until_async(|| async {
+            let blocks = fs.get_block_locations(&file_path).await.ok();
+            blocks.map(|b| b.block_locs.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+    let blocks_after = fs.get_block_locations(&file_path).await?;
+    assert_eq!(
+        blocks_after.len,
+        data.len() as i64,
+        "file len should be unchanged after free"
+    );
+    assert_eq!(
+        blocks_after.block_locs.len(),
+        0,
+        "all curvine blocks should be deleted"
+    );
+    assert!(
+        fs.exists(&file_path).await?,
+        "file should still exist after free"
+    );
+
+    info!("TTL Free cleanup verified: data deleted, file exists");
     Ok(())
 }
 

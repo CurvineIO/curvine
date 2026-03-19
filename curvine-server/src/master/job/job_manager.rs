@@ -16,6 +16,7 @@ use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
 use crate::master::{JobStore, LoadJobRunner, MountManager};
 use core::time::Duration;
+use curvine_client::unified::MountValue;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::executor::ScheduledExecutor;
@@ -24,12 +25,12 @@ use curvine_common::state::{
     JobStatus, JobTaskProgress, JobTaskState, LoadJobCommand, LoadJobResult,
 };
 use curvine_common::FsResult;
-use log::{info, warn};
+use log::info;
 use orpc::common::LocalTime;
-use orpc::runtime::{LoopTask, RpcRuntime, Runtime};
-use orpc::sync::channel::BlockingChannel;
+use orpc::runtime::{LoopTask, Runtime};
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
+use tokio::time::timeout;
 
 /// Load the Task Manager
 pub struct JobManager {
@@ -84,6 +85,35 @@ impl JobManager {
         self.jobs.update_state(job_id, state, message)
     }
 
+    pub async fn wait_job_complete(
+        &self,
+        job_id: impl AsRef<str>,
+        duration: Duration,
+    ) -> FsResult<JobStatus> {
+        timeout(duration, self.wait_job_complete0(job_id)).await?
+    }
+
+    async fn wait_job_complete0(&self, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
+        let job_id = job_id.as_ref();
+        let status = self.get_job_status(job_id)?;
+        if status.state.is_finish() {
+            return Ok(status);
+        }
+
+        let mut listener = if let Some(job) = self.jobs.get(job_id) {
+            job.new_listener()
+        } else {
+            return err_ext!(FsError::job_not_found(job_id));
+        };
+
+        loop {
+            let next_state = JobTaskState::from(listener.next_state().await?);
+            if next_state.is_finish() {
+                return self.get_job_status(job_id);
+            }
+        }
+    }
+
     pub fn get_job_status(&self, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
         let job_id = job_id.as_ref();
         if let Some(job) = self.jobs.get(job_id) {
@@ -108,7 +138,22 @@ impl JobManager {
         )
     }
 
-    pub fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
+    pub fn get_mnt(&self, path: &Path) -> FsResult<Option<(Path, Arc<MountValue>)>> {
+        if let Some(mnt) = self.mount_manager.get_mount_info(path)? {
+            let mnt_value = self.factory.get_mnt(&mnt)?;
+            let target_path = mnt_value.toggle_path(path)?;
+
+            Ok(Some((target_path, mnt_value)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn rt(&self) -> &Runtime {
+        &self.rt
+    }
+
+    pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
         let source_path = Path::from_str(&command.source_path)?;
 
         // Check mount info for both UFS and CV paths
@@ -121,20 +166,11 @@ impl JobManager {
         };
 
         let job_runner = self.create_runner();
-
-        let (tx, mut rx) = BlockingChannel::new(1).split();
-        self.rt.spawn(async move {
-            let res = job_runner.submit_load_task(command, mnt).await;
-            if let Err(e) = tx.send(res) {
-                warn!("send submit_load_job result: {}", e);
-            }
-        });
-
-        rx.recv_check()?
+        job_runner.submit_load_task(command, mnt).await
     }
 
     /// Handle cancellation of tasks
-    pub fn cancel_job(&self, job_id: impl AsRef<str>) -> FsResult<()> {
+    pub async fn cancel_job(&self, job_id: impl AsRef<str>) -> FsResult<()> {
         let job_id = job_id.as_ref();
         let assigned_workers = {
             if let Some(job) = self.jobs.get(job_id) {
@@ -161,12 +197,7 @@ impl JobManager {
         self.update_state(job_id, JobTaskState::Canceled, "Canceling job by user");
 
         let job_runner = self.create_runner();
-        let job_id = job_id.to_string();
-        self.rt.spawn(async move {
-            if let Err(e) = job_runner.cancel_job(&job_id, assigned_workers).await {
-                warn!("Cancel job {} error: {}", job_id, e);
-            }
-        });
+        job_runner.cancel_job(&job_id, assigned_workers).await?;
 
         Ok(())
     }

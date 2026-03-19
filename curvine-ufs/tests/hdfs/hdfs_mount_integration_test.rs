@@ -31,7 +31,7 @@
 #[cfg(any(feature = "opendal-hdfs", feature = "opendal-webhdfs"))]
 mod mount_integration_tests {
     use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-    use curvine_common::state::{ConsistencyStrategy, MountInfo, MountType, TtlAction};
+    use curvine_common::state::{MountInfo, TtlAction};
     use curvine_ufs::opendal::OpendalFileSystem;
     use std::collections::HashMap;
     use std::env;
@@ -77,11 +77,12 @@ mod mount_integration_tests {
                 properties,
                 ttl_ms: 0,
                 ttl_action: TtlAction::None,
-                consistency_strategy: ConsistencyStrategy::None,
+                read_verify_ufs: false,
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                mount_type: MountType::Cst,
+                write_type: curvine_common::state::WriteType::CacheMode,
+                provider: None,
             };
 
             println!("Creating filesystem with MountInfo...");
@@ -228,28 +229,25 @@ mod mount_integration_tests {
                     "standard-mount",
                     "/curvine-std",
                     "/curvine-std-ufs",
-                    MountType::Cst,
                     TtlAction::None,
                 ),
                 (
                     "cached-mount",
                     "/curvine-cache",
                     "/curvine-cache-ufs",
-                    MountType::Cst,
                     TtlAction::Delete,
                 ),
                 (
                     "orch-mount",
                     "/curvine-orch",
                     "/curvine-orch-ufs",
-                    MountType::Orch,
                     TtlAction::None,
                 ),
             ];
 
             let mut filesystems: Vec<(String, OpendalFileSystem, MountInfo)> = Vec::new();
 
-            for (name, cv_path, ufs_suffix, mount_type, ttl_action) in mount_configs {
+            for (name, cv_path, ufs_suffix, ttl_action) in mount_configs {
                 println!("Creating mount configuration: {}", name);
 
                 let mut properties = HashMap::new();
@@ -267,11 +265,12 @@ mod mount_integration_tests {
                         0
                     }, // 1 hour for cached
                     ttl_action,
-                    consistency_strategy: ConsistencyStrategy::None,
+                    read_verify_ufs: false,
                     storage_type: None,
                     block_size: None,
                     replicas: None,
-                    mount_type,
+                    write_type: curvine_common::state::WriteType::CacheMode,
+                    provider: None,
                 };
 
                 match create_filesystem_from_mount(&mount_info) {
@@ -294,8 +293,8 @@ mod mount_integration_tests {
                     Path::from_str(&format!("hdfs://test-cluster/{}/config-test.txt", name))
                         .unwrap();
                 let test_content = format!(
-                    "Content from mount: {} (type: {:?}, ttl: {}ms)",
-                    name, mount_info.mount_type, mount_info.ttl_ms
+                    "Content from mount: {} (ttl: {}ms)",
+                    name, mount_info.ttl_ms
                 )
                 .as_bytes()
                 .to_vec();
@@ -406,11 +405,12 @@ mod mount_integration_tests {
                 properties: properties.clone(),
                 ttl_ms: 0,
                 ttl_action: TtlAction::None,
-                consistency_strategy: ConsistencyStrategy::None,
+                read_verify_ufs: false,
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                mount_type: MountType::Cst,
+                write_type: curvine_common::state::WriteType::CacheMode,
+                provider: None,
             };
 
             let fs_v1 = create_filesystem_from_mount(&mount_info_v1)
@@ -454,11 +454,12 @@ mod mount_integration_tests {
                 },
                 ttl_ms: 1800000, // 30 minutes TTL
                 ttl_action: TtlAction::Delete,
-                consistency_strategy: ConsistencyStrategy::Always,
+                read_verify_ufs: true,
                 storage_type: None,
                 block_size: None,
                 replicas: None,
-                mount_type: MountType::Cst,
+                write_type: curvine_common::state::WriteType::CacheMode,
+                provider: None,
             };
 
             let fs_v2 = create_filesystem_from_mount(&mount_info_v2)

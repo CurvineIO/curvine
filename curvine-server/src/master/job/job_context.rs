@@ -21,7 +21,7 @@ use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
 use orpc::err_box;
-use orpc::sync::StateCtl;
+use orpc::sync::{StateListener, StateMonitor};
 
 #[derive(Debug, Clone)]
 pub struct TaskDetail {
@@ -41,7 +41,7 @@ impl TaskDetail {
 #[derive(Clone)]
 pub struct JobContext {
     pub info: LoadJobInfo,
-    pub state: StateCtl,
+    pub state: StateMonitor,
     pub progress: JobTaskProgress,
     pub assigned_workers: FastHashSet<WorkerAddress>,
     pub tasks: FastHashMap<String, TaskDetail>,
@@ -88,7 +88,7 @@ impl JobContext {
 
         JobContext {
             info: job,
-            state: StateCtl::new(JobTaskState::Pending.into()),
+            state: StateMonitor::new(JobTaskState::Pending.into()),
             progress: Default::default(),
             assigned_workers: Default::default(),
             tasks: Default::default(),
@@ -106,9 +106,13 @@ impl JobContext {
     }
 
     pub fn update_state(&mut self, state: JobTaskState, message: impl Into<String>) {
-        self.state.set_state(state);
+        self.state.advance_state(state, true);
         self.progress.update_time = LocalTime::mills() as i64;
         self.progress.message = message.into();
+    }
+
+    pub fn new_listener(&self) -> StateListener {
+        self.state.new_listener()
     }
 
     pub fn update_progress(

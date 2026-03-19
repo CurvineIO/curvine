@@ -188,6 +188,15 @@ impl FsClient {
         Ok(())
     }
 
+    pub async fn free(&self, path: &Path) -> FsResult<()> {
+        let header = FreeRequest {
+            path: path.encode(),
+        };
+
+        let _: FreeResponse = self.rpc(RpcCode::Free, header).await?;
+        Ok(())
+    }
+
     pub async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
         let header = RenameRequest {
             src: src.encode(),

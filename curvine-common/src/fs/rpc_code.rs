@@ -46,6 +46,7 @@ pub enum RpcCode {
     ListLock = 22,
     CreateContainer = 23,
     CompleteContainer = 24,
+    Free = 25,
 
     // manager interface.
     Mount = 30,

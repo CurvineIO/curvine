@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use crate::master::JobWorkerClient;
-use curvine_client::unified::UfsFileSystem;
+use curvine_client::unified::{MountValue, UfsFileSystem};
 use curvine_common::conf::ClientConf;
-use curvine_common::fs::Path;
 use curvine_common::state::{MountInfo, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::client::ClientFactory;
@@ -27,7 +26,7 @@ use std::time::Duration;
 
 pub struct UfsFactory {
     client_factory: ClientFactory,
-    ufs_cache: FastSyncCache<u32, UfsFileSystem>,
+    ufs_cache: FastSyncCache<u32, Arc<MountValue>>,
 }
 
 impl UfsFactory {
@@ -48,13 +47,17 @@ impl UfsFactory {
         Ok(client)
     }
 
-    pub fn get_ufs(&self, mnt: &MountInfo) -> FsResult<UfsFileSystem> {
+    pub fn get_mnt(&self, mnt: &MountInfo) -> FsResult<Arc<MountValue>> {
         if let Some(v) = self.ufs_cache.get(&mnt.mount_id) {
             return Ok(v);
         };
-        let path = Path::from_str(&mnt.ufs_path)?;
-        let ufs = UfsFileSystem::new(&path, mnt.properties.clone(), None)?;
-        self.ufs_cache.insert(mnt.mount_id, ufs.clone());
-        Ok(ufs)
+
+        let mnt_value = Arc::new(MountValue::new(mnt.clone())?);
+        self.ufs_cache.insert(mnt.mount_id, mnt_value.clone());
+        Ok(mnt_value)
+    }
+
+    pub fn get_ufs(&self, mnt: &MountInfo) -> FsResult<UfsFileSystem> {
+        self.get_mnt(mnt).map(|x| x.ufs.clone())
     }
 }

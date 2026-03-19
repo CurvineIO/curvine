@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::master::{JobManager, RpcContext};
-use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CancelJobRequest, CancelJobResponse, GetJobStatusRequest, GetJobStatusResponse,
     SubmitJobRequest, SubmitJobResponse, TaskReportRequest, TaskReportResponse,
@@ -41,7 +40,7 @@ impl JobHandler {
     ///
     /// Handles the submission of a new load job by parsing the request,
     /// validating parameters, and forwarding to the load manager.
-    pub fn submit_load_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub async fn submit_load_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: SubmitJobRequest = ctx.parse_header()?;
         let command: LoadJobCommand = SerdeUtils::deserialize(&req.job_command)?;
         ctx.set_audit(Some(command.source_path.clone()), None);
@@ -50,7 +49,7 @@ impl JobHandler {
             return err_box!("Path cannot be empty");
         }
 
-        let res = self.job_manager.submit_load_job(command)?;
+        let res = self.job_manager.submit_load_job(command).await?;
         let response = SubmitJobResponse {
             job_id: res.job_id,
             target_path: res.target_path,
@@ -83,13 +82,13 @@ impl JobHandler {
     ///
     /// Handles the cancellation of a load job by its ID and returns
     /// the result of the cancellation operation.
-    pub fn cancel_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub async fn cancel_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: CancelJobRequest = ctx.parse_header()?;
 
         let job_id = req.job_id;
         ctx.set_audit(Some(job_id.clone()), None);
 
-        self.job_manager.cancel_job(job_id.clone())?;
+        self.job_manager.cancel_job(job_id.clone()).await?;
 
         ctx.response(CancelJobResponse {})
     }
@@ -111,15 +110,5 @@ impl JobHandler {
         )?;
 
         ctx.response(TaskReportResponse {})
-    }
-
-    pub fn handle(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
-        match ctx.code {
-            RpcCode::SubmitJob => self.submit_load_job(ctx),
-            RpcCode::GetJobStatus => self.get_load_status(ctx),
-            RpcCode::CancelJob => self.cancel_job(ctx),
-            RpcCode::ReportTask => self.task_report(ctx),
-            v => err_box!("Unsupported operation: {:?}", v),
-        }
     }
 }

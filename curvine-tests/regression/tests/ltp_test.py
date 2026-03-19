@@ -21,7 +21,7 @@ LTP_TEST_SUITES = [
 ]
 
 
-def run_ltp_test(ltp_path='/opt/ltp', test_path='/curvine-fuse', test_results_dir=None, test_dir=None, test_suites=None, project_path=None, ltp_status=None):
+def run_ltp_test(ltp_path='/opt/ltp', test_path='/curvine-fuse', test_results_dir=None, test_dir=None, test_suites=None, project_path=None, ltp_status=None, process_holder=None, process_key='ltp'):
     """Run LTP test
     
     Args:
@@ -32,6 +32,8 @@ def run_ltp_test(ltp_path='/opt/ltp', test_path='/curvine-fuse', test_results_di
         test_suites: List of test suites to run (default: LTP_TEST_SUITES)
         project_path: Path to the project root (required for cluster preparation)
         ltp_status: Status dictionary to update (optional)
+        process_holder: Optional dict to register current process for cancel (keyed by process_key)
+        process_key: Key in process_holder for this test's process
         
     Returns:
         bool: True if test completed successfully, False otherwise
@@ -158,15 +160,25 @@ def run_ltp_test(ltp_path='/opt/ltp', test_path='/curvine-fuse', test_results_di
                     ['./runltp', '-d', test_path, '-f', test_suite_str, '-l', log_file],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    universal_newlines=True
+                    universal_newlines=True,
+                    start_new_session=True
                 )
+                if process_holder is not None:
+                    process_holder[process_key] = process
+                try:
+                    # Stream output in real time
+                    for line in process.stdout:
+                        print(line, end='')
+                    # Wait for process to finish
+                    process.wait()
+                finally:
+                    if process_holder is not None:
+                        process_holder[process_key] = None
                 
-                # Stream output in real time
-                for line in process.stdout:
-                    print(line, end='')
-                
-                # Wait for process to finish
-                process.wait()
+                if process.returncode < 0 and ltp_status:
+                    ltp_status['status'] = 'cancelled'
+                    ltp_status['message'] = 'LTP test was cancelled.'
+                    return False
                 
                 # Read stderr
                 stderr_output = process.stderr.read()
@@ -377,9 +389,10 @@ def run_ltp_test(ltp_path='/opt/ltp', test_path='/curvine-fuse', test_results_di
         return False
 
 
-def run_ltp_test_independent(ltp_path, test_path, test_results_dir, test_suites, project_path, ltp_status, ltp_lock):
-    """Run LTP test independently in a thread
-    
+def run_ltp_test_independent(ltp_path, test_path, test_results_dir, test_suites, project_path, ltp_status, ltp_lock,
+                             test_processes=None, process_key='ltp', target_test_dir=None):
+    """Run LTP test independently in a thread.
+
     Args:
         ltp_path: Path to LTP installation
         test_path: Target test path
@@ -388,22 +401,29 @@ def run_ltp_test_independent(ltp_path, test_path, test_results_dir, test_suites,
         project_path: Path to the project root
         ltp_status: Status dictionary to update
         ltp_lock: Lock object for thread safety
+        test_processes: Optional dict to register current process for cancel (keyed by process_key)
+        process_key: Key in test_processes for this test's process
+        target_test_dir: If set, write results to this specific directory
     """
     with ltp_lock:
         ltp_status['status'] = 'testing'
         ltp_status['message'] = 'Starting LTP test...'
         ltp_status['test_dir'] = ''
         ltp_status['report_url'] = ''
-        
+
         try:
+            if target_test_dir:
+                os.makedirs(target_test_dir, exist_ok=True)
             success = run_ltp_test(
                 ltp_path=ltp_path,
                 test_path=test_path,
                 test_results_dir=test_results_dir,
-                test_dir=None,
+                test_dir=target_test_dir,
                 test_suites=test_suites,
                 project_path=project_path,
-                ltp_status=ltp_status
+                ltp_status=ltp_status,
+                process_holder=test_processes,
+                process_key=process_key
             )
             if not success:
                 ltp_status['status'] = 'failed'

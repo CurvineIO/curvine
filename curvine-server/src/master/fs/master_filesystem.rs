@@ -137,6 +137,19 @@ impl MasterFilesystem {
         Ok(true)
     }
 
+    pub fn free<T: AsRef<str>>(&self, path: T) -> FsResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+
+        let free_res = fs_dir.free(&inp)?;
+        drop(fs_dir);
+
+        let mut worker_manager = self.worker_manager.write();
+        worker_manager.remove_blocks(&free_res);
+
+        Ok(())
+    }
+
     pub fn rename<T: AsRef<str>>(&self, src: T, dst: T, flags: RenameFlags) -> FsResult<bool> {
         let src = src.as_ref();
         let dst = dst.as_ref();
@@ -239,6 +252,8 @@ impl MasterFilesystem {
         let inp = if last_inode.is_some() {
             if flags.overwrite() {
                 self.truncate(&mut fs_dir, &inp, opts)?;
+            } else {
+                return err_ext!(FsError::file_exists(inp.path()));
             }
             inp
         } else {
@@ -273,16 +288,20 @@ impl MasterFilesystem {
             return self.get_block_locations(path);
         }
 
-        if flags.create() {
-            let status = self.create_with_opts(path, opts, flags)?;
-            return Ok(FileBlocks::new(status, vec![]));
-        }
-
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
         let inode = match inp.get_last_inode() {
-            None => return err_ext!(FsError::file_not_found(inp.path())),
+            None => {
+                return if flags.create() {
+                    drop(fs_dir);
+                    let status = self.create_with_opts(path, opts, flags)?;
+                    Ok(FileBlocks::new(status, vec![]))
+                } else {
+                    err_ext!(FsError::file_not_found(inp.path()))
+                }
+            }
+
             Some(inode) => {
                 if inode.is_dir() {
                     return err_box!("{} is a directory", inp.path());
@@ -449,7 +468,7 @@ impl MasterFilesystem {
                     let locs = fs_dir.get_block_locations(next.id)?;
                     let extend_block = ExtendedBlock {
                         id: next.id,
-                        len: next.len,
+                        len: next.len as i64,
                         storage_type: file.storage_policy.storage_type,
                         file_type: file.file_type,
                         alloc_opts: next.alloc_opts.clone(),
@@ -562,7 +581,7 @@ impl MasterFilesystem {
 
             let extend_block = ExtendedBlock {
                 id: meta.id,
-                len: meta.len,
+                len: meta.len as i64,
                 storage_type: inode.storage_policy().storage_type,
                 file_type: match inode {
                     File(_, f) => f.file_type,
@@ -697,10 +716,8 @@ impl MasterFilesystem {
         }
 
         //(Whether to increase, block id, block location)
-        let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
-        let mut wm = self.worker_manager.write();
+        let mut checked = Vec::with_capacity(list.blocks.len());
         for item in list.blocks {
-            let loc = BlockLocation::new(list.worker_id, item.storage_type);
             match item.status {
                 BlockReportStatus::Finalized | BlockReportStatus::Writing => {
                     let exists = match self.block_exists(item.id) {
@@ -710,15 +727,35 @@ impl MasterFilesystem {
                             continue;
                         }
                     };
+                    checked.push((item, Some(exists)));
+                }
+                BlockReportStatus::Deleted => checked.push((item, None)),
+            }
+        }
+
+        let mut batch: Vec<(bool, i64, BlockLocation)> = vec![];
+        let mut wm = self.worker_manager.write();
+        for (item, exists) in checked {
+            let loc = BlockLocation::new(list.worker_id, item.storage_type);
+            match item.status {
+                BlockReportStatus::Finalized | BlockReportStatus::Writing => {
+                    let exists = match exists {
+                        Some(v) => v,
+                        None => {
+                            warn!(
+                                "block_report invariant violated: missing existence flag for block {}",
+                                item.id
+                            );
+                            continue;
+                        }
+                    };
 
                     if exists {
                         batch.push((true, item.id, loc));
                     } else {
-                        // The block does not exist, and the mark block needs to be deleted.
                         wm.remove_block(list.worker_id, item.id);
                     }
                 }
-
                 BlockReportStatus::Deleted => {
                     batch.push((false, item.id, loc));
                     wm.deleted_block(list.worker_id, item.id);
@@ -766,13 +803,29 @@ impl MasterFilesystem {
         opts.validate()?;
 
         let path = path.as_ref();
-        let mut fs_dir = self.fs_dir.write();
-        let inp = Self::resolve_path(&fs_dir, path)?;
+        let (del_res, inode_id) = {
+            let mut fs_dir = self.fs_dir.write();
+            let inp = Self::resolve_path(&fs_dir, path)?;
+            let inode_id = try_option!(inp.get_last_inode(), "File {} not exists", path).id();
+            let del_res = fs_dir.resize(&inp, opts)?;
+            (del_res, inode_id)
+        };
 
-        let del_res = fs_dir.resize(&inp, opts)?;
-        self.worker_manager.write().remove_blocks(&del_res);
+        if !del_res.blocks.is_empty() {
+            self.worker_manager.write().remove_blocks(&del_res);
+        }
 
-        self.get_file_blocks(path, &fs_dir, &inp)
+        let blocks = self.get_block_locations(path)?;
+        if blocks.status.id != inode_id {
+            return err_box!(
+                "Path {} resolved to different inode after resize, expected {}, got {}",
+                path,
+                inode_id,
+                blocks.status.id
+            );
+        }
+
+        Ok(blocks)
     }
 
     pub fn assign_worker<T: AsRef<str>>(

@@ -82,7 +82,7 @@ where
     K: DeserializeOwned + Sized + Serialize + Clone + Hash + Eq + Send + Sync + 'static,
     V: DeserializeOwned + Sized + Serialize + Clone + Send + Sync + 'static,
 {
-    fn apply(&self, _: bool, message: &[u8]) -> RaftResult<()> {
+    async fn apply(&self, _: bool, message: &[u8]) -> RaftResult<()> {
         let mut map = self.write()?;
         let pairs: (K, V) = SerdeUtils::deserialize(message)?;
         map.insert(pairs.0, pairs.1);
@@ -161,7 +161,7 @@ where
     K: Serialize + DeserializeOwned + Clone + Sync + Send + 'static,
     V: Serialize + DeserializeOwned + Clone + Sync + Send + 'static,
 {
-    fn apply(&self, _: bool, message: &[u8]) -> RaftResult<()> {
+    async fn apply(&self, _: bool, message: &[u8]) -> RaftResult<()> {
         let db = self.lock()?;
         let pairs: (K, V) = SerdeUtils::deserialize(message)?;
         let k = SerdeUtils::serialize(&pairs.0)?;

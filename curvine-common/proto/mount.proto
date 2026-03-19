@@ -7,11 +7,6 @@ option java_outer_classname = "MountProto";
 
 import "common.proto";
 
-enum MountTypeProto {
-    MOUNT_TYPE_PROTO_CST = 0;
-    MOUNT_TYPE_PROTO_ORCH = 1;
-}
-
 message MountInfoProto {
     required string cv_path = 1;
     required string ufs_path = 2;
@@ -19,13 +14,12 @@ message MountInfoProto {
     map<string, string> properties = 4;
     required int64 ttl_ms = 5;
     required TtlActionProto ttl_action = 6;
-    required ConsistencyStrategyProto consistency_strategy = 7;
+    required bool read_verify_ufs = 7;
     optional StorageTypeProto storage_type = 8;
     optional int64 block_size = 9;
     optional int32 replicas = 10;
-    required MountTypeProto mount_type = 11;
-    required WriteTypeProto write_type = 12;
-    optional ProviderProto provider = 13;
+    required WriteTypeProto write_type = 11;
+    optional ProviderProto provider = 12;
 }
 
 message MountOptionsProto {
@@ -33,19 +27,13 @@ message MountOptionsProto {
     map<string, string> add_properties = 2;
     optional int64 ttl_ms = 3;
     optional TtlActionProto ttl_action = 4;
-    optional ConsistencyStrategyProto consistency_strategy = 5;
+    required bool read_verify_ufs = 5;
     optional StorageTypeProto storage_type = 6;
     optional int64 block_size = 7;
     optional int32 replicas = 8;
-    required MountTypeProto mount_type = 9;
     repeated string remove_properties = 10;
     required WriteTypeProto write_type = 11;
     optional ProviderProto provider = 12;
-}
-
-enum ConsistencyStrategyProto {
-    CONSISTENCY_STRATEGY_PROTO_NONE = 0;
-    CONSISTENCY_STRATEGY_PROTO_ALWAYS = 1;
 }
 
 enum ProviderProto {

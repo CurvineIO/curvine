@@ -22,8 +22,7 @@ use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::proto::SmallFileMetaProto;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, MountType, OpenFlags,
-    SetAttrOpts,
+    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
@@ -189,6 +188,10 @@ impl CurvineFileSystem {
         self.fs_client.delete(path, recursive).await
     }
 
+    pub async fn free(&self, path: &Path) -> FsResult<()> {
+        self.fs_client.free(path).await
+    }
+
     pub async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
         self.fs_client.file_status(path).await
     }
@@ -238,18 +241,6 @@ impl CurvineFileSystem {
         }
         if cv_path.is_root() {
             return err_box!("mount path can not be root");
-        }
-
-        if !opts.update
-            && opts.mount_type == MountType::Cst
-            && ufs_path.authority_path() != cv_path.path()
-        {
-            return err_box!(
-                "for Cst mount type, the ufs path and the cv path must be identical. \
-                     current ufs path: {},  current cv path: {}",
-                ufs_path.authority_path(),
-                cv_path.path()
-            );
         }
 
         self.fs_client.mount(ufs_path, cv_path, opts).await?;

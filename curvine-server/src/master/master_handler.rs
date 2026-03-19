@@ -220,6 +220,23 @@ impl MasterHandler {
         ctx.response(rep_header)
     }
 
+    pub fn retry_check_free(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: FreeRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+
+        self.free0(ctx.msg.req_id(), header)?;
+        ctx.response(FreeResponse::default())
+    }
+
+    pub fn free0(&self, req_id: i64, header: FreeRequest) -> FsResult<()> {
+        if self.check_is_retry(req_id)? {
+            return Ok(());
+        }
+
+        let res = self.fs.free(&header.path);
+        self.set_req_cache(req_id, res)
+    }
+
     pub fn rename0(&mut self, req_id: i64, header: RenameRequest) -> FsResult<bool> {
         if self.check_is_retry(req_id)? {
             return Ok(true);
@@ -656,6 +673,14 @@ impl MasterHandler {
 impl MessageHandler for MasterHandler {
     type Error = FsError;
 
+    fn is_sync(&self, msg: &Message) -> bool {
+        let code = RpcCode::from(msg.code());
+        !matches!(
+            code,
+            RpcCode::SubmitJob | RpcCode::GetJobStatus | RpcCode::CancelJob | RpcCode::ReportTask
+        )
+    }
+
     fn handle(&mut self, msg: &Message) -> FsResult<Message> {
         let mut rpc_context = RpcContext::new(msg);
         let ctx = &mut rpc_context;
@@ -679,6 +704,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::CompleteContainer => self.complete_container(ctx),
             RpcCode::Exists => self.exists(ctx),
             RpcCode::Delete => self.retry_check_delete(ctx),
+            RpcCode::Free => self.retry_check_free(ctx),
             RpcCode::Rename => self.retry_check_rename(ctx),
             RpcCode::ListStatus => self.list_status(ctx),
             RpcCode::GetBlockLocations => self.get_block_locations(ctx),
@@ -701,12 +727,6 @@ impl MessageHandler for MasterHandler {
             RpcCode::WorkerHeartbeat => self.worker_heartbeat(ctx),
             RpcCode::WorkerBlockReport => self.block_report(ctx),
             RpcCode::GetMasterInfo => self.get_master_info(ctx),
-
-            // Load task related requests
-            RpcCode::SubmitJob
-            | RpcCode::GetJobStatus
-            | RpcCode::CancelJob
-            | RpcCode::ReportTask => self.job_handler.handle(ctx),
 
             RpcCode::ReportBlockReplicationResult => {
                 if let Some(ref mut replication_service) = self.replication_handler {
@@ -740,6 +760,26 @@ impl MessageHandler for MasterHandler {
         match response {
             Ok(v) => Ok(v),
             Err(e) => Ok(msg.error_ext(&e)),
+        }
+    }
+
+    async fn async_handle(&mut self, msg: Message) -> FsResult<Message> {
+        let mut rpc_context = RpcContext::new(&msg);
+        let ctx = &mut rpc_context;
+        let code = RpcCode::from(msg.code());
+
+        // Check whether the master is active
+        if !self.fs.master_monitor.is_active() {
+            return Err(FsError::not_leader_master(ctx.code, self.client_ip()));
+        }
+
+        match code {
+            RpcCode::SubmitJob => self.job_handler.submit_load_job(ctx).await,
+            RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
+            RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
+            RpcCode::ReportTask => self.job_handler.task_report(ctx),
+
+            v => err_box!("unsupported operation {:?}", v),
         }
     }
 }

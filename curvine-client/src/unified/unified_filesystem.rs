@@ -14,22 +14,21 @@
 
 use crate::file::{CurvineFileSystem, FsClient, FsContext, FsReader};
 use crate::rpc::JobMasterClient;
-use crate::unified::{CacheSyncWriter, MountCache, MountValue, UnifiedReader, UnifiedWriter};
+use crate::unified::{MountCache, MountValue, UnifiedReader, UnifiedWriter};
 use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, Path, Reader};
+use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{
-    ConsistencyStrategy, CreateFileOpts, FileAllocOpts, FileLock, FileStatus, LoadJobCommand,
+    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, JobStatus, LoadJobCommand, LoadJobResult,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
-    WriteType,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use log::{error, info, warn};
 use orpc::common::TimeSpent;
-use orpc::runtime::{RpcRuntime, Runtime};
+use orpc::runtime::Runtime;
 use orpc::{err_box, err_ext};
 use std::sync::Arc;
 
@@ -37,7 +36,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 enum CacheValidity {
     Valid,
-    Invalid(Option<FileStatus>),
+    Invalid,
 }
 
 #[derive(Clone)]
@@ -102,6 +101,16 @@ impl UnifiedFileSystem {
         }
     }
 
+    pub async fn get_mount_checked(
+        &self,
+        path: &Path,
+    ) -> FsResult<Option<(Path, Arc<MountValue>)>> {
+        match self.get_mount(path).await? {
+            Some(v) if v.1.info.is_cache_mode() => Ok(Some(v)),
+            _ => Ok(None),
+        }
+    }
+
     pub async fn get_master_info(&self) -> FsResult<MasterInfo> {
         self.cv.get_master_info().await
     }
@@ -158,28 +167,37 @@ impl UnifiedFileSystem {
         self.cv.clone_runtime()
     }
 
-    // If the path lies outside the mount point, the operation behaves as a full delete.
-    // If it's within the mount point, only the associated cache files will be removed. (ufs will be ignored)
-    pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<()> {
-        self.cv.delete(path, recursive).await
+    pub async fn free(&self, path: &Path) -> FsResult<()> {
+        match self.get_mount(path).await? {
+            None => err_box!(
+                "the current file is not mounted to ufs, so the `free` command cannot be executed."
+            ),
+            Some((_, mnt)) => {
+                if mnt.info.is_fs_mode() {
+                    self.cv.free(path).await
+                } else {
+                    self.cv.delete(path, false).await
+                }
+            }
+        }
     }
 
     pub async fn symlink(&self, target: &str, link: &Path, force: bool) -> FsResult<()> {
-        match self.get_mount(link).await? {
+        match self.get_mount_checked(link).await? {
             None => self.cv.symlink(target, link, force).await,
             Some(_) => err_ext!(FsError::unsupported("symlink")),
         }
     }
 
     pub async fn link(&self, src_path: &Path, dst_path: &Path) -> FsResult<()> {
-        match self.get_mount(src_path).await? {
+        match self.get_mount_checked(src_path).await? {
             None => self.cv.link(src_path, dst_path).await,
             Some(_) => err_ext!(FsError::unsupported("link")),
         }
     }
 
     pub async fn resize(&self, path: &Path, opts: FileAllocOpts) -> FsResult<()> {
-        match self.get_mount(path).await? {
+        match self.get_mount_checked(path).await? {
             None => self.cv.resize(path, opts).await,
             Some(_) => err_ext!(FsError::unsupported("resize")),
         }
@@ -192,20 +210,14 @@ impl UnifiedFileSystem {
         mount: &MountValue,
     ) -> FsResult<CacheValidity> {
         if cv_status.is_expired() {
-            return Ok(CacheValidity::Invalid(None));
+            return Ok(CacheValidity::Invalid);
         }
 
-        // Cache must be complete to be valid
         if !cv_status.is_complete() {
-            log::debug!(
-                "check_cache_validity: INVALID - cache not complete, ufs_path={}, cv_len={}",
-                ufs_path,
-                cv_status.len
-            );
-            return Ok(CacheValidity::Invalid(None));
+            return Ok(CacheValidity::Invalid);
         }
 
-        if cv_status.is_cv_only() || mount.info.consistency_strategy == ConsistencyStrategy::None {
+        if !mount.info.read_verify_ufs {
             return Ok(CacheValidity::Valid);
         }
 
@@ -216,7 +228,7 @@ impl UnifiedFileSystem {
         {
             Ok(CacheValidity::Valid)
         } else {
-            Ok(CacheValidity::Invalid(Some(ufs_status)))
+            Ok(CacheValidity::Invalid)
         }
     }
 
@@ -226,53 +238,64 @@ impl UnifiedFileSystem {
         ufs_path: &Path,
         mount: &MountValue,
     ) -> FsResult<Option<FsReader>> {
-        let reader = match self.cv().open(cv_path).await {
-            Ok(reader) => reader,
+        let blocks = match self.cv.get_block_locations(cv_path).await {
+            Ok(blocks) => blocks,
             Err(e) => {
                 if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
-                    error!("failed to open curvine file {}: {}", cv_path, e)
+                    error!("failed to get block locations for {}: {}", cv_path, e)
                 }
                 return Ok(None);
             }
         };
 
-        match self
-            .check_cache_validity(reader.status(), ufs_path, mount)
-            .await?
-        {
-            CacheValidity::Valid => Ok(Some(reader)),
-            CacheValidity::Invalid(_) => Ok(None),
+        if mount.info.is_fs_mode() {
+            if blocks.cv_exists() {
+                let cv_reader = Some(FsReader::new(
+                    cv_path.clone(),
+                    self.cv.fs_context(),
+                    blocks,
+                )?);
+                Ok(cv_reader)
+            } else if blocks.ufs_exists() {
+                Ok(None)
+            } else {
+                err_box!("path {} data lost", cv_path)
+            }
+        } else {
+            match self
+                .check_cache_validity(&blocks.status, ufs_path, mount)
+                .await?
+            {
+                CacheValidity::Valid => {
+                    let cv_reader = Some(FsReader::new(
+                        cv_path.clone(),
+                        self.cv.fs_context(),
+                        blocks,
+                    )?);
+                    Ok(cv_reader)
+                }
+                CacheValidity::Invalid => Ok(None),
+            }
         }
     }
 
-    pub fn async_cache(&self, source_path: &Path) -> FsResult<()> {
+    pub async fn async_cache(&self, source_path: &Path) -> FsResult<LoadJobResult> {
         let client = JobMasterClient::new(self.fs_client());
         let source_path = source_path.clone_uri();
-
-        self.fs_context().rt().spawn(async move {
-            let command = LoadJobCommand::builder(source_path.clone()).build();
-            let res = client.submit_load_job(command).await;
-            match res {
-                Err(e) => warn!("submit async cache error for {}: {}", source_path, e),
-                Ok(res) => info!(
-                    "submit async cache successfully for {}, job id {}, target_path {}",
-                    source_path, res.job_id, res.target_path
-                ),
-            }
-        });
-
-        Ok(())
+        let command = LoadJobCommand::builder(source_path.clone()).build();
+        client.submit_load_job(command).await
     }
 
-    pub async fn wait_job_complete(&self, path: &Path, mark: &str) -> FsResult<()> {
+    pub async fn wait_job_complete(&self, path: &Path, fail_if_not_found: bool) -> FsResult<()> {
         let client = JobMasterClient::new(self.fs_client());
         let job_id = CommonUtils::create_job_id(path.full_path());
+        client.wait_job_complete(job_id, fail_if_not_found).await
+    }
 
-        let res = client.wait_job_complete(job_id, mark).await;
-        match res {
-            Ok(_) | Err(FsError::JobNotFound(_)) => Ok(()),
-            Err(e) => Err(e),
-        }
+    pub async fn get_job_status(&self, path: &Path) -> FsResult<JobStatus> {
+        let client = JobMasterClient::new(self.fs_client());
+        let job_id = CommonUtils::create_job_id(path.full_path());
+        client.get_job_status(job_id).await
     }
 
     pub async fn cleanup(&self) {
@@ -281,6 +304,47 @@ impl UnifiedFileSystem {
 
     pub fn disable_unified(&mut self) {
         self.enable_unified = false
+    }
+
+    pub async fn copy_ufs_file(
+        &self,
+        path: &Path,
+        mnt: &MountValue,
+        opts: CreateFileOpts,
+        cv_len: i64,
+    ) -> FsResult<()> {
+        let ufs_path = mnt.get_ufs_path(path)?;
+        let mut reader = mnt.ufs.open(&ufs_path).await?;
+        if reader.len() != cv_len {
+            return err_box!(
+                "file length mismatch: cv_path={:?}, ufs_path={:?}, ufs_len={}, cv_len={}",
+                path,
+                ufs_path,
+                reader.len(),
+                cv_len
+            );
+        }
+
+        let flags = OpenFlags::new_create().set_overwrite(true);
+        let mut writer = self.cv.open_with_opts(path, opts, flags).await?;
+
+        loop {
+            let data = reader.async_read(None).await?;
+            if data.is_empty() {
+                break;
+            }
+            writer.async_write(data).await?;
+        }
+        reader.complete().await?;
+        writer.complete().await?;
+
+        Ok(())
+    }
+
+    pub async fn open_for_write(&self, path: &Path) -> FsResult<UnifiedWriter> {
+        let opts = self.cv().create_opts_builder().create_parent(true).build();
+        let flags = OpenFlags::new_write_only().set_create(true);
+        self.open_with_opts(path, opts, flags).await
     }
 
     pub async fn open_with_opts(
@@ -295,30 +359,37 @@ impl UnifiedFileSystem {
                 Ok(UnifiedWriter::Cv(writer))
             }
 
-            Some((ufs_path, mount)) => match mount.info.write_type {
-                WriteType::Cache => {
-                    let opts = mount.info.get_create_opts(&self.conf().client);
+            Some((_, mount)) if mount.info.is_fs_mode() => {
+                let mut writer = self.cv.open_with_opts(path, opts.clone(), flags).await?;
+                if writer.file_blocks().cv_exists()
+                    || flags.overwrite()
+                    || !writer.status().ufs_exists()
+                {
+                    Ok(UnifiedWriter::Cv(writer))
+                } else {
+                    writer.complete().await?;
+
+                    info!(
+                        "copying data from UFS to CV, path={}, len={}",
+                        path,
+                        writer.status().len
+                    );
+                    self.copy_ufs_file(path, &mount, opts.clone(), writer.status().len)
+                        .await?;
+
                     let writer = self.cv.open_with_opts(path, opts, flags).await?;
                     Ok(UnifiedWriter::Cv(writer))
                 }
+            }
 
-                WriteType::Through => {
-                    let writer = if flags.append() {
-                        mount.ufs.append(&ufs_path).await?
-                    } else {
-                        mount.ufs.create(&ufs_path, flags.overwrite()).await?
-                    };
-                    Ok(writer)
-                }
-
-                _ => {
-                    if flags.overwrite() {
-                        mount.ufs.create(&ufs_path, true).await?;
-                    }
-                    let writer = CacheSyncWriter::new(self, path, &mount, flags).await?;
-                    Ok(UnifiedWriter::CacheSync(writer))
-                }
-            },
+            Some((ufs_path, mount)) => {
+                let writer = if flags.append() {
+                    mount.ufs.append(&ufs_path).await?
+                } else {
+                    mount.ufs.create(&ufs_path, flags.overwrite()).await?
+                };
+                Ok(writer)
+            }
         }
     }
 
@@ -327,7 +398,7 @@ impl UnifiedFileSystem {
         path: &Path,
         opts: MkdirOpts,
     ) -> FsResult<Option<FileStatus>> {
-        match self.get_mount(path).await? {
+        match self.get_mount_checked(path).await? {
             None => {
                 let status = self.cv.mkdir_with_opts(path, opts).await?;
                 Ok(Some(status))
@@ -338,16 +409,7 @@ impl UnifiedFileSystem {
                 if !flag {
                     err_ext!(FsError::file_exists(ufs_path.path()))
                 } else {
-                    match self.cv.mkdir_with_opts(path, opts).await {
-                        Ok(status) => Ok(Some(status)),
-                        Err(e) => {
-                            warn!(
-                                "failed to create directory in cache for {}, ignoring: {}",
-                                path, e
-                            );
-                            Ok(None)
-                        }
-                    }
+                    Ok(None)
                 }
             }
         }
@@ -358,29 +420,25 @@ impl UnifiedFileSystem {
         path: &Path,
         opts: SetAttrOpts,
     ) -> FsResult<Option<FileStatus>> {
-        match self.get_mount(path).await? {
+        match self.get_mount_checked(path).await? {
             None => {
                 let status = self.cv.set_attr(path, opts).await?;
                 Ok(Some(status))
             }
 
-            Some(_) => {
-                // ufs currently does not support set attr, so it returns None.
-                // mount.ufs.set_attr(&ufs_path, opts).await?;
-                Ok(None)
-            }
+            Some(_) => Ok(None),
         }
     }
 
     pub async fn get_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
-        match self.get_mount(path).await? {
+        match self.get_mount_checked(path).await? {
             None => self.cv.get_lock(path, lock).await,
             Some(_) => err_ext!(FsError::unsupported("get_lock")),
         }
     }
 
     pub async fn set_lock(&self, path: &Path, lock: FileLock) -> FsResult<Option<FileLock>> {
-        match self.get_mount(path).await? {
+        match self.get_mount_checked(path).await? {
             None => self.cv.set_lock(path, lock).await,
             Some(_) => err_ext!(FsError::unsupported("set_lock")),
         }
@@ -418,10 +476,9 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
     }
 
     async fn append(&self, path: &Path) -> FsResult<UnifiedWriter> {
-        match self.get_mount(path).await? {
-            None => Ok(UnifiedWriter::Cv(self.cv.append(path).await?)),
-            Some((ufs_path, mount)) => mount.ufs.append(&ufs_path).await,
-        }
+        let flags = OpenFlags::new_append().set_create(true);
+        let opts = self.cv.create_opts_builder().build();
+        self.open_with_opts(path, opts, flags).await
     }
 
     async fn exists(&self, path: &Path) -> FsResult<bool> {
@@ -429,7 +486,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
             vec!["exists".to_string()],
         );
-        match self.get_mount(path).await? {
+        match self.get_mount_checked(path).await? {
             None => self.cv.exists(path).await,
             Some((ufs_path, mount)) => mount.ufs.exists(&ufs_path).await,
         }
@@ -460,7 +517,13 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                 .inc();
 
             if mount.info.auto_cache() {
-                self.async_cache(&ufs_path)?;
+                match self.async_cache(&ufs_path).await {
+                    Err(e) => warn!("submit async cache error for {}: {}", ufs_path, e),
+                    Ok(res) => info!(
+                        "submit async cache successfully for {}, job id {}, target_path {}",
+                        path, res.job_id, res.target_path
+                    ),
+                }
             }
 
             // Reading from ufs
@@ -478,18 +541,12 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
             vec!["rename".to_string()],
         );
-        match self.get_mount(src).await? {
+
+        match self.get_mount_checked(src).await? {
             None => self.cv.rename(src, dst).await,
             Some((src_ufs, mount)) => {
-                // For write-through modes, we must wait for the sync job to complete before renaming in UFS.
-                // This ensures all data has been fully written to UFS, preventing data loss or inconsistency
-                // that could occur if we rename a file while its data is still being synced.
-                if mount.info.is_write_through() {
-                    self.wait_job_complete(src, "rename").await?;
-                }
-
                 let dst_ufs = mount.get_ufs_path(dst)?;
-                let _ = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
+                let res = mount.ufs.rename(&src_ufs, &dst_ufs).await?;
 
                 // After rename, the file's mtime changes, making the cached data invalid
                 if let Err(e) = self.cv.delete(src, true).await {
@@ -498,7 +555,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
                     }
                 }
 
-                Ok(true)
+                Ok(res)
             }
         }
     }
@@ -508,10 +565,11 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
             vec!["delete".to_string()],
         );
-        match self.get_mount(path).await? {
+
+        match self.get_mount_checked(path).await? {
             None => self.cv.delete(path, recursive).await,
             Some((ufs_path, mount)) => {
-                // Delete from UFS
+                // delete from UFS
                 mount.ufs.delete(&ufs_path, recursive).await?;
 
                 // delete cache
@@ -532,24 +590,9 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             vec!["get_status".to_string()],
         );
 
-        let (ufs_path, mount) = match self.get_mount(path).await? {
-            None => return self.cv.get_status(path).await,
-            Some(v) => v,
-        };
-
-        match self.cv.get_status(path).await {
-            Ok(v) => match self.check_cache_validity(&v, &ufs_path, &mount).await? {
-                CacheValidity::Valid => Ok(v),
-                CacheValidity::Invalid(Some(ufs_status)) => Ok(ufs_status),
-                CacheValidity::Invalid(None) => mount.ufs.get_status(&ufs_path).await,
-            },
-
-            Err(e) => {
-                if !matches!(e, FsError::FileNotFound(_) | FsError::Expired(_)) {
-                    warn!("failed to get status file {}: {}", path, e);
-                };
-                mount.ufs.get_status(&ufs_path).await
-            }
+        match self.get_mount_checked(path).await? {
+            None => self.cv.get_status(path).await,
+            Some((ufs_path, mount)) => mount.ufs.get_status(&ufs_path).await,
         }
     }
 
@@ -558,7 +601,8 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
             vec!["list_status".to_string()],
         );
-        match self.get_mount(path).await? {
+
+        match self.get_mount_checked(path).await? {
             None => self.cv.list_status(path).await,
             Some((ufs_path, mount)) => mount.ufs.list_status(&ufs_path).await,
         }
@@ -569,7 +613,8 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
             vec!["list_status".to_string()],
         );
-        match self.get_mount(path).await? {
+
+        match self.get_mount_checked(path).await? {
             None => self.cv.list_status_bytes(path).await,
             Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
         }
@@ -580,7 +625,8 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
             vec!["set_attr".to_string()],
         );
-        match self.get_mount(path).await? {
+
+        match self.get_mount_checked(path).await? {
             None => {
                 self.cv.set_attr(path, opts).await?;
                 Ok(())

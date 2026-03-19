@@ -21,7 +21,7 @@ use curvine_common::fs::{self, CurvineURI, Path};
 use curvine_common::state::{MkdirOpts, MountInfo, MountOptions};
 use curvine_common::FsResult;
 use log::info;
-use orpc::{err_box, try_option};
+use orpc::{err_box, err_msg, try_option};
 use std::collections::HashMap;
 
 pub struct MountManager {
@@ -76,28 +76,12 @@ impl MountManager {
             .add_mount(assign_id, mount_path, ufs_path, mnt_opt)
     }
 
-    fn update_mount(
-        &self,
-        mnt_id: Option<u32>,
-        cv_path: &str,
-        ufs_path: &str,
-        mnt_opt: &MountOptions,
-    ) -> FsResult<()> {
-        if !self.mount_table.exists(cv_path) {
-            return err_box!("update mode: mount point {} does not exist", ufs_path);
-        }
+    fn update_mount(&self, cv_path: &str, mnt_opt: &MountOptions) -> FsResult<()> {
+        let path = Path::from_str(cv_path)?;
+        let existing = try_option!(self.get_mount_info(&path)?);
+        let merged = existing.merge_with(mnt_opt.clone());
 
-        self.mount_table.umount(cv_path)?;
-
-        self.create_mount_point(cv_path)?;
-
-        let assign_id = match mnt_id {
-            Some(id) => id,
-            None => self.mount_table.assign_mount_id()?,
-        };
-
-        self.mount_table
-            .add_mount(assign_id, cv_path, ufs_path, mnt_opt)
+        self.mount_table.update_mount(merged)
     }
 
     /// same baseuri of ufs can only mount once
@@ -112,7 +96,7 @@ impl MountManager {
         mnt_opt: &MountOptions,
     ) -> FsResult<()> {
         if mnt_opt.update {
-            return self.update_mount(mnt_id, cv_path, ufs_path, mnt_opt);
+            return self.update_mount(cv_path, mnt_opt);
         }
 
         self.add_mount(mnt_id, cv_path, ufs_path, mnt_opt)
@@ -133,6 +117,10 @@ impl MountManager {
 
     pub fn unprotected_umount_by_id(&self, id: u32) -> FsResult<()> {
         self.mount_table.unprotected_umount_by_id(id)
+    }
+
+    pub fn has_mounted(&self, id: u32) -> bool {
+        self.mount_table.has_mounted(id)
     }
 
     /**

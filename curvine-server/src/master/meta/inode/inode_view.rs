@@ -349,7 +349,7 @@ impl InodeView {
 
     pub fn replicas(&self) -> u16 {
         match self {
-            File(_, f) => f.replicas,
+            File(_, f) => f.replicas as u16,
             Container(_, c) => c.replicas,
             _ => {
                 panic!("Only File and Container support to get storage policy access")
@@ -359,7 +359,7 @@ impl InodeView {
 
     pub fn block_size(&self) -> i64 {
         match self {
-            File(_, f) => f.block_size,
+            File(_, f) => f.block_size as i64,
             Container(_, c) => c.block_size,
             _ => {
                 panic!("Only File and Container support to get block size")
@@ -489,7 +489,7 @@ impl InodeView {
                 status.is_complete = f.is_complete();
                 status.len = f.len;
                 status.replicas = f.replicas as i32;
-                status.block_size = f.block_size;
+                status.block_size = f.block_size as i64;
                 status.file_type = f.file_type;
                 status.x_attr = f.features.x_attr.clone();
                 status.storage_policy = f.storage_policy.clone();

@@ -18,8 +18,9 @@ use crate::master::journal::*;
 use crate::master::meta::inode::InodePath;
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::inode::InodeView::Dir;
-use crate::master::{MountManager, SyncFsDir};
+use crate::master::{JobManager, MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
+use curvine_common::error::FsError;
 use curvine_common::proto::raft::SnapshotData;
 use curvine_common::raft::storage::AppStorage;
 use curvine_common::raft::{RaftResult, RaftUtils};
@@ -32,22 +33,29 @@ use orpc::{err_box, try_option, try_option_ref, CommonResult};
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs, mem};
-
 // Replay the master metadata operation log.
 #[derive(Clone)]
 pub struct JournalLoader {
     fs_dir: SyncFsDir,
     mnt_mgr: Arc<MountManager>,
+    ufs_loader: UfsLoader,
     seq_id: Arc<AtomicCounter>,
     retain_checkpoint_num: usize,
     ignore_replay_error: bool,
 }
 
 impl JournalLoader {
-    pub fn new(fs_dir: SyncFsDir, mnt_mgr: Arc<MountManager>, conf: &JournalConf) -> Self {
+    pub fn new(
+        fs_dir: SyncFsDir,
+        mnt_mgr: Arc<MountManager>,
+        conf: &JournalConf,
+        job_manager: Arc<JobManager>,
+    ) -> Self {
+        let ufs_loader = UfsLoader::new(job_manager, conf);
         Self {
             fs_dir,
             mnt_mgr,
+            ufs_loader,
             seq_id: Arc::new(AtomicCounter::new(0)),
             retain_checkpoint_num: 3.max(conf.retain_checkpoint_num),
             ignore_replay_error: conf.ignore_replay_error,
@@ -70,6 +78,8 @@ impl JournalLoader {
             JournalEntry::Rename(e) => self.rename(e),
 
             JournalEntry::Delete(e) => self.delete(e),
+
+            JournalEntry::Free(e) => self.free(e),
 
             JournalEntry::ReopenFile(e) => self.reopen_file(e),
 
@@ -188,8 +198,13 @@ impl JournalLoader {
 
     pub fn rename(&self, entry: RenameEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let src_inp = InodePath::resolve(fs_dir.root_ptr(), entry.src, &fs_dir.store)?;
+        let entry_src = entry.src;
+        let src_inp = InodePath::resolve(fs_dir.root_ptr(), entry_src.clone(), &fs_dir.store)?;
         let dst_inp = InodePath::resolve(fs_dir.root_ptr(), entry.dst, &fs_dir.store)?;
+        if src_inp.get_last_inode().is_none() {
+            warn!("Rename: source path not found: {}", entry_src);
+            return Ok(());
+        }
         fs_dir.unprotected_rename(
             &src_inp,
             &dst_inp,
@@ -202,8 +217,25 @@ impl JournalLoader {
 
     pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
+        let entry_path = entry.path;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry_path.clone(), &fs_dir.store)?;
+        if inp.get_last_inode().is_none() {
+            warn!("Delete: path not found: {}", entry_path);
+            return Ok(());
+        }
         fs_dir.unprotected_delete(&inp, entry.mtime)?;
+        Ok(())
+    }
+
+    pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
+        let mut fs_dir = self.fs_dir.write();
+        let entry_path = entry.path;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry_path.clone(), &fs_dir.store)?;
+        if inp.get_last_inode().is_none() {
+            warn!("Free: path not found: {}", entry_path);
+            return Ok(());
+        }
+        fs_dir.unprotected_free(&inp, entry.mtime)?;
         Ok(())
     }
 
@@ -216,6 +248,14 @@ impl JournalLoader {
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
+        // need ensure log warn if unprotected_umount_by_id fail
+        if !self.mnt_mgr.has_mounted(entry.id) {
+            warn!("Unmount: id already unmounted: {}", entry.id);
+            // Still clean RocksDB (idempotent)
+            let mut fs_dir = self.fs_dir.write();
+            fs_dir.unprotected_unmount(entry.id)?;
+            return Ok(());
+        }
         self.mnt_mgr.unprotected_umount_by_id(entry.id)?;
         let mut fs_dir = self.fs_dir.write();
         fs_dir.unprotected_unmount(entry.id)?;
@@ -231,25 +271,43 @@ impl JournalLoader {
     }
 
     pub fn symlink(&self, entry: SymlinkEntry) -> CommonResult<()> {
+        let link_path = entry.link.clone();
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.link, &fs_dir.store)?;
-        fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force)?;
-        Ok(())
+        match fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force) {
+            Ok(_) => Ok(()),
+            Err(FsError::FileAlreadyExists(_)) => {
+                warn!("Symlink: file already exists: {}", link_path);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn link(&self, entry: LinkEntry) -> CommonResult<()> {
+        let src_path = entry.src_path;
+        let dst_path = entry.dst_path;
         let mut fs_dir = self.fs_dir.write();
-        let old_path = InodePath::resolve(fs_dir.root_ptr(), entry.src_path, &fs_dir.store)?;
-        let new_path = InodePath::resolve(fs_dir.root_ptr(), entry.dst_path, &fs_dir.store)?;
+        let old_path = InodePath::resolve(fs_dir.root_ptr(), src_path.clone(), &fs_dir.store)?;
+        let new_path = InodePath::resolve(fs_dir.root_ptr(), dst_path.clone(), &fs_dir.store)?;
 
         // Get the original inode ID
         let original_inode_id = match old_path.get_last_inode() {
             Some(inode) => inode.id(),
-            None => return err_box!("Original file not found during link recovery"),
+            None => {
+                warn!("Link: source path not found: {}", src_path);
+                return Ok(());
+            }
         };
 
-        fs_dir.unprotected_link(new_path, original_inode_id, entry.op_ms)?;
-        Ok(())
+        match fs_dir.unprotected_link(new_path, original_inode_id, entry.op_ms) {
+            Ok(_) => Ok(()),
+            Err(FsError::FileAlreadyExists(_)) => {
+                warn!("Link: dst_path already exists: {}", dst_path);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn set_locks(&self, entry: SetLocksEntry) -> CommonResult<()> {
@@ -284,7 +342,7 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn apply0(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
+    async fn apply0(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
         // The raft log has logs that do not contain referenced data.
         if message.is_empty() {
             return Ok(());
@@ -294,7 +352,9 @@ impl JournalLoader {
 
         // The leader node ignores all logs because they have been applied to the master node before synchronization via raft.
         if is_leader {
-            self.seq_id.set(batch.seq_id + 1);
+            let seq_id = batch.seq_id + 1;
+            self.ufs_loader.apply_batch(batch).await?;
+            self.seq_id.set(seq_id);
             return Ok(());
         }
 
@@ -317,8 +377,8 @@ impl JournalLoader {
 }
 
 impl AppStorage for JournalLoader {
-    fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
-        match self.apply0(is_leader, message) {
+    async fn apply(&self, is_leader: bool, message: &[u8]) -> RaftResult<()> {
+        match self.apply0(is_leader, message).await {
             Ok(_) => Ok(()),
 
             Err(e) => {

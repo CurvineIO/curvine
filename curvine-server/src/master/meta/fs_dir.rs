@@ -220,6 +220,45 @@ impl FsDir {
         Ok(del_res)
     }
 
+    pub fn free(&mut self, inp: &InodePath) -> FsResult<DeleteResult> {
+        let op_ms = LocalTime::mills();
+
+        let del_res = self.unprotected_free(inp, op_ms as i64)?;
+        self.journal_writer
+            .log_free(op_ms, inp.path(), op_ms as i64)?;
+
+        Ok(del_res)
+    }
+
+    pub(crate) fn unprotected_free(
+        &mut self,
+        inp: &InodePath,
+        mtime: i64,
+    ) -> FsResult<DeleteResult> {
+        let mut inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_ext!(FsError::file_not_found(inp.path())),
+        };
+        let file = inode.as_file_mut()?;
+        if !file.ufs_exists() {
+            return err_box!("path {} data not synchronized to ufs", inp.path());
+        }
+
+        if file.blocks.is_empty() {
+            return Ok(DeleteResult::default());
+        }
+
+        let del_res = DeleteResult {
+            inodes: 0,
+            blocks: file.get_locs(&self.store)?,
+        };
+
+        file.free(mtime);
+        self.store.apply_free(&[&inode])?;
+
+        Ok(del_res)
+    }
+
     pub fn rename(
         &mut self,
         src_inp: &InodePath,
@@ -1104,7 +1143,7 @@ impl FsDir {
         let res = block.assign_worker(workers);
         let block = ExtendedBlock {
             id: block.id,
-            len: block.len,
+            len: block.len as i64,
             alloc_opts: block.alloc_opts.clone(),
             storage_type: file.storage_policy.storage_type,
             file_type: file.file_type,
