@@ -21,6 +21,8 @@ Open the Portal: **http://localhost:5002/result**
 | `--nextest-profile NAME` | Nextest profile for unittest (e.g. `ci-no-ufs`). See [Nextest profile](#nextest-profile) below. |
 | `--update-code` | Run `git pull` on current branch before starting |
 | `--run-once` | Trigger one dailytest, wait for it to finish, then exit |
+| `--run-once-ut-cov` | Trigger one UT + coverage run only (no FIO/FUSE/LTP), then exit (for CI) |
+| `--summary-to-markdown PATH` | Load `test_summary.json` from PATH, print Markdown table to stdout and exit |
 
 #### Nextest profile
 
@@ -79,6 +81,13 @@ docker run -v "$(pwd)":/workspace curvine-tests --run-once
 ```
 
 To use a nextest profile (e.g. skip UFS tests in CI): `--nextest-profile ci-no-ufs` or `-e NEXTEST_PROFILE=ci-no-ufs`.
+CI one-shot (UT + coverage only, no FIO/FUSE/LTP):
+
+```bash
+docker run -v "$(pwd)":/workspace curvine-tests --run-once-ut-cov
+```
+
+Results are written to `curvine-tests/regression_result/<timestamp>/` (e.g. `test_summary.json`). To render the JSON as a Markdown table for GitHub Step Summary: `python3 curvine-tests/regression/build-server.py --summary-to-markdown <path-to-test-dir>`.
 
 **Optional: mount dependency caches** to avoid re-downloading on every build:
 

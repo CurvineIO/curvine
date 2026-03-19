@@ -1,4 +1,4 @@
-name: Compile and Test
+name: Compile and Smoke Test
 
 on:
   push:
@@ -12,8 +12,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Tune build parallelism: 4 uses more CPU on standard 4-vCPU runner; set to 2 if OOM
+  CARGO_BUILD_JOBS: 4
 
 jobs:
+  # Speed note: slowness is from runner CPU/RAM (standard = 4 vCPU, ~16GB), not container size.
+  # Containers share the runner; you cannot set CPU/memory in workflow. Options: use larger
+  # runners (org enables "larger runners", then runs-on: labels: ubuntu-24.04-8core etc.), or
+  # self-hosted runners with more cores.
   cleanup:
     runs-on: ubuntu-latest
     steps:
@@ -31,8 +37,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: cleanup
+    # curvine-tests image extends curvine-compile:rocky9 and pre-installs Flask, werkzeug, pip, jq, fio (see curvine-tests/Dockerfile)
     container:
-      image: ghcr.io/curvineio/curvine-compile:latest
+      image: ghcr.io/curvineio/curvine-tests:rocky9
     
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +58,8 @@ jobs:
         with:
           shared-key: "curvine-build"
           cache-all-crates: false
-          cache-targets: false
+          # Cache target/ so release build and smoke tests can reuse artifacts (much faster on cache hit)
+          cache-targets: true
       
       - name: Run fmt
         run: |
@@ -67,18 +75,16 @@ jobs:
         run: |
           echo "Running clippy (static code analysis)"
           # Run clippy in debug mode to match build
-          cargo clippy --all-targets --jobs 2 -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
+          cargo clippy --all-targets --jobs ${{ env.CARGO_BUILD_JOBS }} -- --${CLIPPY_LEVEL}=warnings --allow clippy::uninlined-format-args
           
           echo "After clippy, disk usage:"
           df -h
       
       - name: Clean after clippy
         run: |
-          # Clean clippy artifacts to save space
-          find target -name "*.rlib" -delete || true
-          find target -name "*.rmeta" -delete || true
+          # Free disk by removing only clippy's incremental data; keep .rlib/.rmeta so
+          # Rust Cache (cache-targets) can reuse them for the release build
           rm -rf target/debug/incremental || true
-          
           echo "After clippy cleanup, disk usage:"
           df -h
         
@@ -87,11 +93,25 @@ jobs:
           echo "Starting final build, disk usage:"
           df -h
           
-          # Build with limited parallelism to save memory  
-          cargo build --verbose --jobs 2
+          cargo build --verbose --jobs ${{ env.CARGO_BUILD_JOBS }}
           
           echo "After build, disk usage:"
           df -h
+
+      # - name: Run unit tests (skip UFS-dependent tests in CI)
+      #   env:
+      #     NEXTEST_CI_NO_UFS: "1"
+      #   run: |
+      #     export PATH="/root/.cargo/bin:$PATH"
+      #     cd "$GITHUB_WORKSPACE"
+      #     python3 curvine-tests/regression/build-server.py \
+      #       -p "$GITHUB_WORKSPACE" \
+      #       -r "$GITHUB_WORKSPACE/test_results" \
+      #       --nextest-profile ci-no-ufs \
+      #       --run-once \
+      #       --unit-only \
+      #       --summary-to-markdown "$GITHUB_STEP_SUMMARY"
+        # On failure, summary is written to GitHub Step Summary; step exits non-zero so pipeline fails.
 
       - name: Final cleanup before cache save
         run: |
