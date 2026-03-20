@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::fs::DeleteResult;
-use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
+use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::{InodeFile, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
@@ -57,17 +57,7 @@ impl InodeStore {
 
         batch.commit()?;
 
-        if let Some(ttl_config) = child.ttl_config() {
-            let expiration_ms = ttl_config.expiry_time_ms();
-            let inode_id = child.id() as u64;
-            if let Err(e) = self.ttl_bucket_list.add_inode(inode_id, expiration_ms) {
-                log::warn!(
-                    "Direct ttl registration failed for inode {}: {}",
-                    child.id(),
-                    e
-                );
-            }
-        }
+        self.ttl_bucket_list.add(child);
 
         match child {
             InodeView::File(_, _) => self.fs_stats.increment_file_count(),
@@ -98,13 +88,11 @@ impl InodeStore {
             batch.delete_child(parent_id, inode.name())?;
             del_res.inodes += 1;
 
-            if let Err(e) = self.ttl_bucket_list.remove_inode(inode.id() as u64) {
-                log::warn!("Direct ttl removal failed for inode {}: {}", inode.id(), e);
-            }
-
             match &inode {
                 InodeView::Dir(_, dir) => {
                     batch.delete_inode(inode.id())?;
+                    self.ttl_bucket_list.remove(&inode);
+
                     // Don't count root directory
                     if dir.id != ROOT_INODE_ID {
                         deleted_dirs += 1;
@@ -218,23 +206,9 @@ impl InodeStore {
         let mut batch = self.store.new_batch();
         for inode in &inodes {
             batch.write_inode(inode)?;
+            self.ttl_bucket_list.add(inode);
         }
         batch.commit()?;
-
-        for inode in &inodes {
-            let inode_id = inode.id() as u64;
-            let _ = self.ttl_bucket_list.remove_inode(inode_id);
-            if let Some(ttl_config) = inode.ttl_config() {
-                let expiration_ms = ttl_config.expiry_time_ms();
-                if let Err(e) = self.ttl_bucket_list.add_inode(inode_id, expiration_ms) {
-                    log::warn!(
-                        "Direct ttl re-registration failed for inode {}: {}",
-                        inode_id,
-                        e
-                    );
-                }
-            }
-        }
 
         Ok(())
     }
@@ -366,10 +340,7 @@ impl InodeStore {
                         // Collect block info
                         del_res.blocks.extend(file.get_locs(self)?);
 
-                        // Remove from TTL
-                        if let Err(e) = self.ttl_bucket_list.remove_inode(inode_id as u64) {
-                            log::warn!("Direct ttl removal failed for inode {}: {}", inode_id, e);
-                        }
+                        self.ttl_bucket_list.remove(&inode_view);
                     } else {
                         // Write the updated inode back to storage
                         batch.write_inode(&inode_view)?;
@@ -426,6 +397,8 @@ impl InodeStore {
                         continue;
                     }
                 };
+                self.ttl_bucket_list.add(&store_inode);
+
                 let inode = if matches!(store_inode, InodeView::Dir(_, _)) {
                     store_inode
                 } else {
@@ -459,17 +432,6 @@ impl InodeStore {
                     let file_entry = InodeView::FileEntry(child_name.to_string(), child_id);
 
                     stack.push_back((next_parent.clone(), child_id, file_entry))
-                }
-                if let Some(ttl_config) = next_parent.ttl_config() {
-                    let inode_id = next_parent.id() as u64;
-                    let expiration_ms = ttl_config.expiry_time_ms();
-                    if let Err(e) = self.ttl_bucket_list.add_inode(inode_id, expiration_ms) {
-                        log::warn!(
-                            "Direct ttl registration failed during tree creation for inode {}: {}",
-                            next_parent.id(),
-                            e
-                        );
-                    }
                 }
             }
         }
