@@ -68,7 +68,7 @@ impl JournalLoader {
         let client = RaftClient::from_conf(rt.clone(), conf);
         let journal_writer = Arc::new(JournalWriter::new(true, client, conf));
         let log_store = RocksLogStorage::from_conf(conf, false);
-        Self::new(
+        Self::build(
             rt,
             fs_dir,
             mnt_mgr,
@@ -81,7 +81,29 @@ impl JournalLoader {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
+        rt: Arc<Runtime>,
+        fs_dir: SyncFsDir,
+        mnt_mgr: Arc<MountManager>,
+        conf: &JournalConf,
+        job_manager: Arc<JobManager>,
+        log_store: RocksLogStorage,
+        journal_writer: Arc<JournalWriter>,
+    ) -> Self {
+        Self::build(
+            rt,
+            fs_dir,
+            mnt_mgr,
+            conf,
+            job_manager,
+            log_store,
+            journal_writer,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
         rt: Arc<Runtime>,
         fs_dir: SyncFsDir,
         mnt_mgr: Arc<MountManager>,
@@ -328,6 +350,11 @@ impl JournalLoader {
                     }
                 }
 
+                ApplyMsg::Shutdown(tx) => {
+                    let _ = tx.send(());
+                    break;
+                }
+
                 msg => match self.apply_msg(is_leader, &msg).await {
                     Ok(_) => retry_num = 0,
 
@@ -432,18 +459,6 @@ impl JournalLoader {
 
             _ => Ok(()),
         }
-    }
-
-    pub fn replay_entry(&self, entry: JournalEntry) -> CommonResult<()> {
-        {
-            let fs_dir = self.fs_dir.read();
-            fs_dir.update_op_id(entry.op_id());
-            if let Some(inode_id) = entry.inode_id() {
-                fs_dir.update_last_inode_id(inode_id)?;
-            }
-        }
-
-        self.apply_entry(entry)
     }
 
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {
@@ -650,6 +665,12 @@ impl JournalLoader {
             }
         };
 
+        if let Some(mut inode_ptr) = old_path.get_last_inode() {
+            if let File(_, _) = inode_ptr.as_mut() {
+                inode_ptr.incr_nlink();
+            }
+        }
+
         match fs_dir.unprotected_link(new_path, original_inode_id, entry.mtime as u64) {
             Ok(_) => Ok(()),
             Err(FsError::FileAlreadyExists(_)) => {
@@ -711,6 +732,13 @@ impl JournalLoader {
             info!("delete expired checkpoint: {}", path.to_string_lossy());
         }
 
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> RaftResult<()> {
+        let (tx, rx) = CallChannel::channel();
+        self.sender.send(ApplyMsg::Shutdown(tx)).await?;
+        rx.receive().await?;
         Ok(())
     }
 }

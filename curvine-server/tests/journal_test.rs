@@ -14,22 +14,76 @@
 
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::CurvineURI;
+use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::raft::{NodeId, RaftPeer};
 use curvine_common::state::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, MountOptions, OpenFlags,
     RenameFlags, WorkerInfo,
 };
+use curvine_common::utils::SerdeUtils;
 use curvine_server::master::fs::MasterFilesystem;
-use curvine_server::master::journal::JournalSystem;
+use curvine_server::master::journal::{JournalBatch, JournalLoader, JournalSystem};
 use curvine_server::master::{Master, MountManager};
 use log::info;
 use orpc::common::{Logger, TimeSpent};
 use orpc::io::net::NetUtils;
+use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{err_box, CommonResult};
+use raft::eraftpb::Entry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+fn replay_entries(
+    loader: &JournalLoader,
+    entries: Vec<curvine_server::master::journal::JournalEntry>,
+) -> CommonResult<()> {
+    let rt = AsyncRuntime::single();
+    rt.block_on(async move {
+        for (offset, entry) in entries.into_iter().enumerate() {
+            let mut batch = JournalBatch::new(offset as u64 + 1);
+            batch.push(entry);
+            let entry = Entry {
+                term: 1,
+                index: offset as u64 + 1,
+                data: SerdeUtils::serialize(&batch)?,
+                ..Default::default()
+            };
+            loader.apply(true, ApplyMsg::new_entry(entry)).await?;
+        }
+        Ok(())
+    })
+}
+
+fn reopen_journal_system(conf: &ClusterConf) -> CommonResult<JournalSystem> {
+    for _ in 0..50 {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            JournalSystem::from_conf(conf)
+        })) {
+            Ok(Ok(js)) => return Ok(js),
+            Ok(Err(e)) if e.to_string().contains("lock hold by current process") => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(panic) if panic_message(&panic).contains("lock hold by current process") => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+    JournalSystem::from_conf(conf).map_err(|e| e.into())
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        return msg.clone();
+    }
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        return (*msg).to_string();
+    }
+    String::new()
+}
 
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
 #[test]
@@ -59,9 +113,7 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
     let journal_loader = follower_journal_system.journal_loader();
     let entries = journal_system.fs().fs_dir.read().take_entries();
     info!("entries size {}", entries.len());
-    for entry in entries {
-        journal_loader.replay_entry(entry).unwrap();
-    }
+    replay_entries(&journal_loader, entries)?;
 
     fs_leader.print_tree();
     fs_follower.print_tree();
@@ -284,11 +336,11 @@ fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
     js.create_snapshot()?;
 
     drop(fs);
-    drop(js);
     drop(mnt_mgr);
+    js.shutdown();
 
     conf.format_master = false;
-    let js = JournalSystem::from_conf(&conf)?;
+    let js = reopen_journal_system(&conf)?;
     js.apply_snapshot()?;
     let fs = MasterFilesystem::with_js(&conf, &js);
     let mnt_mgr = js.mount_manager();
@@ -296,6 +348,10 @@ fn test_master_restart_with_snapshot_recovery() -> CommonResult<()> {
     assert!(fs.exists("/a")?);
     let leader_mnt = mnt_mgr.get_mount_table().unwrap();
     assert_eq!(leader_mnt.len(), 1);
+
+    drop(fs);
+    drop(mnt_mgr);
+    js.shutdown();
 
     Ok(())
 }

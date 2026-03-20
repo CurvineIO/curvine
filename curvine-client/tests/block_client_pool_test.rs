@@ -36,8 +36,6 @@ static TEST_SERVER: Lazy<(WorkerAddress, Arc<Runtime>)> = Lazy::new(|| {
     };
     let rt = server.new_rt();
     server.start(0); // Start server immediately (consumes server)
-                     // Wait for server to start
-    std::thread::sleep(Duration::from_millis(100));
     (worker_addr, rt)
 });
 
@@ -59,8 +57,21 @@ fn create_test_context() -> FsContext {
     FsContext::with_rt(conf, rt).unwrap()
 }
 
+async fn wait_for_test_server_ready() {
+    let worker_addr = get_test_server_addr();
+    let context = create_test_context();
+    for _ in 0..50 {
+        if context.block_client(&worker_addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("Server failed to start within 5 seconds");
+}
+
 #[tokio::test]
 async fn test_writer_uses_pool() {
+    wait_for_test_server_ready().await;
     let worker_addr = get_test_server_addr();
     let pool = create_test_pool(true, 30000);
     let context = Arc::new(create_test_context());
@@ -86,6 +97,7 @@ async fn test_writer_uses_pool() {
 
 #[tokio::test]
 async fn test_reader_uses_pool() {
+    wait_for_test_server_ready().await;
     let worker_addr = get_test_server_addr();
     let pool = create_test_pool(true, 30000);
     let context = Arc::new(create_test_context());
@@ -111,6 +123,7 @@ async fn test_reader_uses_pool() {
 
 #[tokio::test]
 async fn test_expired_connection_not_acquired() {
+    wait_for_test_server_ready().await;
     let worker_addr = get_test_server_addr();
     let pool = create_test_pool(true, 100); // 100ms idle time
     let context = Arc::new(create_test_context());
@@ -136,6 +149,7 @@ async fn test_expired_connection_not_acquired() {
 
 #[tokio::test]
 async fn test_clear_idle_connections() {
+    wait_for_test_server_ready().await;
     let worker_addr = get_test_server_addr();
     let pool = create_test_pool(true, 100); // 100ms idle time
     let context = Arc::new(create_test_context());
@@ -167,6 +181,7 @@ async fn test_clear_idle_connections() {
 
 #[tokio::test]
 async fn test_pool_acquire_release_count() {
+    wait_for_test_server_ready().await;
     let worker_addr = get_test_server_addr();
     let pool = create_test_pool(true, 30000);
     let context = Arc::new(create_test_context());
