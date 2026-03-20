@@ -12,15 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::UfsFactory;
 use crate::master::fs::heartbeat_checker::HeartbeatChecker;
 use crate::master::fs::master_filesystem::MasterFilesystem;
-use crate::master::job::JobManager;
-use crate::master::meta::inode::ttl::ttl_manager::InodeTtlManager;
-use crate::master::meta::inode::ttl::ttl_scheduler::TtlHeartbeatChecker;
-use crate::master::meta::inode::ttl_executor::InodeTtlExecutor;
-use crate::master::meta::inode::ttl_scheduler::TtlHeartbeatConfig;
-use crate::master::mount::MountManager;
+use crate::master::meta::inode::ttl::TtlHeartbeatChecker;
+use crate::master::meta::inode::ttl::TtlHeartbeatConfig;
+use crate::master::meta::inode::ttl::{InodeTtlExecutor, InodeTtlManager};
 use crate::master::quota::QuotaManager;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::MasterMonitor;
@@ -67,12 +63,7 @@ impl MasterActor {
         .unwrap();
     }
 
-    pub fn start_ttl_scheduler(
-        &mut self,
-        mount_manager: Arc<MountManager>,
-        factory: Arc<UfsFactory>,
-        job_manager: Arc<JobManager>,
-    ) -> CommonResult<()> {
+    pub fn start_ttl_scheduler(&mut self) -> CommonResult<()> {
         info!("Starting inode ttl scheduler.");
 
         let ttl_bucket_list = {
@@ -81,20 +72,13 @@ impl MasterActor {
             fs_dir.get_ttl_bucket_list()
         };
 
-        let ttl_manager = InodeTtlManager::new(
-            self.fs.clone(),
-            ttl_bucket_list,
-            mount_manager.clone(),
-            factory.clone(),
-            job_manager.clone(),
-        )?;
+        let ttl_manager = InodeTtlManager::new(self.fs.clone(), ttl_bucket_list)?;
 
         let ttl_manager_arc = Arc::new(ttl_manager);
 
         self.start_ttl_heartbeat_checker(ttl_manager_arc)?;
 
-        let ttl_executor =
-            InodeTtlExecutor::with_managers(self.fs.clone(), mount_manager, factory, job_manager);
+        let ttl_executor = InodeTtlExecutor::with_managers(self.fs.clone());
         self.quota_manager.set_ttl_executor(ttl_executor);
         info!("QuotaManager TTL executor initialized.");
 
@@ -117,7 +101,10 @@ impl MasterActor {
             self.fs.conf.ttl_checker_interval_ms(),
         );
         scheduler.start(heartbeat_checker)?;
-        info!("Inode ttl checker started");
+        info!(
+            "Inode ttl checker started, interval: {} ms",
+            self.fs.conf.ttl_checker_interval_ms()
+        );
         Ok(())
     }
 

@@ -15,6 +15,7 @@
 #![allow(unused)]
 
 use crate::master::fs::MasterFilesystem;
+use crate::master::meta::inode::ttl::TtlBucket;
 use crate::master::Master;
 use curvine_common::state::MetricValue;
 use log::{debug, info, warn};
@@ -62,6 +63,9 @@ pub struct MasterMetrics {
     pub(crate) eviction_trigger_count: Counter,
     pub(crate) eviction_files_deleted: Counter,
     pub(crate) eviction_bytes_freed: Counter,
+
+    pub(crate) ttl_bucket_len: Gauge,
+    pub(crate) ttl_total_inodes: Gauge,
 }
 
 impl MasterMetrics {
@@ -154,6 +158,8 @@ impl MasterMetrics {
                 "eviction_bytes_freed",
                 "Total bytes freed by eviction",
             )?,
+            ttl_bucket_len: m::new_gauge("ttl_bucket_len", "Number of TTL buckets")?,
+            ttl_total_inodes: m::new_gauge("ttl_total_inodes", "Total number of inodes")?,
         };
 
         Ok(wm)
@@ -180,6 +186,10 @@ impl MasterMetrics {
                     .set(size as i64);
             }
         }
+        let ttl_list = fs_dir.get_ttl_bucket_list();
+        drop(fs_dir);
+        self.ttl_bucket_len.set(ttl_list.buckets_len() as i64);
+        self.ttl_total_inodes.set(ttl_list.total_inodes() as i64);
 
         self.worker_num
             .with_label_values(&["live"])

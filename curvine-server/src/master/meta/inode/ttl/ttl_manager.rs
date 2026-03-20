@@ -12,17 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::UfsFactory;
 use crate::master::fs::MasterFilesystem;
-use crate::master::job::JobManager;
-use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
-use crate::master::meta::inode::ttl::ttl_checker::InodeTtlChecker;
-use crate::master::meta::inode::ttl::ttl_executor::InodeTtlExecutor;
-use crate::master::meta::inode::ttl::ttl_types::{TtlCleanupConfig, TtlCleanupResult, TtlResult};
-use crate::master::mount::MountManager;
-use log::{debug, error};
+use crate::master::meta::inode::ttl::TtlBucketList;
+use crate::master::meta::inode::ttl::TtlResult;
+use crate::master::meta::inode::ttl::{InodeTtlChecker, InodeTtlExecutor};
+use curvine_common::FsResult;
+use log::{error, info};
+use orpc::common::TimeSpent;
 use std::sync::Arc;
-use std::time::Instant;
 
 // TTL Manager Module
 //
@@ -40,59 +37,32 @@ pub struct InodeTtlManager {
 }
 
 impl InodeTtlManager {
-    pub fn new(
-        filesystem: MasterFilesystem,
-        bucket_list: Arc<TtlBucketList>,
-        mount_manager: Arc<MountManager>,
-        factory: Arc<UfsFactory>,
-        job_manager: Arc<JobManager>,
-    ) -> TtlResult<Self> {
-        let ttl_executor = InodeTtlExecutor::with_managers(
-            filesystem.clone(),
-            mount_manager,
-            factory,
-            job_manager,
-        );
+    pub fn new(filesystem: MasterFilesystem, bucket_list: Arc<TtlBucketList>) -> TtlResult<Self> {
+        let ttl_executor = InodeTtlExecutor::with_managers(filesystem.clone());
 
-        // Create cleanup configuration directly from master config
-        let cleanup_config = TtlCleanupConfig {
-            check_interval_ms: filesystem.conf.ttl_checker_interval_ms(),
-            bucket_interval_ms: filesystem.conf.ttl_bucket_interval_ms(),
-            max_retry_count: filesystem.conf.ttl_checker_retry_attempts,
-            max_retry_duration_ms: filesystem.conf.ttl_max_retry_duration_ms(),
-            retry_interval_ms: filesystem.conf.ttl_retry_interval_ms(),
-        };
-
-        let checker = Arc::new(InodeTtlChecker::new(
-            ttl_executor,
-            cleanup_config,
-            bucket_list,
-        )?);
+        let checker = Arc::new(InodeTtlChecker::new(ttl_executor, bucket_list)?);
 
         let manager = Self { checker };
         Ok(manager)
     }
 
-    pub fn cleanup(&self) -> TtlResult<TtlCleanupResult> {
-        let start_time = Instant::now();
+    pub fn cleanup(&self) -> FsResult<i64> {
+        let spend = TimeSpent::new();
 
         match self.checker.cleanup_once() {
-            Ok(result) => {
-                let duration = start_time.elapsed();
-
-                debug!(
-                    "Inode ttl cleanup completed: processed {} items in {}ms",
-                    result.total_processed,
-                    duration.as_millis()
+            Ok(total_processed) => {
+                info!(
+                    "inode ttl cleanup completed: processed {} items in {} ms",
+                    total_processed,
+                    spend.used_ms()
                 );
 
-                Ok(result)
+                Ok(total_processed)
             }
             Err(e) => {
-                let duration = start_time.elapsed();
                 error!(
-                    "Inode ttl cleanup failed after {}ms: {}",
-                    duration.as_millis(),
+                    "inode ttl cleanup failed after {}ms: {}",
+                    spend.used_ms(),
                     e
                 );
                 Err(e)

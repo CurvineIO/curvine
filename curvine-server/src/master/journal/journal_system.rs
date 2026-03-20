@@ -14,7 +14,7 @@
 
 use crate::master::fs::{MasterFilesystem, WorkerManager};
 use crate::master::journal::{JournalLoader, JournalWriter};
-use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
+use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::FsDir;
 use crate::master::quota::eviction::evictor::{Evictor, LFUEvictor, LRUEvictor};
 use crate::master::quota::eviction::types::EvictionPolicy;
@@ -91,7 +91,9 @@ impl JournalSystem {
         let client = RaftClient::from_conf(rt.clone(), &conf.journal);
         let journal_writer = Arc::new(JournalWriter::new(conf.testing, client, &conf.journal));
 
-        let ttl_bucket_list = Arc::new(TtlBucketList::new(conf.master.ttl_bucket_interval_ms()));
+        let ttl_bucket_list = Arc::new(TtlBucketList::new(
+            conf.master.ttl_bucket_interval_ms() as i64
+        ));
         let eviction_conf = EvictionConf::from_conf(conf);
         let evictor: Arc<dyn Evictor> = match eviction_conf.policy {
             EvictionPolicy::Lru => Arc::new(LRUEvictor::new(eviction_conf.clone())),
@@ -120,6 +122,7 @@ impl JournalSystem {
             rt.clone(),
             conf.testing,
         );
+
         let job_manager = Arc::new(JobManager::from_cluster_conf(
             fs.clone(),
             mount_manager.clone(),

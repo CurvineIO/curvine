@@ -14,7 +14,7 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::journal::{JournalEntry, JournalWriter};
-use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
+use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
