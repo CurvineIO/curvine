@@ -14,7 +14,7 @@
 
 use crate::conf::ClientConf;
 use crate::fs::Path;
-use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StorageType, TtlAction};
+use crate::state::{CreateFileOpts, CreateFileOptsBuilder, StoragePolicy, StorageType, TtlAction};
 use num_enum::{FromPrimitive, IntoPrimitive};
 use orpc::common::DurationUnit;
 use orpc::{err_box, CommonError, CommonResult};
@@ -124,6 +124,28 @@ impl MountInfo {
             .build()
     }
 
+    pub fn merge_create_opts(&self, opts: CreateFileOpts) -> CreateFileOpts {
+        CreateFileOpts {
+            create_parent: opts.create_parent,
+            replicas: self.replicas.unwrap_or(opts.replicas as i32) as u16,
+            block_size: self.block_size.unwrap_or(opts.block_size),
+            file_type: opts.file_type,
+            x_attr: opts.x_attr,
+            storage_policy: StoragePolicy {
+                ttl_ms: self.ttl_ms,
+                ttl_action: self.ttl_action,
+                storage_type: self
+                    .storage_type
+                    .unwrap_or(opts.storage_policy.storage_type),
+                ..opts.storage_policy
+            },
+            mode: opts.mode,
+            client_name: opts.client_name,
+            owner: opts.owner,
+            group: opts.group,
+        }
+    }
+
     pub fn is_cache_mode(&self) -> bool {
         self.write_type == WriteType::CacheMode
     }
@@ -182,13 +204,18 @@ impl MountOptions {
     }
 
     pub fn to_info(self, mount_id: u32, cv_path: &str, ufs_path: &str) -> MountInfo {
+        let ttl_action = match self.write_type {
+            WriteType::CacheMode => TtlAction::Delete,
+            WriteType::FsMode => TtlAction::Free,
+        };
+
         MountInfo {
             cv_path: cv_path.to_string(),
             ufs_path: ufs_path.to_string(),
             mount_id,
             properties: self.add_properties,
             ttl_ms: self.ttl_ms.unwrap_or(0),
-            ttl_action: self.ttl_action.unwrap_or(TtlAction::None),
+            ttl_action,
             read_verify_ufs: self.read_verify_ufs,
             storage_type: self.storage_type,
             block_size: self.block_size,

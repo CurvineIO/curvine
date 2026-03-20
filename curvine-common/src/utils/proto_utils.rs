@@ -200,6 +200,7 @@ impl ProtoUtils {
             ttl_ms: policy.ttl_ms,
             ttl_action: policy.ttl_action.into(),
             ufs_mtime: policy.ufs_mtime,
+            state: policy.state as i32,
         }
     }
 
@@ -209,6 +210,7 @@ impl ProtoUtils {
             ttl_ms: policy.ttl_ms,
             ttl_action: TtlAction::from(policy.ttl_action),
             ufs_mtime: policy.ufs_mtime,
+            state: StorageState::from(policy.state as i8),
         }
     }
 

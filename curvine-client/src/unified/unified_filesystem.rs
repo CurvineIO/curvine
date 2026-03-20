@@ -203,26 +203,17 @@ impl UnifiedFileSystem {
         ufs_path: &Path,
         mount: &MountValue,
     ) -> FsResult<CacheValidity> {
-        if cv_status.is_expired() {
-            return Ok(CacheValidity::Invalid(None));
-        }
-
-        if !cv_status.is_complete() || !cv_status.ufs_exists() {
-            return Ok(CacheValidity::Invalid(None));
-        }
-
-        if !mount.info.read_verify_ufs {
-            return Ok(CacheValidity::Valid);
-        }
-
-        let ufs_status = mount.ufs.get_status(ufs_path).await?;
-        if cv_status.len == ufs_status.len
-            && cv_status.storage_policy.ufs_mtime != 0
-            && cv_status.storage_policy.ufs_mtime == ufs_status.mtime
-        {
+        if mount.info.read_verify_ufs {
+            let ufs_status = mount.ufs.get_status(ufs_path).await?;
+            if cv_status.cv_valid(Some(&ufs_status)) {
+                Ok(CacheValidity::Valid)
+            } else {
+                Ok(CacheValidity::Invalid(Some(ufs_status)))
+            }
+        } else if cv_status.cv_valid(None) {
             Ok(CacheValidity::Valid)
         } else {
-            Ok(CacheValidity::Invalid(Some(ufs_status)))
+            Ok(CacheValidity::Invalid(None))
         }
     }
 
@@ -256,18 +247,12 @@ impl UnifiedFileSystem {
                 err_box!("path {} data lost", cv_path)
             }
         } else {
-            if !blocks.cv_exists() {
-                return Ok(None);
-            }
-
             match self
                 .check_cache_validity(&blocks.status, ufs_path, mount)
                 .await?
             {
                 CacheValidity::Valid => {
-                    if blocks.status.ufs_exists() {
-                        blocks.status.mtime = blocks.status.storage_policy.ufs_mtime;
-                    }
+                    blocks.status.mtime = blocks.status.storage_policy.ufs_mtime;
                     let cv_reader = FsReader::new(cv_path.clone(), self.cv.fs_context(), blocks)?;
                     Ok(Some(FallbackFsReader::new(
                         cv_reader,
@@ -338,6 +323,7 @@ impl UnifiedFileSystem {
         opts: CreateFileOpts,
         cv_len: i64,
     ) -> FsResult<()> {
+        let opts = mnt.info.merge_create_opts(opts);
         let ufs_path = mnt.get_ufs_path(path)?;
         let mut reader = mnt.ufs.open(&ufs_path).await?;
         if reader.len() != cv_len {
@@ -385,8 +371,9 @@ impl UnifiedFileSystem {
             }
 
             Some((_, mount)) if mount.info.is_fs_mode() => {
+                let opts = mount.info.merge_create_opts(opts);
                 let mut writer = self.cv.open_with_opts(path, opts.clone(), flags).await?;
-                if writer.file_blocks().cv_exists() || flags.overwrite() {
+                if writer.file_blocks().data_exists() || flags.overwrite() {
                     Ok(UnifiedWriter::Cv(writer))
                 } else {
                     writer.complete().await?;
@@ -526,7 +513,14 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
 
     async fn open(&self, path: &Path) -> FsResult<UnifiedReader> {
         let (ufs_path, mount) = match self.get_mount(path).await? {
-            None => return Ok(UnifiedReader::Cv(self.cv.open(path).await?)),
+            None => {
+                let reader = UnifiedReader::Cv(self.cv.open(path).await?);
+                return if reader.status().is_expired() {
+                    return err_ext!(FsError::file_expired(path.path()));
+                } else {
+                    Ok(reader)
+                };
+            }
             Some(v) => v,
         };
 
@@ -631,9 +625,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Some((ufs_path, mnt)) => match self.cv.get_status(path).await {
                 Ok(mut v) => match self.check_cache_validity(&v, &ufs_path, &mnt).await? {
                     CacheValidity::Valid => {
-                        if v.ufs_exists() {
-                            v.mtime = v.storage_policy.ufs_mtime;
-                        }
+                        v.mtime = v.storage_policy.ufs_mtime;
                         Ok(v)
                     }
                     CacheValidity::Invalid(Some(ufs_status)) => Ok(ufs_status),

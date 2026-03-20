@@ -18,7 +18,7 @@ use crate::master::meta::store::InodeStore;
 use crate::master::meta::{BlockMeta, InodeId};
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileType,
-    StoragePolicy, TtlAction,
+    StoragePolicy,
 };
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
@@ -86,7 +86,7 @@ impl InodeFile {
             block_size: opts.block_size as u32,
             replicas: opts.replicas as u8,
 
-            storage_policy: opts.storage_policy,
+            storage_policy: StoragePolicy::with_cv(opts.storage_policy),
             features: FileFeature {
                 x_attr: Default::default(),
                 file_write: None,
@@ -160,7 +160,7 @@ impl InodeFile {
     }
 
     pub fn compute_len(&self) -> i64 {
-        if self.cv_exists() {
+        if self.data_exists() {
             self.blocks.iter().map(|x| x.len as i64).sum()
         } else {
             self.len
@@ -206,7 +206,7 @@ impl InodeFile {
 
     pub fn reopen(&mut self, client_name: impl AsRef<str>) -> Option<ExtendedBlock> {
         self.features.set_writing(client_name.as_ref().to_string());
-        self.invalid_cache();
+        self.storage_policy.detach_ufs();
         if let Some(last_block) = self.get_block_mut(-1) {
             let blk = ExtendedBlock {
                 id: last_block.id,
@@ -268,10 +268,7 @@ impl InodeFile {
         // Update file metadata with new options
         self.replicas = opts.replicas as u8;
         self.block_size = opts.block_size as u32;
-        self.storage_policy = StoragePolicy {
-            ufs_mtime: 0,
-            ..opts.storage_policy
-        };
+        self.storage_policy.overwrite(opts.storage_policy);
         self.mtime = mtime;
 
         // Reset file writing state for new write operation
@@ -336,11 +333,7 @@ impl InodeFile {
     }
 
     pub fn free(&mut self, mtime: i64) -> bool {
-        if self.storage_policy.ttl_action == TtlAction::None {
-            return false;
-        };
-
-        if self.ufs_exists() && self.cv_exists() {
+        if self.storage_policy.free() {
             self.mtime = mtime;
             self.blocks.clear();
             true
@@ -394,11 +387,11 @@ impl InodeFile {
             Ok(vec![])
         } else if opts.len < self.len {
             let del_blocks = self.truncate(opts);
-            self.invalid_cache();
+            self.storage_policy.detach_ufs();
             Ok(del_blocks)
         } else {
             self.extend(opts)?;
-            self.invalid_cache();
+            self.storage_policy.detach_ufs();
             Ok(vec![])
         }
     }
@@ -510,15 +503,19 @@ impl InodeFile {
     }
 
     pub fn ufs_exists(&self) -> bool {
-        self.storage_policy.ufs_mtime > 0
+        self.storage_policy.ufs_exists()
     }
 
     pub fn cv_exists(&self) -> bool {
-        self.len > 0 && !self.blocks.is_empty()
+        self.storage_policy.cv_exists()
     }
 
-    pub fn invalid_cache(&mut self) {
-        self.storage_policy.ufs_mtime = 0;
+    pub fn data_exists(&self) -> bool {
+        if self.len == 0 {
+            true
+        } else {
+            self.cv_exists() && !self.blocks.is_empty()
+        }
     }
 }
 

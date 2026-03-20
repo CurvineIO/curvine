@@ -380,7 +380,9 @@ impl InodeView {
         }
 
         if let Some(ufs_mtime) = opts.ufs_mtime {
-            self.storage_policy_mut().ufs_mtime = ufs_mtime;
+            if self.is_file() {
+                self.storage_policy_mut().save_ufs(ufs_mtime);
+            }
         }
     }
 

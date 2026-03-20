@@ -62,14 +62,13 @@ impl FallbackFsReader {
     /// Returns an error if UFS data cannot be trusted (modified externally or never flushed).
     async fn validate_ufs_consistency(&self) -> FsResult<()> {
         let cv_status = self.cv_reader.status();
-        let cv_ufs_mtime = cv_status.storage_policy.ufs_mtime;
-        let cv_len = cv_status.len;
         let ufs_status = self.ufs_fs.get_status(&self.ufs_path).await?;
 
-        if let Err(e) =
-            check_ufs_consistency(cv_ufs_mtime, cv_len, ufs_status.mtime, ufs_status.len)
-        {
-            return err_box!("UFS data inconsistent for {}: {}", self.ufs_path, e);
+        if !cv_status.ufs_valid(&ufs_status) {
+            return err_box!(
+                "UFS data inconsistent for {}: CV and UFS len/mtime do not match or CV not valid",
+                self.ufs_path
+            );
         }
 
         Ok(())
@@ -99,28 +98,6 @@ pub(crate) fn is_worker_err(e: &FsError) -> bool {
     }
 
     false
-}
-
-/// Shared consistency check logic used by runtime path and tests.
-pub(crate) fn check_ufs_consistency(
-    cv_ufs_mtime: i64,
-    cv_len: i64,
-    ufs_mtime: i64,
-    ufs_len: i64,
-) -> FsResult<()> {
-    if cv_ufs_mtime == 0 {
-        return err_box!("data has not been flushed to UFS yet (ufs_mtime=0)");
-    }
-    if cv_ufs_mtime != ufs_mtime || cv_len != ufs_len {
-        return err_box!(
-            "UFS data inconsistent: cv_ufs_mtime={}, ufs_mtime={}, cv_len={}, ufs_len={}",
-            cv_ufs_mtime,
-            ufs_mtime,
-            cv_len,
-            ufs_len
-        );
-    }
-    Ok(())
 }
 
 impl Reader for FallbackFsReader {
@@ -269,43 +246,5 @@ mod tests {
     fn test_is_worker_err_common_connection_refused() {
         let e = FsError::common("Connection refused (os error 111)");
         assert!(is_worker_err(&e));
-    }
-
-    // --- TC-6 to TC-9: check_ufs_consistency pure function ---
-
-    #[test]
-    fn test_ufs_consistency_mtime_zero() {
-        // Data has never been flushed to UFS — cannot fall back.
-        let result = check_ufs_consistency(0, 100, 0, 100);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("ufs_mtime=0"));
-    }
-
-    #[test]
-    fn test_ufs_consistency_mtime_mismatch() {
-        // UFS was modified externally after Curvine last flushed.
-        let result = check_ufs_consistency(1000, 100, 2000, 100);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("cv_ufs_mtime=1000"));
-        assert!(msg.contains("ufs_mtime=2000"));
-    }
-
-    #[test]
-    fn test_ufs_consistency_len_mismatch() {
-        // mtime matches but file length differs — still inconsistent.
-        let result = check_ufs_consistency(1000, 100, 1000, 150);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("cv_len=100"));
-        assert!(msg.contains("ufs_len=150"));
-    }
-
-    #[test]
-    fn test_ufs_consistency_all_match() {
-        // Both mtime and len match — safe to fall back.
-        let result = check_ufs_consistency(1000, 100, 1000, 100);
-        assert!(result.is_ok());
     }
 }

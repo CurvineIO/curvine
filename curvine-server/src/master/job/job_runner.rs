@@ -84,22 +84,15 @@ impl LoadJobRunner {
         // Skip based on data state (even when job is None, e.g. after job cleanup)
         if source_path.is_cv() {
             Ok(false)
-        } else {
-            // ufs -> cv: if CV exists and ufs_mtime matches UFS mtime, data already synced, skip
-            let source_status = mnt.ufs.get_status(source_path).await?;
-            if source_status.is_dir {
-                Ok(false)
-            } else if let Ok(cv_status) = self.master_fs.file_status(target_path.path()) {
-                if cv_status.is_expired() || !cv_status.is_complete {
-                    Ok(false)
-                } else {
-                    Ok(source_status.len == cv_status.len
-                        && cv_status.storage_policy.ufs_mtime != 0
-                        && cv_status.storage_policy.ufs_mtime == source_status.mtime)
-                }
+        } else if let Ok(cv_status) = self.master_fs.file_status(target_path.path()) {
+            if cv_status.cv_valid(None) {
+                let source_status = mnt.ufs.get_status(source_path).await?;
+                Ok(cv_status.cv_valid(Some(&source_status)))
             } else {
                 Ok(false)
             }
+        } else {
+            Ok(false)
         }
     }
 
