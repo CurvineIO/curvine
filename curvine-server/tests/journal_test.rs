@@ -20,7 +20,7 @@ use curvine_common::state::{
     RenameFlags, WorkerInfo,
 };
 use curvine_server::master::fs::MasterFilesystem;
-use curvine_server::master::journal::{JournalLoader, JournalSystem};
+use curvine_server::master::journal::JournalSystem;
 use curvine_server::master::{Master, MountManager};
 use log::info;
 use orpc::common::{Logger, TimeSpent};
@@ -56,17 +56,11 @@ fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult
     let follower_journal_system = JournalSystem::from_conf(&conf)?;
     let fs_follower = MasterFilesystem::with_js(&conf, &follower_journal_system);
     let mnt_mgr2 = follower_journal_system.mount_manager();
-    let journal_loader = JournalLoader::new_replay_loader(
-        fs_follower.fs_dir(),
-        mnt_mgr2.clone(),
-        &conf.journal,
-        follower_journal_system.job_manager(),
-    );
-
+    let journal_loader = follower_journal_system.journal_loader();
     let entries = journal_system.fs().fs_dir.read().take_entries();
     info!("entries size {}", entries.len());
     for entry in entries {
-        journal_loader.apply_entry(entry).unwrap();
+        journal_loader.replay_entry(entry).unwrap();
     }
 
     fs_leader.print_tree();

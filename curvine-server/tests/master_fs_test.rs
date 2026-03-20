@@ -65,6 +65,38 @@ fn new_fs(format: bool, name: &str) -> MasterFilesystem {
     fs
 }
 
+fn new_fs_with_journal(
+    format: bool,
+    name: &str,
+    journal_name: &str,
+) -> (MasterFilesystem, JournalSystem) {
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: format,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir(format!("master-fs-test/meta-{}", name)),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: false,
+            journal_dir: Utils::test_sub_dir(format!(
+                "master-fs-test/journal-{}-{}",
+                journal_name,
+                Utils::rand_str(6)
+            )),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let journal_system = JournalSystem::from_conf(&conf).unwrap();
+    let fs = MasterFilesystem::with_js(&conf, &journal_system);
+    fs.add_test_worker(WorkerInfo::default());
+    (fs, journal_system)
+}
+
 fn new_handler() -> MasterHandler {
     Master::init_test_metrics();
 
@@ -149,6 +181,28 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
     assert!(fs.exists("/x1/x2/x3")?);
     let hash2 = fs.sum_hash();
     assert_eq!(hash1, hash2);
+
+    Ok(())
+}
+
+#[test]
+fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonResult<()> {
+    let hash1 = {
+        let (fs, _js) = new_fs_with_journal(true, "restore-full", "restore-full-phase1");
+        fs.mkdir("/a", false)?;
+        fs.mkdir("/x1/x2/x3", true)?;
+        let hash = fs.sum_hash();
+        drop(fs);
+        drop(_js);
+        hash
+    };
+
+    let (fs, _js) = new_fs_with_journal(false, "restore-full", "restore-full-phase2");
+    fs.restore_from_rocksdb()?;
+
+    assert!(fs.exists("/a")?);
+    assert!(fs.exists("/x1/x2/x3")?);
+    assert_eq!(hash1, fs.sum_hash());
 
     Ok(())
 }
@@ -734,13 +788,13 @@ fn replay_all_then_duplicate_last(js: &JournalSystem, loader: &JournalLoader) {
 
     // First: replay all entries
     for e in entries.iter() {
-        loader.apply_entry(e.clone()).unwrap();
+        loader.replay_entry(e.clone()).unwrap();
     }
 
     // Second: replay last entry again
     let dup_start = entries.len() - 1;
     for e in &entries[dup_start..] {
-        let result = loader.apply_entry(e.clone());
+        let result = loader.replay_entry(e.clone());
         assert!(
             result.is_ok(),
             "duplicate entry should be idempotent: {:?}",
