@@ -18,7 +18,7 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_client::rpc::JobMasterClient;
 use curvine_client::unified::{UfsFileSystem, UnifiedReader, UnifiedWriter};
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{CreateFileOptsBuilder, FileStatus, JobTaskState, SetAttrOptsBuilder};
+use curvine_common::state::{CreateFileOptsBuilder, JobTaskState, SetAttrOptsBuilder};
 use curvine_common::FsResult;
 use log::{error, info, warn};
 use orpc::common::{LocalTime, TimeSpent};
@@ -121,19 +121,17 @@ impl LoadTaskRunner {
         writer.complete().await?;
         reader.complete().await?;
 
-        // cv -> ufs
-        let ufs_mtime = if reader.path().is_cv() && !writer.path().is_cv() {
-            let ufs_status = self.get_ufs()?.get_status(writer.path()).await?;
-
-            let attr_opts = SetAttrOptsBuilder::new()
-                .ufs_mtime(ufs_status.mtime)
-                .build();
-
-            self.fs.set_attr(reader.path(), attr_opts).await?;
-            ufs_status.mtime
+        let (cv_path, ufs_mtime) = if writer.path().is_cv() {
+            // ufs -> cv
+            (writer.path(), reader.status().mtime)
         } else {
-            reader.status().storage_policy.ufs_mtime
+            // cv -> ufs
+            let ufs_status = self.get_ufs()?.get_status(writer.path()).await?;
+            (reader.path(), ufs_status.mtime)
         };
+
+        let attr_opts = SetAttrOptsBuilder::new().ufs_mtime(ufs_mtime).build();
+        self.fs.set_attr(cv_path, attr_opts).await?;
 
         self.update_progress(writer.pos(), reader.len(), true).await;
 
@@ -159,7 +157,7 @@ impl LoadTaskRunner {
         let reader = self.open_unified(&source_path).await?;
 
         // Create writer (automatically selects filesystem based on scheme)
-        let writer = self.create_unified(&target_path, reader.status()).await?;
+        let writer = self.create_unified(&target_path).await?;
 
         Ok((reader, writer))
     }
@@ -175,22 +173,8 @@ impl LoadTaskRunner {
         }
     }
 
-    async fn create_unified(
-        &self,
-        path: &Path,
-        read_status: &FileStatus,
-    ) -> FsResult<UnifiedWriter> {
+    async fn create_unified(&self, path: &Path) -> FsResult<UnifiedWriter> {
         if path.is_cv() {
-            // Curvine path - get source mtime for UFS→Curvine import
-            let source_path = Path::from_str(&self.task.info.source_path)?;
-            let source_mtime = if !source_path.is_cv() {
-                // Import from UFS, get source mtime
-                read_status.mtime
-            } else {
-                // Curvine→Curvine (not supported yet), use 0
-                0
-            };
-
             let opts = CreateFileOptsBuilder::new()
                 .create_parent(true)
                 .replicas(self.task.info.job.replicas)
@@ -198,7 +182,6 @@ impl LoadTaskRunner {
                 .storage_type(self.task.info.job.storage_type)
                 .ttl_ms(self.task.info.job.ttl_ms)
                 .ttl_action(self.task.info.job.ttl_action)
-                .ufs_mtime(source_mtime)
                 .build();
 
             let overwrite = self.task.info.job.overwrite.unwrap_or(false);
