@@ -75,9 +75,11 @@ impl JournalLoader {
             job_manager,
             log_store,
             journal_writer,
+            true,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rt: Arc<Runtime>,
         fs_dir: SyncFsDir,
@@ -86,6 +88,7 @@ impl JournalLoader {
         job_manager: Arc<JobManager>,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
+        testing: bool,
     ) -> Self {
         let ufs_loader = UfsLoader::new(job_manager, conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
@@ -106,10 +109,12 @@ impl JournalLoader {
             metrics: Master::get_metrics(),
         };
 
-        let loader1 = loader.clone();
-        rt.spawn(async move {
-            Self::run_apply(loader1, receiver).await;
-        });
+        if !testing {
+            let loader1 = loader.clone();
+            rt.spawn(async move {
+                Self::run_apply(loader1, receiver).await;
+            });
+        }
 
         loader
     }
@@ -425,6 +430,18 @@ impl JournalLoader {
 
             _ => Ok(()),
         }
+    }
+
+    pub fn replay_entry(&self, entry: JournalEntry) -> CommonResult<()> {
+        {
+            let fs_dir = self.fs_dir.read();
+            fs_dir.update_op_id(entry.op_id());
+            if let Some(inode_id) = entry.inode_id() {
+                fs_dir.update_last_inode_id(inode_id)?;
+            }
+        }
+
+        self.apply_entry(entry)
     }
 
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {

@@ -37,9 +37,8 @@ use orpc::CommonResult;
 use std::sync::Arc;
 
 // Test the master filesystem function separately.
-// This test does not require a cluster startup.
-// Returns (MasterFilesystem, JournalSystem) to ensure proper resource cleanup.
-fn new_fs(format: bool, name: &str) -> (MasterFilesystem, JournalSystem) {
+// This test does not require a full journal system.
+fn new_fs(format: bool, name: &str) -> MasterFilesystem {
     Master::init_test_metrics();
 
     let conf = ClusterConf {
@@ -51,7 +50,42 @@ fn new_fs(format: bool, name: &str) -> (MasterFilesystem, JournalSystem) {
         },
         journal: JournalConf {
             enable: false,
-            journal_dir: Utils::test_sub_dir(format!("master-fs-test/journal-{}", name)),
+            journal_dir: Utils::test_sub_dir(format!(
+                "master-fs-test/journal-{}-{}",
+                name,
+                Utils::rand_str(6)
+            )),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let fs = JournalSystem::fs_only_for_test(&conf).unwrap();
+    fs.add_test_worker(WorkerInfo::default());
+    fs
+}
+
+fn new_fs_with_journal(
+    format: bool,
+    name: &str,
+    journal_name: &str,
+) -> (MasterFilesystem, JournalSystem) {
+    Master::init_test_metrics();
+
+    let conf = ClusterConf {
+        format_master: format,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir(format!("master-fs-test/meta-{}", name)),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: false,
+            journal_dir: Utils::test_sub_dir(format!(
+                "master-fs-test/journal-{}-{}",
+                journal_name,
+                Utils::rand_str(6)
+            )),
             ..Default::default()
         },
         ..Default::default()
@@ -60,7 +94,6 @@ fn new_fs(format: bool, name: &str) -> (MasterFilesystem, JournalSystem) {
     let journal_system = JournalSystem::from_conf(&conf).unwrap();
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
     fs.add_test_worker(WorkerInfo::default());
-
     (fs, journal_system)
 }
 
@@ -101,7 +134,7 @@ fn new_handler() -> MasterHandler {
 
 #[test]
 fn test_master_filesystem_core_operations() -> CommonResult<()> {
-    let (fs, _js) = new_fs(true, "fs_test");
+    let fs = new_fs(true, "fs_test");
 
     mkdir(&fs)?;
     delete(&fs)?;
@@ -132,23 +165,44 @@ fn test_rpc_retry_cache_for_idempotent_operations() -> CommonResult<()> {
 fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
     // First phase: create metadata and persist to RocksDB
     let hash1 = {
-        let (fs, _js) = new_fs(true, "restore");
+        let fs = new_fs(true, "restore");
         fs.mkdir("/a", false)?;
         fs.mkdir("/x1/x2/x3", true)?;
         let hash = fs.sum_hash();
         drop(fs);
-        drop(_js); // Explicitly drop JournalSystem to release RocksDB lock
         hash
     }; // Scope ensures all resources are dropped before reopening DB
 
     // Second phase: restore from persisted metadata
-    let (fs, _js) = new_fs(false, "restore");
+    let fs = new_fs(false, "restore");
     fs.restore_from_rocksdb()?;
 
     assert!(fs.exists("/a")?);
     assert!(fs.exists("/x1/x2/x3")?);
     let hash2 = fs.sum_hash();
     assert_eq!(hash1, hash2);
+
+    Ok(())
+}
+
+#[test]
+fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonResult<()> {
+    let hash1 = {
+        let (fs, _js) = new_fs_with_journal(true, "restore-full", "restore-full-phase1");
+        fs.mkdir("/a", false)?;
+        fs.mkdir("/x1/x2/x3", true)?;
+        let hash = fs.sum_hash();
+        drop(fs);
+        drop(_js);
+        hash
+    };
+
+    let (fs, _js) = new_fs_with_journal(false, "restore-full", "restore-full-phase2");
+    fs.restore_from_rocksdb()?;
+
+    assert!(fs.exists("/a")?);
+    assert!(fs.exists("/x1/x2/x3")?);
+    assert_eq!(hash1, fs.sum_hash());
 
     Ok(())
 }
@@ -422,7 +476,7 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
 
 #[test]
 fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
-    let (fs, _js) = new_fs(true, "link_test");
+    let fs = new_fs(true, "link_test");
     fs.mkdir("/a/b", true)?;
     fs.create("/a/b/file.log", true)?;
     fs.print_tree();
@@ -722,12 +776,7 @@ fn setup_pair(
     let js2 = JournalSystem::from_conf(&conf).unwrap();
     let fs2 = MasterFilesystem::with_js(&conf, &js2);
     fs2.add_test_worker(worker);
-    let loader = JournalLoader::new_replay_loader(
-        fs2.fs_dir(),
-        js2.mount_manager(),
-        &conf.journal,
-        js2.job_manager(),
-    );
+    let loader = js2.journal_loader();
 
     (fs1, js1, loader, js2, fs2)
 }
@@ -739,13 +788,13 @@ fn replay_all_then_duplicate_last(js: &JournalSystem, loader: &JournalLoader) {
 
     // First: replay all entries
     for e in entries.iter() {
-        loader.apply_entry(e.clone()).unwrap();
+        loader.replay_entry(e.clone()).unwrap();
     }
 
     // Second: replay last entry again
     let dup_start = entries.len() - 1;
     for e in &entries[dup_start..] {
-        let result = loader.apply_entry(e.clone());
+        let result = loader.replay_entry(e.clone());
         assert!(
             result.is_ok(),
             "duplicate entry should be idempotent: {:?}",

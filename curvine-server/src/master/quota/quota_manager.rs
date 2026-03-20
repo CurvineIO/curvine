@@ -42,6 +42,7 @@ impl QuotaManager {
         fs: MasterFilesystem,
         evictor: Arc<dyn Evictor>,
         rt: Arc<Runtime>,
+        testing: bool,
     ) -> Arc<Self> {
         let (tx, mut rx): (Sender<Option<MasterInfo>>, Receiver<Option<MasterInfo>>) =
             mpsc::channel(1024);
@@ -56,11 +57,13 @@ impl QuotaManager {
 
         let mgr = manager.clone();
 
-        rt.spawn(async move {
-            while let Some(cluster_info) = rx.recv().await {
-                mgr.handle_trigger(cluster_info);
-            }
-        });
+        if !testing {
+            rt.spawn(async move {
+                while let Some(cluster_info) = rx.recv().await {
+                    mgr.handle_trigger(cluster_info);
+                }
+            });
+        }
 
         manager
     }
