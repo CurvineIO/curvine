@@ -528,7 +528,8 @@ impl JournalLoader {
     }
     pub fn rename(&self, entry: RenameEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let src_inp = InodePath::resolve(fs_dir.root_ptr(), entry.src, &fs_dir.store)?;
+        let entry_src = entry.src;
+        let src_inp = InodePath::resolve(fs_dir.root_ptr(), entry_src.clone(), &fs_dir.store)?;
         let dst_inp = InodePath::resolve(fs_dir.root_ptr(), entry.dst, &fs_dir.store)?;
         if src_inp.get_last_inode().is_none() {
             warn!("Rename: source path not found: {}", entry_src);
@@ -553,8 +554,12 @@ impl JournalLoader {
 
     pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
-        fs_dir.unprotected_free(&inp, entry.mtime)?;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
+        let Some(inode) = inp.get_last_inode() else {
+            warn!("Free: path not found: {:?}", entry);
+            return Ok(());
+        };
+        fs_dir.unprotected_free(inode, entry.mtime, entry.recursive)?;
         Ok(())
     }
 
@@ -567,6 +572,14 @@ impl JournalLoader {
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
+        // need ensure log warn if unprotected_umount_by_id fail
+        if !self.mnt_mgr.has_mounted(entry.id) {
+            warn!("Unmount: id already unmounted: {}", entry.id);
+            // Still clean RocksDB (idempotent)
+            let mut fs_dir = self.fs_dir.write();
+            fs_dir.unprotected_unmount(entry.id)?;
+            return Ok(());
+        }
         self.mnt_mgr.unprotected_umount_by_id(entry.id)?;
         let mut fs_dir = self.fs_dir.write();
         fs_dir.unprotected_unmount(entry.id)?;
@@ -589,27 +602,43 @@ impl JournalLoader {
     }
 
     pub fn symlink(&self, entry: SymlinkEntry) -> CommonResult<()> {
+        let link_path = entry.link.clone();
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.link, &fs_dir.store)?;
-        fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force)?;
-        Ok(())
+        match fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force) {
+            Ok(_) => Ok(()),
+            Err(FsError::FileAlreadyExists(_)) => {
+                warn!("Symlink: file already exists: {}", link_path);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn link(&self, entry: LinkEntry) -> CommonResult<()> {
         let src_path = entry.src_path;
         let dst_path = entry.dst_path;
         let mut fs_dir = self.fs_dir.write();
-        let old_path = InodePath::resolve(fs_dir.root_ptr(), entry.src_path, &fs_dir.store)?;
-        let new_path = InodePath::resolve(fs_dir.root_ptr(), entry.dst_path, &fs_dir.store)?;
+        let old_path = InodePath::resolve(fs_dir.root_ptr(), src_path.clone(), &fs_dir.store)?;
+        let new_path = InodePath::resolve(fs_dir.root_ptr(), dst_path.clone(), &fs_dir.store)?;
 
         // Get the original inode ID
         let original_inode_id = match old_path.get_last_inode() {
             Some(inode) => inode.id(),
-            None => return err_box!("Original file not found during link recovery"),
+            None => {
+                warn!("Link: source path not found: {}", src_path);
+                return Ok(());
+            }
         };
 
-        fs_dir.unprotected_link(new_path, original_inode_id, entry.op_ms)?;
-        Ok(())
+        match fs_dir.unprotected_link(new_path, original_inode_id, entry.mtime as u64) {
+            Ok(_) => Ok(()),
+            Err(FsError::FileAlreadyExists(_)) => {
+                warn!("Link: dst_path already exists: {}", dst_path);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn set_locks(&self, entry: SetLocksEntry) -> CommonResult<()> {
