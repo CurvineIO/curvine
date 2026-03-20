@@ -482,6 +482,8 @@ impl ProtoUtils {
             mode: opts.mode,
             owner: opts.owner,
             group: opts.group,
+            sync_ufs_meta: opts.sync_ufs_meta,
+            ufs_len: opts.ufs_len,
         }
     }
 
@@ -497,6 +499,8 @@ impl ProtoUtils {
             client_name: opts.client_name,
             owner: opts.owner,
             group: opts.group,
+            sync_ufs_meta: opts.sync_ufs_meta,
+            ufs_len: opts.ufs_len,
         }
     }
 

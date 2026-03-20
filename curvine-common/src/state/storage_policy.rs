@@ -55,6 +55,14 @@ impl StoragePolicy {
         }
     }
 
+    pub fn with_ufs(new_policy: StoragePolicy) -> Self {
+        Self {
+            ufs_mtime: new_policy.ufs_mtime,
+            state: StorageState::Ufs,
+            ..new_policy
+        }
+    }
+
     pub fn overwrite(&mut self, new_policy: StoragePolicy) {
         self.storage_type = new_policy.storage_type;
         self.ttl_ms = new_policy.ttl_ms;

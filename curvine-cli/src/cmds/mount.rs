@@ -17,9 +17,7 @@ use clap::Parser;
 use curvine_client::unified::{UfsFileSystem, UnifiedFileSystem};
 use curvine_common::error::{ErrorKind, FsError};
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{
-    MountOptions, Provider, SetAttrOptsBuilder, StorageType, TtlAction, WriteType,
-};
+use curvine_common::state::{MountOptions, Provider, StorageType, TtlAction, WriteType};
 use curvine_common::utils::ProtoUtils;
 use orpc::common::{ByteUnit, DurationUnit};
 use orpc::{err_box, CommonResult};
@@ -405,6 +403,7 @@ impl MountCommand {
 
                 stats.scanned += 1;
                 let ufs_mtime = ufs_entry.mtime;
+                let ufs_len = ufs_entry.len;
                 let cv_path = mount.get_cv_path(&ufs_path)?;
                 let cv_key = cv_path.full_path().to_string();
 
@@ -461,32 +460,10 @@ impl MountCommand {
                     continue;
                 }
 
-                let mut create_opts = mount.get_create_opts(&fs.conf().client);
-                create_opts.storage_policy.ufs_mtime = ufs_mtime;
-
-                if let Err(e) = client.create_with_opts(&cv_path, create_opts, true).await {
+                let create_opts = mount.get_sync_opts(&fs.conf().client, ufs_mtime, ufs_len);
+                if let Err(e) = client.create_with_opts(&cv_path, create_opts, false).await {
                     stats.failed += 1;
                     eprintln!("[resync] failed to create {}: {}", cv_path, e);
-                    progress.tick(&stats, queue.len());
-                    continue;
-                }
-
-                // Complete as an empty metadata placeholder.
-                if let Err(e) = client.complete_file(&cv_path, 0, Vec::new(), false).await {
-                    stats.failed += 1;
-                    eprintln!("[resync] failed to complete {}: {}", cv_path, e);
-                    progress.tick(&stats, queue.len());
-                    continue;
-                }
-
-                let attr_opts = SetAttrOptsBuilder::new()
-                    .mtime(ufs_mtime)
-                    .ufs_mtime(ufs_mtime)
-                    .build();
-
-                if let Err(e) = client.set_attr(&cv_path, attr_opts).await {
-                    stats.failed += 1;
-                    eprintln!("[resync] failed to set attr {}: {}", cv_path, e);
                     progress.tick(&stats, queue.len());
                     continue;
                 }
