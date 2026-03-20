@@ -19,8 +19,8 @@ use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::FreeResult;
 use curvine_common::proto::SmallFileMetaProto;
+use curvine_common::state::FreeResult;
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,

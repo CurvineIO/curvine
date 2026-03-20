@@ -15,22 +15,22 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::master::journal::*;
-use crate::master::meta::inode::{InodePath,InodeView};
-use crate::master::meta::inode::InodeView::{Dir};
+use crate::master::meta::inode::InodeView::Dir;
+use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::{JobManager, MountManager, SyncFsDir};
-use crate::master::{MasterMetrics,Master};
+use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
-use curvine_common::proto::raft::{SnapshotData, FsmState, AppliedIndex};
-use curvine_common::raft::storage::{ApplyMsg,AppStorage, LogStorage, RocksLogStorage};
-use curvine_common::raft::{RaftResult, RaftUtils, RaftClient};
+use curvine_common::error::FsError;
+use curvine_common::proto::raft::{AppliedIndex, FsmState, SnapshotData};
+use curvine_common::raft::storage::{AppStorage, ApplyMsg, LogStorage, RocksLogStorage};
+use curvine_common::raft::{RaftClient, RaftResult, RaftUtils};
 use curvine_common::state::RenameFlags;
 use curvine_common::utils::SerdeUtils;
-use curvine_common::error::FsError;
 use log::{debug, error, info, warn};
 use orpc::common::{FileUtils, LocalTime};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
-use orpc::{err_box, try_option, CommonResult};
+use orpc::{err_box, CommonResult};
 use raft::eraftpb::Entry;
 use raft::StateRole;
 use std::path::Path;

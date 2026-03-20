@@ -382,7 +382,6 @@ impl FsDir {
     }
 
     pub fn create_file(&mut self, mut inp: InodePath, opts: CreateFileOpts) -> FsResult<InodePath> {
-        let op_ms = LocalTime::mills();
         if inp.get_last_inode().is_some() {
             return err_ext!(FsError::file_exists(inp.path()));
         }
@@ -404,7 +403,6 @@ impl FsDir {
         mut inp: InodePath,
         opts: CreateFileOpts,
     ) -> FsResult<InodePath> {
-        let op_ms = LocalTime::mills();
         if inp.get_last_inode().is_some() {
             return err_ext!(FsError::file_exists(inp.path()));
         }
@@ -419,7 +417,7 @@ impl FsDir {
             InodeContainer::with_opts(self.inode_id.next()?, LocalTime::mills() as i64, opts);
 
         inp = self.add_last_inode(inp, Container(name.clone(), container.clone()))?;
-        self.journal_writer.log_create_inode_entry(self, op_ms, &inp)?;
+        self.journal_writer.log_create_inode_entry(self, &inp)?;
 
         Ok(inp)
     }

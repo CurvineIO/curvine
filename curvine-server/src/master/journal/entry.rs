@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::{InodeView, InodeDir, InodeFile};
+use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};

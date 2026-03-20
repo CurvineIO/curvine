@@ -336,7 +336,7 @@ impl JournalWriter {
         entries
     }
 
-    pub fn log_create_inode_entry(&self,fs_dir: &FsDir, inode_path: &InodePath) -> FsResult<()> {
+    pub fn log_create_inode_entry(&self, fs_dir: &FsDir, inode_path: &InodePath) -> FsResult<()> {
         let inode_entry = inode_path.get_last_inode().unwrap();
         let entry = CreateInodeEntry {
             op_id: fs_dir.next_op_id(),
