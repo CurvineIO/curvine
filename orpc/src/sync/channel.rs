@@ -210,6 +210,13 @@ impl<T> BlockingReceiver<T> {
             BlockingReceiver::Bounded(s) => s.recv_timeout(timeout),
         }
     }
+
+    pub fn try_recv(&self) -> Result<T, block_mpsc::TryRecvError> {
+        match self {
+            BlockingReceiver::Unbounded(s) => s.try_recv(),
+            BlockingReceiver::Bounded(s) => s.try_recv(),
+        }
+    }
 }
 
 pub struct BlockingChannel<T> {

@@ -156,6 +156,28 @@ impl JournalSystem {
         Ok(js)
     }
 
+    pub fn fs_only_for_test(conf: &ClusterConf) -> FsResult<MasterFilesystem> {
+        let rt = conf.journal.create_runtime();
+        let worker_manager = SyncWorkerManager::new(WorkerManager::new(conf));
+        let client = RaftClient::from_conf(rt, &conf.journal);
+        let journal_writer = Arc::new(JournalWriter::new(conf.testing, client, &conf.journal));
+        let ttl_bucket_list = Arc::new(TtlBucketList::new(conf.master.ttl_bucket_interval_ms()));
+        let eviction_conf = EvictionConf::from_conf(conf);
+        let evictor: Arc<dyn Evictor> = match eviction_conf.policy {
+            EvictionPolicy::Lru => Arc::new(LRUEvictor::new(eviction_conf.clone())),
+            EvictionPolicy::Lfu => Arc::new(LFUEvictor::new(eviction_conf.clone())),
+        };
+        let fs_dir = SyncFsDir::new(FsDir::new(conf, journal_writer, ttl_bucket_list, evictor)?);
+        let master_monitor = MasterMonitor::new(StateCtl::new(0), StateCtl::new(0));
+
+        Ok(MasterFilesystem::new(
+            conf,
+            fs_dir,
+            worker_manager,
+            master_monitor,
+        ))
+    }
+
     pub async fn start(self) -> FsResult<RoleStateListener> {
         let listener = self.raft_journal.run().await?;
         Ok(listener)
@@ -173,6 +195,10 @@ impl JournalSystem {
 
     pub fn worker_manager(&self) -> SyncWorkerManager {
         self.worker_manager.clone()
+    }
+
+    pub fn journal_loader(&self) -> JournalLoader {
+        self.raft_journal.app_store().clone()
     }
 
     pub fn state_listener(&self) -> RoleStateListener {

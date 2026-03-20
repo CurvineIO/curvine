@@ -333,8 +333,8 @@ impl JournalWriter {
     pub fn take_entries(&self) -> Vec<JournalEntry> {
         let mut entries = vec![];
         let receiver = self.receiver.as_ref().unwrap().lock().unwrap();
-        while let Ok(v) = receiver.recv_check() {
-            entries.push(v)
+        while let Ok(v) = receiver.try_recv() {
+            entries.push(v);
         }
         entries
     }
