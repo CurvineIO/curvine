@@ -14,8 +14,7 @@
 
 use crate::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
 use crate::master::job::JobHandler;
-use crate::master::meta::inode::SmallFileMeta;
-use crate::master::meta::inode::{InodeView, PATH_SEPARATOR};
+use crate::master::meta::inode::{InodeView,SmallFileMeta, PATH_SEPARATOR};
 use crate::master::meta::InodeId;
 use crate::master::replication::master_replication_handler::MasterReplicationHandler;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;

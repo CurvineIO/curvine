@@ -394,7 +394,7 @@ impl FsDir {
         // Create an inode file node.
         let file = InodeFile::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
         inp = self.add_last_inode(inp, File(name, file))?;
-        self.journal_writer.log_create_inode_entry(self, op_ms, &inp)?;
+        self.journal_writer.log_create_inode_entry(self, &inp)?;
 
         Ok(inp)
     }
@@ -454,7 +454,7 @@ impl FsDir {
             parent.incr_nlink();
         }
 
-        let added = parent.add_child(child.clone())?;
+        let added = parent.add_child(child)?;
         self.store.apply_add(parent.as_ref(), added.as_ref())?;
         inp.append(added)?;
 

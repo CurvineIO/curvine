@@ -22,9 +22,7 @@ use curvine_common::proto::{
     BlockWriteResponse, ContainerBlockWriteResponse, ContainerWriteRequest, FileWriteDataProto,
     SmallFileMetaProto,
 };
-use curvine_common::state::ExtendedBlock;
-use curvine_common::state::FileType;
-use curvine_common::state::StorageType;
+use curvine_common::state::{ExtendedBlock, FileType, StorageType};
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use log::info;

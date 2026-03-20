@@ -15,20 +15,15 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::master::journal::*;
-use crate::master::meta::inode::InodePath;
+use crate::master::meta::inode::{InodePath,InodeView};
 use crate::master::meta::inode::InodeView::{Dir};
-use crate::master::meta::inode::InodeView;
 use crate::master::{JobManager, MountManager, SyncFsDir};
-use crate::master::MasterMetrics;
-use crate::master::Master;
+use crate::master::{MasterMetrics,Master};
 use curvine_common::conf::JournalConf;
-use curvine_common::proto::raft::{SnapshotData};
-use curvine_common::proto::raft::FsmState;
-use curvine_common::proto::raft::AppliedIndex;
+use curvine_common::proto::raft::{SnapshotData, FsmState, AppliedIndex};
 use curvine_common::raft::storage::{ApplyMsg,AppStorage, LogStorage, RocksLogStorage};
-use curvine_common::raft::{RaftResult, RaftUtils};
+use curvine_common::raft::{RaftResult, RaftUtils, RaftClient};
 use curvine_common::state::RenameFlags;
-use curvine_common::raft::RaftClient;
 use curvine_common::utils::SerdeUtils;
 use curvine_common::error::FsError;
 use log::{debug, error, info, warn};
@@ -443,8 +438,13 @@ impl JournalLoader {
 
     fn create_inode(&self, entry: CreateInodeEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
+        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
+
+        if inp.is_full() {
+            warn!("create_file: file already exists: {:?}", entry);
+            return Ok(());
+        }
         fs_dir.update_last_inode_id(entry.inode_entry.id())?;
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
         let name = inp.name().to_string();
 
         // handle inode File and
@@ -500,7 +500,14 @@ impl JournalLoader {
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
 
-        let mut inode = try_option!(inp.get_last_inode());
+        let mut inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => {
+                warn!("add_block: file not found: {:?}", entry);
+                return Ok(());
+            }
+        };
+
         let file = inode.as_file_mut()?;
         let _ = mem::replace(&mut file.blocks, entry.blocks);
         fs_dir
@@ -514,7 +521,13 @@ impl JournalLoader {
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
 
-        let inode: orpc::sys::RawPtr<InodeView> = try_option!(inp.get_last_inode());
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => {
+                warn!("complete_file: file not found: {:?}", entry);
+                return Ok(());
+            }
+        };
         match (inode.as_mut(), entry.inode) {
             (InodeView::File(_, file), InodeView::File(_, new_file)) => {
                 let _ = mem::replace(file, new_file);

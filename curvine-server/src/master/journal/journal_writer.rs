@@ -336,10 +336,11 @@ impl JournalWriter {
         entries
     }
 
-    pub fn log_create_inode_entry(&self,fs_dir: &FsDir, op_ms: u64, inode_path: &InodePath) -> FsResult<()> {
+    pub fn log_create_inode_entry(&self,fs_dir: &FsDir, inode_path: &InodePath) -> FsResult<()> {
         let inode_entry = inode_path.get_last_inode().unwrap();
         let entry = CreateInodeEntry {
-            op_ms,
+            op_id: fs_dir.next_op_id(),
+            rpc_id: 0,
             path: inode_path.path().to_string(),
             inode_entry: inode_entry.as_ref().clone(),
         };
