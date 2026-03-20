@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::InodeView;
-use crate::master::meta::inode::{InodeDir, InodeFile};
+use crate::master::meta::inode::{InodeView, InodeDir, InodeFile};
 use crate::master::meta::BlockMeta;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};
@@ -36,7 +35,8 @@ pub struct CreateFileEntry {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct CreateInodeEntry {
-    pub(crate) op_ms: u64,
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
     pub(crate) path: String,
     pub(crate) inode_entry: InodeView,
 }
@@ -199,7 +199,7 @@ impl JournalEntry {
     pub fn op_id(&self) -> u64 {
         match self {
             JournalEntry::Mkdir(e) => e.op_id,
-            JournalEntry::CreateInode(e) => e.inode_entry.id() as u64,
+            JournalEntry::CreateInode(e) => e.op_id,
             JournalEntry::ReopenFile(e) => e.op_id,
             JournalEntry::OverWriteFile(e) => e.op_id,
             JournalEntry::AddBlock(e) => e.op_id,
@@ -221,7 +221,7 @@ impl JournalEntry {
     pub fn rpc_id(&self) -> i64 {
         match self {
             JournalEntry::Mkdir(e) => e.rpc_id,
-            JournalEntry::CreateInode(e) => e.inode_entry.id(),
+            JournalEntry::CreateInode(e) => e.rpc_id,
             JournalEntry::ReopenFile(e) => e.rpc_id,
             JournalEntry::OverWriteFile(e) => e.rpc_id,
             JournalEntry::AddBlock(e) => e.rpc_id,

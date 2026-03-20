@@ -565,7 +565,7 @@ impl MasterFilesystem {
         fs_dir: &FsDir,
         inode: &InodeView,
     ) -> FsResult<Vec<LocatedBlock>> {
-        let wm: std::sync::RwLockReadGuard<'_, super::WorkerManager> = self.worker_manager.read();
+        let wm = self.worker_manager.read();
         let file_locs = fs_dir.get_file_locations(inode)?;
 
         let mut block_locs = Vec::new();
@@ -573,11 +573,11 @@ impl MasterFilesystem {
         for (index, meta) in inode.blocks_iter().enumerate() {
             // Validation logic (only for File type with multiple blocks)
             if let File(_, f) = inode {
-                if index + 1 < f.blocks.len() && meta.len != f.block_size {
+                if index + 1 < f.blocks.len() && meta.len() != f.block_size as i64 {
                     return err_box!(
                         "block status abnormal, block id {}, block len {}, expected block size {}",
                         meta.id,
-                        meta.len,
+                        meta.len(),
                         f.block_size
                     );
                 }
@@ -585,7 +585,7 @@ impl MasterFilesystem {
 
             let extend_block = ExtendedBlock {
                 id: meta.id,
-                len: meta.len as i64,
+                len: meta.len(),
                 storage_type: inode.storage_policy().storage_type,
                 file_type: match inode {
                     File(_, f) => f.file_type,
