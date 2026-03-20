@@ -54,6 +54,7 @@ pub struct JournalLoader {
     batch_size: u64,
     retry_interval: Duration,
     metrics: &'static MasterMetrics,
+    has_apply_worker: bool,
 }
 
 impl JournalLoader {
@@ -107,6 +108,7 @@ impl JournalLoader {
             batch_size: conf.scan_batch_size,
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics(),
+            has_apply_worker: !testing,
         };
 
         if !testing {
@@ -715,7 +717,7 @@ impl JournalLoader {
 
 impl AppStorage for JournalLoader {
     async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
-        if wait {
+        if wait || !self.has_apply_worker {
             if let Err(e) = self.apply_msg(false, &msg).await {
                 if self.ignore_reply_error {
                     error!("apply entry failed: {}", e);
@@ -737,11 +739,17 @@ impl AppStorage for JournalLoader {
     }
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {
+        if !self.has_apply_worker {
+            return Ok(());
+        }
         self.sender.send(ApplyMsg::RoleChange(role)).await?;
         Ok(())
     }
 
     async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        if !self.has_apply_worker {
+            return self.create_snapshot0(None);
+        }
         let (tx, rx) = CallChannel::channel();
         let msg = ApplyMsg::CreateSnapshot(tx);
 
@@ -750,6 +758,9 @@ impl AppStorage for JournalLoader {
     }
 
     async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        if !self.has_apply_worker {
+            return self.apply_snapshot0(snapshot);
+        }
         let (tx, rx) = CallChannel::channel();
         let msg = ApplyMsg::ApplySnapshot((tx, snapshot));
 
