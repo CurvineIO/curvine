@@ -159,7 +159,10 @@ impl FsReaderBuffer {
         let slice_size = conf.read_slice_size;
 
         let pos = 0;
-        let len = file_blocks.status.len;
+        let len = file_blocks
+            .status
+            .container_len
+            .unwrap_or(file_blocks.status.len);
 
         let base = FsReaderParallel::from_base(
             FsReaderBase::new(path.clone(), fs_context.clone(), file_blocks.clone()),

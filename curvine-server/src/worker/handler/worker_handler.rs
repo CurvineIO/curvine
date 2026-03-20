@@ -69,9 +69,17 @@ impl WorkerHandler {
     fn get_handler(&mut self, msg: &Message) -> FsResult<&mut BlockHandler> {
         let code = RpcCode::from(msg.code());
 
-        let need_new_handler = self.handler.is_none()
-            || !matches!(msg.request_status(), RequestStatus::Running)
-            || !Self::handler_matches_code(&self.handler, code);
+        let need_new_handler = if matches!(code, RpcCode::WriteContainerBlock) {
+            // For batch operations: only create new on Open
+            self.handler.is_none()
+                || !Self::handler_matches_code(&self.handler, code)
+                || matches!(msg.request_status(), RequestStatus::Open)
+        } else {
+            // For non-batch operations: keep original logic
+            self.handler.is_none()
+                || !matches!(msg.request_status(), RequestStatus::Running)
+                || !Self::handler_matches_code(&self.handler, code)
+        };
 
         if need_new_handler {
             let handler = BlockHandler::new(code, self.store.clone())?;
@@ -92,7 +100,7 @@ impl WorkerHandler {
                 | (Some(BlockHandler::Reader(_)), RpcCode::ReadBlock)
                 | (
                     Some(BlockHandler::BatchWriter(_)),
-                    RpcCode::WriteBlocksBatch
+                    RpcCode::WriteContainerBlock
                 )
         )
     }

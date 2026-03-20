@@ -13,7 +13,7 @@
 //  limitations under the License.
 
 use crate::master::journal::{
-    CompleteFileEntry, DeleteEntry, JournalEntry, MkdirEntry, RenameEntry,
+    CompleteInodeEntry, DeleteEntry, JournalEntry, MkdirEntry, RenameEntry,
 };
 use crate::master::JobManager;
 use curvine_client::unified::MountValue;
@@ -98,7 +98,7 @@ impl UfsLoader {
     pub async fn apply_entry(&self, entry: &JournalEntry) -> CommonResult<()> {
         match entry {
             JournalEntry::Mkdir(e) => self.mkdir(e).await,
-            JournalEntry::CompleteFile(e) => self.complete_file(e).await,
+            JournalEntry::CompleteInode(e) => self.complete_file(e).await,
             JournalEntry::Rename(e) => self.rename(e).await,
             JournalEntry::Delete(e) => self.delete(e).await,
             _ => Ok(()),
@@ -115,8 +115,8 @@ impl UfsLoader {
         }
     }
 
-    pub async fn complete_file(&self, e: &CompleteFileEntry) -> CommonResult<()> {
-        if !e.file.is_complete() {
+    pub async fn complete_file(&self, e: &CompleteInodeEntry) -> CommonResult<()> {
+        if !e.inode.as_file_ref()?.is_complete() {
             return Ok(());
         }
 

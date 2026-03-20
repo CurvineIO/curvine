@@ -31,7 +31,6 @@ pub struct WriteContext {
 impl WriteContext {
     pub fn from_req(msg: &Message) -> FsResult<Self> {
         let req: BlockWriteRequest = msg.parse_header()?;
-
         let context = Self {
             block: ProtoUtils::extend_block_from_pb(req.block),
             req_id: msg.req_id(),

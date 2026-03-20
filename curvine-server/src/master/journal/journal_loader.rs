@@ -15,9 +15,10 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::master::journal::*;
-use crate::master::meta::inode::InodePath;
-use crate::master::meta::inode::InodeView::{Dir, File};
-use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncFsDir};
+use crate::master::meta::inode::InodeView::Dir;
+use crate::master::meta::inode::{InodePath, InodeView};
+use crate::master::{JobManager, MountManager, SyncFsDir};
+use crate::master::{Master, MasterMetrics};
 use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
 use curvine_common::proto::raft::{AppliedIndex, FsmState, SnapshotData};
@@ -393,13 +394,13 @@ impl JournalLoader {
         match entry {
             JournalEntry::Mkdir(e) => self.mkdir(e),
 
-            JournalEntry::CreateFile(e) => self.create_file(e),
+            JournalEntry::CreateInode(e) => self.create_inode(e),
 
             JournalEntry::OverWriteFile(e) => self.overwrite_file(e),
 
             JournalEntry::AddBlock(e) => self.add_block(e),
 
-            JournalEntry::CompleteFile(e) => self.complete_file(e),
+            JournalEntry::CompleteInode(e) => self.complete_inode_entry(e),
 
             JournalEntry::Rename(e) => self.rename(e),
 
@@ -435,7 +436,7 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn create_file(&self, entry: CreateFileEntry) -> CommonResult<()> {
+    fn create_inode(&self, entry: CreateInodeEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
 
@@ -443,8 +444,17 @@ impl JournalLoader {
             warn!("create_file: file already exists: {:?}", entry);
             return Ok(());
         }
+        fs_dir.update_last_inode_id(entry.inode_entry.id())?;
         let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, File(name, entry.file))?;
+
+        // handle inode File and
+        let inode_to_add = match entry.inode_entry {
+            InodeView::File(_, file) => InodeView::File(name, file),
+            InodeView::Container(_, container) => InodeView::Container(name, container),
+            _ => return err_box!("Only Expect File and Container for adding inode"),
+        };
+
+        let _ = fs_dir.add_last_inode(inp, inode_to_add)?;
         Ok(())
     }
 
@@ -497,6 +507,7 @@ impl JournalLoader {
                 return Ok(());
             }
         };
+
         let file = inode.as_file_mut()?;
         let _ = mem::replace(&mut file.blocks, entry.blocks);
         fs_dir
@@ -506,31 +517,36 @@ impl JournalLoader {
         Ok(())
     }
 
-    fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
+    fn complete_inode_entry(&self, entry: CompleteInodeEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
 
-        let mut inode = match inp.get_last_inode() {
+        let inode = match inp.get_last_inode() {
             Some(v) => v,
             None => {
                 warn!("complete_file: file not found: {:?}", entry);
                 return Ok(());
             }
         };
-        let file = inode.as_file_mut()?;
-
-        let _ = mem::replace(file, entry.file);
+        match (inode.as_mut(), entry.inode) {
+            (InodeView::File(_, file), InodeView::File(_, new_file)) => {
+                let _ = mem::replace(file, new_file);
+            }
+            (InodeView::Container(_, container), InodeView::Container(_, new_container)) => {
+                let _ = mem::replace(container, new_container);
+            }
+            _ => return err_box!("Inode type mismatch during complete"),
+        }
         // Update block location
         fs_dir
             .store
-            .apply_complete_file(inode.as_ref(), &entry.commit_blocks)?;
-
+            .apply_complete_inode_entry(inode.as_ref(), &entry.commit_blocks)?;
         Ok(())
     }
     pub fn rename(&self, entry: RenameEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let entry_src = entry.src;
-        let src_inp = InodePath::resolve(fs_dir.root_ptr(), &entry_src, &fs_dir.store)?;
+        let src_inp = InodePath::resolve(fs_dir.root_ptr(), entry_src.clone(), &fs_dir.store)?;
         let dst_inp = InodePath::resolve(fs_dir.root_ptr(), entry.dst, &fs_dir.store)?;
         if src_inp.get_last_inode().is_none() {
             warn!("Rename: source path not found: {}", entry_src);
@@ -549,7 +565,7 @@ impl JournalLoader {
     pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let entry_path = entry.path;
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry_path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry_path.clone(), &fs_dir.store)?;
         if inp.get_last_inode().is_none() {
             warn!("Delete: path not found: {}", entry_path);
             return Ok(());
@@ -578,8 +594,12 @@ impl JournalLoader {
     }
 
     pub fn unmount(&self, entry: UnMountEntry) -> CommonResult<()> {
+        // need ensure log warn if unprotected_umount_by_id fail
         if !self.mnt_mgr.has_mounted(entry.id) {
-            warn!("Unmount: id already unmounted: {:?}", entry);
+            warn!("Unmount: id already unmounted: {}", entry.id);
+            // Still clean RocksDB (idempotent)
+            let mut fs_dir = self.fs_dir.write();
+            fs_dir.unprotected_unmount(entry.id)?;
             return Ok(());
         }
         self.mnt_mgr.unprotected_umount_by_id(entry.id)?;
@@ -604,13 +624,13 @@ impl JournalLoader {
     }
 
     pub fn symlink(&self, entry: SymlinkEntry) -> CommonResult<()> {
-        let link_path = entry.link;
+        let link_path = entry.link.clone();
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &link_path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.link, &fs_dir.store)?;
         match fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force) {
             Ok(_) => Ok(()),
             Err(FsError::FileAlreadyExists(_)) => {
-                warn!("Symlink: file already exists: {:?}", link_path);
+                warn!("Symlink: file already exists: {}", link_path);
                 Ok(())
             }
             Err(e) => Err(e.into()),
@@ -618,15 +638,17 @@ impl JournalLoader {
     }
 
     pub fn link(&self, entry: LinkEntry) -> CommonResult<()> {
+        let src_path = entry.src_path;
+        let dst_path = entry.dst_path;
         let mut fs_dir = self.fs_dir.write();
-        let old_path = InodePath::resolve(fs_dir.root_ptr(), &entry.src_path, &fs_dir.store)?;
-        let new_path = InodePath::resolve(fs_dir.root_ptr(), &entry.dst_path, &fs_dir.store)?;
+        let old_path = InodePath::resolve(fs_dir.root_ptr(), src_path.clone(), &fs_dir.store)?;
+        let new_path = InodePath::resolve(fs_dir.root_ptr(), dst_path.clone(), &fs_dir.store)?;
 
         // Get the original inode ID
         let original_inode_id = match old_path.get_last_inode() {
             Some(inode) => inode.id(),
             None => {
-                warn!("Link: source path not found: {:?}", entry);
+                warn!("Link: source path not found: {}", src_path);
                 return Ok(());
             }
         };
@@ -634,7 +656,7 @@ impl JournalLoader {
         match fs_dir.unprotected_link(new_path, original_inode_id, entry.mtime as u64) {
             Ok(_) => Ok(()),
             Err(FsError::FileAlreadyExists(_)) => {
-                warn!("Link: dst_path already exists: {:?}", entry);
+                warn!("Link: dst_path already exists: {}", dst_path);
                 Ok(())
             }
             Err(e) => Err(e.into()),

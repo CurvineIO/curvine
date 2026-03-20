@@ -36,13 +36,14 @@ pub struct FsReader {
 impl FsReader {
     pub fn new(path: Path, fs_context: Arc<FsContext>, file_blocks: FileBlocks) -> FsResult<Self> {
         let chunk_size = fs_context.read_chunk_size();
-        let len = file_blocks.status.len;
+        let status = file_blocks.status.clone();
+        // For files inside a container, use the per-file length
+        let len = status.container_len.unwrap_or(status.len);
         let conf = &fs_context.conf.client;
-
         let read_detector = ReadDetector::with_conf(conf, len);
 
         info!(
-            "Create reader, path={}, len={}, blocks={}, chunk_size={}, chunk_number={}, read_parallel={}, slice_size={}, read_ahead={}-{}",
+            "Create reader, path={}, len={}, blocks={}, chunk_size={}, chunk_number={}, read_parallel={}, slice_size={}, read_ahead={}-{}, container_offset={:?}",
             &file_blocks.status.path,
             ByteUnit::byte_to_string(len as u64),
             file_blocks.block_locs.len(),
@@ -51,7 +52,8 @@ impl FsReader {
             read_detector.read_parallel(),
             conf.read_slice_size,
             conf.enable_read_ahead,
-            conf.read_ahead_len
+            conf.read_ahead_len,
+            status.container_offset
         );
 
         let inner = FsReaderBuffer::new(path, fs_context, file_blocks.clone(), read_detector)?;

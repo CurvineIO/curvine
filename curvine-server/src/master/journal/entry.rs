@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::master::meta::inode::{InodeDir, InodeFile};
+use crate::master::meta::inode::{InodeDir, InodeFile, InodeView};
 use crate::master::meta::BlockMeta;
 use curvine_common::state::{CommitBlock, FileLock, MountInfo, SetAttrOpts};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,14 @@ pub struct CreateFileEntry {
     pub(crate) rpc_id: i64,
     pub(crate) path: String,
     pub(crate) file: InodeFile,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CreateInodeEntry {
+    pub(crate) op_id: u64,
+    pub(crate) rpc_id: i64,
+    pub(crate) path: String,
+    pub(crate) inode_entry: InodeView,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -59,16 +67,14 @@ pub struct AddBlockEntry {
     pub(crate) commit_block: Vec<CommitBlock>,
 }
 
-// File writing is completed.
 #[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct CompleteFileEntry {
+pub struct CompleteInodeEntry {
     pub(crate) op_id: u64,
     pub(crate) rpc_id: i64,
     pub(crate) path: String,
-    pub(crate) file: InodeFile,
+    pub(crate) inode: InodeView,
     pub(crate) commit_blocks: Vec<CommitBlock>,
 }
-
 // Rename
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct RenameEntry {
@@ -171,11 +177,11 @@ pub struct SnapshotEntry {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum JournalEntry {
     Mkdir(MkdirEntry),
-    CreateFile(CreateFileEntry),
+    CreateInode(CreateInodeEntry),
     ReopenFile(ReopenFileEntry),
     OverWriteFile(OverWriteFileEntry),
     AddBlock(AddBlockEntry),
-    CompleteFile(CompleteFileEntry),
+    CompleteInode(CompleteInodeEntry),
     Rename(RenameEntry),
     Delete(DeleteEntry),
     Mount(MountEntry),
@@ -193,11 +199,11 @@ impl JournalEntry {
     pub fn op_id(&self) -> u64 {
         match self {
             JournalEntry::Mkdir(e) => e.op_id,
-            JournalEntry::CreateFile(e) => e.op_id,
+            JournalEntry::CreateInode(e) => e.op_id,
             JournalEntry::ReopenFile(e) => e.op_id,
             JournalEntry::OverWriteFile(e) => e.op_id,
             JournalEntry::AddBlock(e) => e.op_id,
-            JournalEntry::CompleteFile(e) => e.op_id,
+            JournalEntry::CompleteInode(e) => e.op_id,
             JournalEntry::Rename(e) => e.op_id,
             JournalEntry::Delete(e) => e.op_id,
             JournalEntry::Mount(e) => e.op_id,
@@ -215,11 +221,11 @@ impl JournalEntry {
     pub fn rpc_id(&self) -> i64 {
         match self {
             JournalEntry::Mkdir(e) => e.rpc_id,
-            JournalEntry::CreateFile(e) => e.rpc_id,
+            JournalEntry::CreateInode(e) => e.rpc_id,
             JournalEntry::ReopenFile(e) => e.rpc_id,
             JournalEntry::OverWriteFile(e) => e.rpc_id,
             JournalEntry::AddBlock(e) => e.rpc_id,
-            JournalEntry::CompleteFile(e) => e.rpc_id,
+            JournalEntry::CompleteInode(e) => e.rpc_id,
             JournalEntry::Rename(e) => e.rpc_id,
             JournalEntry::Delete(e) => e.rpc_id,
             JournalEntry::Mount(e) => e.rpc_id,
@@ -237,10 +243,10 @@ impl JournalEntry {
     pub fn inode_id(&self) -> Option<i64> {
         match self {
             JournalEntry::Mkdir(e) => Some(e.dir.id),
-            JournalEntry::CreateFile(e) => Some(e.file.id),
+            JournalEntry::CreateInode(e) => Some(e.inode_entry.id()),
             JournalEntry::ReopenFile(e) => Some(e.file.id),
             JournalEntry::OverWriteFile(e) => Some(e.file.id),
-            JournalEntry::CompleteFile(e) => Some(e.file.id),
+            JournalEntry::CompleteInode(e) => Some(e.inode.id()),
             JournalEntry::Symlink(e) => Some(e.new_inode.id),
             JournalEntry::SetLocks(e) => Some(e.ino),
             _ => None,

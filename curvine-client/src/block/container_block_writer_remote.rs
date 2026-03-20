@@ -15,44 +15,53 @@
 use crate::block::block_client::BlockClient;
 use crate::file::FsContext;
 use curvine_common::fs::Path;
-use curvine_common::state::{ExtendedBlock, WorkerAddress};
+use curvine_common::proto::{ContainerMetadataProto, SmallFileMetaProto};
+use curvine_common::state::{ContainerStatus, ExtendedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use orpc::common::Utils;
 use orpc::err_box;
 
-pub struct BatchBlockWriterRemote {
-    blocks: Vec<ExtendedBlock>,
+pub struct ContainerBlockWriterRemote {
+    block: ExtendedBlock,
     worker_address: WorkerAddress,
     client: BlockClient,
     pos: i64,
     seq_id: i32,
     req_id: i64,
     block_size: i64,
+    container_meta: Option<ContainerMetadataProto>,
 }
 
-impl BatchBlockWriterRemote {
+impl ContainerBlockWriterRemote {
     pub async fn new(
         fs_context: &FsContext,
-        blocks: Vec<ExtendedBlock>,
+        block: ExtendedBlock,
         worker_address: WorkerAddress,
         pos: i64,
+        container_status: ContainerStatus,
+        small_files_metadata: Vec<SmallFileMetaProto>,
     ) -> FsResult<Self> {
+        // create a container block
         let req_id = Utils::req_id();
         let seq_id = 0;
         let block_size = fs_context.block_size();
-
         let client = fs_context.block_client(&worker_address).await?;
         let write_context = client
-            .write_blocks_batch(
-                &blocks,
+            .write_container_block(
+                &block,
                 0,
                 block_size,
                 req_id,
                 fs_context.write_chunk_size() as i32,
                 fs_context.write_chunk_size() as i32,
                 false,
+                container_status,
+                small_files_metadata,
             )
             .await?;
+
+        // Extract container metadata from response
+        let container_meta = write_context.container_meta.clone();
 
         for context in &write_context.contexts {
             if block_size != context.block_size {
@@ -65,13 +74,14 @@ impl BatchBlockWriterRemote {
         }
 
         let writer = Self {
-            blocks,
+            block,
             worker_address,
             client,
             pos,
             seq_id,
             req_id,
             block_size,
+            container_meta,
         };
 
         Ok(writer)
@@ -88,15 +98,17 @@ impl BatchBlockWriterRemote {
 
         // Send all files in one RPC call
         self.client
-            .write_files_batch(files, self.req_id, next_seq_id)
+            .write_container(files, self.req_id, next_seq_id, self.container_meta.clone())
             .await?;
 
-        for (i, (_, content)) in files.iter().enumerate() {
-            if i < self.blocks.len() {
-                let file_len = content.len() as i64;
-                self.blocks[i].len = file_len;
-            }
+        let file_len = files
+            .iter()
+            .map(|x: &(&Path, &str)| x.1.len())
+            .sum::<usize>() as i64;
+        if self.block.len < file_len {
+            self.block.len = file_len
         }
+
         Ok(())
     }
 
@@ -113,15 +125,17 @@ impl BatchBlockWriterRemote {
     pub async fn complete(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
         self.client
-            .write_commit_batch(
-                &self.blocks,
+            .write_commit_container(
+                &self.block,
                 self.pos,
                 self.block_size,
                 self.req_id,
                 next_seq_id,
                 false,
+                self.container_meta.take(),
             )
             .await?;
+
         Ok(())
     }
 
