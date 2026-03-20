@@ -26,7 +26,7 @@ use std::time::Duration;
 
 // An independent thread of execution of an event loop
 pub struct EventLoop<T> {
-    tread_name: String,
+    thread_name: String,
     dependency_ctl: Option<StateCtl>,
     receiver: mpsc::Receiver<T>,
     timeout: Duration,
@@ -43,7 +43,7 @@ where
         poll_timeout_ms: u64,
     ) -> Self {
         Self {
-            tread_name: thread_name.into(),
+            thread_name: thread_name.into(),
             dependency_ctl: Some(dependency_ctl),
             receiver,
             timeout: Duration::from_millis(poll_timeout_ms),
@@ -55,7 +55,7 @@ where
         F: MutEvent<T, E> + Send + 'static,
         E: Error + From<String>,
     {
-        let name = self.tread_name.to_string();
+        let name = self.thread_name.to_string();
         let builder = thread::Builder::new().name(name.clone());
 
         let ctl = self
