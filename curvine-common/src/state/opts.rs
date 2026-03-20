@@ -31,6 +31,8 @@ pub struct CreateFileOpts {
     pub client_name: String,
     pub owner: String,
     pub group: String,
+    pub sync_ufs_meta: bool,
+    pub ufs_len: i64,
 }
 
 impl CreateFileOpts {
@@ -46,6 +48,8 @@ impl CreateFileOpts {
             mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
             owner: "".to_string(),
             group: "".to_string(),
+            sync_ufs_meta: false,
+            ufs_len: 0,
         }
     }
 
@@ -73,6 +77,8 @@ pub struct CreateFileOptsBuilder {
     client_name: Option<String>,
     pub owner: String,
     pub group: String,
+    sync_ufs_meta: bool,
+    ufs_len: i64,
 }
 
 impl Default for CreateFileOptsBuilder {
@@ -94,6 +100,8 @@ impl CreateFileOptsBuilder {
             client_name: None,
             owner: "".to_string(),
             group: "".to_string(),
+            sync_ufs_meta: false,
+            ufs_len: 0,
         }
     }
 
@@ -114,6 +122,8 @@ impl CreateFileOptsBuilder {
             client_name: None,
             owner: "".to_string(),
             group: "".to_string(),
+            sync_ufs_meta: false,
+            ufs_len: 0,
         }
     }
 
@@ -157,8 +167,10 @@ impl CreateFileOptsBuilder {
         self
     }
 
-    pub fn ufs_mtime(mut self, mtime: i64) -> Self {
+    pub fn ufs_mtime_len(mut self, mtime: i64, len: i64) -> Self {
+        self.sync_ufs_meta = true;
         self.storage_policy.ufs_mtime = mtime;
+        self.ufs_len = len;
         self
     }
 
@@ -201,6 +213,8 @@ impl CreateFileOptsBuilder {
             client_name: self.client_name.unwrap_or_default(),
             owner: self.owner,
             group: self.group,
+            sync_ufs_meta: self.sync_ufs_meta,
+            ufs_len: self.ufs_len,
         }
     }
 }

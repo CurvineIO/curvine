@@ -41,6 +41,8 @@ message CreateFileOptsProto {
     required uint32 mode = 9;
     required string owner = 10;
     required string group = 11;
+    required bool sync_ufs_meta = 12 [default = false];
+    required int64 ufs_len = 13 [default = 0];
 }
 
 // Create a file.

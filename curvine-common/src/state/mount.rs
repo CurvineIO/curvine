@@ -114,19 +114,20 @@ impl MountInfo {
     }
 
     pub fn get_create_opts(&self, conf: &ClientConf) -> CreateFileOpts {
-        CreateFileOptsBuilder::new()
-            .create_parent(true)
-            .replicas(self.replicas.unwrap_or(conf.replicas))
-            .block_size(self.block_size.unwrap_or(conf.block_size))
-            .storage_type(self.storage_type.unwrap_or(conf.storage_type))
-            .ttl_ms(self.ttl_ms)
-            .ttl_action(self.ttl_action)
-            .build()
+        let opts = CreateFileOptsBuilder::with_conf(conf).build();
+        self.merge_create_opts(opts)
+    }
+
+    pub fn get_sync_opts(&self, conf: &ClientConf, ufs_mtime: i64, ufs_len: i64) -> CreateFileOpts {
+        let opts = CreateFileOptsBuilder::with_conf(conf)
+            .ufs_mtime_len(ufs_mtime, ufs_len)
+            .build();
+        self.merge_create_opts(opts)
     }
 
     pub fn merge_create_opts(&self, opts: CreateFileOpts) -> CreateFileOpts {
         CreateFileOpts {
-            create_parent: opts.create_parent,
+            create_parent: true,
             replicas: self.replicas.unwrap_or(opts.replicas as i32) as u16,
             block_size: self.block_size.unwrap_or(opts.block_size),
             file_type: opts.file_type,
@@ -137,12 +138,15 @@ impl MountInfo {
                 storage_type: self
                     .storage_type
                     .unwrap_or(opts.storage_policy.storage_type),
-                ..opts.storage_policy
+                ufs_mtime: opts.storage_policy.ufs_mtime,
+                ..Default::default()
             },
             mode: opts.mode,
             client_name: opts.client_name,
             owner: opts.owner,
             group: opts.group,
+            sync_ufs_meta: opts.sync_ufs_meta,
+            ufs_len: opts.ufs_len,
         }
     }
 

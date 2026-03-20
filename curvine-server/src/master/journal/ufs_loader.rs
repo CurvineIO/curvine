@@ -116,7 +116,7 @@ impl UfsLoader {
     }
 
     pub async fn complete_file(&self, e: &CompleteFileEntry) -> CommonResult<()> {
-        if !e.file.is_complete() {
+        if !e.file.is_complete() || e.file.ufs_only() {
             return Ok(());
         }
 
