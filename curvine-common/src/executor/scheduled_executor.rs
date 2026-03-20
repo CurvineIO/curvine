@@ -22,13 +22,13 @@ use std::time::Duration;
 // Schedules execution threads
 pub struct ScheduledExecutor {
     interval_ms: u64,
-    tread_name: String,
+    thread_name: String,
 }
 
 impl ScheduledExecutor {
     pub fn new(thread_name: impl Into<String>, interval_ms: u64) -> Self {
         Self {
-            tread_name: thread_name.into(),
+            thread_name: thread_name.into(),
             interval_ms,
         }
     }
@@ -37,7 +37,7 @@ impl ScheduledExecutor {
     where
         T: LoopTask + Send + 'static,
     {
-        let name = self.tread_name.to_string();
+        let name = self.thread_name.to_string();
         let builder = thread::Builder::new().name(name.clone());
         let interval_ms = self.interval_ms;
         builder.spawn(move || {
