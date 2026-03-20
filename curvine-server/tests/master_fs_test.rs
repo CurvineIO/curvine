@@ -18,26 +18,28 @@ use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
     CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
 };
+use curvine_common::raft::storage::{AppStorage, ApplyMsg};
 use curvine_common::state::MountOptions;
 use curvine_common::state::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, WorkerInfo,
 };
-
 use curvine_common::state::{OpenFlags, RenameFlags, SetAttrOptsBuilder};
+use curvine_common::utils::SerdeUtils;
 use curvine_server::master::fs::{FsRetryCache, MasterFilesystem, OperationStatus};
-use curvine_server::master::journal::JournalLoader;
-use curvine_server::master::journal::JournalSystem;
+use curvine_server::master::journal::{JournalBatch, JournalEntry, JournalLoader, JournalSystem};
 use curvine_server::master::replication::master_replication_manager::MasterReplicationManager;
 use curvine_server::master::{JobHandler, JobManager, Master, MasterHandler, RpcContext};
 use orpc::common::LocalTime;
 use orpc::common::Utils;
 use orpc::message::Builder;
-use orpc::runtime::AsyncRuntime;
+use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
+use raft::eraftpb::Entry;
 use std::sync::Arc;
+use std::time::Duration;
 
-// Test the master filesystem function separately.
-// This test does not require a full journal system.
+// Use a lightweight filesystem-only setup for tests that do not need the full
+// journal runtime lifecycle.
 fn new_fs(format: bool, name: &str) -> MasterFilesystem {
     Master::init_test_metrics();
 
@@ -68,8 +70,7 @@ fn new_fs(format: bool, name: &str) -> MasterFilesystem {
 fn new_fs_with_journal(
     format: bool,
     name: &str,
-    journal_name: &str,
-) -> (MasterFilesystem, JournalSystem) {
+) -> CommonResult<(MasterFilesystem, JournalSystem)> {
     Master::init_test_metrics();
 
     let conf = ClusterConf {
@@ -81,20 +82,50 @@ fn new_fs_with_journal(
         },
         journal: JournalConf {
             enable: false,
-            journal_dir: Utils::test_sub_dir(format!(
-                "master-fs-test/journal-{}-{}",
-                journal_name,
-                Utils::rand_str(6)
-            )),
+            // Reuse the same journal_dir across reopen phases so the test hits
+            // the real RocksDB reopen path instead of a fresh directory.
+            journal_dir: Utils::test_sub_dir(format!("master-fs-test/journal-{}", name)),
             ..Default::default()
         },
         ..Default::default()
     };
 
-    let journal_system = JournalSystem::from_conf(&conf).unwrap();
+    let journal_system = JournalSystem::from_conf(&conf)?;
     let fs = MasterFilesystem::with_js(&conf, &journal_system);
     fs.add_test_worker(WorkerInfo::default());
-    (fs, journal_system)
+    Ok((fs, journal_system))
+}
+
+fn reopen_fs_with_journal(
+    format: bool,
+    name: &str,
+) -> CommonResult<(MasterFilesystem, JournalSystem)> {
+    for _ in 0..50 {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            new_fs_with_journal(format, name)
+        })) {
+            Ok(Ok(v)) => return Ok(v),
+            Ok(Err(e)) if e.to_string().contains("lock hold by current process") => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(panic) if panic_message(&panic).contains("lock hold by current process") => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+    new_fs_with_journal(format, name)
+}
+
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        return msg.clone();
+    }
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        return (*msg).to_string();
+    }
+    String::new()
 }
 
 fn new_handler() -> MasterHandler {
@@ -187,22 +218,26 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
 
 #[test]
 fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonResult<()> {
+    let test_name = format!("restore-full-{}", Utils::rand_str(6));
     let hash1 = {
-        let (fs, _js) = new_fs_with_journal(true, "restore-full", "restore-full-phase1");
+        let (fs, js) = new_fs_with_journal(true, &test_name)?;
         fs.mkdir("/a", false)?;
         fs.mkdir("/x1/x2/x3", true)?;
         let hash = fs.sum_hash();
         drop(fs);
-        drop(_js);
+        js.shutdown();
         hash
     };
 
-    let (fs, _js) = new_fs_with_journal(false, "restore-full", "restore-full-phase2");
+    let (fs, js) = reopen_fs_with_journal(false, &test_name)?;
     fs.restore_from_rocksdb()?;
 
     assert!(fs.exists("/a")?);
     assert!(fs.exists("/x1/x2/x3")?);
     assert_eq!(hash1, fs.sum_hash());
+
+    drop(fs);
+    js.shutdown();
 
     Ok(())
 }
@@ -781,33 +816,45 @@ fn setup_pair(
     (fs1, js1, loader, js2, fs2)
 }
 
-/// Simulate the entry replaying at the follower
-fn replay_all_then_duplicate_last(js: &JournalSystem, loader: &JournalLoader) {
+fn apply_entries(
+    loader: &JournalLoader,
+    entries: &[JournalEntry],
+    start_index: u64,
+) -> CommonResult<()> {
+    let rt = AsyncRuntime::single();
+    rt.block_on(async {
+        for (offset, entry) in entries.iter().cloned().enumerate() {
+            let index = start_index + offset as u64;
+            let mut batch = JournalBatch::new(index);
+            batch.push(entry);
+            let entry = Entry {
+                term: 1,
+                index,
+                data: SerdeUtils::serialize(&batch)?,
+                ..Default::default()
+            };
+            loader.apply(true, ApplyMsg::new_entry(entry)).await?;
+        }
+        Ok(())
+    })
+}
+
+/// Simulate follower replay through the real AppStorage apply path.
+fn replay_all_then_duplicate_last(js: &JournalSystem, loader: &JournalLoader) -> CommonResult<()> {
     let entries = js.fs().fs_dir.read().take_entries();
     assert!(!entries.is_empty());
 
-    // First: replay all entries
-    for e in entries.iter() {
-        loader.replay_entry(e.clone()).unwrap();
-    }
+    apply_entries(loader, &entries, 1)?;
 
-    // Second: replay last entry again
     let dup_start = entries.len() - 1;
-    for e in &entries[dup_start..] {
-        let result = loader.replay_entry(e.clone());
-        assert!(
-            result.is_ok(),
-            "duplicate entry should be idempotent: {:?}",
-            result
-        );
-    }
+    apply_entries(loader, &entries[dup_start..], entries.len() as u64)
 }
 
 #[test]
 fn test_idempotent_mkdir() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("mkdir");
     fs.mkdir("/data", false)?;
-    replay_all_then_duplicate_last(&js, &loader);
+    replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -816,7 +863,7 @@ fn test_idempotent_mkdir() -> CommonResult<()> {
 fn test_idempotent_create_file() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("create-file");
     fs.create("/file.log", true)?;
-    replay_all_then_duplicate_last(&js, &loader);
+    replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -826,7 +873,7 @@ fn test_idempotent_delete() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("delete");
     fs.mkdir("/data", false)?;
     fs.delete("/data", true)?;
-    replay_all_then_duplicate_last(&js, &loader);
+    replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -836,7 +883,7 @@ fn test_idempotent_rename() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("rename");
     fs.mkdir("/src", false)?;
     fs.rename("/src", "/dst", RenameFlags::empty())?;
-    replay_all_then_duplicate_last(&js, &loader);
+    replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -849,7 +896,7 @@ fn test_idempotent_free() -> CommonResult<()> {
     let set_opts = SetAttrOptsBuilder::new().ufs_mtime(1).build();
     fs.set_attr("/file.log", set_opts)?;
     fs.free("/file.log", false)?;
-    replay_all_then_duplicate_last(&js, &loader);
+    replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -860,7 +907,7 @@ fn test_idempotent_set_attr() -> CommonResult<()> {
     fs.mkdir("/data", false)?;
     let opts = SetAttrOptsBuilder::new().owner("test_owner").build();
     fs.set_attr("/data", opts)?;
-    replay_all_then_duplicate_last(&js, &loader);
+    replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -872,7 +919,7 @@ fn test_idempotent_unmount() -> CommonResult<()> {
     let mnt_opt = MountOptions::builder().build();
     mnt_mgr.mount(None, "/mnt/test", "oss://bucket/", &mnt_opt)?;
     mnt_mgr.umount("/mnt/test")?;
-    replay_all_then_duplicate_last(&js, &loader);
+    replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -882,7 +929,7 @@ fn test_idempotent_symlink() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("symlink");
     fs.mkdir("/dir", false)?;
     fs.symlink("/target", "/dir/link", false, 0o777)?;
-    replay_all_then_duplicate_last(&js, &loader);
+    replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -892,8 +939,21 @@ fn test_idempotent_link() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("link");
     fs.create("/original.txt", true)?;
     fs.link("/original.txt", "/hardlink.txt")?;
-    replay_all_then_duplicate_last(&js, &loader);
-    assert_eq!(fs.sum_hash(), fs2.sum_hash());
+    replay_all_then_duplicate_last(&js, &loader)?;
+
+    let original = fs.file_status("/original.txt")?;
+    let hardlink = fs.file_status("/hardlink.txt")?;
+    let replay_original = fs2.file_status("/original.txt")?;
+    let replay_hardlink = fs2.file_status("/hardlink.txt")?;
+
+    assert_eq!(original.id, hardlink.id);
+    assert_eq!(replay_original.id, replay_hardlink.id);
+    assert_eq!(original.id, replay_original.id);
+
+    assert_eq!(original.nlink, 2);
+    assert_eq!(hardlink.nlink, 2);
+    assert_eq!(replay_original.nlink, 2);
+    assert_eq!(replay_hardlink.nlink, 2);
     Ok(())
 }
 
@@ -910,7 +970,7 @@ fn test_idempotent_mount() -> CommonResult<()> {
         ufs_uri.encode_uri().as_ref(),
         &mnt_opt,
     )?;
-    replay_all_then_duplicate_last(&js, &loader);
+    replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -929,7 +989,7 @@ fn test_idempotent_set_locks() -> CommonResult<()> {
         ..Default::default()
     };
     fs.set_lock("/lockfile.log", lock)?;
-    replay_all_then_duplicate_last(&js, &loader);
+    replay_all_then_duplicate_last(&js, &loader)?;
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }

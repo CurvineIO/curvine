@@ -164,7 +164,6 @@ impl JournalSystem {
                 parts.job_manager.clone(),
                 log_store,
                 parts.journal_writer.clone(),
-                conf.testing,
             ),
             conf.journal.clone(),
             role_monitor,
@@ -200,6 +199,32 @@ impl JournalSystem {
         let rt = self.rt.clone();
         let js = self;
         rt.block_on(async move { js.start().await })
+    }
+
+    pub fn shutdown(self) {
+        let Self {
+            rt,
+            fs,
+            worker_manager,
+            raft_journal,
+            master_monitor,
+            mount_manager,
+            quota_manager,
+            job_manager,
+        } = self;
+
+        let _ = rt.block_on(raft_journal.app_store().shutdown());
+        drop(fs);
+        drop(worker_manager);
+        drop(raft_journal);
+        drop(master_monitor);
+        drop(mount_manager);
+        drop(quota_manager);
+        drop(job_manager);
+        match Arc::try_unwrap(rt) {
+            Ok(rt) => rt.shutdown_background(),
+            Err(rt) => drop(rt),
+        }
     }
 
     pub fn fs(&self) -> MasterFilesystem {
