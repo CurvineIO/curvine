@@ -669,7 +669,8 @@ impl FsDir {
     }
 
     pub fn update_last_inode_id(&self, new_value: i64) -> CommonResult<()> {
-        if new_value > self.last_inode_id() {
+        let old_value = self.last_inode_id();
+        if new_value > old_value {
             self.inode_id.reset(new_value)
         } else {
             Ok(())

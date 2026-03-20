@@ -85,6 +85,16 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     String::new()
 }
 
+fn new_test_ufs_uri(name: &str) -> CommonResult<CurvineURI> {
+    let dir = std::env::temp_dir().join(format!(
+        "curvine-journal-{name}-{}-{}",
+        std::process::id(),
+        orpc::common::LocalTime::mills()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    CurvineURI::new(format!("file://{}/", dir.display()))
+}
+
 // First start a master and perform the operation; then start 1 stand by, manually replay the log to check consistency.
 #[test]
 fn test_journal_replay_consistency_between_leader_and_follower() -> CommonResult<()> {
@@ -198,7 +208,6 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
 
     active.print_tree();
     standby.print_tree();
-
     assert_eq!(active.last_inode_id(), standby.last_inode_id());
     assert_eq!(active.sum_hash(), standby.sum_hash());
 
@@ -273,10 +282,10 @@ fn run(fs_leader: &MasterFilesystem, worker: &WorkerInfo) -> CommonResult<()> {
 
 fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
     /************* Master node execution log **************/
-    //mount oss://cluster1/ -> /x/y/z
+    //mount file:///... -> /x/y/z
     let mgr = mnt_mgr;
     let mount_uri = CurvineURI::new("/x/y/z")?;
-    let ufs_uri = CurvineURI::new("oss://cluster1/")?;
+    let ufs_uri = new_test_ufs_uri("mnt-1")?;
     let mut config = HashMap::new();
     config.insert("k1".to_string(), "v1".to_string());
     let mnt_opt = MountOptions::builder().set_properties(config).build();
@@ -287,9 +296,9 @@ fn run_mnt(mnt_mgr: Arc<MountManager>) -> CommonResult<()> {
         &mnt_opt,
     )?;
 
-    //mount hdfs://cluster1/ -> /x/z/y
+    //mount file:///... -> /x/z/y
     let mount_uri = CurvineURI::new("/x/z/y")?;
-    let ufs_uri = CurvineURI::new("hdfs://cluster1/")?;
+    let ufs_uri = new_test_ufs_uri("mnt-2")?;
     let mut config = HashMap::new();
     config.insert("k2".to_string(), "v1".to_string());
     let mnt_opt = MountOptions::builder().build();
