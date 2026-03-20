@@ -108,7 +108,7 @@ impl SimpleServer {
 
 impl Default for SimpleServer {
     fn default() -> Self {
-        let host = NetUtils::local_hostname();
+        let host = "127.0.0.1";
         let port = NetUtils::get_available_port();
         Self::new(host, port)
     }
