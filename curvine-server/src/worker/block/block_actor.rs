@@ -106,8 +106,8 @@ impl BlockActor {
     // Worker registration.
     pub fn register(&self) -> CommonResult<()> {
         let storages_info = self.store.get_and_check_storages();
-        self.client
-            .heartbeat(HeartbeatStatus::Start, storages_info)?;
+        let result = self.client.heartbeat(HeartbeatStatus::Start, storages_info);
+        result?;
         Ok(())
     }
 

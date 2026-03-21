@@ -27,7 +27,8 @@ use orpc::common::LocalTime;
 use orpc::io::net::{InetAddr, NetUtils};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, CommonResult};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -44,7 +45,20 @@ pub struct MiniCluster {
     pub client_rt: Arc<Runtime>,
 }
 
+static RESERVED_TEST_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
 impl MiniCluster {
+    fn reserve_test_port() -> u16 {
+        let ports = RESERVED_TEST_PORTS.get_or_init(|| Mutex::new(HashSet::new()));
+        loop {
+            let port = NetUtils::get_available_port();
+            let mut guard = ports.lock().unwrap();
+            if guard.insert(port) {
+                return port;
+            }
+        }
+    }
+
     pub fn new(master_conf: Vec<ClusterConf>, worker_conf: Vec<ClusterConf>) -> Self {
         let client_rt = Arc::new(master_conf[0].client_rpc_conf().create_runtime());
         Self {
@@ -59,6 +73,29 @@ impl MiniCluster {
     pub fn with_num(conf: &ClusterConf, master_num: u16, worker_num: u16) -> Self {
         let master_conf = Self::default_master_conf(conf, master_num);
         let worker_conf = Self::default_worker_conf(&master_conf[0], worker_num);
+        let mut seen_ports = HashSet::new();
+        let mut duplicates = vec![];
+        for (index, item) in master_conf.iter().enumerate() {
+            for (label, port) in [
+                ("master-rpc", item.master.rpc_port),
+                ("journal-rpc", item.journal.rpc_port),
+                ("master-web", item.master.web_port),
+            ] {
+                if !seen_ports.insert(port) {
+                    duplicates.push(format!("master[{index}]-{label}:{port}"));
+                }
+            }
+        }
+        for (index, item) in worker_conf.iter().enumerate() {
+            for (label, port) in [
+                ("worker-rpc", item.worker.rpc_port),
+                ("worker-web", item.worker.web_port),
+            ] {
+                if !seen_ports.insert(port) {
+                    duplicates.push(format!("worker[{index}]-{label}:{port}"));
+                }
+            }
+        }
         Self::new(master_conf, worker_conf)
     }
 
@@ -132,7 +169,7 @@ impl MiniCluster {
                         info!("Master service is ready (Raft leader elected and RPC service listening), retry count: {}", retry_count);
                         return Ok(());
                     }
-                    Err(_) => {
+                    Err(_e) => {
                         if retry_count % 5 == 0 && rpc_connection_attempted {
                             // Log every 5 retries after first RPC attempt
                             info!("Raft leader ready but RPC service not yet available, continuing to wait... (attempt {})", retry_count);
@@ -166,7 +203,12 @@ impl MiniCluster {
 
         while LocalTime::mills() <= wait_time {
             retry_count += 1;
-            let info = fs.get_master_info().await?;
+            let info = match fs.get_master_info().await {
+                Ok(info) => info,
+                Err(e) => {
+                    return Err(e);
+                }
+            };
             if info.live_workers.len() == self.worker_conf.len() {
                 info!(
                     "Cluster is ready, active Worker count: {}",
@@ -233,9 +275,9 @@ impl MiniCluster {
         let mut master_addrs = vec![];
         for index in 0..num {
             let mut master = conf.clone();
-            master.master.rpc_port = NetUtils::get_available_port();
-            master.journal.rpc_port = NetUtils::get_available_port();
-            master.master.web_port = NetUtils::get_available_port();
+            master.master.rpc_port = Self::reserve_test_port();
+            master.journal.rpc_port = Self::reserve_test_port();
+            master.master.web_port = Self::reserve_test_port();
             master.master.meta_dir = format!("{}/{}", master.master.meta_dir, index);
             master.journal.journal_dir = format!("{}/{}", master.journal.journal_dir, index);
 
@@ -276,8 +318,8 @@ impl MiniCluster {
 
         for index in 0..num {
             let mut worker = conf.clone();
-            worker.worker.rpc_port = NetUtils::get_available_port();
-            worker.worker.web_port = NetUtils::get_available_port();
+            worker.worker.rpc_port = Self::reserve_test_port();
+            worker.worker.web_port = Self::reserve_test_port();
 
             let mut dirs = vec![];
             for item in worker.worker.data_dir {
