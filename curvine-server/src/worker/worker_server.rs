@@ -29,8 +29,6 @@ use orpc::io::net::ConnState;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
-use serde_json::json;
-use std::io::Write;
 use std::sync::Arc;
 use std::thread;
 
@@ -175,13 +173,6 @@ impl Worker {
         }
 
         // step 3: Start rpc server
-        // #region agent log
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/home/barry/CodeSpace/curvine/.cursor/debug-6d9197.log")
-            .and_then(|mut f| writeln!(f, "{}", json!({"sessionId":"6d9197","runId":"pre-fix-port","hypothesisId":"H5","location":"curvine-server/src/worker/worker_server.rs:176","message":"worker server start attempt","data":{"workerId":self.worker_id,"rpcPort":self.addr.rpc_port,"webPort":self.addr.web_port,"hostname":self.addr.hostname},"timestamp":orpc::common::LocalTime::mills()})));
-        // #endregion
         let mut rpc_status = self.rpc_server.start();
         rpc_status.wait_running().await.unwrap();
 

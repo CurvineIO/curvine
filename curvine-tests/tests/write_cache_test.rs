@@ -124,22 +124,21 @@ fn test_fs_mode() {
         let dst_path = format!("/write_cache_{:?}/meta_rename.log", WriteType::FsMode).into();
         fs.rename(&path, &dst_path).await.unwrap();
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        // Check UFS file
-        let ufs_path = mnt.get_ufs_path(&dst_path).unwrap();
-        let mut reader1 = mnt.ufs.open(&ufs_path).await.unwrap();
-        let str1 = reader1.read_as_string().await.unwrap();
-
-        let mut reader2 = fs.open(&dst_path).await.unwrap();
-        let str2 = reader2.read_as_string().await.unwrap();
-
-        assert_eq!(str1, str2);
+        // FsMode rename updates CV first; UFS rename follows journal apply (may lag one tick).
+        // Single-shot open fails with NotFound (see runtime: Rename ok then UFS stat NotFound).
+        wait_for_cv_ufs_consistency(&fs, &dst_path).await;
 
         // Test delete
+        let ufs_path = mnt.get_ufs_path(&dst_path).unwrap();
         fs.delete(&dst_path, false).await.unwrap();
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        assert!(!mnt.ufs.exists(&ufs_path).await.unwrap());
+        let mut ufs_gone = awaitility::at_most(Duration::from_secs(60));
+        ufs_gone.poll_interval(Duration::from_millis(100));
+        ufs_gone
+            .until_async(|| async { !mnt.ufs.exists(&ufs_path).await.unwrap_or(true) })
+            .await;
+        ufs_gone
+            .result()
+            .expect("UFS should not list deleted file after journal delete");
     });
 }
 
@@ -374,26 +373,52 @@ async fn verify_read_data(fs: &UnifiedFileSystem, path: &Path, expected_data: &[
     );
 }
 
-async fn verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) {
-    let (ufs_path, mnt) = fs.get_mount(path).await.unwrap().unwrap();
-
-    let mut cv_reader = fs.cv().open(path).await.unwrap();
-    let mut ufs_reader = mnt.ufs.open(&ufs_path).await.unwrap();
-
-    assert!(cv_reader.status().is_complete);
-
-    assert_eq!(
-        cv_reader.status().storage_policy.ufs_mtime,
-        ufs_reader.status().mtime
-    );
-
+/// Returns true when UFS object exists and matches CV (mtime + full content).
+async fn try_verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) -> bool {
+    let (ufs_path, mnt) = match fs.get_mount(path).await {
+        Ok(Some(v)) => v,
+        _ => return false,
+    };
+    let mut ufs_reader = match mnt.ufs.open(&ufs_path).await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let mut cv_reader = match fs.cv().open(path).await {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !cv_reader.status().is_complete {
+        return false;
+    }
+    if cv_reader.status().storage_policy.ufs_mtime != ufs_reader.status().mtime {
+        return false;
+    }
     let mut cv_data = BytesMut::zeroed(cv_reader.len() as usize);
-    cv_reader.read_full(&mut cv_data).await.unwrap();
-
+    if cv_reader.read_full(&mut cv_data).await.is_err() {
+        return false;
+    }
     let mut ufs_data = BytesMut::zeroed(ufs_reader.len() as usize);
-    ufs_reader.read_full(&mut ufs_data).await.unwrap();
+    if ufs_reader.read_full(&mut ufs_data).await.is_err() {
+        return false;
+    }
+    Utils::crc32(&cv_data) == Utils::crc32(&ufs_data)
+}
 
-    assert_eq!(Utils::crc32(&cv_data), Utils::crc32(&ufs_data))
+async fn verify_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) {
+    assert!(
+        try_verify_cv_ufs_consistency(fs, path).await,
+        "CV/UFS consistency check failed for {}",
+        path.path()
+    );
+}
+
+async fn wait_for_cv_ufs_consistency(fs: &UnifiedFileSystem, path: &Path) {
+    let mut w = awaitility::at_most(Duration::from_secs(60));
+    w.poll_interval(Duration::from_millis(100));
+    w.until_async(|| async { try_verify_cv_ufs_consistency(fs, path).await })
+        .await;
+    w.result()
+        .expect("timed out waiting for CV and UFS to match after journal/UFS apply");
 }
 
 async fn mount(fs: &UnifiedFileSystem, write_type: WriteType) {

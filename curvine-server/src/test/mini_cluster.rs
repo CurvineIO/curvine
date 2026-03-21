@@ -27,9 +27,7 @@ use orpc::common::LocalTime;
 use orpc::io::net::{InetAddr, NetUtils};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::{err_box, CommonResult};
-use serde_json::json;
 use std::collections::HashSet;
-use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -98,13 +96,6 @@ impl MiniCluster {
                 }
             }
         }
-        // #region agent log
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/home/barry/CodeSpace/curvine/.cursor/debug-6d9197.log")
-            .and_then(|mut f| writeln!(f, "{}", json!({"sessionId":"6d9197","runId":"pre-fix-port","hypothesisId":"H4","location":"curvine-server/src/test/mini_cluster.rs:61","message":"mini cluster allocated ports","data":{"masterNum":master_num,"workerNum":worker_num,"duplicateCount":duplicates.len(),"duplicates":duplicates},"timestamp":orpc::common::LocalTime::mills()})));
-        // #endregion
         Self::new(master_conf, worker_conf)
     }
 
@@ -175,24 +166,10 @@ impl MiniCluster {
 
                 match RpcClient::with_raw(&addr, &conf).await {
                     Ok(_client) => {
-                        // #region agent log
-                        let _ = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/barry/CodeSpace/curvine/.cursor/debug-6d9197.log")
-                            .and_then(|mut f| writeln!(f, "{}", json!({"sessionId":"6d9197","runId":"pre-fix-set-lock","hypothesisId":"H2","location":"curvine-server/src/test/mini_cluster.rs:130","message":"wait_master_ready rpc ok","data":{"retryCount":retry_count,"addr":addr.to_string(),"rpcConnectionAttempted":rpc_connection_attempted},"timestamp":orpc::common::LocalTime::mills()})));
-                        // #endregion
                         info!("Master service is ready (Raft leader elected and RPC service listening), retry count: {}", retry_count);
                         return Ok(());
                     }
-                    Err(e) => {
-                        // #region agent log
-                        let _ = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/home/barry/CodeSpace/curvine/.cursor/debug-6d9197.log")
-                            .and_then(|mut f| writeln!(f, "{}", json!({"sessionId":"6d9197","runId":"pre-fix-set-lock","hypothesisId":"H2","location":"curvine-server/src/test/mini_cluster.rs:135","message":"wait_master_ready rpc err","data":{"retryCount":retry_count,"addr":addr.to_string(),"error":e.to_string(),"rpcConnectionAttempted":rpc_connection_attempted},"timestamp":orpc::common::LocalTime::mills()})));
-                        // #endregion
+                    Err(_e) => {
                         if retry_count % 5 == 0 && rpc_connection_attempted {
                             // Log every 5 retries after first RPC attempt
                             info!("Raft leader ready but RPC service not yet available, continuing to wait... (attempt {})", retry_count);
@@ -226,28 +203,9 @@ impl MiniCluster {
 
         while LocalTime::mills() <= wait_time {
             retry_count += 1;
-            let started_at = LocalTime::mills();
-            let master_info = fs.get_master_info().await;
-            let elapsed_ms = LocalTime::mills() - started_at;
-            let info = match master_info {
-                Ok(info) => {
-                    // #region agent log
-                    let _ = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/home/barry/CodeSpace/curvine/.cursor/debug-6d9197.log")
-                        .and_then(|mut f| writeln!(f, "{}", json!({"sessionId":"6d9197","runId":"pre-fix-set-lock","hypothesisId":"H1","location":"curvine-server/src/test/mini_cluster.rs:169","message":"wait_ready master info ok","data":{"retryCount":retry_count,"elapsedMs":elapsed_ms,"liveWorkers":info.live_workers.len(),"expectedWorkers":self.worker_conf.len()},"timestamp":orpc::common::LocalTime::mills()})));
-                    // #endregion
-                    info
-                }
+            let info = match fs.get_master_info().await {
+                Ok(info) => info,
                 Err(e) => {
-                    // #region agent log
-                    let _ = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/home/barry/CodeSpace/curvine/.cursor/debug-6d9197.log")
-                        .and_then(|mut f| writeln!(f, "{}", json!({"sessionId":"6d9197","runId":"pre-fix-set-lock","hypothesisId":"H1","location":"curvine-server/src/test/mini_cluster.rs:169","message":"wait_ready master info err","data":{"retryCount":retry_count,"elapsedMs":elapsed_ms,"expectedWorkers":self.worker_conf.len(),"error":e.to_string()},"timestamp":orpc::common::LocalTime::mills()})));
-                    // #endregion
                     return Err(e);
                 }
             };

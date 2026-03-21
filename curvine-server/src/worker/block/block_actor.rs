@@ -23,8 +23,6 @@ use orpc::common::TimeSpent;
 use orpc::runtime::{GroupExecutor, Runtime};
 use orpc::sync::StateCtl;
 use orpc::CommonResult;
-use serde_json::json;
-use std::io::Write;
 use std::sync::Arc;
 
 /// Worker block management role.
@@ -109,13 +107,6 @@ impl BlockActor {
     pub fn register(&self) -> CommonResult<()> {
         let storages_info = self.store.get_and_check_storages();
         let result = self.client.heartbeat(HeartbeatStatus::Start, storages_info);
-        // #region agent log
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/home/barry/CodeSpace/curvine/.cursor/debug-6d9197.log")
-            .and_then(|mut f| writeln!(f, "{}", json!({"sessionId":"6d9197","runId":"pre-fix-set-lock","hypothesisId":"H3","location":"curvine-server/src/worker/block/block_actor.rs:109","message":"worker register result","data":{"workerId":self.client.worker_id,"workerAddr":format!("{}:{}", self.client.worker_addr.ip_addr, self.client.worker_addr.rpc_port),"ok":result.is_ok(),"error":result.as_ref().err().map(|e| e.to_string())},"timestamp":orpc::common::LocalTime::mills()})));
-        // #endregion
         result?;
         Ok(())
     }
