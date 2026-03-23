@@ -109,7 +109,9 @@ impl SimpleServer {
 impl Default for SimpleServer {
     fn default() -> Self {
         let host = "127.0.0.1";
-        let port = NetUtils::get_available_port();
+        // hold_available_port keeps the socket bound until RpcServer claims it,
+        // preventing TOCTOU races when nextest runs tests in parallel.
+        let port = NetUtils::hold_available_port();
         Self::new(host, port)
     }
 }

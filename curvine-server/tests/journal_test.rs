@@ -145,8 +145,10 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     Logger::default();
     Master::init_test_metrics();
 
-    let port1 = NetUtils::get_available_port();
-    let port2 = NetUtils::get_available_port();
+    // hold_available_port keeps each socket bound until the Raft server claims it,
+    // preventing TOCTOU races when nextest runs tests in parallel.
+    let port1 = NetUtils::hold_available_port();
+    let port2 = NetUtils::hold_available_port();
 
     let mut conf = ClusterConf::default();
     conf.journal.writer_flush_batch_size = 1;
@@ -204,12 +206,29 @@ fn test_raft_consensus_and_state_synchronization_between_two_masters() -> Common
     run(&active, &worker)?;
     run_mnt(mnt_mgr.clone())?;
 
-    thread::sleep(Duration::from_secs(30));
-
-    active.print_tree();
-    standby.print_tree();
-    assert_eq!(active.last_inode_id(), standby.last_inode_id());
-    assert_eq!(active.sum_hash(), standby.sum_hash());
+    // Poll until the standby's filesystem state AND mount table converge with
+    // the active node, rather than using a fixed sleep that may be insufficient
+    // under load. Both inode state and mount table are replicated via separate
+    // Raft log entries, so we must wait for all of them to be applied.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let leader_mnt = mnt_mgr1.get_mount_table().unwrap_or_default();
+        let follower_mnt = mnt_mgr2.get_mount_table().unwrap_or_default();
+        if active.last_inode_id() == standby.last_inode_id()
+            && active.sum_hash() == standby.sum_hash()
+            && leader_mnt.len() == follower_mnt.len()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            active.print_tree();
+            standby.print_tree();
+            assert_eq!(active.last_inode_id(), standby.last_inode_id());
+            assert_eq!(active.sum_hash(), standby.sum_hash());
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 
     let leader_mnt = mnt_mgr1.get_mount_table().unwrap();
     let follower_mnt = mnt_mgr2.get_mount_table().unwrap();

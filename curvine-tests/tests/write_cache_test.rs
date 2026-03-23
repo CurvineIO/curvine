@@ -23,8 +23,6 @@ use orpc::sys::DataSlice;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
-
 fn get_fs() -> UnifiedFileSystem {
     let testing = Testing::builder().workers(1).build().unwrap();
     // Check if UFS configuration is available, if not, skip the test
@@ -237,8 +235,9 @@ fn test_fs_mode_ufs_write_overwrite() {
 
         verify_read_data(&fs, &path, data_overwrite.as_bytes()).await;
 
-        sleep(Duration::from_secs(3)).await;
-        verify_cv_ufs_consistency(&fs, &path).await;
+        // Wait until CV and UFS are fully consistent instead of a fixed sleep,
+        // as UFS sync jobs may take longer under parallel test load.
+        wait_for_cv_ufs_consistency(&fs, &path).await;
     });
 }
 
@@ -268,8 +267,9 @@ fn test_fs_mode_ufs_write_append() {
 
         verify_read_data(&fs, &path, expected_append.as_bytes()).await;
 
-        sleep(Duration::from_secs(3)).await;
-        verify_cv_ufs_consistency(&fs, &path).await;
+        // Wait until CV and UFS are fully consistent instead of a fixed sleep,
+        // as UFS sync jobs may take longer under parallel test load.
+        wait_for_cv_ufs_consistency(&fs, &path).await;
     });
 }
 
@@ -314,8 +314,9 @@ fn test_fs_mode_ufs_write_random() {
 
         verify_read_data(&fs, &path, &expected).await;
 
-        sleep(Duration::from_secs(3)).await;
-        verify_cv_ufs_consistency(&fs, &path).await;
+        // Wait until CV and UFS are fully consistent instead of a fixed sleep,
+        // as UFS sync jobs may take longer under parallel test load.
+        wait_for_cv_ufs_consistency(&fs, &path).await;
     });
 }
 

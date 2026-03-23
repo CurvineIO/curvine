@@ -34,8 +34,10 @@ const LOOP_NUM: i32 = 100;
 // Test the worker interface function.
 fn start_worker() -> ClusterConf {
     let mut conf = ClusterConf::default();
-    conf.worker.rpc_port = NetUtils::get_available_port();
-    conf.worker.web_port = NetUtils::get_available_port();
+    // Use hold_available_port so the socket stays bound until RpcServer::run() claims it,
+    // preventing TOCTOU races when nextest runs tests in parallel.
+    conf.worker.rpc_port = NetUtils::hold_available_port();
+    conf.worker.web_port = NetUtils::hold_available_port();
     conf.worker.data_dir = vec!["[MEM:10MB]../testing/worker-test".to_owned()];
     conf.client.init().unwrap();
 

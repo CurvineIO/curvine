@@ -20,7 +20,7 @@ use axum::error_handling::HandleErrorLayer;
 use axum::http::StatusCode;
 use axum::Json;
 use log::{error, info};
-use orpc::io::net::InetAddr;
+use orpc::io::net::{InetAddr, NetUtils};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::ServerConf;
 use orpc::CommonResult;
@@ -95,7 +95,16 @@ where
     }
 
     pub async fn run(&self) -> CommonResult<()> {
-        let listener = TcpListener::bind(self.get_bind_addr()).await?;
+        // Prefer a pre-bound listener from the test port reservation map.
+        // This eliminates the TOCTOU race between port discovery and actual bind
+        // when parallel test processes (cargo nextest) run simultaneously.
+        let listener = match NetUtils::take_held_listener(self.address.port) {
+            Some(std_listener) => {
+                std_listener.set_nonblocking(true)?;
+                TcpListener::from_std(std_listener)?
+            }
+            None => TcpListener::bind(self.get_bind_addr()).await?,
+        };
         info!(
             "WebServer [{}] start successfully, bind address: {}",
             self.conf.name, self.address,
