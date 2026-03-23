@@ -51,11 +51,15 @@ impl MiniCluster {
     fn reserve_test_port() -> u16 {
         let ports = RESERVED_TEST_PORTS.get_or_init(|| Mutex::new(HashSet::new()));
         loop {
-            let port = NetUtils::get_available_port();
+            // hold_available_port keeps the socket bound until RpcServer::run() calls
+            // take_held_listener, preventing TOCTOU races across parallel nextest processes.
+            let port = NetUtils::hold_available_port();
             let mut guard = ports.lock().unwrap();
             if guard.insert(port) {
                 return port;
             }
+            // Duplicate within this process: release the held listener and retry.
+            NetUtils::take_held_listener(port);
         }
     }
 

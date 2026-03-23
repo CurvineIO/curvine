@@ -14,19 +14,46 @@
 
 use crate::io::IOResult;
 use crate::{try_err, try_option};
-use std::net::ToSocketAddrs;
+use std::collections::HashMap;
+use std::net::{TcpListener, ToSocketAddrs};
+use std::sync::{Mutex, OnceLock};
 use sysinfo::System;
+
+// Process-global map of pre-bound listeners for test port reservation.
+// Keeps sockets alive between port selection and server startup, preventing
+// TOCTOU races when multiple test processes run in parallel (e.g. cargo nextest).
+static HELD_LISTENERS: OnceLock<Mutex<HashMap<u16, TcpListener>>> = OnceLock::new();
 
 pub struct NetUtils;
 
 impl NetUtils {
     // Get a system-available port.
     pub fn get_available_port() -> u16 {
-        std::net::TcpListener::bind("0.0.0.0:0")
+        TcpListener::bind("0.0.0.0:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port()
+    }
+
+    // Bind to an available port and hold the socket open in a global map.
+    // The port stays reserved until `take_held_listener` is called, eliminating
+    // the TOCTOU race between port discovery and actual server bind.
+    // Use this in test infrastructure instead of `get_available_port`.
+    pub fn hold_available_port() -> u16 {
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let map = HELD_LISTENERS.get_or_init(|| Mutex::new(HashMap::new()));
+        map.lock().unwrap().insert(port, listener);
+        port
+    }
+
+    // Remove and return the held TcpListener for a port.
+    // Called by the server runtime when it is ready to accept connections.
+    pub fn take_held_listener(port: u16) -> Option<TcpListener> {
+        HELD_LISTENERS
+            .get()
+            .and_then(|map| map.lock().unwrap().remove(&port))
     }
 
     pub fn local_hostname() -> String {
