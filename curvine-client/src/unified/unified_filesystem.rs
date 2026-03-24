@@ -491,7 +491,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         let flags = OpenFlags::new_write_only()
             .set_create(true)
             .set_overwrite(overwrite);
-        let opts = self.cv.create_opts_builder().build();
+        let opts = self.cv.create_opts_builder().create_parent(true).build();
         self.open_with_opts(path, opts, flags).await
     }
 
