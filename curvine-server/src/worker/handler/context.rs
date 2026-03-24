@@ -47,7 +47,7 @@ impl WriteContext {
 
 pub struct ReadContext {
     pub block_id: i64,
-    pub chuck_size: i32,
+    pub chunk_size: i32,
     pub req_id: i64,
     pub short_circuit: bool,
     pub off: i64,
@@ -62,7 +62,7 @@ impl ReadContext {
         let req: BlockReadRequest = msg.parse_header()?;
         let context = Self {
             block_id: req.id,
-            chuck_size: req.chunk_size,
+            chunk_size: req.chunk_size,
             req_id: msg.req_id(),
             short_circuit: req.short_circuit,
             off: req.off,
