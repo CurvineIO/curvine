@@ -14,11 +14,15 @@
 
 use crate::fs::{FsKind, Path};
 use crate::proto::{GetFileStatusResponse, ListStatusResponse};
-use crate::state::{FileStatus, SetAttrOpts};
+use crate::state::{FileStatus, ListOptions, SetAttrOpts};
 use crate::utils::ProtoUtils;
 use crate::FsResult;
+use async_stream::stream;
+use futures::stream::Stream;
+use orpc::err_box;
 use prost::bytes::BytesMut;
 use std::future::Future;
+use std::pin::Pin;
 
 pub trait FileSystem<Writer, Reader> {
     fn fs_kind(&self) -> FsKind;
@@ -65,4 +69,72 @@ pub trait FileSystem<Writer, Reader> {
     }
 
     fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> impl Future<Output = FsResult<()>>;
+
+    fn list_options(
+        &self,
+        _path: &Path,
+        _opts: ListOptions,
+    ) -> impl Future<Output = FsResult<Vec<FileStatus>>> + Send {
+        async move { err_box!("not supported list_options") }
+    }
+
+    fn list_options_bytes(
+        &self,
+        path: &Path,
+        opts: ListOptions,
+    ) -> impl Future<Output = FsResult<BytesMut>> {
+        async move {
+            let statuses = self
+                .list_options(path, opts)
+                .await?
+                .into_iter()
+                .map(ProtoUtils::file_status_to_pb)
+                .collect();
+
+            let rep = ListStatusResponse { statuses };
+            Ok(ProtoUtils::encode(rep)?)
+        }
+    }
+
+    fn list_stream<'a>(
+        &'a self,
+        path: &'a Path,
+        options: ListOptions,
+    ) -> Pin<Box<dyn Stream<Item = FsResult<FileStatus>> + 'a>> {
+        let stream = stream! {
+            let (limit, mut start_after) = (options.limit, options.start_after);
+            loop {
+                let opts = ListOptions {
+                    limit,
+                    start_after: start_after.clone(),
+                };
+                let list = match self.list_options(path, opts).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        yield Err(e);
+                        break;
+                    }
+                };
+
+                if list.is_empty() {
+                    break;
+                }
+
+                let n = list.len();
+                let last_name = list.last().map(|s| s.name.clone());
+                for status in list {
+                    yield Ok(status);
+                }
+
+                if let Some(l) = limit {
+                    if n < l {
+                        break;
+                    }
+                }
+                start_after = last_name;
+            }
+        };
+
+        Box::pin(stream)
+    }
 }

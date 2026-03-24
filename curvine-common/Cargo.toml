@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 orpc = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
+async-stream =  { workspace = true }
 tokio-util = { workspace = true }
 log = { workspace = true }
 raft = { workspace = true }

@@ -201,3 +201,7 @@ message FreeResultProto {
     required int64 bytes = 3;
 }
 
+message ListOptionsProto {
+  optional int32 limit = 1;
+  optional string start_after = 2;
+}

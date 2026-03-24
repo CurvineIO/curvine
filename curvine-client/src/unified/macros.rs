@@ -470,6 +470,32 @@ macro_rules! impl_filesystem_for_enum {
                 }
             }
 
+            async fn list_options(
+                &self,
+                path: &::curvine_common::fs::Path,
+                opts: ::curvine_common::state::ListOptions,
+            ) -> ::curvine_common::FsResult<Vec<::curvine_common::state::FileStatus>> {
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.list_options(path, opts).await,
+                    )+
+                }
+            }
+
+            fn list_stream<'a>(
+                &'a self,
+                path: &'a::curvine_common::fs::Path,
+                opts: ::curvine_common::state::ListOptions,
+            ) -> ::std::pin::Pin<Box<dyn ::futures::Stream<Item = ::curvine_common::FsResult<::curvine_common::state::FileStatus>> + 'a>> {
+                match self {
+                    $(
+                        $(#[$cfg])*
+                        Self::$variant(inner) => inner.list_stream(path, opts),
+                    )+
+                }
+            }
+
             async fn set_attr(
                 &self,
                 path: &::curvine_common::fs::Path,
