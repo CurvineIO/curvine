@@ -151,6 +151,8 @@ pub struct FuseConf {
     #[serde(skip_serializing, skip_deserializing)]
     pub meta_cache_ttl_duration: Duration,
 
+    pub list_limit: usize,
+
     pub log: LogConf,
 }
 
@@ -314,6 +316,7 @@ impl Default for FuseConf {
             node_cache_ttl: Default::default(),
             meta_cache_ttl_duration: Default::default(),
 
+            list_limit: 1000,
             log: LogConf::default(),
         };
 

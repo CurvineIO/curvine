@@ -96,6 +96,12 @@ impl FuseResponse {
         self.unique
     }
 
+    fn rep_log(&self, e: &FuseError) {
+        if self.debug || !matches!(e.errno, libc::ENOENT | libc::ENODATA | libc::ENOSYS) {
+            warn!("send_req unique {}: {}", self.unique, e);
+        }
+    }
+
     pub async fn send_rep<T: Debug, E: Into<FuseError> + Debug>(
         &self,
         res: Result<T, E>,
@@ -116,9 +122,7 @@ impl FuseResponse {
 
             Err(e) => {
                 let e = e.into();
-                if self.debug || (e.errno != libc::ENOENT && e.errno != libc::ENODATA) {
-                    warn!("send_rep unique {}: {:?}", self.unique, e);
-                }
+                self.rep_log(&e);
                 ResponseData::create(self.unique, e.errno, vec![])
             }
         };
@@ -156,9 +160,7 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                if self.debug || (e.errno != libc::ENOENT && e.errno != libc::ENODATA) {
-                    warn!("send_buf unique {}: {}", self.unique, e);
-                }
+                self.rep_log(&e);
                 ResponseData::create(self.unique, e.errno, vec![])
             }
         };
@@ -177,9 +179,7 @@ impl FuseResponse {
             }
 
             Err(e) => {
-                if self.debug || (e.errno != libc::ENOENT && e.errno != libc::ENODATA) {
-                    warn!("send_data unique {}: {}", self.unique, e);
-                }
+                self.rep_log(&e);
                 ResponseData::create(self.unique, e.errno, vec![])
             }
         };

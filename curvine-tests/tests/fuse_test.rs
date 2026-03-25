@@ -17,7 +17,7 @@
 fn persist_restore() {
     use std::sync::Arc;
 
-    use curvine_common::fs::{Path, StateReader, StateWriter};
+    use curvine_common::fs::{FileSystem, Path, StateReader, StateWriter};
     use curvine_common::state::{CreateFileOptsBuilder, FileStatus, OpenFlags};
     use curvine_fuse::fs::state::NodeState;
     use curvine_fuse::FUSE_ROOT_ID;
@@ -48,18 +48,11 @@ fn persist_restore() {
         let c = state1.do_lookup(b.ino, Some("c"), &status_c).unwrap();
 
         // Create dir_handles
-        let dir_status_list = vec![
-            FileStatus::with_name(10, "file1".to_string(), false),
-            FileStatus::with_name(11, "file2".to_string(), false),
-        ];
-        let dir_handle1 = state1
-            .new_dir_handle(a.ino, dir_status_list.clone())
-            .await
-            .unwrap();
-        let dir_handle2 = state1
-            .new_dir_handle(b.ino, dir_status_list.clone())
-            .await
-            .unwrap();
+        let path_a_dir = Path::from_str("/a").unwrap();
+        let path_b_dir = Path::from_str("/a/b").unwrap();
+        fs1.mkdir(&path_b_dir, true).await.unwrap();
+        let dir_handle1 = state1.new_dir_handle(a.ino, &path_a_dir).await.unwrap();
+        let dir_handle2 = state1.new_dir_handle(b.ino, &path_b_dir).await.unwrap();
 
         // Create file handles
         let path = Path::from_str("/a/1.log").unwrap();
@@ -97,7 +90,6 @@ fn persist_restore() {
         let original_id_creator = state1.node_read().current_id();
         let original_fh_creator = state1.current_fh();
         let original_handle1_status = handle1.status().clone();
-        let _original_dir_handle1_list = dir_handle1.get_all().to_vec();
 
         // Persist state
         let mut writer = StateWriter::new(&test_path).unwrap();
@@ -146,7 +138,7 @@ fn persist_restore() {
             .unwrap();
         assert_eq!(restored_dir_handle1.ino, dir_handle1.ino);
         assert_eq!(restored_dir_handle1.fh, dir_handle1.fh);
-        assert_eq!(restored_dir_handle1.len(), dir_handle1.len());
+        assert_eq!(restored_dir_handle1.path, dir_handle1.path);
 
         let restored_dir_handle2 = state2
             .find_dir_handle(dir_handle2.ino, dir_handle2.fh)

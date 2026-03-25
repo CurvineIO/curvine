@@ -31,7 +31,7 @@ use log::{debug, error, info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
-use orpc::{sys, ternary, try_option};
+use orpc::{sys, ternary, try_option, try_option_ref};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::bytes::BytesMut;
@@ -254,28 +254,31 @@ impl CurvineFileSystem {
     ) -> FuseResult<FuseDirentList> {
         let handle = self.state.find_dir_handle(header.nodeid, arg.fh)?;
 
-        let mut map = self.state.node_write();
         let mut res = FuseDirentList::new(arg);
-        for (index, status) in handle.get_list(arg.offset as usize) {
+        let mut index = arg.offset;
+        let mut batch = handle.get_batch(arg.offset as usize).await?;
+        while let Some(status) = batch.pop_front() {
+            let mut map = self.state.node_write();
+
             let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
                 if self.conf.enable_meta_cache {
                     let path = Path::from_str(&status.path)?;
                     self.state.meta_cache().put_status(&path, status.clone());
                 }
-                map.do_lookup(header.nodeid, Some(&status.name), status)?
+                map.do_lookup(header.nodeid, Some(&status.name), &status)?
             } else {
-                Self::status_to_attr(&self.conf, status)?
+                Self::status_to_attr(&self.conf, &status)?
             };
-            let entry = Self::create_entry_out(&self.conf, attr);
 
-            if plus {
-                if !res.add_plus((index + 1) as u64, status, entry) {
-                    break;
-                }
-            } else if !res.add((index + 1) as u64, status, entry) {
+            let entry = Self::create_entry_out(&self.conf, attr);
+            if !res.add_dirent(plus, index, &status, entry) {
+                batch.push_front(status);
                 break;
             }
+            index += 1;
         }
+        handle.set_buf(batch).await?;
+
         Ok(res)
     }
 
@@ -545,7 +548,7 @@ impl CurvineFileSystem {
         Ok(status)
     }
 
-    async fn get_cached_list(&self, path: &Path) -> FuseResult<Vec<FileStatus>> {
+    pub async fn get_cached_list(&self, path: &Path) -> FuseResult<Vec<FileStatus>> {
         if self.conf.enable_meta_cache {
             if let Some(list) = self.state.meta_cache().get_list(path) {
                 return Ok(list);
@@ -994,8 +997,10 @@ impl fs::FileSystem for CurvineFileSystem {
         self.check_permissions(&dir_path, op.header, action.acl_mask())
             .await?;
 
-        let list = self.get_cached_list(&dir_path).await?;
-        let handle = self.state.new_dir_handle(op.header.nodeid, list).await?;
+        let handle = self
+            .state
+            .new_dir_handle(op.header.nodeid, &dir_path)
+            .await?;
         let open_flags = Self::fill_open_flags(&self.conf, op.arg.flags);
         let attr = fuse_open_out {
             fh: handle.fh,
