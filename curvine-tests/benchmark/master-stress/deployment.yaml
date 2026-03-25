@@ -1,0 +1,449 @@
+# Master connection stress: StatefulSet (Parallel) + headless Service + ConfigMap.
+# FUSE mount points: /fuse-mnts/curvine-fuse1 .. N (writable emptyDir; not under read-only /).
+# Host /dev/fuse is mounted into the pod (many minimal images lack a working FUSE char dev).
+# Remote layout: STRESS_REMOTE_ROOT (default /curvine-master-stress) / ${POD_NAME} / {i} — one subtree per Pod.
+# On start: curvine-cli fs rm -r ${STRESS_REMOTE_ROOT}/${POD_NAME} (unless SKIP_REMOTE_POD_CLEANUP=1), then mkdir each leaf.
+# Pod anti-affinity: at most one stress pod per node (replicas > node count => Pending).
+# All resources in namespace curvine (create ns first: kubectl create namespace curvine).
+# Edit image if needed; default master-addrs in Secret. kubectl apply -f deployment.yaml
+#
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: curvine-stress-master
+  namespace: curvine-system
+type: Opaque
+stringData:
+  master-addrs: "cv-curvine-master-0.cv-curvine-master.default.svc.cluster.local:8995,cv-curvine-master-1.cv-curvine-master.default.svc.cluster.local:8995,cv-curvine-master-2.cv-curvine-master.default.svc.cluster.local:8995"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: curvine-stress-scripts
+  namespace: curvine-system
+data:
+  stress-entrypoint.sh: |
+    #!/usr/bin/env bash
+    #
+    # Curvine master connection stress: N independent curvine-fuse processes, each with
+    # its own mnt-path and fs-path; each stage ends with RM (after rename / after links / after dir mv).
+    #
+    # Env: MASTER_ADDRS (required), POD_NAME, NUM_MOUNTS, INTERVAL_SEC, FUSE_WEB_PORT_BASE,
+    #      MNT_ROOT (default /fuse-mnts) — must be writable (emptyDir).
+    #      STRESS_REMOTE_ROOT (default /curvine-master-stress) — shared parent; each pod uses .../${POD_NAME}/.
+    #      SKIP_REMOTE_POD_CLEANUP=1 — do not fs rm -r ${STRESS_REMOTE_ROOT}/${POD_NAME} on start.
+    #      FUSE_USE_DEFAULT_OPTS=1 — use curvine-fuse built-in fuse opts (includes allow_other).
+    #      SKIP_REMOTE_MKDIR=1 — skip curvine-cli mkdir (paths must already exist on cluster).
+    #      CURVINE_CLI — path to curvine-cli binary (default: PATH or /opt/curvine/curvine-cli).
+    #
+    set -u
+
+    : "${MASTER_ADDRS:?MASTER_ADDRS must be set (e.g. m1:8995,m2:8995)}"
+
+    POD_NAME="${POD_NAME:-$(hostname)}"
+    NUM_MOUNTS="${NUM_MOUNTS:-100}"
+    INTERVAL_SEC="${INTERVAL_SEC:-1}"
+    FUSE_WEB_PORT_BASE="${FUSE_WEB_PORT_BASE:-28000}"
+    MNT_ROOT="${MNT_ROOT:-/fuse-mnts}"
+    STRESS_REMOTE_ROOT="${STRESS_REMOTE_ROOT:-/curvine-master-stress}"
+    case "${STRESS_REMOTE_ROOT}" in
+      /*) ;;
+      *) STRESS_REMOTE_ROOT="/${STRESS_REMOTE_ROOT}" ;;
+    esac
+    if [ "${STRESS_REMOTE_ROOT}" = "/" ]; then
+      echo "ERROR: STRESS_REMOTE_ROOT must not be /" >&2
+      exit 1
+    fi
+    REMOTE_POD_PREFIX="${STRESS_REMOTE_ROOT}/${POD_NAME}"
+
+    if ! [[ "${NUM_MOUNTS}" =~ ^[0-9]+$ ]] || [ "${NUM_MOUNTS}" -lt 1 ]; then
+      echo "NUM_MOUNTS must be a positive integer" >&2
+      exit 1
+    fi
+
+    mkdir -p "${MNT_ROOT}" || {
+      echo "ERROR: cannot create writable MNT_ROOT=${MNT_ROOT} (read-only root? mount emptyDir here)" >&2
+      exit 1
+    }
+    echo "[bootstrap] MNT_ROOT=${MNT_ROOT} REMOTE_POD_PREFIX=${REMOTE_POD_PREFIX} NUM_MOUNTS=${NUM_MOUNTS}"
+
+    if [ ! -c /dev/fuse ]; then
+      echo "ERROR: /dev/fuse is missing or not a character device. Mount host /dev/fuse (see manifest volumes)." >&2
+      ls -la /dev 2>&1 | head -n 40 >&2 || true
+      exit 1
+    fi
+    echo "[bootstrap] $(ls -l /dev/fuse)"
+
+    if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+      echo "WARN: neither fusermount3 nor fusermount found in PATH; auto_unmount may misbehave" >&2
+    fi
+
+    # Drop allow_other for single-user container mounts; avoids fuse.conf edge cases.
+    CURVINE_FUSE_EXTRA=(--options async --options auto_unmount)
+    if [ "${FUSE_USE_DEFAULT_OPTS:-0}" = 1 ]; then
+      CURVINE_FUSE_EXTRA=()
+    fi
+
+    if [ "${FUSE_USE_DEFAULT_OPTS:-0}" = 1 ] && [ -f /etc/fuse.conf ] && ! grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf 2>/dev/null; then
+      echo 'user_allow_other' >>/etc/fuse.conf
+    fi
+
+    resolve_curvine_cli() {
+      if [ -n "${CURVINE_CLI:-}" ] && [ -x "${CURVINE_CLI}" ]; then
+        echo "${CURVINE_CLI}"
+        return 0
+      fi
+      if command -v curvine-cli >/dev/null 2>&1; then
+        command -v curvine-cli
+        return 0
+      fi
+      if [ -x /opt/curvine/curvine-cli ]; then
+        echo /opt/curvine/curvine-cli
+        return 0
+      fi
+      return 1
+    }
+
+    # Remote fs-path roots must exist; otherwise FUSE mount succeeds but stat/ls on the mount
+    # shows d????????? and "cannot access" (no valid root inode metadata).
+    REMOTE_CLI_NEEDED=0
+    if [ "${SKIP_REMOTE_POD_CLEANUP:-0}" != 1 ]; then
+      REMOTE_CLI_NEEDED=1
+    fi
+    if [ "${SKIP_REMOTE_MKDIR:-0}" != 1 ]; then
+      REMOTE_CLI_NEEDED=1
+    fi
+
+    CLI_BIN=""
+    if [ "${REMOTE_CLI_NEEDED}" = 1 ]; then
+      if ! CLI_BIN="$(resolve_curvine_cli)"; then
+        echo "ERROR: curvine-cli not found. Set CURVINE_CLI, or set SKIP_REMOTE_POD_CLEANUP=1 and SKIP_REMOTE_MKDIR=1." >&2
+        exit 1
+      fi
+    fi
+
+    if [ "${SKIP_REMOTE_POD_CLEANUP:-0}" != 1 ] && [ -n "${CLI_BIN}" ]; then
+      echo "[bootstrap] remote cleanup (this pod only): fs rm --recursive ${REMOTE_POD_PREFIX}"
+      "${CLI_BIN}" --master-addrs "${MASTER_ADDRS}" fs rm "${REMOTE_POD_PREFIX}" --recursive || true
+    fi
+
+    if [ "${SKIP_REMOTE_MKDIR:-0}" != 1 ]; then
+      echo "[bootstrap] creating remote fs-path roots under ${REMOTE_POD_PREFIX} via ${CLI_BIN}"
+      for i in $(seq 1 "${NUM_MOUNTS}"); do
+        fs_path="${REMOTE_POD_PREFIX}/${i}"
+        echo "[bootstrap] remote mkdir ${fs_path}"
+        if ! "${CLI_BIN}" --master-addrs "${MASTER_ADDRS}" fs mkdir "${fs_path}" --parents; then
+          echo "ERROR: curvine-cli mkdir failed for ${fs_path}" >&2
+          exit 1
+        fi
+      done
+    else
+      echo "[bootstrap] SKIP_REMOTE_MKDIR=1 — ensure ${REMOTE_POD_PREFIX}/1..N exist on Curvine"
+    fi
+
+    declare -a FUSE_PIDS=()
+    declare -a WORKER_PIDS=()
+
+    cleanup() {
+      echo "Stopping workers and fuse processes..."
+      for pid in "${WORKER_PIDS[@]:-}"; do
+        kill "${pid}" 2>/dev/null || true
+      done
+      for pid in "${FUSE_PIDS[@]:-}"; do
+        kill "${pid}" 2>/dev/null || true
+      done
+      wait 2>/dev/null || true
+    }
+
+    trap cleanup SIGTERM SIGINT EXIT
+
+    wait_mount_ready() {
+      local idx="$1"
+      local mnt_path="$2"
+      local logf="/tmp/fuse-${idx}.log"
+      local deadline=$((SECONDS + 180))
+      while [ "${SECONDS}" -lt "${deadline}" ]; do
+        if mountpoint -q "${mnt_path}" 2>/dev/null; then
+          echo "[fuse ${idx}] mount OK ${mnt_path}"
+          return 0
+        fi
+        if ! kill -0 "${FUSE_PIDS[$((idx - 1))]}" 2>/dev/null; then
+          echo "[fuse ${idx}] process exited before mount; log tail:" >&2
+          tail -n 120 "${logf}" >&2 || true
+          return 1
+        fi
+        sleep 0.5
+      done
+      echo "Timeout waiting for mount at ${mnt_path}" >&2
+      echo "=== fuse-${idx}.log (last 120 lines) ===" >&2
+      tail -n 120 "${logf}" >&2 || true
+      return 1
+    }
+
+    echo "Starting ${NUM_MOUNTS} curvine-fuse instances for pod=${POD_NAME}"
+
+    for i in $(seq 1 "${NUM_MOUNTS}"); do
+      mnt_path="${MNT_ROOT}/curvine-fuse${i}"
+      fs_path="${REMOTE_POD_PREFIX}/${i}"
+      web_port=$((FUSE_WEB_PORT_BASE + i))
+      mkdir -p "${mnt_path}" || {
+        echo "ERROR: mkdir failed for ${mnt_path}" >&2
+        exit 1
+      }
+      logf="/tmp/fuse-${i}.log"
+      echo "[fuse ${i}] start mnt_path=${mnt_path} fs_path=${fs_path} web_port=${web_port}"
+      curvine-fuse \
+        --mnt-path "${mnt_path}" \
+        --fs-path "${fs_path}" \
+        --master-addrs "${MASTER_ADDRS}" \
+        --web-port "${web_port}" \
+        "${CURVINE_FUSE_EXTRA[@]}" >>"${logf}" 2>&1 &
+      FUSE_PIDS+=($!)
+    done
+
+    sleep 5
+
+    for i in $(seq 1 "${NUM_MOUNTS}"); do
+      wait_mount_ready "${i}" "${MNT_ROOT}/curvine-fuse${i}" || exit 1
+    done
+
+    echo "All mounts are up; starting workload loops (interval ${INTERVAL_SEC}s)"
+
+    run_worker() {
+      local id="$1"
+      local base="${MNT_ROOT}/curvine-fuse${id}/.stress-workload"
+      mkdir -p "${base}" || {
+        echo "[worker ${id}] ERROR mkdir ${base}" >&2
+        return 1
+      }
+      while true; do
+        rm -f "${base}/blob.dat" "${base}/blob_named.dat" "${base}/link_src.dat" "${base}/link_hard.dat" "${base}/link_sym.dat" 2>/dev/null || true
+        rm -rf "${base}/mvdir" "${base}/mvdir2" "${base}/subdir" 2>/dev/null || true
+
+        # --- file rename; then delete so this stage leaves no file ---
+        echo "[worker ${id}] PUT ${base}/blob.dat"
+        echo "stress-${id}-$(date +%s%N)" >"${base}/blob.dat" || echo "[worker ${id}] WARN write failed" >&2
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] LS ${base}"
+        ls -la "${base}" || echo "[worker ${id}] WARN ls failed" >&2
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] STAT ${base}/blob.dat"
+        stat "${base}/blob.dat" || echo "[worker ${id}] WARN stat failed" >&2
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] DU ${base}"
+        du -sh "${base}" 2>/dev/null || du -sk "${base}" 2>/dev/null || echo "[worker ${id}] WARN du failed" >&2
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] MV rename blob.dat -> blob_named.dat"
+        mv -f "${base}/blob.dat" "${base}/blob_named.dat" || echo "[worker ${id}] WARN mv file failed" >&2
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] LS ${base} (after rename)"
+        ls -la "${base}" || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] STAT ${base}/blob_named.dat"
+        stat "${base}/blob_named.dat" || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] RM (after rename) blob_named.dat"
+        rm -f "${base}/blob_named.dat" || true
+        sleep "${INTERVAL_SEC}"
+
+        # --- links on a fresh file; then delete all names so this stage is clean ---
+        echo "[worker ${id}] PUT ${base}/link_src.dat"
+        echo "link-${id}-$(date +%s%N)" >"${base}/link_src.dat" || echo "[worker ${id}] WARN write link_src failed" >&2
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] LN hard link_src.dat -> link_hard.dat"
+        ln "${base}/link_src.dat" "${base}/link_hard.dat" || echo "[worker ${id}] WARN hardlink failed" >&2
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] LN -s link_src.dat -> link_sym.dat"
+        ln -sf link_src.dat "${base}/link_sym.dat" || echo "[worker ${id}] WARN symlink failed" >&2
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] LS ${base} (after links)"
+        ls -la "${base}" || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] STAT ${base}/link_sym.dat"
+        stat "${base}/link_sym.dat" || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] READLINK ${base}/link_sym.dat"
+        readlink "${base}/link_sym.dat" || readlink -f "${base}/link_sym.dat" || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] DU ${base} (with links)"
+        du -sh "${base}" 2>/dev/null || du -sk "${base}" 2>/dev/null || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] RM (after links) link_hard.dat link_sym.dat link_src.dat"
+        rm -f "${base}/link_hard.dat" "${base}/link_sym.dat" "${base}/link_src.dat" || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] MKDIR ${base}/mvdir + inner.txt"
+        mkdir -p "${base}/mvdir" || echo "[worker ${id}] WARN mkdir mvdir failed" >&2
+        echo "nested-${id}" >"${base}/mvdir/inner.txt" || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] DU ${base}/mvdir"
+        du -sh "${base}/mvdir" 2>/dev/null || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] STAT ${base}/mvdir/inner.txt"
+        stat "${base}/mvdir/inner.txt" || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] MV rename dir mvdir -> mvdir2"
+        mv -f "${base}/mvdir" "${base}/mvdir2" || echo "[worker ${id}] WARN mv dir failed" >&2
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] LS ${base}/mvdir2"
+        ls -la "${base}/mvdir2" || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] DU ${base}/mvdir2"
+        du -sh "${base}/mvdir2" 2>/dev/null || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] RM (after dir rename) inner.txt + rmdir mvdir2"
+        rm -f "${base}/mvdir2/inner.txt" || true
+        rmdir "${base}/mvdir2" 2>/dev/null || rm -rf "${base}/mvdir2" || true
+        sleep "${INTERVAL_SEC}"
+
+        echo "[worker ${id}] MKDIR ${base}/subdir"
+        mkdir -p "${base}/subdir" || echo "[worker ${id}] WARN mkdir subdir failed" >&2
+        sleep "${INTERVAL_SEC}"
+        echo "[worker ${id}] RMDIR ${base}/subdir"
+        rmdir "${base}/subdir" 2>/dev/null || true
+        sleep "${INTERVAL_SEC}"
+      done
+    }
+
+    for i in $(seq 1 "${NUM_MOUNTS}"); do
+      run_worker "${i}" &
+      WORKER_PIDS+=($!)
+    done
+
+    echo "Stress running; forward SIGTERM to stop."
+    wait
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: curvine-master-stress
+  namespace: curvine-system
+  labels:
+    app: curvine-master-stress
+spec:
+  clusterIP: None
+  selector:
+    app: curvine-master-stress
+  ports:
+    - port: 9999
+      name: noop
+      targetPort: 9999
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: curvine-master-stress
+  namespace: curvine-system 
+  labels:
+    app: curvine-master-stress
+spec:
+  serviceName: curvine-master-stress
+  podManagementPolicy: Parallel
+  replicas: 1
+  selector:
+    matchLabels:
+      app: curvine-master-stress
+  template:
+    metadata:
+      labels:
+        app: curvine-master-stress
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - curvine-master-stress
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: stress
+          image: ghcr.io/curvineio/curvine-csi:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+          command: ["/bin/bash", "/scripts/stress-entrypoint.sh"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MASTER_ADDRS
+              valueFrom:
+                secretKeyRef:
+                  name: curvine-stress-master
+                  key: master-addrs
+            # - name: NUM_MOUNTS
+            #   value: "100"
+            # - name: INTERVAL_SEC
+            #   value: "1"
+            # - name: FUSE_WEB_PORT_BASE
+            #   value: "28000"
+            # - name: MNT_ROOT
+            #   value: "/fuse-mnts"
+            # - name: FUSE_USE_DEFAULT_OPTS
+            #   value: "1"
+            # - name: SKIP_REMOTE_MKDIR
+            #   value: "1"
+            # - name: CURVINE_CLI
+            #   value: "/opt/curvine/curvine-cli"
+            # - name: STRESS_REMOTE_ROOT
+            #   value: "/curvine-master-stress"
+            # - name: SKIP_REMOTE_POD_CLEANUP
+            #   value: "1"
+          volumeMounts:
+            - name: dev-fuse
+              mountPath: /dev/fuse
+            - name: stress-scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: fuse-mnt-root
+              mountPath: /fuse-mnts
+            - name: fuse-tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+      volumes:
+        - name: dev-fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice
+        - name: stress-scripts
+          configMap:
+            name: curvine-stress-scripts
+            defaultMode: 0755
+        - name: fuse-mnt-root
+          emptyDir: {}
+        - name: fuse-tmp
+          emptyDir: {}
