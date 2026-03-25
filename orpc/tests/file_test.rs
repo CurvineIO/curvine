@@ -16,7 +16,7 @@ use bytes::{BufMut, BytesMut};
 use orpc::client::ClientFactory;
 use orpc::common::Utils;
 use orpc::error::CommonErrorExt;
-use orpc::io::net::InetAddr;
+use orpc::io::net::{InetAddr, NetUtils};
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::runtime::RpcRuntime;
 use orpc::server::{RpcServer, ServerConf};
@@ -43,7 +43,10 @@ fn test_distributed_file_location_and_creation() {
 
 #[test]
 fn test_rpc_file_server_write_read_with_checksum_validation() -> CommonResult<()> {
-    let conf = ServerConf::default();
+    // Loopback avoids bind failures when `local_hostname()` is not bindable on some hosts (e.g. macOS).
+    // hold_available_port keeps the socket bound until RpcServer claims it,
+    // preventing TOCTOU races when nextest runs tests in parallel.
+    let conf = ServerConf::with_hostname("127.0.0.1", NetUtils::hold_available_port());
     let dirs = vec![
         String::from("../testing/orpc-d1"),
         String::from("../testing/orpc-d2"),

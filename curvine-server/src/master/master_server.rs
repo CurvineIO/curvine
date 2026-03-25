@@ -212,11 +212,7 @@ impl Master {
         self.job_manager.start();
 
         // step6: Start TTL scheduler (requires mount_manager and job_manager)
-        if let Err(e) = self.actor.start_ttl_scheduler(
-            self.mount_manager.clone(),
-            self.job_manager.factory().clone(),
-            self.job_manager.clone(),
-        ) {
+        if let Err(e) = self.actor.start_ttl_scheduler() {
             error!("Failed to start inode ttl scheduler: {}", e);
         }
 

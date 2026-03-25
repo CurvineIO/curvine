@@ -69,7 +69,7 @@ impl ReadHandler {
             );
         }
 
-        if context.chuck_size <= 0 {
+        if context.chunk_size <= 0 {
             return err_box!("chunk_size must be greater than 0");
         }
 
@@ -94,7 +94,7 @@ impl ReadHandler {
             context.enable_read_ahead,
             context.read_ahead_len,
             context.drop_cache_len,
-            context.chuck_size as i64,
+            context.chunk_size as i64,
         );
 
         let log_msg = format!(
@@ -102,7 +102,7 @@ impl ReadHandler {
             label,
             context.req_id,
             path,
-            context.chuck_size,
+            context.chunk_size,
             ByteUnit::byte_to_string(context.len as u64),
             self.os_cache.enable,
             self.os_cache.read_ahead_len
@@ -149,7 +149,7 @@ impl ReadHandler {
 
         let spend = TimeSpent::new();
         self.last_task = file.read_ahead(&self.os_cache, self.last_task.take());
-        let region = file.read_region(self.enable_send_file, context.chuck_size)?;
+        let region = file.read_region(self.enable_send_file, context.chunk_size)?;
         let used = spend.used_us();
 
         if used >= self.io_slow_us {

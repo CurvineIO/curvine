@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use crate::master::fs::MasterFilesystem;
-use crate::master::meta::inode::ttl_executor::InodeTtlExecutor;
+use crate::master::meta::inode::ttl::InodeTtlExecutor;
 use crate::master::meta::inode::InodeView;
 use crate::master::quota::eviction::evictor::Evictor;
 use crate::master::quota::eviction::types::EvictPlan;
@@ -42,6 +42,7 @@ impl QuotaManager {
         fs: MasterFilesystem,
         evictor: Arc<dyn Evictor>,
         rt: Arc<Runtime>,
+        testing: bool,
     ) -> Arc<Self> {
         let (tx, mut rx): (Sender<Option<MasterInfo>>, Receiver<Option<MasterInfo>>) =
             mpsc::channel(1024);
@@ -56,11 +57,13 @@ impl QuotaManager {
 
         let mgr = manager.clone();
 
-        rt.spawn(async move {
-            while let Some(cluster_info) = rx.recv().await {
-                mgr.handle_trigger(cluster_info);
-            }
-        });
+        if !testing {
+            rt.spawn(async move {
+                while let Some(cluster_info) = rx.recv().await {
+                    mgr.handle_trigger(cluster_info);
+                }
+            });
+        }
 
         manager
     }
@@ -203,7 +206,7 @@ impl QuotaManager {
         })
     }
 
-    fn execute_eviction(&self, mode: EvictionMode, inode_ids: &[i64]) {
+    fn execute_eviction(&self, _mode: EvictionMode, inode_ids: &[i64]) {
         let ttl_executor_guard = self.ttl_executor.read();
         let Some(ttl_executor) = ttl_executor_guard.as_ref() else {
             log::warn!("cluster-evict: ttl_executor not initialized, skipping eviction");
@@ -233,16 +236,12 @@ impl QuotaManager {
                 .collect()
         };
 
-        for (inode_id_i64, file_size) in file_sizes {
-            let inode_id = inode_id_i64 as u64;
-            let res = match mode {
-                EvictionMode::FreeFile => ttl_executor.free_inode(inode_id),
-                EvictionMode::DeleteFile => ttl_executor.delete_inode(inode_id),
-            };
+        for (inode_id, file_size) in file_sizes {
+            let res = ttl_executor.execute_by_id(inode_id);
 
             match res {
                 Ok(_) => {
-                    successfully_evicted.push(inode_id_i64);
+                    successfully_evicted.push(inode_id);
                     total_bytes_freed += file_size;
                 }
                 Err(e) => {

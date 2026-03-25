@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{FileType, StoragePolicy};
+use crate::state::{FileType, StoragePolicy, TtlAction};
 use orpc::common::LocalTime;
 use orpc::ternary;
 use serde::{Deserialize, Serialize};
@@ -73,8 +73,12 @@ impl FileStatus {
     }
 
     pub fn is_expired(&self) -> bool {
-        self.storage_policy.ttl_ms != 0
-            && LocalTime::mills() as i64 > self.atime + self.storage_policy.ttl_ms
+        let sp = &self.storage_policy;
+        if sp.ttl_action != TtlAction::None && sp.ttl_ms > 0 {
+            LocalTime::mills() as i64 > self.mtime.saturating_add(sp.ttl_ms)
+        } else {
+            false
+        }
     }
 
     // Check if this file has hard links (nlink > 1 and is a regular file)

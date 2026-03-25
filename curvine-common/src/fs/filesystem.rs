@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::{FsKind, Path};
-use crate::proto::{GetFileStatusResponse, ListStatusResponse};
-use crate::state::{FileStatus, SetAttrOpts};
+use crate::fs::{FsKind, ListStream, Path};
+use crate::proto::{GetFileStatusResponse, ListOptionsResponse, ListStatusResponse};
+use crate::state::{FileStatus, ListOptions, SetAttrOpts};
 use crate::utils::ProtoUtils;
 use crate::FsResult;
+use orpc::err_box;
 use prost::bytes::BytesMut;
 use std::future::Future;
 
@@ -65,4 +66,38 @@ pub trait FileSystem<Writer, Reader> {
     }
 
     fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> impl Future<Output = FsResult<()>>;
+
+    fn list_options(
+        &self,
+        _path: &Path,
+        _opts: ListOptions,
+    ) -> impl Future<Output = FsResult<Vec<FileStatus>>> + Send {
+        async move { err_box!("not supported list_options") }
+    }
+
+    fn list_options_bytes(
+        &self,
+        path: &Path,
+        opts: ListOptions,
+    ) -> impl Future<Output = FsResult<BytesMut>> {
+        async move {
+            let statuses = self
+                .list_options(path, opts)
+                .await?
+                .into_iter()
+                .map(ProtoUtils::file_status_to_pb)
+                .collect();
+
+            let rep = ListOptionsResponse { statuses };
+            Ok(ProtoUtils::encode(rep)?)
+        }
+    }
+
+    fn list_stream(
+        &self,
+        _path: &Path,
+        _options: ListOptions,
+    ) -> impl Future<Output = FsResult<ListStream>> {
+        async move { err_box!("not supported list_stream") }
+    }
 }

@@ -164,6 +164,7 @@ mod tests {
     use crate::test::SimpleServer;
     use crate::CommonResult;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn pool() -> CommonResult<()> {
@@ -171,6 +172,23 @@ mod tests {
         let addr = server.bind_addr().clone();
         let rt = Arc::new(AsyncRuntime::single());
         server.start(0);
+
+        let conf = ClientConf::default();
+        let rt_wait = rt.clone();
+        let wait_addr = addr.clone();
+        rt.block_on(async move {
+            for _ in 0..50 {
+                if ClientFactory::with_rt(conf.clone(), rt_wait.clone())
+                    .create(&wait_addr, false)
+                    .await
+                    .is_ok()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("Server failed to start within 5 seconds");
+        });
 
         let rt1 = rt.clone();
         rt.block_on(async move {

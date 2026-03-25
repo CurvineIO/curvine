@@ -831,6 +831,7 @@ dependencies = [
 name = "curvine-client"
 version = "0.2.0"
 dependencies = [
+ "async-stream",
  "bytes",
  "curvine-common",
  "curvine-tracing-appender",
@@ -859,6 +860,7 @@ name = "curvine-common"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum 0.7.9",
  "bincode",
  "bitflags 2.10.0",
@@ -869,6 +871,7 @@ dependencies = [
  "crossbeam",
  "dashmap",
  "flate2",
+ "futures",
  "hyper 1.7.0",
  "indexmap 2.11.0",
  "linked-hash-map",
@@ -908,6 +911,7 @@ dependencies = [
  "curvine-common",
  "curvine-tracing-appender",
  "dashmap",
+ "futures",
  "fxhash",
  "libc",
  "log",
@@ -1051,6 +1055,7 @@ dependencies = [
  "curvine-server",
  "curvine-tracing-appender",
  "curvine-ufs",
+ "futures",
  "log",
  "once_cell",
  "orpc",
@@ -1077,6 +1082,7 @@ name = "curvine-ufs"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "bytes",
  "cc",

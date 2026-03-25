@@ -54,7 +54,6 @@ fn test_ttl_cleanup() -> CommonResult<()> {
     testing.start_cluster()?;
 
     let conf = testing.get_active_cluster_conf()?;
-    println!("conf: {:?}", conf);
     let rt = Arc::new(conf.client_rpc_conf().create_runtime());
     let fs_context = Arc::new(FsContext::with_rt(conf.clone(), rt.clone())?);
     let client = FsClient::new(fs_context);

@@ -24,6 +24,7 @@ pin-project-lite = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
+async-stream = { workspace = true }
 moka = { workspace = true }
 fxhash = { workspace = true }
 prometheus = { workspace = true }

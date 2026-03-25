@@ -15,15 +15,14 @@
 #![allow(clippy::large_enum_variant)]
 
 use crate::master::meta::feature::AclFeature;
-use crate::master::meta::inode::ttl_types::TtlConfig;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::{
     Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
 };
 use core::panic;
-use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy};
+use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction};
 use curvine_common::utils::SerdeUtils;
-use orpc::common::Utils;
+use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, LinkedList};
@@ -65,13 +64,7 @@ impl InodeView {
             FileEntry(_, id) => *id,
         }
     }
-    pub fn ttl_config(&self) -> Option<TtlConfig> {
-        match self {
-            File(_, f) => TtlConfig::from_storage_policy(&f.storage_policy),
-            Dir(_, d) => TtlConfig::from_storage_policy(&d.storage_policy),
-            FileEntry(_, _) => None,
-        }
-    }
+
     pub fn name(&self) -> &str {
         match self {
             File(name, _) => name,
@@ -299,6 +292,24 @@ impl InodeView {
         }
     }
 
+    pub fn expiration_ms(&self) -> Option<i64> {
+        let sp = self.storage_policy();
+        if sp.ttl_ms > 0 && sp.ttl_action != TtlAction::None {
+            Some(self.mtime().saturating_add(sp.ttl_ms))
+        } else {
+            None
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        let sp = self.storage_policy();
+        if sp.ttl_action != TtlAction::None && sp.ttl_ms > 0 {
+            LocalTime::mills() as i64 > self.mtime().saturating_add(sp.ttl_ms)
+        } else {
+            false
+        }
+    }
+
     pub fn x_attr(&self) -> &HashMap<String, Vec<u8>> {
         match self {
             File(_, f) => &f.features.x_attr,
@@ -368,7 +379,9 @@ impl InodeView {
         }
 
         if let Some(ttl_action) = opts.ttl_action {
-            self.storage_policy_mut().ttl_action = ttl_action;
+            if self.storage_policy_mut().ttl_action != TtlAction::Free {
+                self.storage_policy_mut().ttl_action = ttl_action;
+            }
         }
 
         for attr in opts.add_x_attr {

@@ -104,6 +104,8 @@ fn test_tmpfs_filesystem_detection_on_linux() {
     assert!(!sys::is_tmpfs("/").unwrap());
 }
 
+// Sparse / st_blocks hole detection is only implemented for Linux in `file_actual_size`.
+#[cfg(target_os = "linux")]
 #[test]
 fn resize_truncate_extend_with_hole() {
     // Test case 1: truncate extends file size, creating holes (sparse file)

@@ -482,6 +482,8 @@ impl ProtoUtils {
             mode: opts.mode,
             owner: opts.owner,
             group: opts.group,
+            sync_ufs_meta: opts.sync_ufs_meta,
+            ufs_len: opts.ufs_len,
         }
     }
 
@@ -497,6 +499,8 @@ impl ProtoUtils {
             client_name: opts.client_name,
             owner: opts.owner,
             group: opts.group,
+            sync_ufs_meta: opts.sync_ufs_meta,
+            ufs_len: opts.ufs_len,
         }
     }
 
@@ -519,6 +523,20 @@ impl ProtoUtils {
             mode: opts.mode,
             owner: opts.owner,
             group: opts.group,
+        }
+    }
+
+    pub fn list_options_from_pb(opts: ListOptionsProto) -> ListOptions {
+        ListOptions {
+            limit: opts.limit.map(|v| v as usize),
+            start_after: opts.start_after,
+        }
+    }
+
+    pub fn list_options_to_pb(opts: ListOptions) -> ListOptionsProto {
+        ListOptionsProto {
+            limit: opts.limit.map(|v| v as i32),
+            start_after: opts.start_after,
         }
     }
 

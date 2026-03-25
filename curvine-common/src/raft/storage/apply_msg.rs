@@ -24,6 +24,7 @@ pub enum ApplyMsg {
     CreateSnapshot(CallSender<RaftResult<SnapshotData>>),
     ApplySnapshot((CallSender<RaftResult<()>>, SnapshotData)),
     RoleChange(StateRole),
+    Shutdown(CallSender<()>),
 }
 
 impl ApplyMsg {

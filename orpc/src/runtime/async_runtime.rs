@@ -71,6 +71,10 @@ impl AsyncRuntime {
     pub fn single() -> Self {
         Self::new("single", 1, 1)
     }
+
+    pub fn shutdown_background(self) {
+        self.inner.shutdown_background();
+    }
 }
 
 impl RpcRuntime for AsyncRuntime {

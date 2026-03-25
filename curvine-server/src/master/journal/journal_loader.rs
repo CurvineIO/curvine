@@ -53,6 +53,7 @@ pub struct JournalLoader {
     batch_size: u64,
     retry_interval: Duration,
     metrics: &'static MasterMetrics,
+    has_apply_worker: bool,
 }
 
 impl JournalLoader {
@@ -66,7 +67,7 @@ impl JournalLoader {
         let client = RaftClient::from_conf(rt.clone(), conf);
         let journal_writer = Arc::new(JournalWriter::new(true, client, conf));
         let log_store = RocksLogStorage::from_conf(conf, false);
-        Self::new(
+        Self::build(
             rt,
             fs_dir,
             mnt_mgr,
@@ -74,10 +75,12 @@ impl JournalLoader {
             job_manager,
             log_store,
             journal_writer,
+            true,
         )
     }
 
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         rt: Arc<Runtime>,
         fs_dir: SyncFsDir,
         mnt_mgr: Arc<MountManager>,
@@ -85,6 +88,29 @@ impl JournalLoader {
         job_manager: Arc<JobManager>,
         log_store: RocksLogStorage,
         journal_writer: Arc<JournalWriter>,
+    ) -> Self {
+        Self::build(
+            rt,
+            fs_dir,
+            mnt_mgr,
+            conf,
+            job_manager,
+            log_store,
+            journal_writer,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        rt: Arc<Runtime>,
+        fs_dir: SyncFsDir,
+        mnt_mgr: Arc<MountManager>,
+        conf: &JournalConf,
+        job_manager: Arc<JobManager>,
+        log_store: RocksLogStorage,
+        journal_writer: Arc<JournalWriter>,
+        testing: bool,
     ) -> Self {
         let ufs_loader = UfsLoader::new(job_manager, conf);
         let (sender, receiver) = AsyncChannel::new(conf.writer_channel_size).split();
@@ -103,12 +129,15 @@ impl JournalLoader {
             batch_size: conf.scan_batch_size,
             retry_interval: Duration::from_secs(conf.retry_interval_secs),
             metrics: Master::get_metrics(),
+            has_apply_worker: !testing,
         };
 
-        let loader1 = loader.clone();
-        rt.spawn(async move {
-            Self::run_apply(loader1, receiver).await;
-        });
+        if !testing {
+            let loader1 = loader.clone();
+            rt.spawn(async move {
+                Self::run_apply(loader1, receiver).await;
+            });
+        }
 
         loader
     }
@@ -318,6 +347,11 @@ impl JournalLoader {
                         info!("role changed to leader, scheduling UFS replay scan from ufs_applied: {:?}", ufs_applied);
                         retry_msg.replace(ApplyMsg::new_scan(ufs_applied));
                     }
+                }
+
+                ApplyMsg::Shutdown(tx) => {
+                    let _ = tx.send(());
+                    break;
                 }
 
                 msg => match self.apply_msg(is_leader, &msg).await {
@@ -631,6 +665,12 @@ impl JournalLoader {
             }
         };
 
+        if let Some(mut inode_ptr) = old_path.get_last_inode() {
+            if let File(_, _) = inode_ptr.as_mut() {
+                inode_ptr.incr_nlink();
+            }
+        }
+
         match fs_dir.unprotected_link(new_path, original_inode_id, entry.mtime as u64) {
             Ok(_) => Ok(()),
             Err(FsError::FileAlreadyExists(_)) => {
@@ -694,11 +734,18 @@ impl JournalLoader {
 
         Ok(())
     }
+
+    pub async fn shutdown(&self) -> RaftResult<()> {
+        let (tx, rx) = CallChannel::channel();
+        self.sender.send(ApplyMsg::Shutdown(tx)).await?;
+        rx.receive().await?;
+        Ok(())
+    }
 }
 
 impl AppStorage for JournalLoader {
     async fn apply(&self, wait: bool, msg: ApplyMsg) -> RaftResult<()> {
-        if wait {
+        if wait || !self.has_apply_worker {
             if let Err(e) = self.apply_msg(false, &msg).await {
                 if self.ignore_reply_error {
                     error!("apply entry failed: {}", e);
@@ -720,11 +767,17 @@ impl AppStorage for JournalLoader {
     }
 
     async fn role_change(&self, role: StateRole) -> RaftResult<()> {
+        if !self.has_apply_worker {
+            return Ok(());
+        }
         self.sender.send(ApplyMsg::RoleChange(role)).await?;
         Ok(())
     }
 
     async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        if !self.has_apply_worker {
+            return self.create_snapshot0(None);
+        }
         let (tx, rx) = CallChannel::channel();
         let msg = ApplyMsg::CreateSnapshot(tx);
 
@@ -733,6 +786,9 @@ impl AppStorage for JournalLoader {
     }
 
     async fn apply_snapshot(&self, snapshot: SnapshotData) -> RaftResult<()> {
+        if !self.has_apply_worker {
+            return self.apply_snapshot0(snapshot);
+        }
         let (tx, rx) = CallChannel::channel();
         let msg = ApplyMsg::ApplySnapshot((tx, snapshot));
 

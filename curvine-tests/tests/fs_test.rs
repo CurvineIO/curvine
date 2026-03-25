@@ -18,12 +18,13 @@ use curvine_client::ClientMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOptsBuilder, MkdirOptsBuilder, SetAttrOptsBuilder, TtlAction,
+    CreateFileOptsBuilder, MkdirOptsBuilder, SetAttrOptsBuilder, StorageState, TtlAction,
 };
 use curvine_common::state::{FileLock, LockFlags, LockType};
 use curvine_common::FsResult;
 use curvine_tests::Testing;
 use log::info;
+use orpc::common::LocalTime;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
 use std::sync::Arc;
@@ -1016,4 +1017,26 @@ fn get_lock() {
         // Cleanup
         info!("=== get_lock test completed ===");
     })
+}
+
+#[test]
+fn sync_ufs_file() {
+    let testing = Testing::default();
+    let fs = testing.get_fs(None, None).unwrap();
+    fs.clone_runtime().block_on(async move {
+        let (ufs_mtime, ufs_len) = (LocalTime::mills() as i64, 1024);
+        let opts = CreateFileOptsBuilder::with_conf(&fs.conf().client)
+            .ufs_mtime_len(ufs_mtime, ufs_len)
+            .build();
+
+        let path = "/sync_ufs_file.log".into();
+        let mut file = fs.create_with_opts(&path, opts, false).await.unwrap();
+        file.complete().await.unwrap();
+
+        let stats = fs.get_status(&path).await.unwrap();
+        info!("stats: {:?}", stats);
+        assert_eq!(stats.len, ufs_len);
+        assert_eq!(stats.storage_policy.ufs_mtime, ufs_mtime);
+        assert_eq!(stats.storage_policy.state, StorageState::Ufs);
+    });
 }

@@ -30,7 +30,6 @@ mod inodes_children;
 pub use self::inodes_children::*;
 
 pub mod ttl;
-pub(crate) use self::ttl::*;
 
 pub const ROOT_INODE_ID: i64 = 1000;
 

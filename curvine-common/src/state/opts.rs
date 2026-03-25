@@ -18,6 +18,7 @@ use orpc::common::ByteUnit;
 use orpc::sys;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 
 #[derive(Debug, Clone)]
 pub struct CreateFileOpts {
@@ -31,6 +32,8 @@ pub struct CreateFileOpts {
     pub client_name: String,
     pub owner: String,
     pub group: String,
+    pub sync_ufs_meta: bool,
+    pub ufs_len: i64,
 }
 
 impl CreateFileOpts {
@@ -46,6 +49,8 @@ impl CreateFileOpts {
             mode: ClientConf::DEFAULT_FILE_SYSTEM_MODE,
             owner: "".to_string(),
             group: "".to_string(),
+            sync_ufs_meta: false,
+            ufs_len: 0,
         }
     }
 
@@ -73,6 +78,8 @@ pub struct CreateFileOptsBuilder {
     client_name: Option<String>,
     pub owner: String,
     pub group: String,
+    sync_ufs_meta: bool,
+    ufs_len: i64,
 }
 
 impl Default for CreateFileOptsBuilder {
@@ -94,6 +101,8 @@ impl CreateFileOptsBuilder {
             client_name: None,
             owner: "".to_string(),
             group: "".to_string(),
+            sync_ufs_meta: false,
+            ufs_len: 0,
         }
     }
 
@@ -114,6 +123,8 @@ impl CreateFileOptsBuilder {
             client_name: None,
             owner: "".to_string(),
             group: "".to_string(),
+            sync_ufs_meta: false,
+            ufs_len: 0,
         }
     }
 
@@ -157,8 +168,10 @@ impl CreateFileOptsBuilder {
         self
     }
 
-    pub fn ufs_mtime(mut self, mtime: i64) -> Self {
+    pub fn ufs_mtime_len(mut self, mtime: i64, len: i64) -> Self {
+        self.sync_ufs_meta = true;
         self.storage_policy.ufs_mtime = mtime;
+        self.ufs_len = len;
         self
     }
 
@@ -201,6 +214,8 @@ impl CreateFileOptsBuilder {
             client_name: self.client_name.unwrap_or_default(),
             owner: self.owner,
             group: self.group,
+            sync_ufs_meta: self.sync_ufs_meta,
+            ufs_len: self.ufs_len,
         }
     }
 }
@@ -492,6 +507,39 @@ impl SetAttrOptsBuilder {
             add_x_attr: self.add_x_attr,
             remove_x_attr: self.remove_x_attr,
             ufs_mtime: self.ufs_mtime,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ListOptions {
+    pub limit: Option<usize>,
+    pub start_after: Option<String>,
+}
+
+impl ListOptions {
+    pub fn from_status(limit: usize, status: &FileStatus) -> Self {
+        Self {
+            limit: Some(limit),
+            start_after: Some(status.name.to_owned()),
+        }
+    }
+
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: Some(limit),
+            start_after: None,
+        }
+    }
+}
+
+impl fmt::Display for ListOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.limit, &self.start_after) {
+            (Some(l), Some(s)) => write!(f, "{}-{}", l, s),
+            (Some(l), None) => write!(f, "{}-none", l),
+            (None, Some(s)) => write!(f, "none-{}", s),
+            (None, None) => Ok(()),
         }
     }
 }

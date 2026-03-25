@@ -14,7 +14,7 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::journal::{JournalEntry, JournalWriter};
-use crate::master::meta::inode::ttl::ttl_bucket::TtlBucketList;
+use crate::master::meta::inode::ttl::TtlBucketList;
 use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
 use crate::master::meta::inode::*;
 use crate::master::meta::store::{InodeStore, RocksInodeStore};
@@ -24,7 +24,7 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileLock, FileStatus,
-    FreeResult, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
+    FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
 use log::{debug, info, warn};
@@ -483,6 +483,46 @@ impl FsDir {
         Ok(res)
     }
 
+    pub fn list_options(&self, inp: &InodePath, opts: &ListOptions) -> FsResult<Vec<FileStatus>> {
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_box!("File {} not exists", inp.path()),
+        };
+
+        match inode.as_ref() {
+            File(_, _) => Ok(vec![inode.to_file_status(inp.path())]),
+
+            Dir(_, d) => {
+                let children = d.list_options(opts);
+                let mut res = Vec::with_capacity(children.len());
+
+                for item in children {
+                    let child_path = inp.child_path(item.name());
+
+                    match item {
+                        File(..) | Dir(..) => res.push(item.to_file_status(&child_path)),
+
+                        FileEntry(name, id) => {
+                            let inode_opt = self.store.get_inode(*id, Some(name))?;
+                            if let Some(inode_view) = inode_opt {
+                                res.push(inode_view.to_file_status(&child_path));
+                            }
+                        }
+                    }
+                }
+                Ok(res)
+            }
+
+            FileEntry(name, id) => {
+                let inode_opt = self.store.get_inode(*id, Some(name))?;
+                match inode_opt {
+                    Some(inode_view) => Ok(vec![inode_view.to_file_status(inp.path())]),
+                    None => err_box!("File {} not exists", inp.path()),
+                }
+            }
+        }
+    }
+
     pub fn acquire_new_block(
         &mut self,
         inp: &InodePath,
@@ -669,7 +709,8 @@ impl FsDir {
     }
 
     pub fn update_last_inode_id(&self, new_value: i64) -> CommonResult<()> {
-        if new_value > self.last_inode_id() {
+        let old_value = self.last_inode_id();
+        if new_value > old_value {
             self.inode_id.reset(new_value)
         } else {
             Ok(())

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::handler::{HandlerService, MessageHandler, RpcFrame};
-use crate::io::net::InetAddr;
+use crate::io::net::{InetAddr, NetUtils};
 use crate::runtime::{RpcRuntime, Runtime};
 use crate::server::{ServerConf, ServerMonitor, ServerStateListener};
 use crate::sync::StateCtl;
@@ -139,7 +139,16 @@ where
 
     pub async fn run(&self) -> CommonResult<()> {
         let bind_addr = self.get_bind_addr();
-        let listener = TcpListener::bind(&bind_addr).await?;
+        // Prefer a pre-bound listener from the test port reservation map.
+        // This eliminates the TOCTOU race between port discovery and actual bind
+        // when parallel test processes (cargo nextest) run simultaneously.
+        let listener = match NetUtils::take_held_listener(self.addr.port) {
+            Some(std_listener) => {
+                std_listener.set_nonblocking(true)?;
+                TcpListener::from_std(std_listener)?
+            }
+            None => TcpListener::bind(&bind_addr).await?,
+        };
         info!(
             "Rpc server [{}] start successfully, bind address: {}, hostname: {}, thread_name: {}, io threads: {}, worker threads: {}",
             self.conf.name,

@@ -77,16 +77,22 @@ impl InodeFile {
     }
 
     pub fn with_opts(id: i64, time: i64, opts: CreateFileOpts) -> InodeFile {
+        let (len, storage_policy) = if opts.sync_ufs_meta {
+            (opts.ufs_len, StoragePolicy::with_ufs(opts.storage_policy))
+        } else {
+            (0, StoragePolicy::with_cv(opts.storage_policy))
+        };
+
         let mut file = Self {
             id,
             file_type: opts.file_type,
             mtime: time,
             atime: time,
-            len: 0,
+            len,
             block_size: opts.block_size as u32,
             replicas: opts.replicas as u8,
 
-            storage_policy: StoragePolicy::with_cv(opts.storage_policy),
+            storage_policy,
             features: FileFeature {
                 x_attr: Default::default(),
                 file_write: None,
@@ -104,7 +110,9 @@ impl InodeFile {
             parent_id: EMPTY_PARENT_ID,
         };
 
-        file.features.set_writing(opts.client_name);
+        if !opts.sync_ufs_meta {
+            file.features.set_writing(opts.client_name);
+        }
         if !opts.x_attr.is_empty() {
             file.features.set_attrs(opts.x_attr);
         }
@@ -504,6 +512,10 @@ impl InodeFile {
 
     pub fn ufs_exists(&self) -> bool {
         self.storage_policy.ufs_exists()
+    }
+
+    pub fn ufs_only(&self) -> bool {
+        self.storage_policy.ufs_only()
     }
 
     pub fn cv_exists(&self) -> bool {
