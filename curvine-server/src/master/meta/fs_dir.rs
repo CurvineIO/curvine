@@ -483,6 +483,18 @@ impl FsDir {
         Ok(res)
     }
 
+    fn list_single_file(status: FileStatus, opts: &ListOptions) -> Vec<FileStatus> {
+        if matches!(opts.limit, Some(0)) {
+            return vec![];
+        }
+        if let Some(sa) = opts.start_after.as_deref() {
+            if status.name.as_str() <= sa {
+                return vec![];
+            }
+        }
+        vec![status]
+    }
+
     pub fn list_options(&self, inp: &InodePath, opts: &ListOptions) -> FsResult<Vec<FileStatus>> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -490,7 +502,10 @@ impl FsDir {
         };
 
         match inode.as_ref() {
-            File(_, _) => Ok(vec![inode.to_file_status(inp.path())]),
+            File(_, _) => {
+                let status = inode.to_file_status(inp.path());
+                Ok(Self::list_single_file(status, opts))
+            }
 
             Dir(_, d) => {
                 let children = d.list_options(opts);
@@ -516,7 +531,10 @@ impl FsDir {
             FileEntry(name, id) => {
                 let inode_opt = self.store.get_inode(*id, Some(name))?;
                 match inode_opt {
-                    Some(inode_view) => Ok(vec![inode_view.to_file_status(inp.path())]),
+                    Some(inode_view) => {
+                        let status = inode_view.to_file_status(inp.path());
+                        Ok(Self::list_single_file(status, opts))
+                    }
                     None => err_box!("File {} not exists", inp.path()),
                 }
             }

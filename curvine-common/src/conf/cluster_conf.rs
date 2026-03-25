@@ -69,6 +69,7 @@ impl ClusterConf {
     pub const DEFAULT_WORKER_PORT: u16 = 8997;
     pub const DEFAULT_MASTER_WEB_PORT: u16 = 9000;
     pub const DEFAULT_WORKER_WEB_PORT: u16 = 9001;
+    pub const DEFAULT_FUSE_WEB_PORT: u16 = 9002;
 
     pub const ENV_MASTER_HOSTNAME: &'static str = "CURVINE_MASTER_HOSTNAME";
     pub const ENV_WORKER_HOSTNAME: &'static str = "CURVINE_WORKER_HOSTNAME";

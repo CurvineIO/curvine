@@ -15,14 +15,17 @@
 use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
 use crate::fs::state::{NodeAttr, NodeMap};
-use crate::fs::{FuseReader, FuseWriter};
+use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
-use crate::{err_fuse, FuseResult, STATE_FILE_MAGIC, STATE_FILE_VERSION};
+use crate::{
+    err_fuse, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC, STATE_FILE_VERSION,
+};
 use curvine_client::file::FsReader;
 use curvine_client::unified::{UnifiedFileSystem, UnifiedReader};
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
-use curvine_common::fs::{FileSystem, MetaCache, Path, StateReader, StateWriter};
-use curvine_common::state::{CreateFileOpts, FileBlocks, FileStatus, OpenFlags};
+use curvine_common::fs::{FileSystem, ListStream, MetaCache, Path, StateReader, StateWriter};
+use curvine_common::state::{CreateFileOpts, FileBlocks, FileStatus, ListOptions, OpenFlags};
+use futures::stream::{self, StreamExt};
 use log::{error, info, warn};
 use orpc::common::FastHashMap;
 use orpc::err_box;
@@ -504,12 +507,15 @@ impl NodeState {
         }
     }
 
-    pub async fn new_dir_handle(
-        &self,
-        ino: u64,
-        list: Vec<FileStatus>,
-    ) -> FuseResult<Arc<DirHandle>> {
-        let handle = Arc::new(DirHandle::new(ino, self.next_fh(), list));
+    pub async fn new_dir_handle(&self, ino: u64, path: &Path) -> FuseResult<Arc<DirHandle>> {
+        let stream = self.list_stream(path).await?;
+        let handle = Arc::new(DirHandle::new(
+            ino,
+            self.next_fh(),
+            path,
+            self.conf.list_limit,
+            stream,
+        ));
         let mut lock = self.dir_handles.write();
         lock.entry(ino)
             .or_default()
@@ -567,6 +573,20 @@ impl NodeState {
         writer.write_len(self.fh_creator.get())?;
 
         Ok(())
+    }
+
+    pub async fn list_stream(&self, path: &Path) -> FuseResult<ListStream> {
+        let inner = self
+            .fs
+            .list_stream(path, ListOptions::with_limit(self.conf.list_limit))
+            .await?;
+
+        let dots = stream::iter([
+            Ok(CurvineFileSystem::new_dot_status(FUSE_CURRENT_DIR)),
+            Ok(CurvineFileSystem::new_dot_status(FUSE_PARENT_DIR)),
+        ]);
+
+        Ok(ListStream::new(dots.chain(inner)))
     }
 
     pub async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
@@ -631,7 +651,11 @@ impl NodeState {
         info!("node_state::restore: restoring dir_handles");
         let dir_handles_count = reader.read_len()?;
         for _ in 0..dir_handles_count {
-            let handle = reader.read_struct::<DirHandle>()?;
+            let mut handle = reader.read_struct::<DirHandle>()?;
+            let path = Path::from_str(&handle.path)?;
+            let stream = self.list_stream(&path).await?;
+            handle.set_stream(stream);
+
             self.dir_handles
                 .write()
                 .entry(handle.ino)

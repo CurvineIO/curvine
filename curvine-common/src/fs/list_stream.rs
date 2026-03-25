@@ -33,7 +33,7 @@ impl ListStream {
         Self::new(stream::iter(list.into_iter().map(Ok)))
     }
 
-    pub async fn collect(&mut self) -> FsResult<Vec<FileStatus>> {
+    pub async fn collect_vec(&mut self) -> FsResult<Vec<FileStatus>> {
         let mut vec = Vec::new();
         while let Some(item) = self.next().await {
             vec.push(item?);
