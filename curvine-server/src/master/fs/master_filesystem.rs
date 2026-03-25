@@ -353,6 +353,22 @@ impl MasterFilesystem {
         }
     }
 
+    pub fn list_options<T: AsRef<str>>(
+        &self,
+        path: T,
+        opts: ListOptions,
+    ) -> FsResult<Vec<FileStatus>> {
+        let path = path.as_ref();
+        let fs_dir = self.fs_dir.read();
+        let (is_glob_pattern, _) = parse_glob_pattern(path.as_ref());
+        if is_glob_pattern {
+            err_box!("list_options does not support glob pattern, path {}", path)
+        } else {
+            let inp = Self::resolve_path(&fs_dir, path.as_ref())?;
+            fs_dir.list_options(&inp, &opts)
+        }
+    }
+
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
         InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
     }
