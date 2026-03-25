@@ -62,7 +62,7 @@ impl ClientMetrics {
             write_time_us: m::new_counter("client_write_time_us", "write time us total")?,
             read_bytes: m::new_counter("client_read_bytes", "read bytes total")?,
             read_time_us: m::new_counter("client_read_time_us", "read time us total")?,
-            block_idle_conn: m::new_gauge("block_idle_conn", "block idle conn total")?,
+            block_idle_conn: m::new_gauge("client_block_idle_conn", "block idle conn total")?,
         };
 
         Ok(cm)
@@ -79,7 +79,7 @@ impl ClientMetrics {
         for mf in metric_families {
             let name = mf.get_name().to_string();
             if !name.starts_with(Self::PREFIX) {
-                break;
+                continue;
             }
 
             let metric_type = match mf.get_field_type() {
