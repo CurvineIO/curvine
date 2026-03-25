@@ -18,11 +18,12 @@ use crate::OssHdfsConf;
 use crate::{err_ufs, FOLDER_SUFFIX};
 use bytes::BytesMut;
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, FsKind, Path, Reader, Writer};
-use curvine_common::state::{FileStatus, FileType, SetAttrOpts};
+use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
+use curvine_common::state::{FileStatus, FileType, ListOptions, SetAttrOpts};
 use curvine_common::FsResult;
-use futures::StreamExt;
-use opendal::options::ListOptions;
+use futures::future::ready;
+use futures::stream::TryStreamExt;
+use futures::{Stream, StreamExt};
 use opendal::services::*;
 use opendal::{
     layers::{LoggingLayer, RetryLayer, TimeoutLayer},
@@ -31,6 +32,8 @@ use opendal::{
 use orpc::sys::DataSlice;
 use orpc::{err_box, err_ext, try_option_mut};
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::task::ready;
 use std::time::Duration;
 
 /// OpenDAL Reader implementation
@@ -845,7 +848,7 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
                     .await
                     .map_err(FsError::from_error)?;
             } else {
-                let opts = ListOptions {
+                let opts = opendal::options::ListOptions {
                     limit: Some(2),
                     ..Default::default()
                 };
@@ -917,5 +920,47 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
 
     async fn set_attr(&self, _path: &Path, _opts: SetAttrOpts) -> FsResult<()> {
         err_ufs!("SetAttr operation is not supported by OpenDAL file system")
+    }
+
+    async fn list_stream(&self, path: &Path, opts: ListOptions) -> FsResult<ListStream> {
+        let fs = self.clone();
+        let path = path.clone();
+        let dir_path = fs.get_dir_path(&path)?;
+        let opts = opendal::options::ListOptions {
+            limit: opts.limit,
+            start_after: opts.start_after.map(|x| format!("{}{}", dir_path, x)),
+            ..Default::default()
+        };
+
+        let lister = fs
+            .operator
+            .lister_options(&dir_path, opts)
+            .await
+            .map_err(FsError::from_error)?;
+
+        let stream = lister
+            .map_err(FsError::from_error)
+            .try_filter_map(move |entry| {
+                let raw_path = format!(
+                    "{}://{}/{}",
+                    fs.scheme,
+                    fs.bucket_or_container,
+                    entry.path().trim_end_matches('/')
+                );
+
+                let entry_path = match Path::from_str(raw_path) {
+                    Ok(v) => v,
+                    Err(e) => return ready(Err(FsError::from(e))),
+                };
+
+                if entry_path.path() == path.path() {
+                    ready(Ok(None))
+                } else {
+                    let metadata = entry.metadata();
+                    ready(Ok(Some(Self::read_status(&entry_path, metadata))))
+                }
+            });
+
+        Ok(ListStream::new(stream))
     }
 }

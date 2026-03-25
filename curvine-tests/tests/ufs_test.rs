@@ -61,8 +61,9 @@
 
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
-use curvine_common::state::{MountOptions, WriteType};
+use curvine_common::state::{ListOptions, MountOptions, WriteType};
 use curvine_tests::Testing;
+use futures::StreamExt;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
 use std::collections::HashMap;
@@ -147,6 +148,7 @@ fn ufs_test() -> CommonResult<()> {
         test_exists(&fs, &config_clone).await?;
         test_get_status(&fs, &config_clone).await?;
         test_list_status(&fs, &config_clone).await?;
+        test_list_stream(&fs, &config_clone).await?;
 
         // 4. Test file write operations
         println!("\n=== Testing File Write Operations ===");
@@ -193,7 +195,7 @@ async fn mount_storage(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonRes
 async fn cleanup_test_dir(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonResult<()> {
     let test_path: Path = config.test_base_dir().into();
     if fs.exists(&test_path).await? {
-        fs.delete(&test_path, true).await?;
+        // fs.delete(&test_path, true).await?;
         println!("✓ Test directory cleaned: {}", config.test_base_dir());
     }
     Ok(())
@@ -307,6 +309,67 @@ async fn test_list_status(fs: &UnifiedFileSystem, config: &TestConfig) -> Common
     let dir_names: Vec<&str> = statuses.iter().map(|s| s.name.as_str()).collect();
     assert!(dir_names.contains(&"dir1"), "dir1 should be in the list");
     assert!(dir_names.contains(&"dir2"), "dir2 should be in the list");
+
+    Ok(())
+}
+
+async fn test_list_stream(fs: &UnifiedFileSystem, config: &TestConfig) -> CommonResult<()> {
+    let base_dir = config.test_base_dir();
+
+    let nonempty: Path = format!("{}/ufs_list_stream_nonempty", base_dir).into();
+    if fs.exists(&nonempty).await? {
+        fs.delete(&nonempty, true).await?;
+    }
+    fs.mkdir(&nonempty, true).await?;
+    for i in 0..5 {
+        let path: Path = format!("{}/ufs_list_stream_nonempty/{}.log", base_dir, i).into();
+        let _ = fs.create(&path, true).await?;
+    }
+
+    let mut stream = fs
+        .list_stream(&nonempty, ListOptions::with_limit(2))
+        .await?;
+    let mut names = Vec::new();
+    while let Some(item) = stream.next().await {
+        names.push(item.unwrap().name);
+    }
+    assert_eq!(
+        names,
+        vec![
+            "0.log".to_string(),
+            "1.log".to_string(),
+            "2.log".to_string(),
+            "3.log".to_string(),
+            "4.log".to_string(),
+        ]
+    );
+    println!(
+        "✓ list_stream paged walk matches full list order under {}",
+        nonempty
+    );
+
+    // Empty directory
+    let empty_dir: Path = format!("{}/ufs_list_stream_empty", base_dir).into();
+    if fs.exists(&empty_dir).await? {
+        fs.delete(&empty_dir, true).await?;
+    }
+    fs.mkdir(&empty_dir, true).await?;
+    let opts = ListOptions::default();
+    assert!(fs
+        .list_stream(&empty_dir, opts)
+        .await?
+        .next()
+        .await
+        .is_none());
+
+    let mut lister = fs
+        .list_stream(&empty_dir, ListOptions::with_limit(2))
+        .await?;
+    assert!(lister.next().await.is_none());
+    println!(
+        "✓ list_stream on empty directory yields no items under {}",
+        empty_dir
+    );
 
     Ok(())
 }
