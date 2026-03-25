@@ -24,6 +24,7 @@ once_cell = { workspace = true }
 clap = { workspace = true }
 awaitility = "0.4"
 tempfile = { workspace = true }
+futures = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 curvine-fuse = { workspace = true }
