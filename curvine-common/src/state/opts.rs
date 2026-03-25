@@ -18,6 +18,7 @@ use orpc::common::ByteUnit;
 use orpc::sys;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 
 #[derive(Debug, Clone)]
 pub struct CreateFileOpts {
@@ -528,6 +529,17 @@ impl ListOptions {
         Self {
             limit: Some(limit),
             start_after: None,
+        }
+    }
+}
+
+impl fmt::Display for ListOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.limit, &self.start_after) {
+            (Some(l), Some(s)) => write!(f, "{}-{}", l, s),
+            (Some(l), None) => write!(f, "{}-none", l),
+            (None, Some(s)) => write!(f, "none-{}", s),
+            (None, None) => Ok(()),
         }
     }
 }
