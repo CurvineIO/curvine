@@ -614,6 +614,24 @@ impl MasterHandler {
         };
         ctx.response(rep_header)
     }
+
+    pub fn list_options(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+        let header: ListOptionsRequest = ctx.parse_header()?;
+        if header.options.limit.unwrap_or(0) < 0 {
+            return err_box!("list options limit must be greater than 0");
+        }
+        let opts = ProtoUtils::list_options_from_pb(header.options);
+        let audit_path = format!("{}[{}]", header.path, opts);
+        ctx.set_audit(Some(audit_path), None);
+
+        let list = self.fs.list_options(&header.path, opts)?;
+        let res = list
+            .into_iter()
+            .map(ProtoUtils::file_status_to_pb)
+            .collect();
+        let rep_header = ListOptionsResponse { statuses: res };
+        ctx.response(rep_header)
+    }
 }
 
 impl MessageHandler for MasterHandler {
@@ -654,6 +672,7 @@ impl MessageHandler for MasterHandler {
             RpcCode::Free => self.retry_check_free(ctx),
             RpcCode::Rename => self.retry_check_rename(ctx),
             RpcCode::ListStatus => self.list_status(ctx),
+            RpcCode::ListOptions => self.list_options(ctx),
             RpcCode::GetBlockLocations => self.get_block_locations(ctx),
             RpcCode::SetAttr => self.set_attr_retry_check(ctx),
             RpcCode::Symlink => self.symlink_retry_check(ctx),
