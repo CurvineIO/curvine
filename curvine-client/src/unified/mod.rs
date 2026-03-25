@@ -16,10 +16,12 @@ use crate::file::{FsReader, FsWriter};
 use crate::impl_filesystem_for_enum;
 use crate::{impl_reader_for_enum, impl_writer_for_enum};
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{MountInfo, Provider};
+use curvine_common::state::{FileStatus, MountInfo, Provider};
 use curvine_common::FsResult;
+use futures::Stream;
 use orpc::err_box;
 use std::collections::HashMap;
+use std::pin::Pin;
 
 #[cfg(feature = "opendal")]
 use curvine_ufs::opendal::*;
