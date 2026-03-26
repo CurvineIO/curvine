@@ -622,7 +622,7 @@ async fn run_mixed(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
     let remote_dir = normalize_remote_dir(&args.remote_path);
     let remote_root = Path::from_str(&remote_dir)?;
     let _ = fs.mkdir(&remote_root, true).await;
-    let client_root = Path::from_str(&format!("{}/{}", remote_dir, client_id))?;
+    let client_root = Path::from_str(format!("{}/{}", remote_dir, client_id))?;
     let _ = fs.mkdir(&client_root, true).await;
     let _ = publish_bootstrap_identity(p2p_service.clone(), args, "MIXED").await?;
 
@@ -735,7 +735,7 @@ async fn run_mixed(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
                         sha256,
                         owner: client_id.clone(),
                         write_seq,
-                        created_at_ms: orpc::common::LocalTime::mills() as u64,
+                        created_at_ms: orpc::common::LocalTime::mills(),
                     };
                     append_manifest_entry(write_manifest_dir.as_path(), &client_id, &entry)?;
                     write_ok = write_ok.saturating_add(1);
