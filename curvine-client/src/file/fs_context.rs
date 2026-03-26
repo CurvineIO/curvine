@@ -13,9 +13,10 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
+use crate::client_metrics::ReadSource;
 use crate::file::{CurvineFileSystem, FsClient};
 use crate::p2p::ChunkId;
-use crate::p2p::P2pService;
+use crate::p2p::{P2pService, P2pStatsSnapshot};
 use crate::ClientMetrics;
 use bytes::Bytes;
 use curvine_common::conf::ClusterConf;
@@ -46,14 +47,6 @@ const ADAPTIVE_MIN_SAMPLES: u64 = 8;
 const ADAPTIVE_BYPASS_RATIO_NUM: u64 = 9;
 const ADAPTIVE_BYPASS_RATIO_DEN: u64 = 10;
 const ADAPTIVE_PROBE_INTERVAL: u64 = 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadSource {
-    P2p,
-    WorkerLocal,
-    WorkerRemote,
-    Hole,
-}
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub(crate) struct ReadChunkKey {
@@ -113,6 +106,10 @@ impl FsContext {
 
         CLIENT_METRICS
             .get_or_init(|| ClientMetrics::new(&conf.client.metadata_operation_buckets).unwrap());
+        Self::get_metrics().set_read_label_policy(
+            conf.client.p2p.metrics_label_series_cap,
+            conf.client.p2p.metrics_hash_job_id,
+        );
 
         let connector = ClusterConnector::with_rt(conf.client_rpc_conf(), rt.clone());
         for node in conf.master_nodes() {
@@ -318,7 +315,7 @@ impl FsContext {
                 self.adaptive_p2p_samples.fetch_add(1, Ordering::Relaxed);
                 update_latency_ewma(&self.adaptive_p2p_latency_us, elapsed_us);
             }
-            ReadSource::Hole => {}
+            _ => {}
         }
     }
 
@@ -376,6 +373,7 @@ impl FsContext {
         let interval = fs.conf().client.clean_task_interval;
         let rt = fs.clone_runtime();
         let fs_context = Arc::downgrade(&fs.fs_context);
+        let snapshot_context = fs_context.clone();
         let metrics_context = fs_context.clone();
         let pool = Arc::downgrade(&pool);
 
@@ -384,10 +382,14 @@ impl FsContext {
             loop {
                 interval.tick().await;
 
+                let Some(snapshot_fs_context) = snapshot_context.upgrade() else {
+                    break;
+                };
                 let Some(pool) = pool.upgrade() else {
                     break;
                 };
                 pool.clear_idle_conn();
+                sync_p2p_metrics(&snapshot_fs_context);
 
                 if metric_report_enable {
                     let Some(fs_context) = metrics_context.upgrade() else {
@@ -422,6 +424,15 @@ impl FsContext {
             }
         });
     }
+}
+
+fn sync_p2p_metrics(fs_context: &Arc<FsContext>) {
+    let (service_id, snapshot) = if let Some(p2p_service) = fs_context.p2p_service() {
+        (p2p_service.peer_id().to_string(), p2p_service.snapshot())
+    } else {
+        ("disabled".to_string(), P2pStatsSnapshot::default())
+    };
+    FsContext::get_metrics().sync_p2p_snapshot(&service_id, &snapshot);
 }
 
 async fn sync_p2p_runtime_policy(fs_context: &Arc<FsContext>) -> FsResult<()> {
@@ -515,10 +526,10 @@ impl Drop for FsContext {
 #[cfg(test)]
 mod tests {
     use super::{
-        should_bypass_p2p_adaptive, FsContext, ReadSource, ADAPTIVE_MIN_SAMPLES,
-        ADAPTIVE_PROBE_INTERVAL,
+        should_bypass_p2p_adaptive, FsContext, ADAPTIVE_MIN_SAMPLES, ADAPTIVE_PROBE_INTERVAL,
     };
     use crate::block::BlockClient;
+    use crate::client_metrics::ReadSource;
     use crate::file::CurvineFileSystem;
     use crate::p2p::P2pState;
     use curvine_common::conf::ClusterConf;
