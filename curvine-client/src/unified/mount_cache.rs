@@ -196,7 +196,6 @@ impl MountCache {
 
         let mounts = fs.get_mount_table().await?;
         let mut state = self.mounts.write().unwrap();
-
         state.clear();
         for item in mounts {
             state.insert(item)?;
@@ -221,7 +220,9 @@ impl MountCache {
             return Ok(None);
         }
 
-        for mount_path in path.get_possible_mounts() {
+        if let Some(mount_path) = find_most_specific_mount_path(path, |candidate| {
+            state.get(path.is_cv(), candidate).is_some()
+        }) {
             if let Some(mount) = state.get(path.is_cv(), &mount_path) {
                 return Ok(Some(mount));
             }
@@ -233,5 +234,40 @@ impl MountCache {
     pub fn remove(&self, path: &Path) {
         let mut state = self.mounts.write().unwrap();
         state.remove(path);
+    }
+}
+
+fn find_most_specific_mount_path<F>(path: &Path, mut exists: F) -> Option<String>
+where
+    F: FnMut(&str) -> bool,
+{
+    path.get_possible_mounts()
+        .into_iter()
+        .rev()
+        .find(|candidate| exists(candidate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn most_specific_mount_path_prefers_deepest_match() {
+        let path = Path::from_str("/models/checkpoints/step-1").unwrap();
+        let mounts = HashSet::from(["/models".to_string(), "/models/checkpoints".to_string()]);
+
+        let found = find_most_specific_mount_path(&path, |candidate| mounts.contains(candidate));
+
+        assert_eq!(found.as_deref(), Some("/models/checkpoints"));
+    }
+
+    #[test]
+    fn most_specific_mount_path_returns_none_when_absent() {
+        let path = Path::from_str("/models/checkpoints/step-1").unwrap();
+
+        let found = find_most_specific_mount_path(&path, |_| false);
+
+        assert!(found.is_none());
     }
 }
