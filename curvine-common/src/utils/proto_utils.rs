@@ -217,7 +217,7 @@ impl ProtoUtils {
     pub fn file_status_to_pb(status: FileStatus) -> FileStatusProto {
         FileStatusProto {
             id: status.id,
-            version_epoch: status.version_epoch,
+            version_epoch: Some(status.version_epoch),
             path: status.path,
             name: status.name,
             is_dir: status.is_dir,
@@ -243,7 +243,7 @@ impl ProtoUtils {
     pub fn file_status_from_pb(status: FileStatusProto) -> FileStatus {
         FileStatus {
             id: status.id,
-            version_epoch: status.version_epoch,
+            version_epoch: status.version_epoch.unwrap_or_default(),
             path: status.path,
             name: status.name,
             is_dir: status.is_dir,
@@ -818,6 +818,20 @@ mod tests {
         let bytes = legacy.encode_to_vec();
         let decoded = FileStatusProto::decode(bytes.as_slice())
             .expect("current proto should decode legacy payload without version_epoch");
+        assert_eq!(decoded.version_epoch, None);
+        assert_eq!(ProtoUtils::file_status_from_pb(decoded).version_epoch, 0);
+    }
+
+    #[test]
+    fn file_status_from_pb_defaults_optional_version_epoch_to_zero() {
+        let mut pb = ProtoUtils::file_status_to_pb(FileStatus {
+            id: 7,
+            path: "/tmp/a".to_string(),
+            name: "a".to_string(),
+            ..Default::default()
+        });
+        pb.version_epoch = None;
+        let decoded = ProtoUtils::file_status_from_pb(pb);
         assert_eq!(decoded.version_epoch, 0);
     }
 }
