@@ -21,5 +21,8 @@ pub use self::cache_manager::{
 mod discovery;
 pub use self::discovery::{DiscoveryPeerSnapshot, DiscoverySnapshot};
 
+mod service;
+pub use self::service::{P2pService, P2pState, P2pStatsSnapshot};
+
 mod transfer;
 pub use self::transfer::{ChunkId, TransferRequest, TransferResponse};
