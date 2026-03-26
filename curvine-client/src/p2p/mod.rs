@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::Bytes;
+use ring::digest;
+
 mod cache_manager;
 pub use self::cache_manager::{
     CacheGetResult, CacheGetResultTag, CacheManager, CachePutResultTag, CacheSnapshot, CachedChunk,
@@ -19,10 +22,15 @@ pub use self::cache_manager::{
 };
 
 mod discovery;
-pub use self::discovery::{DiscoveryPeerSnapshot, DiscoverySnapshot};
-
-mod service;
-pub use self::service::{P2pService, P2pState, P2pStatsSnapshot};
+pub use self::discovery::{DiscoveryService, DiscoverySnapshot};
 
 mod transfer;
 pub use self::transfer::{ChunkId, TransferRequest, TransferResponse};
+
+mod service;
+pub use self::service::{P2pReadTraceContext, P2pService, P2pState, P2pStatsSnapshot};
+
+fn sha256_bytes(data: &[u8]) -> Bytes {
+    let hashed = digest::digest(&digest::SHA256, data);
+    Bytes::copy_from_slice(hashed.as_ref())
+}
