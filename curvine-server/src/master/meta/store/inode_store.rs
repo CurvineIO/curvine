@@ -222,6 +222,8 @@ impl InodeStore {
 
         batch.commit()?;
 
+        self.fs_stats.increment_file_count();
+
         Ok(())
     }
 
