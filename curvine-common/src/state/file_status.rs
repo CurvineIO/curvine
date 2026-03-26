@@ -21,6 +21,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileStatus {
     pub id: i64,
+    pub version_epoch: i64,
     pub path: String,
     pub name: String,
     pub is_dir: bool,
