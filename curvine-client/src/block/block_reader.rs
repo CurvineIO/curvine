@@ -14,7 +14,8 @@
 
 use crate::block::block_reader::ReaderAdapter::{Hole, Local, Remote};
 use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
-use crate::file::{FsContext, ReadChunkKey, ReadSource};
+use crate::client_metrics::{ReadFallbackReason, ReadSource};
+use crate::file::{FsContext, ReadChunkKey};
 use crate::p2p::{ChunkId, FetchChunkOrigin, P2pReadTraceContext};
 use bytes::Bytes;
 use curvine_common::error::FsError;
@@ -132,6 +133,8 @@ pub struct BlockReader {
     file_id: i64,
     file_version_epoch: i64,
     file_mtime: i64,
+    tenant_id: Option<String>,
+    job_id: Option<String>,
     fs_context: Arc<FsContext>,
 }
 
@@ -142,6 +145,9 @@ struct ReadPipelineInput {
     read_key: ReadChunkKey,
     chunk_id: ChunkId,
     expect_len: usize,
+    version_epoch: i64,
+    block_id: i64,
+    read_off: i64,
 }
 
 enum ReadPipelineOutcome {
@@ -150,6 +156,7 @@ enum ReadPipelineOutcome {
 }
 
 impl BlockReader {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         fs_context: Arc<FsContext>,
         located: LocatedBlock,
@@ -157,6 +164,8 @@ impl BlockReader {
         file_id: i64,
         file_version_epoch: i64,
         file_mtime: i64,
+        tenant_id: Option<String>,
+        job_id: Option<String>,
     ) -> CommonResult<Self> {
         let len = located.block.len;
 
@@ -166,8 +175,16 @@ impl BlockReader {
             &fs_context.client_addr,
         )?;
 
-        let adapter =
-            Self::get_reader(&locs, located.block.clone(), fs_context.clone(), off, len).await?;
+        let adapter = Self::get_reader(
+            &locs,
+            located.block.clone(),
+            fs_context.clone(),
+            off,
+            len,
+            tenant_id.as_deref(),
+            job_id.as_deref(),
+        )
+        .await?;
 
         let reader = Self {
             inner: adapter,
@@ -176,6 +193,8 @@ impl BlockReader {
             file_id,
             file_version_epoch,
             file_mtime,
+            tenant_id,
+            job_id,
             fs_context,
         };
 
@@ -213,6 +232,8 @@ impl BlockReader {
         fs_context: Arc<FsContext>,
         off: i64,
         len: i64,
+        tenant_id: Option<&str>,
+        job_id: Option<&str>,
     ) -> FsResult<ReaderAdapter> {
         if locs.is_empty() && block.alloc_opts.is_some() {
             let reader = BlockReaderHole::new(fs_context.clone(), block.clone(), off, len)?;
@@ -243,6 +264,11 @@ impl BlockReader {
             match res {
                 Ok(v) => return Ok(v),
                 Err(e) => {
+                    FsContext::get_metrics().observe_read_fallback(
+                        ReadFallbackReason::OpenReaderError,
+                        tenant_id,
+                        job_id,
+                    );
                     warn!("fail to create block reader for {}: {}", loc, e);
                 }
             }
@@ -332,22 +358,61 @@ impl BlockReader {
         }
     }
 
-    fn try_read_chunk_cache(&mut self, read_key: &ReadChunkKey) -> FsResult<Option<DataSlice>> {
-        let Some(cached) = self.fs_context.get_read_chunk_cache(read_key) else {
-            return Ok(None);
-        };
-        self.advance_cached_position(cached.len())?;
-        Ok(Some(DataSlice::bytes(cached)))
+    fn observe_read_source_metric(&self, source: ReadSource, bytes: usize, start_nanos: u128) {
+        self.observe_read_source_metric_with_adaptive(source, Some(source), bytes, start_nanos);
     }
 
-    fn build_trace_context(&self, read_off: i64) -> P2pReadTraceContext {
+    fn observe_read_source_metric_with_adaptive(
+        &self,
+        source: ReadSource,
+        adaptive_source: Option<ReadSource>,
+        bytes: usize,
+        start_nanos: u128,
+    ) {
+        if let Some(adaptive_source) = adaptive_source {
+            self.fs_context
+                .observe_adaptive_read_latency(adaptive_source, start_nanos);
+        }
+        FsContext::get_metrics().observe_read_source(
+            source,
+            bytes,
+            start_nanos,
+            self.tenant_id.as_deref(),
+            self.job_id.as_deref(),
+        );
+    }
+
+    fn observe_read_fallback_metric(&self, reason: ReadFallbackReason) {
+        FsContext::get_metrics().observe_read_fallback(
+            reason,
+            self.tenant_id.as_deref(),
+            self.job_id.as_deref(),
+        );
+    }
+
+    fn try_read_chunk_cache(&mut self, read_key: &ReadChunkKey) -> FsResult<Option<DataSlice>> {
+        let start = LocalTime::nanos();
+        if let Some(cached) = self.fs_context.get_read_chunk_cache(read_key) {
+            self.advance_cached_position(cached.len())?;
+            self.observe_read_source_metric(ReadSource::LocalChunkCache, cached.len(), start);
+            return Ok(Some(DataSlice::bytes(cached)));
+        }
+        Ok(None)
+    }
+
+    fn build_trace_context(
+        &self,
+        version_epoch: i64,
+        block_id: i64,
+        read_off: i64,
+    ) -> P2pReadTraceContext {
         P2pReadTraceContext {
             trace_id: Some(format!(
                 "{}:{}:{}:{}",
-                self.file_id, self.file_version_epoch, self.block.id, read_off
+                self.file_id, version_epoch, block_id, read_off
             )),
-            tenant_id: None,
-            job_id: None,
+            tenant_id: self.tenant_id.clone(),
+            job_id: self.job_id.clone(),
         }
     }
 
@@ -357,8 +422,11 @@ impl BlockReader {
         chunk_id: ChunkId,
         expect_len: usize,
         read_key: &ReadChunkKey,
+        version_epoch: i64,
+        block_id: i64,
+        read_off: i64,
     ) -> FsResult<Option<DataSlice>> {
-        if matches!(source, ReadSource::Hole) || expect_len == 0 {
+        if source == ReadSource::Hole || expect_len == 0 {
             return Ok(None);
         }
         let Some(service) = self.fs_context.p2p_service() else {
@@ -371,15 +439,14 @@ impl BlockReader {
                 chunk_id,
                 expect_len,
                 expected_mtime,
-                Some(&self.build_trace_context(self.pos())),
+                Some(&self.build_trace_context(version_epoch, block_id, read_off)),
             )
             .await
         {
             self.advance_cached_position(data.len())?;
             self.fs_context
                 .put_read_chunk_cache(read_key.clone(), data.clone());
-            self.fs_context
-                .observe_adaptive_read_latency(ReadSource::P2p, start);
+            self.observe_read_source_metric_with_adaptive(ReadSource::P2p, None, data.len(), start);
             return Ok(Some(DataSlice::bytes(data)));
         }
         Ok(None)
@@ -391,8 +458,11 @@ impl BlockReader {
         chunk_id: ChunkId,
         expect_len: usize,
         read_key: &ReadChunkKey,
+        version_epoch: i64,
+        block_id: i64,
+        read_off: i64,
     ) -> FsResult<Option<DataSlice>> {
-        if matches!(source, ReadSource::Hole) || expect_len == 0 {
+        if source == ReadSource::Hole || expect_len == 0 {
             return Ok(None);
         }
         if self.fs_context.should_bypass_p2p(source) {
@@ -408,17 +478,23 @@ impl BlockReader {
                 chunk_id,
                 expect_len,
                 expected_mtime,
-                Some(&self.build_trace_context(self.pos())),
+                Some(&self.build_trace_context(version_epoch, block_id, read_off)),
             )
             .await
         {
             self.advance_cached_position(data.len())?;
             self.fs_context
                 .put_read_chunk_cache(read_key.clone(), data.clone());
-            if origin == FetchChunkOrigin::Network {
-                self.fs_context
-                    .observe_adaptive_read_latency(ReadSource::P2p, start);
-            }
+            let adaptive_source = match origin {
+                FetchChunkOrigin::Network => Some(ReadSource::P2p),
+                FetchChunkOrigin::Cached => None,
+            };
+            self.observe_read_source_metric_with_adaptive(
+                ReadSource::P2p,
+                adaptive_source,
+                data.len(),
+                start,
+            );
             return Ok(Some(DataSlice::bytes(data)));
         }
         if service.conf().fallback_worker_on_fail {
@@ -452,12 +528,18 @@ impl BlockReader {
                 self.file_mtime,
             );
         }
-        self.fs_context.observe_adaptive_read_latency(source, start);
+        self.observe_read_source_metric(source, bytes.len(), start);
         Ok(DataSlice::bytes(bytes))
     }
 
     async fn handle_worker_read_error(&mut self, e: FsError) -> FsResult<()> {
         if matches!(&self.inner, Hole(_)) || self.locs.is_empty() {
+            let reason = if matches!(&self.inner, Hole(_)) {
+                ReadFallbackReason::HoleReadError
+            } else {
+                ReadFallbackReason::AllWorkersFailed
+            };
+            self.observe_read_fallback_metric(reason);
             return Err(e.ctx(format!(
                 "failed to read block on {}",
                 self.inner.worker_address()
@@ -474,14 +556,18 @@ impl BlockReader {
         self.inner.abort().await;
         self.locs.retain(|x| x != &failed_addr);
         if self.locs.is_empty() {
+            self.observe_read_fallback_metric(ReadFallbackReason::AllWorkersFailed);
             return Err(e.ctx(format!("failed to read block on {}", failed_addr)));
         }
+        self.observe_read_fallback_metric(ReadFallbackReason::SwitchReplica);
         self.inner = Self::get_reader(
             &self.locs,
             self.block.clone(),
             self.fs_context.clone(),
             self.pos(),
             self.len(),
+            self.tenant_id.as_deref(),
+            self.job_id.as_deref(),
         )
         .await?;
         Ok(())
@@ -489,24 +575,19 @@ impl BlockReader {
 
     fn build_read_pipeline_input(&self) -> ReadPipelineInput {
         let read_off = self.pos();
+        let version_epoch = self.file_version_epoch.max(0);
+        let block_id = self.block.id;
         ReadPipelineInput {
             source: self.inner.source_tag(),
-            read_key: ReadChunkKey::new(
-                self.file_id,
-                self.file_version_epoch,
-                self.block.id,
-                read_off,
-            ),
-            chunk_id: ChunkId::with_version(
-                self.file_id,
-                self.file_version_epoch,
-                self.block.id,
-                read_off,
-            ),
+            read_key: ReadChunkKey::new(self.file_id, version_epoch, block_id, read_off),
+            chunk_id: ChunkId::with_version(self.file_id, version_epoch, block_id, read_off),
             expect_len: self
                 .remaining()
                 .min(self.fs_context.read_chunk_size() as i64)
                 .max(0) as usize,
+            version_epoch,
+            block_id,
+            read_off,
         }
     }
 
@@ -523,6 +604,9 @@ impl BlockReader {
                 input.chunk_id,
                 input.expect_len,
                 &input.read_key,
+                input.version_epoch,
+                input.block_id,
+                input.read_off,
             )
             .await?
         {
@@ -541,6 +625,9 @@ impl BlockReader {
                 input.chunk_id,
                 input.expect_len,
                 &input.read_key,
+                input.version_epoch,
+                input.block_id,
+                input.read_off,
             )
             .await?
         {
@@ -643,6 +730,8 @@ mod tests {
             file_id: 11,
             file_version_epoch: 3,
             file_mtime: mtime,
+            tenant_id: None,
+            job_id: None,
             fs_context: fs_context.clone(),
         };
         let input = ReadPipelineInput {
@@ -650,6 +739,9 @@ mod tests {
             read_key,
             chunk_id,
             expect_len: 4,
+            version_epoch: 3,
+            block_id: block.id,
+            read_off: 0,
         };
 
         let outcome = timeout(
@@ -684,6 +776,8 @@ mod tests {
             file_id: 11,
             file_version_epoch: 3,
             file_mtime: 17,
+            tenant_id: None,
+            job_id: None,
             fs_context,
         };
 
