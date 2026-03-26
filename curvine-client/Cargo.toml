@@ -32,7 +32,7 @@ moka = { workspace = true }
 fxhash = { workspace = true }
 prometheus = { workspace = true }
 linked-hash-map = { workspace = true }
-libp2p = { version = "0.56.0", default-features = false, features = ["tokio", "tcp", "quic", "noise", "yamux", "request-response", "mdns", "kad", "macros"] }
+libp2p = { version = "0.56.0", default-features = false, features = ["tokio", "tcp", "quic", "noise", "yamux", "request-response", "mdns", "kad", "identify", "macros"] }
 libp2p-stream = "0.4.0-alpha"
 ring = "0.17"
 

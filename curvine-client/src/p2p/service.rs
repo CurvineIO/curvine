@@ -18,6 +18,7 @@ use bytes::Bytes;
 use curvine_common::conf::ClientP2pConf;
 use curvine_common::utils::CommonUtils;
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
+use libp2p::identify;
 use libp2p::identity;
 use libp2p::kad;
 use libp2p::mdns;
@@ -687,6 +688,7 @@ impl request_response::Codec for ChunkTransferCodec {
 struct P2pNetworkBehaviour {
     request_response: request_response::Behaviour<ChunkTransferCodec>,
     stream: p2p_stream::Behaviour,
+    identify: identify::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
     kad: kad::Behaviour<kad::store::MemoryStore>,
 }
@@ -694,6 +696,7 @@ struct P2pNetworkBehaviour {
 #[derive(Debug)]
 enum P2pNetworkEvent {
     RequestResponse(request_response::Event<ChunkFetchRequest, ChunkFetchResponse>),
+    Identify(identify::Event),
     Mdns(mdns::Event),
     Kad(kad::Event),
     Ignore,
@@ -708,6 +711,12 @@ impl From<request_response::Event<ChunkFetchRequest, ChunkFetchResponse>> for P2
 impl From<mdns::Event> for P2pNetworkEvent {
     fn from(value: mdns::Event) -> Self {
         Self::Mdns(value)
+    }
+}
+
+impl From<identify::Event> for P2pNetworkEvent {
+    fn from(value: identify::Event) -> Self {
+        Self::Identify(value)
     }
 }
 
@@ -742,6 +751,7 @@ struct PendingFetchRequest {
     response: oneshot::Sender<Option<FetchedChunk>>,
     candidates: VecDeque<PeerId>,
     active_peer: Option<PeerId>,
+    defer_dht: bool,
     started_at: Instant,
     deadline: Instant,
 }
@@ -1317,7 +1327,7 @@ impl P2pService {
                     .await
                     .ok()
                     .unwrap_or(CachePutResultTag::Failed);
-                    if published == CachePutResultTag::Stored {
+                    if published != CachePutResultTag::Failed {
                         let _ = timeout(
                             publish_timeout,
                             tx.send(NetworkCommand::Publish { chunk_id }),
@@ -1336,10 +1346,9 @@ impl P2pService {
             mtime,
             Some(checksum),
         ) {
-            CachePutResultTag::Stored => {
+            CachePutResultTag::Stored | CachePutResultTag::Refreshed => {
                 self.send_network_command(NetworkCommand::Publish { chunk_id })
             }
-            CachePutResultTag::Refreshed => true,
             CachePutResultTag::Failed => false,
         }
     }
@@ -1794,6 +1803,7 @@ impl P2pService {
         }
         let data_plane = self.data_plane.clone();
         let cache_manager = self.cache_manager.clone();
+        let pending_fetched = self.pending_fetched.clone();
         let hot_published_chunks = self.hot_published_chunks.clone();
         let tenant_whitelist = Arc::new(parse_tenant_whitelist(&self.conf.tenant_whitelist));
         let conf = self.conf.clone();
@@ -1816,6 +1826,7 @@ impl P2pService {
                         stream,
                         data_plane.clone(),
                         cache_manager.clone(),
+                        pending_fetched.clone(),
                         hot_published_chunks.clone(),
                         tenant_whitelist.clone(),
                         conf.clone(),
@@ -1856,6 +1867,7 @@ impl P2pService {
 
         let conf = self.conf.clone();
         let cache_manager = self.cache_manager.clone();
+        let pending_fetched = self.pending_fetched.clone();
         let hot_published_chunks = self.hot_published_chunks.clone();
         let data_plane = self.data_plane.clone();
         let network_ready_notify = self.network_ready_notify.clone();
@@ -1865,6 +1877,7 @@ impl P2pService {
             run_network_loop(
                 conf,
                 cache_manager,
+                pending_fetched,
                 hot_published_chunks,
                 data_plane,
                 rx,
@@ -2436,6 +2449,7 @@ fn handle_network_command(
                         response,
                         candidates,
                         active_peer: None,
+                        defer_dht: false,
                         started_at: now,
                         deadline,
                     },
@@ -2477,6 +2491,7 @@ fn handle_network_command(
                             response,
                             candidates,
                             active_peer: None,
+                            defer_dht: true,
                             started_at: now,
                             deadline,
                         },
@@ -2486,31 +2501,15 @@ fn handle_network_command(
                     );
                     return true;
                 }
-                emit_p2p_trace(
-                    "discover",
-                    "dht_query",
-                    &trace,
+                enqueue_provider_query(
+                    swarm,
+                    loop_state,
+                    fetch_token,
                     chunk_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
-                let query_id = swarm
-                    .behaviour_mut()
-                    .kad
-                    .get_providers(provider_record_key(provider_record_id(chunk_id)));
-                loop_state.pending_queries.insert(
-                    query_id,
-                    PendingProviderQuery {
-                        fetch_token,
-                        chunk_id,
-                        max_len,
-                        expected_mtime,
-                        trace,
-                        response,
-                        deadline: now + loop_state.discovery_timeout,
-                    },
+                    max_len,
+                    expected_mtime,
+                    trace,
+                    response,
                 );
             } else {
                 emit_p2p_trace(
@@ -2542,6 +2541,7 @@ fn handle_network_command(
                         response,
                         candidates,
                         active_peer: None,
+                        defer_dht: false,
                         started_at: now,
                         deadline,
                     },
@@ -2626,6 +2626,7 @@ struct SwarmEventCtx<'a> {
     conf: &'a ClientP2pConf,
     data_plane: &'a DataPlaneState,
     cache_manager: &'a Arc<CacheManager>,
+    pending_fetched: &'a Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
     hot_published_chunks: &'a Arc<FastDashMap<ChunkId, HotPublishedChunk>>,
     init: &'a NetworkInitState,
     loop_state: &'a mut NetworkLoopState,
@@ -2640,6 +2641,7 @@ fn handle_swarm_event(event: SwarmEvent<P2pNetworkEvent>, ctx: &mut SwarmEventCt
                 swarm: ctx.swarm,
                 data_plane: ctx.data_plane,
                 cache_manager: ctx.cache_manager,
+                pending_fetched: ctx.pending_fetched,
                 hot_published_chunks: ctx.hot_published_chunks,
                 conf: ctx.conf,
                 init: ctx.init,
@@ -2648,6 +2650,9 @@ fn handle_swarm_event(event: SwarmEvent<P2pNetworkEvent>, ctx: &mut SwarmEventCt
                 stats: ctx.stats,
             };
             handle_request_response_event(event, &mut rr_ctx);
+        }
+        SwarmEvent::Behaviour(P2pNetworkEvent::Identify(event)) => {
+            handle_identify_event(event, ctx.swarm, ctx.init, ctx.loop_state);
         }
         SwarmEvent::Behaviour(P2pNetworkEvent::Mdns(event)) => {
             if ctx.conf.enable_mdns {
@@ -2722,6 +2727,28 @@ fn handle_mdns_event(
             for (peer, _) in entries {
                 mdns_peers.remove(&peer);
             }
+        }
+    }
+}
+
+fn handle_identify_event(
+    event: identify::Event,
+    swarm: &mut libp2p::Swarm<P2pNetworkBehaviour>,
+    init: &NetworkInitState,
+    loop_state: &mut NetworkLoopState,
+) {
+    let identify::Event::Received { peer_id, info, .. } = event else {
+        return;
+    };
+    if !is_peer_allowed(peer_id, init.local_peer_id, &init.peer_whitelist) {
+        return;
+    }
+    let Some(remote_addr) = loop_state.peer_remote_addrs.get(&peer_id) else {
+        return;
+    };
+    for listen_addr in info.listen_addrs {
+        if let Some(dial_addr) = identify_dial_addr(&listen_addr, remote_addr) {
+            swarm.behaviour_mut().kad.add_address(&peer_id, dial_addr);
         }
     }
 }
@@ -2837,6 +2864,7 @@ fn finalize_provider_query(
             response: pending.response,
             candidates,
             active_peer: None,
+            defer_dht: false,
             started_at: Instant::now(),
             deadline: Instant::now() + loop_state.transfer_timeout,
         },
@@ -2848,6 +2876,44 @@ fn finalize_provider_query(
 
 fn negative_provider_cache_ttl_from_discovery(discovery_timeout: Duration) -> Duration {
     discovery_timeout
+}
+
+fn enqueue_provider_query(
+    swarm: &mut libp2p::Swarm<P2pNetworkBehaviour>,
+    loop_state: &mut NetworkLoopState,
+    fetch_token: u64,
+    chunk_id: ChunkId,
+    max_len: usize,
+    expected_mtime: Option<i64>,
+    trace: TraceLabels,
+    response: oneshot::Sender<Option<FetchedChunk>>,
+) {
+    emit_p2p_trace(
+        "discover",
+        "dht_query",
+        &trace,
+        chunk_id,
+        None,
+        None,
+        None,
+        None,
+    );
+    let query_id = swarm
+        .behaviour_mut()
+        .kad
+        .get_providers(provider_record_key(provider_record_id(chunk_id)));
+    loop_state.pending_queries.insert(
+        query_id,
+        PendingProviderQuery {
+            fetch_token,
+            chunk_id,
+            max_len,
+            expected_mtime,
+            trace,
+            response,
+            deadline: Instant::now() + loop_state.discovery_timeout,
+        },
+    );
 }
 
 fn handle_connection_established(
@@ -2887,7 +2953,7 @@ fn handle_connection_closed(peer_id: PeerId, loop_state: &mut NetworkLoopState) 
     loop_state.peer_data_ports.remove(&peer_id);
     loop_state
         .peer_block_tickets
-        .retain(|(peer, _), _| *peer != peer_id);
+        .retain(|(peer, _, _, _), _| *peer != peer_id);
     loop_state.stream_unsupported_peers.remove(&peer_id);
     for providers in loop_state.provider_cache.values_mut() {
         providers.peers.remove(&peer_id);
@@ -2942,7 +3008,7 @@ struct NetworkLoopState {
     peer_ewma: HashMap<PeerId, PeerEwma>,
     peer_remote_addrs: HashMap<PeerId, Multiaddr>,
     peer_data_ports: HashMap<PeerId, u16>,
-    peer_block_tickets: HashMap<(PeerId, ProviderRecordId), [u8; 16]>,
+    peer_block_tickets: HashMap<(PeerId, ProviderRecordId, String, i64), [u8; 16]>,
     stream_unsupported_peers: HashSet<PeerId>,
     stream_dispatch_txs: Vec<mpsc::Sender<StreamFetchDispatch>>,
     data_dispatch_txs: Vec<mpsc::Sender<DataPlaneFetchDispatch>>,
@@ -3055,6 +3121,7 @@ fn bootstrap_and_listen_swarm(
 async fn run_network_loop(
     conf: ClientP2pConf,
     cache_manager: Arc<CacheManager>,
+    pending_fetched: Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
     hot_published_chunks: Arc<FastDashMap<ChunkId, HotPublishedChunk>>,
     data_plane: DataPlaneState,
     mut command_rx: mpsc::Receiver<NetworkCommand>,
@@ -3142,6 +3209,7 @@ async fn run_network_loop(
                         stream,
                         data_plane.clone(),
                         cache_manager.clone(),
+                        pending_fetched.clone(),
                         hot_published_chunks.clone(),
                         Arc::clone(&init.tenant_whitelist),
                         conf.clone(),
@@ -3207,6 +3275,7 @@ async fn run_network_loop(
                     conf: &conf,
                     data_plane: &data_plane,
                     cache_manager: &cache_manager,
+                    pending_fetched: &pending_fetched,
                     hot_published_chunks: &hot_published_chunks,
                     init: &init,
                     loop_state: &mut loop_state,
@@ -3241,6 +3310,7 @@ fn handle_incoming_stream_fetch_request(
     mut stream: libp2p::swarm::Stream,
     data_plane: DataPlaneState,
     cache_manager: Arc<CacheManager>,
+    pending_fetched: Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
     hot_published_chunks: Arc<FastDashMap<ChunkId, HotPublishedChunk>>,
     tenant_whitelist: Arc<HashSet<String>>,
     conf: ClientP2pConf,
@@ -3266,6 +3336,7 @@ fn handle_incoming_stream_fetch_request(
             } else {
                 prepare_incoming_fetch_response(
                     &data_plane,
+                    pending_fetched.as_ref(),
                     &cache_manager,
                     hot_published_chunks.as_ref(),
                     tenant_whitelist.as_ref(),
@@ -3299,6 +3370,7 @@ fn handle_data_plane_connection(
     stream: TcpStream,
     data_plane: DataPlaneState,
     cache_manager: Arc<CacheManager>,
+    pending_fetched: Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
     hot_published_chunks: Arc<FastDashMap<ChunkId, HotPublishedChunk>>,
     tenant_whitelist: Arc<HashSet<String>>,
     conf: ClientP2pConf,
@@ -3338,6 +3410,7 @@ fn handle_data_plane_connection(
             } else {
                 let mut prepared = prepare_incoming_fetch_response(
                     &data_plane,
+                    pending_fetched.as_ref(),
                     &cache_manager,
                     hot_published_chunks.as_ref(),
                     tenant_whitelist.as_ref(),
@@ -3430,6 +3503,10 @@ fn build_network_behaviour(
         )],
         req_config.clone(),
     );
+    let identify_behaviour = identify::Behaviour::new(
+        identify::Config::new("/curvine/p2p/identify/1".to_string(), key.public())
+            .with_push_listen_addr_updates(true),
+    );
     let mdns_behaviour = if conf.enable_mdns {
         Toggle::from(Some(mdns::tokio::Behaviour::new(
             mdns::Config::default(),
@@ -3442,6 +3519,7 @@ fn build_network_behaviour(
     Ok(P2pNetworkBehaviour {
         request_response: request_response_behaviour,
         stream: p2p_stream::Behaviour::new(),
+        identify: identify_behaviour,
         mdns: mdns_behaviour,
         kad: kad_behaviour,
     })
@@ -3528,6 +3606,44 @@ fn strip_peer_id(addr: &Multiaddr) -> Multiaddr {
         result.push(protocol);
     }
     result
+}
+
+fn identify_dial_addr(listen_addr: &Multiaddr, remote_addr: &Multiaddr) -> Option<Multiaddr> {
+    let remote_ip = remote_addr.iter().find_map(|protocol| match protocol {
+        Protocol::Ip4(value) => Some(IpAddr::V4(value)),
+        Protocol::Ip6(value) => Some(IpAddr::V6(value)),
+        _ => None,
+    })?;
+    let mut result = Multiaddr::empty();
+    let mut has_ip = false;
+    for protocol in strip_peer_id(listen_addr).iter() {
+        match protocol {
+            Protocol::Ip4(value) => {
+                has_ip = true;
+                result.push(Protocol::Ip4(if value.is_unspecified() {
+                    match remote_ip {
+                        IpAddr::V4(remote) => remote,
+                        IpAddr::V6(_) => return None,
+                    }
+                } else {
+                    value
+                }));
+            }
+            Protocol::Ip6(value) => {
+                has_ip = true;
+                result.push(Protocol::Ip6(if value.is_unspecified() {
+                    match remote_ip {
+                        IpAddr::V6(remote) => remote,
+                        IpAddr::V4(_) => return None,
+                    }
+                } else {
+                    value
+                }));
+            }
+            protocol => result.push(protocol),
+        }
+    }
+    has_ip.then_some(result)
 }
 
 fn enable_quic_transport(conf: &ClientP2pConf) -> bool {
@@ -3823,7 +3939,12 @@ fn dispatch_fetch_request(
             && loop_state.peer_data_ports.contains_key(&peer_id)
             && loop_state
                 .peer_block_tickets
-                .contains_key(&(peer_id, provider_record_id(pending.chunk_id)));
+                .contains_key(&peer_block_ticket_key(
+                    peer_id,
+                    pending.chunk_id,
+                    pending.trace.tenant_id.as_str(),
+                    pending.expected_mtime,
+                ));
         if let Some(dispatch) = data_plane_ready
             .then(|| {
                 build_data_plane_fetch_dispatch(
@@ -3873,6 +3994,19 @@ fn dispatch_fetch_request(
         loop_state.pending_requests.insert(request_id, pending);
         return;
     }
+    if pending.defer_dht && conf.enable_dht {
+        enqueue_provider_query(
+            swarm,
+            loop_state,
+            pending.fetch_token,
+            pending.chunk_id,
+            pending.max_len,
+            pending.expected_mtime,
+            pending.trace,
+            pending.response,
+        );
+        return;
+    }
     emit_p2p_trace(
         "connect",
         "no_candidate",
@@ -3896,9 +4030,12 @@ fn build_data_plane_fetch_dispatch(
         loop_state.peer_remote_addrs.get(&peer_id)?,
         *loop_state.peer_data_ports.get(&peer_id)?,
     )?;
-    let ticket = *loop_state
-        .peer_block_tickets
-        .get(&(peer_id, provider_record_id(pending.chunk_id)))?;
+    let ticket = *loop_state.peer_block_tickets.get(&peer_block_ticket_key(
+        peer_id,
+        pending.chunk_id,
+        pending.trace.tenant_id.as_str(),
+        pending.expected_mtime,
+    ))?;
     Some(DataPlaneFetchDispatch {
         request_id: loop_state.next_data_request_id,
         peer: peer_id,
@@ -4174,6 +4311,7 @@ struct RequestResponseEventCtx<'a> {
     swarm: &'a mut libp2p::Swarm<P2pNetworkBehaviour>,
     data_plane: &'a DataPlaneState,
     cache_manager: &'a Arc<CacheManager>,
+    pending_fetched: &'a Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
     hot_published_chunks: &'a Arc<FastDashMap<ChunkId, HotPublishedChunk>>,
     conf: &'a ClientP2pConf,
     init: &'a NetworkInitState,
@@ -4223,6 +4361,7 @@ fn handle_request_response_event(
                 handle_incoming_fetch_request(
                     ctx.data_plane.clone(),
                     ctx.cache_manager.clone(),
+                    ctx.pending_fetched.clone(),
                     ctx.hot_published_chunks.clone(),
                     Arc::clone(&ctx.init.tenant_whitelist),
                     request,
@@ -4261,6 +4400,7 @@ fn handle_request_response_event(
 fn handle_incoming_fetch_request(
     data_plane: DataPlaneState,
     cache_manager: Arc<CacheManager>,
+    pending_fetched: Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
     hot_published_chunks: Arc<FastDashMap<ChunkId, HotPublishedChunk>>,
     tenant_whitelist: Arc<HashSet<String>>,
     request: ChunkFetchRequest,
@@ -4270,6 +4410,7 @@ fn handle_incoming_fetch_request(
     tokio::spawn(async move {
         let prepared = prepare_incoming_fetch_response(
             &data_plane,
+            pending_fetched.as_ref(),
             &cache_manager,
             hot_published_chunks.as_ref(),
             tenant_whitelist.as_ref(),
@@ -4283,6 +4424,7 @@ fn handle_incoming_fetch_request(
 
 fn prepare_incoming_fetch_response(
     data_plane: &DataPlaneState,
+    pending_fetched: &FastDashMap<ChunkId, PendingFetchedChunk>,
     cache_manager: &CacheManager,
     hot_published_chunks: &FastDashMap<ChunkId, HotPublishedChunk>,
     tenant_whitelist: &HashSet<String>,
@@ -4317,6 +4459,7 @@ fn prepare_incoming_fetch_response(
         };
     };
     let first_chunk = load_remote_response_chunk(
+        pending_fetched,
         cache_manager,
         hot_published_chunks,
         first_chunk_id,
@@ -4369,6 +4512,7 @@ fn prepare_incoming_fetch_response(
             break;
         };
         let chunk = load_remote_response_chunk(
+            pending_fetched,
             cache_manager,
             hot_published_chunks,
             chunk_id,
@@ -4504,6 +4648,7 @@ fn request_chunk_id(request: &ChunkFetchRequest, index: usize) -> Option<ChunkId
 }
 
 fn load_remote_response_chunk(
+    pending_fetched: &FastDashMap<ChunkId, PendingFetchedChunk>,
     cache_manager: &CacheManager,
     hot_published_chunks: &FastDashMap<ChunkId, HotPublishedChunk>,
     chunk_id: ChunkId,
@@ -4511,6 +4656,11 @@ fn load_remote_response_chunk(
     expected_mtime: Option<i64>,
     now_ms: i64,
 ) -> Option<ChunkFetchResponseChunk> {
+    if let Some(chunk) =
+        load_remote_pending_chunk(pending_fetched, chunk_id, max_len, expected_mtime)
+    {
+        return Some(chunk);
+    }
     let hot_chunk = hot_published_chunks
         .get(&chunk_id)
         .map(|chunk| chunk.clone());
@@ -4545,6 +4695,28 @@ fn load_remote_response_chunk(
         mtime: chunk.mtime,
         checksum: chunk.checksum,
         data: chunk.data,
+    })
+}
+
+fn load_remote_pending_chunk(
+    pending_fetched: &FastDashMap<ChunkId, PendingFetchedChunk>,
+    chunk_id: ChunkId,
+    max_len: usize,
+    expected_mtime: Option<i64>,
+) -> Option<ChunkFetchResponseChunk> {
+    let pending = pending_fetched.get(&chunk_id)?.clone();
+    if expected_mtime
+        .is_some_and(|expected| expected > 0 && pending.mtime > 0 && pending.mtime != expected)
+    {
+        return None;
+    }
+    let len = pending.data.len().min(max_len.max(1));
+    let data = pending.data.slice(0..len);
+    Some(ChunkFetchResponseChunk {
+        off: chunk_id.off,
+        mtime: pending.mtime,
+        checksum: sha256_bytes(data.as_ref()),
+        data,
     })
 }
 
@@ -4588,6 +4760,8 @@ fn handle_fetch_response_payload(
         loop_state,
         peer,
         pending.chunk_id,
+        pending.trace.tenant_id.as_str(),
+        pending.expected_mtime,
         response.data_port,
         response.ticket,
     );
@@ -4696,6 +4870,8 @@ fn cache_peer_data_route(
     loop_state: &mut NetworkLoopState,
     peer: PeerId,
     chunk_id: ChunkId,
+    tenant_id: &str,
+    expected_mtime: Option<i64>,
     data_port: u16,
     ticket: [u8; 16],
 ) {
@@ -4703,10 +4879,25 @@ fn cache_peer_data_route(
         loop_state.peer_data_ports.insert(peer, data_port);
     }
     if ticket != EMPTY_DATA_PLANE_TICKET {
-        loop_state
-            .peer_block_tickets
-            .insert((peer, provider_record_id(chunk_id)), ticket);
+        loop_state.peer_block_tickets.insert(
+            peer_block_ticket_key(peer, chunk_id, tenant_id, expected_mtime),
+            ticket,
+        );
     }
+}
+
+fn peer_block_ticket_key(
+    peer: PeerId,
+    chunk_id: ChunkId,
+    tenant_id: &str,
+    expected_mtime: Option<i64>,
+) -> (PeerId, ProviderRecordId, String, i64) {
+    (
+        peer,
+        provider_record_id(chunk_id),
+        tenant_id.trim().to_string(),
+        expected_mtime.unwrap_or(0),
+    )
 }
 
 fn handle_stream_fetch_outcome(
@@ -4795,9 +4986,12 @@ fn handle_data_plane_fetch_outcome(
             .entry(outcome.peer)
             .or_default()
             .observe_failure();
-        loop_state
-            .peer_block_tickets
-            .remove(&(outcome.peer, provider_record_id(pending.chunk_id)));
+        loop_state.peer_block_tickets.remove(&peer_block_ticket_key(
+            outcome.peer,
+            pending.chunk_id,
+            pending.trace.tenant_id.as_str(),
+            pending.expected_mtime,
+        ));
     }
     pending.started_at = Instant::now();
     dispatch_fetch_request(swarm, pending, init, loop_state, conf);
@@ -4969,6 +5163,7 @@ fn expire_pending_queries(
                     response: pending.response,
                     candidates,
                     active_peer: None,
+                    defer_dht: false,
                     started_at: now,
                     deadline: now + loop_state.transfer_timeout,
                 },
@@ -5640,11 +5835,44 @@ mod tests {
     }
 
     #[test]
+    fn identify_dial_addr_uses_remote_ip_for_unspecified_listen_addr() {
+        let listen_addr =
+            Multiaddr::from_str("/ip4/0.0.0.0/tcp/31001").expect("listen addr should parse");
+        let remote_addr =
+            Multiaddr::from_str("/ip4/172.29.0.11/tcp/49822").expect("remote addr should parse");
+        assert_eq!(
+            identify_dial_addr(&listen_addr, &remote_addr),
+            Some(
+                Multiaddr::from_str("/ip4/172.29.0.11/tcp/31001")
+                    .expect("normalized addr should parse")
+            )
+        );
+    }
+
+    #[test]
+    fn identify_dial_addr_strips_peer_id_suffix() {
+        let listen_addr = Multiaddr::from_str(
+            "/ip4/172.29.0.11/tcp/31001/p2p/12D3KooWQdB3bVnqJjREd3m7v6ybVNewc19hXtF87mpy4VbQJu1A",
+        )
+        .expect("listen addr should parse");
+        let remote_addr =
+            Multiaddr::from_str("/ip4/172.29.0.11/tcp/49822").expect("remote addr should parse");
+        assert_eq!(
+            identify_dial_addr(&listen_addr, &remote_addr),
+            Some(
+                Multiaddr::from_str("/ip4/172.29.0.11/tcp/31001")
+                    .expect("normalized addr should parse")
+            )
+        );
+    }
+
+    #[test]
     fn control_plane_response_redirects_to_data_plane_when_available() {
         let conf = test_conf("control-plane-redirect");
         let data_plane = DataPlaneState::new(&conf);
         data_plane.port.store(31_002, Ordering::Relaxed);
         let cache_manager = CacheManager::new(&conf);
+        let pending_fetched = FastDashMap::default();
         let hot_published_chunks = FastDashMap::default();
         let chunk_id = ChunkId::with_version(1, 2, 3, 0);
         let data = Bytes::from_static(b"hello");
@@ -5654,6 +5882,7 @@ mod tests {
         assert_eq!(stored, CachePutResultTag::Stored);
         let prepared = prepare_incoming_fetch_response(
             &data_plane,
+            &pending_fetched,
             &cache_manager,
             &hot_published_chunks,
             &HashSet::new(),
@@ -5683,9 +5912,11 @@ mod tests {
         let data_plane = DataPlaneState::new(&conf);
         data_plane.port.store(31_002, Ordering::Relaxed);
         let cache_manager = CacheManager::new(&conf);
+        let pending_fetched = FastDashMap::default();
         let hot_published_chunks = FastDashMap::default();
         let prepared = prepare_incoming_fetch_response(
             &data_plane,
+            &pending_fetched,
             &cache_manager,
             &hot_published_chunks,
             &HashSet::new(),
@@ -5742,6 +5973,7 @@ mod tests {
         let data_plane = DataPlaneState::new(&conf);
         data_plane.port.store(31_002, Ordering::Relaxed);
         let cache_manager = CacheManager::new(&conf);
+        let pending_fetched = FastDashMap::default();
         let hot_published_chunks = FastDashMap::default();
         let chunk_id = ChunkId::with_version(1, 2, 3, 0);
         let data = Bytes::from_static(b"hello");
@@ -5751,6 +5983,7 @@ mod tests {
         assert_eq!(stored, CachePutResultTag::Stored);
         let prepared = prepare_incoming_fetch_response(
             &data_plane,
+            &pending_fetched,
             &cache_manager,
             &hot_published_chunks,
             &HashSet::new(),
@@ -5774,6 +6007,129 @@ mod tests {
         assert!(data_plane.tickets.is_empty());
     }
 
+    #[test]
+    fn control_plane_response_redirects_with_pending_published_first_chunk() {
+        let conf = test_conf("control-plane-pending-redirect");
+        let data_plane = DataPlaneState::new(&conf);
+        data_plane.port.store(31_002, Ordering::Relaxed);
+        let cache_manager = CacheManager::new(&conf);
+        let pending_fetched = FastDashMap::default();
+        let hot_published_chunks = FastDashMap::default();
+        let chunk_id = ChunkId::with_version(1, 2, 3, 0);
+        pending_fetched.insert(
+            chunk_id,
+            PendingFetchedChunk {
+                data: Bytes::from_static(b"hello"),
+                mtime: 9,
+                persist_token: 41,
+            },
+        );
+        let prepared = prepare_incoming_fetch_response(
+            &data_plane,
+            &pending_fetched,
+            &cache_manager,
+            &hot_published_chunks,
+            &HashSet::new(),
+            ChunkFetchRequest {
+                file_id: 1,
+                version_epoch: 2,
+                block_id: 3,
+                off: 0,
+                len: 5,
+                expected_mtime: 9,
+                prefetch_count: 0,
+                tenant_id: String::new(),
+            },
+            7,
+            true,
+        );
+        assert_eq!(prepared.response.data_port, 31_002);
+        assert_ne!(prepared.response.ticket, EMPTY_DATA_PLANE_TICKET);
+        assert!(prepared.response.chunks.is_empty());
+    }
+
+    #[test]
+    fn control_plane_response_returns_pending_published_chunk_before_persist() {
+        let conf = test_conf("control-plane-pending-data");
+        let data_plane = DataPlaneState::new(&conf);
+        let cache_manager = CacheManager::new(&conf);
+        let pending_fetched = FastDashMap::default();
+        let hot_published_chunks = FastDashMap::default();
+        let chunk_id = ChunkId::with_version(1, 2, 3, 0);
+        pending_fetched.insert(
+            chunk_id,
+            PendingFetchedChunk {
+                data: Bytes::from_static(b"hello"),
+                mtime: 9,
+                persist_token: 41,
+            },
+        );
+        let prepared = prepare_incoming_fetch_response(
+            &data_plane,
+            &pending_fetched,
+            &cache_manager,
+            &hot_published_chunks,
+            &HashSet::new(),
+            ChunkFetchRequest {
+                file_id: 1,
+                version_epoch: 2,
+                block_id: 3,
+                off: 0,
+                len: 5,
+                expected_mtime: 9,
+                prefetch_count: 0,
+                tenant_id: String::new(),
+            },
+            7,
+            false,
+        );
+        assert_eq!(prepared.response.chunks.len(), 1);
+        assert_eq!(
+            prepared.response.chunks[0].data,
+            Bytes::from_static(b"hello")
+        );
+        assert_eq!(prepared.response.chunks[0].mtime, 9);
+    }
+    #[test]
+    fn cached_data_plane_ticket_is_not_reused_across_tenants_or_mtime() {
+        let conf = test_conf("data-plane-ticket-scope");
+        let mut loop_state = NetworkLoopState::new(&conf);
+        let peer = new_peer_id();
+        let chunk_id = ChunkId::with_version(1, 2, 3, 0);
+        let ticket = [9u8; 16];
+        let (response, _rx) = oneshot::channel();
+        loop_state
+            .peer_remote_addrs
+            .insert(peer, "/ip4/127.0.0.1/tcp/4001".parse().unwrap());
+        loop_state.peer_data_ports.insert(peer, 31_002);
+        loop_state.peer_block_tickets.insert(
+            peer_block_ticket_key(peer, chunk_id, "tenant-a", Some(11)),
+            ticket,
+        );
+        let pending = PendingFetchRequest {
+            fetch_token: 1,
+            chunk_id,
+            max_len: 128,
+            expected_mtime: Some(22),
+            trace: TraceLabels {
+                trace_id: String::new(),
+                tenant_id: "tenant-b".to_string(),
+                job_id: String::new(),
+                sampled: false,
+            },
+            response,
+            candidates: VecDeque::new(),
+            active_peer: None,
+            defer_dht: false,
+            started_at: Instant::now(),
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+
+        assert!(
+            build_data_plane_fetch_dispatch(&loop_state, peer, &pending, 1).is_none(),
+            "ticket cache must not be reused across tenant or mtime changes"
+        );
+    }
     #[tokio::test]
     async fn expire_pending_query_timeout_falls_back_to_connected_peers() {
         let conf = test_conf("query-timeout-fallback");
