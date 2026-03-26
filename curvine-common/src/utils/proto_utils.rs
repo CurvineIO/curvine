@@ -878,7 +878,7 @@ mod tests {
         let src = MasterInfo {
             p2p_policy_version: 7,
             p2p_peer_whitelist: vec![
-                "12D3KooWJ8v1tDU6yE2y9JAzobYjGg9VG7z6gK5yR2rKfZ9W8f2A".to_string(),
+                "12D3KooWJ8v1tDU6yE2y9JAzobYjGg9VG7z6gK5yR2rKfZ9W8f2A".to_string()
             ],
             p2p_tenant_whitelist: vec!["tenant-a".to_string(), "tenant-b".to_string()],
             ..Default::default()
