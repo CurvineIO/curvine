@@ -240,8 +240,10 @@ mod tests {
 
     #[test]
     fn running_services_share_published_chunks_and_cleanup_on_stop() {
-        let mut conf = ClientP2pConf::default();
-        conf.enable = true;
+        let conf = ClientP2pConf {
+            enable: true,
+            ..ClientP2pConf::default()
+        };
         let publisher = P2pService::new(conf.clone());
         let consumer = P2pService::new(conf);
         assert!(publisher.start());
