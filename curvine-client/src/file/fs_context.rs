@@ -311,19 +311,26 @@ impl FsContext {
     pub fn start_clean_task(fs: CurvineFileSystem, pool: Arc<BlockClientPool>) {
         let metric_report_enable = fs.conf().client.metric_report_enable;
         let interval = fs.conf().client.clean_task_interval;
-        let fs_context = fs.fs_context.clone();
         let rt = fs.clone_runtime();
-        let metrics_fs = fs.clone();
+        let fs_context = Arc::downgrade(&fs.fs_context);
+        let metrics_context = fs_context.clone();
+        let pool = Arc::downgrade(&pool);
 
         rt.spawn(async move {
             let mut interval = tokio::time::interval(interval);
             loop {
                 interval.tick().await;
 
+                let Some(pool) = pool.upgrade() else {
+                    break;
+                };
                 pool.clear_idle_conn();
 
                 if metric_report_enable {
-                    if let Err(e) = metrics_fs.metrics_report().await {
+                    let Some(fs_context) = metrics_context.upgrade() else {
+                        break;
+                    };
+                    if let Err(e) = metrics_report(&fs_context).await {
                         warn!("metrics report: {}", e)
                     }
                 }
@@ -331,15 +338,22 @@ impl FsContext {
         });
 
         rt.spawn(async move {
-            if let Err(e) = sync_p2p_runtime_policy(&fs_context).await {
+            let Some(startup_fs_context) = fs_context.upgrade() else {
+                return;
+            };
+            if let Err(e) = sync_p2p_runtime_policy(&startup_fs_context).await {
                 warn!("sync p2p runtime policy: {}", e)
             }
+            drop(startup_fs_context);
 
             let mut interval = tokio::time::interval(interval);
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if let Err(e) = sync_p2p_runtime_policy(&fs_context).await {
+                let Some(runtime_fs_context) = fs_context.upgrade() else {
+                    break;
+                };
+                if let Err(e) = sync_p2p_runtime_policy(&runtime_fs_context).await {
                     warn!("sync p2p runtime policy: {}", e)
                 }
             }
@@ -371,13 +385,34 @@ async fn sync_p2p_runtime_policy(fs_context: &Arc<FsContext>) -> FsResult<()> {
     }
 }
 
+async fn metrics_report(fs_context: &Arc<FsContext>) -> FsResult<()> {
+    let metrics = ClientMetrics::encode()?;
+    FsClient::new(fs_context.clone())
+        .metrics_report(metrics)
+        .await
+}
+
+impl Drop for FsContext {
+    fn drop(&mut self) {
+        if let Some(service) = self.p2p_service.as_ref() {
+            service.stop();
+        }
+        self.block_pool.shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FsContext, ReadChunkKey};
+    use crate::block::BlockClient;
+    use crate::file::CurvineFileSystem;
     use crate::p2p::{ChunkId, P2pState};
     use bytes::Bytes;
     use curvine_common::conf::ClusterConf;
-    use std::sync::Arc;
+    use curvine_common::state::WorkerAddress;
+    use orpc::runtime::RpcRuntime;
+    use std::sync::{Arc, Weak};
+    use std::time::Duration;
 
     #[test]
     fn fs_context_skips_p2p_service_when_disabled() {
@@ -422,5 +457,40 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let fetched = rt.block_on(service_b.fetch_chunk(chunk_id, data.len(), Some(99)));
         assert_eq!(fetched, Some(data));
+    }
+
+    #[test]
+    fn clean_tasks_do_not_keep_fs_context_alive() {
+        let conf = ClusterConf::default();
+        let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+        let fs = CurvineFileSystem::with_rt(conf, rt.clone()).expect("fs should build");
+        let weak = Arc::downgrade(&fs.fs_context);
+
+        drop(fs);
+        rt.block_on(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn drop_shutdown_clears_idle_block_pool_cycles() {
+        let conf = ClusterConf::default();
+        let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+        let ctx = Arc::new(FsContext::with_rt(conf, rt).expect("fs context should build"));
+        let weak_pool: Weak<_> = Arc::downgrade(&ctx.block_pool);
+
+        let mut client = BlockClient::new_for_test(WorkerAddress {
+            worker_id: 1,
+            ..WorkerAddress::default()
+        });
+        client.set_pool(ctx.block_pool.clone());
+        ctx.block_pool.release(client);
+        assert_eq!(ctx.block_pool.idle_conn(), 1);
+
+        drop(ctx);
+
+        assert!(weak_pool.upgrade().is_none());
     }
 }
