@@ -117,9 +117,10 @@ mod tests {
 
     #[test]
     fn enabled_service_transitions_between_stopped_and_running() {
-        let mut conf = ClientP2pConf::default();
-        conf.enable = true;
-        let service = P2pService::new(conf);
+        let service = P2pService::new(ClientP2pConf {
+            enable: true,
+            ..ClientP2pConf::default()
+        });
         assert_eq!(service.state(), P2pState::Stopped);
         assert!(service.start());
         assert_eq!(service.state(), P2pState::Running);
