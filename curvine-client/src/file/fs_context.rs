@@ -198,27 +198,22 @@ impl FsContext {
         &self.read_accelerator
     }
 
-    #[allow(dead_code)]
     pub(crate) fn p2p_state(&self) -> Option<P2pState> {
         self.read_accelerator.p2p_state()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn p2p_peer_id(&self) -> Option<String> {
         self.read_accelerator.p2p_peer_id()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn p2p_bootstrap_peer_addr(&self) -> Option<String> {
         self.read_accelerator.p2p_bootstrap_peer_addr()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn p2p_stats_snapshot(&self) -> Option<P2pStatsSnapshot> {
         self.read_accelerator.p2p_stats_snapshot()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn p2p_runtime_policy_version(&self) -> Option<u64> {
         self.read_accelerator.p2p_runtime_policy_version()
     }
