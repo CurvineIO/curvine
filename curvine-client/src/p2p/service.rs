@@ -458,6 +458,64 @@ fn decode_response_header(
     Ok((chunk_count, data_port, ticket))
 }
 
+async fn read_exact_bytes<T>(io: &mut T, len: usize) -> std::io::Result<Bytes>
+where
+    T: futures::AsyncRead + Unpin + Send,
+{
+    if len == 0 {
+        return Ok(Bytes::new());
+    }
+    let mut buf = Vec::with_capacity(len);
+    let uninit = &mut buf.spare_capacity_mut()[..len];
+    let bytes = unsafe { std::slice::from_raw_parts_mut(uninit.as_mut_ptr().cast::<u8>(), len) };
+    io.read_exact(bytes).await?;
+    unsafe {
+        buf.set_len(len);
+    }
+    Ok(Bytes::from(buf))
+}
+
+async fn read_response_header_frame<T>(io: &mut T) -> std::io::Result<(usize, u16, [u8; 16])>
+where
+    T: futures::AsyncRead + Unpin + Send,
+{
+    let mut header = [0u8; RESPONSE_FIXED_BYTES];
+    io.read_exact(&mut header).await?;
+    decode_response_header(header)
+}
+
+async fn read_response_item_frame<T>(
+    io: &mut T,
+    total_len: &mut usize,
+    response_size_maximum: usize,
+) -> std::io::Result<ChunkFetchResponseChunk>
+where
+    T: futures::AsyncRead + Unpin + Send,
+{
+    let mut item_header = [0u8; RESPONSE_ITEM_FIXED_BYTES];
+    io.read_exact(&mut item_header).await?;
+    let off = i64::from_le_bytes(item_header[0..8].try_into().unwrap());
+    let mtime = i64::from_le_bytes(item_header[8..16].try_into().unwrap());
+    let checksum_len = u16::from_le_bytes(item_header[16..18].try_into().unwrap()) as usize;
+    let data_len = u32::from_le_bytes(item_header[18..22].try_into().unwrap()) as usize;
+    *total_len = total_len
+        .saturating_add(RESPONSE_ITEM_FIXED_BYTES)
+        .saturating_add(checksum_len)
+        .saturating_add(data_len);
+    if *total_len > response_size_maximum {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "response frame exceeds maximum size",
+        ));
+    }
+    Ok(ChunkFetchResponseChunk {
+        off,
+        mtime,
+        checksum: read_exact_bytes(io, checksum_len).await?,
+        data: read_exact_bytes(io, data_len).await?,
+    })
+}
+
 fn encode_data_plane_request(
     request: &DataPlaneFetchRequest,
 ) -> [u8; DATA_PLANE_REQUEST_FIXED_BYTES] {
@@ -578,38 +636,13 @@ impl request_response::Codec for ChunkTransferCodec {
     where
         T: futures::AsyncRead + Unpin + Send,
     {
-        let mut header = [0u8; RESPONSE_FIXED_BYTES];
-        io.read_exact(&mut header).await?;
-        let (chunk_count, data_port, ticket) = decode_response_header(header)?;
+        let (chunk_count, data_port, ticket) = read_response_header_frame(io).await?;
         let mut chunks = Vec::with_capacity(chunk_count);
         let mut total_len = RESPONSE_FIXED_BYTES;
         for _ in 0..chunk_count {
-            let mut item_header = [0u8; RESPONSE_ITEM_FIXED_BYTES];
-            io.read_exact(&mut item_header).await?;
-            let off = i64::from_le_bytes(item_header[0..8].try_into().unwrap());
-            let mtime = i64::from_le_bytes(item_header[8..16].try_into().unwrap());
-            let checksum_len = u16::from_le_bytes(item_header[16..18].try_into().unwrap()) as usize;
-            let data_len = u32::from_le_bytes(item_header[18..22].try_into().unwrap()) as usize;
-            total_len = total_len
-                .saturating_add(RESPONSE_ITEM_FIXED_BYTES)
-                .saturating_add(checksum_len)
-                .saturating_add(data_len);
-            if total_len > self.response_size_maximum {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "response frame exceeds maximum size",
-                ));
-            }
-            let mut checksum = vec![0u8; checksum_len];
-            io.read_exact(&mut checksum).await?;
-            let mut data = vec![0u8; data_len];
-            io.read_exact(&mut data).await?;
-            chunks.push(ChunkFetchResponseChunk {
-                off,
-                mtime,
-                checksum: Bytes::from(checksum),
-                data: Bytes::from(data),
-            });
+            chunks.push(
+                read_response_item_frame(io, &mut total_len, self.response_size_maximum).await?,
+            );
         }
         Ok(ChunkFetchResponse {
             data_port,
@@ -802,7 +835,8 @@ struct StreamFetchDispatch {
 struct DataPlaneFetchOutcome {
     request_id: u64,
     peer: PeerId,
-    response: Option<ChunkFetchResponse>,
+    chunk: Option<FetchedChunk>,
+    recv: usize,
 }
 
 struct DataPlaneFetchDispatch {
@@ -840,9 +874,31 @@ struct PrefetchedChunk {
 }
 
 #[derive(Clone)]
-struct PendingFetchedChunk {
-    data: Bytes,
-    mtime: i64,
+enum PendingFetchedChunk {
+    Ready {
+        data: Bytes,
+        mtime: i64,
+        persist_token: u64,
+    },
+    Loading(Arc<PendingFetchedLoading>),
+}
+
+#[derive(Clone)]
+struct PendingFetchedLoading {
+    receiver: watch::Receiver<PendingFetchedLoadingState>,
+    persist_token: u64,
+}
+
+#[derive(Clone)]
+enum PendingFetchedLoadingState {
+    Pending,
+    Ready { data: Bytes, mtime: i64 },
+    Failed,
+}
+
+struct PendingFetchedPlaceholder {
+    chunk_id: ChunkId,
+    sender: watch::Sender<PendingFetchedLoadingState>,
     persist_token: u64,
 }
 
@@ -867,6 +923,23 @@ struct HotPublishedChunk {
 struct CachedProviders {
     peers: HashSet<PeerId>,
     expire_at: Instant,
+}
+
+impl PendingFetchedChunk {
+    fn ready(data: Bytes, mtime: i64, persist_token: u64) -> Self {
+        Self::Ready {
+            data,
+            mtime,
+            persist_token,
+        }
+    }
+
+    fn persist_token(&self) -> u64 {
+        match self {
+            PendingFetchedChunk::Ready { persist_token, .. } => *persist_token,
+            PendingFetchedChunk::Loading(loading) => loading.persist_token,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -899,7 +972,7 @@ pub struct P2pService {
     network_ready_notify: Arc<Notify>,
     network_tx: Mutex<Option<mpsc::Sender<NetworkCommand>>>,
     fetch_tokens: AtomicU64,
-    persist_tokens: AtomicU64,
+    persist_tokens: Arc<AtomicU64>,
     network_warmup_done: AtomicBool,
     runtime_policy_version: AtomicU64,
     runtime_policy_applied: AtomicBool,
@@ -949,7 +1022,7 @@ impl P2pService {
             network_ready_notify: Arc::new(Notify::new()),
             network_tx: Mutex::new(None),
             fetch_tokens: AtomicU64::new(1),
-            persist_tokens: AtomicU64::new(1),
+            persist_tokens: Arc::new(AtomicU64::new(1)),
             network_warmup_done: AtomicBool::new(false),
             runtime_policy_version: AtomicU64::new(runtime_policy_version),
             runtime_policy_applied: AtomicBool::new(runtime_policy_version == 0),
@@ -1222,7 +1295,10 @@ impl P2pService {
         let pending_usage_bytes: u64 = self
             .pending_fetched
             .iter()
-            .map(|entry| entry.value().data.len() as u64)
+            .map(|entry| match entry.value() {
+                PendingFetchedChunk::Ready { data, .. } => data.len() as u64,
+                PendingFetchedChunk::Loading(_) => 0,
+            })
             .sum();
         let cache_usage_bytes = cache_snapshot
             .usage_bytes
@@ -1422,7 +1498,10 @@ impl P2pService {
         let trace = TraceLabels::from_context(fetch_token, context, &self.conf);
         let lookup_start = LocalTime::nanos();
 
-        if let Some(chunk) = self.pending_fetched_chunk(chunk_id, max_len, expected_mtime) {
+        if let Some(chunk) = self
+            .pending_fetched_chunk(chunk_id, max_len, expected_mtime)
+            .await
+        {
             emit_p2p_trace(
                 "cache_get",
                 "pending_hit",
@@ -1484,7 +1563,10 @@ impl P2pService {
             return Some(chunk.data);
         }
 
-        if let Some(chunk) = self.pending_fetched_chunk(chunk_id, max_len, expected_mtime) {
+        if let Some(chunk) = self
+            .pending_fetched_chunk(chunk_id, max_len, expected_mtime)
+            .await
+        {
             emit_p2p_trace(
                 "cache_get",
                 "pending_hit_after_flight",
@@ -1925,6 +2007,13 @@ impl P2pService {
         let cache_manager = self.cache_manager.clone();
         let pending_fetched = self.pending_fetched.clone();
         let hot_published_chunks = self.hot_published_chunks.clone();
+        let fetched_persist_txs = self
+            .fetched_persist_txs
+            .lock()
+            .ok()
+            .map(|persist_txs| persist_txs.clone())
+            .unwrap_or_default();
+        let persist_tokens = self.persist_tokens.clone();
         let data_plane = self.data_plane.clone();
         let network_ready_notify = self.network_ready_notify.clone();
         let network_state = self.network_state.clone();
@@ -1935,6 +2024,8 @@ impl P2pService {
                 cache_manager,
                 pending_fetched,
                 hot_published_chunks,
+                fetched_persist_txs,
+                persist_tokens,
                 data_plane,
                 rx,
                 network_state,
@@ -1999,33 +2090,67 @@ impl P2pService {
         transfer_timeout(&self.conf)
     }
 
-    fn pending_fetched_chunk(
+    fn ready_pending_fetched_chunk(
+        &self,
+        data: Bytes,
+        mtime: i64,
+        max_len: usize,
+        expected_mtime: Option<i64>,
+    ) -> Option<Bytes> {
+        if expected_mtime.is_some_and(|expected| expected > 0 && mtime > 0 && mtime != expected) {
+            self.network_mtime_mismatches
+                .fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let len = data.len().min(max_len.max(1));
+        Some(data.slice(0..len))
+    }
+
+    async fn pending_fetched_chunk(
         &self,
         chunk_id: ChunkId,
         max_len: usize,
         expected_mtime: Option<i64>,
     ) -> Option<Bytes> {
-        let pending = self.pending_fetched.get(&chunk_id)?;
-        if expected_mtime
-            .is_some_and(|expected| expected > 0 && pending.mtime > 0 && pending.mtime != expected)
-        {
-            self.network_mtime_mismatches
-                .fetch_add(1, Ordering::Relaxed);
-            return None;
+        let pending = self.pending_fetched.get(&chunk_id)?.clone();
+        match pending {
+            PendingFetchedChunk::Ready { data, mtime, .. } => {
+                self.ready_pending_fetched_chunk(data, mtime, max_len, expected_mtime)
+            }
+            PendingFetchedChunk::Loading(loading) => {
+                let mut receiver = loading.receiver.clone();
+                let wait = timeout(self.transfer_timeout(), async {
+                    loop {
+                        let state = receiver.borrow().clone();
+                        match state {
+                            PendingFetchedLoadingState::Pending => {
+                                if receiver.changed().await.is_err() {
+                                    return None;
+                                }
+                            }
+                            PendingFetchedLoadingState::Ready { data, mtime } => {
+                                return self.ready_pending_fetched_chunk(
+                                    data,
+                                    mtime,
+                                    max_len,
+                                    expected_mtime,
+                                );
+                            }
+                            PendingFetchedLoadingState::Failed => return None,
+                        }
+                    }
+                })
+                .await;
+                wait.ok().flatten()
+            }
         }
-        let len = pending.data.len().min(max_len.max(1));
-        Some(pending.data.slice(0..len))
     }
 
     fn persist_fetched_chunk(&self, chunk_id: ChunkId, data: Bytes, mtime: i64, checksum: Bytes) {
         let persist_token = self.next_persist_token();
         self.pending_fetched.insert(
             chunk_id,
-            PendingFetchedChunk {
-                data: data.clone(),
-                mtime,
-                persist_token,
-            },
+            PendingFetchedChunk::ready(data.clone(), mtime, persist_token),
         );
         let request = PendingFetchedPersist {
             chunk_id,
@@ -2254,8 +2379,54 @@ fn cleanup_pending_fetched_entry(
     persist_token: u64,
 ) {
     let _ = pending_fetched.remove_if(&chunk_id, |_, current| {
-        current.persist_token == persist_token
+        current.persist_token() == persist_token
     });
+}
+
+fn new_pending_fetched_placeholder(
+    chunk_id: ChunkId,
+    persist_token: u64,
+) -> (PendingFetchedChunk, PendingFetchedPlaceholder) {
+    let (sender, receiver) = watch::channel(PendingFetchedLoadingState::Pending);
+    (
+        PendingFetchedChunk::Loading(Arc::new(PendingFetchedLoading {
+            receiver,
+            persist_token,
+        })),
+        PendingFetchedPlaceholder {
+            chunk_id,
+            sender,
+            persist_token,
+        },
+    )
+}
+
+fn fulfill_pending_fetched_placeholder(
+    pending_fetched: &FastDashMap<ChunkId, PendingFetchedChunk>,
+    placeholder: PendingFetchedPlaceholder,
+    data: Bytes,
+    mtime: i64,
+) {
+    let _ = placeholder.sender.send(PendingFetchedLoadingState::Ready {
+        data: data.clone(),
+        mtime,
+    });
+    pending_fetched.insert(
+        placeholder.chunk_id,
+        PendingFetchedChunk::ready(data, mtime, placeholder.persist_token),
+    );
+}
+
+fn fail_pending_fetched_placeholder(
+    pending_fetched: &FastDashMap<ChunkId, PendingFetchedChunk>,
+    placeholder: PendingFetchedPlaceholder,
+) {
+    let _ = placeholder.sender.send(PendingFetchedLoadingState::Failed);
+    cleanup_pending_fetched_entry(
+        pending_fetched,
+        placeholder.chunk_id,
+        placeholder.persist_token,
+    );
 }
 
 fn compact_fetched_persist_batch(
@@ -3180,6 +3351,8 @@ async fn run_network_loop(
     cache_manager: Arc<CacheManager>,
     pending_fetched: Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
     hot_published_chunks: Arc<FastDashMap<ChunkId, HotPublishedChunk>>,
+    fetched_persist_txs: Vec<mpsc::Sender<PendingFetchedPersist>>,
+    persist_tokens: Arc<AtomicU64>,
     data_plane: DataPlaneState,
     mut command_rx: mpsc::Receiver<NetworkCommand>,
     network_state: Arc<NetworkState>,
@@ -3234,6 +3407,10 @@ async fn run_network_loop(
         loop_state.data_dispatch_txs.push(dispatch_tx);
         tokio::spawn(run_data_plane_fetch_worker(
             conf.clone(),
+            cache_manager.clone(),
+            pending_fetched.clone(),
+            fetched_persist_txs.clone(),
+            persist_tokens.clone(),
             dispatch_rx,
             data_result_tx.clone(),
         ));
@@ -3754,11 +3931,7 @@ where
         let persist_token = next_persist_token();
         pending_entries.push((
             item.chunk_id,
-            PendingFetchedChunk {
-                data: item.data.clone(),
-                mtime: item.mtime,
-                persist_token,
-            },
+            PendingFetchedChunk::ready(item.data.clone(), item.mtime, persist_token),
         ));
         completed.push((item.chunk_id, persist_token));
     }
@@ -4310,20 +4483,215 @@ async fn run_stream_fetch_worker(
     }
 }
 
+fn data_plane_request_chunk_id(request: &DataPlaneFetchRequest, index: usize) -> Option<ChunkId> {
+    let step = i64::try_from(request.len.max(1)).ok()?;
+    let idx = i64::try_from(index).ok()?;
+    let off = request.off.checked_add(step.checked_mul(idx)?)?;
+    Some(ChunkId::with_version(
+        request.file_id,
+        request.version_epoch,
+        request.block_id,
+        off,
+    ))
+}
+
+fn enqueue_pending_fetched_persist_request(
+    persist_txs: &[mpsc::Sender<PendingFetchedPersist>],
+    request: PendingFetchedPersist,
+) -> Result<(), PendingFetchedPersist> {
+    if persist_txs.is_empty() {
+        return Err(request);
+    }
+    let worker_idx = fetched_persist_worker_index(request.chunk_id, persist_txs.len());
+    match persist_txs[worker_idx].try_send(request) {
+        Ok(_) => Ok(()),
+        Err(TrySendError::Full(request)) | Err(TrySendError::Closed(request)) => Err(request),
+    }
+}
+
+fn spawn_direct_fetched_persist(
+    cache_manager: Arc<CacheManager>,
+    pending_fetched: Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
+    request: PendingFetchedPersist,
+) {
+    tokio::spawn(async move {
+        let chunk_id = request.chunk_id;
+        let persist_token = request.persist_token;
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = cache_manager.put_fetched_with_result_and_checksum(
+                request.chunk_id,
+                request.data,
+                request.mtime,
+                Some(request.checksum),
+            );
+        })
+        .await;
+        cleanup_pending_fetched_entry(&pending_fetched, chunk_id, persist_token);
+    });
+}
+
+fn fail_pending_fetched_placeholders(
+    pending_fetched: &FastDashMap<ChunkId, PendingFetchedChunk>,
+    placeholders: VecDeque<PendingFetchedPlaceholder>,
+) {
+    for placeholder in placeholders {
+        fail_pending_fetched_placeholder(pending_fetched, placeholder);
+    }
+}
+
+async fn stream_data_plane_response<T>(
+    io: &mut T,
+    dispatch: &DataPlaneFetchDispatch,
+    response_limit: usize,
+    pending_fetched: Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
+    persist_tokens: &AtomicU64,
+    data_result_tx: &mpsc::Sender<DataPlaneFetchOutcome>,
+    enable_checksum: bool,
+    persist_txs: &[mpsc::Sender<PendingFetchedPersist>],
+    cache_manager: Arc<CacheManager>,
+    first_chunk_sent: &mut bool,
+) -> std::io::Result<usize>
+where
+    T: futures::AsyncRead + Unpin + Send,
+{
+    let (chunk_count, _, _) = read_response_header_frame(io).await?;
+    let mut placeholders = VecDeque::with_capacity(chunk_count.saturating_sub(1));
+    for idx in 1..chunk_count {
+        let Some(chunk_id) = data_plane_request_chunk_id(&dispatch.request, idx) else {
+            fail_pending_fetched_placeholders(pending_fetched.as_ref(), placeholders);
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "invalid data plane chunk index",
+            ));
+        };
+        let persist_token = persist_tokens.fetch_add(1, Ordering::Relaxed);
+        let (pending, placeholder) = new_pending_fetched_placeholder(chunk_id, persist_token);
+        pending_fetched.insert(chunk_id, pending);
+        placeholders.push_back(placeholder);
+    }
+
+    let mut total_len = RESPONSE_FIXED_BYTES;
+    let mut prefetched = 0usize;
+    for idx in 0..chunk_count {
+        let item = match read_response_item_frame(io, &mut total_len, response_limit).await {
+            Ok(item) => item,
+            Err(e) => {
+                fail_pending_fetched_placeholders(pending_fetched.as_ref(), placeholders);
+                return Err(e);
+            }
+        };
+        let Some(expected_chunk_id) = data_plane_request_chunk_id(&dispatch.request, idx) else {
+            fail_pending_fetched_placeholders(pending_fetched.as_ref(), placeholders);
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "invalid data plane response offset",
+            ));
+        };
+        if item.off != expected_chunk_id.off {
+            fail_pending_fetched_placeholders(pending_fetched.as_ref(), placeholders);
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "unexpected data plane chunk order",
+            ));
+        }
+        if idx == 0 {
+            if item.data.is_empty() {
+                fail_pending_fetched_placeholders(pending_fetched.as_ref(), placeholders);
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "missing requested data plane chunk",
+                ));
+            }
+            let len = item.data.len().min(dispatch.request.len.max(1));
+            let data = item.data.slice(0..len);
+            let checksum = if item.checksum.is_empty() || len == item.data.len() {
+                item.checksum
+            } else {
+                sha256_bytes(data.as_ref())
+            };
+            data_result_tx
+                .send(DataPlaneFetchOutcome {
+                    request_id: dispatch.request_id,
+                    peer: dispatch.peer,
+                    chunk: Some(FetchedChunk {
+                        data,
+                        mtime: item.mtime,
+                        checksum,
+                        prefetched: Vec::new(),
+                    }),
+                    recv: total_len,
+                })
+                .await
+                .map_err(|_| {
+                    Error::new(ErrorKind::BrokenPipe, "data plane result channel closed")
+                })?;
+            *first_chunk_sent = true;
+            continue;
+        }
+        let Some(placeholder) = placeholders.pop_front() else {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "missing data plane placeholder",
+            ));
+        };
+        let resolved_mtime = if item.mtime > 0 {
+            item.mtime
+        } else {
+            dispatch.request.expected_mtime.max(0)
+        };
+        let valid_mtime = dispatch.request.expected_mtime <= 0
+            || resolved_mtime <= 0
+            || resolved_mtime == dispatch.request.expected_mtime;
+        if item.data.is_empty() || !valid_mtime || (enable_checksum && item.checksum.is_empty()) {
+            fail_pending_fetched_placeholder(pending_fetched.as_ref(), placeholder);
+            continue;
+        }
+        let persist_request = PendingFetchedPersist {
+            chunk_id: placeholder.chunk_id,
+            data: item.data.clone(),
+            mtime: resolved_mtime,
+            checksum: item.checksum.clone(),
+            persist_token: placeholder.persist_token,
+        };
+        fulfill_pending_fetched_placeholder(
+            pending_fetched.as_ref(),
+            placeholder,
+            item.data,
+            resolved_mtime,
+        );
+        prefetched += 1;
+        if let Err(request) = enqueue_pending_fetched_persist_request(persist_txs, persist_request)
+        {
+            spawn_direct_fetched_persist(cache_manager.clone(), pending_fetched.clone(), request);
+        }
+    }
+    if !*first_chunk_sent {
+        fail_pending_fetched_placeholders(pending_fetched.as_ref(), placeholders);
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "missing selected data plane chunk",
+        ));
+    }
+    Ok(prefetched)
+}
+
 async fn run_data_plane_fetch_worker(
     conf: ClientP2pConf,
+    cache_manager: Arc<CacheManager>,
+    pending_fetched: Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
+    fetched_persist_txs: Vec<mpsc::Sender<PendingFetchedPersist>>,
+    persist_tokens: Arc<AtomicU64>,
     mut dispatch_rx: mpsc::Receiver<DataPlaneFetchDispatch>,
     data_result_tx: mpsc::Sender<DataPlaneFetchOutcome>,
 ) {
     let timeout_budget = transfer_timeout(&conf);
     let response_limit = response_frame_limit_bytes(&conf);
-    let protocol = StreamProtocol::new(CHUNK_STREAM_PROTOCOL);
     let mut active_peer: Option<PeerId> = None;
     let mut active_endpoint: Option<SocketAddr> = None;
     let mut active_stream: Option<Compat<TcpStream>> = None;
     while let Some(dispatch) = dispatch_rx.recv().await {
-        let mut codec = ChunkTransferCodec::new(1024 * 1024, response_limit);
-        let mut response = None;
+        let mut first_chunk_sent = false;
+        let mut completed = false;
         let mut attempts = 0u8;
         while attempts < 2 {
             let need_open = active_stream.is_none()
@@ -4339,7 +4707,7 @@ async fn run_data_plane_fetch_worker(
                         active_endpoint = Some(dispatch.endpoint);
                         active_stream = Some(stream.compat());
                     }
-                    _ => break,
+                    Ok(Err(_)) | Err(_) => break,
                 }
             }
             let Some(stream) = active_stream.as_mut() else {
@@ -4358,14 +4726,31 @@ async fn run_data_plane_fetch_worker(
                 attempts += 1;
                 continue;
             }
-            response = timeout(
+            let streamed = timeout(
                 timeout_budget,
-                request_response::Codec::read_response(&mut codec, &protocol, stream),
+                stream_data_plane_response(
+                    stream,
+                    &dispatch,
+                    response_limit,
+                    pending_fetched.clone(),
+                    persist_tokens.as_ref(),
+                    &data_result_tx,
+                    conf.enable_checksum,
+                    &fetched_persist_txs,
+                    cache_manager.clone(),
+                    &mut first_chunk_sent,
+                ),
             )
-            .await
-            .ok()
-            .and_then(Result::ok);
-            if response.is_some() {
+            .await;
+            if matches!(streamed, Ok(Ok(_))) {
+                completed = true;
+                break;
+            }
+            if first_chunk_sent {
+                completed = true;
+                active_peer = None;
+                active_endpoint = None;
+                active_stream = None;
                 break;
             }
             active_peer = None;
@@ -4373,14 +4758,16 @@ async fn run_data_plane_fetch_worker(
             active_stream = None;
             attempts += 1;
         }
-        if data_result_tx
-            .send(DataPlaneFetchOutcome {
-                request_id: dispatch.request_id,
-                peer: dispatch.peer,
-                response,
-            })
-            .await
-            .is_err()
+        if !completed
+            && data_result_tx
+                .send(DataPlaneFetchOutcome {
+                    request_id: dispatch.request_id,
+                    peer: dispatch.peer,
+                    chunk: None,
+                    recv: 0,
+                })
+                .await
+                .is_err()
         {
             break;
         }
@@ -4787,19 +5174,23 @@ fn load_remote_pending_chunk(
     expected_mtime: Option<i64>,
 ) -> Option<ChunkFetchResponseChunk> {
     let pending = pending_fetched.get(&chunk_id)?.clone();
-    if expected_mtime
-        .is_some_and(|expected| expected > 0 && pending.mtime > 0 && pending.mtime != expected)
-    {
-        return None;
+    match pending {
+        PendingFetchedChunk::Ready { data, mtime, .. } => {
+            if expected_mtime.is_some_and(|expected| expected > 0 && mtime > 0 && mtime != expected)
+            {
+                return None;
+            }
+            let len = data.len().min(max_len.max(1));
+            let data = data.slice(0..len);
+            Some(ChunkFetchResponseChunk {
+                off: chunk_id.off,
+                mtime,
+                checksum: sha256_bytes(data.as_ref()),
+                data,
+            })
+        }
+        PendingFetchedChunk::Loading(_) => None,
     }
-    let len = pending.data.len().min(max_len.max(1));
-    let data = pending.data.slice(0..len);
-    Some(ChunkFetchResponseChunk {
-        off: chunk_id.off,
-        mtime: pending.mtime,
-        checksum: sha256_bytes(data.as_ref()),
-        data,
-    })
 }
 
 struct IncomingFetchResponseCtx<'a> {
@@ -5044,14 +5435,33 @@ fn handle_data_plane_fetch_outcome(
     };
     release_peer_inflight(&pending, &mut loop_state.inflight_per_peer);
     pending.active_peer = None;
-    if let Some(response) = outcome.response {
-        if let Some(next_pending) =
-            handle_fetch_response_payload(pending, outcome.peer, response, loop_state, stats)
-        {
-            pending = next_pending;
-        } else {
-            return;
-        }
+    if let Some(chunk) = outcome.chunk {
+        let elapsed = pending.started_at.elapsed();
+        let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+        let recv = outcome.recv.max(chunk.data.len());
+        stats.bytes_recv.fetch_add(recv as u64, Ordering::Relaxed);
+        stats.latency_us_total.fetch_add(
+            elapsed.as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+        stats.latency_samples.fetch_add(1, Ordering::Relaxed);
+        loop_state
+            .peer_ewma
+            .entry(outcome.peer)
+            .or_default()
+            .observe_success(elapsed_ms, recv);
+        emit_p2p_trace(
+            "transfer",
+            "response_ok",
+            &pending.trace,
+            pending.chunk_id,
+            Some(&outcome.peer),
+            Some(elapsed_ms),
+            Some(recv),
+            None,
+        );
+        let _ = pending.response.send(Some(chunk));
+        return;
     } else {
         emit_p2p_trace(
             "transfer",
@@ -5874,13 +6284,31 @@ mod tests {
         });
         assert_eq!(pending_entries.len(), 2);
         assert_eq!(pending_entries[0].0, chunk_a);
-        assert_eq!(pending_entries[0].1.data, Bytes::from_static(b"a"));
-        assert_eq!(pending_entries[0].1.mtime, 7);
-        assert_eq!(pending_entries[0].1.persist_token, 41);
+        match &pending_entries[0].1 {
+            PendingFetchedChunk::Ready {
+                data,
+                mtime,
+                persist_token,
+            } => {
+                assert_eq!(*data, Bytes::from_static(b"a"));
+                assert_eq!(*mtime, 7);
+                assert_eq!(*persist_token, 41);
+            }
+            PendingFetchedChunk::Loading(_) => panic!("batch entries should be ready"),
+        }
         assert_eq!(pending_entries[1].0, chunk_b);
-        assert_eq!(pending_entries[1].1.data, Bytes::from_static(b"b"));
-        assert_eq!(pending_entries[1].1.mtime, 8);
-        assert_eq!(pending_entries[1].1.persist_token, 42);
+        match &pending_entries[1].1 {
+            PendingFetchedChunk::Ready {
+                data,
+                mtime,
+                persist_token,
+            } => {
+                assert_eq!(*data, Bytes::from_static(b"b"));
+                assert_eq!(*mtime, 8);
+                assert_eq!(*persist_token, 42);
+            }
+            PendingFetchedChunk::Loading(_) => panic!("batch entries should be ready"),
+        }
         assert_eq!(completed, vec![(chunk_a, 41), (chunk_b, 42)]);
     }
 
@@ -6124,11 +6552,7 @@ mod tests {
         let chunk_id = ChunkId::with_version(1, 2, 3, 0);
         pending_fetched.insert(
             chunk_id,
-            PendingFetchedChunk {
-                data: Bytes::from_static(b"hello"),
-                mtime: 9,
-                persist_token: 41,
-            },
+            PendingFetchedChunk::ready(Bytes::from_static(b"hello"), 9, 41),
         );
         let prepared = prepare_incoming_fetch_response(
             &data_plane,
@@ -6164,11 +6588,7 @@ mod tests {
         let chunk_id = ChunkId::with_version(1, 2, 3, 0);
         pending_fetched.insert(
             chunk_id,
-            PendingFetchedChunk {
-                data: Bytes::from_static(b"hello"),
-                mtime: 9,
-                persist_token: 41,
-            },
+            PendingFetchedChunk::ready(Bytes::from_static(b"hello"), 9, 41),
         );
         let prepared = prepare_incoming_fetch_response(
             &data_plane,
@@ -6236,6 +6656,148 @@ mod tests {
             "ticket cache must not be reused across tenant or mtime changes"
         );
     }
+
+    #[tokio::test]
+    async fn pending_fetched_loading_waits_until_ready() {
+        let service = P2pService::new(test_conf("pending-fetched-loading"));
+        let chunk_id = ChunkId::with_version(1, 2, 3, 0);
+        let (pending, placeholder) = new_pending_fetched_placeholder(chunk_id, 7);
+        service.pending_fetched.insert(chunk_id, pending);
+        let pending_fetched = service.pending_fetched.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            fulfill_pending_fetched_placeholder(
+                &pending_fetched,
+                placeholder,
+                Bytes::from_static(b"payload"),
+                9,
+            );
+        });
+        let bytes = service
+            .pending_fetched_chunk(chunk_id, 7, Some(9))
+            .await
+            .expect("loading entry should resolve");
+        assert_eq!(bytes, Bytes::from_static(b"payload"));
+    }
+
+    #[tokio::test]
+    async fn stream_data_plane_response_emits_first_chunk_before_tail_finishes() {
+        let service = P2pService::new(test_conf("data-plane-streaming"));
+        let dispatch = DataPlaneFetchDispatch {
+            request_id: 11,
+            peer: new_peer_id(),
+            endpoint: SocketAddr::from(([127, 0, 0, 1], 31002)),
+            request: DataPlaneFetchRequest {
+                ticket: EMPTY_DATA_PLANE_TICKET,
+                file_id: 1,
+                version_epoch: 2,
+                block_id: 3,
+                off: 0,
+                len: 7,
+                expected_mtime: 9,
+                prefetch_count: 1,
+            },
+        };
+        let (client, server) = tokio::io::duplex(4096);
+        let (outcome_tx, mut outcome_rx) = mpsc::channel(1);
+        let pending_fetched = service.pending_fetched.clone();
+        let cache_manager = service.cache_manager.clone();
+        let persist_tokens = AtomicU64::new(100);
+        let response_limit = response_frame_limit_bytes(&service.conf);
+        let stream_task = tokio::spawn(async move {
+            let mut client = client.compat();
+            let mut first_chunk_sent = false;
+            stream_data_plane_response(
+                &mut client,
+                &dispatch,
+                response_limit,
+                pending_fetched,
+                &persist_tokens,
+                &outcome_tx,
+                true,
+                &[],
+                cache_manager,
+                &mut first_chunk_sent,
+            )
+            .await
+        });
+        let writer = tokio::spawn(async move {
+            let mut server = server.compat();
+            server
+                .write_all(&encode_response_header(2, 0, EMPTY_DATA_PLANE_TICKET))
+                .await
+                .expect("header should write");
+            let first = ChunkFetchResponseChunk {
+                off: 0,
+                mtime: 9,
+                checksum: Bytes::from_static(b"first-checksum"),
+                data: Bytes::from_static(b"chunk-0"),
+            };
+            let first_checksum_len = u16::try_from(first.checksum.len()).expect("fits u16");
+            let first_data_len = u32::try_from(first.data.len()).expect("fits u32");
+            let mut first_header = [0u8; RESPONSE_ITEM_FIXED_BYTES];
+            first_header[0..8].copy_from_slice(&first.off.to_le_bytes());
+            first_header[8..16].copy_from_slice(&first.mtime.to_le_bytes());
+            first_header[16..18].copy_from_slice(&first_checksum_len.to_le_bytes());
+            first_header[18..22].copy_from_slice(&first_data_len.to_le_bytes());
+            server
+                .write_all(&first_header)
+                .await
+                .expect("first header should write");
+            server
+                .write_all(first.checksum.as_ref())
+                .await
+                .expect("first checksum should write");
+            server
+                .write_all(first.data.as_ref())
+                .await
+                .expect("first data should write");
+            sleep(Duration::from_millis(50)).await;
+            let second = ChunkFetchResponseChunk {
+                off: 7,
+                mtime: 9,
+                checksum: Bytes::from_static(b"second-checksum"),
+                data: Bytes::from_static(b"chunk-1"),
+            };
+            let second_checksum_len = u16::try_from(second.checksum.len()).expect("fits u16");
+            let second_data_len = u32::try_from(second.data.len()).expect("fits u32");
+            let mut second_header = [0u8; RESPONSE_ITEM_FIXED_BYTES];
+            second_header[0..8].copy_from_slice(&second.off.to_le_bytes());
+            second_header[8..16].copy_from_slice(&second.mtime.to_le_bytes());
+            second_header[16..18].copy_from_slice(&second_checksum_len.to_le_bytes());
+            second_header[18..22].copy_from_slice(&second_data_len.to_le_bytes());
+            server
+                .write_all(&second_header)
+                .await
+                .expect("second header should write");
+            server
+                .write_all(second.checksum.as_ref())
+                .await
+                .expect("second checksum should write");
+            server
+                .write_all(second.data.as_ref())
+                .await
+                .expect("second data should write");
+        });
+
+        timeout(Duration::from_millis(20), outcome_rx.recv())
+            .await
+            .expect("first chunk should arrive before tail is fully streamed")
+            .expect("worker should emit an outcome");
+        writer.await.expect("writer should finish");
+        let prefetched = stream_task
+            .await
+            .expect("stream task should join")
+            .expect("streaming should succeed");
+        assert_eq!(prefetched, 1);
+        let chunk_id = ChunkId::with_version(1, 2, 3, 7);
+        let bytes = service
+            .pending_fetched_chunk(chunk_id, 7, Some(9))
+            .await
+            .expect("tail chunk should become visible");
+        assert_eq!(bytes, Bytes::from_static(b"chunk-1"));
+    }
+
     #[tokio::test]
     async fn expire_pending_query_timeout_falls_back_to_connected_peers() {
         let conf = test_conf("query-timeout-fallback");
