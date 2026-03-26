@@ -14,6 +14,7 @@
 
 use crate::block::{BlockClient, BlockClientPool};
 use crate::file::CurvineFileSystem;
+use crate::p2p::P2pService;
 use crate::ClientMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::ClientAddressProto;
@@ -47,6 +48,7 @@ pub struct FsContext {
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
+    pub(crate) p2p_service: Option<Arc<P2pService>>,
 }
 
 impl FsContext {
@@ -90,6 +92,11 @@ impl FsContext {
             conf.client.block_conn_idle_size,
             conf.client.block_conn_idle_time.as_millis() as u64,
         ));
+        let p2p_service = conf
+            .client
+            .p2p
+            .enable
+            .then(|| Arc::new(P2pService::new(conf.client.p2p.clone())));
 
         let context = Self {
             conf,
@@ -98,6 +105,7 @@ impl FsContext {
             os_cache,
             failed_workers: exclude_workers,
             block_pool,
+            p2p_service,
         };
         Ok(context)
     }
@@ -174,6 +182,10 @@ impl FsContext {
         self.os_cache.clone()
     }
 
+    pub fn p2p_service(&self) -> Option<Arc<P2pService>> {
+        self.p2p_service.clone()
+    }
+
     pub fn get_metrics<'a>() -> &'a ClientMetrics {
         CLIENT_METRICS.get().expect("client get metrics error!")
     }
@@ -222,5 +234,31 @@ impl FsContext {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FsContext;
+    use crate::p2p::P2pState;
+    use curvine_common::conf::ClusterConf;
+    use std::sync::Arc;
+
+    #[test]
+    fn fs_context_skips_p2p_service_when_disabled() {
+        let conf = ClusterConf::default();
+        let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+        let ctx = FsContext::with_rt(conf, rt).expect("fs context should build");
+        assert!(ctx.p2p_service().is_none());
+    }
+
+    #[test]
+    fn fs_context_creates_p2p_service_when_enabled() {
+        let mut conf = ClusterConf::default();
+        conf.client.p2p.enable = true;
+        let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+        let ctx = FsContext::with_rt(conf, rt).expect("fs context should build");
+        let service = ctx.p2p_service().expect("p2p service should exist");
+        assert_eq!(service.state(), P2pState::Stopped);
     }
 }
