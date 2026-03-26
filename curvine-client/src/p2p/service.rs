@@ -15,10 +15,13 @@
 use crate::p2p::{CacheSnapshot, ChunkId, DiscoverySnapshot};
 use bytes::Bytes;
 use curvine_common::conf::ClientP2pConf;
+use curvine_common::utils::CommonUtils;
 use once_cell::sync::Lazy;
 use orpc::sync::FastDashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, Clone)]
 struct PublishedChunk {
@@ -61,6 +64,10 @@ pub struct P2pService {
     service_id: u64,
     published_bytes: AtomicU64,
     published_chunks: FastDashMap<ChunkId, usize>,
+    peer_whitelist: Mutex<Vec<String>>,
+    tenant_whitelist: Mutex<HashSet<String>>,
+    runtime_policy_version: AtomicU64,
+    runtime_policy_lock: AsyncMutex<()>,
 }
 
 impl P2pService {
@@ -70,6 +77,8 @@ impl P2pService {
         } else {
             P2pState::Disabled
         };
+        let peer_whitelist = conf.peer_whitelist.clone();
+        let tenant_whitelist: HashSet<String> = conf.tenant_whitelist.iter().cloned().collect();
         Self {
             conf,
             state: AtomicU8::new(state as u8),
@@ -77,6 +86,10 @@ impl P2pService {
             service_id: NEXT_SERVICE_ID.fetch_add(1, Ordering::Relaxed),
             published_bytes: AtomicU64::new(0),
             published_chunks: FastDashMap::default(),
+            peer_whitelist: Mutex::new(peer_whitelist),
+            tenant_whitelist: Mutex::new(tenant_whitelist),
+            runtime_policy_version: AtomicU64::new(0),
+            runtime_policy_lock: AsyncMutex::new(()),
         }
     }
 
@@ -135,7 +148,20 @@ impl P2pService {
     }
 
     pub fn publish_chunk(&self, chunk_id: ChunkId, data: Bytes, mtime: i64) -> bool {
+        self.publish_chunk_for_tenant(chunk_id, data, mtime, None)
+    }
+
+    pub fn publish_chunk_for_tenant(
+        &self,
+        chunk_id: ChunkId,
+        data: Bytes,
+        mtime: i64,
+        tenant_id: Option<&str>,
+    ) -> bool {
         if !self.is_running() || data.is_empty() {
+            return false;
+        }
+        if !self.is_tenant_allowed(tenant_id) {
             return false;
         }
 
@@ -164,7 +190,21 @@ impl P2pService {
         max_len: usize,
         expected_mtime: Option<i64>,
     ) -> Option<Bytes> {
+        self.fetch_chunk_for_tenant(chunk_id, max_len, expected_mtime, None)
+            .await
+    }
+
+    pub async fn fetch_chunk_for_tenant(
+        &self,
+        chunk_id: ChunkId,
+        max_len: usize,
+        expected_mtime: Option<i64>,
+        tenant_id: Option<&str>,
+    ) -> Option<Bytes> {
         if !self.is_running() || max_len == 0 {
+            return None;
+        }
+        if !self.is_tenant_allowed(tenant_id) {
             return None;
         }
 
@@ -174,6 +214,56 @@ impl P2pService {
         }
 
         Some(chunk.data.slice(0..chunk.data.len().min(max_len)))
+    }
+
+    pub fn runtime_policy_version(&self) -> u64 {
+        self.runtime_policy_version.load(Ordering::Relaxed)
+    }
+
+    pub fn is_tenant_allowed(&self, tenant_id: Option<&str>) -> bool {
+        let tenant_whitelist = self
+            .tenant_whitelist
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if tenant_whitelist.is_empty() {
+            return true;
+        }
+        tenant_id.is_some_and(|tenant_id| tenant_whitelist.contains(tenant_id))
+    }
+
+    pub async fn sync_runtime_policy_from_master(
+        &self,
+        policy_version: u64,
+        peer_whitelist: Vec<String>,
+        tenant_whitelist: Vec<String>,
+        policy_signature: String,
+    ) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let _guard = self.runtime_policy_lock.lock().await;
+        if policy_version == 0 {
+            self.apply_runtime_policy(
+                0,
+                self.conf.peer_whitelist.clone(),
+                self.conf.tenant_whitelist.clone(),
+            );
+            return true;
+        }
+        if policy_version <= self.runtime_policy_version() {
+            return true;
+        }
+        if !CommonUtils::verify_p2p_policy_signatures(
+            &self.conf.policy_hmac_key,
+            policy_version,
+            &peer_whitelist,
+            &tenant_whitelist,
+            &policy_signature,
+        ) {
+            return false;
+        }
+        self.apply_runtime_policy(policy_version, peer_whitelist, tenant_whitelist);
+        true
     }
 
     fn clear_published_chunks(&self) {
@@ -194,6 +284,25 @@ impl P2pService {
         self.published_chunks.clear();
         self.published_bytes.store(0, Ordering::Relaxed);
     }
+
+    fn apply_runtime_policy(
+        &self,
+        version: u64,
+        peer_whitelist: Vec<String>,
+        tenant_whitelist: Vec<String>,
+    ) {
+        *self
+            .peer_whitelist
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = peer_whitelist;
+        *self
+            .tenant_whitelist
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            tenant_whitelist.into_iter().collect();
+        self.runtime_policy_version
+            .store(version, Ordering::Relaxed);
+    }
 }
 
 impl Drop for P2pService {
@@ -208,6 +317,7 @@ mod tests {
     use crate::p2p::ChunkId;
     use bytes::Bytes;
     use curvine_common::conf::ClientP2pConf;
+    use curvine_common::utils::CommonUtils;
     use std::sync::atomic::{AtomicI64, Ordering};
 
     static TEST_CHUNK_SEQ: AtomicI64 = AtomicI64::new(1);
@@ -261,5 +371,51 @@ mod tests {
 
         let after_stop = rt.block_on(consumer.fetch_chunk(chunk_id, 4, Some(7)));
         assert!(after_stop.is_none());
+    }
+
+    #[test]
+    fn signed_runtime_policy_updates_effective_tenant_whitelist() {
+        let mut conf = ClientP2pConf::default();
+        conf.enable = true;
+        conf.policy_hmac_key = "secret".to_string();
+        conf.tenant_whitelist = vec!["local-tenant".to_string()];
+        let service = P2pService::new(conf);
+        assert!(service.start());
+
+        let peers = vec!["peer-a".to_string()];
+        let tenants = vec!["runtime-tenant".to_string()];
+        let signature = CommonUtils::sign_p2p_policy("secret", 7, &peers, &tenants);
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        assert!(rt.block_on(service.sync_runtime_policy_from_master(7, peers, tenants, signature,)));
+
+        assert_eq!(service.runtime_policy_version(), 7);
+        assert!(service.is_tenant_allowed(Some("runtime-tenant")));
+        assert!(!service.is_tenant_allowed(Some("local-tenant")));
+    }
+
+    #[test]
+    fn runtime_policy_version_zero_restores_local_whitelist() {
+        let mut conf = ClientP2pConf::default();
+        conf.enable = true;
+        conf.policy_hmac_key = "secret".to_string();
+        conf.tenant_whitelist = vec!["local-tenant".to_string()];
+        let service = P2pService::new(conf);
+        assert!(service.start());
+
+        let peers = vec!["peer-a".to_string()];
+        let tenants = vec!["runtime-tenant".to_string()];
+        let signature = CommonUtils::sign_p2p_policy("secret", 3, &peers, &tenants);
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        assert!(rt.block_on(service.sync_runtime_policy_from_master(3, peers, tenants, signature,)));
+        assert!(rt.block_on(service.sync_runtime_policy_from_master(
+            0,
+            vec![],
+            vec![],
+            String::new(),
+        )));
+
+        assert_eq!(service.runtime_policy_version(), 0);
+        assert!(service.is_tenant_allowed(Some("local-tenant")));
+        assert!(!service.is_tenant_allowed(Some("runtime-tenant")));
     }
 }
