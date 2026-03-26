@@ -1057,6 +1057,30 @@ fn list_options() {
         let full = fs.list_status(&dir).await.unwrap();
         assert_eq!(full.len(), 5, "full list should have 5 entries");
 
+        // list file
+        let file1 = Path::from_str(format!("/fs_test/list_options/{}.log", 1)).unwrap();
+        let opts = ListOptions {
+            limit: Some(1),
+            start_after: None,
+        };
+        let list = fs.list_options(&file1, opts).await.unwrap();
+        assert_eq!(list.len(), 1);
+
+        let opts = ListOptions {
+            limit: Some(1),
+            start_after: Some("1.log".to_owned()),
+        };
+        let list = fs.list_options(&file1, opts).await.unwrap();
+        assert_eq!(list.len(), 0);
+
+        let opts = ListOptions {
+            limit: Some(1),
+            start_after: None,
+        };
+        let mut list_stream = fs.list_stream(&file1, opts).await.unwrap();
+        let list = list_stream.collect_vec().await.unwrap();
+        assert_eq!(list.len(), 1);
+
         // limit only
         let opts = ListOptions {
             limit: Some(2),

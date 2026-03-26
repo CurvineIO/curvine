@@ -1,5 +1,6 @@
 use axum::routing::get;
 use axum::Router;
+use curvine_client::file::FsContext;
 use std::net::SocketAddr;
 
 pub struct WebServer;
@@ -11,7 +12,7 @@ impl WebServer {
             .route("/healthz", get(|| async { "ok" }));
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        tracing::info!("FUSE metrics server listening on {}", addr);
+        log::info!("FUSE metrics server listening on {}", addr);
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
@@ -20,5 +21,7 @@ impl WebServer {
 }
 
 async fn metrics_handler() -> String {
-    orpc::common::Metrics::text_output().unwrap_or_else(|e| format!("Error: {}", e))
+    FsContext::get_metrics()
+        .text_output()
+        .unwrap_or_else(|e| format!("Error: {}", e))
 }

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::conf::ClusterConf;
 use orpc::common::{DurationUnit, FileUtils, LogConf, Utils};
 use orpc::sys::{CString, FFIUtils};
 use orpc::{err_box, sys, try_err, CommonResult};
@@ -151,6 +152,8 @@ pub struct FuseConf {
     #[serde(skip_serializing, skip_deserializing)]
     pub meta_cache_ttl_duration: Duration,
 
+    pub list_limit: usize,
+
     pub log: LogConf,
 }
 
@@ -288,7 +291,7 @@ impl Default for FuseConf {
             ac_attr_timeout: FuseConf::TTR_TIMEOUT,
             ac_attr_timeout_set: FuseConf::TTR_TIMEOUT,
             remember: false,
-            web_port: 9002,
+            web_port: ClusterConf::DEFAULT_FUSE_WEB_PORT,
 
             max_background: 256,
             congestion_threshold: 192,
@@ -314,6 +317,7 @@ impl Default for FuseConf {
             node_cache_ttl: Default::default(),
             meta_cache_ttl_duration: Default::default(),
 
+            list_limit: 1000,
             log: LogConf::default(),
         };
 
