@@ -3051,6 +3051,7 @@ fn bootstrap_and_listen_swarm(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_network_loop(
     conf: ClientP2pConf,
     cache_manager: Arc<CacheManager>,
@@ -3234,6 +3235,7 @@ async fn next_incoming_stream(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_incoming_stream_fetch_request(
     _peer: PeerId,
     mut stream: libp2p::swarm::Stream,
@@ -3540,10 +3542,13 @@ fn response_frame_limit_bytes(conf: &ClientP2pConf) -> usize {
     conf.cache_capacity.clamp(4 * 1024 * 1024, max_cap) as usize
 }
 
+type PendingFetchedEntries = Vec<(ChunkId, PendingFetchedChunk)>;
+type CompletedPendingFetchedEntries = Vec<(ChunkId, u64)>;
+
 fn build_pending_fetched_batch<F>(
     batch: &[FetchedCacheBatchItem],
     mut next_persist_token: F,
-) -> (Vec<(ChunkId, PendingFetchedChunk)>, Vec<(ChunkId, u64)>)
+) -> (PendingFetchedEntries, CompletedPendingFetchedEntries)
 where
     F: FnMut() -> u64,
 {
