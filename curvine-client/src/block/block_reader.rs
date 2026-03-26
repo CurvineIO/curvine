@@ -17,6 +17,7 @@ use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
 use crate::file::{FsContext, ReadChunkKey};
 use crate::p2p::ChunkId;
 use bytes::Bytes;
+use curvine_common::error::FsError;
 use curvine_common::state::{ClientAddress, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use log::warn;
@@ -57,6 +58,13 @@ impl ReaderAdapter {
             Local(r) => r.complete().await,
             Remote(r) => r.complete().await,
             Hole(r) => r.complete(),
+        }
+    }
+
+    async fn abort(&mut self) {
+        match self {
+            Local(_) | Hole(_) => {}
+            Remote(r) => r.abort().await,
         }
     }
 
@@ -391,36 +399,109 @@ impl BlockReader {
                     return Ok(chunk);
                 }
                 Err(e) => {
-                    if matches!(&self.inner, Hole(_)) || self.locs.is_empty() {
-                        return Err(e.ctx(format!(
-                            "failed to read block on {}",
-                            self.inner.worker_address()
-                        )));
-                    }
-
-                    warn!(
-                        "read data error block id {}, addr {}: {}",
-                        self.block_id(),
-                        self.inner.worker_address(),
-                        e
-                    );
-                    self.locs.retain(|x| x != self.inner.worker_address());
-                    self.inner = Self::get_reader(
-                        &self.locs,
-                        self.block.clone(),
-                        self.fs_context.clone(),
-                        self.pos(),
-                        self.len(),
-                    )
-                    .await?;
+                    self.handle_worker_read_error(e).await?;
                 }
             }
         }
+    }
+
+    async fn handle_worker_read_error(&mut self, e: FsError) -> FsResult<()> {
+        if matches!(&self.inner, Hole(_)) || self.locs.is_empty() {
+            return Err(e.ctx(format!(
+                "failed to read block on {}",
+                self.inner.worker_address()
+            )));
+        }
+
+        let failed_addr = self.inner.worker_address().clone();
+        warn!(
+            "read data error block id {}, addr {}: {}",
+            self.block_id(),
+            failed_addr,
+            e
+        );
+        self.inner.abort().await;
+        self.locs.retain(|x| x != &failed_addr);
+        if self.locs.is_empty() {
+            return Err(e.ctx(format!("failed to read block on {}", failed_addr)));
+        }
+        self.inner = Self::get_reader(
+            &self.locs,
+            self.block.clone(),
+            self.fs_context.clone(),
+            self.pos(),
+            self.len(),
+        )
+        .await?;
+        Ok(())
     }
 
     fn advance_cached_position(&mut self, len: usize) -> FsResult<()> {
         let next_pos = self.pos() + len as i64;
         self.inner.seek(next_pos)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::block_reader::ReaderAdapter::Remote;
+    use curvine_common::conf::ClusterConf;
+    use curvine_common::error::FsError;
+    use curvine_common::state::{
+        FileAllocMode, FileAllocOpts, FileType, StorageType, WorkerAddress,
+    };
+    use once_cell::sync::Lazy;
+
+    static TEST_RT: Lazy<Arc<Runtime>> = Lazy::new(|| {
+        let conf = ClusterConf::default();
+        Arc::new(conf.client_rpc_conf().create_runtime())
+    });
+
+    fn test_fs_context() -> Arc<FsContext> {
+        let conf = ClusterConf::default();
+        Arc::new(FsContext::with_rt(conf, TEST_RT.clone()).expect("fs context should build"))
+    }
+
+    fn test_worker(worker_id: u32) -> WorkerAddress {
+        WorkerAddress {
+            worker_id,
+            hostname: format!("worker-{}", worker_id),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: 8000 + worker_id,
+            web_port: 9000 + worker_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn last_replica_read_failure_does_not_turn_allocated_block_into_hole() {
+        let fs_context = test_fs_context();
+        let worker = test_worker(1);
+        let block = ExtendedBlock::with_alloc(
+            7,
+            4,
+            StorageType::Disk,
+            FileType::File,
+            Some(FileAllocOpts::with_alloc(4, FileAllocMode::ZERO_RANGE)),
+        );
+        let remote = BlockReaderRemote::new_for_test(block.clone(), worker.clone(), 0, 4);
+        let mut reader = BlockReader {
+            inner: Remote(remote),
+            locs: vec![worker],
+            block,
+            file_id: 11,
+            file_version_epoch: 3,
+            file_mtime: 17,
+            fs_context,
+        };
+
+        let err = reader
+            .handle_worker_read_error(FsError::common("boom"))
+            .await
+            .expect_err("last replica failure should surface as error");
+
+        assert!(matches!(reader.inner, Remote(_)));
+        assert!(err.to_string().contains("failed to read block"));
     }
 }

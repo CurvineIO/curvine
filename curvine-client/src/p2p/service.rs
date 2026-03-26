@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify, Semaphore};
 use tokio::time::{sleep, timeout};
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 
@@ -124,6 +124,8 @@ struct DataPlaneTicket {
 struct DataPlaneState {
     port: Arc<AtomicU64>,
     started: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    shutdown_tx: Arc<watch::Sender<bool>>,
     tickets: Arc<FastDashMap<[u8; 16], DataPlaneTicket>>,
     next_ticket: Arc<AtomicU64>,
     ticket_ttl_ms: i64,
@@ -132,9 +134,12 @@ struct DataPlaneState {
 
 impl DataPlaneState {
     fn new(conf: &ClientP2pConf) -> Self {
+        let (shutdown_tx, _) = watch::channel(false);
         Self {
             port: Arc::new(AtomicU64::new(0)),
             started: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+            shutdown_tx: Arc::new(shutdown_tx),
             tickets: Arc::new(FastDashMap::default()),
             next_ticket: Arc::new(AtomicU64::new(1)),
             ticket_ttl_ms: data_plane_ticket_ttl(conf).as_millis().max(1) as i64,
@@ -219,6 +224,30 @@ impl DataPlaneState {
             Ok(mut current) => *current = updated,
             Err(poisoned) => *poisoned.into_inner() = updated,
         }
+    }
+
+    fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    fn clear_shutdown(&self) {
+        if *self.shutdown_tx.borrow() {
+            let _ = self.shutdown_tx.send(false);
+        }
+    }
+
+    fn request_shutdown(&self) {
+        if !*self.shutdown_tx.borrow() {
+            let _ = self.shutdown_tx.send(true);
+        }
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 }
 
@@ -948,6 +977,7 @@ impl P2pService {
     pub fn start(&self) -> bool {
         if self.is_enabled() {
             self.stats();
+            self.data_plane.clear_shutdown();
             self.ensure_data_plane_started();
             self.network_warmup_done.store(false, Ordering::Relaxed);
             self.ensure_network_started();
@@ -962,6 +992,8 @@ impl P2pService {
             self.state.store(P2pState::Stopped as u8, Ordering::Relaxed);
             self.network_warmup_done.store(false, Ordering::Relaxed);
             PEER_STATS.remove(&self.peer_id);
+            self.data_plane.request_shutdown();
+            force_reset_data_plane_listener_state(&self.data_plane);
             self.data_plane.tickets.clear();
             self.stop_network();
         }
@@ -1802,6 +1834,7 @@ impl P2pService {
         {
             return;
         }
+        let generation = self.data_plane.next_generation();
         let data_plane = self.data_plane.clone();
         let cache_manager = self.cache_manager.clone();
         let pending_fetched = self.pending_fetched.clone();
@@ -1810,35 +1843,57 @@ impl P2pService {
         let conf = self.conf.clone();
         let stats = self.stats();
         let future = async move {
-            let listener = match TcpListener::bind(("0.0.0.0", 0)).await {
-                Ok(listener) => listener,
-                Err(e) => {
-                    data_plane.started.store(false, Ordering::Relaxed);
-                    warn!("failed to bind p2p data plane listener: {}", e);
-                    return;
-                }
-            };
-            if let Ok(addr) = listener.local_addr() {
-                data_plane.port.store(addr.port() as u64, Ordering::Relaxed);
-            }
+            let mut shutdown_rx = data_plane.subscribe_shutdown();
             loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => handle_data_plane_connection(
-                        stream,
-                        data_plane.clone(),
-                        cache_manager.clone(),
-                        pending_fetched.clone(),
-                        hot_published_chunks.clone(),
-                        tenant_whitelist.clone(),
-                        conf.clone(),
-                        stats.clone(),
-                    ),
+                let listener = match TcpListener::bind(("0.0.0.0", 0)).await {
+                    Ok(listener) => listener,
                     Err(e) => {
-                        warn!("p2p data plane accept failed: {}", e);
-                        break;
+                        clear_data_plane_listener_port(&data_plane, generation);
+                        warn!("failed to bind p2p data plane listener: {}", e);
+                        tokio::select! {
+                            _ = shutdown_rx.changed() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(200)) => continue,
+                        }
+                    }
+                };
+                if let Ok(addr) = listener.local_addr() {
+                    set_data_plane_listener_port(&data_plane, generation, addr.port());
+                }
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.changed() => {
+                            reset_data_plane_listener_state(&data_plane, generation);
+                            return;
+                        }
+                        accepted = listener.accept() => {
+                            match accepted {
+                                Ok((stream, _)) => handle_data_plane_connection(
+                                    stream,
+                                    data_plane.clone(),
+                                    cache_manager.clone(),
+                                    pending_fetched.clone(),
+                                    hot_published_chunks.clone(),
+                                    tenant_whitelist.clone(),
+                                    conf.clone(),
+                                    stats.clone(),
+                                ),
+                                Err(e) => {
+                                    clear_data_plane_listener_port(&data_plane, generation);
+                                    warn!("p2p data plane accept failed: {}", e);
+                                    tokio::select! {
+                                        _ = shutdown_rx.changed() => {
+                                            reset_data_plane_listener_state(&data_plane, generation);
+                                            return;
+                                        }
+                                        _ = tokio::time::sleep(Duration::from_millis(200)) => break,
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
+            reset_data_plane_listener_state(&data_plane, generation);
         };
         if let Some(runtime) = &self.runtime {
             runtime.spawn(future);
@@ -3572,6 +3627,28 @@ fn persist_runtime_policy_version(conf: &ClientP2pConf, policy_version: u64) -> 
         && fs::write(path, policy_version.to_string()).is_ok()
 }
 
+fn set_data_plane_listener_port(data_plane: &DataPlaneState, generation: u64, port: u16) {
+    if data_plane.generation() == generation {
+        data_plane.port.store(port as u64, Ordering::Relaxed);
+    }
+}
+
+fn clear_data_plane_listener_port(data_plane: &DataPlaneState, generation: u64) {
+    if data_plane.generation() == generation {
+        data_plane.port.store(0, Ordering::Relaxed);
+    }
+}
+
+fn force_reset_data_plane_listener_state(data_plane: &DataPlaneState) {
+    data_plane.port.store(0, Ordering::Relaxed);
+    data_plane.started.store(false, Ordering::Relaxed);
+}
+
+fn reset_data_plane_listener_state(data_plane: &DataPlaneState, generation: u64) {
+    if data_plane.generation() == generation {
+        force_reset_data_plane_listener_state(data_plane);
+    }
+}
 fn parse_bootstrap_peers(peers: &[String]) -> Vec<(PeerId, Multiaddr)> {
     peers
         .iter()
@@ -5467,6 +5544,30 @@ mod tests {
         TEST_RT.clone()
     }
 
+    async fn wait_for_data_plane_port(service: &P2pService, deadline: Duration) -> Option<u16> {
+        let started = Instant::now();
+        while started.elapsed() < deadline {
+            let port = service.data_plane.port();
+            if port > 0 && service.data_plane.started.load(Ordering::Relaxed) {
+                return Some(port);
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    async fn wait_for_data_plane_stopped(service: &P2pService, deadline: Duration) -> Option<()> {
+        let started = Instant::now();
+        while started.elapsed() < deadline {
+            if service.data_plane.port() == 0 && !service.data_plane.started.load(Ordering::Relaxed)
+            {
+                return Some(());
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        None
+    }
+
     #[test]
     fn empty_peer_whitelist_remains_open_after_bootstrap_merge() {
         let bootstrap_peer_ids = HashSet::from([new_peer_id()]);
@@ -6263,6 +6364,65 @@ mod tests {
         service.stop();
     }
 
+    #[test]
+    fn clear_data_plane_listener_port_keeps_task_started() {
+        let conf = test_conf("data-plane-reset");
+        let data_plane = DataPlaneState::new(&conf);
+        let generation = data_plane.next_generation();
+        data_plane.started.store(true, Ordering::Relaxed);
+        data_plane.port.store(31_002, Ordering::Relaxed);
+
+        clear_data_plane_listener_port(&data_plane, generation);
+
+        assert!(data_plane.started.load(Ordering::Relaxed));
+        assert_eq!(data_plane.port(), 0);
+    }
+    #[test]
+    fn stale_generation_cannot_reset_new_listener_state() {
+        let conf = test_conf("data-plane-generation");
+        let data_plane = DataPlaneState::new(&conf);
+        let stale_generation = data_plane.next_generation();
+        let current_generation = data_plane.next_generation();
+        data_plane.started.store(true, Ordering::Relaxed);
+        set_data_plane_listener_port(&data_plane, current_generation, 31_002);
+
+        reset_data_plane_listener_state(&data_plane, stale_generation);
+
+        assert!(data_plane.started.load(Ordering::Relaxed));
+        assert_eq!(data_plane.port(), 31_002);
+    }
+
+    #[tokio::test]
+    async fn data_plane_listener_stops_and_restarts_cleanly() {
+        let mut conf = test_conf("data-plane-lifecycle");
+        conf.enable = true;
+        conf.enable_mdns = false;
+        conf.enable_dht = false;
+
+        let service = P2pService::new_with_runtime(conf, Some(test_runtime()));
+        service.start();
+
+        let first_port = wait_for_data_plane_port(&service, Duration::from_secs(2))
+            .await
+            .expect("data plane should start");
+        assert!(first_port > 0);
+
+        service.stop();
+        wait_for_data_plane_stopped(&service, Duration::from_secs(2))
+            .await
+            .expect("data plane should stop");
+
+        service.start();
+        let restarted_port = wait_for_data_plane_port(&service, Duration::from_secs(2))
+            .await
+            .expect("data plane should restart");
+        assert!(restarted_port > 0);
+
+        service.stop();
+        wait_for_data_plane_stopped(&service, Duration::from_secs(2))
+            .await
+            .expect("data plane should stop after restart");
+    }
     #[tokio::test]
     async fn invalid_runtime_peer_whitelist_update_is_rejected() {
         let mut conf = test_conf("invalid-runtime-peer-whitelist");
