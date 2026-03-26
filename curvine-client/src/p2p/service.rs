@@ -694,6 +694,7 @@ struct P2pNetworkBehaviour {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum P2pNetworkEvent {
     RequestResponse(request_response::Event<ChunkFetchRequest, ChunkFetchResponse>),
     Identify(identify::Event),
@@ -2878,6 +2879,7 @@ fn negative_provider_cache_ttl_from_discovery(discovery_timeout: Duration) -> Du
     discovery_timeout
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enqueue_provider_query(
     swarm: &mut libp2p::Swarm<P2pNetworkBehaviour>,
     loop_state: &mut NetworkLoopState,
@@ -3366,6 +3368,7 @@ fn handle_incoming_stream_fetch_request(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_data_plane_connection(
     stream: TcpStream,
     data_plane: DataPlaneState,
@@ -4397,6 +4400,7 @@ fn handle_request_response_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_incoming_fetch_request(
     data_plane: DataPlaneState,
     cache_manager: Arc<CacheManager>,
@@ -4422,6 +4426,7 @@ fn handle_incoming_fetch_request(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_incoming_fetch_response(
     data_plane: &DataPlaneState,
     pending_fetched: &FastDashMap<ChunkId, PendingFetchedChunk>,
