@@ -15,11 +15,12 @@
 use crate::block::BatchBlockWriter;
 use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
+use async_stream::stream;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
-use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::{CommitBlock, FreeResult};
+use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
+use curvine_common::state::{CommitBlock, FreeResult, ListOptions};
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
@@ -193,6 +194,55 @@ impl CurvineFileSystem {
 
     pub async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
         self.fs_client.list_status_bytes(path).await
+    }
+
+    pub async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {
+        self.fs_client.list_options(path, opts).await
+    }
+
+    pub async fn list_stream(&self, path: &Path, options: ListOptions) -> FsResult<ListStream> {
+        let fs = self.clone();
+        let path = path.clone();
+        let (limit, mut start_after) = (options.limit, options.start_after);
+
+        let stream = stream! {
+            loop {
+                let options = ListOptions {
+                    limit,
+                    start_after: start_after.clone(),
+                };
+                let list = match fs.list_options(&path, options).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        yield Err(e);
+                        break;
+                    }
+                };
+
+                if list.is_empty() {
+                    break;
+                }
+
+                let n = list.len();
+                let last_name = list.last().map(|s| s.name.clone());
+                for status in list {
+                    yield Ok(status);
+                }
+
+                if let Some(l) = limit {
+                    if n < l {
+                        break;
+                    }
+                }
+                start_after = last_name;
+            }
+        };
+
+        Ok(ListStream::new(stream))
+    }
+
+    pub async fn list_options_bytes(&self, path: &Path, opts: ListOptions) -> FsResult<BytesMut> {
+        self.fs_client.list_options_bytes(path, opts).await
     }
 
     pub async fn list_files(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
@@ -423,5 +473,72 @@ impl CurvineFileSystem {
             .complete_files_batch(complete_requests)
             .await?;
         Ok(())
+    }
+}
+
+impl FileSystem<FsWriter, FsReader> for CurvineFileSystem {
+    fn fs_kind(&self) -> FsKind {
+        FsKind::Cv
+    }
+
+    async fn mkdir(&self, path: &Path, create_parent: bool) -> FsResult<bool> {
+        self.mkdir(path, create_parent).await
+    }
+
+    async fn create(&self, path: &Path, overwrite: bool) -> FsResult<FsWriter> {
+        self.create(path, overwrite).await
+    }
+
+    async fn append(&self, path: &Path) -> FsResult<FsWriter> {
+        self.append(path).await
+    }
+
+    async fn exists(&self, path: &Path) -> FsResult<bool> {
+        self.exists(path).await
+    }
+
+    async fn open(&self, path: &Path) -> FsResult<FsReader> {
+        self.open(path).await
+    }
+
+    async fn rename(&self, src: &Path, dst: &Path) -> FsResult<bool> {
+        self.rename(src, dst).await
+    }
+
+    async fn delete(&self, path: &Path, recursive: bool) -> FsResult<()> {
+        self.delete(path, recursive).await
+    }
+
+    async fn get_status(&self, path: &Path) -> FsResult<FileStatus> {
+        self.get_status(path).await
+    }
+
+    async fn get_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
+        self.get_status_bytes(path).await
+    }
+
+    async fn list_status(&self, path: &Path) -> FsResult<Vec<FileStatus>> {
+        self.list_status(path).await
+    }
+
+    async fn list_status_bytes(&self, path: &Path) -> FsResult<BytesMut> {
+        self.list_status_bytes(path).await
+    }
+
+    async fn set_attr(&self, path: &Path, opts: SetAttrOpts) -> FsResult<()> {
+        self.set_attr(path, opts).await?;
+        Ok(())
+    }
+
+    async fn list_options(&self, path: &Path, opts: ListOptions) -> FsResult<Vec<FileStatus>> {
+        self.list_options(path, opts).await
+    }
+
+    async fn list_options_bytes(&self, path: &Path, opts: ListOptions) -> FsResult<BytesMut> {
+        self.list_options_bytes(path, opts).await
+    }
+
+    async fn list_stream(&self, path: &Path, opts: ListOptions) -> FsResult<ListStream> {
+        self.list_stream(path, opts).await
     }
 }
