@@ -28,7 +28,9 @@ mod transfer;
 pub use self::transfer::{ChunkId, TransferRequest, TransferResponse};
 
 mod service;
-pub use self::service::{P2pReadTraceContext, P2pService, P2pState, P2pStatsSnapshot};
+pub use self::service::{
+    FetchChunkOrigin, P2pReadTraceContext, P2pService, P2pState, P2pStatsSnapshot,
+};
 
 fn sha256_bytes(data: &[u8]) -> Bytes {
     let hashed = digest::digest(&digest::SHA256, data);

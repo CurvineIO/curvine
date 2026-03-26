@@ -341,6 +341,12 @@ pub enum P2pState {
     Stopped = 3,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchChunkOrigin {
+    Cached,
+    Network,
+}
+
 #[derive(Debug)]
 enum NetworkCommand {
     Publish {
@@ -1479,6 +1485,18 @@ impl P2pService {
         expected_mtime: Option<i64>,
         context: Option<&P2pReadTraceContext>,
     ) -> Option<Bytes> {
+        self.fetch_chunk_with_origin_context(chunk_id, max_len, expected_mtime, context)
+            .await
+            .map(|(data, _)| data)
+    }
+
+    pub(crate) async fn fetch_chunk_with_origin_context(
+        &self,
+        chunk_id: ChunkId,
+        max_len: usize,
+        expected_mtime: Option<i64>,
+        context: Option<&P2pReadTraceContext>,
+    ) -> Option<(Bytes, FetchChunkOrigin)> {
         self.fetch_chunk_with_prefetch_context(chunk_id, max_len, expected_mtime, context)
             .await
     }
@@ -1489,49 +1507,20 @@ impl P2pService {
         max_len: usize,
         expected_mtime: Option<i64>,
         context: Option<&P2pReadTraceContext>,
-    ) -> Option<Bytes> {
+    ) -> Option<(Bytes, FetchChunkOrigin)> {
         if !self.is_enabled() || self.state() != P2pState::Running || max_len == 0 {
             return None;
         }
-        self.maybe_wait_network_ready().await;
         let fetch_token = self.next_fetch_token();
         let trace = TraceLabels::from_context(fetch_token, context, &self.conf);
         let lookup_start = LocalTime::nanos();
-
         if let Some(chunk) = self
-            .pending_fetched_chunk(chunk_id, max_len, expected_mtime)
+            .lookup_cached_chunk(chunk_id, max_len, expected_mtime, &trace, lookup_start)
             .await
         {
-            emit_p2p_trace(
-                "cache_get",
-                "pending_hit",
-                &trace,
-                chunk_id,
-                None,
-                Some(((LocalTime::nanos() - lookup_start) as f64) / 1_000_000.0),
-                Some(chunk.len()),
-                None,
-            );
-            return Some(chunk);
+            return Some((chunk, FetchChunkOrigin::Cached));
         }
-
-        if let Some(chunk) = self
-            .cache_manager
-            .get(chunk_id, max_len, expected_mtime)
-            .chunk
-        {
-            emit_p2p_trace(
-                "cache_get",
-                "cache_hit",
-                &trace,
-                chunk_id,
-                None,
-                Some(((LocalTime::nanos() - lookup_start) as f64) / 1_000_000.0),
-                Some(chunk.data.len()),
-                None,
-            );
-            return Some(chunk.data);
-        }
+        self.maybe_wait_network_ready().await;
 
         let flight_lock = self.fetch_flight_lock(chunk_id);
         let flight_guard =
@@ -1560,7 +1549,7 @@ impl P2pService {
             );
             drop(flight_guard);
             self.cleanup_fetch_flight(&chunk_id, &flight_lock);
-            return Some(chunk.data);
+            return Some((chunk.data, FetchChunkOrigin::Cached));
         }
 
         if let Some(chunk) = self
@@ -1579,7 +1568,7 @@ impl P2pService {
             );
             drop(flight_guard);
             self.cleanup_fetch_flight(&chunk_id, &flight_lock);
-            return Some(chunk);
+            return Some((chunk, FetchChunkOrigin::Cached));
         }
 
         if let Some(limiter) = &self.qps_limiter {
@@ -1731,7 +1720,7 @@ impl P2pService {
             drop(flight_guard);
             self.cleanup_fetch_flight(&chunk_id, &flight_lock);
             drop(permit);
-            return Some(chunk.data);
+            return Some((chunk.data, FetchChunkOrigin::Network));
         }
         emit_p2p_trace(
             "transfer",
@@ -1747,6 +1736,31 @@ impl P2pService {
         self.cleanup_fetch_flight(&chunk_id, &flight_lock);
         drop(permit);
         None
+    }
+
+    pub(crate) async fn fetch_cached_chunk_with_context(
+        &self,
+        chunk_id: ChunkId,
+        max_len: usize,
+        expected_mtime: Option<i64>,
+        context: Option<&P2pReadTraceContext>,
+    ) -> Option<Bytes> {
+        if !self.is_enabled() || self.state() != P2pState::Running || max_len == 0 {
+            return None;
+        }
+        let trace = TraceLabels::from_context(
+            self.fetch_tokens.load(Ordering::Relaxed),
+            context,
+            &self.conf,
+        );
+        self.lookup_cached_chunk(
+            chunk_id,
+            max_len,
+            expected_mtime,
+            &trace,
+            LocalTime::nanos(),
+        )
+        .await
     }
 
     async fn fetch_chunk_from_network_with_hedge(
@@ -2144,6 +2158,50 @@ impl P2pService {
                 wait.ok().flatten()
             }
         }
+    }
+
+    async fn lookup_cached_chunk(
+        &self,
+        chunk_id: ChunkId,
+        max_len: usize,
+        expected_mtime: Option<i64>,
+        trace: &TraceLabels,
+        lookup_start: u128,
+    ) -> Option<Bytes> {
+        if let Some(chunk) = self
+            .pending_fetched_chunk(chunk_id, max_len, expected_mtime)
+            .await
+        {
+            emit_p2p_trace(
+                "cache_get",
+                "pending_hit",
+                trace,
+                chunk_id,
+                None,
+                Some(((LocalTime::nanos() - lookup_start) as f64) / 1_000_000.0),
+                Some(chunk.len()),
+                None,
+            );
+            return Some(chunk);
+        }
+        if let Some(chunk) = self
+            .cache_manager
+            .get(chunk_id, max_len, expected_mtime)
+            .chunk
+        {
+            emit_p2p_trace(
+                "cache_get",
+                "cache_hit",
+                trace,
+                chunk_id,
+                None,
+                Some(((LocalTime::nanos() - lookup_start) as f64) / 1_000_000.0),
+                Some(chunk.data.len()),
+                None,
+            );
+            return Some(chunk.data);
+        }
+        None
     }
 
     fn persist_fetched_chunk(&self, chunk_id: ChunkId, data: Bytes, mtime: i64, checksum: Bytes) {

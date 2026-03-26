@@ -14,14 +14,14 @@
 
 use crate::block::block_reader::ReaderAdapter::{Hole, Local, Remote};
 use crate::block::{BlockReaderHole, BlockReaderLocal, BlockReaderRemote};
-use crate::file::{FsContext, ReadChunkKey};
-use crate::p2p::ChunkId;
+use crate::file::{FsContext, ReadChunkKey, ReadSource};
+use crate::p2p::{ChunkId, FetchChunkOrigin, P2pReadTraceContext};
 use bytes::Bytes;
 use curvine_common::error::FsError;
 use curvine_common::state::{ClientAddress, ExtendedBlock, LocatedBlock, WorkerAddress};
 use curvine_common::FsResult;
 use log::warn;
-use orpc::common::Utils;
+use orpc::common::{LocalTime, Utils};
 use orpc::error::ErrorExt;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sys::DataSlice;
@@ -115,6 +115,14 @@ impl ReaderAdapter {
             Hole(r) => r.worker_address(),
         }
     }
+
+    fn source_tag(&self) -> ReadSource {
+        match self {
+            Local(_) => ReadSource::WorkerLocal,
+            Remote(_) => ReadSource::WorkerRemote,
+            Hole(_) => ReadSource::Hole,
+        }
+    }
 }
 
 pub struct BlockReader {
@@ -128,6 +136,18 @@ pub struct BlockReader {
 }
 
 type ReadChunkFlight = (Arc<AsyncMutex<()>>, OwnedMutexGuard<()>);
+
+struct ReadPipelineInput {
+    source: ReadSource,
+    read_key: ReadChunkKey,
+    chunk_id: ChunkId,
+    expect_len: usize,
+}
+
+enum ReadPipelineOutcome {
+    Data(DataSlice),
+    Retry,
+}
 
 impl BlockReader {
     pub async fn new(
@@ -238,52 +258,20 @@ impl BlockReader {
     // Based on network transmission efficiency considerations, the data size of the underlying tcp is fixed each time.
     pub async fn read(&mut self) -> FsResult<DataSlice> {
         if !self.has_remaining() {
-            // end of block file
             return Ok(DataSlice::empty());
         }
-
-        let read_key = ReadChunkKey::new(
-            self.file_id,
-            self.file_version_epoch,
-            self.block.id,
-            self.pos(),
-        );
-        if let Some(chunk) = self.try_read_chunk_cache(&read_key)? {
-            return Ok(chunk);
+        loop {
+            let input = self.build_read_pipeline_input();
+            match self.execute_read_pipeline(&input).await? {
+                ReadPipelineOutcome::Data(data) => return Ok(data),
+                ReadPipelineOutcome::Retry => continue,
+            }
         }
-
-        let mut flight = self.acquire_read_chunk_flight(&read_key).await;
-        if let Some(chunk) = self.try_read_chunk_cache(&read_key)? {
-            self.release_read_chunk_flight(&read_key, &mut flight);
-            return Ok(chunk);
-        }
-
-        let chunk_id = ChunkId::with_version(
-            self.file_id,
-            self.file_version_epoch,
-            self.block.id,
-            self.pos(),
-        );
-        let expect_len = self
-            .remaining()
-            .min(self.fs_context.read_chunk_size() as i64)
-            .max(0) as usize;
-        if let Some(chunk) = self
-            .try_read_from_p2p(chunk_id, expect_len, &read_key)
-            .await?
-        {
-            self.release_read_chunk_flight(&read_key, &mut flight);
-            return Ok(chunk);
-        }
-
-        let chunk = self.read_from_worker(&read_key, chunk_id).await;
-        self.release_read_chunk_flight(&read_key, &mut flight);
-        chunk
     }
 
     pub fn blocking_read(&mut self, rt: &Runtime) -> FsResult<DataSlice> {
         if !self.has_remaining() {
-            return Ok(DataSlice::empty()); // end of block file
+            return Ok(DataSlice::empty());
         }
         rt.block_on(self.read())
     }
@@ -352,26 +340,86 @@ impl BlockReader {
         Ok(Some(DataSlice::bytes(cached)))
     }
 
-    async fn try_read_from_p2p(
+    fn build_trace_context(&self, read_off: i64) -> P2pReadTraceContext {
+        P2pReadTraceContext {
+            trace_id: Some(format!(
+                "{}:{}:{}:{}",
+                self.file_id, self.file_version_epoch, self.block.id, read_off
+            )),
+            tenant_id: None,
+            job_id: None,
+        }
+    }
+
+    async fn try_read_from_p2p_cached(
         &mut self,
+        source: ReadSource,
         chunk_id: ChunkId,
         expect_len: usize,
         read_key: &ReadChunkKey,
     ) -> FsResult<Option<DataSlice>> {
-        if expect_len == 0 || !matches!(&self.inner, Remote(_)) {
+        if matches!(source, ReadSource::Hole) || expect_len == 0 {
             return Ok(None);
         }
         let Some(service) = self.fs_context.p2p_service() else {
             return Ok(None);
         };
-        if let Some(cached) = service
-            .fetch_chunk(chunk_id, expect_len, Some(self.file_mtime))
+        let expected_mtime = (self.file_mtime > 0).then_some(self.file_mtime);
+        let start = LocalTime::nanos();
+        if let Some(data) = service
+            .fetch_cached_chunk_with_context(
+                chunk_id,
+                expect_len,
+                expected_mtime,
+                Some(&self.build_trace_context(self.pos())),
+            )
             .await
         {
-            self.advance_cached_position(cached.len())?;
+            self.advance_cached_position(data.len())?;
             self.fs_context
-                .put_read_chunk_cache(read_key.clone(), cached.clone());
-            return Ok(Some(DataSlice::bytes(cached)));
+                .put_read_chunk_cache(read_key.clone(), data.clone());
+            self.fs_context
+                .observe_adaptive_read_latency(ReadSource::P2p, start);
+            return Ok(Some(DataSlice::bytes(data)));
+        }
+        Ok(None)
+    }
+
+    async fn try_read_from_p2p(
+        &mut self,
+        source: ReadSource,
+        chunk_id: ChunkId,
+        expect_len: usize,
+        read_key: &ReadChunkKey,
+    ) -> FsResult<Option<DataSlice>> {
+        if matches!(source, ReadSource::Hole) || expect_len == 0 {
+            return Ok(None);
+        }
+        if self.fs_context.should_bypass_p2p(source) {
+            return Ok(None);
+        }
+        let Some(service) = self.fs_context.p2p_service() else {
+            return Ok(None);
+        };
+        let expected_mtime = (self.file_mtime > 0).then_some(self.file_mtime);
+        let start = LocalTime::nanos();
+        if let Some((data, origin)) = service
+            .fetch_chunk_with_origin_context(
+                chunk_id,
+                expect_len,
+                expected_mtime,
+                Some(&self.build_trace_context(self.pos())),
+            )
+            .await
+        {
+            self.advance_cached_position(data.len())?;
+            self.fs_context
+                .put_read_chunk_cache(read_key.clone(), data.clone());
+            if origin == FetchChunkOrigin::Network {
+                self.fs_context
+                    .observe_adaptive_read_latency(ReadSource::P2p, start);
+            }
+            return Ok(Some(DataSlice::bytes(data)));
         }
         if service.conf().fallback_worker_on_fail {
             Ok(None)
@@ -380,29 +428,32 @@ impl BlockReader {
         }
     }
 
+    fn normalize_worker_chunk(chunk: DataSlice) -> Bytes {
+        match chunk.freeze() {
+            DataSlice::Bytes(bytes) => bytes,
+            DataSlice::Empty => Bytes::new(),
+            other => Bytes::copy_from_slice(other.as_slice()),
+        }
+    }
+
     async fn read_from_worker(
         &mut self,
+        source: ReadSource,
         read_key: &ReadChunkKey,
         chunk_id: ChunkId,
     ) -> FsResult<DataSlice> {
-        loop {
-            match self.inner.read().await {
-                Ok(chunk) => {
-                    if !chunk.is_empty() {
-                        self.fs_context.on_worker_chunk_read(
-                            read_key.clone(),
-                            chunk_id,
-                            Bytes::copy_from_slice(chunk.as_slice()),
-                            self.file_mtime,
-                        );
-                    }
-                    return Ok(chunk);
-                }
-                Err(e) => {
-                    self.handle_worker_read_error(e).await?;
-                }
-            }
+        let start = LocalTime::nanos();
+        let bytes = Self::normalize_worker_chunk(self.inner.read().await?);
+        if !bytes.is_empty() {
+            self.fs_context.on_worker_chunk_read(
+                read_key.clone(),
+                chunk_id,
+                bytes.clone(),
+                self.file_mtime,
+            );
         }
+        self.fs_context.observe_adaptive_read_latency(source, start);
+        Ok(DataSlice::bytes(bytes))
     }
 
     async fn handle_worker_read_error(&mut self, e: FsError) -> FsResult<()> {
@@ -436,6 +487,86 @@ impl BlockReader {
         Ok(())
     }
 
+    fn build_read_pipeline_input(&self) -> ReadPipelineInput {
+        let read_off = self.pos();
+        ReadPipelineInput {
+            source: self.inner.source_tag(),
+            read_key: ReadChunkKey::new(
+                self.file_id,
+                self.file_version_epoch,
+                self.block.id,
+                read_off,
+            ),
+            chunk_id: ChunkId::with_version(
+                self.file_id,
+                self.file_version_epoch,
+                self.block.id,
+                read_off,
+            ),
+            expect_len: self
+                .remaining()
+                .min(self.fs_context.read_chunk_size() as i64)
+                .max(0) as usize,
+        }
+    }
+
+    async fn execute_read_pipeline(
+        &mut self,
+        input: &ReadPipelineInput,
+    ) -> FsResult<ReadPipelineOutcome> {
+        if let Some(data) = self.try_read_chunk_cache(&input.read_key)? {
+            return Ok(ReadPipelineOutcome::Data(data));
+        }
+        if let Some(data) = self
+            .try_read_from_p2p_cached(
+                input.source,
+                input.chunk_id,
+                input.expect_len,
+                &input.read_key,
+            )
+            .await?
+        {
+            return Ok(ReadPipelineOutcome::Data(data));
+        }
+
+        let mut flight = self.acquire_read_chunk_flight(&input.read_key).await;
+        if let Some(data) = self.try_read_chunk_cache(&input.read_key)? {
+            self.release_read_chunk_flight(&input.read_key, &mut flight);
+            return Ok(ReadPipelineOutcome::Data(data));
+        }
+
+        match self
+            .try_read_from_p2p(
+                input.source,
+                input.chunk_id,
+                input.expect_len,
+                &input.read_key,
+            )
+            .await?
+        {
+            Some(data) => {
+                self.release_read_chunk_flight(&input.read_key, &mut flight);
+                return Ok(ReadPipelineOutcome::Data(data));
+            }
+            None => {}
+        }
+
+        match self
+            .read_from_worker(input.source, &input.read_key, input.chunk_id)
+            .await
+        {
+            Ok(data) => {
+                self.release_read_chunk_flight(&input.read_key, &mut flight);
+                Ok(ReadPipelineOutcome::Data(data))
+            }
+            Err(e) => {
+                self.release_read_chunk_flight(&input.read_key, &mut flight);
+                self.handle_worker_read_error(e).await?;
+                Ok(ReadPipelineOutcome::Retry)
+            }
+        }
+    }
+
     fn advance_cached_position(&mut self, len: usize) -> FsResult<()> {
         let next_pos = self.pos() + len as i64;
         self.inner.seek(next_pos)?;
@@ -453,6 +584,7 @@ mod tests {
         FileAllocMode, FileAllocOpts, FileType, StorageType, WorkerAddress,
     };
     use once_cell::sync::Lazy;
+    use tokio::time::{sleep, timeout, Duration, Instant};
 
     static TEST_RT: Lazy<Arc<Runtime>> = Lazy::new(|| {
         let conf = ClusterConf::default();
@@ -472,6 +604,68 @@ mod tests {
             rpc_port: 8000 + worker_id,
             web_port: 9000 + worker_id,
         }
+    }
+
+    async fn wait_until_cached(
+        service: Arc<crate::p2p::P2pService>,
+        timeout_budget: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout_budget;
+        while Instant::now() < deadline {
+            if service.snapshot().cached_chunks_count > 0 {
+                return true;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn cached_p2p_hit_bypasses_read_chunk_flight() {
+        let mut conf = ClusterConf::default();
+        conf.client.read_chunk_size = 4;
+        conf.client.p2p.enable = true;
+        let fs_context =
+            Arc::new(FsContext::with_rt(conf, TEST_RT.clone()).expect("fs context should build"));
+        let block = ExtendedBlock::new(7, 4, StorageType::Disk, FileType::File);
+        let chunk_id = ChunkId::with_version(11, 3, block.id, 0);
+        let read_key = ReadChunkKey::new(11, 3, block.id, 0);
+        let mtime = 17;
+        let service = fs_context.p2p_service().expect("p2p service should exist");
+        assert!(service.start());
+        assert!(service.publish_chunk(chunk_id, Bytes::from_static(b"ping"), mtime));
+        assert!(wait_until_cached(service.clone(), Duration::from_secs(1)).await);
+
+        let lock = fs_context.read_chunk_flight_lock(read_key.clone());
+        let _guard = lock.clone().lock_owned().await;
+
+        let mut reader = BlockReader {
+            inner: Hole(BlockReaderHole::new(fs_context.clone(), block.clone(), 0, 4).unwrap()),
+            locs: Vec::new(),
+            block: block.clone(),
+            file_id: 11,
+            file_version_epoch: 3,
+            file_mtime: mtime,
+            fs_context: fs_context.clone(),
+        };
+        let input = ReadPipelineInput {
+            source: ReadSource::WorkerRemote,
+            read_key,
+            chunk_id,
+            expect_len: 4,
+        };
+
+        let outcome = timeout(
+            Duration::from_millis(50),
+            reader.execute_read_pipeline(&input),
+        )
+        .await
+        .expect("cached p2p hit should not wait for read chunk flight")
+        .expect("pipeline should succeed");
+        let ReadPipelineOutcome::Data(data) = outcome else {
+            panic!("expected cached data");
+        };
+        assert_eq!(data.as_slice(), b"ping");
     }
 
     #[tokio::test]
