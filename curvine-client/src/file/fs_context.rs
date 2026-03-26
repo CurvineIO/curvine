@@ -92,11 +92,13 @@ impl FsContext {
             conf.client.block_conn_idle_size,
             conf.client.block_conn_idle_time.as_millis() as u64,
         ));
-        let p2p_service = conf
-            .client
-            .p2p
-            .enable
-            .then(|| Arc::new(P2pService::new(conf.client.p2p.clone())));
+        let p2p_service = if conf.client.p2p.enable {
+            let service = Arc::new(P2pService::new(conf.client.p2p.clone()));
+            service.start();
+            Some(service)
+        } else {
+            None
+        };
 
         let context = Self {
             conf,
@@ -259,6 +261,6 @@ mod tests {
         let rt = Arc::new(conf.client_rpc_conf().create_runtime());
         let ctx = FsContext::with_rt(conf, rt).expect("fs context should build");
         let service = ctx.p2p_service().expect("p2p service should exist");
-        assert_eq!(service.state(), P2pState::Stopped);
+        assert_eq!(service.state(), P2pState::Running);
     }
 }
