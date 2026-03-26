@@ -535,7 +535,7 @@ impl BlockReader {
             return Ok(ReadPipelineOutcome::Data(data));
         }
 
-        match self
+        if let Some(data) = self
             .try_read_from_p2p(
                 input.source,
                 input.chunk_id,
@@ -544,11 +544,8 @@ impl BlockReader {
             )
             .await?
         {
-            Some(data) => {
-                self.release_read_chunk_flight(&input.read_key, &mut flight);
-                return Ok(ReadPipelineOutcome::Data(data));
-            }
-            None => {}
+            self.release_read_chunk_flight(&input.read_key, &mut flight);
+            return Ok(ReadPipelineOutcome::Data(data));
         }
 
         match self
