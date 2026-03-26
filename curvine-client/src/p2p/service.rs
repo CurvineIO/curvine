@@ -375,10 +375,12 @@ mod tests {
 
     #[test]
     fn signed_runtime_policy_updates_effective_tenant_whitelist() {
-        let mut conf = ClientP2pConf::default();
-        conf.enable = true;
-        conf.policy_hmac_key = "secret".to_string();
-        conf.tenant_whitelist = vec!["local-tenant".to_string()];
+        let conf = ClientP2pConf {
+            enable: true,
+            policy_hmac_key: "secret".to_string(),
+            tenant_whitelist: vec!["local-tenant".to_string()],
+            ..ClientP2pConf::default()
+        };
         let service = P2pService::new(conf);
         assert!(service.start());
 
@@ -395,10 +397,12 @@ mod tests {
 
     #[test]
     fn runtime_policy_version_zero_restores_local_whitelist() {
-        let mut conf = ClientP2pConf::default();
-        conf.enable = true;
-        conf.policy_hmac_key = "secret".to_string();
-        conf.tenant_whitelist = vec!["local-tenant".to_string()];
+        let conf = ClientP2pConf {
+            enable: true,
+            policy_hmac_key: "secret".to_string(),
+            tenant_whitelist: vec!["local-tenant".to_string()],
+            ..ClientP2pConf::default()
+        };
         let service = P2pService::new(conf);
         assert!(service.start());
 
