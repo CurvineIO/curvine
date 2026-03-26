@@ -128,6 +128,10 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     String::new()
 }
 
+fn file_counts(fs: &MasterFilesystem) -> (i64, i64) {
+    fs.get_file_counts()
+}
+
 fn new_handler() -> MasterHandler {
     Master::init_test_metrics();
 
@@ -872,8 +876,29 @@ fn test_idempotent_create_file() -> CommonResult<()> {
 fn test_idempotent_delete() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("delete");
     fs.mkdir("/data", false)?;
+    let after_mkdir = file_counts(&fs);
+    eprintln!("delete counts after mkdir = {:?}", after_mkdir);
     fs.delete("/data", true)?;
+    let after_delete = file_counts(&fs);
+    eprintln!("delete counts after delete = {:?}", after_delete);
     replay_all_then_duplicate_last(&js, &loader)?;
+    let leader_counts = file_counts(&fs);
+    let follower_counts = file_counts(&fs2);
+    eprintln!("delete leader counts after replay = {:?}", leader_counts);
+    eprintln!(
+        "delete follower counts after replay = {:?}",
+        follower_counts
+    );
+    assert!(
+        leader_counts.0 >= 0 && leader_counts.1 >= 0,
+        "leader file counts must stay non-negative: {:?}",
+        leader_counts
+    );
+    assert!(
+        follower_counts.0 >= 0 && follower_counts.1 >= 0,
+        "follower file counts must stay non-negative: {:?}",
+        follower_counts
+    );
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -925,11 +950,84 @@ fn test_idempotent_unmount() -> CommonResult<()> {
 }
 
 #[test]
+fn test_inode_file_num_stays_non_negative_for_symlink_create_delete() -> CommonResult<()> {
+    let fs = new_fs(true, "inode-file-num-symlink");
+
+    let (dir_count, file_count) = file_counts(&fs);
+    assert_eq!(dir_count, 0);
+    assert_eq!(file_count, 0);
+
+    fs.mkdir("/dir", false)?;
+    let (dir_count, file_count) = file_counts(&fs);
+    assert_eq!(dir_count, 1);
+    assert_eq!(file_count, 0);
+
+    fs.symlink("/target", "/dir/link", false, 0o777)?;
+    let (dir_count_after_create, file_count_after_create) = file_counts(&fs);
+
+    fs.delete("/dir/link", false)?;
+    let (dir_count_after_delete, file_count_after_delete) = file_counts(&fs);
+
+    assert_eq!(dir_count_after_create, dir_count_after_delete);
+    assert_eq!(
+        file_count_after_create,
+        file_count_after_delete + 1,
+        "symlink create/delete should change file count symmetrically"
+    );
+    assert!(
+        file_count_after_delete >= 0,
+        "inode_file_num must never be negative, got {}",
+        file_count_after_delete
+    );
+    Ok(())
+}
+
+#[test]
+fn test_inode_file_num_stays_non_negative_when_renaming_over_symlink() -> CommonResult<()> {
+    let fs = new_fs(true, "inode-file-num-rename-over-link");
+
+    fs.mkdir("/dir", false)?;
+    fs.create("/dir/file.log", true)?;
+    fs.symlink("/target", "/dir/link", false, 0o777)?;
+
+    fs.rename("/dir/file.log", "/dir/link", RenameFlags::empty())?;
+
+    let (_dir_count, file_count) = file_counts(&fs);
+    assert!(
+        file_count >= 0,
+        "inode_file_num must never be negative after rename-overwrite, got {}",
+        file_count
+    );
+    Ok(())
+}
+
+#[test]
 fn test_idempotent_symlink() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("symlink");
     fs.mkdir("/dir", false)?;
+    let after_mkdir = file_counts(&fs);
+    eprintln!("symlink counts after mkdir = {:?}", after_mkdir);
     fs.symlink("/target", "/dir/link", false, 0o777)?;
+    let after_create = file_counts(&fs);
+    eprintln!("symlink counts after create = {:?}", after_create);
     replay_all_then_duplicate_last(&js, &loader)?;
+    let leader_counts = file_counts(&fs);
+    let follower_counts = file_counts(&fs2);
+    eprintln!("symlink leader counts after replay = {:?}", leader_counts);
+    eprintln!(
+        "symlink follower counts after replay = {:?}",
+        follower_counts
+    );
+    assert!(
+        leader_counts.0 >= 0 && leader_counts.1 >= 0,
+        "leader file counts must stay non-negative: {:?}",
+        leader_counts
+    );
+    assert!(
+        follower_counts.0 >= 0 && follower_counts.1 >= 0,
+        "follower file counts must stay non-negative: {:?}",
+        follower_counts
+    );
     assert_eq!(fs.sum_hash(), fs2.sum_hash());
     Ok(())
 }
@@ -938,8 +1036,43 @@ fn test_idempotent_symlink() -> CommonResult<()> {
 fn test_idempotent_link() -> CommonResult<()> {
     let (fs, js, loader, _js2, fs2) = setup_pair("link");
     fs.create("/original.txt", true)?;
+    let after_create = file_counts(&fs);
+    eprintln!("link counts after create = {:?}", after_create);
     fs.link("/original.txt", "/hardlink.txt")?;
+    let after_hardlink = file_counts(&fs);
+    eprintln!("link counts after hardlink = {:?}", after_hardlink);
     replay_all_then_duplicate_last(&js, &loader)?;
+
+    let leader_counts = file_counts(&fs);
+    let follower_counts = file_counts(&fs2);
+    let file_count_drift = follower_counts.0 - leader_counts.0;
+    let dir_count_drift = follower_counts.1 - leader_counts.1;
+    eprintln!("link leader counts after replay = {:?}", leader_counts);
+    eprintln!("link follower counts after replay = {:?}", follower_counts);
+    eprintln!(
+        "link count drift after replay: files={}, dirs={}",
+        file_count_drift, dir_count_drift
+    );
+    assert!(
+        leader_counts.0 >= 0 && leader_counts.1 >= 0,
+        "leader file counts must stay non-negative: {:?}",
+        leader_counts
+    );
+    assert!(
+        follower_counts.0 >= 0 && follower_counts.1 >= 0,
+        "follower file counts must stay non-negative: {:?}",
+        follower_counts
+    );
+    assert_eq!(
+        dir_count_drift, 0,
+        "hardlink replay should not change directory counts: leader={:?}, follower={:?}",
+        leader_counts, follower_counts
+    );
+    assert_eq!(
+        file_count_drift, 0,
+        "hardlink replay should preserve file counts: leader={:?}, follower={:?}",
+        leader_counts, follower_counts
+    );
 
     let original = fs.file_status("/original.txt")?;
     let hardlink = fs.file_status("/hardlink.txt")?;
