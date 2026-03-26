@@ -12,15 +12,50 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoveryPeerSnapshot {
-    pub peer_id: String,
-    pub addrs: Vec<String>,
+use curvine_common::conf::ClientP2pConf;
+
+#[derive(Debug, Clone, Default)]
+pub struct DiscoverySnapshot {
+    pub mdns_peers: usize,
+    pub dht_peers: usize,
+    pub bootstrap_connected: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DiscoverySnapshot {
-    pub mdns_peers: Vec<DiscoveryPeerSnapshot>,
-    pub dht_peers: Vec<DiscoveryPeerSnapshot>,
-    pub bootstrap_peers: Vec<DiscoveryPeerSnapshot>,
+#[derive(Debug, Clone)]
+pub struct DiscoveryService {
+    conf: ClientP2pConf,
+}
+
+impl DiscoveryService {
+    pub fn new(conf: ClientP2pConf) -> Self {
+        Self { conf }
+    }
+
+    pub fn bootstrap_peers(&self) -> &[String] {
+        &self.conf.bootstrap_peers
+    }
+
+    pub fn snapshot_with_active_peers(&self, active_peers: usize) -> DiscoverySnapshot {
+        let mdns_peers = if self.conf.enable_mdns {
+            active_peers
+        } else {
+            0
+        };
+        let dht_peers = if self.conf.enable_dht {
+            active_peers
+        } else {
+            0
+        };
+        let bootstrap_connected = self.conf.bootstrap_peers.len().min(active_peers);
+
+        DiscoverySnapshot {
+            mdns_peers,
+            dht_peers,
+            bootstrap_connected,
+        }
+    }
+
+    pub fn snapshot(&self) -> DiscoverySnapshot {
+        self.snapshot_with_active_peers(0)
+    }
 }
