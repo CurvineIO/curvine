@@ -4539,6 +4539,7 @@ fn fail_pending_fetched_placeholders(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_data_plane_response<T>(
     io: &mut T,
     dispatch: &DataPlaneFetchDispatch,
