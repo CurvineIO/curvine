@@ -849,6 +849,7 @@ dependencies = [
  "prometheus",
  "prost 0.11.9",
  "prost-build",
+ "ring",
  "serde_json",
  "tokio",
  "tracing",

@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod cache_manager;
+pub use self::cache_manager::{
+    CacheGetResult, CacheGetResultTag, CacheManager, CachePutResultTag, CacheSnapshot, CachedChunk,
+    FetchedCacheBatchItem,
+};
+
 mod discovery;
 pub use self::discovery::{DiscoveryPeerSnapshot, DiscoverySnapshot};
 
