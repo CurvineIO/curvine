@@ -192,8 +192,15 @@ impl FsReaderBase {
                     }
 
                     None => {
-                        // Create a new block reader
-                        BlockReader::new(self.fs_context.clone(), loc.clone(), block_off).await?
+                        BlockReader::new(
+                            self.fs_context.clone(),
+                            loc.clone(),
+                            block_off,
+                            self.file_blocks.status.id,
+                            self.file_blocks.status.version_epoch,
+                            self.file_blocks.status.mtime,
+                        )
+                        .await?
                     }
                 };
                 self.update_reader(Some(new_reader), false).await?;
