@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
-use crate::file::CurvineFileSystem;
+use crate::file::{CurvineFileSystem, FsClient};
 use crate::p2p::ChunkId;
 use crate::p2p::P2pService;
 use crate::ClientMetrics;
@@ -311,8 +311,11 @@ impl FsContext {
     pub fn start_clean_task(fs: CurvineFileSystem, pool: Arc<BlockClientPool>) {
         let metric_report_enable = fs.conf().client.metric_report_enable;
         let interval = fs.conf().client.clean_task_interval;
+        let fs_context = fs.fs_context.clone();
+        let rt = fs.clone_runtime();
+        let metrics_fs = fs.clone();
 
-        fs.clone_runtime().spawn(async move {
+        rt.spawn(async move {
             let mut interval = tokio::time::interval(interval);
             loop {
                 interval.tick().await;
@@ -320,12 +323,51 @@ impl FsContext {
                 pool.clear_idle_conn();
 
                 if metric_report_enable {
-                    if let Err(e) = fs.metrics_report().await {
+                    if let Err(e) = metrics_fs.metrics_report().await {
                         warn!("metrics report: {}", e)
                     }
                 }
             }
         });
+
+        rt.spawn(async move {
+            if let Err(e) = sync_p2p_runtime_policy(&fs_context).await {
+                warn!("sync p2p runtime policy: {}", e)
+            }
+
+            let mut interval = tokio::time::interval(interval);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Err(e) = sync_p2p_runtime_policy(&fs_context).await {
+                    warn!("sync p2p runtime policy: {}", e)
+                }
+            }
+        });
+    }
+}
+
+async fn sync_p2p_runtime_policy(fs_context: &Arc<FsContext>) -> FsResult<()> {
+    let Some(service) = fs_context.p2p_service() else {
+        return Ok(());
+    };
+    let client = FsClient::new(fs_context.clone());
+    let response = client.get_p2p_policy().await?;
+    if service
+        .sync_runtime_policy_from_master(
+            response.p2p_policy_version,
+            response.p2p_peer_whitelist,
+            response.p2p_tenant_whitelist,
+            response.p2p_policy_signature.unwrap_or_default(),
+        )
+        .await
+    {
+        Ok(())
+    } else {
+        orpc::err_box!(
+            "failed to apply p2p runtime policy version {}",
+            response.p2p_policy_version
+        )
     }
 }
 
