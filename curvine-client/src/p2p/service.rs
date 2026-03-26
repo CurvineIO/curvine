@@ -207,7 +207,6 @@ impl DataPlaneState {
         })
     }
 
-    #[cfg(test)]
     fn tenant_whitelist(&self) -> Arc<HashSet<String>> {
         match self.tenant_whitelist.lock() {
             Ok(tenant_whitelist) => Arc::clone(&tenant_whitelist),
@@ -1935,7 +1934,6 @@ impl P2pService {
         let cache_manager = self.cache_manager.clone();
         let pending_fetched = self.pending_fetched.clone();
         let hot_published_chunks = self.hot_published_chunks.clone();
-        let tenant_whitelist = Arc::new(parse_tenant_whitelist(&self.conf.tenant_whitelist));
         let conf = self.conf.clone();
         let stats = self.stats();
         let future = async move {
@@ -1969,7 +1967,6 @@ impl P2pService {
                                     cache_manager.clone(),
                                     pending_fetched.clone(),
                                     hot_published_chunks.clone(),
-                                    tenant_whitelist.clone(),
                                     conf.clone(),
                                     stats.clone(),
                                 ),
@@ -2132,30 +2129,30 @@ impl P2pService {
                 self.ready_pending_fetched_chunk(data, mtime, max_len, expected_mtime)
             }
             PendingFetchedChunk::Loading(loading) => {
+                let deadline = Instant::now() + self.transfer_timeout();
                 let mut receiver = loading.receiver.clone();
-                let wait = timeout(self.transfer_timeout(), async {
-                    loop {
-                        let state = receiver.borrow().clone();
-                        match state {
-                            PendingFetchedLoadingState::Pending => {
-                                if receiver.changed().await.is_err() {
-                                    return None;
-                                }
-                            }
-                            PendingFetchedLoadingState::Ready { data, mtime } => {
-                                return self.ready_pending_fetched_chunk(
-                                    data,
-                                    mtime,
-                                    max_len,
-                                    expected_mtime,
-                                );
-                            }
-                            PendingFetchedLoadingState::Failed => return None,
+                loop {
+                    let state = receiver.borrow().clone();
+                    match state {
+                        PendingFetchedLoadingState::Pending => {}
+                        PendingFetchedLoadingState::Ready { data, mtime } => {
+                            return self.ready_pending_fetched_chunk(
+                                data,
+                                mtime,
+                                max_len,
+                                expected_mtime,
+                            );
                         }
+                        PendingFetchedLoadingState::Failed => return None,
                     }
-                })
-                .await;
-                wait.ok().flatten()
+                    let wait_budget = deadline.saturating_duration_since(Instant::now());
+                    if wait_budget.is_zero() {
+                        return None;
+                    }
+                    if timeout(wait_budget, receiver.changed()).await.is_err() {
+                        return None;
+                    }
+                }
             }
         }
     }
@@ -3665,7 +3662,6 @@ fn handle_data_plane_connection(
     cache_manager: Arc<CacheManager>,
     pending_fetched: Arc<FastDashMap<ChunkId, PendingFetchedChunk>>,
     hot_published_chunks: Arc<FastDashMap<ChunkId, HotPublishedChunk>>,
-    tenant_whitelist: Arc<HashSet<String>>,
     conf: ClientP2pConf,
     stats: Arc<PeerStats>,
 ) {
@@ -3684,6 +3680,7 @@ fn handle_data_plane_connection(
             let Some(request) = data_plane.authorize(&request) else {
                 break;
             };
+            let tenant_whitelist = data_plane.tenant_whitelist();
             let prepared = if let Some(hot) = prepare_hot_incoming_fetch_response(
                 &data_plane,
                 hot_published_chunks.as_ref(),
@@ -3884,6 +3881,7 @@ fn reset_data_plane_listener_state(data_plane: &DataPlaneState, generation: u64)
         force_reset_data_plane_listener_state(data_plane);
     }
 }
+
 fn parse_bootstrap_peers(peers: &[String]) -> Vec<(PeerId, Multiaddr)> {
     peers
         .iter()
@@ -3974,12 +3972,12 @@ fn response_frame_limit_bytes(conf: &ClientP2pConf) -> usize {
 }
 
 type PendingFetchedEntries = Vec<(ChunkId, PendingFetchedChunk)>;
-type CompletedPendingFetchedEntries = Vec<(ChunkId, u64)>;
+type CompletedPersistEntries = Vec<(ChunkId, u64)>;
 
 fn build_pending_fetched_batch<F>(
     batch: &[FetchedCacheBatchItem],
     mut next_persist_token: F,
-) -> (PendingFetchedEntries, CompletedPendingFetchedEntries)
+) -> (PendingFetchedEntries, CompletedPersistEntries)
 where
     F: FnMut() -> u64,
 {
@@ -4388,159 +4386,6 @@ fn data_plane_request_from_pending(
     }
 }
 
-fn enqueue_stream_fetch(loop_state: &mut NetworkLoopState, dispatch: StreamFetchDispatch) -> bool {
-    let len = loop_state.stream_dispatch_txs.len();
-    if len == 0 {
-        return false;
-    }
-    let preferred = stream_worker_index_for_peer(dispatch.peer, len);
-    let mut dispatch = Some(dispatch);
-    let mut offset = 0usize;
-    while offset < len {
-        let idx = (preferred + offset) % len;
-        let result = loop_state.stream_dispatch_txs[idx].try_send(dispatch.take().unwrap());
-        match result {
-            Ok(_) => {
-                loop_state.stream_dispatch_cursor = idx.wrapping_add(1) % len;
-                return true;
-            }
-            Err(TrySendError::Full(value)) | Err(TrySendError::Closed(value)) => {
-                dispatch = Some(value);
-                offset += 1;
-            }
-        }
-    }
-    false
-}
-
-fn enqueue_data_plane_fetch(
-    loop_state: &mut NetworkLoopState,
-    dispatch: DataPlaneFetchDispatch,
-) -> bool {
-    let len = loop_state.data_dispatch_txs.len();
-    if len == 0 {
-        return false;
-    }
-    let preferred = stream_worker_index_for_peer(dispatch.peer, len);
-    let mut dispatch = Some(dispatch);
-    let mut offset = 0usize;
-    while offset < len {
-        let idx = (preferred + offset) % len;
-        let result = loop_state.data_dispatch_txs[idx].try_send(dispatch.take().unwrap());
-        match result {
-            Ok(_) => return true,
-            Err(TrySendError::Full(value)) | Err(TrySendError::Closed(value)) => {
-                dispatch = Some(value);
-                offset += 1;
-            }
-        }
-    }
-    false
-}
-
-fn stream_worker_index_for_peer(peer_id: PeerId, worker_count: usize) -> usize {
-    if worker_count <= 1 {
-        return 0;
-    }
-    let bytes = peer_id.to_bytes();
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x00000100000001b3);
-    }
-    (hash as usize) % worker_count
-}
-
-async fn run_stream_fetch_worker(
-    control: p2p_stream::Control,
-    conf: ClientP2pConf,
-    mut dispatch_rx: mpsc::Receiver<StreamFetchDispatch>,
-    stream_result_tx: mpsc::Sender<StreamFetchOutcome>,
-) {
-    let timeout_budget = transfer_timeout(&conf);
-    let response_limit = response_frame_limit_bytes(&conf);
-    let protocol = StreamProtocol::new(CHUNK_STREAM_PROTOCOL);
-    let mut control = control;
-    let mut active_peer: Option<PeerId> = None;
-    let mut active_stream: Option<libp2p::swarm::Stream> = None;
-    while let Some(dispatch) = dispatch_rx.recv().await {
-        let mut codec = ChunkTransferCodec::new(1024 * 1024, response_limit);
-        let mut unsupported_protocol = false;
-        let mut response = None;
-        let mut attempts = 0u8;
-        while attempts < 2 {
-            let need_open = active_stream.is_none() || active_peer != Some(dispatch.peer);
-            if need_open {
-                active_peer = None;
-                active_stream = None;
-                match timeout(
-                    timeout_budget,
-                    control.open_stream(dispatch.peer, protocol.clone()),
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => {
-                        active_peer = Some(dispatch.peer);
-                        active_stream = Some(stream);
-                    }
-                    Ok(Err(p2p_stream::OpenStreamError::UnsupportedProtocol(_))) => {
-                        unsupported_protocol = true;
-                        break;
-                    }
-                    _ => break,
-                }
-            }
-            let Some(stream) = active_stream.as_mut() else {
-                break;
-            };
-            let write_ok = timeout(
-                timeout_budget,
-                request_response::Codec::write_request(
-                    &mut codec,
-                    &protocol,
-                    stream,
-                    dispatch.request.clone(),
-                ),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .is_some();
-            if !write_ok {
-                active_peer = None;
-                active_stream = None;
-                attempts += 1;
-                continue;
-            }
-            response = timeout(
-                timeout_budget,
-                request_response::Codec::read_response(&mut codec, &protocol, stream),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok);
-            if response.is_some() {
-                break;
-            }
-            active_peer = None;
-            active_stream = None;
-            attempts += 1;
-        }
-        if stream_result_tx
-            .send(StreamFetchOutcome {
-                request_id: dispatch.request_id,
-                peer: dispatch.peer,
-                response,
-                unsupported_protocol,
-            })
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
 fn data_plane_request_chunk_id(request: &DataPlaneFetchRequest, index: usize) -> Option<ChunkId> {
     let step = i64::try_from(request.len.max(1)).ok()?;
     let idx = i64::try_from(index).ok()?;
@@ -4732,6 +4577,159 @@ where
         ));
     }
     Ok(prefetched)
+}
+
+fn enqueue_stream_fetch(loop_state: &mut NetworkLoopState, dispatch: StreamFetchDispatch) -> bool {
+    let len = loop_state.stream_dispatch_txs.len();
+    if len == 0 {
+        return false;
+    }
+    let preferred = stream_worker_index_for_peer(dispatch.peer, len);
+    let mut dispatch = Some(dispatch);
+    let mut offset = 0usize;
+    while offset < len {
+        let idx = (preferred + offset) % len;
+        let result = loop_state.stream_dispatch_txs[idx].try_send(dispatch.take().unwrap());
+        match result {
+            Ok(_) => {
+                loop_state.stream_dispatch_cursor = idx.wrapping_add(1) % len;
+                return true;
+            }
+            Err(TrySendError::Full(value)) | Err(TrySendError::Closed(value)) => {
+                dispatch = Some(value);
+                offset += 1;
+            }
+        }
+    }
+    false
+}
+
+fn enqueue_data_plane_fetch(
+    loop_state: &mut NetworkLoopState,
+    dispatch: DataPlaneFetchDispatch,
+) -> bool {
+    let len = loop_state.data_dispatch_txs.len();
+    if len == 0 {
+        return false;
+    }
+    let preferred = stream_worker_index_for_peer(dispatch.peer, len);
+    let mut dispatch = Some(dispatch);
+    let mut offset = 0usize;
+    while offset < len {
+        let idx = (preferred + offset) % len;
+        let result = loop_state.data_dispatch_txs[idx].try_send(dispatch.take().unwrap());
+        match result {
+            Ok(_) => return true,
+            Err(TrySendError::Full(value)) | Err(TrySendError::Closed(value)) => {
+                dispatch = Some(value);
+                offset += 1;
+            }
+        }
+    }
+    false
+}
+
+fn stream_worker_index_for_peer(peer_id: PeerId, worker_count: usize) -> usize {
+    if worker_count <= 1 {
+        return 0;
+    }
+    let bytes = peer_id.to_bytes();
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x00000100000001b3);
+    }
+    (hash as usize) % worker_count
+}
+
+async fn run_stream_fetch_worker(
+    control: p2p_stream::Control,
+    conf: ClientP2pConf,
+    mut dispatch_rx: mpsc::Receiver<StreamFetchDispatch>,
+    stream_result_tx: mpsc::Sender<StreamFetchOutcome>,
+) {
+    let timeout_budget = transfer_timeout(&conf);
+    let response_limit = response_frame_limit_bytes(&conf);
+    let protocol = StreamProtocol::new(CHUNK_STREAM_PROTOCOL);
+    let mut control = control;
+    let mut active_peer: Option<PeerId> = None;
+    let mut active_stream: Option<libp2p::swarm::Stream> = None;
+    while let Some(dispatch) = dispatch_rx.recv().await {
+        let mut codec = ChunkTransferCodec::new(1024 * 1024, response_limit);
+        let mut unsupported_protocol = false;
+        let mut response = None;
+        let mut attempts = 0u8;
+        while attempts < 2 {
+            let need_open = active_stream.is_none() || active_peer != Some(dispatch.peer);
+            if need_open {
+                active_peer = None;
+                active_stream = None;
+                match timeout(
+                    timeout_budget,
+                    control.open_stream(dispatch.peer, protocol.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
+                        active_peer = Some(dispatch.peer);
+                        active_stream = Some(stream);
+                    }
+                    Ok(Err(p2p_stream::OpenStreamError::UnsupportedProtocol(_))) => {
+                        unsupported_protocol = true;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            let Some(stream) = active_stream.as_mut() else {
+                break;
+            };
+            let write_ok = timeout(
+                timeout_budget,
+                request_response::Codec::write_request(
+                    &mut codec,
+                    &protocol,
+                    stream,
+                    dispatch.request.clone(),
+                ),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some();
+            if !write_ok {
+                active_peer = None;
+                active_stream = None;
+                attempts += 1;
+                continue;
+            }
+            response = timeout(
+                timeout_budget,
+                request_response::Codec::read_response(&mut codec, &protocol, stream),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            if response.is_some() {
+                break;
+            }
+            active_peer = None;
+            active_stream = None;
+            attempts += 1;
+        }
+        if stream_result_tx
+            .send(StreamFetchOutcome {
+                request_id: dispatch.request_id,
+                peer: dispatch.peer,
+                response,
+                unsupported_protocol,
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
 }
 
 async fn run_data_plane_fetch_worker(
@@ -4973,7 +4971,9 @@ fn prepare_incoming_fetch_response(
     }
     let now_ms = LocalTime::mills() as i64;
     let expected_mtime = (request.expected_mtime > 0).then_some(request.expected_mtime);
-    let mut chunks = Vec::new();
+    let prefetch_count = request.prefetch_count.min(max_prefetch_count());
+    let limit = usize::from(prefetch_count) + 1;
+    let mut chunks = Vec::with_capacity(limit);
     let mut sent = 0u64;
     let Some(first_chunk_id) = request_chunk_id(&request, 0) else {
         return PreparedIncomingResponse {
@@ -5033,8 +5033,6 @@ fn prepare_incoming_fetch_response(
     };
     sent = sent.saturating_add(first_chunk.data.len() as u64);
     chunks.push(first_chunk);
-    let prefetch_count = request.prefetch_count.min(max_prefetch_count());
-    let limit = usize::from(prefetch_count) + 1;
     for idx in 1..limit {
         let Some(chunk_id) = request_chunk_id(&request, idx) else {
             break;
@@ -5048,17 +5046,12 @@ fn prepare_incoming_fetch_response(
             expected_mtime,
             now_ms,
         );
-        match (idx == 0, chunk) {
-            (true, Some(item)) => {
+        match chunk {
+            Some(item) => {
                 sent = sent.saturating_add(item.data.len() as u64);
                 chunks.push(item);
             }
-            (true, None) => break,
-            (false, Some(item)) => {
-                sent = sent.saturating_add(item.data.len() as u64);
-                chunks.push(item);
-            }
-            (false, None) => break,
+            None => break,
         }
     }
     PreparedIncomingResponse {
@@ -5094,36 +5087,42 @@ fn prepare_hot_incoming_fetch_response(
     let expected_mtime = (request.expected_mtime > 0).then_some(request.expected_mtime);
     let prefetch_count = request.prefetch_count.min(max_prefetch_count());
     let limit = usize::from(prefetch_count) + 1;
-    let first_chunk_id = request_chunk_id(request, 0)?;
-    let build_hot_item = |chunk_id| {
-        hot_published_chunks.get(&chunk_id).and_then(|chunk| {
-            if chunk.expire_at_ms <= now_ms {
-                hot_published_chunks.remove(&chunk_id);
-                return None;
-            }
-            if expected_mtime
-                .is_some_and(|expected| expected > 0 && chunk.mtime > 0 && chunk.mtime != expected)
-            {
-                return None;
-            }
-            let len = chunk.data.len().min(request.len.max(1));
-            let data = chunk.data.slice(0..len);
-            if data.is_empty() {
-                return None;
-            }
-            let checksum = if chunk.checksum.is_empty() || len == chunk.data.len() {
-                chunk.checksum.clone()
-            } else {
-                sha256_bytes(data.as_ref())
-            };
-            Some(ChunkFetchResponseChunk {
-                off: chunk_id.off,
-                mtime: chunk.mtime,
-                checksum,
-                data,
+    let mut sent = 0u64;
+    let mut chunks = Vec::with_capacity(limit);
+    let build_hot_item = |chunk_id: ChunkId| {
+        let hot_chunk = hot_published_chunks
+            .get(&chunk_id)
+            .map(|chunk| chunk.clone());
+        if hot_chunk
+            .as_ref()
+            .is_some_and(|chunk| chunk.expire_at_ms <= now_ms)
+        {
+            hot_published_chunks.remove(&chunk_id);
+        }
+        hot_chunk
+            .filter(|chunk| {
+                chunk.expire_at_ms > now_ms
+                    && expected_mtime.is_none_or(|expected| {
+                        expected <= 0 || chunk.mtime <= 0 || chunk.mtime == expected
+                    })
             })
-        })
+            .map(|chunk| {
+                let len = chunk.data.len().min(request.len.max(1));
+                let data = chunk.data.slice(0..len);
+                let checksum = if chunk.checksum.is_empty() || len == chunk.data.len() {
+                    chunk.checksum
+                } else {
+                    sha256_bytes(data.as_ref())
+                };
+                ChunkFetchResponseChunk {
+                    off: chunk_id.off,
+                    mtime: chunk.mtime,
+                    checksum,
+                    data,
+                }
+            })
     };
+    let first_chunk_id = request_chunk_id(request, 0)?;
     let first_item = build_hot_item(first_chunk_id)?;
     if redirect_to_data_plane {
         let data_port = data_plane.port();
@@ -5139,8 +5138,7 @@ fn prepare_hot_incoming_fetch_response(
             });
         }
     }
-    let mut sent = first_item.data.len() as u64;
-    let mut chunks = Vec::with_capacity(limit);
+    sent = sent.saturating_add(first_item.data.len() as u64);
     chunks.push(first_item);
     for idx in 1..limit {
         let Some(chunk_id) = request_chunk_id(request, idx) else {
@@ -6057,11 +6055,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_peer_whitelist_entry_is_rejected() {
-        assert!(parse_peer_whitelist(&["invalid-peer-id".to_string()]).is_none());
-    }
-
-    #[test]
     fn invalid_startup_peer_whitelist_fails_closed() {
         let local_peer_id = new_peer_id();
         let whitelist = parse_peer_whitelist(&["invalid-peer-id".to_string()])
@@ -6073,390 +6066,12 @@ mod tests {
     }
 
     #[test]
-    fn request_timeout_uses_dedicated_config() {
-        let conf = ClientP2pConf {
-            request_timeout_ms: 1234,
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(request_timeout(&conf), Duration::from_millis(1234));
-    }
-
-    #[test]
-    fn network_checksum_verify_sampling_is_periodic() {
-        assert!(should_verify_network_checksum(1));
-        assert!(should_verify_network_checksum(4));
-        assert!(!should_verify_network_checksum(5));
-        assert!(should_verify_network_checksum(64));
-        assert!(!should_verify_network_checksum(65));
-    }
-
-    #[test]
     fn provider_record_id_collapses_offsets_in_same_block() {
         let a = ChunkId::with_version(1, 2, 3, 0);
         let b = ChunkId::with_version(1, 2, 3, 1024);
         let c = ChunkId::with_version(1, 2, 4, 0);
         assert_eq!(provider_record_id(a), provider_record_id(b));
         assert_ne!(provider_record_id(a), provider_record_id(c));
-    }
-
-    #[test]
-    fn cache_cleanup_interval_is_clamped() {
-        let short_ttl = ClientP2pConf {
-            cache_ttl: Duration::from_millis(10),
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(cache_cleanup_interval(&short_ttl), Duration::from_secs(1));
-
-        let long_ttl = ClientP2pConf {
-            cache_ttl: Duration::from_secs(120),
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(cache_cleanup_interval(&long_ttl), Duration::from_secs(60));
-    }
-
-    #[test]
-    fn network_warmup_timeout_is_capped() {
-        let quick = ClientP2pConf {
-            connect_timeout_ms: 100,
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(network_warmup_timeout(&quick), Duration::from_millis(100));
-
-        let slow = ClientP2pConf {
-            connect_timeout_ms: 5_000,
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(network_warmup_timeout(&slow), Duration::from_millis(500));
-    }
-
-    #[test]
-    fn fetched_persist_batch_window_is_clamped() {
-        let fast = ClientP2pConf {
-            transfer_timeout_ms: 0,
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(
-            fetched_persist_batch_window(&fast),
-            Duration::from_millis(100)
-        );
-
-        let slow = ClientP2pConf {
-            transfer_timeout_ms: 5_000,
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(
-            fetched_persist_batch_window(&slow),
-            Duration::from_millis(1000)
-        );
-    }
-
-    #[test]
-    fn fetched_persist_max_batch_size_is_capped() {
-        let small = ClientP2pConf {
-            max_inflight_requests: 1,
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(fetched_persist_batch_size(&small), 8);
-        assert_eq!(fetched_persist_max_batch_size(&small), 32);
-
-        let large = ClientP2pConf {
-            max_inflight_requests: 2048,
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(fetched_persist_batch_size(&large), 64);
-        assert_eq!(fetched_persist_max_batch_size(&large), 256);
-    }
-
-    #[test]
-    fn hot_published_cache_params_are_clamped() {
-        let tiny = ClientP2pConf {
-            max_inflight_requests: 1,
-            provider_ttl: Duration::from_millis(1),
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(hot_published_entries_limit(&tiny), 64);
-        assert_eq!(hot_published_ttl(&tiny), Duration::from_secs(60));
-
-        let huge = ClientP2pConf {
-            max_inflight_requests: 16_384,
-            provider_ttl: Duration::from_secs(1000),
-            ..ClientP2pConf::default()
-        };
-        assert_eq!(hot_published_entries_limit(&huge), 1024);
-        assert_eq!(hot_published_ttl(&huge), Duration::from_secs(300));
-    }
-
-    #[test]
-    fn compact_fetched_persist_batch_keeps_latest_for_same_chunk() {
-        let chunk_a = ChunkId::with_version(7, 1, 1, 0);
-        let chunk_b = ChunkId::with_version(7, 1, 1, 64);
-        let compacted = compact_fetched_persist_batch(vec![
-            PendingFetchedPersist {
-                chunk_id: chunk_a,
-                data: Bytes::from_static(b"a-1"),
-                mtime: 10,
-                checksum: Bytes::from_static(b"sum-a-1"),
-                persist_token: 1,
-            },
-            PendingFetchedPersist {
-                chunk_id: chunk_b,
-                data: Bytes::from_static(b"b-1"),
-                mtime: 11,
-                checksum: Bytes::from_static(b"sum-b-1"),
-                persist_token: 2,
-            },
-            PendingFetchedPersist {
-                chunk_id: chunk_a,
-                data: Bytes::from_static(b"a-2"),
-                mtime: 12,
-                checksum: Bytes::from_static(b"sum-a-2"),
-                persist_token: 3,
-            },
-        ]);
-        let compacted_map: HashMap<ChunkId, PendingFetchedPersist> = compacted
-            .into_iter()
-            .map(|item| (item.chunk_id, item))
-            .collect();
-        assert_eq!(compacted_map.len(), 2);
-        let chunk_a_item = compacted_map.get(&chunk_a).expect("chunk_a should exist");
-        assert_eq!(chunk_a_item.data, Bytes::from_static(b"a-2"));
-        assert_eq!(chunk_a_item.mtime, 12);
-        assert_eq!(chunk_a_item.persist_token, 3);
-    }
-
-    #[test]
-    fn fetched_persist_worker_index_stays_in_range() {
-        let chunk = ChunkId::with_version(9, 1, 2, 3);
-        assert_eq!(fetched_persist_worker_index(chunk, 0), 0);
-        assert_eq!(fetched_persist_worker_index(chunk, 1), 0);
-        assert!(fetched_persist_worker_index(chunk, 8) < 8);
-    }
-
-    #[test]
-    fn stream_worker_index_for_peer_is_stable() {
-        let peer = new_peer_id();
-        assert_eq!(stream_worker_index_for_peer(peer, 0), 0);
-        assert_eq!(stream_worker_index_for_peer(peer, 1), 0);
-        let idx1 = stream_worker_index_for_peer(peer, 8);
-        let idx2 = stream_worker_index_for_peer(peer, 8);
-        assert!(idx1 < 8);
-        assert_eq!(idx1, idx2);
-    }
-
-    #[test]
-    fn direct_connected_probe_candidates_is_limited() {
-        let conf = test_conf("direct-probe-limit");
-        let local_peer_id = new_peer_id();
-        let peer_a = new_peer_id();
-        let peer_b = new_peer_id();
-        let peer_c = new_peer_id();
-        let bootstrap_connected = HashSet::new();
-        let peer_ewma = HashMap::new();
-        let inflight = HashMap::new();
-
-        let two_candidates = direct_connected_probe_candidates(
-            &conf,
-            &HashSet::from([peer_a, peer_b]),
-            &bootstrap_connected,
-            local_peer_id,
-            &peer_ewma,
-            &inflight,
-        );
-        assert!(two_candidates.is_some());
-
-        let three_candidates = direct_connected_probe_candidates(
-            &conf,
-            &HashSet::from([peer_a, peer_b, peer_c]),
-            &bootstrap_connected,
-            local_peer_id,
-            &peer_ewma,
-            &inflight,
-        );
-        assert!(three_candidates.is_none());
-    }
-
-    #[test]
-    fn cold_start_prefetch_caps_buffered_response_window() {
-        assert_eq!(dynamic_prefetch_count(1024 * 1024, None), 15);
-    }
-
-    #[test]
-    fn low_latency_prefetch_stays_medium_sized() {
-        let stats = PeerEwma {
-            latency_ms: 1.0,
-            failure_ratio: 0.0,
-            throughput_mb_s: 256.0,
-        };
-        assert_eq!(dynamic_prefetch_count(1024 * 1024, Some(stats)), 15);
-    }
-
-    #[test]
-    fn medium_latency_prefetch_expands_window() {
-        let stats = PeerEwma {
-            latency_ms: 8.0,
-            failure_ratio: 0.0,
-            throughput_mb_s: 128.0,
-        };
-        assert_eq!(dynamic_prefetch_count(1024 * 1024, Some(stats)), 31);
-    }
-
-    #[test]
-    fn high_latency_prefetch_uses_full_window() {
-        let stats = PeerEwma {
-            latency_ms: 50.0,
-            failure_ratio: 0.0,
-            throughput_mb_s: 32.0,
-        };
-        assert_eq!(dynamic_prefetch_count(1024 * 1024, Some(stats)), 127);
-    }
-
-    #[test]
-    fn data_plane_prefetch_uses_full_response_window() {
-        let conf = test_conf("data-plane-prefetch");
-        assert_eq!(data_plane_prefetch_count(1024 * 1024, &conf), 127);
-    }
-
-    #[test]
-    fn pending_fetched_batch_keeps_prefetched_chunks_immediately_available() {
-        let chunk_a = ChunkId::with_version(1, 2, 3, 0);
-        let chunk_b = ChunkId::with_version(1, 2, 3, 1024);
-        let batch = vec![
-            FetchedCacheBatchItem {
-                chunk_id: chunk_a,
-                data: Bytes::from_static(b"a"),
-                mtime: 7,
-                checksum: Bytes::from_static(b"ca"),
-            },
-            FetchedCacheBatchItem {
-                chunk_id: chunk_b,
-                data: Bytes::from_static(b"b"),
-                mtime: 8,
-                checksum: Bytes::from_static(b"cb"),
-            },
-        ];
-        let (pending_entries, completed) = build_pending_fetched_batch(&batch, {
-            let mut next = 40u64;
-            move || {
-                next += 1;
-                next
-            }
-        });
-        assert_eq!(pending_entries.len(), 2);
-        assert_eq!(pending_entries[0].0, chunk_a);
-        match &pending_entries[0].1 {
-            PendingFetchedChunk::Ready {
-                data,
-                mtime,
-                persist_token,
-            } => {
-                assert_eq!(*data, Bytes::from_static(b"a"));
-                assert_eq!(*mtime, 7);
-                assert_eq!(*persist_token, 41);
-            }
-            PendingFetchedChunk::Loading(_) => panic!("batch entries should be ready"),
-        }
-        assert_eq!(pending_entries[1].0, chunk_b);
-        match &pending_entries[1].1 {
-            PendingFetchedChunk::Ready {
-                data,
-                mtime,
-                persist_token,
-            } => {
-                assert_eq!(*data, Bytes::from_static(b"b"));
-                assert_eq!(*mtime, 8);
-                assert_eq!(*persist_token, 42);
-            }
-            PendingFetchedChunk::Loading(_) => panic!("batch entries should be ready"),
-        }
-        assert_eq!(completed, vec![(chunk_a, 41), (chunk_b, 42)]);
-    }
-
-    #[test]
-    fn response_header_round_trips_data_port() {
-        let ticket = [7u8; 16];
-        let header = encode_response_header(3, 31_002, ticket);
-        let (chunk_count, data_port, parsed_ticket) =
-            decode_response_header(header).expect("header should parse");
-        assert_eq!(chunk_count, 3);
-        assert_eq!(data_port, 31_002);
-        assert_eq!(parsed_ticket, ticket);
-    }
-
-    #[test]
-    fn data_plane_request_round_trips_ticket_and_range() {
-        let request = DataPlaneFetchRequest {
-            ticket: [9u8; 16],
-            file_id: 1,
-            version_epoch: 2,
-            block_id: 3,
-            off: 4,
-            len: 1024,
-            expected_mtime: 5,
-            prefetch_count: 6,
-        };
-        let encoded = encode_data_plane_request(&request);
-        let decoded = decode_data_plane_request(encoded).expect("request should parse");
-        assert_eq!(decoded.ticket, request.ticket);
-        assert_eq!(decoded.file_id, request.file_id);
-        assert_eq!(decoded.version_epoch, request.version_epoch);
-        assert_eq!(decoded.block_id, request.block_id);
-        assert_eq!(decoded.off, request.off);
-        assert_eq!(decoded.len, request.len);
-        assert_eq!(decoded.expected_mtime, request.expected_mtime);
-        assert_eq!(decoded.prefetch_count, request.prefetch_count);
-    }
-
-    #[test]
-    fn peer_data_endpoint_uses_remote_ip_for_tcp_peer() {
-        let addr = Multiaddr::from_str("/ip4/172.29.0.11/tcp/31001").expect("addr should parse");
-        let endpoint = peer_data_endpoint(&addr, 31_002).expect("endpoint should exist");
-        assert_eq!(
-            endpoint,
-            std::net::SocketAddr::from(([172, 29, 0, 11], 31_002))
-        );
-    }
-
-    #[test]
-    fn peer_data_endpoint_uses_remote_ip_for_quic_peer() {
-        let addr =
-            Multiaddr::from_str("/ip4/172.29.0.11/udp/31001/quic-v1").expect("addr should parse");
-        let endpoint = peer_data_endpoint(&addr, 31_002).expect("endpoint should exist");
-        assert_eq!(
-            endpoint,
-            std::net::SocketAddr::from(([172, 29, 0, 11], 31_002))
-        );
-    }
-
-    #[test]
-    fn identify_dial_addr_uses_remote_ip_for_unspecified_listen_addr() {
-        let listen_addr =
-            Multiaddr::from_str("/ip4/0.0.0.0/tcp/31001").expect("listen addr should parse");
-        let remote_addr =
-            Multiaddr::from_str("/ip4/172.29.0.11/tcp/49822").expect("remote addr should parse");
-        assert_eq!(
-            identify_dial_addr(&listen_addr, &remote_addr),
-            Some(
-                Multiaddr::from_str("/ip4/172.29.0.11/tcp/31001")
-                    .expect("normalized addr should parse")
-            )
-        );
-    }
-
-    #[test]
-    fn identify_dial_addr_strips_peer_id_suffix() {
-        let listen_addr = Multiaddr::from_str(
-            "/ip4/172.29.0.11/tcp/31001/p2p/12D3KooWQdB3bVnqJjREd3m7v6ybVNewc19hXtF87mpy4VbQJu1A",
-        )
-        .expect("listen addr should parse");
-        let remote_addr =
-            Multiaddr::from_str("/ip4/172.29.0.11/tcp/49822").expect("remote addr should parse");
-        assert_eq!(
-            identify_dial_addr(&listen_addr, &remote_addr),
-            Some(
-                Multiaddr::from_str("/ip4/172.29.0.11/tcp/31001")
-                    .expect("normalized addr should parse")
-            )
-        );
     }
 
     #[test]
@@ -6675,6 +6290,27 @@ mod tests {
         );
         assert_eq!(prepared.response.chunks[0].mtime, 9);
     }
+
+    #[test]
+    fn data_plane_tenant_whitelist_follows_runtime_updates() {
+        let mut conf = test_conf("data-plane-tenant-policy");
+        conf.tenant_whitelist = vec!["tenant-b".to_string()];
+        let data_plane = DataPlaneState::new(&conf);
+        assert!(!is_tenant_allowed(
+            "tenant-a",
+            data_plane.tenant_whitelist().as_ref()
+        ));
+        data_plane.update_tenant_whitelist(&["tenant-a".to_string()]);
+        assert!(is_tenant_allowed(
+            "tenant-a",
+            data_plane.tenant_whitelist().as_ref()
+        ));
+        assert!(!is_tenant_allowed(
+            "tenant-b",
+            data_plane.tenant_whitelist().as_ref()
+        ));
+    }
+
     #[test]
     fn cached_data_plane_ticket_is_not_reused_across_tenants_or_mtime() {
         let conf = test_conf("data-plane-ticket-scope");
@@ -6985,34 +6621,6 @@ mod tests {
         service.stop();
     }
 
-    #[test]
-    fn clear_data_plane_listener_port_keeps_task_started() {
-        let conf = test_conf("data-plane-reset");
-        let data_plane = DataPlaneState::new(&conf);
-        let generation = data_plane.next_generation();
-        data_plane.started.store(true, Ordering::Relaxed);
-        data_plane.port.store(31_002, Ordering::Relaxed);
-
-        clear_data_plane_listener_port(&data_plane, generation);
-
-        assert!(data_plane.started.load(Ordering::Relaxed));
-        assert_eq!(data_plane.port(), 0);
-    }
-    #[test]
-    fn stale_generation_cannot_reset_new_listener_state() {
-        let conf = test_conf("data-plane-generation");
-        let data_plane = DataPlaneState::new(&conf);
-        let stale_generation = data_plane.next_generation();
-        let current_generation = data_plane.next_generation();
-        data_plane.started.store(true, Ordering::Relaxed);
-        set_data_plane_listener_port(&data_plane, current_generation, 31_002);
-
-        reset_data_plane_listener_state(&data_plane, stale_generation);
-
-        assert!(data_plane.started.load(Ordering::Relaxed));
-        assert_eq!(data_plane.port(), 31_002);
-    }
-
     #[tokio::test]
     async fn data_plane_listener_stops_and_restarts_cleanly() {
         let mut conf = test_conf("data-plane-lifecycle");
@@ -7044,6 +6652,7 @@ mod tests {
             .await
             .expect("data plane should stop after restart");
     }
+
     #[tokio::test]
     async fn invalid_runtime_peer_whitelist_update_is_rejected() {
         let mut conf = test_conf("invalid-runtime-peer-whitelist");
