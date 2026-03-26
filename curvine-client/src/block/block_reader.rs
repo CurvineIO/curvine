@@ -416,6 +416,7 @@ impl BlockReader {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_read_from_p2p_cached(
         &mut self,
         source: ReadSource,
@@ -452,6 +453,7 @@ impl BlockReader {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_read_from_p2p(
         &mut self,
         source: ReadSource,
