@@ -39,13 +39,15 @@ impl HeapTraceConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct HeapTraceSummary {
     pub runtime_enabled: bool,
     pub sample_interval_bytes: usize,
     pub capture_count: u64,
     pub last_capture_epoch_ms: Option<u64>,
 }
+
+pub type HeapProfileSummary = HeapTraceSummary;
 
 impl HeapTraceSummary {
     pub fn from_config(conf: &HeapTraceConfig) -> Self {

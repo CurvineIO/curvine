@@ -31,6 +31,7 @@ prost = { workspace = true }
 prost-build = { workspace = true }
 num_enum = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
@@ -56,3 +57,6 @@ tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 inferno = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
