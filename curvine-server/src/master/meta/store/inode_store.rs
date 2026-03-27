@@ -213,7 +213,15 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_symlink(&self, parent: &InodeView, new_inode: &InodeView) -> CommonResult<()> {
+    /// Persists a symlink inode and its directory edge.
+    /// `is_add`: new symlink at `link` (adds a dentry); bump live file count.
+    /// `!is_add`: update-in-place (`symlink` with `force=true` over an existing symlink); file count unchanged.
+    pub fn apply_symlink(
+        &self,
+        parent: &InodeView,
+        new_inode: &InodeView,
+        is_add: bool,
+    ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(parent)?;
@@ -222,7 +230,9 @@ impl InodeStore {
 
         batch.commit()?;
 
-        self.fs_stats.increment_file_count();
+        if is_add {
+            self.fs_stats.increment_file_count();
+        }
 
         Ok(())
     }
