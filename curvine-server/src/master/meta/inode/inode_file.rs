@@ -277,6 +277,7 @@ impl InodeFile {
         // Clear all blocks and reset file size
         self.blocks.clear();
         self.len = 0;
+        self.version_epoch = self.version_epoch.max(0).saturating_add(1);
 
         // Update file metadata with new options
         self.replicas = opts.replicas as u8;
@@ -533,6 +534,23 @@ impl InodeFile {
         } else {
             self.cv_exists() && !self.blocks.is_empty()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InodeFile;
+    use curvine_common::state::CreateFileOpts;
+
+    #[test]
+    fn overwrite_bumps_version_epoch() {
+        let opts = CreateFileOpts::with_create(false);
+        let mut file = InodeFile::with_opts(7, 100, opts.clone());
+        let initial_epoch = file.version_epoch;
+
+        file.overwrite(opts, 200);
+
+        assert_eq!(file.version_epoch, initial_epoch + 1);
     }
 }
 
