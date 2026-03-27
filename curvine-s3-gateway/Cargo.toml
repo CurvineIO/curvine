@@ -32,7 +32,7 @@ scopeguard = "1.2"
 hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
-base64 = { workspace = true }
+base64 = "0.21"
 hex = "0.4"
 log = { workspace = true }
 zeroize = "1.7"

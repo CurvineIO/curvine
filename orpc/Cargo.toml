@@ -13,6 +13,7 @@ heap-trace = [
     "dep:tikv-jemallocator",
     "dep:tikv-jemalloc-ctl",
     "dep:inferno",
+    "dep:base64",
 ]
 
 [dependencies]
@@ -54,4 +55,4 @@ md-5 = { workspace = true }
 tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 inferno = { workspace = true, optional = true }
-base64 = { workspace = true }
+base64 = { workspace = true, optional = true }
