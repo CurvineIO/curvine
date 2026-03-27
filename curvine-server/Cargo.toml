@@ -9,7 +9,7 @@ license.workspace = true
 [features]
 default = []
 jni = ["curvine-ufs/jni"]
-heap-trace = ["orpc/heap-trace"]
+heap-trace = ["orpc/heap-trace", "curvine-s3-gateway/heap-trace"]
 
 [dependencies]
 orpc = { workspace = true }
