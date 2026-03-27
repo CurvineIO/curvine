@@ -29,6 +29,22 @@ use std::fmt::{Display, Formatter};
 use std::fs::read_to_string;
 use std::time::Duration;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeapTraceConf {
+    pub runtime_enabled: bool,
+    pub sample_interval_bytes: usize,
+}
+
+impl Default for HeapTraceConf {
+    fn default() -> Self {
+        Self {
+            runtime_enabled: false,
+            sample_interval_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
 // Cluster configuration files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -54,6 +70,8 @@ pub struct ClusterConf {
     pub client: ClientConf,
 
     pub fuse: FuseConf,
+
+    pub heap_trace: HeapTraceConf,
 
     pub s3_gateway: S3GatewayConf,
 
@@ -287,6 +305,7 @@ impl Default for ClusterConf {
             log: Default::default(),
             client: Default::default(),
             fuse: FuseConf::default(),
+            heap_trace: Default::default(),
             s3_gateway: Default::default(),
             job: Default::default(),
             cli: Default::default(),
