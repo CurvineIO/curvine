@@ -213,9 +213,9 @@ impl InodeStore {
         Ok(())
     }
 
-    /// Persists a symlink inode and its directory edge.
-    /// `is_add`: new symlink at `link` (adds a dentry); bump live file count.
-    /// `!is_add`: update-in-place (`symlink` with `force=true` over an existing symlink); file count unchanged.
+    /// Persists a symlink inode and its directory edge under `parent`.
+    /// `is_add`: create a new symlink dentry (adds a directory entry); bump live file count.
+    /// `!is_add`: update an existing symlink dentry in place; file count unchanged.
     pub fn apply_symlink(
         &self,
         parent: &InodeView,
