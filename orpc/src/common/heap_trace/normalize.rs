@@ -45,6 +45,7 @@ pub fn normalize_stack_lines(input: &str) -> CommonResult<String> {
     Ok(frames.join("\n"))
 }
 
+#[must_use]
 pub fn normalize_site(frames: &[String]) -> NormalizedHeapSite {
     let frames = frames
         .iter()

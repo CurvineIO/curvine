@@ -16,6 +16,7 @@
 
 use orpc::common::heap_trace::{
     normalize_site, normalize_stack_lines, reduce_topn, HeapTraceHotspot, OTHER_HOTSPOT_SITE_NAME,
+    UNKNOWN_SITE_NAME,
 };
 
 #[test]
@@ -58,7 +59,23 @@ fn normalize_falls_back_when_no_curvine_frame_exists() {
     assert_eq!(generic_site.site_name, "std::alloc::alloc");
 
     let unknown_site = normalize_site(&Vec::new());
-    assert_eq!(unknown_site.site_name, "unknown");
+    assert_eq!(unknown_site.site_name, UNKNOWN_SITE_NAME);
+}
+
+#[test]
+fn reduce_hotspots_with_zero_topn_returns_other_bucket() {
+    let reduced = reduce_topn(
+        vec![
+            hotspot(99, "curvine::write", "aaa", 800),
+            hotspot(4, "rocksdb::flush", "bbb", 600),
+        ],
+        0,
+    );
+
+    assert_eq!(reduced.len(), 1);
+    assert_eq!(reduced[0].rank, 1);
+    assert_eq!(reduced[0].site_name, OTHER_HOTSPOT_SITE_NAME);
+    assert_eq!(reduced[0].bytes, 1400);
 }
 
 #[test]
