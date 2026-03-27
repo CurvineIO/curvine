@@ -17,7 +17,9 @@ use log::{info, warn};
 use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, CommonResult};
 use rocksdb::checkpoint::Checkpoint;
+use rocksdb::properties;
 use rocksdb::*;
+use std::collections::HashMap;
 
 pub type KVBytes = (Box<[u8]>, Box<[u8]>);
 
@@ -313,28 +315,141 @@ impl DBEngine {
         format!("{}/ck-{}", self.conf.checkpoint_dir, id)
     }
 
-    pub fn get_rocksdb_memory(&self) -> CommonResult<Vec<(String, u64)>> {
-        let mut memory_info = Vec::with_capacity(4);
+    /// RocksDB statistics (memory, compaction/flush pressure, snapshots, versions), as `HashMap<metric key, value>`.
+    ///
+    /// **Key naming** (`.` in property names becomes `_`)
+    /// - **DB scope**: `db_{name.replace('.', '_')}`, e.g. `db_rocksdb_block-cache-usage`.
+    /// - **CF scope**: `cf_{cf_name}_{name.replace('.', '_')}`, e.g. `cf_inodes_rocksdb_cur-size-all-mem-tables`.
+    ///
+    /// **`db_*` vs real “whole DB” semantics**
+    ///
+    /// Values under `db_*` are read with `DB::property_int_value` (RocksDB C API **without** a column-family
+    /// handle). For several int properties—including `rocksdb.size-all-mem-tables` and
+    /// `rocksdb.estimate-table-readers-mem`—that path reports metrics for the **default column family only**,
+    /// **not** the sum over all column families. Example: `db_rocksdb_size-all-mem-tables` can be tiny while
+    /// `cf_inodes_rocksdb_size-all-mem-tables` is large. For **memtable** and **table-reader** totals on a
+    /// multi-CF database, **sum the corresponding `cf_*` keys** across your column families (and do **not**
+    /// add those `db_*` keys on top).
+    ///
+    /// **Shared block cache** properties (`block-cache-*`) are typically **DB-wide**; `db_*` is appropriate there.
+    ///
+    /// **Units** (properties not listed below are usually **bytes**)
+    /// - **Counts**: `rocksdb.num-immutable-mem-table`, `rocksdb.num-snapshots`, `rocksdb.num-live-versions`,
+    ///   `rocksdb.num-running-flushes`, `rocksdb.num-running-compactions`.
+    /// - **0/1 flags**: `rocksdb.compaction-pending`, `rocksdb.mem-table-flush-pending`.
+    /// - **Time**: `rocksdb.oldest-snapshot-time` is **Unix seconds** (may be 0 when no snapshot, depending on RocksDB version).
+    ///
+    /// **DB-level metrics (via `property_int_value`; mostly shared cache + process-wide counters)**
+    ///
+    /// | Property suffix | Meaning |
+    /// |-----------------|---------|
+    /// | `rocksdb.block-cache-capacity` | Block cache **configured capacity** (bytes), not current usage. |
+    /// | `rocksdb.block-cache-usage` | Block cache **current usage** (bytes), hot read-path cache. |
+    /// | `rocksdb.block-cache-pinned-usage` | Bytes of **pinned** entries in the block cache. |
+    /// | `rocksdb.size-all-mem-tables` | **Default CF only** when exposed as `db_*` (see note above); memtable bytes for that CF. |
+    /// | `rocksdb.estimate-table-readers-mem` | **Default CF only** when exposed as `db_*`; use `cf_*` sum for all CFs. |
+    ///
+    /// **DB-level metrics (compaction / flush in flight)**
+    ///
+    /// | Property suffix | Meaning |
+    /// |-----------------|---------|
+    /// | `rocksdb.num-running-flushes` | Number of **flushes** currently running. |
+    /// | `rocksdb.num-running-compactions` | Number of **compactions** currently running. |
+    ///
+    /// **DB-level metrics (snapshots, whole DB)**
+    ///
+    /// | Property suffix | Meaning |
+    /// |-----------------|---------|
+    /// | `rocksdb.num-snapshots` | Unreleased **Snapshot** count (holding snapshots pins old SSTs). |
+    /// | `rocksdb.oldest-snapshot-time` | **Unix timestamp (seconds)** of the oldest snapshot. |
+    ///
+    /// **CF-level metrics (per column family)**
+    ///
+    /// | Property suffix | Meaning |
+    /// |-----------------|---------|
+    /// | `rocksdb.cur-size-all-mem-tables` | This CF: active + unflushed immutable memtables (bytes). |
+    /// | `rocksdb.cur-size-active-mem-table` | This CF: **active** memtable size (bytes). |
+    /// | `rocksdb.size-all-mem-tables` | This CF: memtable size including pinned immutable (bytes). |
+    /// | `rocksdb.num-immutable-mem-table` | This CF: count of unflushed **immutable** memtables (not bytes). |
+    /// | `rocksdb.estimate-table-readers-mem` | This CF: estimated table reader memory (bytes). |
+    ///
+    /// **CF-level metrics (compaction / flush pressure)**
+    ///
+    /// | Property suffix | Meaning |
+    /// |-----------------|---------|
+    /// | `rocksdb.compaction-pending` | Whether compaction is pending (**0/1**). |
+    /// | `rocksdb.mem-table-flush-pending` | Whether memtable flush is pending (**0/1**). |
+    /// | `rocksdb.estimate-pending-compaction-bytes` | Estimated bytes to rewrite for pending compaction (level-style, **bytes**). |
+    ///
+    /// **CF-level metrics (versions / long-lived readers)**
+    ///
+    /// | Property suffix | Meaning |
+    /// |-----------------|---------|
+    /// | `rocksdb.num-live-versions` | Number of **live Version** structs; high values often correlate with unreleased iterators, snapshots, or unfinished compactions. |
+    ///
+    /// **Approximate “RocksDB internal accounted memory” (bytes, not process RSS)**
+    ///
+    /// Use **three parts** (do **not** use `db_rocksdb_size-all-mem-tables` / `db_rocksdb_estimate-table-readers-mem`
+    /// for multi-CF totals—they track **default CF only**; see `db_*` note above):
+    ///
+    /// 1. **Block cache (once, DB-wide):** `db_rocksdb_block-cache-usage`.
+    /// 2. **Memtables (sum all CFs):** add every `cf_{cf}_rocksdb_size-all-mem-tables` (same property as
+    ///    `rocksdb.size-all-mem-tables` per column family).
+    /// 3. **Table readers (sum all CFs):** add every `cf_{cf}_rocksdb_estimate-table-readers-mem`.
+    ///
+    /// **Do not** add `block-cache-pinned-usage` on top of `block-cache-usage` (pinned is usually part of usage);
+    /// **do not** treat `block-cache-capacity` as used bytes. **Do not** add both `db_*` and `cf_*` memtable
+    /// or table-reader figures for the same scope.
+    ///
+    /// This sum is a coarse RocksDB-internal estimate; it **excludes** WAL, OS page cache, etc., and **does not equal** process memory in `top`/`ps`.
+    pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
+        let mut info = HashMap::new();
 
-        let properties = [
-            ("rocksdb.cur-size-all-mem-tables", "mem-tables"),
-            ("rocksdb.block-cache-usage", "block-cache"),
-            ("rocksdb.block-cache-pinned-usage", "block-cache-pinned"),
-            ("rocksdb.estimate-table-readers-mem", "table-readers"),
+        // DB scope: block cache; default-CF memtable/table-reader ints (see doc); flush/compaction; snapshots.
+        let db_keys = vec![
+            properties::BLOCK_CACHE_CAPACITY,
+            properties::BLOCK_CACHE_USAGE,
+            properties::BLOCK_CACHE_PINNED_USAGE,
+            properties::SIZE_ALL_MEM_TABLES,
+            properties::ESTIMATE_TABLE_READERS_MEM,
+            properties::NUM_RUNNING_FLUSHES,
+            properties::NUM_RUNNING_COMPACTIONS,
+            properties::NUM_SNAPSHOTS,
+            properties::OLDEST_SNAPSHOT_TIME,
+        ];
+        for key in db_keys {
+            if let Some(value) = self.db.property_int_value(key)? {
+                info.insert(format!("db_{}", key.as_str().replace(".", "_")), value);
+            }
+        }
+
+        // CF scope: memtables, immutables, table readers; compaction/flush backlog; live versions.
+        let cf_keys = vec![
+            properties::CUR_SIZE_ALL_MEM_TABLES,
+            properties::CUR_SIZE_ACTIVE_MEM_TABLE,
+            properties::SIZE_ALL_MEM_TABLES,
+            properties::NUM_IMMUTABLE_MEM_TABLE,
+            properties::ESTIMATE_TABLE_READERS_MEM,
+            properties::COMPACTION_PENDING,
+            properties::MEM_TABLE_FLUSH_PENDING,
+            properties::ESTIMATE_PENDING_COMPACTION_BYTES,
+            properties::NUM_LIVE_VERSIONS,
         ];
 
-        for (property, name) in properties {
-            if let Some(value) = self.db.property_value(property)? {
-                match value.parse::<u64>() {
-                    Ok(size) => memory_info.push((name.to_string(), size)),
-                    Err(e) => {
-                        log::error!("Failed to parse property value: {}", e);
+        for cf_name in &self.conf.family_list {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                for &key in &cf_keys {
+                    if let Some(value) = self.db.property_int_value_cf(cf, key)? {
+                        info.insert(
+                            format!("cf_{}_{}", cf_name, key.as_str().replace(".", "_")),
+                            value,
+                        );
                     }
                 }
             }
         }
 
-        Ok(memory_info)
+        Ok(info)
     }
 
     pub fn conf(&self) -> &DBConf {

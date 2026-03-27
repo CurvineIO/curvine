@@ -22,7 +22,6 @@ use orpc::{err_box, try_option, CommonResult};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-#[derive(Clone)]
 pub struct InodePath {
     path: String,
     name: String,
@@ -51,11 +50,11 @@ impl InodePath {
             //make sure resolved_inode is not a FileEntry
             //if it is a FileEntry, load the complete file data from store
             let resolved_inode = match cur_inode.as_ref() {
-                FileEntry(name, id) => {
+                FileEntry(f) => {
                     // If it is a FileEntry, load the complete object from store
-                    match store.get_inode(*id, Some(name))? {
+                    match store.get_inode(f.id(), Some(f.name()))? {
                         Some(full_inode) => InodePtr::from_owned(full_inode),
-                        None => return err_box!("Failed to load inode {} from store", id),
+                        None => return err_box!("Failed to load inode {} from store", f.id()),
                     }
                 }
                 _ => cur_inode.clone(),
@@ -70,7 +69,7 @@ impl InodePath {
             index += 1;
             let child_name: &str = components[index].as_str();
             match cur_inode.as_mut() {
-                Dir(_, d) => {
+                Dir(d) => {
                     if let Some(child) = d.get_child_ptr(child_name) {
                         cur_inode = child;
                     } else {
@@ -79,10 +78,7 @@ impl InodePath {
                     }
                 }
 
-                File(_, _) | FileEntry(_, _) => {
-                    // File or FileEntry nodes cannot have children, stop path resolution
-                    break;
-                }
+                _ => break,
             }
         }
 
@@ -110,8 +106,8 @@ impl InodePath {
         // Leaf
         match curr_node.as_ref() {
             File(..) | Dir(..) => path_inodes_rebuild.push(curr_node.clone()),
-            FileEntry(name, id) => {
-                let resolved_leaf_node = match store.get_inode(*id, Some(name))? {
+            FileEntry(e) => {
+                let resolved_leaf_node = match store.get_inode(e.id(), Some(e.name()))? {
                     Some(full_inode) => InodePtr::from_owned(full_inode),
                     None => {
                         return err_box!(
@@ -211,7 +207,7 @@ impl InodePath {
             }
 
             // Expand to next level
-            if let Dir(_, d) = curr_node.as_mut() {
+            if let Dir(d) = curr_node.as_mut() {
                 let next_name = components.get(curr_index as usize + 1).map(|s| s.as_str());
                 if let Some(child_name_str) = next_name {
                     // Check the child node name is a glob pattern or not
