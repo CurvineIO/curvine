@@ -506,6 +506,8 @@ impl MasterHandler {
         }
 
         let header: SetAttrRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+
         let opts = ProtoUtils::set_attr_opts_from_pb(header.opts);
         let status = self.fs.set_attr(header.path, opts)?;
 
