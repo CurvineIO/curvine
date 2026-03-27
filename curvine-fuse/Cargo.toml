@@ -38,6 +38,7 @@ futures = { workspace = true }
 default = ["fuse3"]
 fuse2 = []
 fuse3 = []
+heap-trace = ["orpc/heap-trace"]
 
 [build-dependencies]
 bindgen = { workspace = true }

@@ -39,6 +39,10 @@ curvine-tests = { path = "curvine-tests" }
 curvine-fuse = { path = "curvine-fuse" }
 curvine-web = { path = "curvine-web" }
 curvine-s3-gateway = { path = "curvine-s3-gateway" }
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = "0.6"
+inferno = "0.12"
+base64 = "0.21"
 
 # The most important library start
 

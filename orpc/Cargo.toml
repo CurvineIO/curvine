@@ -7,6 +7,14 @@ description = "High-performance network communication framework."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = []
+heap-trace = [
+    "dep:tikv-jemallocator",
+    "dep:tikv-jemalloc-ctl",
+    "dep:inferno",
+]
+
 [dependencies]
 tokio = { workspace = true }
 futures = { workspace = true }
@@ -43,3 +51,7 @@ tracing-log = { workspace = true }
 fxhash = { workspace = true }
 moka = { workspace = true }
 md-5 = { workspace = true }
+tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+inferno = { workspace = true, optional = true }
+base64 = { workspace = true }
