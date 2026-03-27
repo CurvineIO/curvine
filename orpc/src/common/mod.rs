@@ -47,3 +47,6 @@ pub use self::fast_hash_map::FastHashMap;
 
 mod fast_hash_set;
 pub use self::fast_hash_set::FastHashSet;
+
+#[cfg(feature = "heap-trace")]
+pub mod heap_trace;
