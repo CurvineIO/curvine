@@ -1,0 +1,1 @@
+- [Curvine heap trace design](specs/2026-03-27-curvine-heap-trace-design.md) — debug-only jemalloc-based通用heap热点追踪方案
