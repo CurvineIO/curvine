@@ -948,6 +948,7 @@ impl FsDir {
 
         let name = link.name().to_string();
         parent.update_mtime(new_inode.mtime);
+        let is_add = old_inode.is_none();
         let new_inode_ptr = match old_inode {
             Some(v) => {
                 let _ = mem::replace(v.as_mut(), File(name, new_inode));
@@ -961,7 +962,7 @@ impl FsDir {
         };
 
         self.store
-            .apply_symlink(parent.as_ref(), new_inode_ptr.as_ref())?;
+            .apply_symlink(parent.as_ref(), new_inode_ptr.as_ref(), is_add)?;
         Ok(link)
     }
 

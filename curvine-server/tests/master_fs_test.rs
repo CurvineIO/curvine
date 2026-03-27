@@ -35,8 +35,19 @@ use orpc::message::Builder;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
 use raft::eraftpb::Entry;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+// Master metrics gauges are process-wide; tests that assert inode_file_num / inode_dir_num must
+// not run in parallel with each other or counts race with other tests' format/init.
+static INODE_COUNT_METRICS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn inode_count_metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    INODE_COUNT_METRICS_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
+}
 
 // Use a lightweight filesystem-only setup for tests that do not need the full
 // journal runtime lifecycle.
@@ -951,6 +962,7 @@ fn test_idempotent_unmount() -> CommonResult<()> {
 
 #[test]
 fn test_inode_file_num_stays_non_negative_for_symlink_create_delete() -> CommonResult<()> {
+    let _lock = inode_count_metrics_test_lock();
     let fs = new_fs(true, "inode-file-num-symlink");
 
     let (dir_count, file_count) = file_counts(&fs);
@@ -983,7 +995,29 @@ fn test_inode_file_num_stays_non_negative_for_symlink_create_delete() -> CommonR
 }
 
 #[test]
+fn test_inode_file_num_stable_on_forced_symlink_rewrite() -> CommonResult<()> {
+    let _lock = inode_count_metrics_test_lock();
+    let fs = new_fs(true, "inode-file-num-symlink-force");
+
+    fs.mkdir("/dir", false)?;
+    fs.symlink("/target-a", "/dir/link", false, 0o777)?;
+    let file_count_after_first = file_counts(&fs).1;
+
+    fs.symlink("/target-b", "/dir/link", true, 0o777)?;
+    fs.symlink("/target-c", "/dir/link", true, 0o777)?;
+    let file_count_after_rewrites = file_counts(&fs).1;
+
+    assert_eq!(
+        file_count_after_first, file_count_after_rewrites,
+        "force symlink replace must not inflate inode_file_num (was {}, after rewrites {})",
+        file_count_after_first, file_count_after_rewrites
+    );
+    Ok(())
+}
+
+#[test]
 fn test_inode_file_num_stays_non_negative_when_renaming_over_symlink() -> CommonResult<()> {
+    let _lock = inode_count_metrics_test_lock();
     let fs = new_fs(true, "inode-file-num-rename-over-link");
 
     fs.mkdir("/dir", false)?;
