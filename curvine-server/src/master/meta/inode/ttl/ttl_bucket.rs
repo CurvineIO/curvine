@@ -134,9 +134,8 @@ impl TtlBucketList {
     pub fn add(&self, inode: &InodeView) {
         if inode.is_file_entry() {
             warn!(
-                "ttl_bucket: skip add for unresolved FileEntry (inode_id={}, name='{}'); TTL index needs a resolved inode",
+                "ttl_bucket: skip add for unresolved FileEntry (inode_id={}); TTL index needs a resolved inode",
                 inode.id(),
-                inode.name()
             );
             return;
         }
@@ -156,9 +155,8 @@ impl TtlBucketList {
     pub fn remove(&self, inode: &InodeView) -> bool {
         if inode.is_file_entry() {
             warn!(
-                "ttl_bucket: skip remove for unresolved FileEntry (inode_id={}, name='{}')",
+                "ttl_bucket: skip remove for unresolved FileEntry (inode_id={})",
                 inode.id(),
-                inode.name()
             );
             return false;
         }

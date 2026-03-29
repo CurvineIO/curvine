@@ -155,7 +155,7 @@ impl QuotaManager {
                 let fs_guard = self.fs.fs_dir.read();
                 let freed = inode_ids
                     .iter()
-                    .filter_map(|&inode_id| fs_guard.store.get_inode(inode_id, None).ok().flatten())
+                    .filter_map(|&inode_id| fs_guard.store.get_inode(inode_id).ok().flatten())
                     .map(|inode_view| match &inode_view {
                         InodeView::File(_, f) => f.len.max(0),
                         _ => 0,
@@ -225,7 +225,7 @@ impl QuotaManager {
                 .filter_map(|&inode_id| {
                     fs_guard
                         .store
-                        .get_inode(inode_id, None)
+                        .get_inode(inode_id)
                         .ok()
                         .flatten()
                         .and_then(|inode_view| match &inode_view {

@@ -29,13 +29,13 @@ fn test_inode_dir_add_children_and_sort_alphabetically() {
 
     root.print_child();
 
-    let children = root.children_vec();
+    let children = root.list_options(&Default::default());
 
     assert_eq!(children.len(), 4);
-    assert_eq!(children[0].name(), "aa1");
-    assert_eq!(children[1].name(), "aa2");
-    assert_eq!(children[2].name(), "aa3");
-    assert_eq!(children[3].name(), "b");
+    assert_eq!(children[0].name, "aa1");
+    assert_eq!(children[1].name, "aa2");
+    assert_eq!(children[2].name, "aa3");
+    assert_eq!(children[3].name, "b");
 }
 
 #[test]

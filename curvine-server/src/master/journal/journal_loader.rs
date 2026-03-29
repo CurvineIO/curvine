@@ -464,8 +464,8 @@ impl JournalLoader {
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
-        let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, Dir(name, entry.dir))?;
+        let child_name = inp.name().to_string();
+        let _ = fs_dir.add_last_inode(inp, Dir(child_name, entry.dir))?;
         Ok(())
     }
 
@@ -477,8 +477,8 @@ impl JournalLoader {
             warn!("create_file: file already exists: {:?}", entry);
             return Ok(());
         }
-        let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, File(name, entry.file))?;
+        let child_name = inp.name().to_string();
+        let _ = fs_dir.add_last_inode(inp, File(child_name, entry.file))?;
         Ok(())
     }
 
@@ -599,7 +599,7 @@ impl JournalLoader {
             warn!("Free: path not found: {:?}", entry);
             return Ok(());
         };
-        fs_dir.unprotected_free(inode, entry.mtime, entry.recursive)?;
+        fs_dir.unprotected_free(&inp, inode, entry.mtime, entry.recursive)?;
         Ok(())
     }
 

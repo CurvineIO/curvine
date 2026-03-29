@@ -51,9 +51,8 @@ impl InodePath {
             //make sure resolved_inode is not a FileEntry
             //if it is a FileEntry, load the complete file data from store
             let resolved_inode = match cur_inode.as_ref() {
-                FileEntry(name, id) => {
-                    // If it is a FileEntry, load the complete object from store
-                    match store.get_inode(*id, Some(name))? {
+                FileEntry(id) => {
+                    match store.get_inode_with_name(*id, name)? {
                         Some(full_inode) => InodePtr::from_owned(full_inode),
                         None => return err_box!("Failed to load inode {} from store", id),
                     }
@@ -79,7 +78,7 @@ impl InodePath {
                     }
                 }
 
-                File(_, _) | FileEntry(_, _) => {
+                File(_, _) | FileEntry(_) => {
                     // File or FileEntry nodes cannot have children, stop path resolution
                     break;
                 }
@@ -100,18 +99,28 @@ impl InodePath {
         curr_index: i64,
         curr_node: &InodePtr,
         components_length: i64,
-        parent_map: &HashMap<i64, (i64, i64)>,
+        parent_map: &HashMap<i64, (i64, i64, String)>,
         store: &InodeStore,
     ) -> CommonResult<Self> {
         let mut path_inodes_rebuild = Vec::new();
+        let mut path_components_rebuild = Vec::new();
         let mut idx = curr_index;
         let mut current_id = curr_node.as_ref().id();
 
-        // Leaf
+        // Current node name
+        if let Some((_, _, name)) = parent_map.get(&current_id) {
+            path_components_rebuild.push(name.clone());
+        } else {
+            return err_box!("No path component found for inode {}", current_id);
+        }
+
         match curr_node.as_ref() {
             File(..) | Dir(..) => path_inodes_rebuild.push(curr_node.clone()),
-            FileEntry(name, id) => {
-                let resolved_leaf_node = match store.get_inode(*id, Some(name))? {
+            FileEntry(id) => {
+                let current_name = path_components_rebuild
+                    .last()
+                    .expect("path component must exist before resolving FileEntry");
+                let resolved_leaf_node = match store.get_inode_with_name(*id, current_name)? {
                     Some(full_inode) => InodePtr::from_owned(full_inode),
                     None => {
                         return err_box!(
@@ -126,13 +135,12 @@ impl InodePath {
 
         // Parents
         while idx != 0 {
-            if let Some((parent_idx, parent_id)) = parent_map.get(&current_id) {
+            if let Some((parent_idx, parent_id, _)) = parent_map.get(&current_id) {
                 if *parent_id == EMPTY_PARENT_ID {
-                    // Reached the root
                     break;
                 }
 
-                let resolved_parent = match store.get_inode(*parent_id, None)? {
+                let resolved_parent = match store.get_inode(*parent_id)? {
                     Some(full_inode) => InodePtr::from_owned(full_inode),
                     None => {
                         return err_box!("Failed to load parent inode {} from store", parent_id)
@@ -140,21 +148,21 @@ impl InodePath {
                 };
 
                 path_inodes_rebuild.push(resolved_parent);
+                if let Some((_, _, parent_name)) = parent_map.get(parent_id) {
+                    path_components_rebuild.push(parent_name.clone());
+                } else {
+                    return err_box!("No path component found for inode {}", parent_id);
+                }
                 idx = *parent_idx;
                 current_id = *parent_id;
             } else {
                 return err_box!("No parent found for inode {}", current_id);
             }
         }
-        // Reverse to get correct order from root to leaf
         path_inodes_rebuild.reverse();
+        path_components_rebuild.reverse();
 
-        let components_result: Vec<String> = path_inodes_rebuild
-            .iter()
-            .map(|node| node.as_ref().name().to_string())
-            .collect();
-
-        let path_str = components_result
+        let path_str = path_components_rebuild
             .iter()
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
@@ -170,13 +178,11 @@ impl InodePath {
 
         Ok(Self {
             path: path_str,
-            name: components_result.last().cloned().unwrap_or_else(|| {
-                format!(
-                    "Failed to load last name from path {:?}",
-                    path_inodes_rebuild
-                )
-            }),
-            components: components_result,
+            name: path_components_rebuild
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "".to_string()),
+            components: path_components_rebuild,
             inodes: path_inodes_rebuild,
         })
     }
@@ -193,8 +199,8 @@ impl InodePath {
         let mut queue: VecDeque<(i64, InodePtr)> = VecDeque::new(); // index + node!
 
         // Parent map: current inode id -> (index, parent inode id) for path reconstruction
-        let mut parent_map: HashMap<i64, (i64, i64)> = HashMap::new();
-        parent_map.insert(ROOT_INODE_ID, (0, EMPTY_PARENT_ID)); // Root has no parent
+        let mut parent_map: HashMap<i64, (i64, i64, String)> = HashMap::new();
+        parent_map.insert(ROOT_INODE_ID, (0, EMPTY_PARENT_ID, String::new())); // Root has no parent
         queue.push_back((0, root)); // Start BFS
 
         while let Some((curr_index, curr_node)) = queue.pop_front() {
@@ -223,13 +229,16 @@ impl InodePath {
                             for child_ptr in children.iter() {
                                 parent_map.insert(
                                     child_ptr.as_ref().id(),
-                                    (curr_index + 1, curr_node.id()),
+                                    (curr_index + 1, curr_node.id(), child_name_str.to_string()),
                                 );
                                 queue.push_back((curr_index + 1, child_ptr.clone()));
                             }
                         }
                     } else if let Some(child) = d.get_child_ptr(child_name_str) {
-                        parent_map.insert(child.id(), (curr_index + 1, curr_node.id()));
+                        parent_map.insert(
+                            child.id(),
+                            (curr_index + 1, curr_node.id(), child_name_str.to_string()),
+                        );
                         queue.push_back((curr_index + 1, child));
                     }
                 }
@@ -349,7 +358,7 @@ impl InodePath {
         self.inodes.len()
     }
 
-    pub fn append(&mut self, inode: InodePtr) -> CommonResult<()> {
+    pub fn append_with_name(&mut self, inode: InodePtr, edge_name: &str) -> CommonResult<()> {
         if self.components.len() == self.inodes.len() {
             return err_box!(
                 "Path {} is The path is complete, appending nodes is not allowed",
@@ -357,9 +366,9 @@ impl InodePath {
             );
         }
 
-        match self.get_component(self.inodes.len()) {
-            Ok(n) if n == inode.name() => (),
-            _ => return err_box!("data status  {:?}", self),
+        let expected = self.get_component(self.inodes.len())?;
+        if expected != edge_name {
+            return err_box!("data status  {:?}", self);
         }
 
         self.inodes.push(inode);

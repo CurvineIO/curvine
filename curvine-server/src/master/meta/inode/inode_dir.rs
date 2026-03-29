@@ -16,7 +16,7 @@ use crate::master::meta::feature::{AclFeature, DirFeature};
 use crate::master::meta::inode::inodes_children::InodeChildren;
 use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::{
-    ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
+    ChildrenIter, Inode, InodeFile, InodePtr, InodeView, NamedInodeView, EMPTY_PARENT_ID,
 };
 use curvine_common::state::{ListOptions, MkdirOpts, StoragePolicy};
 use glob::Pattern;
@@ -73,9 +73,21 @@ impl InodeDir {
     }
 
     /// Add a word node and return a reference to that word node.
-    pub fn add_child(&mut self, mut inode: InodeView) -> CommonResult<InodePtr> {
+    pub fn add_child(&mut self, inode: InodeView) -> CommonResult<InodePtr> {
+        match inode {
+            File(name, file) => self.add_child_with_name(&name.clone(), File(name, file)),
+            Dir(name, dir) => self.add_child_with_name(&name.clone(), Dir(name, dir)),
+            InodeView::FileEntry(_) => unreachable!("FileEntry cannot be added without an edge name"),
+        }
+    }
+
+    pub fn add_child_with_name(
+        &mut self,
+        child_name: &str,
+        mut inode: InodeView,
+    ) -> CommonResult<InodePtr> {
         inode.set_parent_id(self.id);
-        self.children.add_child(inode)
+        self.children.add_child_with_name(child_name, inode)
     }
 
     /// Get the child node of the specified inode name.
@@ -106,9 +118,8 @@ impl InodeDir {
 
     pub fn print_child(&self) {
         for child in self.children.iter() {
-            let t = if child.is_dir() { "dir" } else { "file" };
-
-            println!("{} {} {}", t, child.id(), child.name());
+            let t = if child.inode.is_dir() { "dir" } else { "file" };
+            println!("{} {} {}", t, child.inode.id(), child.name);
         }
     }
 
@@ -116,12 +127,12 @@ impl InodeDir {
         self.children.iter()
     }
 
-    pub fn list_options(&self, options: &ListOptions) -> Vec<&InodeView> {
+    pub fn list_options(&self, options: &ListOptions) -> Vec<NamedInodeView<'_>> {
         self.children.list_options(options)
     }
 
     pub fn children_vec(&self) -> Vec<InodeView> {
-        self.children.iter().cloned().collect()
+        self.children.iter().map(|child| child.inode.clone()).collect()
     }
 
     pub fn children_len(&self) -> usize {

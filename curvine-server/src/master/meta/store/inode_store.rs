@@ -48,12 +48,17 @@ impl InodeStore {
         self.ttl_bucket_list.clone()
     }
 
-    pub fn apply_add(&self, parent: &InodeView, child: &InodeView) -> CommonResult<()> {
+    pub fn apply_add(
+        &self,
+        parent: &InodeView,
+        child_name: &str,
+        child: &InodeView,
+    ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(child)?;
         batch.write_inode(parent)?;
-        batch.add_child(parent.id(), child.name(), child.id())?;
+        batch.add_child(parent.id(), child_name, child.id())?;
 
         batch.commit()?;
 
@@ -73,19 +78,24 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_delete(&self, parent: &InodeView, del: &InodeView) -> CommonResult<DeleteResult> {
+    pub fn apply_delete(
+        &self,
+        parent: &InodeView,
+        del_name: &str,
+        del: &InodeView,
+    ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
         batch.write_inode(parent)?;
 
         let mut stack = LinkedList::new();
-        stack.push_back((parent.id(), del.clone()));
+        stack.push_back((parent.id(), del_name.to_string(), del.clone()));
         let mut del_res = DeleteResult::new();
         let mut deleted_files = 0i64;
         let mut deleted_dirs = 0i64;
 
-        while let Some((parent_id, inode)) = stack.pop_front() {
+        while let Some((parent_id, inode_name, inode)) = stack.pop_front() {
             // Delete inode edges
-            batch.delete_child(parent_id, inode.name())?;
+            batch.delete_child(parent_id, &inode_name)?;
             del_res.inodes += 1;
 
             match &inode {
@@ -98,7 +108,7 @@ impl InodeStore {
                         deleted_dirs += 1;
                     }
                     for item in dir.children_iter() {
-                        stack.push_back((inode.id(), item.clone()))
+                        stack.push_back((inode.id(), item.name.to_string(), item.inode.clone()))
                     }
                 }
 
@@ -134,18 +144,20 @@ impl InodeStore {
     pub fn apply_rename(
         &self,
         src_parent: &InodeView,
-        src_inode: &InodeView,
+        src_name: &str,
+        _src_inode: &InodeView,
         dst_parent: &InodeView,
+        dst_name: &str,
         dst_inode: &InodeView,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         // Delete the old node using the original name
-        batch.delete_child(src_parent.id(), src_inode.name())?;
+        batch.delete_child(src_parent.id(), src_name)?;
 
         // Add new node.
         batch.write_inode(dst_inode)?;
-        batch.add_child(dst_parent.id(), dst_inode.name(), dst_inode.id())?;
+        batch.add_child(dst_parent.id(), dst_name, dst_inode.id())?;
 
         // Update the modification time of the previous node.
         batch.write_inode(src_parent)?;
@@ -219,6 +231,7 @@ impl InodeStore {
     pub fn apply_symlink(
         &self,
         parent: &InodeView,
+        new_name: &str,
         new_inode: &InodeView,
         is_add: bool,
     ) -> CommonResult<()> {
@@ -226,7 +239,7 @@ impl InodeStore {
 
         batch.write_inode(parent)?;
         batch.write_inode(new_inode)?;
-        batch.add_child(parent.id(), new_inode.name(), new_inode.id())?;
+        batch.add_child(parent.id(), new_name, new_inode.id())?;
 
         batch.commit()?;
 
@@ -240,7 +253,8 @@ impl InodeStore {
     pub fn apply_link(
         &self,
         parent: &InodeView,
-        new_entry: &InodeView,
+        entry_name: &str,
+        _new_entry: &InodeView,
         original_inode_id: i64,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
@@ -248,7 +262,7 @@ impl InodeStore {
         batch.write_inode(parent)?;
 
         //link is a edge, link to same inode
-        batch.add_child(parent.id(), new_entry.name(), original_inode_id)?;
+        batch.add_child(parent.id(), entry_name, original_inode_id)?;
 
         // Increment nlink count of the original inode (in the same batch for atomicity)
         self.increment_inode_nlink(original_inode_id, &mut batch)?;
@@ -265,7 +279,7 @@ impl InodeStore {
         inode_id: i64,
         batch: &mut InodeWriteBatch<'_>,
     ) -> CommonResult<()> {
-        if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
+        if let Some(mut inode_view) = self.get_inode(inode_id)? {
             match &mut inode_view {
                 InodeView::File(_, _) => {
                     inode_view.incr_nlink();
@@ -284,6 +298,7 @@ impl InodeStore {
     pub fn apply_unlink(
         &self,
         parent: &InodeView,
+        child_name: &str,
         child: &InodeView,
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
@@ -292,7 +307,7 @@ impl InodeStore {
         batch.write_inode(parent)?;
 
         // Remove the child from the parent's children list
-        batch.delete_child(parent.id(), child.name())?;
+        batch.delete_child(parent.id(), child_name)?;
 
         // Decrement nlink count of the file being unlinked.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
@@ -312,7 +327,8 @@ impl InodeStore {
     pub fn apply_unlink_file_entry(
         &self,
         parent: &InodeView,
-        child: &InodeView,
+        child_name: &str,
+        _child: &InodeView,
         inode_id: i64,
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
@@ -321,7 +337,7 @@ impl InodeStore {
         batch.write_inode(parent)?;
 
         // Remove the FileEntry from the parent's children list
-        batch.delete_child(parent.id(), child.name())?;
+        batch.delete_child(parent.id(), child_name)?;
 
         // Decrement nlink count of the original inode.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
@@ -342,7 +358,7 @@ impl InodeStore {
     ) -> CommonResult<DeleteResult> {
         let mut del_res = DeleteResult::new();
         // Load the inode from storage
-        if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
+        if let Some(mut inode_view) = self.get_inode(inode_id)? {
             match &mut inode_view {
                 InodeView::File(_, file) => {
                     let remaining_links = file.decrement_nlink();
@@ -387,12 +403,12 @@ impl InodeStore {
         stack.push_back((
             root.as_ptr(),
             ROOT_INODE_ID,
-            InodeView::FileEntry(String::new(), ROOT_INODE_ID),
+            String::new(),
         ));
         let mut last_inode_id = ROOT_INODE_ID;
         let mut file_count = 0i64;
         let mut dir_count = 0i64;
-        while let Some((mut parent, child_id, file_entry)) = stack.pop_front() {
+        while let Some((mut parent, child_id, child_name)) = stack.pop_front() {
             last_inode_id = last_inode_id.max(child_id);
 
             let next_parent = if child_id != ROOT_INODE_ID {
@@ -414,7 +430,7 @@ impl InodeStore {
                 let inode = if matches!(store_inode, InodeView::Dir(_, _)) {
                     store_inode
                 } else {
-                    file_entry
+                    InodeView::FileEntry(child_id)
                 };
 
                 // Count files and directories during tree reconstruction
@@ -429,7 +445,7 @@ impl InodeStore {
                     InodeView::FileEntry(..) => file_count += 1,
                 }
 
-                parent.add_child(inode)?
+                parent.add_child_with_name(&child_name, inode)?
             } else {
                 parent
             };
@@ -441,9 +457,7 @@ impl InodeStore {
                     let (key, value) = try_err!(item);
                     let (_, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
                     let child_id = RocksUtils::i64_from_bytes(&value)?;
-                    let file_entry = InodeView::FileEntry(child_name.to_string(), child_id);
-
-                    stack.push_back((next_parent.clone(), child_id, file_entry))
+                    stack.push_back((next_parent.clone(), child_id, child_name.to_string()))
                 }
             }
         }
@@ -478,16 +492,17 @@ impl InodeStore {
         Ok(())
     }
 
-    //get_inode should return the inode with the name of the FileEntry
-    //TODO refactor: remove seq name from store_inode
-    pub fn get_inode(&self, id: i64, name: Option<&str>) -> CommonResult<Option<InodeView>> {
-        let mut inode_view = self.store.get_inode(id)?;
-        if let Some(name) = name {
-            if let Some(ref mut inode) = inode_view {
-                inode.change_name(name.to_string());
-            }
-        }
-        Ok(inode_view)
+    pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>> {
+        self.store.get_inode(id)
+    }
+
+    pub fn get_inode_with_name(&self, id: i64, name: &str) -> CommonResult<Option<InodeView>> {
+        let inode_view = self.store.get_inode(id)?;
+        Ok(inode_view.map(|inode| match inode {
+            InodeView::File(_, file) => InodeView::File(name.to_string(), file),
+            InodeView::Dir(_, dir) => InodeView::Dir(name.to_string(), dir),
+            InodeView::FileEntry(inode_id) => InodeView::FileEntry(inode_id),
+        }))
     }
 
     pub fn cf_hash(&self, cf: &str) -> u128 {

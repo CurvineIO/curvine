@@ -33,7 +33,7 @@ use std::fmt::{Debug, Formatter};
 pub enum InodeView {
     File(String, InodeFile) = 1,
     Dir(String, InodeDir) = 2,
-    FileEntry(String, i64) = 3,
+    FileEntry(i64) = 3,
 }
 
 impl InodeView {
@@ -50,7 +50,7 @@ impl InodeView {
     }
 
     pub fn is_file_entry(&self) -> bool {
-        matches!(self, FileEntry(_, _))
+        matches!(self, FileEntry(_))
     }
 
     pub fn is_link(&self) -> bool {
@@ -61,7 +61,7 @@ impl InodeView {
         match self {
             File(_, f) => f.id(),
             Dir(_, d) => d.id(),
-            FileEntry(_, id) => *id,
+            FileEntry(id) => *id,
         }
     }
 
@@ -69,7 +69,7 @@ impl InodeView {
         match self {
             File(name, _) => name,
             Dir(name, _) => name,
-            FileEntry(name, _) => name,
+            FileEntry(_) => panic!("FileEntry does not carry name; use edge name instead"),
         }
     }
 
@@ -112,11 +112,11 @@ impl InodeView {
     }
 
     // Test and print for use. Memory copying occurs.
-    pub fn children(&self) -> Vec<&InodeView> {
+    pub fn children(&self) -> Vec<(String, &InodeView)> {
         let mut vec = Vec::with_capacity(8);
         if let Dir(_, d) = self {
             for item in d.children_iter() {
-                vec.push(item)
+                vec.push((item.name.to_string(), item.inode))
             }
         }
 
@@ -136,7 +136,15 @@ impl InodeView {
         match self {
             File(name, _) => err_box!("Path not a dir: {}", name),
             Dir(_, d) => d.add_child(child),
-            _ => err_box!("Inode type error: {}", self.name()),
+            FileEntry(_) => err_box!("Inode type error: file entry requires edge name"),
+        }
+    }
+
+    pub fn add_child_with_name(&mut self, child_name: &str, child: InodeView) -> CommonResult<InodePtr> {
+        match self {
+            File(name, _) => err_box!("Path not a dir: {}", name),
+            Dir(_, d) => d.add_child_with_name(child_name, child),
+            FileEntry(_) => err_box!("Inode type error: file entry requires edge name"),
         }
     }
 
@@ -144,7 +152,7 @@ impl InodeView {
         match self {
             File(name, _) => err_box!("Path not a dir: {}", name),
             Dir(_, d) => d.delete_child(id, name),
-            _ => err_box!("Inode type error: {}", self.name()),
+            FileEntry(_) => err_box!("Inode type error: file entry requires edge name"),
         }
     }
 
@@ -204,14 +212,6 @@ impl InodeView {
         }
     }
 
-    pub fn change_name(&mut self, new_name: String) {
-        match self {
-            File(name, _) => *name = new_name,
-            Dir(name, _) => *name = new_name,
-            FileEntry(name, _) => *name = new_name,
-        }
-    }
-
     pub fn atime(&self) -> i64 {
         match self {
             File(_, f) => f.atime(),
@@ -224,7 +224,7 @@ impl InodeView {
         match self {
             File(_, _) => err_box!("Not a dir"),
             Dir(_, ref mut d) => Ok(d),
-            _ => err_box!("Inode type error: {}", self.name()),
+            FileEntry(_) => err_box!("Inode type error: file entry requires edge name"),
         }
     }
 
@@ -232,7 +232,7 @@ impl InodeView {
         match self {
             File(_, _) => err_box!("Not a dir"),
             Dir(_, ref d) => Ok(d),
-            _ => err_box!("Inode type error: {}", self.name()),
+            FileEntry(_) => err_box!("Inode type error: file entry requires edge name"),
         }
     }
 
@@ -240,7 +240,7 @@ impl InodeView {
         match self {
             File(_, f) => Ok(f),
             Dir(_, _) => err_box!("Not a file"),
-            _ => err_box!("Inode type error: {}", self.name()),
+            FileEntry(_) => err_box!("Inode type error: file entry requires edge name"),
         }
     }
 
@@ -248,7 +248,7 @@ impl InodeView {
         match self {
             File(_, ref mut f) => Ok(f),
             Dir(_, _) => err_box!("Not a file"),
-            _ => err_box!("FileEntry is cannot be mutated: {}", self.name()),
+            FileEntry(_) => err_box!("FileEntry cannot be mutated without loading full inode metadata"),
         }
     }
 
@@ -334,7 +334,7 @@ impl InodeView {
         match self {
             File(_, f) => f.nlink(),
             Dir(_, d) => d.nlink(),
-            FileEntry(_, _) => {
+            FileEntry(_) => {
                 panic!("FileEntry does not support nlink")
             }
         }
@@ -400,11 +400,18 @@ impl InodeView {
     }
 
     pub fn to_file_status(&self, path: &str) -> FileStatus {
+        match self {
+            File(name, _) | Dir(name, _) => self.to_file_status_with_name(path, name),
+            FileEntry(_) => panic!("FileEntry requires edge name to build FileStatus"),
+        }
+    }
+
+    pub fn to_file_status_with_name(&self, path: &str, name: &str) -> FileStatus {
         let acl = self.acl();
         let mut status = FileStatus {
             id: self.id(),
             path: path.to_owned(),
-            name: self.name().to_owned(),
+            name: name.to_owned(),
             is_dir: self.is_dir(),
             mtime: self.mtime(),
             atime: self.atime(),
@@ -442,7 +449,7 @@ impl InodeView {
                 status.storage_policy = d.storage_policy.clone();
             }
 
-            FileEntry(_, _inode_id) => {
+            FileEntry(_inode_id) => {
                 panic!("FileEntry does not support to_file_status");
             }
         }
@@ -472,15 +479,15 @@ impl InodeView {
         }
 
         let children = inode.children();
-        for (index, item) in children.iter().enumerate() {
+        for (index, (name, item)) in children.iter().enumerate() {
             if index == children.len() - 1 {
-                println!("{}└── {}", prefix, item.name());
+                println!("{}└── {}", prefix, name);
                 if item.is_dir() {
                     let prefix_new = format!("{}    ", prefix);
                     Self::print_tree0(item, prefix_new, level + 1);
                 }
             } else {
-                println!("{}├── {}", prefix, item.name());
+                println!("{}├── {}", prefix, name);
                 if item.is_dir() {
                     let prefix_new = format!("{}│   ", prefix);
                     Self::print_tree0(item, prefix_new, level + 1);
@@ -503,7 +510,7 @@ impl InodeView {
                 res += hash
             }
 
-            for child in v.children() {
+            for (_, child) in v.children() {
                 stack.push_front(child)
             }
         }
@@ -517,7 +524,7 @@ impl Clone for InodeView {
         match self {
             File(name, f) => File(name.clone(), f.clone()),
             Dir(name, d) => Dir(name.clone(), d.clone()),
-            FileEntry(name, id) => FileEntry(name.clone(), *id),
+            FileEntry(id) => FileEntry(*id),
         }
     }
 }
@@ -527,7 +534,7 @@ impl Debug for InodeView {
         match self {
             File(name, x) => write!(f, "File(name={}, x={:?})", name, x),
             Dir(name, x) => write!(f, "Dir(name={}, x={:?})", name, x),
-            FileEntry(name, id) => write!(f, "FileEntry(name={}, id={})", name, id),
+            FileEntry(id) => write!(f, "FileEntry(id={})", id),
         }
     }
 }
