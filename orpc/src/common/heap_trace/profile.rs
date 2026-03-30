@@ -41,18 +41,22 @@ pub fn read_profile(raw_profile_path: &Path) -> CommonResult<HeapTraceProfile> {
 
 #[cfg(feature = "heap-trace")]
 pub fn dump_profile(raw_profile_path: &Path) -> CommonResult<()> {
-    use libc::c_char;
+    use std::ffi::CString;
+    use tikv_jemalloc_ctl::profiling::prof;
     use tikv_jemalloc_ctl::{epoch, raw};
 
     static PROF_DUMP: &[u8] = b"prof.dump\0";
 
     epoch::advance().map_err(|err| err.to_string())?;
 
-    let dump_path = raw_profile_path.to_string_lossy().to_string();
-    let dump_path = format!("{dump_path}\0");
+    if !prof::read().map_err(|err| err.to_string())? {
+        return Err("jemalloc heap profiling is disabled".into());
+    }
+
+    let dump_path = CString::new(raw_profile_path.to_string_lossy().into_owned())
+        .map_err(|err| err.to_string())?;
     unsafe {
-        raw::write(PROF_DUMP, dump_path.as_ptr() as *const c_char)
-            .map_err(|err| err.to_string())?;
+        raw::write(PROF_DUMP, dump_path.as_ptr()).map_err(|err| err.to_string())?;
     }
     Ok(())
 }
