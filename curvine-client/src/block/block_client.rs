@@ -60,6 +60,18 @@ impl BlockClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test(worker_addr: WorkerAddress) -> Self {
+        Self {
+            client: None,
+            client_name: String::new(),
+            timeout: Duration::from_millis(0),
+            pool: None,
+            worker_addr,
+            uptime: LocalTime::mills(),
+        }
+    }
+
     pub fn set_pool(&mut self, pool: Arc<BlockClientPool>) {
         self.pool.replace(pool);
         self.uptime = LocalTime::mills();

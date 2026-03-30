@@ -21,6 +21,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileStatus {
     pub id: i64,
+    #[serde(default)]
+    pub version_epoch: i64,
     pub path: String,
     pub name: String,
     pub is_dir: bool,
@@ -120,5 +122,29 @@ impl FileStatus {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn file_status_serde_decodes_legacy_json_without_version_epoch() {
+        let mut json = serde_json::to_value(FileStatus {
+            id: 7,
+            path: "/tmp/a".to_string(),
+            name: "a".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        if let Value::Object(obj) = &mut json {
+            obj.remove("version_epoch");
+        }
+
+        let decoded: FileStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.version_epoch, 0);
     }
 }

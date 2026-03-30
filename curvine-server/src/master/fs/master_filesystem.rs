@@ -24,6 +24,7 @@ use crate::master::{Master, MasterMonitor, SyncFsDir, SyncWorkerManager};
 use curvine_common::conf::{ClusterConf, MasterConf};
 use curvine_common::error::FsError;
 use curvine_common::state::*;
+use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
 use log::warn;
 use orpc::sync::ArcRwLock;
@@ -628,7 +629,28 @@ impl MasterFilesystem {
             info.lost_workers.push(worker.clone());
         }
 
+        info.p2p_policy_version = self.conf.p2p_policy_version;
+        info.p2p_peer_whitelist = self.conf.p2p_peer_whitelist.clone();
+        info.p2p_tenant_whitelist = self.conf.p2p_tenant_whitelist.clone();
+
         Ok(info)
+    }
+
+    pub fn p2p_runtime_policy(&self) -> (u64, Vec<String>, Vec<String>, String) {
+        let version = self.conf.p2p_policy_version;
+        let peers = self.conf.p2p_peer_whitelist.clone();
+        let tenants = self.conf.p2p_tenant_whitelist.clone();
+        let mut signatures = Vec::with_capacity(2);
+        for key in [
+            &self.conf.p2p_policy_signing_key,
+            &self.conf.p2p_policy_transition_signing_key,
+        ] {
+            let signature = CommonUtils::sign_p2p_policy(key, version, &peers, &tenants);
+            if !signature.is_empty() && !signatures.iter().any(|existing| existing == &signature) {
+                signatures.push(signature);
+            }
+        }
+        (version, peers, tenants, signatures.join(","))
     }
 
     pub fn fs_dir(&self) -> ArcRwLock<FsDir> {
@@ -840,5 +862,35 @@ impl Default for MasterFilesystem {
         let journal_system = JournalSystem::from_conf(&conf)
             .expect("Failed to initialize JournalSystem from default ClusterConf");
         journal_system.fs()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MasterFilesystem;
+    use crate::master::journal::JournalSystem;
+    use crate::master::Master;
+    use curvine_common::conf::ClusterConf;
+    use curvine_common::utils::CommonUtils;
+
+    #[test]
+    fn p2p_runtime_policy_uses_master_config_and_signing_key() {
+        Master::init_test_metrics();
+        let mut conf = ClusterConf::format();
+        conf.master.p2p_policy_version = 9;
+        conf.master.p2p_policy_signing_key = "secret".to_string();
+        conf.master.p2p_peer_whitelist = vec!["peer-a".to_string()];
+        conf.master.p2p_tenant_whitelist = vec!["tenant-a".to_string()];
+
+        let journal_system = JournalSystem::from_conf(&conf).expect("journal system should build");
+        let fs = MasterFilesystem::with_js(&conf, &journal_system);
+
+        let (version, peers, tenants, signature) = fs.p2p_runtime_policy();
+        assert_eq!(version, 9);
+        assert_eq!(peers, vec!["peer-a".to_string()]);
+        assert_eq!(tenants, vec!["tenant-a".to_string()]);
+        assert!(CommonUtils::verify_p2p_policy_signatures(
+            "secret", version, &peers, &tenants, &signature,
+        ));
     }
 }
