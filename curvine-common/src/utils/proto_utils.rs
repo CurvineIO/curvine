@@ -217,6 +217,7 @@ impl ProtoUtils {
     pub fn file_status_to_pb(status: FileStatus) -> FileStatusProto {
         FileStatusProto {
             id: status.id,
+            version_epoch: Some(status.version_epoch),
             path: status.path,
             name: status.name,
             is_dir: status.is_dir,
@@ -242,6 +243,7 @@ impl ProtoUtils {
     pub fn file_status_from_pb(status: FileStatusProto) -> FileStatus {
         FileStatus {
             id: status.id,
+            version_epoch: status.version_epoch.unwrap_or_default(),
             path: status.path,
             name: status.name,
             is_dir: status.is_dir,
@@ -707,5 +709,129 @@ impl ProtoUtils {
             inodes: res.inodes,
             bytes: res.bytes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyStoragePolicyProto {
+        #[prost(enumeration = "StorageTypeProto", required, tag = "1")]
+        pub storage_type: i32,
+        #[prost(int64, required, tag = "2", default = "0")]
+        pub ttl_ms: i64,
+        #[prost(enumeration = "TtlActionProto", required, tag = "3")]
+        pub ttl_action: i32,
+        #[prost(int64, required, tag = "4")]
+        pub ufs_mtime: i64,
+        #[prost(enumeration = "StorageStateProto", required, tag = "5")]
+        pub state: i32,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyFileStatusProto {
+        #[prost(int64, required, tag = "1")]
+        pub id: i64,
+        #[prost(string, required, tag = "2")]
+        pub path: String,
+        #[prost(string, required, tag = "3")]
+        pub name: String,
+        #[prost(bool, required, tag = "4")]
+        pub is_dir: bool,
+        #[prost(int64, required, tag = "5")]
+        pub mtime: i64,
+        #[prost(int64, required, tag = "6")]
+        pub atime: i64,
+        #[prost(int32, required, tag = "7")]
+        pub children_num: i32,
+        #[prost(bool, required, tag = "8", default = "false")]
+        pub is_complete: bool,
+        #[prost(int64, required, tag = "9")]
+        pub len: i64,
+        #[prost(int32, required, tag = "10")]
+        pub replicas: i32,
+        #[prost(int64, required, tag = "11")]
+        pub block_size: i64,
+        #[prost(enumeration = "FileTypeProto", required, tag = "12")]
+        pub file_type: i32,
+        #[prost(map = "string, bytes", tag = "13")]
+        pub x_attr: std::collections::HashMap<String, Vec<u8>>,
+        #[prost(message, required, tag = "14")]
+        pub storage_policy: LegacyStoragePolicyProto,
+        #[prost(string, required, tag = "15")]
+        pub owner: String,
+        #[prost(string, required, tag = "16")]
+        pub group: String,
+        #[prost(uint32, required, tag = "17")]
+        pub mode: u32,
+        #[prost(string, optional, tag = "18")]
+        pub target: Option<String>,
+        #[prost(uint32, required, tag = "19")]
+        pub nlink: u32,
+    }
+
+    #[test]
+    fn file_status_proto_roundtrip_keeps_version_epoch() {
+        let status = FileStatus {
+            id: 7,
+            path: "/tmp/a".to_string(),
+            name: "a".to_string(),
+            version_epoch: 42,
+            ..Default::default()
+        };
+        let pb = ProtoUtils::file_status_to_pb(status.clone());
+        let decoded = ProtoUtils::file_status_from_pb(pb);
+        assert_eq!(decoded.version_epoch, 42);
+    }
+
+    #[test]
+    fn file_status_proto_decodes_legacy_payload_without_version_epoch() {
+        let legacy = LegacyFileStatusProto {
+            id: 7,
+            path: "/tmp/a".to_string(),
+            name: "a".to_string(),
+            is_dir: false,
+            mtime: 11,
+            atime: 12,
+            children_num: 0,
+            is_complete: true,
+            len: 33,
+            replicas: 1,
+            block_size: 128,
+            file_type: FileTypeProto::File as i32,
+            x_attr: Default::default(),
+            storage_policy: LegacyStoragePolicyProto {
+                storage_type: StorageTypeProto::Disk as i32,
+                ttl_ms: 0,
+                ttl_action: TtlActionProto::None as i32,
+                ufs_mtime: 0,
+                state: StorageStateProto::Cv as i32,
+            },
+            owner: "owner".to_string(),
+            group: "group".to_string(),
+            mode: 0o644,
+            target: None,
+            nlink: 1,
+        };
+        let bytes = legacy.encode_to_vec();
+        let decoded = FileStatusProto::decode(bytes.as_slice())
+            .expect("current proto should decode legacy payload without version_epoch");
+        assert_eq!(decoded.version_epoch, None);
+        assert_eq!(ProtoUtils::file_status_from_pb(decoded).version_epoch, 0);
+    }
+
+    #[test]
+    fn file_status_from_pb_defaults_optional_version_epoch_to_zero() {
+        let mut pb = ProtoUtils::file_status_to_pb(FileStatus {
+            id: 7,
+            path: "/tmp/a".to_string(),
+            name: "a".to_string(),
+            ..Default::default()
+        });
+        pb.version_epoch = None;
+        let decoded = ProtoUtils::file_status_from_pb(pb);
+        assert_eq!(decoded.version_epoch, 0);
     }
 }

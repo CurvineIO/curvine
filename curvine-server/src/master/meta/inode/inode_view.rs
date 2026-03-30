@@ -403,6 +403,7 @@ impl InodeView {
         let acl = self.acl();
         let mut status = FileStatus {
             id: self.id(),
+            version_epoch: 0,
             path: path.to_owned(),
             name: self.name().to_owned(),
             is_dir: self.is_dir(),
@@ -425,6 +426,7 @@ impl InodeView {
 
         match self {
             File(_, f) => {
+                status.version_epoch = f.version_epoch;
                 status.is_complete = f.is_complete();
                 status.len = f.len;
                 status.replicas = f.replicas as i32;
