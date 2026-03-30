@@ -1,10 +1,13 @@
 use axum::extract::Extension;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 #[cfg(feature = "heap-trace")]
-use orpc::common::heap_trace::{latest_summary, HeapProfileSummary, HeapTraceRuntime};
+use orpc::common::heap_trace::{
+    capture_flamegraph_svg_response, capture_profile_response, latest_capture_summary_response,
+    latest_flamegraph_response, latest_pprof_response, HeapTraceRuntime,
+};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,7 +26,7 @@ impl WebServer {
         #[cfg(feature = "heap-trace")]
         if let Some(runtime) = heap_trace {
             app = app
-                .route("/debug/heap/profile", post(capture_profile))
+                .route("/debug/heap/profile", axum::routing::post(capture_profile))
                 .route("/debug/heap/latest", get(latest_capture_summary))
                 .route("/debug/heap/flamegraph.svg", get(capture_flamegraph_svg))
                 .route("/debug/heap/flamegraph", get(latest_flamegraph))
@@ -42,9 +45,9 @@ impl WebServer {
 
 #[cfg(feature = "heap-trace")]
 async fn capture_profile(Extension(runtime): Extension<HeapTraceRuntime>) -> Response {
-    match runtime.profile_artifact().await {
-        Ok(artifact) => {
-            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+    match capture_profile_response(&runtime).await {
+        Ok(response) => {
+            response_with_content_type(StatusCode::OK, &response.content_type, response.body)
         }
         Err(err) => error_response(err),
     }
@@ -52,18 +55,16 @@ async fn capture_profile(Extension(runtime): Extension<HeapTraceRuntime>) -> Res
 
 #[cfg(feature = "heap-trace")]
 async fn latest_capture_summary(Extension(runtime): Extension<HeapTraceRuntime>) -> Response {
-    let summary = latest_summary().unwrap_or_else(|| HeapProfileSummary {
-        runtime_enabled: runtime.conf().runtime_enabled,
-        sample_interval_bytes: runtime.conf().sample_interval_bytes,
-        capture_count: 0,
-        last_capture_epoch_ms: None,
-    });
-    (StatusCode::OK, Json(summary)).into_response()
+    (
+        StatusCode::OK,
+        Json(latest_capture_summary_response(&runtime)),
+    )
+        .into_response()
 }
 
 #[cfg(feature = "heap-trace")]
 async fn capture_flamegraph_svg(Extension(runtime): Extension<HeapTraceRuntime>) -> Response {
-    match runtime.flamegraph_http_response().await {
+    match capture_flamegraph_svg_response(&runtime).await {
         Ok(response) => {
             response_with_content_type(StatusCode::OK, &response.content_type, response.body)
         }
@@ -73,9 +74,9 @@ async fn capture_flamegraph_svg(Extension(runtime): Extension<HeapTraceRuntime>)
 
 #[cfg(feature = "heap-trace")]
 async fn latest_flamegraph(Extension(runtime): Extension<HeapTraceRuntime>) -> Response {
-    match runtime.latest_flamegraph_artifact().await {
-        Some(artifact) => {
-            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+    match latest_flamegraph_response(&runtime).await {
+        Some(response) => {
+            response_with_content_type(StatusCode::OK, &response.content_type, response.body)
         }
         None => not_found_response("heap flamegraph artifact not found"),
     }
@@ -83,9 +84,9 @@ async fn latest_flamegraph(Extension(runtime): Extension<HeapTraceRuntime>) -> R
 
 #[cfg(feature = "heap-trace")]
 async fn latest_pprof(Extension(runtime): Extension<HeapTraceRuntime>) -> Response {
-    match runtime.latest_profile_artifact().await {
-        Some(artifact) => {
-            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+    match latest_pprof_response(&runtime).await {
+        Some(response) => {
+            response_with_content_type(StatusCode::OK, &response.content_type, response.body)
         }
         None => not_found_response("heap profile artifact not found"),
     }

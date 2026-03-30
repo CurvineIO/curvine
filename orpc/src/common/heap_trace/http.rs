@@ -37,27 +37,74 @@ pub fn router(runtime: HeapTraceRuntime) -> Router {
         .with_state(runtime)
 }
 
+pub async fn capture_profile_response(
+    runtime: &HeapTraceRuntime,
+) -> crate::CommonResult<HeapTraceHttpResponse> {
+    runtime
+        .profile_artifact()
+        .await
+        .map(|artifact| HeapTraceHttpResponse {
+            content_type: artifact.media_type,
+            body: artifact.payload,
+        })
+}
+
+pub fn latest_capture_summary_response(runtime: &HeapTraceRuntime) -> HeapProfileSummary {
+    latest_summary().unwrap_or_else(|| HeapProfileSummary {
+        runtime_enabled: runtime.conf().runtime_enabled,
+        sample_interval_bytes: runtime.conf().sample_interval_bytes,
+        capture_count: 0,
+        last_capture_epoch_ms: None,
+    })
+}
+
+pub async fn capture_flamegraph_svg_response(
+    runtime: &HeapTraceRuntime,
+) -> crate::CommonResult<HeapTraceHttpResponse> {
+    runtime.flamegraph_http_response().await
+}
+
+pub async fn latest_flamegraph_response(
+    runtime: &HeapTraceRuntime,
+) -> Option<HeapTraceHttpResponse> {
+    runtime
+        .latest_flamegraph_artifact()
+        .await
+        .map(|artifact| HeapTraceHttpResponse {
+            content_type: artifact.media_type,
+            body: artifact.payload,
+        })
+}
+
+pub async fn latest_pprof_response(runtime: &HeapTraceRuntime) -> Option<HeapTraceHttpResponse> {
+    runtime
+        .latest_profile_artifact()
+        .await
+        .map(|artifact| HeapTraceHttpResponse {
+            content_type: artifact.media_type,
+            body: artifact.payload,
+        })
+}
+
 async fn capture_profile(State(runtime): State<HeapTraceRuntime>) -> Response {
-    match runtime.profile_artifact().await {
-        Ok(artifact) => {
-            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+    match capture_profile_response(&runtime).await {
+        Ok(response) => {
+            response_with_content_type(StatusCode::OK, &response.content_type, response.body)
         }
         Err(err) => error_response(err),
     }
 }
 
 async fn latest_capture_summary(State(runtime): State<HeapTraceRuntime>) -> Response {
-    let summary = latest_summary().unwrap_or_else(|| HeapProfileSummary {
-        runtime_enabled: runtime.conf().runtime_enabled,
-        sample_interval_bytes: runtime.conf().sample_interval_bytes,
-        capture_count: 0,
-        last_capture_epoch_ms: None,
-    });
-    (StatusCode::OK, Json(summary)).into_response()
+    (
+        StatusCode::OK,
+        Json(latest_capture_summary_response(&runtime)),
+    )
+        .into_response()
 }
 
 async fn capture_flamegraph_svg(State(runtime): State<HeapTraceRuntime>) -> Response {
-    match runtime.flamegraph_http_response().await {
+    match capture_flamegraph_svg_response(&runtime).await {
         Ok(response) => {
             response_with_content_type(StatusCode::OK, &response.content_type, response.body)
         }
@@ -66,18 +113,18 @@ async fn capture_flamegraph_svg(State(runtime): State<HeapTraceRuntime>) -> Resp
 }
 
 async fn latest_flamegraph(State(runtime): State<HeapTraceRuntime>) -> Response {
-    match runtime.latest_flamegraph_artifact().await {
-        Some(artifact) => {
-            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+    match latest_flamegraph_response(&runtime).await {
+        Some(response) => {
+            response_with_content_type(StatusCode::OK, &response.content_type, response.body)
         }
         None => not_found_response("heap flamegraph artifact not found"),
     }
 }
 
 async fn latest_pprof(State(runtime): State<HeapTraceRuntime>) -> Response {
-    match runtime.latest_profile_artifact().await {
-        Some(artifact) => {
-            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+    match latest_pprof_response(&runtime).await {
+        Some(response) => {
+            response_with_content_type(StatusCode::OK, &response.content_type, response.body)
         }
         None => not_found_response("heap profile artifact not found"),
     }
