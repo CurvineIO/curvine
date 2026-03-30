@@ -25,7 +25,7 @@ const HOTSPOT_LIMIT: usize = 10;
 const OTHER_HOTSPOT_SITE_NAME: &str = "__other__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeapTraceHotspot {
+pub struct HeapMetricHotspot {
     pub rank: usize,
     pub site_name: String,
     pub stable_id: String,
@@ -154,10 +154,10 @@ pub fn record_capture_attempt() {
     record_run_status("attempt");
 }
 
-pub fn update_hotspots(hotspots: &[HeapTraceHotspot]) {
+pub fn update_hotspots(hotspots: &[HeapMetricHotspot]) {
     init_metrics();
 
-    let reduced = reduce_topn(hotspots.to_vec(), HOTSPOT_LIMIT);
+    let reduced = reduce_metric_topn(hotspots.to_vec(), HOTSPOT_LIMIT);
     reset_hotspot_gauges();
 
     for hotspot in reduced {
@@ -198,7 +198,10 @@ pub fn clear_latest_summary() {
     *guard = None;
 }
 
-pub fn reduce_topn(mut hotspots: Vec<HeapTraceHotspot>, topn: usize) -> Vec<HeapTraceHotspot> {
+pub fn reduce_metric_topn(
+    mut hotspots: Vec<HeapMetricHotspot>,
+    topn: usize,
+) -> Vec<HeapMetricHotspot> {
     hotspots.sort_by_key(|hotspot| {
         (
             Reverse(hotspot.bytes),
@@ -212,7 +215,7 @@ pub fn reduce_topn(mut hotspots: Vec<HeapTraceHotspot>, topn: usize) -> Vec<Heap
         return if other.bytes == 0 {
             Vec::new()
         } else {
-            vec![HeapTraceHotspot { rank: 1, ..other }]
+            vec![HeapMetricHotspot { rank: 1, ..other }]
         };
     }
 
@@ -226,7 +229,7 @@ pub fn reduce_topn(mut hotspots: Vec<HeapTraceHotspot>, topn: usize) -> Vec<Heap
 
     let other = aggregate_other(remaining);
     if other.bytes > 0 {
-        reduced.push(HeapTraceHotspot {
+        reduced.push(HeapMetricHotspot {
             rank: reduced.len() + 1,
             ..other
         });
@@ -235,11 +238,11 @@ pub fn reduce_topn(mut hotspots: Vec<HeapTraceHotspot>, topn: usize) -> Vec<Heap
     reduced
 }
 
-fn aggregate_other(hotspots: Vec<HeapTraceHotspot>) -> HeapTraceHotspot {
+fn aggregate_other(hotspots: Vec<HeapMetricHotspot>) -> HeapMetricHotspot {
     let bytes = hotspots.iter().map(|hotspot| hotspot.bytes).sum();
     let objects = hotspots.iter().map(|hotspot| hotspot.objects).sum();
     let growth_bytes = hotspots.iter().map(|hotspot| hotspot.growth_bytes).sum();
-    HeapTraceHotspot {
+    HeapMetricHotspot {
         rank: 0,
         site_name: OTHER_HOTSPOT_SITE_NAME.to_string(),
         stable_id: OTHER_HOTSPOT_SITE_NAME.to_string(),

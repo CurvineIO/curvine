@@ -27,8 +27,8 @@ pub use self::flamegraph::*;
 pub use self::http::*;
 pub use self::metrics::*;
 pub use self::normalize::{
-    normalize_site, normalize_stack_lines, NormalizedHeapSite, OTHER_HOTSPOT_SITE_NAME,
-    UNKNOWN_SITE_NAME,
+    normalize_site, normalize_stack_lines, reduce_topn, HeapTraceHotspot, NormalizedHeapSite,
+    OTHER_HOTSPOT_SITE_NAME, UNKNOWN_SITE_NAME,
 };
 pub use self::profile::*;
 pub use self::runtime::*;

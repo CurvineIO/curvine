@@ -16,8 +16,8 @@
 
 use orpc::common::heap_trace::{
     clear_latest_summary, latest_summary, next_profile_id, prune_old_artifacts, record_parse_error,
-    record_run_failure, record_run_success, reduce_topn, set_enabled, store_latest_summary,
-    update_hotspots, write_summary, HeapProfileSummary, HeapTraceHotspot,
+    record_run_failure, record_run_success, reduce_metric_topn, set_enabled, store_latest_summary,
+    update_hotspots, write_summary, HeapMetricHotspot, HeapProfileSummary,
 };
 use orpc::common::Metrics;
 use std::fs;
@@ -134,7 +134,7 @@ fn unique_temp_dir() -> PathBuf {
 
 #[test]
 fn reduce_topn_groups_remaining_hotspots() {
-    let reduced = reduce_topn(
+    let reduced = reduce_metric_topn(
         vec![
             hotspot(4, "s1", "a", 400, 4, 40),
             hotspot(7, "s2", "b", 300, 3, 30),
@@ -160,9 +160,9 @@ fn hotspot(
     bytes: usize,
     objects: usize,
     growth_bytes: i64,
-) -> HeapTraceHotspot {
+) -> HeapMetricHotspot {
     let site_name = site_name.into();
-    HeapTraceHotspot {
+    HeapMetricHotspot {
         rank,
         site_name: site_name.clone(),
         stable_id: stable_id.into(),
