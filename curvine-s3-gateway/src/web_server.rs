@@ -23,12 +23,12 @@ impl WebServer {
         #[cfg(feature = "heap-trace")]
         if let Some(runtime) = heap_trace {
             app = app
-                .layer(Extension((*runtime).clone()))
                 .route("/debug/heap/profile", post(capture_profile))
                 .route("/debug/heap/latest", get(latest_capture_summary))
                 .route("/debug/heap/flamegraph.svg", get(capture_flamegraph_svg))
                 .route("/debug/heap/flamegraph", get(latest_flamegraph))
-                .route("/debug/heap/pprof", get(latest_pprof));
+                .route("/debug/heap/pprof", get(latest_pprof))
+                .layer(Extension((*runtime).clone()));
         }
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
