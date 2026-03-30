@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::heap_trace::HeapProfileSummary;
 use crate::common::Utils;
 use crate::CommonResult;
 use serde::{Deserialize, Serialize};
@@ -21,6 +20,14 @@ use std::fs;
 use std::path::Path;
 
 const LATEST_SUMMARY_FILE: &str = "heap-profile-latest-summary.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct HeapProfileSummary {
+    pub runtime_enabled: bool,
+    pub sample_interval_bytes: usize,
+    pub capture_count: u64,
+    pub last_capture_epoch_ms: Option<u64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HeapTraceArtifactKind {
@@ -61,14 +68,11 @@ pub fn write_summary(path: &Path, summary: &HeapProfileSummary) -> CommonResult<
         fs::create_dir_all(parent)?;
     }
 
-    let payload = serde_json::to_vec_pretty(summary)?;
-    fs::write(path, payload)?;
+    let payload = summary_to_json(summary);
+    fs::write(path, &payload)?;
 
     if let Some(parent) = path.parent() {
-        fs::write(
-            parent.join(LATEST_SUMMARY_FILE),
-            serde_json::to_vec_pretty(summary)?,
-        )?;
+        fs::write(parent.join(LATEST_SUMMARY_FILE), payload)?;
     }
 
     Ok(())
@@ -109,6 +113,29 @@ pub fn prune_old_artifacts(dir: &Path, keep_last: usize) -> CommonResult<()> {
     }
 
     Ok(())
+}
+
+fn summary_to_json(summary: &HeapProfileSummary) -> Vec<u8> {
+    let last_capture_epoch_ms = summary
+        .last_capture_epoch_ms
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string());
+
+    format!(
+        concat!(
+            "{{\n",
+            "  \"runtime_enabled\": {},\n",
+            "  \"sample_interval_bytes\": {},\n",
+            "  \"capture_count\": {},\n",
+            "  \"last_capture_epoch_ms\": {}\n",
+            "}}\n"
+        ),
+        summary.runtime_enabled,
+        summary.sample_interval_bytes,
+        summary.capture_count,
+        last_capture_epoch_ms
+    )
+    .into_bytes()
 }
 
 fn is_profile_related(file_name: &str) -> bool {

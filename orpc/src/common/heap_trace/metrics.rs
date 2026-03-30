@@ -12,15 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::heap_trace::{reduce_topn, HeapProfileSummary, HeapTraceHotspot};
+use crate::common::heap_trace::HeapProfileSummary;
 use crate::common::Metrics;
 use once_cell::sync::Lazy;
+use std::cmp::Reverse;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const HOTSPOT_LABELS: [&str; 3] = ["rank", "site_id", "site_name"];
 const RUN_STATUS_LABELS: [&str; 1] = ["status"];
 const HOTSPOT_LIMIT: usize = 10;
+const OTHER_HOTSPOT_SITE_NAME: &str = "__other__";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapTraceHotspot {
+    pub rank: usize,
+    pub site_name: String,
+    pub stable_id: String,
+    pub bytes: usize,
+    pub objects: usize,
+    pub growth_bytes: i64,
+    pub frames: Vec<String>,
+}
 
 pub static HEAP_TRACE_ENABLED: Lazy<Option<crate::common::Gauge>> = Lazy::new(|| {
     Metrics::new_gauge(
@@ -183,6 +196,58 @@ pub fn latest_summary() -> Option<HeapProfileSummary> {
 pub fn clear_latest_summary() {
     let mut guard = LATEST_SUMMARY.lock().unwrap();
     *guard = None;
+}
+
+pub fn reduce_topn(mut hotspots: Vec<HeapTraceHotspot>, topn: usize) -> Vec<HeapTraceHotspot> {
+    hotspots.sort_by_key(|hotspot| {
+        (
+            Reverse(hotspot.bytes),
+            hotspot.site_name.clone(),
+            hotspot.stable_id.clone(),
+        )
+    });
+
+    if topn == 0 {
+        let other = aggregate_other(hotspots);
+        return if other.bytes == 0 {
+            Vec::new()
+        } else {
+            vec![HeapTraceHotspot { rank: 1, ..other }]
+        };
+    }
+
+    let split_at = hotspots.len().min(topn);
+    let remaining = hotspots.split_off(split_at);
+    let mut reduced = hotspots;
+
+    for (idx, hotspot) in reduced.iter_mut().enumerate() {
+        hotspot.rank = idx + 1;
+    }
+
+    let other = aggregate_other(remaining);
+    if other.bytes > 0 {
+        reduced.push(HeapTraceHotspot {
+            rank: reduced.len() + 1,
+            ..other
+        });
+    }
+
+    reduced
+}
+
+fn aggregate_other(hotspots: Vec<HeapTraceHotspot>) -> HeapTraceHotspot {
+    let bytes = hotspots.iter().map(|hotspot| hotspot.bytes).sum();
+    let objects = hotspots.iter().map(|hotspot| hotspot.objects).sum();
+    let growth_bytes = hotspots.iter().map(|hotspot| hotspot.growth_bytes).sum();
+    HeapTraceHotspot {
+        rank: 0,
+        site_name: OTHER_HOTSPOT_SITE_NAME.to_string(),
+        stable_id: OTHER_HOTSPOT_SITE_NAME.to_string(),
+        bytes,
+        objects,
+        growth_bytes,
+        frames: vec![OTHER_HOTSPOT_SITE_NAME.to_string()],
+    }
 }
 
 fn record_run_status(status: &str) {

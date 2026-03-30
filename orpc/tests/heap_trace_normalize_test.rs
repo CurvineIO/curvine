@@ -145,8 +145,6 @@ fn hotspot(rank: usize, site_name: &str, stable_id: &str, bytes: usize) -> HeapT
         site_name: site_name.to_string(),
         stable_id: stable_id.to_string(),
         bytes,
-        objects: 0,
-        growth_bytes: 0,
         frames: vec![site_name.to_string()],
     }
 }

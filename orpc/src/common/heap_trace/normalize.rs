@@ -33,8 +33,6 @@ pub struct HeapTraceHotspot {
     pub site_name: String,
     pub stable_id: String,
     pub bytes: usize,
-    pub objects: usize,
-    pub growth_bytes: i64,
     pub frames: Vec<String>,
 }
 
@@ -101,16 +99,12 @@ pub fn reduce_topn(mut hotspots: Vec<HeapTraceHotspot>, topn: usize) -> Vec<Heap
 }
 
 fn aggregate_other(hotspots: Vec<HeapTraceHotspot>) -> HeapTraceHotspot {
-    let bytes = hotspots.iter().map(|hotspot| hotspot.bytes).sum();
-    let objects = hotspots.iter().map(|hotspot| hotspot.objects).sum();
-    let growth_bytes = hotspots.iter().map(|hotspot| hotspot.growth_bytes).sum();
+    let bytes = hotspots.into_iter().map(|hotspot| hotspot.bytes).sum();
     HeapTraceHotspot {
         rank: 0,
         site_name: OTHER_HOTSPOT_SITE_NAME.to_string(),
         stable_id: Utils::md5(OTHER_HOTSPOT_SITE_NAME),
         bytes,
-        objects,
-        growth_bytes,
         frames: vec![OTHER_HOTSPOT_SITE_NAME.to_string()],
     }
 }
