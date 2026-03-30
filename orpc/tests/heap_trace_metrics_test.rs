@@ -22,10 +22,13 @@ use orpc::common::heap_trace::{
 use orpc::common::Metrics;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn exports_unified_heap_trace_metrics_with_site_name_labels() {
+    let _guard = heap_trace_test_guard();
+
     set_enabled(true);
     record_run_success(Duration::from_millis(125));
     record_run_failure();
@@ -60,6 +63,8 @@ fn exports_unified_heap_trace_metrics_with_site_name_labels() {
 
 #[test]
 fn bounds_hotspots_and_tracks_attempt_run_state() {
+    let _guard = heap_trace_test_guard();
+
     update_hotspots(
         &(0..12)
             .map(|idx| {
@@ -86,6 +91,8 @@ fn bounds_hotspots_and_tracks_attempt_run_state() {
 
 #[test]
 fn stores_latest_summary_and_prunes_old_artifacts() {
+    let _guard = heap_trace_test_guard();
+
     clear_latest_summary();
 
     let summary = HeapProfileSummary {
@@ -151,6 +158,14 @@ fn reduce_topn_groups_remaining_hotspots() {
     assert_eq!(reduced[2].bytes, 200);
     assert_eq!(reduced[2].objects, 2);
     assert_eq!(reduced[2].growth_bytes, 20);
+}
+
+fn heap_trace_test_guard() -> MutexGuard<'static, ()> {
+    static HEAP_TRACE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    HEAP_TRACE_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
 }
 
 fn hotspot(
