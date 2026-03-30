@@ -537,23 +537,6 @@ impl InodeFile {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::InodeFile;
-    use curvine_common::state::CreateFileOpts;
-
-    #[test]
-    fn overwrite_bumps_version_epoch() {
-        let opts = CreateFileOpts::with_create(false);
-        let mut file = InodeFile::with_opts(7, 100, opts.clone());
-        let initial_epoch = file.version_epoch;
-
-        file.overwrite(opts, 200);
-
-        assert_eq!(file.version_epoch, initial_epoch + 1);
-    }
-}
-
 impl Inode for InodeFile {
     fn id(&self) -> i64 {
         self.id
@@ -583,5 +566,22 @@ impl Inode for InodeFile {
 impl PartialEq for InodeFile {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InodeFile;
+    use curvine_common::state::CreateFileOpts;
+
+    #[test]
+    fn overwrite_bumps_version_epoch() {
+        let opts = CreateFileOpts::with_create(false);
+        let mut file = InodeFile::with_opts(7, 100, opts.clone());
+        let initial_epoch = file.version_epoch;
+
+        file.overwrite(opts, 200);
+
+        assert_eq!(file.version_epoch, initial_epoch + 1);
     }
 }
