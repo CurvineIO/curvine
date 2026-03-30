@@ -217,6 +217,7 @@ impl ProtoUtils {
     pub fn file_status_to_pb(status: FileStatus) -> FileStatusProto {
         FileStatusProto {
             id: status.id,
+            version_epoch: Some(status.version_epoch),
             path: status.path,
             name: status.name,
             is_dir: status.is_dir,
@@ -242,6 +243,7 @@ impl ProtoUtils {
     pub fn file_status_from_pb(status: FileStatusProto) -> FileStatus {
         FileStatus {
             id: status.id,
+            version_epoch: status.version_epoch.unwrap_or_default(),
             path: status.path,
             name: status.name,
             is_dir: status.is_dir,
@@ -301,6 +303,9 @@ impl ProtoUtils {
             fs_used: src.fs_used,
             non_fs_used: src.non_fs_used,
             reserved_bytes: src.reserved_bytes,
+            p2p_policy_version: src.p2p_policy_version,
+            p2p_peer_whitelist: src.p2p_peer_whitelist,
+            p2p_tenant_whitelist: src.p2p_tenant_whitelist,
             ..Default::default()
         };
 
@@ -359,6 +364,9 @@ impl ProtoUtils {
             blacklist_workers: Self::worker_info_from_pb(src.blacklist_workers),
             decommission_workers: Self::worker_info_from_pb(src.decommission_workers),
             lost_workers: Self::worker_info_from_pb(src.lost_workers),
+            p2p_policy_version: src.p2p_policy_version,
+            p2p_peer_whitelist: src.p2p_peer_whitelist,
+            p2p_tenant_whitelist: src.p2p_tenant_whitelist,
         }
     }
 
@@ -707,5 +715,205 @@ impl ProtoUtils {
             inodes: res.inodes,
             bytes: res.bytes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyStoragePolicyProto {
+        #[prost(enumeration = "StorageTypeProto", required, tag = "1")]
+        pub storage_type: i32,
+        #[prost(int64, required, tag = "2", default = "0")]
+        pub ttl_ms: i64,
+        #[prost(enumeration = "TtlActionProto", required, tag = "3")]
+        pub ttl_action: i32,
+        #[prost(int64, required, tag = "4")]
+        pub ufs_mtime: i64,
+        #[prost(enumeration = "StorageStateProto", required, tag = "5")]
+        pub state: i32,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyFileStatusProto {
+        #[prost(int64, required, tag = "1")]
+        pub id: i64,
+        #[prost(string, required, tag = "2")]
+        pub path: String,
+        #[prost(string, required, tag = "3")]
+        pub name: String,
+        #[prost(bool, required, tag = "4")]
+        pub is_dir: bool,
+        #[prost(int64, required, tag = "5")]
+        pub mtime: i64,
+        #[prost(int64, required, tag = "6")]
+        pub atime: i64,
+        #[prost(int32, required, tag = "7")]
+        pub children_num: i32,
+        #[prost(bool, required, tag = "8", default = "false")]
+        pub is_complete: bool,
+        #[prost(int64, required, tag = "9")]
+        pub len: i64,
+        #[prost(int32, required, tag = "10")]
+        pub replicas: i32,
+        #[prost(int64, required, tag = "11")]
+        pub block_size: i64,
+        #[prost(enumeration = "FileTypeProto", required, tag = "12")]
+        pub file_type: i32,
+        #[prost(map = "string, bytes", tag = "13")]
+        pub x_attr: std::collections::HashMap<String, Vec<u8>>,
+        #[prost(message, required, tag = "14")]
+        pub storage_policy: LegacyStoragePolicyProto,
+        #[prost(string, required, tag = "15")]
+        pub owner: String,
+        #[prost(string, required, tag = "16")]
+        pub group: String,
+        #[prost(uint32, required, tag = "17")]
+        pub mode: u32,
+        #[prost(string, optional, tag = "18")]
+        pub target: Option<String>,
+        #[prost(uint32, required, tag = "19")]
+        pub nlink: u32,
+    }
+
+    #[test]
+    fn file_status_proto_roundtrip_keeps_version_epoch() {
+        let status = FileStatus {
+            id: 7,
+            path: "/tmp/a".to_string(),
+            name: "a".to_string(),
+            version_epoch: 42,
+            ..Default::default()
+        };
+        let pb = ProtoUtils::file_status_to_pb(status.clone());
+        let decoded = ProtoUtils::file_status_from_pb(pb);
+        assert_eq!(decoded.version_epoch, 42);
+    }
+
+    #[test]
+    fn file_status_proto_decodes_legacy_payload_without_version_epoch() {
+        let legacy = LegacyFileStatusProto {
+            id: 7,
+            path: "/tmp/a".to_string(),
+            name: "a".to_string(),
+            is_dir: false,
+            mtime: 11,
+            atime: 12,
+            children_num: 0,
+            is_complete: true,
+            len: 33,
+            replicas: 1,
+            block_size: 128,
+            file_type: FileTypeProto::File as i32,
+            x_attr: Default::default(),
+            storage_policy: LegacyStoragePolicyProto {
+                storage_type: StorageTypeProto::Disk as i32,
+                ttl_ms: 0,
+                ttl_action: TtlActionProto::None as i32,
+                ufs_mtime: 0,
+                state: StorageStateProto::Cv as i32,
+            },
+            owner: "owner".to_string(),
+            group: "group".to_string(),
+            mode: 0o644,
+            target: None,
+            nlink: 1,
+        };
+        let bytes = legacy.encode_to_vec();
+        let decoded = FileStatusProto::decode(bytes.as_slice())
+            .expect("current proto should decode legacy payload without version_epoch");
+        assert_eq!(decoded.version_epoch, None);
+        assert_eq!(ProtoUtils::file_status_from_pb(decoded).version_epoch, 0);
+    }
+
+    #[test]
+    fn file_status_from_pb_defaults_optional_version_epoch_to_zero() {
+        let mut pb = ProtoUtils::file_status_to_pb(FileStatus {
+            id: 7,
+            path: "/tmp/a".to_string(),
+            name: "a".to_string(),
+            ..Default::default()
+        });
+        pb.version_epoch = None;
+        let decoded = ProtoUtils::file_status_from_pb(pb);
+        assert_eq!(decoded.version_epoch, 0);
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyGetMasterInfoResponse {
+        #[prost(string, required, tag = "1")]
+        active_master: String,
+        #[prost(string, repeated, tag = "2")]
+        journal_nodes: Vec<String>,
+        #[prost(int64, required, tag = "3")]
+        inode_dir_num: i64,
+        #[prost(int64, required, tag = "4")]
+        inode_file_num: i64,
+        #[prost(int64, required, tag = "5")]
+        block_num: i64,
+        #[prost(int64, required, tag = "6")]
+        capacity: i64,
+        #[prost(int64, required, tag = "7")]
+        available: i64,
+        #[prost(int64, required, tag = "8")]
+        fs_used: i64,
+        #[prost(int64, required, tag = "9")]
+        non_fs_used: i64,
+        #[prost(int64, required, tag = "10", default = "0")]
+        reserved_bytes: i64,
+        #[prost(message, repeated, tag = "11")]
+        live_workers: Vec<WorkerInfoProto>,
+        #[prost(message, repeated, tag = "12")]
+        blacklist_workers: Vec<WorkerInfoProto>,
+        #[prost(message, repeated, tag = "13")]
+        decommission_workers: Vec<WorkerInfoProto>,
+        #[prost(message, repeated, tag = "14")]
+        lost_workers: Vec<WorkerInfoProto>,
+    }
+
+    #[test]
+    fn master_info_proto_roundtrip_keeps_p2p_runtime_policy() {
+        let src = MasterInfo {
+            p2p_policy_version: 7,
+            p2p_peer_whitelist: vec![
+                "12D3KooWJ8v1tDU6yE2y9JAzobYjGg9VG7z6gK5yR2rKfZ9W8f2A".to_string()
+            ],
+            p2p_tenant_whitelist: vec!["tenant-a".to_string(), "tenant-b".to_string()],
+            ..Default::default()
+        };
+        let pb = ProtoUtils::master_info_to_pb(src);
+        let decoded = ProtoUtils::master_info_from_pb(pb);
+        assert_eq!(decoded.p2p_policy_version, 7);
+        assert_eq!(decoded.p2p_peer_whitelist.len(), 1);
+        assert_eq!(decoded.p2p_tenant_whitelist.len(), 2);
+        assert_eq!(decoded.p2p_tenant_whitelist[0], "tenant-a");
+    }
+
+    #[test]
+    fn master_info_proto_decodes_legacy_payload_without_p2p_policy_version() {
+        let legacy = LegacyGetMasterInfoResponse {
+            active_master: "master".to_string(),
+            journal_nodes: vec!["journal-1".to_string()],
+            inode_dir_num: 1,
+            inode_file_num: 2,
+            block_num: 3,
+            capacity: 4,
+            available: 5,
+            fs_used: 6,
+            non_fs_used: 7,
+            reserved_bytes: 0,
+            live_workers: vec![],
+            blacklist_workers: vec![],
+            decommission_workers: vec![],
+            lost_workers: vec![],
+        };
+        let bytes = legacy.encode_to_vec();
+        let decoded = GetMasterInfoResponse::decode(bytes.as_slice())
+            .expect("current proto should decode legacy payload without p2p policy version");
+        assert_eq!(decoded.p2p_policy_version, 0);
+        assert!(decoded.p2p_peer_whitelist.is_empty());
+        assert!(decoded.p2p_tenant_whitelist.is_empty());
     }
 }
