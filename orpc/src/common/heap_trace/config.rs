@@ -37,6 +37,13 @@ impl HeapTraceConfig {
             sample_interval_bytes,
         }
     }
+
+    pub fn disabled() -> Self {
+        Self {
+            runtime_enabled: false,
+            sample_interval_bytes: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

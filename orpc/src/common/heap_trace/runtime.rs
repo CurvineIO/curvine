@@ -196,6 +196,10 @@ impl HeapTraceRuntime {
     }
 
     pub async fn trigger_now(&self) -> CommonResult<RuntimeCapture> {
+        if !self.is_enabled() {
+            return err_box!("heap trace runtime is disabled");
+        }
+
         if self
             .running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -261,6 +265,10 @@ impl HeapTraceRuntime {
     }
 
     pub async fn start_periodic(&self, interval: Duration) -> CommonResult<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+
         if interval.is_zero() {
             return err_box!("heap trace periodic interval must be greater than zero");
         }
@@ -436,6 +444,22 @@ mod tests {
             dir.path().to_path_buf(),
             profiler,
         )
+    }
+
+    #[tokio::test]
+    async fn trigger_now_returns_error_when_runtime_disabled() {
+        let dir = TempDir::new().unwrap();
+        let profiler = Arc::new(FakeProfiler::new(false));
+        let runtime = HeapTraceRuntime::with_profiler(
+            HeapTraceConfig::disabled(),
+            dir.path().to_path_buf(),
+            profiler.clone(),
+        );
+
+        let err = runtime.trigger_now().await.unwrap_err();
+
+        assert!(err.to_string().contains("heap trace runtime is disabled"));
+        assert_eq!(profiler.calls(), 0);
     }
 
     #[tokio::test]

@@ -17,6 +17,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::version;
 use curvine_server::master::Master;
 use curvine_server::worker::Worker;
+#[cfg(feature = "heap-trace")]
+use log::warn;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
 
@@ -62,10 +64,19 @@ fn init_heap_trace(conf: &ClusterConf) -> CommonResult<()> {
         return Ok(());
     }
 
-    const MALLOC_CONF: &str = "prof:true,prof_active:true";
-    if std::env::var_os("MALLOC_CONF").is_none() {
-        std::env::set_var("MALLOC_CONF", MALLOC_CONF);
+    const REQUIRED_JEMALLOC_SETTINGS: &[&str] = &["prof:true", "prof_active:true"];
+    let malloc_conf = std::env::var("MALLOC_CONF").unwrap_or_default();
+    let profiling_ready = REQUIRED_JEMALLOC_SETTINGS
+        .iter()
+        .all(|setting| malloc_conf.contains(setting));
+
+    if !profiling_ready {
+        warn!(
+            "Heap trace requested but jemalloc profiling is not enabled at process start; disabling heap trace runtime. Set MALLOC_CONF=prof:true,prof_active:true[,lg_prof_sample:<log2 bytes>] before launch."
+        );
+        return Ok(());
     }
+
     Ok(())
 }
 

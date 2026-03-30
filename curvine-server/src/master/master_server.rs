@@ -21,6 +21,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::error;
 #[cfg(feature = "heap-trace")]
+use log::warn;
+#[cfg(feature = "heap-trace")]
 use orpc::common::heap_trace::{HeapTraceConfig, HeapTraceRuntime};
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
@@ -286,8 +288,16 @@ fn build_heap_trace_runtime(conf: &ClusterConf) -> Option<Arc<HeapTraceRuntime>>
         return None;
     }
 
+    let malloc_conf = std::env::var("MALLOC_CONF").unwrap_or_default();
+    if !malloc_conf.contains("prof:true") || !malloc_conf.contains("prof_active:true") {
+        warn!(
+            "Heap trace requested for master, but MALLOC_CONF did not enable jemalloc profiling at process start; runtime capture disabled"
+        );
+        return Some(Arc::new(HeapTraceRuntime::new(HeapTraceConfig::disabled())));
+    }
+
     Some(Arc::new(HeapTraceRuntime::new(HeapTraceConfig::new(
         conf.heap_trace.runtime_enabled,
-        conf.heap_trace.sample_interval_bytes,
+        0,
     ))))
 }
