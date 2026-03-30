@@ -20,6 +20,22 @@ use std::path::Path;
 const FLAMEGRAPH_FORMAT: &str = "svg";
 const FLAMEGRAPH_TITLE: &str = "Curvine Heap Trace";
 
+#[cfg(any(test, not(feature = "heap-trace")))]
+fn escape_svg_text(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct HeapTraceFlamegraph {
     pub format: String,
@@ -75,14 +91,22 @@ pub fn render_flamegraph_svg(collapsed_stacks: &str) -> CommonResult<String> {
     svg.push_str("<title>");
     svg.push_str(FLAMEGRAPH_TITLE);
     svg.push_str("</title><desc>");
-    svg.push_str(collapsed_stacks);
+    svg.push_str(&escape_svg_text(collapsed_stacks));
     svg.push_str("</desc></svg>");
     Ok(svg)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::render_flamegraph_svg;
+    use super::{escape_svg_text, render_flamegraph_svg};
+
+    #[test]
+    fn escape_svg_text_encodes_xml_entities() {
+        assert_eq!(
+            escape_svg_text("root;<alloc>&\"quote\";'apos' 1\n"),
+            "root;&lt;alloc&gt;&amp;&quot;quote&quot;;&apos;apos&apos; 1\n"
+        );
+    }
 
     #[test]
     fn render_flamegraph_from_collapsed_stacks() {
