@@ -2836,6 +2836,7 @@ dependencies = [
 name = "orpc"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "base64 0.21.7",
  "bincode",
@@ -2865,6 +2866,7 @@ dependencies = [
  "serde",
  "socket2 0.5.10",
  "sysinfo",
+ "tempfile",
  "thiserror 1.0.69",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
