@@ -14,6 +14,7 @@
 
 use crate::error::FsError;
 
+pub mod alloc;
 pub mod conf;
 pub mod error;
 pub mod executor;

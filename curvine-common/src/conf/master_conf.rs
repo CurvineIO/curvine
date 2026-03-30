@@ -130,6 +130,8 @@ pub struct MasterConf {
     pub lock_expire_time: String,
     #[serde(skip)]
     pub lock_expire_time_unit: DurationUnit,
+
+    pub buffer_size: usize,
 }
 
 impl MasterConf {
@@ -303,6 +305,8 @@ impl Default for MasterConf {
 
             lock_expire_time: "5m".to_string(),
             lock_expire_time_unit: Default::default(),
+
+            buffer_size: 128 * 1024,
         };
 
         conf.init().unwrap();

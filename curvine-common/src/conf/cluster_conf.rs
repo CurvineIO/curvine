@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::alloc::allocator_type_name;
 use crate::conf::CliConf;
 use crate::conf::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf};
 use crate::rocksdb::DBConf;
@@ -265,6 +266,7 @@ impl ClusterConf {
 
     pub fn print(&self) {
         let conf = self.to_pretty_toml().unwrap();
+        info!("allocator: {}", allocator_type_name());
         info!("git version: {}", version::GIT_VERSION);
         info!("cluster conf start: \n{}\n", conf);
     }

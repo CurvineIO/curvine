@@ -35,3 +35,6 @@ pub use self::read_frame::ReadFrame;
 
 mod frame;
 pub use self::frame::Frame;
+
+mod frame_buf;
+pub use self::frame_buf::FrameBuf;

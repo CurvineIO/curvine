@@ -17,6 +17,7 @@ use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
 use crate::ClientMetrics;
 use async_stream::stream;
 use bytes::BytesMut;
+use curvine_common::alloc::allocator_type_name;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
@@ -56,9 +57,10 @@ impl CurvineFileSystem {
 
         let c = &fs.conf().client;
         info!(
-            "Create new filesystem, git version: {}, masters: {}, threads: {}-{}, \
+            "Create new filesystem, git version: {}, allocator: {}, masters: {}, threads: {}-{}, \
             buffer(rw): {}-{}, conn timeout(ms): {}-{}, rpc timeout(ms): {}-{}, data timeout(ms): {}",
             GIT_VERSION,
+            allocator_type_name(),
             fs.conf().masters_string(),
             rt.io_threads(),
             rt.worker_threads(),

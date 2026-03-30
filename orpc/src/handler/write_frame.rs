@@ -12,19 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::io::IOResult;
-use crate::message::Message;
-use bytes::BytesMut;
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::net::TcpStream;
 
+use crate::handler::FrameBuf;
+use crate::io::IOResult;
+use crate::message::Message;
+
 pub struct WriteFrame {
     io: WriteHalf<TcpStream>,
-    buf: BytesMut,
+    buf: FrameBuf,
 }
 
 impl WriteFrame {
-    pub(crate) fn new(io: WriteHalf<TcpStream>, buf: BytesMut) -> Self {
+    pub(crate) fn new(io: WriteHalf<TcpStream>, buf: FrameBuf) -> Self {
         Self { io, buf }
     }
 
