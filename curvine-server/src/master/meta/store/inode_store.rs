@@ -23,7 +23,6 @@ use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
-
 // Currently, only RockSDB is supported.
 // Note: InodeStore is intentionally NOT Clone.
 // Cloning InodeStore increases Arc<RocksInodeStore> refcount, which prevents
@@ -60,10 +59,10 @@ impl InodeStore {
         self.ttl_bucket_list.add(child);
 
         match child {
-            InodeView::File(_, _) => self.fs_stats.increment_file_count(),
-            InodeView::Dir(_, dir) => {
+            InodeView::File(_) => self.fs_stats.increment_file_count(),
+            InodeView::Dir(d) => {
                 // Don't count root directory
-                if dir.id != ROOT_INODE_ID {
+                if d.id != ROOT_INODE_ID {
                     self.fs_stats.increment_dir_count();
                 }
             }
@@ -89,7 +88,7 @@ impl InodeStore {
             del_res.inodes += 1;
 
             match &inode {
-                InodeView::Dir(_, dir) => {
+                InodeView::Dir(dir) => {
                     batch.delete_inode(inode.id())?;
                     self.ttl_bucket_list.remove(&inode);
 
@@ -267,7 +266,7 @@ impl InodeStore {
     ) -> CommonResult<()> {
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {
-                InodeView::File(_, _) => {
+                InodeView::File(_) => {
                     inode_view.incr_nlink();
                     batch.write_inode(&inode_view)?;
                 }
@@ -296,7 +295,7 @@ impl InodeStore {
 
         // Decrement nlink count of the file being unlinked.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
-        let del_res = if let InodeView::File(_, _) = child {
+        let del_res = if let InodeView::File(_) = child {
             self.decrement_inode_nlink(child.id(), &mut batch)?
         } else {
             DeleteResult::new()
@@ -344,13 +343,13 @@ impl InodeStore {
         // Load the inode from storage
         if let Some(mut inode_view) = self.get_inode(inode_id, None)? {
             match &mut inode_view {
-                InodeView::File(_, file) => {
-                    let remaining_links = file.decrement_nlink();
+                InodeView::File(f) => {
+                    let remaining_links = f.decrement_nlink();
                     if remaining_links == 0 {
                         batch.delete_inode(inode_id)?;
 
                         // Collect block info
-                        del_res.blocks.extend(file.get_locs(self)?);
+                        del_res.blocks.extend(f.get_locs(self)?);
 
                         self.ttl_bucket_list.remove(&inode_view);
                     } else {
@@ -387,7 +386,7 @@ impl InodeStore {
         stack.push_back((
             root.as_ptr(),
             ROOT_INODE_ID,
-            InodeView::FileEntry(String::new(), ROOT_INODE_ID),
+            InodeView::new_entry(String::new(), ROOT_INODE_ID),
         ));
         let mut last_inode_id = ROOT_INODE_ID;
         let mut file_count = 0i64;
@@ -411,7 +410,7 @@ impl InodeStore {
                 };
                 self.ttl_bucket_list.add(&store_inode);
 
-                let inode = if matches!(store_inode, InodeView::Dir(_, _)) {
+                let inode = if matches!(store_inode, InodeView::Dir(_)) {
                     store_inode
                 } else {
                     file_entry
@@ -419,8 +418,8 @@ impl InodeStore {
 
                 // Count files and directories during tree reconstruction
                 match &inode {
-                    InodeView::File(_, _) => file_count += 1,
-                    InodeView::Dir(_, dir) => {
+                    InodeView::File(_) => file_count += 1,
+                    InodeView::Dir(dir) => {
                         // Don't count root directory
                         if dir.id != ROOT_INODE_ID {
                             dir_count += 1;
@@ -441,7 +440,7 @@ impl InodeStore {
                     let (key, value) = try_err!(item);
                     let (_, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
                     let child_id = RocksUtils::i64_from_bytes(&value)?;
-                    let file_entry = InodeView::FileEntry(child_name.to_string(), child_id);
+                    let file_entry = InodeView::new_entry(child_name.to_string(), child_id);
 
                     stack.push_back((next_parent.clone(), child_id, file_entry))
                 }
@@ -570,5 +569,13 @@ impl InodeStore {
 
     pub fn apply_set_locks(&self, id: i64, lock: &[FileLock]) -> CommonResult<()> {
         self.store.set_locks(id, lock)
+    }
+
+    pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
+        self.store.get_rocksdb_metrics()
+    }
+
+    pub fn store(&self) -> &RocksInodeStore {
+        &self.store
     }
 }

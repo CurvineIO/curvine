@@ -157,7 +157,7 @@ impl QuotaManager {
                     .iter()
                     .filter_map(|&inode_id| fs_guard.store.get_inode(inode_id, None).ok().flatten())
                     .map(|inode_view| match &inode_view {
-                        InodeView::File(_, f) => f.len.max(0),
+                        InodeView::File(f) => f.len.max(0),
                         _ => 0,
                     })
                     .sum::<i64>();
@@ -229,7 +229,7 @@ impl QuotaManager {
                         .ok()
                         .flatten()
                         .and_then(|inode_view| match &inode_view {
-                            InodeView::File(_, f) => Some((inode_id, f.len.max(0))),
+                            InodeView::File(f) => Some((inode_id, f.len.max(0))),
                             _ => None,
                         })
                 })

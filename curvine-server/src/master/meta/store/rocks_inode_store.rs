@@ -19,6 +19,7 @@ use curvine_common::state::{BlockLocation, FileLock, MountInfo};
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
 use rocksdb::{DBIteratorWithThreadMode, WriteBatchWithTransaction, DB};
+use std::collections::HashMap;
 
 pub struct RocksInodeStore {
     pub(crate) db: DBEngine,
@@ -204,8 +205,8 @@ impl RocksInodeStore {
         }
     }
 
-    pub fn get_rocksdb_memory(&self) -> CommonResult<Vec<(String, u64)>> {
-        self.db.get_rocksdb_memory()
+    pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
+        self.db.get_rocksdb_metrics()
     }
 }
 
