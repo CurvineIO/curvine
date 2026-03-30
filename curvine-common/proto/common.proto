@@ -72,6 +72,7 @@ message FileStatusProto {
     required uint32 mode = 17;
     optional string target = 18;
     required uint32 nlink = 19;
+    optional int64 version_epoch = 20 [default = 0];
 }
 
 // Describe the worker address information.

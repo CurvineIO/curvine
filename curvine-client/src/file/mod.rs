@@ -26,6 +26,7 @@ pub use self::fs_writer::FsWriter;
 
 mod fs_context;
 pub use self::fs_context::FsContext;
+pub(crate) use self::fs_context::ReadChunkKey;
 
 mod fs_reader_base;
 pub use self::fs_reader_base::FsReaderBase;

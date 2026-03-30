@@ -22,7 +22,7 @@ use orpc::err_box;
 use orpc::sys::DataSlice;
 
 pub struct BlockReaderRemote {
-    client: BlockClient,
+    client: Option<BlockClient>,
     block: ExtendedBlock,
     worker_address: WorkerAddress,
     pos: i64,
@@ -57,7 +57,7 @@ impl BlockReaderRemote {
             .await?;
 
         let reader = Self {
-            client,
+            client: Some(client),
             block,
             worker_address,
             pos: off,
@@ -68,6 +68,25 @@ impl BlockReaderRemote {
         };
 
         Ok(reader)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        block: ExtendedBlock,
+        worker_address: WorkerAddress,
+        off: i64,
+        len: i64,
+    ) -> Self {
+        Self {
+            client: None,
+            block,
+            worker_address,
+            pos: off,
+            len,
+            req_id: Utils::req_id(),
+            seq_id: 0,
+            header: None,
+        }
     }
 
     fn next_seq_id(&mut self) -> i32 {
@@ -108,7 +127,10 @@ impl BlockReaderRemote {
 
         let seq_id = self.next_seq_id();
         let header = self.header.take();
-        let chunk = self.client.read_data(self.req_id, seq_id, header).await?;
+        let Some(client) = self.client.as_ref() else {
+            return err_box!("No readable data");
+        };
+        let chunk = client.read_data(self.req_id, seq_id, header).await?;
 
         self.pos += chunk.len() as i64;
         Ok(chunk)
@@ -116,9 +138,29 @@ impl BlockReaderRemote {
 
     pub async fn complete(&mut self) -> FsResult<()> {
         let next_seq_id = self.next_seq_id();
-        self.client
+        let Some(client) = self.client.as_ref() else {
+            return Ok(());
+        };
+        client
             .read_commit(&self.block, self.req_id, next_seq_id)
             .await
+    }
+
+    pub async fn abort(&mut self) {
+        let next_seq_id = self.next_seq_id();
+        let Some(mut client) = self.client.take() else {
+            return;
+        };
+        let _ = client
+            .read_commit(&self.block, self.req_id, next_seq_id)
+            .await;
+        client.clear_pool();
+        self.header = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_client(&mut self, client: BlockClient) {
+        self.client = Some(client);
     }
 
     pub fn block_id(&self) -> i64 {
@@ -127,5 +169,46 @@ impl BlockReaderRemote {
 
     pub fn worker_address(&self) -> &WorkerAddress {
         &self.worker_address
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::BlockClientPool;
+    use curvine_common::state::{FileType, StorageType};
+    use std::sync::Arc;
+
+    fn test_worker(worker_id: u32) -> WorkerAddress {
+        WorkerAddress {
+            worker_id,
+            hostname: format!("worker-{}", worker_id),
+            ip_addr: "127.0.0.1".to_string(),
+            rpc_port: 8000 + worker_id,
+            web_port: 9000 + worker_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_remote_reader_does_not_repool_and_complete_is_noop() {
+        let worker = test_worker(1);
+        let block = ExtendedBlock::new(9, 4, StorageType::Disk, FileType::File);
+        let mut reader = BlockReaderRemote::new_for_test(block, worker.clone(), 0, 4);
+        let pool = Arc::new(BlockClientPool::new(true, 8, 60_000));
+        let mut client = BlockClient::new_for_test(worker);
+        client.set_pool(pool.clone());
+        reader.set_test_client(client);
+
+        assert_eq!(pool.idle_conn(), 0);
+        assert_eq!(Arc::strong_count(&pool), 2);
+
+        reader.abort().await;
+
+        assert_eq!(pool.idle_conn(), 0);
+        assert_eq!(Arc::strong_count(&pool), 1);
+        reader
+            .complete()
+            .await
+            .expect("aborted reader completion should be a no-op");
     }
 }

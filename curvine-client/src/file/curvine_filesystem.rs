@@ -52,6 +52,9 @@ impl CurvineFileSystem {
             fs_client: Arc::new(fs_client),
         };
 
+        if let Some(service) = fs.fs_context.p2p_service() {
+            service.start();
+        }
         FsContext::start_clean_task(fs.clone(), fs.fs_context.block_pool.clone());
 
         let c = &fs.conf().client;
@@ -385,6 +388,9 @@ impl CurvineFileSystem {
         .await;
         if let Err(e) = res {
             warn!("close {}", e);
+        }
+        if let Some(service) = self.fs_context.p2p_service() {
+            service.stop();
         }
     }
 

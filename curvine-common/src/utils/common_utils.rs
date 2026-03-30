@@ -12,11 +12,15 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use hmac::{Hmac, Mac};
 use log::info;
 use orpc::common::Utils;
 use orpc::{err_msg, CommonResult};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
+
+type PolicyHmac = Hmac<Sha256>;
 
 pub struct CommonUtils;
 
@@ -55,5 +59,106 @@ impl CommonUtils {
 
         info!("reload: new process spawned successfully");
         Ok(())
+    }
+
+    pub fn sign_p2p_policy(
+        secret: &str,
+        version: u64,
+        peer_whitelist: &[String],
+        tenant_whitelist: &[String],
+    ) -> String {
+        if secret.trim().is_empty() {
+            return String::new();
+        }
+        let Ok(mut mac) = PolicyHmac::new_from_slice(secret.as_bytes()) else {
+            return String::new();
+        };
+        Self::update_signing_segment(&mut mac, &version.to_string());
+        Self::update_signing_segment(&mut mac, &peer_whitelist.len().to_string());
+        for peer in peer_whitelist {
+            Self::update_signing_segment(&mut mac, peer);
+        }
+        Self::update_signing_segment(&mut mac, &tenant_whitelist.len().to_string());
+        for tenant in tenant_whitelist {
+            Self::update_signing_segment(&mut mac, tenant);
+        }
+        let digest = mac.finalize().into_bytes();
+        digest.iter().map(|v| format!("{:02x}", v)).collect()
+    }
+
+    pub fn verify_p2p_policy_signature(
+        secret: &str,
+        version: u64,
+        peer_whitelist: &[String],
+        tenant_whitelist: &[String],
+        signature: &str,
+    ) -> bool {
+        if secret.trim().is_empty() {
+            return true;
+        }
+        let signed = Self::sign_p2p_policy(secret, version, peer_whitelist, tenant_whitelist);
+        !signed.is_empty() && !signature.is_empty() && signed == signature
+    }
+
+    pub fn verify_p2p_policy_signatures(
+        secret: &str,
+        version: u64,
+        peer_whitelist: &[String],
+        tenant_whitelist: &[String],
+        signatures: &str,
+    ) -> bool {
+        if secret.trim().is_empty() {
+            return true;
+        }
+        signatures
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .any(|signature| {
+                Self::verify_p2p_policy_signature(
+                    secret,
+                    version,
+                    peer_whitelist,
+                    tenant_whitelist,
+                    signature,
+                )
+            })
+    }
+
+    fn update_signing_segment(mac: &mut PolicyHmac, value: &str) {
+        mac.update(value.len().to_string().as_bytes());
+        mac.update(b":");
+        mac.update(value.as_bytes());
+        mac.update(b"\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommonUtils;
+
+    #[test]
+    fn p2p_policy_signature_roundtrip_verifies() {
+        let peers = vec!["peer-a".to_string()];
+        let tenants = vec!["tenant-a".to_string(), "tenant-b".to_string()];
+        let signature = CommonUtils::sign_p2p_policy("secret", 7, &peers, &tenants);
+        assert!(CommonUtils::verify_p2p_policy_signature(
+            "secret", 7, &peers, &tenants, &signature,
+        ));
+    }
+
+    #[test]
+    fn p2p_policy_signature_decoder_accepts_transition_list() {
+        let peers = vec!["peer-a".to_string()];
+        let tenants = vec!["tenant-a".to_string()];
+        let signature = CommonUtils::sign_p2p_policy("new-secret", 9, &peers, &tenants);
+        let signatures = format!("bad, {}, also-bad", signature);
+        assert!(CommonUtils::verify_p2p_policy_signatures(
+            "new-secret",
+            9,
+            &peers,
+            &tenants,
+            &signatures,
+        ));
     }
 }
