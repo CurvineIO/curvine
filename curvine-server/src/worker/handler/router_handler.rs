@@ -12,14 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use axum::routing::get;
 use axum::Router;
 
 use curvine_web::router::RouterHandler;
+#[cfg(feature = "heap-trace")]
+use orpc::common::heap_trace::HeapTraceRuntime;
 
 use crate::worker::Worker;
 
-pub struct WorkerRouterHandler;
+#[derive(Clone, Default)]
+pub struct WorkerRouterHandler {
+    #[cfg(feature = "heap-trace")]
+    heap_trace: Option<Arc<HeapTraceRuntime>>,
+}
+
+impl WorkerRouterHandler {
+    pub fn new(#[cfg(feature = "heap-trace")] heap_trace: Option<Arc<HeapTraceRuntime>>) -> Self {
+        Self {
+            #[cfg(feature = "heap-trace")]
+            heap_trace,
+        }
+    }
+}
 
 async fn metrics() -> String {
     let metrics = Worker::get_metrics();
@@ -28,6 +45,15 @@ async fn metrics() -> String {
 
 impl RouterHandler for WorkerRouterHandler {
     fn router(&self) -> Router {
-        Router::new().route("/metrics", get(metrics))
+        let router = Router::new().route("/metrics", get(metrics));
+
+        #[cfg(feature = "heap-trace")]
+        let router = if let Some(runtime) = &self.heap_trace {
+            router.merge(orpc::common::heap_trace::router(runtime.as_ref().clone()))
+        } else {
+            router
+        };
+
+        router
     }
 }

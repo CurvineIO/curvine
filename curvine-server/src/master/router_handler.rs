@@ -24,6 +24,8 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::state::{FileBlocks, FileStatus, WorkerInfo};
 use curvine_common::FsResult;
 use curvine_web::router::RouterHandler;
+#[cfg(feature = "heap-trace")]
+use orpc::common::heap_trace::HeapTraceRuntime;
 use orpc::common::LocalTime;
 use orpc::err_box;
 
@@ -35,14 +37,22 @@ pub struct MasterRouterHandler {
     fs: MasterFilesystem,
     conf: ClusterConf,
     start_time: String,
+    #[cfg(feature = "heap-trace")]
+    heap_trace: Option<Arc<HeapTraceRuntime>>,
 }
 
 impl MasterRouterHandler {
-    pub fn new(conf: ClusterConf, fs: MasterFilesystem) -> Self {
+    pub fn new(
+        conf: ClusterConf,
+        fs: MasterFilesystem,
+        #[cfg(feature = "heap-trace")] heap_trace: Option<Arc<HeapTraceRuntime>>,
+    ) -> Self {
         Self {
             fs,
             conf,
             start_time: LocalTime::now_datetime(),
+            #[cfg(feature = "heap-trace")]
+            heap_trace,
         }
     }
 }
@@ -243,7 +253,7 @@ impl RouterHandler for MasterRouterHandler {
     fn router(&self) -> Router {
         let instance = Arc::new(self.clone());
         let conf = self.conf.clone();
-        Router::new()
+        let router = Router::new()
             .route("/metrics", get(metrics))
             .route("/report", get(report))
             .route("/api/overview", get(overview))
@@ -255,6 +265,15 @@ impl RouterHandler for MasterRouterHandler {
             .route("/get-dcm", get(get_dcm))
             .route("/remove-dcm", get(remove_dcm))
             .route("/workers", get(workers1))
-            .layer(Extension(instance))
+            .layer(Extension(instance));
+
+        #[cfg(feature = "heap-trace")]
+        let router = if let Some(runtime) = &self.heap_trace {
+            router.merge(orpc::common::heap_trace::router(runtime.as_ref().clone()))
+        } else {
+            router
+        };
+
+        router
     }
 }

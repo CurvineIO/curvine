@@ -20,6 +20,10 @@ use curvine_server::worker::Worker;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
 
+#[cfg(feature = "heap-trace")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> CommonResult<()> {
     let args: ServerArgs = ServerArgs::parse();
     println!(
@@ -37,16 +41,36 @@ fn main() -> CommonResult<()> {
     match service {
         ServiceType::Master => {
             conf.check_master_hostname()?;
+            init_heap_trace(&conf)?;
             let master = Master::with_conf(conf)?;
             master.block_on_start();
         }
 
         ServiceType::Worker => {
+            init_heap_trace(&conf)?;
             let worker = Worker::with_conf(conf)?;
             worker.block_on_start();
         }
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "heap-trace")]
+fn init_heap_trace(conf: &ClusterConf) -> CommonResult<()> {
+    if !conf.heap_trace.runtime_enabled {
+        return Ok(());
+    }
+
+    const MALLOC_CONF: &str = "prof:true,prof_active:true";
+    if std::env::var_os("MALLOC_CONF").is_none() {
+        std::env::set_var("MALLOC_CONF", MALLOC_CONF);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "heap-trace"))]
+fn init_heap_trace(_conf: &ClusterConf) -> CommonResult<()> {
     Ok(())
 }
 

@@ -13,12 +13,15 @@
 // limitations under the License.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use once_cell::sync::OnceCell;
 
 use curvine_common::conf::ClusterConf;
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::error;
+#[cfg(feature = "heap-trace")]
+use orpc::common::heap_trace::{HeapTraceConfig, HeapTraceRuntime};
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
@@ -45,6 +48,8 @@ pub struct MasterService {
     job_manager: Arc<JobManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<MasterReplicationManager>,
+    #[cfg(feature = "heap-trace")]
+    heap_trace: Option<Arc<HeapTraceRuntime>>,
 }
 
 impl MasterService {
@@ -56,6 +61,7 @@ impl MasterService {
         job_manager: Arc<JobManager>,
         rt: Arc<Runtime>,
         replication_manager: Arc<MasterReplicationManager>,
+        #[cfg(feature = "heap-trace")] heap_trace: Option<Arc<HeapTraceRuntime>>,
     ) -> Self {
         Self {
             conf,
@@ -65,6 +71,8 @@ impl MasterService {
             job_manager,
             rt,
             replication_manager,
+            #[cfg(feature = "heap-trace")]
+            heap_trace,
         }
     }
 
@@ -109,7 +117,12 @@ impl WebHandlerService for MasterService {
     type Item = MasterRouterHandler;
 
     fn get_handler(&self) -> Self::Item {
-        MasterRouterHandler::new(self.conf.clone(), self.fs.clone())
+        MasterRouterHandler::new(
+            self.conf.clone(),
+            self.fs.clone(),
+            #[cfg(feature = "heap-trace")]
+            self.heap_trace.clone(),
+        )
     }
 }
 
@@ -122,6 +135,8 @@ pub struct Master {
     mount_manager: Arc<MountManager>,
     job_manager: Arc<JobManager>,
     replication_manager: Arc<MasterReplicationManager>,
+    #[cfg(feature = "heap-trace")]
+    heap_trace: Option<Arc<HeapTraceRuntime>>,
 }
 
 impl Master {
@@ -144,6 +159,8 @@ impl Master {
         let job_manager = journal_system.job_manager();
 
         let rt = Arc::new(conf.master_server_conf().create_runtime());
+        #[cfg(feature = "heap-trace")]
+        let heap_trace = build_heap_trace_runtime(&conf);
 
         let replication_manager = MasterReplicationManager::new(&fs, &conf, &rt, &worker_manager);
 
@@ -165,6 +182,8 @@ impl Master {
             job_manager.clone(),
             rt.clone(),
             replication_manager.clone(),
+            #[cfg(feature = "heap-trace")]
+            heap_trace.clone(),
         );
 
         let rpc_conf = conf.master_server_conf();
@@ -172,7 +191,7 @@ impl Master {
 
         // step4: Create a web server
         let web_conf = conf.master_web_conf();
-        let web_server = WebServer::new(web_conf, service);
+        let web_server = WebServer::with_rt(rt.clone(), web_conf, service);
 
         Ok(Self {
             start_time: LocalTime::mills(),
@@ -183,6 +202,8 @@ impl Master {
             mount_manager,
             job_manager,
             replication_manager,
+            #[cfg(feature = "heap-trace")]
+            heap_trace,
         })
     }
 
@@ -191,6 +212,13 @@ impl Master {
     }
 
     pub async fn start(mut self) -> ServerStateListener {
+        #[cfg(feature = "heap-trace")]
+        if let Some(runtime) = &self.heap_trace {
+            if let Err(err) = runtime.start_periodic(Duration::from_secs(60)).await {
+                error!("Failed to start heap trace runtime: {}", err);
+            }
+        }
+
         // step 1: Start journal_system, raft server and raft node will be started internally
         let mut listener = self.journal_system.start().await.unwrap();
         listener.wait_role().await.unwrap();
@@ -250,4 +278,16 @@ impl Master {
     pub fn service(&self) -> &MasterService {
         self.rpc_server.service()
     }
+}
+
+#[cfg(feature = "heap-trace")]
+fn build_heap_trace_runtime(conf: &ClusterConf) -> Option<Arc<HeapTraceRuntime>> {
+    if !conf.heap_trace.runtime_enabled {
+        return None;
+    }
+
+    Some(Arc::new(HeapTraceRuntime::new(HeapTraceConfig::new(
+        conf.heap_trace.runtime_enabled,
+        conf.heap_trace.sample_interval_bytes,
+    ))))
 }

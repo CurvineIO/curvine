@@ -23,6 +23,8 @@ use curvine_common::state::{HeartbeatStatus, WorkerAddress};
 use curvine_web::server::{WebHandlerService, WebServer};
 use log::info;
 use once_cell::sync::OnceCell;
+#[cfg(feature = "heap-trace")]
+use orpc::common::heap_trace::{HeapTraceConfig, HeapTraceRuntime};
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
@@ -31,6 +33,7 @@ use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 static CLUSTER_CONF: OnceCell<ClusterConf> = OnceCell::new();
 
@@ -43,10 +46,16 @@ pub struct WorkerService {
     task_manager: Arc<TaskManager>,
     rt: Arc<Runtime>,
     replication_manager: Arc<WorkerReplicationManager>,
+    #[cfg(feature = "heap-trace")]
+    heap_trace: Option<Arc<HeapTraceRuntime>>,
 }
 
 impl WorkerService {
-    pub fn with_conf(conf: &ClusterConf, rt: Arc<Runtime>) -> CommonResult<Self> {
+    pub fn with_conf(
+        conf: &ClusterConf,
+        rt: Arc<Runtime>,
+        #[cfg(feature = "heap-trace")] heap_trace: Option<Arc<HeapTraceRuntime>>,
+    ) -> CommonResult<Self> {
         let store: BlockStore = BlockStore::new(&conf.cluster_id, conf)?;
 
         let task_manager = TaskManager::with_rt(rt.clone(), conf)?;
@@ -60,6 +69,8 @@ impl WorkerService {
             task_manager: Arc::new(task_manager),
             rt,
             replication_manager,
+            #[cfg(feature = "heap-trace")]
+            heap_trace,
         };
         Ok(ws)
     }
@@ -91,7 +102,10 @@ impl WebHandlerService for WorkerService {
     type Item = WorkerRouterHandler;
 
     fn get_handler(&self) -> Self::Item {
-        WorkerRouterHandler {}
+        WorkerRouterHandler::new(
+            #[cfg(feature = "heap-trace")]
+            self.heap_trace.clone(),
+        )
     }
 }
 
@@ -103,6 +117,8 @@ pub struct Worker {
     rpc_server: RpcServer<WorkerService>,
     web_server: WebServer<WorkerService>,
     block_actor: BlockActor,
+    #[cfg(feature = "heap-trace")]
+    heap_trace: Option<Arc<HeapTraceRuntime>>,
 }
 
 impl Worker {
@@ -110,7 +126,14 @@ impl Worker {
         Logger::init(conf.worker.log.clone());
 
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
-        let service: WorkerService = WorkerService::with_conf(&conf, rt.clone())?;
+        #[cfg(feature = "heap-trace")]
+        let heap_trace = build_heap_trace_runtime(&conf);
+        let service: WorkerService = WorkerService::with_conf(
+            &conf,
+            rt.clone(),
+            #[cfg(feature = "heap-trace")]
+            heap_trace.clone(),
+        )?;
         let worker_id = service.store.worker_id();
 
         CLUSTER_CONF.get_or_init(|| conf.clone());
@@ -156,12 +179,21 @@ impl Worker {
             rpc_server,
             web_server,
             block_actor,
+            #[cfg(feature = "heap-trace")]
+            heap_trace,
         };
 
         Ok(worker)
     }
 
     pub async fn start(self) -> ServerStateListener {
+        #[cfg(feature = "heap-trace")]
+        if let Some(runtime) = &self.heap_trace {
+            if let Err(err) = runtime.start_periodic(Duration::from_secs(60)).await {
+                log::error!("Failed to start heap trace runtime: {}", err);
+            }
+        }
+
         let conf = CLUSTER_CONF.get().expect("Cluster conf not initialized");
         if conf.worker.enable_s3_gateway {
             #[cfg(target_os = "linux")]
@@ -238,4 +270,16 @@ impl Worker {
             }
         });
     }
+}
+
+#[cfg(feature = "heap-trace")]
+fn build_heap_trace_runtime(conf: &ClusterConf) -> Option<Arc<HeapTraceRuntime>> {
+    if !conf.heap_trace.runtime_enabled {
+        return None;
+    }
+
+    Some(Arc::new(HeapTraceRuntime::new(HeapTraceConfig::new(
+        conf.heap_trace.runtime_enabled,
+        conf.heap_trace.sample_interval_bytes,
+    ))))
 }
