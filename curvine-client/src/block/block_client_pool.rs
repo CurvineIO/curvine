@@ -215,4 +215,22 @@ impl BlockClientPool {
             .block_idle_conn
             .set(idle_count as i64);
     }
+
+    pub fn shutdown(self: &Arc<Self>) {
+        let mut total_cleared = 0;
+        self.pool.retain(|_addr, queue| {
+            while let Some(mut client) = queue.pop_front() {
+                client.clear_pool();
+                total_cleared += 1;
+            }
+            false
+        });
+        self.cur_idle_size.set(0);
+        if total_cleared > 0 {
+            info!(
+                "shutdown cleared {} idle block connections from pool {}",
+                total_cleared, self.id
+            );
+        }
+    }
 }

@@ -401,6 +401,11 @@ impl FsClient {
         self.rpc_bytes(RpcCode::GetMasterInfo, header).await
     }
 
+    pub async fn get_p2p_policy(&self) -> FsResult<GetP2pPolicyResponse> {
+        let header = GetP2pPolicyRequest::default();
+        self.rpc(RpcCode::GetP2pPolicy, header).await
+    }
+
     pub async fn mount(
         &self,
         ufs_path: &Path,
