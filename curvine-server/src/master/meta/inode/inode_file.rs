@@ -34,6 +34,8 @@ pub struct InodeFile {
     pub(crate) file_type: FileType,
     pub(crate) mtime: i64,
     pub(crate) atime: i64,
+    #[serde(default)]
+    pub(crate) version_epoch: i64,
 
     pub(crate) len: i64,
     pub(crate) block_size: u32,
@@ -61,6 +63,7 @@ impl InodeFile {
             file_type: FileType::File,
             mtime: time,
             atime: time,
+            version_epoch: 1,
             len: 0,
             block_size: 0,
             replicas: 0,
@@ -88,6 +91,7 @@ impl InodeFile {
             file_type: opts.file_type,
             mtime: time,
             atime: time,
+            version_epoch: 1,
             len,
             block_size: opts.block_size as u32,
             replicas: opts.replicas as u8,
@@ -128,6 +132,7 @@ impl InodeFile {
             file_type: FileType::Link,
             mtime: time,
             atime: time,
+            version_epoch: 1,
             len: 0,
             block_size: 0,
             replicas: 0,
@@ -272,6 +277,7 @@ impl InodeFile {
         // Clear all blocks and reset file size
         self.blocks.clear();
         self.len = 0;
+        self.version_epoch = self.version_epoch.max(0).saturating_add(1);
 
         // Update file metadata with new options
         self.replicas = opts.replicas as u8;
@@ -560,5 +566,22 @@ impl Inode for InodeFile {
 impl PartialEq for InodeFile {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InodeFile;
+    use curvine_common::state::CreateFileOpts;
+
+    #[test]
+    fn overwrite_bumps_version_epoch() {
+        let opts = CreateFileOpts::with_create(false);
+        let mut file = InodeFile::with_opts(7, 100, opts.clone());
+        let initial_epoch = file.version_epoch;
+
+        file.overwrite(opts, 200);
+
+        assert_eq!(file.version_epoch, initial_epoch + 1);
     }
 }

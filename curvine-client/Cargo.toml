@@ -15,6 +15,7 @@ hyper = { workspace = true }
 prost = { workspace = true }
 prost-build = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -22,13 +23,18 @@ log = { workspace = true }
 bytes = { workspace = true }
 pin-project-lite = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 dashmap = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
+async-trait = { workspace = true }
 moka = { workspace = true }
 fxhash = { workspace = true }
 prometheus = { workspace = true }
 linked-hash-map = { workspace = true }
+libp2p = { version = "0.56.0", default-features = false, features = ["tokio", "tcp", "quic", "noise", "yamux", "request-response", "mdns", "kad", "macros"] }
+libp2p-stream = "0.4.0-alpha"
+ring = "0.17"
 
 [features]
 default = ["opendal-s3"]
