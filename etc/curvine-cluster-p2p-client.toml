@@ -1,0 +1,52 @@
+
+format_master = false
+format_worker = false
+
+[master]
+meta_dir = "/data/curvine/master-meta"
+log = { level = "info", log_dir = "stdout", file_name = "master.log" }
+p2p_policy_version = 1
+p2p_policy_signing_key = "replace-with-strong-secret-32-chars-min"
+p2p_tenant_whitelist = []
+
+[journal]
+journal_addrs = [
+    {id = 1, hostname = "localhost", port = 8996}
+]
+journal_dir = "/data/curvine/journal"
+
+[worker]
+dir_reserved = "0"
+data_dir = [
+    "[DISK]/data/curvine/worker-data",
+]
+log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
+enable_s3_gateway = false
+
+[client]
+
+[client.p2p]
+enable = true
+cache_dir = "/data/curvine/p2p-cache"
+policy_hmac_key = "replace-with-strong-secret-32-chars-min"
+bootstrap_peers = [
+    "/ip4/10.0.0.11/udp/4101/quic-v1/p2p/12D3KooWH4NJL41x4kBnKmsiQjiGYMEtrhJfmJjKEmVQwZWwcJer",
+]
+
+[fuse]
+
+[log]
+level = "info"
+log_dir = "stdout"
+file_name = "curvine.log"
+
+[s3_gateway]
+listen = "0.0.0.0:9900"
+region = "us-east-1"
+put_temp_dir = "/tmp/curvine-temp"
+put_memory_buffer_threshold = 1048576
+put_max_memory_buffer = 16777216
+get_chunk_size_mb = 1.0
+
+[cli]
+log = { level = "warn", log_dir = "stdout", file_name = "cli.log" }
