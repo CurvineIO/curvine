@@ -259,9 +259,18 @@ impl Worker {
         );
 
         let rt_clone = worker_rt.clone();
+        #[cfg(feature = "heap-trace")]
+        let heap_trace = build_heap_trace_runtime(&conf);
         worker_rt.spawn(async move {
-            match curvine_s3_gateway::start_gateway(conf, listen_addr.clone(), region, rt_clone)
-                .await
+            match curvine_s3_gateway::start_gateway(
+                conf,
+                listen_addr.clone(),
+                region,
+                rt_clone,
+                #[cfg(feature = "heap-trace")]
+                heap_trace,
+            )
+            .await
             {
                 Ok(_) => {
                     info!("S3 gateway started successfully on {}", listen_addr);

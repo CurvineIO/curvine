@@ -19,10 +19,14 @@ use curvine_s3_gateway::auth::{
     AccessKeyStoreEnum, CredentialEntry, CredentialStore, CurvineAccessKeyStore,
     LocalAccessKeyStore,
 };
+#[cfg(feature = "heap-trace")]
+use orpc::common::heap_trace::{HeapTraceConfig, HeapTraceRuntime};
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::CommonResult;
 use rand::Rng;
 use std::sync::Arc;
+#[cfg(feature = "heap-trace")]
+use std::time::Duration;
 
 #[derive(Debug, Parser, Clone)]
 #[command(version = version::VERSION)]
@@ -129,11 +133,23 @@ fn serve_gateway(args: ObjectArgs, conf: ClusterConf) -> CommonResult<()> {
         conf.client.worker_threads,
     ));
 
+    #[cfg(feature = "heap-trace")]
+    let heap_trace = build_heap_trace_runtime(&conf);
+
+    #[cfg(feature = "heap-trace")]
+    if let Some(runtime) = &heap_trace {
+        if let Err(err) = rt.block_on(runtime.start_periodic(Duration::from_secs(60))) {
+            tracing::error!("Failed to start heap trace runtime: {}", err);
+        }
+    }
+
     rt.block_on(curvine_s3_gateway::start_gateway(
         conf,
         listen,
         region,
         rt.clone(),
+        #[cfg(feature = "heap-trace")]
+        heap_trace,
     ))
 }
 
@@ -424,4 +440,24 @@ fn generate_random_credentials() -> (String, String) {
         .collect();
 
     (access_key, secret_key)
+}
+
+#[cfg(feature = "heap-trace")]
+fn build_heap_trace_runtime(conf: &ClusterConf) -> Option<Arc<HeapTraceRuntime>> {
+    if !conf.heap_trace.runtime_enabled {
+        return None;
+    }
+
+    let malloc_conf = std::env::var("MALLOC_CONF").unwrap_or_default();
+    if !malloc_conf.contains("prof:true") || !malloc_conf.contains("prof_active:true") {
+        tracing::warn!(
+            "Heap trace requested for s3 gateway, but MALLOC_CONF did not enable jemalloc profiling at process start; runtime capture disabled"
+        );
+        return Some(Arc::new(HeapTraceRuntime::new(HeapTraceConfig::disabled())));
+    }
+
+    Some(Arc::new(HeapTraceRuntime::new(HeapTraceConfig::new(
+        conf.heap_trace.runtime_enabled,
+        conf.heap_trace.sample_interval_bytes,
+    ))))
 }

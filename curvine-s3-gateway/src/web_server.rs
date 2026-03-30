@@ -1,22 +1,117 @@
-use axum::routing::get;
-use axum::Router;
+use axum::extract::Extension;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+#[cfg(feature = "heap-trace")]
+use orpc::common::heap_trace::{latest_summary, HeapProfileSummary, HeapTraceRuntime};
+use serde_json::json;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 pub struct WebServer;
 
 impl WebServer {
-    pub async fn start(port: u16) -> orpc::CommonResult<()> {
-        let app = Router::new()
+    pub async fn start(
+        port: u16,
+        #[cfg(feature = "heap-trace")] heap_trace: Option<Arc<HeapTraceRuntime>>,
+    ) -> orpc::CommonResult<()> {
+        let mut app = Router::new()
             .route("/metrics", get(metrics_handler))
             .route("/healthz", get(|| async { "ok" }));
 
+        #[cfg(feature = "heap-trace")]
+        if let Some(runtime) = heap_trace {
+            app = app
+                .layer(Extension((*runtime).clone()))
+                .route("/debug/heap/profile", post(capture_profile))
+                .route("/debug/heap/latest", get(latest_capture_summary))
+                .route("/debug/heap/flamegraph.svg", get(capture_flamegraph_svg))
+                .route("/debug/heap/flamegraph", get(latest_flamegraph))
+                .route("/debug/heap/pprof", get(latest_pprof));
+        }
+
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        tracing::info!("FUSE metrics server listening on {}", addr);
+        tracing::info!("S3 gateway metrics server listening on {}", addr);
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
         Ok(())
     }
+}
+
+#[cfg(feature = "heap-trace")]
+async fn capture_profile(Extension(runtime): Extension<HeapTraceRuntime>) -> Response {
+    match runtime.profile_artifact().await {
+        Ok(artifact) => {
+            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+        }
+        Err(err) => error_response(err),
+    }
+}
+
+#[cfg(feature = "heap-trace")]
+async fn latest_capture_summary(Extension(runtime): Extension<HeapTraceRuntime>) -> Response {
+    let summary = latest_summary().unwrap_or_else(|| HeapProfileSummary {
+        runtime_enabled: runtime.conf().runtime_enabled,
+        sample_interval_bytes: runtime.conf().sample_interval_bytes,
+        capture_count: 0,
+        last_capture_epoch_ms: None,
+    });
+    (StatusCode::OK, Json(summary)).into_response()
+}
+
+#[cfg(feature = "heap-trace")]
+async fn capture_flamegraph_svg(Extension(runtime): Extension<HeapTraceRuntime>) -> Response {
+    match runtime.flamegraph_http_response().await {
+        Ok(response) => {
+            response_with_content_type(StatusCode::OK, &response.content_type, response.body)
+        }
+        Err(err) => error_response(err),
+    }
+}
+
+#[cfg(feature = "heap-trace")]
+async fn latest_flamegraph(Extension(runtime): Extension<HeapTraceRuntime>) -> Response {
+    match runtime.latest_flamegraph_artifact().await {
+        Some(artifact) => {
+            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+        }
+        None => not_found_response("heap flamegraph artifact not found"),
+    }
+}
+
+#[cfg(feature = "heap-trace")]
+async fn latest_pprof(Extension(runtime): Extension<HeapTraceRuntime>) -> Response {
+    match runtime.latest_profile_artifact().await {
+        Some(artifact) => {
+            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+        }
+        None => not_found_response("heap profile artifact not found"),
+    }
+}
+
+#[cfg(feature = "heap-trace")]
+fn response_with_content_type(status: StatusCode, content_type: &str, body: Vec<u8>) -> Response {
+    let mut response = (status, body).into_response();
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response
+}
+
+#[cfg(feature = "heap-trace")]
+fn error_response(err: orpc::CommonError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"message": err.to_string()})),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "heap-trace")]
+fn not_found_response(message: &str) -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({"message": message}))).into_response()
 }
 
 async fn metrics_handler() -> String {

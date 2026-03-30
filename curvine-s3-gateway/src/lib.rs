@@ -53,6 +53,8 @@ use auth::{
 };
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::ClusterConf;
+#[cfg(feature = "heap-trace")]
+use orpc::common::heap_trace::HeapTraceRuntime;
 use orpc::runtime::RpcRuntime;
 
 /// Register S3 handlers with concrete type - zero dynamic dispatch overhead
@@ -289,6 +291,7 @@ pub async fn start_gateway(
     listen: String,
     region: String,
     rt: std::sync::Arc<orpc::runtime::AsyncRuntime>,
+    #[cfg(feature = "heap-trace")] heap_trace: Option<Arc<HeapTraceRuntime>>,
 ) -> orpc::CommonResult<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -304,8 +307,16 @@ pub async fn start_gateway(
 
     // Clone web_port before moving conf into spawn
     let web_port = conf.s3_gateway.web_port;
+    #[cfg(feature = "heap-trace")]
+    let web_heap_trace = heap_trace.clone();
     rt.spawn(async move {
-        if let Err(e) = web_server::WebServer::start(web_port).await {
+        if let Err(e) = web_server::WebServer::start(
+            web_port,
+            #[cfg(feature = "heap-trace")]
+            web_heap_trace,
+        )
+        .await
+        {
             tracing::error!("Failed to start metrics server: {}", e);
         }
     });

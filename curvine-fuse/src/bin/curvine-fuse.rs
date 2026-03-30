@@ -18,11 +18,15 @@ use curvine_common::version;
 use curvine_fuse::fs::CurvineFileSystem;
 use curvine_fuse::session::FuseSession;
 use curvine_fuse::web_server::WebServer;
+#[cfg(feature = "heap-trace")]
+use orpc::common::heap_trace::{HeapTraceConfig, HeapTraceRuntime};
 use orpc::common::Logger;
 use orpc::io::net::InetAddr;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{err_box, CommonResult};
 use std::sync::Arc;
+#[cfg(feature = "heap-trace")]
+use std::time::Duration;
 
 // fuse mount.
 // Debugging, after starting the cluster, execute the following naming, mount fuse
@@ -46,10 +50,29 @@ fn main() -> CommonResult<()> {
         cluster_conf.fuse.worker_threads,
     ));
 
+    #[cfg(feature = "heap-trace")]
+    let heap_trace = build_heap_trace_runtime(&cluster_conf);
+
+    #[cfg(feature = "heap-trace")]
+    if let Some(runtime) = &heap_trace {
+        if let Err(err) = rt.block_on(runtime.start_periodic(Duration::from_secs(60))) {
+            tracing::error!("Failed to start heap trace runtime: {}", err);
+        }
+    }
+
     let fuse_rt = rt.clone();
+    let web_port = cluster_conf.fuse.web_port;
+    #[cfg(feature = "heap-trace")]
+    let web_heap_trace = heap_trace.clone();
 
     rt.spawn(async move {
-        if let Err(e) = WebServer::start(cluster_conf.fuse.web_port).await {
+        if let Err(e) = WebServer::start(
+            web_port,
+            #[cfg(feature = "heap-trace")]
+            web_heap_trace,
+        )
+        .await
+        {
             tracing::error!("Failed to start metrics server: {}", e);
         }
     });
@@ -62,6 +85,26 @@ fn main() -> CommonResult<()> {
     })?;
 
     Ok(())
+}
+
+#[cfg(feature = "heap-trace")]
+fn build_heap_trace_runtime(conf: &ClusterConf) -> Option<Arc<HeapTraceRuntime>> {
+    if !conf.heap_trace.runtime_enabled {
+        return None;
+    }
+
+    let malloc_conf = std::env::var("MALLOC_CONF").unwrap_or_default();
+    if !malloc_conf.contains("prof:true") || !malloc_conf.contains("prof_active:true") {
+        tracing::warn!(
+            "Heap trace requested for fuse, but MALLOC_CONF did not enable jemalloc profiling at process start; runtime capture disabled"
+        );
+        return Some(Arc::new(HeapTraceRuntime::new(HeapTraceConfig::disabled())));
+    }
+
+    Some(Arc::new(HeapTraceRuntime::new(HeapTraceConfig::new(
+        conf.heap_trace.runtime_enabled,
+        conf.heap_trace.sample_interval_bytes,
+    ))))
 }
 
 // Mount command function parameters
