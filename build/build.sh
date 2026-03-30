@@ -137,12 +137,13 @@ DIST_ZIP=curvine-${CURVINE_VERSION}-${ARCH_NAME}-${OS_VERSION}.zip
 PROFILE="--release"
 declare -a PACKAGES=("all")  # Default to build all packages
 declare -a UFS_TYPES=("opendal-s3")  # Default UFS type
-declare -a EXTRA_FEATURES=()  # Extra features to add
+declare -a EXTRA_FEATURES=()  # From -f only; --alloc is merged into FEATURES later
+ALLOC=jemalloc
 CRATE_ZIP=""
 SKIP_JAVA_SDK=0  # Flag to skip Java SDK compilation
 
 # Parse command line arguments
-TEMP=$(getopt -o p:u:f:dzhv --long package:,ufs:,features:,debug,zip,skip-java-sdk,help -n "$0" -- "$@")
+TEMP=$(getopt -o p:u:f:a:dzhv --long package:,ufs:,features:,alloc:,debug,zip,skip-java-sdk,help -n "$0" -- "$@")
 if [ $? != 0 ] ; then print_help ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -167,6 +168,10 @@ while true ; do
       for feature in "${FEATURE_ARRAY[@]}"; do
         EXTRA_FEATURES+=("$feature")
       done
+      shift 2
+      ;;
+    -a|--alloc)
+      ALLOC="$2"
       shift 2
       ;;
     -d|--debug)
@@ -453,9 +458,12 @@ if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
   done
 fi
 
+# Append --alloc as a workspace feature: curvine-common/{jemalloc|mimalloc} → cargo --features
+FEATURES+=("curvine-common/${ALLOC}")
+
 # Add features to command if any
 if [ ${#FEATURES[@]} -gt 0 ]; then
-  # Join features with comma
+  # Join features with comma for --features
   IFS=, eval 'FEATURE_LIST="${FEATURES[*]}"'
   cmd="$cmd --no-default-features --features $FEATURE_LIST"
 fi
