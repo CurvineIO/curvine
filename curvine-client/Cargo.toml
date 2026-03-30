@@ -29,6 +29,7 @@ moka = { workspace = true }
 fxhash = { workspace = true }
 prometheus = { workspace = true }
 linked-hash-map = { workspace = true }
+ring = "0.17"
 
 [features]
 default = ["opendal-s3"]
