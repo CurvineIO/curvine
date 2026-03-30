@@ -312,6 +312,30 @@ impl HeapTraceRuntime {
     pub async fn latest_svg_path(&self) -> Option<PathBuf> {
         self.state.lock().await.latest_flamegraph_path.clone()
     }
+
+    pub async fn latest_profile_artifact(&self) -> Option<HeapTraceArtifact> {
+        let state = self.state.lock().await;
+        state.latest_profile.clone().map(|profile| {
+            HeapTraceArtifact::new(
+                HeapTraceArtifactKind::Profile,
+                "application/octet-stream",
+                PROFILE_FILE_NAME,
+                profile.payload,
+            )
+        })
+    }
+
+    pub async fn latest_flamegraph_artifact(&self) -> Option<HeapTraceArtifact> {
+        let state = self.state.lock().await;
+        state.latest_flamegraph.clone().map(|flamegraph| {
+            HeapTraceArtifact::new(
+                HeapTraceArtifactKind::Flamegraph,
+                "image/svg+xml",
+                FLAMEGRAPH_FILE_NAME,
+                flamegraph.svg.into_bytes(),
+            )
+        })
+    }
 }
 
 impl Drop for HeapTraceRuntime {
@@ -503,17 +527,15 @@ mod tests {
         let right = HeapTraceRuntime::new(HeapTraceConfig::new(true, 4096));
 
         assert_ne!(left.artifact_dir.as_ref(), right.artifact_dir.as_ref());
-        assert!(
-            left.artifact_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("curvine-heap-trace-"))
-        );
-        assert!(
-            right.artifact_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("curvine-heap-trace-"))
-        );
+        assert!(left
+            .artifact_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("curvine-heap-trace-")));
+        assert!(right
+            .artifact_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("curvine-heap-trace-")));
     }
 }

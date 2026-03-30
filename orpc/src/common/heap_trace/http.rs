@@ -12,10 +12,93 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::common::heap_trace::{latest_summary, HeapProfileSummary, HeapTraceRuntime};
+use axum::extract::State;
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct HeapTraceHttpResponse {
     pub content_type: String,
     pub body: Vec<u8>,
+}
+
+pub fn router(runtime: HeapTraceRuntime) -> Router {
+    Router::new()
+        .route("/debug/heap/profile", post(capture_profile))
+        .route("/debug/heap/latest", get(latest_capture_summary))
+        .route("/debug/heap/flamegraph.svg", get(capture_flamegraph_svg))
+        .route("/debug/heap/flamegraph", get(latest_flamegraph))
+        .route("/debug/heap/pprof", get(latest_pprof))
+        .with_state(runtime)
+}
+
+async fn capture_profile(State(runtime): State<HeapTraceRuntime>) -> Response {
+    match runtime.profile_artifact().await {
+        Ok(artifact) => {
+            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+        }
+        Err(err) => error_response(err),
+    }
+}
+
+async fn latest_capture_summary(State(runtime): State<HeapTraceRuntime>) -> Response {
+    let summary = latest_summary().unwrap_or_else(|| HeapProfileSummary {
+        runtime_enabled: runtime.conf().runtime_enabled,
+        sample_interval_bytes: runtime.conf().sample_interval_bytes,
+        capture_count: 0,
+        last_capture_epoch_ms: None,
+    });
+    (StatusCode::OK, Json(summary)).into_response()
+}
+
+async fn capture_flamegraph_svg(State(runtime): State<HeapTraceRuntime>) -> Response {
+    match runtime.flamegraph_http_response().await {
+        Ok(response) => {
+            response_with_content_type(StatusCode::OK, &response.content_type, response.body)
+        }
+        Err(err) => error_response(err),
+    }
+}
+
+async fn latest_flamegraph(State(runtime): State<HeapTraceRuntime>) -> Response {
+    match runtime.latest_flamegraph_artifact().await {
+        Some(artifact) => {
+            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+        }
+        None => not_found_response("heap flamegraph artifact not found"),
+    }
+}
+
+async fn latest_pprof(State(runtime): State<HeapTraceRuntime>) -> Response {
+    match runtime.latest_profile_artifact().await {
+        Some(artifact) => {
+            response_with_content_type(StatusCode::OK, &artifact.media_type, artifact.payload)
+        }
+        None => not_found_response("heap profile artifact not found"),
+    }
+}
+
+fn response_with_content_type(status: StatusCode, content_type: &str, body: Vec<u8>) -> Response {
+    let mut response = (status, body).into_response();
+    if let Ok(value) = HeaderValue::from_str(content_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response
+}
+
+fn error_response(err: crate::CommonError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"message": err.to_string()})),
+    )
+        .into_response()
+}
+
+fn not_found_response(message: &str) -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({"message": message}))).into_response()
 }
