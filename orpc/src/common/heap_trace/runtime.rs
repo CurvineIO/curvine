@@ -22,16 +22,18 @@ use crate::{err_box, CommonResult};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use super::{dump_profile, read_profile};
 
 const PROFILE_FILE_NAME: &str = "heap.pb.gz";
 const FLAMEGRAPH_FILE_NAME: &str = "heap.svg";
 const SUMMARY_FILE_NAME: &str = "heap-profile-summary.json";
+const RAW_PROFILE_FILE_NAME: &str = "heap.raw.pb.gz";
 const DEFAULT_FLAMEGRAPH_STACKS: &str = "heap_trace;capture 1\n";
 
 #[derive(Debug, Clone)]
@@ -56,16 +58,16 @@ pub trait HeapProfiler: Send + Sync {
 
 #[derive(Debug)]
 struct JemallocHeapProfiler {
-    profile_dir: PathBuf,
+    raw_profile_path: PathBuf,
 }
 
 impl JemallocHeapProfiler {
-    fn new(profile_dir: PathBuf) -> Self {
-        Self { profile_dir }
+    fn new(raw_profile_path: PathBuf) -> Self {
+        Self { raw_profile_path }
     }
 
-    fn raw_profile_path(&self) -> PathBuf {
-        self.profile_dir.join("heap.raw.pb.gz")
+    fn raw_profile_path(&self) -> &PathBuf {
+        &self.raw_profile_path
     }
 }
 
@@ -76,8 +78,8 @@ impl HeapProfiler for JemallocHeapProfiler {
         if let Some(parent) = raw_profile_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        dump_profile(&raw_profile_path)?;
-        let profile = read_profile(&raw_profile_path)?;
+        dump_profile(raw_profile_path)?;
+        let profile = read_profile(raw_profile_path)?;
         Ok(CapturedProfile::new(profile, DEFAULT_FLAMEGRAPH_STACKS))
     }
 }
@@ -91,7 +93,6 @@ struct RuntimeState {
     latest_summary_path: Option<PathBuf>,
     capture_count: u64,
     last_capture_epoch_ms: Option<u64>,
-    periodic_task: Option<JoinHandle<()>>,
 }
 
 impl RuntimeState {
@@ -104,7 +105,6 @@ impl RuntimeState {
             latest_summary_path: None,
             capture_count: 0,
             last_capture_epoch_ms: None,
-            periodic_task: None,
         }
     }
 }
@@ -115,14 +115,17 @@ pub struct HeapTraceRuntime {
     profiler: Arc<dyn HeapProfiler>,
     artifact_dir: Arc<PathBuf>,
     state: Arc<Mutex<RuntimeState>>,
+    periodic_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     run_lock: Arc<Mutex<()>>,
     running: Arc<AtomicBool>,
 }
 
 impl HeapTraceRuntime {
     pub fn new(conf: HeapTraceConfig) -> Self {
-        let artifact_dir = std::env::temp_dir().join("curvine-heap-trace");
-        let profiler = Arc::new(JemallocHeapProfiler::new(artifact_dir.clone()));
+        let runtime_id = Uuid::new_v4().simple().to_string();
+        let artifact_dir = std::env::temp_dir().join(format!("curvine-heap-trace-{runtime_id}"));
+        let raw_profile_path = artifact_dir.join(RAW_PROFILE_FILE_NAME);
+        let profiler = Arc::new(JemallocHeapProfiler::new(raw_profile_path));
         Self::with_profiler(conf, artifact_dir, profiler)
     }
 
@@ -138,6 +141,7 @@ impl HeapTraceRuntime {
             profiler,
             artifact_dir: Arc::new(artifact_dir.into()),
             state: Arc::new(Mutex::new(RuntimeState::new())),
+            periodic_task: Arc::new(Mutex::new(None)),
             run_lock: Arc::new(Mutex::new(())),
             running: Arc::new(AtomicBool::new(false)),
         }
@@ -261,31 +265,45 @@ impl HeapTraceRuntime {
             return err_box!("heap trace periodic interval must be greater than zero");
         }
 
-        let mut state = self.state.lock().await;
-        if state.periodic_task.is_some() {
+        let mut periodic_task = self.periodic_task.lock().await;
+        if periodic_task.is_some() {
             return Ok(());
         }
 
-        let runtime = self.clone();
+        let weak_state = Arc::downgrade(&self.state);
+        let running = self.running.clone();
+        let run_lock = self.run_lock.clone();
+        let conf = self.conf.clone();
+        let profiler = self.profiler.clone();
+        let artifact_dir = self.artifact_dir.clone();
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
-                if runtime.running.load(Ordering::SeqCst) {
+                let Some(state) = Weak::upgrade(&weak_state) else {
+                    break;
+                };
+                if running.load(Ordering::SeqCst) {
                     continue;
                 }
+                let runtime = HeapTraceRuntime {
+                    conf: conf.clone(),
+                    profiler: profiler.clone(),
+                    artifact_dir: artifact_dir.clone(),
+                    state,
+                    periodic_task: Arc::new(Mutex::new(None)),
+                    run_lock: run_lock.clone(),
+                    running: running.clone(),
+                };
                 let _ = runtime.trigger_now().await;
             }
         });
-        state.periodic_task = Some(handle);
+        *periodic_task = Some(handle);
         Ok(())
     }
 
     pub async fn stop_periodic(&self) {
-        let handle = {
-            let mut state = self.state.lock().await;
-            state.periodic_task.take()
-        };
+        let handle = self.periodic_task.lock().await.take();
         if let Some(handle) = handle {
             handle.abort();
         }
@@ -298,8 +316,11 @@ impl HeapTraceRuntime {
 
 impl Drop for HeapTraceRuntime {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.try_lock() {
-            if let Some(handle) = state.periodic_task.take() {
+        if Arc::strong_count(&self.periodic_task) != 1 {
+            return;
+        }
+        if let Ok(mut periodic_task) = self.periodic_task.try_lock() {
+            if let Some(handle) = periodic_task.take() {
                 handle.abort();
             }
         }
@@ -454,5 +475,45 @@ mod tests {
 
         assert!(profiler.calls() >= 2);
         assert!(runtime.latest_svg_path().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn start_periodic_stops_after_runtime_drop_without_explicit_stop() {
+        let dir = TempDir::new().unwrap();
+        let profiler = Arc::new(FakeProfiler::new(false));
+        let runtime = Arc::new(test_runtime(profiler.clone(), &dir));
+
+        runtime
+            .start_periodic(Duration::from_millis(10))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let before_drop = profiler.calls();
+        assert!(before_drop > 0);
+
+        drop(runtime);
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        assert_eq!(profiler.calls(), before_drop);
+    }
+
+    #[tokio::test]
+    async fn default_runtime_uses_unique_artifact_directory() {
+        let left = HeapTraceRuntime::new(HeapTraceConfig::new(true, 4096));
+        let right = HeapTraceRuntime::new(HeapTraceConfig::new(true, 4096));
+
+        assert_ne!(left.artifact_dir.as_ref(), right.artifact_dir.as_ref());
+        assert!(
+            left.artifact_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("curvine-heap-trace-"))
+        );
+        assert!(
+            right.artifact_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("curvine-heap-trace-"))
+        );
     }
 }

@@ -62,6 +62,28 @@ pub fn dump_profile(raw_profile_path: &Path) -> CommonResult<()> {
 }
 
 #[cfg(not(feature = "heap-trace"))]
-pub fn dump_profile(_raw_profile_path: &Path) -> CommonResult<()> {
+pub fn dump_profile(raw_profile_path: &Path) -> CommonResult<()> {
+    if let Some(parent) = raw_profile_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(raw_profile_path, [])?;
     Ok(())
+}
+
+#[cfg(all(test, not(feature = "heap-trace")))]
+mod tests {
+    use super::{dump_profile, read_profile};
+    use tempfile::TempDir;
+
+    #[test]
+    fn dump_profile_stub_creates_readable_placeholder_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("heap.raw.pb.gz");
+
+        dump_profile(&path).unwrap();
+        let profile = read_profile(&path).unwrap();
+
+        assert_eq!(profile.format, "pprof");
+        assert!(profile.payload.is_empty());
+    }
 }
