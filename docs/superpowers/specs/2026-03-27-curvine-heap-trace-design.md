@@ -363,6 +363,13 @@ jemalloc profiling 的优点：
 2. flamegraph 主热点能落到对应调用路径。
 3. 新增一种新的 heap-heavy 结构时，无需加埋点也能进入 profile 结果。
 
+### Task 10 验证结果补充（2026-03-30）
+
+- 目标测试 / 编译矩阵已通过。
+- 本地 manual smoke flow 已到达 `POST /debug/heap/profile`、`GET /debug/heap/latest`、`GET /debug/heap/flamegraph.svg` 与 `/metrics`。
+- 在当前环境中，启用 capture / flamegraph generation 未能完成端到端验证：jemalloc profiling 处于 disabled 状态，且运行时注入的 `MALLOC_CONF` profiling keys 被拒绝。
+- 指标命名已确认保持 role-agnostic，统一使用 `curvine_heap_*` 前缀。
+
 ## 验收标准
 
 首版验收定义如下：
