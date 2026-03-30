@@ -19,7 +19,210 @@ use orpc::common::{ByteUnit, DurationUnit, Utils};
 use orpc::io::net::InetAddr;
 use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
+use std::io::{Error, ErrorKind};
+use std::path::PathBuf;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientP2pConf {
+    pub enable: bool,
+    pub identity_key_path: String,
+    pub peer_whitelist: Vec<String>,
+    pub listen_addrs: Vec<String>,
+    pub bootstrap_peers: Vec<String>,
+    pub enable_mdns: bool,
+    pub enable_dht: bool,
+    pub request_timeout_ms: u64,
+    pub p2p_qps_limit: u64,
+    pub hedge_delay_ms: u64,
+    pub discovery_timeout_ms: u64,
+    pub connect_timeout_ms: u64,
+    pub transfer_timeout_ms: u64,
+    pub max_inflight_requests: usize,
+    pub max_inflight_per_peer: usize,
+    pub adaptive_window: bool,
+    pub min_inflight_per_peer: usize,
+    pub max_active_peers: usize,
+    pub cache_dir: String,
+    #[serde(skip)]
+    pub cache_capacity: u64,
+    #[serde(alias = "cache_capacity")]
+    pub cache_capacity_str: String,
+    #[serde(skip)]
+    pub cache_ttl: Duration,
+    #[serde(alias = "cache_ttl")]
+    pub cache_ttl_str: String,
+    pub cache_shards: usize,
+    pub enable_checksum: bool,
+    pub fallback_worker_on_fail: bool,
+    pub tenant_whitelist: Vec<String>,
+    pub policy_hmac_key: String,
+    pub trace_enable: bool,
+    pub trace_sample_rate: f64,
+    pub metrics_label_series_cap: usize,
+    pub metrics_hash_job_id: bool,
+    #[serde(skip)]
+    pub provider_ttl: Duration,
+    #[serde(alias = "provider_ttl")]
+    pub provider_ttl_str: String,
+    #[serde(skip)]
+    pub provider_publish_interval: Duration,
+    #[serde(alias = "provider_publish_interval")]
+    pub provider_publish_interval_str: String,
+}
+
+impl ClientP2pConf {
+    pub fn init(&mut self) -> CommonResult<()> {
+        if self.cache_dir.trim().is_empty() || self.cache_dir == "testing/p2p-cache" {
+            self.cache_dir = default_p2p_cache_dir();
+        }
+        self.cache_capacity = ByteUnit::from_str(&self.cache_capacity_str)?.as_byte();
+        self.cache_ttl = DurationUnit::from_str(&self.cache_ttl_str)?.as_duration();
+        self.provider_ttl = DurationUnit::from_str(&self.provider_ttl_str)?.as_duration();
+        self.provider_publish_interval =
+            DurationUnit::from_str(&self.provider_publish_interval_str)?.as_duration();
+        if self.cache_capacity == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.cache_capacity must be greater than 0",
+            )
+            .into());
+        }
+        if self.cache_ttl.is_zero() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.cache_ttl must be greater than 0",
+            )
+            .into());
+        }
+        if self.discovery_timeout_ms == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.discovery_timeout_ms must be greater than 0",
+            )
+            .into());
+        }
+        if self.connect_timeout_ms == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.connect_timeout_ms must be greater than 0",
+            )
+            .into());
+        }
+        if self.transfer_timeout_ms == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.transfer_timeout_ms must be greater than 0",
+            )
+            .into());
+        }
+        if self.provider_ttl.is_zero() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.provider_ttl must be greater than 0",
+            )
+            .into());
+        }
+        if self.max_inflight_per_peer > 0 && self.min_inflight_per_peer > self.max_inflight_per_peer
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.min_inflight_per_peer must be less than or equal to client.p2p.max_inflight_per_peer",
+            )
+            .into());
+        }
+        if self.provider_publish_interval >= self.provider_ttl {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.provider_publish_interval must be less than client.p2p.provider_ttl",
+            )
+            .into());
+        }
+        if !(0.0..=1.0).contains(&self.trace_sample_rate) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.trace_sample_rate must be between 0 and 1",
+            )
+            .into());
+        }
+        if self.metrics_label_series_cap == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "client.p2p.metrics_label_series_cap must be greater than 0",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl Default for ClientP2pConf {
+    fn default() -> Self {
+        let mut conf = Self {
+            enable: false,
+            identity_key_path: String::new(),
+            peer_whitelist: vec![],
+            listen_addrs: vec!["/ip4/0.0.0.0/udp/0/quic-v1".to_string()],
+            bootstrap_peers: vec![],
+            enable_mdns: true,
+            enable_dht: true,
+            request_timeout_ms: 800,
+            p2p_qps_limit: 5000,
+            hedge_delay_ms: 0,
+            discovery_timeout_ms: 800,
+            connect_timeout_ms: 800,
+            transfer_timeout_ms: 800,
+            max_inflight_requests: 256,
+            max_inflight_per_peer: 32,
+            adaptive_window: true,
+            min_inflight_per_peer: 1,
+            max_active_peers: 512,
+            cache_dir: default_p2p_cache_dir(),
+            cache_capacity: 0,
+            cache_capacity_str: "200GB".to_string(),
+            cache_ttl: Duration::default(),
+            cache_ttl_str: "24h".to_string(),
+            cache_shards: 64,
+            enable_checksum: true,
+            fallback_worker_on_fail: true,
+            tenant_whitelist: vec![],
+            policy_hmac_key: String::new(),
+            trace_enable: false,
+            trace_sample_rate: 0.1,
+            metrics_label_series_cap: 1024,
+            metrics_hash_job_id: true,
+            provider_ttl: Duration::default(),
+            provider_ttl_str: "10m".to_string(),
+            provider_publish_interval: Duration::default(),
+            provider_publish_interval_str: "30s".to_string(),
+        };
+        conf.init().unwrap();
+        conf
+    }
+}
+
+fn default_p2p_cache_dir() -> String {
+    default_p2p_cache_dir_from(
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::temp_dir(),
+    )
+}
+
+fn default_p2p_cache_dir_from(
+    xdg_cache_home: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+    temp_dir: PathBuf,
+) -> String {
+    xdg_cache_home
+        .map(|path| path.join("curvine"))
+        .or_else(|| home_dir.map(|path| path.join(".cache").join("curvine")))
+        .unwrap_or_else(|| temp_dir.join("curvine"))
+        .join("p2p-cache")
+        .to_string_lossy()
+        .to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -212,6 +415,8 @@ pub struct ClientConf {
 
     // Sequential read check threshold
     pub sequential_read_threshold: u64,
+
+    pub p2p: ClientP2pConf,
 }
 
 impl ClientConf {
@@ -276,6 +481,7 @@ impl ClientConf {
 
         // Process smart prefetch configuration
         self.large_file_size = ByteUnit::from_str(&self.large_file_size_str)?.as_byte() as i64;
+        self.p2p.init()?;
 
         Ok(())
     }
@@ -417,9 +623,49 @@ impl Default for ClientConf {
             large_file_size_str: "10GB".to_string(),
             max_read_parallel: 8,
             sequential_read_threshold: 7,
+            p2p: ClientP2pConf::default(),
         };
 
         conf.init().unwrap();
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_p2p_cache_dir_from, ClientP2pConf};
+    use crate::conf::ClusterConf;
+    use std::path::PathBuf;
+
+    #[test]
+    fn p2p_default_cache_dir_prefers_xdg_cache_home() {
+        let path = default_p2p_cache_dir_from(
+            Some(PathBuf::from("/var/cache")),
+            Some(PathBuf::from("/home/curvine")),
+            PathBuf::from("/tmp"),
+        );
+        assert_eq!(path, "/var/cache/curvine/p2p-cache");
+    }
+
+    #[test]
+    fn p2p_init_rewrites_legacy_testing_cache_dir() {
+        let mut conf = ClientP2pConf {
+            enable: true,
+            cache_dir: "testing/p2p-cache".to_string(),
+            ..ClientP2pConf::default()
+        };
+        conf.init().expect("p2p config should init");
+        assert_ne!(conf.cache_dir, "testing/p2p-cache");
+        assert!(conf.cache_dir.ends_with("p2p-cache"));
+    }
+
+    #[test]
+    fn cluster_conf_allows_minimal_p2p_block() {
+        let mut conf = toml::from_str::<ClusterConf>("[client.p2p]\nenable = true\n")
+            .expect("minimal p2p config should parse");
+        conf.client.init().expect("minimal p2p config should init");
+        assert!(conf.client.p2p.enable);
+        assert!(!conf.client.p2p.cache_dir.is_empty());
+        assert_ne!(conf.client.p2p.cache_dir, "testing/p2p-cache");
     }
 }
