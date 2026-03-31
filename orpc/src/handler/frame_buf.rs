@@ -69,6 +69,12 @@ impl FrameBuf {
         buf
     }
 
+    pub fn take_capacity(&mut self, len: usize) -> BytesMut {
+        let mut buf = self.take_exact(len);
+        buf.clear();
+        buf
+    }
+
     pub fn into_inner(self) -> BytesMut {
         self.inner
     }
