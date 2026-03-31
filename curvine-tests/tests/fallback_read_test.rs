@@ -35,7 +35,6 @@
 //! | TC-14  | seek() after fallback to UFS -> continues from new position       |
 
 use bytes::BytesMut;
-use curvine_client::file::FsReader;
 use curvine_client::unified::{FallbackFsReader, UfsFileSystem, UnifiedFileSystem, UnifiedReader};
 use curvine_common::fs::{FileSystem, Path, Reader, Writer};
 use curvine_common::state::{MountOptionsBuilder, WriteType};
@@ -141,7 +140,7 @@ async fn build_reader_with_unreachable_worker(
         }
     }
 
-    let cv_reader = FsReader::new(cv_path.clone(), fs.cv().fs_context(), blocks).unwrap();
+    let cv_reader = fs.cv().open_with_blocks(cv_path, blocks).unwrap();
     let (ufs_path, mount) = fs.get_mount(cv_path).await.unwrap().unwrap();
     FallbackFsReader::new(cv_reader, ufs_path, mount.ufs.clone())
 }

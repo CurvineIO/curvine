@@ -18,7 +18,6 @@ use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{err_fuse, FuseResult, STATE_FILE_MAGIC, STATE_FILE_VERSION};
-use curvine_client::file::FsReader;
 use curvine_client::unified::{UnifiedFileSystem, UnifiedReader};
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
 use curvine_common::fs::{FileSystem, MetaCache, Path, StateReader, StateWriter};
@@ -275,7 +274,7 @@ impl NodeState {
     pub async fn new_reader(&self, path: &Path) -> FuseResult<FuseReader> {
         let reader = match self.get_cached_blocks(path) {
             Some(blocks) => {
-                let reader = FsReader::new(path.clone(), self.fs.fs_context().clone(), blocks)?;
+                let reader = self.fs.open_cv_with_blocks(path, blocks)?;
                 UnifiedReader::Cv(reader)
             }
 

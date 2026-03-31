@@ -60,11 +60,7 @@ fn test_block_deletion_and_cleanup_verification() -> CommonResult<()> {
         // Verify each previously allocated block cannot be opened on any worker
         for lc in file_blocks.block_locs {
             for loc in lc.locs {
-                let bc = fs
-                    .fs_context()
-                    .block_client(&loc)
-                    .await
-                    .map_err(CommonError::from)?;
+                let bc = fs.block_client(&loc).await.map_err(CommonError::from)?;
                 let res = bc
                     .open_block(
                         &fs.conf().client,

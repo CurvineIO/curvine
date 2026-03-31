@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::block::BatchBlockWriter;
+use crate::block::{BatchBlockWriter, BlockClient};
 use crate::file::{FsClient, FsContext, FsReader, FsWriter, FsWriterBase};
+use crate::p2p::{P2pState, P2pStatsSnapshot};
 use crate::ClientMetrics;
 use async_stream::stream;
 use bytes::BytesMut;
@@ -24,6 +25,7 @@ use curvine_common::state::{CommitBlock, FreeResult, ListOptions};
 use curvine_common::state::{
     CreateFileOpts, CreateFileOptsBuilder, FileAllocOpts, FileBlocks, FileLock, FileStatus,
     MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
+    WorkerAddress,
 };
 use curvine_common::utils::ProtoUtils;
 use curvine_common::version::GIT_VERSION;
@@ -32,6 +34,7 @@ use log::info;
 use log::warn;
 use orpc::client::ClientConf;
 use orpc::err_box;
+use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,9 +55,6 @@ impl CurvineFileSystem {
             fs_client: Arc::new(fs_client),
         };
 
-        if let Some(service) = fs.fs_context.p2p_service() {
-            service.start();
-        }
         FsContext::start_clean_task(fs.clone(), fs.fs_context.block_pool.clone());
 
         let c = &fs.conf().client;
@@ -142,9 +142,11 @@ impl CurvineFileSystem {
 
     pub async fn open(&self, path: &Path) -> FsResult<FsReader> {
         let file_blocks = self.fs_client.get_block_locations(path).await?;
+        self.open_with_blocks(path, file_blocks)
+    }
 
-        let reader = FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)?;
-        Ok(reader)
+    pub fn open_with_blocks(&self, path: &Path, file_blocks: FileBlocks) -> FsResult<FsReader> {
+        FsReader::new(path.clone(), self.fs_context.clone(), file_blocks)
     }
 
     pub async fn open_for_write(&self, path: &Path, overwrite: bool) -> FsResult<FsWriter> {
@@ -349,6 +351,38 @@ impl CurvineFileSystem {
         self.fs_context.clone()
     }
 
+    pub fn client_name(&self) -> String {
+        self.fs_context.clone_client_name()
+    }
+
+    pub fn p2p_enabled(&self) -> bool {
+        self.fs_context.p2p_state().is_some()
+    }
+
+    pub fn p2p_state(&self) -> Option<P2pState> {
+        self.fs_context.p2p_state()
+    }
+
+    pub fn p2p_peer_id(&self) -> Option<String> {
+        self.fs_context.p2p_peer_id()
+    }
+
+    pub fn p2p_bootstrap_peer_addr(&self) -> Option<String> {
+        self.fs_context.p2p_bootstrap_peer_addr()
+    }
+
+    pub fn p2p_stats_snapshot(&self) -> Option<P2pStatsSnapshot> {
+        self.fs_context.p2p_stats_snapshot()
+    }
+
+    pub fn p2p_runtime_policy_version(&self) -> Option<u64> {
+        self.fs_context.p2p_runtime_policy_version()
+    }
+
+    pub async fn block_client(&self, addr: &WorkerAddress) -> IOResult<BlockClient> {
+        self.fs_context.block_client(addr).await
+    }
+
     pub async fn read_string(&self, path: &Path) -> FsResult<String> {
         let mut reader = self.open(path).await?;
 
@@ -389,13 +423,11 @@ impl CurvineFileSystem {
         if let Err(e) = res {
             warn!("close {}", e);
         }
-        if let Some(service) = self.fs_context.p2p_service() {
-            service.stop();
-        }
+        self.fs_context.stop_p2p();
     }
 
     pub async fn write_batch_string(&self, files: &[(Path, &str)]) -> FsResult<()> {
-        let chunk_size = self.fs_context().write_chunk_size();
+        let chunk_size = self.fs_context.write_chunk_size();
         let mut batch = Vec::with_capacity(files.len());
         let mut batch_memory = 0;
 
@@ -471,7 +503,7 @@ impl CurvineFileSystem {
                 path.encode(),
                 content.len() as i64,
                 vec![commit_block.clone()],
-                self.fs_context().clone_client_name(),
+                self.client_name(),
                 false,
             ));
         }

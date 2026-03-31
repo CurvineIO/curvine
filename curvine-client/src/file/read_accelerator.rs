@@ -151,10 +151,6 @@ impl ReadAccelerator {
         self.p2p_service.as_ref().map(|service| service.state())
     }
 
-    pub(crate) fn p2p_service(&self) -> Option<Arc<P2pService>> {
-        self.p2p_service.clone()
-    }
-
     #[allow(dead_code)]
     pub(crate) fn p2p_peer_id(&self) -> Option<String> {
         self.p2p_service

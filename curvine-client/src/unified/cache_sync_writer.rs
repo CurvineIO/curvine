@@ -46,7 +46,7 @@ impl CacheSyncWriter {
         let conf = &fs.conf().client;
         let opts = mnt.info.get_create_opts(conf);
         let inner = fs.cv().open_with_opts(cv_path, opts, flags).await?;
-        let job_client = JobMasterClient::with_context(fs.fs_context());
+        let job_client = JobMasterClient::new(fs.fs_client());
 
         let writer = Self {
             job_client,

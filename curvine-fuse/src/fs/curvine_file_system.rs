@@ -160,7 +160,7 @@ impl CurvineFileSystem {
     }
 
     fn to_file_lock(&self, arg: &fuse_lk_in) -> FileLock {
-        let client_id = self.fs.cv().fs_context().clone_client_name();
+        let client_id = self.fs.client_name();
         FileLock {
             client_id,
             owner_id: arg.owner,
@@ -175,7 +175,7 @@ impl CurvineFileSystem {
 
     async fn fs_unlock(&self, handler: &FileHandle, flags: LockFlags) -> FuseResult<()> {
         if let Some(owner_id) = handler.remove_lock(flags) {
-            let client_id = self.fs.cv().fs_context().clone_client_name();
+            let client_id = self.fs.client_name();
             let path = Path::from_str(&handler.status.path)?;
 
             let mut lock = FileLock {

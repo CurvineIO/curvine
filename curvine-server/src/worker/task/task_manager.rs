@@ -170,7 +170,7 @@ impl TaskManager {
         Ok(())
     }
 
-    pub fn get_fs_context(&self) -> Arc<FsContext> {
+    pub(crate) fn get_fs_context(&self) -> Arc<FsContext> {
         self.fs.fs_context()
     }
 

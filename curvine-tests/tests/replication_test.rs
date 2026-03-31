@@ -16,7 +16,7 @@ use bytes::BytesMut;
 use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Reader, Writer};
-use curvine_common::state::{BlockLocation, CreateFileOptsBuilder, FileBlocks, WorkerAddress};
+use curvine_common::state::{BlockLocation, FileBlocks, WorkerAddress};
 use curvine_tests::Testing;
 use log::info;
 use orpc::common::Utils;
@@ -276,8 +276,8 @@ async fn write_test_file(
     path: &Path,
     data: &[u8],
 ) -> CommonResult<FileBlocks> {
-    let opts = CreateFileOptsBuilder::with_conf(&fs.fs_context().cluster_conf().client)
-        .client_name(fs.fs_context().clone_client_name())
+    let opts = fs
+        .create_opts_builder()
         .replicas(2)
         .create_parent(true)
         .build();

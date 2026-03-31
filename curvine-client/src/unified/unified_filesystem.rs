@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::file::{CurvineFileSystem, FsClient, FsContext, FsReader};
+use crate::p2p::{P2pState, P2pStatsSnapshot};
 use crate::rpc::JobMasterClient;
 use crate::unified::{FallbackFsReader, MountCache, MountValue, UnifiedReader, UnifiedWriter};
 use crate::ClientMetrics;
@@ -21,9 +22,9 @@ use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
-    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
-    SetAttrOpts,
+    CreateFileOpts, FileAllocOpts, FileBlocks, FileLock, FileStatus, FreeResult, JobStatus,
+    ListOptions, LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions,
+    OpenFlags, SetAttrOpts,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -75,12 +76,36 @@ impl UnifiedFileSystem {
         &self.cv
     }
 
-    pub fn fs_context(&self) -> &Arc<FsContext> {
-        &self.cv.fs_context
-    }
-
     pub fn fs_client(&self) -> Arc<FsClient> {
         self.cv.fs_client()
+    }
+
+    pub fn client_name(&self) -> String {
+        self.cv.client_name()
+    }
+
+    pub fn p2p_enabled(&self) -> bool {
+        self.cv.p2p_enabled()
+    }
+
+    pub fn p2p_state(&self) -> Option<P2pState> {
+        self.cv.p2p_state()
+    }
+
+    pub fn p2p_peer_id(&self) -> Option<String> {
+        self.cv.p2p_peer_id()
+    }
+
+    pub fn p2p_bootstrap_peer_addr(&self) -> Option<String> {
+        self.cv.p2p_bootstrap_peer_addr()
+    }
+
+    pub fn p2p_stats_snapshot(&self) -> Option<P2pStatsSnapshot> {
+        self.cv.p2p_stats_snapshot()
+    }
+
+    pub fn p2p_runtime_policy_version(&self) -> Option<u64> {
+        self.cv.p2p_runtime_policy_version()
     }
 
     // Check if the path is a mount point, if so, return the mount point information
@@ -168,6 +193,10 @@ impl UnifiedFileSystem {
         self.cv.clone_runtime()
     }
 
+    pub fn open_cv_with_blocks(&self, path: &Path, blocks: FileBlocks) -> FsResult<FsReader> {
+        self.cv.open_with_blocks(path, blocks)
+    }
+
     pub async fn free(&self, path: &Path, recursive: bool) -> FsResult<FreeResult> {
         match self.get_mount(path).await? {
             None => err_box!(
@@ -236,7 +265,7 @@ impl UnifiedFileSystem {
 
         if mount.info.is_fs_mode() {
             if blocks.cv_exists() {
-                let cv_reader = FsReader::new(cv_path.clone(), self.cv.fs_context(), blocks)?;
+                let cv_reader = self.cv.open_with_blocks(cv_path, blocks)?;
                 Ok(Some(FallbackFsReader::new(
                     cv_reader,
                     ufs_path.clone(),
@@ -254,7 +283,7 @@ impl UnifiedFileSystem {
             {
                 CacheValidity::Valid => {
                     blocks.status.mtime = blocks.status.storage_policy.ufs_mtime;
-                    let cv_reader = FsReader::new(cv_path.clone(), self.cv.fs_context(), blocks)?;
+                    let cv_reader = self.cv.open_with_blocks(cv_path, blocks)?;
                     Ok(Some(FallbackFsReader::new(
                         cv_reader,
                         ufs_path.clone(),
@@ -269,8 +298,9 @@ impl UnifiedFileSystem {
     pub fn async_cache(&self, source_path: &Path) -> FsResult<()> {
         let client = JobMasterClient::new(self.fs_client());
         let source_path = source_path.clone_uri();
+        let rt = self.clone_runtime();
 
-        self.fs_context().rt().spawn(async move {
+        rt.spawn(async move {
             let command = LoadJobCommand::builder(source_path.clone()).build();
             let res = client.submit_load_job(command).await;
             match res {

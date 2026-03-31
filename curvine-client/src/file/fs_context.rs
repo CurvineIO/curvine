@@ -198,10 +198,6 @@ impl FsContext {
         &self.read_accelerator
     }
 
-    pub(crate) fn p2p_service(&self) -> Option<Arc<P2pService>> {
-        self.read_accelerator.p2p_service()
-    }
-
     #[allow(dead_code)]
     pub(crate) fn p2p_state(&self) -> Option<P2pState> {
         self.read_accelerator.p2p_state()
