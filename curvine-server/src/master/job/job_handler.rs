@@ -21,6 +21,7 @@ use curvine_common::state::LoadJobCommand;
 use curvine_common::utils::{ProtoUtils, SerdeUtils};
 use curvine_common::FsResult;
 use orpc::err_box;
+use orpc::handler::FrameBuf;
 use orpc::message::Message;
 use std::sync::Arc;
 
@@ -40,7 +41,11 @@ impl JobHandler {
     ///
     /// Handles the submission of a new load job by parsing the request,
     /// validating parameters, and forwarding to the load manager.
-    pub async fn submit_load_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub async fn submit_load_job(
+        &self,
+        ctx: &mut RpcContext<'_>,
+        buf: &mut FrameBuf,
+    ) -> FsResult<Message> {
         let req: SubmitJobRequest = ctx.parse_header()?;
         let command: LoadJobCommand = SerdeUtils::deserialize(&req.job_command)?;
         ctx.set_audit(Some(command.source_path.clone()), None);
@@ -56,14 +61,18 @@ impl JobHandler {
             state: res.state as i32,
         };
 
-        ctx.response(response)
+        ctx.response_buf(response, buf)
     }
 
     /// Get the loading task status
     ///
     /// Retrieves the current status of a load job by its ID and constructs
     /// a response with detailed metrics.
-    pub fn get_load_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn get_load_status(
+        &self,
+        ctx: &mut RpcContext<'_>,
+        buf: &mut FrameBuf,
+    ) -> FsResult<Message> {
         let req: GetJobStatusRequest = ctx.parse_header()?;
         ctx.set_audit(Some(req.job_id.clone()), None);
 
@@ -76,14 +85,18 @@ impl JobHandler {
             progress: ProtoUtils::work_progress_to_pb(status.progress),
         };
 
-        ctx.response(response)
+        ctx.response_buf(response, buf)
     }
 
     /// Cancel the loading task
     ///
     /// Handles the cancellation of a load job by its ID and returns
     /// the result of the cancellation operation.
-    pub async fn cancel_job(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub async fn cancel_job(
+        &self,
+        ctx: &mut RpcContext<'_>,
+        buf: &mut FrameBuf,
+    ) -> FsResult<Message> {
         let req: CancelJobRequest = ctx.parse_header()?;
 
         let job_id = req.job_id;
@@ -91,14 +104,14 @@ impl JobHandler {
 
         self.job_manager.cancel_job(job_id.clone()).await?;
 
-        ctx.response(CancelJobResponse {})
+        ctx.response_buf(CancelJobResponse {}, buf)
     }
 
     /// Handle the task status reported by Worker
     ///
     /// Processes status reports from worker nodes about load tasks,
     /// updating the job status in the load manager.
-    pub fn task_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn task_report(&self, ctx: &mut RpcContext<'_>, buf: &mut FrameBuf) -> FsResult<Message> {
         let req: TaskReportRequest = ctx.parse_header()?;
         let job_id = req.job_id.clone();
         ctx.set_audit(Some(job_id.clone()), None);
@@ -110,6 +123,6 @@ impl JobHandler {
             ProtoUtils::work_progress_from_pb(req.report),
         )?;
 
-        ctx.response(TaskReportResponse {})
+        ctx.response_buf(TaskReportResponse {}, buf)
     }
 }
