@@ -49,6 +49,21 @@ impl FsClient {
         &self.context.conf
     }
 
+    /// Perform version handshake with master
+    pub async fn handshake(&self) -> FsResult<()> {
+        let client_version = env!("CARGO_PKG_VERSION");
+
+        let req = GetMasterInfoRequest {
+            client_version: Some(client_version.to_string()),
+        };
+
+        // This will trigger version check on master side
+        let _: GetMasterInfoResponse = self.rpc(RpcCode::GetMasterInfo, req).await?;
+
+        log::info!("Client version {} handshake successful", client_version);
+        Ok(())
+    }
+
     pub async fn mkdir(&self, path: &Path, opts: MkdirOpts) -> FsResult<FileStatus> {
         let header = MkdirRequest {
             path: path.encode(),
