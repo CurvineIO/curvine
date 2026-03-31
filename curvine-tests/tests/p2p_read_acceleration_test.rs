@@ -30,9 +30,9 @@ fn p2p_test_guard() -> MutexGuard<'static, ()> {
     P2P_TEST_LOCK.lock().unwrap()
 }
 
-async fn wait_bootstrap_addr(service: Arc<curvine_client::p2p::P2pService>) -> Option<String> {
+async fn wait_bootstrap_addr(fs: &curvine_client::file::CurvineFileSystem) -> Option<String> {
     for _ in 0..400 {
-        if let Some(addr) = service.bootstrap_peer_addr() {
+        if let Some(addr) = fs.p2p_bootstrap_peer_addr() {
             return Some(addr);
         }
         sleep(Duration::from_millis(25)).await;
@@ -41,11 +41,11 @@ async fn wait_bootstrap_addr(service: Arc<curvine_client::p2p::P2pService>) -> O
 }
 
 async fn wait_policy_version(
-    service: Arc<curvine_client::p2p::P2pService>,
+    fs: &curvine_client::file::CurvineFileSystem,
     min_version: u64,
 ) -> bool {
     for _ in 0..200 {
-        if service.runtime_policy_version() >= min_version {
+        if fs.p2p_runtime_policy_version().unwrap_or_default() >= min_version {
             return true;
         }
         sleep(Duration::from_millis(25)).await;
@@ -54,13 +54,13 @@ async fn wait_policy_version(
 }
 
 async fn wait_policy_version_with_deadline(
-    service: Arc<curvine_client::p2p::P2pService>,
+    fs: &curvine_client::file::CurvineFileSystem,
     min_version: u64,
     deadline: Duration,
 ) -> bool {
     let started = tokio::time::Instant::now();
     while started.elapsed() < deadline {
-        if service.runtime_policy_version() >= min_version {
+        if fs.p2p_runtime_policy_version().unwrap_or_default() >= min_version {
             return true;
         }
         sleep(Duration::from_millis(25)).await;
@@ -69,11 +69,14 @@ async fn wait_policy_version_with_deadline(
 }
 
 async fn wait_policy_rejects(
-    service: Arc<curvine_client::p2p::P2pService>,
+    fs: &curvine_client::file::CurvineFileSystem,
     min_rejects: u64,
 ) -> bool {
     for _ in 0..200 {
-        if service.snapshot().policy_rejects >= min_rejects {
+        if fs
+            .p2p_stats_snapshot()
+            .is_some_and(|snapshot| snapshot.policy_rejects >= min_rejects)
+        {
             return true;
         }
         sleep(Duration::from_millis(25)).await;
@@ -113,13 +116,9 @@ fn test_minicluster_p2p_read_acceleration() -> FsResult<()> {
         Utils::uuid()
     );
     let provider_fs = testing.get_fs(Some(rt.clone()), Some(provider_conf))?;
-    let provider_service = provider_fs
-        .fs_context()
-        .p2p_service()
-        .expect("p2p should be enabled in this test");
 
     let bootstrap = rt
-        .block_on(wait_bootstrap_addr(provider_service.clone()))
+        .block_on(wait_bootstrap_addr(&provider_fs))
         .expect("provider bootstrap address should be ready");
 
     let mut consumer_conf = base_conf;
@@ -133,10 +132,6 @@ fn test_minicluster_p2p_read_acceleration() -> FsResult<()> {
         Utils::uuid()
     );
     let consumer_fs = testing.get_fs(Some(rt.clone()), Some(consumer_conf))?;
-    let consumer_service = consumer_fs
-        .fs_context()
-        .p2p_service()
-        .expect("p2p should be enabled in this test");
 
     let path = Path::from_str("/p2p/minicluster-e2e.log")?;
     rt.block_on(async move {
@@ -150,10 +145,16 @@ fn test_minicluster_p2p_read_acceleration() -> FsResult<()> {
         let provider_data = read_all(&provider_fs, &path).await?;
         assert_eq!(provider_data, payload.as_bytes());
 
-        let provider_before = provider_service.snapshot();
+        let provider_before = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test");
         let consumer_data = read_all(&consumer_fs, &path).await?;
-        let provider_after = provider_service.snapshot();
-        let consumer_after = consumer_service.snapshot();
+        let provider_after = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test");
+        let consumer_after = consumer_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test");
 
         if consumer_data != payload.as_bytes() {
             let expected = payload.as_bytes();
@@ -214,13 +215,9 @@ fn test_minicluster_p2p_runtime_policy_sync_from_master() -> FsResult<()> {
         Utils::uuid()
     );
     let provider_fs = testing.get_fs(Some(rt.clone()), Some(provider_conf))?;
-    let provider_service = provider_fs
-        .fs_context()
-        .p2p_service()
-        .expect("p2p should be enabled in this test");
 
     let bootstrap = rt
-        .block_on(wait_bootstrap_addr(provider_service.clone()))
+        .block_on(wait_bootstrap_addr(&provider_fs))
         .expect("provider bootstrap address should be ready");
 
     let mut consumer_conf = base_conf;
@@ -239,7 +236,7 @@ fn test_minicluster_p2p_runtime_policy_sync_from_master() -> FsResult<()> {
     let consumer_fs = testing.get_fs(Some(rt.clone()), Some(consumer_conf))?;
 
     rt.block_on(async move {
-        assert!(wait_policy_version(provider_service.clone(), 1).await);
+        assert!(wait_policy_version(&provider_fs, 1).await);
 
         let parent = Path::from_str("/p2p-policy-sync")?;
         let _ = provider_fs.delete(&parent, true).await;
@@ -260,9 +257,15 @@ fn test_minicluster_p2p_runtime_policy_sync_from_master() -> FsResult<()> {
         let provider_allow = read_all(&provider_fs, &path_allow).await?;
         assert_eq!(provider_allow, payload_allow.as_bytes());
 
-        let allow_before = provider_service.snapshot().bytes_sent;
+        let allow_before = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test")
+            .bytes_sent;
         let allow_data = read_all(&consumer_fs, &path_allow).await?;
-        let allow_after = provider_service.snapshot().bytes_sent;
+        let allow_after = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test")
+            .bytes_sent;
         assert_eq!(allow_data, payload_allow.as_bytes());
         assert!(allow_after > allow_before);
 
@@ -281,9 +284,15 @@ fn test_minicluster_p2p_runtime_policy_sync_from_master() -> FsResult<()> {
         let provider_deny = read_all(&provider_fs, &path_deny).await?;
         assert_eq!(provider_deny, payload_deny.as_bytes());
 
-        let deny_before = provider_service.snapshot().bytes_sent;
+        let deny_before = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test")
+            .bytes_sent;
         let deny_data = read_all(&consumer_fs, &path_deny).await?;
-        let deny_after = provider_service.snapshot().bytes_sent;
+        let deny_after = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test")
+            .bytes_sent;
         assert_eq!(deny_data, payload_deny.as_bytes());
         assert_eq!(deny_after, deny_before);
 
@@ -325,19 +334,10 @@ fn test_minicluster_p2p_runtime_policy_sync_applies_on_startup() -> FsResult<()>
         Utils::uuid()
     );
     let provider_fs = testing.get_fs(Some(rt.clone()), Some(provider_conf))?;
-    let provider_service = provider_fs
-        .fs_context()
-        .p2p_service()
-        .expect("p2p should be enabled in this test");
 
     rt.block_on(async move {
         assert!(
-            wait_policy_version_with_deadline(
-                provider_service.clone(),
-                1,
-                Duration::from_millis(800)
-            )
-            .await
+            wait_policy_version_with_deadline(&provider_fs, 1, Duration::from_millis(800)).await
         );
         Ok::<(), FsError>(())
     })?;
@@ -378,13 +378,9 @@ fn test_minicluster_p2p_runtime_policy_dual_key_rotation_window() -> FsResult<()
         Utils::uuid()
     );
     let provider_fs = testing.get_fs(Some(rt.clone()), Some(provider_conf))?;
-    let provider_service = provider_fs
-        .fs_context()
-        .p2p_service()
-        .expect("p2p should be enabled in this test");
 
     let bootstrap = rt
-        .block_on(wait_bootstrap_addr(provider_service.clone()))
+        .block_on(wait_bootstrap_addr(&provider_fs))
         .expect("provider bootstrap address should be ready");
 
     let mut consumer_conf = base_conf;
@@ -403,7 +399,7 @@ fn test_minicluster_p2p_runtime_policy_dual_key_rotation_window() -> FsResult<()
     let consumer_fs = testing.get_fs(Some(rt.clone()), Some(consumer_conf))?;
 
     rt.block_on(async move {
-        assert!(wait_policy_version(provider_service.clone(), 1).await);
+        assert!(wait_policy_version(&provider_fs, 1).await);
 
         let parent = Path::from_str("/p2p-policy-rotation-window")?;
         let _ = provider_fs.delete(&parent, true).await;
@@ -422,9 +418,15 @@ fn test_minicluster_p2p_runtime_policy_dual_key_rotation_window() -> FsResult<()
         let provider_data = read_all(&provider_fs, &path).await?;
         assert_eq!(provider_data, payload.as_bytes());
 
-        let before = provider_service.snapshot().bytes_sent;
+        let before = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test")
+            .bytes_sent;
         let data = read_all(&consumer_fs, &path).await?;
-        let after = provider_service.snapshot().bytes_sent;
+        let after = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test")
+            .bytes_sent;
         assert_eq!(data, payload.as_bytes());
         assert!(after > before);
 
@@ -466,13 +468,9 @@ fn test_minicluster_p2p_runtime_policy_signature_mismatch_rejected() -> FsResult
         Utils::uuid()
     );
     let provider_fs = testing.get_fs(Some(rt.clone()), Some(provider_conf))?;
-    let provider_service = provider_fs
-        .fs_context()
-        .p2p_service()
-        .expect("p2p should be enabled in this test");
 
     let bootstrap = rt
-        .block_on(wait_bootstrap_addr(provider_service.clone()))
+        .block_on(wait_bootstrap_addr(&provider_fs))
         .expect("provider bootstrap address should be ready");
 
     let mut consumer_conf = base_conf;
@@ -491,8 +489,8 @@ fn test_minicluster_p2p_runtime_policy_signature_mismatch_rejected() -> FsResult
     let consumer_fs = testing.get_fs(Some(rt.clone()), Some(consumer_conf))?;
 
     rt.block_on(async move {
-        assert!(!wait_policy_version(provider_service.clone(), 1).await);
-        assert!(wait_policy_rejects(provider_service.clone(), 1).await);
+        assert!(!wait_policy_version(&provider_fs, 1).await);
+        assert!(wait_policy_rejects(&provider_fs, 1).await);
 
         let parent = Path::from_str("/p2p-policy-signature-reject")?;
         let _ = provider_fs.delete(&parent, true).await;
@@ -509,9 +507,15 @@ fn test_minicluster_p2p_runtime_policy_signature_mismatch_rejected() -> FsResult
         writer.write(payload.as_bytes()).await?;
         writer.complete().await?;
 
-        let baseline = provider_service.snapshot().bytes_sent;
+        let baseline = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test")
+            .bytes_sent;
         let data = read_all(&consumer_fs, &path).await?;
-        let after = provider_service.snapshot().bytes_sent;
+        let after = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test")
+            .bytes_sent;
         assert_eq!(data, payload.as_bytes());
         assert_eq!(after, baseline);
 
@@ -543,13 +547,9 @@ fn test_minicluster_p2p_miss_fallbacks_to_worker() -> FsResult<()> {
         Utils::uuid()
     );
     let provider_fs = testing.get_fs(Some(rt.clone()), Some(provider_conf))?;
-    let provider_service = provider_fs
-        .fs_context()
-        .p2p_service()
-        .expect("p2p should be enabled in this test");
 
     let bootstrap = rt
-        .block_on(wait_bootstrap_addr(provider_service.clone()))
+        .block_on(wait_bootstrap_addr(&provider_fs))
         .expect("provider bootstrap address should be ready");
 
     let mut consumer_conf = base_conf;
@@ -563,21 +563,25 @@ fn test_minicluster_p2p_miss_fallbacks_to_worker() -> FsResult<()> {
         Utils::uuid()
     );
     let consumer_fs = testing.get_fs(Some(rt.clone()), Some(consumer_conf))?;
-    let consumer_service = consumer_fs
-        .fs_context()
-        .p2p_service()
-        .expect("p2p should be enabled in this test");
 
     rt.block_on(async move {
         let path = Path::from_str("/p2p-fallback/miss-then-worker.log")?;
         let payload = Utils::rand_str(128 * 1024);
         provider_fs.write_string(&path, payload.as_str()).await?;
 
-        let provider_before = provider_service.snapshot();
-        let consumer_before = consumer_service.snapshot();
+        let provider_before = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test");
+        let consumer_before = consumer_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test");
         let out = read_all(&consumer_fs, &path).await?;
-        let provider_after = provider_service.snapshot();
-        let consumer_after = consumer_service.snapshot();
+        let provider_after = provider_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test");
+        let consumer_after = consumer_fs
+            .p2p_stats_snapshot()
+            .expect("p2p should be enabled in this test");
 
         assert_eq!(out, payload.as_bytes());
         assert_eq!(
@@ -616,13 +620,9 @@ fn test_minicluster_p2p_miss_fails_when_fallback_disabled() -> FsResult<()> {
         Utils::uuid()
     );
     let provider_fs = testing.get_fs(Some(rt.clone()), Some(provider_conf))?;
-    let provider_service = provider_fs
-        .fs_context()
-        .p2p_service()
-        .expect("p2p should be enabled in this test");
 
     let bootstrap = rt
-        .block_on(wait_bootstrap_addr(provider_service.clone()))
+        .block_on(wait_bootstrap_addr(&provider_fs))
         .expect("provider bootstrap address should be ready");
 
     let mut consumer_conf = base_conf;

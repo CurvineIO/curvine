@@ -456,13 +456,10 @@ async fn hold_after_workload(fs: &UnifiedFileSystem, hold_secs: u64, report_inte
     }
 }
 
-async fn wait_bootstrap_addr(
-    service: Arc<curvine_client::p2p::P2pService>,
-    wait_secs: u64,
-) -> Option<String> {
+async fn wait_bootstrap_addr(fs: &UnifiedFileSystem, wait_secs: u64) -> Option<String> {
     let deadline = Instant::now() + Duration::from_secs(wait_secs.max(1));
     while Instant::now() < deadline {
-        if let Some(addr) = service.bootstrap_peer_addr() {
+        if let Some(addr) = fs.p2p_bootstrap_peer_addr() {
             return Some(addr);
         }
         sleep(Duration::from_millis(100)).await;
@@ -490,21 +487,22 @@ fn peer_id_from_bootstrap_addr(addr: &str) -> Option<&str> {
 }
 
 async fn publish_bootstrap_identity(
-    p2p_service: Arc<curvine_client::p2p::P2pService>,
+    fs: &UnifiedFileSystem,
     args: &Args,
     prefix: &str,
 ) -> CommonResult<Option<(String, String)>> {
     if args.bootstrap_file.is_none() && args.peer_file.is_none() {
         return Ok(None);
     }
-    let bootstrap_addr_raw = wait_bootstrap_addr(p2p_service, args.bootstrap_wait_secs)
+    let bootstrap_addr_raw = wait_bootstrap_addr(fs, args.bootstrap_wait_secs)
         .await
         .ok_or_else(|| "bootstrap address not ready".to_string())?;
     let bootstrap_addr =
         rewrite_bootstrap_host(&bootstrap_addr_raw, args.bootstrap_host.as_deref());
-    let peer_id = peer_id_from_bootstrap_addr(&bootstrap_addr)
-        .ok_or_else(|| format!("invalid bootstrap address: {}", bootstrap_addr))?
-        .to_string();
+    let peer_id = fs
+        .p2p_peer_id()
+        .or_else(|| peer_id_from_bootstrap_addr(&bootstrap_addr).map(str::to_string))
+        .ok_or_else(|| format!("invalid bootstrap address: {}", bootstrap_addr))?;
     if let Some(bootstrap_file) = args.bootstrap_file.as_ref() {
         fs::write(bootstrap_file, bootstrap_addr.as_bytes())?;
     }
@@ -521,10 +519,9 @@ async fn run_provider(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
         .input_file
         .as_ref()
         .ok_or_else(|| "provider requires --input-file".to_string())?;
-    let p2p_service = fs
-        .fs_context()
-        .p2p_service()
-        .ok_or_else(|| "p2p service is not enabled".to_string())?;
+    if !fs.p2p_enabled() {
+        return err_box!("p2p service is not enabled");
+    }
     if args.bootstrap_file.is_none() || args.peer_file.is_none() {
         return err_box!("provider requires --bootstrap-file and --peer-file");
     }
@@ -543,10 +540,12 @@ async fn run_provider(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
     }
     fs::write(&args.output_file, warmed)?;
 
-    let _ = publish_bootstrap_identity(p2p_service.clone(), args, "PROVIDER").await?;
+    let _ = publish_bootstrap_identity(&fs, args, "PROVIDER").await?;
     println!(
         "PROVIDER_CACHE_CHUNKS={}",
-        p2p_service.snapshot().cached_chunks_count
+        fs.p2p_stats_snapshot()
+            .map(|snapshot| snapshot.cached_chunks_count)
+            .unwrap_or(0)
     );
 
     hold_after_workload(&fs, args.hold_secs, args.report_interval_secs).await;
@@ -556,7 +555,6 @@ async fn run_provider(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
 }
 
 async fn run_consumer(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
-    let p2p_service = fs.fs_context().p2p_service();
     let remote = Path::from_str(&args.remote_path)?;
     let read_times = args.consumer_reads.max(1);
     let read_interval = Duration::from_millis(args.consumer_read_interval_ms);
@@ -564,7 +562,7 @@ async fn run_consumer(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
     if !startup_wait.is_zero() {
         sleep(startup_wait).await;
     }
-    let before = p2p_service.as_ref().map(|service| service.snapshot());
+    let before = fs.p2p_stats_snapshot();
     let mut payload = Vec::new();
     let read_begin = Instant::now();
     for index in 0..read_times {
@@ -582,7 +580,7 @@ async fn run_consumer(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
     }
     let read_elapsed_ms = read_begin.elapsed().as_secs_f64() * 1000.0;
     std::fs::write(&args.output_file, payload)?;
-    let after = p2p_service.as_ref().map(|service| service.snapshot());
+    let after = fs.p2p_stats_snapshot();
 
     let _ = fs.cv().metrics_report().await;
 
@@ -600,7 +598,7 @@ async fn run_consumer(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
                 .saturating_sub(before.cached_chunks_count)
         })
         .unwrap_or(0);
-    let p2p_enabled = u8::from(p2p_service.is_some());
+    let p2p_enabled = u8::from(fs.p2p_enabled());
 
     println!("CONSUMER_P2P_ENABLED={}", p2p_enabled);
     println!("CONSUMER_P2P_RECV_DELTA={}", recv_delta);
@@ -612,10 +610,9 @@ async fn run_consumer(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
 }
 
 async fn run_mixed(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
-    let p2p_service = fs
-        .fs_context()
-        .p2p_service()
-        .ok_or_else(|| "mixed role requires p2p to be enabled".to_string())?;
+    if !fs.p2p_enabled() {
+        return err_box!("mixed role requires p2p to be enabled");
+    }
     let (read_manifest_dir, write_manifest_dir) = resolve_manifest_dirs(args)?;
     let client_id = client_id(args);
     let size_spec = parse_size_spec(&args.file_size_spec)?;
@@ -624,9 +621,11 @@ async fn run_mixed(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
     let _ = fs.mkdir(&remote_root, true).await;
     let client_root = Path::from_str(format!("{}/{}", remote_dir, client_id))?;
     let _ = fs.mkdir(&client_root, true).await;
-    let _ = publish_bootstrap_identity(p2p_service.clone(), args, "MIXED").await?;
+    let _ = publish_bootstrap_identity(&fs, args, "MIXED").await?;
 
-    let before = p2p_service.snapshot();
+    let before = fs
+        .p2p_stats_snapshot()
+        .ok_or_else(|| "mixed role requires p2p snapshot".to_string())?;
     let deadline = Instant::now() + Duration::from_secs(args.duration_secs.max(1));
     let op_interval = Duration::from_millis(args.op_interval_ms);
     let read_ratio = args.read_ratio.clamp(0, 100);
@@ -758,7 +757,9 @@ async fn run_mixed(fs: UnifiedFileSystem, args: &Args) -> CommonResult<()> {
     }
 
     let _ = fs.cv().metrics_report().await;
-    let after = p2p_service.snapshot();
+    let after = fs
+        .p2p_stats_snapshot()
+        .ok_or_else(|| "mixed role requires p2p snapshot".to_string())?;
     let summary = WorkloadSummary {
         role: "mixed".to_string(),
         client_id: client_id.clone(),
