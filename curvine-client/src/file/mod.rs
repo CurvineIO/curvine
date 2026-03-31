@@ -26,7 +26,9 @@ pub use self::fs_writer::FsWriter;
 
 mod fs_context;
 pub use self::fs_context::FsContext;
-pub(crate) use self::fs_context::{ReadChunkKey, ReadSource};
+
+mod read_accelerator;
+pub(crate) use self::read_accelerator::{AcceleratedReadRequest, ReadAccelerator, ReadChunkFlight};
 
 mod fs_reader_base;
 pub use self::fs_reader_base::FsReaderBase;

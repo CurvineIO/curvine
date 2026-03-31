@@ -21,6 +21,23 @@ use orpc::CommonResult;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ReadSource {
+    LocalChunkCache,
+    P2p,
+    WorkerLocal,
+    WorkerRemote,
+    Hole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ReadFallbackReason {
+    OpenReaderError,
+    SwitchReplica,
+    AllWorkersFailed,
+    HoleReadError,
+}
+
 pub struct ClientMetrics {
     pub mount_cache_hits: CounterVec,
     pub mount_cache_misses: CounterVec,
@@ -70,6 +87,33 @@ impl ClientMetrics {
 
     pub fn text_output(&self) -> CommonResult<String> {
         Metrics::text_output()
+    }
+
+    pub(crate) fn set_read_label_policy(&self, _series_cap: usize, _hash_job_id: bool) {}
+
+    pub(crate) fn observe_read_source(
+        &self,
+        _source: ReadSource,
+        _bytes: usize,
+        _start_nanos: u128,
+        _tenant_id: Option<&str>,
+        _job_id: Option<&str>,
+    ) {
+    }
+
+    pub(crate) fn observe_read_fallback(
+        &self,
+        _reason: ReadFallbackReason,
+        _tenant_id: Option<&str>,
+        _job_id: Option<&str>,
+    ) {
+    }
+
+    pub(crate) fn sync_p2p_snapshot(
+        &self,
+        _service_id: &str,
+        _snapshot: &crate::p2p::P2pStatsSnapshot,
+    ) {
     }
 
     pub fn encode() -> CommonResult<Vec<MetricValue>> {

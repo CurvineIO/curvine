@@ -199,6 +199,8 @@ impl FsReaderBase {
                             self.file_blocks.status.id,
                             self.file_blocks.status.version_epoch,
                             self.file_blocks.status.mtime,
+                            None,
+                            None,
                         )
                         .await?
                     }

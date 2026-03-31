@@ -13,11 +13,9 @@
 // limitations under the License.
 
 use crate::block::{BlockClient, BlockClientPool};
-use crate::file::{CurvineFileSystem, FsClient};
-use crate::p2p::ChunkId;
-use crate::p2p::P2pService;
+use crate::file::{CurvineFileSystem, FsClient, ReadAccelerator};
+use crate::p2p::{P2pService, P2pState, P2pStatsSnapshot};
 use crate::ClientMetrics;
-use bytes::Bytes;
 use curvine_common::conf::ClusterConf;
 use curvine_common::proto::ClientAddressProto;
 use curvine_common::state::{ClientAddress, WorkerAddress};
@@ -29,50 +27,15 @@ use moka::policy::EvictionPolicy;
 use moka::sync::{Cache, CacheBuilder};
 use once_cell::sync::OnceCell;
 use orpc::client::{ClientConf, ClusterConnector};
-use orpc::common::{LocalTime, Utils};
+use orpc::common::Utils;
 use orpc::io::net::NetUtils;
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::sync::FastDashMap;
 use orpc::sys::CacheManager;
 use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex as AsyncMutex;
 
 static CLIENT_METRICS: OnceCell<ClientMetrics> = OnceCell::new();
-const ADAPTIVE_EWMA_ALPHA_DEN: u64 = 8;
-const ADAPTIVE_MIN_SAMPLES: u64 = 8;
-const ADAPTIVE_BYPASS_RATIO_NUM: u64 = 9;
-const ADAPTIVE_BYPASS_RATIO_DEN: u64 = 10;
-const ADAPTIVE_PROBE_INTERVAL: u64 = 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadSource {
-    P2p,
-    WorkerLocal,
-    WorkerRemote,
-    Hole,
-}
-
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub(crate) struct ReadChunkKey {
-    pub(crate) file_id: i64,
-    pub(crate) version_epoch: i64,
-    pub(crate) block_id: i64,
-    pub(crate) off: i64,
-}
-
-impl ReadChunkKey {
-    pub(crate) fn new(file_id: i64, version_epoch: i64, block_id: i64, off: i64) -> Self {
-        Self {
-            file_id,
-            version_epoch,
-            block_id,
-            off,
-        }
-    }
-}
 
 // The core feature of the file system is thread-safe, which can be shared between multiple threads through Arc.
 // 1. The cluster configuration file is saved.
@@ -84,15 +47,8 @@ pub struct FsContext {
     pub(crate) client_addr: ClientAddress,
     pub(crate) os_cache: CacheManager,
     pub(crate) failed_workers: Cache<u32, WorkerAddress, BuildHasherDefault<FxHasher>>,
-    pub(crate) read_chunk_cache: Cache<ReadChunkKey, Bytes, BuildHasherDefault<FxHasher>>,
-    pub(crate) read_chunk_flights: FastDashMap<ReadChunkKey, Arc<AsyncMutex<()>>>,
     pub(crate) block_pool: Arc<BlockClientPool>,
-    pub(crate) p2p_service: Option<Arc<P2pService>>,
-    pub(crate) adaptive_worker_latency_us: AtomicU64,
-    pub(crate) adaptive_worker_samples: AtomicU64,
-    pub(crate) adaptive_p2p_latency_us: AtomicU64,
-    pub(crate) adaptive_p2p_samples: AtomicU64,
-    pub(crate) adaptive_probe_seq: AtomicU64,
+    pub(crate) read_accelerator: ReadAccelerator,
 }
 
 impl FsContext {
@@ -113,6 +69,10 @@ impl FsContext {
 
         CLIENT_METRICS
             .get_or_init(|| ClientMetrics::new(&conf.client.metadata_operation_buckets).unwrap());
+        Self::get_metrics().set_read_label_policy(
+            conf.client.p2p.metrics_label_series_cap,
+            conf.client.p2p.metrics_hash_job_id,
+        );
 
         let connector = ClusterConnector::with_rt(conf.client_rpc_conf(), rt.clone());
         for node in conf.master_nodes() {
@@ -130,15 +90,6 @@ impl FsContext {
             .time_to_live(conf.client.failed_worker_ttl)
             .eviction_policy(EvictionPolicy::lru())
             .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
-        let read_chunk_cache_capacity = (conf.client.p2p.cache_capacity
-            / conf.client.read_chunk_size.max(1) as u64)
-            .clamp(1, 65_536);
-        let read_chunk_cache = CacheBuilder::default()
-            .max_capacity(read_chunk_cache_capacity)
-            .time_to_live(conf.client.p2p.cache_ttl)
-            .eviction_policy(EvictionPolicy::lru())
-            .build_with_hasher(BuildHasherDefault::<FxHasher>::default());
-        let read_chunk_flights = FastDashMap::default();
 
         let block_pool = Arc::new(BlockClientPool::new(
             conf.client.enable_block_conn_pool,
@@ -157,6 +108,7 @@ impl FsContext {
         } else {
             None
         };
+        let read_accelerator = ReadAccelerator::new(&conf, p2p_service.clone());
 
         let context = Self {
             conf,
@@ -164,15 +116,8 @@ impl FsContext {
             client_addr,
             os_cache,
             failed_workers: exclude_workers,
-            read_chunk_cache,
-            read_chunk_flights,
             block_pool,
-            p2p_service,
-            adaptive_worker_latency_us: AtomicU64::new(0),
-            adaptive_worker_samples: AtomicU64::new(0),
-            adaptive_p2p_latency_us: AtomicU64::new(0),
-            adaptive_p2p_samples: AtomicU64::new(0),
-            adaptive_probe_seq: AtomicU64::new(0),
+            read_accelerator,
         };
         Ok(context)
     }
@@ -249,96 +194,57 @@ impl FsContext {
         self.os_cache.clone()
     }
 
-    pub fn p2p_service(&self) -> Option<Arc<P2pService>> {
-        self.p2p_service.clone()
+    pub(crate) fn read_accelerator(&self) -> &ReadAccelerator {
+        &self.read_accelerator
     }
 
-    pub(crate) fn read_chunk_cache_enabled(&self) -> bool {
-        self.p2p_service.is_some()
+    pub(crate) fn p2p_service(&self) -> Option<Arc<P2pService>> {
+        self.read_accelerator.p2p_service()
     }
 
-    pub(crate) fn get_read_chunk_cache(&self, key: &ReadChunkKey) -> Option<Bytes> {
-        if !self.read_chunk_cache_enabled() {
-            return None;
-        }
-        self.read_chunk_cache.get(key)
+    #[allow(dead_code)]
+    pub(crate) fn p2p_state(&self) -> Option<P2pState> {
+        self.read_accelerator.p2p_state()
     }
 
-    pub(crate) fn put_read_chunk_cache(&self, key: ReadChunkKey, data: Bytes) {
-        if self.read_chunk_cache_enabled() && !data.is_empty() {
-            self.read_chunk_cache.insert(key, data);
-        }
+    #[allow(dead_code)]
+    pub(crate) fn p2p_peer_id(&self) -> Option<String> {
+        self.read_accelerator.p2p_peer_id()
     }
 
-    pub(crate) fn read_chunk_flight_lock(&self, key: ReadChunkKey) -> Arc<AsyncMutex<()>> {
-        if let Some(lock) = self.read_chunk_flights.get(&key) {
-            return lock.clone();
-        }
-        let lock = Arc::new(AsyncMutex::new(()));
-        self.read_chunk_flights
-            .entry(key)
-            .or_insert_with(|| lock.clone())
-            .clone()
+    #[allow(dead_code)]
+    pub(crate) fn p2p_bootstrap_peer_addr(&self) -> Option<String> {
+        self.read_accelerator.p2p_bootstrap_peer_addr()
     }
 
-    pub(crate) fn cleanup_read_chunk_flight(&self, key: &ReadChunkKey, lock: &Arc<AsyncMutex<()>>) {
-        if let Some(existing) = self.read_chunk_flights.get(key) {
-            let should_remove = Arc::ptr_eq(existing.value(), lock);
-            drop(existing);
-            if should_remove {
-                self.read_chunk_flights.remove(key);
-            }
-        }
+    #[allow(dead_code)]
+    pub(crate) fn p2p_stats_snapshot(&self) -> Option<P2pStatsSnapshot> {
+        self.read_accelerator.p2p_stats_snapshot()
     }
 
-    pub(crate) fn on_worker_chunk_read(
+    #[allow(dead_code)]
+    pub(crate) fn p2p_runtime_policy_version(&self) -> Option<u64> {
+        self.read_accelerator.p2p_runtime_policy_version()
+    }
+
+    pub(crate) fn stop_p2p(&self) {
+        self.read_accelerator.stop_p2p();
+    }
+
+    pub(crate) fn p2p_snapshot(&self) -> (String, P2pStatsSnapshot) {
+        self.read_accelerator.p2p_snapshot()
+    }
+
+    pub(crate) async fn apply_master_p2p_runtime_policy(
         &self,
-        read_key: ReadChunkKey,
-        chunk_id: ChunkId,
-        data: Bytes,
-        mtime: i64,
-    ) {
-        if data.is_empty() {
-            return;
-        }
-        self.put_read_chunk_cache(read_key, data.clone());
-        if let Some(service) = self.p2p_service() {
-            let _ = service.publish_chunk(chunk_id, data, mtime);
-        }
-    }
-
-    pub(crate) fn observe_adaptive_read_latency(&self, source: ReadSource, start_nanos: u128) {
-        let elapsed_us = ((LocalTime::nanos() - start_nanos) / 1000).min(u64::MAX as u128) as u64;
-        match source {
-            ReadSource::WorkerLocal | ReadSource::WorkerRemote => {
-                self.adaptive_worker_samples.fetch_add(1, Ordering::Relaxed);
-                update_latency_ewma(&self.adaptive_worker_latency_us, elapsed_us);
-            }
-            ReadSource::P2p => {
-                self.adaptive_p2p_samples.fetch_add(1, Ordering::Relaxed);
-                update_latency_ewma(&self.adaptive_p2p_latency_us, elapsed_us);
-            }
-            ReadSource::Hole => {}
-        }
-    }
-
-    pub(crate) fn should_bypass_p2p(&self, source: ReadSource) -> bool {
-        let worker_latency_us = self.adaptive_worker_latency_us.load(Ordering::Relaxed);
-        let worker_samples = self.adaptive_worker_samples.load(Ordering::Relaxed);
-        let p2p_latency_us = self.adaptive_p2p_latency_us.load(Ordering::Relaxed);
-        let p2p_samples = self.adaptive_p2p_samples.load(Ordering::Relaxed);
-        let probe_seq = self
-            .adaptive_probe_seq
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
-        should_bypass_p2p_adaptive(
-            source,
-            worker_latency_us,
-            worker_samples,
-            p2p_latency_us,
-            p2p_samples,
-            probe_seq,
-        )
+        version: u64,
+        peer_whitelist: Vec<String>,
+        tenant_whitelist: Vec<String>,
+        signature: String,
+    ) -> FsResult<()> {
+        self.read_accelerator
+            .apply_master_p2p_runtime_policy(version, peer_whitelist, tenant_whitelist, signature)
+            .await
     }
 
     pub fn get_metrics<'a>() -> &'a ClientMetrics {
@@ -376,6 +282,7 @@ impl FsContext {
         let interval = fs.conf().client.clean_task_interval;
         let rt = fs.clone_runtime();
         let fs_context = Arc::downgrade(&fs.fs_context);
+        let snapshot_context = fs_context.clone();
         let metrics_context = fs_context.clone();
         let pool = Arc::downgrade(&pool);
 
@@ -384,10 +291,14 @@ impl FsContext {
             loop {
                 interval.tick().await;
 
+                let Some(snapshot_fs_context) = snapshot_context.upgrade() else {
+                    break;
+                };
                 let Some(pool) = pool.upgrade() else {
                     break;
                 };
                 pool.clear_idle_conn();
+                sync_p2p_metrics(&snapshot_fs_context);
 
                 if metric_report_enable {
                     let Some(fs_context) = metrics_context.upgrade() else {
@@ -424,28 +335,22 @@ impl FsContext {
     }
 }
 
+fn sync_p2p_metrics(fs_context: &Arc<FsContext>) {
+    let (service_id, snapshot) = fs_context.p2p_snapshot();
+    FsContext::get_metrics().sync_p2p_snapshot(&service_id, &snapshot);
+}
+
 async fn sync_p2p_runtime_policy(fs_context: &Arc<FsContext>) -> FsResult<()> {
-    let Some(service) = fs_context.p2p_service() else {
-        return Ok(());
-    };
     let client = FsClient::new(fs_context.clone());
     let response = client.get_p2p_policy().await?;
-    if service
-        .sync_runtime_policy_from_master(
+    fs_context
+        .apply_master_p2p_runtime_policy(
             response.p2p_policy_version,
             response.p2p_peer_whitelist,
             response.p2p_tenant_whitelist,
             response.p2p_policy_signature.unwrap_or_default(),
         )
         .await
-    {
-        Ok(())
-    } else {
-        orpc::err_box!(
-            "failed to apply p2p runtime policy version {}",
-            response.p2p_policy_version
-        )
-    }
 }
 
 async fn metrics_report(fs_context: &Arc<FsContext>) -> FsResult<()> {
@@ -455,69 +360,16 @@ async fn metrics_report(fs_context: &Arc<FsContext>) -> FsResult<()> {
         .await
 }
 
-fn update_latency_ewma(target: &AtomicU64, observed_us: u64) {
-    loop {
-        let current = target.load(Ordering::Relaxed);
-        let next = if current == 0 {
-            observed_us
-        } else {
-            let retained = current.saturating_mul(ADAPTIVE_EWMA_ALPHA_DEN.saturating_sub(1));
-            retained
-                .saturating_add(observed_us)
-                .saturating_div(ADAPTIVE_EWMA_ALPHA_DEN)
-        };
-        if target
-            .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
-        }
-    }
-}
-
-fn should_bypass_p2p_adaptive(
-    source: ReadSource,
-    worker_latency_us: u64,
-    worker_samples: u64,
-    p2p_latency_us: u64,
-    p2p_samples: u64,
-    probe_seq: u64,
-) -> bool {
-    if !matches!(source, ReadSource::WorkerLocal | ReadSource::WorkerRemote) {
-        return false;
-    }
-    if worker_samples < ADAPTIVE_MIN_SAMPLES {
-        return false;
-    }
-    if p2p_samples == 0 {
-        return false;
-    }
-    if worker_latency_us == 0 || p2p_latency_us == 0 {
-        return false;
-    }
-    if worker_latency_us.saturating_mul(ADAPTIVE_BYPASS_RATIO_DEN)
-        > p2p_latency_us.saturating_mul(ADAPTIVE_BYPASS_RATIO_NUM)
-    {
-        return false;
-    }
-    !probe_seq.is_multiple_of(ADAPTIVE_PROBE_INTERVAL)
-}
-
 impl Drop for FsContext {
     fn drop(&mut self) {
-        if let Some(service) = self.p2p_service.as_ref() {
-            service.stop();
-        }
+        self.stop_p2p();
         self.block_pool.shutdown();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        should_bypass_p2p_adaptive, FsContext, ReadSource, ADAPTIVE_MIN_SAMPLES,
-        ADAPTIVE_PROBE_INTERVAL,
-    };
+    use super::FsContext;
     use crate::block::BlockClient;
     use crate::file::CurvineFileSystem;
     use crate::p2p::P2pState;
@@ -528,43 +380,11 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn adaptive_bypass_only_for_worker_source() {
-        assert!(!should_bypass_p2p_adaptive(
-            ReadSource::P2p,
-            100,
-            ADAPTIVE_MIN_SAMPLES,
-            400,
-            ADAPTIVE_MIN_SAMPLES,
-            1,
-        ));
-    }
-
-    #[test]
-    fn adaptive_bypass_uses_periodic_probe() {
-        assert!(should_bypass_p2p_adaptive(
-            ReadSource::WorkerRemote,
-            100,
-            ADAPTIVE_MIN_SAMPLES,
-            400,
-            ADAPTIVE_MIN_SAMPLES,
-            1,
-        ));
-        assert!(!should_bypass_p2p_adaptive(
-            ReadSource::WorkerRemote,
-            100,
-            ADAPTIVE_MIN_SAMPLES,
-            400,
-            ADAPTIVE_MIN_SAMPLES,
-            ADAPTIVE_PROBE_INTERVAL,
-        ));
-    }
-
-    #[test]
     fn fs_context_skips_p2p_service_when_disabled() {
         let conf = ClusterConf::default();
         let rt = Arc::new(conf.client_rpc_conf().create_runtime());
         let ctx = FsContext::with_rt(conf, rt).expect("fs context should build");
-        assert!(ctx.p2p_service().is_none());
+        assert_eq!(ctx.p2p_state(), None);
     }
 
     #[test]
@@ -573,8 +393,7 @@ mod tests {
         conf.client.p2p.enable = true;
         let rt = Arc::new(conf.client_rpc_conf().create_runtime());
         let ctx = FsContext::with_rt(conf, rt).expect("fs context should build");
-        let service = ctx.p2p_service().expect("p2p service should exist");
-        assert_eq!(service.state(), P2pState::Running);
+        assert_eq!(ctx.p2p_state(), Some(P2pState::Running));
     }
 
     #[test]
