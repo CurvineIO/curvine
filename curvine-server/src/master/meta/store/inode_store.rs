@@ -71,19 +71,18 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_delete(&self, parent: &InodeView, del: &InodeView) -> CommonResult<DeleteResult> {
+    pub fn apply_delete(&self, parent: &InodeView, child_name: &str, del: &InodeView) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
         batch.write_inode(parent)?;
 
         let mut stack = LinkedList::new();
-        stack.push_back((parent.id(), del.clone()));
+        stack.push_back((parent.id(), child_name.to_string(), del.clone()));
         let mut del_res = DeleteResult::new();
         let mut deleted_files = 0i64;
         let mut deleted_dirs = 0i64;
 
-        while let Some((parent_id, inode)) = stack.pop_front() {
-            // Delete inode edges
-            batch.delete_child(parent_id, inode.name())?;
+        while let Some((parent_id, name, inode)) = stack.pop_front() {
+            batch.delete_child(parent_id, &name)?;
             del_res.inodes += 1;
 
             match &inode {
@@ -91,21 +90,18 @@ impl InodeStore {
                     batch.delete_inode(inode.id())?;
                     self.ttl_bucket_list.remove(&inode);
 
-                    // Don't count root directory
                     if dir.id != ROOT_INODE_ID {
                         deleted_dirs += 1;
                     }
 
-                    // Find children from edges (since InodeDir no longer has children field)
                     let childs_iter = self.store.edges_iter(inode.id())?;
                     for item in childs_iter {
                         let (key, value) = try_err!(item);
-                        let (_, _child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
+                        let (_, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
                         let child_id = RocksUtils::i64_from_bytes(&value)?;
 
-                        // Load child inode for recursive deletion
                         if let Some(child_inode) = self.store.get_inode(child_id)? {
-                            stack.push_back((inode.id(), child_inode));
+                            stack.push_back((inode.id(), child_name.to_string(), child_inode));
                         }
                     }
                 }
@@ -142,20 +138,18 @@ impl InodeStore {
     pub fn apply_rename(
         &self,
         src_parent: &InodeView,
-        src_inode: &InodeView,
+        src_name: &str,
         dst_parent: &InodeView,
+        dst_name: &str,
         dst_inode: &InodeView,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
-        // Delete the old node using the original name
-        batch.delete_child(src_parent.id(), src_inode.name())?;
+        batch.delete_child(src_parent.id(), src_name)?;
 
-        // Add new node.
         batch.write_inode(dst_inode)?;
-        batch.add_child(dst_parent.id(), dst_inode.name(), dst_inode.id())?;
+        batch.add_child(dst_parent.id(), dst_name, dst_inode.id())?;
 
-        // Update the modification time of the previous node.
         batch.write_inode(src_parent)?;
         batch.write_inode(dst_parent)?;
 
@@ -221,12 +215,10 @@ impl InodeStore {
         Ok(())
     }
 
-    /// Persists a symlink inode and its directory edge under `parent`.
-    /// `is_add`: create a new symlink dentry (adds a directory entry); bump live file count.
-    /// `!is_add`: update an existing symlink dentry in place; file count unchanged.
     pub fn apply_symlink(
         &self,
         parent: &InodeView,
+        name: &str,
         new_inode: &InodeView,
         is_add: bool,
     ) -> CommonResult<()> {
@@ -234,7 +226,7 @@ impl InodeStore {
 
         batch.write_inode(parent)?;
         batch.write_inode(new_inode)?;
-        batch.add_child(parent.id(), new_inode.name(), new_inode.id())?;
+        batch.add_child(parent.id(), name, new_inode.id())?;
 
         batch.commit()?;
 
@@ -248,17 +240,15 @@ impl InodeStore {
     pub fn apply_link(
         &self,
         parent: &InodeView,
-        new_entry: &InodeView,
+        name: &str,
         original_inode_id: i64,
     ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(parent)?;
 
-        //link is a edge, link to same inode
-        batch.add_child(parent.id(), new_entry.name(), original_inode_id)?;
+        batch.add_child(parent.id(), name, original_inode_id)?;
 
-        // Increment nlink count of the original inode (in the same batch for atomicity)
         self.increment_inode_nlink(original_inode_id, &mut batch)?;
 
         batch.commit()?;
@@ -292,23 +282,16 @@ impl InodeStore {
     pub fn apply_unlink(
         &self,
         parent: &InodeView,
-        child: &InodeView,
+        child_name: &str,
+        child_id: i64,
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
 
-        // Write the updated parent directory (child will be removed by the caller)
         batch.write_inode(parent)?;
 
-        // Remove the child from the parent's children list
-        batch.delete_child(parent.id(), child.name())?;
+        batch.delete_child(parent.id(), child_name)?;
 
-        // Decrement nlink count of the file being unlinked.
-        // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
-        let del_res = if let InodeView::File(_) = child {
-            self.decrement_inode_nlink(child.id(), &mut batch)?
-        } else {
-            DeleteResult::new()
-        };
+        let del_res = self.decrement_inode_nlink(child_id, &mut batch)?;
 
         batch.commit()?;
 
@@ -320,19 +303,15 @@ impl InodeStore {
     pub fn apply_unlink_file_entry(
         &self,
         parent: &InodeView,
-        child: &InodeView,
+        child_name: &str,
         inode_id: i64,
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
 
-        // Write the updated parent directory
         batch.write_inode(parent)?;
 
-        // Remove the FileEntry from the parent's children list
-        batch.delete_child(parent.id(), child.name())?;
+        batch.delete_child(parent.id(), child_name)?;
 
-        // Decrement nlink count of the original inode.
-        // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
         let del_res = self.decrement_inode_nlink(inode_id, &mut batch)?;
 
         batch.commit()?;
@@ -410,13 +389,11 @@ impl InodeStore {
                 let childs_iter = self.store.edges_iter(parent_entry.id())?;
                 for item in childs_iter {
                     let (key, value) = try_err!(item);
-                    let (key_parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
+                    let (_key_parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
                     let child_id = RocksUtils::i64_from_bytes(&value)?;
 
-                    // Update last_inode_id
                     last_inode_id = last_inode_id.max(child_id);
 
-                    // Load child metadata to determine kind (Dir or File)
                     let child_inode = match self.store.get_inode(child_id)? {
                         Some(v) => v,
                         None => {

@@ -401,8 +401,6 @@ impl JournalLoader {
         let mut fs_dir = self.fs_dir.write();
         match snapshot.files_data {
             None => {
-                // If snapshot_id is 0, this is a default/initial snapshot with no actual data.
-                // Skip restore and keep the existing tree created by FsDir::new().
                 if snapshot.snapshot_id == 0 {
                     info!("apply initial snapshot with no data, skipping restore");
                 } else {
