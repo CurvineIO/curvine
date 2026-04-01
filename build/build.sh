@@ -102,6 +102,7 @@ print_help() {
   echo
   echo "  -d, --debug           Build in debug mode (default: release mode)"
   echo "  -f, --features LIST   Comma-separated list of extra features to enable"
+  echo "  --perf                Enable heap tracing feature (equivalent to --features heap-trace)"
   echo "  -z, --zip             Create zip archive"
   echo "  --skip-java-sdk           Skip Java SDK compilation (useful for Docker builds)"
   echo "  -h, --help            Show this help message"
@@ -114,6 +115,7 @@ print_help() {
   echo "  $0 --ufs opendal-hdfs --ufs opendal-webhdfs  # Build with HDFS support"
   echo "  $0 --ufs oss-hdfs                         # Build with OSS-HDFS support (JindoSDK)"
   echo "  $0 --features jni --package client     # Build client with JNI support"
+  echo "  $0 --perf -p server                       # Build server with heap tracing enabled"
   echo "  $0 --skip-java-sdk                         # Build all packages except Java SDK"
 }
 
@@ -140,9 +142,10 @@ declare -a UFS_TYPES=("opendal-s3")  # Default UFS type
 declare -a EXTRA_FEATURES=()  # Extra features to add
 CRATE_ZIP=""
 SKIP_JAVA_SDK=0  # Flag to skip Java SDK compilation
+ENABLE_PERF=0    # Flag to enable heap-trace feature
 
 # Parse command line arguments
-TEMP=$(getopt -o p:u:f:dzhv --long package:,ufs:,features:,debug,zip,skip-java-sdk,help -n "$0" -- "$@")
+TEMP=$(getopt -o p:u:f:dzhv --long package:,ufs:,features:,debug,perf,zip,skip-java-sdk,help -n "$0" -- "$@")
 if [ $? != 0 ] ; then print_help ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -171,6 +174,10 @@ while true ; do
       ;;
     -d|--debug)
       PROFILE=""
+      shift
+      ;;
+    --perf)
+      ENABLE_PERF=1
       shift
       ;;
     -z|--zip)
@@ -451,6 +458,11 @@ if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
         ;;
     esac
   done
+fi
+
+# Add heap-trace feature for perf build mode
+if [ $ENABLE_PERF -eq 1 ]; then
+  FEATURES+=("heap-trace")
 fi
 
 # Add features to command if any

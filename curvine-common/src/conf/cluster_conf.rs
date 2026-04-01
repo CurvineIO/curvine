@@ -34,6 +34,7 @@ use std::time::Duration;
 pub struct HeapTraceConf {
     pub runtime_enabled: bool,
     pub sample_interval_bytes: usize,
+    pub periodic_interval_secs: u64,
 }
 
 impl Default for HeapTraceConf {
@@ -41,6 +42,7 @@ impl Default for HeapTraceConf {
         Self {
             runtime_enabled: false,
             sample_interval_bytes: 8 * 1024 * 1024,
+            periodic_interval_secs: 60,
         }
     }
 }

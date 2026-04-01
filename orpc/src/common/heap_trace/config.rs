@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 pub struct HeapTraceConfig {
     pub runtime_enabled: bool,
     pub sample_interval_bytes: usize,
+    pub periodic_interval_secs: u64,
 }
 
 impl Default for HeapTraceConfig {
@@ -26,15 +27,17 @@ impl Default for HeapTraceConfig {
         Self {
             runtime_enabled: false,
             sample_interval_bytes: 8 * 1024 * 1024,
+            periodic_interval_secs: 60,
         }
     }
 }
 
 impl HeapTraceConfig {
-    pub fn new(runtime_enabled: bool, sample_interval_bytes: usize) -> Self {
+    pub fn new(runtime_enabled: bool, sample_interval_bytes: usize, periodic_interval_secs: u64) -> Self {
         Self {
             runtime_enabled,
             sample_interval_bytes,
+            periodic_interval_secs,
         }
     }
 
@@ -42,6 +45,7 @@ impl HeapTraceConfig {
         Self {
             runtime_enabled: false,
             sample_interval_bytes: 0,
+            periodic_interval_secs: 0,
         }
     }
 }
@@ -50,6 +54,7 @@ impl HeapTraceConfig {
 pub struct HeapTraceSummary {
     pub runtime_enabled: bool,
     pub sample_interval_bytes: usize,
+    pub periodic_interval_secs: u64,
     pub capture_count: u64,
     pub last_capture_epoch_ms: Option<u64>,
 }
@@ -59,6 +64,7 @@ impl HeapTraceSummary {
         Self {
             runtime_enabled: conf.runtime_enabled,
             sample_interval_bytes: conf.sample_interval_bytes,
+            periodic_interval_secs: conf.periodic_interval_secs,
             capture_count: 0,
             last_capture_epoch_ms: None,
         }

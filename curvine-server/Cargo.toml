@@ -47,7 +47,7 @@ rand = { workspace = true }
 url = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
-tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true, features = ["profiling"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 curvine-s3-gateway = { workspace = true }

@@ -43,7 +43,7 @@ impl HeapProfiler for FakeProfiler {
 fn test_runtime(dir: &TempDir) -> HeapTraceRuntime {
     clear_latest_summary();
     HeapTraceRuntime::with_profiler(
-        HeapTraceConfig::new(true, 4096),
+        HeapTraceConfig::new(true, 4096, 60),
         dir.path().to_path_buf(),
         Arc::new(FakeProfiler),
     )

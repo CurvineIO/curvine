@@ -1,0 +1,41 @@
+# Test configuration for heap-trace verification
+
+format_master = true
+format_worker = false
+
+[heap_trace]
+runtime_enabled = true
+sample_interval_bytes = 8388608
+periodic_interval_secs = 60
+
+[master]
+meta_dir = "testing/meta"
+web_port = 9000
+log = { level = "debug", log_dir = "stdout", file_name = "master.log" }
+
+[journal]
+journal_addrs = [
+    {id = 1, hostname = "localhost", port = 8996}
+]
+journal_dir = "testing/journal"
+
+[worker]
+data_dir = ["[DISK]testing/data"]
+log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
+enable_s3_gateway = false
+
+[client]
+
+[fuse]
+
+[log]
+level = "debug"
+log_dir = "stdout"
+file_name = "curvine.log"
+
+[s3_gateway]
+listen = "0.0.0.0:9900"
+region = "us-east-1"
+
+[cli]
+log = { level = "warn", log_dir = "stdout", file_name = "cli.log" }

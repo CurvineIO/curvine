@@ -42,15 +42,32 @@ pub fn read_profile(raw_profile_path: &Path) -> CommonResult<HeapTraceProfile> {
 #[cfg(feature = "heap-trace")]
 pub fn dump_profile(raw_profile_path: &Path) -> CommonResult<()> {
     use std::ffi::CString;
-    use tikv_jemalloc_ctl::profiling::prof;
     use tikv_jemalloc_ctl::{epoch, raw};
 
     static PROF_DUMP: &[u8] = b"prof.dump\0";
 
-    epoch::advance().map_err(|err| err.to_string())?;
+    epoch::advance().map_err(|err| format!("epoch advance failed: {}", err))?;
 
-    if !prof::read().map_err(|err| err.to_string())? {
-        return Err("jemalloc heap profiling is disabled".into());
+    // Debug: check opt.prof and prof.active states
+    let (opt_prof, prof_active): (bool, bool) = unsafe {
+        let opt_prof = raw::read(b"opt.prof\0")
+            .map_err(|err| format!("read opt.prof failed: {}", err))?;
+        let prof_active = raw::read(b"prof.active\0")
+            .map_err(|err| format!("read prof.active failed: {}", err))?;
+        (opt_prof, prof_active)
+    };
+
+    log::debug!("jemalloc profiling state: opt.prof={}, prof.active={}", opt_prof, prof_active);
+
+    if !opt_prof {
+        return Err("jemalloc opt.prof is false - profiling was not enabled at startup. Check MALLOC_CONF=prof:true,prof_active:true".into());
+    }
+
+    if !prof_active {
+        return Err(format!(
+            "jemalloc prof.active is false (opt.prof={}). Profiling may have been disabled or MALLOC_CONF was not set before process start.",
+            opt_prof
+        ).into());
     }
 
     let dump_path = CString::new(raw_profile_path.to_string_lossy().into_owned())

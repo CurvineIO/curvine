@@ -20,6 +20,7 @@ fn heap_trace_conf_defaults_disable_runtime() {
 
     assert!(!conf.heap_trace.runtime_enabled);
     assert_eq!(conf.heap_trace.sample_interval_bytes, 8 * 1024 * 1024);
+    assert_eq!(conf.heap_trace.periodic_interval_secs, 60);
 }
 
 #[test]
@@ -29,11 +30,13 @@ fn cluster_conf_parses_heap_trace_section() {
             [heap_trace]
             runtime_enabled = true
             sample_interval_bytes = 1048576
+            periodic_interval_secs = 120
         "#,
     )
     .unwrap();
 
     assert!(conf.heap_trace.runtime_enabled);
     assert_eq!(conf.heap_trace.sample_interval_bytes, 1_048_576);
+    assert_eq!(conf.heap_trace.periodic_interval_secs, 120);
     assert_eq!(conf.cluster_id, "curvine");
 }

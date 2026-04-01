@@ -216,8 +216,11 @@ impl Master {
     pub async fn start(mut self) -> ServerStateListener {
         #[cfg(feature = "heap-trace")]
         if let Some(runtime) = &self.heap_trace {
-            if let Err(err) = runtime.start_periodic(Duration::from_secs(60)).await {
-                error!("Failed to start heap trace runtime: {}", err);
+            let interval_secs = runtime.conf().periodic_interval_secs;
+            if interval_secs > 0 {
+                if let Err(err) = runtime.start_periodic(Duration::from_secs(interval_secs)).await {
+                    error!("Failed to start heap trace runtime: {}", err);
+                }
             }
         }
 
@@ -298,6 +301,7 @@ fn build_heap_trace_runtime(conf: &ClusterConf) -> Option<Arc<HeapTraceRuntime>>
 
     Some(Arc::new(HeapTraceRuntime::new(HeapTraceConfig::new(
         conf.heap_trace.runtime_enabled,
-        0,
+        conf.heap_trace.sample_interval_bytes,
+        conf.heap_trace.periodic_interval_secs,
     ))))
 }

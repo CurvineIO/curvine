@@ -440,7 +440,7 @@ mod tests {
 
     fn test_runtime(profiler: Arc<FakeProfiler>, dir: &TempDir) -> HeapTraceRuntime {
         HeapTraceRuntime::with_profiler(
-            HeapTraceConfig::new(true, 4096),
+            HeapTraceConfig::new(true, 4096, 60),
             dir.path().to_path_buf(),
             profiler,
         )
@@ -547,8 +547,8 @@ mod tests {
 
     #[tokio::test]
     async fn default_runtime_uses_unique_artifact_directory() {
-        let left = HeapTraceRuntime::new(HeapTraceConfig::new(true, 4096));
-        let right = HeapTraceRuntime::new(HeapTraceConfig::new(true, 4096));
+        let left = HeapTraceRuntime::new(HeapTraceConfig::new(true, 4096, 60));
+        let right = HeapTraceRuntime::new(HeapTraceConfig::new(true, 4096, 60));
 
         assert_ne!(left.artifact_dir.as_ref(), right.artifact_dir.as_ref());
         assert!(left
