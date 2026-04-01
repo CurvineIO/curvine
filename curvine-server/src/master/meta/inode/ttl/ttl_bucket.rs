@@ -132,14 +132,8 @@ impl TtlBucketList {
     }
 
     pub fn add(&self, inode: &InodeView) {
-        if inode.is_file_entry() {
-            warn!(
-                "ttl_bucket: skip add for unresolved FileEntry (inode_id={}, name='{}'); TTL index needs a resolved inode",
-                inode.id(),
-                inode.name()
-            );
-            return;
-        }
+        // In the new design, all InodeView instances are rich data (Dir or File)
+        // No need to check for FileEntry anymore
 
         if let Some(expiration_ms) = inode.expiration_ms() {
             let bucket = self.get_or_create_bucket(expiration_ms);
@@ -154,14 +148,8 @@ impl TtlBucketList {
     }
 
     pub fn remove(&self, inode: &InodeView) -> bool {
-        if inode.is_file_entry() {
-            warn!(
-                "ttl_bucket: skip remove for unresolved FileEntry (inode_id={}, name='{}')",
-                inode.id(),
-                inode.name()
-            );
-            return false;
-        }
+        // In the new design, all InodeView instances are rich data (Dir or File)
+        // No need to check for FileEntry anymore
 
         if let Some(expiration_ms) = inode.expiration_ms() {
             let interval_start = self.get_bucket_interval_start(expiration_ms);
@@ -207,11 +195,11 @@ mod tests {
         let mut f = InodeFile::new(id, mtime);
         f.storage_policy.ttl_ms = ttl_ms;
         f.storage_policy.ttl_action = TtlAction::Delete;
-        InodeView::new_file("t".to_string(), f)
+        InodeView::new_file(f)
     }
 
     fn file_no_ttl(id: i64, mtime: i64) -> InodeView {
-        InodeView::new_file("t".to_string(), InodeFile::new(id, mtime))
+        InodeView::new_file(InodeFile::new(id, mtime))
     }
 
     #[test]

@@ -12,148 +12,96 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(clippy::large_enum_variant)]
+//! Rich metadata enum for inode entries.
+//!
+//! `InodeView` holds the complete metadata for an inode, loaded from InodeStore.
+//! For tree navigation, use `DirEntry` which is lightweight and only contains id + kind.
+//!
+//! # Architecture
+//! ```text
+//! InodeView (rich metadata enum)
+//!   ├── Dir(Box<InodeDir>)  - directory metadata
+//!   └── File(Box<InodeFile>) - file metadata
+//! ```
+//!
+//! Note: FileEntry variant has been removed. Lightweight file entries in the tree
+//! are now represented as `DirEntry { entry: InodeEntry::File(id), children: None }`.
 
 use crate::master::meta::feature::AclFeature;
-use crate::master::meta::inode::InodeView::{Dir, File, FileEntry};
-use crate::master::meta::inode::{
-    Inode, InodeDir, InodeFile, InodePtr, PATH_SEPARATOR, ROOT_INODE_ID,
-};
-use core::panic;
+use crate::master::meta::inode::{Inode, InodeDir, InodeFile, PATH_SEPARATOR, ROOT_INODE_ID};
 use curvine_common::state::{FileStatus, FileType, SetAttrOpts, StoragePolicy, TtlAction};
 use curvine_common::utils::SerdeUtils;
 use orpc::common::{LocalTime, Utils};
 use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, LinkedList};
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::ops::{Deref, DerefMut};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NamedFile {
-    pub name: String,
-    pub file: InodeFile,
-}
-
-impl NamedFile {
-    pub fn new(name: String, file: InodeFile) -> Self {
-        NamedFile { name, file }
-    }
-}
-
-impl Deref for NamedFile {
-    type Target = InodeFile;
-
-    fn deref(&self) -> &Self::Target {
-        &self.file
-    }
-}
-
-impl DerefMut for NamedFile {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.file
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NamedDir {
-    pub name: String,
-    pub dir: InodeDir,
-}
-
-impl NamedDir {
-    pub fn new(name: String, dir: InodeDir) -> Self {
-        NamedDir { name, dir }
-    }
-}
-
-impl Deref for NamedDir {
-    type Target = InodeDir;
-
-    fn deref(&self) -> &Self::Target {
-        &self.dir
-    }
-}
-
-impl DerefMut for NamedDir {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.dir
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NamedEntry {
-    pub name: String,
-    pub id: i64,
-}
-
-impl NamedEntry {
-    pub fn new(name: String, id: i64) -> Self {
-        NamedEntry { name, id }
-    }
-
-    pub fn id(&self) -> i64 {
-        self.id
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-}
-
+/// Rich metadata enum for inode entries.
+/// Contains complete metadata for files and directories.
+///
+/// For tree navigation, use `DirEntry` instead.
 #[derive(Serialize, Deserialize)]
 #[repr(i8)]
 pub enum InodeView {
-    File(Box<NamedFile>) = 1,
-    Dir(Box<NamedDir>) = 2,
-    FileEntry(Box<NamedEntry>) = 3,
+    /// File with complete metadata
+    File(Box<InodeFile>) = 1,
+    /// Directory with complete metadata
+    Dir(Box<InodeDir>) = 2,
+    // FileEntry variant removed - use DirEntry { entry: InodeEntry::File(id), ... } instead
 }
 
 impl InodeView {
-    pub fn new_dir(name: String, dir: InodeDir) -> Self {
-        Dir(Box::new(NamedDir::new(name, dir)))
+    /// Creates a new file view
+    pub fn new_file(file: InodeFile) -> Self {
+        InodeView::File(Box::new(file))
     }
 
-    pub fn new_file(name: String, file: InodeFile) -> Self {
-        File(Box::new(NamedFile::new(name, file)))
+    /// Creates a new directory view
+    pub fn new_dir(dir: InodeDir) -> Self {
+        InodeView::Dir(Box::new(dir))
     }
 
-    pub fn new_entry(name: String, id: i64) -> Self {
-        FileEntry(Box::new(NamedEntry::new(name, id)))
-    }
-
+    /// Returns true if this is a directory
     pub fn is_dir(&self) -> bool {
-        matches!(self, Dir(_))
+        matches!(self, InodeView::Dir(_))
     }
 
+    /// Returns true if this is a file
     pub fn is_file(&self) -> bool {
-        !self.is_dir()
+        matches!(self, InodeView::File(_))
     }
 
-    pub fn is_file_entry(&self) -> bool {
-        matches!(self, FileEntry(_))
-    }
-
+    /// Returns true if this is a symlink
     pub fn is_link(&self) -> bool {
-        matches!(self, File(v) if v.file_type == FileType::Link)
+        matches!(self, InodeView::File(f) if f.file_type == FileType::Link)
     }
 
+    /// Returns the inode id
     pub fn id(&self) -> i64 {
         match self {
-            File(f) => f.id(),
-            Dir(d) => d.id(),
-            FileEntry(e) => e.id,
+            InodeView::File(f) => f.id(),
+            InodeView::Dir(d) => d.id(),
         }
     }
 
+    /// Returns the name from the directory if available
+    /// Note: Name is primarily stored in the parent's children map key.
+    /// This method is for compatibility during transition.
     pub fn name(&self) -> &str {
         match self {
-            File(f) => &f.name,
-            Dir(d) => &d.name,
-            FileEntry(e) => &e.name,
+            InodeView::File(_f) => "", // Name is in parent's children key
+            InodeView::Dir(_d) => "",  // Name is in parent's children key
         }
     }
 
+    /// Changes the name (for compatibility during transition)
+    /// Note: This is a no-op in the new design as name is stored in parent's children key.
+    pub fn change_name(&mut self, _new_name: String) {
+        // No-op: name is stored in parent's children map key, not in InodeView
+    }
+
+    /// Parses a path into components
     pub fn path_components(path: &str) -> CommonResult<Vec<String>> {
         if !Self::is_full_path(path) {
             return err_box!("Absolute path required, but got {}", path);
@@ -172,207 +120,140 @@ impl InodeView {
         }
     }
 
+    /// Checks if a path is a full (absolute) path
     pub fn is_full_path(path: &str) -> bool {
         path.starts_with(PATH_SEPARATOR)
     }
 
-    pub fn get_child(&self, name: &str) -> Option<&InodeView> {
-        match self {
-            File(_) => None,
-            Dir(d) => d.get_child(name),
-            FileEntry(_) => None,
-        }
-    }
-
-    pub fn get_child_ptr(&mut self, name: &str) -> Option<InodePtr> {
-        match self {
-            File(_) => None,
-            Dir(d) => d.get_child_ptr(name),
-            FileEntry(_) => None,
-        }
-    }
-
-    // Test and print for use. Memory copying occurs.
-    pub fn children(&self) -> Vec<&InodeView> {
-        let mut vec = Vec::with_capacity(8);
-        if let Dir(d) = self {
-            for item in d.children_iter() {
-                vec.push(item)
-            }
-        }
-
-        vec
-    }
-
-    pub fn child_len(&self) -> usize {
-        match self {
-            File(_) => 0,
-            Dir(d) => d.children_iter().len(),
-            FileEntry(..) => 0,
-        }
-    }
-
-    // Add child nodes.
-    pub fn add_child(&mut self, child: InodeView) -> CommonResult<InodePtr> {
-        match self {
-            File(f) => err_box!("Path not a dir: {}", f.name),
-            Dir(d) => d.add_child(child),
-            _ => err_box!("Inode type error: {}", self.name()),
-        }
-    }
-
-    pub fn delete_child(&mut self, id: i64, name: &str) -> CommonResult<InodeView> {
-        match self {
-            File(f) => err_box!("Path not a dir: {}", f.name),
-            Dir(d) => d.delete_child(id, name),
-            _ => err_box!("Inode type error: {}", self.name()),
-        }
-    }
-
+    /// Returns the modification time
     pub fn mtime(&self) -> i64 {
         match self {
-            File(f) => f.mtime(),
-            Dir(d) => d.mtime(),
-            FileEntry(..) => 0,
+            InodeView::File(f) => f.mtime(),
+            InodeView::Dir(d) => d.mtime(),
         }
     }
 
+    /// Updates the modification time if the new time is greater
     pub fn update_mtime(&mut self, time: i64) {
         match self {
-            File(f) => {
+            InodeView::File(f) => {
                 if time > f.mtime {
                     f.mtime = time
                 }
             }
-            Dir(d) => {
+            InodeView::Dir(d) => {
                 if time > d.mtime {
                     d.mtime = time
                 }
             }
-            FileEntry(..) => (),
         }
     }
 
+    /// Increments the link count
     pub fn incr_nlink(&mut self) {
         match self {
-            File(f) => f.nlink += 1,
-            Dir(d) => d.nlink += 1,
-            FileEntry(..) => (),
+            InodeView::File(f) => f.nlink += 1,
+            InodeView::Dir(d) => d.nlink += 1,
         }
     }
 
-    pub fn dec_nlink(&mut self) {
+    /// Decrements the link count
+    pub fn decr_nlink(&mut self) {
         match self {
-            File(f) => {
+            InodeView::File(f) => {
                 if f.nlink > 0 {
                     f.nlink -= 1
                 }
             }
-            Dir(d) => {
+            InodeView::Dir(d) => {
                 if d.nlink > 0 {
                     d.nlink -= 1
                 }
             }
-            FileEntry(..) => (),
         }
     }
 
+    /// Sets the parent id
     pub fn set_parent_id(&mut self, parent_id: i64) {
         match self {
-            File(f) => f.parent_id = parent_id,
-            Dir(d) => d.parent_id = parent_id,
-            FileEntry(..) => (),
+            InodeView::File(f) => f.parent_id = parent_id,
+            InodeView::Dir(d) => d.parent_id = parent_id,
         }
     }
 
-    pub fn change_name(&mut self, new_name: String) {
-        match self {
-            File(f) => f.name = new_name,
-            Dir(d) => d.name = new_name,
-            FileEntry(e) => e.name = new_name,
-        }
-    }
-
+    /// Returns the access time
     pub fn atime(&self) -> i64 {
         match self {
-            File(f) => f.atime(),
-            Dir(d) => d.atime(),
-            FileEntry(..) => 0,
+            InodeView::File(f) => f.atime(),
+            InodeView::Dir(d) => d.atime(),
         }
     }
 
+    /// Returns a mutable reference to the directory data
     pub fn as_dir_mut(&mut self) -> CommonResult<&mut InodeDir> {
         match self {
-            File(_) => err_box!("Not a dir"),
-            Dir(d) => Ok(d),
-            _ => err_box!("Inode type error: {}", self.name()),
+            InodeView::Dir(d) => Ok(d),
+            _ => err_box!("Not a directory"),
         }
     }
 
+    /// Returns a reference to the directory data
     pub fn as_dir_ref(&self) -> CommonResult<&InodeDir> {
         match self {
-            File(_) => err_box!("Not a dir"),
-            Dir(d) => Ok(d),
-            _ => err_box!("Inode type error: {}", self.name()),
+            InodeView::Dir(d) => Ok(d),
+            _ => err_box!("Not a directory"),
         }
     }
 
+    /// Returns a reference to the file data
     pub fn as_file_ref(&self) -> CommonResult<&InodeFile> {
         match self {
-            File(f) => Ok(f),
-            Dir(_) => err_box!("Not a file"),
-            _ => err_box!("Inode type error: {}", self.name()),
+            InodeView::File(f) => Ok(f),
+            _ => err_box!("Not a file"),
         }
     }
 
+    /// Returns a mutable reference to the file data
     pub fn as_file_mut(&mut self) -> CommonResult<&mut InodeFile> {
         match self {
-            File(f) => Ok(f),
-            Dir(_) => err_box!("Not a file"),
-            _ => err_box!("FileEntry is cannot be mutated: {}", self.name()),
+            InodeView::File(f) => Ok(f),
+            _ => err_box!("Not a file"),
         }
     }
 
+    /// Returns the ACL feature
     pub fn acl(&self) -> &AclFeature {
         match self {
-            File(f) => &f.features.acl,
-            Dir(d) => &d.features.acl,
-            FileEntry(..) => {
-                panic!("FileEntry does not support ACL access")
-            }
+            InodeView::File(f) => &f.features.acl,
+            InodeView::Dir(d) => &d.features.acl,
         }
     }
 
+    /// Returns a mutable reference to the ACL feature
     pub fn acl_mut(&mut self) -> &mut AclFeature {
         match self {
-            File(f) => &mut f.features.acl,
-            Dir(d) => &mut d.features.acl,
-            FileEntry(..) => {
-                panic!("FileEntry does not support mutable ACL access")
-            }
+            InodeView::File(f) => &mut f.features.acl,
+            InodeView::Dir(d) => &mut d.features.acl,
         }
     }
 
+    /// Returns the storage policy
     pub fn storage_policy(&self) -> &StoragePolicy {
         match self {
-            File(f) => &f.storage_policy,
-            Dir(d) => &d.storage_policy,
-            FileEntry(..) => {
-                panic!("FileEntry does not support storage policy access")
-            }
+            InodeView::File(f) => &f.storage_policy,
+            InodeView::Dir(d) => &d.storage_policy,
         }
     }
 
+    /// Returns a mutable reference to the storage policy
     pub fn storage_policy_mut(&mut self) -> &mut StoragePolicy {
         match self {
-            File(f) => &mut f.storage_policy,
-            Dir(d) => &mut d.storage_policy,
-            FileEntry(..) => {
-                panic!("FileEntry does not support mutable storage policy access")
-            }
+            InodeView::File(f) => &mut f.storage_policy,
+            InodeView::Dir(d) => &mut d.storage_policy,
         }
     }
 
+    /// Returns the expiration time in milliseconds if TTL is set
     pub fn expiration_ms(&self) -> Option<i64> {
         let sp = self.storage_policy();
         if sp.ttl_ms > 0 && sp.ttl_action != TtlAction::None {
@@ -382,6 +263,7 @@ impl InodeView {
         }
     }
 
+    /// Checks if this inode has expired based on TTL
     pub fn is_expired(&self) -> bool {
         let sp = self.storage_policy();
         if sp.ttl_action != TtlAction::None && sp.ttl_ms > 0 {
@@ -391,40 +273,31 @@ impl InodeView {
         }
     }
 
+    /// Returns the extended attributes
     pub fn x_attr(&self) -> &HashMap<String, Vec<u8>> {
         match self {
-            File(f) => &f.features.x_attr,
-            Dir(d) => &d.features.x_attr,
-            FileEntry(..) => {
-                panic!("FileEntry does not support x_attr access")
-            }
+            InodeView::File(f) => &f.features.x_attr,
+            InodeView::Dir(d) => &d.features.x_attr,
         }
     }
 
+    /// Returns a mutable reference to the extended attributes
     pub fn x_attr_mut(&mut self) -> &mut HashMap<String, Vec<u8>> {
         match self {
-            File(f) => &mut f.features.x_attr,
-            Dir(d) => &mut d.features.x_attr,
-            FileEntry(..) => {
-                panic!("FileEntry does not support mutable x_attr access")
-            }
+            InodeView::File(f) => &mut f.features.x_attr,
+            InodeView::Dir(d) => &mut d.features.x_attr,
         }
     }
 
+    /// Returns the link count
     pub fn nlink(&self) -> u32 {
         match self {
-            File(f) => f.nlink(),
-            Dir(d) => d.nlink(),
-            FileEntry(_) => {
-                panic!("FileEntry does not support nlink")
-            }
+            InodeView::File(f) => f.nlink(),
+            InodeView::Dir(d) => d.nlink(),
         }
     }
 
-    pub fn as_ptr(&mut self) -> InodePtr {
-        InodePtr::from_ref(self)
-    }
-
+    /// Applies attribute options
     pub fn set_attr(&mut self, opts: SetAttrOpts) {
         if let Some(owner) = opts.owner {
             self.acl_mut().owner = owner;
@@ -441,17 +314,15 @@ impl InodeView {
         // Handle time modifications
         if let Some(atime) = opts.atime {
             match self {
-                File(f) => f.atime = atime,
-                Dir(d) => d.atime = atime,
-                _ => (),
+                InodeView::File(f) => f.atime = atime,
+                InodeView::Dir(d) => d.atime = atime,
             }
         }
 
         if let Some(mtime) = opts.mtime {
             match self {
-                File(f) => f.mtime = mtime,
-                Dir(d) => d.mtime = mtime,
-                _ => (),
+                InodeView::File(f) => f.mtime = mtime,
+                InodeView::Dir(d) => d.mtime = mtime,
             }
         }
 
@@ -480,16 +351,19 @@ impl InodeView {
         }
     }
 
-    pub fn to_file_status(&self, path: &str) -> FileStatus {
+    /// Converts to FileStatus
+    /// Note: `path` and `name` should be provided by the caller as they are stored
+    /// in the parent's children map key, not in InodeView.
+    pub fn to_file_status(&self, path: &str, name: &str) -> FileStatus {
         let acl = self.acl();
         let mut status = FileStatus {
             id: self.id(),
             path: path.to_owned(),
-            name: self.name().to_owned(),
+            name: name.to_owned(),
             is_dir: self.is_dir(),
             mtime: self.mtime(),
             atime: self.atime(),
-            children_num: self.child_len() as i32,
+            children_num: 0, // Children count from DirEntry, not InodeView
             is_complete: false,
             len: 0,
             replicas: 0,
@@ -505,7 +379,7 @@ impl InodeView {
         };
 
         match self {
-            File(f) => {
+            InodeView::File(f) => {
                 status.is_complete = f.is_complete();
                 status.len = f.len;
                 status.replicas = f.replicas as i32;
@@ -516,89 +390,34 @@ impl InodeView {
                 status.target = f.target.clone();
             }
 
-            Dir(d) => {
+            InodeView::Dir(d) => {
                 status.file_type = FileType::Dir;
-                status.len = d.children_len() as i64;
+                status.len = 0; // Children count from DirEntry
                 status.x_attr = d.features.x_attr.clone();
                 status.storage_policy = d.storage_policy.clone();
-            }
-
-            FileEntry(_) => {
-                panic!("FileEntry does not support to_file_status");
             }
         }
 
         status
     }
 
-    /// Print directory structure, output is the same as the linux tree command
-    /// example:
-    /// .
-    // ├── a1
-    // ├── a2
-    // └── a3
-    //     └── b
-    //         └── c
-    pub fn print_tree(&self) {
-        Self::print_tree0(self, "".to_string(), 0)
-    }
-
+    /// Checks if this is the root inode
     pub fn is_root(&self) -> bool {
         self.id() == ROOT_INODE_ID
     }
 
-    fn print_tree0(inode: &InodeView, prefix: String, level: usize) {
-        if level == 0 {
-            println!(".")
-        }
-
-        let children = inode.children();
-        for (index, item) in children.iter().enumerate() {
-            if index == children.len() - 1 {
-                println!("{}└── {}", prefix, item.name());
-                if item.is_dir() {
-                    let prefix_new = format!("{}    ", prefix);
-                    Self::print_tree0(item, prefix_new, level + 1);
-                }
-            } else {
-                println!("{}├── {}", prefix, item.name());
-                if item.is_dir() {
-                    let prefix_new = format!("{}│   ", prefix);
-                    Self::print_tree0(item, prefix_new, level + 1);
-                }
-            }
-        }
-    }
-
+    /// Calculates a hash sum for verification (used in testing)
     pub fn sum_hash(&self) -> u128 {
-        let mut res: u128 = 0;
-        let mut stack = LinkedList::new();
-        stack.push_back(self);
-
-        while let Some(v) = stack.pop_front() {
-            let bytes = SerdeUtils::serialize(&v).unwrap();
-            if !v.is_root() {
-                let hash = Utils::crc32(&bytes) as u128;
-                // let inode: InodeView = SerdeUtils::deserialize(&bytes).unwrap();
-                // info!("id = {}[{}], detail = {:?}", inode.id(), hash, inode);
-                res += hash
-            }
-
-            for child in v.children() {
-                stack.push_front(child)
-            }
-        }
-
-        res
+        let bytes = SerdeUtils::serialize(&self).unwrap();
+        Utils::crc32(&bytes) as u128
     }
 }
 
 impl Clone for InodeView {
     fn clone(&self) -> Self {
         match self {
-            File(f) => File(f.clone()),
-            Dir(d) => Dir(d.clone()),
-            FileEntry(e) => FileEntry(e.clone()),
+            InodeView::File(f) => InodeView::File(f.clone()),
+            InodeView::Dir(d) => InodeView::Dir(d.clone()),
         }
     }
 }
@@ -606,9 +425,8 @@ impl Clone for InodeView {
 impl Debug for InodeView {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            File(v) => write!(f, "File(name={}, x={:?})", v.name, v.file),
-            Dir(v) => write!(f, "Dir(name={}, x={:?})", v.name, v.dir),
-            FileEntry(v) => write!(f, "FileEntry(name={}, id={})", v.name, v.id),
+            InodeView::File(v) => write!(f, "File(id={}, len={})", v.id, v.len),
+            InodeView::Dir(v) => write!(f, "Dir(id={})", v.id),
         }
     }
 }
@@ -616,5 +434,34 @@ impl Debug for InodeView {
 impl PartialEq for InodeView {
     fn eq(&self, other: &Self) -> bool {
         self.id() == other.id()
+    }
+}
+
+impl Inode for InodeView {
+    fn id(&self) -> i64 {
+        self.id()
+    }
+
+    fn parent_id(&self) -> i64 {
+        match self {
+            InodeView::File(f) => f.parent_id(),
+            InodeView::Dir(d) => d.parent_id(),
+        }
+    }
+
+    fn is_dir(&self) -> bool {
+        self.is_dir()
+    }
+
+    fn nlink(&self) -> u32 {
+        self.nlink()
+    }
+
+    fn mtime(&self) -> i64 {
+        self.mtime()
+    }
+
+    fn atime(&self) -> i64 {
+        self.atime()
     }
 }

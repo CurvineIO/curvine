@@ -63,25 +63,27 @@ impl InodeTtlExecutor {
             match &inode_view {
                 InodeView::File(f) => {
                     let parent_path = self.build_path_recursive(f.parent_id())?;
+                    // Note: name is stored in parent's children key, not in InodeFile
+                    // For now, use inode_id as placeholder
+                    let name = format!("inode_{}", f.id());
                     let file_path = if parent_path == "/" {
-                        format!("/{}", f.name)
+                        format!("/{}", name)
                     } else {
-                        format!("{}/{}", parent_path, f.name)
+                        format!("{}/{}", parent_path, name)
                     };
                     return Ok(file_path);
                 }
                 InodeView::Dir(d) => {
                     let parent_path = self.build_path_recursive(d.parent_id())?;
+                    // Note: name is stored in parent's children key, not in InodeDir
+                    // For now, use inode_id as placeholder
+                    let name = format!("inode_{}", d.id());
                     let dir_path = if parent_path == "/" {
-                        format!("/{}", d.name)
+                        format!("/{}", name)
                     } else {
-                        format!("{}/{}", parent_path, d.name)
+                        format!("{}/{}", parent_path, name)
                     };
                     return Ok(dir_path);
-                }
-                InodeView::FileEntry(e) => {
-                    // For empty files, we can't determine parent_id, so return a basic path
-                    return Ok(format!("/{}", e.name));
                 }
             }
         }

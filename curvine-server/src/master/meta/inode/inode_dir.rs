@@ -12,32 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Directory metadata structure.
+//!
+//! `InodeDir` holds the pure metadata for a directory inode.
+//! Children are managed separately in `DirEntry` (tree layer).
+//!
+//! # Architecture
+//! ```text
+//! InodeDir (pure metadata)
+//!   - id, parent_id
+//!   - mtime, atime, nlink
+//!   - storage_policy
+//!   - features (ACL, xattr)
+//!
+//! DirEntry (tree layer)
+//!   - entry: InodeEntry::Dir(id)
+//!   - children: InodeChildren
+//! ```
+
 use crate::master::meta::feature::{AclFeature, DirFeature};
-use crate::master::meta::inode::inodes_children::InodeChildren;
-use crate::master::meta::inode::{
-    ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
-};
-use curvine_common::state::{ListOptions, MkdirOpts, StoragePolicy};
-use glob::Pattern;
-use orpc::CommonResult;
+use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
+use curvine_common::state::{MkdirOpts, StoragePolicy};
 use serde::{Deserialize, Serialize};
 
+/// Directory metadata - pure metadata without children.
+///
+/// Children are managed in `DirEntry` (tree layer) which is separate from this struct.
+/// This separation allows the tree to be lightweight (id-only) while rich metadata
+/// is loaded on demand from `InodeStore`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeDir {
+    /// Inode id
     pub(crate) id: i64,
+    /// Parent inode id
     pub(crate) parent_id: i64,
+    /// Modification time
     pub(crate) mtime: i64,
+    /// Access time
     pub(crate) atime: i64,
+    /// Link count (number of entries pointing to this directory)
     pub(crate) nlink: u32,
+    /// Storage policy for files created in this directory
     pub(crate) storage_policy: StoragePolicy,
-
+    /// Directory features (ACL, extended attributes)
     pub(crate) features: DirFeature,
-
-    #[serde(skip)]
-    children: InodeChildren,
+    // Note: children field removed - children are now managed in DirEntry (tree layer)
 }
 
 impl InodeDir {
+    /// Creates a new directory with the given id and time
     pub fn new(id: i64, time: i64) -> Self {
         Self {
             id,
@@ -47,10 +70,10 @@ impl InodeDir {
             nlink: 2,
             storage_policy: Default::default(),
             features: Default::default(),
-            children: InodeChildren::new_map(),
         }
     }
 
+    /// Creates a new directory with the given options
     pub fn with_opts(id: i64, time: i64, opts: MkdirOpts) -> Self {
         Self {
             id,
@@ -67,72 +90,79 @@ impl InodeDir {
                 },
                 x_attr: opts.x_attr,
             },
-            children: InodeChildren::new_map(),
         }
     }
 
-    /// Add a word node and return a reference to that word node.
-    pub fn add_child(&mut self, mut inode: InodeView) -> CommonResult<InodePtr> {
-        inode.set_parent_id(self.id);
-        self.children.add_child(inode)
-    }
-
-    /// Get the child node of the specified inode name.
-    pub fn get_child(&self, name: &str) -> Option<&InodeView> {
-        self.children.get_child(name)
-    }
-
-    pub fn get_child_ptr(&mut self, name: &str) -> Option<InodePtr> {
-        self.children.get_child_ptr(name)
-    }
-
-    pub fn get_child_ptr_by_glob_pattern(
-        &mut self,
-        glob_pattern: &Pattern,
-    ) -> Option<Vec<InodePtr>> {
-        self.children.get_child_ptr_by_glob_pattern(glob_pattern)
-    }
-
+    /// Updates the modification time if the new time is greater
     pub fn update_mtime(&mut self, time: i64) {
         if time > self.mtime {
             self.mtime = time
         }
     }
 
-    pub fn delete_child(&mut self, child_id: i64, child_name: &str) -> CommonResult<InodeView> {
-        self.children.delete_child(child_id, child_name)
+    /// Returns the parent inode id
+    pub fn parent_id(&self) -> i64 {
+        self.parent_id
     }
 
-    pub fn print_child(&self) {
-        for child in self.children.iter() {
-            let t = if child.is_dir() { "dir" } else { "file" };
-
-            println!("{} {} {}", t, child.id(), child.name());
-        }
+    /// Sets the parent inode id
+    pub fn set_parent_id(&mut self, parent_id: i64) {
+        self.parent_id = parent_id;
     }
 
-    pub fn children_iter(&self) -> ChildrenIter<'_> {
-        self.children.iter()
+    /// Returns the modification time
+    pub fn mtime(&self) -> i64 {
+        self.mtime
     }
 
-    pub fn list_options(&self, options: &ListOptions) -> Vec<&InodeView> {
-        self.children.list_options(options)
+    /// Returns the access time
+    pub fn atime(&self) -> i64 {
+        self.atime
     }
 
-    pub fn children_vec(&self) -> Vec<InodeView> {
-        self.children.iter().cloned().collect()
+    /// Returns the link count
+    pub fn nlink(&self) -> u32 {
+        self.nlink
     }
 
-    pub fn children_len(&self) -> usize {
-        self.children.len()
+    /// Returns the storage policy
+    pub fn storage_policy(&self) -> &StoragePolicy {
+        &self.storage_policy
     }
 
-    pub fn add_file_child(&mut self, name: &str, file: InodeFile) -> CommonResult<InodePtr> {
-        self.add_child(InodeView::new_file(name.to_string(), file))
+    /// Returns a mutable reference to the storage policy
+    pub fn storage_policy_mut(&mut self) -> &mut StoragePolicy {
+        &mut self.storage_policy
     }
 
-    pub fn add_dir_child(&mut self, name: &str, dir: InodeDir) -> CommonResult<InodePtr> {
-        self.add_child(InodeView::new_dir(name.to_string(), dir))
+    /// Returns the features
+    pub fn features(&self) -> &DirFeature {
+        &self.features
+    }
+
+    /// Returns a mutable reference to the features
+    pub fn features_mut(&mut self) -> &mut DirFeature {
+        &mut self.features
+    }
+
+    /// Returns the ACL feature
+    pub fn acl(&self) -> &AclFeature {
+        &self.features.acl
+    }
+
+    /// Returns a mutable reference to the ACL feature
+    pub fn acl_mut(&mut self) -> &mut AclFeature {
+        &mut self.features.acl
+    }
+
+    /// Returns the extended attributes
+    pub fn x_attr(&self) -> &std::collections::HashMap<String, Vec<u8>> {
+        &self.features.x_attr
+    }
+
+    /// Returns a mutable reference to the extended attributes
+    pub fn x_attr_mut(&mut self) -> &mut std::collections::HashMap<String, Vec<u8>> {
+        &mut self.features.x_attr
     }
 }
 

@@ -14,9 +14,9 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::TtlBucketList;
-use crate::master::meta::inode::{InodeFile, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{DirEntry, InodeDir, InodeFile, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
-use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
+use crate::master::meta::{FileSystemStats, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
 use curvine_common::state::{BlockLocation, CommitBlock, FileLock, MountInfo};
 use orpc::common::{FileUtils, Utils};
@@ -47,12 +47,12 @@ impl InodeStore {
         self.ttl_bucket_list.clone()
     }
 
-    pub fn apply_add(&self, parent: &InodeView, child: &InodeView) -> CommonResult<()> {
+    pub fn apply_add(&self, parent: &InodeView, child_name: &str, child: &InodeView) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(child)?;
         batch.write_inode(parent)?;
-        batch.add_child(parent.id(), child.name(), child.id())?;
+        batch.add_child(parent.id(), child_name, child.id())?;
 
         batch.commit()?;
 
@@ -66,7 +66,6 @@ impl InodeStore {
                     self.fs_stats.increment_dir_count();
                 }
             }
-            InodeView::FileEntry(..) => self.fs_stats.increment_file_count(),
         }
 
         Ok(())
@@ -96,8 +95,18 @@ impl InodeStore {
                     if dir.id != ROOT_INODE_ID {
                         deleted_dirs += 1;
                     }
-                    for item in dir.children_iter() {
-                        stack.push_back((inode.id(), item.clone()))
+
+                    // Find children from edges (since InodeDir no longer has children field)
+                    let childs_iter = self.store.edges_iter(inode.id())?;
+                    for item in childs_iter {
+                        let (key, value) = try_err!(item);
+                        let (_, _child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
+                        let child_id = RocksUtils::i64_from_bytes(&value)?;
+
+                        // Load child inode for recursive deletion
+                        if let Some(child_inode) = self.store.get_inode(child_id)? {
+                            stack.push_back((inode.id(), child_inode));
+                        }
                     }
                 }
 
@@ -367,87 +376,85 @@ impl InodeStore {
         Ok(del_res)
     }
 
-    pub fn create_blank_tree(&self) -> CommonResult<(i64, InodeView)> {
-        let root = FsDir::create_root();
+    pub fn create_blank_tree(&self) -> CommonResult<(i64, DirEntry)> {
+        // Create and persist root inode
+        let root_dir = InodeDir::new(ROOT_INODE_ID, 0);
+        let root_view = InodeView::new_dir(root_dir);
+
+        let mut batch = self.store.new_batch();
+        batch.write_inode(&root_view)?;
+        batch.commit()?;
+
+        // Add to TTL bucket
+        self.ttl_bucket_list.add(&root_view);
+
+        let root = DirEntry::new_dir(ROOT_INODE_ID);
         self.fs_stats.set_counts(0, 0);
         Ok((ROOT_INODE_ID, root))
     }
 
     // Restore to a directory tree from rocksdb
-    pub fn create_tree(&self) -> CommonResult<(i64, InodeView)> {
-        // Load root metadata from DB to preserve mtime, nlink, and other attributes
-        // that have been updated since the root was first created.
-        let mut root = self
-            .store
-            .get_inode(ROOT_INODE_ID)?
-            .unwrap_or_else(FsDir::create_root);
+    // Returns a lightweight DirEntry tree (id-only) for navigation
+    pub fn create_tree(&self) -> CommonResult<(i64, DirEntry)> {
+        let mut root = DirEntry::new_dir(ROOT_INODE_ID);
 
         let mut stack = LinkedList::new();
-        stack.push_back((
-            root.as_ptr(),
-            ROOT_INODE_ID,
-            InodeView::new_entry(String::new(), ROOT_INODE_ID),
-        ));
+        stack.push_back(root.as_ptr());
         let mut last_inode_id = ROOT_INODE_ID;
         let mut file_count = 0i64;
         let mut dir_count = 0i64;
-        while let Some((mut parent, child_id, file_entry)) = stack.pop_front() {
-            last_inode_id = last_inode_id.max(child_id);
 
-            let next_parent = if child_id != ROOT_INODE_ID {
-                let store_inode = match self.store.get_inode(child_id)? {
-                    Some(v) => v,
-                    None => {
-                        // Orphaned edge: inode was deleted but edge was not cleaned up
-                        // (can happen after a crash between two non-atomic batch commits).
-                        // Skip this entry to keep the tree consistent.
-                        log::warn!(
-                            "create_tree: orphaned edge detected, child_id={} has no inode, skipping",
-                            child_id
-                        );
-                        continue;
-                    }
-                };
-                self.ttl_bucket_list.add(&store_inode);
-
-                let inode = if matches!(store_inode, InodeView::Dir(_)) {
-                    store_inode
-                } else {
-                    file_entry
-                };
-
-                // Count files and directories during tree reconstruction
-                match &inode {
-                    InodeView::File(_) => file_count += 1,
-                    InodeView::Dir(dir) => {
-                        // Don't count root directory
-                        if dir.id != ROOT_INODE_ID {
-                            dir_count += 1;
-                        }
-                    }
-                    InodeView::FileEntry(..) => file_count += 1,
-                }
-
-                parent.add_child(inode)?
-            } else {
-                parent
-            };
-
-            // Find all child nodes in the directory.
-            if next_parent.is_dir() {
-                let childs_iter = self.store.edges_iter(next_parent.id())?;
+        while let Some(mut parent_entry) = stack.pop_front() {
+            // Find all child nodes in the directory
+            if parent_entry.is_dir() {
+                let childs_iter = self.store.edges_iter(parent_entry.id())?;
                 for item in childs_iter {
                     let (key, value) = try_err!(item);
-                    let (_, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
+                    let (key_parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
                     let child_id = RocksUtils::i64_from_bytes(&value)?;
-                    let file_entry = InodeView::new_entry(child_name.to_string(), child_id);
 
-                    stack.push_back((next_parent.clone(), child_id, file_entry))
+                    // Update last_inode_id
+                    last_inode_id = last_inode_id.max(child_id);
+
+                    // Load child metadata to determine kind (Dir or File)
+                    let child_inode = match self.store.get_inode(child_id)? {
+                        Some(v) => v,
+                        None => {
+                            // Orphaned edge: skip
+                            log::warn!(
+                                "create_tree: orphaned edge detected, child_id={} has no inode, skipping",
+                                child_id
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Add to TTL bucket
+                    self.ttl_bucket_list.add(&child_inode);
+
+                    // Create DirEntry for this child
+                    let child_entry = if child_inode.is_dir() {
+                        dir_count += 1;
+                        DirEntry::new_dir(child_id)
+                    } else {
+                        file_count += 1;
+                        DirEntry::new_file(child_id)
+                    };
+
+                    // Add child to parent's children
+                    parent_entry.add_child(child_name.to_string(), child_entry);
+
+                    // Push directory children for further traversal
+                    if child_inode.is_dir() {
+                        if let Some(child) = parent_entry.get_child_mut(&child_name) {
+                            stack.push_back(child.as_ptr());
+                        }
+                    }
                 }
             }
         }
 
-        // Update statistics with the counts from tree reconstruction
+        // Update statistics
         self.fs_stats.set_counts(file_count, dir_count);
 
         Ok((last_inode_id, root))
