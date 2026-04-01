@@ -23,5 +23,3 @@ pub use self::rocks_utils::RocksUtils;
 
 mod write_batch;
 pub use self::write_batch::WriteBatch;
-
-pub static DEFAULT_FAMILY: &str = "default";

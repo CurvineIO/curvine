@@ -147,7 +147,7 @@ impl JournalSystem {
 
         let log_store = RocksLogStorage::from_conf(&conf.journal, conf.format_master);
 
-        let db_conf = conf.meta_rocks_conf();
+        let db_conf = conf.db_conf();
         if conf.format_master && FileUtils::exists(&db_conf.data_dir) {
             FileUtils::delete_path(&db_conf.data_dir, true)?;
         }

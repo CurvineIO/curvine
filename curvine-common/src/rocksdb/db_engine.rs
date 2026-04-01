@@ -18,6 +18,7 @@ use orpc::common::{FileUtils, Utils};
 use orpc::{err_box, try_err, CommonResult};
 use rocksdb::checkpoint::Checkpoint;
 use rocksdb::properties;
+use rocksdb::statistics::Ticker;
 use rocksdb::*;
 use std::collections::HashMap;
 
@@ -34,12 +35,10 @@ impl DBEngine {
         // Do you need to retry formatting? If format is true, the directory will be deleted.
         Self::format(format, &conf)?;
 
-        let db_path = &conf.data_dir;
-        let db_opt = conf.create_db_opt();
+        let db_opt = conf.create_db_opts();
         let write_opt = conf.create_write_opt();
-        let cfs = conf.create_cf_opt();
-
-        let db = try_err!(DB::open_cf_with_opts(&db_opt, db_path, cfs));
+        let cfs = conf.get_cf_with_opts();
+        let db = try_err!(DB::open_cf_with_opts(&db_opt, &conf.data_dir, cfs));
         info!(
             "Create rocksdb success, format: {}, conf: {:?}",
             format, conf
@@ -58,8 +57,8 @@ impl DBEngine {
 
     pub fn restore<T: AsRef<str>>(&mut self, checkpoint: T) -> CommonResult<()> {
         let db_path = self.conf.data_dir.clone();
-        let db_opt = self.conf.create_db_opt();
-        let cfs = self.conf.create_cf_opt();
+        let db_opt = self.conf.create_db_opts();
+        let cfs = self.conf.get_cf_with_opts();
         let checkpoint = checkpoint.as_ref();
 
         // The database points to a temporary directory while we prepare the restore.
@@ -402,6 +401,12 @@ impl DBEngine {
     /// or table-reader figures for the same scope.
     ///
     /// This sum is a coarse RocksDB-internal estimate; it **excludes** WAL, OS page cache, etc., and **does not equal** process memory in `top`/`ps`.
+    ///
+    /// **Additional keys (this method only)**
+    ///
+    /// - `db_rocksdb_block_cache_hit_count` / `db_rocksdb_block_cache_miss_count` / `db_rocksdb_block_cache_hit_rate_ppm`:
+    ///   from `rocksdb.options-statistics` (needs `enable_statistics` in `create_db_opts`). Hit rate is
+    ///   `hit / (hit + miss)` scaled to **parts per million** (0–1_000_000); if both are zero, ppm is 0.
     pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
         let mut info = HashMap::new();
 
@@ -449,7 +454,36 @@ impl DBEngine {
             }
         }
 
+        // Requires `Options::enable_statistics()` (set in `DBConf::create_db_opts`).
+        if let Some(stats) = try_err!(self.db.property_value(properties::OPTIONS_STATISTICS)) {
+            let hit = Self::parse_statistics_ticker_u64(&stats, Ticker::BlockCacheHit.name())
+                .unwrap_or(0);
+            let miss = Self::parse_statistics_ticker_u64(&stats, Ticker::BlockCacheMiss.name())
+                .unwrap_or(0);
+            info.insert("db_rocksdb_block_cache_hit_count".to_string(), hit);
+            info.insert("db_rocksdb_block_cache_miss_count".to_string(), miss);
+            let denom = hit.saturating_add(miss);
+            let ppm = if denom == 0 {
+                0
+            } else {
+                hit.saturating_mul(1_000_000) / denom
+            };
+            info.insert("db_rocksdb_block_cache_hit_rate_ppm".to_string(), ppm);
+        }
+
         Ok(info)
+    }
+
+    fn parse_statistics_ticker_u64(stats: &str, ticker_name: &str) -> Option<u64> {
+        const SUFFIX: &str = " COUNT : ";
+        for line in stats.lines() {
+            if let Some((name, rest)) = line.split_once(SUFFIX) {
+                if name == ticker_name {
+                    return rest.trim().parse().ok();
+                }
+            }
+        }
+        None
     }
 
     pub fn conf(&self) -> &DBConf {

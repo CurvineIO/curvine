@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::conf::ClusterConf;
-use orpc::common::{DurationUnit, LogConf, Utils};
+use crate::rocksdb::DBConf;
+use orpc::common::{ByteUnit, DurationUnit, LogConf, Utils};
 use orpc::runtime::GroupExecutor;
 use orpc::{err_box, CommonResult};
 use serde::{Deserialize, Serialize};
@@ -36,10 +37,6 @@ pub struct MasterConf {
     // Metadata configuration, currently only supports rocksdb.
     // rocksdb configuration.
     pub meta_dir: String,
-    pub meta_disable_wal: bool,
-    pub meta_compression_type: String,
-    pub meta_db_write_buffer_size: String,
-    pub meta_write_buffer_size: String,
 
     pub min_block_size: i64,
     pub max_block_size: i64,
@@ -132,6 +129,9 @@ pub struct MasterConf {
     pub lock_expire_time_unit: DurationUnit,
 
     pub buffer_size: usize,
+
+    #[serde(default = "MasterConf::rocksdb_default")]
+    pub rocksdb: DBConf,
 }
 
 impl MasterConf {
@@ -165,6 +165,17 @@ impl MasterConf {
         }
 
         Ok(())
+    }
+
+    pub fn rocksdb_default() -> DBConf {
+        DBConf {
+            block_size: ByteUnit::kb(4),
+            disable_wal: true,
+            use_bloom_filter: true,
+            cache_index_and_filter_blocks: true,
+            pin_l0_filter_and_index_blocks_in_cache: true,
+            ..Default::default()
+        }
     }
 
     pub fn heartbeat_interval_ms(&self) -> u64 {
@@ -225,6 +236,9 @@ impl MasterConf {
 impl Default for MasterConf {
     fn default() -> Self {
         let dir = Utils::cur_dir_sub("fs-meta");
+
+        let rocksdb = Self::rocksdb_default().set_dir(&dir);
+
         let mut conf = Self {
             hostname: ClusterConf::DEFAULT_HOSTNAME.to_string(),
             rpc_port: ClusterConf::DEFAULT_MASTER_PORT,
@@ -235,10 +249,6 @@ impl Default for MasterConf {
             io_close_idle: true,
 
             meta_dir: dir,
-            meta_disable_wal: true,
-            meta_compression_type: "none".to_string(),
-            meta_db_write_buffer_size: "0".to_string(),
-            meta_write_buffer_size: "64MB".to_string(),
 
             min_block_size: 1024 * 1024,
             max_block_size: 100 * 1024 * 1024 * 1024,
@@ -307,6 +317,8 @@ impl Default for MasterConf {
             lock_expire_time_unit: Default::default(),
 
             buffer_size: 128 * 1024,
+
+            rocksdb,
         };
 
         conf.init().unwrap();

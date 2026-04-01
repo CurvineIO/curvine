@@ -37,6 +37,7 @@ impl RocksInodeStore {
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
+            .set_disable_wal(true)
             .add_cf(Self::CF_INODES)
             .add_cf(Self::CF_EDGES)
             .add_cf(Self::CF_BLOCK)

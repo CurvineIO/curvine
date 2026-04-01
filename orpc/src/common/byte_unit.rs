@@ -16,6 +16,8 @@
 
 use crate::{err_box, CommonResult};
 use once_cell::sync::Lazy;
+use serde::de::{Unexpected, Visitor};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 #[derive(Clone, Debug, Copy, PartialEq, PartialOrd, Default)]
@@ -33,6 +35,18 @@ impl ByteUnit {
 
     pub fn new(value: u64) -> Self {
         ByteUnit(value)
+    }
+
+    pub fn kb(value: u64) -> Self {
+        ByteUnit(value * Self::KB)
+    }
+
+    pub fn mb(value: u64) -> Self {
+        ByteUnit(value * Self::MB)
+    }
+
+    pub fn gb(value: u64) -> Self {
+        ByteUnit(value * Self::GB)
     }
 
     pub fn as_byte(&self) -> u64 {
@@ -148,9 +162,63 @@ impl fmt::Display for ByteUnit {
     }
 }
 
+impl<'de> Deserialize<'de> for ByteUnit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SizeVisitor;
+
+        impl Visitor<'_> for SizeVisitor {
+            type Value = ByteUnit;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("valid size")
+            }
+
+            fn visit_i64<E>(self, size: i64) -> Result<ByteUnit, E>
+            where
+                E: de::Error,
+            {
+                if size >= 0 {
+                    self.visit_u64(size as u64)
+                } else {
+                    Err(E::invalid_value(Unexpected::Signed(size), &self))
+                }
+            }
+
+            fn visit_u64<E>(self, size: u64) -> Result<ByteUnit, E>
+            where
+                E: de::Error,
+            {
+                Ok(ByteUnit(size))
+            }
+
+            fn visit_str<E>(self, size_str: &str) -> Result<ByteUnit, E>
+            where
+                E: de::Error,
+            {
+                ByteUnit::from_str(size_str).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(SizeVisitor)
+    }
+}
+
+impl Serialize for ByteUnit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::common::ByteUnit;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn bytes_unit() {
@@ -171,5 +239,21 @@ mod tests {
             let res_size = ByteUnit::from_str(exp).unwrap();
             assert_eq!(res_size.as_byte(), size);
         }
+    }
+
+    #[test]
+    fn toml_serde() {
+        let toml = r#"
+        size = "1MB"
+        "#;
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct Config {
+            size: ByteUnit,
+        }
+
+        let conf: Config = toml::from_str(toml).unwrap();
+        println!("conf = {:?}", conf);
+        println!("conf = {:?}", toml::to_string_pretty(&conf).unwrap());
     }
 }

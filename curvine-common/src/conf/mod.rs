@@ -30,12 +30,6 @@ pub use self::fuse_conf::FuseConf;
 mod journal_conf;
 pub use self::journal_conf::JournalConf;
 
-mod size_string;
-pub use self::size_string::SizeString;
-
-mod duration_string;
-pub use self::duration_string::DurationString;
-
 mod ufs_conf;
 pub use self::ufs_conf::UfsConf;
 pub use self::ufs_conf::UfsConfBuilder;

@@ -52,7 +52,7 @@ impl FsDir {
         ttl_bucket_list: Arc<TtlBucketList>,
         evictor: Arc<dyn Evictor>,
     ) -> FsResult<Self> {
-        let db_conf = conf.meta_rocks_conf();
+        let db_conf = conf.db_conf();
 
         let store = RocksInodeStore::new(db_conf, conf.format_master)?;
         let state = InodeStore::new(store, ttl_bucket_list);

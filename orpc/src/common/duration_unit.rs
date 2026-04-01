@@ -15,6 +15,8 @@
 #![allow(clippy::should_implement_trait)]
 
 use crate::{err_box, CommonResult};
+use serde::de::{Unexpected, Visitor};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::time::Duration;
 
@@ -123,9 +125,63 @@ impl fmt::Display for DurationUnit {
     }
 }
 
+impl<'de> Deserialize<'de> for DurationUnit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct SizeVisitor;
+
+        impl Visitor<'_> for SizeVisitor {
+            type Value = DurationUnit;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("valid string")
+            }
+
+            fn visit_i64<E>(self, size: i64) -> Result<DurationUnit, E>
+            where
+                E: de::Error,
+            {
+                if size >= 0 {
+                    self.visit_u64(size as u64)
+                } else {
+                    Err(E::invalid_value(Unexpected::Signed(size), &self))
+                }
+            }
+
+            fn visit_u64<E>(self, size: u64) -> Result<DurationUnit, E>
+            where
+                E: de::Error,
+            {
+                Ok(DurationUnit(size))
+            }
+
+            fn visit_str<E>(self, size_str: &str) -> Result<DurationUnit, E>
+            where
+                E: de::Error,
+            {
+                DurationUnit::from_str(size_str).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(SizeVisitor)
+    }
+}
+
+impl Serialize for DurationUnit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::common::DurationUnit;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn duration_unit() {
@@ -146,5 +202,21 @@ mod test {
             let res_dur: DurationUnit = DurationUnit::from_str(exp).unwrap();
             assert_eq!(res_dur.as_millis(), d.as_millis());
         }
+    }
+
+    #[test]
+    fn toml_serde() {
+        let toml = r#"
+        time = "1m"
+        "#;
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct Config {
+            time: DurationUnit,
+        }
+
+        let conf: Config = toml::from_str(toml).unwrap();
+        println!("conf = {:?}", conf);
+        println!("conf = {:?}", toml::to_string_pretty(&conf).unwrap());
     }
 }
