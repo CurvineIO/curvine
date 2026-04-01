@@ -15,7 +15,7 @@
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
-use crate::master::meta::inode::{InodeFile, InodePath, InodeView, PATH_SEPARATOR};
+use crate::master::meta::inode::{DirEntry, InodeFile, InodePath, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
 
 use crate::master::fs::DeleteResult;
@@ -100,7 +100,7 @@ impl MasterFilesystem {
             if opts.create_parent {
                 if let Some(last_inode) = inp.get_last_inode() {
                     if last_inode.is_dir() {
-                        let status = last_inode.to_file_status(inp.path());
+                        let status = last_inode.to_file_status(inp.path(), inp.name());
                         return Ok(status);
                     }
                 }
@@ -115,7 +115,7 @@ impl MasterFilesystem {
 
         let inp = fs_dir.mkdir(inp, opts)?;
         let last = try_option!(inp.get_last_inode());
-        let status = last.to_file_status(inp.path());
+        let status = last.to_file_status(inp.path(), inp.name());
         Ok(status)
     }
 
@@ -370,11 +370,11 @@ impl MasterFilesystem {
     }
 
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
-        InodePath::resolve(fs_dir.root_ptr(), path, &fs_dir.store)
+        InodePath::resolve(fs_dir.root_entry(), path, &fs_dir.store)
     }
 
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
-        InodePath::resolve_for_glob_pattern(fs_dir.root_ptr(), path, &fs_dir.store)
+        InodePath::resolve_for_glob_pattern(fs_dir.root_entry(), path, &fs_dir.store)
     }
 
     pub fn check_path_length(&self, path: &str) -> CommonResult<()> {
@@ -513,7 +513,7 @@ impl MasterFilesystem {
         fs_dir.complete_file(&inp, len, commit_blocks, client_name, only_flush)?;
         if only_flush {
             let locs = self.get_block_locs(path, &fs_dir, file)?;
-            let status = inode.to_file_status(path);
+            let status = inode.to_file_status(path, inp.name());
             Ok(Some(FileBlocks::new(status, locs)))
         } else {
             Ok(None)
@@ -529,7 +529,7 @@ impl MasterFilesystem {
         let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
         let file = inode.as_file_ref()?;
         let blocks = self.get_block_locs(path, fs_dir, file)?;
-        Ok(FileBlocks::new(inode.to_file_status(path), blocks))
+        Ok(FileBlocks::new(inode.to_file_status(path, inp.name()), blocks))
     }
 
     fn get_block_locs(
@@ -585,7 +585,7 @@ impl MasterFilesystem {
         let file = inode.as_file_ref()?;
         let block_locs = self.get_block_locs(path, &fs_dir, file)?;
         let locate_blocks = FileBlocks {
-            status: inode.to_file_status(path),
+            status: inode.to_file_status(path, inp.name()),
             block_locs,
         };
 
@@ -657,7 +657,7 @@ impl MasterFilesystem {
     }
 
     // Create a directory number based on rocksdb data for testing.
-    pub fn create_tree(&self) -> CommonResult<InodeView> {
+    pub fn create_tree(&self) -> CommonResult<DirEntry> {
         let fs_dir = self.fs_dir.read();
         fs_dir.create_tree()
     }

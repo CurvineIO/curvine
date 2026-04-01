@@ -14,6 +14,9 @@
 
 use orpc::sys::RawPtr;
 
+mod dir_entry;
+pub use self::dir_entry::*;
+
 mod inode_file;
 pub use self::inode_file::*;
 
@@ -26,8 +29,7 @@ pub use self::inode_view::*;
 mod inode_path;
 pub use self::inode_path::InodePath;
 
-mod inodes_children;
-pub use self::inodes_children::*;
+// inodes_children.rs removed - InodeChildren now defined in dir_entry.rs
 
 pub mod ttl;
 
