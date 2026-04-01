@@ -468,6 +468,11 @@ impl JournalLoader {
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
+        if inp.is_full() {
+            return Ok(());
+        }
+        let opts = curvine_common::state::MkdirOpts::with_create(true);
+        let inp = fs_dir.create_parent_dir(inp, opts)?;
         let _ = fs_dir.add_last_inode(inp, InodeView::new_dir(entry.dir))?;
         Ok(())
     }
@@ -480,6 +485,8 @@ impl JournalLoader {
             warn!("create_file: file already exists: {:?}", entry);
             return Ok(());
         }
+        let opts = curvine_common::state::CreateFileOpts::with_create(true);
+        let inp = fs_dir.create_parent_dir(inp, opts.dir_opts())?;
         let _ = fs_dir.add_last_inode(inp, InodeView::new_file(entry.file))?;
         Ok(())
     }

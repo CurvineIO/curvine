@@ -134,7 +134,7 @@ impl FsDir {
     }
 
     // Create all previous directories that may be missing on the path.
-    fn create_parent_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
+    pub(crate) fn create_parent_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
         let mut index = inp.existing_len();
 
         // The parent directory already exists and does not need to be created.
@@ -178,15 +178,10 @@ impl FsDir {
     }
 
     fn is_dir_empty(&self, inp: &InodePath) -> bool {
-        let mut current = &self.root_entry;
-        for i in 1..inp.existing_len() {
-            if let Some(next) = current.get_child(&inp.get_components()[i]) {
-                current = next;
-            } else {
-                return true;
-            }
-        }
-        current.child_count() == 0
+        inp.get_last_entry()
+            .and_then(|entry| entry.children())
+            .map(|c| c.is_empty())
+            .unwrap_or(true)
     }
 
     pub(crate) fn unprotected_delete(
@@ -226,23 +221,15 @@ impl FsDir {
             }
         };
 
-        self.remove_child_from_tree(inp.get_components(), inp.existing_len() - 1, child_name);
+        self.remove_child_from_tree(inp, child_name);
 
         Ok(del_res)
     }
 
-    fn remove_child_from_tree(&mut self, components: &[String], parent_index: usize, child_name: &str) {
-        let mut current = &mut self.root_entry;
-
-        for i in 1..parent_index {
-            if let Some(next) = current.get_child_mut(&components[i]) {
-                current = next;
-            } else {
-                return;
-            }
+    fn remove_child_from_tree(&mut self, inp: &InodePath, child_name: &str) {
+        if let Some(parent_entry) = inp.get_parent_entry() {
+            parent_entry.as_mut().remove_child(child_name);
         }
-
-        current.remove_child(child_name);
     }
 
     pub fn free(&mut self, inp: &InodePath, recursive: bool) -> FsResult<FreeResult> {
@@ -373,14 +360,14 @@ impl FsDir {
             &new_inode,
         )?;
 
-        self.remove_child_from_tree(src_inp.get_components(), src_inp.existing_len() - 1, src_inp.name());
+        self.remove_child_from_tree(src_inp, src_inp.name());
 
         let child_entry = if new_inode.is_dir() {
             DirEntry::new_dir(new_inode.id())
         } else {
             DirEntry::new_file(new_inode.id())
         };
-        self.add_child_to_tree(dst_inp.get_components(), dst_inp.existing_len(), &new_name, child_entry);
+        self.add_child_to_tree(dst_inp, &new_name, child_entry);
 
         Ok(del_res)
     }
@@ -410,7 +397,6 @@ impl FsDir {
 
         let pos = inp.existing_len() as i32;
 
-        // parent must be an existing directory.
         let mut parent = match inp.get_inode(pos - 1) {
             Some(v) => {
                 if !v.is_dir() {
@@ -423,14 +409,12 @@ impl FsDir {
             None => return err_box!("Parent path not exists: {}", inp.get_parent_path()),
         };
 
-        // Update the parent directory for the last modification time.
         parent.update_mtime(child.mtime());
         if child.is_dir() {
             parent.incr_nlink();
         }
 
-        // Create a DirEntry for the child and add it to the tree
-        let child_name = inp.get_component(inp.existing_len())?;
+        let child_name = inp.get_component(inp.existing_len())?.to_string();
         let child_id = child.id();
         let child_entry = if child.is_dir() {
             DirEntry::new_dir(child_id)
@@ -438,34 +422,30 @@ impl FsDir {
             DirEntry::new_file(child_id)
         };
 
-        self.add_child_to_tree(inp.get_components(), inp.existing_len(), child_name, child_entry);
+        let mut child_entry_ref = None;
+        if let Some(parent_entry) = inp.get_parent_entry() {
+            parent_entry.as_mut().add_child(child_name.clone(), child_entry);
+            if let Some(child) = parent_entry.as_ref().get_child(&child_name) {
+                child_entry_ref = Some(DirEntryRef::from_ref(child));
+            }
+        }
 
         let child_ptr = InodePtr::from_owned(child);
-        self.store.apply_add(parent.as_ref(), child_name, child_ptr.as_ref())?;
-        inp.append(child_ptr)?;
+        self.store.apply_add(parent.as_ref(), &child_name, child_ptr.as_ref())?;
+
+        if let Some(entry_ref) = child_entry_ref {
+            inp.append_with_entry(child_ptr, entry_ref)?;
+        } else {
+            inp.append(child_ptr)?;
+        }
 
         Ok(inp)
     }
 
-    fn add_child_to_tree(
-        &mut self,
-        components: &[String],
-        existing_len: usize,
-        child_name: &str,
-        child_entry: DirEntry,
-    ) {
-        let mut current = &mut self.root_entry;
-
-        for i in 1..existing_len {
-            let component = &components[i];
-            if let Some(next) = current.get_child_mut(component) {
-                current = next;
-            } else {
-                return;
-            }
+    fn add_child_to_tree(&mut self, inp: &InodePath, child_name: &str, child_entry: DirEntry) {
+        if let Some(parent_entry) = inp.get_last_entry() {
+            parent_entry.as_mut().add_child(child_name.to_string(), child_entry);
         }
-
-        current.add_child(child_name.to_string(), child_entry);
     }
 
     pub fn file_status(&self, inp: &InodePath) -> FsResult<FileStatus> {
@@ -974,7 +954,7 @@ impl FsDir {
             }
             None => {
                 let child_entry = DirEntry::new_file(new_inode_id);
-                self.add_child_to_tree(link.get_components(), link.existing_len(), &name, child_entry);
+                self.add_child_to_tree(&link, &name, child_entry);
 
                 let added = InodePtr::from_owned(new_inode_view);
                 link.append(added)?;
@@ -1048,7 +1028,7 @@ impl FsDir {
         let added = InodePtr::from_owned(linked_inode);
 
         let child_entry = DirEntry::new_file(original_inode_id);
-        self.add_child_to_tree(new_path.get_components(), new_path.existing_len(), &name, child_entry);
+        self.add_child_to_tree(&new_path, &name, child_entry);
 
         new_path.append(added)?;
 
