@@ -38,10 +38,14 @@ impl WorkerMap {
         }
     }
 
-    pub fn insert(&mut self, addr: WorkerAddress, storages: Vec<StorageInfo>) -> FsResult<()> {
-        // Check whether the address and worker id conflict.
+    pub fn remove(&mut self, addr: &WorkerAddress) {
+        self.workers.swap_remove(&addr.worker_id);
+        self.lost_workers.swap_remove(&addr.worker_id);
+    }
+
+    pub fn ensure_worker_id_addr(&self, addr: &WorkerAddress) -> FsResult<()> {
         if let Some(v) = self.workers.get(&addr.worker_id) {
-            if v.address != addr {
+            if v.address != *addr {
                 return err_box!(
                     "worker id addr mismatch,  expected {}, actual: {}",
                     v.address,
@@ -49,6 +53,11 @@ impl WorkerMap {
                 );
             }
         }
+        Ok(())
+    }
+
+    pub fn insert(&mut self, addr: WorkerAddress, storages: Vec<StorageInfo>) -> FsResult<()> {
+        self.ensure_worker_id_addr(&addr)?;
 
         // Register the worker and update the storage information.
         // @todo Heartbeat may be too simple and directly covers historical data.

@@ -14,15 +14,17 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::TtlBucketList;
-use crate::master::meta::inode::{InodeFile, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{InodeFile, InodePath, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
-use curvine_common::state::{BlockLocation, CommitBlock, FileLock, MountInfo};
+use curvine_common::state::{BlockLocation, CommitBlock, FileLock, FileStatus, MountInfo};
+use curvine_common::utils::SerdeUtils;
 use orpc::common::{FileUtils, Utils};
-use orpc::{err_box, try_err, CommonResult};
+use orpc::{err_box, try_err, try_option, CommonResult};
 use std::collections::{HashMap, LinkedList};
 use std::sync::Arc;
+
 // Currently, only RockSDB is supported.
 // Note: InodeStore is intentionally NOT Clone.
 // Cloning InodeStore increases Arc<RocksInodeStore> refcount, which prevents
@@ -487,6 +489,63 @@ impl InodeStore {
             }
         }
         Ok(inode_view)
+    }
+
+    pub fn batched_get_inodes(
+        &self,
+        inp: &InodePath,
+        list: Vec<&InodeView>,
+    ) -> CommonResult<Vec<FileStatus>> {
+        if list.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut out = vec![FileStatus::default(); list.len()];
+        let mut scan_inodes = Vec::with_capacity(list.len());
+
+        for (index, inode) in list.iter().enumerate() {
+            if inode.is_file_entry() {
+                scan_inodes.push((index, RocksUtils::i64_to_bytes(inode.id())));
+            } else {
+                let child_path = inp.child_path(inode.name());
+                out[index] = inode.to_file_status(&child_path);
+            }
+        }
+
+        if scan_inodes.is_empty() {
+            return Ok(out);
+        }
+
+        let keys = scan_inodes.iter().map(|x| &x.1);
+        let batch_res = self.store.batched_multi_get_inodes(keys, false)?;
+        for (i, item) in batch_res.into_iter().enumerate() {
+            let index = try_option!(scan_inodes.get(i)).0;
+            let file_entry = try_option!(list.get(index));
+
+            if let Some(bytes) = try_err!(item) {
+                let mut inode: InodeView = SerdeUtils::deserialize(bytes.as_ref())?;
+                if inode.id() != file_entry.id() {
+                    return err_box!(
+                        "batched_get_inodes: inode id mismatch for key index {} (expected id {}, stored inode id {})",
+                        i,
+                        file_entry.id(),
+                        inode.id()
+                    );
+                }
+
+                inode.change_name(file_entry.name().to_owned());
+                let child_path = inp.child_path(file_entry.name());
+                out[index] = inode.to_file_status(&child_path);
+            } else {
+                return err_box!(
+                    "batched_get_inodes: inode missing in store path {}, id {}",
+                    inp.child_path(file_entry.name()),
+                    file_entry.id()
+                );
+            }
+        }
+
+        Ok(out)
     }
 
     pub fn cf_hash(&self, cf: &str) -> u128 {
