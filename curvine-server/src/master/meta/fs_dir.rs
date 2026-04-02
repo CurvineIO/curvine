@@ -452,35 +452,23 @@ impl FsDir {
             None => return err_box!("File {} not exists", inp.path()),
         };
 
-        let mut res = Vec::with_capacity(1.max(inode.child_len()));
         match inode.as_ref() {
-            File(_) => res.push(inode.to_file_status(inp.path())),
+            File(_) => Ok(vec![inode.to_file_status(inp.path())]),
 
             Dir(d) => {
-                for item in d.children_iter() {
-                    let child_path = inp.child_path(item.name());
-                    match item {
-                        File(..) | Dir(..) => res.push(item.to_file_status(&child_path)),
-                        FileEntry(e) => {
-                            let inode_opt = self.store.get_inode(e.id, Some(&e.name))?;
-                            if let Some(inode_view) = inode_opt {
-                                res.push(inode_view.to_file_status(&child_path));
-                            }
-                        }
-                    }
-                }
+                let iter = d.children_iter().collect();
+                let res = self.store.batched_get_inodes(inp, iter)?;
+                Ok(res)
             }
 
             FileEntry(e) => {
                 let inode_opt = self.store.get_inode(e.id, Some(&e.name))?;
                 match inode_opt {
-                    Some(inode_view) => res.push(inode_view.to_file_status(inp.path())),
-                    None => return err_box!("File {} not exists", inp.path()),
+                    Some(inode_view) => Ok(vec![inode_view.to_file_status(inp.path())]),
+                    None => err_box!("File {} not exists", inp.path()),
                 }
             }
         }
-
-        Ok(res)
     }
 
     fn list_single_file(status: FileStatus, opts: &ListOptions) -> Vec<FileStatus> {
@@ -509,22 +497,7 @@ impl FsDir {
 
             Dir(d) => {
                 let children = d.list_options(opts);
-                let mut res = Vec::with_capacity(children.len());
-
-                for item in children {
-                    let child_path = inp.child_path(item.name());
-
-                    match item {
-                        File(..) | Dir(..) => res.push(item.to_file_status(&child_path)),
-
-                        FileEntry(e) => {
-                            let inode_opt = self.store.get_inode(e.id, Some(&e.name))?;
-                            if let Some(inode_view) = inode_opt {
-                                res.push(inode_view.to_file_status(&child_path));
-                            }
-                        }
-                    }
-                }
+                let res = self.store.batched_get_inodes(inp, children)?;
                 Ok(res)
             }
 

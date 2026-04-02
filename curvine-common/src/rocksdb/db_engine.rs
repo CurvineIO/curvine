@@ -113,6 +113,20 @@ impl DBEngine {
         Ok(cf_bytes)
     }
 
+    pub fn batched_multi_get_cf<'a, K, I>(
+        &'a self,
+        cf: &str,
+        keys: I,
+        sorted_input: bool,
+    ) -> CommonResult<Vec<Result<Option<DBPinnableSlice<'a>>, Error>>>
+    where
+        K: AsRef<[u8]> + 'a + ?Sized,
+        I: IntoIterator<Item = &'a K>,
+    {
+        let cf = self.cf(cf)?;
+        Ok(self.db.batched_multi_get_cf(cf, keys, sorted_input))
+    }
+
     pub fn get<K>(&self, key: K) -> CommonResult<Option<Vec<u8>>>
     where
         K: AsRef<[u8]>,
