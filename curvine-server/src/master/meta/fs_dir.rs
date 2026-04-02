@@ -461,13 +461,16 @@ impl FsDir {
             InodeView::File(_) => DirEntry::new_file(child.id()),
         };
 
-        let mut child_entry_ref = None;
-        if let Some(parent_entry) = inp.get_parent_entry() {
-            parent_entry.as_mut().add_child(child_name.clone(), child_entry);
-            if let Some(child) = parent_entry.as_ref().get_child(&child_name) {
-                child_entry_ref = Some(DirEntryRef::from_ref(child));
-            }
-        }
+        let parent_entry = match inp.get_parent_entry() {
+            Some(e) => e,
+            None => return err_box!("Cannot add child: parent entry not found for path {}", inp.path()),
+        };
+        parent_entry.as_mut().add_child(child_name.clone(), child_entry);
+
+        let child_entry_ref = match parent_entry.as_ref().get_child(&child_name) {
+            Some(c) => DirEntryRef::from_ref(c),
+            None => return err_box!("Child not found after adding to tree"),
+        };
 
         let child_ptr = InodePtr::from_owned(child);
         self.store.apply_add(parent.as_ref(), &child_name, child_ptr.as_ref())?;
@@ -1004,8 +1007,16 @@ impl FsDir {
                 let child_entry = DirEntry::new_file(new_inode_id);
                 self.add_child_to_tree(&link, &name, child_entry);
 
+                let child_entry_ref = match link
+                    .get_last_entry()
+                    .and_then(|e| e.as_ref().get_child(&name))
+                {
+                    Some(c) => DirEntryRef::from_ref(c),
+                    None => return err_box!("Child entry not found after adding to tree"),
+                };
+
                 let added = InodePtr::from_owned(new_inode_view);
-                link.append(added, None)?;
+                link.append(added, child_entry_ref)?;
                 link.get_last_inode().unwrap()
             }
         };
@@ -1078,7 +1089,15 @@ impl FsDir {
         let child_entry = DirEntry::new_file(original_inode_id);
         self.add_child_to_tree(&new_path, &name, child_entry);
 
-        new_path.append(added, None)?;
+        let child_entry_ref = match new_path
+            .get_last_entry()
+            .and_then(|e| e.as_ref().get_child(&name))
+        {
+            Some(c) => DirEntryRef::from_ref(c),
+            None => return err_box!("Child entry not found after adding to tree"),
+        };
+
+        new_path.append(added, child_entry_ref)?;
 
         self.store
             .apply_link(parent.as_ref(), &name, original_inode_id)?;

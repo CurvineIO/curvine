@@ -19,12 +19,22 @@ use orpc::{err_box, try_option, CommonResult};
 use std::collections::VecDeque;
 use std::fmt;
 
+pub struct ResolvedInode {
+    pub inode: InodePtr,
+    pub entry: DirEntryRef,
+}
+
+impl ResolvedInode {
+    pub fn new(inode: InodePtr, entry: DirEntryRef) -> Self {
+        Self { inode, entry }
+    }
+}
+
 pub struct InodePath {
     path: String,
     name: String,
     pub components: Vec<String>,
-    pub inodes: Vec<InodePtr>,
-    entries: Vec<DirEntryRef>,
+    resolved: Vec<ResolvedInode>,
 }
 
 impl InodePath {
@@ -36,13 +46,12 @@ impl InodePath {
             return err_box!("Path {} is invalid", path);
         }
 
-        let mut inodes: Vec<InodePtr> = Vec::with_capacity(components.len());
-        let mut entries: Vec<DirEntryRef> = Vec::with_capacity(components.len());
+        let mut resolved: Vec<ResolvedInode> = Vec::with_capacity(components.len());
         let mut cur_entry = root;
         let mut index = 0;
 
         while index < components.len() {
-            entries.push(DirEntryRef::from_ref(cur_entry));
+            let entry_ref = DirEntryRef::from_ref(cur_entry);
 
             let view = if cur_entry.is_dir() {
                 match cur_entry.as_dir() {
@@ -55,7 +64,8 @@ impl InodePath {
                     None => return err_box!("Failed to load file inode {} from store", cur_entry.id()),
                 }
             };
-            inodes.push(InodePtr::from_owned(view));
+            let inode_ptr = InodePtr::from_owned(view);
+            resolved.push(ResolvedInode::new(inode_ptr, entry_ref));
 
             if index == components.len() - 1 {
                 break;
@@ -78,8 +88,7 @@ impl InodePath {
             path: path.to_string(),
             name: name.to_string(),
             components,
-            inodes,
-            entries,
+            resolved,
         };
 
         Ok(inode_path)
@@ -90,7 +99,7 @@ impl InodePath {
     }
 
     pub fn is_full(&self) -> bool {
-        self.components.len() == self.inodes.len()
+        self.components.len() == self.resolved.len()
     }
 
     pub fn name(&self) -> &str {
@@ -136,8 +145,8 @@ impl InodePath {
         }
     }
 
-    pub fn get_inodes(&self) -> &Vec<InodePtr> {
-        &self.inodes
+    pub fn get_inodes(&self) -> Vec<InodePtr> {
+        self.resolved.iter().map(|r| r.inode.clone()).collect()
     }
 
     pub fn get_last_inode(&self) -> Option<InodePtr> {
@@ -145,7 +154,7 @@ impl InodePath {
     }
 
     pub fn clone_last_dir(&self) -> CommonResult<crate::master::meta::inode::InodeDir> {
-        if let Some(v) = self.get_inode((self.inodes.len() - 1) as i32) {
+        if let Some(v) = self.get_inode((self.resolved.len() - 1) as i32) {
             Ok(v.as_dir_ref()?.clone())
         } else {
             err_box!("status error: {}", self.path)
@@ -167,11 +176,7 @@ impl InodePath {
             pos as usize
         };
 
-        if pos < self.inodes.len() {
-            Some(self.inodes[pos].clone())
-        } else {
-            None
-        }
+        self.resolved.get(pos).map(|r| r.inode.clone())
     }
 
     pub fn len(&self) -> usize {
@@ -183,21 +188,18 @@ impl InodePath {
     }
 
     pub fn existing_len(&self) -> usize {
-        self.inodes.len()
+        self.resolved.len()
     }
 
-    pub fn append(&mut self, inode: InodePtr, entry: Option<DirEntryRef>) -> CommonResult<()> {
-        if self.components.len() == self.inodes.len() {
+    pub fn append(&mut self, inode: InodePtr, entry: DirEntryRef) -> CommonResult<()> {
+        if self.components.len() == self.resolved.len() {
             return err_box!(
                 "Path {} is complete, appending nodes is not allowed",
                 self.path
             );
         }
 
-        self.inodes.push(inode);
-        if let Some(e) = entry {
-            self.entries.push(e);
-        }
+        self.resolved.push(ResolvedInode::new(inode, entry));
         Ok(())
     }
 
@@ -206,27 +208,26 @@ impl InodePath {
     }
 
     pub fn delete_last(&mut self) {
-        self.inodes.pop();
-        self.entries.pop();
+        self.resolved.pop();
     }
 
     pub fn get_last_entry(&self) -> Option<&DirEntryRef> {
-        self.entries.last()
+        self.resolved.last().map(|r| &r.entry)
     }
 
     pub fn get_parent_entry(&self) -> Option<&DirEntryRef> {
-        let len = self.entries.len();
+        let len = self.resolved.len();
         if len >= 1 && self.existing_len() < self.len() {
-            Some(&self.entries[len - 1])
+            Some(&self.resolved[len - 1].entry)
         } else if len >= 2 {
-            Some(&self.entries[len - 2])
+            Some(&self.resolved[len - 2].entry)
         } else {
             None
         }
     }
 
     pub fn get_last_entry_mut(&mut self) -> Option<&mut DirEntryRef> {
-        self.entries.last_mut()
+        self.resolved.last_mut().map(|r| &mut r.entry)
     }
 }
 
@@ -236,7 +237,7 @@ impl fmt::Debug for InodePath {
             .field("path", &self.path)
             .field("name", &self.name)
             .field("components", &self.components)
-            .field("inodes", &self.inodes.len())
+            .field("resolved", &self.resolved.len())
             .finish()
     }
 }
