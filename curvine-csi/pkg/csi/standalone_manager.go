@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -626,14 +627,20 @@ func mountPropagationBidirectionalPtr() *corev1.MountPropagationMode {
 // buildFuseArgs builds the argument list for the curvine-fuse container.
 // It always includes the required base arguments and appends any additional
 // FUSE parameters supplied via opts.FuseParams.
+// Keys are sorted to ensure deterministic argument ordering across pod restarts.
 func buildFuseArgs(opts *StandaloneOptions) []string {
 	args := []string{
 		"--master-addrs", opts.MasterAddrs,
 		"--fs-path", opts.FSPath,
 		"--mnt-path", StandaloneMountPath,
 	}
-	for key, value := range opts.FuseParams {
-		args = append(args, "--"+key, value)
+	keys := make([]string, 0, len(opts.FuseParams))
+	for key := range opts.FuseParams {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		args = append(args, "--"+key, opts.FuseParams[key])
 	}
 	return args
 }
