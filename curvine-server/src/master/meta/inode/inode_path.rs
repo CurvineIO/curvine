@@ -44,16 +44,18 @@ impl InodePath {
         while index < components.len() {
             entries.push(DirEntryRef::from_ref(cur_entry));
 
-            let view = store.get_inode(cur_entry.id(), None)?;
-            match view {
-                Some(v) => {
-                    let ptr = InodePtr::from_owned(v);
-                    inodes.push(ptr);
+            let view = if cur_entry.is_dir() {
+                match cur_entry.as_dir() {
+                    Some(dir) => InodeView::new_dir(dir.clone()),
+                    None => return err_box!("Directory entry has no InodeDir for id {}", cur_entry.id()),
                 }
-                None => {
-                    return err_box!("Failed to load inode {} from store", cur_entry.id());
+            } else {
+                match store.get_inode(cur_entry.id(), None)? {
+                    Some(v) => v,
+                    None => return err_box!("Failed to load file inode {} from store", cur_entry.id()),
                 }
-            }
+            };
+            inodes.push(InodePtr::from_owned(view));
 
             if index == components.len() - 1 {
                 break;
