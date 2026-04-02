@@ -138,23 +138,7 @@ func (n *nodeService) NodeStageVolume(ctx context.Context, request *csi.NodeStag
 		requestID, mntPath, mountKey, clusterID, masterAddrs, fsPathToMount)
 
 	// Collect FUSE parameters from VolumeContext or PublishContext
-	fuseParams := make(map[string]string)
-	fuseParamKeys := []string{
-		"io-threads", "worker-threads", "mnt-per-task", "clone-fd",
-		"fuse-channel-size", "stream-channel-size", "auto-cache",
-		"direct-io", "kernel-cache", "cache-readdir", "entry-timeout",
-		"attr-timeout", "negative-timeout", "max-background",
-		"congestion-threshold", "node-cache-size", "node-cache-timeout",
-		"master-hostname", "master-rpc-port", "master-web-port", "mnt-number",
-	}
-	for _, key := range fuseParamKeys {
-		// Try VolumeContext first, then PublishContext
-		if value, ok := volumeContext[key]; ok && value != "" {
-			fuseParams[key] = value
-		} else if value, ok := publishContext[key]; ok && value != "" {
-			fuseParams[key] = value
-		}
-	}
+	fuseParams := collectFuseParams(volumeContext, publishContext)
 
 	// Check if shared mount point already exists
 	mountInfo, exists := n.mountState.GetMount(mntPath, clusterID)
@@ -657,44 +641,67 @@ func buildMountOptions(request *csi.NodePublishVolumeRequest, requestID string) 
 	return ""
 }
 
+// supportedFuseParams maps the CLI flag name (as used by curvine-fuse) to its value
+// type. This is the single source of truth for which StorageClass / PV parameters
+// are recognised and forwarded to the curvine-fuse process.
+var supportedFuseParams = map[string]string{
+	// Threading & mount-point settings
+	"mnt-number":           "usize",
+	"io-threads":           "usize",
+	"worker-threads":       "usize",
+	"mnt-per-task":         "usize",
+	"clone-fd":             "bool",
+	"fuse-channel-size":    "usize",
+	"stream-channel-size":  "usize",
+	// I/O behaviour
+	"direct-io":       "bool",
+	"write-back-cache": "bool",
+	"non-seekable":    "bool",
+	"cache-readdir":   "bool",
+	// Timeout settings
+	"entry-timeout":    "f64",
+	"attr-timeout":     "f64",
+	"negative-timeout": "f64",
+	"ac-attr-timeout":  "f64",
+	// Performance settings
+	"max-background":       "uint16",
+	"congestion-threshold": "uint16",
+	// Node cache
+	"node-cache-size":    "uint64",
+	"node-cache-timeout": "string",
+	// Metadata cache
+	"enable-meta-cache":   "bool",
+	"meta-cache-capacity": "uint64",
+	"meta-cache-ttl":      "string",
+	// Miscellaneous
+	"read-dir-fill-ino": "bool",
+	"remember":          "bool",
+	"check-permission":  "bool",
+	"list-limit":        "usize",
+	"web-port":          "uint16",
+}
+
+// collectFuseParams gathers FUSE parameters that are present in either
+// volumeContext or publishContext (volumeContext takes precedence) and
+// returns them as a map of CLI-flag-name → value.
+func collectFuseParams(volumeContext, publishContext map[string]string) map[string]string {
+	params := make(map[string]string)
+	for key := range supportedFuseParams {
+		if v, ok := volumeContext[key]; ok && v != "" {
+			params[key] = v
+		} else if v, ok := publishContext[key]; ok && v != "" {
+			params[key] = v
+		}
+	}
+	return params
+}
+
 // appendFuseParameters adds all supported fuse parameters from publishContext
 func appendFuseParameters(args []string, publishContext map[string]string, requestID string) []string {
-	// Define supported fuse parameters and their types
-	fuseParams := map[string]string{
-		"master-hostname":      "string",
-		"master-rpc-port":      "uint16",
-		"mnt-number":           "usize",
-		"master-web-port":      "uint16",
-		"io-threads":           "usize",
-		"worker-threads":       "usize",
-		"mnt-per-task":         "usize",
-		"clone-fd":             "bool",
-		"fuse-channel-size":    "usize",
-		"stream-channel-size":  "usize",
-		"auto-cache":           "bool",
-		"direct-io":            "bool",
-		"kernel-cache":         "bool",
-		"cache-readdir":        "bool",
-		"entry-timeout":        "f64",
-		"attr-timeout":         "f64",
-		"negative-timeout":     "f64",
-		"max-background":       "uint16",
-		"congestion-threshold": "uint16",
-		"node-cache-size":      "uint64",
-		"node-cache-timeout":   "string",
-	}
-
 	// Process parameters from publishContext
-	for key, value := range publishContext {
-		// Skip parameters that are handled elsewhere
-		if key == "curvinePath" {
-			continue
-		}
-
-		// Check if this is a supported fuse parameter
-		paramType, isSupported := fuseParams[key]
-		if !isSupported {
-			klog.Warningf("RequestID: %s, Unsupported fuse parameter: %s", requestID, key)
+	for key, paramType := range supportedFuseParams {
+		value, ok := publishContext[key]
+		if !ok || value == "" {
 			continue
 		}
 

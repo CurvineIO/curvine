@@ -92,6 +92,7 @@ type StandaloneOptions struct {
 	NodeName    string
 	Namespace   string
 	Image       string
+	FuseParams  map[string]string // Additional FUSE parameters to pass to curvine-fuse
 }
 
 // StandaloneStatus represents the status of a Standalone
@@ -456,11 +457,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 					Command: []string{
 						"/opt/curvine/curvine-fuse",
 					},
-					Args: []string{
-						"--master-addrs", opts.MasterAddrs,
-						"--fs-path", opts.FSPath,
-						"--mnt-path", StandaloneMountPath,
-					},
+					Args: buildFuseArgs(opts),
 					SecurityContext: &corev1.SecurityContext{
 						Privileged: &privileged,
 					},
@@ -624,6 +621,21 @@ func buildResourceRequirements() corev1.ResourceRequirements {
 func mountPropagationBidirectionalPtr() *corev1.MountPropagationMode {
 	mode := corev1.MountPropagationBidirectional
 	return &mode
+}
+
+// buildFuseArgs builds the argument list for the curvine-fuse container.
+// It always includes the required base arguments and appends any additional
+// FUSE parameters supplied via opts.FuseParams.
+func buildFuseArgs(opts *StandaloneOptions) []string {
+	args := []string{
+		"--master-addrs", opts.MasterAddrs,
+		"--fs-path", opts.FSPath,
+		"--mnt-path", StandaloneMountPath,
+	}
+	for key, value := range opts.FuseParams {
+		args = append(args, "--"+key, value)
+	}
+	return args
 }
 
 // DeleteStandalone deletes the Standalone for the given mount key on this node
