@@ -1000,7 +1000,6 @@ impl FsDir {
         parent.update_mtime(new_inode.mtime);
         let is_add = old_inode.is_none();
 
-        // Get inode id before moving new_inode into InodeView
         let new_inode_id = new_inode.id();
         let new_inode_view = InodeView::new_file(new_inode);
         let new_inode_ptr = match old_inode {

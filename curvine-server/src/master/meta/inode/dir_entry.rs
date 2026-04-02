@@ -260,7 +260,6 @@ impl DirEntry {
     fn sum_hash_recursive(&self, name: &str) -> u128 {
         let mut hash: u128 = 0;
 
-        // Hash this node's id + kind + edge name
         let id_bytes = self.id().to_be_bytes();
         hash += Utils::crc32(&id_bytes) as u128;
 
@@ -269,7 +268,6 @@ impl DirEntry {
 
         hash += Utils::crc32(name.as_bytes()) as u128;
 
-        // Hash children recursively
         if let Some(children) = self.children() {
             for (child_name, child) in children.iter() {
                 hash += child.sum_hash_recursive(child_name);

@@ -90,16 +90,14 @@ impl InodeView {
     /// This method is for compatibility during transition.
     pub fn name(&self) -> &str {
         match self {
-            InodeView::File(_f) => "", // Name is in parent's children key
-            InodeView::Dir(_d) => "",  // Name is in parent's children key
+            InodeView::File(_f) => "",
+            InodeView::Dir(_d) => "",
         }
     }
 
     /// Changes the name (for compatibility during transition)
     /// Note: This is a no-op in the new design as name is stored in parent's children key.
-    pub fn change_name(&mut self, _new_name: String) {
-        // No-op: name is stored in parent's children map key, not in InodeView
-    }
+    pub fn change_name(&mut self, _new_name: String) {}
 
     /// Parses a path into components
     pub fn path_components(path: &str) -> CommonResult<Vec<String>> {
@@ -363,7 +361,7 @@ impl InodeView {
             is_dir: self.is_dir(),
             mtime: self.mtime(),
             atime: self.atime(),
-            children_num: 0, // Children count from DirEntry, not InodeView
+            children_num: 0,
             is_complete: false,
             len: 0,
             replicas: 0,
@@ -392,7 +390,7 @@ impl InodeView {
 
             InodeView::Dir(d) => {
                 status.file_type = FileType::Dir;
-                status.len = 0; // Children count from DirEntry
+                status.len = 0;
                 status.x_attr = d.features.x_attr.clone();
                 status.storage_policy = d.storage_policy.clone();
             }
