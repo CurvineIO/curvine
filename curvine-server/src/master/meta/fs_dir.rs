@@ -472,11 +472,7 @@ impl FsDir {
         let child_ptr = InodePtr::from_owned(child);
         self.store.apply_add(parent.as_ref(), &child_name, child_ptr.as_ref())?;
 
-        if let Some(entry_ref) = child_entry_ref {
-            inp.append_with_entry(child_ptr, entry_ref)?;
-        } else {
-            inp.append(child_ptr)?;
-        }
+        inp.append(child_ptr, child_entry_ref)?;
 
         Ok(inp)
     }
@@ -1009,7 +1005,7 @@ impl FsDir {
                 self.add_child_to_tree(&link, &name, child_entry);
 
                 let added = InodePtr::from_owned(new_inode_view);
-                link.append(added)?;
+                link.append(added, None)?;
                 link.get_last_inode().unwrap()
             }
         };
@@ -1082,7 +1078,7 @@ impl FsDir {
         let child_entry = DirEntry::new_file(original_inode_id);
         self.add_child_to_tree(&new_path, &name, child_entry);
 
-        new_path.append(added)?;
+        new_path.append(added, None)?;
 
         self.store
             .apply_link(parent.as_ref(), &name, original_inode_id)?;

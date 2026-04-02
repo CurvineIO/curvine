@@ -186,7 +186,7 @@ impl InodePath {
         self.inodes.len()
     }
 
-    pub fn append(&mut self, inode: InodePtr) -> CommonResult<()> {
+    pub fn append(&mut self, inode: InodePtr, entry: Option<DirEntryRef>) -> CommonResult<()> {
         if self.components.len() == self.inodes.len() {
             return err_box!(
                 "Path {} is complete, appending nodes is not allowed",
@@ -195,19 +195,9 @@ impl InodePath {
         }
 
         self.inodes.push(inode);
-        Ok(())
-    }
-
-    pub fn append_with_entry(&mut self, inode: InodePtr, entry: DirEntryRef) -> CommonResult<()> {
-        if self.components.len() == self.inodes.len() {
-            return err_box!(
-                "Path {} is complete, appending nodes is not allowed",
-                self.path
-            );
+        if let Some(e) = entry {
+            self.entries.push(e);
         }
-
-        self.inodes.push(inode);
-        self.entries.push(entry);
         Ok(())
     }
 
