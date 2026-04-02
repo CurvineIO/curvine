@@ -248,12 +248,8 @@ impl ClusterConf {
     }
 
     // Get the rocksdb configuration used to obtain metadata
-    pub fn meta_rocks_conf(&self) -> DBConf {
-        DBConf::new(&self.master.meta_dir)
-            .set_compress_type(&self.master.meta_compression_type)
-            .set_disable_wal(self.master.meta_disable_wal)
-            .set_db_write_buffer_size(&self.master.meta_db_write_buffer_size)
-            .set_write_buffer_size(&self.master.meta_write_buffer_size)
+    pub fn db_conf(&self) -> DBConf {
+        self.master.rocksdb.clone().set_dir(&self.master.meta_dir)
     }
 
     pub fn io_retry_policy_builder(&self) -> TimeBondedRetryBuilder {

@@ -43,8 +43,8 @@ impl RocksStorageCore {
     pub const INDEX_KEY: &'static [u8] = &[0x02u8];
     pub const STATE_KEY: &'static [u8] = &[0x03u8];
 
-    pub fn new<T: AsRef<str>>(dir: T, format: bool) -> Self {
-        let conf = DBConf::new(dir)
+    pub fn new(conf: DBConf, format: bool) -> Self {
+        let conf = conf
             .add_cf(Self::CF_ENTRIES)
             .add_cf(Self::CF_META)
             .set_disable_wal(false);
