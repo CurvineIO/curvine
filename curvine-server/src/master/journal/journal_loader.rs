@@ -401,9 +401,13 @@ impl JournalLoader {
         let mut fs_dir = self.fs_dir.write();
         match snapshot.files_data {
             None => {
-                let dir = fs_dir.get_checkpoint_path(LocalTime::mills());
-                FileUtils::create_dir(&dir, true)?;
-                fs_dir.restore(dir)?;
+                if snapshot.snapshot_id == 0 {
+                    info!("apply initial snapshot with no data, skipping restore");
+                } else {
+                    let dir = fs_dir.get_checkpoint_path(LocalTime::mills());
+                    FileUtils::create_dir(&dir, true)?;
+                    fs_dir.restore(dir)?;
+                }
                 fs_dir.update_op_id(snapshot.fsm_state.op_id());
             }
 
@@ -463,28 +467,33 @@ impl JournalLoader {
 
     fn mkdir(&self, entry: MkdirEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
-        let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, InodeView::new_dir(name, entry.dir))?;
+        let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
+        if inp.is_full() {
+            return Ok(());
+        }
+        let opts = curvine_common::state::MkdirOpts::with_create(true);
+        let inp = fs_dir.create_parent_dir(inp, opts)?;
+        let _ = fs_dir.add_last_inode(inp, InodeView::new_dir(entry.dir))?;
         Ok(())
     }
 
     fn create_file(&self, entry: CreateFileEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
 
         if inp.is_full() {
             warn!("create_file: file already exists: {:?}", entry);
             return Ok(());
         }
-        let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, InodeView::new_file(name, entry.file))?;
+        let opts = curvine_common::state::CreateFileOpts::with_create(true);
+        let inp = fs_dir.create_parent_dir(inp, opts.dir_opts())?;
+        let _ = fs_dir.add_last_inode(inp, InodeView::new_file(entry.file))?;
         Ok(())
     }
 
     fn reopen_file(&self, entry: ReopenFileEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
 
         let mut inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -503,7 +512,7 @@ impl JournalLoader {
 
     fn overwrite_file(&self, entry: OverWriteFileEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
 
         let mut inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -522,7 +531,7 @@ impl JournalLoader {
 
     fn add_block(&self, entry: AddBlockEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
 
         let mut inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -542,7 +551,7 @@ impl JournalLoader {
 
     fn complete_file(&self, entry: CompleteFileEntry) -> CommonResult<()> {
         let fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
 
         let mut inode = match inp.get_last_inode() {
             Some(v) => v,
@@ -564,8 +573,8 @@ impl JournalLoader {
     pub fn rename(&self, entry: RenameEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let entry_src = entry.src;
-        let src_inp = InodePath::resolve(fs_dir.root_ptr(), &entry_src, &fs_dir.store)?;
-        let dst_inp = InodePath::resolve(fs_dir.root_ptr(), entry.dst, &fs_dir.store)?;
+        let src_inp = InodePath::resolve(fs_dir.root_entry(), &entry_src, &fs_dir.store)?;
+        let dst_inp = InodePath::resolve(fs_dir.root_entry(), &entry.dst, &fs_dir.store)?;
         if src_inp.get_last_inode().is_none() {
             warn!("Rename: source path not found: {}", entry_src);
             return Ok(());
@@ -583,7 +592,7 @@ impl JournalLoader {
     pub fn delete(&self, entry: DeleteEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let entry_path = entry.path;
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry_path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_entry(), &entry_path, &fs_dir.store)?;
         if inp.get_last_inode().is_none() {
             warn!("Delete: path not found: {}", entry_path);
             return Ok(());
@@ -594,12 +603,12 @@ impl JournalLoader {
 
     pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
-        let Some(inode) = inp.get_last_inode() else {
+        let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
+        if inp.get_last_inode().is_none() {
             warn!("Free: path not found: {:?}", entry);
             return Ok(());
-        };
-        fs_dir.unprotected_free(inode, entry.mtime, entry.recursive)?;
+        }
+        fs_dir.unprotected_free(&inp, entry.mtime, entry.recursive)?;
         Ok(())
     }
 
@@ -624,23 +633,20 @@ impl JournalLoader {
 
     pub fn set_attr(&self, entry: SetAttrEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &entry.path, &fs_dir.store)?;
-        let last_inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("SetAttr: path not found: {:?}", entry);
-                return Ok(());
-            }
-        };
+        let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
+        if inp.get_last_inode().is_none() {
+            warn!("SetAttr: path not found: {:?}", entry);
+            return Ok(());
+        }
 
-        fs_dir.unprotected_set_attr(last_inode, entry.opts)?;
+        fs_dir.unprotected_set_attr(&inp, entry.opts)?;
         Ok(())
     }
 
     pub fn symlink(&self, entry: SymlinkEntry) -> CommonResult<()> {
         let link_path = entry.link;
         let mut fs_dir = self.fs_dir.write();
-        let inp = InodePath::resolve(fs_dir.root_ptr(), &link_path, &fs_dir.store)?;
+        let inp = InodePath::resolve(fs_dir.root_entry(), &link_path, &fs_dir.store)?;
         match fs_dir.unprotected_symlink(inp, entry.new_inode, entry.force) {
             Ok(_) => Ok(()),
             Err(FsError::FileAlreadyExists(_)) => {
@@ -653,8 +659,8 @@ impl JournalLoader {
 
     pub fn link(&self, entry: LinkEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
-        let old_path = InodePath::resolve(fs_dir.root_ptr(), &entry.src_path, &fs_dir.store)?;
-        let new_path = InodePath::resolve(fs_dir.root_ptr(), &entry.dst_path, &fs_dir.store)?;
+        let old_path = InodePath::resolve(fs_dir.root_entry(), &entry.src_path, &fs_dir.store)?;
+        let new_path = InodePath::resolve(fs_dir.root_entry(), &entry.dst_path, &fs_dir.store)?;
 
         // Get the original inode ID
         let original_inode_id = match old_path.get_last_inode() {

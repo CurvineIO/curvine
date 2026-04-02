@@ -595,7 +595,7 @@ fn state(fs: &MasterFilesystem) -> CommonResult<()> {
 
     fs.print_tree();
     let fs_dir = fs.fs_dir.read();
-    let mem_hash = fs_dir.root_dir().sum_hash();
+    let mem_hash = fs_dir.root_entry().sum_hash();
 
     let state_tree = fs_dir.create_tree()?;
     state_tree.print_tree();

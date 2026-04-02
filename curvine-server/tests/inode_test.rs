@@ -14,28 +14,30 @@
 
 use curvine_common::rocksdb::DBConf;
 use curvine_common::state::BlockLocation;
-use curvine_server::master::meta::inode::{InodeDir, InodeFile, InodeView, ROOT_INODE_ID};
+use curvine_server::master::meta::inode::{DirEntry, InodeView, ROOT_INODE_ID};
 use curvine_server::master::meta::store::RocksInodeStore;
 use orpc::CommonResult;
 
 #[test]
-fn test_inode_dir_add_children_and_sort_alphabetically() {
-    let mut root = InodeDir::new(0, 0);
+fn test_dir_entry_add_children_and_sort_alphabetically() {
+    let mut root = DirEntry::new_dir_with_id(0, 0);
     println!("{:?}", root);
-    root.add_file_child("aa1", InodeFile::new(1, 0)).unwrap();
-    root.add_file_child("aa3", InodeFile::new(2, 0)).unwrap();
-    root.add_file_child("aa2", InodeFile::new(3, 0)).unwrap();
-    root.add_file_child("b", InodeFile::new(5, 0)).unwrap();
 
-    root.print_child();
+    // Add children using DirEntry
+    root.add_child("aa1".to_string(), DirEntry::new_file(1));
+    root.add_child("aa3".to_string(), DirEntry::new_file(2));
+    root.add_child("aa2".to_string(), DirEntry::new_file(3));
+    root.add_child("b".to_string(), DirEntry::new_file(5));
 
-    let children = root.children_vec();
+    root.print_tree();
 
+    // Verify children are sorted alphabetically (BTreeMap guarantees this)
+    let children: Vec<&str> = root.children().unwrap().iter().map(|(n, _)| n).collect();
     assert_eq!(children.len(), 4);
-    assert_eq!(children[0].name(), "aa1");
-    assert_eq!(children[1].name(), "aa2");
-    assert_eq!(children[2].name(), "aa3");
-    assert_eq!(children[3].name(), "b");
+    assert_eq!(children[0], "aa1");
+    assert_eq!(children[1], "aa2");
+    assert_eq!(children[2], "aa3");
+    assert_eq!(children[3], "b");
 }
 
 #[test]
