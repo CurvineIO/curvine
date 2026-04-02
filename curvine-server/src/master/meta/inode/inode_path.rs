@@ -228,15 +228,6 @@ impl InodePath {
     pub fn get_last_entry_mut(&mut self) -> Option<&mut DirEntryRef> {
         self.entries.last_mut()
     }
-
-    pub fn get_parent_entry_mut(&mut self) -> Option<&mut DirEntryRef> {
-        let len = self.entries.len();
-        if len >= 2 {
-            Some(&mut self.entries[len - 2])
-        } else {
-            None
-        }
-    }
 }
 
 impl fmt::Debug for InodePath {
