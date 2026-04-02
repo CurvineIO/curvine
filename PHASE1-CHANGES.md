@@ -199,3 +199,64 @@ impl InodeStore {
 | `ttl_*.rs` | ~30 行 | 低 |
 | `quota_manager.rs` | ~10 行 | 低 |
 | **总计** | **~420 行** | |
+
+---
+
+## 七、当前已确认问题：FUSE create/write 回归
+
+### 现象
+
+在 `meta-opt` worktree 的 `build/dist` 环境下，挂载点 `/curvine-fuse` 执行：
+
+```bash
+cp /tmp/1.txt .
+```
+
+会返回 `EIO`，但目录下会留下空文件 `1.txt`。
+
+### 已确认的证据
+
+1. `0278d542..83796359` 之间 **没有任何 `curvine-fuse/` 代码变更**，变更范围仅在 `curvine-server` metadata 相关文件：
+   - `curvine-server/src/master/meta/fs_dir.rs`
+   - `curvine-server/src/master/meta/inode/inode_path.rs`
+   - `curvine-server/src/master/meta/store/inode_store.rs`
+   - 以及相关设计/测试文件
+2. `build/dist/logs/master.out` 显示 create 链路成功：
+   - `FileStatus /1.txt -> false`
+   - `OpenFile [WCT]/1.txt -> true`
+   - `AddBlock -> true`
+   - `CompleteFile -> true`
+3. `build/dist/logs/fuse.out` 显示 FUSE 侧只有 writer 创建和关闭：
+   - `Create writer, path=/1.txt`
+   - `Close writer, path=/1.txt`
+   - **没有出现 write 日志**
+
+### 当前判断
+
+这说明：
+
+- 文件创建本身是成功的
+- master 侧也接受并完成了 create/open/complete 流程
+- 但 FUSE 内核后续没有继续走正常 write 路径，最终只留下空文件并向用户返回 `EIO`
+
+由于 `curvine-fuse/` 在问题区间内没有变更，当前应将根因优先收敛到本次 metadata 改造引入的 create 路径语义变化，而不是 FUSE 层实现本身。
+
+### 最可疑代码位置
+
+- `curvine-server/src/master/meta/fs_dir.rs` 中 `add_last_inode()`
+- `curvine-server/src/master/meta/inode/inode_path.rs` 中 `ResolvedInode` / `get_parent_entry()` / `append()`
+
+当前最可疑的点是：
+
+- create 场景下，`InodePath` 的“已解析元数据”和“树上 entry 引用”现在被强绑定为 `ResolvedInode`
+- `add_last_inode()` 先更新内存树，再抓取 `child_entry_ref`，再持久化 `apply_add()`，最后 `inp.append(...)`
+- 这条新链路比旧实现多依赖 `get_parent_entry()`、`child_entry_ref` 和返回 `InodePath` 状态的一致性
+
+### 暂不下结论的点
+
+当前还 **没有** 证实是某一行具体代码直接导致内核不再下发 write；但可以确认：
+
+- 这不是单纯的 FUSE write 实现问题
+- 这是 metadata 优化后 create 返回状态/路径语义不一致的高概率回归方向
+- 后续排查应继续围绕 `create_file()` / `add_last_inode()` / `file_status()` 返回一致性展开
+- 详细调查记录见：`docs/meta-opt-fuse-create-regression.md`
