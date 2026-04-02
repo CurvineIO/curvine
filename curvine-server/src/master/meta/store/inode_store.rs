@@ -571,4 +571,8 @@ impl InodeStore {
     pub fn store(&self) -> &RocksInodeStore {
         &self.store
     }
+
+    pub fn has_root_inode(&self) -> CommonResult<bool> {
+        Ok(self.store.get_inode(ROOT_INODE_ID)?.is_some())
+    }
 }
