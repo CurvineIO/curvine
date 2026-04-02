@@ -14,13 +14,13 @@
 
 use curvine_common::rocksdb::DBConf;
 use curvine_common::state::BlockLocation;
-use curvine_server::master::meta::inode::{DirEntry, InodeDir, InodeFile, InodeView, ROOT_INODE_ID};
+use curvine_server::master::meta::inode::{DirEntry, InodeView, ROOT_INODE_ID};
 use curvine_server::master::meta::store::RocksInodeStore;
 use orpc::CommonResult;
 
 #[test]
 fn test_dir_entry_add_children_and_sort_alphabetically() {
-    let mut root = DirEntry::new_dir(0);
+    let mut root = DirEntry::new_dir_with_id(0, 0);
     println!("{:?}", root);
 
     // Add children using DirEntry

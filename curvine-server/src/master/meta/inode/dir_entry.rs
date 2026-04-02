@@ -14,57 +14,68 @@
 
 //! Tree layer types for inode metadata.
 //!
-//! These types form the lightweight in-memory tree structure used for navigation.
-//! Rich metadata is stored separately in InodeView and loaded from InodeStore on demand.
-//!
 //! # Architecture
 //! ```text
-//! DirEntry (tree node, lightweight)
-//!   ├── entry: InodeEntry (File(id) | Dir(id))
+//! DirEntry (tree node)
+//!   ├── entry: InodeEntry
+//!   │   ├── File(i64) - file id only, metadata from InodeStore
+//!   │   └── Dir(Box<InodeDir>) - directory with embedded metadata
 //!   └── children: Option<Box<InodeChildren>>
 //!
 //! InodeChildren = BTreeMap<String, Box<DirEntry>>
 //! ```
 //!
 //! # Design Principles
+//! - Directories embed metadata (InodeDir) for zero-lookup access during path resolution
+//! - Files store only id, metadata loaded from InodeStore on demand
 //! - Name belongs to edge: stored only in children map key, not duplicated in DirEntry
-//! - Tree handles navigation: resolve/DFS/BFS use DirEntry tree
-//! - Store handles metadata: rich data (InodeView) loaded from InodeStore by id
 
+use crate::master::meta::inode::InodeDir;
 use orpc::common::Utils;
 use orpc::sys::RawPtr;
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Lightweight entry enum - only contains id and kind.
-/// Used inside DirEntry to identify the inode without carrying rich metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Entry enum for tree nodes.
+/// - File: id only, metadata loaded from InodeStore on demand
+/// - Dir: embedded InodeDir for zero-lookup access during path resolution
+#[derive(Debug, Clone)]
 pub enum InodeEntry {
-    /// File inode with its id
     File(i64),
-    /// Directory inode with its id
-    Dir(i64),
+    Dir(Box<InodeDir>),
 }
 
 impl InodeEntry {
-    /// Returns the inode id
     #[inline]
     pub fn id(&self) -> i64 {
         match self {
-            InodeEntry::File(id) | InodeEntry::Dir(id) => *id,
+            InodeEntry::File(id) => *id,
+            InodeEntry::Dir(dir) => dir.id,
         }
     }
 
-    /// Returns true if this is a directory entry
     #[inline]
     pub fn is_dir(&self) -> bool {
         matches!(self, InodeEntry::Dir(_))
     }
 
-    /// Returns true if this is a file entry
     #[inline]
     pub fn is_file(&self) -> bool {
         matches!(self, InodeEntry::File(_))
+    }
+
+    pub fn as_dir(&self) -> Option<&InodeDir> {
+        match self {
+            InodeEntry::Dir(dir) => Some(dir),
+            _ => None,
+        }
+    }
+
+    pub fn as_dir_mut(&mut self) -> Option<&mut InodeDir> {
+        match self {
+            InodeEntry::Dir(dir) => Some(dir),
+            _ => None,
+        }
     }
 }
 
@@ -131,24 +142,20 @@ impl InodeChildren {
     }
 }
 
-/// Tree node - lightweight structure for navigation.
-/// Similar to the dentry (directory entry) concept in file systems.
+/// Tree node for the in-memory directory tree.
 ///
 /// Each node contains:
-/// - `entry`: identifies the inode (id + kind) without rich metadata
-/// - `children`: only present for directories, contains child nodes
+/// - `entry`: InodeEntry - File(id) or Dir(Box<InodeDir>)
+/// - `children`: only present for directories
 ///
 /// Names are stored in the parent's children map key, not duplicated here.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
-    /// The inode entry (id + kind)
     pub entry: InodeEntry,
-    /// Children for directories, None for files
     pub children: Option<Box<InodeChildren>>,
 }
 
 impl DirEntry {
-    /// Creates a new file entry
     pub fn new_file(inode_id: i64) -> Self {
         DirEntry {
             entry: InodeEntry::File(inode_id),
@@ -156,61 +163,56 @@ impl DirEntry {
         }
     }
 
-    /// Creates a new directory entry with empty children
-    pub fn new_dir(inode_id: i64) -> Self {
+    pub fn new_dir(dir: InodeDir) -> Self {
         DirEntry {
-            entry: InodeEntry::Dir(inode_id),
+            entry: InodeEntry::Dir(Box::new(dir)),
             children: Some(Box::new(InodeChildren::new())),
         }
     }
 
-    /// Creates a directory entry without children (for lazy loading scenarios)
-    pub fn new_dir_empty(inode_id: i64) -> Self {
-        DirEntry {
-            entry: InodeEntry::Dir(inode_id),
-            children: None,
-        }
+    pub fn new_dir_with_id(inode_id: i64, time: i64) -> Self {
+        Self::new_dir(InodeDir::new(inode_id, time))
     }
 
-    /// Returns the inode id
     #[inline]
     pub fn id(&self) -> i64 {
         self.entry.id()
     }
 
-    /// Returns true if this is a directory
     #[inline]
     pub fn is_dir(&self) -> bool {
         self.entry.is_dir()
     }
 
-    /// Returns true if this is a file
     #[inline]
     pub fn is_file(&self) -> bool {
         self.entry.is_file()
     }
 
-    /// Gets the children (only for directories)
+    pub fn as_dir(&self) -> Option<&InodeDir> {
+        self.entry.as_dir()
+    }
+
+    pub fn as_dir_mut(&mut self) -> Option<&mut InodeDir> {
+        self.entry.as_dir_mut()
+    }
+
     pub fn children(&self) -> Option<&InodeChildren> {
         self.children.as_deref()
     }
 
-    /// Gets mutable children (only for directories)
     pub fn children_mut(&mut self) -> Option<&mut InodeChildren> {
         self.children.as_deref_mut()
     }
 
-    /// Gets a child by name (only for directories)
     pub fn get_child(&self, name: &str) -> Option<&DirEntry> {
         self.children.as_ref()?.get(name)
     }
 
-    /// Gets a mutable child by name (only for directories)
     pub fn get_child_mut(&mut self, name: &str) -> Option<&mut DirEntry> {
         self.children.as_deref_mut()?.get_mut(name)
     }
 
-    /// Adds a child (only for directories)
     pub fn add_child(&mut self, name: String, child: DirEntry) -> bool {
         if let Some(ref mut children) = self.children {
             children.insert(name, child)
@@ -285,7 +287,7 @@ impl fmt::Display for InodeEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             InodeEntry::File(id) => write!(f, "File({})", id),
-            InodeEntry::Dir(id) => write!(f, "Dir({})", id),
+            InodeEntry::Dir(dir) => write!(f, "Dir({})", dir.id),
         }
     }
 }
@@ -312,7 +314,7 @@ mod tests {
         assert!(file.is_file());
         assert!(!file.is_dir());
 
-        let dir = InodeEntry::Dir(456);
+        let dir = InodeEntry::Dir(Box::new(InodeDir::new(456, 0)));
         assert_eq!(dir.id(), 456);
         assert!(dir.is_dir());
         assert!(!dir.is_file());
@@ -329,13 +331,12 @@ mod tests {
 
     #[test]
     fn test_dir_entry_dir() {
-        let mut dir = DirEntry::new_dir(456);
+        let mut dir = DirEntry::new_dir(InodeDir::new(456, 0));
         assert_eq!(dir.id(), 456);
         assert!(dir.is_dir());
         assert!(dir.children.is_some());
         assert_eq!(dir.child_count(), 0);
 
-        // Add a child
         let child = DirEntry::new_file(789);
         assert!(dir.add_child("child.txt".to_string(), child));
         assert_eq!(dir.child_count(), 1);
@@ -357,14 +358,13 @@ mod tests {
         assert!(children.is_empty());
 
         children.insert("a".to_string(), DirEntry::new_file(1));
-        children.insert("b".to_string(), DirEntry::new_dir(2));
+        children.insert("b".to_string(), DirEntry::new_dir(InodeDir::new(2, 0)));
 
         assert_eq!(children.len(), 2);
         assert!(children.get("a").unwrap().is_file());
         assert!(children.get("b").unwrap().is_dir());
 
-        // Test iteration
         let names: Vec<&str> = children.iter().map(|(n, _)| n).collect();
-        assert_eq!(names, vec!["a", "b"]); // BTreeMap is sorted
+        assert_eq!(names, vec!["a", "b"]);
     }
 }

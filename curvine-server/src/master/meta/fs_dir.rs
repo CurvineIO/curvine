@@ -404,10 +404,9 @@ impl FsDir {
 
         self.remove_child_from_tree(src_inp, src_inp.name());
 
-        let child_entry = if new_inode.is_dir() {
-            DirEntry::new_dir(new_inode.id())
-        } else {
-            DirEntry::new_file(new_inode.id())
+        let child_entry = match &new_inode {
+            InodeView::Dir(d) => DirEntry::new_dir((**d).clone()),
+            InodeView::File(_) => DirEntry::new_file(new_inode.id()),
         };
         self.add_child_to_tree(dst_inp, &new_name, child_entry);
 
@@ -457,11 +456,9 @@ impl FsDir {
         }
 
         let child_name = inp.get_component(inp.existing_len())?.to_string();
-        let child_id = child.id();
-        let child_entry = if child.is_dir() {
-            DirEntry::new_dir(child_id)
-        } else {
-            DirEntry::new_file(child_id)
+        let child_entry = match &child {
+            InodeView::Dir(d) => DirEntry::new_dir((**d).clone()),
+            InodeView::File(_) => DirEntry::new_file(child.id()),
         };
 
         let mut child_entry_ref = None;
@@ -810,7 +807,7 @@ impl FsDir {
         let path = path.as_ref();
 
         // Set to other value first to facilitate memory recycling.
-        self.root_entry = DirEntry::new_dir(ROOT_INODE_ID);
+        self.root_entry = DirEntry::new_dir_with_id(ROOT_INODE_ID, 0);
 
         // Reset rocksdb
         self.store.restore(path)?;

@@ -356,26 +356,32 @@ impl InodeStore {
     }
 
     pub fn create_blank_tree(&self) -> CommonResult<(i64, DirEntry)> {
-        // Create and persist root inode
         let root_dir = InodeDir::new(ROOT_INODE_ID, 0);
-        let root_view = InodeView::new_dir(root_dir);
+        let root_view = InodeView::new_dir(root_dir.clone());
 
         let mut batch = self.store.new_batch();
         batch.write_inode(&root_view)?;
         batch.commit()?;
 
-        // Add to TTL bucket
         self.ttl_bucket_list.add(&root_view);
 
-        let root = DirEntry::new_dir(ROOT_INODE_ID);
+        let root = DirEntry::new_dir(root_dir);
         self.fs_stats.set_counts(0, 0);
         Ok((ROOT_INODE_ID, root))
     }
 
-    // Restore to a directory tree from rocksdb
-    // Returns a lightweight DirEntry tree (id-only) for navigation
     pub fn create_tree(&self) -> CommonResult<(i64, DirEntry)> {
-        let mut root = DirEntry::new_dir(ROOT_INODE_ID);
+        let root_inode = match self.store.get_inode(ROOT_INODE_ID)? {
+            Some(v) => v,
+            None => {
+                return err_box!("Root inode not found in store");
+            }
+        };
+
+        let root_dir = root_inode.as_dir_ref()?.clone();
+        let mut root = DirEntry::new_dir(root_dir);
+
+        self.ttl_bucket_list.add(&root_inode);
 
         let mut stack = LinkedList::new();
         stack.push_back(root.as_ptr());
@@ -410,12 +416,15 @@ impl InodeStore {
                     self.ttl_bucket_list.add(&child_inode);
 
                     // Create DirEntry for this child
-                    let child_entry = if child_inode.is_dir() {
-                        dir_count += 1;
-                        DirEntry::new_dir(child_id)
-                    } else {
-                        file_count += 1;
-                        DirEntry::new_file(child_id)
+                    let child_entry = match &child_inode {
+                        InodeView::Dir(d) => {
+                            dir_count += 1;
+                            DirEntry::new_dir((**d).clone())
+                        }
+                        InodeView::File(_) => {
+                            file_count += 1;
+                            DirEntry::new_file(child_id)
+                        }
                     };
 
                     // Add child to parent's children
