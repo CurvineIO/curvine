@@ -604,11 +604,11 @@ impl JournalLoader {
     pub fn free(&self, entry: FreeEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
-        let Some(inode) = inp.get_last_inode() else {
+        if inp.get_last_inode().is_none() {
             warn!("Free: path not found: {:?}", entry);
             return Ok(());
-        };
-        fs_dir.unprotected_free(inode, entry.mtime, entry.recursive)?;
+        }
+        fs_dir.unprotected_free(&inp, entry.mtime, entry.recursive)?;
         Ok(())
     }
 
@@ -634,15 +634,12 @@ impl JournalLoader {
     pub fn set_attr(&self, entry: SetAttrEntry) -> CommonResult<()> {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_entry(), &entry.path, &fs_dir.store)?;
-        let last_inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => {
-                warn!("SetAttr: path not found: {:?}", entry);
-                return Ok(());
-            }
-        };
+        if inp.get_last_inode().is_none() {
+            warn!("SetAttr: path not found: {:?}", entry);
+            return Ok(());
+        }
 
-        fs_dir.unprotected_set_attr(last_inode, entry.opts)?;
+        fs_dir.unprotected_set_attr(&inp, entry.opts)?;
         Ok(())
     }
 

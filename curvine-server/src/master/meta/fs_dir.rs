@@ -239,12 +239,11 @@ impl FsDir {
             return err_box!("The root is not allowed to be free");
         }
 
-        let inode = match inp.get_last_inode() {
-            Some(v) => v,
-            None => return err_ext!(FsError::file_not_found(inp.path())),
-        };
+        if inp.get_last_inode().is_none() {
+            return err_ext!(FsError::file_not_found(inp.path()));
+        }
 
-        let free_res = self.unprotected_free(inode, op_ms, recursive)?;
+        let free_res = self.unprotected_free(inp, op_ms, recursive)?;
         self.journal_writer
             .log_free(self, inp.path(), op_ms, recursive)?;
 
@@ -253,25 +252,47 @@ impl FsDir {
 
     pub(crate) fn unprotected_free(
         &mut self,
-        inode: InodePtr,
+        inp: &InodePath,
         mtime: i64,
-        _recursive: bool,
+        recursive: bool,
     ) -> FsResult<FreeResult> {
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_box!("Inode not found for free"),
+        };
+
         let mut free_res = FreeResult::default();
         let mut change_inodes = vec![];
 
-        let mut stack = LinkedList::new();
+        let mut stack: LinkedList<InodePtr> = LinkedList::new();
         stack.push_back(inode);
-        while let Some(inode) = stack.pop_front() {
-            match inode.as_mut() {
-                Dir(_d) => {}
+
+        while let Some(cur_inode) = stack.pop_front() {
+            match cur_inode.as_mut() {
+                Dir(_) => {
+                    if recursive {
+                        if let Some(entry) = self.find_entry_by_id(cur_inode.id()) {
+                            if let Some(children) = entry.children() {
+                                let child_ids: Vec<(String, i64)> = children
+                                    .iter()
+                                    .map(|(name, entry)| (name.to_string(), entry.id()))
+                                    .collect();
+                                for (child_name, child_id) in child_ids {
+                                    if let Some(child_inode) = self.store.get_inode(child_id, Some(&child_name))? {
+                                        stack.push_back(InodePtr::from_owned(child_inode));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 File(f) => {
                     let locs = f.get_locs(&self.store)?;
                     let len = f.len;
                     if f.free(mtime) {
                         free_res.add(len, locs);
-                        change_inodes.push(inode.as_ref().clone());
+                        change_inodes.push(cur_inode.as_ref().clone());
                     }
                 }
             }
@@ -279,6 +300,27 @@ impl FsDir {
 
         self.store.apply_free(change_inodes)?;
         Ok(free_res)
+    }
+
+    fn find_entry_by_id(&self, id: i64) -> Option<&DirEntry> {
+        if self.root_entry.id() == id {
+            return Some(&self.root_entry);
+        }
+        self.find_entry_recursive(&self.root_entry, id)
+    }
+
+    fn find_entry_recursive<'a>(&'a self, entry: &'a DirEntry, id: i64) -> Option<&'a DirEntry> {
+        if let Some(children) = entry.children() {
+            for (_, child) in children.iter() {
+                if child.id() == id {
+                    return Some(child);
+                }
+                if let Some(found) = self.find_entry_recursive(child, id) {
+                    return Some(found);
+                }
+            }
+        }
+        None
     }
 
     pub fn rename(
@@ -866,18 +908,23 @@ impl FsDir {
             None => return err_ext!(FsError::file_not_found(inp.path())),
         };
 
-        self.unprotected_set_attr(inode.clone(), opts.clone())?;
+        self.unprotected_set_attr(&inp, opts.clone())?;
         self.journal_writer.log_set_attr(self, &inp, opts)?;
         Ok(inode.to_file_status(inp.path(), inp.name()))
     }
 
-    pub fn unprotected_set_attr(&mut self, inode: InodePtr, opts: SetAttrOpts) -> FsResult<()> {
-        // All InodeView are now rich data, no need to check for FileEntry
+    pub fn unprotected_set_attr(&mut self, inp: &InodePath, opts: SetAttrOpts) -> FsResult<()> {
+        let inode = match inp.get_last_inode() {
+            Some(v) => v,
+            None => return err_box!("Inode not found for set_attr"),
+        };
 
         let mut change_inodes = vec![];
-        let mut stack = LinkedList::new();
+        let mut stack: LinkedList<InodePtr> = LinkedList::new();
         stack.push_back(inode.clone());
+
         let child_opts = opts.child_opts();
+
         while let Some(cur_inode) = stack.pop_front() {
             let set_opts = if cur_inode.id() != inode.id() {
                 child_opts.clone()
@@ -887,13 +934,22 @@ impl FsDir {
             cur_inode.as_mut().set_attr(set_opts);
             change_inodes.push(cur_inode.as_ref().clone());
 
-            match cur_inode.as_mut() {
-                Dir(_dir) if opts.recursive => {
-                    // Note: children iteration requires DirEntry tree access
-                    // This is a placeholder - will need DirEntry integration
-                    // TODO: Iterate over DirEntry children for recursive set_attr
+            if opts.recursive {
+                if let Some(entry) = self.find_entry_by_id(cur_inode.id()) {
+                    if entry.is_dir() {
+                        if let Some(children) = entry.children() {
+                            let child_ids: Vec<(String, i64)> = children
+                                .iter()
+                                .map(|(name, entry)| (name.to_string(), entry.id()))
+                                .collect();
+                            for (child_name, child_id) in child_ids {
+                                if let Some(child_inode) = self.store.get_inode(child_id, Some(&child_name))? {
+                                    stack.push_back(InodePtr::from_owned(child_inode));
+                                }
+                            }
+                        }
+                    }
                 }
-                _ => (),
             }
         }
 
