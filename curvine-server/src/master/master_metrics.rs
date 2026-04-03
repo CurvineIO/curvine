@@ -218,7 +218,7 @@ impl MasterMetrics {
             let counter = match self.get_or_register(&value) {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!("Not found metrics {}: {}", value.name, e);
+                    warn!("Metric not found: {}: {}", value.name, e);
                     continue;
                 }
             };
