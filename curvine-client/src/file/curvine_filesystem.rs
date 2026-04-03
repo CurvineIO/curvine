@@ -449,7 +449,7 @@ impl CurvineFileSystem {
             .add_blocks_batch(add_block_requests)
             .await?;
 
-        // assert if allocated_blocks is not smae with add_block_requests
+        // The allocated blocks should correspond to the add_block_requests sent above.
         let mut batch_writer =
             BatchBlockWriter::new(self.fs_context.clone(), allocated_blocks).await?;
 
