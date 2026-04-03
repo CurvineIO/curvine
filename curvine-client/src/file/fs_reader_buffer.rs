@@ -348,9 +348,9 @@ impl FsReaderBuffer {
                     }
                 }
 
-                premit_res = chunk_sender.reserve() => {
+                permit_res = chunk_sender.reserve() => {
                     if !paused {
-                        match premit_res {
+                        match permit_res {
                             Ok(permit) => SelectTask::Permit(permit),
                             Err(_e) => return Ok(()), // data channel closed: normal shutdown
                         }

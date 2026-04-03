@@ -116,7 +116,7 @@ impl JobStore {
         let mut job = if let Some(job) = self.jobs.get_mut(job_id) {
             job
         } else {
-            return err_box!("Not fond job {}", job_id);
+            return err_box!("Not found job {}", job_id);
         };
 
         let old_state: JobTaskState = job.state.state();

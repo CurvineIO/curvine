@@ -124,7 +124,7 @@ impl JobContext {
         let detail = if let Some(v) = self.tasks.get_mut(task_id) {
             v
         } else {
-            return err_box!("Not fond task {}", task_id);
+            return err_box!("Not found task {}", task_id);
         };
         // set task progress
         detail.progress = progress;

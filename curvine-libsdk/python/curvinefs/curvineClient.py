@@ -22,7 +22,7 @@ class CurvineClient:
         status = GetFileStatusResponse()
         status.ParseFromString(status_bytes)  # GetFileStatusResponse
         file_status = status.status # FileStatusProto
-        file_staus_dict = {
+        file_status_dict = {
             "id": file_status.id,
             "path": file_status.path,
             "name": file_status.name,
@@ -36,7 +36,7 @@ class CurvineClient:
             "block_size": file_status.block_size,
             "file_type": file_status.file_type,
         }
-        return file_staus_dict
+        return file_status_dict
 
     def get_master_info(self):
         try:
