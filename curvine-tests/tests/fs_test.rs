@@ -73,8 +73,8 @@ fn run_filesystem_end_to_end_operations_on_cluster(
         test_overwrite(&fs).await?;
         println!("test_overwrite done");
 
-        test_batch_writting(&fs).await?;
-        println!("test_batch_writting done");
+        test_batch_writing(&fs).await?;
+        println!("test_batch_writing done");
 
         file_status(&fs).await?;
         println!("file_status done");
@@ -283,7 +283,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     Ok(())
 }
 
-async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
+async fn test_batch_writing(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Helper function to read file content
     async fn read_file_content(fs: &CurvineFileSystem, path: &Path) -> CommonResult<String> {
         let status = fs.get_status(path).await?;

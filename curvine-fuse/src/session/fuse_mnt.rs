@@ -58,7 +58,7 @@ impl FuseMnt {
         }
     }
 
-    fn crate_task_fd(&self, clone: bool) -> IOResult<BorrowedFd> {
+    fn create_task_fd(&self, clone: bool) -> IOResult<BorrowedFd> {
         let clone_fd = if clone && *UNIX_KERNEL_VERSION >= FUSE_CLONE_FD_MIN_VERSION {
             match FuseUtils::fuse_clone_fd(self.fd) {
                 Ok(clone_fd) => {
@@ -91,7 +91,7 @@ impl FuseMnt {
 
     // Get 2 fds for asynchronous reading and writing data.
     pub fn create_async_task_fd(&self, clone: bool) -> IOResult<Arc<AsyncFd>> {
-        let fd = self.crate_task_fd(clone)?;
+        let fd = self.create_task_fd(clone)?;
         let fd = Arc::new(AsyncFd::new(fd)?);
         Ok(fd)
     }
