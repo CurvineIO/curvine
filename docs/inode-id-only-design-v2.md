@@ -1,50 +1,79 @@
-# inode_view id-only 设计稿 (更新版)
+# inode_view id-only 设计稿 (目录专用 EntryKey + arena 版)
 
 ## 1. 文档信息
 
-- **主题**：inode 内存树改造为 id-only 模型
+- **主题**：inode 内存树改造为 id-only + stable handle 模型
 - **范围**：`curvine-server` master metadata 路径
-- **当前状态**：meta-opt worktree 处于 main 分支状态，已引入 NamedEntry/NamedFile/NamedDir 结构
-- **命名决策**：`DirEntry` 作为树节点 struct，`InodeView` 保持为 rich data enum (最小改动)
+- **目标**：保留 id-only 的低冗余设计，同时移除 `DirEntryRef` 裸指针带来的悬垂引用风险
+- **核心决策**：只有目录节点进入 tree，并使用 `EntryKey + arena`；文件继续通过 `parent + name` 点查
 
 ---
 
-## 2. 核心类型定义
+## 2. 问题背景
 
-### 2.1 树层 (轻量)
+当前 meta-opt 的主要优化方向是：
+
+- 内存树只保留拓扑导航能力
+- rich metadata 统一收敛到 `InodeView`
+- 文件节点只保留 `inode id`
+
+这条方向本身是对的，但当前实现把树上的定位结果缓存成了 `DirEntryRef`。这会带来两个问题：
+
+1. **内存安全问题**
+   - `DirEntryRef = RawPtr<DirEntry>`
+   - 一旦树结构发生插入、删除、移动，旧地址可能失效
+   - 后续 `as_ref()` / `as_mut()` 可能直接触发段错误
+
+2. **create 路径语义脆弱**
+   - `InodePath` 同时持有 `inode` 和 `entry`
+   - 只要 tree 和 store 更新时序不一致，就会让 create 返回路径不自洽
+
+因此，这版设计稿改成：
+
+- **缓存稳定句柄，不缓存节点地址**
+- **树节点统一存放在 arena**
+- **children 里只存 name -> EntryKey**
+
+---
+
+## 3. 核心类型定义
+
+### 3.1 树层 (directory-only stable handle)
 
 ```rust
-/// 树节点 - 轻量，只负责拓扑导航
-/// 类似文件系统的 dentry (directory entry) 概念
+pub struct EntryKey {
+    slot: u32,
+    generation: u32,
+}
+
 pub struct DirEntry {
-    entry: InodeEntry,
-    children: Option<Box<InodeChildren>>,
+    dir: Box<InodeDir>,
+    children: Box<DirChildren>,
 }
 
-/// 轻量 entry enum - 只包含 id 和 kind
-pub enum InodeEntry {
-    File(i64),
-    Dir(i64),
+pub struct DirChildren {
+    inner: BTreeMap<String, EntryKey>,
 }
 
-/// children 容器 - key 是名字，value 是树节点
-pub struct InodeChildren {
-    inner: BTreeMap<String, Box<DirEntry>>,
+pub struct EntrySlot {
+    generation: u32,
+    value: Option<DirEntry>,
+}
+
+pub struct EntryArena {
+    slots: Vec<EntrySlot>,
+    free_list: Vec<u32>,
 }
 ```
 
-### 2.2 元数据层 (rich) - 保持现有含义
+### 3.2 元数据层 (rich metadata)
 
 ```rust
-/// rich metadata enum - 保持现有含义，只有 Dir 和 File
-/// 现有代码中 InodeView 的用法不改，最小改动
 pub enum InodeView {
     Dir(Box<InodeDir>),
     File(Box<InodeFile>),
-    // FileEntry variant 删除！
 }
 
-/// InodeDir - 纯 metadata，删除 children 字段
 pub struct InodeDir {
     id: i64,
     parent_id: i64,
@@ -53,345 +82,480 @@ pub struct InodeDir {
     nlink: u32,
     storage_policy: StoragePolicy,
     features: DirFeature,
-    // children 字段删除！
 }
 
-/// InodeFile - 纯 metadata，保持不变
-pub struct InodeFile { ... }
+pub struct InodeFile {
+    // unchanged
+}
 ```
 
-### 2.3 指针类型
+### 3.3 路径解析结果
 
 ```rust
-/// InodePtr - 指向 rich metadata (InodeView)，保持现有含义不变
 pub type InodePtr = RawPtr<InodeView>;
 
-/// 树节点引用 (用于导航)
-pub type DirEntryRef = RawPtr<DirEntry>;
+pub struct ResolvedDir {
+    dir: InodePtr,
+    entry_key: EntryKey,
+}
+
+pub struct InodePath {
+    path: String,
+    name: String,
+    components: Vec<String>,
+    resolved_dirs: Vec<ResolvedDir>,
+    leaf_inode: Option<InodePtr>,
+}
 ```
 
-### 2.4 关键变化总结
+### 3.4 关键变化总结
 
-| 项目 | 当前 | 新设计 |
-|-----|------|-------|
-| DirEntry | 不存在 | 树节点 struct (轻量，entry + children) |
-| InodeEntry | 不存在 | `File(id) \| Dir(id)` enum |
-| InodeView | rich data enum + FileEntry | rich data enum，删除 FileEntry variant |
-| InodeDir.children | 存在 | 删除 |
-| InodePtr | 指向 InodeView | 指向 InodeView (不变) |
-| NamedFile/NamedDir/NamedEntry | 存在 | 删除 (名字只在 children key) |
+| 项目 | 旧实现 | 新设计 |
+|-----|--------|--------|
+| 树节点定位 | `DirEntryRef` 裸指针 | 目录节点使用 `EntryKey` |
+| children value | `Box<DirEntry>` | `EntryKey` (仅目录 child) |
+| 节点存储 | 散落在 `Box` | 目录节点统一存放在 `EntryArena` |
+| 失效检测 | 无 | `generation` 校验 |
+| `InodePath` tree 定位 | 缓存地址 | 仅缓存目录 key |
+| 文件节点 | 在 tree 中占一个 entry | 不进入 tree，按需点查 |
+| 目录节点 | `Dir(Box<InodeDir>)` | `DirEntry { dir, children }` |
 
 ---
 
-## 3. 元数据架构逻辑
+## 4. 元数据架构逻辑
 
-### 3.1 分层架构
+### 4.1 分层架构
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      业务层 (FsDir)                          │
-│  file_status / list_status / set_attr / create / delete     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    路径解析层 (InodePath)                     │
-│  resolve(path) → Vec<InodePtr> (指向 InodeView rich data)    │
-└─────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-┌──────────────────────────┐    ┌──────────────────────────────┐
-│     树层 (DirEntry)       │    │    存储层 (InodeStore)        │
-│  - 拓扑导航               │    │  - RocksDB 持久化            │
-│  - children 关系          │    │  - get_inode(id) → InodeView │
-│  - entry: File(id)/Dir(id)│    │  - edges: parent→child 映射  │
-│  - 轻量，内存常驻         │    │                              │
-└──────────────────────────┘    └──────────────────────────────┘
-                                              │
-                                              ▼
-                              ┌──────────────────────────────┐
-                              │      RocksDB CFs             │
-                              │  - inode_cf: id → InodeView  │
-                              │  - edge_cf: (parent,name)→id │
-                              │  - block_cf: block locations │
-                              └──────────────────────────────┘
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                        业务层 (FsDir)                        │
+│  file_status / list_status / set_attr / create / delete      │
+└──────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│                     路径解析层 (InodePath)                    │
+│  resolve(path) -> resolved_dirs + optional leaf_inode         │
+└──────────────────────────────────────────────────────────────┘
+               │                                  │
+               ▼                                  ▼
+┌───────────────────────────┐      ┌────────────────────────────┐
+│       树层 (EntryArena)    │      │      存储层 (InodeStore)   │
+│  - directory topology     │      │  - RocksDB metadata        │
+│  - EntryKey lookup        │      │  - get_inode(id)           │
+│  - dir_name -> EntryKey   │      │  - edge(parent,name)->id   │
+└───────────────────────────┘      └────────────────────────────┘
 ```
 
-### 3.2 内存树 vs RocksDB 存储
+### 4.2 为什么必须是 EntryKey
 
-**内存树 (DirEntry)**：
-- 只存储拓扑关系：parent → children
-- 每个节点只有 `{ entry, children }`
-- entry = `File(id)` 或 `Dir(id)`，无 rich metadata
-- 启动时从 RocksDB edges 构建完整拓扑
+这里的关键点不是“所有 inode 都要 EntryKey”，而是“所有驻留在 tree 里的目录节点，都要有稳定 handle”。
+
+不能直接用 `inode id` 代替目录 tree handle，原因是：
+
+- `inode id` 表示 metadata object
+- `EntryKey` 表示目录 tree node
+- tree 结构修改时，需要的是稳定定位目录节点，而不是 metadata id
+
+也就是说：
+
+- 目录使用 `EntryKey`
+- 文件继续使用 `inode id`
+- file lookup 通过 `(parent_dir_inode_id, name)` 进入 store
+
+### 4.3 内存树 vs RocksDB 存储
+
+**内存树 (`EntryArena`)**：
+
+- 只保留目录拓扑
+- 目录 child 关系保存为 `dir_name -> EntryKey`
+- 文件节点完全不进入 tree
+- dir 节点保存 `InodeDir`，避免频繁读 store
 
 **RocksDB 存储**：
-- **inode_cf**：`id → serialized(InodeView)` (rich metadata)
-- **edge_cf**：`(parent_id, name) → child_id` (拓扑关系)
-- **block_cf**：block locations
 
-### 3.3 数据流向
+- `inode_cf`: `id -> InodeView`
+- `edge_cf`: `(parent_id, name) -> child_id`
+- `block_cf`: block locations
 
-```
-启动恢复:
-  RocksDB edge_cf → 遍历所有 (parent, name) → child_id
-                  → 构建完整 DirEntry 树 (轻量)
+### 4.4 复杂度判断
 
-路径解析:
-  DirEntry.children["name"] → 找到 child DirEntry
-  DirEntry.entry → 取得 id (和 kind)
-  InodeStore.get_inode(id) → RocksDB inode_cf → InodeView
-  InodeView → 存入 InodePath.inodes
+- `EntryKey -> DirEntry`: 近似 `O(1)`
+- `children.get(name)`: 只用于目录导航
+- file lookup: `edge_cf(parent_id, name) -> child_id`
+- 路径解析成本主要取决于：
+  - 路径深度
+  - 单目录下目录 child 的索引成本
+  - 叶子文件的点查成本
 
-业务操作:
-  InodePath.get_last_inode() → InodePtr (指向 InodeView)
-  InodePtr.as_file_ref() → &InodeFile (rich metadata)
-  修改后 → InodeStore.apply_xxx() → 写入 RocksDB
-```
+因此，引入 `EntryKey` 的主要目的不是加速，而是：
 
-### 3.4 关键操作流程
+- 保住接近原有的寻址性能
+- 去掉裸指针的不安全性
 
-#### create_tree() - 启动恢复树拓扑
+---
 
-```
-1. 加载 root: store.get_inode(ROOT_ID) → InodeView::Dir
-2. 转换为树节点: DirEntry { entry: Dir(ROOT_ID), children: Some(...) }
+## 5. 树层接口设计
 
-3. BFS/DFS 遍历 edge_cf:
-   for each (parent_id, child_name) → child_id:
-     - 从 store 加载 child metadata 判断 kind
-     - 构造 DirEntry: 
-       - 文件: DirEntry { entry: File(id), children: None }
-       - 目录: DirEntry { entry: Dir(id), children: Some(...) }
-     - 添加到 parent 的 children map
-
-4. 结果: 完整的 DirEntry 树，每个节点只有 id + children
-```
-
-#### resolve(path) - 路径解析
-
-```
-输入: path = "/a/b/c"
-持有: root DirEntry (树根)
-
-1. 分解路径: components = ["", "a", "b", "c"]
-
-2. 从 root 开始逐层导航:
-   cur = root
-   for name in components (skip root):
-     cur = cur.children.get(name)  // 从 DirEntry 树导航
-     if cur == None: break (路径不存在)
-
-     // 每一步都加载 rich data 存入 InodePath
-     view = store.get_inode(cur.entry.id())
-     inodes.push(InodePtr::from(view))
-
-3. 返回 InodePath { path, components, inodes: Vec<InodePtr> }
-   - inodes 全部是 rich data (InodeView)
-   - 可直接用于业务操作
-```
-
-#### file_status(path) - 获取文件状态
-
-```
-1. resolve(path) → InodePath
-2. inode = path.get_last_inode()  // InodePtr → InodeView
-3. match inode:
-     InodeView::File(f) → 构建 FileStatus from InodeFile
-     InodeView::Dir(d)  → 构建 FileStatus from InodeDir
-4. 返回 FileStatus
-```
-
-#### create_file(path) - 创建文件
-
-```
-1. resolve(parent_path) → InodePath (到父目录)
-2. parent = path.get_last_inode().as_dir_mut()  // &mut InodeDir
-
-3. 创建新 InodeFile (rich metadata)
-   分配新 id
-
-4. 更新内存树 (DirEntry):
-   parent_entry.children.add_child(
-     DirEntry { entry: File(new_id), children: None }
-   )
-
-5. 持久化到 RocksDB:
-   batch.write_inode(new_file)       // inode_cf (写 InodeView)
-   batch.add_child(parent.id, name, new_id)  // edge_cf
-   batch.write_inode(parent)         // 更新 parent mtime
-   batch.commit()
-```
-
-#### create 路径的已知风险（meta-opt 当前发现）
-
-当前 `meta-opt` 分支已经发现一个与 create 路径强相关的回归：
-
-- 在 `/curvine-fuse` 执行 `cp /tmp/1.txt .` 会返回 `EIO`
-- 但文件节点会被成功创建出来，目录下留下空的 `/1.txt`
-- `master.out` 显示 `OpenFile [WCT]/1.txt`、`AddBlock`、`CompleteFile` 都成功
-- `fuse.out` 只有 writer 的创建/关闭日志，没有出现 write 日志
-
-这说明 create 后返回给 FUSE 的文件状态/路径语义存在一致性风险，导致后续没有进入预期的 write 路径。
-
-**重要约束**：
-
-- 问题区间内没有 `curvine-fuse/` 代码变更
-- 回归范围应优先锁定在 metadata 改造后的 create 链路
-- 尤其是 `FsDir::add_last_inode()` 与 `InodePath::ResolvedInode` 对 tree entry / inode metadata 的同步语义
-
-后续如果继续演进此设计，必须重点验证：
-
-1. create 返回的 `InodePath` 是否完整且自洽
-2. `get_parent_entry()` 在部分解析路径下是否始终指向真实父目录
-3. 新 child 插入树后拿到的 `child_entry_ref` 是否与最终持久化状态严格一致
-4. `file_status()` 返回的 `path/id/name/type/len` 是否与刚创建节点完全一致
-5. 详细调查记录：`docs/meta-opt-fuse-create-regression.md`
-
-#### delete(path) - 删除节点
-
-```
-1. resolve(path) → InodePath
-
-2. 从内存树删除 (递归):
-   parent_entry.children.delete(name)
-   if 是目录: 递归删除所有 children 的 DirEntry
-
-3. 持久化删除:
-   batch.delete_child(parent.id, name)  // edge_cf
-   batch.delete_inode(inode.id)         // inode_cf (递归)
-   batch.commit()
-```
-
-### 3.5 InodeStore 接口设计
+### 5.1 EntryArena
 
 ```rust
-pub struct InodeStore {
-    store: Arc<RocksInodeStore>,  // RocksDB 操作
-    fs_stats: Arc<FileSystemStats>,
-    ttl_bucket_list: Arc<TtlBucketList>,
-    // 不再持有 DirEntry 树！树在 FsDir 中
-}
+impl EntryArena {
+    pub fn insert(&mut self, entry: DirEntry) -> EntryKey;
 
-impl InodeStore {
-    /// 从 RocksDB 加载 rich metadata
-    pub fn get_inode(&self, id: i64) -> CommonResult<Option<InodeView>>
+    pub fn get(&self, key: EntryKey) -> Option<&DirEntry>;
 
-    /// 恢复树拓扑 (返回轻量 DirEntry 树)
-    pub fn create_tree(&self) -> CommonResult<DirEntry>
+    pub fn get_mut(&mut self, key: EntryKey) -> Option<&mut DirEntry>;
 
-    /// 遍历目录的所有 child id (从 edge_cf)
-    pub fn edges_iter(&self, parent_id: i64) -> impl Iterator<Item=(String, i64)>
-
-    /// 写入 rich metadata (InodeView)
-    pub fn apply_add(&self, parent: &InodeDir, child: &InodeView) -> CommonResult<()>
-    pub fn apply_delete(&self, parent: &InodeDir, child: &InodeView) -> CommonResult<()>
-    // ...
+    pub fn remove(&mut self, key: EntryKey) -> Option<DirEntry>;
 }
 ```
 
-### 3.6 FsDir 持有树和 Store
+### 5.2 DirChildren
+
+```rust
+impl DirChildren {
+    pub fn get(&self, name: &str) -> Option<EntryKey>;
+
+    pub fn insert(&mut self, name: String, key: EntryKey) -> bool;
+
+    pub fn remove(&mut self, name: &str) -> Option<EntryKey>;
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, EntryKey)>;
+}
+```
+
+### 5.3 FsDir
 
 ```rust
 pub struct FsDir {
-    root: DirEntry,        // 内存树根 (轻量拓扑)
-    store: InodeStore,     // RocksDB 存储
-    lock: RwLock<()>,      // 保护树和 store 的一致性
+    root_key: EntryKey,
+    arena: EntryArena,
+    store: InodeStore,
 }
 
 impl FsDir {
-    pub fn create_tree(&mut self) {
-        self.root = self.store.create_tree()?;
-    }
+    pub fn root_key(&self) -> EntryKey;
 
-    pub fn resolve(&self, path: &str) -> CommonResult<InodePath> {
-        InodePath::resolve(&self.root, path, &self.store)
-    }
+    pub fn entry(&self, key: EntryKey) -> CommonResult<&DirEntry>;
+
+    pub fn entry_mut(&mut self, key: EntryKey) -> CommonResult<&mut DirEntry>;
+
+    pub fn resolve(&self, path: &str) -> CommonResult<InodePath>;
+
+    pub fn lookup_file(&self, parent: &InodeDir, name: &str) -> CommonResult<Option<InodeView>>;
 }
 ```
 
-### 3.7 数据一致性
+---
 
-**写入顺序**：
-1. 先写 RocksDB (inode + edge)
-2. 再更新内存树 (DirEntry)
+## 6. 关键流程
 
-**恢复顺序**：
-1. 从 RocksDB edge_cf 构建树拓扑 (DirEntry)
-2. 按需从 inode_cf 加载 metadata (InodeView)
+### 6.1 create_tree() - 启动恢复树拓扑
 
-**锁保护**：
-- FsDir 的 RwLock 保护树和 store 的原子更新
-- 单个操作内：先拿锁 → 改 store → 改树 → 释放锁
+```text
+1. 从 store 读取 root inode
+2. arena.insert(root_dir_entry) -> root_key
+3. 以 root_key 开始 BFS/DFS
+4. 遍历 edge_cf:
+   - load child inode
+   - if child is dir:
+       arena.insert(child_dir_entry) -> child_key
+       parent.children.insert(name, child_key)
+   - if child is file:
+       do not insert into tree
+5. 返回 (last_inode_id, root_key, arena)
+```
+
+这一步的重要变化是：
+
+- 遍历队列里保存的是 `EntryKey`
+- 不是 `DirEntryRef`
+- 所以不会因为 `BTreeMap` / `Vec` 结构变化导致悬垂地址
+
+### 6.2 resolve(path) - 路径解析
+
+```text
+输入: /a/b/c.log
+
+1. components = ["", "a", "b", "c"]
+2. cur_key = root_key
+3. 对中间目录逐层查找:
+   - cur_entry = arena.get(cur_key)
+   - next_key = cur_entry.children.get(name)
+   - load dir inode into resolved_dirs
+4. 最后一段:
+   - if last component is directory child in tree:
+       load dir inode
+   - else:
+       lookup_file(parent_dir_inode_id, leaf_name)
+4. 返回 InodePath
+```
+
+返回结果的关键保证：
+
+- 中间目录段使用 `entry_key`
+- 叶子文件只保留 `inode`
+- 文件不再持有 tree-level handle
+
+### 6.2.1 为什么 resolve 要区分目录段和叶子文件
+
+在目录专用 `EntryKey` 模型下，`resolve()` 不能再把每一段路径都当成 tree node 处理，而要明确区分：
+
+- **中间目录段**：一定走内存 tree
+- **叶子文件**：不在 tree 中，必须走 store 点查
+
+原因很简单：
+
+- tree 只缓存目录
+- 文件不进入 arena
+- 因此只有目录才有 `EntryKey`
+
+#### 场景 1：目录路径 `/a/b/c`
+
+```text
+1. root_key -> "a" -> "b" -> "c"
+2. 每一段都是目录
+3. 每一段都能在 arena 中找到对应 DirEntry
+4. 返回:
+   - resolved_dirs = [/, /a, /a/b, /a/b/c]
+   - leaf_inode = Some(InodeView::Dir(...))
+```
+
+#### 场景 2：文件路径 `/a/b/c.log`
+
+```text
+1. root_key -> "a" -> "b"
+2. "a" 和 "b" 都是目录，可以在 arena 中定位
+3. 最后一段 "c.log" 不在 tree 中
+4. 用 parent_dir_inode_id + "c.log" 去 edge_cf 点查 child inode id
+5. 再从 inode_cf 加载 InodeView::File
+6. 返回:
+   - resolved_dirs = [/, /a, /a/b]
+   - leaf_inode = Some(InodeView::File(...))
+```
+
+#### 场景 3：部分解析路径 `/a/b/new.log`
+
+```text
+1. root_key -> "a" -> "b"
+2. 父目录 /a/b 已经存在
+3. 最后一段 "new.log" 在 edge_cf 中不存在
+4. 返回:
+   - resolved_dirs = [/, /a, /a/b]
+   - leaf_inode = None
+```
+
+这个场景正是 `create_file()` 最依赖的输入状态：
+
+- 父目录已定位
+- 父目录有稳定 `EntryKey`
+- 叶子文件尚不存在
+
+#### 场景 4：路径中间遇到文件 `/a/file/x`
+
+```text
+1. root_key -> "a"
+2. lookup_file(parent=/a, name="file") -> InodeView::File
+3. 由于中间段已经是文件，不允许继续向下解析
+4. resolve 立即停止，并返回错误
+```
+
+这也是为什么 `resolve()` 不能简单写成“每一段都先查 tree，再补 metadata”：
+
+- 文件段没有 tree entry
+- 一旦某一段被解析为文件，这条路径就不可能再有子段
+
+### 6.2.2 对 create / rename / delete 的直接意义
+
+#### create_file
+
+- 只需要依赖 `resolved_dirs` 的最后一个目录
+- 不需要也不应该为新文件分配 `EntryKey`
+
+#### rename file
+
+- file rename 的本质是 edge 变更：
+  - `(src_parent_id, src_name)` 删除
+  - `(dst_parent_id, dst_name)` 新增
+- tree 不做 file 节点迁移
+
+#### rename dir
+
+- dir rename 才需要移动 tree node
+- 被移动的是目录 `EntryKey`
+
+#### delete file
+
+- 只删 edge 和 inode/store 状态
+- tree 无需删除 file node
+
+#### delete dir
+
+- 既要删 edge/store
+- 也要递归删除 arena 中的目录 subtree
+
+### 6.3 create_file(path) - 创建文件
+
+```text
+1. resolve(parent_path) -> InodePath
+2. parent_inode = get_parent_dir()
+3. parent_entry_key = get_parent_dir_key()
+4. 构造 child InodeFile
+5. store.apply_add(parent, child_name, child_inode)
+6. 不向 tree 插入 file node
+7. inp.leaf_inode = Some(child_inode_ptr)
+```
+
+### 6.4 delete(path) - 删除节点
+
+```text
+1. resolve(path)
+2. if target is dir:
+   - parent_entry_key = get_parent_dir_key()
+   - parent.children.remove(name) -> child_key
+   - 递归从 arena 删除 subtree
+3. if target is file:
+   - tree 无需删除 file node
+4. store.apply_delete(...)
+```
+
+### 6.5 rename(path) - 移动目录项
+
+```text
+1. resolve(src) and resolve(dst)
+2. src_parent.children.remove(src_name) -> moved_key
+3. if moved target is dir:
+   - dst_parent.children.insert(dst_name, moved_key)
+4. if moved target is file:
+   - tree 不做文件节点迁移
+5. update store edge relation
+```
+
+rename 的关键点是：
+
+- 目录移动的是 `EntryKey`
+- 文件移动的是 edge 映射
+- file rename 不需要 file tree entry
 
 ---
 
-## 4. 设计原则
+## 7. create 回归与稳定性说明
 
-### 原则 1：树节点与 inode metadata 分层
-- 树节点 (DirEntry)：负责拓扑与递归
-- inode metadata (InodeView)：负责 owner/group/mode/nlink/mtime/xattr 等 rich 信息
+当前已知回归记录见：`docs/meta-opt-fuse-create-regression.md`
 
-### 原则 2：名字属于 edge，不属于 node/entry
-- child 的名字只存在于 `DirEntry.children` 的 key
-- 不在 DirEntry 或 InodeView 中重复存储 name
-- 删除 NamedFile/NamedDir/NamedEntry wrapper
+切换到 `EntryKey + arena` 后，重点改善这几个点：
 
-### 原则 3：目录树必须可递归展开
-- children 里必须存 DirEntry，不能只存 InodeEntry
-- 否则目录 child 会丢失 subtree
+1. `InodePath` 不再缓存 `DirEntryRef`
+2. `get_parent_entry()` 改成 `get_parent_dir_key()`
+3. 目录返回 `EntryKey`，文件只返回 `inode`
+4. 删除/重命名目录后，旧 key 可以通过 `generation` 检测失效
 
-### 原则 4：内存树上只保留最小必要信息
-- DirEntry 里只保留 inode id、inode kind、children 指针
-
-### 原则 5：tree 负责导航，store 负责元数据
-- resolve/DFS/BFS/递归操作：主要依赖 DirEntry 树
-- file_status/ACL/storage_policy：按 id 去 InodeStore 取 InodeView
+这不能自动解决所有 create 语义问题，但至少能先把最危险的内存安全问题移除。
 
 ---
 
-## 5. 实施顺序
+## 8. 设计原则
+
+### 原则 1：tree handle 必须稳定
+
+- 不允许再用 `RawPtr<DirEntry>` 作为长期缓存
+- tree 层统一用 `EntryKey`
+
+### 原则 2：name 属于 edge，不属于 inode
+
+- child 名字只存在于 parent.children 的 key
+- `InodeView` 不再承担 name 语义
+ - file name 通过 `edge_cf(parent_id, name)` 管理
+
+### 原则 3：目录 identity 与 inode identity 分离
+
+- 目录：`inode id` + `EntryKey`
+- 文件：只有 `inode id`
+
+### 原则 4：tree 负责导航，store 负责 rich metadata
+
+- tree 只负责目录导航
+- store 仍然是 metadata truth source
+
+### 原则 5：先安全，再优化
+
+- 先移除段错误风险
+- 再根据压测决定是否要把 `children` 从 `BTreeMap` 升级到 `HashMap` 或混合结构
+
+---
+
+## 9. 内存与性能预期
+
+### 9.1 性能
+
+- `EntryKey` 额外带来一次 arena 索引
+- 这通常比字符串查找成本更低
+- 对百万级总节点数影响通常很小
+
+### 9.2 内存
+
+- `children` value 从 `Box<DirEntry>` 变成 `EntryKey`
+- `EntryArena` 只为目录节点增加 slot metadata
+- 但会减少大量小对象 `Box` 分配与碎片
+
+因此，净内存变化预计是：
+
+- 目录数很大时有一定增加
+- 文件数很大时收益更明显，因为文件不再进入 tree
+- 是否值得，取决于对安全性的要求
+
+当前结论：**值得换**
+
+---
+
+## 10. 实施顺序
 
 ### Phase 1：定义新类型
-1. 定义 `DirEntry` struct (entry + children)
-2. 定义 `InodeEntry` enum (`File(id) | Dir(id)`)
-3. 定义 `InodeChildren` struct
-4. 从 `InodeView` 删除 `FileEntry` variant
-5. 从 `InodeDir` 删除 children 字段
-6. 删除 `NamedFile`、`NamedDir`、`NamedEntry` wrapper
 
-### Phase 2：修改 InodeStore
-1. `get_inode()` 返回 `Option<InodeView>` (不变，但无 FileEntry)
-2. 重写 `create_tree()` 返回 `DirEntry` 树
+1. 定义 `EntryKey`
+2. 定义 `EntryArena`
+3. `DirChildren` value 改为 `EntryKey`
+4. 删除 `DirEntryRef` 在目录 tree 中的长期语义
 
-### Phase 3：修改 InodePath
-1. `resolve()` 使用 `DirEntry` 树导航
-2. `inodes` 存储 `Vec<InodePtr>` (指向 InodeView，全 rich data)
-3. 移除 FileEntry 相关逻辑
+### Phase 2：改造树构建
 
-### Phase 4：修改业务层
-1. `FsDir.root` 改为 `DirEntry`
-2. 所有树操作用 `DirEntry`
-3. 所有 metadata 操作用 `InodeView` (不变)
+1. `InodeStore::create_tree()` 返回 `(last_inode_id, root_key, arena)`
+2. BFS/DFS 队列只保存目录 `EntryKey`
+3. 文件 child 不进入 tree
+4. 所有目录 tree child 操作改成 key lookup
 
-### Phase 5：清理与测试
-1. 删除 `NamedFile`、`NamedDir`、`NamedEntry`
-2. 删除 `InodeView::FileEntry` variant
-3. 全量回归测试
+### Phase 3：改造 InodePath
+
+1. 中间目录段缓存 `entry_key`
+2. 叶子文件只缓存 `leaf_inode`
+3. `get_parent_entry()` 改为 `get_parent_dir_key()`
+
+### Phase 4：改造业务层
+
+1. `FsDir.root_entry` 改为 `root_key + arena`
+2. 目录操作改为 key-based
+3. 文件操作保持 `parent + name` 点查
+4. 所有目录 tree lookup 都统一走 `arena`
+
+### Phase 5：回归测试
+
+1. create / open / complete 路径回归
+2. restore / replay 路径回归
+3. hardlink / rename / delete 路径回归
+4. 大目录场景性能验证
 
 ---
 
-## 6. 验收标准
+## 11. 验收标准
 
-- `DirEntry` 是 struct，包含 `entry: InodeEntry` 和 `children`
-- `InodeEntry` 只有 `File(i64)` 和 `Dir(i64)` 两个 variant
-- `InodeView` 只有 `Dir` 和 `File` 两个 variant，无 `FileEntry`
-- `InodeDir` 无 children 字段
-- `InodeChildren` value 是 `Box<DirEntry>`，key 是名字
-- `InodePtr` 指向 `InodeView` (不变)
-- `InodePath.inodes` 全部是 rich data (InodeView)
-- `FsDir.root` 是 `DirEntry`
-- `create_tree()` 构造 `DirEntry` 轻量拓扑树
-- `resolve()` 用 `DirEntry` 导航，结果存 `InodeView`
-- 所有测试通过
+- `DirEntryRef` 不再作为 tree 长期定位手段
+- `DirChildren` value 为 `EntryKey`
+- `FsDir` 持有 `root_key` 和 `EntryArena`
+- `InodePath` 仅为目录段缓存 `entry_key`
+- 文件叶子不再需要 tree-level key
+- `create_tree()` 的遍历过程不再缓存裸指针
+- 目录 create/delete/rename 基于 `EntryKey`
+- 文件 create/delete/rename 基于 `parent + name + inode id`
+- hardlink 场景下 file identity 继续由 inode id + edge 关系表达
+- 恢复、创建、删除、重命名相关测试全部通过

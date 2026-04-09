@@ -4,10 +4,12 @@
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
   "workspaceFolder": "/workspace",
   "remoteUser": "root",
+  "privileged": true,
   "init": true,
   "overrideCommand": true,
   "updateRemoteUserUID": false,
   "mounts": [
+    "source=/dev/fuse,target=/dev/fuse,type=bind",
     "source=curvine-cargo-cache,target=/root/.cargo,type=volume",
     "source=curvine-m2-cache,target=/root/.m2,type=volume",
     "source=curvine-npm-cache,target=/root/.npm,type=volume"

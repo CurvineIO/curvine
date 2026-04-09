@@ -14,7 +14,9 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::TtlBucketList;
-use crate::master::meta::inode::{DirEntry, InodeDir, InodeFile, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{
+    DirEntry, DirTree, InodeDir, InodeFile, InodeView, ROOT_INODE_ID,
+};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
@@ -47,7 +49,12 @@ impl InodeStore {
         self.ttl_bucket_list.clone()
     }
 
-    pub fn apply_add(&self, parent: &InodeView, child_name: &str, child: &InodeView) -> CommonResult<()> {
+    pub fn apply_add(
+        &self,
+        parent: &InodeView,
+        child_name: &str,
+        child: &InodeView,
+    ) -> CommonResult<()> {
         let mut batch = self.store.new_batch();
 
         batch.write_inode(child)?;
@@ -71,7 +78,12 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_delete(&self, parent: &InodeView, child_name: &str, del: &InodeView) -> CommonResult<DeleteResult> {
+    pub fn apply_delete(
+        &self,
+        parent: &InodeView,
+        child_name: &str,
+        del: &InodeView,
+    ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
         batch.write_inode(parent)?;
 
@@ -237,6 +249,28 @@ impl InodeStore {
         Ok(())
     }
 
+    pub fn apply_replace_inode(
+        &self,
+        parent: &InodeView,
+        name: &str,
+        old_inode_id: i64,
+        new_inode: &InodeView,
+    ) -> CommonResult<()> {
+        let mut batch = self.store.new_batch();
+
+        batch.write_inode(parent)?;
+        batch.write_inode(new_inode)?;
+        batch.add_child(parent.id(), name, new_inode.id())?;
+
+        if old_inode_id != new_inode.id() {
+            batch.delete_inode(old_inode_id)?;
+        }
+
+        batch.commit()?;
+        self.ttl_bucket_list.add(new_inode);
+        Ok(())
+    }
+
     pub fn apply_link(
         &self,
         parent: &InodeView,
@@ -355,7 +389,7 @@ impl InodeStore {
         Ok(del_res)
     }
 
-    pub fn create_blank_tree(&self) -> CommonResult<(i64, DirEntry)> {
+    pub fn create_blank_tree(&self) -> CommonResult<(i64, DirTree)> {
         let root_dir = InodeDir::new(ROOT_INODE_ID, 0);
         let root_view = InodeView::new_dir(root_dir.clone());
 
@@ -365,12 +399,12 @@ impl InodeStore {
 
         self.ttl_bucket_list.add(&root_view);
 
-        let root = DirEntry::new_dir(root_dir);
+        let root = DirTree::new(DirEntry::new_dir(root_dir));
         self.fs_stats.set_counts(0, 0);
         Ok((ROOT_INODE_ID, root))
     }
 
-    pub fn create_tree(&self) -> CommonResult<(i64, DirEntry)> {
+    pub fn create_tree(&self) -> CommonResult<(i64, DirTree)> {
         let root_inode = match self.store.get_inode(ROOT_INODE_ID)? {
             Some(v) => v,
             None => {
@@ -379,62 +413,48 @@ impl InodeStore {
         };
 
         let root_dir = root_inode.as_dir_ref()?.clone();
-        let mut root = DirEntry::new_dir(root_dir);
+        let mut tree = DirTree::new(DirEntry::new_dir(root_dir));
 
         self.ttl_bucket_list.add(&root_inode);
 
         let mut stack = LinkedList::new();
-        stack.push_back(root.as_ptr());
+        stack.push_back(tree.root_key());
         let mut last_inode_id = ROOT_INODE_ID;
         let mut file_count = 0i64;
         let mut dir_count = 0i64;
 
-        while let Some(mut parent_entry) = stack.pop_front() {
-            // Find all child nodes in the directory
-            if parent_entry.is_dir() {
-                let childs_iter = self.store.edges_iter(parent_entry.id())?;
-                for item in childs_iter {
-                    let (key, value) = try_err!(item);
-                    let (_key_parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
-                    let child_id = RocksUtils::i64_from_bytes(&value)?;
+        while let Some(parent_key) = stack.pop_front() {
+            let parent_id = tree.entry(parent_key)?.id();
+            let childs_iter = self.store.edges_iter(parent_id)?;
+            for item in childs_iter {
+                let (key, value) = try_err!(item);
+                let (_key_parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
+                let child_id = RocksUtils::i64_from_bytes(&value)?;
 
-                    last_inode_id = last_inode_id.max(child_id);
+                last_inode_id = last_inode_id.max(child_id);
 
-                    let child_inode = match self.store.get_inode(child_id)? {
-                        Some(v) => v,
-                        None => {
-                            // Orphaned edge: skip
-                            log::warn!(
-                                "create_tree: orphaned edge detected, child_id={} has no inode, skipping",
-                                child_id
-                            );
-                            continue;
-                        }
-                    };
+                let child_inode = match self.store.get_inode(child_id)? {
+                    Some(v) => v,
+                    None => {
+                        log::warn!(
+                            "create_tree: orphaned edge detected, child_id={} has no inode, skipping",
+                            child_id
+                        );
+                        continue;
+                    }
+                };
 
-                    // Add to TTL bucket
-                    self.ttl_bucket_list.add(&child_inode);
-
-                    // Create DirEntry for this child
-                    let child_entry = match &child_inode {
-                        InodeView::Dir(d) => {
-                            dir_count += 1;
-                            DirEntry::new_dir((**d).clone())
-                        }
-                        InodeView::File(_) => {
-                            file_count += 1;
-                            DirEntry::new_file(child_id)
-                        }
-                    };
-
-                    // Add child to parent's children
-                    parent_entry.add_child(child_name.to_string(), child_entry);
-
-                    // Push directory children for further traversal
-                    if child_inode.is_dir() {
-                        if let Some(child) = parent_entry.get_child_mut(&child_name) {
-                            stack.push_back(child.as_ptr());
-                        }
+                self.ttl_bucket_list.add(&child_inode);
+                match &child_inode {
+                    InodeView::Dir(d) => {
+                        dir_count += 1;
+                        let child_key = tree.insert_dir((**d).clone());
+                        tree.entry_mut(parent_key)?
+                            .add_child(child_name.to_string(), child_key);
+                        stack.push_back(child_key);
+                    }
+                    InodeView::File(_) => {
+                        file_count += 1;
                     }
                 }
             }
@@ -443,7 +463,34 @@ impl InodeStore {
         // Update statistics
         self.fs_stats.set_counts(file_count, dir_count);
 
-        Ok((last_inode_id, root))
+        Ok((last_inode_id, tree))
+    }
+
+    pub fn list_children(&self, parent_id: i64) -> CommonResult<Vec<(String, i64)>> {
+        let childs_iter = self.store.edges_iter(parent_id)?;
+        let mut children = Vec::new();
+        for item in childs_iter {
+            let (key, value) = try_err!(item);
+            let (_parent_id, child_name) = RocksUtils::i64_str_from_bytes(&key).unwrap();
+            let child_id = RocksUtils::i64_from_bytes(&value)?;
+            children.push((child_name.to_string(), child_id));
+        }
+        Ok(children)
+    }
+
+    pub fn lookup_child_id(&self, parent_id: i64, child_name: &str) -> CommonResult<Option<i64>> {
+        self.store.get_child_id_exact(parent_id, child_name)
+    }
+
+    pub fn lookup_child(
+        &self,
+        parent_id: i64,
+        child_name: &str,
+    ) -> CommonResult<Option<InodeView>> {
+        match self.lookup_child_id(parent_id, child_name)? {
+            Some(id) => self.get_inode(id, Some(child_name)),
+            None => Ok(None),
+        }
     }
 
     pub fn get_file_locations(

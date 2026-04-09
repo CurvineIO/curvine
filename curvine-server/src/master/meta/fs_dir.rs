@@ -27,7 +27,7 @@ use curvine_common::state::{
     FreeResult, ListOptions, MkdirOpts, MountInfo, RenameFlags, SetAttrOpts, WorkerAddress,
 };
 use curvine_common::FsResult;
-use log::{debug, info, warn};
+use log::{debug, info};
 use orpc::common::{LocalTime, TimeSpent};
 use orpc::sync::AtomicCounter;
 use orpc::{err_box, err_ext, try_option, CommonResult};
@@ -37,8 +37,8 @@ use std::sync::Arc;
 
 /// Note: The modification operation uses &mut self, which is a necessary improvement. We use the unsafe API to perform modifications.
 pub struct FsDir {
-    /// The root of the lightweight tree (DirEntry) for navigation
-    pub(crate) root_entry: DirEntry,
+    /// Directory-only tree for path navigation
+    pub(crate) tree: DirTree,
     pub(crate) inode_id: InodeId,
     pub(crate) store: InodeStore,
     pub(crate) journal_writer: Arc<JournalWriter>,
@@ -58,14 +58,14 @@ impl FsDir {
         let store = RocksInodeStore::new(db_conf, conf.format_master)?;
         let state = InodeStore::new(store, ttl_bucket_list);
 
-        let (last_inode_id, root_entry) = if conf.format_master || !state.has_root_inode()? {
+        let (last_inode_id, tree) = if conf.format_master || !state.has_root_inode()? {
             state.create_blank_tree()?
         } else {
             state.create_tree()?
         };
 
         let fs_dir = Self {
-            root_entry,
+            tree,
             inode_id: InodeId::new(),
             store: state,
             journal_writer,
@@ -77,14 +77,16 @@ impl FsDir {
         Ok(fs_dir)
     }
 
-    /// Returns a reference to the root DirEntry
-    pub fn root_entry(&self) -> &DirEntry {
-        &self.root_entry
+    pub fn tree(&self) -> &DirTree {
+        &self.tree
     }
 
-    /// Returns a mutable reference to the root DirEntry
-    pub fn root_entry_mut(&mut self) -> &mut DirEntry {
-        &mut self.root_entry
+    pub fn tree_mut(&mut self) -> &mut DirTree {
+        &mut self.tree
+    }
+
+    pub fn root_entry(&self) -> &DirEntry {
+        self.tree.root_entry().expect("root entry must exist")
     }
 
     fn next_inode_id(&self) -> FsResult<i64> {
@@ -134,7 +136,11 @@ impl FsDir {
     }
 
     // Create all previous directories that may be missing on the path.
-    pub(crate) fn create_parent_dir(&mut self, mut inp: InodePath, opts: MkdirOpts) -> FsResult<InodePath> {
+    pub(crate) fn create_parent_dir(
+        &mut self,
+        mut inp: InodePath,
+        opts: MkdirOpts,
+    ) -> FsResult<InodePath> {
         let mut index = inp.existing_len();
 
         // The parent directory already exists and does not need to be created.
@@ -178,9 +184,13 @@ impl FsDir {
     }
 
     fn is_dir_empty(&self, inp: &InodePath) -> bool {
-        inp.get_last_entry()
-            .and_then(|entry| entry.children())
-            .map(|c| c.is_empty())
+        inp.get_last_inode()
+            .map(|inode| {
+                self.store
+                    .list_children(inode.id())
+                    .map(|v| v.is_empty())
+                    .unwrap_or(true)
+            })
             .unwrap_or(true)
     }
 
@@ -210,14 +220,17 @@ impl FsDir {
                     if let File(ref mut nf) = target_inode.as_mut() {
                         nf.decrement_nlink();
                     }
-                    self.store.apply_unlink(parent.as_ref(), child_name, child.id())?
+                    self.store
+                        .apply_unlink(parent.as_ref(), child_name, child.id())?
                 } else {
-                    self.store.apply_delete(parent.as_ref(), child_name, child)?
+                    self.store
+                        .apply_delete(parent.as_ref(), child_name, child)?
                 }
             }
             Dir(_) => {
                 parent.decr_nlink();
-                self.store.apply_delete(parent.as_ref(), child_name, child)?
+                self.store
+                    .apply_delete(parent.as_ref(), child_name, child)?
             }
         };
 
@@ -227,8 +240,10 @@ impl FsDir {
     }
 
     fn remove_child_from_tree(&mut self, inp: &InodePath, child_name: &str) {
-        if let Some(parent_entry) = inp.get_parent_entry() {
-            parent_entry.as_mut().remove_child(child_name);
+        if let Some(parent_key) = inp.get_parent_entry_key() {
+            if let Ok(parent_entry) = self.tree.entry_mut(parent_key) {
+                parent_entry.remove_child(child_name);
+            }
         }
     }
 
@@ -271,17 +286,11 @@ impl FsDir {
             match cur_inode.as_mut() {
                 Dir(_) => {
                     if recursive {
-                        if let Some(entry) = self.find_entry_by_id(cur_inode.id()) {
-                            if let Some(children) = entry.children() {
-                                let child_ids: Vec<(String, i64)> = children
-                                    .iter()
-                                    .map(|(name, entry)| (name.to_string(), entry.id()))
-                                    .collect();
-                                for (child_name, child_id) in child_ids {
-                                    if let Some(child_inode) = self.store.get_inode(child_id, Some(&child_name))? {
-                                        stack.push_back(InodePtr::from_owned(child_inode));
-                                    }
-                                }
+                        for (child_name, child_id) in self.store.list_children(cur_inode.id())? {
+                            if let Some(child_inode) =
+                                self.store.get_inode(child_id, Some(&child_name))?
+                            {
+                                stack.push_back(InodePtr::from_owned(child_inode));
                             }
                         }
                     }
@@ -300,27 +309,6 @@ impl FsDir {
 
         self.store.apply_free(change_inodes)?;
         Ok(free_res)
-    }
-
-    fn find_entry_by_id(&self, id: i64) -> Option<&DirEntry> {
-        if self.root_entry.id() == id {
-            return Some(&self.root_entry);
-        }
-        self.find_entry_recursive(&self.root_entry, id)
-    }
-
-    fn find_entry_recursive<'a>(&'a self, entry: &'a DirEntry, id: i64) -> Option<&'a DirEntry> {
-        if let Some(children) = entry.children() {
-            for (_, child) in children.iter() {
-                if child.id() == id {
-                    return Some(child);
-                }
-                if let Some(found) = self.find_entry_recursive(child, id) {
-                    return Some(found);
-                }
-            }
-        }
-        None
     }
 
     pub fn rename(
@@ -379,12 +367,10 @@ impl FsDir {
                 new_name = src_inp.name().to_string();
                 v
             }
-            _ => {
-                match dst_inp.get_inode(-2) {
-                    Some(v) => v,
-                    None => return err_box!("Parent {} does not exist", dst_inp.get_parent_path()),
-                }
-            }
+            _ => match dst_inp.get_inode(-2) {
+                Some(v) => v,
+                None => return err_box!("Parent {} does not exist", dst_inp.get_parent_path()),
+            },
         };
 
         let mut new_inode = src_inode.as_ref().clone();
@@ -402,13 +388,24 @@ impl FsDir {
             &new_inode,
         )?;
 
-        self.remove_child_from_tree(src_inp, src_inp.name());
+        if new_inode.is_dir() {
+            let moved_key = if let Some(src_parent_key) = src_inp.get_parent_entry_key() {
+                match self.tree.entry_mut(src_parent_key) {
+                    Ok(src_parent_entry) => src_parent_entry.remove_child(src_inp.name()),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
 
-        let child_entry = match &new_inode {
-            InodeView::Dir(d) => DirEntry::new_dir((**d).clone()),
-            InodeView::File(_) => DirEntry::new_file(new_inode.id()),
-        };
-        self.add_child_to_tree(dst_inp, &new_name, child_entry);
+            if let Some(moved_key) = moved_key {
+                if let Some(dst_parent_key) = dst_inp.get_parent_entry_key() {
+                    self.tree
+                        .entry_mut(dst_parent_key)?
+                        .add_child(new_name.clone(), moved_key);
+                }
+            }
+        }
 
         Ok(del_res)
     }
@@ -456,34 +453,65 @@ impl FsDir {
         }
 
         let child_name = inp.get_component(inp.existing_len())?.to_string();
-        let child_entry = match &child {
-            InodeView::Dir(d) => DirEntry::new_dir((**d).clone()),
-            InodeView::File(_) => DirEntry::new_file(child.id()),
-        };
-
-        let parent_entry = match inp.get_parent_entry() {
-            Some(e) => e,
-            None => return err_box!("Cannot add child: parent entry not found for path {}", inp.path()),
-        };
-        parent_entry.as_mut().add_child(child_name.clone(), child_entry);
-
-        let child_entry_ref = match parent_entry.as_ref().get_child(&child_name) {
-            Some(c) => DirEntryRef::from_ref(c),
-            None => return err_box!("Child not found after adding to tree"),
-        };
-
         let child_ptr = InodePtr::from_owned(child);
-        self.store.apply_add(parent.as_ref(), &child_name, child_ptr.as_ref())?;
+        self.store
+            .apply_add(parent.as_ref(), &child_name, child_ptr.as_ref())?;
+        let child_key = if let InodeView::Dir(d) = child_ptr.as_ref() {
+            let parent_key = match inp.get_parent_entry_key() {
+                Some(v) => v,
+                None => {
+                    return err_box!(
+                        "Cannot add child: parent entry not found for path {}",
+                        inp.path()
+                    )
+                }
+            };
+            let child_key = self.tree.insert_dir((**d).clone());
+            self.tree
+                .entry_mut(parent_key)?
+                .add_child(child_name.clone(), child_key);
+            Some(child_key)
+        } else {
+            None
+        };
 
-        inp.append(child_ptr, child_entry_ref)?;
+        inp.append(child_ptr, child_key)?;
 
         Ok(inp)
     }
 
-    fn add_child_to_tree(&mut self, inp: &InodePath, child_name: &str, child_entry: DirEntry) {
-        if let Some(parent_entry) = inp.get_last_entry() {
-            parent_entry.as_mut().add_child(child_name.to_string(), child_entry);
+    fn list_child_statuses(
+        &self,
+        parent_id: i64,
+        path: &str,
+        opts: Option<&ListOptions>,
+    ) -> FsResult<Vec<FileStatus>> {
+        let mut res = Vec::new();
+        let mut count = 0i32;
+        for (child_name, child_id) in self.store.list_children(parent_id)? {
+            if let Some(opts) = opts {
+                if let Some(sa) = opts.start_after.as_deref() {
+                    if child_name.as_str() <= sa {
+                        continue;
+                    }
+                }
+                if let Some(limit) = opts.limit {
+                    if count >= limit as i32 {
+                        break;
+                    }
+                }
+            }
+            if let Some(child_inode) = self.store.get_inode(child_id, Some(&child_name))? {
+                let child_path = if path == PATH_SEPARATOR {
+                    format!("/{}", child_name)
+                } else {
+                    format!("{}{}{}", path, PATH_SEPARATOR, child_name)
+                };
+                res.push(child_inode.to_file_status(&child_path, &child_name));
+                count += 1;
+            }
         }
+        Ok(res)
     }
 
     pub fn file_status(&self, inp: &InodePath) -> FsResult<FileStatus> {
@@ -510,23 +538,7 @@ impl FsDir {
             File(_) => res.push(inode.to_file_status(inp.path(), inp.name())),
 
             Dir(_d) => {
-                let mut dir_entry = &self.root_entry;
-                for i in 1..inp.existing_len() {
-                    let name = inp.get_component(i)?;
-                    match dir_entry.get_child(name) {
-                        Some(child) => dir_entry = child,
-                        None => break,
-                    }
-                }
-
-                if let Some(children) = dir_entry.children() {
-                    for (child_name, child_entry) in children.iter() {
-                        if let Some(child_inode) = self.store.get_inode(child_entry.id(), Some(child_name))? {
-                            let child_path = inp.child_path(child_name);
-                            res.push(child_inode.to_file_status(&child_path, child_name));
-                        }
-                    }
-                }
+                res.extend(self.list_child_statuses(inode.id(), inp.path(), None)?);
             }
         }
 
@@ -557,43 +569,7 @@ impl FsDir {
                 Ok(Self::list_single_file(status, opts))
             }
 
-            Dir(_d) => {
-                let mut dir_entry = &self.root_entry;
-                for i in 1..inp.existing_len() {
-                    let name = inp.get_component(i)?;
-                    match dir_entry.get_child(name) {
-                        Some(child) => dir_entry = child,
-                        None => break,
-                    }
-                }
-
-                let mut res = Vec::new();
-                let mut count = 0i32;
-
-                if let Some(children) = dir_entry.children() {
-                    for (child_name, child_entry) in children.iter() {
-                        if let Some(sa) = opts.start_after.as_deref() {
-                            if child_name <= sa {
-                                continue;
-                            }
-                        }
-
-                        if let Some(limit) = opts.limit {
-                            if count >= limit as i32 {
-                                break;
-                            }
-                        }
-
-                        if let Some(child_inode) = self.store.get_inode(child_entry.id(), Some(child_name))? {
-                            let child_path = inp.child_path(child_name);
-                            res.push(child_inode.to_file_status(&child_path, child_name));
-                            count += 1;
-                        }
-                    }
-                }
-
-                Ok(res)
-            }
+            Dir(_d) => self.list_child_statuses(inode.id(), inp.path(), Some(opts)),
         }
     }
 
@@ -763,11 +739,11 @@ impl FsDir {
     }
 
     pub fn print_tree(&self) {
-        self.root_entry.print_tree()
+        self.tree.print_tree()
     }
 
     pub fn sum_hash(&self) -> u128 {
-        self.root_entry.sum_hash()
+        self.tree.sum_hash()
     }
 
     pub fn last_inode_id(&self) -> i64 {
@@ -784,15 +760,15 @@ impl FsDir {
     }
 
     // Read data from rocksdb to build a directory tree
-    pub fn create_tree(&self) -> CommonResult<DirEntry> {
+    pub fn create_tree(&self) -> CommonResult<DirTree> {
         self.store.create_tree().map(|x| x.1)
     }
 
     // Restore in-memory tree from RocksDB without checkpoint (for testing only).
     // In production, use restore() with checkpoint path via Raft snapshot.
     pub fn restore_from_rocksdb(&mut self) -> CommonResult<()> {
-        let (last_inode_id, root_entry) = self.store.create_tree()?;
-        self.root_entry = root_entry;
+        let (last_inode_id, tree) = self.store.create_tree()?;
+        self.tree = tree;
         self.update_last_inode_id(last_inode_id)?;
         Ok(())
     }
@@ -806,7 +782,7 @@ impl FsDir {
         let path = path.as_ref();
 
         // Set to other value first to facilitate memory recycling.
-        self.root_entry = DirEntry::new_dir_with_id(ROOT_INODE_ID, 0);
+        self.tree = DirTree::new(DirEntry::new_dir_with_id(ROOT_INODE_ID, 0));
 
         // Reset rocksdb
         self.store.restore(path)?;
@@ -814,8 +790,8 @@ impl FsDir {
         spend.reset();
 
         // Update the directory tree
-        let (last_inode_id, root_entry) = self.store.create_tree()?;
-        self.root_entry = root_entry;
+        let (last_inode_id, tree) = self.store.create_tree()?;
+        self.tree = tree;
         self.update_last_inode_id(last_inode_id)?;
         let time2 = spend.used_ms();
 
@@ -930,20 +906,10 @@ impl FsDir {
             cur_inode.as_mut().set_attr(set_opts);
             change_inodes.push(cur_inode.as_ref().clone());
 
-            if opts.recursive {
-                if let Some(entry) = self.find_entry_by_id(cur_inode.id()) {
-                    if entry.is_dir() {
-                        if let Some(children) = entry.children() {
-                            let child_ids: Vec<(String, i64)> = children
-                                .iter()
-                                .map(|(name, entry)| (name.to_string(), entry.id()))
-                                .collect();
-                            for (child_name, child_id) in child_ids {
-                                if let Some(child_inode) = self.store.get_inode(child_id, Some(&child_name))? {
-                                    stack.push_back(InodePtr::from_owned(child_inode));
-                                }
-                            }
-                        }
+            if opts.recursive && cur_inode.is_dir() {
+                for (child_name, child_id) in self.store.list_children(cur_inode.id())? {
+                    if let Some(child_inode) = self.store.get_inode(child_id, Some(&child_name))? {
+                        stack.push_back(InodePtr::from_owned(child_inode));
                     }
                 }
             }
@@ -985,44 +951,51 @@ impl FsDir {
         let old_inode = if let Some(v) = link.get_last_inode() {
             if !v.is_link() || (v.is_link() && !force) {
                 return err_ext!(FsError::file_exists(link.path()));
-            } else {
-                Some(v)
             }
+            Some(v)
         } else {
-            None
+            match self.store.lookup_child(parent.id(), link.name())? {
+                Some(inode) => {
+                    if !inode.is_link() || !force {
+                        return err_ext!(FsError::file_exists(link.path()));
+                    }
+                    Some(InodePtr::from_owned(inode))
+                }
+                None => None,
+            }
         };
 
         let name = link.name().to_string();
         parent.update_mtime(new_inode.mtime);
         let is_add = old_inode.is_none();
+        let mut replaced_inode_id = None;
 
-        let new_inode_id = new_inode.id();
         let new_inode_view = InodeView::new_file(new_inode);
         let new_inode_ptr = match old_inode {
             Some(v) => {
+                replaced_inode_id = Some(v.id());
                 let _ = mem::replace(v.as_mut(), new_inode_view);
                 v
             }
             None => {
-                let child_entry = DirEntry::new_file(new_inode_id);
-                self.add_child_to_tree(&link, &name, child_entry);
-
-                let child_entry_ref = match link
-                    .get_last_entry()
-                    .and_then(|e| e.as_ref().get_child(&name))
-                {
-                    Some(c) => DirEntryRef::from_ref(c),
-                    None => return err_box!("Child entry not found after adding to tree"),
-                };
-
                 let added = InodePtr::from_owned(new_inode_view);
-                link.append(added, child_entry_ref)?;
+                link.append(added, None)?;
                 link.get_last_inode().unwrap()
             }
         };
 
-        self.store
-            .apply_symlink(parent.as_ref(), &name, new_inode_ptr.as_ref(), is_add)?;
+        match replaced_inode_id {
+            Some(old_inode_id) => self.store.apply_replace_inode(
+                parent.as_ref(),
+                &name,
+                old_inode_id,
+                new_inode_ptr.as_ref(),
+            )?,
+            None => {
+                self.store
+                    .apply_symlink(parent.as_ref(), &name, new_inode_ptr.as_ref(), is_add)?
+            }
+        }
         Ok(link)
     }
 
@@ -1085,19 +1058,7 @@ impl FsDir {
 
         parent.update_mtime(op_ms as i64);
         let added = InodePtr::from_owned(linked_inode);
-
-        let child_entry = DirEntry::new_file(original_inode_id);
-        self.add_child_to_tree(&new_path, &name, child_entry);
-
-        let child_entry_ref = match new_path
-            .get_last_entry()
-            .and_then(|e| e.as_ref().get_child(&name))
-        {
-            Some(c) => DirEntryRef::from_ref(c),
-            None => return err_box!("Child entry not found after adding to tree"),
-        };
-
-        new_path.append(added, child_entry_ref)?;
+        new_path.append(added, None)?;
 
         self.store
             .apply_link(parent.as_ref(), &name, original_inode_id)?;

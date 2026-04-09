@@ -13,20 +13,19 @@
 // limitations under the License.
 
 use crate::master::meta::glob_utils::parse_glob_pattern;
-use crate::master::meta::inode::{DirEntry, DirEntryRef, InodeView, InodePtr, PATH_SEPARATOR};
+use crate::master::meta::inode::{DirTree, EntryKey, InodePtr, InodeView, PATH_SEPARATOR};
 use crate::master::meta::store::InodeStore;
 use orpc::{err_box, try_option, CommonResult};
-use std::collections::VecDeque;
 use std::fmt;
 
 pub struct ResolvedInode {
     pub inode: InodePtr,
-    pub entry: DirEntryRef,
+    pub entry_key: Option<EntryKey>,
 }
 
 impl ResolvedInode {
-    pub fn new(inode: InodePtr, entry: DirEntryRef) -> Self {
-        Self { inode, entry }
+    pub fn new(inode: InodePtr, entry_key: Option<EntryKey>) -> Self {
+        Self { inode, entry_key }
     }
 }
 
@@ -38,7 +37,7 @@ pub struct InodePath {
 }
 
 impl InodePath {
-    pub fn resolve(root: &DirEntry, path: &str, store: &InodeStore) -> CommonResult<Self> {
+    pub fn resolve(tree: &DirTree, path: &str, store: &InodeStore) -> CommonResult<Self> {
         let components = InodeView::path_components(path)?;
         let name = try_option!(components.last());
 
@@ -47,25 +46,14 @@ impl InodePath {
         }
 
         let mut resolved: Vec<ResolvedInode> = Vec::with_capacity(components.len());
-        let mut cur_entry = root;
+        let mut cur_key = tree.root_key();
         let mut index = 0;
 
         while index < components.len() {
-            let entry_ref = DirEntryRef::from_ref(cur_entry);
-
-            let view = if cur_entry.is_dir() {
-                match cur_entry.as_dir() {
-                    Some(dir) => InodeView::new_dir(dir.clone()),
-                    None => return err_box!("Directory entry has no InodeDir for id {}", cur_entry.id()),
-                }
-            } else {
-                match store.get_inode(cur_entry.id(), None)? {
-                    Some(v) => v,
-                    None => return err_box!("Failed to load file inode {} from store", cur_entry.id()),
-                }
-            };
+            let cur_entry = tree.entry(cur_key)?;
+            let view = InodeView::new_dir(cur_entry.as_dir().clone());
             let inode_ptr = InodePtr::from_owned(view);
-            resolved.push(ResolvedInode::new(inode_ptr, entry_ref));
+            resolved.push(ResolvedInode::new(inode_ptr, Some(cur_key)));
 
             if index == components.len() - 1 {
                 break;
@@ -74,14 +62,16 @@ impl InodePath {
             index += 1;
             let child_name: &str = components[index].as_str();
 
-            match cur_entry.get_child(child_name) {
-                Some(child) => {
-                    cur_entry = child;
-                }
-                None => {
-                    break;
-                }
+            if let Some(child_key) = cur_entry.get_child(child_name) {
+                cur_key = child_key;
+                continue;
             }
+
+            if let Some(child_inode) = store.lookup_child(cur_entry.id(), child_name)? {
+                let child_ptr = InodePtr::from_owned(child_inode);
+                resolved.push(ResolvedInode::new(child_ptr, None));
+            }
+            break;
         }
 
         let inode_path = Self {
@@ -191,7 +181,7 @@ impl InodePath {
         self.resolved.len()
     }
 
-    pub fn append(&mut self, inode: InodePtr, entry: DirEntryRef) -> CommonResult<()> {
+    pub fn append(&mut self, inode: InodePtr, entry_key: Option<EntryKey>) -> CommonResult<()> {
         if self.components.len() == self.resolved.len() {
             return err_box!(
                 "Path {} is complete, appending nodes is not allowed",
@@ -199,7 +189,7 @@ impl InodePath {
             );
         }
 
-        self.resolved.push(ResolvedInode::new(inode, entry));
+        self.resolved.push(ResolvedInode::new(inode, entry_key));
         Ok(())
     }
 
@@ -211,23 +201,19 @@ impl InodePath {
         self.resolved.pop();
     }
 
-    pub fn get_last_entry(&self) -> Option<&DirEntryRef> {
-        self.resolved.last().map(|r| &r.entry)
+    pub fn get_last_entry_key(&self) -> Option<EntryKey> {
+        self.resolved.last().and_then(|r| r.entry_key)
     }
 
-    pub fn get_parent_entry(&self) -> Option<&DirEntryRef> {
+    pub fn get_parent_entry_key(&self) -> Option<EntryKey> {
         let len = self.resolved.len();
         if len >= 1 && self.existing_len() < self.len() {
-            Some(&self.resolved[len - 1].entry)
+            self.resolved[len - 1].entry_key
         } else if len >= 2 {
-            Some(&self.resolved[len - 2].entry)
+            self.resolved[len - 2].entry_key
         } else {
             None
         }
-    }
-
-    pub fn get_last_entry_mut(&mut self) -> Option<&mut DirEntryRef> {
-        self.resolved.last_mut().map(|r| &mut r.entry)
     }
 }
 
@@ -244,7 +230,7 @@ impl fmt::Debug for InodePath {
 
 impl InodePath {
     pub fn resolve_for_glob_pattern(
-        root: &DirEntry,
+        tree: &DirTree,
         pattern: &str,
         store: &InodeStore,
     ) -> CommonResult<Vec<Self>> {
@@ -252,49 +238,52 @@ impl InodePath {
         let components_len = components.len();
         let mut results = Vec::new();
 
-        let mut queue: VecDeque<(usize, &DirEntry, String)> = VecDeque::new();
-        queue.push_back((0, root, String::new()));
-
-        while let Some((index, entry, path)) = queue.pop_front() {
+        let mut stack: Vec<(String, usize)> = vec![(String::new(), 0)];
+        while let Some((path, index)) = stack.pop() {
             if index == components_len - 1 {
                 let full_path = if path.is_empty() {
                     "/".to_string()
                 } else {
                     path
                 };
-                if let Ok(inp) = Self::resolve(root, &full_path, store) {
+                if let Ok(inp) = Self::resolve(tree, &full_path, store) {
                     results.push(inp);
                 }
                 continue;
             }
 
-            let next_index = index + 1;
-            if next_index >= components_len {
-                continue;
-            }
-            let next_name = &components[next_index];
-
+            let full_path = if path.is_empty() {
+                "/".to_string()
+            } else {
+                path.clone()
+            };
+            let inp = match Self::resolve(tree, &full_path, store) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let parent = match inp.get_last_inode() {
+                Some(v) if v.is_dir() => v,
+                _ => continue,
+            };
+            let next_name = &components[index + 1];
             let (is_glob, glob_pattern) = parse_glob_pattern(next_name);
 
-            if let Some(children) = entry.children() {
-                for (child_name, child_entry) in children.iter() {
-                    let matches = if is_glob {
-                        glob_pattern
-                            .as_ref()
-                            .map(|p| p.matches(child_name))
-                            .unwrap_or(false)
+            for (child_name, _child_id) in store.list_children(parent.id())? {
+                let matches = if is_glob {
+                    glob_pattern
+                        .as_ref()
+                        .map(|p| p.matches(&child_name))
+                        .unwrap_or(false)
+                } else {
+                    child_name == *next_name
+                };
+                if matches {
+                    let child_path = if path.is_empty() {
+                        format!("/{}", child_name)
                     } else {
-                        child_name == next_name
+                        format!("{}{}{}", path, PATH_SEPARATOR, child_name)
                     };
-
-                    if matches {
-                        let child_path = if path.is_empty() {
-                            format!("/{}", child_name)
-                        } else {
-                            format!("{}{}{}", path, PATH_SEPARATOR, child_name)
-                        };
-                        queue.push_back((next_index, child_entry, child_path));
-                    }
+                    stack.push((child_path, index + 1));
                 }
             }
         }

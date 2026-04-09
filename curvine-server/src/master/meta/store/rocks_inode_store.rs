@@ -66,6 +66,19 @@ impl RocksInodeStore {
         Ok(InodeChildrenIter { inner: iter })
     }
 
+    pub fn get_child_id_exact(
+        &self,
+        parent_id: i64,
+        child_name: &str,
+    ) -> CommonResult<Option<i64>> {
+        let key = RocksUtils::i64_str_to_bytes(parent_id, child_name);
+        let value = self.db.get_cf(Self::CF_EDGES, key)?;
+        match value {
+            Some(v) => Ok(Some(RocksUtils::i64_from_bytes(&v)?)),
+            None => Ok(None),
+        }
+    }
+
     // Get all location information for all block ids.
     pub fn get_locations(&self, block_id: i64) -> CommonResult<Vec<BlockLocation>> {
         let prefix = RocksUtils::i64_to_bytes(block_id);

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::master::meta::inode::InodeView;
-use log::{debug, info, warn};
+use log::{debug, info};
 use orpc::common::FastHashSet;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;

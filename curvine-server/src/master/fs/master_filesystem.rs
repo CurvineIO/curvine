@@ -15,7 +15,7 @@
 use crate::master::fs::context::ValidateAddBlock;
 use crate::master::fs::policy::ChooseContext;
 use crate::master::journal::JournalSystem;
-use crate::master::meta::inode::{DirEntry, InodeFile, InodePath, PATH_SEPARATOR};
+use crate::master::meta::inode::{DirTree, InodeFile, InodePath, PATH_SEPARATOR};
 use crate::master::meta::FsDir;
 
 use crate::master::fs::DeleteResult;
@@ -370,11 +370,11 @@ impl MasterFilesystem {
     }
 
     fn resolve_path(fs_dir: &FsDir, path: &str) -> CommonResult<InodePath> {
-        InodePath::resolve(fs_dir.root_entry(), path, &fs_dir.store)
+        InodePath::resolve(fs_dir.tree(), path, &fs_dir.store)
     }
 
     fn resolve_path_by_glob_pattern(fs_dir: &FsDir, path: &str) -> CommonResult<Vec<InodePath>> {
-        InodePath::resolve_for_glob_pattern(fs_dir.root_entry(), path, &fs_dir.store)
+        InodePath::resolve_for_glob_pattern(fs_dir.tree(), path, &fs_dir.store)
     }
 
     pub fn check_path_length(&self, path: &str) -> CommonResult<()> {
@@ -529,7 +529,10 @@ impl MasterFilesystem {
         let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
         let file = inode.as_file_ref()?;
         let blocks = self.get_block_locs(path, fs_dir, file)?;
-        Ok(FileBlocks::new(inode.to_file_status(path, inp.name()), blocks))
+        Ok(FileBlocks::new(
+            inode.to_file_status(path, inp.name()),
+            blocks,
+        ))
     }
 
     fn get_block_locs(
@@ -657,7 +660,7 @@ impl MasterFilesystem {
     }
 
     // Create a directory number based on rocksdb data for testing.
-    pub fn create_tree(&self) -> CommonResult<DirEntry> {
+    pub fn create_tree(&self) -> CommonResult<DirTree> {
         let fs_dir = self.fs_dir.read();
         fs_dir.create_tree()
     }

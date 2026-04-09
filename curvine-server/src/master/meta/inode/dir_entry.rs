@@ -12,161 +12,97 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tree layer types for inode metadata.
+//! Directory-only tree types for master metadata.
 //!
-//! # Architecture
-//! ```text
-//! DirEntry (tree node)
-//!   ├── entry: InodeEntry
-//!   │   ├── File(i64) - file id only, metadata from InodeStore
-//!   │   └── Dir(Box<InodeDir>) - directory with embedded metadata
-//!   └── children: Option<Box<InodeChildren>>
-//!
-//! InodeChildren = BTreeMap<String, Box<DirEntry>>
-//! ```
-//!
-//! # Design Principles
-//! - Directories embed metadata (InodeDir) for zero-lookup access during path resolution
-//! - Files store only id, metadata loaded from InodeStore on demand
-//! - Name belongs to edge: stored only in children map key, not duplicated in DirEntry
+//! Files are resolved from `InodeStore` on demand. Only directories are stored
+//! in the in-memory tree and addressed by stable `EntryKey`s.
 
-use crate::master::meta::inode::InodeDir;
+use crate::master::meta::inode::{Inode, InodeDir, ROOT_INODE_ID};
 use orpc::common::Utils;
-use orpc::sys::RawPtr;
+use orpc::{err_box, CommonResult};
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Entry enum for tree nodes.
-/// - File: id only, metadata loaded from InodeStore on demand
-/// - Dir: embedded InodeDir for zero-lookup access during path resolution
-#[derive(Debug, Clone)]
-pub enum InodeEntry {
-    File(i64),
-    Dir(Box<InodeDir>),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EntryKey {
+    slot: u32,
+    generation: u32,
 }
 
-impl InodeEntry {
-    #[inline]
-    pub fn id(&self) -> i64 {
-        match self {
-            InodeEntry::File(id) => *id,
-            InodeEntry::Dir(dir) => dir.id,
-        }
+impl EntryKey {
+    pub const INVALID: Self = Self {
+        slot: u32::MAX,
+        generation: 0,
+    };
+
+    pub fn new(slot: u32, generation: u32) -> Self {
+        Self { slot, generation }
     }
 
-    #[inline]
-    pub fn is_dir(&self) -> bool {
-        matches!(self, InodeEntry::Dir(_))
+    pub fn slot(self) -> usize {
+        self.slot as usize
     }
 
-    #[inline]
-    pub fn is_file(&self) -> bool {
-        matches!(self, InodeEntry::File(_))
-    }
-
-    pub fn as_dir(&self) -> Option<&InodeDir> {
-        match self {
-            InodeEntry::Dir(dir) => Some(dir),
-            _ => None,
-        }
-    }
-
-    pub fn as_dir_mut(&mut self) -> Option<&mut InodeDir> {
-        match self {
-            InodeEntry::Dir(dir) => Some(dir),
-            _ => None,
-        }
+    pub fn generation(self) -> u32 {
+        self.generation
     }
 }
 
-/// Children container for directory entries.
-/// Key is the child name (edge), value is the child tree node.
 #[derive(Debug, Clone, Default)]
-pub struct InodeChildren {
-    inner: BTreeMap<String, Box<DirEntry>>,
+pub struct DirChildren {
+    inner: BTreeMap<String, EntryKey>,
 }
 
-impl InodeChildren {
-    /// Creates an empty children container
+impl DirChildren {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Returns the number of children
     #[inline]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    /// Returns true if there are no children
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
-    /// Gets a child by name
-    pub fn get(&self, name: &str) -> Option<&DirEntry> {
-        self.inner.get(name).map(|b| b.as_ref())
+    pub fn get(&self, name: &str) -> Option<EntryKey> {
+        self.inner.get(name).copied()
     }
 
-    /// Gets a mutable child by name
-    pub fn get_mut(&mut self, name: &str) -> Option<&mut DirEntry> {
-        self.inner.get_mut(name).map(|b| b.as_mut())
-    }
-
-    /// Adds a child entry. Returns true if the child was newly inserted.
-    pub fn insert(&mut self, name: String, entry: DirEntry) -> bool {
+    pub fn insert(&mut self, name: String, key: EntryKey) -> bool {
         use std::collections::btree_map::Entry;
         match self.inner.entry(name) {
             Entry::Vacant(v) => {
-                v.insert(Box::new(entry));
+                v.insert(key);
                 true
             }
             Entry::Occupied(_) => false,
         }
     }
 
-    /// Removes a child by name. Returns the removed entry if it existed.
-    pub fn remove(&mut self, name: &str) -> Option<DirEntry> {
-        self.inner.remove(name).map(|b| *b)
+    pub fn remove(&mut self, name: &str) -> Option<EntryKey> {
+        self.inner.remove(name)
     }
 
-    /// Returns an iterator over children
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &DirEntry)> {
-        self.inner.iter().map(|(k, v)| (k.as_str(), v.as_ref()))
-    }
-
-    /// Returns a mutable iterator over children
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&str, &mut DirEntry)> {
-        self.inner.iter_mut().map(|(k, v)| (k.as_str(), v.as_mut()))
+    pub fn iter(&self) -> impl Iterator<Item = (&str, EntryKey)> {
+        self.inner.iter().map(|(k, v)| (k.as_str(), *v))
     }
 }
 
-/// Tree node for the in-memory directory tree.
-///
-/// Each node contains:
-/// - `entry`: InodeEntry - File(id) or Dir(Box<InodeDir>)
-/// - `children`: only present for directories
-///
-/// Names are stored in the parent's children map key, not duplicated here.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
-    pub entry: InodeEntry,
-    pub children: Option<Box<InodeChildren>>,
+    dir: Box<InodeDir>,
+    children: Box<DirChildren>,
 }
 
 impl DirEntry {
-    pub fn new_file(inode_id: i64) -> Self {
-        DirEntry {
-            entry: InodeEntry::File(inode_id),
-            children: None,
-        }
-    }
-
     pub fn new_dir(dir: InodeDir) -> Self {
-        DirEntry {
-            entry: InodeEntry::Dir(Box::new(dir)),
-            children: Some(Box::new(InodeChildren::new())),
+        Self {
+            dir: Box::new(dir),
+            children: Box::new(DirChildren::new()),
         }
     }
 
@@ -176,119 +112,193 @@ impl DirEntry {
 
     #[inline]
     pub fn id(&self) -> i64 {
-        self.entry.id()
+        self.dir.id()
     }
 
     #[inline]
-    pub fn is_dir(&self) -> bool {
-        self.entry.is_dir()
+    pub fn is_root(&self) -> bool {
+        self.id() == ROOT_INODE_ID
     }
 
-    #[inline]
-    pub fn is_file(&self) -> bool {
-        self.entry.is_file()
+    pub fn as_dir(&self) -> &InodeDir {
+        &self.dir
     }
 
-    pub fn as_dir(&self) -> Option<&InodeDir> {
-        self.entry.as_dir()
+    pub fn as_dir_mut(&mut self) -> &mut InodeDir {
+        &mut self.dir
     }
 
-    pub fn as_dir_mut(&mut self) -> Option<&mut InodeDir> {
-        self.entry.as_dir_mut()
+    pub fn children(&self) -> &DirChildren {
+        &self.children
     }
 
-    pub fn children(&self) -> Option<&InodeChildren> {
-        self.children.as_deref()
+    pub fn children_mut(&mut self) -> &mut DirChildren {
+        &mut self.children
     }
 
-    pub fn children_mut(&mut self) -> Option<&mut InodeChildren> {
-        self.children.as_deref_mut()
+    pub fn get_child(&self, name: &str) -> Option<EntryKey> {
+        self.children.get(name)
     }
 
-    pub fn get_child(&self, name: &str) -> Option<&DirEntry> {
-        self.children.as_ref()?.get(name)
+    pub fn add_child(&mut self, name: String, child: EntryKey) -> bool {
+        self.children.insert(name, child)
     }
 
-    pub fn get_child_mut(&mut self, name: &str) -> Option<&mut DirEntry> {
-        self.children.as_deref_mut()?.get_mut(name)
+    pub fn remove_child(&mut self, name: &str) -> Option<EntryKey> {
+        self.children.remove(name)
     }
 
-    pub fn add_child(&mut self, name: String, child: DirEntry) -> bool {
-        if let Some(ref mut children) = self.children {
-            children.insert(name, child)
-        } else {
-            false
-        }
-    }
-
-    /// Removes a child (only for directories)
-    pub fn remove_child(&mut self, name: &str) -> Option<DirEntry> {
-        self.children.as_mut()?.remove(name)
-    }
-
-    /// Returns the number of children (0 for files)
     pub fn child_count(&self) -> usize {
-        self.children.as_ref().map(|c| c.len()).unwrap_or(0)
-    }
-
-    /// Returns a raw pointer to this entry (for tree traversal)
-    pub fn as_ptr(&mut self) -> DirEntryRef {
-        DirEntryRef::from_ref(self)
-    }
-
-    /// Prints the tree structure for debugging
-    pub fn print_tree(&self) {
-        self.print_tree_recursive("", 0);
-    }
-
-    fn print_tree_recursive(&self, name: &str, depth: usize) {
-        let indent = "  ".repeat(depth);
-        let kind = if self.is_dir() { "D" } else { "F" };
-        println!("{}{}: {} (id={})", indent, name, kind, self.id());
-
-        if let Some(children) = self.children() {
-            for (child_name, child) in children.iter() {
-                child.print_tree_recursive(child_name, depth + 1);
-            }
-        }
-    }
-
-    /// Calculates a hash sum for verification (used in testing)
-    /// Hashes the tree structure: ids + kinds + edge names
-    pub fn sum_hash(&self) -> u128 {
-        self.sum_hash_recursive("")
-    }
-
-    fn sum_hash_recursive(&self, name: &str) -> u128 {
-        let mut hash: u128 = 0;
-
-        let id_bytes = self.id().to_be_bytes();
-        hash += Utils::crc32(&id_bytes) as u128;
-
-        let kind_byte = if self.is_dir() { 1u8 } else { 0u8 };
-        hash += Utils::crc32(&[kind_byte]) as u128;
-
-        hash += Utils::crc32(name.as_bytes()) as u128;
-
-        if let Some(children) = self.children() {
-            for (child_name, child) in children.iter() {
-                hash += child.sum_hash_recursive(child_name);
-            }
-        }
-
-        hash
+        self.children.len()
     }
 }
 
-/// Reference type for DirEntry (used in tree traversal)
-pub type DirEntryRef = RawPtr<DirEntry>;
+#[derive(Debug, Clone)]
+struct EntrySlot {
+    generation: u32,
+    value: Option<DirEntry>,
+}
 
-impl fmt::Display for InodeEntry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            InodeEntry::File(id) => write!(f, "File({})", id),
-            InodeEntry::Dir(dir) => write!(f, "Dir({})", dir.id),
+#[derive(Debug, Clone, Default)]
+pub struct EntryArena {
+    slots: Vec<EntrySlot>,
+    free_list: Vec<u32>,
+}
+
+impl EntryArena {
+    pub fn insert(&mut self, entry: DirEntry) -> EntryKey {
+        if let Some(slot) = self.free_list.pop() {
+            let idx = slot as usize;
+            let generation = self.slots[idx].generation.saturating_add(1).max(1);
+            self.slots[idx].generation = generation;
+            self.slots[idx].value = Some(entry);
+            EntryKey::new(slot, generation)
+        } else {
+            let slot = self.slots.len() as u32;
+            self.slots.push(EntrySlot {
+                generation: 1,
+                value: Some(entry),
+            });
+            EntryKey::new(slot, 1)
         }
+    }
+
+    pub fn get(&self, key: EntryKey) -> Option<&DirEntry> {
+        let slot = self.slots.get(key.slot())?;
+        if slot.generation != key.generation() {
+            return None;
+        }
+        slot.value.as_ref()
+    }
+
+    pub fn get_mut(&mut self, key: EntryKey) -> Option<&mut DirEntry> {
+        let slot = self.slots.get_mut(key.slot())?;
+        if slot.generation != key.generation() {
+            return None;
+        }
+        slot.value.as_mut()
+    }
+
+    pub fn remove(&mut self, key: EntryKey) -> Option<DirEntry> {
+        let slot = self.slots.get_mut(key.slot())?;
+        if slot.generation != key.generation() {
+            return None;
+        }
+        let entry = slot.value.take();
+        if entry.is_some() {
+            self.free_list.push(key.slot);
+        }
+        entry
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DirTree {
+    root_key: EntryKey,
+    arena: EntryArena,
+}
+
+impl DirTree {
+    pub fn new(root: DirEntry) -> Self {
+        let mut arena = EntryArena::default();
+        let root_key = arena.insert(root);
+        Self { root_key, arena }
+    }
+
+    pub fn root_key(&self) -> EntryKey {
+        self.root_key
+    }
+
+    pub fn arena(&self) -> &EntryArena {
+        &self.arena
+    }
+
+    pub fn arena_mut(&mut self) -> &mut EntryArena {
+        &mut self.arena
+    }
+
+    pub fn root_entry(&self) -> CommonResult<&DirEntry> {
+        self.entry(self.root_key)
+    }
+
+    pub fn entry(&self, key: EntryKey) -> CommonResult<&DirEntry> {
+        match self.arena.get(key) {
+            Some(entry) => Ok(entry),
+            None => err_box!("DirEntry not found for key {:?}", key),
+        }
+    }
+
+    pub fn entry_mut(&mut self, key: EntryKey) -> CommonResult<&mut DirEntry> {
+        match self.arena.get_mut(key) {
+            Some(entry) => Ok(entry),
+            None => err_box!("DirEntry not found for key {:?}", key),
+        }
+    }
+
+    pub fn insert_dir(&mut self, dir: InodeDir) -> EntryKey {
+        self.arena.insert(DirEntry::new_dir(dir))
+    }
+
+    pub fn remove(&mut self, key: EntryKey) -> Option<DirEntry> {
+        if key == self.root_key {
+            return None;
+        }
+        self.arena.remove(key)
+    }
+
+    pub fn print_tree(&self) {
+        if let Ok(root) = self.root_entry() {
+            self.print_tree_recursive("", root, 0);
+        }
+    }
+
+    fn print_tree_recursive(&self, name: &str, entry: &DirEntry, depth: usize) {
+        let indent = "  ".repeat(depth);
+        println!("{}{}: D (id={})", indent, name, entry.id());
+        for (child_name, child_key) in entry.children().iter() {
+            if let Some(child) = self.arena.get(child_key) {
+                self.print_tree_recursive(child_name, child, depth + 1);
+            }
+        }
+    }
+
+    pub fn sum_hash(&self) -> u128 {
+        self.root_entry()
+            .map(|root| self.sum_hash_recursive("", root))
+            .unwrap_or_default()
+    }
+
+    fn sum_hash_recursive(&self, name: &str, entry: &DirEntry) -> u128 {
+        let mut hash: u128 = 0;
+        hash += Utils::crc32(&entry.id().to_be_bytes()) as u128;
+        hash += Utils::crc32(&[1u8]) as u128;
+        hash += Utils::crc32(name.as_bytes()) as u128;
+        for (child_name, child_key) in entry.children().iter() {
+            if let Some(child) = self.arena.get(child_key) {
+                hash += self.sum_hash_recursive(child_name, child);
+            }
+        }
+        hash
     }
 }
 
@@ -296,9 +306,9 @@ impl fmt::Display for DirEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "DirEntry {{ entry: {}, children: {} }}",
-            self.entry,
-            self.children.as_ref().map(|c| c.len()).unwrap_or(0)
+            "DirEntry {{ id: {}, children: {} }}",
+            self.id(),
+            self.child_count()
         )
     }
 }
@@ -308,63 +318,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_inode_entry() {
-        let file = InodeEntry::File(123);
-        assert_eq!(file.id(), 123);
-        assert!(file.is_file());
-        assert!(!file.is_dir());
-
-        let dir = InodeEntry::Dir(Box::new(InodeDir::new(456, 0)));
-        assert_eq!(dir.id(), 456);
-        assert!(dir.is_dir());
-        assert!(!dir.is_file());
-    }
-
-    #[test]
-    fn test_dir_entry_file() {
-        let file = DirEntry::new_file(123);
-        assert_eq!(file.id(), 123);
-        assert!(file.is_file());
-        assert!(file.children.is_none());
-        assert_eq!(file.child_count(), 0);
-    }
-
-    #[test]
-    fn test_dir_entry_dir() {
-        let mut dir = DirEntry::new_dir(InodeDir::new(456, 0));
-        assert_eq!(dir.id(), 456);
-        assert!(dir.is_dir());
-        assert!(dir.children.is_some());
-        assert_eq!(dir.child_count(), 0);
-
-        let child = DirEntry::new_file(789);
-        assert!(dir.add_child("child.txt".to_string(), child));
-        assert_eq!(dir.child_count(), 1);
-
-        // Get child
-        let found = dir.get_child("child.txt");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().id(), 789);
-
-        // Remove child
-        let removed = dir.remove_child("child.txt");
-        assert!(removed.is_some());
-        assert_eq!(dir.child_count(), 0);
-    }
-
-    #[test]
-    fn test_inode_children() {
-        let mut children = InodeChildren::new();
-        assert!(children.is_empty());
-
-        children.insert("a".to_string(), DirEntry::new_file(1));
-        children.insert("b".to_string(), DirEntry::new_dir(InodeDir::new(2, 0)));
-
-        assert_eq!(children.len(), 2);
-        assert!(children.get("a").unwrap().is_file());
-        assert!(children.get("b").unwrap().is_dir());
-
-        let names: Vec<&str> = children.iter().map(|(n, _)| n).collect();
+    fn test_dir_children_insert_and_iter() {
+        let mut children = DirChildren::new();
+        let a = EntryKey::new(1, 1);
+        let b = EntryKey::new(2, 1);
+        assert!(children.insert("a".to_string(), a));
+        assert!(children.insert("b".to_string(), b));
+        assert_eq!(children.get("a"), Some(a));
+        let names: Vec<&str> = children.iter().map(|(name, _)| name).collect();
         assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_entry_arena_generation() {
+        let mut arena = EntryArena::default();
+        let key1 = arena.insert(DirEntry::new_dir(InodeDir::new(1, 0)));
+        assert!(arena.get(key1).is_some());
+        let _ = arena.remove(key1);
+        assert!(arena.get(key1).is_none());
+        let key2 = arena.insert(DirEntry::new_dir(InodeDir::new(2, 0)));
+        assert_eq!(key1.slot(), key2.slot());
+        assert_ne!(key1.generation(), key2.generation());
     }
 }
