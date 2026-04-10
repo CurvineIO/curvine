@@ -288,7 +288,7 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
-        let inode = match inp.get_last_inode() {
+        match inp.get_last_inode() {
             None => {
                 return if flags.create() {
                     drop(fs_dir);
@@ -303,7 +303,6 @@ impl MasterFilesystem {
                 if inode.is_dir() {
                     return err_box!("{} is a directory", inp.path());
                 }
-                inode
             }
         };
 
@@ -313,14 +312,8 @@ impl MasterFilesystem {
             return Ok(FileBlocks::new(status, vec![]));
         }
 
-        let status = fs_dir.reopen_file(&inp, opts.client_name)?;
-        let file = inode.as_file_ref()?;
-        let blocks = if !file.blocks.is_empty() {
-            self.get_block_locs(path, &fs_dir, file)?
-        } else {
-            vec![]
-        };
-        Ok(FileBlocks::new(status, blocks))
+        fs_dir.reopen_file(&inp, opts.client_name)?;
+        self.get_file_blocks(&fs_dir, &inp)
     }
 
     pub fn file_status<T: AsRef<str>>(&self, path: T) -> FsResult<FileStatus> {
@@ -505,32 +498,23 @@ impl MasterFilesystem {
         let mut fs_dir = self.fs_dir.write();
         let inp = Self::resolve_path(&fs_dir, path)?;
 
-        let inode = match inp.get_last_inode() {
-            None => return err_box!("File does not exist: {}", inp.path()),
-            Some(v) => v,
+        if inp.get_last_inode().is_none() {
+            return err_box!("File does not exist: {}", inp.path());
         };
-        let file = inode.as_file_ref()?;
         fs_dir.complete_file(&inp, len, commit_blocks, client_name, only_flush)?;
         if only_flush {
-            let locs = self.get_block_locs(path, &fs_dir, file)?;
-            let status = inode.to_file_status(path, inp.name());
-            Ok(Some(FileBlocks::new(status, locs)))
+            Ok(Some(self.get_file_blocks(&fs_dir, &inp)?))
         } else {
             Ok(None)
         }
     }
 
-    pub fn get_file_blocks(
-        &self,
-        path: &str,
-        fs_dir: &FsDir,
-        inp: &InodePath,
-    ) -> FsResult<FileBlocks> {
-        let inode = try_option!(inp.get_last_inode(), "File {} not exists", path);
+    pub fn get_file_blocks(&self, fs_dir: &FsDir, inp: &InodePath) -> FsResult<FileBlocks> {
+        let inode = try_option!(inp.get_last_inode(), "File {} not exists", inp.path());
         let file = inode.as_file_ref()?;
-        let blocks = self.get_block_locs(path, fs_dir, file)?;
+        let blocks = self.get_block_locs(inp.path(), fs_dir, file)?;
         Ok(FileBlocks::new(
-            inode.to_file_status(path, inp.name()),
+            inode.to_file_status(inp.path(), inp.name()),
             blocks,
         ))
     }
@@ -586,13 +570,14 @@ impl MasterFilesystem {
             None => return err_ext!(FsError::file_not_found(path)),
         };
         let file = inode.as_file_ref()?;
-        let block_locs = self.get_block_locs(path, &fs_dir, file)?;
-        let locate_blocks = FileBlocks {
-            status: inode.to_file_status(path, inp.name()),
-            block_locs,
-        };
+        if file.blocks.is_empty() {
+            return Ok(FileBlocks::new(
+                inode.to_file_status(path, inp.name()),
+                Vec::new(),
+            ));
+        }
 
-        Ok(locate_blocks)
+        self.get_file_blocks(&fs_dir, &inp)
     }
 
     pub fn master_info(&self) -> FsResult<MasterInfo> {

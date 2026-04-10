@@ -16,7 +16,7 @@ use crate::file::{FsReader, FsWriter};
 use crate::impl_filesystem_for_enum;
 use crate::{impl_reader_for_enum, impl_writer_for_enum};
 use curvine_common::fs::{FileSystem, Path};
-use curvine_common::state::{MountInfo, Provider};
+use curvine_common::state::{FileBlocks, MountInfo, Provider};
 use curvine_common::FsResult;
 use orpc::err_box;
 use std::collections::HashMap;
@@ -68,6 +68,19 @@ impl_writer_for_enum! {
 
         #[cfg(feature = "oss-hdfs")]
         OssHdfs(OssHdfsWriter),
+    }
+}
+
+impl UnifiedWriter {
+    pub fn file_blocks(&self) -> Option<FileBlocks> {
+        match self {
+            Self::Cv(writer) => Some(writer.snapshot_file_blocks()),
+            Self::CacheSync(writer) => Some(writer.snapshot_file_blocks()),
+            #[cfg(feature = "opendal")]
+            Self::Opendal(_) => None,
+            #[cfg(feature = "oss-hdfs")]
+            Self::OssHdfs(_) => None,
+        }
     }
 }
 

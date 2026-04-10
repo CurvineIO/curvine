@@ -155,10 +155,12 @@ impl WriteHandler {
         let file = try_option_mut!(self.file);
         let context = try_option_mut!(self.context);
         Self::check_context(context, msg)?;
+        let mut should_flush = false;
 
         // msg.header
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
+            should_flush = header.flush;
             // Flush operation should not trigger seek or boundary check
             if !header.flush {
                 if header.offset < 0 || header.offset >= context.block_size {
@@ -199,6 +201,10 @@ impl WriteHandler {
             self.metrics.write_bytes.inc_by(msg.data_len() as i64);
             self.metrics.write_time_us.inc_by(used as i64);
             self.metrics.write_count.inc();
+        }
+
+        if should_flush {
+            file.flush()?;
         }
 
         Ok(msg.success())

@@ -147,7 +147,9 @@ impl FsWriterBase {
     }
 
     pub async fn flush(&mut self) -> FsResult<()> {
-        self.complete0(true).await?;
+        if let Some(file_blocks) = self.complete0(true).await? {
+            self.file_blocks = WriteFileBlocks::new(file_blocks);
+        }
         Ok(())
     }
 

@@ -23,7 +23,7 @@ use orpc::runtime::RpcRuntime;
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
 use orpc::sync::ErrorMonitor;
 use orpc::sys::DataSlice;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 // Control task type
 enum WriterTask {
@@ -105,6 +105,7 @@ impl BufferChannel {
 pub struct FsWriterBuffer {
     path: Path,
     file_blocks: FileBlocks,
+    latest_file_blocks: Arc<RwLock<FileBlocks>>,
     writer: BufferChannel,
     pos: i64,
 }
@@ -114,15 +115,18 @@ impl FsWriterBuffer {
         let err_monitor = Arc::new(ErrorMonitor::new());
         let path = writer.path().clone();
         let file_blocks = writer.file_blocks();
+        let latest_file_blocks = Arc::new(RwLock::new(file_blocks.clone()));
         let pos = writer.pos();
 
         let (chunk_sender, chunk_receiver) = AsyncChannel::new(chunk_num).split();
         let (task_sender, task_receiver) = AsyncChannel::new(2).split();
         let monitor = err_monitor.clone();
+        let latest_blocks = latest_file_blocks.clone();
 
         let rt = writer.fs_context().clone_runtime();
         rt.spawn(async move {
-            let res = Self::write_future(chunk_receiver, task_receiver, writer).await;
+            let res =
+                Self::write_future(chunk_receiver, task_receiver, writer, latest_blocks).await;
             match res {
                 Ok(_) => {}
                 Err(e) => {
@@ -141,6 +145,7 @@ impl FsWriterBuffer {
         Self {
             path,
             file_blocks,
+            latest_file_blocks,
             writer,
             pos,
         }
@@ -160,6 +165,10 @@ impl FsWriterBuffer {
 
     pub fn file_blocks(&self) -> &FileBlocks {
         &self.file_blocks
+    }
+
+    pub fn snapshot_file_blocks(&self) -> FileBlocks {
+        self.latest_file_blocks.read().unwrap().clone()
     }
 
     pub fn pos(&self) -> i64 {
@@ -202,6 +211,7 @@ impl FsWriterBuffer {
         mut chunk_receiver: AsyncReceiver<DataSlice>,
         mut task_receiver: AsyncReceiver<WriterTask>,
         mut writer: FsWriterBase,
+        latest_file_blocks: Arc<RwLock<FileBlocks>>,
     ) -> FsResult<()> {
         loop {
             // The queue can be written and controlled to complete any future.
@@ -224,6 +234,7 @@ impl FsWriterBuffer {
                             writer.write(chunk).await?;
                         }
                         writer.flush().await?;
+                        *latest_file_blocks.write().unwrap() = writer.file_blocks();
                         cx.send(1)?;
                     }
 
@@ -232,6 +243,7 @@ impl FsWriterBuffer {
                             writer.write(chunk).await?;
                         }
                         writer.complete().await?;
+                        *latest_file_blocks.write().unwrap() = writer.file_blocks();
                         tx.send(1)?;
                         return Ok(());
                     }
@@ -256,8 +268,10 @@ impl FsWriterBuffer {
                         }
 
                         writer.resize(opts).await?;
+                        let file_blocks = writer.file_blocks();
+                        *latest_file_blocks.write().unwrap() = file_blocks.clone();
 
-                        if let Err(e) = tx.send(writer.file_blocks()) {
+                        if let Err(e) = tx.send(file_blocks) {
                             return Err(e.into());
                         }
                     }

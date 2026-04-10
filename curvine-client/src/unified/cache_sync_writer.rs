@@ -17,7 +17,9 @@ use log::info;
 use tracing::warn;
 
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileAllocOpts, FileStatus, LoadJobResult, OpenFlags, WriteType};
+use curvine_common::state::{
+    FileAllocOpts, FileBlocks, FileStatus, LoadJobResult, OpenFlags, WriteType,
+};
 use curvine_common::FsResult;
 use orpc::sys::DataSlice;
 
@@ -66,6 +68,14 @@ impl CacheSyncWriter {
         } else {
             Ok(())
         }
+    }
+
+    pub fn file_blocks(&self) -> &FileBlocks {
+        self.inner.file_blocks()
+    }
+
+    pub fn snapshot_file_blocks(&self) -> FileBlocks {
+        self.inner.snapshot_file_blocks()
     }
 }
 

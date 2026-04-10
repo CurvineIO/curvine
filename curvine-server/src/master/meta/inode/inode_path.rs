@@ -18,6 +18,11 @@ use crate::master::meta::store::InodeStore;
 use orpc::{err_box, try_option, CommonResult};
 use std::fmt;
 
+/// Holds the rich inode materialized for the current request.
+///
+/// Directories come from the in-memory dir tree, while the terminal file inode
+/// may be loaded from the store. Callers should keep using this object for the
+/// rest of the request instead of resolving the same entity again by path.
 pub struct ResolvedInode {
     pub inode: InodePtr,
     pub entry_key: Option<EntryKey>,
@@ -29,6 +34,12 @@ impl ResolvedInode {
     }
 }
 
+/// Request-scoped rich view for a resolved path.
+///
+/// `InodePath` is not only a path shell. Once `resolve()` succeeds, every
+/// resolved component in `resolved` becomes the authoritative rich entity view
+/// for this request. Helpers that already hold `&InodePath` should derive file
+/// status and block metadata from it instead of reloading the same inode.
 pub struct InodePath {
     path: String,
     name: String,
@@ -67,6 +78,9 @@ impl InodePath {
                 continue;
             }
 
+            // The directory tree stays id-only. When the leaf is a file, we
+            // materialize a rich inode once and keep using it within this
+            // request.
             if let Some(child_inode) = store.lookup_child(cur_entry.id(), child_name)? {
                 let child_ptr = InodePtr::from_owned(child_inode);
                 resolved.push(ResolvedInode::new(child_ptr, None));

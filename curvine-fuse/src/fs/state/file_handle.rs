@@ -73,15 +73,34 @@ impl FileHandle {
 
         if let Some(writer) = state.find_writer(&op.header.nodeid) {
             let read_end = op.arg.offset as i64 + op.arg.size as i64;
+            let mut latest_len = reader.len();
+            let mut latest_blocks = None;
             if read_end >= reader.len() {
-                {
-                    writer.lock().await.flush(None).await?;
+                latest_len = read_end;
+            }
+            let path = match state.get_path(op.header.nodeid) {
+                Ok(path) => path,
+                Err(_) => Path::from_str(&self.status.path)?,
+            };
+            {
+                let mut writer = writer.lock().await;
+                writer.flush(None).await?;
+                if let Some(blocks) = writer.file_blocks().await? {
+                    latest_len = blocks.status.len;
+                    latest_blocks = Some(blocks.clone());
+                    state.meta_cache().put_open(&path, blocks);
                 }
-                // Re-resolve the current path by inode before refreshing the reader.
-                // This keeps open handles readable after rename and concurrent growth.
-                let path = state.get_path(op.header.nodeid)?;
+            }
+            if latest_len != reader.len() || read_end >= reader.len() {
+                // Refresh the reader from the same flushed file view instead of
+                // re-opening against a potentially older metadata snapshot or
+                // failing on an already unlinked temp path.
                 reader.as_mut().complete(None).await?;
-                let new_reader = state.new_reader(&path).await?;
+                let new_reader = if let Some(blocks) = latest_blocks {
+                    state.new_reader_with_blocks(&path, blocks)?
+                } else {
+                    state.new_reader(&path).await?
+                };
                 reader.replace(new_reader);
             }
         }

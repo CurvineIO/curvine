@@ -655,18 +655,18 @@ impl FsDir {
         inp: &InodePath,
         client_name: impl AsRef<str>,
     ) -> FsResult<FileStatus> {
-        let inode_ptr = match inp.get_last_inode() {
+        let mut inode = match inp.get_last_inode() {
             None => return err_ext!(FsError::file_not_found(inp.path())),
             Some(v) => v,
         };
 
-        let mut inode = match inode_ptr.as_ref() {
-            File(..) => inode_ptr.as_ref().clone(),
+        match inode.as_ref() {
+            File(..) => {}
             Dir(..) => {
                 let err_msg = format!("Cannot append to already exists {} directory", inp.path());
                 return err_ext!(FsError::file_exists(err_msg));
             }
-        };
+        }
 
         let file = inode.as_file_mut()?;
         let _ = file.reopen(client_name);

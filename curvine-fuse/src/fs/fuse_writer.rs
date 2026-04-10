@@ -19,7 +19,7 @@ use curvine_client::unified::UnifiedWriter;
 use curvine_common::conf::FuseConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path, Writer};
-use curvine_common::state::{FileAllocOpts, FileStatus};
+use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus};
 use curvine_common::FsResult;
 use log::error;
 use orpc::runtime::{RpcRuntime, Runtime};
@@ -33,6 +33,7 @@ enum WriteTask {
     Write(i64, Bytes, FuseResponse),
     Flush(CallSender<i8>, Option<FuseResponse>),
     Complete(CallSender<i8>, Option<FuseResponse>),
+    FileBlocks(CallSender<Option<FileBlocks>>),
     Resize(CallSender<i8>, FileAllocOpts),
 }
 
@@ -117,6 +118,15 @@ impl FuseWriter {
         fun.await.map_err(|e| self.check_error(e))
     }
 
+    pub async fn file_blocks(&self) -> FsResult<Option<FileBlocks>> {
+        let fun = async {
+            let (rx, tx) = CallChannel::channel();
+            self.sender.send(WriteTask::FileBlocks(rx)).await?;
+            tx.receive().await
+        };
+        fun.await.map_err(|e| self.check_error(e.into()))
+    }
+
     pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
@@ -159,6 +169,10 @@ impl FuseWriter {
                         reply.send_rep(res).await?;
                     }
                     tx.send(1)?;
+                }
+
+                WriteTask::FileBlocks(tx) => {
+                    tx.send(writer.file_blocks())?;
                 }
 
                 WriteTask::Resize(tx, opts) => {

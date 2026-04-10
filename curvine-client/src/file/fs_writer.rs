@@ -73,6 +73,10 @@ impl FsWriter {
     pub fn file_blocks(&self) -> &FileBlocks {
         self.inner.file_blocks()
     }
+
+    pub fn snapshot_file_blocks(&self) -> FileBlocks {
+        self.inner.snapshot_file_blocks()
+    }
 }
 
 impl Writer for FsWriter {

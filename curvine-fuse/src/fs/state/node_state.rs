@@ -307,6 +307,20 @@ impl NodeState {
         Ok(reader)
     }
 
+    pub fn new_reader_with_blocks(
+        &self,
+        path: &Path,
+        blocks: FileBlocks,
+    ) -> FuseResult<FuseReader> {
+        let reader = FsReader::new(path.clone(), self.fs.fs_context().clone(), blocks)?;
+        let reader = FuseReader::new(
+            &self.conf,
+            self.fs.clone_runtime(),
+            UnifiedReader::Cv(reader),
+        );
+        Ok(reader)
+    }
+
     pub async fn new_handle(
         &self,
         ino: u64,
@@ -316,17 +330,27 @@ impl NodeState {
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
 
-        // Before creating reader, flush any active writer to ensure reader gets correct file length
-        // This is critical for applications like git clone that read files while they're being written
+        // Before creating reader, flush any active writer to ensure reader gets
+        // the newest visible blocks without prematurely sealing the file.
+        let mut reader_blocks = None;
         if flags.read() {
             if let Some(existing_writer) = self.find_writer(&ino) {
-                existing_writer.lock().await.flush(None).await?;
+                let mut writer = existing_writer.lock().await;
+                writer.flush(None).await?;
+                if let Some(blocks) = writer.file_blocks().await? {
+                    reader_blocks = Some(blocks.clone());
+                    self.meta_cache.put_open(path, blocks);
+                }
             }
         }
 
         let (reader, writer) = match flags.access_mode() {
             mode if mode == OpenFlags::RDONLY => {
-                let reader = self.new_reader(path).await?;
+                let reader = if let Some(blocks) = reader_blocks {
+                    self.new_reader_with_blocks(path, blocks)?
+                } else {
+                    self.new_reader(path).await?
+                };
                 (Some(RawPtr::from_owned(reader)), None)
             }
 
