@@ -41,6 +41,12 @@ FAILED_TESTS=0
 FAILED_TEST_LIST=()
 FAILED_CMD_LIST=()
 
+if [ "$(id -u)" -eq 0 ] || ! command -v sudo >/dev/null 2>&1; then
+    SUDO_CMD=""
+else
+    SUDO_CMD="sudo"
+fi
+
 # JSON test results tracking
 JSON_TEST_RESULTS=()
 CURRENT_TEST_GROUP=""
@@ -558,13 +564,13 @@ test_permissions() {
     local test_user="fuse-test"
     local test_group="fuse-test"
 
-    sudo groupadd "$test_group" 2>/dev/null || true
-    sudo useradd -g "$test_group" -M -s /bin/false "$test_user" 2>/dev/null || true
+    $SUDO_CMD groupadd "$test_group" 2>/dev/null || true
+    $SUDO_CMD useradd -g "$test_group" -M -s /bin/false "$test_user" 2>/dev/null || true
 
     # Test chown
     print_test "Changing file owner to $test_user with chown"
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
-    if sudo chown "$test_user" "$perm_file" 2>/dev/null; then
+    if $SUDO_CMD chown "$test_user" "$perm_file" 2>/dev/null; then
         local file_owner=$(stat -c '%U' "$perm_file" 2>/dev/null || stat -f '%Su' "$perm_file")
         if [ "$file_owner" = "$test_user" ]; then
             print_success "Changed file owner to $test_user"
@@ -578,7 +584,7 @@ test_permissions() {
     # Test chgrp
     print_test "Changing file group to $test_group with chgrp"
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
-    if sudo chgrp "$test_group" "$perm_file" 2>/dev/null; then
+    if $SUDO_CMD chgrp "$test_group" "$perm_file" 2>/dev/null; then
         local file_group=$(stat -c '%G' "$perm_file" 2>/dev/null || stat -f '%Sg' "$perm_file")
         if [ "$file_group" = "$test_group" ]; then
             print_success "Changed file group to $test_group"
@@ -595,7 +601,7 @@ test_permissions() {
 
     print_test "Changing file owner and group to $test_user:$test_group with chown"
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
-    if sudo chown "$test_user:$test_group" "$another_file" 2>/dev/null; then
+    if $SUDO_CMD chown "$test_user:$test_group" "$another_file" 2>/dev/null; then
         local file_owner=$(stat -c '%U' "$another_file" 2>/dev/null || stat -f '%Su' "$another_file")
         local file_group=$(stat -c '%G' "$another_file" 2>/dev/null || stat -f '%Sg' "$another_file")
         if [ "$file_owner" = "$test_user" ] && [ "$file_group" = "$test_group" ]; then
@@ -608,8 +614,8 @@ test_permissions() {
     fi
 
     # Cleanup test user and group
-    sudo userdel "$test_user" 2>/dev/null || true
-    sudo groupdel "$test_group" 2>/dev/null || true
+    $SUDO_CMD userdel "$test_user" 2>/dev/null || true
+    $SUDO_CMD groupdel "$test_group" 2>/dev/null || true
 
     # Test numeric chmod
     print_test "Changing permissions with numeric mode (chmod 600)"

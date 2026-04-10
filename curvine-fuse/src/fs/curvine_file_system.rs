@@ -1189,6 +1189,19 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let attr = self.lookup_status(id, Some(name), handle.status())?;
         self.invalidate_cache(&path)?;
+        // Reply with FUSE open flags only. Returning the original O_* request
+        // bits (such as O_EXCL) can break CREATE on stricter kernels.
+        let mut open_flags = 0;
+        if self.conf.direct_io {
+            open_flags |= FUSE_FOPEN_DIRECT_IO;
+        } else {
+            let keep_cache = self.state.should_keep_cache(handle.ino, handle.status())?;
+            if keep_cache {
+                open_flags |= FUSE_FOPEN_KEEP_CACHE;
+            } else {
+                open_flags |= FUSE_FOPEN_DIRECT_IO;
+            }
+        }
         let r = fuse_create_out(
             fuse_entry_out {
                 nodeid: handle.ino,
@@ -1201,7 +1214,7 @@ impl fs::FileSystem for CurvineFileSystem {
             },
             fuse_open_out {
                 fh: handle.fh,
-                open_flags: op.arg.flags,
+                open_flags,
                 padding: 0,
             },
         );

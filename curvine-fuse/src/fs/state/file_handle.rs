@@ -71,13 +71,15 @@ impl FileHandle {
             None => return err_fuse!(libc::EIO),
         };
 
-        if op.arg.offset as i64 >= reader.len() {
-            if let Some(writer) = state.find_writer(&op.header.nodeid) {
+        if let Some(writer) = state.find_writer(&op.header.nodeid) {
+            let read_end = op.arg.offset as i64 + op.arg.size as i64;
+            if read_end >= reader.len() {
                 {
                     writer.lock().await.flush(None).await?;
                 }
-                // TODO: Optimize by adding refresh interface to refresh block list
-                let path = reader.path().clone();
+                // Re-resolve the current path by inode before refreshing the reader.
+                // This keeps open handles readable after rename and concurrent growth.
+                let path = state.get_path(op.header.nodeid)?;
                 reader.as_mut().complete(None).await?;
                 let new_reader = state.new_reader(&path).await?;
                 reader.replace(new_reader);
