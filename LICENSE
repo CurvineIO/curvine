@@ -1,6 +1,28 @@
+Curvine Open Source License
+
+Curvine is licensed under a modified version of the Apache License 2.0, with the following additional conditions:
+
+1. Curvine may be used commercially, including for internal business use, private deployment, dedicated deployment for a single customer, or as infrastructure software within an enterprise. However, if any of the conditions below are met, a separate commercial license must be obtained from the producer:
+
+   a. Hosted or managed service restriction: Unless explicitly authorized by Curvine in writing, you may not use the Curvine source code to provide hosted services, managed services, cloud services, SaaS, PaaS, API services, storage services, cache services, acceleration services, or other similar commercial services to third parties.
+
+   b. Multi-customer platform restriction: Unless explicitly authorized by Curvine in writing, you may not use the Curvine source code to operate a shared, pooled, or unified service platform for multiple customers, tenants, organizations, or accounts as part of a commercial offering.
+
+   c. Single-customer dedicated deployment exception: A separate commercial license is not required solely because Curvine is deployed or operated for a single customer, provided that such deployment is dedicated to that single customer, that customer exclusively controls or exclusively receives the benefit of the environment, and the deployment is not part of a shared or multi-customer hosted service.
+
+2. As a contributor, you agree that:
+
+   a. The producer may adjust the open source agreement for future versions of Curvine to be more strict or more relaxed as deemed necessary.
+
+   b. Your contributed code may be used for commercial purposes, including but not limited to cloud business, managed services, commercial licensing, and other commercial operations of the producer.
+
+   c. The license adjustment described above applies only to future releases and does not automatically modify the license terms applicable to copies of prior releases already received by users.
+
+Apart from the specific conditions mentioned above, all other rights and restrictions follow the Apache License 2.0. The full text of the Apache License 2.0 is set out below.
+
                                  Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
+                          Version 2.0, January 2004
+                       http://www.apache.org/licenses/
 
    TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 
