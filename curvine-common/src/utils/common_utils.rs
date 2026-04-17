@@ -12,11 +12,16 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use crate::fs::Path;
+use crate::state::{FileStatus, FileType};
+use crate::FsResult;
 use log::info;
 use orpc::common::Utils;
-use orpc::{err_msg, CommonResult};
+use orpc::io::LocalFile;
+use orpc::{err_msg, ternary, CommonResult};
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct CommonUtils;
 
@@ -55,5 +60,35 @@ impl CommonUtils {
 
         info!("reload: new process spawned successfully");
         Ok(())
+    }
+
+    fn to_epoch_ms(ts: std::io::Result<SystemTime>) -> i64 {
+        ts.ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    pub fn metadata_to_file_status(path: &Path, meta: &std::fs::Metadata) -> FileStatus {
+        FileStatus {
+            path: path.full_path().to_owned(),
+            name: path.name().to_owned(),
+            is_dir: meta.is_dir(),
+            mtime: Self::to_epoch_ms(meta.modified()),
+            atime: Self::to_epoch_ms(meta.accessed()),
+            children_num: 0,
+            is_complete: true,
+            len: meta.len() as i64,
+            replicas: 1,
+            block_size: 512,
+            file_type: ternary!(meta.is_dir(), FileType::Dir, FileType::File),
+            mode: 0o777,
+            ..Default::default()
+        }
+    }
+
+    pub fn file_to_status(path: &Path, file: &LocalFile) -> FsResult<FileStatus> {
+        let meta = file.metadata()?;
+        Ok(Self::metadata_to_file_status(path, &meta))
     }
 }
