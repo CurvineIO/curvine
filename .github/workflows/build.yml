@@ -21,7 +21,7 @@ jobs:
   # runners (org enables "larger runners", then runs-on: labels: ubuntu-24.04-8core etc.), or
   # self-hosted runners with more cores.
   cleanup:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Clean hostedtoolcache to free disk space on host
         run: |
@@ -35,7 +35,7 @@ jobs:
           df -h
 
   build:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: cleanup
     # curvine-tests image extends curvine-compile:rocky9 and pre-installs Flask, werkzeug, pip, jq, fio (see curvine-tests/Dockerfile)
     container:
