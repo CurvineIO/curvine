@@ -16,6 +16,7 @@ use curvine_common::fs::RpcCode;
 use curvine_common::FsResult;
 use log::info;
 use orpc::common::TimeSpent;
+use orpc::handler::FrameBuf;
 use orpc::io::net::ConnState;
 use orpc::message::{Builder, Message};
 use orpc::CommonResult;
@@ -55,8 +56,24 @@ impl<'a> RpcContext<'a> {
         Ok(rep_msg)
     }
 
+    pub fn response_buf<T: PMessage + Default>(
+        &self,
+        header: T,
+        buf: &mut FrameBuf,
+    ) -> FsResult<Message> {
+        let len = header.encoded_len();
+        let mut encode_buf = buf.take_capacity(len);
+        header.encode(&mut encode_buf)?;
+
+        let rep_msg = Builder::success(self.msg).header(encode_buf).build();
+        Ok(rep_msg)
+    }
+
     pub fn audit_log(&self, succeeded: bool, used_us: u64, conn_state: Option<&ConnState>) {
-        if self.code == RpcCode::WorkerHeartbeat || self.code == RpcCode::WorkerBlockReport {
+        if matches!(
+            self.code,
+            RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::GetMountTable
+        ) {
             return;
         }
 

@@ -52,7 +52,7 @@ impl FsDir {
         ttl_bucket_list: Arc<TtlBucketList>,
         evictor: Arc<dyn Evictor>,
     ) -> FsResult<Self> {
-        let db_conf = conf.meta_rocks_conf();
+        let db_conf = conf.db_conf();
 
         let store = RocksInodeStore::new(db_conf, conf.format_master)?;
         let state = InodeStore::new(store, ttl_bucket_list);
@@ -73,7 +73,7 @@ impl FsDir {
 
     // Create root directory
     pub fn create_root() -> InodeView {
-        Dir(ROOT_INODE_NAME.to_string(), InodeDir::new(ROOT_INODE_ID, 0))
+        InodeView::new_dir(ROOT_INODE_NAME.to_string(), InodeDir::new(ROOT_INODE_ID, 0))
     }
 
     pub fn root_ptr(&self) -> InodePtr {
@@ -125,7 +125,7 @@ impl FsDir {
 
         let dir = InodeDir::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
 
-        inp = self.add_last_inode(inp, Dir(name.clone(), dir.clone()))?;
+        inp = self.add_last_inode(inp, InodeView::new_dir(name.clone(), dir.clone()))?;
 
         let parent_path = inp.get_valid_parent_path();
         self.journal_writer.log_mkdir(self, &parent_path, &dir)?;
@@ -194,11 +194,11 @@ impl FsDir {
         parent.update_mtime(mtime);
 
         let del_res = match child {
-            File(_, file) => {
-                if file.nlink() > 1 {
+            File(f) => {
+                if f.nlink() > 1 {
                     let target_inode = target.clone();
-                    if let File(_, ref mut target_file) = target_inode.as_mut() {
-                        target_file.decrement_nlink();
+                    if let File(ref mut nf) = target_inode.as_mut() {
+                        nf.decrement_nlink();
                     }
                     self.store.apply_unlink(parent.as_ref(), child)?
                 } else {
@@ -206,13 +206,13 @@ impl FsDir {
                     self.store.apply_delete(parent.as_ref(), child)?
                 }
             }
-            FileEntry(_, inode_id) => {
+            FileEntry(e) => {
                 // This is a link entry, just remove the directory entry
                 // The actual inode's nlink count should be decremented
                 self.store
-                    .apply_unlink_file_entry(parent.as_ref(), child, *inode_id)?
+                    .apply_unlink_file_entry(parent.as_ref(), child, e.id)?
             }
-            Dir(_, _) => {
+            Dir(_) => {
                 parent.dec_nlink();
                 // Directories are always deleted
                 self.store.apply_delete(parent.as_ref(), child)?
@@ -256,24 +256,24 @@ impl FsDir {
         stack.push_back(inode);
         while let Some(inode) = stack.pop_front() {
             match inode.as_mut() {
-                FileEntry(name, id) => {
-                    if let Some(store_inode) = self.store.get_inode(*id, Some(name))? {
+                FileEntry(e) => {
+                    if let Some(store_inode) = self.store.get_inode(e.id, Some(&e.name))? {
                         stack.push_back(InodePtr::from_owned(store_inode));
                     }
                 }
 
-                Dir(_, dir) => {
+                Dir(d) => {
                     if recursive {
-                        for child in dir.children_iter() {
+                        for child in d.children_iter() {
                             stack.push_back(InodePtr::from_ref(child));
                         }
                     }
                 }
 
-                File(_, file) => {
-                    let locs = file.get_locs(&self.store)?;
-                    let len = file.len;
-                    if file.free(mtime) {
+                File(f) => {
+                    let locs = f.get_locs(&self.store)?;
+                    let len = f.len;
+                    if f.free(mtime) {
                         free_res.add(len, locs);
                         change_inodes.push(inode.as_ref().clone());
                     }
@@ -387,7 +387,7 @@ impl FsDir {
 
         // Create an inode file node.
         let file = InodeFile::with_opts(self.next_inode_id()?, LocalTime::mills() as i64, opts);
-        inp = self.add_last_inode(inp, File(name, file))?;
+        inp = self.add_last_inode(inp, InodeView::new_file(name, file))?;
         self.journal_writer.log_create_file(self, &inp)?;
 
         Ok(inp)
@@ -452,35 +452,35 @@ impl FsDir {
             None => return err_box!("File {} not exists", inp.path()),
         };
 
-        let mut res = Vec::with_capacity(1.max(inode.child_len()));
         match inode.as_ref() {
-            File(_, _) => res.push(inode.to_file_status(inp.path())),
+            File(_) => Ok(vec![inode.to_file_status(inp.path())]),
 
-            Dir(_, d) => {
-                for item in d.children_iter() {
-                    let child_path = inp.child_path(item.name());
-                    match item {
-                        File(..) | Dir(..) => res.push(item.to_file_status(&child_path)),
-                        FileEntry(name, id) => {
-                            let inode_opt = self.store.get_inode(*id, Some(name))?;
-                            if let Some(inode_view) = inode_opt {
-                                res.push(inode_view.to_file_status(&child_path));
-                            }
-                        }
-                    }
-                }
+            Dir(d) => {
+                let iter = d.children_iter().collect();
+                let res = self.store.batched_get_inodes(inp, iter)?;
+                Ok(res)
             }
 
-            FileEntry(name, id) => {
-                let inode_opt = self.store.get_inode(*id, Some(name))?;
+            FileEntry(e) => {
+                let inode_opt = self.store.get_inode(e.id, Some(&e.name))?;
                 match inode_opt {
-                    Some(inode_view) => res.push(inode_view.to_file_status(inp.path())),
-                    None => return err_box!("File {} not exists", inp.path()),
+                    Some(inode_view) => Ok(vec![inode_view.to_file_status(inp.path())]),
+                    None => err_box!("File {} not exists", inp.path()),
                 }
             }
         }
+    }
 
-        Ok(res)
+    fn list_single_file(status: FileStatus, opts: &ListOptions) -> Vec<FileStatus> {
+        if matches!(opts.limit, Some(0)) {
+            return vec![];
+        }
+        if let Some(sa) = opts.start_after.as_deref() {
+            if status.name.as_str() <= sa {
+                return vec![];
+            }
+        }
+        vec![status]
     }
 
     pub fn list_options(&self, inp: &InodePath, opts: &ListOptions) -> FsResult<Vec<FileStatus>> {
@@ -490,33 +490,24 @@ impl FsDir {
         };
 
         match inode.as_ref() {
-            File(_, _) => Ok(vec![inode.to_file_status(inp.path())]),
+            File(_) => {
+                let status = inode.to_file_status(inp.path());
+                Ok(Self::list_single_file(status, opts))
+            }
 
-            Dir(_, d) => {
+            Dir(d) => {
                 let children = d.list_options(opts);
-                let mut res = Vec::with_capacity(children.len());
-
-                for item in children {
-                    let child_path = inp.child_path(item.name());
-
-                    match item {
-                        File(..) | Dir(..) => res.push(item.to_file_status(&child_path)),
-
-                        FileEntry(name, id) => {
-                            let inode_opt = self.store.get_inode(*id, Some(name))?;
-                            if let Some(inode_view) = inode_opt {
-                                res.push(inode_view.to_file_status(&child_path));
-                            }
-                        }
-                    }
-                }
+                let res = self.store.batched_get_inodes(inp, children)?;
                 Ok(res)
             }
 
-            FileEntry(name, id) => {
-                let inode_opt = self.store.get_inode(*id, Some(name))?;
+            FileEntry(e) => {
+                let inode_opt = self.store.get_inode(e.id, Some(&e.name))?;
                 match inode_opt {
-                    Some(inode_view) => Ok(vec![inode_view.to_file_status(inp.path())]),
+                    Some(inode_view) => {
+                        let status = inode_view.to_file_status(inp.path());
+                        Ok(Self::list_single_file(status, opts))
+                    }
                     None => err_box!("File {} not exists", inp.path()),
                 }
             }
@@ -864,19 +855,19 @@ impl FsDir {
             }
 
             match cur_inode.as_mut() {
-                Dir(_, dir) if opts.recursive => {
+                Dir(dir) if opts.recursive => {
                     for child in dir.children_iter() {
                         stack.push_back(InodePtr::from_ref(child));
                     }
                 }
 
-                FileEntry(name, id) => {
-                    if let Some(store_inode) = self.store.get_inode(*id, Some(name))? {
+                FileEntry(e) => {
+                    if let Some(store_inode) = self.store.get_inode(e.id, Some(&e.name))? {
                         stack.push_back(InodePtr::from_owned(store_inode));
                     } else {
                         warn!(
                             "unprotected_set_attr: missing inode {} for FileEntry '{}'",
-                            id, name
+                            e.id, e.name
                         );
                     }
                 }
@@ -930,20 +921,21 @@ impl FsDir {
 
         let name = link.name().to_string();
         parent.update_mtime(new_inode.mtime);
+        let is_add = old_inode.is_none();
         let new_inode_ptr = match old_inode {
             Some(v) => {
-                let _ = mem::replace(v.as_mut(), File(name, new_inode));
+                let _ = mem::replace(v.as_mut(), InodeView::new_file(name, new_inode));
                 v
             }
             None => {
-                let added = parent.add_child(File(name, new_inode))?;
+                let added = parent.add_child(InodeView::new_file(name, new_inode))?;
                 link.append(added.clone())?;
                 added
             }
         };
 
         self.store
-            .apply_symlink(parent.as_ref(), new_inode_ptr.as_ref())?;
+            .apply_symlink(parent.as_ref(), new_inode_ptr.as_ref(), is_add)?;
         Ok(link)
     }
 
@@ -954,22 +946,22 @@ impl FsDir {
         // Get the original inode ID and update nlink in memory if it's a direct File
         let (original_inode_id, mut original_inode_ptr) = match src_path.get_last_inode() {
             Some(inode) => match inode.as_ref() {
-                File(_, file) => {
+                File(file) => {
                     // Check if it's a regular file (not a directory or symlink)
                     if file.file_type != curvine_common::state::FileType::File {
                         return err_ext!(FsError::common("Cannot create link to non-regular file"));
                     }
                     (file.id, Some(inode.clone()))
                 }
-                FileEntry(_, inode_id) => (*inode_id, None), // FileEntry already points to an inode
-                Dir(_, _) => return err_ext!(FsError::common("Cannot create link to directory")),
+                FileEntry(e) => (e.id, None), // FileEntry already points to an inode
+                Dir(_) => return err_ext!(FsError::common("Cannot create link to directory")),
             },
             None => return err_ext!(FsError::file_not_found(src_path.path())),
         };
 
         // If we have the original inode in memory, increment its nlink count
         if let Some(ref mut inode_ptr) = original_inode_ptr {
-            if let File(_, _) = inode_ptr.as_mut() {
+            if let File(_) = inode_ptr.as_mut() {
                 inode_ptr.incr_nlink();
             }
         }
@@ -1007,7 +999,7 @@ impl FsDir {
 
         // Create a FileEntry that points to the original inode
         let name = new_path.name().to_string();
-        let file_entry = FileEntry(name.clone(), original_inode_id);
+        let file_entry = InodeView::new_entry(name.clone(), original_inode_id);
 
         // Update parent directory
         parent.update_mtime(op_ms as i64);

@@ -29,7 +29,7 @@ impl FileSystemStats {
     }
 
     pub fn increment_file_count(&self) {
-        self.metrics.inode_file_num.inc()
+        self.metrics.inode_file_num.inc();
     }
 
     pub fn increment_dir_count(&self) {
@@ -41,7 +41,7 @@ impl FileSystemStats {
     }
 
     pub fn add_file_count(&self, count: i64) {
-        self.metrics.inode_file_num.add(count)
+        self.metrics.inode_file_num.add(count);
     }
 
     pub fn add_dir_count(&self, count: i64) {

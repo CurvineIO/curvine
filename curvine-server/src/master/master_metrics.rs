@@ -46,7 +46,7 @@ pub struct MasterMetrics {
     pub(crate) journal_ufs_applied: Gauge,
 
     pub(crate) used_memory_bytes: Gauge,
-    pub(crate) rocksdb_used_memory_bytes: GaugeVec,
+    pub(crate) rocksdb_metrics: GaugeVec,
 
     pub(crate) inode_dir_num: Gauge,
     pub(crate) inode_file_num: Gauge,
@@ -111,11 +111,7 @@ impl MasterMetrics {
             )?,
 
             used_memory_bytes: m::new_gauge("used_memory_bytes", "Total memory used")?,
-            rocksdb_used_memory_bytes: m::new_gauge_vec(
-                "rocksdb_used_memory_bytes",
-                "RocksDB memory usage in bytes",
-                &["tag"],
-            )?,
+            rocksdb_metrics: m::new_gauge_vec("rocksdb_metrics", "RocksDB metrics", &["tag"])?,
 
             inode_dir_num: m::new_gauge("inode_dir_num", "Total dir")?,
 
@@ -179,13 +175,13 @@ impl MasterMetrics {
         }
 
         let fs_dir = fs.fs_dir.read();
-        if let Ok(memory_info) = fs_dir.get_rocks_store().get_rocksdb_memory() {
-            for (component, size) in memory_info {
-                self.rocksdb_used_memory_bytes
-                    .with_label_values(&[&component])
-                    .set(size as i64);
-            }
+        let rocksdb_metrics = fs_dir.get_rocks_store().get_rocksdb_metrics()?;
+        for (key, value) in rocksdb_metrics {
+            self.rocksdb_metrics
+                .with_label_values(&[&key])
+                .set(value as i64);
         }
+
         let ttl_list = fs_dir.get_ttl_bucket_list();
         drop(fs_dir);
         self.ttl_bucket_len.set(ttl_list.buckets_len() as i64);
@@ -222,7 +218,7 @@ impl MasterMetrics {
             let counter = match self.get_or_register(&value) {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!("Not fond metrics {}: {}", value.name, e);
+                    warn!("Metric not found: {}: {}", value.name, e);
                     continue;
                 }
             };

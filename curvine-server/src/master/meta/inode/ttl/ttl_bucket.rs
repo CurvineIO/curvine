@@ -207,11 +207,11 @@ mod tests {
         let mut f = InodeFile::new(id, mtime);
         f.storage_policy.ttl_ms = ttl_ms;
         f.storage_policy.ttl_action = TtlAction::Delete;
-        InodeView::File("t".to_string(), f)
+        InodeView::new_file("t".to_string(), f)
     }
 
     fn file_no_ttl(id: i64, mtime: i64) -> InodeView {
-        InodeView::File("t".to_string(), InodeFile::new(id, mtime))
+        InodeView::new_file("t".to_string(), InodeFile::new(id, mtime))
     }
 
     #[test]

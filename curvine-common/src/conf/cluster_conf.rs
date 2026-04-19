@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::alloc::allocator_type_name;
 use crate::conf::CliConf;
 use crate::conf::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf};
 use crate::rocksdb::DBConf;
@@ -69,6 +70,7 @@ impl ClusterConf {
     pub const DEFAULT_WORKER_PORT: u16 = 8997;
     pub const DEFAULT_MASTER_WEB_PORT: u16 = 9000;
     pub const DEFAULT_WORKER_WEB_PORT: u16 = 9001;
+    pub const DEFAULT_FUSE_WEB_PORT: u16 = 9002;
 
     pub const ENV_MASTER_HOSTNAME: &'static str = "CURVINE_MASTER_HOSTNAME";
     pub const ENV_WORKER_HOSTNAME: &'static str = "CURVINE_WORKER_HOSTNAME";
@@ -247,12 +249,8 @@ impl ClusterConf {
     }
 
     // Get the rocksdb configuration used to obtain metadata
-    pub fn meta_rocks_conf(&self) -> DBConf {
-        DBConf::new(&self.master.meta_dir)
-            .set_compress_type(&self.master.meta_compression_type)
-            .set_disable_wal(self.master.meta_disable_wal)
-            .set_db_write_buffer_size(&self.master.meta_db_write_buffer_size)
-            .set_write_buffer_size(&self.master.meta_write_buffer_size)
+    pub fn db_conf(&self) -> DBConf {
+        self.master.rocksdb.clone().set_dir(&self.master.meta_dir)
     }
 
     pub fn io_retry_policy_builder(&self) -> TimeBondedRetryBuilder {
@@ -265,6 +263,7 @@ impl ClusterConf {
 
     pub fn print(&self) {
         let conf = self.to_pretty_toml().unwrap();
+        info!("allocator: {}", allocator_type_name());
         info!("git version: {}", version::GIT_VERSION);
         info!("cluster conf start: \n{}\n", conf);
     }

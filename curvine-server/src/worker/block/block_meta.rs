@@ -199,8 +199,9 @@ impl BlockMeta {
     fn get_block_dir(&self) -> CommonResult<PathBuf> {
         let dir = match self.state {
             BlockState::Finalized | BlockState::Writing => {
-                let d1 = (self.id >> 16) & 0x1F;
-                let d2 = (self.id >> 8) & 0x1F;
+                let uid = self.id as u64;
+                let d1 = (uid >> 48) & 0x1F;
+                let d2 = (uid >> 32) & 0x1F;
 
                 let mut path = PathBuf::from(&self.dir.base_path);
                 path.push(ACTIVE_DIR);

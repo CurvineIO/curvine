@@ -15,7 +15,8 @@
 use crate::file::{FsReader, FsWriter};
 use crate::impl_filesystem_for_enum;
 use crate::{impl_reader_for_enum, impl_writer_for_enum};
-use curvine_common::fs::{FileSystem, Path};
+use curvine_common::fs::local::{LocalFilesystem, LocalReader, LocalWriter};
+use curvine_common::fs::{FileSystem, FsKind, Path};
 use curvine_common::state::{MountInfo, Provider};
 use curvine_common::FsResult;
 use orpc::err_box;
@@ -35,12 +36,6 @@ pub use self::unified_filesystem::UnifiedFileSystem;
 mod mount_cache;
 pub use self::mount_cache::*;
 
-mod cache_sync_writer;
-pub use self::cache_sync_writer::CacheSyncWriter;
-
-mod cache_sync_reader;
-pub use self::cache_sync_reader::CacheSyncReader;
-
 mod fallback_fs_reader;
 pub use self::fallback_fs_reader::FallbackFsReader;
 
@@ -48,34 +43,32 @@ pub use self::fallback_fs_reader::FallbackFsReader;
 pub enum UnifiedWriter {
     Cv(FsWriter),
 
-    CacheSync(CacheSyncWriter),
-
     #[cfg(feature = "opendal")]
     Opendal(OpendalWriter),
 
     #[cfg(feature = "oss-hdfs")]
     OssHdfs(OssHdfsWriter),
+
+    Local(LocalWriter),
 }
 
 impl_writer_for_enum! {
     enum UnifiedWriter {
         Cv(FsWriter),
 
-        CacheSync(CacheSyncWriter),
-
         #[cfg(feature = "opendal")]
         Opendal(OpendalWriter),
 
         #[cfg(feature = "oss-hdfs")]
         OssHdfs(OssHdfsWriter),
+
+        Local(LocalWriter),
     }
 }
 
 #[allow(clippy::large_enum_variant)]
 pub enum UnifiedReader {
     Cv(FsReader),
-
-    CacheSync(CacheSyncReader),
 
     Fallback(FallbackFsReader),
 
@@ -84,13 +77,13 @@ pub enum UnifiedReader {
 
     #[cfg(feature = "oss-hdfs")]
     OssHdfs(OssHdfsReader),
+
+    Local(LocalReader),
 }
 
 impl_reader_for_enum! {
     enum UnifiedReader {
         Cv(FsReader),
-
-        CacheSync(CacheSyncReader),
 
         Fallback(FallbackFsReader),
 
@@ -99,6 +92,8 @@ impl_reader_for_enum! {
 
         #[cfg(feature = "oss-hdfs")]
         OssHdfs(OssHdfsReader),
+
+        Local(LocalReader),
     }
 }
 
@@ -112,6 +107,8 @@ pub enum UfsReader {
 
     #[cfg(feature = "oss-hdfs")]
     OssHdfs(OssHdfsReader),
+
+    Local(LocalReader),
 }
 
 impl_reader_for_enum! {
@@ -121,6 +118,8 @@ impl_reader_for_enum! {
 
         #[cfg(feature = "oss-hdfs")]
         OssHdfs(OssHdfsReader),
+
+        Local(LocalReader),
     }
 }
 
@@ -131,6 +130,8 @@ pub enum UfsFileSystem {
 
     #[cfg(feature = "oss-hdfs")]
     OssHdfs(OssHdfsFileSystem),
+
+    Local(LocalFilesystem),
 }
 
 impl_filesystem_for_enum! {
@@ -140,6 +141,8 @@ impl_filesystem_for_enum! {
 
         #[cfg(feature = "oss-hdfs")]
         OssHdfs(OssHdfsFileSystem),
+
+        Local(LocalFilesystem),
     }
 }
 
@@ -152,6 +155,15 @@ impl UfsFileSystem {
         let provider = provider.unwrap_or(Provider::Auto);
 
         match (provider, path.scheme()) {
+            (_, Some(FsKind::SCHEME_FILE)) => {
+                let chunk_size = conf
+                    .get("file.chunk_size")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(128 * 1024);
+                let fs = LocalFilesystem::new(chunk_size);
+                Ok(UfsFileSystem::Local(fs))
+            }
+
             // Explicit provider selection
             (Provider::OssHdfs, Some("oss")) => {
                 #[cfg(feature = "oss-hdfs")]
@@ -167,7 +179,7 @@ impl UfsFileSystem {
 
             (Provider::Opendal, Some(scheme))
                 if [
-                    "s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs", "file",
+                    "s3", "oss", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs",
                 ]
                 .contains(&scheme) =>
             {
@@ -233,10 +245,7 @@ impl UfsFileSystem {
             // Other schemes with auto provider
             #[cfg(feature = "opendal")]
             (Provider::Auto, Some(scheme))
-                if [
-                    "s3", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs", "file",
-                ]
-                .contains(&scheme) =>
+                if ["s3", "cos", "gcs", "azure", "azblob", "hdfs", "webhdfs"].contains(&scheme) =>
             {
                 let fs = OpendalFileSystem::new(path, conf)?;
                 Ok(UfsFileSystem::Opendal(fs))
@@ -271,6 +280,8 @@ impl UfsFileSystem {
 
             #[cfg(feature = "oss-hdfs")]
             UfsFileSystem::OssHdfs(fs) => Ok(UfsReader::OssHdfs(fs.open(path).await?)),
+
+            UfsFileSystem::Local(fs) => Ok(UfsReader::Local(fs.open(path).await?)),
         }
     }
 }

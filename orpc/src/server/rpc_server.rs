@@ -161,7 +161,19 @@ where
         self.monitor.advance_running();
 
         loop {
-            let (stream, client_addr) = listener.accept().await?;
+            let (stream, client_addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!(
+                        "accept error on {}: {}. Possible system resource exhaustion; \
+                        please check open file descriptors/handles limits, \
+                        ephemeral port range and usage, process/thread limits, and OS socket backlog limits",
+                        bind_addr,
+                        e
+                    );
+                    continue;
+                }
+            };
 
             // Set the tcp parameter through socket2.
             let sock_ref = SockRef::from(&stream);

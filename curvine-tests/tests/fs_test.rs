@@ -18,11 +18,13 @@ use curvine_client::ClientMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::{Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOptsBuilder, MkdirOptsBuilder, SetAttrOptsBuilder, StorageState, TtlAction,
+    CreateFileOptsBuilder, ListOptions, MkdirOptsBuilder, SetAttrOptsBuilder, StorageState,
+    TtlAction,
 };
 use curvine_common::state::{FileLock, LockFlags, LockType};
 use curvine_common::FsResult;
 use curvine_tests::Testing;
+use futures::stream::StreamExt;
 use log::info;
 use orpc::common::LocalTime;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
@@ -71,8 +73,8 @@ fn run_filesystem_end_to_end_operations_on_cluster(
         test_overwrite(&fs).await?;
         println!("test_overwrite done");
 
-        test_batch_writting(&fs).await?;
-        println!("test_batch_writting done");
+        test_batch_writing(&fs).await?;
+        println!("test_batch_writing done");
 
         file_status(&fs).await?;
         println!("file_status done");
@@ -281,7 +283,7 @@ async fn test_overwrite(fs: &CurvineFileSystem) -> CommonResult<()> {
     Ok(())
 }
 
-async fn test_batch_writting(fs: &CurvineFileSystem) -> CommonResult<()> {
+async fn test_batch_writing(fs: &CurvineFileSystem) -> CommonResult<()> {
     // Helper function to read file content
     async fn read_file_content(fs: &CurvineFileSystem, path: &Path) -> CommonResult<String> {
         let status = fs.get_status(path).await?;
@@ -1038,5 +1040,129 @@ fn sync_ufs_file() {
         assert_eq!(stats.len, ufs_len);
         assert_eq!(stats.storage_policy.ufs_mtime, ufs_mtime);
         assert_eq!(stats.storage_policy.state, StorageState::Ufs);
+    });
+}
+
+#[test]
+fn list_options() {
+    let testing = Testing::default();
+    let fs = testing.get_fs(None, None).unwrap();
+    fs.clone_runtime().block_on(async move {
+        for i in 0..5 {
+            let path = Path::from_str(format!("/fs_test/list_options/{}.log", i)).unwrap();
+            let _ = fs.create(&path, true).await.unwrap();
+        }
+
+        let dir = Path::from_str("/fs_test/list_options").unwrap();
+        let full = fs.list_status(&dir).await.unwrap();
+        assert_eq!(full.len(), 5, "full list should have 5 entries");
+
+        // list file
+        let file1 = Path::from_str(format!("/fs_test/list_options/{}.log", 1)).unwrap();
+        let opts = ListOptions {
+            limit: Some(1),
+            start_after: None,
+        };
+        let list = fs.list_options(&file1, opts).await.unwrap();
+        assert_eq!(list.len(), 1);
+
+        let opts = ListOptions {
+            limit: Some(1),
+            start_after: Some("1.log".to_owned()),
+        };
+        let list = fs.list_options(&file1, opts).await.unwrap();
+        assert_eq!(list.len(), 0);
+
+        let opts = ListOptions {
+            limit: Some(1),
+            start_after: None,
+        };
+        let mut list_stream = fs.list_stream(&file1, opts).await.unwrap();
+        let list = list_stream.collect_vec().await.unwrap();
+        assert_eq!(list.len(), 1);
+
+        // limit only
+        let opts = ListOptions {
+            limit: Some(2),
+            start_after: None,
+        };
+        let list = fs.list_options(&dir, opts).await.unwrap();
+        assert_eq!(list.len(), 2, "limit=2 should return 2 entries");
+        assert_eq!(list[0].name, "0.log");
+        assert_eq!(list[1].name, "1.log");
+
+        // start_after only (exclusive)
+        let opts = ListOptions {
+            limit: None,
+            start_after: Some("1.log".to_string()),
+        };
+        let list = fs.list_options(&dir, opts).await.unwrap();
+        assert_eq!(
+            list.len(),
+            3,
+            "start_after 1.log should return 3 entries (2,3,4)"
+        );
+        assert_eq!(list[0].name, "2.log");
+        assert_eq!(list[1].name, "3.log");
+        assert_eq!(list[2].name, "4.log");
+
+        // limit + start_after
+        let opts = ListOptions {
+            limit: Some(2),
+            start_after: Some("1.log".to_string()),
+        };
+        let list = fs.list_options(&dir, opts).await.unwrap();
+        assert_eq!(list.len(), 2, "limit=2 after 1.log should return 2 entries");
+        assert_eq!(list[0].name, "2.log");
+        assert_eq!(list[1].name, "3.log");
+
+        // from_status style pagination: first page
+        let first = &full[0];
+        let opts = ListOptions::from_status(2, first);
+        let page1 = fs.list_options(&dir, opts).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].name, "1.log");
+        assert_eq!(page1[1].name, "2.log");
+
+        // list_stream(page_size): assembles ListOptions per page until directory exhausted
+        let mut stream = fs
+            .list_stream(&dir, ListOptions::with_limit(2))
+            .await
+            .unwrap();
+        let mut names = Vec::new();
+        while let Some(item) = stream.next().await {
+            names.push(item.unwrap().name);
+        }
+        assert_eq!(
+            names,
+            vec![
+                "0.log".to_string(),
+                "1.log".to_string(),
+                "2.log".to_string(),
+                "3.log".to_string(),
+                "4.log".to_string(),
+            ]
+        );
+    });
+}
+
+#[test]
+fn list_stream_matches_list_options_empty_dir() {
+    let testing = Testing::default();
+    let fs = testing.get_fs(None, None).unwrap();
+    fs.clone_runtime().block_on(async move {
+        let dir = Path::from_str("/fs_test/list_stream_empty").unwrap();
+        let _ = fs.delete(&dir, true).await;
+        fs.mkdir(&dir, true).await.unwrap();
+
+        let opts = ListOptions::default();
+        let list = fs.list_options(&dir, opts).await.unwrap();
+        assert!(list.is_empty());
+
+        let mut stream = fs
+            .list_stream(&dir, ListOptions::with_limit(64))
+            .await
+            .unwrap();
+        assert!(stream.next().await.is_none());
     });
 }

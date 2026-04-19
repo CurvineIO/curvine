@@ -119,8 +119,7 @@ pub struct ClientConf {
     pub data_timeout_ms: u64,
     pub pipeline_timeout_ms: u64,
 
-    // Number of fs master connections.
-    // After testing 3 connections, the best performance can be achieved, so the default value is 3.
+    // After testing 3 connections, the best performance can be achieved, so the default value is 1.
     pub master_conn_pool_size: usize,
 
     // Whether to enable pre-reading
@@ -222,7 +221,7 @@ impl ClientConf {
 
     pub const DEFAULT_FILE_SYSTEM_MODE: u32 = 0o777;
 
-    pub const DEFAULT_CLEAN_TASK_INTERVAL_STR: &'static str = "10s";
+    pub const DEFAULT_CLEAN_TASK_INTERVAL_STR: &'static str = "60s";
 
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
@@ -363,7 +362,7 @@ impl Default for ClientConf {
             rpc_timeout_ms: 120 * 1000,
             data_timeout_ms: 120 * 1000,
             pipeline_timeout_ms: 120 * 1000,
-            master_conn_pool_size: 3,
+            master_conn_pool_size: 1,
 
             enable_read_ahead: true,
             read_ahead_len: 0,

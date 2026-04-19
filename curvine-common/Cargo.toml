@@ -47,8 +47,24 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 bitflags = { workspace = true }
 
+mimalloc = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+tikv-jemalloc-sys = { workspace = true, optional = true }
+
 [features]
-default = []
+jemalloc = [
+    "dep:tikv-jemallocator",
+    "dep:tikv-jemalloc-ctl",
+    "dep:tikv-jemalloc-sys",
+]
+mimalloc = ["dep:mimalloc"]
+system = []
 
 [build-dependencies]
 prost-build = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

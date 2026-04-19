@@ -14,9 +14,10 @@
 
 use crate::conf::ClusterConf;
 use crate::raft::{RaftGroup, RaftPeer};
+use crate::rocksdb::DBConf;
 use crate::FsResult;
 use orpc::client::ClientConf;
-use orpc::common::Utils;
+use orpc::common::{ByteUnit, Utils};
 use orpc::io::net::{InetAddr, NetUtils};
 use orpc::runtime::Runtime;
 use serde::{Deserialize, Serialize};
@@ -107,6 +108,9 @@ pub struct JournalConf {
     // Max timeout for copying data to UFS, expressed as a duration string (e.g. "20m").
     // Default: 20 minutes.
     pub ufs_copy_timeout: String,
+
+    #[serde(default = "JournalConf::rocksdb_default")]
+    pub rocksdb: DBConf,
 }
 
 impl JournalConf {
@@ -121,6 +125,15 @@ impl JournalConf {
         conf
     }
 
+    pub fn rocksdb_default() -> DBConf {
+        DBConf {
+            disable_wal: false,
+            block_size: ByteUnit::kb(16),
+            use_bloom_filter: true,
+            ..Default::default()
+        }
+    }
+
     pub fn create_runtime(&self) -> Arc<Runtime> {
         let rt = Runtime::new("raft-rpc", self.io_threads, self.worker_threads);
         Arc::new(rt)
@@ -128,6 +141,10 @@ impl JournalConf {
 
     pub fn local_addr(&self) -> InetAddr {
         InetAddr::new(self.hostname.clone(), self.rpc_port)
+    }
+
+    pub fn db_conf(&self) -> DBConf {
+        self.rocksdb.clone().set_dir(&self.journal_dir)
     }
 
     pub fn node_id(&self) -> FsResult<u64> {
@@ -192,6 +209,8 @@ impl Default for JournalConf {
             ClusterConf::DEFAULT_HOSTNAME,
             ClusterConf::DEFAULT_RAFT_PORT,
         )];
+
+        let rocksdb = Self::rocksdb_default().set_dir(journal_dir.as_str());
         Self {
             enable: true,
             group_name: "raft-group".to_string(),
@@ -244,6 +263,8 @@ impl Default for JournalConf {
             scan_batch_size: 1000,
             retry_interval_secs: 10,
             ufs_copy_timeout: "20m".to_owned(), // 20 minutes
+
+            rocksdb,
         }
     }
 }
