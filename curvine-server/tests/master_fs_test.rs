@@ -210,7 +210,7 @@ fn test_delete_duplicate_journal_on_leader_crash_retry() -> CommonResult<()> {
     );
     let delete_entry_from_node1 = delete_entries1.into_iter().next().unwrap();
 
-    //  node2 (new leader after node1 crash)
+//  node2 (new leader after node1 crash)
     // node2 received node1's mkdir but NOT node1's delete
     conf.change_test_meta_dir("raft-delete-idem-2");
     let js2 = JournalSystem::from_conf(&conf)?;
@@ -218,14 +218,11 @@ fn test_delete_duplicate_journal_on_leader_crash_retry() -> CommonResult<()> {
     fs2.add_test_worker(worker.clone());
     let mnt_mgr2 = js2.mount_manager();
 
-    let loader2 = JournalLoader::new(
-        rt.clone(),
+    let loader2 = JournalLoader::new_replay_loader(
         fs2.fs_dir(),
         mnt_mgr2.clone(),
         &conf.journal,
         js2.job_manager(),
-        log_store.clone(),
-        journal_writer.clone(),
     );
     loader2.apply_entry(mkdir_entry_from_node1.clone())?;
     println!("node2 state after receiving node1's mkdir:");
@@ -251,7 +248,8 @@ fn test_delete_duplicate_journal_on_leader_crash_retry() -> CommonResult<()> {
     let fs3 = MasterFilesystem::with_js(&conf, &js3);
     fs3.add_test_worker(worker.clone());
     let mnt_mgr3 = js3.mount_manager();
-    let loader3 = JournalLoader::new(
+
+    let loader3 = JournalLoader::new_replay_loader(
         fs3.fs_dir(),
         mnt_mgr3.clone(),
         &conf.journal,
