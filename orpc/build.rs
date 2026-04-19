@@ -54,9 +54,7 @@ fn link_spdk() {
     ];
 
     #[cfg(feature = "spdk-rdma")]
-    {
-        libs.extend(["spdk_rdma_provider", "spdk_rdma_utils"]);
-    }
+    libs.extend(["spdk_rdma_provider", "spdk_rdma_utils"]);
 
     for lib in &whole {
         let path = format!("{}/lib{}.a", lib_dir, lib);
