@@ -35,7 +35,7 @@ impl RocksLogStorage {
     }
 
     pub fn from_conf(conf: &JournalConf, format: bool) -> Self {
-        let core = RocksStorageCore::new(&conf.journal_dir, format);
+        let core = RocksStorageCore::new(conf.db_conf(), format);
         Self::new(core)
     }
 

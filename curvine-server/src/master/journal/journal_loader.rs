@@ -15,8 +15,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::master::journal::*;
-use crate::master::meta::inode::InodePath;
-use crate::master::meta::inode::InodeView::{Dir, File};
+use crate::master::meta::inode::InodeView::File;
+use crate::master::meta::inode::{InodePath, InodeView};
 use crate::master::{JobManager, Master, MasterMetrics, MountManager, SyncFsDir};
 use curvine_common::conf::JournalConf;
 use curvine_common::error::FsError;
@@ -464,7 +464,7 @@ impl JournalLoader {
         let mut fs_dir = self.fs_dir.write();
         let inp = InodePath::resolve(fs_dir.root_ptr(), entry.path, &fs_dir.store)?;
         let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, Dir(name, entry.dir))?;
+        let _ = fs_dir.add_last_inode(inp, InodeView::new_dir(name, entry.dir))?;
         Ok(())
     }
 
@@ -477,7 +477,7 @@ impl JournalLoader {
             return Ok(());
         }
         let name = inp.name().to_string();
-        let _ = fs_dir.add_last_inode(inp, File(name, entry.file))?;
+        let _ = fs_dir.add_last_inode(inp, InodeView::new_file(name, entry.file))?;
         Ok(())
     }
 
@@ -666,7 +666,7 @@ impl JournalLoader {
         };
 
         if let Some(mut inode_ptr) = old_path.get_last_inode() {
-            if let File(_, _) = inode_ptr.as_mut() {
+            if let File(_) = inode_ptr.as_mut() {
                 inode_ptr.incr_nlink();
             }
         }

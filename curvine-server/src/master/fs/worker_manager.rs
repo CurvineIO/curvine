@@ -67,7 +67,13 @@ impl WorkerManager {
         let cmds = match status {
             HeartbeatStatus::Start => {
                 info!("Worker register: {}", addr);
-                vec![]
+                // Enforce the same worker_id ↔ address rule as insert() before remove(): a Start
+                // from a conflicting address must not evict the live registration.
+                self.worker_map.ensure_worker_id_addr(&addr)?;
+                // Same node restarting: clear the slot so we do not treat it as ready or run
+                // Running heartbeat bookkeeping until insert() on the next Running beat.
+                self.worker_map.remove(&addr);
+                return Ok(vec![]);
             }
 
             HeartbeatStatus::Running => self.block_map.handle_heartbeat(addr.worker_id),

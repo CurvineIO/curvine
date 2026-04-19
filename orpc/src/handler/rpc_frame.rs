@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::handler::{Frame, ReadFrame, RpcCodec, WriteFrame};
+use crate::handler::{Frame, FrameBuf, ReadFrame, RpcCodec, WriteFrame};
 use crate::io::net::ConnState;
 use crate::io::IOResult;
 use crate::message::{Message, Protocol, RefMessage};
 use crate::server::ServerConf;
 use crate::sys::{DataSlice, RawIOSlice};
-use crate::{message, sys};
+use crate::{err_box, message, sys};
 use bytes::BytesMut;
 use std::mem;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -37,7 +37,7 @@ pub enum FrameSate {
 /// Custom data frame resolution
 pub struct RpcFrame {
     io: TcpStream,
-    buf: BytesMut,
+    buf: FrameBuf,
     enable_splice: bool,
 }
 
@@ -51,7 +51,7 @@ impl RpcFrame {
 
         RpcFrame {
             io,
-            buf: BytesMut::with_capacity(buffer_size),
+            buf: FrameBuf::new(buffer_size),
             enable_splice,
         }
     }
@@ -66,11 +66,13 @@ impl RpcFrame {
 
     // Read data of the specified length.
     pub async fn read_full(&mut self, len: i32) -> IOResult<BytesMut> {
-        self.buf.reserve(len as usize);
-        unsafe {
-            self.buf.set_len(len as usize);
+        if len == 0 {
+            return Ok(BytesMut::new());
+        } else if len < 0 {
+            return err_box!("Invalid length {}", len);
         }
-        let mut buf = self.buf.split_to(len as usize);
+
+        let mut buf = self.buf.take_exact(len as usize);
         self.io.read_exact(&mut buf).await?;
         Ok(buf)
     }
@@ -181,12 +183,12 @@ impl RpcFrame {
     }
 
     pub fn into_tokio_frame(self) -> Framed<TcpStream, RpcCodec> {
-        Framed::with_capacity(self.io, RpcCodec::new(), self.buf.capacity())
+        Framed::with_capacity(self.io, RpcCodec::new(), self.buf.buf_size())
     }
 
     pub fn split(self) -> (ReadFrame, WriteFrame) {
         let (read, write) = tokio::io::split(self.io);
-        let read_frame = ReadFrame::new(read, BytesMut::with_capacity(self.buf.capacity()));
+        let read_frame = ReadFrame::new(read, self.buf.clone());
         let write_frame = WriteFrame::new(write, self.buf);
         (read_frame, write_frame)
     }

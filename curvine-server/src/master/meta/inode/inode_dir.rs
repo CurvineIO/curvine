@@ -14,7 +14,6 @@
 
 use crate::master::meta::feature::{AclFeature, DirFeature};
 use crate::master::meta::inode::inodes_children::InodeChildren;
-use crate::master::meta::inode::InodeView::{Dir, File};
 use crate::master::meta::inode::{
     ChildrenIter, Inode, InodeFile, InodePtr, InodeView, EMPTY_PARENT_ID,
 };
@@ -129,11 +128,11 @@ impl InodeDir {
     }
 
     pub fn add_file_child(&mut self, name: &str, file: InodeFile) -> CommonResult<InodePtr> {
-        self.add_child(File(name.to_string(), file))
+        self.add_child(InodeView::new_file(name.to_string(), file))
     }
 
     pub fn add_dir_child(&mut self, name: &str, dir: InodeDir) -> CommonResult<InodePtr> {
-        self.add_child(Dir(name.to_string(), dir))
+        self.add_child(InodeView::new_dir(name.to_string(), dir))
     }
 }
 

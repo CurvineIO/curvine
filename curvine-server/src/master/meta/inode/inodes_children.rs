@@ -175,7 +175,7 @@ impl InodeChildren {
                 Entry::Vacant(v) => {
                     if inode.is_file() {
                         // Store lightweight FileEntry in map
-                        v.insert(Box::new(InodeView::FileEntry(
+                        v.insert(Box::new(InodeView::new_entry(
                             inode.name().to_string(),
                             inode.id(),
                         )));

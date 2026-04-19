@@ -29,7 +29,7 @@ use curvine_common::state::{
 use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
-use orpc::handler::MessageHandler;
+use orpc::handler::{FrameBuf, MessageHandler};
 use orpc::io::net::ConnState;
 use orpc::message::Message;
 use std::sync::Arc;
@@ -43,6 +43,7 @@ pub struct MasterHandler {
     pub(crate) job_handler: JobHandler,
     pub(crate) mount_manager: Arc<MountManager>,
     pub(crate) replication_handler: Option<MasterReplicationHandler>,
+    pub(crate) buf: FrameBuf,
 }
 
 impl MasterHandler {
@@ -65,6 +66,7 @@ impl MasterHandler {
             mount_manager,
             job_handler,
             replication_handler: Some(MasterReplicationHandler::new(replication_manager)),
+            buf: FrameBuf::new(conf.master.buffer_size),
         }
     }
 
@@ -101,7 +103,7 @@ impl MasterHandler {
             status: ProtoUtils::file_status_to_pb(status),
             ..Default::default()
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     fn create_file0(
@@ -134,7 +136,7 @@ impl MasterHandler {
         let rep_header = CreateFileResponse {
             file_status: ProtoUtils::file_status_to_pb(status),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn retry_check_open_file(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -150,7 +152,7 @@ impl MasterHandler {
         let rep_header = OpenFileResponse {
             file_blocks: ProtoUtils::file_blocks_to_pb(file_blocks),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     fn open_file0(
@@ -172,7 +174,7 @@ impl MasterHandler {
         self.set_req_cache(req_id, res)
     }
 
-    pub fn file_status(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn file_status(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: GetFileStatusRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
@@ -181,16 +183,16 @@ impl MasterHandler {
             status: ProtoUtils::file_status_to_pb(status),
         };
 
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
-    pub fn exists(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn exists(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: ExistsRequest = ctx.parse_header()?;
         ctx.set_audit(Some(header.path.to_string()), None);
 
         let exists = self.fs.exists(&header.path)?;
         let rep_header = ExistsResponse { exists };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn delete0(&mut self, req_id: i64, header: DeleteRequest) -> FsResult<bool> {
@@ -215,7 +217,7 @@ impl MasterHandler {
 
         self.delete0(ctx.msg.req_id(), header)?;
         let rep_header = DeleteResponse::default();
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn retry_check_free(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -223,9 +225,12 @@ impl MasterHandler {
         ctx.set_audit(Some(header.path.to_string()), None);
 
         let res = self.free0(ctx.msg.req_id(), header)?;
-        ctx.response(FreeResponse {
-            res: ProtoUtils::free_res_to_pb(res),
-        })
+        ctx.response_buf(
+            FreeResponse {
+                res: ProtoUtils::free_res_to_pb(res),
+            },
+            &mut self.buf,
+        )
     }
 
     pub fn free0(&self, req_id: i64, header: FreeRequest) -> FsResult<FreeResult> {
@@ -252,7 +257,7 @@ impl MasterHandler {
 
         let result = self.rename0(ctx.msg.req_id(), header)?;
         let rep_header = RenameResponse { result };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn list_status(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -266,7 +271,7 @@ impl MasterHandler {
             .collect();
 
         let rep_header = ListStatusResponse { statuses: res };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     // The add block internally determines whether it is a retry request.
@@ -291,7 +296,7 @@ impl MasterHandler {
             req.last_block.map(ProtoUtils::extend_block_from_pb),
         )?;
         let rep_header = ProtoUtils::located_block_to_pb(located_block);
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     // Complete_file internally determines whether it is a retry request.
@@ -315,7 +320,7 @@ impl MasterHandler {
             result: true,
             file_blocks: file_blocks.map(ProtoUtils::file_blocks_to_pb),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn create_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -338,7 +343,7 @@ impl MasterHandler {
                 .map(ProtoUtils::file_status_to_pb)
                 .collect(),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn add_blocks_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -365,7 +370,7 @@ impl MasterHandler {
         }
 
         let rep_header = AddBlocksBatchResponse { blocks: results };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn complete_files_batch(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -392,7 +397,7 @@ impl MasterHandler {
         }
 
         let rep_header = CompleteFilesBatchResponse { results };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn get_block_locations(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -403,18 +408,18 @@ impl MasterHandler {
         let rep_header = GetBlockLocationsResponse {
             blocks: ProtoUtils::file_blocks_to_pb(blocks),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
-    pub fn get_master_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn get_master_info(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let _: GetMasterInfoRequest = ctx.parse_header()?;
 
         let info = self.fs.master_info()?;
         let rep_header = ProtoUtils::master_info_to_pb(info);
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
-    pub fn worker_heartbeat(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn worker_heartbeat(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: WorkerHeartbeatRequest = ctx.parse_header()?;
         let mut wm = self.fs.worker_manager.write();
 
@@ -429,16 +434,16 @@ impl MasterHandler {
         let rep_header = WorkerHeartbeatResponse {
             cmds: ProtoUtils::worker_cmd_to_pb(cmds),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
-    pub fn block_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    pub fn block_report(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: BlockReportListRequest = ctx.parse_header()?;
         let list = ProtoUtils::block_report_list_from_pb(header);
         self.fs.block_report(list)?;
 
         let rep_header = BlockReportListResponse::default();
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     fn client_ip(&self) -> &str {
@@ -452,7 +457,7 @@ impl MasterHandler {
         self.fs.clone()
     }
 
-    fn mount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    fn mount(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: MountRequest = ctx.parse_header()?;
         let mnt_opt = ProtoUtils::mount_options_from_pb(request.mount_options);
 
@@ -464,19 +469,19 @@ impl MasterHandler {
         self.mount_manager
             .mount(None, &request.cv_path, &request.ufs_path, &mnt_opt)?;
         let rep_header = MountResponse::default();
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
-    fn umount(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    fn umount(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: UnMountRequest = ctx.parse_header()?;
         ctx.set_audit(Some(request.cv_path.to_string()), None);
 
         self.mount_manager.umount(&request.cv_path)?;
         let rep_header = UnMountResponse::default();
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
-    fn get_mount_info(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    fn get_mount_info(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let request: GetMountInfoRequest = ctx.parse_header()?;
         ctx.set_audit(Some(request.path.to_string()), None);
 
@@ -485,10 +490,10 @@ impl MasterHandler {
         let rep_header = GetMountInfoResponse {
             mount_info: ret.map(ProtoUtils::mount_info_to_pb),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
-    fn get_mount_table(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    fn get_mount_table(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let _: GetMountTableRequest = ctx.parse_header()?;
         let table = self.mount_manager.get_mount_table()?;
 
@@ -497,24 +502,29 @@ impl MasterHandler {
             .map(ProtoUtils::mount_info_to_pb)
             .collect();
         let rep_header = GetMountTableResponse { mount_table };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
-    fn set_attr_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    fn set_attr_retry_check(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         if self.check_is_retry(ctx.msg.req_id())? {
-            return ctx.response(SetAttrResponse::default());
+            return ctx.response_buf(SetAttrResponse::default(), &mut self.buf);
         }
 
         let header: SetAttrRequest = ctx.parse_header()?;
+        ctx.set_audit(Some(header.path.to_string()), None);
+
         let opts = ProtoUtils::set_attr_opts_from_pb(header.opts);
         let status = self.fs.set_attr(header.path, opts)?;
 
-        ctx.response(SetAttrResponse {
-            status: ProtoUtils::file_status_to_pb(status),
-        })
+        ctx.response_buf(
+            SetAttrResponse {
+                status: ProtoUtils::file_status_to_pb(status),
+            },
+            &mut self.buf,
+        )
     }
 
-    fn symlink_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    fn symlink_retry_check(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: SymlinkRequest = ctx.parse_header()?;
         ctx.set_audit(
             Some(header.target.to_string()),
@@ -522,25 +532,25 @@ impl MasterHandler {
         );
 
         if self.check_is_retry(ctx.msg.req_id())? {
-            return ctx.response(SymlinkResponse::default());
+            return ctx.response_buf(SymlinkResponse::default(), &mut self.buf);
         }
 
         self.fs
             .symlink(&header.target, &header.link, header.force, header.mode)?;
 
-        ctx.response(SymlinkResponse::default())
+        ctx.response_buf(SymlinkResponse::default(), &mut self.buf)
     }
 
-    fn metrics_report(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    fn metrics_report(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: MetricsReportRequest = ctx.parse_header()?;
 
         let metrics = ProtoUtils::metrics_report_from_pb(header.metrics);
         Master::get_metrics().metrics_report(metrics)?;
 
-        ctx.response(MetricsReportResponse {})
+        ctx.response_buf(MetricsReportResponse {}, &mut self.buf)
     }
 
-    fn link_retry_check(&self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
+    fn link_retry_check(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let header: LinkRequest = ctx.parse_header()?;
         ctx.set_audit(
             Some(header.src_path.to_string()),
@@ -548,12 +558,12 @@ impl MasterHandler {
         );
 
         if self.check_is_retry(ctx.msg.req_id())? {
-            return ctx.response(LinkResponse::default());
+            return ctx.response_buf(LinkResponse::default(), &mut self.buf);
         }
 
         self.fs.link(&header.src_path, &header.dst_path)?;
 
-        ctx.response(LinkResponse::default())
+        ctx.response_buf(LinkResponse::default(), &mut self.buf)
     }
 
     pub fn resize_file(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -567,7 +577,7 @@ impl MasterHandler {
         let rep_header = FileResizeResponse {
             file_blocks: ProtoUtils::file_blocks_to_pb(file_blocks),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn assign_worker(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -583,7 +593,7 @@ impl MasterHandler {
         let rep_header = AssignWorkerResponse {
             block: ProtoUtils::located_block_to_pb(block),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn get_lock(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -595,7 +605,7 @@ impl MasterHandler {
         let rep_header = GetLockResponse {
             conflict: conflict.map(ProtoUtils::file_lock_to_pb),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn set_lock(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -612,7 +622,7 @@ impl MasterHandler {
         let rep_header = SetLockResponse {
             conflict: conflict.map(ProtoUtils::file_lock_to_pb),
         };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 
     pub fn list_options(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
@@ -630,7 +640,7 @@ impl MasterHandler {
             .map(ProtoUtils::file_status_to_pb)
             .collect();
         let rep_header = ListOptionsResponse { statuses: res };
-        ctx.response(rep_header)
+        ctx.response_buf(rep_header, &mut self.buf)
     }
 }
 
@@ -740,10 +750,10 @@ impl MessageHandler for MasterHandler {
         }
 
         let res = match code {
-            RpcCode::SubmitJob => self.job_handler.submit_load_job(ctx).await,
-            RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx),
-            RpcCode::CancelJob => self.job_handler.cancel_job(ctx).await,
-            RpcCode::ReportTask => self.job_handler.task_report(ctx),
+            RpcCode::SubmitJob => self.job_handler.submit_load_job(ctx, &mut self.buf).await,
+            RpcCode::GetJobStatus => self.job_handler.get_load_status(ctx, &mut self.buf),
+            RpcCode::CancelJob => self.job_handler.cancel_job(ctx, &mut self.buf).await,
+            RpcCode::ReportTask => self.job_handler.task_report(ctx, &mut self.buf),
 
             v => err_box!("unsupported operation {:?}", v),
         };

@@ -38,7 +38,7 @@ fn get_fs() -> CurvineFileSystem {
 }
 
 // Test the master request timeout.
-// The client service recycles the connection in 3 seconds, and retrys the request after 5 seconds to correctly create a new connection.
+// The client service recycles the connection in 3 seconds, and retries the request after 5 seconds to correctly create a new connection.
 #[test]
 fn client_rpc_timeout() -> CommonResult<()> {
     let fs = get_fs();

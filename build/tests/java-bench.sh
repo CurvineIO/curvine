@@ -48,7 +48,7 @@ io.curvine.bench.CurvineBenchV2 \
 -fileSize 100mb \
 -fileNum 10 \
 -checksum true \
--clearDir fasle
+-clearDir false
 
 
 # Performance test code.
@@ -62,4 +62,4 @@ io.curvine.bench.CurvineBenchV2 \
 #-fileSize 100mb \
 #-fileNum 1000 \
 # -checksum true \
-#-clearDir fasle
+#-clearDir false

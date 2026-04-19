@@ -68,6 +68,20 @@ impl FuseDirentList {
         self.add_buf(&header, name)
     }
 
+    pub fn add_dirent(
+        &mut self,
+        plus: bool,
+        off: u64,
+        status: &FileStatus,
+        entry: fuse_entry_out,
+    ) -> bool {
+        if plus {
+            self.add_plus(off, status, entry)
+        } else {
+            self.add(off, status, entry)
+        }
+    }
+
     /// Add an entry to the buffer and return false if the buff is already full.
     fn add_buf<T>(&mut self, data: &T, name: &[u8]) -> bool {
         let bytes = FuseUtils::struct_as_bytes(data);

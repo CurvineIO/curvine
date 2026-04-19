@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -275,6 +275,10 @@ impl LocalFile {
     pub fn actual_size(&self) -> IOResult<u64> {
         let meta = self.inner.metadata()?;
         sys::file_actual_size(meta)
+    }
+
+    pub fn metadata(&self) -> IOResult<Metadata> {
+        Ok(self.inner.metadata()?)
     }
 }
 

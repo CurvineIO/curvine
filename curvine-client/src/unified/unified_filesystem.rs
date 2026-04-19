@@ -19,10 +19,11 @@ use crate::ClientMetrics;
 use bytes::BytesMut;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
-use curvine_common::fs::{FileSystem, FsKind, Path, Reader, Writer};
+use curvine_common::fs::{FileSystem, FsKind, ListStream, Path, Reader, Writer};
 use curvine_common::state::{
-    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, LoadJobCommand,
-    MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags, SetAttrOpts,
+    CreateFileOpts, FileAllocOpts, FileLock, FileStatus, FreeResult, JobStatus, ListOptions,
+    LoadJobCommand, MasterInfo, MkdirOpts, MkdirOptsBuilder, MountInfo, MountOptions, OpenFlags,
+    SetAttrOpts,
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
@@ -490,7 +491,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         let flags = OpenFlags::new_write_only()
             .set_create(true)
             .set_overwrite(overwrite);
-        let opts = self.cv.create_opts_builder().build();
+        let opts = self.cv.create_opts_builder().create_parent(true).build();
         self.open_with_opts(path, opts, flags).await
     }
 
@@ -663,6 +664,37 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
         match self.get_mount_checked(path).await? {
             None => self.cv.list_status_bytes(path).await,
             Some((ufs_path, mount)) => mount.ufs.list_status_bytes(&ufs_path).await,
+        }
+    }
+
+    async fn list_options(&self, path: &Path, options: ListOptions) -> FsResult<Vec<FileStatus>> {
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["list_options".to_string()],
+        );
+
+        match self.get_mount_checked(path).await? {
+            None => self.cv.list_options(path, options).await,
+            Some((ufs_path, mount)) => mount.ufs.list_options(&ufs_path, options).await,
+        }
+    }
+
+    async fn list_options_bytes(&self, path: &Path, options: ListOptions) -> FsResult<BytesMut> {
+        let _timer = TimeSpent::timer_counter_vec(
+            Arc::new(FsContext::get_metrics().metadata_operation_duration.clone()),
+            vec!["list_options".to_string()],
+        );
+
+        match self.get_mount_checked(path).await? {
+            None => self.cv.list_options_bytes(path, options).await,
+            Some((ufs_path, mount)) => mount.ufs.list_options_bytes(&ufs_path, options).await,
+        }
+    }
+
+    async fn list_stream(&self, path: &Path, options: ListOptions) -> FsResult<ListStream> {
+        match self.get_mount_checked(path).await? {
+            None => self.cv.list_stream(path, options).await,
+            Some((ufs_path, mount)) => mount.ufs.list_stream(&ufs_path, options).await,
         }
     }
 

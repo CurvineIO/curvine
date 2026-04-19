@@ -18,7 +18,8 @@ use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
 use curvine_common::state::{BlockLocation, FileLock, MountInfo};
 use curvine_common::utils::SerdeUtils as Serde;
 use orpc::CommonResult;
-use rocksdb::{DBIteratorWithThreadMode, WriteBatchWithTransaction, DB};
+use rocksdb::{DBIteratorWithThreadMode, DBPinnableSlice, Error, WriteBatchWithTransaction, DB};
+use std::collections::HashMap;
 
 pub struct RocksInodeStore {
     pub(crate) db: DBEngine,
@@ -36,6 +37,7 @@ impl RocksInodeStore {
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
         let conf = conf
+            .set_disable_wal(true)
             .add_cf(Self::CF_INODES)
             .add_cf(Self::CF_EDGES)
             .add_cf(Self::CF_BLOCK)
@@ -105,6 +107,19 @@ impl RocksInodeStore {
                 Ok(Some(inode))
             }
         }
+    }
+
+    pub fn batched_multi_get_inodes<'a, K, I>(
+        &'a self,
+        keys: I,
+        sorted_input: bool,
+    ) -> CommonResult<Vec<Result<Option<DBPinnableSlice<'a>>, Error>>>
+    where
+        K: AsRef<[u8]> + 'a + ?Sized,
+        I: IntoIterator<Item = &'a K>,
+    {
+        self.db
+            .batched_multi_get_cf(Self::CF_INODES, keys, sorted_input)
     }
 
     pub fn iter_cf<'a: 'b, 'b>(
@@ -204,8 +219,8 @@ impl RocksInodeStore {
         }
     }
 
-    pub fn get_rocksdb_memory(&self) -> CommonResult<Vec<(String, u64)>> {
-        self.db.get_rocksdb_memory()
+    pub fn get_rocksdb_metrics(&self) -> CommonResult<HashMap<String, u64>> {
+        self.db.get_rocksdb_metrics()
     }
 }
 

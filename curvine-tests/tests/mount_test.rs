@@ -122,7 +122,7 @@ fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
         let target_path = target_path.unwrap();
         assert!(
             target_path == "/s3/a.txt",
-            "actural target_path is {}",
+            "actual target_path is {}",
             target_path
         );
         info!("target_path: {:?}", target_path);
@@ -176,7 +176,7 @@ fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
         assert_eq!(
             mountpoint.cv_path,
             s3_mnt_path.path(),
-            "mnt path should be {}, actural {}",
+            "mnt path should be {}, actual {}",
             s3_mnt_path.path(),
             mountpoint.cv_path
         );
@@ -188,7 +188,7 @@ fn test_mount_umount_s3_hdfs_and_path_mapping() -> CommonResult<()> {
         assert_eq!(
             mountpoint.cv_path,
             s3_mnt_path.path(),
-            "mnt path should be {}, actural {}",
+            "mnt path should be {}, actual {}",
             s3_mnt_path.path(),
             mountpoint.cv_path
         );

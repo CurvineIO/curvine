@@ -405,6 +405,12 @@ impl From<Elapsed> for FsError {
     }
 }
 
+impl From<EncodeError> for FsError {
+    fn from(value: EncodeError) -> Self {
+        Self::PBEncode(ErrorImpl::with_source(value))
+    }
+}
+
 impl ErrorExt for FsError {
     fn ctx(self, ctx: impl Into<String>) -> Self {
         match self {
