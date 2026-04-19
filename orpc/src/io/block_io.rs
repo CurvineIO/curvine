@@ -23,9 +23,6 @@ pub trait BlockIO: Send {
     fn resize(&mut self, truncate: bool, off: i64, len: i64, mode: i32) -> IOResult<()>;
 }
 
-// ---------------------------------------------------------------------------
-// BlockDevice — zero-cost enum dispatch for LocalFile / SpdkBdev
-// ---------------------------------------------------------------------------
 /// Enum-based block device that dispatches to either `LocalFile` or `SpdkBdev`
 pub enum BlockDevice {
     Local(LocalFile),
@@ -89,7 +86,7 @@ impl BlockDevice {
     pub fn supports_read_ahead(&self) -> bool {
         matches!(self, BlockDevice::Local(_))
     }
-    /// Whether this device supports sendfile (zero-copy kernel→socket).
+    /// Whether this device supports sendfile (zero-copy kernel=>socket).
     /// Only `LocalFile` supports this; SPDK uses userspace DMA buffers.
     pub fn supports_send_file(&self) -> bool {
         matches!(self, BlockDevice::Local(_))
