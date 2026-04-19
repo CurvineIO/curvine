@@ -16,7 +16,13 @@ use crate::worker::storage::{DirState, VfsDir, ACTIVE_DIR, STAGING_DIR};
 use curvine_common::state::{ExtendedBlock, StorageType};
 use once_cell::sync::Lazy;
 use orpc::common::{ByteUnit, FileUtils};
-use orpc::io::{IOResult, LocalFile};
+use orpc::io::{BlockDevice, IOResult, LocalFile};
+
+#[cfg(feature = "spdk")]
+use log::info;
+#[cfg(feature = "spdk")]
+use orpc::io::SpdkBdev;
+
 use orpc::{err_box, sys, try_err, CommonResult};
 use regex::Regex;
 use std::fmt::Formatter;
@@ -65,6 +71,8 @@ pub struct BlockMeta {
     pub(crate) state: BlockState,
     pub(crate) dir: Arc<DirState>,
     pub(crate) actual_len: i64,
+    /// SPDK bdev byte offset
+    pub(crate) bdev_offset: i64,
 }
 
 impl BlockMeta {
@@ -75,6 +83,7 @@ impl BlockMeta {
             state: BlockState::Writing,
             dir: dir.state.clone(),
             actual_len: block_size,
+            bdev_offset: 0,
         }
     }
 
@@ -104,6 +113,7 @@ impl BlockMeta {
                     state,
                     dir: dir.state.clone(),
                     actual_len,
+                    bdev_offset: 0,
                 };
 
                 Ok(meta)
@@ -125,6 +135,7 @@ impl BlockMeta {
             state: BlockState::Finalized,
             dir: meta.dir.clone(),
             actual_len,
+            bdev_offset: meta.bdev_offset,
         };
 
         Ok(meta)
@@ -137,6 +148,19 @@ impl BlockMeta {
             state: BlockState::Finalized,
             dir: Arc::new(DirState::default()),
             actual_len: 0,
+            bdev_offset: 0,
+        }
+    }
+
+    /// Finalize SPDK block — uses in-memory BlockMeta length (no filesystem file).
+    pub fn with_final_spdk(meta: &BlockMeta, committed_len: i64) -> Self {
+        Self {
+            id: meta.id,
+            len: committed_len,
+            state: BlockState::Finalized,
+            dir: meta.dir.clone(),
+            actual_len: committed_len,
+            bdev_offset: meta.bdev_offset,
         }
     }
 
@@ -216,13 +240,58 @@ impl BlockMeta {
         Ok(file)
     }
 
-    pub fn create_writer(&self, off: i64, overwrite: bool) -> IOResult<LocalFile> {
-        let file = self.get_block_file()?;
-        LocalFile::with_write_offset(file, overwrite, off)
+    pub fn create_writer(&self, off: i64, overwrite: bool) -> IOResult<BlockDevice> {
+        match self.storage_type() {
+            #[cfg(feature = "spdk")]
+            StorageType::Spdk => {
+                let bdev_name = self.get_bdev_name()?;
+                let abs_offset = self.bdev_offset + off;
+                let max_len = 0.max(self.len - off);
+                info!(
+                    "Opening SPDK bdev '{}' for writing at offset {} (block {} base={}, max_len={})",
+                    bdev_name, abs_offset, self.id, self.bdev_offset, max_len
+                );
+                let bdev = SpdkBdev::open_write(&bdev_name, abs_offset, max_len)?;
+                Ok(BlockDevice::Spdk(bdev))
+            }
+            _ => {
+                let file = self.get_block_file()?;
+                let local = LocalFile::with_write_offset(file, overwrite, off)?;
+                Ok(BlockDevice::Local(local))
+            }
+        }
     }
 
-    pub fn create_reader(&self, offset: u64) -> IOResult<LocalFile> {
-        LocalFile::with_read(self.get_block_file()?, offset)
+    pub fn create_reader(&self, offset: u64) -> IOResult<BlockDevice> {
+        match self.storage_type() {
+            #[cfg(feature = "spdk")]
+            StorageType::Spdk => {
+                let bdev_name = self.get_bdev_name()?;
+                let abs_offset = self.bdev_offset as u64 + offset;
+                let max_len = 0.max(self.len - offset as i64);
+                info!(
+                    "Opening SPDK bdev '{}' for reading at offset {} (block {} base={}, max_len={})",
+                    bdev_name, abs_offset, self.id, self.bdev_offset, max_len
+                );
+                let bdev = SpdkBdev::open_read(&bdev_name, abs_offset, max_len)?;
+                Ok(BlockDevice::Spdk(bdev))
+            }
+            _ => {
+                let local = LocalFile::with_read(self.get_block_file()?, offset)?;
+                Ok(BlockDevice::Local(local))
+            }
+        }
+    }
+
+    /// Get the SPDK bdev name for this block.
+    #[cfg(feature = "spdk")]
+    fn get_bdev_name(&self) -> IOResult<String> {
+        self.dir.bdev_name.clone().ok_or_else(|| {
+            orpc::io::IOError::from(format!(
+                "block {} has StorageType::Spdk but dir (dir_id={}) has no bdev_name assigned",
+                self.id, self.dir.dir_id
+            ))
+        })
     }
 
     pub fn dir_id(&self) -> u32 {
@@ -245,5 +314,64 @@ impl fmt::Display for BlockMeta {
             "BlockMeta id = {}, len = {}, state = {:?}",
             self.id, self.len, self.state
         )
+    }
+}
+
+#[cfg(all(test, feature = "spdk"))]
+mod test {
+    use super::*;
+    use crate::worker::storage::DirState;
+    #[cfg(feature = "spdk")]
+    fn spdk_writing_meta(id: i64, block_size: i64) -> BlockMeta {
+        let dir = Arc::new(DirState {
+            dir_id: 1,
+            base_path: PathBuf::from("/nonexistent/spdk/path"),
+            storage_type: StorageType::Spdk,
+            bdev_name: Some("NVMe_test_n1".to_string()),
+            bdev_capacity: 1024 * 1024 * 1024,
+            offset_alloc: DirState::new_offset_alloc(StorageType::Spdk, 1024 * 1024 * 1024, 4096),
+        });
+        BlockMeta {
+            id,
+            len: block_size,
+            state: BlockState::Writing,
+            dir,
+            actual_len: block_size,
+            bdev_offset: 0,
+        }
+    }
+    #[test]
+    fn with_final_spdk_succeeds() {
+        let meta = spdk_writing_meta(1, 4096);
+        let final_meta = BlockMeta::with_final_spdk(&meta, 2048);
+        assert_eq!(final_meta.state, BlockState::Finalized);
+        assert_eq!(final_meta.len, 2048);
+    }
+    #[test]
+    fn with_final_local_succeeds() -> CommonResult<()> {
+        let test_dir = "../testing/block_meta_test";
+        let _ = std::fs::remove_dir_all(test_dir);
+        let dir = Arc::new(DirState {
+            dir_id: 0,
+            base_path: PathBuf::from(test_dir),
+            storage_type: StorageType::Ssd,
+            bdev_name: None,
+            bdev_capacity: 0,
+            offset_alloc: DirState::new_offset_alloc(StorageType::Ssd, 0, 512),
+        });
+        let meta = BlockMeta {
+            id: 1,
+            len: 100,
+            state: BlockState::Writing,
+            dir,
+            actual_len: 100,
+            bdev_offset: 0,
+        };
+        let path = meta.get_block_path()?;
+        LocalFile::write_string(&path, &"data", true)?;
+        let final_meta = BlockMeta::with_final(&meta)?;
+        assert_eq!(final_meta.state, BlockState::Finalized);
+        let _ = std::fs::remove_dir_all(test_dir);
+        Ok(())
     }
 }

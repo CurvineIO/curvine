@@ -204,10 +204,13 @@ fn test_delete_duplicate_journal_on_leader_crash_retry() -> CommonResult<()> {
     let mnt_mgr2 = js2.mount_manager();
 
     let loader2 = JournalLoader::new(
+        rt.clone(),
         fs2.fs_dir(),
         mnt_mgr2.clone(),
         &conf.journal,
         js2.job_manager(),
+        log_store.clone(),
+        journal_writer.clone(),
     );
     loader2.apply_entry(mkdir_entry_from_node1.clone())?;
     println!("node2 state after receiving node1's mkdir:");

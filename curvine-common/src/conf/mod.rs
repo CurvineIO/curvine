@@ -46,6 +46,7 @@ pub use self::job_conf::JobConf;
 mod cli_conf;
 pub use self::cli_conf::CliConf;
 
+mod spdk_conf;
 #[cfg(test)]
 mod tests {
     use crate::conf::{ClusterConf, WorkerDataDir};

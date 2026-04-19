@@ -1,0 +1,298 @@
+#![cfg(feature = "spdk")]
+
+//! SPDK I/O poller thread - handles NVMe submit/poll on dedicated thread.
+/// Qpairs not thread-safe: submit + poll must on same thread.
+/// Single poller to demonstrate the correctness work.
+/// TODO: shard to multiple pollers (one per controller).
+use log::{error, info};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+
+use crate::io::spdk_ffi;
+
+/// I/O operation submitted to the poller thread.
+pub enum IoOp {
+    Read {
+        ns: *mut spdk_ffi::spdk_nvme_ns,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        buf: *mut c_void,
+        offset: u64,
+        num_bytes: u64,
+    },
+    Write {
+        ns: *mut spdk_ffi::spdk_nvme_ns,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        buf: *mut c_void,
+        offset: u64,
+        num_bytes: u64,
+    },
+    Flush {
+        ns: *mut spdk_ffi::spdk_nvme_ns,
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    },
+}
+
+// SAFETY: exclusive ownership - blocks until completion.
+unsafe impl Send for IoOp {}
+
+/// Completion state shared between poller callback and waiting handler.
+pub struct IoCompletion {
+    inner: Mutex<IoCompletionInner>,
+    cond: Condvar,
+}
+
+struct IoCompletionInner {
+    done: bool,
+    status: i32,
+}
+
+impl IoCompletion {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(IoCompletionInner {
+                done: false,
+                status: 0,
+            }),
+            cond: Condvar::new(),
+        })
+    }
+
+    /// Called by C callback on completion.
+    pub fn complete(&self, status: i32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.done = true;
+        inner.status = status;
+        self.cond.notify_one();
+    }
+
+    /// Block until complete or timeout. Returns NVMe status.
+    pub fn wait(&self, timeout_us: u64) -> i32 {
+        let mut inner = self.inner.lock().unwrap();
+        if timeout_us == 0 {
+            while !inner.done {
+                inner = self.cond.wait(inner).unwrap();
+            }
+        } else {
+            let timeout = std::time::Duration::from_micros(timeout_us);
+            let deadline = std::time::Instant::now() + timeout;
+            while !inner.done {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return -libc::ETIMEDOUT;
+                }
+                let (guard, result) = self.cond.wait_timeout(inner, remaining).unwrap();
+                inner = guard;
+                if result.timed_out() && !inner.done {
+                    return -libc::ETIMEDOUT;
+                }
+            }
+        }
+        inner.status
+    }
+}
+
+/// Request sent from handler threads to the poller.
+pub struct IoRequest {
+    pub op: IoOp,
+    pub completion: Arc<IoCompletion>,
+    /// Per-bdev in-flight counter. Decremented on completion.
+    pub bdev_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+// SAFETY: exclusive ownership - blocks until completion.
+unsafe impl Send for IoRequest {}
+
+/// Poller thread handle.
+pub struct SpdkPoller {
+    tx: crossbeam::channel::Sender<IoRequest>,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SpdkPoller {
+    /// Spawn the poller thread.
+    pub fn start() -> Self {
+        let (tx, rx) = crossbeam::channel::unbounded::<IoRequest>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("spdk-poller".to_string())
+            .spawn(move || {
+                Self::poller_loop(rx, shutdown_clone);
+            })
+            .expect("Failed to spawn SPDK poller thread");
+
+        Self {
+            tx,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
+    /// Get sender for SpdkBdev to hold.
+    pub fn sender(&self) -> crossbeam::channel::Sender<IoRequest> {
+        self.tx.clone()
+    }
+
+    /// Shut down the poller thread.
+    pub fn stop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Main poller loop. Runs on dedicated thread.
+    fn poller_loop(rx: crossbeam::channel::Receiver<IoRequest>, shutdown: Arc<AtomicBool>) {
+        let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
+        let mut inflight: std::collections::HashMap<usize, Arc<std::sync::atomic::AtomicUsize>> =
+            std::collections::HashMap::new();
+
+        loop {
+            if shutdown.load(Ordering::Acquire) && rx.is_empty() {
+                break;
+            }
+
+            // Drain pending requests (non-blocking after first)
+            match rx.recv_timeout(std::time::Duration::from_micros(100)) {
+                Ok(req) => {
+                    Self::submit_one(&req, &mut active_qpairs, &mut inflight);
+                    while let Ok(req) = rx.try_recv() {
+                        Self::submit_one(&req, &mut active_qpairs, &mut inflight);
+                    }
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+            }
+
+            // Poll active qpairs for completions
+            active_qpairs.retain(|&qpair| {
+                let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
+                if rc < 0 {
+                    error!("qpair poll error: {}", rc);
+                    return false;
+                }
+                let key = qpair as usize;
+                inflight
+                    .get(&key)
+                    .map_or(false, |c| c.load(Ordering::Acquire) > 0)
+            });
+        }
+
+        info!("SPDK poller thread exiting");
+    }
+
+    /// Submit a single I/O request on the poller thread.
+    fn submit_one(
+        req: &IoRequest,
+        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
+        inflight: &mut std::collections::HashMap<usize, Arc<std::sync::atomic::AtomicUsize>>,
+    ) {
+        let qpair = match &req.op {
+            IoOp::Read { qpair, .. } => *qpair,
+            IoOp::Write { qpair, .. } => *qpair,
+            IoOp::Flush { qpair, .. } => *qpair,
+        };
+
+        let key = qpair as usize;
+        let inflight_counter = inflight
+            .entry(key)
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .clone();
+
+        // Box::into_raw ensures CallbackCtx survives until poller_callback reclaims it
+        let cb_ctx = Box::new(CallbackCtx {
+            completion: req.completion.clone(),
+            async_ctx: unsafe { std::mem::zeroed() },
+            inflight: inflight_counter.clone(),
+            bdev_inflight: req.bdev_inflight.clone(),
+        });
+        let cb_ctx_ptr = Box::into_raw(cb_ctx);
+
+        // Initialize async_ctx via C helper
+        unsafe {
+            spdk_ffi::curvine_spdk_async_ctx_init(
+                &mut (*cb_ctx_ptr).async_ctx,
+                poller_callback,
+                cb_ctx_ptr as *mut c_void,
+            );
+        }
+
+        let rc = match &req.op {
+            IoOp::Read {
+                ns,
+                qpair,
+                buf,
+                offset,
+                num_bytes,
+            } => unsafe {
+                spdk_ffi::curvine_spdk_ns_submit_read(
+                    *ns,
+                    *qpair,
+                    *buf,
+                    *offset,
+                    *num_bytes,
+                    &mut (*cb_ctx_ptr).async_ctx,
+                )
+            },
+            IoOp::Write {
+                ns,
+                qpair,
+                buf,
+                offset,
+                num_bytes,
+            } => unsafe {
+                spdk_ffi::curvine_spdk_ns_submit_write(
+                    *ns,
+                    *qpair,
+                    *buf,
+                    *offset,
+                    *num_bytes,
+                    &mut (*cb_ctx_ptr).async_ctx,
+                )
+            },
+            IoOp::Flush { ns, qpair } => unsafe {
+                spdk_ffi::curvine_spdk_ns_submit_flush(*ns, *qpair, &mut (*cb_ctx_ptr).async_ctx)
+            },
+        };
+
+        if rc != 0 {
+            // Submission failed - reclaim allocation and complete with error
+            unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
+            req.bdev_inflight.fetch_sub(1, Ordering::Release);
+            req.completion.complete(rc);
+            return;
+        }
+
+        // Track active qpair and bump inflight count
+        inflight_counter.fetch_add(1, Ordering::Release);
+        if !active_qpairs.contains(&qpair) {
+            active_qpairs.push(qpair);
+        }
+    }
+}
+
+/// C callback context. Heap-allocated for SPDK to hold pointer.
+struct CallbackCtx {
+    completion: Arc<IoCompletion>,
+    async_ctx: spdk_ffi::curvine_async_ctx,
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    bdev_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// C callback invoked by SPDK when NVMe command completes.
+unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
+    let ctx = Box::from_raw(cb_arg as *mut CallbackCtx);
+    ctx.inflight.fetch_sub(1, Ordering::Release);
+    ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
+    ctx.completion.complete(status);
+}
+
+impl Drop for SpdkPoller {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}

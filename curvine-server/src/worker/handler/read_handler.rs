@@ -17,11 +17,12 @@ use crate::worker::handler::ReadContext;
 use crate::worker::{Worker, WorkerMetrics};
 use curvine_common::error::FsError;
 use curvine_common::proto::{BlockReadResponse, DataHeaderProto};
+use curvine_common::state::StorageType;
 use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::handler::MessageHandler;
-use orpc::io::LocalFile;
+use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::{CacheManager, ReadAheadTask};
 use orpc::{err_box, ternary, try_option_mut};
@@ -31,7 +32,7 @@ pub struct ReadHandler {
     pub(crate) store: BlockStore,
     pub(crate) os_cache: CacheManager,
     pub(crate) context: Option<ReadContext>,
-    pub(crate) file: Option<LocalFile>,
+    pub(crate) file: Option<BlockDevice>,
     pub(crate) last_task: Option<ReadAheadTask>,
     pub(crate) io_slow_us: u64,
     pub(crate) enable_send_file: bool,
@@ -82,7 +83,9 @@ impl ReadHandler {
             );
         }
 
-        let (label, path, file) = if context.short_circuit {
+        // Check short-circuit before open. SPDK has no filesystem path.
+        let is_short_circuit = context.short_circuit && meta.storage_type() != StorageType::Spdk;
+        let (label, path, file) = if is_short_circuit {
             let path = meta.get_block_file()?;
             ("local", path, None)
         } else {
@@ -111,7 +114,7 @@ impl ReadHandler {
         let response = BlockReadResponse {
             id: context.block_id,
             len: meta.len,
-            path: ternary!(context.short_circuit, Some(path), None),
+            path: ternary!(is_short_circuit, Some(path), None),
             storage_type: meta.storage_type().into(),
         };
 
@@ -141,15 +144,33 @@ impl ReadHandler {
 
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
-            // The customer service initiated seek and skip operations.
-            if header.offset != file.pos() {
-                file.seek(header.offset)?;
+            // SPDK: file.pos() = absolute bdev offset
+            let abs_offset = if file.supports_short_circuit() {
+                header.offset
+            } else {
+                (file.len() - context.len) + header.offset
+            };
+            if abs_offset != file.pos() {
+                file.seek(abs_offset)?;
             }
         }
 
         let spend = TimeSpent::new();
-        self.last_task = file.read_ahead(&self.os_cache, self.last_task.take());
-        let region = file.read_region(self.enable_send_file, context.chunk_size)?;
+        // OS page cache read-ahead is only available for local files
+        if file.supports_read_ahead() {
+            if let Some(local) = file.as_local_mut() {
+                self.last_task = local.read_ahead(&self.os_cache, self.last_task.take());
+            }
+        }
+        // SPDK bypasses kernel — sendfile unavailable
+        let enable_send_file = self.enable_send_file && file.supports_send_file();
+        let region = file.read_region(enable_send_file, context.chunk_size)?;
+        // Post-read read-ahead for next chunk
+        if file.supports_read_ahead() {
+            if let Some(local) = file.as_local_mut() {
+                self.last_task = local.read_ahead(&self.os_cache, self.last_task.take());
+            }
+        }
         let used = spend.used_us();
 
         if used >= self.io_slow_us {

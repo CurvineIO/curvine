@@ -22,7 +22,7 @@ use curvine_common::FsResult;
 use log::{info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::handler::MessageHandler;
-use orpc::io::LocalFile;
+use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::{err_box, ternary, try_option_mut};
 use std::mem;
@@ -30,7 +30,7 @@ use std::mem;
 pub struct WriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<WriteContext>,
-    pub(crate) file: Option<LocalFile>,
+    pub(crate) file: Option<BlockDevice>,
     pub(crate) is_commit: bool,
     pub(crate) io_slow_us: u64,
     pub(crate) metrics: &'static WorkerMetrics,
@@ -50,14 +50,13 @@ impl WriteHandler {
         }
     }
 
-    pub fn resize(file: &mut LocalFile, ctx: &WriteContext) -> FsResult<()> {
+    pub fn resize(file: &mut BlockDevice, ctx: &WriteContext) -> FsResult<()> {
         let opts = if let Some(opts) = &ctx.block.alloc_opts {
             opts
         } else {
             return Ok(());
         };
         opts.validate()?;
-
         if opts.len > ctx.block_size {
             return err_box!(
                 "Invalid resize operation: allocation size {} > block size {}",
@@ -65,10 +64,19 @@ impl WriteHandler {
                 ctx.block_size
             );
         }
+        // SPDK: NVMe namespace has fixed capacity, just validate fits.
+        if !file.supports_short_circuit() {
+            if opts.len > file.len() {
+                return err_box!(
+                    "Resize {} exceeds SPDK bdev capacity {}",
+                    opts.len,
+                    file.len()
+                );
+            }
+            return Ok(());
+        }
 
-        // Remove KEEP_SIZE flag to ensure file size is properly set
-        // KEEP_SIZE only pre-allocates space without changing file size, which causes
-        // length mismatch issues during finalization. Other flags are preserved.
+        // Remove KEEP_SIZE flag to fix length mismatch at finalization.
         let mut mode = opts.mode;
         mode.remove(FileAllocMode::KEEP_SIZE);
         file.resize(opts.truncate, opts.off, opts.len, mode.bits())?;
@@ -106,7 +114,8 @@ impl WriteHandler {
         // check file resize
         Self::resize(&mut file, &context)?;
 
-        let (label, path, file) = if context.short_circuit {
+        let is_short_circuit = context.short_circuit && file.supports_short_circuit();
+        let (label, path, file) = if is_short_circuit {
             ("local", file.path().to_string(), None)
         } else {
             ("remote", file.path().to_string(), Some(file))
@@ -124,7 +133,7 @@ impl WriteHandler {
 
         let response = BlockWriteResponse {
             id: meta.id,
-            path: ternary!(context.short_circuit, Some(path), None),
+            path: ternary!(is_short_circuit, Some(path), None),
             off: context.off,
             block_size: context.block_size,
             storage_type: meta.storage_type().into(),
@@ -168,14 +177,28 @@ impl WriteHandler {
                         context.block_size
                     );
                 }
-                file.seek(header.offset)?;
+                // SPDK: file.pos()/seek() = absolute bdev offset
+                let abs_offset = if file.supports_short_circuit() {
+                    header.offset
+                } else {
+                    (file.len() - context.block_size) + header.offset
+                };
+                file.seek(abs_offset)?;
             }
         }
 
         // Write existing data blocks.
         let data_len = msg.data_len() as i64;
         if data_len > 0 {
-            if file.pos() + data_len > context.block_size {
+            // SPDK: pos() = absolute bdev offset
+            let write_limit = if file.supports_short_circuit() {
+                // Local files: pos() is relative to file start
+                context.block_size
+            } else {
+                // SPDK bdevs: pos() is absolute, len() is the upper bound
+                file.len()
+            };
+            if file.pos() + data_len > write_limit {
                 return err_box!(
                     "Write range [{}, {}) exceeds block size {}",
                     file.pos(),

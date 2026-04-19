@@ -17,10 +17,10 @@
 use crate::conf::ClusterConf;
 use crate::state::StorageType;
 use orpc::common::{ByteUnit, DurationUnit, FileUtils, LogConf, Utils};
+use orpc::io::SpdkConf;
 use orpc::{err_box, CommonResult};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-
 #[derive(Debug, Clone, Serialize, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct WorkerDataDir {
@@ -159,6 +159,9 @@ pub struct WorkerConf {
 
     // Enable S3 gateway alongside worker
     pub enable_s3_gateway: bool,
+
+    // SPDK over NVMe-oF/RDMA configuration.
+    pub spdk: SpdkConf,
 }
 
 impl WorkerConf {
@@ -203,6 +206,7 @@ impl Default for WorkerConf {
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
             enable_s3_gateway: false,
+            spdk: SpdkConf::default(),
         }
     }
 }

@@ -911,7 +911,6 @@ dependencies = [
  "curvine-common",
  "curvine-tracing-appender",
  "dashmap",
- "futures",
  "fxhash",
  "libc",
  "log",
@@ -1006,6 +1005,7 @@ version = "0.2.0"
 dependencies = [
  "axum 0.7.9",
  "bincode",
+ "byteorder",
  "bytes",
  "chrono",
  "clap",
@@ -1055,7 +1055,6 @@ dependencies = [
  "curvine-server",
  "curvine-tracing-appender",
  "curvine-ufs",
- "futures",
  "log",
  "once_cell",
  "orpc",
@@ -1082,7 +1081,6 @@ name = "curvine-ufs"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "async-stream",
  "async-trait",
  "bytes",
  "cc",
@@ -2750,6 +2748,7 @@ dependencies = [
  "axum 0.7.9",
  "bincode",
  "bytes",
+ "cc",
  "chrono",
  "crc32fast",
  "crossbeam",
@@ -2767,6 +2766,7 @@ dependencies = [
  "num_enum",
  "once_cell",
  "pin-project-lite",
+ "pkg-config",
  "prometheus",
  "prost 0.11.9",
  "prost-build",

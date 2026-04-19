@@ -26,6 +26,8 @@ use once_cell::sync::OnceCell;
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
+#[cfg(feature = "spdk")]
+use orpc::io::spdk_env::SpdkEnv;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::server::{RpcServer, ServerStateListener};
 use orpc::CommonResult;
@@ -109,6 +111,68 @@ impl Worker {
     pub fn with_conf(conf: ClusterConf) -> CommonResult<Self> {
         Logger::init(conf.worker.log.clone());
 
+        // Init SPDK before WorkerService - enables BlockMeta to open SPDK bdevs
+        #[cfg(feature = "spdk")]
+        if conf.worker.spdk.enabled {
+            use curvine_common::conf::WorkerDataDir;
+            use curvine_common::state::StorageType;
+            use log::warn;
+            info!("SPDK enabled — initializing global SPDK environment");
+            match SpdkEnv::init_global(conf.worker.spdk.clone()) {
+                Ok(env) => {
+                    info!(
+                        "SPDK environment ready: {} bdev(s), total capacity {}",
+                        env.bdevs().len(),
+                        env.total_capacity()
+                    );
+                    // Validate: each data_dir needs one bdev (dir_id % num_bdevs)
+                    let num_spdk_dirs = conf
+                        .worker
+                        .data_dir
+                        .iter()
+                        .filter(|d| {
+                            WorkerDataDir::from_str(d)
+                                .map(|dd| dd.storage_type == StorageType::Spdk)
+                                .unwrap_or(false)
+                        })
+                        .count();
+                    let num_bdevs = env.bdevs().len();
+                    if num_spdk_dirs > num_bdevs {
+                        return orpc::err_box!(
+                            "Configuration has {} SPDK data_dir entries but only {} bdev(s) \
+                             were discovered. Multiple dirs would map to the same NVMe \
+                             namespace, causing data corruption. Either reduce SPDK data_dir \
+                             entries or add more NVMe-oF targets.",
+                            num_spdk_dirs,
+                            num_bdevs
+                        );
+                    }
+                    if num_spdk_dirs > 0 && num_spdk_dirs < num_bdevs {
+                        warn!(
+                            "{} SPDK data_dir(s) configured but {} bdev(s) discovered. \
+                             {} bdev(s) will be unused.",
+                            num_spdk_dirs,
+                            num_bdevs,
+                            num_bdevs - num_spdk_dirs
+                        );
+                    }
+                }
+                Err(e) => {
+                    // SPDK init failure is fatal — blocks on SPDK dirs would be inaccessible.
+                    return Err(e);
+                }
+            }
+        }
+        #[cfg(not(feature = "spdk"))]
+        {
+            if conf.worker.spdk.enabled {
+                return orpc::err_box!(
+                    "SPDK is not enabled. Compile with --features spdk to use SPDK"
+                );
+            }
+            info!("SPDK disabled (not compiled)");
+        }
+
         let rt = Arc::new(conf.worker_server_conf().create_runtime());
         let service: WorkerService = WorkerService::with_conf(&conf, rt.clone())?;
         let worker_id = service.store.worker_id();
@@ -143,9 +207,15 @@ impl Worker {
             .replication_manager
             .with_master_client(master_client.clone());
 
+        let spdk_enabled = conf.worker.spdk.enabled;
         rpc_server.add_shutdown_hook(move || {
             if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
                 info!("error unregister {}", e)
+            }
+            if spdk_enabled {
+                info!("Shutting down SPDK environment");
+                #[cfg(feature = "spdk")]
+                orpc::io::spdk_env::SpdkEnv::shutdown_global();
             }
         });
 

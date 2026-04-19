@@ -5,8 +5,6 @@ edition.workspace = true
 license.workspace = true
 description = "High-performance network communication framework."
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 tokio = { workspace = true }
 futures = { workspace = true }
@@ -43,3 +41,11 @@ tracing-log = { workspace = true }
 fxhash = { workspace = true }
 moka = { workspace = true }
 md-5 = { workspace = true }
+
+[features]
+spdk = []
+spdk-rdma = ["spdk"]
+
+[build-dependencies]
+pkg-config = "0.3"
+cc = "1"

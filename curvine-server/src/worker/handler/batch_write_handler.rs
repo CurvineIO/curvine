@@ -27,14 +27,14 @@ use curvine_common::utils::ProtoUtils;
 use curvine_common::FsResult;
 use orpc::err_box;
 use orpc::handler::MessageHandler;
-use orpc::io::LocalFile;
+use orpc::io::{BlockDevice, BlockIO};
 use orpc::message::{Builder, Message, RequestStatus};
 use orpc::sys::DataSlice;
 
 pub struct BatchWriteHandler {
     pub(crate) store: BlockStore,
     pub(crate) context: Option<Vec<WriteContext>>,
-    pub(crate) file: Option<Vec<LocalFile>>,
+    pub(crate) file: Option<Vec<BlockDevice>>,
     pub(crate) is_commit: bool,
     pub(crate) write_handler: WriteHandler,
 }
