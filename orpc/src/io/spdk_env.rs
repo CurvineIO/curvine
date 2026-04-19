@@ -223,7 +223,7 @@ impl Display for NvmeTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SpdkConf {
-    pub enabled: bool,    // master switch - false = skip init
+    pub enabled: bool, // master switch - false = skip init
     #[serde(default)]
     pub app_name: String, // SPDK EAL name, e.g. "curvine"
     #[serde(alias = "hugepage", default)]
@@ -233,7 +233,7 @@ pub struct SpdkConf {
     #[serde(default)]
     pub reactor_mask: String, // hex, e.g. "0x3"
     #[serde(default)]
-    pub shm_id: i32,      // -1 = single-process
+    pub shm_id: i32, // -1 = single-process
     #[serde(default)]
     pub mem_channel: u32, // 0 = auto-detect
     #[serde(default)]

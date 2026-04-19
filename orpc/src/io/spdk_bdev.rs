@@ -688,8 +688,12 @@ mod test {
         conf.hugepage_mb = 64;
         conf.reactor_mask = "0x1".to_string();
         let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
-        let trsvcid = std::env::var("SPDK_TARGET_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(4420);
-        let subnqn = std::env::var("SPDK_TARGET_NQN").unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
+        let trsvcid = std::env::var("SPDK_TARGET_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4420);
+        let subnqn = std::env::var("SPDK_TARGET_NQN")
+            .unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
         let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
         conf.targets = vec![crate::io::spdk_env::NvmeTarget {
             traddr,
