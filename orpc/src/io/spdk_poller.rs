@@ -169,6 +169,7 @@ impl SpdkPoller {
             }
 
             // Poll active qpairs for completions
+            // TODO: treat poll failure as fatal; Because rc < 0 silently drops qpair, stranding in-flight completions forever.
             active_qpairs.retain(|&qpair| {
                 let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
                 if rc < 0 {
