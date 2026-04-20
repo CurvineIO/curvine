@@ -58,7 +58,7 @@ impl ReadHandler {
     }
 
     pub fn open(&mut self, msg: &Message) -> FsResult<Message> {
-        let context = ReadContext::from_req(msg)?;
+        let mut context = ReadContext::from_req(msg)?;
         let meta = self.store.get_block(context.block_id)?;
 
         if context.off > meta.len {
@@ -119,6 +119,7 @@ impl ReadHandler {
         };
 
         let _ = mem::replace(&mut self.file, file);
+        context.bdev_offset = meta.bdev_offset;
         let _ = self.context.replace(context);
 
         self.metrics.read_blocks.with_label_values(&[label]).inc();
@@ -144,11 +145,10 @@ impl ReadHandler {
 
         if msg.header_len() > 0 {
             let header: DataHeaderProto = msg.parse_header()?;
-            // SPDK: file.pos() = absolute bdev offset
             let abs_offset = if file.supports_short_circuit() {
                 header.offset
             } else {
-                (file.len() - context.len) + header.offset
+                context.bdev_offset + context.off + header.offset
             };
             if abs_offset != file.pos() {
                 file.seek(abs_offset)?;
