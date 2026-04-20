@@ -907,7 +907,11 @@ impl SpdkEnv {
                 });
             }
             if bdevs.is_empty() {
-                warn!("Controller {} has no active namespaces", target.endpoint());
+                warn!(
+                    "Controller {} has no active namespaces, detaching controller",
+                    target.endpoint()
+                );
+                unsafe { spdk_ffi::spdk_nvme_detach(ctrlr) };
             }
             Ok(bdevs)
         }
