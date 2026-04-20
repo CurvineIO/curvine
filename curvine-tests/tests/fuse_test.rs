@@ -37,15 +37,13 @@ fn persist_restore() {
         let fs1 = testing.get_unified_fs_with_rt(rt.clone()).unwrap();
         let state1 = NodeState::new(fs1.clone());
 
-        // Add some nodes
+        // Add some nodes; lookup() returns fuse_attr whose .ino is the assigned inode number
         let status_a = FileStatus::with_name(2, "a".to_string(), true);
         let status_b = FileStatus::with_name(3, "b".to_string(), true);
         let status_c = FileStatus::with_name(4, "c".to_string(), true);
-        let a = state1
-            .do_lookup(FUSE_ROOT_ID, Some("a"), &status_a)
-            .unwrap();
-        let b = state1.do_lookup(a.ino, Some("b"), &status_b).unwrap();
-        let c = state1.do_lookup(b.ino, Some("c"), &status_c).unwrap();
+        let a = state1.lookup(FUSE_ROOT_ID, "a", status_a).unwrap();
+        let b = state1.lookup(a.ino, "b", status_b).unwrap();
+        let c = state1.lookup(b.ino, "c", status_c).unwrap();
 
         // Create dir_handles
         let path_a_dir = Path::from_str("/a").unwrap();
@@ -54,11 +52,11 @@ fn persist_restore() {
         let dir_handle1 = state1.new_dir_handle(a.ino, &path_a_dir).await.unwrap();
         let dir_handle2 = state1.new_dir_handle(b.ino, &path_b_dir).await.unwrap();
 
-        // Create file handles
+        // Create file handles; ino is now Option<u64>
         let path = Path::from_str("/a/1.log").unwrap();
         let handle1 = state1
             .new_handle(
-                21,
+                Some(21),
                 &path,
                 OpenFlags::new_create().value(),
                 CreateFileOptsBuilder::with_conf(state1.client_conf())
@@ -71,7 +69,7 @@ fn persist_restore() {
         let path = Path::from_str("/a/2.log").unwrap();
         let handle2 = state1
             .new_handle(
-                22,
+                Some(22),
                 &path,
                 OpenFlags::new_create().set_read_write().value(),
                 CreateFileOptsBuilder::with_conf(state1.client_conf())
@@ -86,8 +84,8 @@ fn persist_restore() {
         handle1.add_lock(curvine_common::state::LockFlags::Plock, 200);
 
         // Record original state for comparison
-        let original_node_count = state1.node_read().nodes_len();
-        let original_id_creator = state1.node_read().current_id();
+        let original_node_count = state1.dir_read().inode_lens();
+        let original_id_creator = state1.dir_read().current_id();
         let original_fh_creator = state1.current_fh();
         let original_handle1_status = handle1.status().clone();
 
@@ -113,15 +111,15 @@ fn persist_restore() {
         let path_c = state2.get_path(c.ino).unwrap();
         assert_eq!(path_c.path(), "/a/b/c");
 
-        // Verify node lookup
-        let found_a = state2.find_node(FUSE_ROOT_ID, Some("a")).unwrap();
-        assert_eq!(found_a.id, a.ino);
+        // Verify node lookup via get_ino (returns Option<u64>)
+        let found_a_ino = state2.get_ino(FUSE_ROOT_ID, Some("a")).unwrap();
+        assert_eq!(found_a_ino, a.ino);
 
-        let found_b = state2.find_node(a.ino, Some("b")).unwrap();
-        assert_eq!(found_b.id, b.ino);
+        let found_b_ino = state2.get_ino(a.ino, Some("b")).unwrap();
+        assert_eq!(found_b_ino, b.ino);
 
-        let found_c = state2.find_node(b.ino, Some("c")).unwrap();
-        assert_eq!(found_c.id, c.ino);
+        let found_c_ino = state2.get_ino(b.ino, Some("c")).unwrap();
+        assert_eq!(found_c_ino, c.ino);
 
         // Verify handle restoration
         assert_eq!(state2.all_handles().len(), state1.all_handles().len());
@@ -153,15 +151,15 @@ fn persist_restore() {
         assert_eq!(restored_handle1.status().path, original_handle1_status.path);
         assert_eq!(restored_handle1.status().id, original_handle1_status.id);
 
-        // Verify locks are restored (check that locks exist by trying to remove them)
+        // Verify locks are restored
         let flock_owner = restored_handle1.remove_lock(curvine_common::state::LockFlags::Flock);
         assert_eq!(flock_owner, Some(100));
         let plock_owner = restored_handle1.remove_lock(curvine_common::state::LockFlags::Plock);
         assert_eq!(plock_owner, Some(200));
 
-        // Verify counters
-        let restored_node_count = state2.node_read().nodes_len();
-        let restored_id_creator = state2.node_read().current_id();
+        // Verify counters (inode count, id_creator, fh_creator)
+        let restored_node_count = state2.dir_read().inode_lens();
+        let restored_id_creator = state2.dir_read().current_id();
         let restored_fh_creator = state2.current_fh();
         assert_eq!(restored_node_count, original_node_count);
         assert_eq!(restored_id_creator, original_id_creator);

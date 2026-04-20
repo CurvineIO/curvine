@@ -90,14 +90,14 @@ impl FuseWriter {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
-    pub async fn write(&mut self, op: Write<'_>, reply: FuseResponse) -> FsResult<()> {
+    pub async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FsResult<()> {
         self.sender
             .send(WriteTask::Write(op.arg.offset as i64, op.data, reply))
             .await
             .map_err(|e| self.check_error(e.into()))
     }
 
-    pub async fn flush(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
+    pub async fn flush(&self, reply: Option<FuseResponse>) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(WriteTask::Flush(rx, reply)).await?;
@@ -107,7 +107,7 @@ impl FuseWriter {
         fun.await.map_err(|e| self.check_error(e))
     }
 
-    pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
+    pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(WriteTask::Complete(rx, reply)).await?;
@@ -117,7 +117,7 @@ impl FuseWriter {
         fun.await.map_err(|e| self.check_error(e))
     }
 
-    pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+    pub async fn resize(&self, opts: FileAllocOpts) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(WriteTask::Resize(rx, opts)).await?;

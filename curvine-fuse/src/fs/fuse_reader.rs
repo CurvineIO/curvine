@@ -89,7 +89,7 @@ impl FuseReader {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
-    pub async fn read(&mut self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
+    pub async fn read(&self, op: Read<'_>, reply: FuseResponse) -> FsResult<()> {
         let res = self
             .sender
             .send(ReadTask::Read(
@@ -102,7 +102,7 @@ impl FuseReader {
         res
     }
 
-    pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
+    pub async fn complete(&self, reply: Option<FuseResponse>) -> FsResult<()> {
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(ReadTask::Complete(rx, reply)).await?;

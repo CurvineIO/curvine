@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::conf::ClusterConf;
+use crate::fs::Path;
 use orpc::common::{DurationUnit, FileUtils, LogConf, Utils};
 use orpc::sys::{CString, FFIUtils};
 use orpc::{err_box, sys, try_err, CommonResult};
@@ -113,14 +114,8 @@ pub struct FuseConf {
     // Whether to enable metadata cache
     pub enable_meta_cache: bool,
 
-    // Metadata cache capacity (number of entries)
-    pub meta_cache_capacity: u64,
-
     // Metadata cache TTL (time to live)
-    pub meta_cache_ttl: String,
-
-    pub node_cache_size: u64,
-
+    pub meta_cache_timeout: String,
     pub node_cache_timeout: String,
 
     // File and directory related options
@@ -150,7 +145,7 @@ pub struct FuseConf {
     pub node_cache_ttl: Duration,
 
     #[serde(skip_serializing, skip_deserializing)]
-    pub meta_cache_ttl_duration: Duration,
+    pub meta_cache_ttl: Duration,
 
     pub list_limit: usize,
 
@@ -175,11 +170,18 @@ impl FuseConf {
         self.entry_ttl = Duration::from_secs_f64(self.entry_timeout);
         self.negative_ttl = Duration::from_secs_f64(self.negative_timeout);
         self.node_cache_ttl = DurationUnit::from_str(&self.node_cache_timeout)?.as_duration();
-        self.meta_cache_ttl_duration = DurationUnit::from_str(&self.meta_cache_ttl)?.as_duration();
+        self.meta_cache_ttl = DurationUnit::from_str(&self.meta_cache_timeout)?.as_duration();
 
         if self.mnt_per_task == 0 {
             self.mnt_per_task = self.io_threads;
         }
+
+        let fs_path = Path::from_str(&self.fs_path)?;
+        self.fs_path = fs_path.path().to_owned();
+
+        let mnt_path = Path::from_str(&self.mnt_path)?;
+        self.mnt_path = mnt_path.path().to_owned();
+
         Ok(())
     }
 
@@ -297,11 +299,8 @@ impl Default for FuseConf {
             congestion_threshold: 192,
 
             enable_meta_cache: false,
-            meta_cache_capacity: 100000,
-            meta_cache_ttl: "120s".to_string(),
-
-            node_cache_size: 200000,
-            node_cache_timeout: "24h".to_string(),
+            meta_cache_timeout: "120s".to_string(),
+            node_cache_timeout: "1h".to_string(),
 
             direct_io: false,
             write_back_cache: false,
@@ -315,7 +314,7 @@ impl Default for FuseConf {
             entry_ttl: Default::default(),
             negative_ttl: Default::default(),
             node_cache_ttl: Default::default(),
-            meta_cache_ttl_duration: Default::default(),
+            meta_cache_ttl: Default::default(),
 
             list_limit: 1000,
             log: LogConf::default(),

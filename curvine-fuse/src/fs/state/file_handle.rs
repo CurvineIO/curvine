@@ -23,7 +23,6 @@ use orpc::err_box;
 use orpc::sys::RawPtr;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct HandleLock {
@@ -36,7 +35,7 @@ pub struct FileHandle {
     pub fh: u64,
 
     pub reader: Option<RawPtr<FuseReader>>,
-    pub writer: Option<Arc<Mutex<FuseWriter>>>, // Writer uses Arc for global sharing
+    pub writer: Option<Arc<FuseWriter>>, // Writer uses Arc for global sharing
     pub status: FileStatus,
 
     fh_locks: std::sync::Mutex<HandleLock>,
@@ -47,7 +46,7 @@ impl FileHandle {
         ino: u64,
         fh: u64,
         reader: Option<RawPtr<FuseReader>>,
-        writer: Option<Arc<Mutex<FuseWriter>>>,
+        writer: Option<Arc<FuseWriter>>,
         status: FileStatus,
     ) -> Self {
         Self {
@@ -71,20 +70,19 @@ impl FileHandle {
             None => return err_fuse!(libc::EIO),
         };
 
-        if op.arg.offset as i64 >= reader.len() {
-            if let Some(writer) = state.find_writer(&op.header.nodeid) {
-                {
-                    writer.lock().await.flush(None).await?;
-                }
+        if op.arg.offset as i64 > reader.len() {
+            if let Some(writer) = state.find_writer(self.ino) {
+                writer.flush(None).await?;
+
                 // TODO: Optimize by adding refresh interface to refresh block list
                 let path = reader.path().clone();
-                reader.as_mut().complete(None).await?;
+                reader.complete(None).await?;
                 let new_reader = state.new_reader(&path).await?;
                 reader.replace(new_reader);
             }
         }
 
-        reader.as_mut().read(op, reply).await?;
+        reader.read(op, reply).await?;
         Ok(())
     }
 
@@ -93,20 +91,17 @@ impl FileHandle {
             return Ok(());
         }
 
-        let lock = if let Some(lock) = &self.writer {
-            lock
+        if let Some(writer) = &self.writer {
+            writer.write(op, reply).await?;
+            Ok(())
         } else {
-            return err_fuse!(libc::EIO);
-        };
-
-        let mut writer = lock.lock().await;
-        writer.write(op, reply).await?;
-        Ok(())
+            err_fuse!(libc::EIO)
+        }
     }
 
     pub async fn flush(&self, reply: Option<FuseResponse>) -> FuseResult<()> {
         if let Some(writer) = &self.writer {
-            writer.lock().await.flush(reply).await?;
+            writer.flush(reply).await?;
         } else if let Some(reply) = reply {
             reply.send_rep(Ok::<(), FuseError>(())).await?;
         }
@@ -116,13 +111,13 @@ impl FileHandle {
     pub async fn complete(&self, mut reply: Option<FuseResponse>) -> FuseResult<()> {
         if let Some(writer) = &self.writer {
             if Arc::strong_count(writer) <= 1 {
-                writer.lock().await.complete(reply.take()).await?;
+                writer.complete(reply.take()).await?;
             } else {
-                writer.lock().await.flush(reply.take()).await?;
+                writer.flush(reply.take()).await?;
             }
         }
         if let Some(reader) = &self.reader {
-            reader.as_mut().complete(reply.take()).await?;
+            reader.complete(reply.take()).await?;
         }
         Ok(())
     }
@@ -193,7 +188,7 @@ impl FileHandle {
         let writer = if has_writer {
             let opts = CreateFileOptsBuilder::with_conf(state.client_conf()).build();
             let writer = state
-                .new_writer(ino, &path, OpenFlags::new_write_only(), opts)
+                .new_writer(&path, OpenFlags::new_write_only(), opts)
                 .await?;
             Some(writer)
         } else {

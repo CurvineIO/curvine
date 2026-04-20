@@ -24,8 +24,8 @@ use curvine_common::conf::{ClusterConf, FuseConf};
 use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, StateReader, StateWriter};
 use curvine_common::state::{
-    CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileLock, FileStatus, LockFlags, LockType,
-    MkdirOptsBuilder, OpenFlags, SetAttrOpts,
+    CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
+    LockType, MkdirOptsBuilder, OpenFlags, SetAttrOpts,
 };
 use log::{debug, error, info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
@@ -223,26 +223,14 @@ impl CurvineFileSystem {
         }
     }
 
-    async fn lookup_path<T: AsRef<str>>(
-        &self,
-        parent: u64,
-        name: Option<T>,
-        path: &Path,
-    ) -> FuseResult<fuse_attr> {
-        let name = name.as_ref();
-        let status = self.get_cached_status(path).await?;
-        let attr = self.state.do_lookup(parent, name, &status)?;
+    async fn lookup_path(&self, parent: u64, name: &str, path: &Path) -> FuseResult<fuse_attr> {
+        let status = self.get_cached_status(parent, Some(name), path).await?;
+        let attr = self.state.lookup(parent, name, status)?;
         Ok(attr)
     }
 
-    fn lookup_status<T: AsRef<str>>(
-        &self,
-        parent: u64,
-        name: Option<T>,
-        status: &FileStatus,
-    ) -> FuseResult<fuse_attr> {
-        let name = name.as_ref();
-        let attr = self.state.do_lookup(parent, name, status)?;
+    fn lookup_status(&self, parent: u64, name: &str, status: FileStatus) -> FuseResult<fuse_attr> {
+        let attr = self.state.lookup(parent, name, status)?;
         Ok(attr)
     }
 
@@ -258,14 +246,11 @@ impl CurvineFileSystem {
         let mut index = arg.offset;
         let mut batch = handle.get_batch(arg.offset as usize).await?;
         {
-            let mut map = self.state.node_write();
+            let mut dir = self.state.dir_write();
             while let Some(status) = batch.pop_front() {
                 let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
-                    if self.conf.enable_meta_cache {
-                        let path = Path::from_str(&status.path)?;
-                        self.state.meta_cache().put_status(&path, status.clone());
-                    }
-                    map.do_lookup(header.nodeid, Some(&status.name), &status)?
+                    let inode = dir.lookup(header.nodeid, &status.name, status.clone())?;
+                    Self::status_to_attr(&self.conf, &inode.status)?
                 } else {
                     Self::status_to_attr(&self.conf, &status)?
                 };
@@ -292,7 +277,7 @@ impl CurvineFileSystem {
         if header.uid == 0 || !self.conf.check_permission {
             return Ok(());
         }
-        let status = self.get_cached_status(path).await?;
+        let status = self.get_cached_status(header.nodeid, None, path).await?;
         self.check_access_permissions(&status, header, mask)
     }
 
@@ -522,7 +507,7 @@ impl CurvineFileSystem {
         if fh != 0 {
             let handle = self.state.find_handle(ino, fh)?;
             if let Some(writer) = &handle.writer {
-                writer.lock().await.resize(opts).await?;
+                writer.resize(opts).await?;
             } else {
                 return err_fuse!(libc::EACCES);
             }
@@ -530,58 +515,25 @@ impl CurvineFileSystem {
             self.fs.resize(path, opts).await?;
         };
 
-        self.invalidate_cache(path)?;
         Ok(())
     }
 
-    async fn get_cached_status(&self, path: &Path) -> FuseResult<FileStatus> {
-        if self.conf.enable_meta_cache {
-            if let Some(status) = self.state.meta_cache().get_status(path) {
-                return Ok(status);
-            }
+    async fn get_cached_status(
+        &self,
+        ino: u64,
+        name: Option<&str>,
+        path: &Path,
+    ) -> FuseResult<FileStatus> {
+        if let Some(status) = self.state.get_cache_status(ino, name) {
+            Ok(status)
+        } else {
+            let status = self.fs_get_status(path).await?;
+            Ok(status)
         }
-
-        let status = self.fs_get_status(path).await?;
-        if self.conf.enable_meta_cache {
-            self.state.meta_cache().put_status(path, status.clone());
-        }
-
-        Ok(status)
     }
 
-    pub async fn get_cached_list(&self, path: &Path) -> FuseResult<Vec<FileStatus>> {
-        if self.conf.enable_meta_cache {
-            if let Some(list) = self.state.meta_cache().get_list(path) {
-                return Ok(list);
-            }
-        }
-
-        let list = self.fs.list_status(path).await?;
-        let mut res = Vec::with_capacity(list.len() + 2);
-        res.push(CurvineFileSystem::new_dot_status(FUSE_CURRENT_DIR));
-        res.push(CurvineFileSystem::new_dot_status(FUSE_PARENT_DIR));
-        for status in list {
-            res.push(status);
-        }
-
-        if self.conf.enable_meta_cache {
-            self.state.meta_cache().put_list(path, res.clone());
-        }
-
-        Ok(res)
-    }
-    fn invalidate_cache(&self, path: &Path) -> FuseResult<()> {
-        if !self.conf.enable_meta_cache {
-            return Ok(());
-        }
-
-        self.state.meta_cache().invalidate(path);
-
-        if let Ok(Some(parent)) = path.parent() {
-            self.state.meta_cache().invalidate_list(&parent);
-        }
-
-        Ok(())
+    fn invalid_cache(&self, ino: u64, name: Option<&str>) {
+        self.state.invalid_cache(ino, name)
     }
 }
 
@@ -646,13 +598,10 @@ impl fs::FileSystem for CurvineFileSystem {
         let name = try_option!(op.name.to_str());
         let id = op.header.nodeid;
 
-        let (parent, name) = if name == FUSE_CURRENT_DIR {
-            (id, None)
-        } else if name == FUSE_PARENT_DIR {
-            let parent = self.state.get_parent_id(id)?;
-            (parent, None)
+        let parent = if name == FUSE_PARENT_DIR {
+            self.state.get_parent_ino(id)?
         } else {
-            (id, Some(name.to_string()))
+            id
         };
 
         let parent_path = self.state.get_path(parent)?;
@@ -660,15 +609,13 @@ impl fs::FileSystem for CurvineFileSystem {
             .await?;
 
         // Get the path.
-        let path = self.state.get_path_common(parent, name.as_deref())?;
-        let status = self.get_cached_status(&path).await?;
-        let res = self.lookup_status(parent, name.as_deref(), &status);
+        let path = self.state.get_path_common(parent, Some(name))?;
+        let res = self.lookup_path(parent, name, &path).await;
 
         let entry = match res {
             Ok(attr) => {
                 let mut entry = Self::create_entry_out(&self.conf, attr);
-                let keep_attr = self.state.should_keep_attr(entry.nodeid, &status)?;
-                if !keep_attr {
+                if !self.state.keep_attr(entry.nodeid) {
                     entry.entry_valid = 0;
                     entry.attr_valid = 0;
                     entry.entry_valid_nsec = 0;
@@ -712,39 +659,26 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         let path = self.state.get_path(op.header.nodeid)?;
-        debug!("Getting xattr: path='{}' name='{}'", path, name);
-
-        let status = self.get_cached_status(&path).await?;
+        let status = self
+            .get_cached_status(op.header.nodeid, None, &path)
+            .await?;
 
         let mut buf = FuseBuf::default();
-        match name {
-            "id" => {
-                let value = status.id.to_string();
-                if op.arg.size == 0 {
-                    buf.add_xattr_out(value.len())
-                } else {
-                    buf.add_slice(value.as_bytes());
-                }
+        if let Some(value) = status.x_attr.get(name) {
+            if op.arg.size == 0 {
+                buf.add_xattr_out(value.len())
+            } else if op.arg.size < value.len() as u32 {
+                return err_fuse!(
+                    libc::ERANGE,
+                    "Buffer too small for xattr value: {} < {}",
+                    op.arg.size,
+                    value.len()
+                );
+            } else {
+                buf.add_slice(value);
             }
-            _ => {
-                // For other xattr names, try to get from file's xattr
-                if let Some(value) = status.x_attr.get(name) {
-                    if op.arg.size == 0 {
-                        buf.add_xattr_out(value.len())
-                    } else if op.arg.size < value.len() as u32 {
-                        return err_fuse!(
-                            libc::ERANGE,
-                            "Buffer too small for xattr value: {} < {}",
-                            op.arg.size,
-                            value.len()
-                        );
-                    } else {
-                        buf.add_slice(value);
-                    }
-                } else {
-                    return err_fuse!(libc::ENODATA, "No such attribute: {}", name);
-                }
-            }
+        } else {
+            return err_fuse!(libc::ENODATA, "No such attribute: {}", name);
         }
 
         Ok(buf.take())
@@ -789,7 +723,7 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let _ = self.fs_set_attr(&path, opts).await?;
-        self.invalidate_cache(&path)?;
+        self.state.invalid_cache(op.header.nodeid, None);
         Ok(())
     }
 
@@ -823,7 +757,8 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let _ = self.fs_set_attr(&path, opts).await?;
-        self.invalidate_cache(&path)?;
+        self.state.invalid_cache(op.header.nodeid, None);
+
         Ok(())
     }
 
@@ -833,7 +768,9 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
         debug!("Listing xattrs: path='{}' size={}", path, op.arg.size);
 
-        let status = self.get_cached_status(&path).await?;
+        let status = self
+            .get_cached_status(op.header.nodeid, None, &path)
+            .await?;
 
         // Build the list of xattr names
         let mut xattr_names = Vec::new();
@@ -871,28 +808,25 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn get_attr(&self, op: GetAttr<'_>) -> FuseResult<fuse_attr_out> {
         let path = self.state.get_path(op.header.nodeid)?;
-
-        let status = self.get_cached_status(&path).await?;
+        let status = self
+            .get_cached_status(op.header.nodeid, None, &path)
+            .await?;
 
         let mut fuse_attr = Self::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
 
-        let keep_cache = self.state.should_keep_attr(op.header.nodeid, &status)?;
-        let (attr_valid, attr_valid_nsec) = if keep_cache {
-            (
-                self.conf.attr_ttl.as_secs(),
-                self.conf.attr_ttl.subsec_nanos(),
-            )
-        } else {
-            (0, 0)
-        };
-
-        let attr = fuse_attr_out {
-            attr_valid,
-            attr_valid_nsec,
+        let mut attr = fuse_attr_out {
+            attr_valid: self.conf.attr_ttl.as_secs(),
+            attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
             dummy: 0,
             attr: fuse_attr,
         };
+
+        if !self.state.keep_attr(op.header.nodeid) {
+            attr.attr_valid = 0;
+            attr.attr_valid_nsec = 0;
+        }
+
         Ok(attr)
     }
 
@@ -922,8 +856,10 @@ impl fs::FileSystem for CurvineFileSystem {
         // If kernel didn't provide FATTR_MODE, we still need to clear bits accordingly.
         if (op.arg.valid & (FATTR_UID | FATTR_GID)) != 0 {
             // Fetch current status to determine file type and mode
-            let cur_status = self.get_cached_status(&path).await?;
-            if cur_status.file_type == curvine_common::state::FileType::File {
+            let cur_status = self
+                .get_cached_status(op.header.nodeid, None, &path)
+                .await?;
+            if cur_status.file_type == FileType::File {
                 let mut new_mode = if let Some(mode) = opts.mode {
                     mode
                 } else {
@@ -955,7 +891,7 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        self.invalidate_cache(&path)?;
+        self.state.invalid_cache(op.header.nodeid, None);
         let mut attr = Self::status_to_attr(&self.conf, &status)?;
         attr.ino = op.header.nodeid;
 
@@ -971,16 +907,6 @@ impl fs::FileSystem for CurvineFileSystem {
     // This interface is not supported at present
     async fn access(&self, op: Access<'_>) -> FuseResult<()> {
         let path = self.state.get_path(op.header.nodeid)?;
-
-        // Check parent directory execute permission for path traversal
-        if let Ok(parent_id) = self.state.get_parent_id(op.header.nodeid) {
-            // Skip when parent_id is invalid (e.g., root has no parent). Inode 0 is invalid.
-            if parent_id != 0 {
-                let parent_path = self.state.get_path(parent_id)?;
-                self.check_permissions(&parent_path, op.header, libc::X_OK as u32)
-                    .await?;
-            }
-        }
 
         // Get file status to check permissions
         self.check_permissions(&path, op.header, op.arg.mask)
@@ -1067,8 +993,7 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         };
 
-        self.invalidate_cache(&path)?;
-        let entry = self.lookup_status(op.header.nodeid, Some(name), &status)?;
+        let entry = self.lookup_status(op.header.nodeid, name, status)?;
         Ok(Self::create_entry_out(&self.conf, entry))
     }
 
@@ -1119,7 +1044,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let opts = CreateFileOptsBuilder::with_conf(&self.fs.conf().client);
         let handle = self
             .state
-            .new_handle(op.header.nodeid, &path, op.arg.flags, opts.build())
+            .new_handle(Some(op.header.nodeid), &path, op.arg.flags, opts.build())
             .await?;
 
         let mut open_flags = op.arg.flags;
@@ -1128,7 +1053,7 @@ impl fs::FileSystem for CurvineFileSystem {
         } else {
             let keep_cache = self
                 .state
-                .should_keep_cache(op.header.nodeid, handle.status())?;
+                .keep_cache(op.header.nodeid, handle.status().clone());
             if keep_cache {
                 open_flags |= FUSE_FOPEN_KEEP_CACHE;
             } else {
@@ -1142,14 +1067,6 @@ impl fs::FileSystem for CurvineFileSystem {
             padding: 0,
         };
 
-        // Invalidate cache for write operations because:
-        // 1. O_TRUNC flag may truncate the file immediately, changing file size
-        // 2. Overwrite operations may change file metadata (size, mtime) immediately
-        // 3. Ensures subsequent read operations get fresh metadata
-        if action.write() {
-            self.invalidate_cache(&path)?;
-        }
-
         Ok(entry)
     }
 
@@ -1158,19 +1075,10 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::EIO);
         }
 
-        let id = op.header.nodeid;
         let name = try_option!(op.name.to_str());
         if name.len() > FUSE_MAX_NAME_LENGTH {
             return err_fuse!(libc::ENAMETOOLONG);
         }
-
-        if self.state.is_pending_delete(id) {
-            return err_fuse!(libc::ETXTBSY, "file has been deleted or unlinked");
-        }
-
-        let path = self.state.get_path_common(id, Some(name))?;
-        let node = self.state.find_node(id, Some(name))?;
-        let flags = op.arg.flags;
 
         // create opts
         let mut opts = CreateFileOptsBuilder::with_conf(&self.fs.conf().client);
@@ -1182,13 +1090,24 @@ impl fs::FileSystem for CurvineFileSystem {
                 op.arg.mode & 0o7777 & !op.arg.umask,
             )
         }
+
+        let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
         let handle = self
             .state
-            .new_handle(node.id, &path, flags, opts.build())
+            .new_handle(None, &path, op.arg.flags, opts.build())
             .await?;
 
-        let attr = self.lookup_status(id, Some(name), handle.status())?;
-        self.invalidate_cache(&path)?;
+        let attr = self.lookup_status(op.header.nodeid, name, handle.status().clone())?;
+        if attr.ino != handle.ino {
+            return err_fuse!(
+                libc::EIO,
+                "ino mismatch after create: dcache returned ino={} but handle has ino={}, path={}",
+                attr.ino,
+                handle.ino,
+                path
+            );
+        }
+
         let r = fuse_create_out(
             fuse_entry_out {
                 nodeid: handle.ino,
@@ -1219,10 +1138,10 @@ impl fs::FileSystem for CurvineFileSystem {
         self.fs_unlock(&handle, LockFlags::Plock).await?;
         handle.flush(Some(reply)).await?;
 
-        let path = Path::from_str(&handle.status.path)?;
         if handle.writer.is_some() {
-            self.invalidate_cache(&path)?;
+            self.invalid_cache(op.header.nodeid, None);
         }
+
         Ok(())
     }
 
@@ -1235,10 +1154,10 @@ impl fs::FileSystem for CurvineFileSystem {
 
         self.fs_unlock(&handle, LockFlags::Flock).await?;
         self.fs_unlock(&handle, LockFlags::Plock).await?;
-        let complete_result = handle.complete(Some(reply)).await;
+        handle.complete(Some(reply)).await?;
 
-        if !self.state.has_open_handles(ino) && self.state.remove_pending_delete(ino) {
-            let path = Path::from_str(&handle.status.path)?;
+        if self.state.deferred_delete_ready(ino) {
+            let path = self.state.get_path(ino)?;
             info!(
                 "release ino={}: no more open handles, executing delayed deletion of {}",
                 ino, path
@@ -1247,17 +1166,14 @@ impl fs::FileSystem for CurvineFileSystem {
                 warn!("failed to delete {} after last handle closed: {}", path, e);
             }
         }
-
-        let path = Path::from_str(&handle.status.path)?;
         if handle.writer.is_some() {
-            self.invalidate_cache(&path)?;
+            self.invalid_cache(op.header.nodeid, None);
         }
-
-        complete_result
+        Ok(())
     }
 
     async fn forget(&self, op: Forget<'_>) -> FuseResult<()> {
-        self.state.forget_node(op.header.nodeid, op.arg.nlookup)
+        self.state.forget(op.header.nodeid, op.arg.nlookup)
     }
 
     async fn unlink(&self, op: Unlink<'_>) -> FuseResult<()> {
@@ -1265,11 +1181,10 @@ impl fs::FileSystem for CurvineFileSystem {
         let parent_ino = op.header.nodeid;
 
         let path = self.state.get_path_common(parent_ino, Some(name))?;
-        if self.state.should_delete_now(parent_ino, Some(name))? {
+        if self.state.should_delete_now(parent_ino, name)? {
             self.fs.delete(&path, false).await?;
         }
-        self.state.unlink_node(parent_ino, Some(name))?;
-        self.invalidate_cache(&path)?;
+        self.state.unlink(parent_ino, name)?;
 
         Ok(())
     }
@@ -1287,15 +1202,7 @@ impl fs::FileSystem for CurvineFileSystem {
         );
 
         self.fs.link(&src_path, &des_path).await?;
-        let src_status = self.get_cached_status(&src_path).await?;
-        self.state.find_link_inode(src_status.id, oldnodeid);
-
-        self.invalidate_cache(&des_path)?;
-        self.invalidate_cache(&src_path)?;
-
-        let attr = self
-            .lookup_path(op.header.nodeid, Some(name), &des_path)
-            .await?;
+        let attr = self.lookup_path(op.header.nodeid, name, &des_path).await?;
 
         let result = Self::create_entry_out(&self.conf, attr);
         Ok(result)
@@ -1306,9 +1213,8 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
 
         self.fs.delete(&path, false).await?;
-        self.state.unlink_node(op.header.nodeid, Some(name))?;
+        self.state.unlink(op.header.nodeid, name)?;
 
-        self.invalidate_cache(&path)?;
         Ok(())
     }
 
@@ -1326,16 +1232,13 @@ impl fs::FileSystem for CurvineFileSystem {
         self.fs.rename(&old_path, &new_path).await?;
 
         self.state
-            .rename_node(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
-
-        self.invalidate_cache(&old_path)?;
-        self.invalidate_cache(&new_path)?;
+            .rename(op.header.nodeid, old_name, op.arg.newdir, new_name)?;
 
         Ok(())
     }
 
     async fn batch_forget(&self, op: BatchForget<'_>) -> FuseResult<()> {
-        self.state.batch_forget_node(&op.nodes)
+        self.state.batch_forget(&op.nodes)
     }
 
     // Create a symbolic link
@@ -1343,25 +1246,19 @@ impl fs::FileSystem for CurvineFileSystem {
         let linkname = try_option!(op.linkname.to_str());
         let target = try_option!(op.target.to_str());
         let id = op.header.nodeid;
-        debug!("symlink: linkname={:?}, target={:?}", linkname, target);
 
         if linkname.len() > FUSE_MAX_NAME_LENGTH {
             return err_fuse!(libc::ENAMETOOLONG);
         }
 
-        let (parent, linkname) = if linkname == FUSE_CURRENT_DIR {
-            (id, None)
-        } else if linkname == FUSE_PARENT_DIR {
-            let parent = self.state.get_parent_id(id)?;
-            (parent, None)
+        let parent = if linkname == FUSE_PARENT_DIR {
+            self.state.get_parent_ino(id)?
         } else {
-            (id, Some(linkname))
+            id
         };
 
-        let link_path = self.state.get_path_common(parent, linkname)?;
+        let link_path = self.state.get_path_common(parent, Some(linkname))?;
         self.fs.symlink(target, &link_path, false).await?;
-
-        self.invalidate_cache(&link_path)?;
 
         let entry = self.lookup_path(parent, linkname, &link_path).await?;
         Ok(Self::create_entry_out(&self.conf, entry))
@@ -1372,10 +1269,12 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
 
         // Get file status to read the symlink target
-        let status = self.get_cached_status(&path).await?;
+        let status = self
+            .get_cached_status(op.header.nodeid, None, &path)
+            .await?;
 
         // Check if it's actually a symlink
-        if status.file_type != curvine_common::state::FileType::Link {
+        if status.file_type != FileType::Link {
             return err_fuse!(libc::EINVAL, "Not a symbolic link: {}", path);
         }
 
@@ -1400,8 +1299,10 @@ impl fs::FileSystem for CurvineFileSystem {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
         handle.flush(Some(reply)).await?;
 
-        let path = Path::from_str(&handle.status.path)?;
-        self.invalidate_cache(&path)?;
+        if handle.writer.is_some() {
+            self.invalid_cache(op.header.nodeid, None);
+        }
+
         Ok(())
     }
 
