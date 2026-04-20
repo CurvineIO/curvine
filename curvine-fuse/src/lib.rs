@@ -68,6 +68,8 @@ pub const FUSE_BUFFER_HEADER_SIZE: usize = 0x1000; // 4096
 
 pub const FUSE_DEFAULT_PAGE_SIZE: usize = 4096;
 
+pub const FUSE_PATH_MAX_DEPTH: usize = 4096;
+
 pub const FUSE_MAX_PAGES: u32 = 1 << 22;
 
 pub const FUSE_BIG_WRITES: u32 = 1 << 5;
