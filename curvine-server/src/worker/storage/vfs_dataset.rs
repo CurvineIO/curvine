@@ -111,6 +111,7 @@ impl VfsDataset {
     // 1. Scan all blocks in the directory (filesystem or RocksDB for SPDK)
     // 2. Block is added to block_map.
     // 3. Update capacity usage.
+    // TODO: pre-filter to avoid scan_all() per SPDK dir
     fn initialize(&mut self) {
         let spent = TimeSpent::new();
         for dir in self.dir_list.dir_iter() {
