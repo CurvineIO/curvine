@@ -20,19 +20,39 @@ const LOOP_NUM: i32 = 50;
 
 /// Build an SPDK config from environment variables.
 /// Start a worker with SPDK-backed storage.
+
+fn require_spdk_test_env() {
+    let required = ["SPDK_TARGET_ADDR", "SPDK_TARGET_PORT", "SPDK_TARGET_NQN"];
+    let missing: Vec<&str> = required
+        .into_iter()
+        .filter(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .is_none()
+        })
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "Skipping SPDK integration tests: set {} to run these tests.",
+            missing.join(", ")
+        );
+        std::process::exit(0);
+    }
+}
+
 fn start_spdk_worker() -> ClusterConf {
+    require_spdk_test_env();
     let mut conf = ClusterConf::default();
     conf.worker.rpc_port = NetUtils::hold_available_port();
     conf.worker.web_port = NetUtils::hold_available_port();
     conf.worker.data_dir = vec!["[SPDK]/tmp/curvine-spdk-test".to_owned()];
-
-    let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap();
     let trsvcid: u16 = std::env::var("SPDK_TARGET_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4420);
-    let subnqn =
-        std::env::var("SPDK_TARGET_NQN").unwrap_or_else(|_| "nqn.2024-01.io.curvine:test".into());
+        .unwrap()
+        .parse()
+        .expect("SPDK_TARGET_PORT must be a valid u16");
+    let subnqn = std::env::var("SPDK_TARGET_NQN").unwrap();
     let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
 
     conf.worker.spdk = SpdkConf {
