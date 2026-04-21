@@ -157,7 +157,7 @@ impl SpdkPoller {
                 <= std::mem::size_of::<spdk_ffi::curvine_async_ctx>(),
             "curvine_async_ctx C struct exceeds Rust buffer"
         );
-        
+
         loop {
             if shutdown.load(Ordering::Acquire) && rx.is_empty() {
                 break;

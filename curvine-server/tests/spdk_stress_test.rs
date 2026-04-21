@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 mod common;
 
 static WORKER_CONF: OnceLock<ClusterConf> = OnceLock::new();
-
+const DEFAULT_CHUNK_SIZE: i32 = 4096; // NVMe-aligned chunk size
+const DEFAULT_NUM_CHUNKS: i32 = 50;
 fn get_worker() -> &'static ClusterConf {
     WORKER_CONF.get_or_init(|| {
         common::require_spdk_test_env();
