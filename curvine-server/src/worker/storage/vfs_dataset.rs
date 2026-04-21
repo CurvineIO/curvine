@@ -88,6 +88,21 @@ impl VfsDataset {
             dir_list.add_dir(vfs_dir);
         }
 
+        if has_spdk {
+            let mut seen: HashMap<String, u32> = HashMap::new();
+            for dir in dir_list.dir_iter() {
+                if dir.storage_type() == StorageType::Spdk {
+                    if let Some(bdev) = dir.state.bdev_name.as_ref() {
+                        if let Some(prev_id) = seen.insert(bdev.clone(), dir.id()) {
+                            return orpc::err_box!(
+                                "SPDK dirs {} and {} both map to bdev '{}' (dir_id collision). Remove one or reformat.",  
+                                prev_id, dir.id(), bdev
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // Open the shared RocksDB for SPDK metadata if any SPDK dirs exist.
         let spdk_meta = if has_spdk {
             // Use the first data_dir's storage path as the RocksDB location.

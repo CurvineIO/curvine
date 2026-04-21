@@ -5,6 +5,7 @@
 /// Single poller to demonstrate the correctness work.
 /// TODO: shard to multiple pollers (one per controller).
 use log::{error, info};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -148,8 +149,7 @@ impl SpdkPoller {
     /// Main poller loop. Runs on dedicated thread.
     fn poller_loop(rx: crossbeam::channel::Receiver<IoRequest>, shutdown: Arc<AtomicBool>) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
-        let mut inflight: std::collections::HashMap<usize, Arc<std::sync::atomic::AtomicUsize>> =
-            std::collections::HashMap::new();
+        let mut inflight: HashMap<usize, Arc<std::sync::atomic::AtomicUsize>> = HashMap::new();
 
         loop {
             if shutdown.load(Ordering::Acquire) && rx.is_empty() {
@@ -190,7 +190,7 @@ impl SpdkPoller {
     fn submit_one(
         req: &IoRequest,
         active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
-        inflight: &mut std::collections::HashMap<usize, Arc<std::sync::atomic::AtomicUsize>>,
+        inflight: &mut HashMap<usize, Arc<std::sync::atomic::AtomicUsize>>,
     ) {
         let qpair = match &req.op {
             IoOp::Read { qpair, .. } => *qpair,
