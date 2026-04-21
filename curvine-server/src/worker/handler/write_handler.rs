@@ -66,13 +66,6 @@ impl WriteHandler {
         }
         // SPDK: NVMe namespace has fixed capacity, just validate fits.
         if !file.supports_short_circuit() {
-            if opts.len > file.len() {
-                return err_box!(
-                    "Resize {} exceeds SPDK bdev capacity {}",
-                    opts.len,
-                    file.len()
-                );
-            }
             return Ok(());
         }
 
