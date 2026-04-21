@@ -151,6 +151,13 @@ impl SpdkPoller {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
         let mut inflight: HashMap<usize, Arc<std::sync::atomic::AtomicUsize>> = HashMap::new();
 
+        // Verify curvine_async_ctx buffer fits the C struct.
+        debug_assert!(
+            unsafe { spdk_ffi::curvine_spdk_async_ctx_sizeof() }
+                <= std::mem::size_of::<spdk_ffi::curvine_async_ctx>(),
+            "curvine_async_ctx C struct exceeds Rust buffer"
+        );
+        
         loop {
             if shutdown.load(Ordering::Acquire) && rx.is_empty() {
                 break;
