@@ -157,6 +157,8 @@ impl SpdkPoller {
             }
 
             // Drain pending requests (non-blocking after first)
+            // TODO: recv_timeout(100us) adds up to 100us latency per I/O when completions are pending.
+            // Use try_recv when active_qpairs is non-empty; only block when idle.
             match rx.recv_timeout(std::time::Duration::from_micros(100)) {
                 Ok(req) => {
                     Self::submit_one(&req, &mut active_qpairs, &mut inflight);
