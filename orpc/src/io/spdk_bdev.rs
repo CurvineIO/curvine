@@ -645,6 +645,7 @@ impl Drop for SpdkBdev {
                 // Poison pointers so DmaBuf::drop is a no-op.
                 self.read_buf.ptr = std::ptr::null_mut();
                 self.write_buf.ptr = std::ptr::null_mut();
+                // TODO: leak qpair and handle on timeout because reusing a qpair with orphaned callbacks causes use after free.
                 break;
             }
             if !logged {
