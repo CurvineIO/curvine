@@ -72,7 +72,7 @@ impl BdevOffsetAllocator {
         Self {
             inner: Mutex::new(OffsetAllocInner {
                 cursor: 0,
-                align: if align > 0 {
+                align: if align > 0 && (align as u64).is_power_of_two() {
                     align
                 } else {
                     DEFAULT_BLOCK_ALIGN
