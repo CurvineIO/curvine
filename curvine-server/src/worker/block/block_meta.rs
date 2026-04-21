@@ -252,6 +252,9 @@ impl BlockMeta {
                     "Opening SPDK bdev '{}' for writing at offset {} (block {} base={}, max_len={})",
                     bdev_name, abs_offset, self.id, self.bdev_offset, max_len
                 );
+                if max_len == 0 {
+                    return err_box!("Cannot open SPDK writer: no space remaining");
+                }
                 let bdev = SpdkBdev::open_write(&bdev_name, abs_offset, max_len)?;
                 Ok(BlockDevice::Spdk(bdev))
             }
@@ -274,6 +277,9 @@ impl BlockMeta {
                     "Opening SPDK bdev '{}' for reading at offset {} (block {} base={}, max_len={})",
                     bdev_name, abs_offset, self.id, self.bdev_offset, max_len
                 );
+                if max_len == 0 {
+                    return err_box!("Cannot open SPDK writer: no space remaining");
+                }
                 let bdev = SpdkBdev::open_read(&bdev_name, abs_offset, max_len)?;
                 Ok(BlockDevice::Spdk(bdev))
             }
