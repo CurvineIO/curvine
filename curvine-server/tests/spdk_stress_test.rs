@@ -20,40 +20,39 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
+mod common;
 
 static WORKER_CONF: OnceLock<ClusterConf> = OnceLock::new();
 
-const DEFAULT_CHUNK_SIZE: i32 = 4096;
-const DEFAULT_NUM_CHUNKS: i32 = 50;
-
-// ============================================================================
-// Configuration
-// ============================================================================
-
 fn get_worker() -> &'static ClusterConf {
     WORKER_CONF.get_or_init(|| {
+        common::require_spdk_test_env();
         let mut conf = ClusterConf::default();
 
         conf.worker.rpc_port = NetUtils::hold_available_port();
         conf.worker.web_port = NetUtils::hold_available_port();
         conf.worker.data_dir = vec!["[SPDK]/tmp/curvine-spdk-stress".into()];
 
-        let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+        let traddr = std::env::var("SPDK_TARGET_ADDR").unwrap();
         let trsvcid: u16 = std::env::var("SPDK_TARGET_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4420);
+            .unwrap()
+            .parse()
+            .expect("SPDK_TARGET_PORT must be a valid u16");
+        let subnqn = std::env::var("SPDK_TARGET_NQN").unwrap();
         let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
 
         conf.worker.spdk = SpdkConf {
             enabled: true,
             app_name: "curvine-spdk-stress".into(),
-            hugepage_mb: 64,
-            reactor_mask: "0x2".into(),
+            hugepage_mb: std::env::var("SPDK_HUGEPAGE_MB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64),
+            reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or_else(|_| "0x2".to_string()),
             targets: vec![NvmeTarget {
                 traddr,
                 trsvcid,
-                subnqn: "nqn.2024-01.io.curvine:test".into(),
+                subnqn,
                 trtype,
                 adrfam: "ipv4".into(),
                 ..Default::default()

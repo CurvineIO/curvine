@@ -20,29 +20,8 @@ const LOOP_NUM: i32 = 50;
 
 /// Build an SPDK config from environment variables.
 /// Start a worker with SPDK-backed storage.
-
-fn require_spdk_test_env() {
-    let required = ["SPDK_TARGET_ADDR", "SPDK_TARGET_PORT", "SPDK_TARGET_NQN"];
-    let missing: Vec<&str> = required
-        .into_iter()
-        .filter(|key| {
-            std::env::var(key)
-                .ok()
-                .filter(|value| !value.is_empty())
-                .is_none()
-        })
-        .collect();
-    if !missing.is_empty() {
-        eprintln!(
-            "Skipping SPDK integration tests: set {} to run these tests.",
-            missing.join(", ")
-        );
-        std::process::exit(0);
-    }
-}
-
 fn start_spdk_worker() -> ClusterConf {
-    require_spdk_test_env();
+    common::require_spdk_test_env();
     let mut conf = ClusterConf::default();
     conf.worker.rpc_port = NetUtils::hold_available_port();
     conf.worker.web_port = NetUtils::hold_available_port();
