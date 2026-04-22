@@ -95,8 +95,10 @@ impl VfsDataset {
                     if let Some(bdev) = dir.state.bdev_name.as_ref() {
                         if let Some(prev_id) = seen.insert(bdev.clone(), dir.id()) {
                             return orpc::err_box!(
-                                "SPDK dirs {} and {} both map to bdev '{}' (dir_id collision). Remove one or reformat.",  
-                                prev_id, dir.id(), bdev
+                                "SPDK dirs {} and {} both map to bdev '{}' (dir_id collision).",
+                                prev_id,
+                                dir.id(),
+                                bdev
                             );
                         }
                     }
