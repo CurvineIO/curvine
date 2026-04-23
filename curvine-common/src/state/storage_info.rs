@@ -44,7 +44,7 @@ pub enum StorageType {
 
     #[num_enum(default)]
     Disk = 4,
-    // TODO: refactor into a separate IoMode enum (Kernel vs Spdk).
+
     SpdkDisk = 5,
 }
 

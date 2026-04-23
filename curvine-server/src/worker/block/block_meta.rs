@@ -21,7 +21,7 @@ use orpc::io::{BlockDevice, IOResult, LocalFile};
 #[cfg(feature = "spdk")]
 use log::info;
 #[cfg(feature = "spdk")]
-use orpc::io::SpdkDiskBdev;
+use orpc::io::SpdkBdev;
 
 use orpc::{err_box, sys, try_err, CommonResult};
 use regex::Regex;
@@ -255,8 +255,8 @@ impl BlockMeta {
                 if max_len == 0 {
                     return err_box!("Cannot open SPDK writer: no space remaining");
                 }
-                let bdev = SpdkDiskBdev::open_write(&bdev_name, abs_offset, max_len)?;
-                Ok(BlockDevice::SpdkDisk(bdev))
+                let bdev = SpdkBdev::open_write(&bdev_name, abs_offset, max_len)?;
+                Ok(BlockDevice::Spdk(bdev))
             }
             _ => {
                 let file = self.get_block_file()?;
@@ -280,8 +280,8 @@ impl BlockMeta {
                 if max_len == 0 {
                     return err_box!("Cannot open SPDK reader: no space remaining");
                 }
-                let bdev = SpdkDiskBdev::open_read(&bdev_name, abs_offset, max_len)?;
-                Ok(BlockDevice::SpdkDisk(bdev))
+                let bdev = SpdkBdev::open_read(&bdev_name, abs_offset, max_len)?;
+                Ok(BlockDevice::Spdk(bdev))
             }
             _ => {
                 let local = LocalFile::with_read(self.get_block_file()?, offset)?;
