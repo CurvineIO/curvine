@@ -219,10 +219,7 @@ impl VfsDataset {
         }
         if let Some(ref store) = self.spdk_meta {
             if let Err(e) = store.delete(block_id) {
-                warn!(
-                    "SpdkMetaStore delete failed for block {}: {}",
-                    block_id, e
-                );
+                warn!("SpdkMetaStore delete failed for block {}: {}", block_id, e);
             }
         }
     }

@@ -366,10 +366,7 @@ impl VfsDir {
     /// - Filters to this directory's dir_id
     /// - Restores the offset allocator state
     /// - Returns blocks as BlockMeta (non-finalized blocks become Recovering state)
-    pub fn scan_spdk_blocks(
-        &self,
-        store: &super::SpdkMetaStore,
-    ) -> CommonResult<Vec<BlockMeta>> {
+    pub fn scan_spdk_blocks(&self, store: &super::SpdkMetaStore) -> CommonResult<Vec<BlockMeta>> {
         let all_records = store.scan_all()?;
         let all_records_len = all_records.len();
         // Filter to only records belonging to this directory.
