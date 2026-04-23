@@ -80,7 +80,7 @@ fn write_block(
     conf: &ClusterConf,
 ) -> CommonResult<(u64, Duration)> {
     let block_size = (chunk_size as i64) * (num_chunks as i64);
-    let block = ExtendedBlock::new(id, block_size, StorageType::Spdk, FileType::File);
+    let block = ExtendedBlock::new(id, block_size, StorageType::SpdkDisk, FileType::File);
 
     let open_req = BlockWriteRequest {
         block: ProtoUtils::extend_block_to_pb(block.clone()),

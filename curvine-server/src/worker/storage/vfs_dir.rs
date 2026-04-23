@@ -62,7 +62,7 @@ impl VfsDir {
         let staging_dir = stats.path().join(STAGING_DIR);
 
         // SPDK: skip filesystem (no local dir, version file, or filesystem checks).
-        if conf.storage_type != StorageType::Spdk {
+        if conf.storage_type != StorageType::SpdkDisk {
             FileUtils::create_dir(&active_dir, true)?;
             FileUtils::create_dir(&staging_dir, true)?;
             stats.check_dir()?;
@@ -71,20 +71,20 @@ impl VfsDir {
             LocalFile::write_toml(ver_file.as_path(), &version)?;
         }
 
-        // SPDK: resolve bdev name from global SpdkEnv (one bdev per data_dir)
+        // SPDK: resolve bdev name from global SpdkDiskEnv (one bdev per data_dir)
         #[cfg(feature = "spdk")]
-        let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::Spdk {
-            use orpc::io::spdk_env::SpdkEnv;
-            let env = SpdkEnv::global().ok_or_else(|| {
+        let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
+            use orpc::io::spdk_env::SpdkDiskEnv;
+            let env = SpdkDiskEnv::global().ok_or_else(|| {
                 orpc::err_msg!(
-                    "StorageType::Spdk dir '{}' requires SPDK environment, but it is not initialized",
+                    "StorageType::SpdkDisk dir '{}' requires SPDK environment, but it is not initialized",
                     conf.path
                 )
             })?;
             let names = env.bdev_names();
             if names.is_empty() {
                 return orpc::err_box!(
-                    "StorageType::Spdk dir '{}' but no bdevs discovered from SPDK targets",
+                    "StorageType::SpdkDisk dir '{}' but no bdevs discovered from SPDK targets",
                     conf.path
                 );
             }
@@ -101,9 +101,9 @@ impl VfsDir {
             None
         };
         #[cfg(not(feature = "spdk"))]
-        let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::Spdk {
+        let bdev_name: Option<(String, i64)> = if conf.storage_type == StorageType::SpdkDisk {
             return orpc::err_box!(
-                "StorageType::Spdk is not available. Compile with --features spdk"
+                "StorageType::SpdkDisk is not available. Compile with --features spdk"
             );
         } else {
             None
@@ -111,7 +111,7 @@ impl VfsDir {
         let (bdev_name_str, bdev_capacity, bdev_block_size) = match bdev_name {
             Some((name, cap)) => {
                 #[cfg(feature = "spdk")]
-                let bs = orpc::io::spdk_env::SpdkEnv::global()
+                let bs = orpc::io::spdk_env::SpdkDiskEnv::global()
                     .and_then(|env| env.get_bdev(&name))
                     .map(|b| b.block_size as i64)
                     .unwrap_or(DEFAULT_BLOCK_ALIGN);
@@ -172,7 +172,7 @@ impl VfsDir {
 
     pub fn capacity(&self) -> i64 {
         // SPDK: use bdev capacity (fs returns 0 for non-existent path)
-        if self.storage_type == StorageType::Spdk {
+        if self.storage_type == StorageType::SpdkDisk {
             let bdev_cap = self.state.bdev_capacity;
             return if self.conf_capacity <= 0 {
                 bdev_cap
@@ -192,7 +192,7 @@ impl VfsDir {
 
     pub fn available(&self) -> i64 {
         // SPDK: available = capacity - used - reserved (fs returns 0)
-        if self.storage_type == StorageType::Spdk {
+        if self.storage_type == StorageType::SpdkDisk {
             let capacity = self.capacity();
             let fs_used = self.fs_used();
             let reserved_bytes = self.reserved_bytes;
@@ -211,7 +211,7 @@ impl VfsDir {
 
     pub fn non_fs_used(&self) -> i64 {
         // SPDK: no filesystem overhead
-        if self.storage_type == StorageType::Spdk {
+        if self.storage_type == StorageType::SpdkDisk {
             return 0;
         }
         let v = self.stats.used_space() as i64 - self.fs_used();
@@ -305,7 +305,7 @@ impl VfsDir {
 
     pub fn create_block(&self, block: &ExtendedBlock) -> CommonResult<BlockMeta> {
         let mut meta = BlockMeta::with_tmp(block, self);
-        if self.storage_type == StorageType::Spdk {
+        if self.storage_type == StorageType::SpdkDisk {
             // Allocate a non-overlapping offset range on the bdev for this block.
             let offset = self
                 .state
@@ -326,7 +326,7 @@ impl VfsDir {
     }
 
     pub fn finalize_block(&self, meta: &BlockMeta, committed_len: i64) -> CommonResult<BlockMeta> {
-        if self.storage_type == StorageType::Spdk {
+        if self.storage_type == StorageType::SpdkDisk {
             // SPDK: skip metadata stat (use in-memory BlockMeta)
             return Ok(BlockMeta::with_final_spdk(meta, committed_len));
         }
@@ -337,7 +337,7 @@ impl VfsDir {
     // Scan all blocks in the directory
     pub fn scan_blocks(&self) -> CommonResult<Vec<BlockMeta>> {
         // SPDK bdevs don't store blocks on the filesystem — nothing to scan
-        if self.storage_type == StorageType::Spdk {
+        if self.storage_type == StorageType::SpdkDisk {
             // SPDK: loaded via scan_spdk_blocks() in VfsDataset
             return Ok(vec![]);
         }
@@ -366,7 +366,10 @@ impl VfsDir {
     /// - Filters to this directory's dir_id
     /// - Restores the offset allocator state
     /// - Returns blocks as BlockMeta (non-finalized blocks become Recovering state)
-    pub fn scan_spdk_blocks(&self, store: &super::SpdkMetaStore) -> CommonResult<Vec<BlockMeta>> {
+    pub fn scan_spdk_blocks(
+        &self,
+        store: &super::SpdkMetaStore,
+    ) -> CommonResult<Vec<BlockMeta>> {
         let all_records = store.scan_all()?;
         let all_records_len = all_records.len();
         // Filter to only records belonging to this directory.
@@ -413,7 +416,7 @@ impl VfsDir {
     }
 
     pub fn check_dir(&self) -> CommonResult<()> {
-        if self.storage_type == StorageType::Spdk {
+        if self.storage_type == StorageType::SpdkDisk {
             return Ok(());
         }
         self.stats.check_dir()
@@ -480,10 +483,10 @@ mod test {
         Arc::new(DirState {
             dir_id: 1,
             base_path: PathBuf::from(p),
-            storage_type: StorageType::Spdk,
+            storage_type: StorageType::SpdkDisk,
             bdev_name: Some("nvme0".into()),
             bdev_capacity: cap,
-            offset_alloc: DirState::new_offset_alloc(StorageType::Spdk, cap, 4096),
+            offset_alloc: DirState::new_offset_alloc(StorageType::SpdkDisk, cap, 4096),
         })
     }
 
@@ -493,7 +496,7 @@ mod test {
             stats: FsStats::new(p),
             active_dir: PathBuf::from(p).join("a"),
             staging_dir: PathBuf::from(p).join("s"),
-            storage_type: StorageType::Spdk,
+            storage_type: StorageType::SpdkDisk,
             conf_capacity: conf,
             reserved_bytes: 0,
             final_bytes: AtomicLong::new(0),

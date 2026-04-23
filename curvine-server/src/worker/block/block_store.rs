@@ -95,14 +95,14 @@ impl BlockStore {
         };
         state.decrement_blocks_to_delete();
         let dir_id = meta.dir_id();
-        let is_spdk = meta.storage_type() == StorageType::Spdk;
+        let is_spdk = meta.storage_type() == StorageType::SpdkDisk;
 
         // SPDK: free bdev offset + persist metadata while holding write lock.
         if is_spdk {
             if let Ok(dir) = state.find_dir(dir_id) {
                 dir.state.offset_alloc.free(id);
             }
-            state.spdk_delete(id, StorageType::Spdk);
+            state.spdk_delete(id, StorageType::SpdkDisk);
         }
         drop(state);
 

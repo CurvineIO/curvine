@@ -114,7 +114,7 @@ impl WriterAdapter {
         // SPDK bypasses kernel — no local path for writes
         let short_circuit = conf.short_circuit
             && fs_context.is_local_worker(worker_addr)
-            && located_block.block.storage_type != StorageType::Spdk;
+            && located_block.block.storage_type != StorageType::SpdkDisk;
 
         let adapter = if short_circuit {
             let writer = BlockWriterLocal::new(

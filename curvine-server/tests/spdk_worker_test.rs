@@ -61,7 +61,7 @@ fn start_spdk_worker() -> ClusterConf {
 }
 fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     let block_size = (CHUNK_SIZE * LOOP_NUM) as i64;
-    let block = ExtendedBlock::new(id, block_size, StorageType::Spdk, FileType::File);
+    let block = ExtendedBlock::new(id, block_size, StorageType::SpdkDisk, FileType::File);
 
     let request = BlockWriteRequest {
         block: ProtoUtils::extend_block_to_pb(block),
@@ -92,7 +92,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     );
     assert_eq!(
         StorageType::from(response.storage_type),
-        StorageType::Spdk,
+        StorageType::SpdkDisk,
         "Response storage_type should be Spdk"
     );
 
@@ -112,7 +112,7 @@ fn spdk_block_write(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
         seq_id += 1;
     }
 
-    let block = ExtendedBlock::new(id, block_size, StorageType::Spdk, FileType::File);
+    let block = ExtendedBlock::new(id, block_size, StorageType::SpdkDisk, FileType::File);
     let complete_request = BlockWriteRequest {
         block: ProtoUtils::extend_block_to_pb(block),
         off: 0,
@@ -161,7 +161,7 @@ fn spdk_block_read(id: i64, conf: &ClusterConf) -> CommonResult<u64> {
     );
     assert_eq!(
         StorageType::from(rep.storage_type),
-        StorageType::Spdk,
+        StorageType::SpdkDisk,
         "Response storage_type should be Spdk"
     );
 
@@ -219,7 +219,7 @@ fn test_spdk_worker_end_to_end() -> CommonResult<()> {
     {
         let block_id = Utils::req_id().abs();
         let block_size = (CHUNK_SIZE * 10) as i64;
-        let block = ExtendedBlock::new(block_id, block_size, StorageType::Spdk, FileType::File);
+        let block = ExtendedBlock::new(block_id, block_size, StorageType::SpdkDisk, FileType::File);
 
         let request = BlockWriteRequest {
             block: ProtoUtils::extend_block_to_pb(block),

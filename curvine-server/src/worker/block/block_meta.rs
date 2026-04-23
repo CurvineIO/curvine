@@ -21,7 +21,7 @@ use orpc::io::{BlockDevice, IOResult, LocalFile};
 #[cfg(feature = "spdk")]
 use log::info;
 #[cfg(feature = "spdk")]
-use orpc::io::SpdkBdev;
+use orpc::io::SpdkDiskBdev;
 
 use orpc::{err_box, sys, try_err, CommonResult};
 use regex::Regex;
@@ -244,7 +244,7 @@ impl BlockMeta {
     pub fn create_writer(&self, off: i64, overwrite: bool) -> IOResult<BlockDevice> {
         match self.storage_type() {
             #[cfg(feature = "spdk")]
-            StorageType::Spdk => {
+            StorageType::SpdkDisk => {
                 let bdev_name = self.get_bdev_name()?;
                 let abs_offset = self.bdev_offset + off;
                 let max_len = 0.max(self.len - off);
@@ -255,8 +255,8 @@ impl BlockMeta {
                 if max_len == 0 {
                     return err_box!("Cannot open SPDK writer: no space remaining");
                 }
-                let bdev = SpdkBdev::open_write(&bdev_name, abs_offset, max_len)?;
-                Ok(BlockDevice::Spdk(bdev))
+                let bdev = SpdkDiskBdev::open_write(&bdev_name, abs_offset, max_len)?;
+                Ok(BlockDevice::SpdkDisk(bdev))
             }
             _ => {
                 let file = self.get_block_file()?;
@@ -269,7 +269,7 @@ impl BlockMeta {
     pub fn create_reader(&self, offset: u64) -> IOResult<BlockDevice> {
         match self.storage_type() {
             #[cfg(feature = "spdk")]
-            StorageType::Spdk => {
+            StorageType::SpdkDisk => {
                 let bdev_name = self.get_bdev_name()?;
                 let abs_offset = self.bdev_offset as u64 + offset;
                 let max_len = 0.max(self.len - offset as i64);
@@ -280,8 +280,8 @@ impl BlockMeta {
                 if max_len == 0 {
                     return err_box!("Cannot open SPDK reader: no space remaining");
                 }
-                let bdev = SpdkBdev::open_read(&bdev_name, abs_offset, max_len)?;
-                Ok(BlockDevice::Spdk(bdev))
+                let bdev = SpdkDiskBdev::open_read(&bdev_name, abs_offset, max_len)?;
+                Ok(BlockDevice::SpdkDisk(bdev))
             }
             _ => {
                 let local = LocalFile::with_read(self.get_block_file()?, offset)?;
@@ -295,7 +295,7 @@ impl BlockMeta {
     fn get_bdev_name(&self) -> IOResult<String> {
         self.dir.bdev_name.clone().ok_or_else(|| {
             orpc::io::IOError::from(format!(
-                "block {} has StorageType::Spdk but dir (dir_id={}) has no bdev_name assigned",
+                "block {} has StorageType::SpdkDisk but dir (dir_id={}) has no bdev_name assigned",
                 self.id, self.dir.dir_id
             ))
         })
@@ -333,10 +333,14 @@ mod test {
         let dir = Arc::new(DirState {
             dir_id: 1,
             base_path: PathBuf::from("/nonexistent/spdk/path"),
-            storage_type: StorageType::Spdk,
+            storage_type: StorageType::SpdkDisk,
             bdev_name: Some("NVMe_test_n1".to_string()),
             bdev_capacity: 1024 * 1024 * 1024,
-            offset_alloc: DirState::new_offset_alloc(StorageType::Spdk, 1024 * 1024 * 1024, 4096),
+            offset_alloc: DirState::new_offset_alloc(
+                StorageType::SpdkDisk,
+                1024 * 1024 * 1024,
+                4096,
+            ),
         });
         BlockMeta {
             id,

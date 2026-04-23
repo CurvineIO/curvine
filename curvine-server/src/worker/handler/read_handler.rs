@@ -84,7 +84,8 @@ impl ReadHandler {
         }
 
         // Check short-circuit before open. SPDK has no filesystem path.
-        let is_short_circuit = context.short_circuit && meta.storage_type() != StorageType::Spdk;
+        let is_short_circuit =
+            context.short_circuit && meta.storage_type() != StorageType::SpdkDisk;
         let (label, path, file) = if is_short_circuit {
             let path = meta.get_block_file()?;
             ("local", path, None)

@@ -45,7 +45,7 @@ pub enum StorageType {
     #[num_enum(default)]
     Disk = 4,
     // TODO: refactor into a separate IoMode enum (Kernel vs Spdk).
-    Spdk = 5,
+    SpdkDisk = 5,
 }
 
 impl StorageType {
@@ -56,7 +56,7 @@ impl StorageType {
             StorageType::Hdd => "HDD",
             StorageType::Ufs => "UFS",
             StorageType::Disk => "DISK",
-            StorageType::Spdk => "SPDK",
+            StorageType::SpdkDisk => "SPDK_DISK",
         }
     }
 
@@ -75,7 +75,7 @@ impl TryFrom<&str> for StorageType {
             "HDD" => Self::Hdd,
             "UFS" => Self::Ufs,
             "DISK" => Self::Disk,
-            "SPDK" => Self::Spdk,
+            "SPDK_DISK" => Self::SpdkDisk,
 
             _ => return err_box!("invalid storage type: {}", value),
         };
@@ -110,18 +110,18 @@ mod test {
     use super::*;
 
     #[test]
-    fn storage_type_spdk_roundtrip() {
-        // Verify Spdk variant parses from string and serializes back
-        let typ = StorageType::try_from("SPDK").unwrap();
-        assert_eq!(typ, StorageType::Spdk);
-        assert_eq!(typ.as_str_name(), "SPDK");
+    fn storage_type_spdk_disk_roundtrip() {
+        // Verify SpdkDisk variant parses from string and serializes back
+        let typ = StorageType::try_from("SPDK_DISK").unwrap();
+        assert_eq!(typ, StorageType::SpdkDisk);
+        assert_eq!(typ.as_str_name(), "SPDK_DISK");
 
         // Case-insensitive
-        let typ2 = StorageType::try_from("spdk").unwrap();
-        assert_eq!(typ2, StorageType::Spdk);
+        let typ2 = StorageType::try_from("spdk_disk").unwrap();
+        assert_eq!(typ2, StorageType::SpdkDisk);
 
         // Numeric value
-        let val: i32 = StorageType::Spdk.into();
+        let val: i32 = StorageType::SpdkDisk.into();
         assert_eq!(val, 5);
     }
 }

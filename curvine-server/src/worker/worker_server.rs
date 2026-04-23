@@ -132,7 +132,7 @@ impl Worker {
                         .iter()
                         .filter(|d| {
                             WorkerDataDir::from_str(d)
-                                .map(|dd| dd.storage_type == StorageType::Spdk)
+                                .map(|dd| dd.storage_type == StorageType::SpdkDisk)
                                 .unwrap_or(false)
                         })
                         .count();

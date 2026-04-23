@@ -12,7 +12,7 @@ enum StorageTypeProto {
     STORAGE_TYPE_PROTO_HDD = 2;
     STORAGE_TYPE_PROTO_UFS = 3;
     STORAGE_TYPE_PROTO_DISK = 4;
-    STORAGE_TYPE_PROTO_SPDK = 5;
+    STORAGE_TYPE_PROTO_SPDK_DISK = 5;
 }
 
 // ttl Expiry Strategy.

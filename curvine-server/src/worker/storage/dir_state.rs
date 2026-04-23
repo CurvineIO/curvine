@@ -39,7 +39,7 @@ impl DirState {
         bdev_capacity: i64,
         bdev_block_size: i64,
     ) -> BdevOffsetAllocator {
-        if storage_type == StorageType::Spdk {
+        if storage_type == StorageType::SpdkDisk {
             BdevOffsetAllocator::new(bdev_capacity, bdev_block_size)
         } else {
             BdevOffsetAllocator::default()
