@@ -139,6 +139,9 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 	// Generate mount-key from master-addrs + fs-path (for standalone pod sharing)
 	mountKey := GenerateMountKey(masterAddrs, fsPathToMount)
 
+	// Collect FUSE parameters from VolumeContext or PublishContext
+	fuseParams := collectFuseParams(volumeContext, publishContext)
+
 	// Ensure Standalone exists and is ready
 	opts := &StandaloneOptions{
 		ClusterID:   clusterID,
@@ -147,6 +150,7 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 		FSPath:      fsPathToMount,
 		NodeName:    n.nodeID,
 		Namespace:   n.k8sClient.namespace,
+		FuseParams:  fuseParams,
 	}
 
 	hostMountPath, ensureErr := n.standaloneManager.EnsureStandalone(ctx, opts)
@@ -293,6 +297,9 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	// Generate mount-key from master-addrs + fs-path (for standalone pod sharing)
 	mountKey := GenerateMountKey(masterAddrs, fsPath)
 
+	// Collect FUSE parameters from VolumeContext or PublishContext
+	fuseParams := collectFuseParams(volumeContext, publishContext)
+
 	// Ensure Standalone exists and is ready
 	opts := &StandaloneOptions{
 		ClusterID:   clusterID,
@@ -301,6 +308,7 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 		FSPath:      fsPath,
 		NodeName:    n.nodeID,
 		Namespace:   n.k8sClient.namespace,
+		FuseParams:  fuseParams,
 	}
 
 	hostMountPath, err := n.standaloneManager.EnsureStandalone(ctx, opts)
