@@ -28,7 +28,10 @@ mod version;
 pub use self::version::*;
 
 mod dir_state;
-pub use self::dir_state::DirState;
+pub use self::dir_state::{DirState, DEFAULT_BLOCK_ALIGN};
+
+mod spdk_meta_store;
+pub use self::spdk_meta_store::SpdkMetaStore;
 
 mod vfs_dataset;
 pub use self::vfs_dataset::VfsDataset;

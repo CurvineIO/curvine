@@ -29,6 +29,44 @@ data_dir = [
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
 enable_s3_gateway = false
 
+# SPDK over NVMe-oF/RDMA configuration  
+[worker.spdk]  
+enabled = false  
+app_name = "curvine"  
+hugepage = "1024MB"  
+reactor_mask = "0x3"  
+shm_id = -1  
+mem_channel = 0  
+
+# I/O parameters  
+io_queue_depth = 128  
+io_queue_requests = 512  
+io_timeout = "30s"  
+io_retry_count = 4  
+keep_alive_timeout = "10s"  
+  
+# DMA buffer pool  
+dma_pool_size = "64MB"  
+block_align = 0  
+
+
+# NVMe-oF targets  
+[[worker.spdk.targets]]  
+trtype = "rdma"  
+adrfam = "ipv4"  
+traddr = "192.168.1.100"  
+trsvcid = 4420  
+subnqn = "nqn.2024-01.io.curvine:subsystem1"  
+hostnqn = ""  
+io_queues = 0  
+keep_alive_timeout_ms = 0  
+  
+[[worker.spdk.targets]]  
+trtype = "rdma"  
+adrfam = "ipv4"  
+traddr = "192.168.1.101"  
+trsvcid = 4420  
+subnqn = "nqn.2024-01.io.curvine:subsystem2"
 
 # Customer service configuration.
 [client]

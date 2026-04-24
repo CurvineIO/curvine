@@ -44,6 +44,8 @@ pub enum StorageType {
 
     #[num_enum(default)]
     Disk = 4,
+
+    SpdkDisk = 5,
 }
 
 impl StorageType {
@@ -54,6 +56,7 @@ impl StorageType {
             StorageType::Hdd => "HDD",
             StorageType::Ufs => "UFS",
             StorageType::Disk => "DISK",
+            StorageType::SpdkDisk => "SPDK_DISK",
         }
     }
 
@@ -72,6 +75,7 @@ impl TryFrom<&str> for StorageType {
             "HDD" => Self::Hdd,
             "UFS" => Self::Ufs,
             "DISK" => Self::Disk,
+            "SPDK_DISK" => Self::SpdkDisk,
 
             _ => return err_box!("invalid storage type: {}", value),
         };
@@ -99,4 +103,25 @@ pub struct StorageInfo {
     pub storage_type: StorageType,
     pub block_num: i64,
     pub dir_path: String,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn storage_type_spdk_disk_roundtrip() {
+        // Verify SpdkDisk variant parses from string and serializes back
+        let typ = StorageType::try_from("SPDK_DISK").unwrap();
+        assert_eq!(typ, StorageType::SpdkDisk);
+        assert_eq!(typ.as_str_name(), "SPDK_DISK");
+
+        // Case-insensitive
+        let typ2 = StorageType::try_from("spdk_disk").unwrap();
+        assert_eq!(typ2, StorageType::SpdkDisk);
+
+        // Numeric value
+        let val: i32 = StorageType::SpdkDisk.into();
+        assert_eq!(val, 5);
+    }
 }

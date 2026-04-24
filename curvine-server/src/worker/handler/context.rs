@@ -55,6 +55,7 @@ pub struct ReadContext {
     pub enable_read_ahead: bool,
     pub read_ahead_len: i64,
     pub drop_cache_len: i64,
+    pub bdev_offset: i64,
 }
 
 impl ReadContext {
@@ -70,6 +71,7 @@ impl ReadContext {
             enable_read_ahead: req.enable_read_ahead,
             read_ahead_len: req.read_ahead_len,
             drop_cache_len: req.drop_cache_len,
+            bdev_offset: 0, // default for local files; set by ReadHandler for SPDK
         };
 
         Ok(context)
