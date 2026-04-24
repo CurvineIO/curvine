@@ -1,0 +1,69 @@
+---
+# 更新Curvine配置文件中的data_dir
+# 使用方法: ansible-playbook update_config.yml -e 'data_dirs=["[SSD]/data/data1","[HDD]/data/data2"]'
+
+- name: Update Curvine Configuration
+  hosts: all
+  gather_facts: no
+  vars:
+    curvine_install_dir: /root/dist
+    curvine_config_file: "{{ curvine_install_dir }}/conf/curvine-cluster.toml"
+    # 默认数据目录，可以通过命令行参数覆盖
+    data_dirs:
+      - "[SSD]/data/data"
+  
+  tasks:
+    - name: Check if config file exists
+      stat:
+        path: "{{ curvine_config_file }}"
+      register: config_stat
+
+    - name: Fail if config file not found
+      fail:
+        msg: "配置文件 {{ curvine_config_file }} 不存在"
+      when: not config_stat.stat.exists
+
+    - name: Backup current config file
+      copy:
+        src: "{{ curvine_config_file }}"
+        dest: "{{ curvine_config_file }}.{{ ansible_date_time.epoch }}.backup"
+        remote_src: yes
+
+    - name: Display data_dirs to be configured
+      debug:
+        msg: "将配置data_dir为: {{ data_dirs | to_json }}"
+
+    - name: Update data_dir in configuration file
+      replace:
+        path: "{{ curvine_config_file }}"
+        regexp: '^(\s*)data_dir\s*=\s*\[.*?\]'
+        replace: 'data_dir = {{ data_dirs | to_json }}'
+        backup: yes
+
+    - name: Verify configuration update
+      shell: grep "data_dir" "{{ curvine_config_file }}"
+      register: verify_config
+      changed_when: false
+
+    - name: Display updated configuration
+      debug:
+        msg: "{{ verify_config.stdout_lines }}"
+
+    - name: Display update completion message
+      debug:
+        msg: "节点 {{ inventory_hostname }} 配置已更新，需要重启服务才能生效"
+
+- name: Configuration Update Summary
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    - name: Display summary
+      debug:
+        msg: |
+          ========================================
+          配置文件已更新！
+          
+          重启服务使配置生效：
+          ansible-playbook restart_services.yml
+          ========================================
+

@@ -1,0 +1,71 @@
+---
+# 检测未格式化的磁盘
+# 使用方法: ansible-playbook detect_unformatted_disks.yml
+
+- name: Detect Unformatted Disks
+  hosts: all
+  gather_facts: no
+  any_errors_fatal: false
+  ignore_unreachable: yes
+  
+  tasks:
+    - name: Get all disk devices from lsblk
+      shell: lsblk -nlo NAME,TYPE,MOUNTPOINT | grep 'disk' | awk '$3==""'
+      register: disk_list
+      ignore_errors: yes
+
+    - name: Get mounted devices from df
+      shell: df -h | grep '^/dev/' | awk '{print $1}' | sed 's|/dev/||'
+      register: mounted_devices
+      ignore_errors: yes
+
+    - name: Find unformatted disks
+      shell: |
+        # 获取所有磁盘设备
+        all_disks=$(lsblk -nlo NAME,TYPE | grep 'disk' | awk '{print $1}')
+        
+        # 获取已挂载的设备
+        mounted=$(df -h | grep '^/dev/' | awk '{print $1}' | sed 's|/dev/||')
+        
+        # 找出未格式化的磁盘
+        unformatted=""
+        for disk in $all_disks; do
+          # 检查磁盘是否有分区
+          has_parts=$(lsblk -nlo NAME,TYPE | grep "^${disk}" | grep -c 'part' || true)
+          
+          # 检查磁盘或其分区是否已挂载
+          is_mounted=0
+          echo "$mounted" | grep -q "^${disk}" && is_mounted=1
+          lsblk -nlo NAME | grep "^${disk}" | while read part; do
+            echo "$mounted" | grep -q "^${part}" && is_mounted=1
+          done
+          
+          # 如果没有分区且未挂载，则认为是未格式化的磁盘
+          if [ $has_parts -eq 0 ] && [ $is_mounted -eq 0 ]; then
+            # 再次确认df中看不到
+            if ! df -h | grep -q "/dev/${disk}"; then
+              unformatted="${unformatted}${disk} "
+            fi
+          fi
+        done
+        
+        echo "$unformatted" | xargs
+      register: unformatted_disks
+      ignore_errors: yes
+
+    - name: Display unformatted disks
+      debug:
+        msg: |
+          节点: {{ inventory_hostname }}
+          未格式化的磁盘: {{ unformatted_disks.stdout if unformatted_disks.stdout != '' else '无' }}
+      when: unformatted_disks.rc == 0
+
+    - name: Save unformatted disks info
+      local_action:
+        module: shell
+        _raw_params: |
+          if [ -n "{{ unformatted_disks.stdout }}" ]; then
+            echo "{{ inventory_hostname }}:{{ unformatted_disks.stdout }}" >> unformatted_disks_list.txt
+          fi
+      when: unformatted_disks.stdout is defined and unformatted_disks.stdout != ''
+
