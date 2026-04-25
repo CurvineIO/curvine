@@ -1,6 +1,13 @@
 [env]
 #RUST_TEST_NOCAPTURE = "1"
 
+[target.x86_64-unknown-linux-gnu]
+# Use a linker wrapper to statically link libstdc++.
+# librocksdb-sys emits `cargo:rustc-link-lib=stdc++` which gets placed in
+# the -Wl,-Bdynamic section before RUSTFLAGS can intercept it. The wrapper
+# script replaces every -lstdc++ with -Wl,-Bstatic,-lstdc++,-Wl,-Bdynamic.
+linker = "build/static-link-wrapper.sh"
+
 [target.x86_64-apple-darwin]
 rustflags = [
     "-C", "link-arg=-undefined",
