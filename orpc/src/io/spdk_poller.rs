@@ -271,7 +271,12 @@ impl SpdkPoller {
 
                         // Drain any pending channel data
                         while let Ok(req) = rx.try_recv() {
-                            Self::submit_one(&req, &mut active_qpairs, &mut known_qpairs, &mut inflight);
+                            Self::submit_one(
+                                &req,
+                                &mut active_qpairs,
+                                &mut known_qpairs,
+                                &mut inflight,
+                            );
                         }
 
                         // Transition to Active to process work
