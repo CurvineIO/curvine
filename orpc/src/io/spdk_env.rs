@@ -4,6 +4,7 @@ use crate::err_msg;
 use crate::io::spdk_ffi;
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
+use nix::sys::eventfd::EventFd;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -720,6 +721,17 @@ impl SpdkEnv {
             .expect("SpdkPoller not started — was init() called?")
             .sender()
     }
+
+    /// Get eventfd for waking poller on new I/O
+    pub fn poller_eventfd(&self) -> std::sync::Arc<EventFd> {
+        self.poller
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("SpdkPoller not started — was init() called?")
+            .eventfd_arc()
+    }
+
     // Handle tracking, which is used by SpdkBdev open/drop
     /// Register SpdkBdev handle. Returns Err if not Initialized.
     pub fn acquire_handle(&self) -> CommonResult<()> {

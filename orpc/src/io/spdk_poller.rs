@@ -3,10 +3,17 @@
 //! SPDK I/O poller thread - handles NVMe submit/poll on dedicated thread.
 /// Qpairs not thread-safe: submit + poll must on same thread.
 /// Single poller to demonstrate the correctness work.
+/// Uses eventfd for instant wake on new I/O submission.
 /// TODO: shard to multiple pollers (one per controller).
+///
+/// ## Disconnect Detection
+/// Detected via periodic keep-alive poll every 1s while idle (~1s latency).
+/// TODO: SPDK fabric eventfd for immediate detection.
 use log::{error, info};
+use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -105,29 +112,47 @@ pub struct IoRequest {
 // SAFETY: exclusive ownership - blocks until completion.
 unsafe impl Send for IoRequest {}
 
+/// Poller states
+enum PollerState {
+    /// Active processing I/O - try_recv loop
+    Active,
+    /// Idle, blocked on eventfd waiting for work
+    Idle,
+}
+
 /// Poller thread handle.
 pub struct SpdkPoller {
-    tx: crossbeam::channel::Sender<IoRequest>,
+    /// Channel sender for I/O submissions
+    tx: Option<crossbeam::channel::Sender<IoRequest>>,
+    /// Eventfd for instant wake signaling
+    eventfd: Arc<EventFd>,
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl SpdkPoller {
-    /// Spawn the poller thread.
+    /// Spawn a new poller thread.
     pub fn start() -> Self {
         let (tx, rx) = crossbeam::channel::unbounded::<IoRequest>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
 
+        // Create eventfd for wake signaling
+        let eventfd = EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK)
+            .expect("Failed to create eventfd");
+        let eventfd_raw = eventfd.as_raw_fd();
+        let eventfd_arc = Arc::new(eventfd);
+
         let handle = std::thread::Builder::new()
             .name("spdk-poller".to_string())
             .spawn(move || {
-                Self::poller_loop(rx, shutdown_clone);
+                Self::poller_loop(rx, shutdown_clone, eventfd_raw);
             })
             .expect("Failed to spawn SPDK poller thread");
 
         Self {
-            tx,
+            tx: Some(tx),
+            eventfd: eventfd_arc,
             shutdown,
             handle: Some(handle),
         }
@@ -135,21 +160,45 @@ impl SpdkPoller {
 
     /// Get sender for SpdkBdev to hold.
     pub fn sender(&self) -> crossbeam::channel::Sender<IoRequest> {
-        self.tx.clone()
+        self.tx.as_ref().expect("Poller stopped").clone()
+    }
+
+    /// Get eventfd for signaling new I/O
+    pub fn eventfd(&self) -> RawFd {
+        self.eventfd.as_raw_fd()
+    }
+
+    /// Get eventfd as Arc for sharing with multiple bdevs
+    pub fn eventfd_arc(&self) -> Arc<EventFd> {
+        self.eventfd.clone()
+    }
+
+    /// Signal the poller that new work is available (non-blocking)
+    pub fn wake(&self) {
+        // Write 1 to eventfd to wake the poller
+        let _ = self.eventfd.write(1);
     }
 
     /// Shut down the poller thread.
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        self.tx.take(); // Drop sender to disconnect channel, unblocking recv()
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+        // EventFd will be closed when self.eventfd drops
     }
 
     /// Main poller loop. Runs on dedicated thread.
-    fn poller_loop(rx: crossbeam::channel::Receiver<IoRequest>, shutdown: Arc<AtomicBool>) {
+    fn poller_loop(
+        rx: crossbeam::channel::Receiver<IoRequest>,
+        shutdown: Arc<AtomicBool>,
+        eventfd: RawFd,
+    ) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
+        let mut known_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
         let mut inflight: HashMap<usize, Arc<std::sync::atomic::AtomicUsize>> = HashMap::new();
+        let mut state = PollerState::Idle;
 
         // Verify curvine_async_ctx buffer fits the C struct.
         debug_assert!(
@@ -158,38 +207,101 @@ impl SpdkPoller {
             "curvine_async_ctx C struct exceeds Rust buffer"
         );
 
+        // Poll interval for keep-alive check (poll every 1s to detect disconnects)
+        let poll_interval_ms: i32 = 1000;
         loop {
+            // Check shutdown first
             if shutdown.load(Ordering::Acquire) && rx.is_empty() {
                 break;
             }
 
-            // Drain pending requests (non-blocking after first)
-            // TODO: recv_timeout(100us) adds up to 100us latency per I/O when completions are pending.
-            // Use try_recv when active_qpairs is non-empty; only block when idle.
-            match rx.recv_timeout(std::time::Duration::from_micros(100)) {
-                Ok(req) => {
-                    Self::submit_one(&req, &mut active_qpairs, &mut inflight);
-                    while let Ok(req) = rx.try_recv() {
-                        Self::submit_one(&req, &mut active_qpairs, &mut inflight);
-                    }
+            // Active state: drain all pending I/Os and poll completions
+            if matches!(state, PollerState::Active) {
+                // Drain pending requests (non-blocking)
+                while let Ok(req) = rx.try_recv() {
+                    Self::submit_one(&req, &mut active_qpairs, &mut known_qpairs, &mut inflight);
                 }
-                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+
+                // Poll qpairs for completions
+                // TODO: treat poll failure as fatal; Because rc < 0 silently drops qpair, stranding in-flight completions forever.
+                active_qpairs.retain(|&qpair| {
+                    let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
+                    if rc < 0 {
+                        error!("qpair poll error: {}", rc);
+                        return false;
+                    }
+                    let key = qpair as usize;
+                    inflight
+                        .get(&key)
+                        .map_or(false, |c| c.load(Ordering::Acquire) > 0)
+                });
+
+                // Transition to Idle if no more work
+                if rx.is_empty() && active_qpairs.is_empty() {
+                    state = PollerState::Idle;
+                }
+                continue;
             }
 
-            // Poll active qpairs for completions
-            // TODO: treat poll failure as fatal; Because rc < 0 silently drops qpair, stranding in-flight completions forever.
-            active_qpairs.retain(|&qpair| {
-                let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
-                if rc < 0 {
-                    error!("qpair poll error: {}", rc);
-                    return false;
+            // Idle state: wait for work (eventfd or channel)
+            if matches!(state, PollerState::Idle) {
+                // Check if channel has pending data (peek)
+                let has_pending = !rx.is_empty();
+
+                if has_pending {
+                    // Channel has data, transition to Active
+                    state = PollerState::Active;
+                    continue;
                 }
-                let key = qpair as usize;
-                inflight
-                    .get(&key)
-                    .map_or(false, |c| c.load(Ordering::Acquire) > 0)
-            });
+
+                // Wait on eventfd with timeout for keep-alive check
+                let mut eventfd_pollfd = libc::pollfd {
+                    fd: eventfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+
+                let result = unsafe { libc::poll(&mut eventfd_pollfd, 1, poll_interval_ms) };
+
+                match result {
+                    n if n > 0 => {
+                        // Eventfd signaled - drain it
+                        let mut buf = [0u8; 8];
+                        let _ = unsafe { libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, 8) };
+
+                        // Drain any pending channel data
+                        while let Ok(req) = rx.try_recv() {
+                            Self::submit_one(&req, &mut active_qpairs, &mut known_qpairs, &mut inflight);
+                        }
+
+                        // Transition to Active to process work
+                        state = PollerState::Active;
+                    }
+                    0 => {
+                        // Timeout - poll known qpairs to check connection health
+                        known_qpairs.retain(|&qpair| {
+                            let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
+                            if rc < 0 {
+                                error!("Poller: keep-alive poll error: {}, removing qpair", rc);
+                                return false;
+                            }
+                            true
+                        });
+                        state = PollerState::Idle;
+                    }
+                    -1 => {
+                        let errno = unsafe { *libc::__errno_location() };
+                        if errno == libc::EINTR {
+                            continue;
+                        }
+                        error!("Poller: poll error: {}", errno);
+                        break;
+                    }
+                    _ => {
+                        break;
+                    }
+                }
+            }
         }
 
         info!("SPDK poller thread exiting");
@@ -199,6 +311,7 @@ impl SpdkPoller {
     fn submit_one(
         req: &IoRequest,
         active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
+        known_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
         inflight: &mut HashMap<usize, Arc<std::sync::atomic::AtomicUsize>>,
     ) {
         let qpair = match &req.op {
@@ -281,6 +394,9 @@ impl SpdkPoller {
         inflight_counter.fetch_add(1, Ordering::Release);
         if !active_qpairs.contains(&qpair) {
             active_qpairs.push(qpair);
+        }
+        if !known_qpairs.contains(&qpair) {
+            known_qpairs.push(qpair);
         }
     }
 }

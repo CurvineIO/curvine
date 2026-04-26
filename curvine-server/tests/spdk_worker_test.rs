@@ -1,4 +1,5 @@
 #![cfg(feature = "spdk")]
+mod common;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
