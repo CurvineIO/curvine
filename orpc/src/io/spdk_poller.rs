@@ -173,12 +173,6 @@ impl SpdkPoller {
         self.eventfd.clone()
     }
 
-    /// Signal the poller that new work is available (non-blocking)
-    pub fn wake(&self) {
-        // Write 1 to eventfd to wake the poller
-        let _ = self.eventfd.write(1);
-    }
-
     /// Shut down the poller thread.
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -288,6 +282,7 @@ impl SpdkPoller {
                             let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
                             if rc < 0 {
                                 error!("Poller: keep-alive poll error: {}, removing qpair", rc);
+                                inflight.remove(&(qpair as usize));
                                 return false;
                             }
                             true
