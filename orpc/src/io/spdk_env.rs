@@ -253,6 +253,8 @@ pub struct SpdkConf {
     pub keep_alive_timeout_str: String, // e.g. "10s"
     #[serde(skip)]
     pub keep_alive_timeout_ms: u64, // parsed by init()
+    #[serde(alias = "poll_interval", default)]
+    pub poll_interval_ms: u64, // default = 1000
     #[serde(alias = "dma_pool_size", default)]
     pub dma_pool_size_str: String, // e.g. "64MB"
     #[serde(skip)]
@@ -343,6 +345,21 @@ impl SpdkConf {
                 let msg = format!("SpdkConf: targets[{}]: {}", i, e);
                 err_msg!(msg)
             })?;
+            if target.keep_alive_timeout_ms > 0
+                && target.keep_alive_timeout_ms < self.poll_interval_ms
+            {
+                return err_box!(
+                    "SpdkConf: targets[{}]: keep_alive_timeout_ms ({}) must be >= poll_interval_ms ({})",
+                    i,
+                    target.keep_alive_timeout_ms,
+                    self.poll_interval_ms
+                );
+            }
+        }
+
+        // Validate poller interval is reasonable
+        if self.poll_interval_ms == 0 {
+            return err_box!("SpdkConf: poll_interval_ms must be > 0");
         }
 
         Ok(())
@@ -367,6 +384,7 @@ impl Default for SpdkConf {
             io_retry_count: 4,
             keep_alive_timeout_str: "10s".to_string(),
             keep_alive_timeout_ms: 10_000,
+            poll_interval_ms: 1000,
             dma_pool_size_str: "64MB".to_string(),
             dma_pool_bytes: 64 * 1024 * 1024,
             block_align: 0,
@@ -573,7 +591,7 @@ impl SpdkEnv {
 
         // Start the dedicated I/O poller thread
         {
-            let poller = crate::io::spdk_poller::SpdkPoller::start();
+            let poller = crate::io::spdk_poller::SpdkPoller::start(self.conf.poll_interval_ms);
             *self.poller.lock().unwrap() = Some(poller);
             info!("SPDK poller thread started");
         }

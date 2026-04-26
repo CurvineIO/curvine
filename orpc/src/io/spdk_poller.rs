@@ -131,8 +131,8 @@ pub struct SpdkPoller {
 }
 
 impl SpdkPoller {
-    /// Spawn a new poller thread.
-    pub fn start() -> Self {
+    /// Spawn a new poller thread with given poll interval (in ms).
+    pub fn start(poll_interval_ms: u64) -> Self {
         let (tx, rx) = crossbeam::channel::unbounded::<IoRequest>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -146,7 +146,7 @@ impl SpdkPoller {
         let handle = std::thread::Builder::new()
             .name("spdk-poller".to_string())
             .spawn(move || {
-                Self::poller_loop(rx, shutdown_clone, eventfd_raw);
+                Self::poller_loop(rx, shutdown_clone, eventfd_raw, poll_interval_ms);
             })
             .expect("Failed to spawn SPDK poller thread");
 
@@ -188,6 +188,7 @@ impl SpdkPoller {
         rx: crossbeam::channel::Receiver<IoRequest>,
         shutdown: Arc<AtomicBool>,
         eventfd: RawFd,
+        poll_interval_ms: u64,
     ) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
         let mut known_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
@@ -201,8 +202,8 @@ impl SpdkPoller {
             "curvine_async_ctx C struct exceeds Rust buffer"
         );
 
-        // Poll interval for keep-alive check (poll every 1s to detect disconnects)
-        let poll_interval_ms: i32 = 1000;
+        // Poll interval for keep-alive check (parameterized to detect disconnects)
+        let poll_interval = poll_interval_ms as i32;
         loop {
             // Check shutdown first
             if shutdown.load(Ordering::Acquire) && rx.is_empty() {
@@ -264,7 +265,7 @@ impl SpdkPoller {
                     revents: 0,
                 };
 
-                let result = unsafe { libc::poll(&mut eventfd_pollfd, 1, poll_interval_ms) };
+                let result = unsafe { libc::poll(&mut eventfd_pollfd, 1, poll_interval) };
 
                 match result {
                     n if n > 0 => {

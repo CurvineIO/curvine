@@ -43,7 +43,7 @@ tracing-log = { workspace = true }
 fxhash = { workspace = true }
 moka = { workspace = true }
 md-5 = { workspace = true }
-nix = { version = "0.30.1", features = ["ioctl", "user", "event"] }
+nix = { workspace = true }
 
 [features]
 spdk = []
