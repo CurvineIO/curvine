@@ -161,8 +161,7 @@ pub struct WorkerConf {
     pub enable_s3_gateway: bool,
 
     // SPDK over NVMe-oF/RDMA configuration.
-    #[serde(rename = "spdk_disk")]
-    pub spdk: SpdkConf,
+    pub spdk_disk: SpdkConf,
 }
 
 impl WorkerConf {
@@ -207,7 +206,7 @@ impl Default for WorkerConf {
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
             enable_s3_gateway: false,
-            spdk: SpdkConf::default(),
+            spdk_disk: SpdkConf::default(),
         }
     }
 }
