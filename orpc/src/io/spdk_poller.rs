@@ -220,11 +220,13 @@ impl SpdkPoller {
                 // Poll qpairs for completions
                 // TODO: treat poll failure as fatal; Because rc < 0 silently drops qpair, stranding in-flight completions forever.
                 let mut keys_to_remove: Vec<usize> = Vec::new();
+                let mut bad_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
                 active_qpairs.retain(|&qpair| {
                     let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
                     if rc < 0 {
                         error!("qpair poll error: {}", rc);
                         keys_to_remove.push(qpair as usize);
+                        bad_qpairs.push(qpair);
                         return false;
                     }
                     let key = qpair as usize;
@@ -236,6 +238,8 @@ impl SpdkPoller {
                     }
                     has_inflight
                 });
+                // Remove failed qpairs from known_qpairs to avoid duplicate errors
+                known_qpairs.retain(|qpair| !bad_qpairs.contains(qpair));
                 for key in keys_to_remove {
                     inflight.remove(&key);
                 }
