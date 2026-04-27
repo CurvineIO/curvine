@@ -3,8 +3,9 @@
 # Needed because crate build scripts (e.g. librocksdb-sys) emit
 # `cargo:rustc-link-lib=stdc++` which lands in the -Bdynamic section.
 #
-# NOTE: each -Wl flag must be a separate arg; do NOT merge into one
-# comma-separated string or gcc will pass a literal "-Wl," to the linker.
+# NOTE: gcc/clang support comma-separated `-Wl,...` lists. This wrapper
+# emits `-Wl,-Bstatic` / `-Wl,-Bdynamic` as separate args around the
+# affected libraries to preserve the intended linker mode transitions.
 
 set -euo pipefail
 
