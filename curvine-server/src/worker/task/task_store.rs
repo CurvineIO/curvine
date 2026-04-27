@@ -78,3 +78,81 @@ impl Deref for TaskStore {
         &self.tasks
     }
 }
+
+#[cfg(test)]
+mod supersede_tests {
+    use super::TaskStore;
+    use crate::worker::task::TaskContext;
+    use curvine_common::state::WorkerAddress;
+    use curvine_common::state::{
+        JobTaskState, LoadJobInfo, LoadTaskInfo, MountInfo, StorageType, TtlAction,
+    };
+    use dashmap::mapref::entry::Entry;
+    use std::sync::Arc;
+
+    fn load_task(task_id: &str, job_id: &str) -> LoadTaskInfo {
+        let job = LoadJobInfo {
+            job_id: job_id.to_string(),
+            source_path: "s".to_string(),
+            target_path: "t".to_string(),
+            block_size: 4096,
+            replicas: 1,
+            storage_type: StorageType::default(),
+            ttl_ms: 0,
+            ttl_action: TtlAction::default(),
+            mount_info: MountInfo::default(),
+            create_time: 0,
+            overwrite: None,
+        };
+        LoadTaskInfo {
+            job,
+            task_id: task_id.to_string(),
+            worker: WorkerAddress::default(),
+            source_path: "s".to_string(),
+            target_path: "t".to_string(),
+            create_time: 0,
+        }
+    }
+
+    /// Mirrors `TaskManager::submit_task`: supersede replaces the map entry; only
+    /// `remove_if` matching the **current** `Arc` may delete (guards spawn epilogue).
+    #[test]
+    fn supersede_marks_old_canceled_remove_if_only_evicts_matching_runner() {
+        let store = TaskStore::new();
+        let tid = "same_task_id".to_string();
+
+        let first = Arc::new(TaskContext::new(load_task(&tid, "job_a")));
+        match store.entry(tid.clone()) {
+            Entry::Vacant(v) => {
+                v.insert(first.clone());
+            }
+            Entry::Occupied(_) => panic!("expected vacant"),
+        }
+
+        let second = Arc::new(TaskContext::new(load_task(&tid, "job_a")));
+        match store.entry(tid.clone()) {
+            Entry::Occupied(mut occ) => {
+                let old = occ.insert(second.clone());
+                assert!(Arc::ptr_eq(&old, &first));
+                old.update_state(JobTaskState::Canceled, "superseded by new submit");
+            }
+            Entry::Vacant(_) => panic!("expected occupied"),
+        }
+
+        assert_eq!(first.get_state(), JobTaskState::Canceled);
+        // Do not hold a `get()` Ref across `remove_if` on the same key (deadlocks: read vs write on one shard).
+        assert!(Arc::ptr_eq(&*store.get(&tid).expect("slot"), &second));
+
+        // Stale runner would call `remove_if` with `first`; must not clear the slot.
+        assert!(store
+            .remove_if(&tid, |_, ctx| Arc::ptr_eq(ctx, &first))
+            .is_none());
+        assert!(store.get(&tid).is_some());
+
+        // Current runner removes with `second`.
+        assert!(store
+            .remove_if(&tid, |_, ctx| Arc::ptr_eq(ctx, &second))
+            .is_some());
+        assert!(store.get(&tid).is_none());
+    }
+}
