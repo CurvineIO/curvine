@@ -43,9 +43,9 @@ impl WorkerDataDir {
         Self::new(StorageType::Disk, 0, path)
     }
 
-    fn is_alphabetic(str: &str) -> bool {
+    fn is_storage_type_definition(str: &str) -> bool {
         for c in str.chars() {
-            if !c.is_alphabetic() {
+            if !c.is_alphabetic() && c != '_' {
                 return false;
             }
         }
@@ -73,7 +73,7 @@ impl WorkerDataDir {
         };
 
         let (stg_type, capacity) = if arr.len() == 1 {
-            if Self::is_alphabetic(arr[0]) {
+            if Self::is_storage_type_definition(arr[0]) {
                 //[HDD]/dir
                 (arr[0], "0")
             } else {
@@ -161,6 +161,7 @@ pub struct WorkerConf {
     pub enable_s3_gateway: bool,
 
     // SPDK over NVMe-oF/RDMA configuration.
+    #[serde(rename = "spdk_disk")]
     pub spdk: SpdkConf,
 }
 
