@@ -99,8 +99,7 @@ impl ClusterConf {
         conf.master.init()?;
         conf.client.init()?;
         conf.fuse.init()?;
-        conf.job.init()?;
-        conf.worker.spdk_disk.init()?;
+        conf.job.init();
 
         if conf.client.master_addrs.is_empty() {
             for peer in &mut conf.journal.journal_addrs {

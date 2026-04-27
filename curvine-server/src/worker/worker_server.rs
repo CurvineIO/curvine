@@ -114,6 +114,7 @@ impl Worker {
         // Init SPDK before WorkerService - enables BlockMeta to open SPDK bdevs
         #[cfg(feature = "spdk")]
         if conf.worker.spdk_disk.enabled {
+            conf.worker.spdk_disk.init()?;
             use curvine_common::conf::WorkerDataDir;
             use curvine_common::state::StorageType;
             use log::warn;
