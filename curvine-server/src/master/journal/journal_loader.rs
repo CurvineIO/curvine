@@ -29,7 +29,7 @@ use log::{debug, error, info, warn};
 use orpc::common::{FileUtils, LocalTime};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel};
-use orpc::{err_box, CommonResult};
+use orpc::{err_box, ternary, CommonResult};
 use raft::eraftpb::Entry;
 use raft::StateRole;
 use std::path::Path;
@@ -193,7 +193,8 @@ impl JournalLoader {
         }
 
         let cur = self.get_fsm_state();
-        if entry.index <= cur.applied.index {
+        let role_applied = ternary!(is_leader, cur.ufs_applied.index, cur.applied.index);
+        if entry.index <= role_applied {
             info!(
                 "skip entry index {}, term {}, fsm_state {:?}",
                 entry.index, entry.term, cur

@@ -302,7 +302,13 @@ impl MasterHandler {
     // Complete_file internally determines whether it is a retry request.
     pub fn complete_file(&mut self, ctx: &mut RpcContext<'_>) -> FsResult<Message> {
         let req: CompleteFileRequest = ctx.parse_header()?;
-        ctx.set_audit(Some(req.path.to_string()), None);
+
+        let audit_path = if req.only_flush {
+            format!("[flush]{}", req.path)
+        } else {
+            format!("[close]{}", req.path)
+        };
+        ctx.set_audit(Some(audit_path), None);
 
         let commit_blocks = req
             .commit_blocks

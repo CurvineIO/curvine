@@ -145,7 +145,7 @@ impl TtlBucketList {
             let bucket = self.get_or_create_bucket(expiration_ms);
             bucket.add(inode.id());
 
-            info!(
+            debug!(
                 "added inode {} to sorted TTL bucket list, expires at {}ms",
                 inode.id(),
                 expiration_ms
