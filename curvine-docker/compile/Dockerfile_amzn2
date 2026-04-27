@@ -7,6 +7,9 @@ LABEL org.opencontainers.image.source="${REPO_URL}"
 
 # 1. Install the basic toolchain and dependencies
 RUN yum install -y \
+    gcc \
+    gcc-c++ \
+    make \
     fuse3 \
     fuse3-devel \
     clang \
@@ -18,12 +21,18 @@ RUN yum install -y \
     unzip \
     jq \
     python3 \
+    python3-pip \
     nodejs \
     npm \
     java-1.8.0-openjdk-devel \
     openssl-devel \
+    zlib-devel \
+    zlib-static \
+    libstdc++-devel \
+    libstdc++-static \
     pkg-config \
     tar \
+    fio \
     && yum clean all
 
 # 2. Install the Rust toolchain

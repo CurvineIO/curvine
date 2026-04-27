@@ -98,6 +98,12 @@ FROM rockylinux:9
 RUN dnf install -y --allowerasing \
     fuse3 \
     procps-ng \
+    zlib \
+    libstdc++ \
+    python3 \
+    python3-pip \
+    jq \
+    fio \
     && dnf clean all \
     && rm -rf /var/cache/dnf/*
 

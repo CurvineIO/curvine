@@ -5,12 +5,17 @@
 FROM ghcr.io/curvineio/curvine-compile:rocky9
 
 # Python + Flask + Werkzeug (build-server) and regression helpers; use dnf (no pip at runtime in CI)
-RUN dnf install -y epel-release && \
+RUN dnf install -y dnf-plugins-core epel-release && \
+    dnf config-manager --set-enabled crb && \
     dnf install -y \
         python3 \
         python3-pip \
         python3-flask \
         python3-werkzeug \
+        libstdc++-devel \
+        libstdc++-static \
+        zlib-devel \
+        zlib-static \
         jq \
         fio \
     && dnf clean all
