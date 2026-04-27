@@ -35,7 +35,7 @@ fn start_spdk_worker() -> ClusterConf {
     let subnqn = std::env::var("SPDK_TARGET_NQN").unwrap();
     let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
 
-    conf.worker.spdk = SpdkConf {
+    conf.worker.spdk_disk = SpdkConf {
         enabled: true,
         app_name: "curvine-spdk-test".to_string(),
         hugepage_mb: std::env::var("SPDK_HUGEPAGE_MB")
