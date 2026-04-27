@@ -25,6 +25,8 @@ RUN dnf install -y \
     java-1.8.0-openjdk-devel \
     openssl-devel \
     zlib-devel \
+    libstdc++-static \
+    zlib-static \
     && dnf clean all
 
 # 1.1. Install Node.js 22 LTS from NodeSource repository (ensures npm >= 9.0.0 and compatibility)
