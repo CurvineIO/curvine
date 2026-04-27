@@ -84,7 +84,7 @@ pub struct StateMonitor {
 
 impl StateMonitor {
     pub fn new(init: i8) -> Self {
-        let (sender, _) = broadcast::channel(1);
+        let (sender, _) = broadcast::channel(4);
         Self {
             ctl: StateCtl::new(init),
             sender,
@@ -92,7 +92,7 @@ impl StateMonitor {
     }
 
     pub fn new_listener(&self) -> StateListener {
-        StateListener::new(self.sender.subscribe())
+        StateListener::new(self.sender.subscribe(), self.ctl.read_only())
     }
 
     pub fn read_ctl(&self) -> StateCtl {
@@ -142,11 +142,16 @@ impl Deref for StateMonitor {
 
 pub struct StateListener {
     receiver: broadcast::Receiver<i8>,
+    ctl: StateCtl,
 }
 
 impl StateListener {
-    pub fn new(receiver: broadcast::Receiver<i8>) -> Self {
-        Self { receiver }
+    pub fn new(receiver: broadcast::Receiver<i8>, ctl: StateCtl) -> Self {
+        Self { receiver, ctl }
+    }
+
+    pub fn current(&self) -> i8 {
+        self.ctl.value()
     }
 
     // Get the next state.
@@ -154,7 +159,7 @@ impl StateListener {
         loop {
             match self.receiver.recv().await {
                 Ok(v) => return Ok(v),
-                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Lagged(_)) => return Ok(self.ctl.value()),
                 Err(e) => return err_box!("{}", e),
             }
         }
@@ -164,11 +169,12 @@ impl StateListener {
     pub async fn wait_state<T: Into<i8>>(&mut self, target: T) -> CommonResult<()> {
         let target = target.into();
         loop {
+            if self.ctl.value() == target {
+                return Ok(());
+            }
             let cur = self.next_state().await?;
             if cur == target {
                 return Ok(());
-            } else {
-                continue;
             }
         }
     }
@@ -177,11 +183,13 @@ impl StateListener {
     pub async fn wait_progress<T: Into<i8>>(&mut self, target: T) -> CommonResult<()> {
         let target = target.into();
         loop {
+            if self.ctl.value() >= target {
+                return Ok(());
+            }
+
             let cur = self.next_state().await?;
             if cur >= target {
                 return Ok(());
-            } else {
-                continue;
             }
         }
     }
