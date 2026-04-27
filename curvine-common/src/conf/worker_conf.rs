@@ -43,7 +43,7 @@ impl WorkerDataDir {
         Self::new(StorageType::Disk, 0, path)
     }
 
-    fn is_storage_type_definition(str: &str) -> bool {
+    fn is_valid_storage_type(str: &str) -> bool {
         for c in str.chars() {
             if !c.is_alphabetic() && c != '_' {
                 return false;
@@ -73,7 +73,7 @@ impl WorkerDataDir {
         };
 
         let (stg_type, capacity) = if arr.len() == 1 {
-            if Self::is_storage_type_definition(arr[0]) {
+            if Self::is_valid_storage_type(arr[0]) {
                 //[HDD]/dir
                 (arr[0], "0")
             } else {
