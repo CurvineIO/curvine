@@ -50,8 +50,19 @@ impl JobTaskState {
             JobTaskState::Completed | JobTaskState::Failed | JobTaskState::Canceled
         )
     }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self, JobTaskState::Pending | JobTaskState::Loading)
+    }
 }
 
+/// Outcome of a load submit or status query: `job_id` / `target_path` identify the
+/// job; `state` is the current phase.
+///
+/// **Callers must not assume this struct always reflects the latest
+/// [`LoadJobCommand`]:** concurrent submits for the same path are defined by the
+/// server as **first submitter wins**; a later `Ok` may describe the in-flight job
+/// only (paths and state), not the superseded request’s options.
 #[derive(Debug, Clone)]
 pub struct LoadJobResult {
     pub job_id: String,

@@ -95,16 +95,16 @@ impl JobManager {
 
     async fn wait_job_complete0(&self, job_id: impl AsRef<str>) -> FsResult<JobStatus> {
         let job_id = job_id.as_ref();
+
+        let mut listener = match self.jobs.get(job_id) {
+            Some(job) => job.new_listener(),
+            None => return err_ext!(FsError::job_not_found(job_id)),
+        };
+
         let status = self.get_job_status(job_id)?;
         if status.state.is_finish() {
             return Ok(status);
         }
-
-        let mut listener = if let Some(job) = self.jobs.get(job_id) {
-            job.new_listener()
-        } else {
-            return err_ext!(FsError::job_not_found(job_id));
-        };
 
         loop {
             let next_state = JobTaskState::from(listener.next_state().await?);
@@ -153,6 +153,9 @@ impl JobManager {
         &self.rt
     }
 
+    /// See `LoadJobRunner::submit_load_task` for the concurrency contract: concurrent
+    /// submits for the same path while a load is running return the **existing** run’s
+    /// result; the new command’s options are not applied (first submitter wins).
     pub async fn submit_load_job(&self, command: LoadJobCommand) -> FsResult<LoadJobResult> {
         let source_path = Path::from_str(&command.source_path)?;
 
