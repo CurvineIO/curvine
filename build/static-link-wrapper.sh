@@ -14,6 +14,9 @@ for arg in "$@"; do
     if [ "$arg" = "-lstdc++" ]; then
         NEWARGS+=("-Wl,-Bstatic" "-lstdc++" "-Wl,-Bdynamic")
     elif [ "$arg" = "-lgcc_s" ]; then
+        # libgcc_s.so provides both the GCC runtime helpers and the EH
+        # (exception-handling) unwinder. GCC does not ship a libgcc_s.a;
+        # the static equivalents are libgcc.a (runtime) + libgcc_eh.a (EH).
         NEWARGS+=("-Wl,-Bstatic" "-lgcc_eh" "-lgcc" "-Wl,-Bdynamic")
     elif [ "$arg" = "-lz" ]; then
         NEWARGS+=("-Wl,-Bstatic" "-lz" "-Wl,-Bdynamic")
