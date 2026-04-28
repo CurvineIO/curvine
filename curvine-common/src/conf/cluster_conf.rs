@@ -99,7 +99,7 @@ impl ClusterConf {
         conf.master.init()?;
         conf.client.init()?;
         conf.fuse.init()?;
-        let _ = conf.job.init();
+        conf.job.init()?;
 
         if conf.client.master_addrs.is_empty() {
             for peer in &mut conf.journal.journal_addrs {

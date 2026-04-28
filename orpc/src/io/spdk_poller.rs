@@ -19,6 +19,8 @@ use std::thread::JoinHandle;
 
 use crate::io::spdk_ffi;
 
+const EVENTSZ: usize = std::mem::size_of::<u64>();
+
 /// I/O operation submitted to the poller thread.
 pub enum IoOp {
     Read {
@@ -254,8 +256,8 @@ impl SpdkPoller {
                 match result {
                     n if n > 0 => {
                         // Eventfd signaled - drain it
-                        let mut buf = [0u8; 8];
-                        let _ = unsafe { libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, 8) };
+                        let mut buf = [0u8; EVENTSZ];
+                        let _ = unsafe { libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, EVENTSZ) };
 
                         // Drain any pending channel data
                         while let Ok(req) = rx.try_recv() {
