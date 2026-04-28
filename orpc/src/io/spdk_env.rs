@@ -2,6 +2,7 @@
 
 use crate::err_msg;
 use crate::io::spdk_ffi;
+use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest, SpdkPoller};
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
 use nix::sys::eventfd::EventFd;
@@ -438,7 +439,7 @@ pub struct SpdkEnv {
     bdevs: Vec<BdevInfo>, // populated during init(), immutable after
     open_handles: AtomicUsize,
     qpair_pool: QpairPool,
-    poller: Mutex<Option<crate::io::spdk_poller::SpdkPoller>>,
+    poller: Mutex<Option<SpdkPoller>>,
 }
 
 // SAFETY: Fields are either immutable after init (conf, bdevs) or atomic (state).
@@ -591,7 +592,7 @@ impl SpdkEnv {
 
         // Start the dedicated I/O poller thread
         {
-            let poller = crate::io::spdk_poller::SpdkPoller::start(self.conf.poll_interval_ms);
+            let poller = SpdkPoller::start(self.conf.poll_interval_ms);
             *self.poller.lock().unwrap() = Some(poller);
             info!("SPDK poller thread started");
         }
@@ -731,7 +732,7 @@ impl SpdkEnv {
     }
 
     /// Get sender channel for poller thread (for SpdkIoChannel).
-    pub fn poller_sender(&self) -> crossbeam::channel::Sender<crate::io::spdk_poller::IoRequest> {
+    pub fn poller_sender(&self) -> crossbeam::channel::Sender<IoRequest> {
         self.poller
             .lock()
             .unwrap()
@@ -783,6 +784,15 @@ impl SpdkEnv {
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
+        // Send unregister to poller before releasing to pool.
+        if let Some(ref poller) = *self.poller.lock().unwrap() {
+            let unregister_req = IoRequest {
+                op: IoOp::Unregister { qpair },
+                completion: Arc::new(IoCompletion::new()),
+                bdev_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            };
+            let _ = poller.sender().send(unregister_req);
+        }
         self.qpair_pool.release(ctrlr, qpair);
     }
 

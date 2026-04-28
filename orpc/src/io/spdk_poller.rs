@@ -40,6 +40,9 @@ pub enum IoOp {
         ns: *mut spdk_ffi::spdk_nvme_ns,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     },
+    Unregister {
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    },
 }
 
 // SAFETY: exclusive ownership - blocks until completion.
@@ -214,6 +217,13 @@ impl SpdkPoller {
             if matches!(state, PollerState::Active) {
                 // Drain pending requests (non-blocking)
                 while let Ok(req) = rx.try_recv() {
+                    // Handle unregister request
+                    if let IoOp::Unregister { qpair } = &req.op {
+                        active_qpairs.retain(|&q| q != *qpair);
+                        known_qpairs.retain(|&q| q != *qpair);
+                        inflight.remove(&(qpair as usize));
+                        continue;
+                    }
                     Self::submit_one(&req, &mut active_qpairs, &mut known_qpairs, &mut inflight);
                 }
 
@@ -279,6 +289,13 @@ impl SpdkPoller {
 
                         // Drain any pending channel data
                         while let Ok(req) = rx.try_recv() {
+                            // Handle unregister request
+                            if let IoOp::Unregister { qpair } = &req.op {
+                                active_qpairs.retain(|&q| q != *qpair);
+                                known_qpairs.retain(|&q| q != *qpair);
+                                inflight.remove(&(qpair as usize));
+                                continue;
+                            }
                             Self::submit_one(
                                 &req,
                                 &mut active_qpairs,
@@ -332,6 +349,10 @@ impl SpdkPoller {
             IoOp::Read { qpair, .. } => *qpair,
             IoOp::Write { qpair, .. } => *qpair,
             IoOp::Flush { qpair, .. } => *qpair,
+            IoOp::Unregister { .. } => {
+                // no I/O submission needed
+                return;
+            }
         };
 
         let key = qpair as usize;
