@@ -343,6 +343,13 @@ impl SpdkBdev {
                     .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
+            if let Err(e) = self.io_channel.eventfd.write(1) {
+                warn!(
+                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                     I/O may be delayed until timeout.",
+                    self.name, e
+                );
+            }
             let rc = completion.wait(self.io_timeout_us);
             if rc != 0 {
                 return err_box!(
