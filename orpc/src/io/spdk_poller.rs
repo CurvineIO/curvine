@@ -1,6 +1,7 @@
 #![cfg(feature = "spdk")]
 
 //! SPDK I/O poller thread - handles NVMe submit/poll on dedicated thread.
+use crate::io::spdk_ffi;
 /// Qpairs not thread-safe: submit + poll must on same thread.
 /// Single poller to demonstrate the correctness work.
 /// Uses eventfd for instant wake on new I/O submission.
@@ -14,10 +15,9 @@ use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::ffi::c_void;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-
-use crate::io::spdk_ffi;
 
 const EVENTSZ: usize = std::mem::size_of::<u64>();
 
@@ -40,6 +40,11 @@ pub enum IoOp {
     Flush {
         ns: *mut spdk_ffi::spdk_nvme_ns,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
+    },
+    /// Unregister a qpair from the poller before it is freed.
+    UnregisterQpair {
+        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        ack: mpsc::Sender<()>,
     },
 }
 
@@ -174,6 +179,31 @@ impl SpdkPoller {
         self.eventfd.clone()
     }
 
+    /// Unregister qpair from poller, blocking until removed to prevent UAF.
+    /// Returns false if poller didn't ack within timeout (likely stuck/dead).
+    pub fn unregister_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        // TODO: use dedicated control channel instead of IoRequest to avoid dummy allocation (negligible cost)
+        let req = IoRequest {
+            op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
+            completion: IoCompletion::new(),
+            bdev_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(req);
+            let _ = self.eventfd.write(1);
+            match ack_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(()) => true,
+                Err(_) => {
+                    error!("Unregister timeout: poller may be stuck, qpair not removed");
+                    false
+                }
+            }
+        } else {
+            false // Poller stopped
+        }
+    }
+
     /// Shut down the poller thread.
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -213,7 +243,11 @@ impl SpdkPoller {
             if matches!(state, PollerState::Active) {
                 // Drain pending requests (non-blocking)
                 while let Ok(req) = rx.try_recv() {
-                    Self::submit_one(&req, &mut active_qpairs);
+                    if matches!(req.op, IoOp::UnregisterQpair { .. }) {
+                        Self::handle_unregister(&req, &mut active_qpairs);
+                    } else {
+                        Self::submit_one(&req, &mut active_qpairs);
+                    }
                 }
 
                 // Poll qpairs for completions
@@ -257,11 +291,17 @@ impl SpdkPoller {
                     n if n > 0 => {
                         // Eventfd signaled - drain it
                         let mut buf = [0u8; EVENTSZ];
-                        let _ = unsafe { libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, EVENTSZ) };
+                        let _ = unsafe {
+                            libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, EVENTSZ)
+                        };
 
                         // Drain any pending channel data
                         while let Ok(req) = rx.try_recv() {
-                            Self::submit_one(&req, &mut active_qpairs);
+                            if matches!(req.op, IoOp::UnregisterQpair { .. }) {
+                                Self::handle_unregister(&req, &mut active_qpairs);
+                            } else {
+                                Self::submit_one(&req, &mut active_qpairs);
+                            }
                         }
 
                         // Transition to Active to process work
@@ -297,12 +337,23 @@ impl SpdkPoller {
         info!("SPDK poller thread exiting");
     }
 
+    /// Handle unregister request, remove qpair from active set and ack.
+    fn handle_unregister(req: &IoRequest, active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>) {
+        if let IoOp::UnregisterQpair { qpair, ack } = &req.op {
+            active_qpairs.retain(|&qp| qp != *qpair);
+            let _ = ack.send(());
+        }
+    }
+
     /// Submit a single I/O request on the poller thread.
     fn submit_one(req: &IoRequest, active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>) {
         let qpair = match &req.op {
             IoOp::Read { qpair, .. } => *qpair,
             IoOp::Write { qpair, .. } => *qpair,
             IoOp::Flush { qpair, .. } => *qpair,
+            IoOp::UnregisterQpair { .. } => {
+                unreachable!("UnregisterQpair handled by handle_unregister")
+            }
         };
 
         // Box::into_raw ensures CallbackCtx survives until poller_callback reclaims it
@@ -358,6 +409,9 @@ impl SpdkPoller {
             IoOp::Flush { ns, qpair } => unsafe {
                 spdk_ffi::curvine_spdk_ns_submit_flush(*ns, *qpair, &mut (*cb_ctx_ptr).async_ctx)
             },
+            IoOp::UnregisterQpair { .. } => {
+                unreachable!("UnregisterQpair handled by handle_unregister")
+            }
         };
 
         if rc != 0 {

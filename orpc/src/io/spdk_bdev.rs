@@ -695,7 +695,16 @@ impl Drop for SpdkBdev {
 
         // Return qpair to pool and release handle.
         if let Some(env) = crate::io::spdk_env::SpdkEnv::global_including_shutdown() {
-            env.release_qpair(self.ctrlr, self.io_channel.qpair);
+            // Unregister qpair from poller before returning it to pool to avoid use-after-free
+            let unregistered = env.unregister_qpair_from_poller(self.io_channel.qpair);
+            if unregistered {
+                env.release_qpair(self.ctrlr, self.io_channel.qpair);
+            } else {
+                error!(
+                    "SpdkBdev '{}': qpair not unregistered, leaking to prevent UAF",
+                    self.name
+                );
+            }
             env.release_handle();
         } else {
             unsafe {

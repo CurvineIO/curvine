@@ -2,7 +2,7 @@
 
 use crate::err_msg;
 use crate::io::spdk_ffi;
-use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest, SpdkPoller};
+use crate::io::spdk_poller::{IoRequest, SpdkPoller};
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
 use nix::sys::eventfd::EventFd;
@@ -792,6 +792,17 @@ impl SpdkEnv {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
         self.qpair_pool.release(ctrlr, qpair);
+    }
+
+    /// Unregister qpair from poller, blocking until removed to prevent UAF.
+    /// Returns false if poller didn't ack within timeout (likely stuck/dead).
+    pub fn unregister_qpair_from_poller(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
+        let poller = self.poller.lock().unwrap();
+        if let Some(poller) = poller.as_ref() {
+            poller.unregister_qpair(qpair)
+        } else {
+            false
+        }
     }
 
     // SPDK FFI — feature-gated
