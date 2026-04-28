@@ -108,7 +108,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn with_conf(conf: ClusterConf) -> CommonResult<Self> {
+    pub fn with_conf(mut conf: ClusterConf) -> CommonResult<Self> {
         Logger::init(conf.worker.log.clone());
 
         // Init SPDK before WorkerService - enables BlockMeta to open SPDK bdevs

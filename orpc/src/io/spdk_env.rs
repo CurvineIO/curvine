@@ -791,15 +791,6 @@ impl SpdkEnv {
         ctrlr: *mut spdk_ffi::spdk_nvme_ctrlr,
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
-        // Send unregister to poller before releasing to pool.
-        if let Some(ref poller) = *self.poller.lock().unwrap() {
-            let unregister_req = IoRequest {
-                op: IoOp::Unregister { qpair },
-                completion: Arc::new(IoCompletion::new()),
-                bdev_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            };
-            let _ = poller.sender().send(unregister_req);
-        }
         self.qpair_pool.release(ctrlr, qpair);
     }
 

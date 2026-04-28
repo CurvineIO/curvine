@@ -44,6 +44,7 @@ io_queue_requests = 512
 io_timeout = "30s"  
 io_retry_count = 4  
 keep_alive_timeout = "10s"  
+poll_interval = 1000  
   
 # DMA buffer pool  
 dma_pool_size = "64MB"  

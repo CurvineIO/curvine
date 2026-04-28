@@ -11,7 +11,6 @@
 /// TODO: SPDK fabric eventfd for immediate detection.
 use log::{error, info};
 use nix::sys::eventfd::{EfdFlags, EventFd};
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,9 +37,6 @@ pub enum IoOp {
     },
     Flush {
         ns: *mut spdk_ffi::spdk_nvme_ns,
-        qpair: *mut spdk_ffi::spdk_nvme_qpair,
-    },
-    Unregister {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     },
 }
@@ -194,8 +190,6 @@ impl SpdkPoller {
         poll_interval_ms: u64,
     ) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
-        let mut known_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
-        let mut inflight: HashMap<usize, Arc<std::sync::atomic::AtomicUsize>> = HashMap::new();
         let mut state = PollerState::Idle;
 
         // Verify curvine_async_ctx buffer fits the C struct.
@@ -209,7 +203,7 @@ impl SpdkPoller {
         let poll_interval = poll_interval_ms as i32;
         loop {
             // Check shutdown first
-            if shutdown.load(Ordering::Acquire) && rx.is_empty() {
+            if shutdown.load(Ordering::Acquire) && rx.is_empty() && active_qpairs.is_empty() {
                 break;
             }
 
@@ -217,42 +211,18 @@ impl SpdkPoller {
             if matches!(state, PollerState::Active) {
                 // Drain pending requests (non-blocking)
                 while let Ok(req) = rx.try_recv() {
-                    // Handle unregister request
-                    if let IoOp::Unregister { qpair } = &req.op {
-                        active_qpairs.retain(|&q| q != *qpair);
-                        known_qpairs.retain(|&q| q != *qpair);
-                        inflight.remove(&(qpair as usize));
-                        continue;
-                    }
-                    Self::submit_one(&req, &mut active_qpairs, &mut known_qpairs, &mut inflight);
+                    Self::submit_one(&req, &mut active_qpairs);
                 }
 
                 // Poll qpairs for completions
-                // TODO: treat poll failure as fatal; Because rc < 0 silently drops qpair, stranding in-flight completions forever.
-                let mut keys_to_remove: Vec<usize> = Vec::new();
-                let mut bad_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
-                active_qpairs.retain(|&qpair| {
-                    let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
+                active_qpairs.retain(|qpair| {
+                    let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
                     if rc < 0 {
                         error!("qpair poll error: {}", rc);
-                        keys_to_remove.push(qpair as usize);
-                        bad_qpairs.push(qpair);
                         return false;
                     }
-                    let key = qpair as usize;
-                    let has_inflight = inflight
-                        .get(&key)
-                        .map_or(false, |c| c.load(Ordering::Acquire) > 0);
-                    if !has_inflight {
-                        keys_to_remove.push(key);
-                    }
-                    has_inflight
+                    true
                 });
-                // Remove failed qpairs from known_qpairs to avoid duplicate errors
-                known_qpairs.retain(|qpair| !bad_qpairs.contains(qpair));
-                for key in keys_to_remove {
-                    inflight.remove(&key);
-                }
 
                 // Transition to Idle if no more work
                 if rx.is_empty() && active_qpairs.is_empty() {
@@ -289,31 +259,18 @@ impl SpdkPoller {
 
                         // Drain any pending channel data
                         while let Ok(req) = rx.try_recv() {
-                            // Handle unregister request
-                            if let IoOp::Unregister { qpair } = &req.op {
-                                active_qpairs.retain(|&q| q != *qpair);
-                                known_qpairs.retain(|&q| q != *qpair);
-                                inflight.remove(&(qpair as usize));
-                                continue;
-                            }
-                            Self::submit_one(
-                                &req,
-                                &mut active_qpairs,
-                                &mut known_qpairs,
-                                &mut inflight,
-                            );
+                            Self::submit_one(&req, &mut active_qpairs);
                         }
 
                         // Transition to Active to process work
                         state = PollerState::Active;
                     }
                     0 => {
-                        // Timeout - poll known qpairs to check connection health
-                        known_qpairs.retain(|&qpair| {
-                            let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(qpair, 0) };
+                        // Timeout - poll active qpairs to check connection health
+                        active_qpairs.retain(|qpair| {
+                            let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
                             if rc < 0 {
                                 error!("Poller: keep-alive poll error: {}, removing qpair", rc);
-                                inflight.remove(&(qpair as usize));
                                 return false;
                             }
                             true
@@ -339,33 +296,17 @@ impl SpdkPoller {
     }
 
     /// Submit a single I/O request on the poller thread.
-    fn submit_one(
-        req: &IoRequest,
-        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
-        known_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
-        inflight: &mut HashMap<usize, Arc<std::sync::atomic::AtomicUsize>>,
-    ) {
+    fn submit_one(req: &IoRequest, active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>) {
         let qpair = match &req.op {
             IoOp::Read { qpair, .. } => *qpair,
             IoOp::Write { qpair, .. } => *qpair,
             IoOp::Flush { qpair, .. } => *qpair,
-            IoOp::Unregister { .. } => {
-                // no I/O submission needed
-                return;
-            }
         };
-
-        let key = qpair as usize;
-        let inflight_counter = inflight
-            .entry(key)
-            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
-            .clone();
 
         // Box::into_raw ensures CallbackCtx survives until poller_callback reclaims it
         let cb_ctx = Box::new(CallbackCtx {
             completion: req.completion.clone(),
             async_ctx: unsafe { std::mem::zeroed() },
-            inflight: inflight_counter.clone(),
             bdev_inflight: req.bdev_inflight.clone(),
         });
         let cb_ctx_ptr = Box::into_raw(cb_ctx);
@@ -425,13 +366,9 @@ impl SpdkPoller {
             return;
         }
 
-        // Track active qpair and bump inflight count
-        inflight_counter.fetch_add(1, Ordering::Release);
+        // Track active qpair
         if !active_qpairs.contains(&qpair) {
             active_qpairs.push(qpair);
-        }
-        if !known_qpairs.contains(&qpair) {
-            known_qpairs.push(qpair);
         }
     }
 }
@@ -440,14 +377,12 @@ impl SpdkPoller {
 struct CallbackCtx {
     completion: Arc<IoCompletion>,
     async_ctx: spdk_ffi::curvine_async_ctx,
-    inflight: Arc<std::sync::atomic::AtomicUsize>,
-    bdev_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    bdev_inflight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// C callback invoked by SPDK when NVMe command completes.
 unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
     let ctx = Box::from_raw(cb_arg as *mut CallbackCtx);
-    ctx.inflight.fetch_sub(1, Ordering::Release);
     ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
     ctx.completion.complete(status);
 }
