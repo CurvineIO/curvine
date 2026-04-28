@@ -362,6 +362,13 @@ impl SpdkConf {
         if self.poll_interval_ms == 0 {
             return err_box!("SpdkConf: poll_interval_ms must be > 0");
         }
+        if self.poll_interval_ms > i32::MAX as u64 {
+            return err_box!(
+                "SpdkConf: poll_interval_ms ({}) exceeds i32::MAX ({})",
+                self.poll_interval_ms,
+                i32::MAX
+            );
+        }
 
         Ok(())
     }
