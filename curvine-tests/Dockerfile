@@ -4,7 +4,7 @@
 # One-shot run:              docker run -v $(pwd):/workspace curvine-tests --run-once
 FROM ghcr.io/curvineio/curvine-compile:rocky9
 
-# Python + Flask + Werkzeug (build-server) and regression helpers; use dnf (no pip at runtime in CI)
+# Python + Flask + Werkzeug (build-server) and regression helpers; no runtime pip installs in CI.
 RUN dnf install -y dnf-plugins-core epel-release && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \

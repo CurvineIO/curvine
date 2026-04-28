@@ -20,9 +20,6 @@ RUN mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sou
 # 1. Install the basic toolchain and dependencies
 RUN apt-get update && apt-get install -y --fix-missing \
     build-essential \
-    gcc \
-    g++ \
-    make \
     fuse3 \
     libfuse3-dev \
     clang \
@@ -243,9 +240,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zlib1g \
     libstdc++6 \
     python3 \
-    python3-pip \
-    jq \
-    fio \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && rm -rf /var/cache/apt/*
