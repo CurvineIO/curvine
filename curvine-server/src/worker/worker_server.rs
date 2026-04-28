@@ -108,7 +108,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    #[allow(unused_mut)]
+    #[cfg_attr(not(feature = "spdk"), allow(unused_mut))]
     pub fn with_conf(mut conf: ClusterConf) -> CommonResult<Self> {
         Logger::init(conf.worker.log.clone());
 
