@@ -179,11 +179,11 @@ impl SpdkPoller {
     /// Shut down the poller thread.
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        self.tx.take(); // Drop sender to disconnect channel, unblocking recv()
+        let _ = self.eventfd.write(1); // Wake poll(eventfd, timeout) so shutdown is observed promptly
+        self.tx.take(); // Drop sender to disconnect the channel during shutdown
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-        // EventFd will be closed when self.eventfd drops
     }
 
     /// Main poller loop. Runs on dedicated thread.
