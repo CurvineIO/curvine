@@ -37,7 +37,7 @@ impl DirTree {
         let cache_ttl = conf.node_cache_ttl.as_millis() as u64;
         let mut tree = Self {
             inodes: FastHashMap::default(),
-            id_creator: AtomicCounter::new(u64::MAX / 2),
+            id_creator: AtomicCounter::new((i64::MAX / 2) as u64),
             conf,
             cache_ttl,
             last_clean: LocalTime::mills(),
@@ -119,8 +119,13 @@ impl DirTree {
     }
 
     pub fn next_id(&self, cv_id: i64) -> u64 {
-        if cv_id > FUSE_ROOT_ID as i64 {
-            return cv_id as u64;
+        let cv_id = cv_id as u64;
+        if cv_id > FUSE_ROOT_ID
+            && cv_id != FUSE_ROOT_ID
+            && cv_id != FUSE_UNKNOWN_INO
+            && !self.inodes.contains_key(&cv_id)
+        {
+            return cv_id;
         }
 
         loop {

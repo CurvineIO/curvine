@@ -65,12 +65,14 @@ impl Inode {
         }
     }
 
-    pub fn with_status(ino: u64, parent: u64, name: &str, status: FileStatus) -> Self {
+    pub fn with_status(ino: u64, parent: u64, name: &str, mut status: FileStatus) -> Self {
         let dir = if status.is_dir {
             Some(Box::new(DirEntry::new()))
         } else {
             None
         };
+
+        status.id = ino as i64;
         Inode {
             ino,
             parent,
@@ -87,7 +89,7 @@ impl Inode {
         }
     }
 
-    pub fn update_status(&mut self, status: FileStatus) {
+    pub fn update_status(&mut self, mut status: FileStatus) {
         if status.is_dir {
             let needs_fresh_dir = self.dir.is_none() || !self.status.is_dir;
             if needs_fresh_dir {
@@ -97,8 +99,10 @@ impl Inode {
             let _ = self.dir.take();
         }
 
-        self.op_state = OpState::Cached;
+        status.id = self.ino as i64;
         self.status = status;
+
+        self.op_state = OpState::Cached;
         self.cache_valid = true;
         self.last_access = LocalTime::mills();
     }
