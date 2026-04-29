@@ -26,6 +26,8 @@ use std::fmt::{Display, Formatter};
 pub struct SpdkIoChannel {
     pub qpair: *mut crate::io::spdk_ffi::spdk_nvme_qpair,
     pub poller_tx: crossbeam::channel::Sender<crate::io::spdk_poller::IoRequest>,
+    /// Eventfd for waking poller on new I/O
+    pub eventfd: std::sync::Arc<nix::sys::eventfd::EventFd>,
 }
 unsafe impl Send for SpdkIoChannel {}
 unsafe impl Sync for SpdkIoChannel {}
@@ -219,8 +221,13 @@ impl SpdkBdev {
                     return Err(e.into());
                 }
             };
-            let poller_tx = env.poller_sender(); // NEW: get sender from SpdkEnv
-            let io_channel = SpdkIoChannel { qpair, poller_tx };
+            let poller_tx = env.poller_sender(); // Get sender from SpdkEnv
+            let eventfd = env.poller_eventfd(); // Get eventfd for wake signaling
+            let io_channel = SpdkIoChannel {
+                qpair,
+                poller_tx,
+                eventfd,
+            };
             let io_timeout_us = env.conf().io_timeout_us;
             Ok(Self {
                 name: name.to_string(),
@@ -336,6 +343,13 @@ impl SpdkBdev {
                     .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
+            if let Err(e) = self.io_channel.eventfd.write(1) {
+                warn!(
+                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                     I/O may be delayed until timeout.",
+                    self.name, e
+                );
+            }
             let rc = completion.wait(self.io_timeout_us);
             if rc != 0 {
                 return err_box!(
@@ -402,6 +416,13 @@ impl SpdkBdev {
                         .fetch_sub(1, std::sync::atomic::Ordering::Release);
                     return err_box!("SPDK poller thread is gone");
                 }
+                if let Err(e) = self.io_channel.eventfd.write(1) {
+                    warn!(
+                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                         I/O may be delayed until timeout.",
+                        self.name, e
+                    );
+                }
                 let rc = completion.wait(self.io_timeout_us);
 
                 if rc != 0 {
@@ -441,6 +462,13 @@ impl SpdkBdev {
                     .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
+            if let Err(e) = self.io_channel.eventfd.write(1) {
+                warn!(
+                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                     I/O may be delayed until timeout.",
+                    self.name, e
+                );
+            }
             let rc = completion.wait(self.io_timeout_us);
             if rc != 0 {
                 return err_box!(
@@ -473,6 +501,13 @@ impl SpdkBdev {
         };
         if self.io_channel.poller_tx.send(req).is_err() {
             return err_box!("SPDK poller thread is gone");
+        }
+        if let Err(e) = self.io_channel.eventfd.write(1) {
+            warn!(
+                "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                 I/O may be delayed until timeout.",
+                self.name, e
+            );
         }
         let rc = completion.wait(self.io_timeout_us);
         if rc != 0 {
@@ -660,7 +695,16 @@ impl Drop for SpdkBdev {
 
         // Return qpair to pool and release handle.
         if let Some(env) = crate::io::spdk_env::SpdkEnv::global_including_shutdown() {
-            env.release_qpair(self.ctrlr, self.io_channel.qpair);
+            // Unregister qpair from poller before returning it to pool to avoid use-after-free
+            let unregistered = env.unregister_qpair_from_poller(self.io_channel.qpair);
+            if unregistered {
+                env.release_qpair(self.ctrlr, self.io_channel.qpair);
+            } else {
+                error!(
+                    "SpdkBdev '{}': qpair not unregistered, leaking to prevent UAF",
+                    self.name
+                );
+            }
             env.release_handle();
         } else {
             unsafe {

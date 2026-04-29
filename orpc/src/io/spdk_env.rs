@@ -2,8 +2,10 @@
 
 use crate::err_msg;
 use crate::io::spdk_ffi;
+use crate::io::spdk_poller::{IoRequest, SpdkPoller};
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
+use nix::sys::eventfd::EventFd;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -252,6 +254,8 @@ pub struct SpdkConf {
     pub keep_alive_timeout_str: String, // e.g. "10s"
     #[serde(skip)]
     pub keep_alive_timeout_ms: u64, // parsed by init()
+    #[serde(alias = "poll_interval", default)]
+    pub poll_interval_ms: u64, // default = 1000
     #[serde(alias = "dma_pool_size", default)]
     pub dma_pool_size_str: String, // e.g. "64MB"
     #[serde(skip)]
@@ -342,6 +346,28 @@ impl SpdkConf {
                 let msg = format!("SpdkConf: targets[{}]: {}", i, e);
                 err_msg!(msg)
             })?;
+            if target.keep_alive_timeout_ms > 0
+                && target.keep_alive_timeout_ms < self.poll_interval_ms
+            {
+                return err_box!(
+                    "SpdkConf: targets[{}]: keep_alive_timeout_ms ({}) must be >= poll_interval_ms ({})",
+                    i,
+                    target.keep_alive_timeout_ms,
+                    self.poll_interval_ms
+                );
+            }
+        }
+
+        // Validate poller interval is reasonable
+        if self.poll_interval_ms == 0 {
+            return err_box!("SpdkConf: poll_interval_ms must be > 0");
+        }
+        if self.poll_interval_ms > i32::MAX as u64 {
+            return err_box!(
+                "SpdkConf: poll_interval_ms ({}) exceeds i32::MAX ({})",
+                self.poll_interval_ms,
+                i32::MAX
+            );
         }
 
         Ok(())
@@ -366,6 +392,7 @@ impl Default for SpdkConf {
             io_retry_count: 4,
             keep_alive_timeout_str: "10s".to_string(),
             keep_alive_timeout_ms: 10_000,
+            poll_interval_ms: 1000,
             dma_pool_size_str: "64MB".to_string(),
             dma_pool_bytes: 64 * 1024 * 1024,
             block_align: 0,
@@ -419,7 +446,7 @@ pub struct SpdkEnv {
     bdevs: Vec<BdevInfo>, // populated during init(), immutable after
     open_handles: AtomicUsize,
     qpair_pool: QpairPool,
-    poller: Mutex<Option<crate::io::spdk_poller::SpdkPoller>>,
+    poller: Mutex<Option<SpdkPoller>>,
 }
 
 // SAFETY: Fields are either immutable after init (conf, bdevs) or atomic (state).
@@ -572,7 +599,7 @@ impl SpdkEnv {
 
         // Start the dedicated I/O poller thread
         {
-            let poller = crate::io::spdk_poller::SpdkPoller::start();
+            let poller = SpdkPoller::start(self.conf.poll_interval_ms);
             *self.poller.lock().unwrap() = Some(poller);
             info!("SPDK poller thread started");
         }
@@ -712,7 +739,7 @@ impl SpdkEnv {
     }
 
     /// Get sender channel for poller thread (for SpdkIoChannel).
-    pub fn poller_sender(&self) -> crossbeam::channel::Sender<crate::io::spdk_poller::IoRequest> {
+    pub fn poller_sender(&self) -> crossbeam::channel::Sender<IoRequest> {
         self.poller
             .lock()
             .unwrap()
@@ -720,6 +747,17 @@ impl SpdkEnv {
             .expect("SpdkPoller not started — was init() called?")
             .sender()
     }
+
+    /// Get eventfd for waking poller on new I/O
+    pub fn poller_eventfd(&self) -> std::sync::Arc<EventFd> {
+        self.poller
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("SpdkPoller not started — was init() called?")
+            .eventfd_arc()
+    }
+
     // Handle tracking, which is used by SpdkBdev open/drop
     /// Register SpdkBdev handle. Returns Err if not Initialized.
     pub fn acquire_handle(&self) -> CommonResult<()> {
@@ -754,6 +792,17 @@ impl SpdkEnv {
         qpair: *mut spdk_ffi::spdk_nvme_qpair,
     ) {
         self.qpair_pool.release(ctrlr, qpair);
+    }
+
+    /// Unregister qpair from poller, blocking until removed to prevent UAF.
+    /// Returns false if poller didn't ack within timeout (likely stuck/dead).
+    pub fn unregister_qpair_from_poller(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
+        let poller = self.poller.lock().unwrap();
+        if let Some(poller) = poller.as_ref() {
+            poller.unregister_qpair(qpair)
+        } else {
+            false
+        }
     }
 
     // SPDK FFI — feature-gated
