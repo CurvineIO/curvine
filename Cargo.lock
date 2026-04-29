@@ -2788,6 +2788,7 @@ dependencies = [
  "mini-moka",
  "moka",
  "murmur3",
+ "nix",
  "num_enum",
  "once_cell",
  "pin-project-lite",

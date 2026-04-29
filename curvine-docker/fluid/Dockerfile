@@ -9,7 +9,7 @@ LABEL org.opencontainers.image.base.name="ghcr.io/curvineio/curvine"
 LABEL org.opencontainers.image.base.tag="${BASE_IMAGE_TAG}"
 
 RUN if [ -f /etc/redhat-release ]; then \
-        dnf install -y python3 python3-pip python3-yaml python3-toml && \
+        dnf install -y python3 python3-yaml python3-toml zlib libstdc++ && \
         dnf clean all && \
         rm -rf /var/cache/dnf/*; \
     else \
@@ -17,7 +17,9 @@ RUN if [ -f /etc/redhat-release ]; then \
         apt-get install -y --no-install-recommends \
             python3 \
             python3-yaml \
-            python3-toml && \
+            python3-toml \
+            zlib1g \
+            libstdc++6 && \
         apt-get clean && \
         rm -rf /var/lib/apt/lists/* && \
         rm -rf /var/cache/apt/*; \
