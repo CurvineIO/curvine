@@ -253,7 +253,7 @@ impl UnifiedFileSystem {
                 .await?
             {
                 CacheValidity::Valid => {
-                    blocks.status.mtime = blocks.status.storage_policy.ufs_mtime;
+                    blocks.status.apply_ufs_fields();
                     let cv_reader = FsReader::new(cv_path.clone(), self.cv.fs_context(), blocks)?;
                     Ok(Some(FallbackFsReader::new(
                         cv_reader,
@@ -626,7 +626,7 @@ impl FileSystem<UnifiedWriter, UnifiedReader> for UnifiedFileSystem {
             Some((ufs_path, mnt)) => match self.cv.get_status(path).await {
                 Ok(mut v) => match self.check_cache_validity(&v, &ufs_path, &mnt).await? {
                     CacheValidity::Valid => {
-                        v.mtime = v.storage_policy.ufs_mtime;
+                        v.apply_ufs_fields();
                         Ok(v)
                     }
                     CacheValidity::Invalid(Some(ufs_status)) => Ok(ufs_status),
