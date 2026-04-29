@@ -1,4 +1,5 @@
 #![cfg(feature = "spdk")]
+mod common;
 use curvine_common::conf::ClusterConf;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
@@ -34,13 +35,16 @@ fn start_spdk_worker() -> ClusterConf {
     let subnqn = std::env::var("SPDK_TARGET_NQN").unwrap();
     let trtype = std::env::var("SPDK_TRANSPORT_TYPE").unwrap_or_else(|_| "tcp".into());
 
-    conf.worker.spdk = SpdkConf {
+    let hugepage_mb: u32 = std::env::var("SPDK_HUGEPAGE_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+
+    conf.worker.spdk_disk = SpdkConf {
         enabled: true,
         app_name: "curvine-spdk-test".to_string(),
-        hugepage_mb: std::env::var("SPDK_HUGEPAGE_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64),
+        hugepage_str: format!("{}MB", hugepage_mb),
+        hugepage_mb,
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or_else(|_| "0x2".to_string()),
         targets: vec![NvmeTarget {
             traddr,

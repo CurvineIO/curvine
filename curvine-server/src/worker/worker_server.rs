@@ -108,17 +108,19 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn with_conf(conf: ClusterConf) -> CommonResult<Self> {
+    #[cfg_attr(not(feature = "spdk"), allow(unused_mut))]
+    pub fn with_conf(mut conf: ClusterConf) -> CommonResult<Self> {
         Logger::init(conf.worker.log.clone());
 
         // Init SPDK before WorkerService - enables BlockMeta to open SPDK bdevs
         #[cfg(feature = "spdk")]
-        if conf.worker.spdk.enabled {
+        if conf.worker.spdk_disk.enabled {
+            conf.worker.spdk_disk.init()?;
             use curvine_common::conf::WorkerDataDir;
             use curvine_common::state::StorageType;
             use log::warn;
             info!("SPDK enabled — initializing global SPDK environment");
-            match SpdkEnv::init_global(conf.worker.spdk.clone()) {
+            match SpdkEnv::init_global(conf.worker.spdk_disk.clone()) {
                 Ok(env) => {
                     info!(
                         "SPDK environment ready: {} bdev(s), total capacity {}",
@@ -165,7 +167,7 @@ impl Worker {
         }
         #[cfg(not(feature = "spdk"))]
         {
-            if conf.worker.spdk.enabled {
+            if conf.worker.spdk_disk.enabled {
                 return orpc::err_box!(
                     "SPDK is not enabled. Compile with --features spdk to use SPDK"
                 );
@@ -207,7 +209,7 @@ impl Worker {
             .replication_manager
             .with_master_client(master_client.clone());
 
-        let spdk_enabled = conf.worker.spdk.enabled;
+        let spdk_enabled = conf.worker.spdk_disk.enabled;
         rpc_server.add_shutdown_hook(move || {
             if let Err(e) = master_client.heartbeat(HeartbeatStatus::End, vec![]) {
                 info!("error unregister {}", e)
