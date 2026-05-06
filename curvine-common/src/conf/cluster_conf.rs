@@ -14,7 +14,9 @@
 
 use crate::alloc::allocator_type_name;
 use crate::conf::CliConf;
-use crate::conf::{ClientConf, FuseConf, JobConf, JournalConf, MasterConf, WorkerConf};
+use crate::conf::{
+    ClientConf, FuseConf, JobConf, JournalConf, MasterConf, VectorSubsystemConf, WorkerConf,
+};
 use crate::rocksdb::DBConf;
 use crate::version;
 use log::info;
@@ -61,6 +63,8 @@ pub struct ClusterConf {
     pub job: JobConf,
 
     pub cli: CliConf,
+
+    pub vector: VectorSubsystemConf,
 }
 
 impl ClusterConf {
@@ -288,6 +292,7 @@ impl Default for ClusterConf {
             s3_gateway: Default::default(),
             job: Default::default(),
             cli: Default::default(),
+            vector: Default::default(),
         }
     }
 }

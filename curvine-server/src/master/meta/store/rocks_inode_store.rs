@@ -14,6 +14,7 @@
 
 use crate::master::meta::inode::InodeView;
 use crate::master::meta::LockMeta;
+use crate::master::vector::VectorMetaStore;
 use curvine_common::rocksdb::{DBConf, DBEngine, RocksIterator, RocksUtils};
 use curvine_common::state::{BlockLocation, FileLock, MountInfo};
 use curvine_common::utils::SerdeUtils as Serde;
@@ -36,13 +37,16 @@ impl RocksInodeStore {
     pub const PREFIX_LOCK: u8 = 0x02;
 
     pub fn new(conf: DBConf, format: bool) -> CommonResult<Self> {
-        let conf = conf
+        let mut conf = conf
             .set_disable_wal(true)
             .add_cf(Self::CF_INODES)
             .add_cf(Self::CF_EDGES)
             .add_cf(Self::CF_BLOCK)
             .add_cf(Self::CF_LOCATION)
             .add_cf(Self::CF_COMMON);
+        for cf in VectorMetaStore::all_column_family_names() {
+            conf = conf.add_cf(cf);
+        }
         let db = DBEngine::new(conf, format)?;
         Ok(Self { db })
     }

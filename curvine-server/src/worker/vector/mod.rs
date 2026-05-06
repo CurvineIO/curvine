@@ -12,18 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod worker_server;
-pub use self::worker_server::*;
+pub mod lancedb_adapter;
+pub mod private_root;
 
-pub mod storage;
-
-pub mod block;
-
-mod worker_metrics;
-pub use self::worker_metrics::WorkerMetrics;
-
-pub mod handler;
-mod replication;
-pub mod task;
-
-pub mod vector;
+pub use lancedb_adapter::LanceDbVectorAdapter;
+pub use private_root::WorkerVectorPrivateRoot;

@@ -12,18 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod worker_server;
-pub use self::worker_server::*;
+use curvine_common::state::{SegmentGeneration, VectorSegmentId};
 
-pub mod storage;
+pub trait VectorTableEventHandler: Send + Sync {
+    fn on_after_publish_generation_scheduled(
+        &self,
+        segment_id: &VectorSegmentId,
+        generation: SegmentGeneration,
+    ) {
+        let _ = (segment_id, generation);
+    }
 
-pub mod block;
+    fn on_query_shard_plan_materialized(&self, shard_digest: u64) {
+        let _ = shard_digest;
+    }
+}
 
-mod worker_metrics;
-pub use self::worker_metrics::WorkerMetrics;
+#[derive(Debug, Default)]
+pub struct NoopVectorTableEventHandler;
 
-pub mod handler;
-mod replication;
-pub mod task;
-
-pub mod vector;
+impl VectorTableEventHandler for NoopVectorTableEventHandler {}

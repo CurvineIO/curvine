@@ -18,7 +18,7 @@ use once_cell::sync::OnceCell;
 
 use curvine_common::conf::ClusterConf;
 use curvine_web::server::{WebHandlerService, WebServer};
-use log::error;
+use log::{error, info};
 use orpc::common::{LocalTime, Logger};
 use orpc::handler::HandlerService;
 use orpc::io::net::ConnState;
@@ -30,6 +30,7 @@ use crate::master::fs::{FsRetryCache, MasterActor, MasterFilesystem};
 use crate::master::journal::JournalSystem;
 use crate::master::replication::master_replication_manager::MasterReplicationManager;
 use crate::master::router_handler::MasterRouterHandler;
+use crate::master::vector::VectorMetaStore;
 use crate::master::{JobHandler, MountManager};
 use crate::master::{JobManager, MasterHandler};
 use crate::master::{MasterMetrics, MasterMonitor, SyncWorkerManager};
@@ -134,6 +135,16 @@ impl Master {
         Logger::init(log);
         MASTER_METRICS.get_or_init(|| MasterMetrics::new().unwrap());
         conf.print();
+
+        info!(
+            "vector subsystem (master): default_shard_count={} segment_target_size_mb={} row_high_watermark={} size_mb_high_watermark={}; RocksDB CFs include [{}..{}]",
+            conf.vector.default_shard_count,
+            conf.vector.segment_target_size_mb,
+            conf.vector.active_segment_row_high_watermark,
+            conf.vector.active_segment_size_mb_high_watermark,
+            VectorMetaStore::CF_VECTOR_BUCKET,
+            VectorMetaStore::CF_VECTOR_COMMON,
+        );
 
         // step1: Create a journal system, the journal system determines how to create a fs dir.
         let journal_system = JournalSystem::from_conf(&conf)?;

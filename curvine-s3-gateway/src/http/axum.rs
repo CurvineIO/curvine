@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use axum::response::IntoResponse;
 use futures::StreamExt;
 
+use crate::auth::sig_v4::SIGV4_SERVICE_S3;
 use crate::auth::{sig_v4, AccesskeyStore};
 use crate::s3::s3_api::VRequest;
 use crate::s3::VRequestPlus;
@@ -81,8 +82,15 @@ impl sig_v4::VHeader for Request {
     }
 
     fn set_header(&mut self, key: &str, val: &str) {
-        let key: axum::http::HeaderName = key.to_string().parse().unwrap();
-        self.request.headers_mut().insert(key, val.parse().unwrap());
+        let Ok(name) = key.parse::<axum::http::HeaderName>() else {
+            log::warn!("reject invalid request header name {key:?}");
+            return;
+        };
+        let Ok(value) = val.parse::<axum::http::HeaderValue>() else {
+            log::warn!("reject invalid request header value for {key:?}");
+            return;
+        };
+        self.request.headers_mut().insert(name, value);
     }
 
     fn delete_header(&mut self, key: &str) {
@@ -91,9 +99,10 @@ impl sig_v4::VHeader for Request {
 
     fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
         for (k, v) in self.request.headers().iter() {
-            if !cb(k.as_str(), unsafe {
-                std::str::from_utf8_unchecked(v.as_bytes())
-            }) {
+            let Ok(val) = v.to_str() else {
+                continue;
+            };
+            if !cb(k.as_str(), val) {
                 return;
             }
         }
@@ -195,8 +204,15 @@ impl sig_v4::VHeader for HeaderWarp {
     }
 
     fn set_header(&mut self, key: &str, val: &str) {
-        let key: axum::http::HeaderName = key.to_string().parse().unwrap();
-        self.0.insert(key, val.parse().unwrap());
+        let Ok(name) = key.parse::<axum::http::HeaderName>() else {
+            log::warn!("reject invalid header warp name {key:?}");
+            return;
+        };
+        let Ok(value) = val.parse::<axum::http::HeaderValue>() else {
+            log::warn!("reject invalid header warp value for {key:?}");
+            return;
+        };
+        self.0.insert(name, value);
     }
 
     fn delete_header(&mut self, key: &str) {
@@ -205,9 +221,10 @@ impl sig_v4::VHeader for HeaderWarp {
 
     fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
         for (k, v) in self.0.iter() {
-            if !cb(k.as_str(), unsafe {
-                std::str::from_utf8_unchecked(v.as_bytes())
-            }) {
+            let Ok(val) = v.to_str() else {
+                continue;
+            };
+            if !cb(k.as_str(), val) {
                 return;
             }
         }
@@ -255,10 +272,15 @@ impl sig_v4::VHeader for Response {
 
     fn set_header(&mut self, key: &str, val: &str) {
         log::debug!("set header {key} {val}");
-        self.headers.insert(
-            key.to_string().parse::<axum::http::HeaderName>().unwrap(),
-            val.parse().unwrap(),
-        );
+        let Ok(name) = key.parse::<axum::http::HeaderName>() else {
+            log::warn!("reject invalid response header name {key:?}");
+            return;
+        };
+        let Ok(value) = val.parse::<axum::http::HeaderValue>() else {
+            log::warn!("reject invalid response header value for {key:?}");
+            return;
+        };
+        self.headers.insert(name, value);
     }
 
     fn delete_header(&mut self, key: &str) {
@@ -266,10 +288,9 @@ impl sig_v4::VHeader for Response {
     }
 
     fn rng_header(&self, mut cb: impl FnMut(&str, &str) -> bool) {
-        self.headers.iter().all(|(k, v)| {
-            cb(k.as_str(), unsafe {
-                std::str::from_utf8_unchecked(v.as_bytes())
-            })
+        let _ = self.headers.iter().all(|(k, v)| match v.to_str() {
+            Ok(val) => cb(k.as_str(), val),
+            Err(_) => true,
         });
     }
 }
@@ -521,6 +542,7 @@ pub async fn handle_authorization_middleware(
                     "v2-signature".to_string(),
                     v2_args.date.clone(),
                     "us-east-1".to_string(),
+                    SIGV4_SERVICE_S3.to_string(),
                 );
                 let v4head = crate::auth::sig_v4::V4Head::new(
                     v2_args.signature.clone(),
@@ -548,6 +570,15 @@ pub async fn handle_authorization_middleware(
     }
 
     let base_arg = auth_result.unwrap();
+
+    if base_arg.service != SIGV4_SERVICE_S3 {
+        tracing::warn!(
+            "S3 gateway rejecting SigV4 credential scope service '{}' (expected '{}')",
+            base_arg.service,
+            SIGV4_SERVICE_S3
+        );
+        return (axum::http::StatusCode::FORBIDDEN, b"").into_response();
+    }
 
     let mut query = Vec::new();
     if let Some(query_str) = req.request.uri().query() {

@@ -47,5 +47,12 @@ url = { workspace = true }
 parking_lot = { workspace = true }
 lru = { workspace = true }
 
+lancedb = "0.27.2"
+arrow-array = "57"
+arrow-schema = "57"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 curvine-s3-gateway = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

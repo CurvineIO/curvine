@@ -1,0 +1,1 @@
+mod lancedb_adapter;

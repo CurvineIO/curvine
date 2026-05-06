@@ -61,3 +61,11 @@ get_chunk_size_mb = 1.0
 
 [cli]
 log = { level = "warn", log_dir = "stdout", file_name = "cli.log" }
+
+# Vector subsystem (S3 Vectors–style control plane + worker local Lance segments).
+[vector]
+worker_private_vector_root = "/var/lib/curvine/worker/vector"
+default_shard_count = 8
+segment_target_size_mb = 512
+active_segment_row_high_watermark = 1000000
+active_segment_size_mb_high_watermark = 4096

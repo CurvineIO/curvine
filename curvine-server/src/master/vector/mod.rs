@@ -12,18 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod worker_server;
-pub use self::worker_server::*;
+pub mod fencing;
+pub mod job_service;
+pub mod journal;
+pub mod meta_store;
+pub mod table_event_handler;
 
-pub mod storage;
-
-pub mod block;
-
-mod worker_metrics;
-pub use self::worker_metrics::WorkerMetrics;
-
-pub mod handler;
-mod replication;
-pub mod task;
-
-pub mod vector;
+pub use fencing::VectorFenceSnapshot;
+pub use job_service::{
+    NoopVectorJobService, VectorJobService, VectorMaintenanceJobKey, VectorMaintenanceJobKind,
+};
+pub use journal::VectorJournalEventKind;
+pub use meta_store::VectorMetaStore;
+pub use table_event_handler::{NoopVectorTableEventHandler, VectorTableEventHandler};

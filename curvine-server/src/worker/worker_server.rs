@@ -17,6 +17,7 @@ use crate::worker::handler::{WorkerHandler, WorkerRouterHandler};
 use crate::worker::replication::worker_replication_handler::WorkerReplicationHandler;
 use crate::worker::replication::worker_replication_manager::WorkerReplicationManager;
 use crate::worker::task::TaskManager;
+use crate::worker::vector::WorkerVectorPrivateRoot;
 use crate::worker::WorkerMetrics;
 use curvine_common::conf::ClusterConf;
 use curvine_common::state::{HeartbeatStatus, WorkerAddress};
@@ -116,6 +117,16 @@ impl Worker {
         CLUSTER_CONF.get_or_init(|| conf.clone());
         WORKER_METRICS.get_or_init(|| WorkerMetrics::new(service.store.clone()).unwrap());
         conf.print();
+
+        let vec_priv = WorkerVectorPrivateRoot::from_conf(&conf.vector);
+        info!(
+            "vector subsystem worker_private_root={} default_shard_count={} segment_target_size_mb={} row_high_watermark={} size_mb_high_watermark={}",
+            vec_priv.root().display(),
+            conf.vector.default_shard_count,
+            conf.vector.segment_target_size_mb,
+            conf.vector.active_segment_row_high_watermark,
+            conf.vector.active_segment_size_mb_high_watermark,
+        );
 
         let block_store = service.store.clone();
         let rpc_server = RpcServer::with_rt(rt.clone(), conf.worker_server_conf(), service.clone());

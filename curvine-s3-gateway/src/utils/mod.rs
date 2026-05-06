@@ -256,7 +256,9 @@ async fn parse_buff<W: tokio::io::AsyncWrite + Send + Unpin>(
                     })?);
                     if let Some(hdr) = head {
                         if hdr.content_size == 0 {
-                            let next = circle_hasher.next(EMPTY_PAYLOAD_HASH).unwrap();
+                            let next = circle_hasher
+                                .next(EMPTY_PAYLOAD_HASH)
+                                .map_err(|_| ChunkParseError::IllegalContent)?;
                             if hdr.signature.as_str() == next.as_str() {
                                 log::info!("all signature verify pass");
                                 state = ParseProcessState::End;
@@ -291,7 +293,9 @@ async fn parse_buff<W: tokio::io::AsyncWrite + Send + Unpin>(
                         let mut hsh = sha2::Sha256::new();
                         let _ = hsh.write_all(&content[0..hdr.content_size]);
                         let hsh = hsh.finalize();
-                        let curr_hash = circle_hasher.next(hex::encode(hsh).as_str()).unwrap();
+                        let curr_hash = circle_hasher
+                            .next(hex::encode(hsh).as_str())
+                            .map_err(|_| ChunkParseError::IllegalContent)?;
                         if curr_hash != hdr.signature {
                             log::warn!("chunk hash not match, return error");
                             return Err(ChunkParseError::HashNoMatch);

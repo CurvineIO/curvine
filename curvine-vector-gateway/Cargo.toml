@@ -1,0 +1,32 @@
+[package]
+name = "curvine-vector-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Curvine AWS S3 Vectors-style HTTP gateway (SigV4 s3vectors)"
+
+[[bin]]
+name = "curvine-vector-gateway"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8.4", features = ["macros"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = { workspace = true }
+curvine-common = { workspace = true }
+orpc = { workspace = true }
+
+[dev-dependencies]
+tower = "0.5"
+tempfile = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

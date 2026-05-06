@@ -86,3 +86,9 @@ pub use self::file_lock::*;
 
 mod result;
 pub use self::result::*;
+
+mod vector;
+pub use self::vector::*;
+
+mod vector_api;
+pub use self::vector_api::*;

@@ -53,6 +53,8 @@ pub mod mount;
 pub mod quota;
 pub use self::quota::*;
 
+pub mod vector;
+
 pub type MetaRaftJournal = RaftJournal<RocksLogStorage, JournalLoader>;
 pub type SyncFsDir = ArcRwLock<FsDir>;
 pub type SyncWorkerManager = ArcRwLock<WorkerManager>;

@@ -43,4 +43,5 @@ urlencoding = "2.1"
 
 curvine-common = { path = "../curvine-common" }
 curvine-client = { path = "../curvine-client" }
+curvine-vector-gateway = { path = "../curvine-vector-gateway" }
 orpc = { path = "../orpc" }
