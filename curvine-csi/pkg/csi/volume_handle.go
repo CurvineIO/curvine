@@ -94,10 +94,10 @@ func GenerateMountKeyWithFuseParams(masterAddrs, fsPath string, fuseParams map[s
 
 	combined := fmt.Sprintf("%s|%s|%s", masterAddrs, fsPath, paramsBuilder.String())
 
-	hash := sha1.New()
-	hash.Write(mountKeyNamespace)
-	hash.Write([]byte(combined))
-	uuidBytes := hash.Sum(nil)
+	h := sha256.New()
+	h.Write(mountKeyNamespace)
+	h.Write([]byte(combined))
+	uuidBytes := h.Sum(nil)
 
 	mountKey := hex.EncodeToString(uuidBytes)[:32]
 	klog.V(5).Infof("Generated mount-key (with fuse params): %s from master-addrs: %s, fs-path: %s, params: %s",
