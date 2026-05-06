@@ -186,7 +186,10 @@ pub struct FuseArgs {
     #[arg(long, help = "Auto-cache attr timeout in seconds (optional)")]
     pub ac_attr_timeout: Option<f64>,
 
-    #[arg(long, help = "Maximum number of entries returned per directory listing (optional)")]
+    #[arg(
+        long,
+        help = "Maximum number of entries returned per directory listing (optional)"
+    )]
     pub list_limit: Option<usize>,
 }
 
