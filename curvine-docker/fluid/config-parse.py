@@ -57,9 +57,8 @@ exec {fuse_cmd}
 """
     
     FUSE_OPTIONS = [
-        'mnt-number', 'mnt-per-task', 'clone-fd', 'fuse-channel-size', 'stream-channel-size',
-        'io-threads', 'worker-threads',
-        'direct-io', 'write-back-cache', 'cache-readdir',
+        'mnt-per-task', 'clone-fd', 'fuse-channel-size', 'stream-channel-size',
+        'direct-io', 'write-back-cache', 'cache-readdir', 'non-seekable',
         'entry-timeout', 'attr-timeout', 'negative-timeout', 'ac-attr-timeout',
         'max-background', 'congestion-threshold',
         'node-cache-size', 'node-cache-timeout',
