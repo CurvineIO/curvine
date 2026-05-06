@@ -647,18 +647,18 @@ func buildMountOptions(request *csi.NodePublishVolumeRequest, requestID string) 
 // are recognised and forwarded to the curvine-fuse process.
 var supportedFuseParams = map[string]string{
 	// Threading & mount-point settings
-	"mnt-number":           "usize",
-	"io-threads":           "usize",
-	"worker-threads":       "usize",
-	"mnt-per-task":         "usize",
-	"clone-fd":             "bool",
-	"fuse-channel-size":    "usize",
-	"stream-channel-size":  "usize",
+	"mnt-number":          "usize",
+	"io-threads":          "usize",
+	"worker-threads":      "usize",
+	"mnt-per-task":        "usize",
+	"clone-fd":            "bool",
+	"fuse-channel-size":   "usize",
+	"stream-channel-size": "usize",
 	// I/O behaviour
-	"direct-io":       "bool",
+	"direct-io":        "bool",
 	"write-back-cache": "bool",
-	"non-seekable":    "bool",
-	"cache-readdir":   "bool",
+	"non-seekable":     "bool",
+	"cache-readdir":    "bool",
 	// Timeout settings
 	"entry-timeout":    "f64",
 	"attr-timeout":     "f64",

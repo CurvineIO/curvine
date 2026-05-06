@@ -56,13 +56,13 @@ var mountKeyNamespace = []byte("curvine-mount-key-namespace-v1")
 // Returns 32 hex characters (128 bits, standard UUID length without dashes) for maximum collision resistance
 func GenerateMountKey(masterAddrs, fsPath string) string {
 	combined := fmt.Sprintf("%s|%s", masterAddrs, fsPath)
-	
+
 	// UUID v5 uses SHA1 hash of namespace + name
 	hash := sha1.New()
 	hash.Write(mountKeyNamespace)
 	hash.Write([]byte(combined))
 	uuidBytes := hash.Sum(nil)
-	
+
 	// Return first 32 hex chars (128 bits, standard UUID length)
 	// This provides 2^128 collision space, much larger than previous 2^64
 	mountKey := hex.EncodeToString(uuidBytes)[:32]
