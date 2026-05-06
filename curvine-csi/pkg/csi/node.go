@@ -130,15 +130,16 @@ func (n *nodeService) NodeStageVolume(ctx context.Context, request *csi.NodeStag
 	// Generate cluster-id from master-addrs
 	clusterID := GenerateClusterID(masterAddrs)
 
-	// Generate mnt-path based on mount-key (master-addrs + fs-path)
-	// This ensures different StorageClasses with same master-addrs but different fs-path get different mount points
-	mountKey := GenerateMountKey(masterAddrs, fsPathToMount)
+	// Collect FUSE parameters from VolumeContext or PublishContext
+	fuseParams := collectFuseParams(volumeContext, publishContext)
+
+	// Generate mnt-path based on mount-key (master-addrs + fs-path + fuse-params)
+	// Including fuse params ensures that StorageClasses with the same cluster endpoint
+	// and fs-path but different FUSE parameters each get their own mount point and FUSE process.
+	mountKey := GenerateMountKeyWithFuseParams(masterAddrs, fsPathToMount, fuseParams)
 	mntPath := fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/curvine/%s/fuse-mount", mountKey)
 	klog.Infof("RequestID: %s, Generated mnt-path: %s (mount-key: %s, cluster-id: %s, master-addrs: %s, fs-path: %s)",
 		requestID, mntPath, mountKey, clusterID, masterAddrs, fsPathToMount)
-
-	// Collect FUSE parameters from VolumeContext or PublishContext
-	fuseParams := collectFuseParams(volumeContext, publishContext)
 
 	// Check if shared mount point already exists
 	mountInfo, exists := n.mountState.GetMount(mntPath, clusterID)
