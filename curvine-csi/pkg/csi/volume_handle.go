@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 
 	"k8s.io/klog"
@@ -66,6 +67,41 @@ func GenerateMountKey(masterAddrs, fsPath string) string {
 	// This provides 2^128 collision space, much larger than previous 2^64
 	mountKey := hex.EncodeToString(uuidBytes)[:32]
 	klog.V(5).Infof("Generated mount-key: %s from master-addrs: %s, fs-path: %s", mountKey, masterAddrs, fsPath)
+	return mountKey
+}
+
+// GenerateMountKeyWithFuseParams generates a unique mount key that incorporates FUSE parameters
+// in addition to master-addrs and fs-path. This ensures that two StorageClasses or PVs that
+// share the same cluster endpoint and fs-path but differ in FUSE parameters (e.g. entry-timeout,
+// attr-timeout) receive separate standalone FUSE pods rather than silently sharing one.
+//
+// The fuseParams map is serialised in sorted-key order for determinism.
+func GenerateMountKeyWithFuseParams(masterAddrs, fsPath string, fuseParams map[string]string) string {
+	// Build a canonical, sorted representation of the fuse params so that the key
+	// is stable regardless of insertion order.
+	keys := make([]string, 0, len(fuseParams))
+	for k := range fuseParams {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var paramsBuilder strings.Builder
+	for _, k := range keys {
+		paramsBuilder.WriteString(k)
+		paramsBuilder.WriteByte('=')
+		paramsBuilder.WriteString(fuseParams[k])
+		paramsBuilder.WriteByte(';')
+	}
+
+	combined := fmt.Sprintf("%s|%s|%s", masterAddrs, fsPath, paramsBuilder.String())
+
+	hash := sha1.New()
+	hash.Write(mountKeyNamespace)
+	hash.Write([]byte(combined))
+	uuidBytes := hash.Sum(nil)
+
+	mountKey := hex.EncodeToString(uuidBytes)[:32]
+	klog.V(5).Infof("Generated mount-key (with fuse params): %s from master-addrs: %s, fs-path: %s, params: %s",
+		mountKey, masterAddrs, fsPath, paramsBuilder.String())
 	return mountKey
 }
 

@@ -136,11 +136,13 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 	// Generate cluster-id from master-addrs (for logging)
 	clusterID := GenerateClusterID(masterAddrs)
 
-	// Generate mount-key from master-addrs + fs-path (for standalone pod sharing)
-	mountKey := GenerateMountKey(masterAddrs, fsPathToMount)
-
 	// Collect FUSE parameters from VolumeContext or PublishContext
 	fuseParams := collectFuseParams(volumeContext, publishContext)
+
+	// Generate mount-key from master-addrs + fs-path + fuse-params
+	// Including fuse params ensures that StorageClasses with the same cluster endpoint
+	// and fs-path but different FUSE parameters each receive their own standalone pod.
+	mountKey := GenerateMountKeyWithFuseParams(masterAddrs, fsPathToMount, fuseParams)
 
 	// Ensure Standalone exists and is ready
 	opts := &StandaloneOptions{
@@ -294,11 +296,13 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	// Generate cluster-id from master-addrs (for logging)
 	clusterID := GenerateClusterID(masterAddrs)
 
-	// Generate mount-key from master-addrs + fs-path (for standalone pod sharing)
-	mountKey := GenerateMountKey(masterAddrs, fsPath)
-
 	// Collect FUSE parameters from VolumeContext or PublishContext
 	fuseParams := collectFuseParams(volumeContext, publishContext)
+
+	// Generate mount-key from master-addrs + fs-path + fuse-params
+	// Including fuse params ensures that StorageClasses with the same cluster endpoint
+	// and fs-path but different FUSE parameters each receive their own standalone pod.
+	mountKey := GenerateMountKeyWithFuseParams(masterAddrs, fsPath, fuseParams)
 
 	// Ensure Standalone exists and is ready
 	opts := &StandaloneOptions{
