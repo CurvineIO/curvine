@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -699,8 +700,16 @@ func collectFuseParams(volumeContext, publishContext map[string]string) map[stri
 
 // appendFuseParameters adds all supported fuse parameters from publishContext
 func appendFuseParameters(args []string, publishContext map[string]string, requestID string) []string {
-	// Process parameters from publishContext
-	for key, paramType := range supportedFuseParams {
+	// Collect keys and sort them so the argument order is deterministic across calls,
+	// matching the behaviour of buildFuseArgs in standalone_manager.go.
+	keys := make([]string, 0, len(supportedFuseParams))
+	for key := range supportedFuseParams {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		paramType := supportedFuseParams[key]
 		value, ok := publishContext[key]
 		if !ok || value == "" {
 			continue

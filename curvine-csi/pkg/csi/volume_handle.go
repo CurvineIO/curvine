@@ -75,8 +75,18 @@ func GenerateMountKey(masterAddrs, fsPath string) string {
 // share the same cluster endpoint and fs-path but differ in FUSE parameters (e.g. entry-timeout,
 // attr-timeout) receive separate standalone FUSE pods rather than silently sharing one.
 //
+// When fuseParams is empty the function delegates to GenerateMountKey so that the key is
+// identical to the one produced before this feature was introduced, preserving upgrade
+// compatibility for existing mounts.
+//
 // The fuseParams map is serialised in sorted-key order for determinism.
 func GenerateMountKeyWithFuseParams(masterAddrs, fsPath string, fuseParams map[string]string) string {
+	// When no fuse params are present fall back to the original SHA-1-based key so that
+	// on-disk paths and standalone Pod names are unchanged for existing StorageClasses.
+	if len(fuseParams) == 0 {
+		return GenerateMountKey(masterAddrs, fsPath)
+	}
+
 	// Build a canonical, sorted representation of the fuse params so that the key
 	// is stable regardless of insertion order.
 	keys := make([]string, 0, len(fuseParams))
