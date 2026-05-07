@@ -17,10 +17,10 @@
 use crate::conf::ClusterConf;
 use crate::state::StorageType;
 use orpc::common::{ByteUnit, DurationUnit, FileUtils, LogConf, Utils};
+use orpc::io::SpdkConf;
 use orpc::{err_box, CommonResult};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-
 #[derive(Debug, Clone, Serialize, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct WorkerDataDir {
@@ -43,9 +43,9 @@ impl WorkerDataDir {
         Self::new(StorageType::Disk, 0, path)
     }
 
-    fn is_alphabetic(str: &str) -> bool {
+    fn is_valid_storage_type(str: &str) -> bool {
         for c in str.chars() {
-            if !c.is_alphabetic() {
+            if !c.is_alphabetic() && c != '_' {
                 return false;
             }
         }
@@ -73,7 +73,7 @@ impl WorkerDataDir {
         };
 
         let (stg_type, capacity) = if arr.len() == 1 {
-            if Self::is_alphabetic(arr[0]) {
+            if Self::is_valid_storage_type(arr[0]) {
                 //[HDD]/dir
                 (arr[0], "0")
             } else {
@@ -159,6 +159,9 @@ pub struct WorkerConf {
 
     // Enable S3 gateway alongside worker
     pub enable_s3_gateway: bool,
+
+    // SPDK over NVMe-oF/RDMA configuration.
+    pub spdk_disk: SpdkConf,
 }
 
 impl WorkerConf {
@@ -203,6 +206,7 @@ impl Default for WorkerConf {
             block_replication_concurrency_limit: 100,
             block_replication_chunk_size: 1024 * 1024,
             enable_s3_gateway: false,
+            spdk_disk: SpdkConf::default(),
         }
     }
 }

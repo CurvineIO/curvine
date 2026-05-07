@@ -36,6 +36,7 @@ fn storage_type_to_str(storage_type: Option<i32>) -> &'static str {
         Some(2) => "hdd",  // StorageTypeProto::Hdd
         Some(3) => "ufs",  // StorageTypeProto::Ufs
         Some(4) => "disk", // StorageTypeProto::Disk
+        Some(5) => "spdk", // StorageTypeProto::Spdk
         _ => "-",
     }
 }

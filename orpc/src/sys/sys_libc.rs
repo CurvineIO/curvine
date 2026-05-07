@@ -547,7 +547,7 @@ pub fn get_uid_by_name(username: &str) -> Option<u32> {
     }
 }
 
-/// Get username by UID using getpwuid system call  
+/// Get username by UID using getpwuid system call
 pub fn get_username_by_uid(uid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {

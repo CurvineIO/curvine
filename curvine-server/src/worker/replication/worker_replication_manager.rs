@@ -22,6 +22,7 @@ use curvine_common::proto::{ReportBlockReplicationRequest, ReportBlockReplicatio
 use curvine_common::state::{ExtendedBlock, FileType};
 use log::{error, info};
 use once_cell::sync::OnceCell;
+use orpc::io::BlockIO;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
 use orpc::{err_box, try_option, CommonResult};
 use std::sync::Arc;

@@ -42,7 +42,7 @@ pub use self::cli_conf::CliConf;
 
 mod vector_conf;
 pub use self::vector_conf::VectorSubsystemConf;
-
+mod spdk_conf;
 #[cfg(test)]
 mod tests {
     use crate::conf::{ClusterConf, WorkerDataDir};

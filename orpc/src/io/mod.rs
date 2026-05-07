@@ -22,3 +22,35 @@ pub mod io_error;
 pub use self::io_error::IOError;
 
 pub type IOResult<T> = Result<T, IOError>;
+
+pub mod block_io;
+pub use self::block_io::{BlockDevice, BlockIO};
+
+#[cfg(feature = "spdk")]
+pub mod spdk_env;
+
+#[cfg(feature = "spdk")]
+pub use spdk_env::{BdevInfo, NvmeTarget, SpdkConf};
+
+#[cfg(not(feature = "spdk"))]
+pub mod spdk_stub;
+
+#[cfg(not(feature = "spdk"))]
+pub use spdk_stub::{BdevInfo, NvmeTarget, SpdkConf};
+
+#[cfg(all(test, feature = "spdk"))]
+mod spdk_bdev_test;
+
+#[cfg(feature = "spdk")]
+pub mod spdk_ffi;
+
+#[cfg(feature = "spdk")]
+pub mod spdk_bdev;
+#[cfg(feature = "spdk")]
+pub use spdk_bdev::SpdkBdev;
+
+#[cfg(feature = "spdk")]
+pub mod spdk_poller;
+
+#[cfg(not(feature = "spdk"))]
+pub mod spdk_poller_stub;
