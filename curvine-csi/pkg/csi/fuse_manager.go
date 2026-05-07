@@ -96,7 +96,7 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 		// This prevents cleaning up a mount that's actually in use
 		if proc, exists := fm.processes[key]; exists {
 			if isProcessRunning(proc.PID) {
-				return fmt.Errorf("mount point %s has errors but FUSE process is still running (PID: %d) - manual intervention required", 
+				return fmt.Errorf("mount point %s has errors but FUSE process is still running (PID: %d) - manual intervention required",
 					mntPath, proc.PID)
 			}
 			// Process not running, safe to remove from map and cleanup
@@ -109,7 +109,7 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 			// Check if already unmounted
 			outputStr := string(output)
 			if !strings.Contains(outputStr, "not mounted") && !strings.Contains(outputStr, "not found") {
-				return fmt.Errorf("failed to unmount stale mount point %s: %v, output: %s", 
+				return fmt.Errorf("failed to unmount stale mount point %s: %v, output: %s",
 					mntPath, err, outputStr)
 			}
 			klog.Infof("Mount point %s already unmounted or not a mount point", mntPath)
@@ -133,7 +133,7 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 		if err := cmd.Run(); err == nil {
 			// Already mounted - verify if it's safe to reuse
 			klog.Infof("Mount point %s is already mounted, checking if it's in use", mntPath)
-			
+
 			// Check if we have this process in our map
 			if proc, exists := fm.processes[key]; exists {
 				if isProcessRunning(proc.PID) {
@@ -144,7 +144,7 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 				// Process not running, remove stale entry
 				delete(fm.processes, key)
 			}
-			
+
 			// Mount point exists but not in our process map
 			// This could be from previous CSI restart - assume it's valid and reuse
 			klog.Warningf("Mount point %s is already mounted but not in process map, will reuse (assume from previous CSI restart)", mntPath)

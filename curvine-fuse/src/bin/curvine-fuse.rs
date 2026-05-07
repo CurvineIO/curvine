@@ -153,6 +153,40 @@ pub struct FuseArgs {
     // FUSE options
     #[arg(short, long)]
     pub(crate) options: Vec<String>,
+
+    // Additional FuseConf fields
+    #[arg(long, help = "Fill inode number when reading directory (optional)")]
+    pub read_dir_fill_ino: Option<bool>,
+
+    #[arg(long, help = "Enable write-back cache (optional)")]
+    pub write_back_cache: Option<bool>,
+
+    #[arg(long, help = "Enable non-seekable mode (optional)")]
+    pub non_seekable: Option<bool>,
+
+    #[arg(long, help = "Enable permission checking (optional)")]
+    pub check_permission: Option<bool>,
+
+    #[arg(long, help = "Enable in-kernel metadata cache (optional)")]
+    pub enable_meta_cache: Option<bool>,
+
+    #[arg(long, help = "Metadata cache capacity in number of entries (optional)")]
+    pub meta_cache_capacity: Option<u64>,
+
+    #[arg(long, help = "Metadata cache TTL (e.g., '120s', '2m') (optional)")]
+    pub meta_cache_ttl: Option<String>,
+
+    #[arg(long, help = "Remember opened inodes across FUSE sessions (optional)")]
+    pub remember: Option<bool>,
+
+    #[arg(long, help = "Auto-cache attr timeout in seconds (optional)")]
+    pub ac_attr_timeout: Option<f64>,
+
+    #[arg(
+        long,
+        help = "Maximum number of entries returned per directory listing (optional)"
+    )]
+    pub list_limit: Option<usize>,
 }
 
 impl FuseArgs {
@@ -245,6 +279,46 @@ impl FuseArgs {
             conf.fuse.web_port = web_port;
         }
 
+        if let Some(read_dir_fill_ino) = self.read_dir_fill_ino {
+            conf.fuse.read_dir_fill_ino = read_dir_fill_ino;
+        }
+
+        if let Some(write_back_cache) = self.write_back_cache {
+            conf.fuse.write_back_cache = write_back_cache;
+        }
+
+        if let Some(non_seekable) = self.non_seekable {
+            conf.fuse.non_seekable = non_seekable;
+        }
+
+        if let Some(check_permission) = self.check_permission {
+            conf.fuse.check_permission = check_permission;
+        }
+
+        if let Some(enable_meta_cache) = self.enable_meta_cache {
+            conf.fuse.enable_meta_cache = enable_meta_cache;
+        }
+
+        if let Some(meta_cache_capacity) = self.meta_cache_capacity {
+            conf.fuse.meta_cache_capacity = meta_cache_capacity;
+        }
+
+        if let Some(meta_cache_ttl) = &self.meta_cache_ttl {
+            conf.fuse.meta_cache_ttl = meta_cache_ttl.clone();
+        }
+
+        if let Some(remember) = self.remember {
+            conf.fuse.remember = remember;
+        }
+
+        if let Some(ac_attr_timeout) = self.ac_attr_timeout {
+            conf.fuse.ac_attr_timeout = ac_attr_timeout;
+        }
+
+        if let Some(list_limit) = self.list_limit {
+            conf.fuse.list_limit = list_limit;
+        }
+
         if let Some(master_addrs) = &self.master_addrs {
             let mut vec = vec![];
             for node in master_addrs.split(",") {
@@ -265,6 +339,9 @@ impl FuseArgs {
         } else {
             conf.fuse.fuse_opts = Self::default_mnt_opts();
         }
+
+        // Re-initialise derived fields (e.g. Duration values) after applying CLI overrides.
+        conf.fuse.init()?;
 
         Ok(conf)
     }
