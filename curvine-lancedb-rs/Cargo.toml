@@ -1,0 +1,35 @@
+[package]
+name = "curvine-lancedb-rs"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Facade crate for LanceDB on Curvine"
+
+[workspace]
+
+[lib]
+name = "lancedb"
+path = "src/lib.rs"
+
+[dependencies]
+lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.21.0"
+tokio = { version = "1.42.0", features = ["full"] }
+
+[features]
+default = []
+aws = ["lancedb_upstream/aws"]
+azure = ["lancedb_upstream/azure"]
+bedrock = ["lancedb_upstream/bedrock"]
+dynamodb = ["lancedb_upstream/dynamodb"]
+fp16kernels = ["lancedb_upstream/fp16kernels"]
+gcs = ["lancedb_upstream/gcs"]
+huggingface = ["lancedb_upstream/huggingface"]
+openai = ["lancedb_upstream/openai"]
+oss = ["lancedb_upstream/oss"]
+polars = ["lancedb_upstream/polars"]
+remote = ["lancedb_upstream/remote"]
+s3-test = ["lancedb_upstream/s3-test"]
+sentence-transformers = ["lancedb_upstream/sentence-transformers"]
