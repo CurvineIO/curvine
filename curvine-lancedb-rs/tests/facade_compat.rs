@@ -23,6 +23,18 @@ fn error_module_reexports_upstream_error_types() {
     assert_eq!(err.to_string(), "LanceDBError: not supported: example");
 }
 
+#[test]
+fn curvine_registry_registers_curvine_scheme() {
+    let registry = lancedb::object_store::curvine_registry();
+    assert!(registry.get_provider("curvine").is_some());
+}
+
+#[test]
+fn curvine_session_uses_registry_with_curvine_scheme() {
+    let session = lancedb::object_store::curvine_session();
+    assert!(session.store_registry().get_provider("curvine").is_some());
+}
+
 #[tokio::test]
 async fn local_connect_passes_through_to_upstream() {
     let tmpdir = tempfile::tempdir().unwrap();
