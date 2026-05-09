@@ -26,6 +26,7 @@ import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.util.regex.Pattern;
 
 public class CurvineNative {
     public static final Logger LOGGER = LoggerFactory.getLogger(CurvineNative.class);
@@ -137,41 +138,82 @@ public class CurvineNative {
         }
     }
 
+    /**
+     * Name passed to {@link System#loadLibrary(String)}: JVM maps {@code foo} -> {@code libfoo.so}. Linux
+     * artifacts are {@code libfoo.so}, so strip the {@code lib} prefix from the basename.
+     */
+    private static String loadLibraryLookupName(String libraryFileName) {
+        String base = FilenameUtils.getBaseName(libraryFileName);
+        if (libraryFileName.endsWith(".so") && base.startsWith("lib")) {
+            return base.substring(3);
+        }
+        return base;
+    }
+
+    /**
+     * Try {@link System#load(String)} for each directory in {@code java.library.path} ({@link File#pathSeparator}-separated).
+     */
+    private static boolean loadFromLibraryPathDirectories(String libraryName) {
+        String pathProp = System.getProperty(LIBRARY_PATH);
+        if (StringUtils.isEmpty(pathProp)) {
+            return false;
+        }
+        for (String dir : pathProp.split(Pattern.quote(File.pathSeparator))) {
+            if (StringUtils.isBlank(dir)) {
+                continue;
+            }
+            File candidate = new File(dir.trim(), libraryName);
+            if (!candidate.isFile()) {
+                continue;
+            }
+            System.load(candidate.getAbsolutePath());
+            LOGGER.info("Loaded native library {} via System.load ({})", libraryName,
+                    candidate.getAbsolutePath());
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Resolves JNI: try {@code loadLibrary}, then concrete paths under {@code java.library.path}, then jar extract.
+     * Order avoids broken {@code new File(entire_java.library.path, name)} when multiple dirs are listed, and prefers
+     * loading from a real filesystem path before copying to tmp (helps some TLS / dlopen cases).
+     */
     public static void load() {
         String libraryName = getLibraryName();
-        Throwable lastException;
+        Throwable lastFailure = null;
+
         try {
-            // Load from java.library.path
-            System.loadLibrary(FilenameUtils.getBaseName(libraryName));
-            LOGGER.info("Loaded {} by System.loadLibrary", libraryName);
+            System.loadLibrary(loadLibraryLookupName(libraryName));
+            LOGGER.info("Loaded native library {} via System.loadLibrary", libraryName);
             return;
         } catch (UnsatisfiedLinkError e) {
-            LOGGER.debug("Failed to load {} by System.loadLibrary", libraryName);
+            LOGGER.debug("System.loadLibrary failed for {}: {}", libraryName, e.toString());
         }
 
         try {
-            // Load from the jar package.
-            String libraryPath = loadLibraryFromJar(libraryName);
-            System.load(libraryPath);
-            LOGGER.info("Loaded lib by jar from path {}", libraryPath);
+            if (loadFromLibraryPathDirectories(libraryName)) {
+                return;
+            }
+        } catch (Throwable e) {
+            lastFailure = e;
+            LOGGER.warn("java.library.path directory scan failed for {}", libraryName, e);
+        }
+
+        try {
+            String extracted = loadLibraryFromJar(libraryName);
+            System.load(extracted);
+            LOGGER.info("Loaded native library {} from jar extract {}", libraryName, extracted);
             return;
         } catch (Throwable e) {
-            LOGGER.warn("failed to read {} from jar file", libraryName, e);
-            lastException = e;
+            lastFailure = e;
+            LOGGER.warn("Failed to load {} from jar", libraryName, e);
         }
 
-        try {
-            // java.library.path set in the code
-            String libraryPath = System.getProperty(LIBRARY_PATH);
-            if (StringUtils.isEmpty(libraryPath)) {
-                throw new RuntimeException(lastException);
-            }
-            String filename = new File(libraryPath, libraryName).getAbsolutePath();
-            LOGGER.info("Loaded {} by System.loadLibrary", filename);
-            System.load(filename);
-        } catch (Throwable e) {
-            throw new RuntimeException(e);
-        }
+        RuntimeException rte = new RuntimeException(
+                "Could not load native library " + libraryName, lastFailure);
+        LOGGER.error(rte.getMessage(), lastFailure);
+        throw rte;
     }
 
     public static String loadLibraryFromJar(String libraryName) throws IOException {

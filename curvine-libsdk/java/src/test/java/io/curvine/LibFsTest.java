@@ -24,10 +24,10 @@ public class LibFsTest {
     @Test
     public void conf() throws Exception {
         Configuration conf = new Configuration();
-        conf.set("fs.curvine.master_addrs", "localhost:9001,localhost:9002");
-        conf.set("fs.curvine.io_threads", "12");
-        conf.set("fs.curvine.rpc_timeout_ms", "300");
-        conf.set("fs.curvine.short_circuit", "false");
+        conf.set("fs.cv.master_addrs", "localhost:9001,localhost:9002");
+        conf.set("fs.cv.io_threads", "12");
+        conf.set("fs.cv.rpc_timeout_ms", "300");
+        conf.set("fs.cv.short_circuit", "false");
 
         FilesystemConf filesystemConf = new FilesystemConf(conf);
         System.out.println(filesystemConf);
@@ -41,10 +41,10 @@ public class LibFsTest {
     @Test
     public void jni1() throws Exception {
         Configuration conf = new Configuration();
-        conf.set("fs.curvine.master_addrs", "localhost:6995");
-        conf.set("fs.curvine.io_threads", "12");
-        conf.set("fs.curvine.so_time_ms", "300");
-        conf.set("fs.curvine.short_circuit", "false");
+        conf.set("fs.cv.master_addrs", "localhost:6995");
+        conf.set("fs.cv.io_threads", "12");
+        conf.set("fs.cv.rpc_timeout_ms", "300");
+        conf.set("fs.cv.short_circuit", "false");
 
 
         FilesystemConf filesystemConf = new FilesystemConf(conf);
