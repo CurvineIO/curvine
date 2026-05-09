@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [tool.maturin]
 python-source = "python"
-module-name = "curvine_libsdk"
-features = ["python-sdk", "pyo3/extension-module"]
+module-name = "curvine_libsdk._native"
+features = ["python-sdk"]
 # include = [{ path = "src/python/**", format = "sdist"}]
 
 [project]

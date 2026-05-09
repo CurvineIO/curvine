@@ -231,7 +231,7 @@ impl ToPyErr for FsError {
 }
 
 #[pymodule]
-fn curvine_libsdk(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(
         python_io_curvine_curvine_native_new_filesystem,
         m

@@ -547,6 +547,10 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
     echo "Error: python3 is required to build the Python SDK wheel." >&2
     exit 1
   fi
+  if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
+    echo "Error: Python 3.8+ is required to build the Python SDK wheel (abi3-py38)." >&2
+    exit 1
+  fi
 
   # Isolated venv for maturin (no manual activation; works under sh and bash).
   PYTHON_SDK_VENV="${CURVINE_PYTHON_SDK_VENV:-$FS_HOME/build/.venv-python-sdk}"
@@ -560,6 +564,15 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
     echo "Creating Python SDK build venv at ${PYTHON_SDK_VENV} ..."
     python3 -m venv "$PYTHON_SDK_VENV" || {
       echo "Error: python3 -m venv failed (install python3-venv on Debian/Ubuntu)." >&2
+      exit 1
+    }
+  fi
+
+  # Minimal venvs may lack pip; ensure it exists before installing maturin.
+  if ! "$PYTHON_SDK_VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+    echo "Bootstrapping pip in Python SDK build venv (ensurepip) ..."
+    "$PYTHON_SDK_VENV/bin/python" -m ensurepip --upgrade || {
+      echo "Error: pip is not available and ensurepip failed (install python3-venv)." >&2
       exit 1
     }
   fi

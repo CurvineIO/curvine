@@ -1,12 +1,12 @@
 # Curvine libsdk
 
-Rust **`cdylib`** with **Java (JNI)** and **Python (PyO3)**. Crate path: **`curvine-libsdk/`** under the workspace root (`curvine-vllm`).
+Rust **`cdylib`** with **Java (JNI)** and **Python (PyO3)**. Crate path: **`curvine-libsdk/`** at the repository workspace root.
 
 | Path | Role |
 |------|------|
 | `Cargo.toml`, `pyproject.toml` | Rust + wheel metadata |
 | `java/` | Hadoop `FileSystem`, JUnit |
-| `python/` | `curvinefs`, native module `curvine_libsdk`, tests |
+| `python/` | `curvinefs`, package `curvine_libsdk` (re-exports PyO3 module `curvine_libsdk._native`), tests |
 
 ---
 

@@ -2,7 +2,7 @@ import argparse
 import os
 import re
 
-# test/ -> ../../../ workspace root with curvine-vllm layout
+# test/ -> ../../../ repository workspace root (etc/curvine-cluster.toml)
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _DEFAULT_CONF = os.path.join(_REPO_ROOT, "etc", "curvine-cluster.toml")
 

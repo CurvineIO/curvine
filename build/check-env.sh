@@ -7,11 +7,14 @@ set -e
 
 # Parse command line arguments
 SKIP_JAVA_SDK=0
+SKIP_PYTHON_SDK=0
 for arg in "$@"; do
     case $arg in
         --skip-java-sdk)
             SKIP_JAVA_SDK=1
-            shift
+            ;;
+        --skip-python-sdk)
+            SKIP_PYTHON_SDK=1
             ;;
     esac
 done
@@ -278,33 +281,36 @@ else
     print_status "FAIL" "npm not found. Please install npm version 9.0.0 or later" "NPM"
 fi
 
-# Check Python (version 3.7 or later)
-echo -e "${BLUE}Checking Python...${NC}"
-if command -v python3 >/dev/null 2>&1; then
-    PYTHON_VERSION=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-    if [ -z "$PYTHON_VERSION" ]; then
-        PYTHON_VERSION=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
-    fi
-    if version_compare "$PYTHON_VERSION" "3.6.0"; then
-        print_status "OK" "Python $PYTHON_VERSION (>= 3.6.0 required)"
+# Check Python (3.8+ for tooling / libsdk; skip if building without Python SDK)
+if [ $SKIP_PYTHON_SDK -eq 0 ]; then
+    echo -e "${BLUE}Checking Python...${NC}"
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_VERSION=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        if [ -z "$PYTHON_VERSION" ]; then
+            PYTHON_VERSION=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+        fi
+        if version_compare "$PYTHON_VERSION" "3.8.0"; then
+            print_status "OK" "Python $PYTHON_VERSION (>= 3.8.0 required for Python SDK build)"
+        else
+            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.8.0 or later is required for Python SDK" "PYTHON"
+        fi
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_VERSION=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+        if [ -z "$PYTHON_VERSION" ]; then
+            PYTHON_VERSION=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+        fi
+        PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
+        if [ "$PYTHON_MAJOR" = "3" ] && version_compare "$PYTHON_VERSION" "3.8.0"; then
+            print_status "OK" "Python $PYTHON_VERSION (>= 3.8.0 required for Python SDK build)"
+        else
+            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.8.0 or later is required for Python SDK" "PYTHON"
+        fi
     else
-        print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.6.0 or later is required" "PYTHON"
-    fi
-elif command -v python >/dev/null 2>&1; then
-    # Check if 'python' command points to Python 3.6+
-    PYTHON_VERSION=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-    if [ -z "$PYTHON_VERSION" ]; then
-        PYTHON_VERSION=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
-    fi
-    # Check if it's Python 3.x
-    PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
-    if [ "$PYTHON_MAJOR" = "3" ] && version_compare "$PYTHON_VERSION" "3.6.0"; then
-        print_status "OK" "Python $PYTHON_VERSION (>= 3.6.0 required)"
-    else
-        print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.6.0 or later is required" "PYTHON"
+        print_status "FAIL" "Python not found. Please install Python 3.8 or later" "PYTHON"
     fi
 else
-    print_status "FAIL" "Python not found. Please install Python version 3.6.0 or later" "PYTHON"
+    echo -e "${BLUE}Checking Python...${NC}"
+    print_status "OK" "Python check skipped (--skip-python-sdk enabled)"
 fi
 
 echo ""
