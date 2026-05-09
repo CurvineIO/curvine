@@ -18,8 +18,8 @@ Rust **`cdylib`** with **Java (JNI)** and **Python (PyO3)**. Crate path: **`curv
 make build
 ```
 
-Runs `build/build.sh`: creates **`build/.venv-python-sdk`** (gitignored), installs **`build/requirements-python-sdk.txt`** (e.g. maturin), regenerates `*_pb2.py`, produces the wheel.  
-Needs **`python3`** with **`venv`**, and **`protoc`**. Override venv dir: **`CURVINE_PYTHON_SDK_VENV`**.  
+Runs `build/build.sh`: creates **`build/.venv-python-sdk`** (gitignored), installs **`build/requirements-python-sdk.txt`** (e.g. maturin), runs **`protoc`** into **`python/curvine_libsdk/_proto/`** (namespaced protobuf stubs), produces the wheel.  
+Needs **`python3`** with **`venv`**, and **`protoc`** (`check-env` expects Python **≥ 3.6**). Override venv dir: **`CURVINE_PYTHON_SDK_VENV`**.  
 Skip Python SDK: **`make build ARGS='--skip-python-sdk'`**.
 
 **2. Artifact** — `build/dist/lib/curvine_libsdk-*-cp38-abi3-*.whl` (same dir may contain legacy `libcurvine_libsdk_python_*`).
@@ -58,10 +58,12 @@ python3 curvine-libsdk/python/test/curvineFileSystemTest.py
 
 ## Java SDK
 
-JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. JNI library name must match **`CurvineNative.getLibraryName()`** (see `java/native/`).
+JDK **8**, Maven **≥ 3.8.1**. From workspace root, **`make build`** (with **`java`** in the package set) builds the JNI native copy and **`curvine-hadoop-*.jar`** under **`build/dist/lib/`**. JNI library name must match **`CurvineNative.getLibraryName()`** (see `java/native/`). Put the matching **`.so`** in **`build/dist/lib/`** next to the JAR and ensure **`java.library.path`** includes that directory (`bin/dfs` wrappers often set this).
+
+**`cannot allocate memory in static TLS block`** (large JNI `.so` + glibc): load from a real **`build/dist/lib`** path first (`CurvineNative` scans `java.library.path` entries); if it still fails, try preloading **`LD_PRELOAD`** with the same **`libcurvine_libsdk_<os>_<arch>_64.so`**, or use a host/OS image validated for Curvine JNI.
 
 ---
 
 ## Local dev (without `make`)
 
-From **`curvine-libsdk/`**: own venv, **`pip install maturin`**, **`maturin develop --release`**, **`protoc -I ../curvine-common/proto --python_out=python ../curvine-common/proto/*.proto`**, **`export PYTHONPATH=python`**.
+From **`curvine-libsdk/`**: own venv, **`pip install maturin`**, **`maturin develop --release`**, then **`protoc`** into **`python/curvine_libsdk/_proto/`** and apply the same **`sed`** relative-import fix as **`build/build.sh`**, **`export PYTHONPATH=python`**.

@@ -281,7 +281,7 @@ else
     print_status "FAIL" "npm not found. Please install npm version 9.0.0 or later" "NPM"
 fi
 
-# Check Python (3.8+ for tooling / libsdk; skip if building without Python SDK)
+# Check Python (3.6+; skip if building without Python SDK)
 if [ $SKIP_PYTHON_SDK -eq 0 ]; then
     echo -e "${BLUE}Checking Python...${NC}"
     if command -v python3 >/dev/null 2>&1; then
@@ -289,10 +289,10 @@ if [ $SKIP_PYTHON_SDK -eq 0 ]; then
         if [ -z "$PYTHON_VERSION" ]; then
             PYTHON_VERSION=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
         fi
-        if version_compare "$PYTHON_VERSION" "3.8.0"; then
-            print_status "OK" "Python $PYTHON_VERSION (>= 3.8.0 required for Python SDK build)"
+        if version_compare "$PYTHON_VERSION" "3.6.0"; then
+            print_status "OK" "Python $PYTHON_VERSION (>= 3.6.0 required)"
         else
-            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.8.0 or later is required for Python SDK" "PYTHON"
+            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.6.0 or later is required" "PYTHON"
         fi
     elif command -v python >/dev/null 2>&1; then
         PYTHON_VERSION=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
@@ -300,13 +300,13 @@ if [ $SKIP_PYTHON_SDK -eq 0 ]; then
             PYTHON_VERSION=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
         fi
         PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
-        if [ "$PYTHON_MAJOR" = "3" ] && version_compare "$PYTHON_VERSION" "3.8.0"; then
-            print_status "OK" "Python $PYTHON_VERSION (>= 3.8.0 required for Python SDK build)"
+        if [ "$PYTHON_MAJOR" = "3" ] && version_compare "$PYTHON_VERSION" "3.6.0"; then
+            print_status "OK" "Python $PYTHON_VERSION (>= 3.6.0 required)"
         else
-            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.8.0 or later is required for Python SDK" "PYTHON"
+            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.6.0 or later is required" "PYTHON"
         fi
     else
-        print_status "FAIL" "Python not found. Please install Python 3.8 or later" "PYTHON"
+        print_status "FAIL" "Python not found. Please install Python version 3.6.0 or later" "PYTHON"
     fi
 else
     echo -e "${BLUE}Checking Python...${NC}"

@@ -1,6 +1,10 @@
 import curvine_libsdk
-from common_pb2 import FileStatusProto
-from master_pb2 import GetFileStatusResponse, GetMasterInfoResponse,ListStatusResponse
+from curvine_libsdk._proto.common_pb2 import FileStatusProto
+from curvine_libsdk._proto.master_pb2 import (
+    GetFileStatusResponse,
+    GetMasterInfoResponse,
+    ListStatusResponse,
+)
 from curvinefs.curvineReader import CurvineReader
 from curvinefs.curvineWriter import CurvineWriter
 

@@ -332,7 +332,10 @@ build_curvine_libsdk() {
   eval "$sdk_cmd"
 }
 
+<<<<<<< HEAD
 >>>>>>> b8a002c (build: ship Python SDK wheel in dist and libsdk fixes)
+=======
+>>>>>>> 5f5ba1d (chore: address PR 800 reviews and libsdk loading fixes)
 # Base command
 cmd="cargo build $PROFILE"
 
@@ -547,10 +550,6 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
     echo "Error: python3 is required to build the Python SDK wheel." >&2
     exit 1
   fi
-  if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
-    echo "Error: Python 3.8+ is required to build the Python SDK wheel (abi3-py38)." >&2
-    exit 1
-  fi
 
   # Isolated venv for maturin (no manual activation; works under sh and bash).
   PYTHON_SDK_VENV="${CURVINE_PYTHON_SDK_VENV:-$FS_HOME/build/.venv-python-sdk}"
@@ -585,8 +584,15 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
 
   PROTO_DIR="$FS_HOME/curvine-common/proto"
   PY_SDK_PY="$FS_HOME/curvine-libsdk/python"
-  echo "Generating Python protobuf stubs into curvine-libsdk/python..."
-  protoc -I"$PROTO_DIR" --python_out="$PY_SDK_PY" "$PROTO_DIR"/*.proto
+  PROTO_PKG="$PY_SDK_PY/curvine_libsdk/_proto"
+  echo "Generating Python protobuf stubs into curvine_libsdk/python/curvine_libsdk/_proto/..."
+  mkdir -p "$PROTO_PKG"
+  protoc -I"$PROTO_DIR" --python_out="$PROTO_PKG" "$PROTO_DIR"/*.proto
+  for f in "$PROTO_PKG"/*_pb2.py; do
+    if [ -f "$f" ]; then
+      sed -i -E 's/^import ([A-Za-z0-9_]+_pb2)( as .*)$/from . import \1\2/' "$f"
+    fi
+  done
 
   MATURIN_RELEASE=()
   if [ -n "$PROFILE" ]; then
