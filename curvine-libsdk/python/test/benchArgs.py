@@ -1,5 +1,10 @@
 import argparse
+import os
 import re
+
+# test/ -> ../../../ repository workspace root (etc/curvine-cluster.toml)
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+_DEFAULT_CONF = os.path.join(_REPO_ROOT, "etc", "curvine-cluster.toml")
 
 # Transform size string to bytes
 def parse_size(size_str: str) -> int:
@@ -25,7 +30,13 @@ class BenchArgs:
         parser = argparse.ArgumentParser(description="Curvine file system bench test")
         
         parser.add_argument("-a", "--action", default="write", help="bench test type (read/write)")
-        parser.add_argument("-c", "--conf", default="D:/Users/S9059520/Curvine/testing/curvine-cluster.toml", help="config file path")
+        _conf_default = os.environ.get("CURVINE_CONF_FILE", _DEFAULT_CONF)
+        parser.add_argument(
+            "-c",
+            "--conf",
+            default=_conf_default,
+            help="cluster config path (override with CURVINE_CONF_FILE)",
+        )
         parser.add_argument("-d", "--dir", default="file:///bench", 
                           help="test directory (support cv:// or file:// protocol)")
         parser.add_argument("--file-num", type=int, default=10, 

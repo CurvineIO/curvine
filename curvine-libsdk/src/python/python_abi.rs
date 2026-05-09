@@ -225,12 +225,13 @@ impl ToPyErr for FsError {
             ErrorKind::Ufs => PyException::new_err(self.to_string()),
             ErrorKind::Expired => PyIOError::new_err(self.to_string()),
             ErrorKind::Common => PyException::new_err(self.to_string()),
+            _ => PyException::new_err(self.to_string()),
         }
     }
 }
 
 #[pymodule]
-fn curvine_libsdk(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(
         python_io_curvine_curvine_native_new_filesystem,
         m

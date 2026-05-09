@@ -102,7 +102,8 @@ print_help() {
   echo "  -d, --debug           Build in debug mode (default: release mode)"
   echo "  -f, --features LIST   Comma-separated list of extra features to enable"
   echo "  -z, --zip             Create zip archive"
-  echo "  --skip-java-sdk           Skip Java SDK compilation (useful for Docker builds)"
+  echo "  --skip-java-sdk        Skip Java SDK compilation (useful for Docker builds)"
+  echo "  --skip-python-sdk      Skip Python SDK compilation (useful for Docker builds)"
   echo "  -h, --help            Show this help message"
   echo
   echo "Examples:"
@@ -113,7 +114,9 @@ print_help() {
   echo "  $0 --ufs opendal-hdfs --ufs opendal-webhdfs  # Build with HDFS support"
   echo "  $0 --ufs oss-hdfs                         # Build with OSS-HDFS support (JindoSDK)"
   echo "  $0 --features jni --package client     # Build client with JNI support"
-  echo "  $0 --skip-java-sdk                         # Build all packages except Java SDK"
+  echo "  $0 --skip-java-sdk                      # Build all packages except Java SDK"
+  echo "  $0 --skip-python-sdk                    # Build all packages except Python SDK"
+  echo "  $0 -p java -p python                    # Build both Java and Python SDKs"
 }
 
 # Create a version file.
@@ -139,10 +142,11 @@ declare -a UFS_TYPES=("opendal-s3")  # Default UFS type
 declare -a EXTRA_FEATURES=()  # From -f only; --alloc is merged into FEATURES later
 ALLOC=jemalloc
 CRATE_ZIP=""
-SKIP_JAVA_SDK=0  # Flag to skip Java SDK compilation
+SKIP_JAVA_SDK=0    # Flag to skip Java SDK compilation
+SKIP_PYTHON_SDK=0  # Flag to skip Python SDK compilation
 
 # Parse command line arguments
-TEMP=$(getopt -o p:u:f:a:dzhv --long package:,ufs:,features:,alloc:,debug,zip,skip-java-sdk,help -n "$0" -- "$@")
+TEMP=$(getopt -o p:u:f:a:dzhv --long package:,ufs:,features:,alloc:,debug,zip,skip-java-sdk,skip-python-sdk,help -n "$0" -- "$@")
 if [ $? != 0 ] ; then print_help ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -183,6 +187,10 @@ while true ; do
       ;;
     --skip-java-sdk)
       SKIP_JAVA_SDK=1
+      shift
+      ;;
+    --skip-python-sdk)
+      SKIP_PYTHON_SDK=1
       shift
       ;;
     -h|--help)
@@ -267,6 +275,16 @@ should_build_package() {
   return 1
 }
 
+BUILD_JAVA_SDK=0
+if should_build_package "java" && [ $SKIP_JAVA_SDK -eq 0 ]; then
+  BUILD_JAVA_SDK=1
+fi
+
+BUILD_PYTHON_SDK=0
+if should_build_package "python" && [ $SKIP_PYTHON_SDK -eq 0 ]; then
+  BUILD_PYTHON_SDK=1
+fi
+
 # Collect all rust packages to build
 declare -a RUST_BUILD_ARGS=()
 declare -a COPY_TARGETS=()
@@ -293,14 +311,18 @@ if should_build_package "fuse" && [ -n "$FUSE_VERSION" ]; then
   COPY_TARGETS+=("curvine-fuse")
 fi
 
-if should_build_package "java" && [ $SKIP_JAVA_SDK -eq 0 ]; then
-  RUST_BUILD_ARGS+=("-p" "curvine-libsdk")
-fi
-
 if should_build_package "tests"; then
   RUST_BUILD_ARGS+=("-p" "curvine-tests")
   COPY_TARGETS+=("curvine-bench")
 fi
+
+build_curvine_libsdk() {
+  local sdk_feature="$1"
+  local sdk_cmd="cargo build $PROFILE -p curvine-libsdk --no-default-features --features curvine-common/${ALLOC},${sdk_feature}"
+  echo "Building curvine-libsdk with feature: ${sdk_feature}"
+  echo "Build command: ${sdk_cmd}"
+  eval "$sdk_cmd"
+}
 
 # Base command
 cmd="cargo build $PROFILE"
@@ -461,9 +483,9 @@ if [ ${#FEATURES[@]} -gt 0 ]; then
   cmd="$cmd --no-default-features --features $FEATURE_LIST"
 fi
 
-# Skip cargo build if only building web module
-if [ ${#PACKAGES[@]} -eq 1 ] && [ "${PACKAGES[0]}" = "web" ]; then
-  echo "Only building web module, skipping cargo build..."
+# Skip cargo build when no non-SDK rust package was selected
+if [ ${#RUST_BUILD_ARGS[@]} -eq 0 ]; then
+  echo "No non-SDK rust packages selected, skipping workspace cargo build..."
 else
   echo "Building crates with command: $cmd"
   eval "$cmd"
@@ -473,10 +495,17 @@ else
     exit 1
   fi
 fi
-# Copy all built binaries
-for target in "${COPY_TARGETS[@]}"; do
-  cp -f "$FS_HOME"/target/${TARGET_DIR}/${target} "$DIST_DIR"/lib
-done
+
+if [ $BUILD_JAVA_SDK -eq 1 ]; then
+  build_curvine_libsdk "java-sdk"
+  # Copy JNI native before Python SDK build (if any) overwrites target/.
+  mkdir -p "$FS_HOME"/curvine-libsdk/java/native
+  if [ -e "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
+  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
+  fi
+fi
 
 # Build optional non-rust packages
 if should_build_package "web"; then
@@ -487,16 +516,8 @@ if should_build_package "web"; then
   mv "$FS_HOME"/curvine-web/webui/dist "$DIST_DIR"/webui
 fi
 
-if should_build_package "java" && [ $SKIP_JAVA_SDK -eq 0 ]; then
-  mkdir -p "$FS_HOME"/curvine-libsdk/java/native
-  
-  # Handle java native library
-  if [ -e "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" ]; then
-    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
-  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
-    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" "$FS_HOME/curvine-libsdk/java/native/libcurvine_libsdk_${OS_VERSION}_$ARCH_NAME.so"
-  fi
-
+if [ $BUILD_JAVA_SDK -eq 1 ]; then
+  # Native library was copied immediately after the java-sdk cargo build.
   # Build java package
   cd "$FS_HOME"/curvine-libsdk/java
   mvn protobuf:compile package -DskipTests -P${TARGET_DIR}
@@ -506,6 +527,106 @@ if should_build_package "java" && [ $SKIP_JAVA_SDK -eq 0 ]; then
   fi
   cp "$FS_HOME"/curvine-libsdk/java/target/curvine-hadoop-*.jar "$DIST_DIR"/lib
 fi
+
+if [ $BUILD_PYTHON_SDK -eq 1 ]; then
+  if ! command -v protoc >/dev/null 2>&1; then
+    echo "Error: protoc is required to build the Python SDK wheel. Install Protobuf 3+." >&2
+    exit 1
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 is required to build the Python SDK wheel." >&2
+    exit 1
+  fi
+
+  # Isolated venv for maturin (no manual activation; works under sh and bash).
+  PYTHON_SDK_VENV="${CURVINE_PYTHON_SDK_VENV:-$FS_HOME/build/.venv-python-sdk}"
+  PY_SDK_REQ="$FS_HOME/build/requirements-python-sdk.txt"
+  if [ ! -f "$PY_SDK_REQ" ]; then
+    echo "Error: missing $PY_SDK_REQ" >&2
+    exit 1
+  fi
+
+  if [ ! -d "$PYTHON_SDK_VENV" ]; then
+    echo "Creating Python SDK build venv at ${PYTHON_SDK_VENV} ..."
+    python3 -m venv "$PYTHON_SDK_VENV" || {
+      echo "Error: python3 -m venv failed (install python3-venv on Debian/Ubuntu)." >&2
+      exit 1
+    }
+  fi
+
+  # Minimal venvs may lack pip; ensure it exists before installing maturin.
+  if ! "$PYTHON_SDK_VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+    echo "Bootstrapping pip in Python SDK build venv (ensurepip) ..."
+    "$PYTHON_SDK_VENV/bin/python" -m ensurepip --upgrade || {
+      echo "Error: pip is not available and ensurepip failed (install python3-venv)." >&2
+      exit 1
+    }
+  fi
+
+  echo "Installing / updating Python SDK build dependencies (maturin) ..."
+  "$PYTHON_SDK_VENV/bin/python" -m pip install -q --upgrade pip
+  "$PYTHON_SDK_VENV/bin/python" -m pip install -q -r "$PY_SDK_REQ"
+
+  MATURIN_CMD=("$PYTHON_SDK_VENV/bin/python" -m maturin)
+
+  PROTO_DIR="$FS_HOME/curvine-common/proto"
+  PY_SDK_PY="$FS_HOME/curvine-libsdk/python"
+  PROTO_PKG="$PY_SDK_PY/curvine_libsdk/_proto"
+  echo "Generating Python protobuf stubs into curvine_libsdk/python/curvine_libsdk/_proto/..."
+  mkdir -p "$PROTO_PKG"
+  protoc -I"$PROTO_DIR" --python_out="$PROTO_PKG" "$PROTO_DIR"/*.proto
+  for f in "$PROTO_PKG"/*_pb2.py; do
+    if [ -f "$f" ]; then
+      sed -i -E 's/^import ([A-Za-z0-9_]+_pb2)( as .*)$/from . import \1\2/' "$f"
+    fi
+  done
+
+  MATURIN_RELEASE=()
+  if [ -n "$PROFILE" ]; then
+    MATURIN_RELEASE=(--release)
+  fi
+
+  # Use native 'linux' tag + skip auditwheel repair by default so wheels install on a wide
+  # range of glibc baselines. (Strict manylinux_2_34-style tags often break uv/pip on older
+  # manylinux_2_32-class hosts.) For PyPI uploads, set e.g. CURVINE_MATURIN_COMPATIBILITY=pypi
+  # and CURVINE_MATURIN_AUDITWHEEL=repair.
+  MATURIN_COMPAT="${CURVINE_MATURIN_COMPATIBILITY:-linux}"
+  MATURIN_AUDIT="${CURVINE_MATURIN_AUDITWHEEL:-skip}"
+
+  echo "Building Python wheel (maturin) into ${DIST_DIR}/lib ..."
+  cd "$FS_HOME/curvine-libsdk"
+  "${MATURIN_CMD[@]}" build --no-default-features \
+    --features "curvine-common/${ALLOC},python-sdk" \
+    "${MATURIN_RELEASE[@]}" \
+    --compatibility "$MATURIN_COMPAT" \
+    --auditwheel "$MATURIN_AUDIT" \
+    --out "$DIST_DIR/lib"
+  if [ $? -ne 0 ]; then
+    echo "maturin build failed. Exiting..."
+    exit 1
+  fi
+
+  # Optional legacy native artifacts (same binary as inside the wheel).
+  mkdir -p "$FS_HOME"/curvine-libsdk/python/native
+  if [ -e "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" \
+      "$FS_HOME/curvine-libsdk/python/native/curvine_libsdk_python.dll"
+    cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" \
+      "$DIST_DIR/lib/curvine_libsdk_python.dll"
+  elif [ -e "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" ]; then
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" \
+      "$FS_HOME/curvine-libsdk/python/native/libcurvine_libsdk_python_${OS_VERSION}_$ARCH_NAME.so"
+    cp -f "$FS_HOME/target/${TARGET_DIR}/libcurvine_libsdk.so" \
+      "$DIST_DIR/lib/libcurvine_libsdk_python_${OS_VERSION}_$ARCH_NAME.so"
+  fi
+fi
+
+# Copy workspace binaries after all cargo builds (workspace + JNI libsdk + maturin's Rust build).
+echo "Copying Rust binaries into ${DIST_DIR}/lib ..."
+for target in "${COPY_TARGETS[@]}"; do
+  cp -f "$FS_HOME"/target/${TARGET_DIR}/${target} "$DIST_DIR"/lib
+done
 
 # create zip
 cd "$DIST_DIR"
