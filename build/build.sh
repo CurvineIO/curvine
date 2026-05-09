@@ -316,14 +316,6 @@ if should_build_package "tests"; then
   COPY_TARGETS+=("curvine-bench")
 fi
 
-<<<<<<< HEAD
-=======
-# Add S3 object gateway package
-if should_build_package "object" || [[ " ${PACKAGES[@]} " =~ " all " ]]; then
-  RUST_BUILD_ARGS+=("-p" "curvine-s3-gateway")
-  COPY_TARGETS+=("curvine-s3-gateway")
-fi
-
 build_curvine_libsdk() {
   local sdk_feature="$1"
   local sdk_cmd="cargo build $PROFILE -p curvine-libsdk --no-default-features --features curvine-common/${ALLOC},${sdk_feature}"
@@ -332,10 +324,6 @@ build_curvine_libsdk() {
   eval "$sdk_cmd"
 }
 
-<<<<<<< HEAD
->>>>>>> b8a002c (build: ship Python SDK wheel in dist and libsdk fixes)
-=======
->>>>>>> 5f5ba1d (chore: address PR 800 reviews and libsdk loading fixes)
 # Base command
 cmd="cargo build $PROFILE"
 
