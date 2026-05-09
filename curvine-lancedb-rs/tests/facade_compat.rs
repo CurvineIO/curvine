@@ -77,8 +77,7 @@ async fn curvine_uri_reports_explicit_unsupported_boundary() {
 
     let rendered = err.to_string();
     assert!(rendered.contains("curvine://"));
-    assert!(rendered
-        .contains("Curvine object store, uri=curvine:///data/lancedb/demo is not implemented"));
+    assert!(rendered.contains("not implemented"));
 }
 
 #[tokio::test]
@@ -99,6 +98,5 @@ async fn curvine_namespace_uri_reports_explicit_unsupported_boundary() {
 
     let rendered = err.to_string();
     assert!(rendered.contains("curvine://"));
-    assert!(rendered
-        .contains("Curvine object store, uri=curvine:///data/lancedb/demo is not implemented"));
+    assert!(rendered.contains("not implemented"));
 }

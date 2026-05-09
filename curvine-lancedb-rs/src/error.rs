@@ -13,9 +13,3 @@
 // limitations under the License.
 
 pub use lancedb_upstream::error::{Error, Result};
-
-pub(crate) fn unsupported(feature: impl Into<String>) -> Error {
-    Error::NotSupported {
-        message: format!("{} is not implemented", feature.into()),
-    }
-}
