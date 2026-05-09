@@ -225,6 +225,7 @@ impl ToPyErr for FsError {
             ErrorKind::Ufs => PyException::new_err(self.to_string()),
             ErrorKind::Expired => PyIOError::new_err(self.to_string()),
             ErrorKind::Common => PyException::new_err(self.to_string()),
+            _ => PyException::new_err(self.to_string()),
         }
     }
 }

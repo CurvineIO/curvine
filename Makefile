@@ -54,7 +54,10 @@ help:
 	@echo "  make build ARGS='-p server -p client'       - Build only server and client components"
 	@echo "  make build ARGS='-p object'                  - Build S3 object gateway"
 	@echo "  make build ARGS='--package core --ufs s3'   - Build core packages with S3 native SDK"
-	@echo "  make build ARGS='--skip-java-sdk'               - Build all packages except Java SDK"
+	@echo "  make build ARGS='--skip-java-sdk'            - Build all packages except Java SDK"
+	@echo "  make build ARGS='--skip-python-sdk'          - Build all packages except Python SDK"
+	@echo "  make build ARGS='-p java -p python'          - Build both Java and Python SDKs"
+	@echo "                               (Python wheel: build/dist/lib/curvine_libsdk-*.whl)"
 	@echo "  make build-hdfs                             - Build with HDFS support (native + WebHDFS)"
 	@echo "  make build-webhdfs                          - Build with WebHDFS support only"
 	@echo "  make dist                                   - Build and create distribution package"
@@ -65,11 +68,7 @@ help:
 
 # 1. Check build environment dependencies
 check-env:
-	@if echo "$(ARGS)" | grep -q -- '--skip-java-sdk'; then \
-		$(SHELL_CMD) build/check-env.sh --skip-java-sdk; \
-	else \
-		$(SHELL_CMD) build/check-env.sh; \
-	fi
+	$(SHELL_CMD) build/check-env.sh $(filter --skip-java-sdk --skip-python-sdk,$(ARGS))
 
 # 2. Format the project
 format:

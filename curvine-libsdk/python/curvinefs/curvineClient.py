@@ -47,17 +47,19 @@ class CurvineClient:
         status.ParseFromString(status_bytes)  # GetMasterInfoResponse
         status_dict = {
             "active_master": status.active_master,
-            "journal_nodes": status.journal_nodes,
-            "inode_num": status.inode_num,
+            "journal_nodes": list(status.journal_nodes),
+            "inode_dir_num": status.inode_dir_num,
+            "inode_file_num": status.inode_file_num,
             "block_num": status.block_num,
             "capacity": status.capacity,
             "available": status.available,
             "fs_used": status.fs_used,
             "non_fs_used": status.non_fs_used,
-            "live_workers": status.live_workers,
-            "blacklist_workers": status.blacklist_workers,
-            "decommission_workers": status.decommission_workers,
-            "lost_workers": status.lost_workers,
+            "reserved_bytes": status.reserved_bytes,
+            "live_workers": list(status.live_workers),
+            "blacklist_workers": list(status.blacklist_workers),
+            "decommission_workers": list(status.decommission_workers),
+            "lost_workers": list(status.lost_workers),
         }
         return status_dict
 

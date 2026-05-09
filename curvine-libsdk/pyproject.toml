@@ -5,13 +5,17 @@ build-backend = "maturin"
 [tool.maturin]
 python-source = "python"
 module-name = "curvine_libsdk"
-features = ["pyo3/extension-module"]
+features = ["python-sdk", "pyo3/extension-module"]
 # include = [{ path = "src/python/**", format = "sdist"}]
 
 [project]
 name = "curvine_libsdk"
 version = "0.1.0"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
+dependencies = [
+    "protobuf>=3.19,<6",
+    "fsspec",
+]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",

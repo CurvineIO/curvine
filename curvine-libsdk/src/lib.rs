@@ -24,4 +24,8 @@ pub use self::lib_fs_writer::LibFsWriter;
 mod lib_fs_reader;
 pub use self::lib_fs_reader::LibFsReader;
 
+#[cfg(feature = "python-sdk")]
+pub mod python;
+
+#[cfg(feature = "java-sdk")]
 pub mod java;
