@@ -1,0 +1,40 @@
+// Copyright 2025 OPPO.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+pub use lancedb_upstream::arrow;
+pub mod connection;
+pub mod error;
+pub use lancedb_upstream::data;
+pub use lancedb_upstream::database;
+pub use lancedb_upstream::dataloader;
+pub use lancedb_upstream::embeddings;
+pub use lancedb_upstream::expr;
+pub use lancedb_upstream::index;
+pub use lancedb_upstream::io;
+pub use lancedb_upstream::ipc;
+pub use lancedb_upstream::query;
+#[cfg(feature = "remote")]
+pub use lancedb_upstream::remote;
+pub use lancedb_upstream::rerankers;
+pub use lancedb_upstream::table;
+pub use lancedb_upstream::utils;
+
+pub use connection::{
+    connect, connect_namespace, ConnectBuilder, ConnectNamespaceBuilder, Connection,
+};
+pub use error::{Error, Result};
+pub use lancedb_upstream::DistanceType;
+pub use lancedb_upstream::ObjectStoreRegistry;
+pub use lancedb_upstream::Session;
+pub use table::Table;

@@ -8,6 +8,7 @@ panic = "abort"
 
 [workspace]
 resolver = "2"
+exclude = ["curvine-lancedb-rs"]
 
 members = [
     "orpc",
