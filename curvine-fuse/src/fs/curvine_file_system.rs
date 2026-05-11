@@ -608,8 +608,8 @@ impl fs::FileSystem for CurvineFileSystem {
         self.check_permissions(&parent_path, op.header, libc::X_OK as u32)
             .await?;
 
-        // Get the path.
-        let path = self.state.get_path_common(parent, Some(name))?;
+        // Reuse parent_path instead of traversing the node tree again.
+        let path = Path::from_str(format!("{}/{}", parent_path.full_path(), name))?;
         let res = self.lookup_path(parent, name, &path).await;
 
         let entry = match res {
