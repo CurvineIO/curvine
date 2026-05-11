@@ -6,6 +6,7 @@ ARG REPO_URL=https://github.com/curvineio/curvine
 LABEL org.opencontainers.image.source="${REPO_URL}"
 
 # 1. Install the basic toolchain and dependencies
+# rockylinux:9 ships curl-minimal; installing package "curl" conflicts with it. curl-minimal is enough for HTTPS downloads below.
 RUN dnf install -y dnf-plugins-core && \
     dnf config-manager --set-enabled crb && \
     dnf install -y \
@@ -18,7 +19,6 @@ RUN dnf install -y dnf-plugins-core && \
     clang \
     llvm \
     llvm-devel \
-    curl \
     git \
     wget \
     zip \
@@ -82,7 +82,7 @@ ENV PATH="/app/protoc/bin:${PATH}"
 
 # 4. Install Maven
 RUN cd /app && \
-    MAVEN_VERSION=3.9.14 && \
+    MAVEN_VERSION=3.9.15 && \
     curl -fL -o apache-maven-${MAVEN_VERSION}-bin.tar.gz https://downloads.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
     tar -xzf apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
     mv apache-maven-${MAVEN_VERSION} maven && \
@@ -117,7 +117,7 @@ RUN cd /opt && \
     rm -f ${JINDOSDK_FILE} && \
     echo "✓ JindoSDK ${JINDOSDK_VERSION} installed successfully for ${ARCH}"
 ENV JINDOSDK_HOME=/opt/jindosdk
-ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib:${LD_LIBRARY_PATH:-}"
+ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib"
 
 # 5. Install Go toolchain with multi-arch support
 RUN ARCH=$(uname -m) && \
@@ -158,11 +158,8 @@ RUN rm -rf \
 
 WORKDIR /workspace
 
-# Ensure environment is properly set up and verify npm version
+# Verify toolchains. Do not `npm install -g npm@latest`: it replaces distro npm and can leave broken deps (e.g. MODULE_NOT_FOUND promise-retry).
 RUN rustc --version && cargo --version && protoc --version && mvn --version && node --version && \
-    npm --version && \
-    npm install -g npm@latest && \
-    echo "npm version after upgrade:" && \
     npm --version && \
     go version
 
