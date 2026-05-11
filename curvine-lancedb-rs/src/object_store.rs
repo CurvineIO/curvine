@@ -39,9 +39,7 @@ impl CurvineObjectStoreProvider {
 #[async_trait]
 impl ObjectStoreProvider for CurvineObjectStoreProvider {
     async fn new_store(&self, base_path: Url, _params: &ObjectStoreParams) -> Result<ObjectStore> {
-        Err(lance_core::Error::invalid_input(format!(
-            "Curvine object store is not implemented, uri={base_path}"
-        )))
+        Err(not_supported_lance_error(base_path))
     }
 }
 
@@ -62,4 +60,9 @@ pub fn unsupported_curvine_uri(uri: impl Into<String>) -> Error {
             uri.into()
         ),
     }
+}
+
+fn not_supported_lance_error(uri: Url) -> lance_core::Error {
+    let err = unsupported_curvine_uri(uri.to_string());
+    lance_core::Error::not_supported(err.to_string())
 }
