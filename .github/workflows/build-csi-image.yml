@@ -124,7 +124,7 @@ jobs:
             ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
             ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
           cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }},ignore-error=true
           shm-size: 2g
           build-args: |
             GOPROXY=https://goproxy.cn,direct
