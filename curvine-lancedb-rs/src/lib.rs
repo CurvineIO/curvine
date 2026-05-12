@@ -15,6 +15,7 @@
 pub use lancedb_upstream::arrow;
 pub mod connection;
 pub mod error;
+pub mod object_store;
 pub use lancedb_upstream::data;
 pub use lancedb_upstream::database;
 pub use lancedb_upstream::dataloader;

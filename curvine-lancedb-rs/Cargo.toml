@@ -12,7 +12,13 @@ name = "lancedb"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait = "0.1.89"
+lance-core = "4.0.0"
+lance-io = "4.0.0"
 lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features = false }
+object_store = "0.12.5"
+snafu = "0.8.9"
+url = "2.5.8"
 
 [dev-dependencies]
 tempfile = "3.21.0"
