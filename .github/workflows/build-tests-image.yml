@@ -56,7 +56,7 @@ jobs:
             ghcr.io/curvineio/curvine-tests:rocky9-${{ matrix.arch }}
             curvine/curvine-tests:rocky9-${{ matrix.arch }}
           cache-from: type=gha,scope=curvine-tests-rocky9-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=curvine-tests-rocky9-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=curvine-tests-rocky9-${{ matrix.arch }},ignore-error=true
 
       - name: Build summary for ${{ matrix.arch }}
         run: |
