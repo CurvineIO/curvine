@@ -672,9 +672,8 @@ var supportedFuseParams = map[string]string{
 	"node-cache-size":    "uint64",
 	"node-cache-timeout": "string",
 	// Metadata cache
-	"enable-meta-cache":   "bool",
-	"meta-cache-capacity": "uint64",
-	"meta-cache-ttl":      "string",
+	"enable-meta-cache": "bool",
+	"meta-cache-ttl":    "string",
 	// Miscellaneous
 	"read-dir-fill-ino": "bool",
 	"remember":          "bool",

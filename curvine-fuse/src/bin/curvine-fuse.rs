@@ -170,9 +170,6 @@ pub struct FuseArgs {
     #[arg(long, help = "Enable in-kernel metadata cache (optional)")]
     pub enable_meta_cache: Option<bool>,
 
-    #[arg(long, help = "Metadata cache capacity in number of entries (optional)")]
-    pub meta_cache_capacity: Option<u64>,
-
     #[arg(long, help = "Metadata cache TTL (e.g., '120s', '2m') (optional)")]
     pub meta_cache_ttl: Option<String>,
 
@@ -299,12 +296,10 @@ impl FuseArgs {
             conf.fuse.enable_meta_cache = enable_meta_cache;
         }
 
-        if let Some(meta_cache_capacity) = self.meta_cache_capacity {
-            conf.fuse.meta_cache_capacity = meta_cache_capacity;
-        }
-
+        // FuseConf::meta_cache_ttl is a Duration parsed by init() from
+        // the meta_cache_timeout string field; write the CLI override there.
         if let Some(meta_cache_ttl) = &self.meta_cache_ttl {
-            conf.fuse.meta_cache_ttl = meta_cache_ttl.clone();
+            conf.fuse.meta_cache_timeout = meta_cache_ttl.clone();
         }
 
         if let Some(remember) = self.remember {

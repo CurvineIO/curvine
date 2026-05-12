@@ -62,7 +62,7 @@ exec {fuse_cmd}
         'entry-timeout', 'attr-timeout', 'negative-timeout', 'ac-attr-timeout',
         'max-background', 'congestion-threshold',
         'node-cache-size', 'node-cache-timeout',
-        'enable-meta-cache', 'meta-cache-capacity', 'meta-cache-ttl',
+        'enable-meta-cache', 'meta-cache-ttl',
         'read-dir-fill-ino', 'remember', 'check-permission', 'list-limit',
         'web-port',
     ]
