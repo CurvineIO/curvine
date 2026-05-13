@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use bitflags::bitflags;
+use serde::{Deserialize, Serialize};
 
 bitflags! {
     /// Open file flags (equivalent to Go's syscall.O_* flags)
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
     pub struct OpenFlags: u32 {
         // Access mode flags (must specify one)
         /// Read-only mode
