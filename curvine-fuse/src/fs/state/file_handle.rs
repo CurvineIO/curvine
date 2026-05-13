@@ -18,7 +18,9 @@ use crate::fs::{FuseReader, FuseWriter};
 use crate::session::FuseResponse;
 use crate::{err_fuse, FuseError, FuseResult};
 use curvine_common::fs::{Path, StateReader, StateWriter};
-use curvine_common::state::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
+use curvine_common::state::{
+    CreateFileOptsBuilder, FileAllocOpts, FileStatus, LockFlags, OpenFlags,
+};
 use orpc::err_box;
 use orpc::sys::RawPtr;
 use serde::{Deserialize, Serialize};
@@ -57,6 +59,18 @@ impl FileHandle {
             status,
             fh_locks: std::sync::Mutex::new(HandleLock::default()),
         }
+    }
+
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    pub fn fh(&self) -> u64 {
+        self.fh
+    }
+
+    pub fn has_writer(&self) -> bool {
+        self.writer.is_some()
     }
 
     pub async fn read(
@@ -151,6 +165,15 @@ impl FileHandle {
             LockFlags::Plock => fh_locks.plock_owner_id.take(),
 
             LockFlags::Flock => fh_locks.flock_owner_id.take(),
+        }
+    }
+
+    pub async fn resize(&self, opts: FileAllocOpts) -> FuseResult<()> {
+        if let Some(writer) = &self.writer {
+            writer.resize(opts).await?;
+            Ok(())
+        } else {
+            err_fuse!(libc::EACCES)
         }
     }
 

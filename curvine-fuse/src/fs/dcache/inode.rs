@@ -12,8 +12,10 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::fs::dcache::{DirEntry, OpState};
-use crate::{err_fuse, FuseResult, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID};
+use crate::fs::dcache::{DirEntry, Lifecycle};
+use crate::raw::fuse_abi::fuse_attr;
+use crate::{err_fuse, FuseResult, FuseUtils, FUSE_PATH_SEPARATOR, FUSE_ROOT_ID};
+use curvine_common::conf::FuseConf;
 use curvine_common::state::{FileStatus, LocatedBlock};
 use orpc::common::LocalTime;
 use serde::{Deserialize, Serialize};
@@ -28,12 +30,11 @@ pub struct Inode {
     pub status: FileStatus,
     pub locs: Option<Box<Vec<LocatedBlock>>>,
 
-    pub op_state: OpState,
+    pub lifecycle: Lifecycle,
 
     pub n_lookup: u64,
     pub ref_ctr: u64,
     pub last_access: u64,
-    pub cache_valid: bool,
 
     pub dir: Option<Box<DirEntry>>,
 
@@ -46,6 +47,7 @@ impl Inode {
             is_dir: true,
             name: FUSE_PATH_SEPARATOR.to_owned(),
             path: FUSE_PATH_SEPARATOR.to_owned(),
+            nlink: 2,
             ..Default::default()
         };
         let dir = Some(Box::new(DirEntry::new()));
@@ -55,11 +57,10 @@ impl Inode {
             name: FUSE_PATH_SEPARATOR.to_owned(),
             status: root_st,
             locs: None,
-            op_state: OpState::Cached,
+            lifecycle: Lifecycle::Invalid,
             n_lookup: 0,
             ref_ctr: 0,
             last_access: LocalTime::mills(),
-            cache_valid: false,
             dir,
             ..Default::default()
         }
@@ -79,11 +80,10 @@ impl Inode {
             name: name.to_owned(),
             status,
             locs: None,
-            op_state: OpState::Cached,
+            lifecycle: Lifecycle::Cached,
             n_lookup: 1,
             ref_ctr: 1,
             last_access: LocalTime::mills(),
-            cache_valid: true,
             dir,
             ..Default::default()
         }
@@ -102,9 +102,14 @@ impl Inode {
         status.id = self.ino as i64;
         self.status = status;
 
-        self.op_state = OpState::Cached;
-        self.cache_valid = true;
+        self.lifecycle = Lifecycle::Cached;
         self.last_access = LocalTime::mills();
+    }
+
+    pub fn invalid_cache(&mut self) {
+        if matches!(self.lifecycle, Lifecycle::Cached) {
+            self.lifecycle = Lifecycle::Invalid;
+        }
     }
 
     pub fn is_root(&self) -> bool {
@@ -158,6 +163,35 @@ impl Inode {
             );
         }
         Ok(())
+    }
+
+    pub fn can_evict(&self, ttl: u64) -> bool {
+        !self.is_root()
+            && !self.cache_valid(ttl)
+            && self.dir.as_ref().is_none_or(|d| d.children.is_empty())
+    }
+
+    pub fn remove_child(&mut self, name: &str) {
+        if let Some(dir) = &mut self.dir {
+            dir.remove_child(name);
+        }
+    }
+
+    pub fn cache_valid(&self, ttl: u64) -> bool {
+        match self.lifecycle {
+            Lifecycle::Cached => self.last_access + ttl >= LocalTime::mills(),
+            Lifecycle::Dirty => true,
+            Lifecycle::Invalid => false,
+        }
+    }
+
+    pub fn dir_scan_valid(&self, ttl: u64) -> bool {
+        let Some(dir) = &self.dir else { return false };
+        dir.scan_complete && self.last_access + ttl >= LocalTime::mills()
+    }
+
+    pub fn to_attr(&self, conf: &FuseConf) -> FuseResult<fuse_attr> {
+        FuseUtils::status_to_attr(conf, &self.status)
     }
 }
 

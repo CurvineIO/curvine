@@ -25,4 +25,9 @@ impl DirEntry {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub fn remove_child(&mut self, name: &str) {
+        self.children.remove(name);
+        self.scan_complete = false;
+    }
 }

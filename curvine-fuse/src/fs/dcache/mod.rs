@@ -12,14 +12,21 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use serde::{Deserialize, Serialize};
+
 mod inode;
 pub use self::inode::Inode;
-
-mod op_state;
-pub use self::op_state::OpState;
 
 mod dir_entry;
 pub use self::dir_entry::DirEntry;
 
 mod dir_tree;
 pub use self::dir_tree::DirTree;
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Lifecycle {
+    #[default]
+    Cached,
+    Invalid,
+    Dirty,
+}

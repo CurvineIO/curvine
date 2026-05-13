@@ -24,10 +24,12 @@ use crate::{
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
 use curvine_common::fs::{FileSystem, ListStream, Path, StateReader, StateWriter};
-use curvine_common::state::{CreateFileOpts, FileStatus, ListOptions, OpenFlags};
+use curvine_common::state::{
+    CreateFileOpts, FileAllocOpts, FileStatus, ListOptions, MkdirOpts, OpenFlags, SetAttrOpts,
+};
 use futures::stream::{self, StreamExt};
 use log::{error, info, warn};
-use orpc::common::{FastHashMap, LocalTime};
+use orpc::common::FastHashMap;
 use orpc::err_box;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
 use orpc::sys::RawPtr;
@@ -79,23 +81,11 @@ impl NodeState {
     }
 
     pub fn invalid_cache(&self, ino: u64, name: Option<&str>) {
-        let mut dir = self.dir_write();
-        if let Some(inode) = dir.get_inode_mut(ino, name) {
-            inode.cache_valid = false;
-        };
-    }
-
-    pub fn get_cache_status(&self, ino: u64, name: Option<&str>) -> Option<FileStatus> {
-        if !self.enable_meta_cache {
-            return None;
-        }
-        let dir = self.dir_read();
-        let inode = dir.get_inode(ino, name)?;
-
-        if inode.cache_valid && inode.last_access + self.meta_cache_ttl >= LocalTime::mills() {
-            Some(inode.status.clone())
-        } else {
-            None
+        if self.enable_meta_cache {
+            let mut dir = self.dir_write();
+            if let Some(inode) = dir.get_inode_mut(ino, name) {
+                inode.invalid_cache();
+            };
         }
     }
 
@@ -111,22 +101,22 @@ impl NodeState {
     ///   - First access OR unchanged mtime/len → cache is valid
     ///   - We don't use kernel notification (FUSE_NOTIFY_INVAL_INODE) as it causes deadlocks in practice
     ///
-    pub fn update_status(&self, ino: u64, status: FileStatus) -> (bool, bool) {
+    pub fn update_status(&self, ino: u64, name: Option<&str>, status: &FileStatus) -> (bool, bool) {
         let mut lock = self.dir_write();
-        let inode = match lock.get_inode_mut(ino, None) {
+        let inode = match lock.get_inode_mut(ino, name) {
             Some(inode) => inode,
             None => return (false, false),
         };
 
         let is_changed = inode.mtime != status.mtime || status.len != inode.len;
-        let cache_valid = inode.cache_valid;
-        inode.update_status(status);
+        let cache_valid = inode.cache_valid(self.meta_cache_ttl);
+        inode.update_status(status.clone());
 
         (cache_valid, is_changed)
     }
 
-    pub fn keep_cache(&self, ino: u64, status: FileStatus) -> bool {
-        let (cache_valid, is_changed) = self.update_status(ino, status);
+    pub fn keep_cache(&self, ino: u64, status: &FileStatus) -> bool {
+        let (cache_valid, is_changed) = self.update_status(ino, None, status);
         !cache_valid || !is_changed
     }
 
@@ -177,13 +167,33 @@ impl NodeState {
         self.dir_read().next_id(status.id)
     }
 
-    pub fn lookup(&self, parent: u64, name: &str, status: FileStatus) -> FuseResult<fuse_attr> {
+    pub fn lookup_status(
+        &self,
+        parent: u64,
+        name: &str,
+        status: FileStatus,
+    ) -> FuseResult<fuse_attr> {
         let mut dir = self.dir_write();
-
         dir.clear(|ino| self.has_open_handles(ino));
 
         let inode = dir.lookup(parent, name, status)?;
-        FuseUtils::status_to_attr(&self.conf, inode)
+        inode.to_attr(&self.conf)
+    }
+
+    pub async fn lookup_common(&self, parent: u64, name: &str) -> FuseResult<fuse_attr> {
+        let status = self.fs_stat(parent, Some(name)).await?;
+        self.lookup_status(parent, name, status)
+    }
+
+    pub async fn lookup_link(
+        &self,
+        parent: u64,
+        name: &str,
+        link_id: u64,
+    ) -> FuseResult<fuse_attr> {
+        let mut status = self.fs_stat(parent, Some(name)).await?;
+        status.id = link_id as i64;
+        self.lookup_status(parent, name, status)
     }
 
     pub fn get_ino(&self, parent: u64, name: Option<&str>) -> Option<u64> {
@@ -194,6 +204,11 @@ impl NodeState {
             let inode = dir.get_inode(parent, name)?;
             Some(inode.ino)
         }
+    }
+
+    pub fn inode_exists(&self, ino: u64, name: Option<&str>) -> bool {
+        let dir = self.dir_read();
+        dir.get_inode(ino, name).is_some()
     }
 
     pub fn unlink(&self, ino: u64, name: &str) -> FuseResult<()> {
@@ -273,10 +288,9 @@ impl NodeState {
         &self,
         ino: Option<u64>,
         path: &Path,
-        flags: u32,
+        flags: OpenFlags,
         opts: CreateFileOpts,
     ) -> FuseResult<Arc<FileHandle>> {
-        let flags = OpenFlags::new(flags);
         // Before creating reader, flush any active writer to ensure reader gets correct file length
         // This is critical for applications like git clone that read files while they're being written
         if let Some(ino) = ino.filter(|_| flags.read()) {
@@ -351,9 +365,9 @@ impl NodeState {
             status,
         ));
 
-        lock.entry(handle.ino)
+        lock.entry(handle.ino())
             .or_default()
-            .insert(handle.fh, handle.clone());
+            .insert(handle.fh(), handle.clone());
 
         Ok(handle)
     }
@@ -397,7 +411,7 @@ impl NodeState {
         }
     }
 
-    pub fn should_delete_now(&self, parent: u64, name: &str) -> FuseResult<bool> {
+    pub async fn should_delete_server(&self, parent: u64, name: &str) -> FuseResult<bool> {
         let ino = self.dir_read().get_ino_check(parent, Some(name))?;
 
         if self.has_open_handles(ino) {
@@ -478,6 +492,131 @@ impl NodeState {
         lock.values()
             .flat_map(|v| v.values().cloned())
             .collect::<Vec<_>>()
+    }
+
+    fn get_cached_status(
+        &self,
+        ino: u64,
+        name: Option<&str>,
+        add_lookup: bool,
+    ) -> Option<FileStatus> {
+        if !self.enable_meta_cache {
+            return None;
+        }
+
+        if add_lookup {
+            self.dir_write()
+                .lookup_valid_inode_mut(ino, name, self.meta_cache_ttl)
+                .map(|inode| inode.status.clone())
+        } else {
+            self.dir_read()
+                .get_valid_inode(ino, name, self.meta_cache_ttl)
+                .map(|inode| inode.status.clone())
+        }
+    }
+
+    pub async fn fs_lookup(&self, ino: u64, name: &str) -> FuseResult<fuse_attr> {
+        if let Some(status) = self.get_cached_status(ino, Some(name), true) {
+            return FuseUtils::status_to_attr(&self.conf, &status);
+        }
+
+        let path = {
+            let dir = self.dir_read();
+            // Parent has a full directory snapshot (scan_complete, still within TTL);
+            // if the child is absent locally, return ENOENT without hitting the server.
+            if self.enable_meta_cache && dir.dir_scan_valid(ino, self.meta_cache_ttl) {
+                return err_fuse!(libc::ENOENT, "inode {} {} not found", ino, name);
+            }
+            dir.get_path_name(ino, name)?
+        };
+
+        let status = self.fs.get_status(&path).await?;
+        self.lookup_status(ino, name, status)
+    }
+
+    pub async fn fs_stat(&self, ino: u64, name: Option<&str>) -> FuseResult<FileStatus> {
+        if let Some(status) = self.get_cached_status(ino, name, false) {
+            return Ok(status);
+        }
+
+        let path = self.get_path_common(ino, name)?;
+        let status = self.fs.get_status(&path).await?;
+
+        if self.enable_meta_cache {
+            let _ = self.update_status(ino, name, &status);
+        }
+
+        Ok(status)
+    }
+
+    pub async fn fs_mkdir(&self, ino: u64, name: &str, opts: MkdirOpts) -> FuseResult<fuse_attr> {
+        let path = self.get_path_name(ino, name)?;
+        let status = match self.fs.mkdir_with_opts(&path, opts).await? {
+            Some(status) => status,
+            None => self.fs.get_status(&path).await?,
+        };
+
+        self.lookup_status(ino, name, status.clone())
+    }
+
+    pub async fn fs_create(
+        &self,
+        ino: u64,
+        name: &str,
+        flags: u32,
+        opts: CreateFileOpts,
+    ) -> FuseResult<Arc<FileHandle>> {
+        let flags = OpenFlags::new(flags);
+        let path = self.get_path_name(ino, name)?;
+
+        let handle = self.new_handle(None, &path, flags, opts).await?;
+        self.lookup_status(ino, name, handle.status().clone())?;
+        Ok(handle)
+    }
+
+    pub async fn fs_open(
+        &self,
+        ino: u64,
+        flags: u32,
+        opts: CreateFileOpts,
+    ) -> FuseResult<Arc<FileHandle>> {
+        let flags = OpenFlags::new(flags);
+
+        let path = self.get_path(ino)?;
+        self.new_handle(Some(ino), &path, flags, opts).await
+    }
+
+    pub async fn fs_set_attr(&self, ino: u64, opts: SetAttrOpts) -> FuseResult<FileStatus> {
+        let path = self.get_path_common(ino, None)?;
+        let status = match self.fs.fuse_set_attr(&path, opts).await? {
+            Some(status) => status,
+            None => self.fs.get_status(&path).await?,
+        };
+        let _ = self.update_status(ino, None, &status);
+
+        Ok(status)
+    }
+
+    pub async fn fs_resize(&self, ino: u64, fh: u64, opts: FileAllocOpts) -> FuseResult<()> {
+        opts.validate()?;
+
+        let path = self.get_path(ino)?;
+        if fh != 0 {
+            let handle = self.find_handle(ino, fh)?;
+            handle.resize(opts).await?;
+        } else {
+            self.fs.resize(&path, opts).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn fs_unlink(&self, parent: u64, name: &str) -> FuseResult<()> {
+        let path = self.get_path_common(parent, Some(name))?;
+        if self.should_delete_server(parent, name).await? {
+            self.fs.delete(&path, false).await?;
+        }
+        self.unlink(parent, name)
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
@@ -577,9 +716,9 @@ impl NodeState {
 
             self.handles
                 .write()
-                .entry(handle.ino)
+                .entry(handle.ino())
                 .or_default()
-                .insert(handle.fh, Arc::new(handle));
+                .insert(handle.fh(), Arc::new(handle));
             restored_handles += 1;
         }
         info!(

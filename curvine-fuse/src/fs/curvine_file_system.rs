@@ -18,16 +18,15 @@ use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
 use crate::session::{FuseBuf, FuseResponse};
 use crate::*;
-use crate::{err_fuse, FuseError, FuseResult, FuseUtils};
+use crate::{err_fuse, FuseResult, FuseUtils};
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClusterConf, FuseConf};
-use curvine_common::error::FsError;
 use curvine_common::fs::{FileSystem, Path, StateReader, StateWriter};
 use curvine_common::state::{
-    CreateFileOptsBuilder, FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags,
-    LockType, MkdirOptsBuilder, OpenFlags, SetAttrOpts,
+    FileAllocMode, FileAllocOpts, FileLock, FileStatus, FileType, LockFlags, LockType, OpenFlags,
+    SetAttrOpts,
 };
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::runtime::Runtime;
 use orpc::sys::FFIUtils;
@@ -38,7 +37,7 @@ use tokio_util::bytes::BytesMut;
 
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
-    state: NodeState,
+    state: Arc<NodeState>,
     conf: FuseConf,
 }
 
@@ -46,7 +45,7 @@ impl CurvineFileSystem {
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
         let fuse_conf = conf.fuse.clone();
         let fs = UnifiedFileSystem::with_rt(conf, rt)?;
-        let state = NodeState::new(fs.clone());
+        let state = Arc::new(NodeState::new(fs.clone()));
 
         let fuse_fs = Self {
             fs,
@@ -78,7 +77,7 @@ impl CurvineFileSystem {
     async fn fs_unlock(&self, handler: &FileHandle, flags: LockFlags) -> FuseResult<()> {
         if let Some(owner_id) = handler.remove_lock(flags) {
             let client_id = self.fs.cv().fs_context().clone_client_name();
-            let path = Path::from_str(&handler.status.path)?;
+            let path = Path::from_str(&handler.status().path)?;
 
             let mut lock = FileLock {
                 client_id,
@@ -96,44 +95,6 @@ impl CurvineFileSystem {
         }
 
         Ok(())
-    }
-
-    async fn fs_get_status(&self, path: &Path) -> FuseResult<FileStatus> {
-        let status = match self.fs.get_status(path).await {
-            Ok(v) => v,
-            Err(e) => {
-                return match e {
-                    FsError::FileNotFound(_) => err_fuse!(libc::ENOENT, "{}", e),
-                    _ => Err(FuseError::from(e)),
-                }
-            }
-        };
-        Ok(status)
-    }
-
-    pub async fn fs_set_attr(
-        &self,
-        path: &Path,
-        opts: SetAttrOpts,
-    ) -> FuseResult<Option<FileStatus>> {
-        match self.fs.fuse_set_attr(path, opts).await {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                let e: FuseError = e.into();
-                err_fuse!(e.errno, "Failed to set attr {}: {}", path, e)
-            }
-        }
-    }
-
-    async fn lookup_path(&self, parent: u64, name: &str, path: &Path) -> FuseResult<fuse_attr> {
-        let status = self.get_cached_status(parent, Some(name), path).await?;
-        let attr = self.state.lookup(parent, name, status)?;
-        Ok(attr)
-    }
-
-    fn lookup_status(&self, parent: u64, name: &str, status: FileStatus) -> FuseResult<fuse_attr> {
-        let attr = self.state.lookup(parent, name, status)?;
-        Ok(attr)
     }
 
     async fn read_dir_common(
@@ -170,16 +131,11 @@ impl CurvineFileSystem {
         Ok(res)
     }
 
-    async fn check_permissions(
-        &self,
-        path: &Path,
-        header: &fuse_in_header,
-        mask: u32,
-    ) -> FuseResult<()> {
+    async fn check_permissions(&self, header: &fuse_in_header, mask: u32) -> FuseResult<()> {
         if header.uid == 0 || !self.conf.check_permission {
             return Ok(());
         }
-        let status = self.get_cached_status(header.nodeid, None, path).await?;
+        let status = self.state.fs_stat(header.nodeid, None).await?;
         self.check_access_permissions(&status, header, mask)
     }
 
@@ -344,46 +300,6 @@ impl CurvineFileSystem {
             has_permission
         }
     }
-
-    async fn fs_resize(
-        &self,
-        path: &Path,
-        ino: u64,
-        fh: u64,
-        opts: FileAllocOpts,
-    ) -> FuseResult<()> {
-        opts.validate()?;
-        if fh != 0 {
-            let handle = self.state.find_handle(ino, fh)?;
-            if let Some(writer) = &handle.writer {
-                writer.resize(opts).await?;
-            } else {
-                return err_fuse!(libc::EACCES);
-            }
-        } else {
-            self.fs.resize(path, opts).await?;
-        };
-
-        Ok(())
-    }
-
-    async fn get_cached_status(
-        &self,
-        ino: u64,
-        name: Option<&str>,
-        path: &Path,
-    ) -> FuseResult<FileStatus> {
-        if let Some(status) = self.state.get_cache_status(ino, name) {
-            Ok(status)
-        } else {
-            let status = self.fs_get_status(path).await?;
-            Ok(status)
-        }
-    }
-
-    fn invalid_cache(&self, ino: u64, name: Option<&str>) {
-        self.state.invalid_cache(ino, name)
-    }
 }
 
 impl fs::FileSystem for CurvineFileSystem {
@@ -445,22 +361,13 @@ impl fs::FileSystem for CurvineFileSystem {
     // Query inode.
     async fn lookup(&self, op: Lookup<'_>) -> FuseResult<fuse_entry_out> {
         let name = try_option!(op.name.to_str());
-        let id = op.header.nodeid;
+        if FuseUtils.is_dot(name) {
+            return err_fuse!(libc::EIO, "not support name {}", name);
+        }
 
-        let parent = if name == FUSE_PARENT_DIR {
-            self.state.get_parent_ino(id)?
-        } else {
-            id
-        };
+        self.check_permissions(op.header, libc::X_OK as u32).await?;
 
-        let parent_path = self.state.get_path(parent)?;
-        self.check_permissions(&parent_path, op.header, libc::X_OK as u32)
-            .await?;
-
-        // Reuse parent_path instead of traversing the node tree again.
-        let path = Path::from_str(format!("{}/{}", parent_path.full_path(), name))?;
-        let res = self.lookup_path(parent, name, &path).await;
-
+        let res = self.state.fs_lookup(op.header.nodeid, name).await;
         let entry = match res {
             Ok(attr) => {
                 let mut entry = FuseUtils::create_entry_out(&self.conf, attr);
@@ -491,11 +398,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let name = try_option!(op.name.to_str());
         FuseUtils::check_xattr(name, true)?;
 
-        let path = self.state.get_path(op.header.nodeid)?;
-        let status = self
-            .get_cached_status(op.header.nodeid, None, &path)
-            .await?;
-
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
         let mut buf = FuseBuf::default();
         if let Some(value) = status.x_attr.get(name) {
             if op.arg.size == 0 {
@@ -517,23 +420,12 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(buf.take())
     }
 
-    // setfattr -n system.posix_acl_access -v "user::rw-,group::r--,other::r--" /curvine-fuse/file
-    // Set POSIX ACL attributes for files and directories
     async fn set_xattr(&self, op: SetXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        let path = self.state.get_path(op.header.nodeid)?;
+        FuseUtils::check_xattr(name, true)?;
 
         // Get the xattr value from the request
         let value_slice: &[u8] = op.value;
-
-        debug!(
-            "Setting xattr: path='{}' name='{}' value='{}'",
-            path,
-            name,
-            String::from_utf8_lossy(value_slice)
-        );
-
-        FuseUtils::check_xattr(name, false)?;
 
         // Create SetAttrOpts with the xattr to add
         let mut add_x_attr = HashMap::new();
@@ -544,44 +436,27 @@ impl fs::FileSystem for CurvineFileSystem {
             ..Default::default()
         };
 
-        let _ = self.fs_set_attr(&path, opts).await?;
-        self.state.invalid_cache(op.header.nodeid, None);
+        let _ = self.state.fs_set_attr(op.header.nodeid, opts).await?;
         Ok(())
     }
 
-    // setfattr -x system.posix_acl_access /curvine-fuse/file
-    // Remove POSIX ACL attributes from files and directories
     async fn remove_xattr(&self, op: RemoveXAttr<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        let path = self.state.get_path(op.header.nodeid)?;
-
-        debug!("Removing xattr: path='{}' name='{}'", path, name);
-
         if FuseUtils::check_xattr(name, false).is_err() {
             return Ok(());
         }
 
-        // Create SetAttrOpts with the xattr to remove
         let opts = SetAttrOpts {
             remove_x_attr: vec![name.to_string()],
             ..Default::default()
         };
-
-        let _ = self.fs_set_attr(&path, opts).await?;
-        self.state.invalid_cache(op.header.nodeid, None);
+        let _ = self.state.fs_set_attr(op.header.nodeid, opts).await?;
 
         Ok(())
     }
 
-    // listxattr /curvine-fuse/file
-    // List all extended attributes for a file or directory
     async fn list_xattr(&self, op: ListXAttr<'_>) -> FuseResult<BytesMut> {
-        let path = self.state.get_path(op.header.nodeid)?;
-        debug!("Listing xattrs: path='{}' size={}", path, op.arg.size);
-
-        let status = self
-            .get_cached_status(op.header.nodeid, None, &path)
-            .await?;
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
 
         // Build the list of xattr names
         let mut xattr_names = Vec::new();
@@ -618,14 +493,9 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn get_attr(&self, op: GetAttr<'_>) -> FuseResult<fuse_attr_out> {
-        let path = self.state.get_path(op.header.nodeid)?;
-        let status = self
-            .get_cached_status(op.header.nodeid, None, &path)
-            .await?;
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
 
-        let mut fuse_attr = FuseUtils::status_to_attr(&self.conf, &status)?;
-        fuse_attr.ino = op.header.nodeid;
-
+        let fuse_attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         let mut attr = fuse_attr_out {
             attr_valid: self.conf.attr_ttl.as_secs(),
             attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
@@ -645,31 +515,14 @@ impl fs::FileSystem for CurvineFileSystem {
     //The chown, chmod, and truncate commands will access the interface.
     // @todo is not implemented at this time, and this interface will not cause inode to be familiar with.
     async fn set_attr(&self, op: SetAttr<'_>) -> FuseResult<fuse_attr_out> {
-        debug!(
-            "Setting attr: path='{}', opts={:?}",
-            op.header.nodeid, op.arg
-        );
-        let path = self.state.get_path(op.header.nodeid)?;
-
         // Convert setattr to opts with UID/GID numeric fallback
-        let mut opts = match FuseUtils::fuse_setattr_to_opts(op.arg) {
-            Ok(opts) => {
-                debug!("Converted setattr opts: {:?}", opts);
-                opts
-            }
-            Err(e) => {
-                error!("Failed to convert setattr opts: {}", e);
-                return Err(e);
-            }
-        };
+        let mut opts = FuseUtils::fuse_setattr_to_opts(op.arg)?;
 
         // Apply chown suid/sgid rules when owner or group changes on regular files.
         // If kernel didn't provide FATTR_MODE, we still need to clear bits accordingly.
         if (op.arg.valid & (FATTR_UID | FATTR_GID)) != 0 {
             // Fetch current status to determine file type and mode
-            let cur_status = self
-                .get_cached_status(op.header.nodeid, None, &path)
-                .await?;
+            let cur_status = self.state.fs_stat(op.header.nodeid, None).await?;
             if cur_status.file_type == FileType::File {
                 let mut new_mode = if let Some(mode) = opts.mode {
                     mode
@@ -687,25 +540,20 @@ impl fs::FileSystem for CurvineFileSystem {
             }
         }
 
-        let mut status = match self.fs_set_attr(&path, opts).await? {
-            Some(v) => v,
-            None => self.fs_get_status(&path).await?,
-        };
+        let mut status = self.state.fs_set_attr(op.header.nodeid, opts).await?;
 
         if (op.arg.valid & FATTR_SIZE) != 0 {
             let expect_len = op.arg.size as i64;
             if expect_len != status.len {
                 let resize_opts = FileAllocOpts::with_truncate(expect_len);
-                self.fs_resize(&path, op.header.nodeid, op.arg.fh, resize_opts)
+                self.state
+                    .fs_resize(op.header.nodeid, op.arg.fh, resize_opts)
                     .await?;
                 status.len = expect_len;
             }
         }
 
-        self.state.invalid_cache(op.header.nodeid, None);
-        let mut attr = FuseUtils::status_to_attr(&self.conf, &status)?;
-        attr.ino = op.header.nodeid;
-
+        let attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         let attr = fuse_attr_out {
             attr_valid: self.conf.attr_ttl.as_secs(),
             attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
@@ -715,15 +563,8 @@ impl fs::FileSystem for CurvineFileSystem {
         Ok(attr)
     }
 
-    // This interface is not supported at present
     async fn access(&self, op: Access<'_>) -> FuseResult<()> {
-        let path = self.state.get_path(op.header.nodeid)?;
-
-        // Get file status to check permissions
-        self.check_permissions(&path, op.header, op.arg.mask)
-            .await?;
-
-        Ok(())
+        self.check_permissions(op.header, op.arg.mask).await
     }
 
     // Open the directory.
@@ -732,8 +573,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         // Check directory permissions based on open action
         let dir_path = self.state.get_path(op.header.nodeid)?;
-        self.check_permissions(&dir_path, op.header, action.acl_mask())
-            .await?;
+        self.check_permissions(op.header, action.acl_mask()).await?;
 
         let handle = self
             .state
@@ -775,42 +615,18 @@ impl fs::FileSystem for CurvineFileSystem {
 
     // Create a directory.
     async fn mkdir(&self, op: MkDir<'_>) -> FuseResult<fuse_entry_out> {
+        let ino = op.header.nodeid;
         let name = try_option!(op.name.to_str());
         if name.len() > FUSE_MAX_NAME_LENGTH {
             return err_fuse!(libc::ENAMETOOLONG);
         }
 
-        let path = self.state.get_path_name(op.header.nodeid, name)?;
-
-        let mut opts = MkdirOptsBuilder::with_conf(&self.fs.conf().client);
-        // Apply requested mode and ownership to directory if provided
-        if op.arg.mode != 0 {
-            opts = opts.acl(
-                op.header.uid,
-                op.header.gid,
-                op.arg.mode & 0o7777 & !op.arg.umask,
-            )
-        }
-
-        let status = match self.fs.mkdir_with_opts(&path, opts.build()).await {
-            Ok(status) => match status {
-                Some(v) => v,
-                None => self.fs.get_status(&path).await?,
-            },
-
-            Err(e) => {
-                let e: FuseError = e.into();
-                return err_fuse!(e.errno, "mkdir {}: {}", path, e);
-            }
-        };
-
-        let entry = self.lookup_status(op.header.nodeid, name, status)?;
-        Ok(FuseUtils::create_entry_out(&self.conf, entry))
+        let opts = FuseUtils::mkdir_opts(&op, &self.fs);
+        let attr = self.state.fs_mkdir(ino, name, opts).await?;
+        Ok(FuseUtils::create_entry_out(&self.conf, attr))
     }
 
     async fn allocate(&self, op: FAllocate<'_>) -> FuseResult<()> {
-        let path = self.state.get_path(op.header.nodeid)?;
-
         let opts = FileAllocOpts {
             truncate: false,
             off: op.arg.offset as i64,
@@ -818,8 +634,8 @@ impl fs::FileSystem for CurvineFileSystem {
             mode: FileAllocMode::from_bits_truncate(op.arg.mode as i32),
         };
 
-        opts.validate()?;
-        self.fs_resize(&path, op.header.nodeid, op.arg.fh, opts)
+        self.state
+            .fs_resize(op.header.nodeid, op.arg.fh, opts)
             .await
     }
 
@@ -846,25 +662,19 @@ impl fs::FileSystem for CurvineFileSystem {
     }
 
     async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
-        let path = self.state.get_path(op.header.nodeid)?;
-        // Check file access permissions before opening
         let action = OpenAction::try_from(op.arg.flags)?;
-        self.check_permissions(&path, op.header, action.acl_mask())
-            .await?;
+        self.check_permissions(op.header, action.acl_mask()).await?;
 
-        let opts = CreateFileOptsBuilder::with_conf(&self.fs.conf().client);
-        let handle = self
-            .state
-            .new_handle(Some(op.header.nodeid), &path, op.arg.flags, opts.build())
-            .await?;
+        let ino = op.header.nodeid;
+        let opts = FuseUtils::open_opts(&self.fs);
+
+        let handle = self.state.fs_open(ino, op.arg.flags, opts).await?;
 
         let mut open_flags = op.arg.flags;
         if self.conf.direct_io {
             open_flags |= FUSE_FOPEN_DIRECT_IO;
         } else {
-            let keep_cache = self
-                .state
-                .keep_cache(op.header.nodeid, handle.status().clone());
+            let keep_cache = self.state.keep_cache(ino, handle.status());
             if keep_cache {
                 open_flags |= FUSE_FOPEN_KEEP_CACHE;
             } else {
@@ -886,42 +696,28 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::EIO);
         }
 
+        let ino = op.header.nodeid;
         let name = try_option!(op.name.to_str());
         if name.len() > FUSE_MAX_NAME_LENGTH {
             return err_fuse!(libc::ENAMETOOLONG);
         }
 
-        // create opts
-        let mut opts = CreateFileOptsBuilder::with_conf(&self.fs.conf().client);
-        // Apply requested mode and ownership to the new file if provided
-        if op.arg.mode != 0 {
-            opts = opts.acl(
-                op.header.uid,
-                op.header.gid,
-                op.arg.mode & 0o7777 & !op.arg.umask,
-            )
-        }
+        let opts = FuseUtils::create_opts(&op, &self.fs);
+        let handle = self.state.fs_create(ino, name, op.arg.flags, opts).await?;
+        let attr = FuseUtils::status_to_attr(&self.conf, handle.status())?;
 
-        let path = self.state.get_path_common(op.header.nodeid, Some(name))?;
-        let handle = self
-            .state
-            .new_handle(None, &path, op.arg.flags, opts.build())
-            .await?;
-
-        let attr = self.lookup_status(op.header.nodeid, name, handle.status().clone())?;
-        if attr.ino != handle.ino {
+        if attr.ino != handle.ino() {
             return err_fuse!(
                 libc::EIO,
-                "ino mismatch after create: dcache returned ino={} but handle has ino={}, path={}",
+                "ino mismatch after create: dcache returned ino={} but handle has ino={}",
                 attr.ino,
-                handle.ino,
-                path
+                handle.ino()
             );
         }
 
         let r = fuse_create_out(
             fuse_entry_out {
-                nodeid: handle.ino,
+                nodeid: handle.ino(),
                 generation: 0,
                 entry_valid: self.conf.entry_ttl.as_secs(),
                 attr_valid: self.conf.attr_ttl.as_secs(),
@@ -930,7 +726,7 @@ impl fs::FileSystem for CurvineFileSystem {
                 attr,
             },
             fuse_open_out {
-                fh: handle.fh,
+                fh: handle.fh(),
                 open_flags: op.arg.flags,
                 padding: 0,
             },
@@ -949,8 +745,8 @@ impl fs::FileSystem for CurvineFileSystem {
         self.fs_unlock(&handle, LockFlags::Plock).await?;
         handle.flush(Some(reply)).await?;
 
-        if handle.writer.is_some() {
-            self.invalid_cache(op.header.nodeid, None);
+        if handle.has_writer() {
+            self.state.invalid_cache(op.header.nodeid, None);
         }
 
         Ok(())
@@ -977,8 +773,8 @@ impl fs::FileSystem for CurvineFileSystem {
                 warn!("failed to delete {} after last handle closed: {}", path, e);
             }
         }
-        if handle.writer.is_some() {
-            self.invalid_cache(op.header.nodeid, None);
+        if handle.has_writer() {
+            self.state.invalid_cache(op.header.nodeid, None);
         }
         Ok(())
     }
@@ -989,15 +785,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn unlink(&self, op: Unlink<'_>) -> FuseResult<()> {
         let name = try_option!(op.name.to_str());
-        let parent_ino = op.header.nodeid;
-
-        let path = self.state.get_path_common(parent_ino, Some(name))?;
-        if self.state.should_delete_now(parent_ino, name)? {
-            self.fs.delete(&path, false).await?;
-        }
-        self.state.unlink(parent_ino, name)?;
-
-        Ok(())
+        self.state.fs_unlink(op.header.nodeid, name).await
     }
 
     async fn link(&self, op: Link<'_>) -> FuseResult<fuse_entry_out> {
@@ -1013,7 +801,10 @@ impl fs::FileSystem for CurvineFileSystem {
         );
 
         self.fs.link(&src_path, &des_path).await?;
-        let attr = self.lookup_path(op.header.nodeid, name, &des_path).await?;
+        let attr = self
+            .state
+            .lookup_link(op.header.nodeid, name, oldnodeid)
+            .await?;
 
         let result = FuseUtils::create_entry_out(&self.conf, attr);
         Ok(result)
@@ -1062,38 +853,36 @@ impl fs::FileSystem for CurvineFileSystem {
             return err_fuse!(libc::ENAMETOOLONG);
         }
 
-        let parent = if linkname == FUSE_PARENT_DIR {
-            self.state.get_parent_ino(id)?
-        } else {
-            id
-        };
+        if FuseUtils.is_dot(linkname) {
+            return err_fuse!(libc::EIO, "not support name {}", linkname);
+        }
 
-        let link_path = self.state.get_path_common(parent, Some(linkname))?;
+        let link_path = self.state.get_path_common(id, Some(linkname))?;
         self.fs.symlink(target, &link_path, false).await?;
 
-        let entry = self.lookup_path(parent, linkname, &link_path).await?;
-        Ok(FuseUtils::create_entry_out(&self.conf, entry))
+        let attr = self.state.lookup_common(id, linkname).await?;
+        Ok(FuseUtils::create_entry_out(&self.conf, attr))
     }
 
     // Read the target of a symbolic link
     async fn readlink(&self, op: Readlink<'_>) -> FuseResult<BytesMut> {
-        let path = self.state.get_path(op.header.nodeid)?;
-
         // Get file status to read the symlink target
-        let status = self
-            .get_cached_status(op.header.nodeid, None, &path)
-            .await?;
+        let status = self.state.fs_stat(op.header.nodeid, None).await?;
 
         // Check if it's actually a symlink
         if status.file_type != FileType::Link {
-            return err_fuse!(libc::EINVAL, "Not a symbolic link: {}", path);
+            return err_fuse!(libc::EINVAL, "Not a symbolic link: {}", status.path);
         }
 
         // Get the target from the file status
         let curvine_target = match status.target {
             Some(target) => target,
             None => {
-                return err_fuse!(libc::ENODATA, "Symbolic link has no target: {}", path);
+                return err_fuse!(
+                    libc::ENODATA,
+                    "Symbolic link has no target: {}",
+                    status.path
+                );
             }
         };
 
@@ -1110,8 +899,8 @@ impl fs::FileSystem for CurvineFileSystem {
         let handle = self.state.find_handle(op.header.nodeid, op.arg.fh)?;
         handle.flush(Some(reply)).await?;
 
-        if handle.writer.is_some() {
-            self.invalid_cache(op.header.nodeid, None);
+        if handle.has_writer() {
+            self.state.invalid_cache(op.header.nodeid, None);
         }
 
         Ok(())

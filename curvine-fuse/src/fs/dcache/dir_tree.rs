@@ -94,6 +94,32 @@ impl DirTree {
         }
     }
 
+    pub fn lookup_valid_inode_mut(
+        &mut self,
+        ino: u64,
+        name: Option<&str>,
+        ttl: u64,
+    ) -> Option<&mut Inode> {
+        let inode = self.get_inode_mut(ino, name)?;
+        if !inode.cache_valid(ttl) {
+            return None;
+        }
+        inode.add_lookup(1);
+        Some(inode)
+    }
+
+    pub fn dir_scan_valid(&self, ino: u64, ttl: u64) -> bool {
+        let Some(inode) = self.get_inode(ino, None) else {
+            return false;
+        };
+        inode.dir_scan_valid(ttl)
+    }
+
+    pub fn get_valid_inode(&self, ino: u64, name: Option<&str>, ttl: u64) -> Option<&Inode> {
+        self.get_inode(ino, name)
+            .filter(|inode| inode.cache_valid(ttl))
+    }
+
     pub fn get_dir_mut_check(&mut self, ino: u64) -> FuseResult<&mut DirEntry> {
         match self.inodes.get_mut(&ino) {
             None => err_fuse!(libc::ENOENT, "inode {} not found", ino),
@@ -135,7 +161,12 @@ impl DirTree {
     }
 
     // LOOKUP: create inode and parent directory entry as needed.
-    pub fn lookup(&mut self, parent: u64, name: &str, status: FileStatus) -> FuseResult<&Inode> {
+    pub fn lookup(
+        &mut self,
+        parent: u64,
+        name: &str,
+        status: FileStatus,
+    ) -> FuseResult<&mut Inode> {
         let ino = match self.get_inode_mut(parent, Some(name)) {
             Some(inode) => {
                 inode.add_lookup(1);
@@ -143,7 +174,12 @@ impl DirTree {
                 inode.ino
             }
             None => {
-                let ino = self.next_id(status.id);
+                let ino = status
+                    .exists_links()
+                    .then(|| self.get_inode(status.id as u64, None).map(|v| v.ino))
+                    .flatten()
+                    .unwrap_or_else(|| self.next_id(status.id));
+
                 self.inodes
                     .insert(ino, Inode::with_status(ino, parent, name, status));
                 ino
@@ -154,7 +190,7 @@ impl DirTree {
         let dir = self.get_dir_mut_check(parent)?;
         dir.children.insert(name.to_owned(), ino);
 
-        self.get_inode_check(ino, None)
+        self.get_inode_mut_check(ino, None)
     }
 
     pub fn unlink(&mut self, parent: u64, name: &str) -> FuseResult<()> {
@@ -298,6 +334,12 @@ impl DirTree {
         Ok(())
     }
 
+    pub fn mark_scan_complete(&mut self, ino: u64) -> FuseResult<()> {
+        let dir = self.get_dir_mut_check(ino)?;
+        dir.scan_complete = true;
+        Ok(())
+    }
+
     pub fn pending_delete(&self, ino: u64) -> bool {
         let inode = self.get_inode(ino, None);
         match inode {
@@ -336,24 +378,17 @@ impl DirTree {
             return;
         }
 
-        let to_remove: Vec<(u64, u64, String)> = self
+        let ttl = self.cache_ttl;
+        let removed: Vec<(u64, u64, String)> = self
             .inodes
             .values()
-            .filter(|inode| {
-                !inode.is_root()
-                    && !has_open_handles(inode.ino)
-                    && inode.last_access + self.cache_ttl <= now
-                    && inode.dir.as_ref().is_none_or(|d| d.children.is_empty())
-            })
-            .map(|inode| (inode.ino, inode.parent, inode.name.clone()))
+            .filter(|inode| inode.can_evict(ttl) && !has_open_handles(inode.ino))
+            .map(|i| (i.ino, i.parent, i.name.clone()))
             .collect();
 
-        let removed = to_remove.len();
-        for (ino, parent, name) in &to_remove {
-            if let Some(parent_inode) = self.inodes.get_mut(parent) {
-                if let Some(dir) = parent_inode.dir.as_mut() {
-                    dir.children.remove(name.as_str());
-                }
+        for (ino, parent, name) in &removed {
+            if let Some(dir) = self.inodes.get_mut(parent) {
+                dir.remove_child(name)
             }
             self.inodes.remove(ino);
         }
@@ -361,7 +396,7 @@ impl DirTree {
         self.last_clean = now;
         info!(
             "DirTree::clear: evicted {} expired inodes, remaining {}, cost {} ms",
-            removed,
+            removed.len(),
             self.inodes.len(),
             LocalTime::mills() - now
         );
