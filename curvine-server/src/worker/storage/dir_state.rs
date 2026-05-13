@@ -101,17 +101,20 @@ impl BdevOffsetAllocator {
         let aligned_size = align_up_i64(size, inner.align);
 
         // Try free-list first
-        for (&offset, &fsize) in inner.free_list.iter() {
-            if fsize >= aligned_size {
-                inner.free_list.remove(&offset);
-                if fsize > aligned_size {
-                    inner
-                        .free_list
-                        .insert(offset + aligned_size, fsize - aligned_size);
-                }
-                inner.map.insert(block_id, (offset, aligned_size));
-                return Ok(offset);
+        let candidate = inner
+            .free_list
+            .iter()
+            .find(|(_, &v)| v >= aligned_size)
+            .map(|(&k, &v)| (k, v));
+        if let Some((offset, fsize)) = candidate {
+            inner.free_list.remove(&offset);
+            if fsize > aligned_size {
+                inner
+                    .free_list
+                    .insert(offset + aligned_size, fsize - aligned_size);
             }
+            inner.map.insert(block_id, (offset, aligned_size));
+            return Ok(offset);
         }
 
         // Fall back to bump
