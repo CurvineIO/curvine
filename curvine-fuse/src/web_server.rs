@@ -1,15 +1,20 @@
+use crate::fs::state::NodeState;
+use crate::FuseMetrics;
+use axum::extract::State;
 use axum::routing::get;
 use axum::Router;
-use curvine_client::file::FsContext;
+use orpc::common::Metrics;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 pub struct WebServer;
 
 impl WebServer {
-    pub async fn start(port: u16) -> orpc::CommonResult<()> {
+    pub async fn start(port: u16, state: Arc<NodeState>) -> orpc::CommonResult<()> {
         let app = Router::new()
             .route("/metrics", get(metrics_handler))
-            .route("/healthz", get(|| async { "ok" }));
+            .route("/healthz", get(|| async { "ok" }))
+            .with_state(state);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         log::info!("FUSE metrics server listening on {}", addr);
@@ -20,8 +25,8 @@ impl WebServer {
     }
 }
 
-async fn metrics_handler() -> String {
-    FsContext::get_metrics()
-        .text_output()
-        .unwrap_or_else(|e| format!("Error: {}", e))
+async fn metrics_handler(State(state): State<Arc<NodeState>>) -> String {
+    let fuse_metrics = FuseMetrics::get();
+    state.set_metrics(fuse_metrics);
+    Metrics::text_output().unwrap_or_else(|e| format!("Error: {}", e))
 }

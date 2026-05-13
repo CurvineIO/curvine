@@ -18,8 +18,8 @@ use crate::fs::state::DirHandle;
 use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
-    err_fuse, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC,
-    STATE_FILE_VERSION,
+    err_fuse, FuseMetrics, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR,
+    STATE_FILE_MAGIC, STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
@@ -492,6 +492,22 @@ impl NodeState {
         lock.values()
             .flat_map(|v| v.values().cloned())
             .collect::<Vec<_>>()
+    }
+
+    pub fn file_handles_len(&self) -> usize {
+        let lock = self.handles.read();
+        lock.values().map(|m| m.len()).sum()
+    }
+
+    pub fn dir_handles_len(&self) -> usize {
+        let lock = self.dir_handles.read();
+        lock.values().map(|m| m.len()).sum()
+    }
+
+    pub fn set_metrics(&self, m: &FuseMetrics) {
+        m.inode_num.set(self.dir_read().inode_lens() as i64);
+        m.file_handle_num.set(self.file_handles_len() as i64);
+        m.dir_handle_num.set(self.dir_handles_len() as i64);
     }
 
     fn get_cached_status(

@@ -48,15 +48,18 @@ fn main() -> CommonResult<()> {
 
     let fuse_rt = rt.clone();
 
-    rt.spawn(async move {
-        if let Err(e) = WebServer::start(cluster_conf.fuse.web_port).await {
-            tracing::error!("Failed to start metrics server: {}", e);
-        }
-    });
-
     rt.block_on(async move {
         let fs = CurvineFileSystem::new(cluster_conf, fuse_rt.clone()).unwrap();
         let conf = fs.conf().clone();
+
+        let node_state = fs.state().clone();
+        let web_port = conf.web_port;
+        fuse_rt.spawn(async move {
+            if let Err(e) = WebServer::start(web_port, node_state).await {
+                log::error!("Failed to start metrics server: {}", e);
+            }
+        });
+
         let mut session = FuseSession::new(fuse_rt.clone(), fs, conf).await.unwrap();
         session.run().await
     })?;

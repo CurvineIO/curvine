@@ -43,6 +43,8 @@ pub struct CurvineFileSystem {
 
 impl CurvineFileSystem {
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
+        FuseMetrics::ensure_init()?;
+
         let fuse_conf = conf.fuse.clone();
         let fs = UnifiedFileSystem::with_rt(conf, rt)?;
         let state = Arc::new(NodeState::new(fs.clone()));
@@ -58,6 +60,10 @@ impl CurvineFileSystem {
 
     pub fn conf(&self) -> &FuseConf {
         &self.conf
+    }
+
+    pub fn state(&self) -> &Arc<NodeState> {
+        &self.state
     }
 
     fn to_file_lock(&self, arg: &fuse_lk_in) -> FileLock {
