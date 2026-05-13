@@ -365,7 +365,7 @@ impl Dataset for VfsDataset {
     }
 }
 
-#[cfg(all(test, feature = "spdk"))]
+#[cfg(test)]
 mod test {
     use crate::worker::block::BlockMeta;
     use crate::worker::block::BlockState;
@@ -385,9 +385,9 @@ mod test {
             worker: WorkerConf {
                 dir_reserved: "0".to_string(),
                 data_dir: vec![
-                    format!("[MEM:100B]/tmp/curvine-test-{}/d1", dir),
-                    format!("[SSD:200B]/tmp/curvine-test-{}/d2", dir),
-                    format!("[SSD:200B]/tmp/curvine-test-{}/d3", dir),
+                    format!("[MEM:100B]../testing/dataset-{}/d1", dir),
+                    format!("[SSD:200B]../testing/dataset-{}/d2", dir),
+                    format!("[SSD:200B]../testing/dataset-{}/d3", dir),
                 ],
                 io_slow_threshold: "300ms".to_string(),
                 ..WorkerConf::default()
