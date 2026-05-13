@@ -53,16 +53,14 @@ impl StatCommand {
                         println!("Ttl action: {:?}", status.storage_policy.ttl_action);
 
                         // Format modification time
-                        let mtime = chrono::DateTime::from_timestamp(status.mtime / 1000, 0)
-                            .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
-                        let formatted_mtime = mtime.format("%Y-%m-%d %H:%M:%S").to_string();
-
-                        let ufs_mtime = chrono::DateTime::from_timestamp(
-                            status.storage_policy.ufs_mtime / 1000,
-                            0,
-                        )
-                        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
-                        let formatted_ufs_mtime = ufs_mtime.format("%Y-%m-%d %H:%M:%S").to_string();
+                        let formatted_mtime = crate::cmds::fs::common::format_epoch_ms_local(
+                            status.mtime,
+                            "%Y-%m-%d %H:%M:%S",
+                        );
+                        let formatted_ufs_mtime = crate::cmds::fs::common::format_epoch_ms_local(
+                            status.storage_policy.ufs_mtime,
+                            "%Y-%m-%d %H:%M:%S",
+                        );
 
                         println!("Type: {}", if status.is_dir { "directory" } else { "file" });
                         println!("Modification time: {}", formatted_mtime);

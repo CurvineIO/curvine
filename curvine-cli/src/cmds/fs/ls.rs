@@ -372,9 +372,8 @@ async fn print_file_entry(
 
     // Format time (use access time if requested, otherwise modification time)
     let timestamp = if config.atime { file.atime } else { file.mtime };
-    let datetime = chrono::DateTime::from_timestamp(timestamp / 1000, 0)
-        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
-    let formatted_time = datetime.format("%Y-%m-%d %H:%M").to_string();
+    let formatted_time =
+        crate::cmds::fs::common::format_epoch_ms_local(timestamp, "%Y-%m-%d %H:%M");
 
     // Format filename (handle non-printable characters)
     let filename = if config.hide_non_printable {
