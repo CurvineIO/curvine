@@ -44,6 +44,7 @@ fxhash = { workspace = true }
 moka = { workspace = true }
 md-5 = { workspace = true }
 nix = { workspace = true }
+parking_lot = { workspace = true }
 
 [features]
 spdk = []

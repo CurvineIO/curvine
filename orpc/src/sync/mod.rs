@@ -43,3 +43,6 @@ pub use self::mutex_hash_map::MutexHashMap;
 
 mod rw_lock_hash_map;
 pub use self::rw_lock_hash_map::RwLockHashMap;
+
+mod mutex;
+pub use self::mutex::*;

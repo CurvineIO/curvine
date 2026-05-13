@@ -123,7 +123,7 @@ bitvec = "1.0.1"
 config = "0.13.4"
 tempfile = "3.21.0"
 md-5 = "0.10.6"
-bitflags = "2.10.0"
+bitflags = { version = "2.10.0", features = ["serde"] }
 glob = "0.3"
 lru = "0.16.1"
 
