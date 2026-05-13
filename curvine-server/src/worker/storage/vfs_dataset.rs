@@ -493,7 +493,7 @@ mod test {
                 FileType::File,
             ))
             .is_ok();
-        assert!(ok && ds.block_map.get(&1).is_none());
+        assert!(ok && !ds.block_map.contains_key(&1));
         Ok(())
     }
     #[test]
@@ -505,7 +505,7 @@ mod test {
         assert_eq!(ds.offset_alloc_for_dir(1).unwrap().allocated_count(), 1);
 
         ds.abort_block(&block1)?;
-        assert!(ds.block_map.get(&1).is_none());
+        assert!(!ds.block_map.contains_key(&1));
         assert_eq!(ds.offset_alloc_for_dir(1).unwrap().free_list_size(), 1);
 
         let block2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
