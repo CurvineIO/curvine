@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fs::operator::Write;
 use crate::raw::fuse_abi::fuse_write_out;
 use crate::session::FuseResponse;
 use curvine_client::unified::UnifiedWriter;
@@ -30,7 +29,7 @@ use std::sync::Arc;
 use tokio_util::bytes::Bytes;
 
 enum WriteTask {
-    Write(i64, Bytes, FuseResponse),
+    Write(i64, Bytes, Option<FuseResponse>),
     Flush(CallSender<i8>, Option<FuseResponse>),
     Complete(CallSender<i8>, Option<FuseResponse>),
     Resize(CallSender<i8>, FileAllocOpts),
@@ -90,9 +89,9 @@ impl FuseWriter {
         self.err_monitor.take_error().unwrap_or(e)
     }
 
-    pub async fn write(&self, op: Write<'_>, reply: FuseResponse) -> FsResult<()> {
+    pub async fn write(&self, off: i64, data: Bytes, reply: Option<FuseResponse>) -> FsResult<()> {
         self.sender
-            .send(WriteTask::Write(op.arg.offset as i64, op.data, reply))
+            .send(WriteTask::Write(off, data, reply))
             .await
             .map_err(|e| self.check_error(e.into()))
     }
@@ -142,13 +141,19 @@ impl FuseWriter {
                             size: len as u32,
                             padding: 0,
                         });
-                    reply.send_rep(res).await?;
+                    if let Some(reply) = reply {
+                        reply.send_rep(res).await?;
+                    } else {
+                        res?;
+                    }
                 }
 
                 WriteTask::Flush(tx, reply) => {
                     let res = writer.flush().await;
                     if let Some(reply) = reply {
                         reply.send_rep(res).await?;
+                    } else {
+                        res?;
                     }
                     tx.send(1)?;
                 }
@@ -157,6 +162,8 @@ impl FuseWriter {
                     let res = writer.complete().await;
                     if let Some(reply) = reply {
                         reply.send_rep(res).await?;
+                    } else {
+                        res?;
                     }
                     tx.send(1)?;
                 }

@@ -57,106 +57,8 @@ impl CurvineFileSystem {
         Ok(fuse_fs)
     }
 
-    fn fill_open_flags(conf: &FuseConf, v: u32) -> u32 {
-        let mut flags = v;
-        if conf.direct_io {
-            flags |= FUSE_FOPEN_DIRECT_IO;
-        } else {
-            flags |= FUSE_FOPEN_KEEP_CACHE;
-        }
-        if conf.cache_readdir {
-            flags |= FUSE_FOPEN_CACHE_DIR
-        }
-        if conf.non_seekable {
-            flags |= FUSE_FOPEN_NONSEEKABLE
-        }
-
-        flags
-    }
-
     pub fn conf(&self) -> &FuseConf {
         &self.conf
-    }
-
-    pub fn status_to_attr(conf: &FuseConf, status: &FileStatus) -> FuseResult<fuse_attr> {
-        let blocks = ((status.len + 511) / 512) as u64;
-
-        let mtime_sec = (status.mtime.max(0) / 1000) as u64;
-        let mtime_nsec = ((status.mtime.max(0) % 1000) * 1_000_000) as u32;
-
-        let atime_sec = (status.atime.max(0) / 1000) as u64;
-        let atime_nsec = ((status.atime.max(0) % 1000) * 1_000_000) as u32;
-
-        let ctime_sec = mtime_sec;
-        let ctime_nsec = mtime_nsec;
-
-        let uid = if status.owner.is_empty() {
-            conf.uid
-        } else if let Ok(numeric_uid) = status.owner.parse::<u32>() {
-            numeric_uid
-        } else {
-            match sys::get_uid_by_name(&status.owner) {
-                Some(uid) => uid,
-                None => conf.uid,
-            }
-        };
-
-        let gid = if status.group.is_empty() {
-            conf.gid
-        } else if let Ok(numeric_gid) = status.group.parse::<u32>() {
-            numeric_gid
-        } else {
-            match sys::get_gid_by_name(&status.group) {
-                Some(gid) => gid,
-                None => conf.gid,
-            }
-        };
-
-        let mode = if status.mode != 0 {
-            FuseUtils::get_mode(status.mode, status.file_type)
-        } else {
-            FuseUtils::get_mode(FUSE_DEFAULT_MODE & !conf.umask, status.file_type)
-        };
-        let size = FuseUtils::fuse_st_size(status);
-
-        // For links, nlink should be greater than 1
-        // Now we use the actual nlink from FileStatus
-        let nlink = status.nlink;
-
-        Ok(fuse_attr {
-            ino: status.id as u64,
-            size,
-            blocks,
-            atime: atime_sec,
-            mtime: mtime_sec,
-            ctime: ctime_sec,
-            atimensec: atime_nsec,
-            mtimensec: mtime_nsec,
-            ctimensec: ctime_nsec,
-            mode,
-            nlink,
-            uid,
-            gid,
-            rdev: 0,
-            blksize: FUSE_BLOCK_SIZE as u32,
-            padding: 0,
-        })
-    }
-
-    pub fn create_entry_out(conf: &FuseConf, attr: fuse_attr) -> fuse_entry_out {
-        fuse_entry_out {
-            nodeid: attr.ino,
-            generation: 0,
-            entry_valid: conf.entry_ttl.as_secs(),
-            attr_valid: conf.attr_ttl.as_secs(),
-            entry_valid_nsec: conf.entry_ttl.subsec_nanos(),
-            attr_valid_nsec: conf.attr_ttl.subsec_nanos(),
-            attr,
-        }
-    }
-
-    pub fn new_dot_status(name: &str) -> FileStatus {
-        FileStatus::with_name(FUSE_UNKNOWN_INO as i64, name.to_string(), true)
     }
 
     fn to_file_lock(&self, arg: &fuse_lk_in) -> FileLock {
@@ -250,12 +152,12 @@ impl CurvineFileSystem {
             while let Some(status) = batch.pop_front() {
                 let attr = if status.name != FUSE_CURRENT_DIR && status.name != FUSE_PARENT_DIR {
                     let inode = dir.lookup(header.nodeid, &status.name, status.clone())?;
-                    Self::status_to_attr(&self.conf, &inode.status)?
+                    FuseUtils::status_to_attr(&self.conf, &inode.status)?
                 } else {
-                    Self::status_to_attr(&self.conf, &status)?
+                    FuseUtils::status_to_attr(&self.conf, &status)?
                 };
 
-                let entry = Self::create_entry_out(&self.conf, attr);
+                let entry = FuseUtils::create_entry_out(&self.conf, attr);
                 if !res.add_dirent(plus, index, &status, entry) {
                     batch.push_front(status);
                     break;
@@ -443,59 +345,6 @@ impl CurvineFileSystem {
         }
     }
 
-    fn fuse_setattr_to_opts(setattr: &fuse_setattr_in) -> FuseResult<SetAttrOpts> {
-        // Only set fields when the corresponding valid flag is present
-        let owner = if (setattr.valid & FATTR_UID) != 0 {
-            match orpc::sys::get_username_by_uid(setattr.uid) {
-                Some(username) => Some(username),
-                None => Some(setattr.uid.to_string()),
-            }
-        } else {
-            None
-        };
-
-        let group = if (setattr.valid & FATTR_GID) != 0 {
-            match orpc::sys::get_groupname_by_gid(setattr.gid) {
-                Some(groupname) => Some(groupname),
-                None => Some(setattr.gid.to_string()),
-            }
-        } else {
-            None
-        };
-
-        // Strip file type bits; keep only permission and special bits
-        let mode = if (setattr.valid & FATTR_MODE) != 0 {
-            Some(setattr.mode & 0o7777)
-        } else {
-            None
-        };
-
-        // Handle time modifications
-        let mut atime = None;
-        let mut mtime = None;
-
-        if (setattr.valid & FATTR_ATIME) != 0 {
-            atime = Some((setattr.atime * 1000) as i64);
-        } else if (setattr.valid & FATTR_ATIME_NOW) != 0 {
-            atime = Some(orpc::common::LocalTime::mills() as i64);
-        }
-
-        if (setattr.valid & FATTR_MTIME) != 0 {
-            mtime = Some((setattr.mtime * 1000) as i64);
-        } else if (setattr.valid & FATTR_MTIME_NOW) != 0 {
-            mtime = Some(orpc::common::LocalTime::mills() as i64);
-        }
-
-        Ok(SetAttrOpts {
-            owner,
-            group,
-            mode,
-            atime,
-            mtime,
-            ..Default::default()
-        })
-    }
-
     async fn fs_resize(
         &self,
         path: &Path,
@@ -614,7 +463,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let entry = match res {
             Ok(attr) => {
-                let mut entry = Self::create_entry_out(&self.conf, attr);
+                let mut entry = FuseUtils::create_entry_out(&self.conf, attr);
                 if !self.state.keep_attr(entry.nodeid) {
                     entry.entry_valid = 0;
                     entry.attr_valid = 0;
@@ -640,23 +489,7 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn get_xattr(&self, op: GetXAttr<'_>) -> FuseResult<BytesMut> {
         let name = try_option!(op.name.to_str());
-
-        // Handle system extended attributes FIRST, before any path resolution
-        // This avoids unnecessary operations and provides fastest response
-        // Kernel may still query these even if FUSE_POSIX_ACL is disabled in init response
-        // Kernel requested POSIX_ACL support (kernel_requested_POSIX_ACL: 1048576)
-        // but we disabled it in our response, yet kernel still queries ACL attributes
-        match name {
-            "security.capability"
-            | "security.selinux"
-            | "system.posix_acl_access"
-            | "system.posix_acl_default" => {
-                return err_fuse!(libc::ENODATA, "get_xattr {}", name);
-            }
-            _ => {
-                // Continue with normal processing for other attributes
-            }
-        }
+        FuseUtils::check_xattr(name, true)?;
 
         let path = self.state.get_path(op.header.nodeid)?;
         let status = self
@@ -700,18 +533,7 @@ impl fs::FileSystem for CurvineFileSystem {
             String::from_utf8_lossy(value_slice)
         );
 
-        // Handle system extended attributes - return EOPNOTSUPP for unsupported attributes
-        match name {
-            "security.capability"
-            | "security.selinux"
-            | "system.posix_acl_access"
-            | "system.posix_acl_default" => {
-                return err_fuse!(libc::EOPNOTSUPP, "not support set_xattr {}", name);
-            }
-            _ => {
-                // Continue with normal processing for other attributes
-            }
-        }
+        FuseUtils::check_xattr(name, false)?;
 
         // Create SetAttrOpts with the xattr to add
         let mut add_x_attr = HashMap::new();
@@ -735,19 +557,8 @@ impl fs::FileSystem for CurvineFileSystem {
 
         debug!("Removing xattr: path='{}' name='{}'", path, name);
 
-        // Handle system extended attributes silently to avoid ERROR logs
-        // Return success for system attributes without forwarding to backend
-        match name {
-            "security.capability"
-            | "security.selinux"
-            | "system.posix_acl_access"
-            | "system.posix_acl_default" => {
-                // Silently ignore system extended attributes removal
-                // Return success to avoid ERROR logs
-                return Ok(());
-            }
-
-            _ => (),
+        if FuseUtils::check_xattr(name, false).is_err() {
+            return Ok(());
         }
 
         // Create SetAttrOpts with the xattr to remove
@@ -812,7 +623,7 @@ impl fs::FileSystem for CurvineFileSystem {
             .get_cached_status(op.header.nodeid, None, &path)
             .await?;
 
-        let mut fuse_attr = Self::status_to_attr(&self.conf, &status)?;
+        let mut fuse_attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
 
         let mut attr = fuse_attr_out {
@@ -841,7 +652,7 @@ impl fs::FileSystem for CurvineFileSystem {
         let path = self.state.get_path(op.header.nodeid)?;
 
         // Convert setattr to opts with UID/GID numeric fallback
-        let mut opts = match Self::fuse_setattr_to_opts(op.arg) {
+        let mut opts = match FuseUtils::fuse_setattr_to_opts(op.arg) {
             Ok(opts) => {
                 debug!("Converted setattr opts: {:?}", opts);
                 opts
@@ -892,7 +703,7 @@ impl fs::FileSystem for CurvineFileSystem {
         }
 
         self.state.invalid_cache(op.header.nodeid, None);
-        let mut attr = Self::status_to_attr(&self.conf, &status)?;
+        let mut attr = FuseUtils::status_to_attr(&self.conf, &status)?;
         attr.ino = op.header.nodeid;
 
         let attr = fuse_attr_out {
@@ -928,7 +739,7 @@ impl fs::FileSystem for CurvineFileSystem {
             .state
             .new_dir_handle(op.header.nodeid, &dir_path)
             .await?;
-        let open_flags = Self::fill_open_flags(&self.conf, op.arg.flags);
+        let open_flags = FuseUtils::fill_open_flags(&self.conf, op.arg.flags);
         let attr = fuse_open_out {
             fh: handle.fh,
             open_flags,
@@ -994,7 +805,7 @@ impl fs::FileSystem for CurvineFileSystem {
         };
 
         let entry = self.lookup_status(op.header.nodeid, name, status)?;
-        Ok(Self::create_entry_out(&self.conf, entry))
+        Ok(FuseUtils::create_entry_out(&self.conf, entry))
     }
 
     async fn allocate(&self, op: FAllocate<'_>) -> FuseResult<()> {
@@ -1204,7 +1015,7 @@ impl fs::FileSystem for CurvineFileSystem {
         self.fs.link(&src_path, &des_path).await?;
         let attr = self.lookup_path(op.header.nodeid, name, &des_path).await?;
 
-        let result = Self::create_entry_out(&self.conf, attr);
+        let result = FuseUtils::create_entry_out(&self.conf, attr);
         Ok(result)
     }
 
@@ -1261,7 +1072,7 @@ impl fs::FileSystem for CurvineFileSystem {
         self.fs.symlink(target, &link_path, false).await?;
 
         let entry = self.lookup_path(parent, linkname, &link_path).await?;
-        Ok(Self::create_entry_out(&self.conf, entry))
+        Ok(FuseUtils::create_entry_out(&self.conf, entry))
     }
 
     // Read the target of a symbolic link

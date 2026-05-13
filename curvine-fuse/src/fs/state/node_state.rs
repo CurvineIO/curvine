@@ -15,10 +15,11 @@
 use crate::fs::dcache::DirTree;
 use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
-use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
+use crate::fs::{FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
-    err_fuse, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC, STATE_FILE_VERSION,
+    err_fuse, FuseResult, FuseUtils, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC,
+    STATE_FILE_VERSION,
 };
 use curvine_client::unified::UnifiedFileSystem;
 use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
@@ -182,7 +183,7 @@ impl NodeState {
         dir.clear(|ino| self.has_open_handles(ino));
 
         let inode = dir.lookup(parent, name, status)?;
-        CurvineFileSystem::status_to_attr(&self.conf, inode)
+        FuseUtils::status_to_attr(&self.conf, inode)
     }
 
     pub fn get_ino(&self, parent: u64, name: Option<&str>) -> Option<u64> {
@@ -523,8 +524,8 @@ impl NodeState {
             .await?;
 
         let dots = stream::iter([
-            Ok(CurvineFileSystem::new_dot_status(FUSE_CURRENT_DIR)),
-            Ok(CurvineFileSystem::new_dot_status(FUSE_PARENT_DIR)),
+            Ok(FuseUtils::new_dot_status(FUSE_CURRENT_DIR)),
+            Ok(FuseUtils::new_dot_status(FUSE_PARENT_DIR)),
         ]);
 
         Ok(ListStream::new(dots.chain(inner)))

@@ -120,11 +120,7 @@ impl DirTree {
 
     pub fn next_id(&self, cv_id: i64) -> u64 {
         let cv_id = cv_id as u64;
-        if cv_id > FUSE_ROOT_ID
-            && cv_id != FUSE_ROOT_ID
-            && cv_id != FUSE_UNKNOWN_INO
-            && !self.inodes.contains_key(&cv_id)
-        {
+        if cv_id > FUSE_ROOT_ID && cv_id != FUSE_UNKNOWN_INO && !self.inodes.contains_key(&cv_id) {
             return cv_id;
         }
 

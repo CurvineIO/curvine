@@ -92,7 +92,9 @@ impl FileHandle {
         }
 
         if let Some(writer) = &self.writer {
-            writer.write(op, reply).await?;
+            writer
+                .write(op.arg.offset as i64, op.data, Some(reply))
+                .await?;
             Ok(())
         } else {
             err_fuse!(libc::EIO)

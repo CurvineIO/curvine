@@ -12,17 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod node_attr;
-pub use self::node_attr::NodeAttr;
-
 mod node_state;
 pub use self::node_state::NodeState;
 
-mod node_map;
-pub use self::node_map::NodeMap;
-
 mod file_handle;
-pub use self::file_handle::FileHandle;
+pub use self::file_handle::*;
 
 mod dir_handle;
 pub use self::dir_handle::DirHandle;
