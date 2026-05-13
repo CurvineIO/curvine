@@ -212,6 +212,7 @@ impl BdevOffsetAllocator {
         let mut inner = self.inner.lock().unwrap();
         inner.map.clear();
         inner.free_list.clear();
+        inner.cursor = 0;
 
         let mut sorted: Vec<(i64, i64, i64)> = entries.to_vec();
         sorted.sort_by_key(|&(_, offset, _)| offset);
@@ -228,14 +229,7 @@ impl BdevOffsetAllocator {
             }
         }
 
-        if prev_end > inner.cursor {
-            inner.cursor = prev_end;
-        }
-        // Gap between last block and cursor is also free
-        if prev_end < inner.cursor {
-            let remaining = inner.cursor - prev_end;
-            inner.free_list.insert(prev_end, remaining);
-        }
+        inner.cursor = prev_end;
     }
 
     /// Alignment value used by this allocator.
