@@ -3,9 +3,9 @@
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 //
-//! Phase 6 — LanceDB on Curvine E2E (ListingDatabase + `curvine://` object store).
-//! 覆盖常用路径与最小向量索引路径；各用例使用独立 `curvine:///tmp/...` workspace，并通过
-//! `storage_option(CURVINE_CONF_FILE_KEY, …)` 注入配置，避免依赖进程级环境变量。
+//! Phase 6 — LanceDB on Curvine E2E (listing database + `curvine://` object store).
+//! Covers common paths and a minimal vector-index path. Each case uses an isolated `curvine:///tmp/...`
+//! workspace and injects config via `storage_option(CURVINE_CONF_FILE_KEY, ...)`, not process env vars.
 
 mod common;
 
@@ -26,6 +26,7 @@ use curvine_common::conf::ClusterConf;
 use futures::{stream::FuturesUnordered, TryStreamExt};
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lancedb::connect;
+use lancedb::connect_namespace;
 use lancedb::database::{CreateTableMode, ReadConsistency};
 use lancedb::error::Error as LanceDbError;
 use lancedb::expr::{col, lit};
@@ -1358,6 +1359,349 @@ fn lancedb_stale_table_handle_append_rebases_on_curvine() -> CommonResult<()> {
             .await
             .map_err(|e| CommonError::from(e.to_string()))?
             .open_table("append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            reopened
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            3
+        );
+        let batches: Vec<RecordBatch> = reopened
+            .query()
+            .select(Select::columns(&["id"]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let mut ids = batches
+            .iter()
+            .flat_map(|batch| int32_values(batch, "id"))
+            .flatten()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2]);
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn lancedb_concurrent_append_rebases_on_curvine() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let db_uri = format!("curvine:///tmp/concurrent_append_live_{ns}");
+        let conn = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        conn.create_table("append_t", int32_batch("id", vec![0]))
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let t1 = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let t2 = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let initial_v1 = t1
+            .version()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let initial_v2 = t2
+            .version()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(initial_v1, initial_v2);
+
+        let append1 = t1.add(int32_batch("id", vec![1])).execute();
+        let append2 = t2.add(int32_batch("id", vec![2])).execute();
+        let (r1, r2) = tokio::join!(append1, append2);
+        r1.map_err(|e| CommonError::from(e.to_string()))?;
+        r2.map_err(|e| CommonError::from(e.to_string()))?;
+
+        let reopened = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            reopened
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            3
+        );
+        let batches: Vec<RecordBatch> = reopened
+            .query()
+            .select(Select::columns(&["id"]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let mut ids = batches
+            .iter()
+            .flat_map(|batch| int32_values(batch, "id"))
+            .flatten()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2]);
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn lancedb_connect_namespace_curvine_concurrent_append() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let root = format!("curvine:///tmp/ns_cv_append_{ns}");
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), root);
+
+        let conn = connect_namespace("dir", properties)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        conn.create_table("ns_append_t", int32_batch("id", vec![0]))
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let t1 = conn
+            .open_table("ns_append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let t2 = conn
+            .open_table("ns_append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let append1 = t1.add(int32_batch("id", vec![1])).execute();
+        let append2 = t2.add(int32_batch("id", vec![2])).execute();
+        let (r1, r2) = tokio::join!(append1, append2);
+        r1.map_err(|e| CommonError::from(e.to_string()))?;
+        r2.map_err(|e| CommonError::from(e.to_string()))?;
+
+        let reopened = conn
+            .open_table("ns_append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            reopened
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            3
+        );
+        let batches: Vec<RecordBatch> = reopened
+            .query()
+            .select(Select::columns(&["id"]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let mut ids = batches
+            .iter()
+            .flat_map(|batch| int32_values(batch, "id"))
+            .flatten()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2]);
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn lancedb_managed_namespace_curvine_concurrent_append() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let root = format!("curvine:///tmp/ns_cv_managed_append_{ns}");
+        let mut properties = HashMap::new();
+        properties.insert("root".to_string(), root);
+        properties.insert(
+            "table_version_tracking_enabled".to_string(),
+            "true".to_string(),
+        );
+
+        let conn = connect_namespace("dir", properties)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        conn.create_table("managed_append_t", int32_batch("id", vec![0]))
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let t1 = conn
+            .open_table("managed_append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let t2 = conn
+            .open_table("managed_append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let append1 = t1.add(int32_batch("id", vec![1])).execute();
+        let append2 = t2.add(int32_batch("id", vec![2])).execute();
+        let (r1, r2) = tokio::join!(append1, append2);
+        r1.map_err(|e| CommonError::from(e.to_string()))?;
+        r2.map_err(|e| CommonError::from(e.to_string()))?;
+
+        let reopened = conn
+            .open_table("managed_append_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        assert_eq!(
+            reopened
+                .count_rows(None)
+                .await
+                .map_err(|e| CommonError::from(e.to_string()))?,
+            3
+        );
+        let batches: Vec<RecordBatch> = reopened
+            .query()
+            .select(Select::columns(&["id"]))
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let mut ids = batches
+            .iter()
+            .flat_map(|batch| int32_values(batch, "id"))
+            .flatten()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2]);
+
+        Ok::<(), CommonError>(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn lancedb_exist_ok_then_concurrent_append_on_curvine() -> CommonResult<()> {
+    let (cluster, rt) = start_minicluster()?;
+    let conf = cluster.conf_path.clone();
+    let ns = unique_ns();
+    rt.block_on(async move {
+        let db_uri = format!("curvine:///tmp/exist_ok_append_{ns}");
+        let conn = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        conn.create_table("exist_t", int32_batch("id", vec![0]))
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let _via_exist = conn
+            .create_empty_table("exist_t", schema.clone())
+            .mode(CreateTableMode::exist_ok(|request| request))
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let t1 = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("exist_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+        let t2 = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("exist_t")
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?;
+
+        let append1 = t1.add(int32_batch("id", vec![1])).execute();
+        let append2 = t2.add(int32_batch("id", vec![2])).execute();
+        let (r1, r2) = tokio::join!(append1, append2);
+        r1.map_err(|e| CommonError::from(e.to_string()))?;
+        r2.map_err(|e| CommonError::from(e.to_string()))?;
+
+        let reopened = connect(&db_uri)
+            .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
+            .execute()
+            .await
+            .map_err(|e| CommonError::from(e.to_string()))?
+            .open_table("exist_t")
             .storage_option(CURVINE_CONF_FILE_KEY, conf.as_str())
             .execute()
             .await

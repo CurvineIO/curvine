@@ -19,6 +19,7 @@ use std::path::MAIN_SEPARATOR;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::curvine_safe_commit_database::CurvineSafeCommitDatabase;
 use crate::object_store::curvine_session;
 
 use lance::dataset::builder::DatasetBuilder;
@@ -32,8 +33,8 @@ use lance_table::io::commit::ConditionalPutCommitHandler;
 use lancedb_upstream::connection::{
     CloneTableBuilder as UpstreamCloneTableBuilder, ConnectBuilder as UpstreamConnectBuilder,
 };
-use lancedb_upstream::database::{CloneTableRequest, DatabaseOptions};
-use lancedb_upstream::embeddings::EmbeddingRegistry;
+use lancedb_upstream::database::{CloneTableRequest, Database, DatabaseOptions};
+use lancedb_upstream::embeddings::{EmbeddingRegistry, MemoryRegistry};
 use lancedb_upstream::error::{Error, Result};
 #[cfg(feature = "remote")]
 use lancedb_upstream::remote::ClientConfig;
@@ -63,14 +64,18 @@ struct ConnectionOptions {
     query_string: Option<String>,
     storage_options: HashMap<String, String>,
     session: Option<Arc<Session>>,
+    embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
     namespace_backed: bool,
 }
 
+/// Builder for a LanceDB connection. For `curvine://` URIs, applies a default session and, after
+/// `execute`, may wrap the inner database so `create_table` / `open_table` use a safe commit handler.
 #[derive(Debug)]
 pub struct ConnectBuilder {
     inner: ConnectBuilderInner,
 }
 
+/// Established connection. For `curvine://` listing URIs, the inner database may be wrapped for safe commits.
 #[derive(Clone)]
 pub struct Connection {
     upstream: UpstreamConnection,
@@ -96,7 +101,7 @@ impl ConnectBuilder {
         if is_curvine_uri(uri) {
             Self {
                 inner: ConnectBuilderInner::Upstream {
-                    builder: Box::new(builder.session(session.expect("curvine session is set"))),
+                    builder: Box::new(builder.session(session.unwrap_or_else(curvine_session))),
                     options,
                 },
             }
@@ -136,7 +141,13 @@ impl ConnectBuilder {
     }
 
     pub fn embedding_registry(self, registry: Arc<dyn EmbeddingRegistry>) -> Self {
-        self.map_upstream(|builder| builder.embedding_registry(registry), |_| {})
+        let reg = registry.clone();
+        self.map_upstream(
+            |builder| builder.embedding_registry(reg),
+            |options| {
+                options.embedding_registry = Some(registry);
+            },
+        )
     }
 
     pub fn storage_option(self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -210,6 +221,7 @@ impl ConnectBuilder {
         match self.inner {
             ConnectBuilderInner::Upstream { builder, options } => {
                 let upstream = builder.execute().await?;
+                let upstream = wrap_upstream_connection_for_curvine(upstream, &options);
                 Ok(Connection { upstream, options })
             }
         }
@@ -218,6 +230,26 @@ impl ConnectBuilder {
 
 pub fn connect(uri: &str) -> ConnectBuilder {
     ConnectBuilder::new(uri)
+}
+
+fn wrap_upstream_connection_for_curvine(
+    upstream: UpstreamConnection,
+    options: &ConnectionOptions,
+) -> UpstreamConnection {
+    if !is_curvine_uri(&options.uri) {
+        return upstream;
+    }
+    let embedding_registry = options
+        .embedding_registry
+        .clone()
+        .unwrap_or_else(|| Arc::new(MemoryRegistry::new()));
+    let inner_db = upstream.database().clone();
+    let wrapped: Arc<dyn Database> = if options.namespace_backed {
+        Arc::new(CurvineSafeCommitDatabase::new_namespace(inner_db))
+    } else {
+        Arc::new(CurvineSafeCommitDatabase::new(inner_db))
+    };
+    UpstreamConnection::new(wrapped, embedding_registry)
 }
 
 impl Connection {
@@ -248,17 +280,13 @@ impl Connection {
 
     async fn clone_curvine_table(&self, request: CloneTableRequest) -> Result<Table> {
         validate_table_name(&request.target_table_name)?;
-        if request.source_version.is_some() && request.source_tag.is_some() {
-            return Err(Error::InvalidInput {
-                message: "Cannot specify both source_version and source_tag".to_string(),
-            });
-        }
 
         let session = self.options.session.clone().unwrap_or_else(curvine_session);
         let storage_params = self.object_store_params();
         let read_params = ReadParams {
             store_options: Some(storage_params.clone()),
             session: Some(session.clone()),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
             ..Default::default()
         };
         let mut source_dataset = DatasetBuilder::from_uri(&request.source_uri)
@@ -277,7 +305,11 @@ impl Connection {
                 let version = source_dataset.version().version;
                 (Ref::Version(None, Some(version)), version)
             }
-            (Some(_), Some(_)) => unreachable!("checked above"),
+            (Some(_), Some(_)) => {
+                return Err(Error::InvalidInput {
+                    message: "Cannot specify both source_version and source_tag".to_string(),
+                });
+            }
         };
         let target_uri = self.table_uri(&request.target_table_name)?;
         clone_dataset_with_session(
@@ -465,6 +497,8 @@ enum ConnectNamespaceBuilderInner {
     },
 }
 
+/// Builder for namespace-backed connections. When `properties` contain a `curvine://` root, behavior
+/// matches `connect` (URI query split, optional default session).
 pub struct ConnectNamespaceBuilder {
     inner: ConnectNamespaceBuilderInner,
 }
@@ -680,14 +714,30 @@ impl ConnectNamespaceBuilder {
                 session,
                 server_side_query,
             } => {
-                let curvine_uri = find_curvine_uri(&properties);
-                let wants_curvine = curvine_uri.is_some();
-                let mut builder = upstream_connect_namespace(&ns_impl, properties);
+                let curvine_root_raw = find_curvine_uri(&properties);
+                let wants_curvine = curvine_root_raw.is_some();
+                let mut properties_for_upstream = properties;
+                for (key, value) in &storage_options {
+                    properties_for_upstream
+                        .entry(format!("storage.{key}"))
+                        .or_insert_with(|| value.clone());
+                }
+                let mut builder = upstream_connect_namespace(&ns_impl, properties_for_upstream);
+
+                let (listing_uri, listing_query) = match curvine_root_raw {
+                    Some(raw) => (
+                        normalize_listing_uri(&raw).unwrap_or_else(|| raw.clone()),
+                        listing_query_string(&raw),
+                    ),
+                    None => (String::new(), None),
+                };
 
                 let mut options = ConnectionOptions {
-                    uri: curvine_uri.unwrap_or_default(),
+                    uri: listing_uri,
+                    query_string: listing_query,
                     session: session.clone(),
                     namespace_backed: true,
+                    embedding_registry: embedding_registry.clone(),
                     ..Default::default()
                 };
 
@@ -716,6 +766,7 @@ impl ConnectNamespaceBuilder {
                     .server_side_query(server_side_query)
                     .execute()
                     .await?;
+                let upstream = wrap_upstream_connection_for_curvine(upstream, &options);
                 Ok(Connection { upstream, options })
             }
         }
@@ -730,7 +781,15 @@ pub fn connect_namespace(
 }
 
 fn is_curvine_uri(uri: &str) -> bool {
-    uri.starts_with("curvine://")
+    let t = uri.trim_start();
+    match Url::parse(t) {
+        Ok(u) => u.scheme().eq_ignore_ascii_case("curvine"),
+        Err(_) => {
+            const PREFIX: &[u8] = b"curvine://";
+            let b = t.as_bytes();
+            b.len() >= PREFIX.len() && b[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+        }
+    }
 }
 
 fn find_curvine_uri(properties: &HashMap<String, String>) -> Option<String> {
