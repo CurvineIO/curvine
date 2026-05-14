@@ -35,6 +35,7 @@ pub use connection::{
     connect, connect_namespace, ConnectBuilder, ConnectNamespaceBuilder, Connection,
 };
 pub use error::{Error, Result};
+pub use lance_io::object_store::ObjectStoreProvider;
 pub use lancedb_upstream::DistanceType;
 pub use lancedb_upstream::ObjectStoreRegistry;
 pub use lancedb_upstream::Session;
