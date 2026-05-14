@@ -10,10 +10,9 @@
 //!
 //! Covered operations: `put`, `head`, `get_opts(head=true)`, ranged `get_opts`, overwrite `put`,
 //! `copy` (source retained, destination overwritten when present), `copy_if_not_exists`,
-//! `delete`, recursive `list`, `list_with_delimiter` (directory prefix is not listed as a file
-//! object), and multipart staging invisibility / complete / abort / out-of-order completion /
-//! same-path race behavior. `PutMode::Update` remains intentionally unsupported until Curvine
-//! exposes a real conditional-write primitive beyond weak synthetic e-tags.
+//! conditional `PutMode::Update` with e-tags, `delete`, recursive `list`, `list_with_delimiter`
+//! (directory prefix is not listed as a file object), and multipart staging invisibility /
+//! complete / abort / out-of-order completion / same-path race behavior.
 
 use std::collections::HashMap;
 use std::env;
@@ -258,18 +257,77 @@ async fn curvine_object_store_semantics_live_cluster() {
         )
         .await;
     assert!(matches!(create_again, Err(OsError::AlreadyExists { .. })));
-    let update_attempt = store
+    let updated = store
         .inner
         .put_opts(
             &create_only,
             Vec::from(&b"create-v3"[..]).into(),
+            PutOptions {
+                mode: PutMode::Update(create_res.clone().into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.read_one_all(&create_only).await.unwrap().as_ref(),
+        b"create-v3"
+    );
+    let stale_update = store
+        .inner
+        .put_opts(
+            &create_only,
+            Vec::from(&b"create-stale"[..]).into(),
             PutOptions {
                 mode: PutMode::Update(create_res.into()),
                 ..Default::default()
             },
         )
         .await;
-    assert!(matches!(update_attempt, Err(OsError::NotImplemented)));
+    assert!(matches!(stale_update, Err(OsError::Precondition { .. })));
+    store
+        .inner
+        .put_opts(
+            &create_only,
+            Vec::from(&b"create-v4"[..]).into(),
+            PutOptions {
+                mode: PutMode::Update(updated.clone().into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.read_one_all(&create_only).await.unwrap().as_ref(),
+        b"create-v4"
+    );
+    let version_update = store
+        .inner
+        .put_opts(
+            &create_only,
+            Vec::from(&b"create-version"[..]).into(),
+            PutOptions {
+                mode: PutMode::Update(object_store::UpdateVersion {
+                    e_tag: None,
+                    version: Some("1".to_string()),
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(version_update, Err(OsError::Generic { .. })));
+    let missing_update = store
+        .inner
+        .put_opts(
+            &Path::parse(format!("{pfx}/missing.bin")).unwrap(),
+            Vec::from(&b"missing"[..]).into(),
+            PutOptions {
+                mode: PutMode::Update(updated.into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(missing_update, Err(OsError::Precondition { .. })));
 
     store.put(&key, b"overwrite").await.unwrap();
     let full = store.read_one_all(&key).await.unwrap();
@@ -489,6 +547,34 @@ async fn curvine_object_store_semantics_live_cluster() {
         store.read_one_all(&multipart_key).await.unwrap().as_ref(),
         b"hello multipart",
         "multipart complete must concatenate parts in order"
+    );
+    let mp_update = store
+        .inner
+        .put_opts(
+            &multipart_key,
+            Vec::from(&b"after multipart"[..]).into(),
+            PutOptions {
+                mode: PutMode::Update(mp_res.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(mp_update.e_tag.is_some());
+    assert_eq!(
+        store.read_one_all(&multipart_key).await.unwrap().as_ref(),
+        b"after multipart",
+        "multipart PutResult must be usable as an UpdateVersion"
+    );
+
+    let prefix_only = Path::parse(format!("{pfx}/prefix_only")).unwrap();
+    let prefix_child = Path::parse(format!("{pfx}/prefix_only/child.bin")).unwrap();
+    store.put(&prefix_child, b"child").await.unwrap();
+    store.inner.delete(&prefix_only).await.unwrap();
+    assert_eq!(
+        store.read_one_all(&prefix_child).await.unwrap().as_ref(),
+        b"child",
+        "deleting a directory prefix must not delete child objects"
     );
 
     let multipart_order_key = Path::parse(format!("{pfx}/multipart/out_of_order.bin")).unwrap();

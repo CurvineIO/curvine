@@ -20,9 +20,10 @@ use curvine_common::conf::ClusterConf;
 use lancedb::connect;
 use lancedb::connect_namespace;
 use lancedb::error::Error as LanceDbError;
-use lancedb::object_store::{curvine_registry, curvine_session};
-use lancedb::{ObjectStoreRegistry, Session};
+use lancedb::object_store::{curvine_registry, curvine_session, CurvineObjectStoreProvider};
+use lancedb::{ObjectStoreProvider, ObjectStoreRegistry, Session};
 use tokio::sync::Mutex;
+use url::Url;
 
 static ENV_MUTEX: Mutex<()> = Mutex::const_new(());
 
@@ -45,6 +46,21 @@ fn curvine_registry_registers_curvine_scheme() {
 fn curvine_session_uses_registry_with_curvine_scheme() {
     let session = curvine_session();
     assert!(session.store_registry().get_provider("curvine").is_some());
+}
+
+#[test]
+fn curvine_provider_extracts_lance_relative_base_path() {
+    let provider = CurvineObjectStoreProvider::new();
+
+    let path = provider
+        .extract_path(&Url::parse("curvine:///tmp/lancedb/demo/table.lance").unwrap())
+        .unwrap();
+    assert_eq!(path.as_ref(), "tmp/lancedb/demo/table.lance");
+
+    let path = provider
+        .extract_path(&Url::parse("curvine://tenant/data/db").unwrap())
+        .unwrap();
+    assert_eq!(path.as_ref(), "tenant/data/db");
 }
 
 #[tokio::test]
@@ -75,6 +91,30 @@ async fn namespace_connect_stays_compatible() {
 
     let names = conn.table_names().execute().await.unwrap();
     assert!(names.is_empty());
+}
+
+#[tokio::test]
+async fn namespace_connect_clone_table_delegates_to_upstream_not_supported() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let mut properties = HashMap::new();
+    properties.insert(
+        "root".to_string(),
+        tmpdir.path().to_str().unwrap().to_string(),
+    );
+
+    let conn = connect_namespace("dir", properties)
+        .execute()
+        .await
+        .unwrap();
+    let result = conn
+        .clone_table("clone_t", "file:///tmp/source.lance")
+        .execute()
+        .await;
+
+    assert!(
+        matches!(result, Err(LanceDbError::NotSupported { .. })),
+        "namespace connections must preserve upstream clone_table unsupported semantics, got {result:?}"
+    );
 }
 
 #[tokio::test]
