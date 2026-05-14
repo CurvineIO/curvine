@@ -18,7 +18,8 @@ use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
-    err_fuse, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC, STATE_FILE_VERSION,
+    err_fuse, FuseMetrics, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC,
+    STATE_FILE_VERSION,
 };
 use curvine_client::file::FsReader;
 use curvine_client::unified::{UnifiedFileSystem, UnifiedReader};
@@ -526,6 +527,22 @@ impl NodeState {
         lock.values()
             .flat_map(|v| v.values().cloned())
             .collect::<Vec<_>>()
+    }
+
+    pub fn file_handles_len(&self) -> usize {
+        let lock = self.handles.read();
+        lock.values().map(|m| m.len()).sum()
+    }
+
+    pub fn dir_handles_len(&self) -> usize {
+        let lock = self.dir_handles.read();
+        lock.values().map(|m| m.len()).sum()
+    }
+
+    pub fn set_metrics(&self, m: &FuseMetrics) {
+        m.inode_num.set(self.node_read().nodes_len() as i64);
+        m.file_handle_num.set(self.file_handles_len() as i64);
+        m.dir_handle_num.set(self.dir_handles_len() as i64);
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
