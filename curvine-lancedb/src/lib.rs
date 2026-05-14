@@ -14,9 +14,9 @@
 
 pub use lancedb_upstream::arrow;
 pub mod connection;
-mod curvine_safe_commit_database;
 pub mod error;
 pub mod object_store;
+mod safe_commit;
 pub use lancedb_upstream::data;
 pub use lancedb_upstream::database;
 pub use lancedb_upstream::dataloader;

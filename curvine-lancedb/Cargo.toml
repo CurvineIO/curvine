@@ -1,9 +1,20 @@
 [package]
-name = "curvine-lancedb-rs"
+name = "curvine-lancedb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Facade crate for LanceDB on Curvine"
+readme = "README.md"
+repository = "https://github.com/CurvineIO/curvine"
+homepage = "https://github.com/CurvineIO/curvine"
+documentation = "https://docs.rs/curvine-lancedb"
+keywords = ["curvine", "lancedb", "vector", "object-store"]
+categories = ["database", "filesystem"]
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/src/**/*.rs",
+]
 
 [lib]
 name = "lancedb"

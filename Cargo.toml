@@ -15,7 +15,7 @@ members = [
     "curvine-server",
     "curvine-client",
     "curvine-libsdk",
-    "curvine-lancedb-rs",
+    "curvine-lancedb",
     'curvine-tests',
     "curvine-fuse",
     "curvine-web",
@@ -34,7 +34,7 @@ curvine-common = { path = "curvine-common" }
 curvine-client = { path = "curvine-client" }
 curvine-libsdk = { path = "curvine-libsdk" }
 curvine-server = { path = "curvine-server" }
-curvine-lancedb-rs = { path = "curvine-lancedb-rs" }
+curvine-lancedb = { path = "curvine-lancedb" }
 curvine-ufs = { path = "curvine-ufs" }
 curvine-tests = { path = "curvine-tests" }
 curvine-fuse = { path = "curvine-fuse" }

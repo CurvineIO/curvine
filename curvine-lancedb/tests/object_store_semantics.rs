@@ -6,7 +6,7 @@
 //! Phase 4B — live Curvine [`object_store`] semantics (one integration test).
 //!
 //! Run (requires a reachable Curvine cluster and `CURVINE_CONF_FILE`):
-//! `CURVINE_CONF_FILE=/path/to/cluster.toml cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored`
+//! `CURVINE_CONF_FILE=/path/to/cluster.toml cargo test -p curvine-lancedb --test object_store_semantics -- --ignored`
 //!
 //! Covered operations: `put`, `head`, `get_opts(head=true)`, ranged `get_opts`, overwrite `put`,
 //! `copy` (source retained, destination overwritten when present), `copy_if_not_exists`,
@@ -20,19 +20,25 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Duration;
+use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
+use curvine_common::fs::Path as CurvinePath;
 use futures::StreamExt;
 use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lancedb::object_store::{CurvineObjectStoreProvider, CURVINE_CONF_FILE_KEY};
 use lancedb::ObjectStoreProvider;
+use md5::{Digest, Md5};
 use object_store::path::Path;
-use object_store::{Error as OsError, GetOptions, GetRange, MultipartUpload, PutMode, PutOptions};
+use object_store::{
+    Attribute, Attributes, Error as OsError, GetOptions, GetRange, MultipartUpload, PutMode,
+    PutMultipartOptions, PutOptions, UpdateVersion,
+};
 use url::Url;
 
 #[tokio::test]
-#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored"]
+#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb --test object_store_semantics -- --ignored"]
 async fn curvine_object_store_semantics_live_cluster() {
-    let conf = match env::var(ClusterConf::ENV_CONF_FILE) {
+    let conf_path = match env::var(ClusterConf::ENV_CONF_FILE) {
         Ok(v) => v,
         Err(_) => {
             eprintln!("Skipping live object-store semantics test: CURVINE_CONF_FILE is not set");
@@ -46,7 +52,7 @@ async fn curvine_object_store_semantics_live_cluster() {
         .as_nanos();
 
     let mut opts = HashMap::new();
-    opts.insert(CURVINE_CONF_FILE_KEY.to_string(), conf);
+    opts.insert(CURVINE_CONF_FILE_KEY.to_string(), conf_path.clone());
     let params = ObjectStoreParams {
         storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(opts))),
         ..Default::default()
@@ -71,6 +77,13 @@ async fn curvine_object_store_semantics_live_cluster() {
     let key = Path::parse(&rel_key).unwrap();
     let payload: &[u8] = b"hello-range-copy";
     store.put(&key, payload).await.unwrap();
+
+    let missing = Path::parse(format!("{pfx}/missing.bin")).unwrap();
+    let missing_head = store.inner.head(&missing).await;
+    assert!(
+        matches!(missing_head, Err(OsError::NotFound { .. })),
+        "missing object head must map to object_store::Error::NotFound, got {missing_head:?}"
+    );
 
     let workspace_curvine_key = Path::parse(&rel_workspace_curvine).unwrap();
     store
@@ -245,6 +258,12 @@ async fn curvine_object_store_semantics_live_cluster() {
         create_res.e_tag.is_some(),
         "create put_opts should return an e_tag"
     );
+    assert_eq!(
+        create_res.version, create_res.e_tag,
+        "Curvine version token should match the synthetic e_tag until a native generation is exposed"
+    );
+    let created_meta = store.inner.head(&create_only).await.unwrap();
+    assert_eq!(created_meta.version, create_res.version);
     let create_again = store
         .inner
         .put_opts(
@@ -279,7 +298,7 @@ async fn curvine_object_store_semantics_live_cluster() {
             &create_only,
             Vec::from(&b"create-stale"[..]).into(),
             PutOptions {
-                mode: PutMode::Update(create_res.into()),
+                mode: PutMode::Update(create_res.clone().into()),
                 ..Default::default()
             },
         )
@@ -301,13 +320,56 @@ async fn curvine_object_store_semantics_live_cluster() {
         store.read_one_all(&create_only).await.unwrap().as_ref(),
         b"create-v4"
     );
+    let overwritten = store
+        .inner
+        .put_opts(
+            &create_only,
+            Vec::from(&b"create-v5-longer"[..]).into(),
+            PutOptions {
+                mode: PutMode::Overwrite,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        overwritten.version, create_res.version,
+        "overwrite should produce a different Curvine object version token"
+    );
+    assert_eq!(overwritten.version, overwritten.e_tag);
+    let versioned_get = store
+        .inner
+        .get_opts(
+            &create_only,
+            GetOptions {
+                version: overwritten.version.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        versioned_get.bytes().await.unwrap().as_ref(),
+        b"create-v5-longer"
+    );
+    let stale_version_get = store
+        .inner
+        .get_opts(
+            &create_only,
+            GetOptions {
+                version: Some("W/\"cv:stale:0:0:true:1\"".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(stale_version_get, Err(OsError::NotImplemented)));
     let version_update = store
         .inner
         .put_opts(
             &create_only,
             Vec::from(&b"create-version"[..]).into(),
             PutOptions {
-                mode: PutMode::Update(object_store::UpdateVersion {
+                mode: PutMode::Update(UpdateVersion {
                     e_tag: None,
                     version: Some("1".to_string()),
                 }),
@@ -328,6 +390,46 @@ async fn curvine_object_store_semantics_live_cluster() {
         )
         .await;
     assert!(matches!(missing_update, Err(OsError::Precondition { .. })));
+
+    let attrs = Attributes::from_iter([
+        (Attribute::CacheControl, "max-age=604800"),
+        (
+            Attribute::ContentDisposition,
+            r#"attachment; filename="curvine.bin""#,
+        ),
+        (Attribute::ContentEncoding, "gzip"),
+        (Attribute::ContentLanguage, "en-US"),
+        (Attribute::ContentType, "application/octet-stream"),
+        (Attribute::Metadata("curvine-key".into()), "curvine-value"),
+    ]);
+    let attr_key = Path::parse(format!("{pfx}/attrs/direct.bin")).unwrap();
+    store
+        .inner
+        .put_opts(
+            &attr_key,
+            Vec::from(&b"attr-body"[..]).into(),
+            PutOptions {
+                attributes: attrs.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let attr_get = store.inner.get(&attr_key).await.unwrap();
+    assert_eq!(attr_get.attributes, attrs);
+    assert_eq!(attr_get.bytes().await.unwrap().as_ref(), b"attr-body");
+    let attr_head = store
+        .inner
+        .get_opts(
+            &attr_key,
+            GetOptions {
+                head: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(attr_head.attributes, attrs);
 
     store.put(&key, b"overwrite").await.unwrap();
     let full = store.read_one_all(&key).await.unwrap();
@@ -543,10 +645,45 @@ async fn curvine_object_store_semantics_live_cluster() {
     );
     let mp_res = upload.complete().await.unwrap();
     assert!(mp_res.e_tag.is_some());
+    assert_eq!(mp_res.version, mp_res.e_tag);
     assert_eq!(
         store.read_one_all(&multipart_key).await.unwrap().as_ref(),
         b"hello multipart",
         "multipart complete must concatenate parts in order"
+    );
+    let multipart_attrs = Attributes::from_iter([
+        (Attribute::ContentType, "application/x-curvine-multipart"),
+        (
+            Attribute::Metadata("multipart-key".into()),
+            "multipart-value",
+        ),
+    ]);
+    let multipart_attr_key = Path::parse(format!("{pfx}/multipart/attrs.bin")).unwrap();
+    let mut attr_upload = store
+        .inner
+        .put_multipart_opts(
+            &multipart_attr_key,
+            PutMultipartOptions {
+                attributes: multipart_attrs.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    attr_upload
+        .put_part(Vec::from(&b"multipart "[..]).into())
+        .await
+        .unwrap();
+    attr_upload
+        .put_part(Vec::from(&b"attrs"[..]).into())
+        .await
+        .unwrap();
+    attr_upload.complete().await.unwrap();
+    let multipart_attr_get = store.inner.get(&multipart_attr_key).await.unwrap();
+    assert_eq!(multipart_attr_get.attributes, multipart_attrs);
+    assert_eq!(
+        multipart_attr_get.bytes().await.unwrap().as_ref(),
+        b"multipart attrs"
     );
     let mp_update = store
         .inner
@@ -561,6 +698,7 @@ async fn curvine_object_store_semantics_live_cluster() {
         .await
         .unwrap();
     assert!(mp_update.e_tag.is_some());
+    assert_eq!(mp_update.version, mp_update.e_tag);
     assert_eq!(
         store.read_one_all(&multipart_key).await.unwrap().as_ref(),
         b"after multipart",
@@ -603,6 +741,35 @@ async fn curvine_object_store_semantics_live_cluster() {
         .unwrap();
     abort_upload.abort().await.unwrap();
     assert!(store.inner.head(&abort_key).await.is_err());
+
+    let failed_complete_key = Path::parse(format!("{pfx}/multipart/fails_as_dir")).unwrap();
+    let failed_complete_child =
+        Path::parse(format!("{pfx}/multipart/fails_as_dir/child.bin")).unwrap();
+    store.put(&failed_complete_child, b"child").await.unwrap();
+    let mut failed_upload = store
+        .inner
+        .put_multipart(&failed_complete_key)
+        .await
+        .unwrap();
+    failed_upload
+        .put_part(Vec::from(&b"will-not-commit"[..]).into())
+        .await
+        .unwrap();
+    let failed_complete = failed_upload.complete().await;
+    assert!(matches!(
+        failed_complete,
+        Err(OsError::AlreadyExists { .. })
+    ));
+    assert_eq!(
+        store
+            .read_one_all(&failed_complete_child)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"child",
+        "failed multipart complete must not disturb existing prefix children"
+    );
+    assert_staging_clean(&conf_path, &failed_complete_key).await;
 
     let race_key = Path::parse(format!("{pfx}/multipart/race.bin")).unwrap();
     let mut upload1 = store.inner.put_multipart(&race_key).await.unwrap();
@@ -671,7 +838,7 @@ async fn curvine_object_store_semantics_live_cluster() {
 }
 
 #[tokio::test]
-#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored"]
+#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb --test object_store_semantics -- --ignored"]
 async fn curvine_object_store_root_workspace_hides_multipart_staging() {
     let conf = match env::var(ClusterConf::ENV_CONF_FILE) {
         Ok(v) => v,
@@ -760,4 +927,30 @@ async fn curvine_object_store_root_workspace_hides_multipart_staging() {
     top_upload.complete().await.unwrap();
     let top_full = store.read_one_all(&top_key).await.unwrap();
     assert_eq!(top_full.as_ref(), b"top-level");
+}
+
+async fn assert_staging_clean(conf_path: &str, location: &Path) {
+    let conf = ClusterConf::from(conf_path).expect("load Curvine cluster configuration");
+    let rt = Arc::new(conf.client_rpc_conf().create_runtime());
+    let fs = CurvineFileSystem::with_rt(conf, rt).expect("create Curvine filesystem");
+    let staging_dir = CurvinePath::from_str(format!(
+        "/.curvine/lancedb/multipart/{}",
+        multipart_staging_id("/", location)
+    ))
+    .expect("valid staging path");
+
+    let statuses = fs.list_status(&staging_dir).await.unwrap_or_default();
+    assert!(
+        statuses.is_empty(),
+        "multipart failure cleanup should remove staging directory entries under {}",
+        staging_dir.full_path()
+    );
+}
+
+fn multipart_staging_id(workspace_root: &str, location: &Path) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(workspace_root.as_bytes());
+    hasher.update([0]);
+    hasher.update(location.as_ref().as_bytes());
+    format!("{:x}", hasher.finalize())
 }

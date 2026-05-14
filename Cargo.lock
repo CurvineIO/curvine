@@ -2067,7 +2067,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "curvine-lancedb-rs"
+name = "curvine-lancedb"
 version = "0.2.0"
 dependencies = [
  "arrow-array",
@@ -2176,7 +2176,7 @@ dependencies = [
  "curvine-client",
  "curvine-common",
  "curvine-fuse",
- "curvine-lancedb-rs",
+ "curvine-lancedb",
  "curvine-server",
  "curvine-tracing-appender",
  "curvine-ufs",
