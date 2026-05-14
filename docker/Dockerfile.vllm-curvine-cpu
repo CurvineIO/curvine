@@ -3,14 +3,25 @@
 # Build the base CPU image from the vLLM repository first, then build this layer
 # from the curvine-vllm repository root (this file lives under curvine-vllm/docker/).
 #
-# Example:
-#   cd /path/to/vllm && docker build -f docker/Dockerfile.cpu --target vllm-openai -t vllm-openai-cpu:local .
-#   cd /path/to/curvine-vllm && docker build -f docker/Dockerfile.vllm-curvine-cpu --build-arg VLLM_BASE_IMAGE=vllm-openai-cpu:local -t vllm-curvine-cpu:latest .
+# Two repositories (build order):
+#   1) vLLM repo: docker pull ubuntu:22.04
+#              && docker build -f docker/Dockerfile.cpu --target vllm-openai -t vllm-openai-cpu:local .
+#      (Avoid `docker build --pull` if BuildKit errors with "content size of zero"
+#       when resolving ubuntu:22.04; see docker/Dockerfile.cpu header comment.)
+#   2) This repo (curvine-vllm): docker build -f docker/Dockerfile.vllm-curvine-cpu \
+#          --build-arg VLLM_BASE_IMAGE=vllm-openai-cpu:local -t vllm-curvine-cpu:latest .
 
 ARG VLLM_BASE_IMAGE=vllm-openai-cpu:local
 FROM ${VLLM_BASE_IMAGE}
 
 USER root
+
+# vLLM CPU V1 engine runs `lscpu -Je` during OMPProcessManager init. Some slim
+# base images omit util-linux; install so EngineCore can start even if the
+# base tag was built before util-linux was added upstream.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends util-linux \
+    && rm -rf /var/lib/apt/lists/*
 
 # Match vLLM CPU Dockerfile default (see vllm/docker/Dockerfile.cpu).
 ARG PYTHON_SITE=/opt/venv/lib/python3.12/site-packages

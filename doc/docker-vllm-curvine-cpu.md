@@ -36,27 +36,43 @@ make build
 
 ---
 
-## 三、构建 vLLM 官方 CPU「OpenAI 服务」底镜像
+## 三、两仓库构建顺序（重要）
 
-在 **vLLM 源码仓库根目录** 执行（与上游 `docker/Dockerfile.cpu` 一致，目标阶段 **`vllm-openai`**）：
+**`vllm-project/vllm` 与 `curvine-vllm` 是两个独立 Git 仓库**：底镜像在 **vLLM 仓库** 构建，Curvine 层在 **curvine-vllm 仓库** 构建。请先完成 **第二节 wheel**，再在 vLLM 仓库打 **`vllm-openai-cpu:local`**，最后在 curvine-vllm 仓库打 **`vllm-curvine-cpu:latest`**。
+
+**基础镜像 `ubuntu:22.04` 与 BuildKit：** 若使用 **`docker build --pull`** 时出现 **`unable to fetch descriptor ... content size of zero`**，多为 BuildKit **强制重拉** manifest 时 Docker Hub / 镜像站返回异常，**不是** Dockerfile 写错。推荐流程：
+
+1. 在宿主机执行 **`docker pull ubuntu:22.04`**（单独拉 tag，走普通 pull 路径，通常可成功）。  
+2. 再执行下面的 **`docker build` 时不要加 `--pull`**，让 BuildKit 使用本机已有 **`ubuntu:22.04`** 元数据。  
+3. 若仍失败：尝试 **`docker builder prune -f`**、更换网络或临时关闭 **`registry-mirrors`** 后重试；需要「始终强制更新基础镜像」时再考虑 **`--pull`**。
+
+---
+
+## 四、构建 vLLM 官方 CPU「OpenAI 服务」底镜像
+
+在 **vLLM 源码仓库根目录**（`Dockerfile.cpu` 所在仓库）执行，目标阶段 **`vllm-openai`**，产出 **`vllm-openai-cpu:local`**：
 
 ```bash
 cd /path/to/vllm
+docker pull ubuntu:22.04
 docker build -f docker/Dockerfile.cpu --target vllm-openai -t vllm-openai-cpu:local .
 ```
+
+（若你确认网络与镜像源稳定，可改用 **`docker build --pull ...`**；遇到上一节所述 **descriptor / content size of zero** 错误时，请改回 **先 `pull`、构建时不带 `--pull`**。）
 
 说明：
 
 - 该阶段镜像内 **`ENTRYPOINT`** 原为 **`vllm serve`**。  
 - 下一节 **Curvine 层** 会替换为 **`entrypoint-vllm-serve-curvine.sh`**：在未开启 Curvine 开关时，行为与 **`vllm serve`** 一致；开启时自动追加 **`--kv-transfer-config`**。
+- 基础镜像已包含 **`util-linux`**（提供 **`lscpu`**），供 vLLM CPU V1 引擎初始化 **OMPProcessManager** 使用；若你使用极旧底镜像，Curvine 层 Dockerfile 内仍会再装一层 **`util-linux`** 作为兜底。
 
 > **构建耗时**：从源码编译 vLLM CPU 版本通常较长，请预留足够时间与磁盘。
 
 ---
 
-## 四、构建 Curvine 层镜像（本仓库）
+## 五、构建 Curvine 层镜像（curvine-vllm 仓库）
 
-在 **curvine-vllm 仓库根目录**（含 **`docker/Dockerfile.vllm-curvine-cpu`**）执行：
+在 **curvine-vllm 仓库根目录**（本仓库，含 **`docker/Dockerfile.vllm-curvine-cpu`**）执行；**`--build-arg VLLM_BASE_IMAGE`** 指向上一节在同一台机器上已构建的 **`vllm-openai-cpu:local`**：
 
 ```bash
 cd /path/to/curvine-vllm
@@ -68,13 +84,14 @@ docker build -f docker/Dockerfile.vllm-curvine-cpu \
 **`Dockerfile` 做了什么（摘要）**：
 
 1. 以 **`VLLM_BASE_IMAGE`** 为基础镜像（默认 **`vllm-openai-cpu:local`**）。  
-2. 将 **`build/dist/lib/curvine_libsdk-*-cp38-abi3-*.whl`** 拷入镜像并 **`uv pip install`**，同时固定 **`protobuf==3.20.3`**。  
-3. 从本仓库拷贝 **`curvine-libsdk/python/curvinefs`** 与 **`curvine_libsdk/_proto`** 到 **`/opt/venv/lib/python3.12/site-packages`**（与上游 CPU 镜像默认 Python 3.12 一致；若你自行改了底镜像 Python 版本，需同步修改 Dockerfile 中的 **`PYTHON_SITE`**）。  
-4. 安装入口脚本 **`/usr/local/bin/entrypoint-vllm-serve-curvine.sh`** 并设为 **`ENTRYPOINT`**。
+2. **`apt-get install util-linux`**：确保存在 **`lscpu`**（vLLM CPU V1 **`OMPProcessManager`** 依赖）；与上游 **`Dockerfile.cpu`** 中已包含的 **`util-linux`** 叠加时通常仅为幂等安装。  
+3. 将 **`build/dist/lib/curvine_libsdk-*-cp38-abi3-*.whl`** 拷入镜像并 **`uv pip install`**，同时固定 **`protobuf==3.20.3`**。  
+4. 从本仓库拷贝 **`curvine-libsdk/python/curvinefs`** 与 **`curvine_libsdk/_proto`** 到 **`/opt/venv/lib/python3.12/site-packages`**（与上游 CPU 镜像默认 Python 3.12 一致；若你自行改了底镜像 Python 版本，需同步修改 Dockerfile 中的 **`PYTHON_SITE`**）。  
+5. 安装入口脚本 **`/usr/local/bin/entrypoint-vllm-serve-curvine.sh`** 并设为 **`ENTRYPOINT`**。
 
 ---
 
-## 五、部署：环境变量说明
+## 六、部署：环境变量说明
 
 ### 5.1 总开关
 
@@ -113,7 +130,7 @@ CURVINE_LD_PRELOAD=/opt/venv/lib/python3.12/site-packages/curvine_libsdk/_native
 
 ---
 
-## 六、运行示例（`docker run`）
+## 七、运行示例（`docker run`）
 
 ### 6.1 POSIX：挂载 FUSE 或共享存储目录
 
@@ -149,7 +166,7 @@ docker run --rm -p 8000:8000 \
 
 ---
 
-## 七、镜像与 Curvine 集成自测（建议步骤）
+## 八、镜像与 Curvine 集成自测（建议步骤）
 
 以下不涉及真实权重推理负载时，可只做「镜像是否可用、Curvine 包是否可导入」级别检查。
 
@@ -162,7 +179,7 @@ docker run --rm --entrypoint /opt/venv/bin/python vllm-curvine-cpu:latest \
   -c "import curvinefs.curvineClient; import curvine_libsdk; print('curvine sdk ok')"
 ```
 
-若此处失败，请对照 **第五节 LD_PRELOAD**、**protobuf**、以及 **`curvinefs/_proto`** 是否随镜像拷贝成功。
+若此处失败，请对照 **第六节 LD_PRELOAD**、**protobuf**、以及 **`curvinefs/_proto`** 是否随镜像拷贝成功。
 
 ### 7.2 检查入口脚本是否注入 `--kv-transfer-config`（可选）
 
@@ -196,7 +213,7 @@ PYTHONPATH=. .venv/bin/python -m unittest tests.v1.kv_connector.unit.test_curvin
 
 ---
 
-## 八、与手写命令行的等价关系
+## 九、与手写命令行的等价关系
 
 等价于（节选）：
 
@@ -209,13 +226,13 @@ vllm serve YOUR_MODEL \
 
 ---
 
-## 九、Kubernetes 部署提示
+## 十、Kubernetes 部署提示
 
 将 **`docker run`** 中的 **`-e`** 逐项写成 **`env`**；**`CURVINE_SDK_CONFIG_PATH`** 对应文件用 **`ConfigMap`/`Secret` + `volumeMount`** 挂载到容器内路径即可。
 
 ---
 
-## 十、附录：文件位置
+## 十一、附录：文件位置
 
 | 文件 | 作用 |
 |------|------|
