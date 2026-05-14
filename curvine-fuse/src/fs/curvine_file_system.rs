@@ -38,15 +38,17 @@ use tokio_util::bytes::BytesMut;
 
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
-    state: NodeState,
+    state: Arc<NodeState>,
     conf: FuseConf,
 }
 
 impl CurvineFileSystem {
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
+        FuseMetrics::ensure_init()?;
+
         let fuse_conf = conf.fuse.clone();
         let fs = UnifiedFileSystem::with_rt(conf, rt)?;
-        let state = NodeState::new(fs.clone());
+        let state = Arc::new(NodeState::new(fs.clone()));
 
         let fuse_fs = Self {
             fs,
@@ -55,6 +57,10 @@ impl CurvineFileSystem {
         };
 
         Ok(fuse_fs)
+    }
+
+    pub fn state(&self) -> &Arc<NodeState> {
+        &self.state
     }
 
     fn fill_open_flags(conf: &FuseConf, v: u32) -> u32 {
