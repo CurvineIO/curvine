@@ -32,6 +32,8 @@
 - [性能基准](https://curvineio.github.io/docs/category/benchmark)
 - [DeepWiki](https://deepwiki.com/CurvineIO/curvine)
 - [提交规范](COMMIT_CONVENTION.md)
+- [vLLM CPU 推理镜像 + Curvine 环境变量部署（本仓库）](doc/docker-vllm-curvine-cpu.md)
+- [Native KV 端到端自测：真实 CurvineClient + 集群（本仓库）](doc/testing-native-kv-e2e.md)
 
 ## 应用场景
 

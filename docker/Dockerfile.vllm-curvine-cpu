@@ -1,0 +1,33 @@
+# vLLM CPU OpenAI image + Curvine Python SDK (wheel) for CurvineKVConnector.
+#
+# Build the base CPU image from the vLLM repository first, then build this layer
+# from the curvine-vllm repository root (this file lives under curvine-vllm/docker/).
+#
+# Example:
+#   cd /path/to/vllm && docker build -f docker/Dockerfile.cpu --target vllm-openai -t vllm-openai-cpu:local .
+#   cd /path/to/curvine-vllm && docker build -f docker/Dockerfile.vllm-curvine-cpu --build-arg VLLM_BASE_IMAGE=vllm-openai-cpu:local -t vllm-curvine-cpu:latest .
+
+ARG VLLM_BASE_IMAGE=vllm-openai-cpu:local
+FROM ${VLLM_BASE_IMAGE}
+
+USER root
+
+# Match vLLM CPU Dockerfile default (see vllm/docker/Dockerfile.cpu).
+ARG PYTHON_SITE=/opt/venv/lib/python3.12/site-packages
+
+# Curvine wheel: copy from local build/dist/lib or override with build context path.
+# Exactly one matching wheel must exist under build/dist/lib/ (per-arch build).
+COPY build/dist/lib/curvine_libsdk-*-cp38-abi3-*.whl /tmp/
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /opt/venv/bin/python "protobuf==3.20.3" /tmp/curvine_libsdk-*-cp38-abi3-*.whl \
+    && rm -f /tmp/curvine_libsdk-*-cp38-abi3-*.whl
+
+COPY curvine-libsdk/python/curvinefs ${PYTHON_SITE}/curvinefs
+COPY curvine-libsdk/python/curvine_libsdk/_proto ${PYTHON_SITE}/curvine_libsdk/_proto
+
+COPY docker/entrypoint-vllm-serve-curvine.sh /usr/local/bin/entrypoint-vllm-serve-curvine.sh
+RUN chmod +x /usr/local/bin/entrypoint-vllm-serve-curvine.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-vllm-serve-curvine.sh"]
+CMD []

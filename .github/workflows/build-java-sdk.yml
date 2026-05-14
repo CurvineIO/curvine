@@ -104,7 +104,10 @@ jobs:
       - name: Build native library
         run: |
           echo "Building native library for ${{ matrix.os }} ${{ matrix.arch }}_64"
-          cargo build --release -p curvine-libsdk --jobs 2
+          cargo build --release -p curvine-libsdk \
+            --no-default-features \
+            --features curvine-common/jemalloc,java-sdk \
+            --jobs 2
           
           # Create output directory
           mkdir -p native-output

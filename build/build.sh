@@ -497,8 +497,9 @@ else
 fi
 
 if [ $BUILD_JAVA_SDK -eq 1 ]; then
+  # JNI artifact: `--no-default-features --features ...,java-sdk` only (never pyo3).
   build_curvine_libsdk "java-sdk"
-  # Copy JNI native before Python SDK build (if any) overwrites target/.
+  # Copy JNI native before Python SDK maturin build (below) replaces target/*/libcurvine_libsdk.*.
   mkdir -p "$FS_HOME"/curvine-libsdk/java/native
   if [ -e "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" ]; then
     cp -f "$FS_HOME/target/${TARGET_DIR}/curvine_libsdk.dll" "$FS_HOME/curvine-libsdk/java/native/curvine_libsdk.dll"
@@ -529,6 +530,10 @@ if [ $BUILD_JAVA_SDK -eq 1 ]; then
 fi
 
 if [ $BUILD_PYTHON_SDK -eq 1 ]; then
+  # Python wheel builds with maturin using python-sdk feature only—separate JNI build above.
+  if [ $BUILD_JAVA_SDK -eq 1 ]; then
+    echo "Note: building JNI first, then Python (maturin) so libsdk artifacts do not cross-link PyO3 and JNI symbols."
+  fi
   if ! command -v protoc >/dev/null 2>&1; then
     echo "Error: protoc is required to build the Python SDK wheel. Install Protobuf 3+." >&2
     exit 1

@@ -9,7 +9,9 @@ crate-type = ['cdylib']
 name = "curvine_libsdk"
 
 [features]
-default = ["java-sdk"]
+# Keep JNI and Python bindings opt-in so a single `libcurvine_libsdk` artifact never
+# accidentally mixes both ABIs; build scripts / CI must pass explicit features.
+default = []
 java-sdk = ["dep:jni"]
 python-sdk = ["dep:pyo3"]
 

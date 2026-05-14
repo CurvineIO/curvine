@@ -1,84 +1,77 @@
 import ctypes
+
 import curvine_libsdk
-from io import BufferedReader
+
 
 class CurvineReader:
     readerHandle = None
-    read_buffer = None
-    read_pos = 0  # read position
-    read_buffer_pos = 0 # buffer position
     file_size = 0
 
-    def __init__(self, nativeHandle, file_size):
-        self.readerHandle = nativeHandle
+    def __init__(self, native_handle, file_size):
+        self.readerHandle = native_handle
         self.file_size = file_size
-    
-    # read
-    def read(self, offset, length): 
-        self.read_pos += offset
-        if self.read_pos < 0:
-            raise IOError("Position is negative") 
-        if self.read_pos >= self.file_size:
+        self._pending = bytearray()
+
+    def seek(self, pos):
+        if pos < 0:
+            raise ValueError("Seek position cannot be negative")
+        if pos > self.file_size:
+            raise ValueError(f"Seek position {pos} exceeds file length {self.file_size}")
+        self._pending.clear()
+        try:
+            curvine_libsdk.python_io_curvine_curvine_native_seek(self.readerHandle, pos)
+        except Exception as e:
+            raise IOError(f"Native seek failed: {e}") from e
+
+    def read(self, offset, length):
+        """Read `length` bytes starting at absolute file `offset`; returns raw bytes."""
+        if length == 0:
             return b""
-        
-        addr_len = [0,0]
-        if self.read_buffer is None:
+        self.seek(offset)
+        return self._read_bytes(length)
+
+    def _read_bytes(self, length):
+        addr_len = [0, 0]
+        data = bytearray()
+        remaining = length
+
+        if self._pending:
+            take = min(len(self._pending), remaining)
+            data.extend(memoryview(self._pending)[:take])
+            del self._pending[:take]
+            remaining -= take
+            if remaining == 0:
+                return bytes(data)
+
+        while remaining > 0:
             try:
                 curvine_libsdk.python_io_curvine_curvine_native_read(self.readerHandle, addr_len)
             except Exception as e:
-                raise IOError(f"Native read file failed: {e}")
-            
+                raise IOError(f"Native read file failed: {e}") from e
+
             memory_address = addr_len[0]
             memory_length = addr_len[1]
-            buffer_type = (ctypes.c_char * length)
-            self.read_buffer =  buffer_type.from_address(memory_address)
-            self.read_pos += length
-        else:
-            memory_address = ctypes.addressof(self.read_buffer)
-            memory_length = self.read_buffer._length_
-        if memory_length <= 0:
-                return b""
-        if offset >= memory_length:
-            return b""
-        if offset + length > memory_length:
-            raise ValueError("Offset and length out of memory length")
-        
-        memory_address = memory_address + offset
-        data = ctypes.string_at(memory_address, length)
+            if memory_length <= 0:
+                break
 
-        return data.decode("utf-8", errors='ignore')
-    
-    # seek
-    def seek(self, pos):        
-        file_len = self.file_size
-        if pos < 0:
-            raise ValueError("Seek position cannot be negative")
-        if pos > file_len:
-            raise ValueError(f"Seek position {pos} exceeds file length {file_len}")
-        
-        to_skip = self.read_pos - pos
-        if self.read_buffer and to_skip >=0 and to_skip <= self.read_buffer._length_:
-            self.read_buffer_pos += to_skip
-        else:
-            # Discard buffer data.
-            self.read_buffer = None
-            self.read_pos = 0
-            try: 
-                curvine_libsdk.python_io_curvine_curvine_native_seek(self.readerHandle, pos)
-            except Exception as e:
-                raise IOError(f"Native seek failed: {e}")
-        self.read_pos = pos
+            chunk = ctypes.string_at(memory_address, memory_length)
+            if len(chunk) <= remaining:
+                data.extend(chunk)
+                remaining -= len(chunk)
+            else:
+                data.extend(chunk[:remaining])
+                self._pending.extend(chunk[remaining:])
+                remaining = 0
 
-    # close_reader
+        return bytes(data)
+
     def close(self):
-        if self.readerHandle == None:
+        if self.readerHandle is None:
             return
         try:
             curvine_libsdk.python_io_curvine_curvine_native_close_reader(self.readerHandle)
         except Exception as e:
-            raise IOError(f"Native close reader failed: {e}")
+            raise IOError(f"Native close reader failed: {e}") from e
         self.readerHandle = None
-        self.read_buffer = None
-        self.read_buffer_pos = 0
-        self.read_pos = 0
+        self._pending.clear()
         self.file_size = 0

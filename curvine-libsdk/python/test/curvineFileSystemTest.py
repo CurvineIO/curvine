@@ -12,7 +12,7 @@ class Test(unittest.TestCase):
     # Test file system function
     def test(self):
         conf_path = os.environ.get("CURVINE_CONF_FILE", _DEFAULT_CONF)
-        fs = CurvineFileSystem(conf_path, 1, 8)
+        fs = CurvineFileSystem(conf_path, 128, 8)
         test_path = os.environ.get("CURVINE_TEST_CV_PATH", "file:///fs_test")
 
         fs.mkdir(test_path, True)
@@ -23,8 +23,13 @@ class Test(unittest.TestCase):
         print("File(Directory) status:",file_status)
         print("------------------------------------------------")
 
-        none_file_status = fs.get_file_status(test_path+"/f.txt")
-        print("ls None file:",none_file_status)
+        missing = test_path + "/f.txt"
+        try:
+            none_file_status = fs.get_file_status(missing)
+        except FileNotFoundError:
+            print("missing file raises FileNotFoundError as expected:", missing)
+            none_file_status = None
+        print("missing file probe:", none_file_status)
         print("------------------------------------------------")
 
         

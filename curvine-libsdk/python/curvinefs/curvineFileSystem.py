@@ -40,12 +40,15 @@ class CurvineFileSystem(AbstractFileSystem):
                 return self.client.ls(path, False)
         elif isinstance(path, list):
             res = {}
-            for item in list:
-                temp_path = item["name"]
+            for item in path:
+                if isinstance(item, str):
+                    temp_path = self.formatPath(item)
+                else:
+                    temp_path = item["name"]
                 if self.isfile(temp_path):
                     res[temp_path] = self.client.read_range(temp_path, 0, -1)
                 else:
-                    res[temp_path] = self.client.ls(path, False)
+                    res[temp_path] = self.client.ls(temp_path, False)
             return res
         else:
             raise ValueError("Path can be only string or list")
@@ -110,14 +113,7 @@ class CurvineFileSystem(AbstractFileSystem):
     
     def exists(self, path, **kwargs):
         path = self.formatPath(path)
-        try:
-            status = self.client.get_file_status(path)
-        except Exception as e:
-            raise
-        
-        if status is None:
-            return False
-        return True
+        return self.client.path_exists(path)
     
     def expand_path(self, path, recursive=False, maxdepth=None, **kwargs):
         raise NotImplementedError
@@ -143,24 +139,27 @@ class CurvineFileSystem(AbstractFileSystem):
     
     def info(self, path, *args, **kwargs):
         path = self.formatPath(path)
-        file_status = self.client.get_file_status(path)
-        return file_status 
+        return self.client.get_file_status(path)
    
     def invalidate_cache(self, path=None):
         raise NotImplementedError
     
     def isdir(self, path):
         path = self.formatPath(path)
-        file_status = self.client.get_file_status(path)
-        return file_status["is_dir"] 
+        try:
+            file_status = self.client.get_file_status(path)
+        except FileNotFoundError:
+            return False
+        return file_status["is_dir"]
     
     def isfile(self, path):
         path = self.formatPath(path)
-        file_status = self.client.get_file_status(path)
-        type = file_status["file_type"]
-        if type == 1:
-            return True
-        return False
+        try:
+            file_status = self.client.get_file_status(path)
+        except FileNotFoundError:
+            return False
+        ftype = file_status["file_type"]
+        return ftype == 1
     
     def lexists(self, path, **kwargs):
         raise NotImplementedError
@@ -175,14 +174,14 @@ class CurvineFileSystem(AbstractFileSystem):
  
     def mkdir(self, path, create_parents, **kwargs):
         path = self.formatPath(path)
-        self.client.mkdir(path, create_parents, **kwargs)
+        self.client.mkdir(path, create_parents)
     
     def mkdirs(self, path, exist_ok=False):
         raise NotImplementedError
     
     def makedir(self, path, create_parents=True, **kwargs):
         path = self.formatPath(path)
-        return self.client.mkdir(path, create_parents, **kwargs)
+        return self.client.mkdir(path, create_parents)
     
     def makedirs(self, path, exist_ok=False):
         raise NotImplementedError
