@@ -173,6 +173,36 @@ fn missing_curvine_config_error() -> LanceError {
     ))
 }
 
+fn curvine_reader_stream(
+    mut reader: impl Reader + Send + 'static,
+    location: Path,
+    range: std::ops::Range<u64>,
+) -> impl futures::Stream<Item = OsResult<Bytes>> {
+    stream! {
+        let mut remaining = range.end.saturating_sub(range.start) as usize;
+        while remaining > 0 {
+            let chunk = match reader.async_read(Some(remaining)).await {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    yield Err(fs_error_to_object_store(&location, e));
+                    return;
+                }
+            };
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            remaining = remaining.saturating_sub(chunk.len());
+            yield Ok(chunk.to_bytes());
+        }
+
+        if let Err(e) = reader.complete().await {
+            yield Err(fs_error_to_object_store(&location, e));
+        }
+    }
+}
+
 #[async_trait]
 impl ObjectStoreProvider for CurvineObjectStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
@@ -341,19 +371,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 .map_err(|e| fs_error_to_object_store(location, e))?;
         }
 
-        let len = (range.end - range.start) as usize;
-        let mut buf = vec![0u8; len];
-        let read_len = reader
-            .read_full(&mut buf)
-            .await
-            .map_err(|e| fs_error_to_object_store(location, e))?;
-        reader
-            .complete()
-            .await
-            .map_err(|e| fs_error_to_object_store(location, e))?;
-        buf.truncate(read_len);
-
-        let stream = stream::once(async move { Ok::<Bytes, OsError>(Bytes::from(buf)) }).boxed();
+        let stream = curvine_reader_stream(reader, location.clone(), range.clone()).boxed();
 
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream),
@@ -775,19 +793,12 @@ impl CurvineObjectStore {
         reader: &mut impl Reader,
         writer: &mut impl Writer,
     ) -> OsResult<()> {
-        let mut offset = 0u64;
-        while offset < size {
-            let take = ((size - offset).min(COPY_CHUNK_BYTES as u64)) as usize;
-            if offset > 0 {
-                reader
-                    .seek(offset as i64)
-                    .await
-                    .map_err(|e| fs_error_to_object_store(from, e))?;
-            }
-
-            let mut buf = vec![0u8; take];
+        let mut remaining = size as usize;
+        let mut buf = vec![0u8; COPY_CHUNK_BYTES];
+        while remaining > 0 {
+            let take = remaining.min(COPY_CHUNK_BYTES);
             let n = reader
-                .read_full(&mut buf)
+                .read_full(&mut buf[..take])
                 .await
                 .map_err(|e| fs_error_to_object_store(from, e))?;
             if n == 0 {
@@ -797,7 +808,7 @@ impl CurvineObjectStore {
                 .write(&buf[..n])
                 .await
                 .map_err(|e| fs_error_to_object_store(to, e))?;
-            offset += n as u64;
+            remaining = remaining.saturating_sub(n);
         }
 
         Ok(())
