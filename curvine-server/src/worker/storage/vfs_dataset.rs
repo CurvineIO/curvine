@@ -223,6 +223,18 @@ impl VfsDataset {
             }
         }
     }
+
+    #[cfg(test)]
+    /// Test helper: get the offset allocator for a given dir_id.
+    pub fn offset_alloc_for_dir(
+        &self,
+        dir_id: u32,
+    ) -> Option<&super::dir_state::BdevOffsetAllocator> {
+        self.dir_list
+            .dir_iter()
+            .find(|d| d.id() == dir_id)
+            .map(|d| &d.state.offset_alloc)
+    }
 }
 
 impl Dataset for VfsDataset {
@@ -353,13 +365,19 @@ impl Dataset for VfsDataset {
     }
 }
 
-#[cfg(all(test, feature = "spdk"))]
+#[cfg(test)]
 mod test {
+    use crate::worker::block::BlockMeta;
     use crate::worker::block::BlockState;
-    use crate::worker::storage::{Dataset, VfsDataset};
+    use crate::worker::storage::{Dataset, DirList, DirState, StorageVersion, VfsDataset, VfsDir};
     use curvine_common::conf::{ClusterConf, WorkerConf};
-    use curvine_common::state::ExtendedBlock;
+    use curvine_common::state::{ExtendedBlock, FileType, StorageType};
+    use orpc::sync::AtomicLong;
+    use orpc::sys::FsStats;
     use orpc::CommonResult;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     fn create_data_set(format: bool, dir: &str) -> VfsDataset {
         let conf = ClusterConf {
@@ -379,9 +397,44 @@ mod test {
         VfsDataset::from_conf("test", &conf).unwrap()
     }
 
+    fn spdk_state(dir_id: u32) -> Arc<DirState> {
+        Arc::new(DirState {
+            dir_id,
+            base_path: PathBuf::from("/tmp/spdk"),
+            storage_type: StorageType::SpdkDisk,
+            bdev_name: Some("nvme0".into()),
+            bdev_capacity: 1 << 30,
+            offset_alloc: DirState::new_offset_alloc(StorageType::SpdkDisk, 1 << 30, 4096),
+        })
+    }
+
+    fn spdk_dir(state: Arc<DirState>) -> VfsDir {
+        let dir_id = state.dir_id;
+        let mut version = StorageVersion::with_cluster("t");
+        version.dir_id = dir_id;
+        VfsDir {
+            version,
+            stats: FsStats::new("/tmp"),
+            active_dir: PathBuf::from("/tmp/a"),
+            staging_dir: PathBuf::from("/tmp/s"),
+            storage_type: StorageType::SpdkDisk,
+            conf_capacity: 1 << 30,
+            reserved_bytes: 0,
+            final_bytes: AtomicLong::new(0),
+            tmp_bytes: AtomicLong::new(0),
+            state,
+            check_failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn spdk_dataset() -> VfsDataset {
+        let st = spdk_state(1);
+        VfsDataset::new("t", DirList::new(vec![spdk_dir(st)]), None)
+    }
+
     #[test]
     fn sample() -> CommonResult<()> {
-        let ds = create_data_set(true, "sample");
+        let mut ds = create_data_set(true, "sample");
         let mut block = ExtendedBlock::with_mem(1, "100B")?;
         let meta = ds.open_block(&block)?;
         assert_eq!(ds.available(), 400);
@@ -393,13 +446,13 @@ mod test {
     }
     #[test]
     fn append() -> CommonResult<()> {
-        let ds = create_data_set(true, "append");
+        let mut ds = create_data_set(true, "append");
         let mut block = ExtendedBlock::with_mem(1, "100B")?;
         let meta = ds.open_block(&block)?;
         meta.write_test_data("50B")?;
         block.len = 50;
         ds.finalize_block(&block)?;
-        block.len = 100;
+        block.len = 70;
         let meta2 = ds.open_block(&block)?;
         meta2.write_test_data("20B")?;
         ds.finalize_block(&block)?;
@@ -421,35 +474,8 @@ mod test {
     }
     #[test]
     fn abort_spdk() -> CommonResult<()> {
-        use crate::worker::block::BlockMeta;
-        use curvine_common::state::StorageType;
-        use orpc::sync::AtomicLong;
-        use orpc::sys::FsStats;
-        use std::path::PathBuf;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
-        let st = Arc::new(DirState {
-            dir_id: 1,
-            base_path: PathBuf::from("/tmp/spdk"),
-            storage_type: StorageType::SpdkDisk,
-            bdev_name: Some("nvme0".into()),
-            bdev_capacity: 1 << 30,
-            offset_alloc: DirState::new_offset_alloc(StorageType::SpdkDisk, 1 << 30, 4096),
-        });
-        let vfs = VfsDir {
-            version: StorageVersion::with_cluster("t"),
-            stats: FsStats::new("/tmp"),
-            active_dir: PathBuf::from("/tmp/a"),
-            staging_dir: PathBuf::from("/tmp/s"),
-            storage_type: StorageType::SpdkDisk,
-            conf_capacity: 1 << 30,
-            reserved_bytes: 0,
-            final_bytes: AtomicLong::new(0),
-            tmp_bytes: AtomicLong::new(0),
-            state: st.clone(),
-            check_failed: Arc::new(AtomicBool::new(false)),
-        };
-        let mut ds = VfsDataset::new("t", DirList::new(vec![vfs]), None);
+        let st = spdk_state(1);
+        let mut ds = VfsDataset::new("t", DirList::new(vec![spdk_dir(st.clone())]), None);
         let meta = BlockMeta {
             id: 1,
             len: 4096,
@@ -465,9 +491,86 @@ mod test {
                 4096,
                 StorageType::SpdkDisk,
                 FileType::File,
-            )?)
+            ))
             .is_ok();
-        assert!(ok && ds.block_map.get(&1).is_none());
+        assert!(ok && !ds.block_map.contains_key(&1));
+        Ok(())
+    }
+    #[test]
+    fn spdk_create_abort_reuse_offset() -> CommonResult<()> {
+        let mut ds = spdk_dataset();
+        let block1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let meta1 = ds.open_block(&block1)?;
+        assert_eq!(meta1.bdev_offset, 0, "first block should get offset 0");
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().allocated_count(), 1);
+
+        ds.abort_block(&block1)?;
+        assert!(!ds.block_map.contains_key(&1));
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().free_list_size(), 1);
+
+        let block2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let meta2 = ds.open_block(&block2)?;
+        assert_eq!(meta2.bdev_offset, 0, "block 2 should reuse freed offset 0");
+        assert_eq!(ds.offset_alloc_for_dir(1).unwrap().free_list_size(), 0);
+
+        Ok(())
+    }
+    #[test]
+    fn spdk_create_abort_interleaved() -> CommonResult<()> {
+        let mut ds = spdk_dataset();
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let b3 = ExtendedBlock::new(3, 4096, StorageType::SpdkDisk, FileType::File);
+        let m1 = ds.open_block(&b1)?;
+        let m2 = ds.open_block(&b2)?;
+        let m3 = ds.open_block(&b3)?;
+        assert_eq!(m1.bdev_offset, 0);
+        assert_eq!(m2.bdev_offset, 4096);
+        assert_eq!(m3.bdev_offset, 8192);
+
+        ds.abort_block(&b2)?;
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(alloc.free_list_size(), 1);
+        assert_eq!(alloc.free_list_entries()[0], (4096, 4096));
+
+        ds.abort_block(&b1)?;
+        let alloc = ds.offset_alloc_for_dir(1).unwrap();
+        assert_eq!(alloc.free_list_size(), 1);
+        assert_eq!(alloc.free_list_entries()[0], (0, 8192));
+
+        let b4 = ExtendedBlock::new(4, 4096, StorageType::SpdkDisk, FileType::File);
+        let m4 = ds.open_block(&b4)?;
+        assert_eq!(m4.bdev_offset, 0);
+
+        let b5 = ExtendedBlock::new(5, 4096, StorageType::SpdkDisk, FileType::File);
+        let m5 = ds.open_block(&b5)?;
+        assert_eq!(m5.bdev_offset, 4096);
+
+        Ok(())
+    }
+    #[test]
+    fn spdk_restore_free_list() -> CommonResult<()> {
+        let st = spdk_state(1);
+        let mut ds = VfsDataset::new("t", DirList::new(vec![spdk_dir(st.clone())]), None);
+        let b1 = ExtendedBlock::new(1, 4096, StorageType::SpdkDisk, FileType::File);
+        let b2 = ExtendedBlock::new(2, 4096, StorageType::SpdkDisk, FileType::File);
+        let b3 = ExtendedBlock::new(3, 4096, StorageType::SpdkDisk, FileType::File);
+        ds.open_block(&b1)?;
+        ds.open_block(&b2)?;
+        ds.open_block(&b3)?;
+
+        ds.abort_block(&b2)?;
+        let snap = st.offset_alloc.snapshot();
+
+        let st2 = spdk_state(1);
+        st2.offset_alloc.restore(&snap);
+
+        let entries = st2.offset_alloc.free_list_entries();
+        assert_eq!(entries.len(), 1, "expected 1 free entry, got {:?}", entries);
+        assert_eq!(entries[0], (4096, 4096));
+        assert_eq!(st2.offset_alloc.free_list_bytes(), 4096);
+
+        assert_eq!(st2.offset_alloc.allocate(4, 4096).unwrap(), 4096);
         Ok(())
     }
 }
