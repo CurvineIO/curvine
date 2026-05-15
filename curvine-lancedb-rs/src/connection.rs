@@ -32,17 +32,18 @@ pub struct ConnectBuilder {
 impl ConnectBuilder {
     pub fn new(uri: &str) -> Self {
         let builder = lancedb_upstream::connect(uri);
-        let builder = if is_curvine_uri(uri) {
-            builder.session(curvine_session())
+        if is_curvine_uri(uri) {
+            Self {
+                inner: ConnectBuilderInner::Upstream(Box::new(builder.session(curvine_session()))),
+            }
         } else {
-            builder
-        };
-        Self {
-            inner: ConnectBuilderInner::Upstream(Box::new(builder)),
+            Self {
+                inner: ConnectBuilderInner::Upstream(Box::new(builder)),
+            }
         }
     }
 
-    fn map_builder(
+    fn map_upstream(
         self,
         f: impl FnOnce(
             lancedb_upstream::connection::ConnectBuilder,
@@ -59,53 +60,53 @@ impl ConnectBuilder {
         self,
         database_options: &dyn lancedb_upstream::database::DatabaseOptions,
     ) -> Self {
-        self.map_builder(|builder| builder.database_options(database_options))
+        self.map_upstream(|builder| builder.database_options(database_options))
     }
 
     pub fn embedding_registry(
         self,
         registry: std::sync::Arc<dyn lancedb_upstream::embeddings::EmbeddingRegistry>,
     ) -> Self {
-        self.map_builder(|builder| builder.embedding_registry(registry))
+        self.map_upstream(|builder| builder.embedding_registry(registry))
     }
 
     pub fn storage_option(self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.map_builder(|builder| builder.storage_option(key, value))
+        self.map_upstream(|builder| builder.storage_option(key, value))
     }
 
     pub fn storage_options(
         self,
         pairs: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
-        self.map_builder(|builder| builder.storage_options(pairs))
+        self.map_upstream(|builder| builder.storage_options(pairs))
     }
 
     pub fn read_consistency_interval(self, read_consistency_interval: std::time::Duration) -> Self {
-        self.map_builder(|builder| builder.read_consistency_interval(read_consistency_interval))
+        self.map_upstream(|builder| builder.read_consistency_interval(read_consistency_interval))
     }
 
     pub fn session(self, session: std::sync::Arc<lancedb_upstream::Session>) -> Self {
-        self.map_builder(|builder| builder.session(session))
+        self.map_upstream(|builder| builder.session(session))
     }
 
     #[cfg(feature = "remote")]
     pub fn api_key(self, api_key: &str) -> Self {
-        self.map_builder(|builder| builder.api_key(api_key))
+        self.map_upstream(|builder| builder.api_key(api_key))
     }
 
     #[cfg(feature = "remote")]
     pub fn region(self, region: &str) -> Self {
-        self.map_builder(|builder| builder.region(region))
+        self.map_upstream(|builder| builder.region(region))
     }
 
     #[cfg(feature = "remote")]
     pub fn host_override(self, host_override: &str) -> Self {
-        self.map_builder(|builder| builder.host_override(host_override))
+        self.map_upstream(|builder| builder.host_override(host_override))
     }
 
     #[cfg(feature = "remote")]
     pub fn client_config(self, config: lancedb_upstream::remote::ClientConfig) -> Self {
-        self.map_builder(|builder| builder.client_config(config))
+        self.map_upstream(|builder| builder.client_config(config))
     }
 
     pub async fn execute(self) -> lancedb_upstream::Result<Connection> {
@@ -119,21 +120,60 @@ pub fn connect(uri: &str) -> ConnectBuilder {
     ConnectBuilder::new(uri)
 }
 
-#[derive(Debug)]
-struct ConnectNamespacePending {
-    ns_impl: String,
-    properties: HashMap<String, String>,
-    storage_options: HashMap<String, String>,
-    read_consistency_interval: Option<std::time::Duration>,
-    embedding_registry: Option<std::sync::Arc<dyn lancedb_upstream::embeddings::EmbeddingRegistry>>,
-    session: Option<std::sync::Arc<lancedb_upstream::Session>>,
-    server_side_query: bool,
+enum ConnectNamespaceBuilderInner {
+    Pending {
+        ns_impl: String,
+        properties: HashMap<String, String>,
+        storage_options: HashMap<String, String>,
+        read_consistency_interval: Option<std::time::Duration>,
+        embedding_registry:
+            Option<std::sync::Arc<dyn lancedb_upstream::embeddings::EmbeddingRegistry>>,
+        session: Option<std::sync::Arc<lancedb_upstream::Session>>,
+        server_side_query: bool,
+    },
+}
+
+pub struct ConnectNamespaceBuilder {
+    inner: ConnectNamespaceBuilderInner,
+}
+
+impl std::fmt::Debug for ConnectNamespaceBuilderInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending {
+                ns_impl,
+                properties,
+                storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+                server_side_query,
+            } => f
+                .debug_struct("Pending")
+                .field("ns_impl", ns_impl)
+                .field("properties", properties)
+                .field("storage_options", storage_options)
+                .field("read_consistency_interval", read_consistency_interval)
+                .field("embedding_registry", &embedding_registry.is_some())
+                .field("session", &session.is_some())
+                .field("server_side_query", server_side_query)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ConnectNamespaceBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectNamespaceBuilder")
+            .field("inner", &self.inner)
+            .finish()
+    }
 }
 
 impl ConnectNamespaceBuilder {
     fn new(ns_impl: &str, properties: HashMap<String, String>) -> Self {
         Self {
-            pending: ConnectNamespacePending {
+            inner: ConnectNamespaceBuilderInner::Pending {
                 ns_impl: ns_impl.to_string(),
                 properties,
                 storage_options: HashMap::new(),
@@ -145,84 +185,197 @@ impl ConnectNamespaceBuilder {
         }
     }
 
-    pub fn storage_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.pending
-            .storage_options
-            .insert(key.into(), value.into());
-        self
+    fn map_upstream(
+        self,
+        f: impl FnOnce(ConnectNamespaceBuilderInner) -> ConnectNamespaceBuilderInner,
+    ) -> Self {
+        Self {
+            inner: f(self.inner),
+        }
+    }
+
+    pub fn storage_option(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.map_upstream(|inner| match inner {
+            ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                mut storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+                server_side_query,
+            } => {
+                storage_options.insert(key.into(), value.into());
+                ConnectNamespaceBuilderInner::Pending {
+                    ns_impl,
+                    properties,
+                    storage_options,
+                    read_consistency_interval,
+                    embedding_registry,
+                    session,
+                    server_side_query,
+                }
+            }
+        })
     }
 
     pub fn storage_options(
-        mut self,
+        self,
         pairs: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
-        for (key, value) in pairs {
-            self.pending
-                .storage_options
-                .insert(key.into(), value.into());
-        }
-        self
+        self.map_upstream(|inner| match inner {
+            ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                mut storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+                server_side_query,
+            } => {
+                for (key, value) in pairs {
+                    storage_options.insert(key.into(), value.into());
+                }
+                ConnectNamespaceBuilderInner::Pending {
+                    ns_impl,
+                    properties,
+                    storage_options,
+                    read_consistency_interval,
+                    embedding_registry,
+                    session,
+                    server_side_query,
+                }
+            }
+        })
     }
 
-    pub fn read_consistency_interval(
-        mut self,
-        read_consistency_interval: std::time::Duration,
-    ) -> Self {
-        self.pending.read_consistency_interval = Some(read_consistency_interval);
-        self
+    pub fn read_consistency_interval(self, read_consistency_interval: std::time::Duration) -> Self {
+        self.map_upstream(|inner| match inner {
+            ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                storage_options,
+                embedding_registry,
+                session,
+                server_side_query,
+                ..
+            } => ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                storage_options,
+                read_consistency_interval: Some(read_consistency_interval),
+                embedding_registry,
+                session,
+                server_side_query,
+            },
+        })
     }
 
     pub fn embedding_registry(
-        mut self,
+        self,
         registry: std::sync::Arc<dyn lancedb_upstream::embeddings::EmbeddingRegistry>,
     ) -> Self {
-        self.pending.embedding_registry = Some(registry);
-        self
+        self.map_upstream(|inner| match inner {
+            ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                storage_options,
+                read_consistency_interval,
+                session,
+                server_side_query,
+                ..
+            } => ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                storage_options,
+                read_consistency_interval,
+                embedding_registry: Some(registry),
+                session,
+                server_side_query,
+            },
+        })
     }
 
-    pub fn session(mut self, session: std::sync::Arc<lancedb_upstream::Session>) -> Self {
-        self.pending.session = Some(session);
-        self
+    pub fn session(self, session: std::sync::Arc<lancedb_upstream::Session>) -> Self {
+        self.map_upstream(|inner| match inner {
+            ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                server_side_query,
+                ..
+            } => ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session: Some(session),
+                server_side_query,
+            },
+        })
     }
 
-    pub fn server_side_query(mut self, enabled: bool) -> Self {
-        self.pending.server_side_query = enabled;
-        self
+    pub fn server_side_query(self, enabled: bool) -> Self {
+        self.map_upstream(|inner| match inner {
+            ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+                ..
+            } => ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+                server_side_query: enabled,
+            },
+        })
     }
 
     pub async fn execute(self) -> lancedb_upstream::Result<Connection> {
-        let wants_curvine = find_curvine_uri(&self.pending.properties).is_some();
-        let mut builder =
-            lancedb_upstream::connect_namespace(&self.pending.ns_impl, self.pending.properties);
+        match self.inner {
+            ConnectNamespaceBuilderInner::Pending {
+                ns_impl,
+                properties,
+                storage_options,
+                read_consistency_interval,
+                embedding_registry,
+                session,
+                server_side_query,
+            } => {
+                let wants_curvine = find_curvine_uri(&properties).is_some();
+                let mut builder = lancedb_upstream::connect_namespace(&ns_impl, properties);
 
-        for (key, value) in self.pending.storage_options {
-            builder = builder.storage_option(key, value);
+                for (key, value) in storage_options {
+                    builder = builder.storage_option(key, value);
+                }
+
+                if let Some(read_consistency_interval) = read_consistency_interval {
+                    builder = builder.read_consistency_interval(read_consistency_interval);
+                }
+
+                if let Some(embedding_registry) = embedding_registry {
+                    builder = builder.embedding_registry(embedding_registry);
+                }
+
+                if let Some(session) = session {
+                    builder = builder.session(session);
+                } else if wants_curvine {
+                    builder = builder.session(curvine_session());
+                }
+
+                builder.server_side_query(server_side_query).execute().await
+            }
         }
-
-        if let Some(read_consistency_interval) = self.pending.read_consistency_interval {
-            builder = builder.read_consistency_interval(read_consistency_interval);
-        }
-
-        if let Some(embedding_registry) = self.pending.embedding_registry {
-            builder = builder.embedding_registry(embedding_registry);
-        }
-
-        if wants_curvine {
-            builder = builder.session(curvine_session());
-        } else if let Some(session) = self.pending.session {
-            builder = builder.session(session);
-        }
-
-        builder
-            .server_side_query(self.pending.server_side_query)
-            .execute()
-            .await
     }
-}
-
-#[derive(Debug)]
-pub struct ConnectNamespaceBuilder {
-    pending: ConnectNamespacePending,
 }
 
 pub fn connect_namespace(

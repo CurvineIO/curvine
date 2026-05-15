@@ -13,6 +13,7 @@ orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-server = { workspace = true }
 curvine-client = { workspace = true }
+curvine-lancedb-rs = { workspace = true }
 curvine-ufs = { workspace = true }
 tokio  = { workspace = true }
 tracing = { workspace = true }
@@ -23,6 +24,8 @@ futures = { workspace = true }
 bytes = { workspace = true }
 once_cell = { workspace = true }
 clap = { workspace = true }
+arrow-array = "57.2"
+arrow-schema = "57.2"
 awaitility = "0.4"
 tempfile = { workspace = true }
 
