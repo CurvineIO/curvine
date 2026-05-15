@@ -178,6 +178,44 @@ fn resolve_curvine_conf_path(params: &ObjectStoreParams) -> Option<String> {
         .or_else(|| env::var(ClusterConf::ENV_CONF_FILE).ok())
 }
 
+fn curvine_store_identity(
+    url: &Url,
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<String> {
+    if let Some(conf_path) = storage_options
+        .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
+        .cloned()
+        .or_else(|| env::var(ClusterConf::ENV_CONF_FILE).ok())
+    {
+        let conf = ClusterConf::from(&conf_path).map_err(|e| {
+            LanceError::invalid_input(format!(
+                "Failed to load Curvine configuration from '{}': {e}",
+                conf_path
+            ))
+        })?;
+        return Ok(format!(
+            "masters:{}",
+            conf.master_nodes()
+                .into_iter()
+                .map(|node| node.addr.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+
+    curvine_absolute_path_str_from_uri(url)
+        .map(|path| format!("uri:{path}"))
+        .map_err(|e| LanceError::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url)))
+}
+
+fn is_known_internal_dir(path: &CurvinePath) -> bool {
+    let path = path.full_path().trim_end_matches('/').to_string();
+    path == MULTIPART_STAGING_ROOT
+        || path.starts_with(&format!("{MULTIPART_STAGING_ROOT}/"))
+        || path == CONDITIONAL_LOCK_ROOT
+        || path.starts_with(&format!("{CONDITIONAL_LOCK_ROOT}/"))
+}
+
 fn missing_curvine_config_error() -> LanceError {
     LanceError::invalid_input(format!(
         "Missing Curvine cluster configuration: set storage option `{CURVINE_CONF_FILE_KEY}` \
@@ -271,12 +309,8 @@ impl ObjectStoreProvider for CurvineObjectStoreProvider {
         curvine_workspace_root_from_uri(url).map_err(|e| {
             LanceError::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url))
         })?;
-        let conf_path = storage_options
-            .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
-            .cloned()
-            .or_else(|| env::var(ClusterConf::ENV_CONF_FILE).ok())
-            .ok_or_else(missing_curvine_config_error)?;
-        Ok(format!("{CURVINE_SCHEME}${conf_path}"))
+        let identity = curvine_store_identity(url, storage_options)?;
+        Ok(format!("{CURVINE_SCHEME}${identity}"))
     }
 }
 
@@ -494,9 +528,10 @@ impl ObjectStoreTrait for CurvineObjectStore {
                     store: CURVINE_SCHEME,
                     source: e.to_string().into(),
                 })?;
-                if self.dir_contains_visible_file(&child).await? {
-                    common_prefixes.insert(prefix);
+                if is_known_internal_dir(&child) {
+                    continue;
                 }
+                common_prefixes.insert(prefix);
             } else {
                 objects.push(file_status_to_object_meta(entry_location, status));
             }
@@ -943,38 +978,6 @@ impl CurvineObjectStore {
         }
 
         Ok(())
-    }
-
-    async fn dir_contains_visible_file(&self, dir: &CurvinePath) -> OsResult<bool> {
-        let statuses = self
-            .list_curvine_dir_or_empty(dir, &Path::default())
-            .await?;
-
-        for status in statuses {
-            if status.is_dir {
-                let child = CurvinePath::from_str(&status.path).map_err(|e| OsError::Generic {
-                    store: CURVINE_SCHEME,
-                    source: e.to_string().into(),
-                })?;
-                if self.is_multipart_internal_dir(&child) {
-                    continue;
-                }
-                if Box::pin(self.dir_contains_visible_file(&child)).await? {
-                    return Ok(true);
-                }
-            } else {
-                let path = relative_object_path(&self.context.workspace_root, &status.path)
-                    .map_err(|msg| OsError::Generic {
-                        store: CURVINE_SCHEME,
-                        source: msg.into(),
-                    })?;
-                if !self.is_internal_reserved_location(&path) {
-                    return Ok(true);
-                }
-            }
-        }
-
-        Ok(false)
     }
 
     fn multipart_dir(&self, location: &Path, upload_id: &str) -> OsResult<CurvinePath> {
