@@ -48,6 +48,7 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
 use once_cell::sync::Lazy;
+use orpc::io::net::InetAddr;
 use orpc::sys::DataSlice;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
@@ -57,6 +58,9 @@ use uuid::Uuid;
 pub const CURVINE_SCHEME: &str = "curvine";
 
 pub const CURVINE_CONF_FILE_KEY: &str = "curvine.conf.path";
+pub const CURVINE_MASTER_ADDRS_KEY: &str = "curvine.master_addrs";
+
+const MASTER_ADDRS_KEY_ALIAS: &str = "master_addrs";
 
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 const MULTIPART_STAGING_ROOT: &str = "/.curvine/lancedb/multipart";
@@ -149,22 +153,11 @@ impl CurvineObjectStoreProvider {
         base_path: &Url,
         params: &ObjectStoreParams,
     ) -> Result<Arc<CurvineContext>> {
-        let conf_path =
-            resolve_curvine_conf_path(params).ok_or_else(missing_curvine_config_error)?;
-
-        let conf = ClusterConf::from(&conf_path).map_err(|e| {
-            LanceError::invalid_input(format!(
-                "Failed to load Curvine configuration from '{}': {e}",
-                conf_path
-            ))
-        })?;
+        let conf = resolve_curvine_conf(params)?;
 
         let rt = Arc::new(conf.client_rpc_conf().create_runtime());
         let fs = CurvineFileSystem::with_rt(conf, rt).map_err(|e| {
-            LanceError::invalid_input(format!(
-                "Failed to initialize Curvine filesystem (config '{}'): {e}",
-                conf_path
-            ))
+            LanceError::invalid_input(format!("Failed to initialize Curvine filesystem: {e}"))
         })?;
 
         curvine_workspace_root_from_uri(base_path).map_err(|e| {
@@ -181,42 +174,141 @@ impl CurvineObjectStoreProvider {
     }
 }
 
-fn resolve_curvine_conf_path(params: &ObjectStoreParams) -> Option<String> {
-    params
-        .storage_options()
+fn resolve_curvine_conf(params: &ObjectStoreParams) -> Result<ClusterConf> {
+    if let Some(conf_path) = resolve_curvine_conf_path(params.storage_options()) {
+        return ClusterConf::from(&conf_path).map_err(|e| {
+            LanceError::invalid_input(format!(
+                "Failed to load Curvine configuration from '{}': {e}",
+                conf_path
+            ))
+        });
+    }
+
+    if let Some(master_addrs) = resolve_curvine_master_addrs(params.storage_options()) {
+        return cluster_conf_from_master_addrs(&master_addrs);
+    }
+
+    if let Ok(conf_path) = env::var(ClusterConf::ENV_CONF_FILE) {
+        return ClusterConf::from(&conf_path).map_err(|e| {
+            LanceError::invalid_input(format!(
+                "Failed to load Curvine configuration from '{}': {e}",
+                conf_path
+            ))
+        });
+    }
+
+    Err(missing_curvine_config_error())
+}
+
+fn resolve_curvine_conf_path(storage_options: Option<&HashMap<String, String>>) -> Option<String> {
+    storage_options
         .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
         .cloned()
-        .or_else(|| env::var(ClusterConf::ENV_CONF_FILE).ok())
+}
+
+fn resolve_curvine_master_addrs(
+    storage_options: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    storage_options.and_then(|opts| {
+        opts.get(CURVINE_MASTER_ADDRS_KEY)
+            .or_else(|| opts.get(MASTER_ADDRS_KEY_ALIAS))
+            .cloned()
+    })
+}
+
+fn cluster_conf_from_master_addrs(master_addrs: &str) -> Result<ClusterConf> {
+    let addrs = parse_master_addrs(master_addrs)?;
+    let mut conf = ClusterConf::default();
+    conf.client.master_addrs = addrs;
+    conf.master.init().map_err(|e| {
+        LanceError::invalid_input(format!(
+            "Failed to initialize Curvine master configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
+        ))
+    })?;
+    conf.client.init().map_err(|e| {
+        LanceError::invalid_input(format!(
+            "Failed to initialize Curvine client configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
+        ))
+    })?;
+    conf.fuse.init().map_err(|e| {
+        LanceError::invalid_input(format!(
+            "Failed to initialize Curvine fuse configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
+        ))
+    })?;
+    conf.job.init().map_err(|e| {
+        LanceError::invalid_input(format!(
+            "Failed to initialize Curvine job configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
+        ))
+    })?;
+    Ok(conf)
+}
+
+fn parse_master_addrs(master_addrs: &str) -> Result<Vec<InetAddr>> {
+    let addrs = master_addrs
+        .split(',')
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+        .map(|addr| {
+            InetAddr::from_str(addr).map_err(|e| {
+                LanceError::invalid_input(format!(
+                    "Invalid `{CURVINE_MASTER_ADDRS_KEY}` entry `{addr}`: expected `host:port`: {e}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if addrs.is_empty() {
+        return Err(LanceError::invalid_input(format!(
+            "`{CURVINE_MASTER_ADDRS_KEY}` must contain at least one `host:port` address"
+        )));
+    }
+
+    Ok(addrs)
 }
 
 fn curvine_store_identity(
     url: &Url,
     storage_options: Option<&HashMap<String, String>>,
 ) -> Result<String> {
-    if let Some(conf_path) = storage_options
-        .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
-        .cloned()
-        .or_else(|| env::var(ClusterConf::ENV_CONF_FILE).ok())
-    {
-        let conf = ClusterConf::from(&conf_path).map_err(|e| {
-            LanceError::invalid_input(format!(
-                "Failed to load Curvine configuration from '{}': {e}",
-                conf_path
-            ))
-        })?;
+    if let Some(conf_path) = resolve_curvine_conf_path(storage_options) {
+        return curvine_conf_identity(&conf_path);
+    }
+
+    if let Some(master_addrs) = resolve_curvine_master_addrs(storage_options) {
         return Ok(format!(
             "masters:{}",
-            conf.master_nodes()
+            parse_master_addrs(&master_addrs)?
                 .into_iter()
-                .map(|node| node.addr.to_string())
+                .map(|addr| addr.to_string())
                 .collect::<Vec<_>>()
                 .join(",")
         ));
     }
 
+    if let Ok(conf_path) = env::var(ClusterConf::ENV_CONF_FILE) {
+        return curvine_conf_identity(&conf_path);
+    }
+
     curvine_absolute_path_str_from_uri(url)
         .map(|path| format!("uri:{path}"))
         .map_err(|e| LanceError::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url)))
+}
+
+fn curvine_conf_identity(conf_path: &str) -> Result<String> {
+    let conf = ClusterConf::from(conf_path).map_err(|e| {
+        LanceError::invalid_input(format!(
+            "Failed to load Curvine configuration from '{}': {e}",
+            conf_path
+        ))
+    })?;
+    Ok(format!(
+        "masters:{}",
+        conf.master_nodes()
+            .into_iter()
+            .map(|node| node.addr.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
 }
 
 fn is_known_internal_dir(path: &CurvinePath) -> bool {
@@ -230,7 +322,8 @@ fn is_known_internal_dir(path: &CurvinePath) -> bool {
 fn missing_curvine_config_error() -> LanceError {
     LanceError::invalid_input(format!(
         "Missing Curvine cluster configuration: set storage option `{CURVINE_CONF_FILE_KEY}` \
-         (highest priority) or environment variable `{}` to the Curvine client configuration file path.",
+         (highest priority), `{CURVINE_MASTER_ADDRS_KEY}`, `{MASTER_ADDRS_KEY_ALIAS}`, \
+         or environment variable `{}` to the Curvine client configuration file path.",
         ClusterConf::ENV_CONF_FILE
     ))
 }
@@ -451,9 +544,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 .delete(&cv_path, false)
                 .await
                 .map_err(|e| fs_error_to_object_store(location, e)),
-            Err(FsError::FileNotFound(_))
-            | Err(FsError::Expired(_))
-            | Err(FsError::JobNotFound(_)) => Ok(()),
+            Err(e) if is_not_found_error(&e) => Ok(()),
             Err(e) => Err(fs_error_to_object_store(location, e)),
         };
         let _ = self.release_object_write_lock(&lock).await;
@@ -1042,14 +1133,7 @@ impl CurvineObjectStore {
     ) -> OsResult<Vec<FileStatus>> {
         match self.context.fs.list_status(dir).await {
             Ok(entries) => Ok(entries),
-            Err(e)
-                if matches!(
-                    &e,
-                    FsError::FileNotFound(_) | FsError::Expired(_) | FsError::JobNotFound(_)
-                ) =>
-            {
-                Ok(Vec::new())
-            }
+            Err(e) if is_not_found_error(&e) => Ok(Vec::new()),
             Err(e) => Err(fs_error_to_object_store(err_location, e)),
         }
     }
@@ -1145,9 +1229,7 @@ impl CurvineObjectStore {
         let dir = self.multipart_dir(location, upload_id)?;
         match self.context.fs.delete(&dir, true).await {
             Ok(_) => Ok(()),
-            Err(FsError::FileNotFound(_))
-            | Err(FsError::Expired(_))
-            | Err(FsError::JobNotFound(_)) => Ok(()),
+            Err(e) if is_not_found_error(&e) => Ok(()),
             Err(e) => Err(fs_error_to_object_store(&Path::default(), e)),
         }
     }
@@ -1165,9 +1247,7 @@ impl CurvineObjectStore {
                 });
             }
             Ok(_) => {}
-            Err(FsError::FileNotFound(_))
-            | Err(FsError::Expired(_))
-            | Err(FsError::JobNotFound(_)) => {}
+            Err(e) if is_not_found_error(&e) => {}
             Err(e) => return Err(fs_error_to_object_store(location, e)),
         }
 
@@ -1214,10 +1294,8 @@ impl CurvineObjectStore {
                         source: e.to_string().into(),
                     })?;
                 }
-                Err(FsError::DirNotEmpty(_))
-                | Err(FsError::FileNotFound(_))
-                | Err(FsError::Expired(_))
-                | Err(FsError::JobNotFound(_)) => break,
+                Err(FsError::DirNotEmpty(_)) => break,
+                Err(e) if is_not_found_error(&e) => break,
                 Err(e) => return Err(fs_error_to_object_store(location, e)),
             }
         }
@@ -1627,6 +1705,13 @@ fn multipart_staging_id(workspace_root: &CurvinePath, location: Option<&Path>) -
 }
 
 fn fs_error_to_object_store(location: &Path, error: FsError) -> OsError {
+    if is_not_found_error(&error) {
+        return OsError::NotFound {
+            path: location.to_string(),
+            source: Box::new(error),
+        };
+    }
+
     match error {
         e @ FsError::FileNotFound(_) | e @ FsError::Expired(_) | e @ FsError::JobNotFound(_) => {
             OsError::NotFound {
@@ -1646,4 +1731,23 @@ fn fs_error_to_object_store(location: &Path, error: FsError) -> OsError {
             source: Box::new(e),
         },
     }
+}
+
+fn is_not_found_error(error: &FsError) -> bool {
+    if matches!(
+        error,
+        FsError::FileNotFound(_) | FsError::Expired(_) | FsError::JobNotFound(_)
+    ) {
+        return true;
+    }
+
+    if !matches!(error, FsError::Common(_)) {
+        return false;
+    }
+
+    // Older Curvine clusters can return filesystem misses as Common errors
+    // with server-side "not exists" / "not found" messages. Object-store list
+    // and head semantics still require these to behave as missing objects.
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("not exists") || message.contains("not found")
 }

@@ -74,12 +74,12 @@ pub(crate) enum SafeCommitScope {
 
 /// Wraps the upstream database. Before `create_table` / `open_table`, sets `ConditionalPutCommitHandler`
 /// when the request did not set `commit_handler`.
-pub(crate) struct CurvineSafeCommitDatabase {
+pub(crate) struct SafeCommitDatabase {
     upstream: Arc<dyn Database>,
     scope: SafeCommitScope,
 }
 
-impl CurvineSafeCommitDatabase {
+impl SafeCommitDatabase {
     pub(crate) fn new(upstream: Arc<dyn Database>) -> Self {
         Self {
             upstream,
@@ -137,20 +137,20 @@ impl CurvineSafeCommitDatabase {
     }
 }
 
-impl fmt::Debug for CurvineSafeCommitDatabase {
+impl fmt::Debug for SafeCommitDatabase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self.upstream.as_ref(), f)
     }
 }
 
-impl fmt::Display for CurvineSafeCommitDatabase {
+impl fmt::Display for SafeCommitDatabase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self.upstream.as_ref(), f)
     }
 }
 
 #[async_trait]
-impl Database for CurvineSafeCommitDatabase {
+impl Database for SafeCommitDatabase {
     fn uri(&self) -> &str {
         self.upstream.uri()
     }
