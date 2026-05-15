@@ -26,7 +26,7 @@ use curvine_client::file::CurvineFileSystem;
 use curvine_common::conf::ClusterConf;
 use curvine_common::error::FsError;
 use curvine_common::fs::{Path as CurvinePath, Reader, Writer};
-use curvine_common::state::FileStatus;
+use curvine_common::state::{FileLock, FileStatus, LockFlags, LockType};
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use lance_core::error::Result;
@@ -45,6 +45,7 @@ use object_store::{
     PutOptions, PutPayload, PutResult, Result as OsResult, UploadPart,
 };
 use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration, Instant};
 use url::Url;
 use uuid::Uuid;
 
@@ -54,7 +55,10 @@ pub const CURVINE_CONF_FILE_KEY: &str = "curvine.conf.path";
 
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 const MULTIPART_STAGING_ROOT: &str = "/.curvine/lancedb/multipart";
+const CONDITIONAL_LOCK_ROOT: &str = "/.curvine/lancedb/locks";
 const INTERNAL_RESERVED_ROOT: &str = ".curvine";
+const CONDITIONAL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
+const CONDITIONAL_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 struct CurvineContext {
@@ -87,8 +91,13 @@ struct CurvineMultipartUpload {
 #[derive(Debug, Clone)]
 struct CompletedPart {
     part_idx: usize,
-    etag: String,
     path: CurvinePath,
+}
+
+#[derive(Debug)]
+struct ConditionalWriteLock {
+    path: CurvinePath,
+    lock: FileLock,
 }
 
 impl Debug for CurvineObjectStore {
@@ -111,10 +120,11 @@ impl Display for CurvineObjectStore {
 
 /// [`ObjectStoreProvider`] for `curvine://` URIs.
 ///
-/// The opening URI is turned into one absolute Curvine workspace path (authority, when present,
-/// is the first path segment: `curvine://tenant/a` → `/tenant/a`). [`ObjectStoreProvider::extract_path`]
-/// applies the same validation and returns an empty [`Path`] because Lance object
-/// keys are relative to that workspace root. See `docs/phase4-curvine-object-store-and-lancedb.md` in this crate.
+/// The store is rooted at Curvine `/`, while [`ObjectStoreProvider::extract_path`]
+/// turns the full URI into a relative Lance object key (for example,
+/// `curvine://tenant/a` -> `tenant/a`, `curvine:///tmp/db` -> `tmp/db`).
+/// This matches Lance's object store contract and lets one Curvine store address
+/// multiple dataset base paths during shallow clone.
 #[derive(Debug, Clone, Default)]
 pub struct CurvineObjectStoreProvider;
 
@@ -146,11 +156,14 @@ impl CurvineObjectStoreProvider {
             ))
         })?;
 
-        let workspace_root = curvine_workspace_root_from_uri(base_path).map_err(|e| {
+        curvine_workspace_root_from_uri(base_path).map_err(|e| {
             LanceError::invalid_input(format!(
                 "Invalid curvine:// workspace URI '{}': {e}",
                 base_path
             ))
+        })?;
+        let workspace_root = CurvinePath::from_str("/").map_err(|e| {
+            LanceError::invalid_input(format!("Failed to initialize Curvine root path: {e}"))
         })?;
 
         Ok(Arc::new(CurvineContext { fs, workspace_root }))
@@ -163,6 +176,44 @@ fn resolve_curvine_conf_path(params: &ObjectStoreParams) -> Option<String> {
         .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
         .cloned()
         .or_else(|| env::var(ClusterConf::ENV_CONF_FILE).ok())
+}
+
+fn curvine_store_identity(
+    url: &Url,
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<String> {
+    if let Some(conf_path) = storage_options
+        .and_then(|opts| opts.get(CURVINE_CONF_FILE_KEY))
+        .cloned()
+        .or_else(|| env::var(ClusterConf::ENV_CONF_FILE).ok())
+    {
+        let conf = ClusterConf::from(&conf_path).map_err(|e| {
+            LanceError::invalid_input(format!(
+                "Failed to load Curvine configuration from '{}': {e}",
+                conf_path
+            ))
+        })?;
+        return Ok(format!(
+            "masters:{}",
+            conf.master_nodes()
+                .into_iter()
+                .map(|node| node.addr.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+
+    curvine_absolute_path_str_from_uri(url)
+        .map(|path| format!("uri:{path}"))
+        .map_err(|e| LanceError::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url)))
+}
+
+fn is_known_internal_dir(path: &CurvinePath) -> bool {
+    let path = path.full_path().trim_end_matches('/').to_string();
+    path == MULTIPART_STAGING_ROOT
+        || path.starts_with(&format!("{MULTIPART_STAGING_ROOT}/"))
+        || path == CONDITIONAL_LOCK_ROOT
+        || path.starts_with(&format!("{CONDITIONAL_LOCK_ROOT}/"))
 }
 
 fn missing_curvine_config_error() -> LanceError {
@@ -231,27 +282,35 @@ impl ObjectStoreProvider for CurvineObjectStoreProvider {
         Ok(store)
     }
 
-    /// The opening `curvine://...` URI identifies the workspace root, not an object key.
-    ///
-    /// We therefore validate the URI with the same absolute-path merger used for
-    /// `workspace_root`, and then return an empty relative [`Path`]. All later
-    /// `head/get/put/list/...` calls operate on keys that are relative to that
-    /// workspace root.
+    /// Convert the full `curvine://...` URI into a Lance object key.
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        curvine_workspace_root_from_uri(url).map_err(|e| {
+        if url.host_str() == Some(INTERNAL_RESERVED_ROOT) {
+            return Err(LanceError::invalid_input(format!(
+                "`{INTERNAL_RESERVED_ROOT}` is a reserved Curvine namespace and cannot be used as a curvine:// authority"
+            )));
+        }
+        let absolute = curvine_absolute_path_str_from_uri(url).map_err(|e| {
             LanceError::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url))
         })?;
-        Ok(Path::default())
+        let relative = absolute.trim_start_matches('/');
+        Path::parse(relative).map_err(|e| {
+            LanceError::invalid_input(format!(
+                "Invalid curvine:// URI path `{}` from `{}`: {e}",
+                absolute, url
+            ))
+        })
     }
 
     fn calculate_object_store_prefix(
         &self,
         url: &Url,
-        _storage_options: Option<&HashMap<String, String>>,
+        storage_options: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        let host = url.host_str().unwrap_or("");
-        let path = url.path().trim_end_matches('/');
-        Ok(format!("curvine${host}{path}"))
+        curvine_workspace_root_from_uri(url).map_err(|e| {
+            LanceError::invalid_input(format!("Invalid curvine:// URI `{}`: {e}", url))
+        })?;
+        let identity = curvine_store_identity(url, storage_options)?;
+        Ok(format!("{CURVINE_SCHEME}${identity}"))
     }
 }
 
@@ -267,37 +326,13 @@ impl ObjectStoreTrait for CurvineObjectStore {
             return Err(OsError::NotImplemented);
         }
 
-        let path = self.object_path(location)?;
-        let overwrite = match opts.mode {
-            PutMode::Overwrite => true,
-            PutMode::Create => false,
-            PutMode::Update(_) => return Err(OsError::NotImplemented),
-        };
-        let mut writer = self
-            .context
-            .fs
-            .create(&path, overwrite)
-            .await
-            .map_err(|e| fs_error_to_object_store(location, e))?;
-
-        for chunk in payload.iter() {
-            writer
-                .write(chunk)
-                .await
-                .map_err(|e| fs_error_to_object_store(location, e))?;
+        match opts.mode {
+            PutMode::Overwrite => return self.put_overwrite(location, payload).await,
+            PutMode::Create => return self.put_create(location, payload).await,
+            PutMode::Update(update) => {
+                return self.put_update(location, payload, update).await;
+            }
         }
-
-        writer
-            .complete()
-            .await
-            .map_err(|e| fs_error_to_object_store(location, e))?;
-
-        let meta = self.head(location).await?;
-
-        Ok(PutResult {
-            e_tag: meta.e_tag,
-            version: meta.version,
-        })
     }
 
     async fn put_multipart_opts(
@@ -310,7 +345,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
         }
 
         let upload_id = Uuid::new_v4().to_string();
-        let upload_dir = self.multipart_dir(&upload_id)?;
+        let upload_dir = self.multipart_dir(location, &upload_id)?;
         self.context
             .fs
             .mkdir(&upload_dir, true)
@@ -402,12 +437,25 @@ impl ObjectStoreTrait for CurvineObjectStore {
 
     async fn delete(&self, location: &Path) -> OsResult<()> {
         let cv_path = self.object_path(location)?;
-        self.context
-            .fs
-            .delete(&cv_path, false)
-            .await
-            .map_err(|e| fs_error_to_object_store(location, e))?;
-        let _ = self.prune_empty_parents(&cv_path, location).await;
+        let lock = self.acquire_object_write_lock(location).await?;
+        let result = match self.context.fs.get_status(&cv_path).await {
+            Ok(status) if status.is_dir => Ok(()),
+            Ok(_) => self
+                .context
+                .fs
+                .delete(&cv_path, false)
+                .await
+                .map_err(|e| fs_error_to_object_store(location, e)),
+            Err(FsError::FileNotFound(_))
+            | Err(FsError::Expired(_))
+            | Err(FsError::JobNotFound(_)) => Ok(()),
+            Err(e) => Err(fs_error_to_object_store(location, e)),
+        };
+        let _ = self.release_object_write_lock(&lock).await;
+        result?;
+        if !self.is_root_workspace() {
+            let _ = self.prune_empty_parents(&cv_path, location).await;
+        }
         Ok(())
     }
 
@@ -476,6 +524,13 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 if self.is_internal_reserved_location(&prefix) {
                     continue;
                 }
+                let child = CurvinePath::from_str(&status.path).map_err(|e| OsError::Generic {
+                    store: CURVINE_SCHEME,
+                    source: e.to_string().into(),
+                })?;
+                if is_known_internal_dir(&child) {
+                    continue;
+                }
                 common_prefixes.insert(prefix);
             } else {
                 objects.push(file_status_to_object_meta(entry_location, status));
@@ -493,9 +548,20 @@ impl ObjectStoreTrait for CurvineObjectStore {
     /// is left unchanged (copy, not move).
     async fn copy(&self, from: &Path, to: &Path) -> OsResult<()> {
         let from_cv = self.object_path(from)?;
-        let to_cv = self.object_path(to)?;
         let meta = self.head(from).await?;
         let size = meta.size;
+        let upload_id = Uuid::new_v4().to_string();
+        let staging = self.multipart_final_path(to, &upload_id)?;
+        if let Some(parent) = staging.parent().map_err(|e| OsError::Generic {
+            store: CURVINE_SCHEME,
+            source: e.to_string().into(),
+        })? {
+            self.context
+                .fs
+                .mkdir(&parent, true)
+                .await
+                .map_err(|e| fs_error_to_object_store(to, e))?;
+        }
 
         let mut reader = self
             .context
@@ -507,28 +573,49 @@ impl ObjectStoreTrait for CurvineObjectStore {
         let mut writer = self
             .context
             .fs
-            .create(&to_cv, true)
+            .create(&staging, true)
             .await
             .map_err(|e| fs_error_to_object_store(to, e))?;
 
-        self.stream_copy_contents(from, to, size, &mut reader, &mut writer)
-            .await?;
-        reader
-            .complete()
-            .await
-            .map_err(|e| fs_error_to_object_store(from, e))?;
-        writer
-            .complete()
-            .await
-            .map_err(|e| fs_error_to_object_store(to, e))?;
-        Ok(())
+        let copy_result: OsResult<()> = async {
+            self.stream_copy_contents(from, to, size, &mut reader, &mut writer)
+                .await?;
+            reader
+                .complete()
+                .await
+                .map_err(|e| fs_error_to_object_store(from, e))?;
+            writer
+                .complete()
+                .await
+                .map_err(|e| fs_error_to_object_store(to, e))?;
+            let lock = self.acquire_object_write_lock(to).await?;
+            let replace = self.replace_from_staging(to, &staging).await.map(|_| ());
+            let _ = self.release_object_write_lock(&lock).await;
+            replace
+        }
+        .await;
+        if copy_result.is_err() {
+            let _ = self.context.fs.delete(&staging, false).await;
+        }
+        copy_result
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OsResult<()> {
         let from_cv = self.object_path(from)?;
-        let to_cv = self.object_path(to)?;
         let meta = self.head(from).await?;
         let size = meta.size;
+        let upload_id = Uuid::new_v4().to_string();
+        let staging = self.multipart_final_path(to, &upload_id)?;
+        if let Some(parent) = staging.parent().map_err(|e| OsError::Generic {
+            store: CURVINE_SCHEME,
+            source: e.to_string().into(),
+        })? {
+            self.context
+                .fs
+                .mkdir(&parent, true)
+                .await
+                .map_err(|e| fs_error_to_object_store(to, e))?;
+        }
 
         let mut reader = self
             .context
@@ -540,7 +627,7 @@ impl ObjectStoreTrait for CurvineObjectStore {
         let mut writer = self
             .context
             .fs
-            .create(&to_cv, false)
+            .create(&staging, true)
             .await
             .map_err(|e| fs_error_to_object_store(to, e))?;
 
@@ -558,12 +645,24 @@ impl ObjectStoreTrait for CurvineObjectStore {
                 .complete()
                 .await
                 .map_err(|e| fs_error_to_object_store(to, e))?;
-            Ok(())
+            let lock = self.acquire_object_write_lock(to).await?;
+            let replace = match self.head(to).await {
+                Ok(_) => Err(OsError::AlreadyExists {
+                    path: to.to_string(),
+                    source: "object already exists".into(),
+                }),
+                Err(OsError::NotFound { .. }) => {
+                    self.replace_from_staging(to, &staging).await.map(|_| ())
+                }
+                Err(err) => Err(err),
+            };
+            let _ = self.release_object_write_lock(&lock).await;
+            replace
         }
         .await;
 
         if finalize_result.is_err() {
-            let _ = self.context.fs.delete(&to_cv, false).await;
+            let _ = self.context.fs.delete(&staging, false).await;
         }
 
         finalize_result
@@ -571,6 +670,220 @@ impl ObjectStoreTrait for CurvineObjectStore {
 }
 
 impl CurvineObjectStore {
+    async fn put_overwrite(&self, location: &Path, payload: PutPayload) -> OsResult<PutResult> {
+        let staging = self.write_payload_to_staging(location, payload).await?;
+        let lock = self.acquire_object_write_lock(location).await?;
+        let result = self.replace_from_staging(location, &staging).await;
+        let _ = self.release_object_write_lock(&lock).await;
+        if result.is_err() {
+            let _ = self.context.fs.delete(&staging, false).await;
+        }
+        result
+    }
+
+    async fn put_create(&self, location: &Path, payload: PutPayload) -> OsResult<PutResult> {
+        let staging = self.write_payload_to_staging(location, payload).await?;
+        let lock = self.acquire_object_write_lock(location).await?;
+        let result = match self.head(location).await {
+            Ok(_) => Err(OsError::AlreadyExists {
+                path: location.to_string(),
+                source: "object already exists".into(),
+            }),
+            Err(OsError::NotFound { .. }) => self.replace_from_staging(location, &staging).await,
+            Err(err) => Err(err),
+        };
+        let _ = self.release_object_write_lock(&lock).await;
+        if result.is_err() {
+            let _ = self.context.fs.delete(&staging, false).await;
+        }
+        result
+    }
+
+    async fn put_update(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        update: object_store::UpdateVersion,
+    ) -> OsResult<PutResult> {
+        let expected_etag = update.e_tag.ok_or_else(|| OsError::Generic {
+            store: CURVINE_SCHEME,
+            source: "ETag required for conditional update".into(),
+        })?;
+
+        let staging = self.write_payload_to_staging(location, payload).await?;
+        let lock = self.acquire_object_write_lock(location).await?;
+        let result = async {
+            let current = self.head_for_update(location).await?;
+            ensure_matching_etag(location, current.e_tag.as_deref(), &expected_etag)?;
+            self.replace_from_staging(location, &staging).await
+        }
+        .await;
+        let _ = self.release_object_write_lock(&lock).await;
+        if result.is_err() {
+            let _ = self.context.fs.delete(&staging, false).await;
+        }
+        result
+    }
+
+    async fn write_payload_to_staging(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+    ) -> OsResult<CurvinePath> {
+        let upload_id = Uuid::new_v4().to_string();
+        let staging = self.multipart_final_path(location, &upload_id)?;
+        if let Some(parent) = staging.parent().map_err(|e| OsError::Generic {
+            store: CURVINE_SCHEME,
+            source: e.to_string().into(),
+        })? {
+            self.context
+                .fs
+                .mkdir(&parent, true)
+                .await
+                .map_err(|e| fs_error_to_object_store(location, e))?;
+        }
+
+        let mut writer = self
+            .context
+            .fs
+            .create(&staging, true)
+            .await
+            .map_err(|e| fs_error_to_object_store(location, e))?;
+        let write_result: OsResult<()> = async {
+            for chunk in payload.iter() {
+                writer
+                    .write(chunk)
+                    .await
+                    .map_err(|e| fs_error_to_object_store(location, e))?;
+            }
+            writer
+                .complete()
+                .await
+                .map_err(|e| fs_error_to_object_store(location, e))
+        }
+        .await;
+        match write_result {
+            Ok(()) => Ok(staging),
+            Err(err) => {
+                let _ = self.context.fs.delete(&staging, false).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn replace_from_staging(
+        &self,
+        location: &Path,
+        staging: &CurvinePath,
+    ) -> OsResult<PutResult> {
+        let dest = self.object_path(location)?;
+        self.prepare_multipart_destination(&dest, location).await?;
+        self.context
+            .fs
+            .rename(staging, &dest)
+            .await
+            .map_err(|e| fs_error_to_object_store(location, e))
+            .and_then(|renamed| {
+                if renamed {
+                    Ok(())
+                } else {
+                    Err(OsError::Generic {
+                        store: CURVINE_SCHEME,
+                        source: "object replacement rename reported no-op".into(),
+                    })
+                }
+            })?;
+
+        let meta = self.head(location).await?;
+        Ok(PutResult {
+            e_tag: meta.e_tag,
+            version: meta.version,
+        })
+    }
+
+    async fn head_for_update(&self, location: &Path) -> OsResult<ObjectMeta> {
+        match self.head(location).await {
+            Ok(meta) => Ok(meta),
+            Err(OsError::NotFound { path, source }) => Err(OsError::Precondition { path, source }),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn acquire_object_write_lock(&self, location: &Path) -> OsResult<ConditionalWriteLock> {
+        let path = self.object_lock_path(location)?;
+        self.ensure_lock_file(&path, location).await?;
+        let owner_id = conditional_lock_owner();
+        let lock = conditional_write_lock(owner_id);
+        let deadline = Instant::now() + CONDITIONAL_LOCK_WAIT_TIMEOUT;
+        // Curvine locks are advisory. This serializes LanceDB-on-Curvine facade writers;
+        // non-facade Curvine clients still require a future server-side conditional primitive.
+        loop {
+            match self.context.fs.set_lock(&path, lock.clone()).await {
+                Ok(None) => {
+                    return Ok(ConditionalWriteLock {
+                        path,
+                        lock: conditional_unlock(owner_id),
+                    });
+                }
+                Ok(Some(_)) if Instant::now() < deadline => {
+                    sleep(CONDITIONAL_LOCK_RETRY_DELAY).await
+                }
+                Ok(Some(_)) => {
+                    return Err(OsError::Generic {
+                        store: CURVINE_SCHEME,
+                        source: format!(
+                            "Timed out waiting for Curvine object write lock at {}",
+                            path.full_path()
+                        )
+                        .into(),
+                    });
+                }
+                Err(e) => return Err(fs_error_to_object_store(location, e)),
+            }
+        }
+    }
+
+    async fn release_object_write_lock(&self, guard: &ConditionalWriteLock) -> OsResult<()> {
+        self.context
+            .fs
+            .set_lock(&guard.path, guard.lock.clone())
+            .await
+            .map(|_| ())
+            .map_err(|e| fs_error_to_object_store(&Path::default(), e))
+    }
+
+    async fn ensure_lock_file(&self, lock_path: &CurvinePath, location: &Path) -> OsResult<()> {
+        if let Some(parent) = lock_path.parent().map_err(|e| OsError::Generic {
+            store: CURVINE_SCHEME,
+            source: e.to_string().into(),
+        })? {
+            self.context
+                .fs
+                .mkdir(&parent, true)
+                .await
+                .map_err(|e| fs_error_to_object_store(location, e))?;
+        }
+
+        match self.context.fs.create(lock_path, false).await {
+            Ok(mut writer) => writer
+                .complete()
+                .await
+                .map_err(|e| fs_error_to_object_store(location, e)),
+            Err(FsError::FileAlreadyExists(_)) => Ok(()),
+            Err(e) => Err(fs_error_to_object_store(location, e)),
+        }
+    }
+
+    fn object_lock_path(&self, location: &Path) -> OsResult<CurvinePath> {
+        let workspace_id = multipart_staging_id(&self.context.workspace_root, Some(location));
+        CurvinePath::from_str(format!("{CONDITIONAL_LOCK_ROOT}/{workspace_id}")).map_err(|e| {
+            OsError::Generic {
+                store: CURVINE_SCHEME,
+                source: e.to_string().into(),
+            }
+        })
+    }
+
     fn object_path(&self, location: &Path) -> OsResult<CurvinePath> {
         let rel = location.as_ref().trim_start_matches('/');
         if self.is_root_workspace() && is_internal_reserved_relative_path(rel) {
@@ -588,7 +901,9 @@ impl CurvineObjectStore {
             .full_path()
             .trim_end_matches('/');
 
-        let full = if rel.is_empty() {
+        let full = if rel.is_empty() && base.is_empty() {
+            "/".to_string()
+        } else if rel.is_empty() {
             base.to_string()
         } else {
             format!("{base}/{rel}")
@@ -665,8 +980,8 @@ impl CurvineObjectStore {
         Ok(())
     }
 
-    fn multipart_dir(&self, upload_id: &str) -> OsResult<CurvinePath> {
-        let workspace_id = workspace_staging_id(&self.context.workspace_root);
+    fn multipart_dir(&self, location: &Path, upload_id: &str) -> OsResult<CurvinePath> {
+        let workspace_id = multipart_staging_id(&self.context.workspace_root, Some(location));
         CurvinePath::from_str(format!(
             "{}/{}/{}",
             MULTIPART_STAGING_ROOT, workspace_id, upload_id
@@ -677,8 +992,13 @@ impl CurvineObjectStore {
         })
     }
 
-    fn multipart_part_path(&self, upload_id: &str, part_idx: usize) -> OsResult<CurvinePath> {
-        let workspace_id = workspace_staging_id(&self.context.workspace_root);
+    fn multipart_part_path(
+        &self,
+        location: &Path,
+        upload_id: &str,
+        part_idx: usize,
+    ) -> OsResult<CurvinePath> {
+        let workspace_id = multipart_staging_id(&self.context.workspace_root, Some(location));
         CurvinePath::from_str(format!(
             "{}/{}/{}/part-{:08}",
             MULTIPART_STAGING_ROOT, workspace_id, upload_id, part_idx
@@ -689,8 +1009,8 @@ impl CurvineObjectStore {
         })
     }
 
-    fn multipart_final_path(&self, upload_id: &str) -> OsResult<CurvinePath> {
-        let workspace_id = workspace_staging_id(&self.context.workspace_root);
+    fn multipart_final_path(&self, location: &Path, upload_id: &str) -> OsResult<CurvinePath> {
+        let workspace_id = multipart_staging_id(&self.context.workspace_root, Some(location));
         CurvinePath::from_str(format!(
             "{}/{}/{}/final",
             MULTIPART_STAGING_ROOT, workspace_id, upload_id
@@ -701,8 +1021,8 @@ impl CurvineObjectStore {
         })
     }
 
-    async fn cleanup_multipart(&self, upload_id: &str) -> OsResult<()> {
-        let dir = self.multipart_dir(upload_id)?;
+    async fn cleanup_multipart(&self, location: &Path, upload_id: &str) -> OsResult<()> {
+        let dir = self.multipart_dir(location, upload_id)?;
         match self.context.fs.delete(&dir, true).await {
             Ok(_) => Ok(()),
             Err(FsError::FileNotFound(_))
@@ -839,39 +1159,33 @@ impl MultipartUpload for CurvineMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let store = self.store.clone();
         let upload_id = self.upload_id.clone();
+        let dest = self.dest.clone();
         let part_idx = self.next_part;
         self.next_part += 1;
         let completed_parts = Arc::clone(&self.completed_parts);
 
         Box::pin(async move {
-            let path = store.multipart_part_path(&upload_id, part_idx)?;
+            let path = store.multipart_part_path(&dest, &upload_id, part_idx)?;
             let mut writer = store
                 .context
                 .fs
                 .create(&path, true)
                 .await
-                .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
+                .map_err(|e| fs_error_to_object_store(&dest, e))?;
 
-            let mut hasher = Md5::new();
             for chunk in data.iter() {
-                hasher.update(chunk);
                 writer
                     .write(chunk)
                     .await
-                    .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
+                    .map_err(|e| fs_error_to_object_store(&dest, e))?;
             }
             writer
                 .complete()
                 .await
-                .map_err(|e| fs_error_to_object_store(&Path::default(), e))?;
+                .map_err(|e| fs_error_to_object_store(&dest, e))?;
 
-            let etag = format!("\"{:x}\"", hasher.finalize());
             let mut guard = completed_parts.lock().await;
-            guard.push(CompletedPart {
-                part_idx,
-                etag,
-                path,
-            });
+            guard.push(CompletedPart { part_idx, path });
             Ok(())
         })
     }
@@ -880,11 +1194,9 @@ impl MultipartUpload for CurvineMultipartUpload {
         let mut parts = self.completed_parts.lock().await.clone();
         parts.sort_by_key(|p| p.part_idx);
 
-        let dest = self.store.object_path(&self.dest)?;
-        self.store
-            .prepare_multipart_destination(&dest, &self.dest)
-            .await?;
-        let staging_final = self.store.multipart_final_path(&self.upload_id)?;
+        let staging_final = self
+            .store
+            .multipart_final_path(&self.dest, &self.upload_id)?;
         let mut writer = self
             .store
             .context
@@ -893,8 +1205,7 @@ impl MultipartUpload for CurvineMultipartUpload {
             .await
             .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
 
-        let mut etag_inputs = String::new();
-        let write_result: OsResult<()> = async {
+        let write_result: OsResult<PutResult> = async {
             for part in parts {
                 let part_meta = self
                     .store
@@ -923,46 +1234,37 @@ impl MultipartUpload for CurvineMultipartUpload {
                     .complete()
                     .await
                     .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
-                etag_inputs.push_str(&part.etag);
             }
             writer
                 .complete()
                 .await
                 .map_err(|e| fs_error_to_object_store(&self.dest, e))?;
-            self.store
-                .context
-                .fs
-                .rename(&staging_final, &dest)
-                .await
-                .map_err(|e| fs_error_to_object_store(&self.dest, e))
-                .and_then(|renamed| {
-                    if renamed {
-                        Ok(())
-                    } else {
-                        Err(OsError::Generic {
-                            store: CURVINE_SCHEME,
-                            source: "multipart final rename reported no-op".into(),
-                        })
-                    }
-                })?;
-            Ok(())
+            let lock = self.store.acquire_object_write_lock(&self.dest).await?;
+            let replace = self
+                .store
+                .replace_from_staging(&self.dest, &staging_final)
+                .await;
+            let _ = self.store.release_object_write_lock(&lock).await;
+            replace
         }
         .await;
 
         match write_result {
-            Ok(()) => {
-                let _ = self.store.cleanup_multipart(&self.upload_id).await;
-                Ok(PutResult {
-                    e_tag: Some(etag_inputs),
-                    version: None,
-                })
+            Ok(result) => {
+                let _ = self
+                    .store
+                    .cleanup_multipart(&self.dest, &self.upload_id)
+                    .await;
+                Ok(result)
             }
             Err(err) => Err(err),
         }
     }
 
     async fn abort(&mut self) -> OsResult<()> {
-        self.store.cleanup_multipart(&self.upload_id).await
+        self.store
+            .cleanup_multipart(&self.dest, &self.upload_id)
+            .await
     }
 }
 
@@ -1030,11 +1332,54 @@ fn is_internal_reserved_relative_path(rel: &str) -> bool {
     rel == INTERNAL_RESERVED_ROOT || rel.starts_with(&format!("{INTERNAL_RESERVED_ROOT}/"))
 }
 
-fn workspace_staging_id(workspace_root: &CurvinePath) -> String {
-    workspace_root
-        .full_path()
-        .trim_start_matches('/')
-        .replace('/', "__")
+fn ensure_matching_etag(location: &Path, actual: Option<&str>, expected: &str) -> OsResult<()> {
+    match actual {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(OsError::Precondition {
+            path: location.to_string(),
+            source: format!("{actual} does not match {expected}").into(),
+        }),
+        None => Err(OsError::Precondition {
+            path: location.to_string(),
+            source: format!("Object at location {location} has no ETag").into(),
+        }),
+    }
+}
+
+fn conditional_write_lock(owner_id: u64) -> FileLock {
+    conditional_lock(owner_id, LockType::WriteLock)
+}
+
+fn conditional_unlock(owner_id: u64) -> FileLock {
+    conditional_lock(owner_id, LockType::UnLock)
+}
+
+fn conditional_lock_owner() -> u64 {
+    let uuid = Uuid::new_v4();
+    u64::from_le_bytes(uuid.as_bytes()[..8].try_into().unwrap_or_default())
+}
+
+fn conditional_lock(owner_id: u64, lock_type: LockType) -> FileLock {
+    FileLock {
+        client_id: format!("curvine-lancedb:{}", std::process::id()),
+        owner_id,
+        pid: std::process::id(),
+        acquire_time: 0,
+        lock_type,
+        lock_flags: LockFlags::Flock,
+        start: 0,
+        end: u64::MAX,
+    }
+}
+
+fn multipart_staging_id(workspace_root: &CurvinePath, location: Option<&Path>) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(workspace_root.full_path().as_bytes());
+    if let Some(location) = location {
+        hasher.update([0]);
+        hasher.update(location.as_ref().as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn fs_error_to_object_store(location: &Path, error: FsError) -> OsError {

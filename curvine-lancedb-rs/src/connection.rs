@@ -13,15 +13,57 @@
 // limitations under the License.
 
 use std::collections::HashMap;
+use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
+use std::ops::Deref;
+use std::path::MAIN_SEPARATOR;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::object_store::curvine_session;
 
-pub use lancedb_upstream::connection::{CloneTableBuilder, OpenTableBuilder, TableNamesBuilder};
-pub use lancedb_upstream::connection::{ConnectRequest, Connection, LanceFileVersion};
+use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::refs::Ref;
+use lance::dataset::transaction::{Operation, Transaction};
+use lance::dataset::{CommitBuilder, ReadParams, WriteDestination};
+use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
+use lance::{Dataset, Result as LanceResult};
+use lance_namespace::LanceNamespace;
+use lance_table::io::commit::ConditionalPutCommitHandler;
+use lancedb_upstream::connection::{
+    CloneTableBuilder as UpstreamCloneTableBuilder, ConnectBuilder as UpstreamConnectBuilder,
+};
+use lancedb_upstream::database::{CloneTableRequest, DatabaseOptions};
+use lancedb_upstream::embeddings::EmbeddingRegistry;
+use lancedb_upstream::error::{Error, Result};
+#[cfg(feature = "remote")]
+use lancedb_upstream::remote::ClientConfig;
+use lancedb_upstream::{
+    connect as upstream_connect, connect_namespace as upstream_connect_namespace,
+    Connection as UpstreamConnection, Session, Table,
+};
+use url::Url;
+
+pub use lancedb_upstream::connection::{
+    ConnectRequest, LanceFileVersion, OpenTableBuilder, TableNamesBuilder,
+};
+
+const LANCE_FILE_EXTENSION: &str = "lance";
 
 #[derive(Debug)]
 enum ConnectBuilderInner {
-    Upstream(Box<lancedb_upstream::connection::ConnectBuilder>),
+    Upstream {
+        builder: Box<UpstreamConnectBuilder>,
+        options: ConnectionOptions,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+struct ConnectionOptions {
+    uri: String,
+    query_string: Option<String>,
+    storage_options: HashMap<String, String>,
+    session: Option<Arc<Session>>,
+    namespace_backed: bool,
 }
 
 #[derive(Debug)]
@@ -29,89 +71,147 @@ pub struct ConnectBuilder {
     inner: ConnectBuilderInner,
 }
 
+#[derive(Clone)]
+pub struct Connection {
+    upstream: UpstreamConnection,
+    options: ConnectionOptions,
+}
+
+pub struct CloneTableBuilder {
+    upstream: UpstreamCloneTableBuilder,
+    connection: Connection,
+    request: CloneTableRequest,
+}
+
 impl ConnectBuilder {
     pub fn new(uri: &str) -> Self {
-        let builder = lancedb_upstream::connect(uri);
+        let builder = upstream_connect(uri);
+        let session = is_curvine_uri(uri).then(curvine_session);
+        let options = ConnectionOptions {
+            uri: normalize_listing_uri(uri).unwrap_or_else(|| uri.to_string()),
+            query_string: listing_query_string(uri),
+            session: session.clone(),
+            ..Default::default()
+        };
         if is_curvine_uri(uri) {
             Self {
-                inner: ConnectBuilderInner::Upstream(Box::new(builder.session(curvine_session()))),
+                inner: ConnectBuilderInner::Upstream {
+                    builder: Box::new(builder.session(session.expect("curvine session is set"))),
+                    options,
+                },
             }
         } else {
             Self {
-                inner: ConnectBuilderInner::Upstream(Box::new(builder)),
+                inner: ConnectBuilderInner::Upstream {
+                    builder: Box::new(builder),
+                    options,
+                },
             }
         }
     }
 
     fn map_upstream(
         self,
-        f: impl FnOnce(
-            lancedb_upstream::connection::ConnectBuilder,
-        ) -> lancedb_upstream::connection::ConnectBuilder,
+        f: impl FnOnce(UpstreamConnectBuilder) -> UpstreamConnectBuilder,
+        update: impl FnOnce(&mut ConnectionOptions),
     ) -> Self {
         match self.inner {
-            ConnectBuilderInner::Upstream(builder) => Self {
-                inner: ConnectBuilderInner::Upstream(Box::new(f(*builder))),
-            },
+            ConnectBuilderInner::Upstream {
+                builder,
+                mut options,
+            } => {
+                update(&mut options);
+                Self {
+                    inner: ConnectBuilderInner::Upstream {
+                        builder: Box::new(f(*builder)),
+                        options,
+                    },
+                }
+            }
         }
     }
 
-    pub fn database_options(
-        self,
-        database_options: &dyn lancedb_upstream::database::DatabaseOptions,
-    ) -> Self {
-        self.map_upstream(|builder| builder.database_options(database_options))
+    pub fn database_options(self, database_options: &dyn DatabaseOptions) -> Self {
+        self.map_upstream(|builder| builder.database_options(database_options), |_| {})
     }
 
-    pub fn embedding_registry(
-        self,
-        registry: std::sync::Arc<dyn lancedb_upstream::embeddings::EmbeddingRegistry>,
-    ) -> Self {
-        self.map_upstream(|builder| builder.embedding_registry(registry))
+    pub fn embedding_registry(self, registry: Arc<dyn EmbeddingRegistry>) -> Self {
+        self.map_upstream(|builder| builder.embedding_registry(registry), |_| {})
     }
 
     pub fn storage_option(self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.map_upstream(|builder| builder.storage_option(key, value))
+        let key = key.into();
+        let value = value.into();
+        let upstream_key = key.clone();
+        let upstream_value = value.clone();
+        self.map_upstream(
+            |builder| builder.storage_option(upstream_key, upstream_value),
+            |options| {
+                options.storage_options.insert(key, value);
+            },
+        )
     }
 
     pub fn storage_options(
         self,
         pairs: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
-        self.map_upstream(|builder| builder.storage_options(pairs))
+        let pairs = pairs
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        let upstream_pairs = pairs.clone();
+        self.map_upstream(
+            |builder| builder.storage_options(upstream_pairs),
+            |options| {
+                options.storage_options.extend(pairs);
+            },
+        )
     }
 
-    pub fn read_consistency_interval(self, read_consistency_interval: std::time::Duration) -> Self {
-        self.map_upstream(|builder| builder.read_consistency_interval(read_consistency_interval))
+    pub fn read_consistency_interval(self, read_consistency_interval: Duration) -> Self {
+        self.map_upstream(
+            |builder| builder.read_consistency_interval(read_consistency_interval),
+            |_| {},
+        )
     }
 
-    pub fn session(self, session: std::sync::Arc<lancedb_upstream::Session>) -> Self {
-        self.map_upstream(|builder| builder.session(session))
+    pub fn session(self, session: Arc<Session>) -> Self {
+        let upstream_session = session.clone();
+        self.map_upstream(
+            |builder| builder.session(upstream_session),
+            |options| {
+                options.session = Some(session);
+            },
+        )
     }
 
     #[cfg(feature = "remote")]
     pub fn api_key(self, api_key: &str) -> Self {
-        self.map_upstream(|builder| builder.api_key(api_key))
+        self.map_upstream(|builder| builder.api_key(api_key), |_| {})
     }
 
     #[cfg(feature = "remote")]
     pub fn region(self, region: &str) -> Self {
-        self.map_upstream(|builder| builder.region(region))
+        self.map_upstream(|builder| builder.region(region), |_| {})
     }
 
     #[cfg(feature = "remote")]
     pub fn host_override(self, host_override: &str) -> Self {
-        self.map_upstream(|builder| builder.host_override(host_override))
+        self.map_upstream(|builder| builder.host_override(host_override), |_| {})
     }
 
     #[cfg(feature = "remote")]
-    pub fn client_config(self, config: lancedb_upstream::remote::ClientConfig) -> Self {
-        self.map_upstream(|builder| builder.client_config(config))
+    pub fn client_config(self, config: ClientConfig) -> Self {
+        self.map_upstream(|builder| builder.client_config(config), |_| {})
     }
 
-    pub async fn execute(self) -> lancedb_upstream::Result<Connection> {
+    pub async fn execute(self) -> Result<Connection> {
         match self.inner {
-            ConnectBuilderInner::Upstream(builder) => builder.execute().await,
+            ConnectBuilderInner::Upstream { builder, options } => {
+                let upstream = builder.execute().await?;
+                Ok(Connection { upstream, options })
+            }
         }
     }
 }
@@ -120,15 +220,247 @@ pub fn connect(uri: &str) -> ConnectBuilder {
     ConnectBuilder::new(uri)
 }
 
+impl Connection {
+    pub fn clone_table(
+        &self,
+        target_table_name: impl Into<String>,
+        source_uri: impl Into<String>,
+    ) -> CloneTableBuilder {
+        let target_table_name = target_table_name.into();
+        let source_uri = source_uri.into();
+        CloneTableBuilder {
+            upstream: self
+                .upstream
+                .clone_table(target_table_name.clone(), source_uri.clone()),
+            connection: self.clone(),
+            request: CloneTableRequest::new(target_table_name, source_uri),
+        }
+    }
+
+    fn should_handle_curvine_clone(&self, request: &CloneTableRequest) -> bool {
+        is_curvine_uri(&self.options.uri)
+            && is_curvine_uri(&request.source_uri)
+            && request.is_shallow
+            && request.target_namespace.is_empty()
+            && request.namespace_client.is_none()
+            && !self.options.namespace_backed
+    }
+
+    async fn clone_curvine_table(&self, request: CloneTableRequest) -> Result<Table> {
+        validate_table_name(&request.target_table_name)?;
+        if request.source_version.is_some() && request.source_tag.is_some() {
+            return Err(Error::InvalidInput {
+                message: "Cannot specify both source_version and source_tag".to_string(),
+            });
+        }
+
+        let session = self.options.session.clone().unwrap_or_else(curvine_session);
+        let storage_params = self.object_store_params();
+        let read_params = ReadParams {
+            store_options: Some(storage_params.clone()),
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let mut source_dataset = DatasetBuilder::from_uri(&request.source_uri)
+            .with_read_params(read_params)
+            .load()
+            .await
+            .map_err(Error::from)?;
+
+        let (version_ref, version_number) = match (request.source_version, request.source_tag) {
+            (Some(version), None) => (Ref::Version(None, Some(version)), version),
+            (None, Some(tag)) => {
+                let tag_contents = source_dataset.tags().get(&tag).await.map_err(Error::from)?;
+                (Ref::Tag(tag), tag_contents.version)
+            }
+            (None, None) => {
+                let version = source_dataset.version().version;
+                (Ref::Version(None, Some(version)), version)
+            }
+            (Some(_), Some(_)) => unreachable!("checked above"),
+        };
+        let target_uri = self.table_uri(&request.target_table_name)?;
+        clone_dataset_with_session(
+            &mut source_dataset,
+            &target_uri,
+            version_ref,
+            version_number,
+            storage_params,
+            session,
+        )
+        .await
+        .map_err(Error::from)?;
+
+        self.open_table(request.target_table_name)
+            .storage_options(self.options.storage_options.clone())
+            .execute()
+            .await
+    }
+
+    fn object_store_params(&self) -> ObjectStoreParams {
+        ObjectStoreParams {
+            storage_options_accessor: if self.options.storage_options.is_empty() {
+                None
+            } else {
+                Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                    self.options.storage_options.clone(),
+                )))
+            },
+            ..Default::default()
+        }
+    }
+
+    fn table_uri(&self, name: &str) -> Result<String> {
+        validate_table_name(name)?;
+
+        let mut uri = self.options.uri.clone();
+        if !(uri.ends_with('/') || uri.ends_with('\\')) {
+            if uri.contains("://") {
+                uri.push('/');
+            } else {
+                uri.push(MAIN_SEPARATOR);
+            }
+        }
+        uri.push_str(name);
+        uri.push('.');
+        uri.push_str(LANCE_FILE_EXTENSION);
+        if let Some(query) = &self.options.query_string {
+            uri.push('?');
+            uri.push_str(query);
+        }
+        Ok(uri)
+    }
+}
+
+impl Deref for Connection {
+    type Target = UpstreamConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.upstream
+    }
+}
+
+impl Debug for Connection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("Connection")
+            .field("uri", &self.options.uri)
+            .finish()
+    }
+}
+
+impl Display for Connection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        self.upstream.fmt(f)
+    }
+}
+
+impl CloneTableBuilder {
+    pub fn source_version(mut self, version: u64) -> Self {
+        self.upstream = self.upstream.source_version(version);
+        self.request.source_version = Some(version);
+        self
+    }
+
+    pub fn source_tag(mut self, tag: impl Into<String>) -> Self {
+        let tag = tag.into();
+        self.upstream = self.upstream.source_tag(tag.clone());
+        self.request.source_tag = Some(tag);
+        self
+    }
+
+    pub fn target_namespace(mut self, namespace: Vec<String>) -> Self {
+        self.upstream = self.upstream.target_namespace(namespace.clone());
+        self.request.target_namespace = namespace;
+        self
+    }
+
+    pub fn is_shallow(mut self, is_shallow: bool) -> Self {
+        self.upstream = self.upstream.is_shallow(is_shallow);
+        self.request.is_shallow = is_shallow;
+        self
+    }
+
+    pub fn namespace_client(mut self, client: Arc<dyn LanceNamespace>) -> Self {
+        self.upstream = self.upstream.namespace_client(client.clone());
+        self.request.namespace_client = Some(client);
+        self
+    }
+
+    pub async fn execute(self) -> Result<Table> {
+        if self.connection.should_handle_curvine_clone(&self.request) {
+            self.connection.clone_curvine_table(self.request).await
+        } else {
+            self.upstream.execute().await
+        }
+    }
+}
+
+async fn clone_dataset_with_session(
+    source_dataset: &mut Dataset,
+    target_uri: &str,
+    version: Ref,
+    version_number: u64,
+    storage_params: ObjectStoreParams,
+    session: Arc<Session>,
+) -> LanceResult<Dataset> {
+    let ref_name = match &version {
+        Ref::Version(branch, _) => branch.clone(),
+        Ref::VersionNumber(_) => source_dataset.version().metadata.get("branch").cloned(),
+        Ref::Tag(tag) => source_dataset.tags().get(tag).await?.branch,
+    };
+    let clone_op = Operation::Clone {
+        is_shallow: true,
+        ref_name,
+        ref_version: version_number,
+        ref_path: source_dataset.uri().to_string(),
+        branch_name: None,
+    };
+    let transaction = Transaction::new(version_number, clone_op, None);
+
+    CommitBuilder::new(WriteDestination::Uri(target_uri))
+        .with_store_params(storage_params)
+        .with_object_store(Arc::new(source_dataset.object_store().clone()))
+        .with_commit_handler(Arc::new(ConditionalPutCommitHandler))
+        .with_storage_format(
+            source_dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_version()?,
+        )
+        .with_session(session)
+        .execute(transaction)
+        .await
+}
+
+fn validate_table_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidTableName {
+            name: name.to_string(),
+            reason: "Table names cannot be empty strings".to_string(),
+        });
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
+    {
+        return Err(Error::InvalidTableName {
+            name: name.to_string(),
+            reason:
+                "Table names can only contain alphanumeric characters, underscores, hyphens, and periods"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
 enum ConnectNamespaceBuilderInner {
     Pending {
         ns_impl: String,
         properties: HashMap<String, String>,
         storage_options: HashMap<String, String>,
-        read_consistency_interval: Option<std::time::Duration>,
-        embedding_registry:
-            Option<std::sync::Arc<dyn lancedb_upstream::embeddings::EmbeddingRegistry>>,
-        session: Option<std::sync::Arc<lancedb_upstream::Session>>,
+        read_consistency_interval: Option<Duration>,
+        embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
+        session: Option<Arc<Session>>,
         server_side_query: bool,
     },
 }
@@ -137,8 +469,8 @@ pub struct ConnectNamespaceBuilder {
     inner: ConnectNamespaceBuilderInner,
 }
 
-impl std::fmt::Debug for ConnectNamespaceBuilderInner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for ConnectNamespaceBuilderInner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Pending {
                 ns_impl,
@@ -162,8 +494,8 @@ impl std::fmt::Debug for ConnectNamespaceBuilderInner {
     }
 }
 
-impl std::fmt::Debug for ConnectNamespaceBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for ConnectNamespaceBuilder {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("ConnectNamespaceBuilder")
             .field("inner", &self.inner)
             .finish()
@@ -249,7 +581,7 @@ impl ConnectNamespaceBuilder {
         })
     }
 
-    pub fn read_consistency_interval(self, read_consistency_interval: std::time::Duration) -> Self {
+    pub fn read_consistency_interval(self, read_consistency_interval: Duration) -> Self {
         self.map_upstream(|inner| match inner {
             ConnectNamespaceBuilderInner::Pending {
                 ns_impl,
@@ -271,10 +603,7 @@ impl ConnectNamespaceBuilder {
         })
     }
 
-    pub fn embedding_registry(
-        self,
-        registry: std::sync::Arc<dyn lancedb_upstream::embeddings::EmbeddingRegistry>,
-    ) -> Self {
+    pub fn embedding_registry(self, registry: Arc<dyn EmbeddingRegistry>) -> Self {
         self.map_upstream(|inner| match inner {
             ConnectNamespaceBuilderInner::Pending {
                 ns_impl,
@@ -296,7 +625,7 @@ impl ConnectNamespaceBuilder {
         })
     }
 
-    pub fn session(self, session: std::sync::Arc<lancedb_upstream::Session>) -> Self {
+    pub fn session(self, session: Arc<Session>) -> Self {
         self.map_upstream(|inner| match inner {
             ConnectNamespaceBuilderInner::Pending {
                 ns_impl,
@@ -340,7 +669,7 @@ impl ConnectNamespaceBuilder {
         })
     }
 
-    pub async fn execute(self) -> lancedb_upstream::Result<Connection> {
+    pub async fn execute(self) -> Result<Connection> {
         match self.inner {
             ConnectNamespaceBuilderInner::Pending {
                 ns_impl,
@@ -351,10 +680,19 @@ impl ConnectNamespaceBuilder {
                 session,
                 server_side_query,
             } => {
-                let wants_curvine = find_curvine_uri(&properties).is_some();
-                let mut builder = lancedb_upstream::connect_namespace(&ns_impl, properties);
+                let curvine_uri = find_curvine_uri(&properties);
+                let wants_curvine = curvine_uri.is_some();
+                let mut builder = upstream_connect_namespace(&ns_impl, properties);
+
+                let mut options = ConnectionOptions {
+                    uri: curvine_uri.unwrap_or_default(),
+                    session: session.clone(),
+                    namespace_backed: true,
+                    ..Default::default()
+                };
 
                 for (key, value) in storage_options {
+                    options.storage_options.insert(key.clone(), value.clone());
                     builder = builder.storage_option(key, value);
                 }
 
@@ -369,10 +707,16 @@ impl ConnectNamespaceBuilder {
                 if let Some(session) = session {
                     builder = builder.session(session);
                 } else if wants_curvine {
-                    builder = builder.session(curvine_session());
+                    let session = curvine_session();
+                    options.session = Some(session.clone());
+                    builder = builder.session(session);
                 }
 
-                builder.server_side_query(server_side_query).execute().await
+                let upstream = builder
+                    .server_side_query(server_side_query)
+                    .execute()
+                    .await?;
+                Ok(Connection { upstream, options })
             }
         }
     }
@@ -402,4 +746,16 @@ fn find_curvine_uri(properties: &HashMap<String, String>) -> Option<String> {
         .values()
         .find(|value| is_curvine_uri(value))
         .cloned()
+}
+
+fn normalize_listing_uri(uri: &str) -> Option<String> {
+    let mut url = Url::parse(uri).ok()?;
+    url.set_query(None);
+    Some(url.to_string())
+}
+
+fn listing_query_string(uri: &str) -> Option<String> {
+    Url::parse(uri)
+        .ok()
+        .and_then(|url| url.query().map(ToString::to_string))
 }

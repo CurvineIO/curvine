@@ -2079,8 +2079,11 @@ dependencies = [
  "curvine-client",
  "curvine-common",
  "futures",
+ "lance",
  "lance-core",
  "lance-io",
+ "lance-namespace",
+ "lance-table",
  "lancedb",
  "md-5",
  "object_store",
@@ -2176,13 +2179,16 @@ dependencies = [
  "curvine-tracing-appender",
  "curvine-ufs",
  "futures",
+ "lance-io",
  "log",
+ "object_store",
  "once_cell",
  "orpc",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

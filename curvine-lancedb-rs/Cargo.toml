@@ -17,8 +17,11 @@ chrono = { workspace = true }
 curvine-client = { workspace = true }
 curvine-common = { workspace = true }
 futures = { workspace = true }
+lance = { version = "4.0.0", default-features = false }
 lance-core = "4.0.0"
 lance-io = "4.0.0"
+lance-namespace = "4.0.0"
+lance-table = "4.0.0"
 lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features = false }
 md-5 = { workspace = true }
 object_store = "0.12.5"
