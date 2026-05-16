@@ -1,0 +1,3 @@
+# Python toolchain for build/build.sh (Python SDK wheel via maturin).
+# Installed into build/.venv-python-sdk/ on first use; kept out of git.
+maturin>=1,<2

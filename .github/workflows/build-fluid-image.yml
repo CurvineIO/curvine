@@ -143,7 +143,7 @@ jobs:
             ${{ needs.prepare.outputs.ghcr_image }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
             ${{ needs.prepare.outputs.docker_image }}:${{ needs.prepare.outputs.tag }}-${{ matrix.arch }}
           cache-from: type=gha,scope=fluid-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=fluid-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=fluid-${{ matrix.arch }},ignore-error=true
           shm-size: 2g
           build-args: |
             BASE_IMAGE_TAG=${{ needs.prepare.outputs.base_image_tag }}

@@ -1,12 +1,19 @@
+import os
 import unittest
+
 from curvinefs.curvineFileSystem import CurvineFileSystem
+
+# Resolve repo root: curvine-libsdk/python/test -> ../../../
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+_DEFAULT_CONF = os.path.join(_REPO_ROOT, "etc", "curvine-cluster.toml")
+
 
 class Test(unittest.TestCase):
     # Test file system function
     def test(self):
-        conf_path = "D:/Users/S9059520/Curvine/testing/curvine-cluster.toml"
-        fs = CurvineFileSystem(conf_path, 128, 8)
-        test_path = "file:///fs_test"
+        conf_path = os.environ.get("CURVINE_CONF_FILE", _DEFAULT_CONF)
+        fs = CurvineFileSystem(conf_path, 1, 8)
+        test_path = os.environ.get("CURVINE_TEST_CV_PATH", "file:///fs_test")
 
         fs.mkdir(test_path, True)
 

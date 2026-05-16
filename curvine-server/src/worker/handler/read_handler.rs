@@ -158,22 +158,15 @@ impl ReadHandler {
 
         let spend = TimeSpent::new();
         // OS page cache read-ahead is only available for local files
-        if file.supports_read_ahead() {
-            if let Some(local) = file.as_local_mut() {
-                self.last_task = local.read_ahead(&self.os_cache, self.last_task.take());
-            }
+        if let Some(local) = file.as_local_mut() {
+            self.last_task = local.read_ahead(&self.os_cache, self.last_task.take());
         }
+
         // SPDK bypasses kernel — sendfile unavailable
         let enable_send_file = self.enable_send_file && file.supports_send_file();
         let region = file.read_region(enable_send_file, context.chunk_size)?;
-        // Post-read read-ahead for next chunk
-        if file.supports_read_ahead() {
-            if let Some(local) = file.as_local_mut() {
-                self.last_task = local.read_ahead(&self.os_cache, self.last_task.take());
-            }
-        }
-        let used = spend.used_us();
 
+        let used = spend.used_us();
         if used >= self.io_slow_us {
             warn!(
                 "Slow read data from disk cost: {}us (threshold={}us), path: {} ",

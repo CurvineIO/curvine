@@ -56,8 +56,6 @@ pub struct ClusterConf {
 
     pub fuse: FuseConf,
 
-    pub s3_gateway: S3GatewayConf,
-
     pub job: JobConf,
 
     pub cli: CliConf,
@@ -285,7 +283,6 @@ impl Default for ClusterConf {
             log: Default::default(),
             client: Default::default(),
             fuse: FuseConf::default(),
-            s3_gateway: Default::default(),
             job: Default::default(),
             cli: Default::default(),
         }
@@ -295,42 +292,5 @@ impl Default for ClusterConf {
 impl Display for ClusterConf {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "")
-    }
-}
-
-/// S3 Object Gateway configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct S3GatewayConf {
-    pub listen: String,
-    pub region: String,
-    pub put_temp_dir: String,
-    pub put_memory_buffer_threshold: usize,
-    pub put_max_memory_buffer: usize,
-    pub access_key: Option<String>,
-    pub secret_key: Option<String>,
-    pub enable_distributed_auth: bool,
-    pub credentials_path: Option<String>,
-    pub cache_refresh_interval_secs: u64,
-    pub get_chunk_size_mb: f32,
-    pub web_port: u16,
-}
-
-impl Default for S3GatewayConf {
-    fn default() -> Self {
-        Self {
-            listen: "0.0.0.0:9900".to_string(),
-            region: "us-east-1".to_string(),
-            put_temp_dir: "/tmp/curvine-temp".to_string(),
-            put_memory_buffer_threshold: 1048576, // 1MB
-            put_max_memory_buffer: 16777216,      // 16MB
-            access_key: None,
-            secret_key: None,
-            enable_distributed_auth: false,
-            credentials_path: None,
-            cache_refresh_interval_secs: 30,
-            get_chunk_size_mb: 1.0,
-            web_port: 9003,
-        }
     }
 }

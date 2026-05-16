@@ -27,7 +27,6 @@ data_dir = [
     "[DISK]testing/data",
 ]
 log = { level = "info", log_dir = "stdout", file_name = "worker.log" }
-enable_s3_gateway = false
 
 # SPDK over NVMe-oF/RDMA configuration  
 [worker.spdk_disk]  
@@ -80,23 +79,6 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 level = "info"
 log_dir = "stdout"
 file_name = "curvine.log"
-
-
-# S3 Object Gateway configuration
-[s3_gateway]
-# Listen address for S3 gateway (host:port)
-listen = "0.0.0.0:9900"
-region = "us-east-1"
-# Temporary directory for all PUT operations (multipart and regular)
-put_temp_dir = "/tmp/curvine-temp"
-# Memory buffer threshold for small files (bytes, default: 1MB)
-put_memory_buffer_threshold = 1048576
-# Maximum memory buffer size (bytes, default: 16MB)
-put_max_memory_buffer = 16777216
-
-# GET Performance Optimization Settings
-# GET read/write chunk size in MB (default: 1.0, options: 0.5/1/2)
-get_chunk_size_mb = 1.0
 
 [cli]
 log = { level = "warn", log_dir = "stdout", file_name = "cli.log" }

@@ -1,0 +1,51 @@
+[package]
+name = "curvine-lancedb-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Facade crate for LanceDB on Curvine"
+
+[lib]
+name = "lancedb"
+path = "src/lib.rs"
+
+[dependencies]
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+curvine-client = { workspace = true }
+curvine-common = { workspace = true }
+futures = { workspace = true }
+lance = { version = "4.0.0", default-features = false }
+lance-core = "4.0.0"
+lance-io = "4.0.0"
+lance-namespace = "4.0.0"
+lance-table = "4.0.0"
+lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features = false }
+md-5 = { workspace = true }
+object_store = "0.12.5"
+tokio = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+arrow-array = "57.2"
+arrow-schema = "57.2"
+tempfile = { workspace = true }
+
+[features]
+default = []
+aws = ["lancedb_upstream/aws"]
+azure = ["lancedb_upstream/azure"]
+bedrock = ["lancedb_upstream/bedrock"]
+dynamodb = ["lancedb_upstream/dynamodb"]
+fp16kernels = ["lancedb_upstream/fp16kernels"]
+gcs = ["lancedb_upstream/gcs"]
+huggingface = ["lancedb_upstream/huggingface"]
+openai = ["lancedb_upstream/openai"]
+oss = ["lancedb_upstream/oss"]
+polars = ["lancedb_upstream/polars"]
+remote = ["lancedb_upstream/remote"]
+s3-test = ["lancedb_upstream/s3-test"]
+sentence-transformers = ["lancedb_upstream/sentence-transformers"]

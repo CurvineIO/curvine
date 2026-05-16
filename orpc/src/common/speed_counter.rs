@@ -22,15 +22,36 @@ impl SpeedCounter {
     }
 
     pub fn to_string(&self, mark: &str, bytes: u64) -> String {
-        let cost = self.0.used_ms() as f64 / 1000.0;
+        // Use microseconds for sub-millisecond precision when the elapsed time
+        // is short; fall back to a minimum of 1us to avoid division by zero.
+        let cost_secs = (self.0.used_us().max(1) as f64) / 1_000_000.0;
+
         let size_string = ByteUnit::byte_to_string(bytes);
-        let speed = ByteUnit::byte_to_string((bytes as f64 / cost) as u64);
-        let band_width = ByteUnit::byte_to_string((bytes as f64 / cost) as u64 * 8);
+        let bytes_per_sec = bytes as f64 / cost_secs;
+        let bits_per_sec = bytes_per_sec * 8.0;
+
+        let speed = ByteUnit::byte_to_string(bytes_per_sec as u64);
+        let band_width = Self::bits_per_sec_to_string(bits_per_sec);
 
         format!(
-            "{} size: {}, cost: {:.2} s, speed: {}/s, bandwidth: {}/s",
-            mark, size_string, cost, speed, band_width
+            "{} size: {}, cost: {:.2} s, speed: {}/s, bandwidth: {}",
+            mark, size_string, cost_secs, speed, band_width
         )
+    }
+
+    /// Format a bit-rate (bits per second) using the network-bandwidth
+    /// convention (decimal SI prefixes, lower-case `b` for bit).
+    fn bits_per_sec_to_string(bits_per_sec: f64) -> String {
+        const UNITS: &[&str] = &["bps", "Kbps", "Mbps", "Gbps", "Tbps", "Pbps"];
+        if !bits_per_sec.is_finite() || bits_per_sec <= 0.0 {
+            return "0bps".to_string();
+        }
+
+        let group = (bits_per_sec.log10() / 1000f64.log10()).floor() as i32;
+        let group = group.clamp(0, (UNITS.len() - 1) as i32) as usize;
+
+        let scaled = bits_per_sec / 1000f64.powi(group as i32);
+        format!("{:.1}{}", scaled, UNITS[group])
     }
 
     pub fn reset(&mut self) {

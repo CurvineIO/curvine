@@ -123,7 +123,8 @@ jobs:
             ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
             curvine/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
           cache-from: type=gha,scope=compile-${{ matrix.build_type }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=compile-${{ matrix.build_type }}-${{ matrix.arch }}
+          # Transient GHA cache API errors (e.g. 502) must not fail the job after image build/push succeeds.
+          cache-to: type=gha,mode=max,scope=compile-${{ matrix.build_type }}-${{ matrix.arch }},ignore-error=true
       
       - name: Build summary for ${{ matrix.build_type }} (${{ matrix.arch }})
         run: |

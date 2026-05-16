@@ -659,8 +659,11 @@ impl fs::FileSystem for CurvineFileSystem {
         self.check_permissions(&parent_path, op.header, libc::X_OK as u32)
             .await?;
 
-        // Get the path.
-        let path = self.state.get_path_common(parent, name.as_deref())?;
+        // Reuse parent_path instead of traversing the node tree again.
+        let path = match name.as_deref() {
+            Some(n) => Path::from_str(format!("{}/{}", parent_path.full_path(), n))?,
+            None => parent_path.clone(),
+        };
         let status = self.get_cached_status(&path).await?;
         let res = self.lookup_status(parent, name.as_deref(), &status);
 
