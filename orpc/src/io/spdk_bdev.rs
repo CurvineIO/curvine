@@ -18,6 +18,7 @@ use crate::sys::DataSlice;
 use bytes::BytesMut;
 use log::{debug, error, warn};
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
 // ---------------------------------------------------------------------------
 // SPDK I/O channel — bridge between Tokio and SPDK reactor
 // ---------------------------------------------------------------------------
@@ -28,6 +29,8 @@ pub struct SpdkIoChannel {
     pub poller_tx: crossbeam::channel::Sender<crate::io::spdk_poller::IoRequest>,
     /// Eventfd for waking poller on new I/O
     pub eventfd: std::sync::Arc<nix::sys::eventfd::EventFd>,
+    /// Flag: poller is idle and blocked on eventfd; only write eventfd when true
+    pub poller_is_sleeping: std::sync::Arc<AtomicBool>,
 }
 unsafe impl Send for SpdkIoChannel {}
 unsafe impl Sync for SpdkIoChannel {}
@@ -223,10 +226,12 @@ impl SpdkBdev {
             };
             let poller_tx = env.poller_sender(); // Get sender from SpdkEnv
             let eventfd = env.poller_eventfd(); // Get eventfd for wake signaling
+            let poller_is_sleeping = env.poller_is_sleeping(); // Skip eventfd if active
             let io_channel = SpdkIoChannel {
                 qpair,
                 poller_tx,
                 eventfd,
+                poller_is_sleeping,
             };
             let io_timeout_us = env.conf().io_timeout_us;
             Ok(Self {
@@ -343,12 +348,14 @@ impl SpdkBdev {
                     .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
-            if let Err(e) = self.io_channel.eventfd.write(1) {
-                warn!(
-                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                     I/O may be delayed until timeout.",
-                    self.name, e
-                );
+            if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+                if let Err(e) = self.io_channel.eventfd.write(1) {
+                    warn!(
+                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                         I/O may be delayed until timeout.",
+                        self.name, e
+                    );
+                }
             }
             let rc = completion.wait(self.io_timeout_us);
             if rc != 0 {
@@ -416,12 +423,14 @@ impl SpdkBdev {
                         .fetch_sub(1, std::sync::atomic::Ordering::Release);
                     return err_box!("SPDK poller thread is gone");
                 }
-                if let Err(e) = self.io_channel.eventfd.write(1) {
-                    warn!(
-                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                         I/O may be delayed until timeout.",
-                        self.name, e
-                    );
+                if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+                    if let Err(e) = self.io_channel.eventfd.write(1) {
+                        warn!(
+                            "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                             I/O may be delayed until timeout.",
+                            self.name, e
+                        );
+                    }
                 }
                 let rc = completion.wait(self.io_timeout_us);
 
@@ -462,12 +471,14 @@ impl SpdkBdev {
                     .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
-            if let Err(e) = self.io_channel.eventfd.write(1) {
-                warn!(
-                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                     I/O may be delayed until timeout.",
-                    self.name, e
-                );
+            if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+                if let Err(e) = self.io_channel.eventfd.write(1) {
+                    warn!(
+                        "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                         I/O may be delayed until timeout.",
+                        self.name, e
+                    );
+                }
             }
             let rc = completion.wait(self.io_timeout_us);
             if rc != 0 {
@@ -502,12 +513,14 @@ impl SpdkBdev {
         if self.io_channel.poller_tx.send(req).is_err() {
             return err_box!("SPDK poller thread is gone");
         }
-        if let Err(e) = self.io_channel.eventfd.write(1) {
-            warn!(
-                "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
-                 I/O may be delayed until timeout.",
-                self.name, e
-            );
+        if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+            if let Err(e) = self.io_channel.eventfd.write(1) {
+                warn!(
+                    "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
+                     I/O may be delayed until timeout.",
+                    self.name, e
+                );
+            }
         }
         let rc = completion.wait(self.io_timeout_us);
         if rc != 0 {
