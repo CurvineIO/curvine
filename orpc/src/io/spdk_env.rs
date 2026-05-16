@@ -758,6 +758,16 @@ impl SpdkEnv {
             .eventfd_arc()
     }
 
+    /// Get is_sleeping flag for bdevs to skip eventfd write when poller is active
+    pub fn poller_is_sleeping(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.poller
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("SpdkPoller not started — was init() called?")
+            .is_sleeping_arc()
+    }
+
     // Handle tracking, which is used by SpdkBdev open/drop
     /// Register SpdkBdev handle. Returns Err if not Initialized.
     pub fn acquire_handle(&self) -> CommonResult<()> {
