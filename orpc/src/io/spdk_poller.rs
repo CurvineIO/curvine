@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 const EVENTSZ: usize = std::mem::size_of::<u64>();
-
+const SPIN_ITER: u32 = 100; // TODO: make tunable for cpu-latency tradeoff
 /// I/O operation submitted to the poller thread.
 pub enum IoOp {
     Read {
@@ -278,9 +278,16 @@ impl SpdkPoller {
                     true
                 });
 
-                // Transition to Idle if no more work
+                // Spin briefly before Idle to avoid eventfd round-trip for back-to-back I/O
                 if rx.is_empty() && active_qpairs.is_empty() {
                     state = PollerState::Idle;
+                    for _ in 0..SPIN_ITER {
+                        std::hint::spin_loop();
+                        if !rx.is_empty() || !active_qpairs.is_empty() {
+                            state = PollerState::Active;
+                            break;
+                        }
+                    }
                 }
                 continue;
             }
