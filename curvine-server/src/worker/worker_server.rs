@@ -234,16 +234,6 @@ impl Worker {
     }
 
     pub async fn start(self) -> ServerStateListener {
-        let conf = CLUSTER_CONF.get().expect("Cluster conf not initialized");
-        if conf.worker.enable_s3_gateway {
-            #[cfg(target_os = "linux")]
-            {
-                info!("Starting S3 gateway alongside worker");
-                let worker_rt = self.rpc_server.clone_rt();
-                Self::start_s3_gateway(conf.clone(), worker_rt).await;
-            }
-        }
-
         // step 3: Start rpc server
         let mut rpc_status = self.rpc_server.start();
         rpc_status.wait_running().await.unwrap();
@@ -283,31 +273,5 @@ impl Worker {
 
     pub fn service(&self) -> &WorkerService {
         self.rpc_server.service()
-    }
-
-    #[cfg(target_os = "linux")]
-    async fn start_s3_gateway(mut conf: ClusterConf, worker_rt: Arc<Runtime>) {
-        let listen_addr = conf.s3_gateway.listen.clone();
-        let region = conf.s3_gateway.region.clone();
-        conf.s3_gateway.enable_distributed_auth = true;
-
-        info!(
-            "Initializing S3 gateway on {} in region {}",
-            listen_addr, region
-        );
-
-        let rt_clone = worker_rt.clone();
-        worker_rt.spawn(async move {
-            match curvine_s3_gateway::start_gateway(conf, listen_addr.clone(), region, rt_clone)
-                .await
-            {
-                Ok(_) => {
-                    info!("S3 gateway started successfully on {}", listen_addr);
-                }
-                Err(e) => {
-                    log::error!("Failed to start S3 gateway on {}: {}", listen_addr, e);
-                }
-            }
-        });
     }
 }

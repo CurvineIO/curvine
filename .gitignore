@@ -12,6 +12,12 @@ glacier-cache.iml
 /journal
 /fs-meta
 curvine-libsdk/java/native
+curvine-libsdk/python/*_pb2.py
+curvine-libsdk/python/curvine_libsdk/_proto/*_pb2.py
+curvine-libsdk/python/curvine_libsdk/*.so
+curvine-libsdk/python/curvine_libsdk/*.pyd
+curvine-libsdk/python/native/
+build/.venv-python-sdk/
 build/dist/
 
 # Node.js 相关
@@ -37,7 +43,8 @@ curvine-libsdk/java/target/
 .staging/
 .summary/
 .claude/
-docs
+# Repo-root design notes (keep local); allow per-crate docs/ (e.g. curvine-lancedb-rs/docs).
+/docs
 
 __pycache__
 

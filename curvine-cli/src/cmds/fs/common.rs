@@ -65,3 +65,19 @@ pub fn format_size(size: u64) -> String {
         format!("{} B", size)
     }
 }
+
+/// Formats a Unix epoch timestamp in milliseconds using the local timezone.
+pub fn format_epoch_ms_local(timestamp_ms: i64, fmt: &str) -> String {
+    if timestamp_ms <= 0 {
+        return "-".to_string();
+    }
+
+    let Some(datetime) = chrono::DateTime::from_timestamp_millis(timestamp_ms) else {
+        return "-".to_string();
+    };
+
+    datetime
+        .with_timezone(&chrono::Local)
+        .format(fmt)
+        .to_string()
+}

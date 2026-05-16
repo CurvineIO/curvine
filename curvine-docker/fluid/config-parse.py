@@ -58,7 +58,13 @@ exec {fuse_cmd}
     
     FUSE_OPTIONS = [
         'mnt-per-task', 'clone-fd', 'fuse-channel-size', 'stream-channel-size',
-        'direct-io', 'cache-readdir', 'entry-timeout', 'attr-timeout'
+        'direct-io', 'write-back-cache', 'cache-readdir', 'non-seekable',
+        'entry-timeout', 'attr-timeout', 'negative-timeout', 'ac-attr-timeout',
+        'max-background', 'congestion-threshold',
+        'node-cache-size', 'node-cache-timeout',
+        'enable-meta-cache', 'meta-cache-capacity', 'meta-cache-ttl',
+        'read-dir-fill-ino', 'remember', 'check-permission', 'list-limit',
+        'web-port',
     ]
     
     def __init__(self, config_path: Optional[str] = None):

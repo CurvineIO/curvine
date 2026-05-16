@@ -12,7 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub const EMPTY_PAYLOAD_HASH: &str =
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-pub const DEFAULT_OWNER_ID: &str = "ffffffffffffffff";
+pub use lancedb_upstream::error::{Error, Result};
