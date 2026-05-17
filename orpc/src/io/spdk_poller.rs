@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 const EVENTSZ: usize = std::mem::size_of::<u64>();
-const SPIN_ITER: u32 = 100; // TODO: make tunable for cpu-latency tradeoff
+const SPIN_ITER: u32 = 1000; // TODO: make tunable for cpu-latency tradeoff
 /// I/O operation submitted to the poller thread.
 pub enum IoOp {
     Read {
