@@ -52,5 +52,8 @@ pub use spdk_bdev::SpdkBdev;
 #[cfg(feature = "spdk")]
 pub mod spdk_poller;
 
+#[cfg(feature = "spdk")]
+pub use spdk_poller::PollerConfig;
+
 #[cfg(not(feature = "spdk"))]
 pub mod spdk_poller_stub;

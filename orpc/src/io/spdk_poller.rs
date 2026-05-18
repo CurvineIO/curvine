@@ -20,7 +20,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 const EVENTSZ: usize = std::mem::size_of::<u64>();
-const SPIN_ITER: u32 = 1000; // TODO: make tunable for cpu-latency tradeoff
 /// I/O operation submitted to the poller thread.
 pub enum IoOp {
     Read {
@@ -126,6 +125,12 @@ enum PollerState {
     Idle,
 }
 
+/// Configuration for the poller thread.
+pub struct PollerConfig {
+    pub poll_interval_ms: u64,
+    pub spin_iter: u32,
+}
+
 /// Poller thread handle.
 pub struct SpdkPoller {
     /// Channel sender for I/O submissions
@@ -140,8 +145,8 @@ pub struct SpdkPoller {
 }
 
 impl SpdkPoller {
-    /// Spawn a new poller thread with given poll interval (in ms).
-    pub fn start(poll_interval_ms: u64) -> Self {
+    /// Spawn a new poller thread with the given config.
+    pub fn start(config: PollerConfig) -> Self {
         let (tx, rx) = crossbeam::channel::unbounded::<IoRequest>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
@@ -157,13 +162,7 @@ impl SpdkPoller {
         let handle = std::thread::Builder::new()
             .name("spdk-poller".to_string())
             .spawn(move || {
-                Self::poller_loop(
-                    rx,
-                    shutdown_clone,
-                    is_sleeping_clone,
-                    eventfd_raw,
-                    poll_interval_ms,
-                );
+                Self::poller_loop(rx, shutdown_clone, is_sleeping_clone, eventfd_raw, config);
             })
             .expect("Failed to spawn SPDK poller thread");
 
@@ -237,7 +236,7 @@ impl SpdkPoller {
         shutdown: Arc<AtomicBool>,
         is_sleeping: Arc<AtomicBool>,
         eventfd: RawFd,
-        poll_interval_ms: u64,
+        config: PollerConfig,
     ) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
         let mut state = PollerState::Idle;
@@ -250,7 +249,7 @@ impl SpdkPoller {
         );
 
         // Poll interval for keep-alive check (parameterized to detect disconnects)
-        let poll_interval = poll_interval_ms as i32;
+        let poll_interval = config.poll_interval_ms as i32;
         loop {
             // Check shutdown first
             if shutdown.load(Ordering::Acquire) && rx.is_empty() && active_qpairs.is_empty() {
@@ -281,7 +280,7 @@ impl SpdkPoller {
                 // Spin briefly before Idle to avoid eventfd round-trip for back-to-back I/O
                 if rx.is_empty() && active_qpairs.is_empty() {
                     state = PollerState::Idle;
-                    for _ in 0..SPIN_ITER {
+                    for _ in 0..config.spin_iter {
                         std::hint::spin_loop();
                         if !rx.is_empty() {
                             state = PollerState::Active;
