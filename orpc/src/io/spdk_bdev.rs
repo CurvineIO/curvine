@@ -348,7 +348,7 @@ impl SpdkBdev {
                     .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
-            if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+            if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
                 if let Err(e) = self.io_channel.eventfd.write(1) {
                     warn!(
                         "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
@@ -423,7 +423,7 @@ impl SpdkBdev {
                         .fetch_sub(1, std::sync::atomic::Ordering::Release);
                     return err_box!("SPDK poller thread is gone");
                 }
-                if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+                if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
                     if let Err(e) = self.io_channel.eventfd.write(1) {
                         warn!(
                             "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
@@ -471,7 +471,7 @@ impl SpdkBdev {
                     .fetch_sub(1, std::sync::atomic::Ordering::Release);
                 return err_box!("SPDK poller thread is gone");
             }
-            if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+            if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
                 if let Err(e) = self.io_channel.eventfd.write(1) {
                     warn!(
                         "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \
@@ -513,7 +513,7 @@ impl SpdkBdev {
         if self.io_channel.poller_tx.send(req).is_err() {
             return err_box!("SPDK poller thread is gone");
         }
-        if self.io_channel.poller_is_sleeping.load(Ordering::Acquire) {
+        if self.io_channel.poller_is_sleeping.load(Ordering::SeqCst) {
             if let Err(e) = self.io_channel.eventfd.write(1) {
                 warn!(
                     "SpdkBdev '{}': failed to wake poller (eventfd write): {}. \

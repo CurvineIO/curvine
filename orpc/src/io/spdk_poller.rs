@@ -304,7 +304,7 @@ impl SpdkPoller {
                 }
 
                 // Mark as sleeping before blocking — bdevs will write eventfd to wake us
-                is_sleeping.store(true, Ordering::Release);
+                is_sleeping.store(true, Ordering::SeqCst);
 
                 // Recheck channel after setting flag (closes race with bdev send)
                 if !rx.is_empty() {
