@@ -283,7 +283,7 @@ impl SpdkPoller {
                     state = PollerState::Idle;
                     for _ in 0..SPIN_ITER {
                         std::hint::spin_loop();
-                        if !rx.is_empty() || !active_qpairs.is_empty() {
+                        if !rx.is_empty() {
                             state = PollerState::Active;
                             break;
                         }
