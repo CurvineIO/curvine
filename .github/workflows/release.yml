@@ -19,10 +19,17 @@ jobs:
     name: Build for Rocky Linux 9
     runs-on: ubuntu-latest
     container:
-      image: curvine/curvine-compile:latest
+      image: ghcr.io/curvineio/curvine-compile:rocky9
 
     steps:
     - uses: actions/checkout@v4
+
+    # hdfs-sys (opendal-hdfs) uses java-locator which shells out to `which`
+    - name: Ensure which is available for hdfs-sys build
+      run: |
+        if ! command -v which >/dev/null 2>&1; then
+          dnf install -y which
+        fi
 
     - name: Cache cargo registry
       uses: actions/cache@v3
