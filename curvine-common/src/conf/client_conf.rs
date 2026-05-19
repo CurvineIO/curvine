@@ -119,7 +119,7 @@ pub struct ClientConf {
     pub data_timeout_ms: u64,
     pub pipeline_timeout_ms: u64,
 
-    // After testing 3 connections, the best performance can be achieved, so the default value is 1.
+    // After testing 3 connections, the best performance can be achieved, so the default value is 3.
     pub master_conn_pool_size: usize,
 
     // Whether to enable pre-reading
@@ -362,7 +362,7 @@ impl Default for ClientConf {
             rpc_timeout_ms: 120 * 1000,
             data_timeout_ms: 120 * 1000,
             pipeline_timeout_ms: 120 * 1000,
-            master_conn_pool_size: 1,
+            master_conn_pool_size: 3,
 
             enable_read_ahead: true,
             read_ahead_len: 0,
