@@ -2,6 +2,7 @@
 
 use crate::err_msg;
 use crate::io::spdk_ffi;
+use crate::io::spdk_poller::PollerConfig;
 use crate::io::spdk_poller::{IoRequest, SpdkPoller};
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
@@ -256,6 +257,10 @@ pub struct SpdkConf {
     pub keep_alive_timeout_ms: u64, // parsed by init()
     #[serde(alias = "poll_interval", default)]
     pub poll_interval_ms: u64, // default = 1000
+    #[serde(default)]
+    // PAUSE iterations before parking on eventfd (on x86, roughly 300 ns - 1 µs at 1000). Burns that much CPU to skip the wakeup
+    // syscall for back-to-back I/O.
+    pub spin_iter: u32,
     #[serde(alias = "dma_pool_size", default)]
     pub dma_pool_size_str: String, // e.g. "64MB"
     #[serde(skip)]
@@ -393,6 +398,7 @@ impl Default for SpdkConf {
             keep_alive_timeout_str: "10s".to_string(),
             keep_alive_timeout_ms: 10_000,
             poll_interval_ms: 1000,
+            spin_iter: 1000,
             dma_pool_size_str: "64MB".to_string(),
             dma_pool_bytes: 64 * 1024 * 1024,
             block_align: 0,
@@ -599,7 +605,10 @@ impl SpdkEnv {
 
         // Start the dedicated I/O poller thread
         {
-            let poller = SpdkPoller::start(self.conf.poll_interval_ms);
+            let poller = SpdkPoller::start(PollerConfig {
+                poll_interval_ms: self.conf.poll_interval_ms,
+                spin_iter: self.conf.spin_iter,
+            });
             *self.poller.lock().unwrap() = Some(poller);
             info!("SPDK poller thread started");
         }
@@ -756,6 +765,16 @@ impl SpdkEnv {
             .as_ref()
             .expect("SpdkPoller not started — was init() called?")
             .eventfd_arc()
+    }
+
+    /// Get is_sleeping flag for bdevs to skip eventfd write when poller is active
+    pub fn poller_is_sleeping(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.poller
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("SpdkPoller not started — was init() called?")
+            .is_sleeping_arc()
     }
 
     // Handle tracking, which is used by SpdkBdev open/drop
