@@ -20,7 +20,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 const EVENTSZ: usize = std::mem::size_of::<u64>();
-
 /// I/O operation submitted to the poller thread.
 pub enum IoOp {
     Read {
@@ -126,6 +125,12 @@ enum PollerState {
     Idle,
 }
 
+/// Configuration for the poller thread.
+pub struct PollerConfig {
+    pub poll_interval_ms: u64,
+    pub spin_iter: u32,
+}
+
 /// Poller thread handle.
 pub struct SpdkPoller {
     /// Channel sender for I/O submissions
@@ -134,14 +139,19 @@ pub struct SpdkPoller {
     eventfd: Arc<EventFd>,
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    /// Whether poller is blocked on eventfd (idle). Bdevs check this to
+    /// skip eventfd write syscall when poller is already active.
+    is_sleeping: Arc<AtomicBool>,
 }
 
 impl SpdkPoller {
-    /// Spawn a new poller thread with given poll interval (in ms).
-    pub fn start(poll_interval_ms: u64) -> Self {
+    /// Spawn a new poller thread with the given config.
+    pub fn start(config: PollerConfig) -> Self {
         let (tx, rx) = crossbeam::channel::unbounded::<IoRequest>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let is_sleeping = Arc::new(AtomicBool::new(false));
+        let is_sleeping_clone = is_sleeping.clone();
 
         // Create eventfd for wake signaling
         let eventfd = EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK)
@@ -152,7 +162,7 @@ impl SpdkPoller {
         let handle = std::thread::Builder::new()
             .name("spdk-poller".to_string())
             .spawn(move || {
-                Self::poller_loop(rx, shutdown_clone, eventfd_raw, poll_interval_ms);
+                Self::poller_loop(rx, shutdown_clone, is_sleeping_clone, eventfd_raw, config);
             })
             .expect("Failed to spawn SPDK poller thread");
 
@@ -161,6 +171,7 @@ impl SpdkPoller {
             eventfd: eventfd_arc,
             shutdown,
             handle: Some(handle),
+            is_sleeping,
         }
     }
 
@@ -177,6 +188,11 @@ impl SpdkPoller {
     /// Get eventfd as Arc for sharing with multiple bdevs
     pub fn eventfd_arc(&self) -> Arc<EventFd> {
         self.eventfd.clone()
+    }
+
+    /// Get is_sleeping flag for bdevs to check before eventfd write
+    pub fn is_sleeping_arc(&self) -> Arc<AtomicBool> {
+        self.is_sleeping.clone()
     }
 
     /// Unregister qpair from poller, blocking until removed to prevent UAF.
@@ -218,8 +234,9 @@ impl SpdkPoller {
     fn poller_loop(
         rx: crossbeam::channel::Receiver<IoRequest>,
         shutdown: Arc<AtomicBool>,
+        is_sleeping: Arc<AtomicBool>,
         eventfd: RawFd,
-        poll_interval_ms: u64,
+        config: PollerConfig,
     ) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
         let mut state = PollerState::Idle;
@@ -232,7 +249,7 @@ impl SpdkPoller {
         );
 
         // Poll interval for keep-alive check (parameterized to detect disconnects)
-        let poll_interval = poll_interval_ms as i32;
+        let poll_interval = config.poll_interval_ms as i32;
         loop {
             // Check shutdown first
             if shutdown.load(Ordering::Acquire) && rx.is_empty() && active_qpairs.is_empty() {
@@ -260,9 +277,16 @@ impl SpdkPoller {
                     true
                 });
 
-                // Transition to Idle if no more work
+                // Spin briefly before Idle to avoid eventfd round-trip for back-to-back I/O
                 if rx.is_empty() && active_qpairs.is_empty() {
                     state = PollerState::Idle;
+                    for _ in 0..config.spin_iter {
+                        std::hint::spin_loop();
+                        if !rx.is_empty() {
+                            state = PollerState::Active;
+                            break;
+                        }
+                    }
                 }
                 continue;
             }
@@ -278,6 +302,16 @@ impl SpdkPoller {
                     continue;
                 }
 
+                // Mark as sleeping before blocking — bdevs will write eventfd to wake us
+                is_sleeping.store(true, Ordering::SeqCst);
+
+                // Recheck channel after setting flag (closes race with bdev send)
+                if !rx.is_empty() {
+                    is_sleeping.store(false, Ordering::Release);
+                    state = PollerState::Active;
+                    continue;
+                }
+
                 // Wait on eventfd with timeout for keep-alive check
                 let mut eventfd_pollfd = libc::pollfd {
                     fd: eventfd,
@@ -289,6 +323,9 @@ impl SpdkPoller {
 
                 match result {
                     n if n > 0 => {
+                        // Woken up — clear sleeping flag
+                        is_sleeping.store(false, Ordering::Release);
+
                         // Eventfd signaled - drain it
                         let mut buf = [0u8; EVENTSZ];
                         let _ = unsafe {
