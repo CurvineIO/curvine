@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+module-name = "curvine_lancedb._native"
+features = ["python-sdk"]
+
+[project]
+name = "curvine-lancedb"
+version = "0.2.0"
+requires-python = ">=3.8"
+dependencies = [
+    "pyarrow>=14.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+]

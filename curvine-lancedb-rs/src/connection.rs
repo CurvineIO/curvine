@@ -78,7 +78,7 @@ pub struct ConnectBuilder {
 /// Established connection. For `curvine://` listing URIs, the inner database may be wrapped for safe commits.
 #[derive(Clone)]
 pub struct Connection {
-    upstream: UpstreamConnection,
+    pub(crate) upstream: UpstreamConnection,
     options: ConnectionOptions,
 }
 
