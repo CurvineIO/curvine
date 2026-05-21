@@ -1,13 +1,23 @@
 #!/bin/bash
-# Linker wrapper that forces -lstdc++, -lgcc_s, and -lz to link statically.
-# Needed because crate build scripts (e.g. librocksdb-sys) emit
-# `cargo:rustc-link-lib=stdc++` which lands in the -Bdynamic section.
+# Cargo linker wrapper. When CURVINE_STATIC_LINK=1, forces -lstdc++, -lgcc_s,
+# and -lz to link statically. Needed because crate build scripts (e.g.
+# librocksdb-sys) emit `cargo:rustc-link-lib=stdc++` which lands in the
+# -Bdynamic section.
 #
 # NOTE: gcc/clang support comma-separated `-Wl,...` lists. This wrapper
 # emits `-Wl,-Bstatic` / `-Wl,-Bdynamic` as separate args around the
 # affected libraries to preserve the intended linker mode transitions.
+#
+# Usage:
+#   CURVINE_STATIC_LINK=1 cargo build --release
+#
+# Without the variable (default), arguments are passed through unchanged.
 
 set -euo pipefail
+
+if [ "${CURVINE_STATIC_LINK:-0}" != "1" ]; then
+    exec "${CC:-cc}" "$@"
+fi
 
 NEWARGS=()
 for arg in "$@"; do
