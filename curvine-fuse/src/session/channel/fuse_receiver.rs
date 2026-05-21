@@ -42,10 +42,12 @@ pub struct FuseReceiver<T> {
     buf: BytesMut,
     fuse_len: usize,
     debug: bool,
+    audit_logging_enabled: bool,
     pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
 }
 
 impl<T: FileSystem> FuseReceiver<T> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fs: Arc<T>,
         rt: Arc<Runtime>,
@@ -53,6 +55,7 @@ impl<T: FileSystem> FuseReceiver<T> {
         sender: AsyncSender<FuseTask>,
         buf_size: usize,
         debug: bool,
+        audit_logging_enabled: bool,
         pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
     ) -> IOResult<Self> {
         let pipe2 = Pipe2::new(PipeFd::new(buf_size, false, false)?)?;
@@ -67,6 +70,7 @@ impl<T: FileSystem> FuseReceiver<T> {
             buf,
             fuse_len: buf_size,
             debug,
+            audit_logging_enabled,
             pending_requests,
         };
 
@@ -120,6 +124,20 @@ impl<T: FileSystem> FuseReceiver<T> {
         FuseResponse::new(unique, self.sender.clone(), self.debug)
     }
 
+    fn audit(&self, req: &FuseRequest) {
+        if !self.audit_logging_enabled {
+            return;
+        }
+        let ino = req.get_header().map(|h| h.nodeid).unwrap_or(0);
+        info!(
+            target: "audit",
+            "unique={} ino={} opcode={:?}",
+            req.unique(),
+            ino,
+            req.opcode(),
+        );
+    }
+
     pub async fn send_stream(&self, req: FuseRequest) -> FuseResult<()> {
         let operator = req.parse_operator()?;
         let rep = self.new_replay(req.unique());
@@ -167,10 +185,11 @@ impl<T: FileSystem> FuseReceiver<T> {
                                     error!("failed to dispatch stream request: {}", e);
                                 }
                             } else {
+                                self.audit(&req);
+
                                 let reply = self.new_replay(req.unique());
                                 let fs = self.fs.clone();
                                 let pending_requests = self.pending_requests.clone();
-
                                 self.rt.spawn(async move {
                                     if let Err(e) = Self::dispatch_meta_interrupt(fs, pending_requests, req, reply).await {
                                         error!("failed to dispatch meta request: {}", e);

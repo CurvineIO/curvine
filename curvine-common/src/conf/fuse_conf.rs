@@ -28,6 +28,8 @@ pub struct FuseConf {
     // Whether to output the request response log.
     pub debug: bool,
 
+    pub audit_logging_enabled: bool,
+
     pub io_threads: usize,
 
     pub worker_threads: usize,
@@ -269,6 +271,7 @@ impl Default for FuseConf {
     fn default() -> Self {
         let mut conf = Self {
             debug: false,
+            audit_logging_enabled: false,
 
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),

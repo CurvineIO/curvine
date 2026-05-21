@@ -144,7 +144,7 @@ impl MasterHandler {
 
         let opts = ProtoUtils::create_opts_from_pb(header.opts);
         let flags = OpenFlags::new(header.flags);
-        let audit_path = format!("[{}]{}", flags.access_mark(), header.path);
+        let audit_path = format!("{}:{}", flags.access_mark(), header.path);
         ctx.set_audit(Some(audit_path), None);
 
         let file_blocks = self.open_file0(ctx.msg.req_id(), header.path, opts, flags)?;
@@ -304,9 +304,9 @@ impl MasterHandler {
         let req: CompleteFileRequest = ctx.parse_header()?;
 
         let audit_path = if req.only_flush {
-            format!("[flush]{}", req.path)
+            format!("flush:{}", req.path)
         } else {
-            format!("[close]{}", req.path)
+            format!("close:{}", req.path)
         };
         ctx.set_audit(Some(audit_path), None);
 
@@ -725,7 +725,7 @@ impl MessageHandler for MasterHandler {
         // Record request processing time and audit log
         let used_us = ctx.spent.used_us();
         if self.audit_logging_enabled {
-            ctx.audit_log(response.is_ok(), used_us, self.conn_state.as_ref());
+            ctx.audit_log(&response, used_us, self.conn_state.as_ref());
         }
 
         let code_label = format!("{:?}", ctx.code);

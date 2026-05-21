@@ -16,7 +16,7 @@ use crate::file::{FsContext, FsReaderBuffer, ReadDetector};
 use curvine_common::fs::{Path, Reader};
 use curvine_common::state::{FileBlocks, FileStatus};
 use curvine_common::FsResult;
-use log::info;
+use log::debug;
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::err_box;
 use orpc::sys::DataSlice;
@@ -41,7 +41,7 @@ impl FsReader {
 
         let read_detector = ReadDetector::with_conf(conf, len);
 
-        info!(
+        debug!(
             "Create reader, path={}, len={}, blocks={}, chunk_size={}, chunk_number={}, read_parallel={}, slice_size={}, read_ahead={}-{}",
             &file_blocks.status.path,
             ByteUnit::byte_to_string(len as u64),
@@ -132,6 +132,6 @@ impl Reader for FsReader {
 
 impl Drop for FsReader {
     fn drop(&mut self) {
-        info!("Close reader, path={}", self.path())
+        debug!("Close reader, path={}", self.path())
     }
 }
