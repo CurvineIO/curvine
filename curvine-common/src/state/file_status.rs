@@ -102,6 +102,10 @@ impl FileStatus {
     /// Returns true if CV data is valid and usable: CV exists, not expired, UFS exists;
     /// when `ufs_status` is provided, also checks len and mtime match UFS.
     pub fn cv_valid(&self, ufs_status: Option<&FileStatus>) -> bool {
+        if self.storage_policy.ufs_mtime == 0 {
+            return false;
+        }
+
         if !self.cv_exists() {
             return false;
         }

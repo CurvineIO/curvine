@@ -510,6 +510,16 @@ impl InodeFile {
         Ok(res)
     }
 
+    pub fn get_locs_bytes(&self, locs: &HashMap<i64, Vec<BlockLocation>>) -> i64 {
+        let mut bytes = 0;
+        for block in &self.blocks {
+            if let Some(locs) = locs.get(&block.id) {
+                bytes += (locs.len() as i64) * (block.len as i64);
+            }
+        }
+        bytes
+    }
+
     pub fn ufs_exists(&self) -> bool {
         self.storage_policy.ufs_exists()
     }
