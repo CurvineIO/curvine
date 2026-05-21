@@ -146,6 +146,10 @@ pub struct ClientConf {
     // If the cache misses, determine whether to allow Curvine to directly read data from the unified file system (UFS).
     pub enable_rust_read_ufs: bool,
 
+    // Whether to enable client-side audit logging for UnifiedFileSystem operations.
+    // The log target is "audit" and records: cmd, ok, src, dst, usedUs.
+    pub audit_logging_enabled: bool,
+
     // Mount information update interval
     #[serde(skip)]
     pub mount_update_ttl: Duration,
@@ -375,6 +379,8 @@ impl Default for ClientConf {
 
             enable_unified_fs: true,
             enable_rust_read_ufs: true,
+
+            audit_logging_enabled: true,
 
             mount_update_ttl: Default::default(),
             mount_update_ttl_str: "10s".to_string(),

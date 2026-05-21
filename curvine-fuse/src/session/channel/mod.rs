@@ -53,6 +53,7 @@ impl<T: FileSystem> FuseChannel<T> {
                 tx,
                 buf_size,
                 conf.debug,
+                conf.audit_logging_enabled,
                 pending_requests.clone(),
             )?;
 

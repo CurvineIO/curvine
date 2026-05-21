@@ -17,7 +17,7 @@ use bytes::BytesMut;
 use curvine_common::fs::{Path, Writer};
 use curvine_common::state::{FileAllocOpts, FileBlocks, FileStatus};
 use curvine_common::FsResult;
-use log::{debug, info};
+use log::debug;
 use orpc::common::{ByteUnit, TimeSpent};
 use orpc::sys::DataSlice;
 use orpc::{err_box, ternary};
@@ -39,7 +39,7 @@ impl FsWriter {
         let chunk_num = fs_context.write_chunk_num();
         let pos = ternary!(append, status.len, 0);
 
-        info!(
+        debug!(
             "Create writer, path={}, pos={}, len = {}, block_size={}, chunk_size={}, chunk_number={}, replicas={}",
             &status.path,
             pos,
@@ -158,6 +158,6 @@ impl Writer for FsWriter {
 
 impl Drop for FsWriter {
     fn drop(&mut self) {
-        info!("Close writer, path={}", self.path())
+        debug!("Close writer, path={}", self.path())
     }
 }
