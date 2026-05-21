@@ -78,11 +78,22 @@ impl StoragePolicy {
     }
 
     pub fn free(&mut self) -> bool {
-        if self.both_exists() && self.ttl_action != TtlAction::None {
-            self.state = StorageState::Ufs;
-            true
-        } else {
-            false
+        match self.ttl_action {
+            TtlAction::Free if self.both_exists() => {
+                self.state = StorageState::Ufs;
+                true
+            }
+
+            TtlAction::Delete => {
+                if self.both_exists() {
+                    self.state = StorageState::Ufs;
+                }
+
+                self.ufs_mtime = 0;
+                true
+            }
+
+            _ => false,
         }
     }
 
