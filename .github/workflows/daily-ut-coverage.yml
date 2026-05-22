@@ -16,7 +16,7 @@ env:
 jobs:
   daily-ut-coverage:
     # Only run scheduled jobs in the upstream repo, not in forks.
-    if: github.repository == 'CurvineIO/curvine' || github.event_name != 'schedule'
+    if: github.event_name != 'schedule' || (github.repository_owner == 'CurvineIO' && github.event.repository.fork == false)
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/curvineio/curvine-tests:rocky9
