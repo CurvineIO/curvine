@@ -59,10 +59,10 @@ enum ConnectBuilderInner {
 }
 
 #[derive(Clone, Debug, Default)]
-struct ConnectionOptions {
+pub(crate) struct ConnectionOptions {
     uri: String,
     query_string: Option<String>,
-    storage_options: HashMap<String, String>,
+    pub(crate) storage_options: HashMap<String, String>,
     session: Option<Arc<Session>>,
     embedding_registry: Option<Arc<dyn EmbeddingRegistry>>,
     namespace_backed: bool,

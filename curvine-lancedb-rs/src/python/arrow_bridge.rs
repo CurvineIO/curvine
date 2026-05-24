@@ -6,6 +6,11 @@ use arrow_schema::{Schema, SchemaRef};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 
+// NOTE: arrow-pyarrow (the `arrow` crate's `pyarrow` feature) would simplify this module
+// with `FromPyArrow` / `ToPyArrow` traits, but arrow 57.x requires pyo3 0.26 while the
+// workspace uses pyo3 0.25. Once all crates upgrade to pyo3 >= 0.26, replace this module
+// with arrow::pyarrow::{FromPyArrow, ToPyArrow}.
+
 /// Convert a Rust `RecordBatch` to a `pyarrow.RecordBatch` via Arrow C Data Interface.
 pub fn record_batch_to_pyarrow(py: Python<'_>, batch: &RecordBatch) -> PyResult<PyObject> {
     let struct_array = StructArray::from(batch.clone());

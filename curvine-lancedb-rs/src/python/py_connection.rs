@@ -1,17 +1,17 @@
-use lancedb_upstream::Connection as UpstreamConnection;
 use pyo3::prelude::*;
 
 use super::arrow_bridge;
 use super::error;
 use super::py_table::PyTable;
+use crate::connection::Connection;
 
 #[pyclass(name = "Connection")]
 pub struct PyConnection {
-    inner: UpstreamConnection,
+    inner: Connection,
 }
 
 impl PyConnection {
-    pub fn new(conn: UpstreamConnection) -> Self {
+    pub fn new(conn: Connection) -> Self {
         Self { inner: conn }
     }
 }
@@ -19,7 +19,7 @@ impl PyConnection {
 #[pymethods]
 impl PyConnection {
     fn table_names<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let conn = self.inner.clone();
+        let conn = self.inner.upstream.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let names = conn.table_names().execute().await.map_err(error::to_py_err)?;
             Ok(names)
@@ -27,7 +27,7 @@ impl PyConnection {
     }
 
     fn open_table<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
-        let conn = self.inner.clone();
+        let conn = self.inner.upstream.clone();
         let name = name.to_string();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let table = conn
@@ -45,7 +45,7 @@ impl PyConnection {
         name: &str,
         data: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let conn = self.inner.clone();
+        let conn = self.inner.upstream.clone();
         let name = name.to_string();
         let batch = arrow_bridge::record_batch_from_pyarrow(py, data)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -59,13 +59,32 @@ impl PyConnection {
     }
 
     fn drop_table<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
-        let conn = self.inner.clone();
+        let conn = self.inner.upstream.clone();
         let name = name.to_string();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             conn.drop_table(&name, &[])
                 .await
                 .map_err(error::to_py_err)?;
             Ok(())
+        })
+    }
+
+    fn clone_table<'py>(
+        &self,
+        py: Python<'py>,
+        target_name: &str,
+        source_uri: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let conn = self.inner.clone();
+        let target_name = target_name.to_string();
+        let source_uri = source_uri.to_string();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let table = conn
+                .clone_table(target_name, source_uri)
+                .execute()
+                .await
+                .map_err(error::to_py_err)?;
+            Ok(PyTable::new(table))
         })
     }
 }
