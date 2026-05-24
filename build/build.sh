@@ -486,14 +486,6 @@ if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
         FEATURES+=("curvine-ufs/jni")
         FEATURES+=("curvine-server/jni")
         ;;
-      spdk)
-        # SPDK NVMe-oF initiator support (TCP transport)
-        FEATURES+=("curvine-server/spdk")
-        ;;
-      spdk-rdma)
-        # SPDK NVMe-oF initiator support (TCP + RDMA transport)
-        FEATURES+=("curvine-server/spdk-rdma")
-        ;;
       *)
         # For other features, add as-is (might be package-specific)
         FEATURES+=("$feature")
