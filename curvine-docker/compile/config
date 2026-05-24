@@ -1,1 +1,4 @@
-# Use crates.io directly (Aliyun mirror times out in some environments)
+[source.crates-io]
+replace-with = "aliyun"
+[source.aliyun]
+registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"
