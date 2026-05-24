@@ -486,6 +486,12 @@ if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
         FEATURES+=("curvine-ufs/jni")
         FEATURES+=("curvine-server/jni")
         ;;
+      spdk)
+        FEATURES+=("curvine-server/spdk")
+        ;;
+      spdk-rdma)
+        FEATURES+=("curvine-server/spdk-rdma")
+        ;;
       *)
         # For other features, add as-is (might be package-specific)
         FEATURES+=("$feature")
