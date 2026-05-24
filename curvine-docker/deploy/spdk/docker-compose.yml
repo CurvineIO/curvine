@@ -13,7 +13,7 @@
 x-target-base: &target-base
   build:
     context: ../../..
-    dockerfile: curvine-docker/deploy/spdk/Dockerfile
+    dockerfile: curvine-docker/deploy/Dockerfile_rocky9
     target: target-runtime
   privileged: true
   volumes:
