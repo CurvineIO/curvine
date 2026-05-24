@@ -1,8 +1,16 @@
 """Basic tests for curvine-lancedb Python SDK."""
+import os
+import uuid
+
 import pyarrow as pa
 import pytest
 
 import curvine_lancedb
+
+requires_curvine = pytest.mark.skipif(
+    not os.environ.get("CURVINE_CONF_FILE"),
+    reason="CURVINE_CONF_FILE not set; live Curvine cluster required",
+)
 
 
 @pytest.fixture
@@ -105,3 +113,43 @@ class TestTable:
         df = result.to_pandas()
         assert len(df) == 2
         assert list(df.columns) == ["name", "score"]
+
+
+@requires_curvine
+class TestCurvineIntegration:
+    """Integration tests against a live Curvine cluster (curvine:// URIs).
+
+    Mirrors the Rust-side lancedb_smoke.rs. Skipped unless CURVINE_CONF_FILE is set.
+    """
+
+    @pytest.mark.asyncio
+    async def test_connect_create_query_drop(self):
+        conf = os.environ["CURVINE_CONF_FILE"]
+        table_name = f"py_sdk_smoke_{uuid.uuid4().hex[:12]}"
+        db_uri = f"curvine:///tmp/{table_name}"
+
+        conn = await (
+            curvine_lancedb.connect(db_uri)
+            .storage_option("curvine.conf.path", conf)
+            .execute()
+        )
+
+        data = pa.record_batch({
+            "id": [1, 2, 3],
+            "name": ["Alice", "Bob", "Charlie"],
+            "score": [95.5, 87.0, 92.3],
+        })
+        table = await conn.create_table(table_name, data)
+        assert table is not None
+
+        names = await conn.table_names()
+        assert table_name in names
+
+        count = await table.count_rows()
+        assert count == 3
+
+        result = await table.search().to_arrow()
+        assert result.num_rows == 3
+        assert set(result.column_names) == {"id", "name", "score"}
+
+        await conn.drop_table(table_name)
