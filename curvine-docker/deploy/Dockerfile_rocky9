@@ -1,20 +1,7 @@
 # ============================================================
-# Base image with CDN mirror fix (avoid geolocated mirrorlist issues)
-# ============================================================
-FROM rockylinux:9 AS rocky-base
-
-RUN for repo in /etc/yum.repos.d/*.repo; do \
-        [ -f "$repo" ] || continue; \
-        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
-        sed -i 's/^metalink=/#metalink=/g' "$repo"; \
-        sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
-        sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
-    done
-
-# ============================================================
 # EPEL + CRB (shared by spdk-deps and spdk-full)
 # ============================================================
-FROM rocky-base AS epel-base
+FROM rockylinux:9 AS epel-base
 
 RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     dnf install -y epel-release && \
@@ -162,8 +149,6 @@ ENV SPDK_DIR=/opt/spdk
 ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
 
 # Install SPDK linking dependencies (static .a libs)
-# epel-release needed here: compile image does not include it
-# CRB is already enabled in the compile image (persisted in its layers)
 RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     dnf install -y epel-release && \
     dnf install -y numactl-devel libuuid-devel rdma-core-devel \
