@@ -102,6 +102,9 @@ print_help() {
   echo "  -d, --debug           Build in debug mode (default: release mode)"
   echo "  -f, --features LIST   Comma-separated list of extra features to enable"
   echo "  -z, --zip             Create zip archive"
+  echo "  --spdk                Enable SPDK NVMe-oF initiator support (TCP transport)"
+  echo "  --spdk-rdma           Enable SPDK NVMe-oF initiator support (TCP + RDMA transport)"
+  echo "  --spdk-dir PATH       Path to pre-built SPDK installation (default: /opt/spdk or \$SPDK_DIR)"
   echo "  --skip-java-sdk        Skip Java SDK compilation (useful for Docker builds)"
   echo "  --skip-python-sdk      Skip Python SDK compilation (useful for Docker builds)"
   echo "  -h, --help            Show this help message"
@@ -114,6 +117,9 @@ print_help() {
   echo "  $0 --ufs opendal-hdfs --ufs opendal-webhdfs  # Build with HDFS support"
   echo "  $0 --ufs oss-hdfs                         # Build with OSS-HDFS support (JindoSDK)"
   echo "  $0 --features jni --package client     # Build client with JNI support"
+  echo "  $0 --spdk                               # Build with SPDK TCP initiator support"
+  echo "  $0 --spdk-rdma                          # Build with SPDK RDMA initiator support"
+  echo "  $0 --spdk-rdma --spdk-dir /opt/spdk    # Build with SPDK at custom path"
   echo "  $0 --skip-java-sdk                      # Build all packages except Java SDK"
   echo "  $0 --skip-python-sdk                    # Build all packages except Python SDK"
   echo "  $0 -p java -p python                    # Build both Java and Python SDKs"
@@ -144,9 +150,12 @@ ALLOC=jemalloc
 CRATE_ZIP=""
 SKIP_JAVA_SDK=0    # Flag to skip Java SDK compilation
 SKIP_PYTHON_SDK=0  # Flag to skip Python SDK compilation
+ENABLE_SPDK=0      # Flag to enable SPDK TCP initiator support
+ENABLE_SPDK_RDMA=0 # Flag to enable SPDK RDMA initiator support
+SPDK_DIR="${SPDK_DIR:-}"  # Path to pre-built SPDK installation
 
 # Parse command line arguments
-TEMP=$(getopt -o p:u:f:a:dzhv --long package:,ufs:,features:,alloc:,debug,zip,skip-java-sdk,skip-python-sdk,help -n "$0" -- "$@")
+TEMP=$(getopt -o p:u:f:a:dzhv --long package:,ufs:,features:,alloc:,debug,zip,spdk,spdk-rdma,spdk-dir:,skip-java-sdk,skip-python-sdk,help -n "$0" -- "$@")
 if [ $? != 0 ] ; then print_help ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -184,6 +193,18 @@ while true ; do
     -z|--zip)
       CRATE_ZIP="zip"
       shift
+      ;;
+    --spdk)
+      ENABLE_SPDK=1
+      shift
+      ;;
+    --spdk-rdma)
+      ENABLE_SPDK_RDMA=1
+      shift
+      ;;
+    --spdk-dir)
+      SPDK_DIR="$2"
+      shift 2
       ;;
     --skip-java-sdk)
       SKIP_JAVA_SDK=1
@@ -465,6 +486,14 @@ if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
         FEATURES+=("curvine-ufs/jni")
         FEATURES+=("curvine-server/jni")
         ;;
+      spdk)
+        # SPDK NVMe-oF initiator support (TCP transport)
+        FEATURES+=("curvine-server/spdk")
+        ;;
+      spdk-rdma)
+        # SPDK NVMe-oF initiator support (TCP + RDMA transport)
+        FEATURES+=("curvine-server/spdk-rdma")
+        ;;
       *)
         # For other features, add as-is (might be package-specific)
         FEATURES+=("$feature")
@@ -475,6 +504,26 @@ fi
 
 # Append --alloc as a workspace feature: curvine-common/{jemalloc|mimalloc} → cargo --features
 FEATURES+=("curvine-common/${ALLOC}")
+
+# Add SPDK features if specified
+if [ $ENABLE_SPDK -eq 1 ]; then
+  FEATURES+=("curvine-server/spdk")
+  echo "Enabling SPDK NVMe-oF initiator support (TCP transport)"
+fi
+
+if [ $ENABLE_SPDK_RDMA -eq 1 ]; then
+  FEATURES+=("curvine-server/spdk-rdma")
+  echo "Enabling SPDK NVMe-oF initiator support (TCP + RDMA transport)"
+fi
+
+# Set SPDK_DIR environment variable for build.rs
+if [ -n "$SPDK_DIR" ]; then
+  export SPDK_DIR
+  echo "Using SPDK_DIR=${SPDK_DIR}"
+elif [ -d "/opt/spdk" ]; then
+  export SPDK_DIR="/opt/spdk"
+  echo "Using default SPDK_DIR=/opt/spdk"
+fi
 
 # Add features to command if any
 if [ ${#FEATURES[@]} -gt 0 ]; then

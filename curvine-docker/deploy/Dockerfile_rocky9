@@ -1,4 +1,79 @@
+FROM rockylinux:9 AS spdk-rocky-base
+
+RUN for repo in /etc/yum.repos.d/*.repo; do \
+        [ -f "$repo" ] || continue; \
+        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
+        sed -i 's/^metalink=/#metalink=/g' "$repo"; \
+        sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
+        sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
+    done
+
+FROM spdk-rocky-base AS spdk-deps
+
+ARG SPDK_VERSION=v25.09
+ARG NASM_VERSION=2.16.03
+ARG ISAL_VERSION=v2.31.1
+
+RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
+    dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y git && \
+    dnf clean all
+
+RUN git clone --branch "$SPDK_VERSION" https://github.com/spdk/spdk.git /spdk
+WORKDIR /spdk
+RUN git submodule update --init --depth 1
+
+RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
+    dnf config-manager --set-disabled devel 2>/dev/null || true && \
+    scripts/pkgdep.sh --rdma && \
+    dnf clean all
+
+RUN curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
+    tar -xz -C /tmp && \
+    cd /tmp/nasm-$NASM_VERSION && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install && \
+    rm -rf /tmp/nasm-$NASM_VERSION
+
+RUN cd /tmp && \
+    git clone --depth 1 --branch $ISAL_VERSION https://github.com/intel/isa-l.git isa-l-src && \
+    cd isa-l-src && \
+    ./autogen.sh && \
+    ./configure && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd / && rm -rf /tmp/isa-l-src
+
+FROM spdk-deps AS spdk-build
+
+WORKDIR /spdk
+
+RUN ./configure \
+    --disable-tests \
+    --with-rdma \
+    --without-vfio-user \
+    --target-arch=native \
+    --with-shared && \
+    make -j$(nproc) && \
+    mkdir -p /opt/spdk && \
+    cp -r ./* /opt/spdk/ && \
+    ldconfig
+
+FROM rockylinux:9 AS spdk-libs
+
+COPY --from=spdk-build /opt/spdk /opt/spdk
+RUN cp /opt/spdk/isa-l/.libs/*.so* /usr/lib64/ && \
+    cp /opt/spdk/isa-l-crypto/.libs/*.so* /usr/lib64/ && \
+    ldconfig
+
+ENV SPDK_DIR=/opt/spdk
+
+# ============================================================
 # Build stage - Use pre-built compile image with all toolchains
+# ============================================================
 FROM ghcr.io/curvineio/curvine-compile:rocky9 AS builder
 
 # Add metadata labels
@@ -21,6 +96,21 @@ ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
 # Copy and build source code if building from source
 COPY . /workspace/
 WORKDIR /workspace
+
+# 5.5. Copy SPDK build artifacts for NVMe-oF initiator support
+COPY --from=spdk-libs /opt/spdk /opt/spdk
+ENV SPDK_DIR=/opt/spdk
+ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
+
+# Install SPDK linking dependencies (static .a libs)
+RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
+    dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf install -y numactl-devel libuuid-devel rdma-core-devel \
+    libibverbs-devel librdmacm-devel && \
+    cp /opt/spdk/isa-l/.libs/*.so* /usr/lib64/ && \
+    cp /opt/spdk/isa-l-crypto/.libs/*.so* /usr/lib64/ && \
+    ldconfig
 
 # 6. Pre-install WebUI dependencies and fix vue-cli-service module resolution
 RUN if [ -d "/workspace/curvine-web/webui" ]; then \
@@ -54,8 +144,8 @@ RUN echo "Building Curvine from source..." && \
     # Build with retry mechanism
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'; then \
-            echo "✓ Build succeeded with 'make all --skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'" && \
+        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs --spdk-rdma'; then \
+            echo "✓ Build succeeded with 'make all --skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs --spdk-rdma'" && \
             break; \
         else \
             echo "✗ Build attempt $attempt failed" && \
@@ -93,16 +183,37 @@ RUN mkdir -p /build-output && \
     echo "  conf/: $(ls -1 /build-output/conf 2>/dev/null | wc -l) files"
 
 # Runtime stage
-FROM rockylinux:9
+FROM rockylinux:9 AS runtime
 
-RUN dnf install -y --allowerasing \
+RUN for repo in /etc/yum.repos.d/*.repo; do \
+         [ -f "$repo" ] || continue; \
+         sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
+         sed -i 's/^metalink=/#metalink=/g' "$repo"; \
+         sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
+         sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
+done
+
+RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
+    dnf install -y --allowerasing \
     fuse3 \
     procps-ng \
     zlib \
     libstdc++ \
     python3 \
+    libaio \
+    numactl-libs \
+    libuuid \
+    openssl-libs \
+    rdma-core \
+    libibverbs \
+    librdmacm \
+    nvme-cli \
     && dnf clean all \
     && rm -rf /var/cache/dnf/*
+
+# Copy ISA-L shared libs for SPDK initiator (built from source, not in EPEL)
+COPY --from=spdk-libs /usr/lib64/libisal* /usr/lib64/
+RUN ldconfig
 
 # Copy JindoSDK from builder stage for OSS-HDFS support
 COPY --from=builder /opt/jindosdk /opt/jindosdk

@@ -57,7 +57,6 @@ tikv-jemalloc-sys = { workspace = true, optional = true }
 [features]
 jemalloc = [
     "dep:tikv-jemallocator",
-    "dep:tikv-jemalloc-ctl",
     "dep:tikv-jemalloc-sys",
 ]
 mimalloc = ["dep:mimalloc"]

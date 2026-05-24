@@ -13,7 +13,7 @@ orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-server = { workspace = true }
 curvine-client = { workspace = true }
-curvine-lancedb-rs = { workspace = true }
+# curvine-lancedb-rs = { workspace = true }
 curvine-ufs = { workspace = true }
 tokio  = { workspace = true }
 tracing = { workspace = true }
@@ -21,7 +21,7 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 log = { workspace = true }
 futures = { workspace = true }
-lance-io = "4.0.0"
+# lance-io = "4.0.0"
 object_store = "0.12.5"
 bytes = { workspace = true }
 once_cell = { workspace = true }

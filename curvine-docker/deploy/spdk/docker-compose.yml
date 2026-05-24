@@ -1,0 +1,78 @@
+# Curvine Full Stack (Master + Worker + SPDK NVMe-oF Target)
+#
+# Prerequisites (run on host before starting):
+#   sudo sysctl -w vm.nr_hugepages=1024
+#   sudo modprobe uio_pci_generic
+#   sudo modprobe nvme nvme-fabrics nvme-tcp
+#
+# make docker-compose-spdk
+#
+# To use a custom config:
+#   CURVINE_CONF_FILE=./my-cluster.toml make docker-compose-spdk
+
+x-target-base: &target-base
+  build:
+    context: ../../..
+    dockerfile: curvine-docker/deploy/spdk/Dockerfile
+    target: target-runtime
+  privileged: true
+  volumes:
+    - /sys:/sys:rw
+    - /lib/modules:/lib/modules:ro
+    - /dev:/dev
+  restart: unless-stopped
+  networks:
+    spdk:
+
+networks:
+  spdk:
+    name: spdk
+
+services:
+  # ============================================================
+  # SPDK NVMe-oF Targets (Storage Nodes) — one per physical device
+  # ============================================================
+  target-1:
+    <<: *target-base
+    hostname: target-1
+    environment:
+      SUBNQN: "nqn.2026-05.curvine:cnode1"
+      TRTYPE: "tcp"
+      TARGET_PORT: "4420"
+      MEM_SIZE: "1024"
+      NVME_PCI_ADDR: "${NVME_PCI_ADDR?Set NVME_PCI_ADDR to your NVMe device PCI address}"
+
+  # ============================================================
+  # Curvine Master
+  # ============================================================
+  master:
+    build:
+      context: ../../..
+      dockerfile: curvine-docker/deploy/Dockerfile_rocky9
+    volumes:
+      - ${CURVINE_CONF_FILE:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
+    command: ["master", "start"]
+    restart: unless-stopped
+    depends_on:
+      - target-1
+    networks:
+      spdk:
+
+  # ============================================================
+  # Curvine Worker
+  # ============================================================
+  worker:
+    build:
+      context: ../../..
+      dockerfile: curvine-docker/deploy/Dockerfile_rocky9
+    privileged: true
+    volumes:
+      - /dev/hugepages:/dev/hugepages
+      - ${CURVINE_CONF_FILE:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
+    depends_on:
+      - master
+      - target-1
+    command: ["worker", "start"]
+    restart: unless-stopped
+    networks:
+      spdk:
