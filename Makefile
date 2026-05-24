@@ -199,9 +199,9 @@ docker-build-spdk-target:
 	@echo "Building SPDK NVMe-oF target Docker image..."
 	docker build \
 		--target target-runtime \
-		-f curvine-docker/deploy/spdk/Dockerfile \
+		-f curvine-docker/deploy/Dockerfile_rocky9 \
 		-t curvine-spdk-target:latest \
-		curvine-docker/deploy/spdk/../../..
+		.
 	@echo "✓ SPDK target image built: curvine-spdk-target:latest"
 
 # Start SPDK target + initiator stack via docker compose (dev/test only)

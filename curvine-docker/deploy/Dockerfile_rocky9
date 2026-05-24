@@ -12,17 +12,37 @@ RUN for repo in /etc/yum.repos.d/*.repo; do \
     done
 
 # ============================================================
+# EPEL + CRB (shared by spdk-deps and spdk-full)
+# ============================================================
+FROM rocky-base AS epel-base
+
+RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
+    dnf install -y epel-release && \
+    dnf config-manager --set-enabled crb && \
+    dnf clean all
+
+# ============================================================
+# Common runtime packages (shared by spdk-full and runtime)
+# ============================================================
+FROM epel-base AS runtime-base
+
+RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
+    dnf install -y \
+    libaio numactl-libs libuuid openssl-libs \
+    python3 procps-ng \
+    rdma-core libibverbs librdmacm \
+    && dnf clean all
+
+# ============================================================
 # Stage 0: Install dependencies & clone SPDK
 # ============================================================
-FROM rocky-base AS spdk-deps
+FROM epel-base AS spdk-deps
 
 ARG SPDK_VERSION=v25.09
 ARG NASM_VERSION=2.16.03
 ARG ISAL_VERSION=v2.31.1
 
 RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
-    dnf install -y epel-release && \
-    dnf config-manager --set-enabled crb && \
     dnf install -y git && \
     dnf clean all
 
@@ -79,18 +99,11 @@ RUN ./configure \
 # ============================================================
 # Stage 2: Full runtime for NVMe-oF Target nodes
 # ============================================================
-FROM rocky-base AS spdk-full
+FROM runtime-base AS spdk-full
 
 RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
-    dnf install -y epel-release && \
-    dnf config-manager --set-enabled crb && \
     dnf install -y \
-    libaio numactl-libs libuuid ncurses-libs openssl-libs \
-    python3 \
-    kmod pciutils procps-ng \
-    libffi \
-    rdma-core libibverbs librdmacm \
-    fuse3-libs \
+    ncurses-libs kmod pciutils libffi fuse3-libs \
     && dnf clean all
 
 COPY --from=spdk-build /opt/spdk /opt/spdk
@@ -143,15 +156,16 @@ ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
 COPY . /workspace/
 WORKDIR /workspace
 
-# 5.5. Copy SPDK build artifacts for NVMe-oF initiator support
+# Copy SPDK build artifacts for NVMe-oF initiator support
 COPY --from=spdk-build /opt/spdk /opt/spdk
 ENV SPDK_DIR=/opt/spdk
 ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
 
 # Install SPDK linking dependencies (static .a libs)
+# epel-release needed here: compile image does not include it
+# CRB is already enabled in the compile image (persisted in its layers)
 RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     dnf install -y epel-release && \
-    dnf config-manager --set-enabled crb && \
     dnf install -y numactl-devel libuuid-devel rdma-core-devel \
     libibverbs-devel librdmacm-devel && \
     cp /opt/spdk/isa-l/.libs/*.so* /usr/lib64/ && \
@@ -229,33 +243,12 @@ RUN mkdir -p /build-output && \
     echo "  conf/: $(ls -1 /build-output/conf 2>/dev/null | wc -l) files"
 
 # Runtime stage
-FROM rockylinux:9 AS runtime
-
-RUN for repo in /etc/yum.repos.d/*.repo; do \
-         [ -f "$repo" ] || continue; \
-         sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
-         sed -i 's/^metalink=/#metalink=/g' "$repo"; \
-         sed -i 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://dl.rockylinux.org/pub/rocky|g' "$repo"; \
-         sed -i 's|^#baseurl=https://download.example/pub/epel|baseurl=https://dl.fedoraproject.org/pub/epel|g' "$repo"; \
-    done
+FROM runtime-base AS runtime
 
 RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     dnf install -y --allowerasing \
-    fuse3 \
-    procps-ng \
-    zlib \
-    libstdc++ \
-    python3 \
-    libaio \
-    numactl-libs \
-    libuuid \
-    openssl-libs \
-    rdma-core \
-    libibverbs \
-    librdmacm \
-    nvme-cli \
-    && dnf clean all \
-    && rm -rf /var/cache/dnf/*
+    fuse3 zlib libstdc++ nvme-cli \
+    && dnf clean all && rm -rf /var/cache/dnf/*
 
 # Copy ISA-L shared libs for SPDK initiator (built from source, not in EPEL)
 COPY --from=spdk-build /opt/spdk/isa-l/.libs/libisal* /usr/lib64/
