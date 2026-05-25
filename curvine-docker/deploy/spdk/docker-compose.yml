@@ -34,7 +34,8 @@ services:
       SUBNQN: "nqn.2026-05.curvine:cnode1"
       TRTYPE: "tcp"
       TARGET_PORT: "4420"
-      MEM_SIZE: "1024"
+      TARGET_IP: "127.0.0.1"
+      MEM_SIZE: "128"
       NVME_PCI_ADDR: "${NVME_PCI_ADDR?Set NVME_PCI_ADDR to your NVMe device PCI address}"
 
   # ============================================================
