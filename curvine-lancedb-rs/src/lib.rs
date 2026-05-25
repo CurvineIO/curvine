@@ -14,6 +14,7 @@
 
 pub use lancedb_upstream::arrow;
 pub mod connection;
+mod curvine_safe_commit_database;
 pub mod error;
 pub mod object_store;
 pub use lancedb_upstream::data;
@@ -32,7 +33,8 @@ pub use lancedb_upstream::table;
 pub use lancedb_upstream::utils;
 
 pub use connection::{
-    connect, connect_namespace, ConnectBuilder, ConnectNamespaceBuilder, Connection,
+    connect, connect_namespace, CloneTableBuilder, ConnectBuilder, ConnectNamespaceBuilder,
+    Connection,
 };
 pub use error::{Error, Result};
 pub use lance_io::object_store::ObjectStoreProvider;

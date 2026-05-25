@@ -24,7 +24,9 @@ lance-namespace = "4.0.0"
 lance-table = "4.0.0"
 lancedb_upstream = { package = "lancedb", version = "0.27.2", default-features = false }
 md-5 = { workspace = true }
+once_cell = { workspace = true }
 object_store = "0.12.5"
+orpc = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
