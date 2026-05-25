@@ -41,10 +41,10 @@ RUN echo "Building Curvine from source..." && \
     mkdir -p /workspace/tmp && \
     export TMPDIR=/workspace/tmp && \
     echo "Using TMPDIR=$TMPDIR for compilation temporary files" && \
-    echo "Running 'make all' with --skip-java-sdk (CSI doesn't need Java SDK)..." && \
+    echo "Running 'make all' with --skip-java-sdk --skip-python-sdk (CSI doesn't need Java/Python SDKs)..." && \
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'; then \
+        if make all ARGS='--skip-java-sdk --skip-python-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs'; then \
             echo "✓ Build succeeded" && \
             break; \
         else \

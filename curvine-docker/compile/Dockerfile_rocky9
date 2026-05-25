@@ -27,6 +27,7 @@ RUN dnf install -y dnf-plugins-core && \
     python3 \
     python3-pip \
     java-1.8.0-openjdk-devel \
+    which \
     openssl-devel \
     libstdc++-devel \
     libstdc++-static \
