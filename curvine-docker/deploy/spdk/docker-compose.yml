@@ -70,8 +70,10 @@ services:
       - /dev/hugepages:/dev/hugepages
       - ${CURVINE_CONF_FILE:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
     depends_on:
-      - master
-      - target-1
+      master:
+        condition: service_started
+      target-1:
+        condition: service_healthy
     command: ["worker", "start"]
     restart: unless-stopped
     networks:
