@@ -318,7 +318,7 @@ fi
 
 build_curvine_libsdk() {
   local sdk_feature="$1"
-  local sdk_cmd="cargo build $PROFILE -p curvine-libsdk --no-default-features --features curvine-common/${ALLOC},${sdk_feature}"
+  local sdk_cmd="cargo build $PROFILE -p curvine-libsdk --no-default-features --features curvine-common/system,${sdk_feature}"
   echo "Building curvine-libsdk with feature: ${sdk_feature}"
   echo "Build command: ${sdk_cmd}"
   eval "$sdk_cmd"
