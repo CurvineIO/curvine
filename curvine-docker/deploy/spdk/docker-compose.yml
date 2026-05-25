@@ -50,8 +50,6 @@ services:
       - ${CURVINE_CONF_FILE:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
     command: ["master", "start"]
     restart: unless-stopped
-    depends_on:
-      - target-1
 
   # ============================================================
   # Curvine Worker

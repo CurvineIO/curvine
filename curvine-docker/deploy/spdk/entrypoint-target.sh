@@ -9,7 +9,7 @@
 #   TRTYPE          — Transport type: tcp or rdma (default: tcp)
 #   TARGET_PORT     — NVMe-oF listener port (default: 4420)
 #   REACTOR_MASK    — CPU core mask (default: 0x3)
-#   MEM_SIZE        — Memory size in MB (default: 1024)
+#   MEM_SIZE        — Memory size in MB (default: 128)
 #   NR_HUGE_PAGES   — Number of 2MB hugepages to allocate (default: 1024)
 #   SERIAL          — NVMe subsystem serial number (default: SPDK0001)
 
@@ -21,7 +21,7 @@ set -euo pipefail
 SPDK_DIR="${SPDK_DIR:-/opt/spdk}"
 NVME_PCI_ADDR="${NVME_PCI_ADDR:-}"
 REACTOR_MASK="${REACTOR_MASK:-0x3}"
-MEM_SIZE="${MEM_SIZE:-1024}"
+MEM_SIZE="${MEM_SIZE:-128}"
 NR_HUGE_PAGES="${NR_HUGE_PAGES:-1024}"
 SERIAL="${SERIAL:-SPDK0001}"
 
