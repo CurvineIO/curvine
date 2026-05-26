@@ -449,7 +449,7 @@ impl FsDir {
     pub fn list_status(&self, inp: &InodePath) -> FsResult<Vec<FileStatus>> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
-            None => return err_box!("File {} not exists", inp.path()),
+            None => return Err(FsError::file_not_found(inp.path())),
         };
 
         match inode.as_ref() {
@@ -465,7 +465,7 @@ impl FsDir {
                 let inode_opt = self.store.get_inode(e.id, Some(&e.name))?;
                 match inode_opt {
                     Some(inode_view) => Ok(vec![inode_view.to_file_status(inp.path())]),
-                    None => err_box!("File {} not exists", inp.path()),
+                    None => Err(FsError::file_not_found(inp.path())),
                 }
             }
         }
@@ -486,7 +486,7 @@ impl FsDir {
     pub fn list_options(&self, inp: &InodePath, opts: &ListOptions) -> FsResult<Vec<FileStatus>> {
         let inode = match inp.get_last_inode() {
             Some(v) => v,
-            None => return err_box!("File {} not exists", inp.path()),
+            None => return Err(FsError::file_not_found(inp.path())),
         };
 
         match inode.as_ref() {
@@ -508,7 +508,7 @@ impl FsDir {
                         let status = inode_view.to_file_status(inp.path());
                         Ok(Self::list_single_file(status, opts))
                     }
-                    None => err_box!("File {} not exists", inp.path()),
+                    None => Err(FsError::file_not_found(inp.path())),
                 }
             }
         }
