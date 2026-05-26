@@ -49,6 +49,12 @@ case "$TRTYPE" in
     *) print_error "Invalid TRTYPE='$TRTYPE' (expected tcp|rdma)"; exit 1 ;;
 esac
 
+# Validate required PCI address
+if [ -z "$NVME_PCI_ADDR" ]; then
+    print_error "NVME_PCI_ADDR is required (set to your NVMe device PCI address, e.g. 0000:01:00.0)"
+    exit 1
+fi
+
 print_info "Config: SUBNQN=$SUBNQN TRTYPE=$TRTYPE PORT=$TARGET_PORT PCI=$NVME_PCI_ADDR"
 
 # ============================================================
