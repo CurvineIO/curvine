@@ -18,9 +18,7 @@ pub struct PyQuery {
 
 impl PyQuery {
     pub fn new(query: UpstreamQuery) -> Self {
-        Self {
-            inner: Some(query),
-        }
+        Self { inner: Some(query) }
     }
 }
 
@@ -75,9 +73,7 @@ pub struct PyVectorQuery {
 
 impl PyVectorQuery {
     pub fn new(query: UpstreamVectorQuery) -> Self {
-        Self {
-            inner: Some(query),
-        }
+        Self { inner: Some(query) }
     }
 }
 
