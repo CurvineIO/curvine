@@ -21,7 +21,11 @@ impl PyConnection {
     fn table_names<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.inner.upstream.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let names = conn.table_names().execute().await.map_err(error::to_py_err)?;
+            let names = conn
+                .table_names()
+                .execute()
+                .await
+                .map_err(error::to_py_err)?;
             Ok(names)
         })
     }
