@@ -47,7 +47,7 @@ services:
       dockerfile: curvine-docker/deploy/Dockerfile_rocky9
     network_mode: "host"
     volumes:
-      - ${CURVINE_CONF_FILE:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
+      - ${CURVINE_CONF_FILE:-./curvine-cluster-spdk.toml}:/app/curvine/conf/curvine-cluster.toml
     command: ["master", "start"]
     restart: unless-stopped
 
@@ -62,7 +62,7 @@ services:
     privileged: true
     volumes:
       - /dev/hugepages:/dev/hugepages
-      - ${CURVINE_CONF_FILE:-./curvine-cluster.toml}:/app/curvine/conf/curvine-cluster.toml
+      - ${CURVINE_CONF_FILE:-./curvine-cluster-spdk.toml}:/app/curvine/conf/curvine-cluster.toml
     depends_on:
       master:
         condition: service_started
