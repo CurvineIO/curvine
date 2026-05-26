@@ -30,14 +30,17 @@ orpc = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
-
-[dev-dependencies]
 arrow-array = "57.2"
 arrow-schema = "57.2"
+pyo3 = { version = "0.25.1", features = ["extension-module", "abi3-py38"], optional = true }
+pyo3-async-runtimes = { version = "0.25.0", features = ["tokio-runtime"], optional = true }
+
+[dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
 default = []
+python-sdk = ["dep:pyo3", "dep:pyo3-async-runtimes"]
 aws = ["lancedb_upstream/aws"]
 azure = ["lancedb_upstream/azure"]
 bedrock = ["lancedb_upstream/bedrock"]

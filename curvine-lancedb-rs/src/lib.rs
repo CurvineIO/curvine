@@ -42,3 +42,6 @@ pub use lancedb_upstream::DistanceType;
 pub use lancedb_upstream::ObjectStoreRegistry;
 pub use lancedb_upstream::Session;
 pub use table::Table;
+
+#[cfg(feature = "python-sdk")]
+pub mod python;
