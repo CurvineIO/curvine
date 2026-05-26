@@ -208,7 +208,7 @@ RUN echo "Building Curvine from source..." && \
     # Build with retry mechanism
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all ARGS='--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs '"${SPDK_FLAG}"'; then \
+        if make all ARGS="--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs ${SPDK_FLAG}"; then \
             echo "✓ Build succeeded with 'make all --skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs ${SPDK_FLAG}'" && \
             break; \
         else \
