@@ -40,6 +40,15 @@ TARGET_PORT="${TARGET_PORT:-4420}"
 TRTYPE="${TRTYPE:-tcp}"
 TARGET_IP="${TARGET_IP:-0.0.0.0}"
 
+# Normalize to lowercase
+TRTYPE="${TRTYPE,,}"
+
+# Validate the TRTYPE
+case "$TRTYPE" in
+    tcp|rdma) ;;
+    *) print_error "Invalid TRTYPE='$TRTYPE' (expected tcp|rdma)"; exit 1 ;;
+esac
+
 print_info "Config: SUBNQN=$SUBNQN TRTYPE=$TRTYPE PORT=$TARGET_PORT PCI=$NVME_PCI_ADDR"
 
 # ============================================================
