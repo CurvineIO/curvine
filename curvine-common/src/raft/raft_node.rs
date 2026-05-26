@@ -466,8 +466,8 @@ where
 
         if let Some(ss) = soft_state {
             info!(
-                "raft state change, current leader {}, node {}",
-                self.group.get_addr_string(self.leader()),
+                "raft state change, current leader address {}, node {}",
+                self.group.get_addr_only_string(self.leader()),
                 self.group.get_addr_string(self.id()),
             );
 

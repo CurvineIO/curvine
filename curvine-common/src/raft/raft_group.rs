@@ -52,6 +52,16 @@ impl RaftGroup {
         }
     }
 
+    pub fn get_addr_only_string(&self, id: u64) -> String {
+        if id == 0 {
+            return "unknown".to_string();
+        }
+        match self.peers.get(&id) {
+            None => format!("{}", id),
+            Some(v) => format!("{}:{}", v.hostname, v.port),
+        }
+    }
+
     pub fn voters(&self) -> Vec<u64> {
         self.peers.iter().map(|x| *x.0).collect()
     }
@@ -119,5 +129,34 @@ impl RaftGroup {
 
     pub fn remove(&mut self, id: &NodeId) {
         self.peers.remove(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_addr_only_string_returns_address_when_peer_exists() {
+        let mut peers = HashMap::new();
+        peers.insert(1, RaftPeer::new(1, "master-1", 8996));
+
+        let group = RaftGroup::new("test", peers);
+
+        assert_eq!("master-1:8996", group.get_addr_only_string(1));
+    }
+
+    #[test]
+    fn get_addr_only_string_falls_back_to_id_when_peer_is_unknown() {
+        let group = RaftGroup::new("test", HashMap::new());
+
+        assert_eq!("2", group.get_addr_only_string(2));
+    }
+
+    #[test]
+    fn get_addr_only_string_returns_unknown_for_zero_leader_id() {
+        let group = RaftGroup::new("test", HashMap::new());
+
+        assert_eq!("unknown", group.get_addr_only_string(0));
     }
 }
