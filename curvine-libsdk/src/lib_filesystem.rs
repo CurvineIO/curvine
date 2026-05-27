@@ -82,13 +82,13 @@ impl LibFilesystem {
         let writer = self
             .rt
             .block_on(async { self.inner.create(&path, overwrite).await })?;
-        Ok(LibFsWriter::new(self.rt.clone(), writer))
+        Ok(LibFsWriter::new(self.rt.clone(), writer, self.inner.conf()))
     }
 
     pub fn append(&self, path: impl AsRef<str>) -> FsResult<LibFsWriter> {
         let path = Path::from_str(path)?;
         let writer = self.rt.block_on(async { self.inner.append(&path).await })?;
-        Ok(LibFsWriter::new(self.rt.clone(), writer))
+        Ok(LibFsWriter::new(self.rt.clone(), writer, self.inner.conf()))
     }
 
     pub fn get_master_info(&self) -> FsResult<BytesMut> {
