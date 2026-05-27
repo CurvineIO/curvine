@@ -58,6 +58,7 @@ This script tests basic filesystem operations including:
   - Symbolic and hard links
   - File permissions (chmod, chown, chgrp)
   - Sed in-place editing
+  - Pwrite visibility (file size and content after pwrite)
 
 For FIO performance tests, use fio-test.sh instead.
 
@@ -1245,6 +1246,50 @@ test_fuse_reload() {
     fi
 }
 
+# Test 17: Pwrite visibility test
+test_pwrite_visibility() {
+    CURRENT_TEST_GROUP="Test 17: Pwrite Visibility"
+    print_header "$CURRENT_TEST_GROUP"
+
+    if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+        print_info "Python not available, skipping pwrite visibility test"
+        return
+    fi
+
+    local python_cmd
+    python_cmd=$(command -v python3 2>/dev/null || command -v python)
+    local test_script="$SCRIPT_DIR/scripts/visibility_test.py"
+
+    if [ ! -f "$test_script" ]; then
+        print_info "Pwrite visibility test script not found: $test_script"
+        print_info "Skipping pwrite visibility test"
+        return
+    fi
+
+    print_test "Testing file size and content visibility after pwrite"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+    local start_time
+    start_time=$(date +%s)
+    local result=0
+
+    if $python_cmd "$test_script" --dir "$TEST_DIR" 2>&1; then
+        result=0
+    else
+        result=$?
+    fi
+
+    local end_time
+    end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+
+    if [ $result -eq 0 ]; then
+        print_success "Pwrite visibility test completed successfully in ${elapsed}s"
+    else
+        handle_error "Pwrite visibility test failed" "python $test_script --dir $TEST_DIR"
+    fi
+}
+
 # Test 16: Git clone operations
 test_git_clone() {
     CURRENT_TEST_GROUP="Test 16: Git Clone Operations"
@@ -1393,6 +1438,7 @@ main() {
     test_delayed_delete
     test_python_high_frequency_write
     test_fuse_reload
+    test_pwrite_visibility
     test_git_clone
 
     print_info "All test functions completed"
