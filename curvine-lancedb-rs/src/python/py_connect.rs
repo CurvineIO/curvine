@@ -23,7 +23,11 @@ impl PyConnectBuilder {
 
 #[pymethods]
 impl PyConnectBuilder {
-    fn storage_option(mut slf: PyRefMut<Self>, key: String, value: String) -> PyResult<PyRefMut<Self>> {
+    fn storage_option(
+        mut slf: PyRefMut<Self>,
+        key: String,
+        value: String,
+    ) -> PyResult<PyRefMut<Self>> {
         let builder = slf.inner.take().ok_or_else(already_consumed_err)?;
         slf.inner = Some(builder.storage_option(key, value));
         Ok(slf)
