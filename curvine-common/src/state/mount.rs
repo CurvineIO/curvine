@@ -435,6 +435,12 @@ mod tests {
             info.get_ufs_path(&path).unwrap().full_path(),
             "s3://spark/test1/test/dt=2025/1.csv"
         );
+
+        let path = Path::from_str("cv://curvine-pro/spark/test1/test/dt=2025/1.csv").unwrap();
+        assert_eq!(
+            info.get_ufs_path(&path).unwrap().full_path(),
+            "s3://spark/test1/test/dt=2025/1.csv"
+        );
     }
 
     #[test]
