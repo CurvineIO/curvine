@@ -213,8 +213,11 @@ impl Path {
         let mut current_path = if self.is_cv() {
             Self::SEPARATOR.to_string()
         } else {
-            match self.scheme() {
-                Some(FsKind::SCHEME_FILE) => {
+            match self
+                .scheme()
+                .expect("non-CV paths must have a non-CV scheme")
+            {
+                FsKind::SCHEME_FILE => {
                     let sp = if self.path.starts_with(Self::SEPARATOR) {
                         Self::SEPARATOR
                     } else {
@@ -228,13 +231,12 @@ impl Path {
                         self.authority().unwrap_or("")
                     )
                 }
-                Some(v) => format!(
+                v => format!(
                     "{}{}{}",
                     v,
                     Self::SCHEME_DELIMITER,
                     self.authority().unwrap_or("")
                 ),
-                None => Self::SEPARATOR.to_string(),
             }
         };
 
