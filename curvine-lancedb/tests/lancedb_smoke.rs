@@ -7,7 +7,10 @@
 //!
 //! ```text
 //! CURVINE_CONF_FILE=/path/to/cluster.toml \
-//!   cargo test -p curvine-lancedb-rs --test lancedb_smoke -- --ignored
+//!   cargo test -p curvine-lancedb --test lancedb_smoke -- --ignored
+//!
+//! CURVINE_MASTER_ADDRS=host1:8995,host2:8995 \
+//!   cargo test -p curvine-lancedb --test lancedb_smoke -- --ignored
 //! ```
 
 use std::env;
@@ -19,19 +22,32 @@ use arrow_schema::{DataType, Field, Schema};
 use curvine_common::conf::ClusterConf;
 use futures::TryStreamExt;
 use lancedb::connect;
-use lancedb::object_store::CURVINE_CONF_FILE_KEY;
+use lancedb::object_store::{CURVINE_CONF_FILE_KEY, CURVINE_MASTER_ADDRS_KEY};
 use lancedb::query::ExecutableQuery;
 
 #[tokio::test]
-#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test lancedb_smoke -- --ignored"]
+#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb --test lancedb_smoke -- --ignored"]
 async fn lancedb_curvine_smoke_connect_table_query_names() {
-    let conf = match env::var(ClusterConf::ENV_CONF_FILE) {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("Skipping live LanceDB smoke test: CURVINE_CONF_FILE is not set");
-            return;
-        }
+    let storage_option = match env::var("CURVINE_MASTER_ADDRS") {
+        Ok(v) => (CURVINE_MASTER_ADDRS_KEY, v),
+        Err(_) => match env::var(ClusterConf::ENV_CONF_FILE) {
+            Ok(v) => (CURVINE_CONF_FILE_KEY, v),
+            Err(_) => {
+                eprintln!(
+                    "Skipping live LanceDB smoke test: neither CURVINE_MASTER_ADDRS nor CURVINE_CONF_FILE is set"
+                );
+                return;
+            }
+        },
     };
+
+    if storage_option.1.trim().is_empty() {
+        eprintln!(
+            "Skipping live LanceDB smoke test: {} is empty",
+            storage_option.0
+        );
+        return;
+    }
 
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -41,7 +57,7 @@ async fn lancedb_curvine_smoke_connect_table_query_names() {
     let db_uri = format!("curvine:///tmp/{table_name}");
 
     let conn = connect(&db_uri)
-        .storage_option(CURVINE_CONF_FILE_KEY, conf.clone())
+        .storage_option(storage_option.0, storage_option.1.clone())
         .execute()
         .await
         .expect("connect curvine://");
@@ -54,7 +70,7 @@ async fn lancedb_curvine_smoke_connect_table_query_names() {
     .expect("record batch");
 
     conn.create_table(&table_name, batch)
-        .storage_option(CURVINE_CONF_FILE_KEY, conf.clone())
+        .storage_option(storage_option.0, storage_option.1.clone())
         .execute()
         .await
         .expect("create_table");

@@ -19,8 +19,8 @@ use std::path::MAIN_SEPARATOR;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::curvine_safe_commit_database::CurvineSafeCommitDatabase;
 use crate::object_store::curvine_session;
+use crate::safe_commit::SafeCommitDatabase;
 
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::Ref;
@@ -245,9 +245,9 @@ fn wrap_upstream_connection_for_curvine(
         .unwrap_or_else(|| Arc::new(MemoryRegistry::new()));
     let inner_db = upstream.database().clone();
     let wrapped: Arc<dyn Database> = if options.namespace_backed {
-        Arc::new(CurvineSafeCommitDatabase::new_namespace(inner_db))
+        Arc::new(SafeCommitDatabase::new_namespace(inner_db))
     } else {
-        Arc::new(CurvineSafeCommitDatabase::new(inner_db))
+        Arc::new(SafeCommitDatabase::new(inner_db))
     };
     UpstreamConnection::new(wrapped, embedding_registry)
 }
