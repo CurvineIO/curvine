@@ -139,7 +139,10 @@ impl UfsLoader {
                     src_ufs_path,
                     dst.full_path()
                 );
-                self.submit_load_task(&dst, &mnt).await?;
+                if let Some((_, dst_mnt)) = self.get_mnt(&dst)? {
+                    // Keep journal apply aligned with fs_mode's durable export contract.
+                    self.submit_load_task(&dst, &dst_mnt).await?;
+                }
                 return Ok(());
             }
 
