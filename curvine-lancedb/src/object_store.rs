@@ -60,8 +60,6 @@ pub const CURVINE_SCHEME: &str = "curvine";
 pub const CURVINE_CONF_FILE_KEY: &str = "curvine.conf.path";
 pub const CURVINE_MASTER_ADDRS_KEY: &str = "curvine.master_addrs";
 
-const MASTER_ADDRS_KEY_ALIAS: &str = "master_addrs";
-
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
 const MULTIPART_STAGING_ROOT: &str = "/.curvine/lancedb/multipart";
 const CONDITIONAL_LOCK_ROOT: &str = "/.curvine/lancedb/locks";
@@ -209,11 +207,7 @@ fn resolve_curvine_conf_path(storage_options: Option<&HashMap<String, String>>) 
 fn resolve_curvine_master_addrs(
     storage_options: Option<&HashMap<String, String>>,
 ) -> Option<String> {
-    storage_options.and_then(|opts| {
-        opts.get(CURVINE_MASTER_ADDRS_KEY)
-            .or_else(|| opts.get(MASTER_ADDRS_KEY_ALIAS))
-            .cloned()
-    })
+    storage_options.and_then(|opts| opts.get(CURVINE_MASTER_ADDRS_KEY).cloned())
 }
 
 fn cluster_conf_from_master_addrs(master_addrs: &str) -> Result<ClusterConf> {
@@ -228,16 +222,6 @@ fn cluster_conf_from_master_addrs(master_addrs: &str) -> Result<ClusterConf> {
     conf.client.init().map_err(|e| {
         LanceError::invalid_input(format!(
             "Failed to initialize Curvine client configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
-        ))
-    })?;
-    conf.fuse.init().map_err(|e| {
-        LanceError::invalid_input(format!(
-            "Failed to initialize Curvine fuse configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
-        ))
-    })?;
-    conf.job.init().map_err(|e| {
-        LanceError::invalid_input(format!(
-            "Failed to initialize Curvine job configuration from `{CURVINE_MASTER_ADDRS_KEY}`: {e}"
         ))
     })?;
     Ok(conf)
@@ -322,8 +306,8 @@ fn is_known_internal_dir(path: &CurvinePath) -> bool {
 fn missing_curvine_config_error() -> LanceError {
     LanceError::invalid_input(format!(
         "Missing Curvine cluster configuration: set storage option `{CURVINE_CONF_FILE_KEY}` \
-         (highest priority), `{CURVINE_MASTER_ADDRS_KEY}`, `{MASTER_ADDRS_KEY_ALIAS}`, \
-         or environment variable `{}` to the Curvine client configuration file path.",
+         (highest priority), `{CURVINE_MASTER_ADDRS_KEY}`, or environment variable `{}` \
+         to the Curvine client configuration file path.",
         ClusterConf::ENV_CONF_FILE
     ))
 }
@@ -1745,9 +1729,23 @@ fn is_not_found_error(error: &FsError) -> bool {
         return false;
     }
 
-    // Older Curvine clusters can return filesystem misses as Common errors
-    // with server-side "not exists" / "not found" messages. Object-store list
-    // and head semantics still require these to behave as missing objects.
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("not exists") || message.contains("not found")
+    let message = error.to_string();
+    is_curvine_missing_common_message(&message)
+}
+
+fn is_curvine_missing_common_message(message: &str) -> bool {
+    let trimmed = message.trim();
+    let trimmed = trimmed.strip_suffix(':').unwrap_or(trimmed).trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    lower == "path does not exist"
+        || lower == "directory does not exist"
+        || lower == "parent directory does not exist"
+        || lower.starts_with("file does not exist:")
+        || lower.starts_with("path not exists:")
+        || lower.starts_with("parent not exists:")
+        || lower.starts_with("parent path not exists:")
+        || (lower.starts_with("file ") && lower.ends_with(" not exists"))
+        || (lower.starts_with("parent ") && lower.ends_with(" does not exist"))
+        || (lower.starts_with("child ") && lower.ends_with(" not exists"))
 }

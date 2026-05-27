@@ -308,6 +308,72 @@ async fn facade_boundary_curvine_master_addrs_storage_option_precedes_env_conf()
 }
 
 #[tokio::test]
+async fn facade_boundary_curvine_conf_path_storage_option_precedes_master_addrs() {
+    let _guard = ENV_MUTEX.lock().await;
+    let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
+    env::remove_var(ClusterConf::ENV_CONF_FILE);
+
+    let result = connect("curvine:///data/lancedb/demo")
+        .storage_option(
+            CURVINE_CONF_FILE_KEY,
+            "/definitely/missing/curvine-cluster.toml",
+        )
+        .storage_option(CURVINE_MASTER_ADDRS_KEY, "missing-port")
+        .execute()
+        .await;
+
+    if let Some(val) = saved {
+        env::set_var(ClusterConf::ENV_CONF_FILE, val);
+    }
+
+    let err = match result {
+        Ok(_) => panic!("expected connect to fail while loading Curvine config path"),
+        Err(err) => err,
+    };
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("/definitely/missing/curvine-cluster.toml"),
+        "curvine.conf.path must take precedence over curvine.master_addrs; got {rendered}"
+    );
+    assert!(
+        !rendered.contains("Invalid `curvine.master_addrs` entry `missing-port`"),
+        "curvine.master_addrs unexpectedly took precedence over curvine.conf.path: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn facade_boundary_curvine_ignores_unprefixed_master_addrs_storage_option() {
+    let _guard = ENV_MUTEX.lock().await;
+    let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
+    env::remove_var(ClusterConf::ENV_CONF_FILE);
+
+    let result = connect("curvine:///data/lancedb/demo")
+        .storage_option("master_addrs", "missing-port")
+        .execute()
+        .await;
+
+    if let Some(val) = saved {
+        env::set_var(ClusterConf::ENV_CONF_FILE, val);
+    }
+
+    let err = match result {
+        Ok(_) => panic!("expected connect to fail without canonical Curvine configuration"),
+        Err(err) => err,
+    };
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("Missing Curvine cluster configuration"),
+        "unprefixed master_addrs must not be consumed by Curvine; got {rendered}"
+    );
+    assert!(
+        !rendered.contains("Invalid `curvine.master_addrs` entry `missing-port`"),
+        "unprefixed master_addrs unexpectedly configured Curvine: {rendered}"
+    );
+}
+
+#[tokio::test]
 async fn curvine_namespace_connect_preserves_explicit_session() {
     let _guard = ENV_MUTEX.lock().await;
     let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
