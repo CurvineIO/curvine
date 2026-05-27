@@ -203,7 +203,7 @@ impl JournalConf {
 
 impl Default for JournalConf {
     fn default() -> Self {
-        let journal_dir = Utils::test_sub_dir("journal");
+        let journal_dir = format!("testing/journal-{}", Utils::rand_id());
         let journal_addrs = vec![RaftPeer::new(
             1,
             ClusterConf::DEFAULT_HOSTNAME,
