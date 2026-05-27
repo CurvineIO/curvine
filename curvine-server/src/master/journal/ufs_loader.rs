@@ -134,7 +134,12 @@ impl UfsLoader {
         let dst = Path::from_str(&e.dst)?;
         if let Some((src_ufs_path, mnt)) = self.get_mnt(&src)? {
             if !mnt.ufs.exists(&src_ufs_path).await? {
-                warn!("rename: src file not exists: {}", src_ufs_path);
+                warn!(
+                    "rename: src file not exists: {}, loading dst {}",
+                    src_ufs_path,
+                    dst.full_path()
+                );
+                self.submit_load_task(&dst, &mnt).await?;
                 return Ok(());
             }
 
