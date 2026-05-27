@@ -14,6 +14,7 @@
 
 package io.curvine;
 
+import java.nio.Buffer;
 import java.nio.charset.StandardCharsets;
 import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -31,8 +32,8 @@ import java.util.regex.Pattern;
 public class CurvineNative {
     public static final Logger LOGGER = LoggerFactory.getLogger(CurvineNative.class);
     private static final Constructor<?> DBB_CONSTRUCTOR;
+    private static final Field DBB_ADDRESS;
     private static final File WORKDIR;
-
 
     public static final String LIBRARY_PATH = "java.library.path";
     public static final String NATIVE_WORKDIR = "curvine.native.workdir";
@@ -55,6 +56,11 @@ public class CurvineNative {
             Field cleanerField = cls.getDeclaredField("cleaner");
             cleanerField.setAccessible(true);
             DBB_CONSTRUCTOR = constructor;
+
+            Field unsafeField = Buffer.class.getDeclaredField("address");
+            unsafeField.setAccessible(true);
+            DBB_ADDRESS = unsafeField;
+
             WORKDIR = getWorkerDir();
         } catch (ClassNotFoundException | NoSuchMethodException | NoSuchFieldException e) {
             throw new IllegalStateException(e);
@@ -67,6 +73,17 @@ public class CurvineNative {
     static ByteBuffer createBuffer(long[] tmp) throws IOException {
         try {
             return (ByteBuffer) DBB_CONSTRUCTOR.newInstance(tmp[0], (int) tmp[1]);
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+    }
+
+    public static long getAddress(ByteBuffer buf) throws IOException {
+        if (!buf.isDirect()) {
+            throw new IllegalArgumentException("only direct buffer");
+        }
+        try {
+            return DBB_ADDRESS.getLong(buf);
         } catch (Exception e) {
             throw new IOException(e);
         }
@@ -280,7 +297,9 @@ public class CurvineNative {
 
     public static native long append(long fs, String path, long[] tmp) throws IOException;
 
-    public static native long write(long nativeHandle, long address, int len) throws IOException;
+    public static native long allocChunk(long nativeHandle, long[] tmp) throws IOException;
+
+    public static native long write(long nativeHandle, long address, int len, long[] tmp) throws IOException;
 
     public static native long flush(long nativeHandle) throws IOException;
 
