@@ -53,14 +53,6 @@ jobs:
           rustc --version
           cargo --version
       
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "curvine-build"
-          cache-all-crates: false
-          # Cache target/ so release build and smoke tests can reuse artifacts (much faster on cache hit)
-          cache-targets: true
-      
       - name: Run fmt
         run: |
           echo "Running fmt check (fastest, no compilation needed)"
@@ -82,8 +74,8 @@ jobs:
       
       - name: Clean after clippy
         run: |
-          # Free disk by removing only clippy's incremental data; keep .rlib/.rmeta so
-          # Rust Cache (cache-targets) can reuse them for the release build
+          # Free disk by removing only clippy's incremental data; keep .rlib/.rmeta
+          # so the release build can reuse them within this job.
           rm -rf target/debug/incremental || true
           echo "After clippy cleanup, disk usage:"
           df -h
@@ -113,9 +105,9 @@ jobs:
       #       --summary-to-markdown "$GITHUB_STEP_SUMMARY"
         # On failure, summary is written to GitHub Step Summary; step exits non-zero so pipeline fails.
 
-      - name: Final cleanup before cache save
+      - name: Final cleanup
         run: |
-          echo "Final cleanup before cache save"
+          echo "Final cleanup"
           
           # Clean all temporary files
           rm -rf target/release/incremental || true
