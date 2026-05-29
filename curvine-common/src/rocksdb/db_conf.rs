@@ -379,7 +379,7 @@ impl DBConf {
 
 impl Default for DBConf {
     fn default() -> Self {
-        let dir = Utils::test_sub_dir(format!("testing/db-{}", Utils::rand_id()));
+        let dir = format!("testing/db-{}", Utils::rand_id());
         let base_dir = dir.as_str();
         Self {
             base_dir: base_dir.to_string(),

@@ -28,6 +28,8 @@ pub struct FuseConf {
     // Whether to output the request response log.
     pub debug: bool,
 
+    pub audit_logging_enabled: bool,
+
     pub io_threads: usize,
 
     pub worker_threads: usize,
@@ -129,6 +131,13 @@ pub struct FuseConf {
     pub write_back_cache: bool,
 
     pub cache_readdir: bool,
+
+    /// When metadata indicates a cache miss on open, use direct I/O instead of
+    /// dropping the kernel page cache. Default false preserves mmap/read coherence
+    /// (#850); set true to restore the pre-fix behavior for strict remote-read
+    /// freshness (log tailers, multi-writer pipelines). May break MAP_SHARED ↔
+    /// pread coherence when enabled.
+    pub direct_io_on_cache_miss: bool,
 
     pub non_seekable: bool,
 
@@ -269,6 +278,7 @@ impl Default for FuseConf {
     fn default() -> Self {
         let mut conf = Self {
             debug: false,
+            audit_logging_enabled: false,
 
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),
@@ -306,6 +316,7 @@ impl Default for FuseConf {
             direct_io: false,
             write_back_cache: false,
             cache_readdir: false,
+            direct_io_on_cache_miss: false,
             non_seekable: false,
             check_permission: true,
 

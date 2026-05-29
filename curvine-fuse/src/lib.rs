@@ -24,8 +24,10 @@ pub mod session;
 pub mod web_server;
 
 mod fuse_error;
-
 pub use self::fuse_error::FuseError;
+
+pub mod fuse_metrics;
+pub use self::fuse_metrics::FuseMetrics;
 
 mod fuse_utils;
 pub use self::fuse_utils::FuseUtils;

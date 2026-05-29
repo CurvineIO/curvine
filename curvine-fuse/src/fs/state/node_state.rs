@@ -18,7 +18,8 @@ use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
-    err_fuse, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC, STATE_FILE_VERSION,
+    err_fuse, FuseMetrics, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC,
+    STATE_FILE_VERSION,
 };
 use curvine_client::file::FsReader;
 use curvine_client::unified::{UnifiedFileSystem, UnifiedReader};
@@ -89,48 +90,38 @@ impl NodeState {
         self.node_read().get_check(id).cloned()
     }
 
-    /// Update node cache state and return cache validity info.
-    ///
-    /// Returns (is_first_access, is_changed) where:
-    /// - is_first_access: true if this is the first access (cache_valid was false)
-    /// - is_changed: true if file mtime or len has changed
-    ///
-    /// Usage patterns:
-    /// 1. For page cache (should_keep_cache):
-    ///    - Cache is valid if: is_first_access || !is_changed
-    ///    - First access OR unchanged mtime/len → cache is valid
-    ///    - We don't use kernel notification (FUSE_NOTIFY_INVAL_INODE) as it causes deadlocks in practice
-    ///
-    /// 2. For attr cache (should_keep_attr):
-    ///    - Cache is valid if: !is_first_access || !is_changed
-    ///    - Non-first access OR unchanged mtime/len → cache is valid
-    ///    - First access AND changed → cache is invalid (returns false)
-    ///    - Note: Non-first access always keeps cache (returns true), but mtime/len changes invalidate it
-    ///    - This helps prevent reading outdated attributes in time-sensitive scenarios (e.g., git clone)
-    ///    - The logic ensures that once a file is accessed, subsequent lookups with unchanged attributes
-    ///      can use cached values, but any change to mtime/len will force cache invalidation
-    fn update_cache_state(&self, id: u64, status: &FileStatus) -> FuseResult<(bool, bool)> {
+    fn update_cache_state(&self, id: u64, status: &FileStatus) -> bool {
         let mut lock = self.node_write();
-        let attr = lock.get_mut_check(id)?;
+        let Some(attr) = lock.get_mut(id) else {
+            return false;
+        };
 
-        let is_first_access = !attr.cache_valid;
         let is_changed = status.mtime != attr.mtime || status.len != attr.len;
 
         attr.cache_valid = true;
         attr.mtime = status.mtime;
         attr.len = status.len;
 
-        Ok((is_first_access, is_changed))
+        is_changed
     }
 
-    pub fn should_keep_cache(&self, id: u64, status: &FileStatus) -> FuseResult<bool> {
-        let (is_first_access, is_changed) = self.update_cache_state(id, status)?;
-        Ok(is_first_access || !is_changed)
+    pub fn should_keep_cache(&self, id: u64, status: &FileStatus) -> bool {
+        let is_changed = self.update_cache_state(id, status);
+        !is_changed
     }
 
-    pub fn should_keep_attr(&self, id: u64, status: &FileStatus) -> FuseResult<bool> {
-        let (is_first_access, is_changed) = self.update_cache_state(id, status)?;
-        Ok(!is_first_access || !is_changed)
+    pub async fn update_writer_len(&self, attr: &mut fuse_attr) {
+        if let Some(len) = self.get_writer_len(attr.ino).await {
+            attr.size = attr.size.max(len)
+        }
+    }
+
+    pub async fn get_writer_len(&self, ino: u64) -> Option<u64> {
+        if let Some(writer) = self.find_writer(&ino) {
+            return Some(writer.lock().await.len() as u64);
+        }
+
+        None
     }
 
     pub fn get_path_common<T: AsRef<str>>(&self, parent: u64, name: Option<T>) -> FuseResult<Path> {
@@ -536,6 +527,22 @@ impl NodeState {
         lock.values()
             .flat_map(|v| v.values().cloned())
             .collect::<Vec<_>>()
+    }
+
+    pub fn file_handles_len(&self) -> usize {
+        let lock = self.handles.read();
+        lock.values().map(|m| m.len()).sum()
+    }
+
+    pub fn dir_handles_len(&self) -> usize {
+        let lock = self.dir_handles.read();
+        lock.values().map(|m| m.len()).sum()
+    }
+
+    pub fn set_metrics(&self, m: &FuseMetrics) {
+        m.inode_num.set(self.node_read().nodes_len() as i64);
+        m.file_handle_num.set(self.file_handles_len() as i64);
+        m.dir_handle_num.set(self.dir_handles_len() as i64);
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {

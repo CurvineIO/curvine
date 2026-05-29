@@ -13,7 +13,7 @@ orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-server = { workspace = true }
 curvine-client = { workspace = true }
-curvine-lancedb-rs = { workspace = true }
+curvine-lancedb = { workspace = true }
 curvine-ufs = { workspace = true }
 tokio  = { workspace = true }
 tracing = { workspace = true }

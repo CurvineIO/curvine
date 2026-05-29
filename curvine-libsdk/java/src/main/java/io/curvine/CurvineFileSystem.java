@@ -25,7 +25,6 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.conf.StorageSize;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FSInputStream;
@@ -91,9 +90,6 @@ public class CurvineFileSystem extends FileSystem {
     private URI uri;
     private String cacheKey;  // Key used for mount cache lookup
 
-    private int writeChunkSize;
-    private int writeChunkNum;
-
     public final static String SCHEME = "cv";
 
     @Override
@@ -150,10 +146,6 @@ public class CurvineFileSystem extends FileSystem {
         
         this.cacheKey = filesystemConf.master_addrs;
         this.libFs = getOrCreateMount(filesystemConf);
-
-        StorageSize size = StorageSize.parse(filesystemConf.write_chunk_size);
-        this.writeChunkSize = (int) size.getUnit().toBytes(size.getValue());
-        this.writeChunkNum = filesystemConf.write_chunk_num;
     }
     
     /**
@@ -215,7 +207,7 @@ public class CurvineFileSystem extends FileSystem {
             statistics.incrementWriteOps(1);
         }
         long nativeHandle = this.libFs.create(formatPath(path), overwrite);
-        CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, 0, writeChunkSize, writeChunkNum);
+        CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, 0);
         return new FSDataOutputStream(output, statistics);
     }
 
@@ -227,7 +219,7 @@ public class CurvineFileSystem extends FileSystem {
 
         long[] tmp = new long[] {0};
         long nativeHandle = this.libFs.append(formatPath(path), tmp);
-        CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, tmp[0], writeChunkSize, writeChunkNum);
+        CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, tmp[0]);
         return new FSDataOutputStream(output, statistics, output.pos());
     }
 

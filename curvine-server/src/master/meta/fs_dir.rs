@@ -272,9 +272,9 @@ impl FsDir {
 
                 File(f) => {
                     let locs = f.get_locs(&self.store)?;
-                    let len = f.len;
+                    let bytes = f.get_locs_bytes(&locs);
                     if f.free(mtime) {
-                        free_res.add(len, locs);
+                        free_res.add(bytes, locs);
                         change_inodes.push(inode.as_ref().clone());
                     }
                 }

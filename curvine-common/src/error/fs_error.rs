@@ -346,7 +346,21 @@ impl From<RaftError> for FsError {
 
 impl From<std::io::Error> for FsError {
     fn from(value: io::Error) -> Self {
-        Self::IO(ErrorImpl::with_source(value))
+        match value.kind() {
+            io::ErrorKind::NotFound => {
+                Self::FileNotFound(ErrorImpl::with_source(value.to_string().into()))
+            }
+            io::ErrorKind::AlreadyExists => {
+                Self::FileAlreadyExists(ErrorImpl::with_source(value.to_string().into()))
+            }
+            io::ErrorKind::DirectoryNotEmpty => {
+                Self::DirNotEmpty(ErrorImpl::with_source(value.to_string().into()))
+            }
+            io::ErrorKind::Unsupported => {
+                Self::Unsupported(ErrorImpl::with_source(value.to_string().into()))
+            }
+            _ => Self::IO(ErrorImpl::with_source(value)),
+        }
     }
 }
 

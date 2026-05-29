@@ -21,6 +21,7 @@ use orpc::io::net::ConnState;
 use orpc::message::{Builder, Message};
 use orpc::CommonResult;
 use prost::Message as PMessage;
+use std::borrow::Cow;
 
 pub struct RpcContext<'a> {
     pub msg: &'a Message,
@@ -69,7 +70,7 @@ impl<'a> RpcContext<'a> {
         Ok(rep_msg)
     }
 
-    pub fn audit_log(&self, succeeded: bool, used_us: u64, conn_state: Option<&ConnState>) {
+    pub fn audit_log<T>(&self, res: &FsResult<T>, used_us: u64, conn_state: Option<&ConnState>) {
         if matches!(
             self.code,
             RpcCode::WorkerHeartbeat | RpcCode::WorkerBlockReport | RpcCode::GetMountTable
@@ -77,21 +78,26 @@ impl<'a> RpcContext<'a> {
             return;
         }
 
-        let src = match &self.audit_src {
-            None => "",
-            Some(v) => v,
-        };
-        let dst = match &self.audit_dst {
-            None => "",
-            Some(v) => v,
-        };
+        let src = self.audit_src.as_deref().unwrap_or("");
+        let dst = self.audit_dst.as_deref().unwrap_or("");
+        let ip = conn_state
+            .map(|s| s.remote_addr.hostname.as_str())
+            .unwrap_or("");
 
-        let ip = match conn_state {
-            None => "",
-            Some(v) => &v.remote_addr.hostname,
+        let err_suffix: Cow<'_, str> = match res.as_ref() {
+            Err(e) => Cow::Owned(format!(" err={:?}", e.kind())),
+            Ok(_) => Cow::Borrowed(""),
         };
-
-        info!(target: "audit", "cmd={:?} succeeded={} ip={} src={} dst={} executionTimeUs={}",
-            self.code, succeeded, ip, src, dst, used_us);
+        info!(
+            target: "audit",
+            "cmd={} ok={} ip={} src={} dst={} usedUs={}{}",
+            self.code,
+            res.is_ok(),
+            ip,
+            src,
+            dst,
+            used_us,
+            err_suffix,
+        );
     }
 }

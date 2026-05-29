@@ -48,15 +48,18 @@ fn main() -> CommonResult<()> {
 
     let fuse_rt = rt.clone();
 
-    rt.spawn(async move {
-        if let Err(e) = WebServer::start(cluster_conf.fuse.web_port).await {
-            tracing::error!("Failed to start metrics server: {}", e);
-        }
-    });
-
     rt.block_on(async move {
         let fs = CurvineFileSystem::new(cluster_conf, fuse_rt.clone()).unwrap();
         let conf = fs.conf().clone();
+
+        let node_state = fs.state().clone();
+        let web_port = conf.web_port;
+        fuse_rt.spawn(async move {
+            if let Err(e) = WebServer::start(web_port, node_state).await {
+                log::error!("Failed to start metrics server: {}", e);
+            }
+        });
+
         let mut session = FuseSession::new(fuse_rt.clone(), fs, conf).await.unwrap();
         session.run().await
     })?;
@@ -122,6 +125,12 @@ pub struct FuseArgs {
 
     #[arg(long, help = "Cache readdir results (optional)")]
     pub cache_readdir: Option<bool>,
+
+    #[arg(
+        long,
+        help = "Use direct I/O on open when local metadata indicates a cache miss (optional, default: false)"
+    )]
+    pub direct_io_on_cache_miss: Option<bool>,
 
     // Timeout settings
     #[arg(long, help = "Entry timeout in seconds (optional)")]
@@ -253,6 +262,10 @@ impl FuseArgs {
 
         if let Some(cache_readdir) = self.cache_readdir {
             conf.fuse.cache_readdir = cache_readdir;
+        }
+
+        if let Some(direct_io_on_cache_miss) = self.direct_io_on_cache_miss {
+            conf.fuse.direct_io_on_cache_miss = direct_io_on_cache_miss;
         }
 
         if let Some(entry_timeout) = self.entry_timeout {

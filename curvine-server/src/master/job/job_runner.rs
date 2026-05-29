@@ -25,6 +25,7 @@ use curvine_common::state::{
 };
 use curvine_common::utils::CommonUtils;
 use curvine_common::FsResult;
+use dashmap::mapref::entry::Entry;
 use futures::future;
 use log::{debug, error, info, warn};
 use orpc::common::{ByteUnit, FastHashMap, FastHashSet, LocalTime};
@@ -65,37 +66,63 @@ impl LoadJobRunner {
         }
     }
 
-    /// Returns true if we should skip submitting the load task (data already synced or job in progress).
     async fn check_job_exists(
         &self,
-        job_id: &str,
+        job: &JobContext,
         mnt: &MountValue,
         source_path: &Path,
         target_path: &Path,
-    ) -> FsResult<bool> {
-        // Job in progress: skip submit
-        if let Some(job) = self.jobs.get(job_id) {
-            let state: JobTaskState = job.state.state();
-            if state == JobTaskState::Pending || state == JobTaskState::Loading {
-                return Ok(true);
+    ) -> FsResult<Option<LoadJobResult>> {
+        if let Some(exist_job) = self.jobs.get(&job.info.job_id) {
+            let state: JobTaskState = exist_job.state.state();
+            if state.is_running() {
+                return Ok(Some(LoadJobResult::with_state(&exist_job.info, state)));
             }
         }
 
-        // Skip based on data state (even when job is None, e.g. after job cleanup)
+        // Data-state fast-path. Applies whether the slot was vacant or held
+        // a terminal ctx — e.g. after JobCleanupTask, after master restart +
+        // journal replay, or after an earlier run completed the sync.
+        //
+        // Only UFS→CV imports can be fast-skipped here; CV sources always
+        // need an explicit export task.
         if source_path.is_cv() {
-            Ok(false)
-        } else if let Ok(cv_status) = self.master_fs.file_status(target_path.path()) {
-            if cv_status.cv_valid(None) {
-                let source_status = mnt.ufs.get_status(source_path).await?;
-                Ok(cv_status.cv_valid(Some(&source_status)))
-            } else {
-                Ok(false)
-            }
+            return Ok(None);
+        }
+
+        // Target not present in Curvine yet — must load.
+        let cv_status = match self.master_fs.file_status(target_path.path()) {
+            Ok(cv_status) => cv_status,
+            Err(FsError::FileNotFound(_)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        // Cached target exists but its own metadata says it isn't usable — must reload.
+        if !cv_status.cv_valid(None) {
+            return Ok(None);
+        }
+
+        // Target looks valid locally; confirm against UFS source before skipping.
+        let source_status = mnt.ufs.get_status(source_path).await?;
+        if cv_status.cv_valid(Some(&source_status)) {
+            Ok(Some(LoadJobResult::with_state(
+                &job.info,
+                JobTaskState::Completed,
+            )))
         } else {
-            Ok(false)
+            Ok(None)
         }
     }
 
+    /// Submits a load job for the given source path (and mount).
+    ///
+    /// **Concurrency:** The job id is derived from the source path. If two clients
+    /// submit for the same path while a job is already **running**, the call
+    /// returns success with the **in-flight** job’s state and `LoadJobResult` built
+    /// from that job’s `LoadJobInfo`; the later request’s `LoadJobCommand` options
+    /// (replicas, overwrite, etc.) are **not** applied. **First submitter wins** for
+    /// that path. Use `JobManager::get_job_status` to inspect the job that is
+    /// actually running (including its resolved options).
     pub async fn submit_load_task(
         &self,
         command: LoadJobCommand,
@@ -115,8 +142,8 @@ impl LoadJobRunner {
         );
 
         let mnt_value = self.factory.get_mnt(&mnt)?;
-        if self
-            .check_job_exists(&job_id, &mnt_value, &source_path, &target_path)
+        if let Some(res) = self
+            .check_job_exists(&job_context, &mnt_value, &source_path, &target_path)
             .await?
         {
             info!(
@@ -124,20 +151,8 @@ impl LoadJobRunner {
                 job_id,
                 source_path.full_path()
             );
-            return if let Some(existing_ctx) = self.jobs.get(&job_id) {
-                Ok(LoadJobResult::with_state(
-                    &existing_ctx.info,
-                    existing_ctx.state.state(),
-                ))
-            } else {
-                Ok(LoadJobResult::with_state(
-                    &job_context.info,
-                    JobTaskState::Completed,
-                ))
-            };
+            return Ok(res);
         }
-
-        self.jobs.remove(&job_id);
 
         debug!(
             "submitting load job {}: {} -> {}",
@@ -146,35 +161,63 @@ impl LoadJobRunner {
             target_path.full_path()
         );
 
-        let res = self
+        let total_size = self
             .create_all_tasks(&mut job_context, &source_path, &mnt)
-            .await;
+            .await?;
 
-        match res {
-            Err(e) => {
-                warn!("create load job {} failed: {}", job_id, e);
-                Err(e)
+        info!(
+            "load job {} submitted: {} -> {}, tasks {}, total_size {}",
+            job_id,
+            source_path.full_path(),
+            target_path.full_path(),
+            job_context.tasks.len(),
+            ByteUnit::byte_to_string(total_size as u64)
+        );
+
+        let tasks = job_context.tasks.clone();
+        let res = LoadJobResult::with_job(&job_context.info);
+
+        // Install / replace the ctx into the store atomically. We branch into:
+        //   - Vacant: first submitter, install and dispatch.
+        //   - Occupied + running: another submitter won the race; return that job’s
+        //     state (this request’s command is not applied—see `submit_load_task` doc).
+        //   - Occupied + terminal: previous run finished/failed/canceled and
+        //     hasn't been cleaned up yet. Replace with the new ctx and dispatch.
+        match self.jobs.entry(job_id.clone()) {
+            Entry::Occupied(mut e) => {
+                let state: JobTaskState = e.get().state.state();
+                if state.is_running() {
+                    let existing = e.get();
+                    debug!(
+                        "job {} race-lost on entry: another submitter is dispatching (state={:?})",
+                        job_id, state
+                    );
+                    return Ok(LoadJobResult::with_state(&existing.info, state));
+                }
+                info!(
+                    "job {} previous run in terminal state {:?}, replacing",
+                    job_id, state
+                );
+                e.insert(job_context);
             }
 
-            Ok(size) => {
-                info!(
-                    "load job {} submitted: {} -> {}, tasks {}, total_size {}",
-                    job_id,
-                    source_path.full_path(),
-                    target_path.full_path(),
-                    job_context.tasks.len(),
-                    ByteUnit::byte_to_string(size as u64)
-                );
-
-                let tasks = job_context.tasks.clone();
-                let res = LoadJobResult::with_job(&job_context.info);
-                self.jobs.insert(job_id, job_context);
-                // @todo Whether to cancel some tasks that may have been dispatched.
-                self.submit_all_task(tasks).await?;
-
-                Ok(res)
+            Entry::Vacant(e) => {
+                e.insert(job_context);
             }
         }
+
+        if let Err(err) = self.submit_all_task(tasks).await {
+            warn!("dispatch load job {} failed: {}", job_id, err);
+            // @todo Cancel sub-tasks that may have already been dispatched.
+            self.jobs.update_state(
+                &job_id,
+                JobTaskState::Failed,
+                format!("dispatch failed: {}", err),
+            );
+            return Err(err);
+        }
+
+        Ok(res)
     }
 
     async fn submit_all_task(&self, tasks: FastHashMap<String, TaskDetail>) -> FsResult<()> {

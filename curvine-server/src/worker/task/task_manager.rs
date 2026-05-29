@@ -14,12 +14,13 @@
 
 use crate::common::UfsFactory;
 use crate::worker::task::load_task_runner::LoadTaskRunner;
-use crate::worker::task::TaskStore;
+use crate::worker::task::{TaskContext, TaskStore};
 use curvine_client::file::{CurvineFileSystem, FsContext};
 use curvine_common::conf::ClusterConf;
-use curvine_common::state::LoadTaskInfo;
+use curvine_common::state::{JobTaskState, LoadTaskInfo};
 use curvine_common::FsResult;
-use log::debug;
+use dashmap::mapref::entry::Entry;
+use log::{debug, info, warn};
 use orpc::runtime::{RpcRuntime, Runtime};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -112,20 +113,44 @@ impl TaskManager {
     ///
     /// # Behavior
     ///
-    /// 1. Checks if task already exists (idempotent operation)
-    /// 2. Creates task context and stores it in TaskStore
-    /// 3. Spawns async task that:
-    ///    - Acquires semaphore permit (blocks if limit reached)
-    ///    - Executes LoadTaskRunner.run()
-    ///    - Automatically releases permit on completion
-    ///    - Removes task from store
+    /// 1. If a task with the same `task_id` is already in the store, it is
+    ///    treated as **superseded**: its `TaskContext` is flipped to
+    ///    `Canceled` (the running `LoadTaskRunner` observes this at the
+    ///    next chunk boundary via `TaskContext::is_cancel`) and the map
+    ///    entry is replaced with a fresh context in a single shard-locked
+    ///    operation. This is intentional: silently de-duping would leave
+    ///    the new dispatcher's `JobContext` without a reporter and the
+    ///    master would hang until `ufs_copy_timeout`.
+    /// 2. If no task exists for the `task_id`, the new context is inserted.
+    /// 3. Spawns an async task that:
+    ///    - Acquires a semaphore permit (blocks if limit reached)
+    ///    - Executes `LoadTaskRunner::run`
+    ///    - Automatically releases the permit on completion
+    ///    - Removes the map entry **only if it still points at its own
+    ///      context** (a later `submit_task` may have superseded it)
     pub fn submit_task(&self, task: LoadTaskInfo) -> FsResult<()> {
         let task_id = task.task_id.clone();
-        if self.tasks.contains(&task_id) {
-            return Ok(());
-        }
+        let context = Arc::new(TaskContext::new(task));
 
-        let context = self.tasks.insert(task);
+        match self.tasks.entry(task_id.clone()) {
+            Entry::Occupied(mut occ) => {
+                let old = occ.insert(context.clone());
+                old.update_state(JobTaskState::Canceled, "superseded by new submit");
+                warn!(
+                    "cancel duplicate task {} (source_path={})",
+                    old.info.task_id, old.info.source_path
+                );
+            }
+
+            Entry::Vacant(vac) => {
+                vac.insert(context.clone());
+            }
+        }
+        info!(
+            "submit task {} {}",
+            context.info.task_id, context.info.source_path
+        );
+
         let runner = LoadTaskRunner::new(
             context.clone(),
             self.fs.clone(),
@@ -134,15 +159,13 @@ impl TaskManager {
             self.task_timeout_ms,
         );
 
-        debug!("submit task {}", task_id);
-
         let tasks = self.tasks.clone();
         let semaphore = self.worker_task_semaphore.clone();
+        let context_this = context.clone();
 
         // Spawn task with concurrency control
         self.rt.spawn(async move {
-            let _permit = semaphore.acquire().await;
-            match _permit {
+            match semaphore.acquire().await {
                 Ok(permit) => {
                     runner.run().await;
                     drop(permit);
@@ -152,7 +175,7 @@ impl TaskManager {
                 }
             }
 
-            let _ = tasks.remove(&task_id);
+            let _ = tasks.remove_if(&task_id, |_, ctx| Arc::ptr_eq(ctx, &context_this));
         });
 
         Ok(())
