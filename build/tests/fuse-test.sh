@@ -59,6 +59,7 @@ This script tests basic filesystem operations including:
   - File permissions (chmod, chown, chgrp)
   - Sed in-place editing
   - Pwrite visibility (file size and content after pwrite)
+  - POSIX rename semantics (EISDIR, ENOTEMPTY, EINVAL)
   - Mmap read/write (MAP_SHARED mmap ↔ pread coherence, issue #850)
 
 For FIO performance tests, use fio-test.sh instead.
@@ -1340,6 +1341,15 @@ test_pwrite_visibility() {
     run_python_script_test "Testing file size and content visibility after pwrite" "visibility_test.py" --dir "$TEST_DIR"
 }
 
+# Test 19: POSIX rename semantics
+test_rename() {
+    CURRENT_TEST_GROUP="Test 19: POSIX Rename Semantics"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing POSIX rename semantics (EISDIR, ENOTEMPTY, EINVAL, etc.)" \
+        "rename_test.py" --dir "$TEST_DIR"
+}
+
 # Print final report
 print_report() {
     print_header "Test Summary"
@@ -1441,9 +1451,11 @@ main() {
     test_delayed_delete
     test_python_high_frequency_write
     test_fuse_reload
-    test_git_clone
     test_mmap
     test_pwrite_visibility
+    test_rename
+
+    test_git_clone
 
     print_info "All test functions completed"
 

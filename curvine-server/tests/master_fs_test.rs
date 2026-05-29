@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use curvine_common::conf::{ClusterConf, JournalConf, MasterConf};
+use curvine_common::error::FsError;
 use curvine_common::fs::CurvineURI;
 use curvine_common::fs::RpcCode;
 use curvine_common::proto::{
@@ -38,15 +39,15 @@ use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-// Master metrics gauges are process-wide; tests that assert inode_file_num / inode_dir_num must
-// not run in parallel with each other or counts race with other tests' format/init.
-static INODE_COUNT_METRICS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+// Master metrics gauges are process-wide; master_fs_test cases must not run in parallel or
+// inode_file_num / inode_dir_num race with other tests' format/init.
+static MASTER_FS_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn inode_count_metrics_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    INODE_COUNT_METRICS_LOCK
+fn master_fs_test_serial() -> std::sync::MutexGuard<'static, ()> {
+    MASTER_FS_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // Use a lightweight filesystem-only setup for tests that do not need the full
@@ -180,6 +181,7 @@ fn new_handler() -> MasterHandler {
 
 #[test]
 fn test_master_filesystem_core_operations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let fs = new_fs(true, "fs_test");
 
     mkdir(&fs)?;
@@ -194,7 +196,16 @@ fn test_master_filesystem_core_operations() -> CommonResult<()> {
 }
 
 #[test]
+fn test_rename_posix_semantics() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    let fs = new_fs(true, "rename-posix");
+    rename_posix_semantics(&fs)?;
+    Ok(())
+}
+
+#[test]
 fn test_rpc_retry_cache_for_idempotent_operations() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let mut handler = new_handler();
     let fs = handler.clone_fs();
 
@@ -209,6 +220,7 @@ fn test_rpc_retry_cache_for_idempotent_operations() -> CommonResult<()> {
 
 #[test]
 fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     // First phase: create metadata and persist to RocksDB
     let hash1 = {
         let fs = new_fs(true, "restore");
@@ -233,6 +245,7 @@ fn test_filesystem_metadata_persistence_and_restore() -> CommonResult<()> {
 
 #[test]
 fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let test_name = format!("restore-full-{}", Utils::rand_str(6));
     let hash1 = {
         let (fs, js) = new_fs_with_journal(true, &test_name)?;
@@ -355,33 +368,117 @@ fn rename(fs: &MasterFilesystem) -> CommonResult<()> {
     // New file should exist
     assert!(fs.exists("/aaa.txt")?);
 
-    // Test file rename to existing directory scenario
-    // Create directory /a/b
+    Ok(())
+}
+
+fn rename_posix_semantics(fs: &MasterFilesystem) -> CommonResult<()> {
     fs.mkdir("/a/b", true)?;
-    // Create file /a/1.log
+
+    // Test file rename to existing directory: POSIX rename must fail with EISDIR.
     fs.create("/a/1.log", true)?;
 
-    println!("=== Before file rename to directory ===");
-    fs.print_tree();
-
-    // Verify original file exists
+    let err = fs
+        .rename("/a/1.log", "/a/b", RenameFlags::empty())
+        .expect_err("rename file to directory must fail");
+    assert!(matches!(err, FsError::IsADirectory(_)));
     assert!(fs.exists("/a/1.log")?);
     assert!(fs.exists("/a/b")?);
+    assert!(!fs.exists("/a/b/1.log")?);
 
-    // Execute file rename to directory operation
-    // Expected result: /a/1.log -> /a/b/1.log
-    fs.rename("/a/1.log", "/a/b", RenameFlags::empty())?;
+    // src file, dst file -> overwrite existing file.
+    fs.create("/a/old.log", true)?;
+    fs.create("/a/new.log", true)?;
+    fs.rename("/a/old.log", "/a/new.log", RenameFlags::empty())?;
+    assert!(!fs.exists("/a/old.log")?);
+    assert!(fs.exists("/a/new.log")?);
 
-    println!("=== After file rename to directory ===");
-    fs.print_tree();
+    // src directory, dst empty directory -> overwrite empty directory.
+    fs.mkdir("/a/src_dir", true)?;
+    fs.create("/a/src_dir/child.txt", true)?;
+    fs.mkdir("/a/empty_dir", true)?;
+    fs.rename("/a/src_dir", "/a/empty_dir", RenameFlags::empty())?;
+    assert!(!fs.exists("/a/src_dir")?);
+    assert!(fs.exists("/a/empty_dir")?);
+    assert!(fs.exists("/a/empty_dir/child.txt")?);
 
-    // Verify rename results
-    // Original file should not exist
-    assert!(!fs.exists("/a/1.log")?);
-    // New file should exist under directory b
-    assert!(fs.exists("/a/b/1.log")?);
-    // Directory b should still exist
-    assert!(fs.exists("/a/b")?);
+    // src directory, dst non-empty directory -> ENOTEMPTY.
+    fs.mkdir("/a/rename_src", true)?;
+    fs.create("/a/rename_src/file.txt", true)?;
+    fs.mkdir("/a/rename_dst", true)?;
+    fs.create("/a/rename_dst/keep.txt", true)?;
+
+    let err = fs
+        .rename("/a/rename_src", "/a/rename_dst", RenameFlags::empty())
+        .expect_err("rename to non-empty directory must fail");
+    assert!(matches!(err, FsError::DirNotEmpty(_)));
+    assert!(fs.exists("/a/rename_src")?);
+    assert!(fs.exists("/a/rename_src/file.txt")?);
+    assert!(fs.exists("/a/rename_dst/keep.txt")?);
+    assert!(!fs.exists("/a/rename_dst/rename_src")?);
+
+    // src directory, dst file -> ENOTDIR.
+    fs.mkdir("/a/dir_src", true)?;
+    fs.create("/a/file_dst", true)?;
+    let err = fs
+        .rename("/a/dir_src", "/a/file_dst", RenameFlags::empty())
+        .expect_err("rename directory to file must fail");
+    assert!(matches!(err, FsError::NotADirectory(_)));
+    assert!(fs.exists("/a/dir_src")?);
+    assert!(fs.exists("/a/file_dst")?);
+
+    // src directory -> dst under src: POSIX EINVAL.
+    fs.mkdir("/a/rename_parent", true)?;
+    let err = fs
+        .rename(
+            "/a/rename_parent",
+            "/a/rename_parent/child",
+            RenameFlags::empty(),
+        )
+        .expect_err("rename into subdirectory must fail");
+    assert!(matches!(err, FsError::InvalidArgument(_)));
+    assert!(fs.exists("/a/rename_parent")?);
+    assert!(!fs.exists("/a/rename_parent/child")?);
+
+    // same-path rename is a no-op for files and directories (including non-empty dirs).
+    fs.create("/a/same_file.txt", true)?;
+    fs.rename("/a/same_file.txt", "/a/same_file.txt", RenameFlags::empty())?;
+    assert!(fs.exists("/a/same_file.txt")?);
+
+    fs.mkdir("/a/same_empty_dir", true)?;
+    fs.rename(
+        "/a/same_empty_dir",
+        "/a/same_empty_dir",
+        RenameFlags::empty(),
+    )?;
+    assert!(fs.exists("/a/same_empty_dir")?);
+
+    fs.mkdir("/a/same_full_dir", true)?;
+    fs.create("/a/same_full_dir/child.txt", true)?;
+    fs.rename("/a/same_full_dir", "/a/same_full_dir", RenameFlags::empty())?;
+    assert!(fs.exists("/a/same_full_dir")?);
+    assert!(fs.exists("/a/same_full_dir/child.txt")?);
+
+    // RENAME_NOREPLACE: fail when dst exists, succeed when absent.
+    fs.create("/a/noreplace_dst", true)?;
+    fs.create("/a/noreplace_src", true)?;
+    let err = fs
+        .rename(
+            "/a/noreplace_src",
+            "/a/noreplace_dst",
+            RenameFlags::NO_REPLACE,
+        )
+        .expect_err("no_replace must fail when dst exists");
+    assert!(matches!(err, FsError::FileAlreadyExists(_)));
+    assert!(fs.exists("/a/noreplace_src")?);
+    assert!(fs.exists("/a/noreplace_dst")?);
+
+    fs.rename(
+        "/a/noreplace_src",
+        "/a/noreplace_new",
+        RenameFlags::NO_REPLACE,
+    )?;
+    assert!(!fs.exists("/a/noreplace_src")?);
+    assert!(fs.exists("/a/noreplace_new")?);
 
     Ok(())
 }
@@ -459,24 +556,31 @@ fn list_status_with_glob(fs: &MasterFilesystem) -> CommonResult<()> {
     assert_eq!(sorted_list_2[0].path, "/a/c2.txt", "file path mismatch");
     assert_eq!(sorted_list_2[0].name, "c2.txt", "file name mismatch");
 
-    // test 3
-    let list_3 = fs.list_status("/a/*").expect("list_2 failed to get status");
-    assert_eq!(list_3.len(), 6, "Should find exactly 6 log files");
+    // test 3: /a/* matches direct children; list_status expands matched dirs (e.g. /a/b -> xx.log).
+    let list_3 = fs.list_status("/a/*").expect("list_3 failed to get status");
+    assert_eq!(
+        list_3.len(),
+        5,
+        "Should find exactly 5 entries for /a/* glob"
+    );
     // Sort for consistent ordering (if order not guaranteed)
     let mut sorted_list_3 = list_3.clone();
     sorted_list_3.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Verify second file: /a/b/xx.log
+    assert_eq!(sorted_list_3[0].path, "/a/b1.log", "file path mismatch");
+    assert_eq!(sorted_list_3[0].name, "b1.log", "file name mismatch");
 
-    assert_eq!(sorted_list_3[0].path, "/a/b/1.log", "file path mismatch");
+    assert_eq!(sorted_list_3[1].path, "/a/b2.log", "file path mismatch");
+    assert_eq!(sorted_list_3[1].name, "b2.log", "file name mismatch");
 
-    // Verify second file: /a/b2.txt
-    assert_eq!(sorted_list_3[2].path, "/a/b2.log", "file path mismatch");
-    assert_eq!(sorted_list_3[2].name, "b2.log", "file name mismatch");
+    assert_eq!(sorted_list_3[2].path, "/a/c1.txt", "file path mismatch");
+    assert_eq!(sorted_list_3[2].name, "c1.txt", "file name mismatch");
 
-    // Verify second file: /a/b/xx.log
-    assert_eq!(sorted_list_3[5].path, "/a/b/xx.log", "file path mismatch");
-    assert_eq!(sorted_list_3[5].name, "xx.log", "file name mismatch");
+    assert_eq!(sorted_list_3[3].path, "/a/c2.txt", "file path mismatch");
+    assert_eq!(sorted_list_3[3].name, "c2.txt", "file name mismatch");
+
+    assert_eq!(sorted_list_3[4].path, "/a/b/xx.log", "file path mismatch");
+    assert_eq!(sorted_list_3[4].name, "xx.log", "file name mismatch");
 
     // test 4
     assert!(fs.list_status("/a/[a").is_err());
@@ -526,6 +630,7 @@ fn list_status(fs: &MasterFilesystem) -> CommonResult<()> {
 
 #[test]
 fn test_hardlink_creation_and_nlink_counting() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let fs = new_fs(true, "link_test");
     fs.mkdir("/a/b", true)?;
     fs.create("/a/b/file.log", true)?;
@@ -867,6 +972,7 @@ fn replay_all_then_duplicate_last(js: &JournalSystem, loader: &JournalLoader) ->
 
 #[test]
 fn test_idempotent_mkdir() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("mkdir");
     fs.mkdir("/data", false)?;
     replay_all_then_duplicate_last(&js, &loader)?;
@@ -876,6 +982,7 @@ fn test_idempotent_mkdir() -> CommonResult<()> {
 
 #[test]
 fn test_idempotent_create_file() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("create-file");
     fs.create("/file.log", true)?;
     replay_all_then_duplicate_last(&js, &loader)?;
@@ -885,6 +992,7 @@ fn test_idempotent_create_file() -> CommonResult<()> {
 
 #[test]
 fn test_idempotent_delete() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("delete");
     fs.mkdir("/data", false)?;
     let after_mkdir = file_counts(&fs);
@@ -916,6 +1024,7 @@ fn test_idempotent_delete() -> CommonResult<()> {
 
 #[test]
 fn test_idempotent_rename() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("rename");
     fs.mkdir("/src", false)?;
     fs.rename("/src", "/dst", RenameFlags::empty())?;
@@ -926,6 +1035,7 @@ fn test_idempotent_rename() -> CommonResult<()> {
 
 #[test]
 fn test_idempotent_free() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("free");
     fs.create("/file.log", true)?;
     // Set ufs_mtime > 0 so the free function passes the ufs_exists() check
@@ -939,6 +1049,7 @@ fn test_idempotent_free() -> CommonResult<()> {
 
 #[test]
 fn test_idempotent_set_attr() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("set-attr");
     fs.mkdir("/data", false)?;
     let opts = SetAttrOptsBuilder::new().owner("test_owner").build();
@@ -950,6 +1061,7 @@ fn test_idempotent_set_attr() -> CommonResult<()> {
 
 #[test]
 fn test_idempotent_unmount() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("unmount");
     let mnt_mgr = js.mount_manager();
     let mnt_opt = MountOptions::builder().build();
@@ -962,7 +1074,7 @@ fn test_idempotent_unmount() -> CommonResult<()> {
 
 #[test]
 fn test_inode_file_num_stays_non_negative_for_symlink_create_delete() -> CommonResult<()> {
-    let _lock = inode_count_metrics_test_lock();
+    let _serial = master_fs_test_serial();
     let fs = new_fs(true, "inode-file-num-symlink");
 
     let (dir_count, file_count) = file_counts(&fs);
@@ -996,7 +1108,7 @@ fn test_inode_file_num_stays_non_negative_for_symlink_create_delete() -> CommonR
 
 #[test]
 fn test_inode_file_num_stable_on_forced_symlink_rewrite() -> CommonResult<()> {
-    let _lock = inode_count_metrics_test_lock();
+    let _serial = master_fs_test_serial();
     let fs = new_fs(true, "inode-file-num-symlink-force");
 
     fs.mkdir("/dir", false)?;
@@ -1017,7 +1129,7 @@ fn test_inode_file_num_stable_on_forced_symlink_rewrite() -> CommonResult<()> {
 
 #[test]
 fn test_inode_file_num_stays_non_negative_when_renaming_over_symlink() -> CommonResult<()> {
-    let _lock = inode_count_metrics_test_lock();
+    let _serial = master_fs_test_serial();
     let fs = new_fs(true, "inode-file-num-rename-over-link");
 
     fs.mkdir("/dir", false)?;
@@ -1037,6 +1149,7 @@ fn test_inode_file_num_stays_non_negative_when_renaming_over_symlink() -> Common
 
 #[test]
 fn test_idempotent_symlink() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("symlink");
     fs.mkdir("/dir", false)?;
     let after_mkdir = file_counts(&fs);
@@ -1068,6 +1181,7 @@ fn test_idempotent_symlink() -> CommonResult<()> {
 
 #[test]
 fn test_idempotent_link() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("link");
     fs.create("/original.txt", true)?;
     let after_create = file_counts(&fs);
@@ -1126,6 +1240,7 @@ fn test_idempotent_link() -> CommonResult<()> {
 
 #[test]
 fn test_idempotent_mount() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("mount");
     let mnt_mgr = js.mount_manager();
     let mount_uri = CurvineURI::new("/mnt/test")?;
@@ -1144,6 +1259,7 @@ fn test_idempotent_mount() -> CommonResult<()> {
 
 #[test]
 fn test_idempotent_set_locks() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
     let (fs, js, loader, _js2, fs2) = setup_pair("set-locks");
     fs.create("/lockfile.log", true)?;
     let lock = curvine_common::state::FileLock {
