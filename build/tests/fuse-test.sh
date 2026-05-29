@@ -59,6 +59,7 @@ This script tests basic filesystem operations including:
   - File permissions (chmod, chown, chgrp)
   - Sed in-place editing
   - Pwrite visibility (file size and content after pwrite)
+  - Mmap read/write (MAP_SHARED mmap ↔ pread coherence, issue #850)
 
 For FIO performance tests, use fio-test.sh instead.
 
@@ -181,6 +182,76 @@ init_test_env() {
     fi
     
     print_info "Test environment initialized successfully"
+}
+
+# Resolve python3/python executable path.
+# Prints the command on success; returns 1 if Python is unavailable.
+get_python_cmd() {
+    if command -v python3 >/dev/null 2>&1; then
+        echo "python3"
+        return 0
+    fi
+    if command -v python >/dev/null 2>&1; then
+        echo "python"
+        return 0
+    fi
+    return 1
+}
+
+# Run a Python test script from build/tests/scripts/.
+#
+# Usage:
+#   run_python_script_test "Test description" script.py [script args...]
+#
+# Returns:
+#   0 - passed or skipped (Python or script unavailable)
+#   1 - failed
+run_python_script_test() {
+    local test_name="$1"
+    local script_name="$2"
+    shift 2
+
+    local python_cmd
+    if ! python_cmd=$(get_python_cmd); then
+        print_info "Python not available, skipping $test_name"
+        return 0
+    fi
+
+    local test_script="$SCRIPT_DIR/scripts/$script_name"
+    if [ ! -f "$test_script" ]; then
+        print_info "Test script not found: $test_script"
+        print_info "Skipping $test_name"
+        return 0
+    fi
+
+    print_test "$test_name"
+    TOTAL_TESTS=$((TOTAL_TESTS + 1))
+
+    local start_time end_time elapsed result=0
+    start_time=$(date +%s)
+
+    local cmd="$python_cmd $test_script"
+    if [ $# -gt 0 ]; then
+        cmd="$cmd $*"
+    fi
+    print_command "$cmd"
+
+    if $python_cmd "$test_script" "$@" 2>&1; then
+        result=0
+    else
+        result=$?
+    fi
+
+    end_time=$(date +%s)
+    elapsed=$((end_time - start_time))
+
+    if [ $result -eq 0 ]; then
+        print_success "$test_name completed successfully in ${elapsed}s"
+        return 0
+    fi
+
+    handle_error "$test_name failed" "$cmd"
+    return 1
 }
 
 # Test 1: Basic file operations
@@ -903,15 +974,10 @@ test_file_locks() {
     fi
 
     # Test 4: POSIX lock (fcntl) - using Python if available
-    if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+    local python_cmd
+    if python_cmd=$(get_python_cmd); then
         print_test "Testing POSIX lock (fcntl) with Python"
         TOTAL_TESTS=$((TOTAL_TESTS + 1))
-        local python_cmd=""
-        if command -v python3 >/dev/null 2>&1; then
-            python_cmd="python3"
-        else
-            python_cmd="python"
-        fi
 
         local lock_script_file=$(mktemp)
         cat > "$lock_script_file" << 'PYTHON_EOF'
@@ -1110,12 +1176,11 @@ test_python_high_frequency_write() {
     CURRENT_TEST_GROUP="Test 14: Python High-Frequency Write"
     print_header "$CURRENT_TEST_GROUP"
 
-    if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
+    local python_cmd
+    if ! python_cmd=$(get_python_cmd); then
         print_info "Python not available, skipping high-frequency write test"
         return
     fi
-
-    local python_cmd=$(command -v python3 2>/dev/null || command -v python)
     local test_file="$TEST_DIR/python-high-freq.txt"
     local iterations=20
     
@@ -1209,85 +1274,7 @@ PYTHON_SCRIPT
 test_fuse_reload() {
     CURRENT_TEST_GROUP="Test 15: FUSE Hot Reload"
     print_header "$CURRENT_TEST_GROUP"
-
-    if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
-        print_info "Python not available, skipping FUSE reload test"
-        return
-    fi
-
-    local python_cmd=$(command -v python3 2>/dev/null || command -v python)
-    local test_script="$SCRIPT_DIR/scripts/fuse_reload_test.py"
-    
-    if [ ! -f "$test_script" ]; then
-        print_info "FUSE reload test script not found: $test_script"
-        print_info "Skipping FUSE reload test"
-        return
-    fi
-
-    print_test "Testing FUSE hot reload functionality"
-    TOTAL_TESTS=$((TOTAL_TESTS + 1))
-
-    local start_time=$(date +%s)
-    
-    # Run the Python test script
-    if $python_cmd "$test_script" 2>&1; then
-        local result=0
-    else
-        local result=$?
-    fi
-    
-    local end_time=$(date +%s)
-    local elapsed=$((end_time - start_time))
-
-    if [ $result -eq 0 ]; then
-        print_success "FUSE reload test completed successfully in ${elapsed}s"
-    else
-        handle_error "FUSE reload test failed" "python $test_script"
-    fi
-}
-
-# Test 17: Pwrite visibility test
-test_pwrite_visibility() {
-    CURRENT_TEST_GROUP="Test 17: Pwrite Visibility"
-    print_header "$CURRENT_TEST_GROUP"
-
-    if ! command -v python3 >/dev/null 2>&1 && ! command -v python >/dev/null 2>&1; then
-        print_info "Python not available, skipping pwrite visibility test"
-        return
-    fi
-
-    local python_cmd
-    python_cmd=$(command -v python3 2>/dev/null || command -v python)
-    local test_script="$SCRIPT_DIR/scripts/visibility_test.py"
-
-    if [ ! -f "$test_script" ]; then
-        print_info "Pwrite visibility test script not found: $test_script"
-        print_info "Skipping pwrite visibility test"
-        return
-    fi
-
-    print_test "Testing file size and content visibility after pwrite"
-    TOTAL_TESTS=$((TOTAL_TESTS + 1))
-
-    local start_time
-    start_time=$(date +%s)
-    local result=0
-
-    if $python_cmd "$test_script" --dir "$TEST_DIR" 2>&1; then
-        result=0
-    else
-        result=$?
-    fi
-
-    local end_time
-    end_time=$(date +%s)
-    local elapsed=$((end_time - start_time))
-
-    if [ $result -eq 0 ]; then
-        print_success "Pwrite visibility test completed successfully in ${elapsed}s"
-    else
-        handle_error "Pwrite visibility test failed" "python $test_script --dir $TEST_DIR"
-    fi
+    run_python_script_test "Testing FUSE hot reload functionality" "fuse_reload_test.py"
 }
 
 # Test 16: Git clone operations
@@ -1335,6 +1322,22 @@ test_git_clone() {
     else
         handle_error "Failed to clone repository" "$cmd"
     fi
+}
+
+# Test 17: Mmap read/write test
+test_mmap() {
+    CURRENT_TEST_GROUP="Test 17: Mmap Read/Write"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing MAP_SHARED mmap write visible to pread after cache-miss open" \
+        "mmap_test.py" --dir "$TEST_DIR"
+}
+
+# Test 18: Pwrite visibility test
+test_pwrite_visibility() {
+    CURRENT_TEST_GROUP="Test 18: Pwrite Visibility"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test "Testing file size and content visibility after pwrite" "visibility_test.py" --dir "$TEST_DIR"
 }
 
 # Print final report
@@ -1438,8 +1441,9 @@ main() {
     test_delayed_delete
     test_python_high_frequency_write
     test_fuse_reload
-    test_pwrite_visibility
     test_git_clone
+    test_mmap
+    test_pwrite_visibility
 
     print_info "All test functions completed"
 
