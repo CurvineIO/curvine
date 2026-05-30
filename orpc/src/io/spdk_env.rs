@@ -608,6 +608,7 @@ impl SpdkEnv {
             let poller = SpdkPoller::start(PollerConfig {
                 poll_interval_ms: self.conf.poll_interval_ms,
                 spin_iter: self.conf.spin_iter,
+                io_queue_depth: self.conf.io_queue_depth as usize,
             });
             *self.poller.lock().unwrap() = Some(poller);
             info!("SPDK poller thread started");

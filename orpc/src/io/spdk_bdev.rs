@@ -31,6 +31,8 @@ pub struct SpdkIoChannel {
     pub eventfd: std::sync::Arc<nix::sys::eventfd::EventFd>,
     /// Flag: poller is idle and blocked on eventfd; only write eventfd when true
     pub poller_is_sleeping: std::sync::Arc<AtomicBool>,
+    /// Flag: the poller detected this qpair died — future I/Os fail immediately.
+    pub qpair_dead: std::sync::Arc<AtomicBool>,
 }
 unsafe impl Send for SpdkIoChannel {}
 unsafe impl Sync for SpdkIoChannel {}
@@ -227,11 +229,13 @@ impl SpdkBdev {
             let poller_tx = env.poller_sender(); // Get sender from SpdkEnv
             let eventfd = env.poller_eventfd(); // Get eventfd for wake signaling
             let poller_is_sleeping = env.poller_is_sleeping(); // Skip eventfd if active
+            let qpair_dead = std::sync::Arc::new(AtomicBool::new(false));
             let io_channel = SpdkIoChannel {
                 qpair,
                 poller_tx,
                 eventfd,
                 poller_is_sleeping,
+                qpair_dead: qpair_dead.clone(),
             };
             let io_timeout_us = env.conf().io_timeout_us;
             Ok(Self {
@@ -311,6 +315,10 @@ impl SpdkBdev {
 
     /// Submit read to SPDK, wait for completion. Uses DMA buffer (large reads chunked).
     fn spdk_read(&mut self, offset: i64, len: usize) -> IOResult<BytesMut> {
+        if self.io_channel.qpair_dead.load(Ordering::Acquire) {
+            return err_box!("SPDK qpair is dead, device unreachable");
+        }
+
         let buf_cap = self.read_buf.capacity();
         let dma_buf = self.read_buf.as_ptr();
 
@@ -342,6 +350,7 @@ impl SpdkBdev {
                 },
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
+                qpair_dead: self.io_channel.qpair_dead.clone(),
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
@@ -379,6 +388,10 @@ impl SpdkBdev {
 
     /// Submit write to SPDK, wait for completion. Uses DMA buffer (large writes chunked).
     fn spdk_write(&mut self, offset: i64, data: &[u8]) -> IOResult<()> {
+        if self.io_channel.qpair_dead.load(Ordering::Acquire) {
+            return err_box!("SPDK qpair is dead, device unreachable");
+        }
+
         use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
 
         if !self.writable {
@@ -417,6 +430,7 @@ impl SpdkBdev {
                     },
                     completion: completion.clone(),
                     bdev_inflight: self.inflight.clone(),
+                    qpair_dead: self.io_channel.qpair_dead.clone(),
                 };
                 if self.io_channel.poller_tx.send(req).is_err() {
                     self.inflight
@@ -465,6 +479,7 @@ impl SpdkBdev {
                 },
                 completion: completion.clone(),
                 bdev_inflight: self.inflight.clone(),
+                qpair_dead: self.io_channel.qpair_dead.clone(),
             };
             if self.io_channel.poller_tx.send(req).is_err() {
                 self.inflight
@@ -498,6 +513,10 @@ impl SpdkBdev {
     }
 
     fn spdk_flush(&self) -> IOResult<()> {
+        if self.io_channel.qpair_dead.load(Ordering::Acquire) {
+            return err_box!("SPDK qpair is dead, device unreachable");
+        }
+
         use crate::io::spdk_poller::{IoCompletion, IoOp, IoRequest};
         let completion = IoCompletion::new();
         self.inflight
@@ -509,6 +528,7 @@ impl SpdkBdev {
             },
             completion: completion.clone(),
             bdev_inflight: self.inflight.clone(),
+            qpair_dead: self.io_channel.qpair_dead.clone(),
         };
         if self.io_channel.poller_tx.send(req).is_err() {
             return err_box!("SPDK poller thread is gone");
