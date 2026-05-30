@@ -424,7 +424,7 @@ impl SpdkPoller {
         info!("SPDK poller thread exiting");
     }
 
-    /// Handle unregister request, remove qpair from active set and ack.
+    /// Handle unregister request, remove qpair from active and dead_qpairs set and ack.
     fn handle_unregister(
         req: &IoRequest,
         active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
@@ -535,7 +535,7 @@ impl SpdkPoller {
         };
 
         if rc != 0 {
-            // Submission failed: reclaim allocation and complete with error
+            // Submission failed - reclaim allocation and complete with error
             unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
             req.bdev_inflight.fetch_sub(1, Ordering::Release);
             req.completion.complete(rc);
