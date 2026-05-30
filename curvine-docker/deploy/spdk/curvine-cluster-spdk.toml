@@ -3,8 +3,7 @@
 # Worker formatting will delete the data directory.  
 format_master = true  
 format_worker = true  
-  
-  
+
 # master configuration  
 [master]  
 meta_dir = "testing/meta"  
