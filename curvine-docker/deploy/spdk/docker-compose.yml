@@ -1,0 +1,72 @@
+# Curvine Full Stack (Master + Worker + SPDK NVMe-oF Target)
+#
+# Prerequisites (run on host before starting):
+#   sudo sysctl -w vm.nr_hugepages=1024
+#   sudo modprobe uio_pci_generic
+#   sudo modprobe nvme nvme-fabrics nvme-tcp
+#
+# make docker-compose-spdk
+#
+# To use a custom config:
+#   CURVINE_CONF_FILE=./my-cluster.toml make docker-compose-spdk
+
+x-target-base: &target-base
+  build:
+    context: ../../..
+    dockerfile: curvine-docker/deploy/Dockerfile_rocky9
+    target: target-runtime
+  network_mode: "host"
+  privileged: true
+  volumes:
+    - /sys:/sys:rw
+    - /lib/modules:/lib/modules:ro
+    - /dev:/dev
+  restart: unless-stopped
+
+services:
+  # ============================================================
+  # SPDK NVMe-oF Targets (Storage Nodes) — one per physical device
+  # ============================================================
+  target-1:
+    <<: *target-base
+    hostname: target-1
+    environment:
+      SUBNQN: "nqn.2026-05.curvine:cnode1"
+      TRTYPE: "tcp"
+      TARGET_PORT: "4420"
+      TARGET_IP: "127.0.0.1"
+      MEM_SIZE: "128"
+      NVME_PCI_ADDR: "${NVME_PCI_ADDR?Set NVME_PCI_ADDR to your NVMe device PCI address}"
+
+  # ============================================================
+  # Curvine Master
+  # ============================================================
+  master:
+    build:
+      context: ../../..
+      dockerfile: curvine-docker/deploy/Dockerfile_rocky9
+    network_mode: "host"
+    volumes:
+      - ${CURVINE_CONF_FILE:-./curvine-cluster-spdk.toml}:/app/curvine/conf/curvine-cluster.toml
+    command: ["master", "start"]
+    restart: unless-stopped
+
+  # ============================================================
+  # Curvine Worker
+  # ============================================================
+  worker:
+    build:
+      context: ../../..
+      dockerfile: curvine-docker/deploy/Dockerfile_rocky9
+    network_mode: "host"
+    privileged: true
+    volumes:
+      - /dev/hugepages:/dev/hugepages
+      - ${CURVINE_CONF_FILE:-./curvine-cluster-spdk.toml}:/app/curvine/conf/curvine-cluster.toml
+    depends_on:
+      master:
+        condition: service_started
+      target-1:
+        condition: service_healthy
+    command: ["worker", "start"]
+    restart: unless-stopped
