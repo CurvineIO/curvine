@@ -37,9 +37,13 @@ fn link_spdk() {
         println!("cargo:rustc-link-search=native={}/dpdk/lib", dir);
     }
 
-    // Link SPDK libs (static)
-    let whole = ["spdk_nvme", "spdk_sock", "spdk_sock_posix"];
-    let mut libs = vec![
+    // SPDK static libs must use whole-archive; GNU ld --as-needed strips
+    // cross-references that SPDK's internal dependency graph relies on.
+    let whole = [
+        "spdk_nvme",
+        "spdk_sock",
+        "spdk_sock_posix",
+        "spdk_thread",
         "spdk_trace",
         "spdk_json",
         "spdk_jsonrpc",
@@ -49,12 +53,8 @@ fn link_spdk() {
         "spdk_env_dpdk",
         "spdk_env_dpdk_rpc",
         "spdk_init",
-        "spdk_thread",
         "spdk_dma",
     ];
-
-    #[cfg(feature = "spdk-rdma")]
-    libs.extend(["spdk_rdma_provider", "spdk_rdma_utils"]);
 
     for lib in &whole {
         let path = format!("{}/lib{}.a", lib_dir, lib);
@@ -62,10 +62,12 @@ fn link_spdk() {
             println!("cargo:rustc-link-lib=static:+whole-archive={}", lib);
         }
     }
-    for lib in &libs {
+
+    #[cfg(feature = "spdk-rdma")]
+    for lib in &["spdk_rdma_provider", "spdk_rdma_utils"] {
         let path = format!("{}/lib{}.a", lib_dir, lib);
         if std::path::Path::new(&path).exists() {
-            println!("cargo:rustc-link-lib=static={}", lib);
+            println!("cargo:rustc-link-lib=static:+whole-archive={}", lib);
         }
     }
 
@@ -74,7 +76,7 @@ fn link_spdk() {
         .as_ref()
         .map(|d| format!("{}/dpdk/build/lib", d))
         .unwrap_or_else(|| "/usr/local/lib".to_string());
-    let dpdk_libs = [
+    let dpdk_all = [
         "rte_eal",
         "rte_mempool",
         "rte_ring",
@@ -90,16 +92,6 @@ fn link_spdk() {
         "rte_cryptodev",
         "rte_compressdev",
         "rte_dmadev",
-    ];
-    for lib in &dpdk_libs {
-        let path = format!("{}/lib{}.a", dpdk_dir, lib);
-        if std::path::Path::new(&path).exists() {
-            println!("cargo:rustc-link-lib=static={}", lib);
-        }
-    }
-
-    // Extra DPDK libs
-    let extra = [
         "rte_log",
         "rte_argparse",
         "rte_bus_vdev",
@@ -111,17 +103,17 @@ fn link_spdk() {
         "rte_stack",
         "rte_timer",
     ];
-    for lib in &extra {
+    for lib in &dpdk_all {
         let path = format!("{}/lib{}.a", dpdk_dir, lib);
         if std::path::Path::new(&path).exists() {
-            println!("cargo:rustc-link-lib=static={}", lib);
+            println!("cargo:rustc-link-lib=static:+whole-archive={}", lib);
         }
     }
 
-    // SPDK keyring
+    // SPDK keyring (also whole-archive)
     let keyring = format!("{}/libspdk_keyring.a", lib_dir);
     if std::path::Path::new(&keyring).exists() {
-        println!("cargo:rustc-link-lib=static=spdk_keyring");
+        println!("cargo:rustc-link-lib=static:+whole-archive=spdk_keyring");
     }
 
     // System libs
