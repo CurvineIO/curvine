@@ -607,17 +607,27 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
     exit 1
   fi
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "Error: python3 is required to build the Python SDK wheel." >&2
+  PYTHON3_BIN=""
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON3_BIN=python3
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON3_BIN=python
+  else
+    echo "Error: python3 (or python) is required to build the Python SDK wheel." >&2
     exit 1
   fi
 
   # Isolated venv for the wheel interpreter (no manual activation; works under sh and bash).
   PYTHON_SDK_VENV="${CURVINE_PYTHON_SDK_VENV:-$FS_HOME/build/.venv-python-sdk}"
-  if [ ! -d "$PYTHON_SDK_VENV" ]; then
+  if [ -d "$PYTHON_SDK_VENV" ]; then
+    if [ ! -f "$PYTHON_SDK_VENV/pyvenv.cfg" ]; then
+      echo "Error: ${PYTHON_SDK_VENV} exists but is not a Python venv (missing pyvenv.cfg)." >&2
+      exit 1
+    fi
+  else
     echo "Creating Python SDK build venv at ${PYTHON_SDK_VENV} ..."
-    python3 -m venv "$PYTHON_SDK_VENV" || {
-      echo "Error: python3 -m venv failed (install python3-venv on Debian/Ubuntu)." >&2
+    "$PYTHON3_BIN" -m venv "$PYTHON_SDK_VENV" || {
+      echo "Error: $PYTHON3_BIN -m venv failed (install python3-venv on Debian/Ubuntu)." >&2
       exit 1
     }
   fi
