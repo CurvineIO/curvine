@@ -210,28 +210,34 @@ impl Path {
             return result;
         }
 
-        let mut current_path = match self.scheme() {
-            Some(FsKind::SCHEME_FILE) => {
-                let sp = if self.path.starts_with(Self::SEPARATOR) {
-                    Self::SEPARATOR
-                } else {
-                    ""
-                };
-                format!(
-                    "{}{}{}{}",
-                    FsKind::SCHEME_FILE,
+        let mut current_path = if self.is_cv() {
+            Self::SEPARATOR.to_string()
+        } else {
+            match self
+                .scheme()
+                .expect("non-CV paths must have a non-CV scheme")
+            {
+                FsKind::SCHEME_FILE => {
+                    let sp = if self.path.starts_with(Self::SEPARATOR) {
+                        Self::SEPARATOR
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{}{}{}{}",
+                        FsKind::SCHEME_FILE,
+                        Self::SCHEME_DELIMITER,
+                        sp,
+                        self.authority().unwrap_or("")
+                    )
+                }
+                v => format!(
+                    "{}{}{}",
+                    v,
                     Self::SCHEME_DELIMITER,
-                    sp,
                     self.authority().unwrap_or("")
-                )
+                ),
             }
-            Some(v) => format!(
-                "{}{}{}",
-                v,
-                Self::SCHEME_DELIMITER,
-                self.authority().unwrap_or("")
-            ),
-            None => Self::SEPARATOR.to_string(),
         };
 
         for part in parts {
@@ -370,6 +376,11 @@ mod tests {
     #[test]
     fn get_possible_mounts() -> CommonResult<()> {
         let p1 = Path::from_str("/a/b/c")?;
+        let mnts = p1.get_possible_mounts();
+        println!("{:?}", mnts);
+        assert_eq!(mnts, Vec::from(["/", "/a", "/a/b", "/a/b/c"]));
+
+        let p1 = Path::from_str("cv://curvine-pro/a/b/c")?;
         let mnts = p1.get_possible_mounts();
         println!("{:?}", mnts);
         assert_eq!(mnts, Vec::from(["/", "/a", "/a/b", "/a/b/c"]));
