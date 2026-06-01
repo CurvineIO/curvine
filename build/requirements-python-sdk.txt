@@ -1,3 +1,2 @@
-# Python toolchain for build/build.sh (Python SDK wheel via maturin).
-# Requires Python >= 3.8 (maturin 1.x). Installed into build/.venv-python-sdk/.
-maturin>=1,<2
+# Python SDK build uses maturin installed via cargo (see ensure_maturin_cmd in build/build.sh).
+# This file is kept for optional future Python build-time dependencies.
