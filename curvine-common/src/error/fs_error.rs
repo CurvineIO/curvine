@@ -60,6 +60,9 @@ pub enum ErrorKind {
     JobNotFound = 23,
     Pipeline = 24,
     MinReplicasNotMet = 25,
+    IsADirectory = 26,
+    NotADirectory = 27,
+    InvalidArgument = 28,
 
     #[num_enum(default)]
     Common = 10000,
@@ -112,6 +115,14 @@ pub enum FsError {
     #[error("{0}")]
     DirNotEmpty(ErrorImpl<StringError>),
 
+    // Path exists as a directory but a non-directory was required
+    #[error("{0}")]
+    IsADirectory(ErrorImpl<StringError>),
+
+    // Path exists but is not a directory where a directory is required
+    #[error("{0}")]
+    NotADirectory(ErrorImpl<StringError>),
+
     // The data state is abnormal.
     #[error("{0}")]
     AbnormalData(ErrorImpl<StringError>),
@@ -131,6 +142,10 @@ pub enum FsError {
     // The path is incorrect.
     #[error("{0}")]
     InvalidPath(ErrorImpl<StringError>),
+
+    // Invalid operation argument (POSIX EINVAL), distinct from InvalidPath.
+    #[error("{0}")]
+    InvalidArgument(ErrorImpl<StringError>),
 
     // Insufficient disk space.
     #[error("{0}")]
@@ -231,6 +246,16 @@ impl FsError {
         Self::DirNotEmpty(ErrorImpl::with_source(msg.into()))
     }
 
+    pub fn is_a_directory(path: impl AsRef<str>) -> Self {
+        let msg = format!("{} is a directory", path.as_ref());
+        Self::IsADirectory(ErrorImpl::with_source(msg.into()))
+    }
+
+    pub fn not_a_directory(path: impl AsRef<str>) -> Self {
+        let msg = format!("{} is not a directory", path.as_ref());
+        Self::NotADirectory(ErrorImpl::with_source(msg.into()))
+    }
+
     pub fn io(error: io::Error) -> Self {
         Self::IO(ErrorImpl::with_source(error))
     }
@@ -238,6 +263,11 @@ impl FsError {
     pub fn invalid_path(path: impl AsRef<str>, ext_msg: impl AsRef<str>) -> Self {
         let msg = format!("Path {} is invalid, {}", path.as_ref(), ext_msg.as_ref());
         Self::InvalidPath(ErrorImpl::with_source(msg.into()))
+    }
+
+    /// Invalid operation argument (maps to POSIX EINVAL).
+    pub fn invalid_argument(msg: impl Into<String>) -> Self {
+        Self::InvalidArgument(ErrorImpl::with_source(msg.into().into()))
     }
 
     pub fn unsupported<T: Into<String>>(feature: T) -> Self {
@@ -303,11 +333,14 @@ impl FsError {
             FsError::InvalidFileSize(_) => ErrorKind::InvalidFileSize,
             FsError::ParentNotDir(_) => ErrorKind::ParentNotDir,
             FsError::DirNotEmpty(_) => ErrorKind::DirNotEmpty,
+            FsError::IsADirectory(_) => ErrorKind::IsADirectory,
+            FsError::NotADirectory(_) => ErrorKind::NotADirectory,
             FsError::AbnormalData(_) => ErrorKind::AbnormalData,
             FsError::BlockIsWriting(_) => ErrorKind::BlockIsWriting,
             FsError::BlockInfo(_) => ErrorKind::BlockInfo,
             FsError::Lease(_) => ErrorKind::Lease,
             FsError::InvalidPath(_) => ErrorKind::InvalidPath,
+            FsError::InvalidArgument(_) => ErrorKind::InvalidArgument,
             FsError::DiskOutOfSpace(_) => ErrorKind::DiskOutOfSpace,
             FsError::InProgress(_) => ErrorKind::InProgress,
             FsError::Unsupported(_) => ErrorKind::Unsupported,
@@ -355,6 +388,12 @@ impl From<std::io::Error> for FsError {
             }
             io::ErrorKind::DirectoryNotEmpty => {
                 Self::DirNotEmpty(ErrorImpl::with_source(value.to_string().into()))
+            }
+            io::ErrorKind::IsADirectory => {
+                Self::IsADirectory(ErrorImpl::with_source(value.to_string().into()))
+            }
+            io::ErrorKind::InvalidInput => {
+                Self::InvalidArgument(ErrorImpl::with_source(value.to_string().into()))
             }
             io::ErrorKind::Unsupported => {
                 Self::Unsupported(ErrorImpl::with_source(value.to_string().into()))
@@ -439,11 +478,14 @@ impl ErrorExt for FsError {
             FsError::InvalidFileSize(e) => FsError::InvalidFileSize(e.ctx(ctx)),
             FsError::ParentNotDir(e) => FsError::ParentNotDir(e.ctx(ctx)),
             FsError::DirNotEmpty(e) => FsError::DirNotEmpty(e.ctx(ctx)),
+            FsError::IsADirectory(e) => FsError::IsADirectory(e.ctx(ctx)),
+            FsError::NotADirectory(e) => FsError::NotADirectory(e.ctx(ctx)),
             FsError::AbnormalData(e) => FsError::AbnormalData(e.ctx(ctx)),
             FsError::BlockIsWriting(e) => FsError::BlockIsWriting(e.ctx(ctx)),
             FsError::BlockInfo(e) => FsError::BlockInfo(e.ctx(ctx)),
             FsError::Lease(e) => FsError::Lease(e.ctx(ctx)),
             FsError::InvalidPath(e) => FsError::InvalidPath(e.ctx(ctx)),
+            FsError::InvalidArgument(e) => FsError::InvalidArgument(e.ctx(ctx)),
             FsError::DiskOutOfSpace(e) => FsError::DiskOutOfSpace(e.ctx(ctx)),
             FsError::InProgress(e) => FsError::InProgress(e.ctx(ctx)),
             FsError::Unsupported(e) => FsError::Unsupported(e.ctx(ctx)),
@@ -470,11 +512,14 @@ impl ErrorExt for FsError {
             FsError::InvalidFileSize(e) => e.encode(ErrorKind::InvalidFileSize),
             FsError::ParentNotDir(e) => e.encode(ErrorKind::ParentNotDir),
             FsError::DirNotEmpty(e) => e.encode(ErrorKind::DirNotEmpty),
+            FsError::IsADirectory(e) => e.encode(ErrorKind::IsADirectory),
+            FsError::NotADirectory(e) => e.encode(ErrorKind::NotADirectory),
             FsError::AbnormalData(e) => e.encode(ErrorKind::AbnormalData),
             FsError::BlockIsWriting(e) => e.encode(ErrorKind::BlockIsWriting),
             FsError::BlockInfo(e) => e.encode(ErrorKind::BlockInfo),
             FsError::Lease(e) => e.encode(ErrorKind::Lease),
             FsError::InvalidPath(e) => e.encode(ErrorKind::InvalidPath),
+            FsError::InvalidArgument(e) => e.encode(ErrorKind::InvalidArgument),
             FsError::DiskOutOfSpace(e) => e.encode(ErrorKind::DiskOutOfSpace),
             FsError::InProgress(e) => e.encode(ErrorKind::InProgress),
             FsError::Unsupported(e) => e.encode(ErrorKind::Unsupported),
@@ -504,11 +549,14 @@ impl ErrorExt for FsError {
             ErrorKind::InvalidFileSize => FsError::InvalidFileSize(de.into_string()),
             ErrorKind::ParentNotDir => FsError::ParentNotDir(de.into_string()),
             ErrorKind::DirNotEmpty => FsError::DirNotEmpty(de.into_string()),
+            ErrorKind::IsADirectory => FsError::IsADirectory(de.into_string()),
+            ErrorKind::NotADirectory => FsError::NotADirectory(de.into_string()),
             ErrorKind::AbnormalData => FsError::AbnormalData(de.into_string()),
             ErrorKind::BlockIsWriting => FsError::BlockIsWriting(de.into_string()),
             ErrorKind::BlockInfo => FsError::BlockInfo(de.into_string()),
             ErrorKind::Lease => FsError::Lease(de.into_string()),
             ErrorKind::InvalidPath => FsError::InvalidPath(de.into_string()),
+            ErrorKind::InvalidArgument => FsError::InvalidArgument(de.into_string()),
             ErrorKind::DiskOutOfSpace => FsError::DiskOutOfSpace(de.into_string()),
             ErrorKind::InProgress => FsError::InProgress(de.into_string()),
             ErrorKind::Unsupported => FsError::Unsupported(de.into_string()),
