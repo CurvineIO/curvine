@@ -281,32 +281,33 @@ else
     print_status "FAIL" "npm not found. Please install npm version 9.0.0 or later" "NPM"
 fi
 
-# Check Python (3.6+; skip if building without Python SDK)
+# Check Python (3.8+ for maturin 1.x; skip if building without Python SDK)
 if [ $SKIP_PYTHON_SDK -eq 0 ]; then
     echo -e "${BLUE}Checking Python...${NC}"
-    if command -v python3 >/dev/null 2>&1; then
-        PYTHON_VERSION=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
+    PYTHON_CHECK_CMD=""
+    if [ -n "${CURVINE_PYTHON3:-}" ]; then
+        PYTHON_CHECK_CMD="$CURVINE_PYTHON3"
+    else
+        for candidate in python3.12 python3.11 python3.10 python3.9 python3.8 python3 python; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                PYTHON_CHECK_CMD="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$PYTHON_CHECK_CMD" ]; then
+        PYTHON_VERSION=$("$PYTHON_CHECK_CMD" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
         if [ -z "$PYTHON_VERSION" ]; then
-            PYTHON_VERSION=$(python3 --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+            PYTHON_VERSION=$("$PYTHON_CHECK_CMD" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
         fi
-        if version_compare "$PYTHON_VERSION" "3.6.0"; then
-            print_status "OK" "Python $PYTHON_VERSION (>= 3.6.0 required)"
+        if version_compare "$PYTHON_VERSION" "3.8.0"; then
+            print_status "OK" "Python $PYTHON_VERSION via $PYTHON_CHECK_CMD (>= 3.8.0 required for Python SDK)"
         else
-            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.6.0 or later is required" "PYTHON"
-        fi
-    elif command -v python >/dev/null 2>&1; then
-        PYTHON_VERSION=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)
-        if [ -z "$PYTHON_VERSION" ]; then
-            PYTHON_VERSION=$(python --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
-        fi
-        PYTHON_MAJOR=$(echo "$PYTHON_VERSION" | cut -d. -f1)
-        if [ "$PYTHON_MAJOR" = "3" ] && version_compare "$PYTHON_VERSION" "3.6.0"; then
-            print_status "OK" "Python $PYTHON_VERSION (>= 3.6.0 required)"
-        else
-            print_status "FAIL" "Python $PYTHON_VERSION found, but version 3.6.0 or later is required" "PYTHON"
+            print_status "FAIL" "Python $PYTHON_VERSION via $PYTHON_CHECK_CMD found, but version 3.8.0 or later is required for maturin 1.x" "PYTHON"
         fi
     else
-        print_status "FAIL" "Python not found. Please install Python version 3.6.0 or later" "PYTHON"
+        print_status "FAIL" "Python not found. Please install Python version 3.8.0 or later" "PYTHON"
     fi
 else
     echo -e "${BLUE}Checking Python...${NC}"

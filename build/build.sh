@@ -72,6 +72,33 @@ get_fuse_version() {
   fi
 }
 
+# maturin 1.x requires Python >= 3.8; default python3 may be older (e.g. 3.6 on EL8).
+python3_sdk_version_ok() {
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null
+}
+
+find_python3_for_sdk() {
+  if [ -n "${CURVINE_PYTHON3:-}" ]; then
+    if python3_sdk_version_ok "$CURVINE_PYTHON3"; then
+      echo "$CURVINE_PYTHON3"
+      return 0
+    fi
+    echo "Error: CURVINE_PYTHON3=$CURVINE_PYTHON3 is below Python 3.8 (required for maturin 1.x)." >&2
+    return 1
+  fi
+
+  for candidate in python3.12 python3.11 python3.10 python3.9 python3.8 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 && python3_sdk_version_ok "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  echo "Error: Python >= 3.8 is required to build the Python SDK wheel (maturin 1.x)." >&2
+  echo "Install python3.8+ or set CURVINE_PYTHON3 to a compatible interpreter." >&2
+  return 1
+}
+
 print_help() {
   echo "Usage: $0 [options]"
   echo
@@ -581,10 +608,9 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
     exit 1
   fi
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "Error: python3 is required to build the Python SDK wheel." >&2
-    exit 1
-  fi
+  PYTHON3_SDK="$(find_python3_for_sdk)" || exit 1
+  PYTHON3_SDK_VERSION="$("$PYTHON3_SDK" --version 2>&1)"
+  echo "Using ${PYTHON3_SDK} (${PYTHON3_SDK_VERSION}) for Python SDK build ..."
 
   # Isolated venv for maturin (no manual activation; works under sh and bash).
   PYTHON_SDK_VENV="${CURVINE_PYTHON_SDK_VENV:-$FS_HOME/build/.venv-python-sdk}"
@@ -594,10 +620,21 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
     exit 1
   fi
 
-  if [ ! -d "$PYTHON_SDK_VENV" ]; then
+  recreate_python_sdk_venv=0
+  if [ -d "$PYTHON_SDK_VENV" ]; then
+    if ! python3_sdk_version_ok "$PYTHON_SDK_VENV/bin/python"; then
+      echo "Recreating Python SDK build venv (existing venv uses Python < 3.8) ..."
+      rm -rf "$PYTHON_SDK_VENV"
+      recreate_python_sdk_venv=1
+    fi
+  else
+    recreate_python_sdk_venv=1
+  fi
+
+  if [ "$recreate_python_sdk_venv" -eq 1 ]; then
     echo "Creating Python SDK build venv at ${PYTHON_SDK_VENV} ..."
-    python3 -m venv "$PYTHON_SDK_VENV" || {
-      echo "Error: python3 -m venv failed (install python3-venv on Debian/Ubuntu)." >&2
+    "$PYTHON3_SDK" -m venv "$PYTHON_SDK_VENV" || {
+      echo "Error: $PYTHON3_SDK -m venv failed (install python3-venv on Debian/Ubuntu)." >&2
       exit 1
     }
   fi
@@ -646,6 +683,7 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
   "${MATURIN_CMD[@]}" build --no-default-features \
     --features "curvine-common/${ALLOC},python-sdk" \
     "${MATURIN_RELEASE[@]}" \
+    --interpreter "$PYTHON_SDK_VENV/bin/python" \
     --compatibility "$MATURIN_COMPAT" \
     --auditwheel "$MATURIN_AUDIT" \
     --out "$DIST_DIR/lib"
