@@ -14,10 +14,12 @@
 
 #![allow(unused)]
 
-use crate::raw::fuse_abi::{fuse_notify_inval_inode_out, fuse_out_header};
+use crate::raw::fuse_abi::{
+    fuse_notify_inval_entry_out, fuse_notify_inval_inode_out, fuse_out_header,
+};
 use crate::session::{FuseNotifyCode, FuseOpCode, FuseTask};
 use crate::{FuseError, FuseResult, FuseUtils};
-use crate::{FUSE_NOTIFY_UNIQUE, FUSE_OUT_HEADER_LEN, FUSE_SUCCESS};
+use crate::{FUSE_MAX_NAME_LENGTH, FUSE_NOTIFY_UNIQUE, FUSE_OUT_HEADER_LEN, FUSE_SUCCESS};
 use log::{info, warn};
 use orpc::io::IOResult;
 use orpc::sync::channel::AsyncSender;
@@ -130,24 +132,13 @@ impl FuseResponse {
         self.sender.send(FuseTask::Reply(data)).await
     }
 
-    pub async fn send_notify<T: Debug>(&self, code: FuseNotifyCode, res: T) -> IOResult<bool> {
+    pub async fn send_notify(&self, code: FuseNotifyCode, data: Vec<DataSlice>) -> IOResult<()> {
         if self.debug {
-            info!("send_notify code {:?}, res: {:?}", code, res);
+            info!("send_notify code {:?}", code);
         }
 
-        #[cfg(target_os = "linux")]
-        {
-            let data = vec![DataSlice::buffer(FuseUtils::struct_as_buf(&res))];
-            let data = ResponseData::create(FUSE_NOTIFY_UNIQUE, code.into(), data);
-
-            self.sender.send(FuseTask::Reply(data)).await?;
-            Ok(true)
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            Ok(false)
-        }
+        let data = ResponseData::create(FUSE_NOTIFY_UNIQUE, code.into(), data);
+        self.sender.send(FuseTask::Reply(data)).await
     }
 
     pub async fn send_buf(&self, res: FuseResult<BytesMut>) -> IOResult<()> {
@@ -192,9 +183,50 @@ impl FuseResponse {
     }
 
     // notify kernel cache invalidation
-    pub async fn send_inode_out(&self, ino: u64, off: i64, len: i64) -> IOResult<bool> {
+    pub async fn send_inode_out(&self, ino: u64, off: i64, len: i64) -> IOResult<()> {
         let arg = fuse_notify_inval_inode_out { ino, off, len };
-        self.send_notify(FuseNotifyCode::FUSE_NOTIFY_INVAL_INODE, arg)
+        let data = vec![DataSlice::buffer(FuseUtils::struct_as_buf(&arg))];
+        self.send_notify(FuseNotifyCode::FUSE_NOTIFY_INVAL_INODE, data)
+            .await
+    }
+
+    pub async fn send_rep_then_inval_inode<T: Debug, E: Into<FuseError> + Debug>(
+        &self,
+        res: Result<T, E>,
+        ino: u64,
+        off: i64,
+        len: i64,
+    ) -> IOResult<()> {
+        self.send_rep(res).await?;
+        self.send_inode_out(ino, off, len).await
+    }
+
+    pub async fn send_rep_then_inval_entry<E: Into<FuseError> + Debug>(
+        &self,
+        res: Result<(), E>,
+        parent: u64,
+        name: &str,
+    ) -> IOResult<()> {
+        self.send_rep(res).await?;
+        self.send_entry_out(parent, name).await
+    }
+
+    pub async fn send_entry_out(&self, parent: u64, name: &str) -> IOResult<()> {
+        let arg = fuse_notify_inval_entry_out {
+            parent,
+            namelen: name.len() as u32,
+            flags: 0,
+        };
+
+        let mut name_buf = BytesMut::with_capacity(name.len() + 1);
+        name_buf.extend_from_slice(name.as_bytes());
+        name_buf.extend_from_slice(b"\0");
+
+        let data = vec![
+            DataSlice::buffer(FuseUtils::struct_as_buf(&arg)),
+            DataSlice::buffer(name_buf),
+        ];
+        self.send_notify(FuseNotifyCode::FUSE_NOTIFY_INVAL_ENTRY, data)
             .await
     }
 }

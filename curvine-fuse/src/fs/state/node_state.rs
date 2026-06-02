@@ -307,14 +307,6 @@ impl NodeState {
     ) -> FuseResult<Arc<FileHandle>> {
         let flags = OpenFlags::new(flags);
 
-        // Before creating reader, flush any active writer to ensure reader gets correct file length
-        // This is critical for applications like git clone that read files while they're being written
-        if flags.read() {
-            if let Some(existing_writer) = self.find_writer(&ino) {
-                existing_writer.lock().await.flush(None).await?;
-            }
-        }
-
         let (reader, writer) = match flags.access_mode() {
             mode if mode == OpenFlags::RDONLY => {
                 let reader = self.new_reader(path).await?;

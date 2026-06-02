@@ -132,13 +132,6 @@ pub struct FuseConf {
 
     pub cache_readdir: bool,
 
-    /// When metadata indicates a cache miss on open, use direct I/O instead of
-    /// dropping the kernel page cache. Default false preserves mmap/read coherence
-    /// (#850); set true to restore the pre-fix behavior for strict remote-read
-    /// freshness (log tailers, multi-writer pipelines). May break MAP_SHARED ↔
-    /// pread coherence when enabled.
-    pub direct_io_on_cache_miss: bool,
-
     pub non_seekable: bool,
 
     pub check_permission: bool,
@@ -316,7 +309,6 @@ impl Default for FuseConf {
             direct_io: false,
             write_back_cache: false,
             cache_readdir: false,
-            direct_io_on_cache_miss: false,
             non_seekable: false,
             check_permission: true,
 
