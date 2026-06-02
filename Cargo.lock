@@ -2036,13 +2036,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-config-macros"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "curvine-fuse"
 version = "0.2.0"
 dependencies = [
  "axum",
  "bindgen",
  "bitflags 2.10.0",
- "bytes",
  "clap",
  "curvine-client",
  "curvine-common",
