@@ -126,12 +126,6 @@ pub struct FuseArgs {
     #[arg(long, help = "Cache readdir results (optional)")]
     pub cache_readdir: Option<bool>,
 
-    #[arg(
-        long,
-        help = "Use direct I/O on open when local metadata indicates a cache miss (optional, default: false)"
-    )]
-    pub direct_io_on_cache_miss: Option<bool>,
-
     // Timeout settings
     #[arg(long, help = "Entry timeout in seconds (optional)")]
     pub entry_timeout: Option<f64>,
@@ -262,10 +256,6 @@ impl FuseArgs {
 
         if let Some(cache_readdir) = self.cache_readdir {
             conf.fuse.cache_readdir = cache_readdir;
-        }
-
-        if let Some(direct_io_on_cache_miss) = self.direct_io_on_cache_miss {
-            conf.fuse.direct_io_on_cache_miss = direct_io_on_cache_miss;
         }
 
         if let Some(entry_timeout) = self.entry_timeout {
