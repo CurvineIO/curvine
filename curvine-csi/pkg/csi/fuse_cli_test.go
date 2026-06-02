@@ -41,7 +41,7 @@ func TestCollectPassthroughParams(t *testing.T) {
 
 	got := CollectPassthroughParams(volumeContext, publishContext)
 	want := map[string]string{
-		"io-threads":        "8",
+		"io-threads":        "4",
 		"entry-timeout":     "1.0",
 		"client.block-size": "65536",
 	}

@@ -33,6 +33,8 @@ var reservedVolumeParameterKeys = map[string]struct{}{
 }
 
 // rejectedVolumeParameterKeys must not appear in StorageClass / PV parameters.
+// Enforcement in validator/node wiring is deferred to C14; until then validator.go may
+// still accept a legacy user-provided mnt-path.
 var rejectedVolumeParameterKeys = map[string]struct{}{
 	"mnt-path": {},
 }
@@ -81,7 +83,8 @@ func MergeVolumeParameters(volumeContext, publishContext map[string]string) map[
 }
 
 // CollectPassthroughParams returns StorageClass/PV keys that should be forwarded to
-// curvine-fuse as --key value pairs (sorted by key).
+// curvine-fuse as --key value pairs. The returned map is unordered; deterministic argv
+// ordering is applied in appendPassthroughArgs when building CLI flags.
 func CollectPassthroughParams(volumeContext, publishContext map[string]string) map[string]string {
 	merged := MergeVolumeParameters(volumeContext, publishContext)
 	out := make(map[string]string)
@@ -154,9 +157,5 @@ func appendPassthroughArgs(args []string, passthrough map[string]string) []strin
 
 // passthroughCLIKey maps a volume parameter key to a curvine-fuse CLI flag name.
 func passthroughCLIKey(key string) string {
-	// client.* keys use the client. prefix on the CLI (e.g. client.block-size).
-	if len(key) > 7 && key[:7] == "client." {
-		return "--" + key
-	}
 	return "--" + key
 }
