@@ -29,14 +29,12 @@ pub fn derive_client_cli_args(input: TokenStream) -> TokenStream {
     let overrides_name = syn::Ident::new("ClientCliOverrides", conf_name.span());
 
     let expanded = quote! {
-        #input
-
         #[derive(Debug, Default, Clone, PartialEq, Eq)]
         pub struct #overrides_name {}
 
         impl #overrides_name {
             /// Applies CLI overrides onto the target configuration struct.
-            pub fn apply_to(&self, _target: &mut #conf_name) -> Result<(), String> {
+            pub fn apply_to(&self, _target: &mut #conf_name) -> orpc::CommonResult<()> {
                 Ok(())
             }
         }
