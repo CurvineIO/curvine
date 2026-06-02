@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Proc-macros for generating client CLI override types from configuration structs.
+//! Proc-macros for Curvine configuration structs under `curvine-common`.
 
 use proc_macro::TokenStream;
 use quote::quote;

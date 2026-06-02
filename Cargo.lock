@@ -2036,7 +2036,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "curvine-config-macros"
+name = "curvine-common-macros"
 version = "0.2.0"
 dependencies = [
  "proc-macro2",
