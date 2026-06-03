@@ -28,7 +28,7 @@ pub struct FuseMountArgs {
 
     // Specify the root path of the mount point to access the file system, default "/"
     #[arg(long, help = "Remote filesystem path (default: /)")]
-    pub(crate) fs_path: Option<String>,
+    fs_path: Option<String>,
 
     // Number of mount points
     #[arg(long, help = "Number of mount points (default: 1)")]
@@ -36,7 +36,7 @@ pub struct FuseMountArgs {
 
     // Debug mode
     #[arg(short, long, action = clap::ArgAction::SetTrue, help = "Enable debug mode")]
-    pub(crate) debug: bool,
+    debug: bool,
 
     // Configuration file path (optional)
     #[arg(
@@ -45,7 +45,7 @@ pub struct FuseMountArgs {
         help = "Configuration file path (optional)",
         default_value = "conf/curvine-cluster.toml"
     )]
-    pub(crate) conf: String,
+    conf: String,
 
     // IO threads (optional)
     #[arg(long, help = "IO threads (optional)")]
@@ -110,7 +110,7 @@ pub struct FuseMountArgs {
 
     // FUSE options
     #[arg(short, long)]
-    pub(crate) options: Vec<String>,
+    options: Vec<String>,
 
     // Additional FuseConf fields
     #[arg(long, help = "Fill inode number when reading directory (optional)")]
