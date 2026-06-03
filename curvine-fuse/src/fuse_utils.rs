@@ -116,7 +116,7 @@ impl FuseUtils {
     // In fuse 2, this default size is 132kb (128 + 4)
     pub fn get_fuse_buf_size() -> usize {
         let page_size = sys::get_pagesize().unwrap_or(FUSE_DEFAULT_PAGE_SIZE);
-        FUSE_MAX_MAX_PAGES * page_size + FUSE_IN_HEADER_LEN
+        FUSE_MAX_MAX_PAGES * page_size + FUSE_BUFFER_HEADER_SIZE
     }
 
     fn fuse_dev_ioc_clone() -> u64 {
