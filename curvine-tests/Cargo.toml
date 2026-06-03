@@ -7,13 +7,26 @@ edition = "2021"
 # Enable OSS-HDFS backend specific tests / code paths (Jindo-based).
 # This is used by `#[cfg(feature = "oss-hdfs")]` in integration tests.
 oss-hdfs = ["curvine-ufs/oss-hdfs"]
+lancedb = [
+    "dep:curvine-lancedb",
+    "dep:lance-io",
+    "dep:object_store",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+    "dep:url",
+]
+
+[[test]]
+name = "lancedb_object_store_e2e"
+path = "tests/lancedb_object_store_e2e.rs"
+required-features = ["lancedb"]
 
 [dependencies]
 orpc = { workspace = true }
 curvine-common = { workspace = true }
 curvine-server = { workspace = true }
 curvine-client = { workspace = true }
-curvine-lancedb = { workspace = true }
+curvine-lancedb = { workspace = true, optional = true }
 curvine-ufs = { workspace = true }
 tokio  = { workspace = true }
 tracing = { workspace = true }
@@ -21,16 +34,16 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 log = { workspace = true }
 futures = { workspace = true }
-lance-io = "4.0.0"
-object_store = "0.12.5"
+lance-io = { version = "4.0.0", optional = true }
+object_store = { version = "0.12.5", optional = true }
 bytes = { workspace = true }
 once_cell = { workspace = true }
 clap = { workspace = true }
-arrow-array = "57.2"
-arrow-schema = "57.2"
+arrow-array = { version = "57.2", optional = true }
+arrow-schema = { version = "57.2", optional = true }
 awaitility = "0.4"
 tempfile = { workspace = true }
-url = { workspace = true }
+url = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 curvine-fuse = { workspace = true }

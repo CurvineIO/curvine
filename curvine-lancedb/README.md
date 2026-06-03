@@ -301,7 +301,7 @@ CURVINE_MASTER_ADDRS=10.209.148.124:8995,10.209.148.125:8995,10.209.148.127:8995
 Run Curvine minicluster e2e:
 
 ```bash
-cargo test -p curvine-tests --test lancedb_object_store_e2e -- --nocapture
+cargo test -p curvine-tests --features lancedb --test lancedb_object_store_e2e -- --nocapture
 ```
 
 Run e2e against an external cluster:
@@ -317,7 +317,7 @@ master_addrs = [
 EOF
 
 CURVINE_E2E_CONF_FILE=/tmp/curvine-lancedb-e2e.toml \
-  cargo test -p curvine-tests --test lancedb_object_store_e2e -- --nocapture
+  cargo test -p curvine-tests --features lancedb --test lancedb_object_store_e2e -- --nocapture
 ```
 
 Before submitting changes, run at least:

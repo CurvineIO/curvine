@@ -24,6 +24,21 @@ members = [
     "curvine-cli",
 ]
 
+# Mirror members here unless a crate is intentionally opt-in.
+# curvine-lancedb stays opt-in because it pulls heavy Lance/Arrow dependencies.
+default-members = [
+    "orpc",
+    "curvine-common",
+    "curvine-server",
+    "curvine-client",
+    "curvine-libsdk",
+    "curvine-tests",
+    "curvine-fuse",
+    "curvine-web",
+    "curvine-ufs",
+    "curvine-cli"
+]
+
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
