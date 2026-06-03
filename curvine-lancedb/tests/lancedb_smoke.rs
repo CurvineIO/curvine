@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! CURVINE_CONF_FILE=/path/to/cluster.toml \
-//!   cargo test -p curvine-lancedb-rs --test lancedb_smoke -- --ignored
+//!   cargo test -p curvine-lancedb --test lancedb_smoke -- --ignored
 //! ```
 
 use std::env;
@@ -23,7 +23,7 @@ use lancedb::object_store::CURVINE_CONF_FILE_KEY;
 use lancedb::query::ExecutableQuery;
 
 #[tokio::test]
-#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test lancedb_smoke -- --ignored"]
+#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb --test lancedb_smoke -- --ignored"]
 async fn lancedb_curvine_smoke_connect_table_query_names() {
     let conf = match env::var(ClusterConf::ENV_CONF_FILE) {
         Ok(v) => v,

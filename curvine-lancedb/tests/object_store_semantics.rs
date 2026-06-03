@@ -6,7 +6,7 @@
 //! Phase 4B — live Curvine [`object_store`] semantics (one integration test).
 //!
 //! Run (requires a reachable Curvine cluster and `CURVINE_CONF_FILE`):
-//! `CURVINE_CONF_FILE=/path/to/cluster.toml cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored`
+//! `CURVINE_CONF_FILE=/path/to/cluster.toml cargo test -p curvine-lancedb --test object_store_semantics -- --ignored`
 //!
 //! Covered operations: `put`, `head`, `get_opts(head=true)`, ranged `get_opts`, overwrite `put`,
 //! `copy` (source retained, destination overwritten when present), `copy_if_not_exists`,
@@ -30,7 +30,7 @@ use object_store::{Error as OsError, GetOptions, GetRange, MultipartUpload, PutM
 use url::Url;
 
 #[tokio::test]
-#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored"]
+#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb --test object_store_semantics -- --ignored"]
 async fn curvine_object_store_semantics_live_cluster() {
     let conf = match env::var(ClusterConf::ENV_CONF_FILE) {
         Ok(v) => v,
@@ -671,7 +671,7 @@ async fn curvine_object_store_semantics_live_cluster() {
 }
 
 #[tokio::test]
-#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb-rs --test object_store_semantics -- --ignored"]
+#[ignore = "live Curvine cluster + CURVINE_CONF_FILE; cargo test -p curvine-lancedb --test object_store_semantics -- --ignored"]
 async fn curvine_object_store_root_workspace_hides_multipart_staging() {
     let conf = match env::var(ClusterConf::ENV_CONF_FILE) {
         Ok(v) => v,

@@ -16,10 +16,10 @@ Facade crate over upstream [LanceDB](https://github.com/lancedb/lancedb) (v0.27.
 
 ```bash
 # Check compilation
-cargo check -p curvine-lancedb-rs
+cargo check -p curvine-lancedb
 
 # Run Rust tests
-cargo test -p curvine-lancedb-rs
+cargo test -p curvine-lancedb
 ```
 
 ---
@@ -33,7 +33,7 @@ cargo test -p curvine-lancedb-rs
 ### Development
 
 ```bash
-cd curvine-lancedb-rs
+cd curvine-lancedb
 
 python3 -m venv .venv && source .venv/bin/activate
 pip3 install maturin pytest pytest-asyncio
