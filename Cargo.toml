@@ -23,6 +23,8 @@ members = [
     "curvine-cli"
 ]
 
+# Mirror members here unless a crate is intentionally opt-in.
+# curvine-lancedb stays opt-in because it pulls heavy Lance/Arrow dependencies.
 default-members = [
     "orpc",
     "curvine-common",
