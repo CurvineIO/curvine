@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::state::{FileType, StoragePolicy, TtlAction};
+use crate::UFS_INODE_ID;
 use orpc::common::LocalTime;
 use orpc::ternary;
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,10 @@ impl FileStatus {
     /// Returns true if CV data is valid and usable: CV exists, not expired, UFS exists;
     /// when `ufs_status` is provided, also checks len and mtime match UFS.
     pub fn cv_valid(&self, ufs_status: Option<&FileStatus>) -> bool {
+        if self.storage_policy.ufs_mtime == 0 {
+            return false;
+        }
+
         if !self.cv_exists() {
             return false;
         }
@@ -120,5 +125,12 @@ impl FileStatus {
         } else {
             false
         }
+    }
+
+    /// After cache validity: set visible `mtime` from `storage_policy.ufs_mtime` and clear `id`
+    /// for the UFS-backed read path.
+    pub fn apply_ufs_fields(&mut self) {
+        self.mtime = self.storage_policy.ufs_mtime;
+        self.id = UFS_INODE_ID;
     }
 }

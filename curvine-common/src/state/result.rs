@@ -23,9 +23,9 @@ pub struct FreeResult {
 }
 
 impl FreeResult {
-    pub fn add(&mut self, file_len: i64, blocks: HashMap<i64, Vec<BlockLocation>>) {
+    pub fn add(&mut self, bytes: i64, blocks: HashMap<i64, Vec<BlockLocation>>) {
         self.inodes += 1;
-        self.bytes += file_len;
+        self.bytes += bytes;
         self.blocks.extend(blocks);
     }
 }

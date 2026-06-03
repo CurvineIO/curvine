@@ -19,8 +19,7 @@ use crate::{java_err, java_err2, LibFsReader, LibFsWriter};
 use jni::objects::{JLongArray, JObject, JString};
 use jni::sys::{jarray, jboolean, jint, jlong};
 use jni::JNIEnv;
-use orpc::sys::DataSlice;
-use orpc::sys::{FFIUtils, RawVec};
+use orpc::sys::FFIUtils;
 
 // It's too troublesome to parse object members by jni. Here the configuration will be passed through the json string.
 #[no_mangle]
@@ -64,20 +63,37 @@ pub unsafe extern "C" fn Java_io_curvine_CurvineNative_append(
     FFIUtils::into_raw_ptr(writer)
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn Java_io_curvine_CurvineNative_allocChunk(
+    mut env: JNIEnv,
+    _this: JObject,
+    writer_ptr: *mut LibFsWriter,
+    tmp: JLongArray,
+) -> jlong {
+    let writer = &mut *writer_ptr;
+
+    let chunk = java_err!(env, writer.alloc_chunk());
+    let arr = [chunk.as_ptr() as jlong, chunk.len() as jlong];
+    env.set_long_array_region(tmp, 0, &arr).unwrap();
+
+    SUCCESS
+}
+
 // Write data.Java passes the direct buffer memory address and length.
 #[no_mangle]
 pub unsafe extern "C" fn Java_io_curvine_CurvineNative_write(
     mut env: JNIEnv,
     _this: JObject,
     writer_ptr: *mut LibFsWriter,
-    buf: jlong,
+    address: jlong,
     len: jint,
+    tmp: JLongArray,
 ) -> jlong {
     let writer = &mut *writer_ptr;
 
-    let raw_vec = RawVec::from_raw(buf as *mut u8, len as usize);
-    let buf = DataSlice::MemSlice(raw_vec);
-    java_err!(env, writer.write(buf));
+    let chunk = java_err!(env, writer.write_v2(address, len));
+    let arr = [chunk.as_ptr() as jlong, chunk.len() as jlong];
+    env.set_long_array_region(tmp, 0, &arr).unwrap();
 
     SUCCESS
 }

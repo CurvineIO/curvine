@@ -119,7 +119,7 @@ pub struct ClientConf {
     pub data_timeout_ms: u64,
     pub pipeline_timeout_ms: u64,
 
-    // After testing 3 connections, the best performance can be achieved, so the default value is 1.
+    // After testing 3 connections, the best performance can be achieved, so the default value is 3.
     pub master_conn_pool_size: usize,
 
     // Whether to enable pre-reading
@@ -145,6 +145,10 @@ pub struct ClientConf {
     // If the cache hits, read data from Curvine.
     // If the cache misses, determine whether to allow Curvine to directly read data from the unified file system (UFS).
     pub enable_rust_read_ufs: bool,
+
+    // Whether to enable client-side audit logging for UnifiedFileSystem operations.
+    // The log target is "audit" and records: cmd, ok, src, dst, usedUs.
+    pub audit_logging_enabled: bool,
 
     // Mount information update interval
     #[serde(skip)]
@@ -362,7 +366,7 @@ impl Default for ClientConf {
             rpc_timeout_ms: 120 * 1000,
             data_timeout_ms: 120 * 1000,
             pipeline_timeout_ms: 120 * 1000,
-            master_conn_pool_size: 1,
+            master_conn_pool_size: 3,
 
             enable_read_ahead: true,
             read_ahead_len: 0,
@@ -375,6 +379,8 @@ impl Default for ClientConf {
 
             enable_unified_fs: true,
             enable_rust_read_ufs: true,
+
+            audit_logging_enabled: true,
 
             mount_update_ttl: Default::default(),
             mount_update_ttl_str: "10s".to_string(),

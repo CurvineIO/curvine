@@ -38,15 +38,17 @@ use tokio_util::bytes::BytesMut;
 
 pub struct CurvineFileSystem {
     fs: UnifiedFileSystem,
-    state: NodeState,
+    state: Arc<NodeState>,
     conf: FuseConf,
 }
 
 impl CurvineFileSystem {
     pub fn new(conf: ClusterConf, rt: Arc<Runtime>) -> FuseResult<Self> {
+        FuseMetrics::ensure_init()?;
+
         let fuse_conf = conf.fuse.clone();
         let fs = UnifiedFileSystem::with_rt(conf, rt)?;
-        let state = NodeState::new(fs.clone());
+        let state = Arc::new(NodeState::new(fs.clone()));
 
         let fuse_fs = Self {
             fs,
@@ -55,6 +57,10 @@ impl CurvineFileSystem {
         };
 
         Ok(fuse_fs)
+    }
+
+    pub fn state(&self) -> &Arc<NodeState> {
+        &self.state
     }
 
     fn fill_open_flags(conf: &FuseConf, v: u32) -> u32 {
@@ -668,16 +674,9 @@ impl fs::FileSystem for CurvineFileSystem {
         let res = self.lookup_status(parent, name.as_deref(), &status);
 
         let entry = match res {
-            Ok(attr) => {
-                let mut entry = Self::create_entry_out(&self.conf, attr);
-                let keep_attr = self.state.should_keep_attr(entry.nodeid, &status)?;
-                if !keep_attr {
-                    entry.entry_valid = 0;
-                    entry.attr_valid = 0;
-                    entry.entry_valid_nsec = 0;
-                    entry.attr_valid_nsec = 0;
-                }
-                entry
+            Ok(mut attr) => {
+                self.state.update_writer_len(&mut attr).await;
+                Self::create_entry_out(&self.conf, attr)
             }
 
             Err(e) if e.errno == libc::ENOENT && !self.conf.negative_ttl.is_zero() => {
@@ -879,20 +878,11 @@ impl fs::FileSystem for CurvineFileSystem {
 
         let mut fuse_attr = Self::status_to_attr(&self.conf, &status)?;
         fuse_attr.ino = op.header.nodeid;
-
-        let keep_cache = self.state.should_keep_attr(op.header.nodeid, &status)?;
-        let (attr_valid, attr_valid_nsec) = if keep_cache {
-            (
-                self.conf.attr_ttl.as_secs(),
-                self.conf.attr_ttl.subsec_nanos(),
-            )
-        } else {
-            (0, 0)
-        };
+        self.state.update_writer_len(&mut fuse_attr).await;
 
         let attr = fuse_attr_out {
-            attr_valid,
-            attr_valid_nsec,
+            attr_valid: self.conf.attr_ttl.as_secs(),
+            attr_valid_nsec: self.conf.attr_ttl.subsec_nanos(),
             dummy: 0,
             attr: fuse_attr,
         };
@@ -1112,7 +1102,7 @@ impl fs::FileSystem for CurvineFileSystem {
         handle.read(&self.state, op, reply).await
     }
 
-    async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
+    async fn open(&self, op: Open<'_>, reply: FuseResponse) -> FuseResult<fuse_open_out> {
         let path = self.state.get_path(op.header.nodeid)?;
         // Check file access permissions before opening
         let action = OpenAction::try_from(op.arg.flags)?;
@@ -1131,11 +1121,11 @@ impl fs::FileSystem for CurvineFileSystem {
         } else {
             let keep_cache = self
                 .state
-                .should_keep_cache(op.header.nodeid, handle.status())?;
+                .should_keep_cache(op.header.nodeid, handle.status());
             if keep_cache {
                 open_flags |= FUSE_FOPEN_KEEP_CACHE;
             } else {
-                open_flags |= FUSE_FOPEN_DIRECT_IO;
+                reply.send_inode_out(op.header.nodeid, 0, -1).await?;
             }
         }
 

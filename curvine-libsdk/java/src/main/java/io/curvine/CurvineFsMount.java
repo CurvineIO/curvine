@@ -15,11 +15,9 @@
 package io.curvine;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.Optional;
 
 import io.curvine.exception.CurvineException;
-import sun.nio.ch.DirectBuffer;
 
 public class CurvineFsMount {
     private final long nativeHandle;
@@ -66,9 +64,12 @@ public class CurvineFsMount {
         return handle;
     }
 
-    public void write(long writerHandle, ByteBuffer buffer) throws IOException {
-        long res = CurvineNative.write(writerHandle, ((DirectBuffer) buffer).address(), buffer.position());
-        checkError(res);
+    public void allocChunk(long writerHandle, long[] tmp) throws IOException {
+        checkError(CurvineNative.allocChunk(writerHandle, tmp));
+    }
+
+    public void write(long writerHandle, long address, int len, long[] tmp) throws IOException {
+        checkError(CurvineNative.write(writerHandle, address, len, tmp));
     }
 
     public void flush(long writerHandle) throws IOException {

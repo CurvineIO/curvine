@@ -149,7 +149,7 @@ impl ReadHandler {
             let abs_offset = if file.supports_short_circuit() {
                 header.offset
             } else {
-                context.bdev_offset + context.off + header.offset
+                context.bdev_offset + header.offset
             };
             if abs_offset != file.pos() {
                 file.seek(abs_offset)?;

@@ -28,28 +28,17 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
     private final CurvineFsMount libFs;
     private boolean closed;
 
-    private ByteBuffer[] buffer;
+    private ByteBuffer buffer;
 
-    private final int chunkSize;
-    private final int chunkNum;
+    private final long[] tmp = new long[] {0, 0};
 
     private long pos = 0;
 
-    private int bufIndex = 0;
-
-    public CurvineOutputStream(
-            CurvineFsMount libFs,
-            long nativeHandle,
-            long pos,
-            int chunk_size,
-            int chunk_num
-    ) {
+    public CurvineOutputStream(CurvineFsMount libFs, long nativeHandle, long pos) {
         this.libFs = libFs;
         this.nativeHandle = nativeHandle;
         this.oneByte = new byte[1];
         this.pos = pos;
-        this.chunkSize = chunk_size;
-        this.chunkNum = chunk_num;
     }
 
     private void checkClosed() throws IOException {
@@ -71,26 +60,6 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
         write(buf, 0, buf.length);
     }
 
-    protected ByteBuffer getBuffer() throws IOException {
-        if (buffer == null) {
-            buffer = createBufferArray(chunkSize, chunkNum);
-        }
-
-        if (!buffer[bufIndex].hasRemaining()) {
-            flushBuffer();
-
-            // select next buffer
-            if (bufIndex == buffer.length - 1) {
-                libFs.flush(nativeHandle);
-                bufIndex = 0;
-            } else {
-                bufIndex++;
-            }
-            buffer[bufIndex].clear();
-        }
-        return buffer[bufIndex];
-    }
-
     @Override
     public void write(@Nonnull byte[] buf, int offset, int length) throws IOException {
         checkClosed();
@@ -103,26 +72,40 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
         }
 
         while (length > 0) {
-            ByteBuffer curBuf = getBuffer();
-            int writeLen = Math.min(length, curBuf.remaining());
-            curBuf.put(buf, offset, writeLen);
+            ensureWritableBuffer();
+
+            int writeLen = Math.min(length, buffer.remaining());
+            buffer.put(buf, offset, writeLen);
             offset += writeLen;
             length -= writeLen;
             pos += writeLen;
         }
     }
 
-
     private void flushBuffer() throws IOException {
-        if (buffer != null && buffer[bufIndex].position() > 0) {
-            libFs.write(nativeHandle, buffer[bufIndex]);
-            // Clear buffer after writing to prevent duplicate writes
-            buffer[bufIndex].clear();
+        if (buffer != null && buffer.position() > 0) {
+            libFs.write(nativeHandle, CurvineNative.getAddress(buffer), buffer.position(), tmp);
+            buffer = CurvineNative.createBuffer(tmp);
+        }
+    }
+
+    private void ensureWritableBuffer() throws IOException {
+        if (buffer == null) {
+            libFs.allocChunk(nativeHandle, tmp);
+            buffer = CurvineNative.createBuffer(tmp);
+        }
+
+        if (!buffer.hasRemaining()) {
+            flushBuffer();
+            if (buffer == null || !buffer.hasRemaining()) {
+                throw new IOException("write buffer has no remaining capacity after flush");
+            }
         }
     }
 
     @Override
     public void flush() throws IOException {
+        checkClosed();
         flushBuffer();
         libFs.flush(nativeHandle);
     }
@@ -157,28 +140,5 @@ public class CurvineOutputStream extends OutputStream implements Syncable {
         // HDFS protocol requires hsync() to guarantee data durability
         // Flush all buffered data to ensure persistence
         flush();
-    }
-
-    private static ByteBuffer[] createBufferArray(int chunkSize, int chunkNum) {
-        if (chunkSize <= 0 || chunkNum <= 0) {
-            throw new IllegalArgumentException("chunkSize and chunkNum must be positive");
-        }
-
-        ByteBuffer sourceBuffer = CurvineNative.createBuffer(chunkSize * chunkNum);
-        ByteBuffer[] chunks = new ByteBuffer[chunkNum];
-
-        sourceBuffer.position(0);
-        sourceBuffer.limit(sourceBuffer.capacity());
-        for (int i = 0; i < chunkNum; i++) {
-            int startPos = i * chunkSize;
-            int endPos = startPos + chunkSize;
-
-            sourceBuffer.position(startPos);
-            sourceBuffer.limit(endPos);
-
-            chunks[i] = sourceBuffer.slice();
-        }
-
-        return chunks;
     }
 }

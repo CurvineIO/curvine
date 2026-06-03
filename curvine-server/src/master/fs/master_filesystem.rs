@@ -168,14 +168,13 @@ impl MasterFilesystem {
             return Ok(false);
         }
 
-        // dst cannot be in the src directory, /a/b -> /a/b/c is not allowed operations.
+        // dst cannot be in the src directory, /a/b -> /a/b/c is not allowed (POSIX EINVAL).
         if let Some(rest) = dst.strip_prefix(src) {
             if rest.starts_with(PATH_SEPARATOR) {
-                return err_box!(
-                    "Rename dst {} is a directory or file under src {}",
-                    dst,
-                    src
-                );
+                return err_ext!(FsError::invalid_argument(format!(
+                    "cannot rename {} to {}: destination is under source",
+                    src, dst
+                )));
             }
         }
 

@@ -72,6 +72,32 @@ get_fuse_version() {
   fi
 }
 
+# maturin is a Rust tool; install via cargo so builds do not depend on pip mirrors or venv pip.
+ensure_maturin_cmd() {
+  if command -v maturin >/dev/null 2>&1; then
+    MATURIN_CMD=(maturin)
+    return 0
+  fi
+  if [ -x "${HOME}/.cargo/bin/maturin" ]; then
+    MATURIN_CMD=("${HOME}/.cargo/bin/maturin")
+    return 0
+  fi
+
+  echo "maturin not found in PATH; installing via cargo ..."
+  cargo install maturin --locked
+  if command -v maturin >/dev/null 2>&1; then
+    MATURIN_CMD=(maturin)
+    return 0
+  fi
+  if [ -x "${HOME}/.cargo/bin/maturin" ]; then
+    MATURIN_CMD=("${HOME}/.cargo/bin/maturin")
+    return 0
+  fi
+
+  echo "Error: maturin install via cargo failed." >&2
+  return 1
+}
+
 print_help() {
   echo "Usage: $0 [options]"
   echo
@@ -102,6 +128,9 @@ print_help() {
   echo "  -d, --debug           Build in debug mode (default: release mode)"
   echo "  -f, --features LIST   Comma-separated list of extra features to enable"
   echo "  -z, --zip             Create zip archive"
+  echo "  --spdk                Enable SPDK NVMe-oF initiator support (TCP transport)"
+  echo "  --spdk-rdma           Enable SPDK NVMe-oF initiator support (TCP + RDMA transport)"
+  echo "  --spdk-dir PATH       Path to pre-built SPDK installation (default: /opt/spdk or \$SPDK_DIR)"
   echo "  --skip-java-sdk        Skip Java SDK compilation (useful for Docker builds)"
   echo "  --skip-python-sdk      Skip Python SDK compilation (useful for Docker builds)"
   echo "  -h, --help            Show this help message"
@@ -114,6 +143,9 @@ print_help() {
   echo "  $0 --ufs opendal-hdfs --ufs opendal-webhdfs  # Build with HDFS support"
   echo "  $0 --ufs oss-hdfs                         # Build with OSS-HDFS support (JindoSDK)"
   echo "  $0 --features jni --package client     # Build client with JNI support"
+  echo "  $0 --spdk                               # Build with SPDK TCP initiator support"
+  echo "  $0 --spdk-rdma                          # Build with SPDK RDMA initiator support"
+  echo "  $0 --spdk-rdma --spdk-dir /opt/spdk    # Build with SPDK at custom path"
   echo "  $0 --skip-java-sdk                      # Build all packages except Java SDK"
   echo "  $0 --skip-python-sdk                    # Build all packages except Python SDK"
   echo "  $0 -p java -p python                    # Build both Java and Python SDKs"
@@ -144,9 +176,12 @@ ALLOC=jemalloc
 CRATE_ZIP=""
 SKIP_JAVA_SDK=0    # Flag to skip Java SDK compilation
 SKIP_PYTHON_SDK=0  # Flag to skip Python SDK compilation
+ENABLE_SPDK=0      # Flag to enable SPDK TCP initiator support
+ENABLE_SPDK_RDMA=0 # Flag to enable SPDK RDMA initiator support
+SPDK_DIR="${SPDK_DIR:-}"  # Path to pre-built SPDK installation
 
 # Parse command line arguments
-TEMP=$(getopt -o p:u:f:a:dzhv --long package:,ufs:,features:,alloc:,debug,zip,skip-java-sdk,skip-python-sdk,help -n "$0" -- "$@")
+TEMP=$(getopt -o p:u:f:a:dzhv --long package:,ufs:,features:,alloc:,debug,zip,spdk,spdk-rdma,spdk-dir:,skip-java-sdk,skip-python-sdk,help -n "$0" -- "$@")
 if [ $? != 0 ] ; then print_help ; exit 1 ; fi
 
 eval set -- "$TEMP"
@@ -184,6 +219,18 @@ while true ; do
     -z|--zip)
       CRATE_ZIP="zip"
       shift
+      ;;
+    --spdk)
+      ENABLE_SPDK=1
+      shift
+      ;;
+    --spdk-rdma)
+      ENABLE_SPDK_RDMA=1
+      shift
+      ;;
+    --spdk-dir)
+      SPDK_DIR="$2"
+      shift 2
       ;;
     --skip-java-sdk)
       SKIP_JAVA_SDK=1
@@ -318,7 +365,7 @@ fi
 
 build_curvine_libsdk() {
   local sdk_feature="$1"
-  local sdk_cmd="cargo build $PROFILE -p curvine-libsdk --no-default-features --features curvine-common/${ALLOC},${sdk_feature}"
+  local sdk_cmd="cargo build $PROFILE -p curvine-libsdk --no-default-features --features curvine-common/system,${sdk_feature}"
   echo "Building curvine-libsdk with feature: ${sdk_feature}"
   echo "Build command: ${sdk_cmd}"
   eval "$sdk_cmd"
@@ -465,6 +512,12 @@ if [ ${#EXTRA_FEATURES[@]} -gt 0 ]; then
         FEATURES+=("curvine-ufs/jni")
         FEATURES+=("curvine-server/jni")
         ;;
+      spdk)
+        FEATURES+=("curvine-server/spdk")
+        ;;
+      spdk-rdma)
+        FEATURES+=("curvine-server/spdk-rdma")
+        ;;
       *)
         # For other features, add as-is (might be package-specific)
         FEATURES+=("$feature")
@@ -475,6 +528,26 @@ fi
 
 # Append --alloc as a workspace feature: curvine-common/{jemalloc|mimalloc} → cargo --features
 FEATURES+=("curvine-common/${ALLOC}")
+
+# Add SPDK features if specified
+if [ $ENABLE_SPDK -eq 1 ]; then
+  FEATURES+=("curvine-server/spdk")
+  echo "Enabling SPDK NVMe-oF initiator support (TCP transport)"
+fi
+
+if [ $ENABLE_SPDK_RDMA -eq 1 ]; then
+  FEATURES+=("curvine-server/spdk-rdma")
+  echo "Enabling SPDK NVMe-oF initiator support (TCP + RDMA transport)"
+fi
+
+# Set SPDK_DIR environment variable for build.rs
+if [ -n "$SPDK_DIR" ]; then
+  export SPDK_DIR
+  echo "Using SPDK_DIR=${SPDK_DIR}"
+elif [ -d "/opt/spdk" ]; then
+  export SPDK_DIR="/opt/spdk"
+  echo "Using default SPDK_DIR=/opt/spdk"
+fi
 
 # Add features to command if any
 if [ ${#FEATURES[@]} -gt 0 ]; then
@@ -534,41 +607,32 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
     exit 1
   fi
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "Error: python3 is required to build the Python SDK wheel." >&2
+  PYTHON3_BIN=""
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON3_BIN=python3
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON3_BIN=python
+  else
+    echo "Error: python3 (or python) is required to build the Python SDK wheel." >&2
     exit 1
   fi
 
-  # Isolated venv for maturin (no manual activation; works under sh and bash).
+  # Isolated venv for the wheel interpreter (no manual activation; works under sh and bash).
   PYTHON_SDK_VENV="${CURVINE_PYTHON_SDK_VENV:-$FS_HOME/build/.venv-python-sdk}"
-  PY_SDK_REQ="$FS_HOME/build/requirements-python-sdk.txt"
-  if [ ! -f "$PY_SDK_REQ" ]; then
-    echo "Error: missing $PY_SDK_REQ" >&2
-    exit 1
-  fi
-
-  if [ ! -d "$PYTHON_SDK_VENV" ]; then
+  if [ -d "$PYTHON_SDK_VENV" ]; then
+    if [ ! -f "$PYTHON_SDK_VENV/pyvenv.cfg" ]; then
+      echo "Error: ${PYTHON_SDK_VENV} exists but is not a Python venv (missing pyvenv.cfg)." >&2
+      exit 1
+    fi
+  else
     echo "Creating Python SDK build venv at ${PYTHON_SDK_VENV} ..."
-    python3 -m venv "$PYTHON_SDK_VENV" || {
-      echo "Error: python3 -m venv failed (install python3-venv on Debian/Ubuntu)." >&2
+    "$PYTHON3_BIN" -m venv "$PYTHON_SDK_VENV" || {
+      echo "Error: $PYTHON3_BIN -m venv failed (install python3-venv on Debian/Ubuntu)." >&2
       exit 1
     }
   fi
 
-  # Minimal venvs may lack pip; ensure it exists before installing maturin.
-  if ! "$PYTHON_SDK_VENV/bin/python" -m pip --version >/dev/null 2>&1; then
-    echo "Bootstrapping pip in Python SDK build venv (ensurepip) ..."
-    "$PYTHON_SDK_VENV/bin/python" -m ensurepip --upgrade || {
-      echo "Error: pip is not available and ensurepip failed (install python3-venv)." >&2
-      exit 1
-    }
-  fi
-
-  echo "Installing / updating Python SDK build dependencies (maturin) ..."
-  "$PYTHON_SDK_VENV/bin/python" -m pip install -q --upgrade pip
-  "$PYTHON_SDK_VENV/bin/python" -m pip install -q -r "$PY_SDK_REQ"
-
-  MATURIN_CMD=("$PYTHON_SDK_VENV/bin/python" -m maturin)
+  ensure_maturin_cmd || exit 1
 
   PROTO_DIR="$FS_HOME/curvine-common/proto"
   PY_SDK_PY="$FS_HOME/curvine-libsdk/python"
@@ -599,6 +663,7 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
   "${MATURIN_CMD[@]}" build --no-default-features \
     --features "curvine-common/${ALLOC},python-sdk" \
     "${MATURIN_RELEASE[@]}" \
+    --interpreter "$PYTHON_SDK_VENV/bin/python" \
     --compatibility "$MATURIN_COMPAT" \
     --auditwheel "$MATURIN_AUDIT" \
     --out "$DIST_DIR/lib"

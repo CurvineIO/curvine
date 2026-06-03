@@ -17,6 +17,7 @@ package io.curvine;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URI;
+import java.nio.file.DirectoryNotEmptyException;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -25,7 +26,6 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.conf.StorageSize;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FSInputStream;
@@ -38,6 +38,7 @@ import org.apache.hadoop.util.Progressable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.curvine.exception.CurvineException;
 import io.curvine.proto.FileStatusProto;
 import io.curvine.proto.GetFileStatusResponse;
 import io.curvine.proto.GetMasterInfoResponse;
@@ -90,9 +91,6 @@ public class CurvineFileSystem extends FileSystem {
     private Path workingDir;
     private URI uri;
     private String cacheKey;  // Key used for mount cache lookup
-
-    private int writeChunkSize;
-    private int writeChunkNum;
 
     public final static String SCHEME = "cv";
 
@@ -150,10 +148,6 @@ public class CurvineFileSystem extends FileSystem {
         
         this.cacheKey = filesystemConf.master_addrs;
         this.libFs = getOrCreateMount(filesystemConf);
-
-        StorageSize size = StorageSize.parse(filesystemConf.write_chunk_size);
-        this.writeChunkSize = (int) size.getUnit().toBytes(size.getValue());
-        this.writeChunkNum = filesystemConf.write_chunk_num;
     }
     
     /**
@@ -215,7 +209,7 @@ public class CurvineFileSystem extends FileSystem {
             statistics.incrementWriteOps(1);
         }
         long nativeHandle = this.libFs.create(formatPath(path), overwrite);
-        CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, 0, writeChunkSize, writeChunkNum);
+        CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, 0);
         return new FSDataOutputStream(output, statistics);
     }
 
@@ -227,7 +221,7 @@ public class CurvineFileSystem extends FileSystem {
 
         long[] tmp = new long[] {0};
         long nativeHandle = this.libFs.append(formatPath(path), tmp);
-        CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, tmp[0], writeChunkSize, writeChunkNum);
+        CurvineOutputStream output = new CurvineOutputStream(libFs, nativeHandle, tmp[0]);
         return new FSDataOutputStream(output, statistics, output.pos());
     }
 
@@ -250,11 +244,51 @@ public class CurvineFileSystem extends FileSystem {
             statistics.incrementWriteOps(1);
         }
         try {
-            libFs.rename(formatPath(src), formatPath(dst));
+            String srcPath = formatPath(src);
+            String dstPath = formatPath(dst);
+            if (srcPath.equals(dstPath)) {
+                return true;
+            }
+            try {
+                libFs.rename(srcPath, dstPath);
+            } catch (IOException e) {
+                if (!shouldMoveIntoDirectory(e)) {
+                    throw e;
+                }
+                // Hadoop semantics: dst is an existing directory, move src into it.
+                dstPath = formatPath(new Path(dst, src.getName()));
+                if (srcPath.equals(dstPath)) {
+                    return true;
+                }
+                libFs.rename(srcPath, dstPath);
+            }
             return true;
         } catch (FileNotFoundException e) {
             return false;
         }
+    }
+
+    /**
+     * Hadoop rename onto an existing directory: file-to-dir returns EISDIR;
+     * dir-to-non-empty-dir returns ENOTEMPTY on the POSIX backend.
+     *
+     * <p>{@link CurvineException#create(int, String)} maps {@code IS_A_DIRECTORY} to a plain
+     * {@code IOException("Is a directory: ...")}, so errno checks alone are not enough.
+     */
+    private static boolean shouldMoveIntoDirectory(IOException e) {
+        if (e instanceof DirectoryNotEmptyException) {
+            return true;
+        }
+        if (e instanceof CurvineException) {
+            int errno = ((CurvineException) e).getErrno();
+            return errno == CurvineException.IS_A_DIRECTORY || errno == CurvineException.DIRECTORY_NOT_EMPTY;
+        }
+        String msg = e.getMessage();
+        if (msg != null) {
+            String lowerMsg = msg.toLowerCase();
+            return lowerMsg.contains("is a directory") || lowerMsg.contains("directory not empty");
+        }
+        return false;
     }
 
     @Override

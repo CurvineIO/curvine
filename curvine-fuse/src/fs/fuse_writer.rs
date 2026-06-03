@@ -24,9 +24,9 @@ use curvine_common::FsResult;
 use log::error;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::ErrorMonitor;
+use orpc::sync::{AtomicCounter, ErrorMonitor};
 use orpc::sys::DataSlice;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio_util::bytes::Bytes;
 
 enum WriteTask {
@@ -42,6 +42,8 @@ pub struct FuseWriter {
     err_monitor: Arc<ErrorMonitor<FsError>>,
     status: FileStatus,
     is_ufs: bool,
+    len: Arc<Mutex<i64>>,
+    write_ver: AtomicCounter,
 }
 
 impl FuseWriter {
@@ -53,9 +55,12 @@ impl FuseWriter {
 
         let status = writer.status().clone();
         let monitor = err_monitor.clone();
+        let len = Arc::new(Mutex::new(status.len));
+        let write_ver = AtomicCounter::new(0);
 
+        let len1 = len.clone();
         rt.spawn(async move {
-            let res = Self::writer_future(writer, receiver).await;
+            let res = Self::writer_future(writer, receiver, len1).await;
             match res {
                 Ok(_) => (),
 
@@ -72,7 +77,13 @@ impl FuseWriter {
             err_monitor,
             status,
             is_ufs,
+            len,
+            write_ver,
         }
+    }
+
+    pub fn write_ver(&self) -> u64 {
+        self.write_ver.get()
     }
 
     pub fn path(&self) -> &Path {
@@ -91,6 +102,7 @@ impl FuseWriter {
     }
 
     pub async fn write(&mut self, op: Write<'_>, reply: FuseResponse) -> FsResult<()> {
+        self.write_ver.incr();
         self.sender
             .send(WriteTask::Write(op.arg.offset as i64, op.data, reply))
             .await
@@ -124,12 +136,22 @@ impl FuseWriter {
             tx.receive().await?;
             Ok::<(), FsError>(())
         };
+        self.write_ver.incr();
         fun.await.map_err(|e| self.check_error(e))
+    }
+
+    pub fn len(&self) -> i64 {
+        *self.len.lock().unwrap()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     async fn writer_future(
         mut writer: UnifiedWriter,
         mut req_receiver: AsyncReceiver<WriteTask>,
+        file_len: Arc<Mutex<i64>>,
     ) -> FsResult<()> {
         while let Some(task) = req_receiver.recv().await {
             match task {
@@ -142,6 +164,12 @@ impl FuseWriter {
                             size: len as u32,
                             padding: 0,
                         });
+
+                    if res.is_ok() {
+                        let mut lock = file_len.lock().unwrap();
+                        *lock = lock.max(off + len as i64);
+                    }
+
                     reply.send_rep(res).await?;
                 }
 

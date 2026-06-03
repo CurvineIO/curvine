@@ -56,6 +56,7 @@ impl PyQuery {
         Ok(PyVectorQuery::new(vq))
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn to_arrow<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let q = self.inner.take().ok_or_else(already_consumed_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -110,6 +111,7 @@ impl PyVectorQuery {
         Ok(slf)
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn to_arrow<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let q = self.inner.take().ok_or_else(already_consumed_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
