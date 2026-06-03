@@ -2036,6 +2036,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-common-macros"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "curvine-fuse"
 version = "0.2.0"
 dependencies = [

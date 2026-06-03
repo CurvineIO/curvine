@@ -12,6 +12,7 @@ resolver = "2"
 members = [
     "orpc",
     "curvine-common",
+    "curvine-common/macros",
     "curvine-server",
     "curvine-client",
     "curvine-libsdk",
@@ -20,7 +21,7 @@ members = [
     "curvine-fuse",
     "curvine-web",
     "curvine-ufs",
-    "curvine-cli"
+    "curvine-cli",
 ]
 
 [workspace.package]
