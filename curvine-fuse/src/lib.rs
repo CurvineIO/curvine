@@ -17,6 +17,7 @@
 use crate::raw::fuse_abi::{fuse_in_header, fuse_out_header};
 use once_cell::sync::Lazy;
 
+pub mod cli;
 pub mod fs;
 pub mod macros;
 pub mod raw;
