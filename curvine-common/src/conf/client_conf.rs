@@ -14,6 +14,7 @@
 
 use crate::conf::ClusterConf;
 use crate::state::{StorageType, TtlAction};
+use curvine_common_macros::ClientCliArgs;
 use orpc::client::ClientConf as RpcConf;
 use orpc::common::{ByteUnit, DurationUnit, Utils};
 use orpc::io::net::InetAddr;
@@ -21,23 +22,28 @@ use orpc::CommonResult;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ClientCliArgs)]
+#[client_cli(prefix = "client", strip_suffix = "_str", opt_in)]
 #[serde(default)]
 pub struct ClientConf {
     // List of master addresses
+    #[client_cli(skip)]
     pub master_addrs: Vec<InetAddr>,
 
     // The hostname of the machine where the customer service is located.
     // In some cases, this value needs to be set to identify that the client and worker are on the same machine.
     pub hostname: String,
 
+    #[client_cli]
     pub io_threads: usize,
+    #[client_cli]
     pub worker_threads: usize,
 
     pub replicas: i32,
     #[serde(skip)]
     pub block_size: i64,
     #[serde(alias = "block_size")]
+    #[client_cli]
     pub block_size_str: String,
 
     #[serde(skip)]
@@ -54,6 +60,7 @@ pub struct ClientConf {
 
     // These 2 parameters are used to improve the speed of reading a single file.
     // Read the parallelism of a file, default is 1
+    #[client_cli]
     pub read_parallel: i64,
     // The file is divided into blocks of different sizes according to this size, and read non-duplicate blocks at parallel task intervals.
     // Assume read_parallel = 2, file blocks 0,1,2,3
@@ -69,6 +76,7 @@ pub struct ClientConf {
     // This limits memory usage and connection count in random read/write scenarios.
     pub max_cache_block_handles: usize,
 
+    #[client_cli]
     pub short_circuit: bool,
 
     #[serde(skip)]

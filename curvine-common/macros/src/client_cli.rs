@@ -15,11 +15,12 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, Lit, Type};
+use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, Lit, Meta, Type};
 
 struct ContainerConfig {
     prefix: Option<String>,
     strip_suffix: Option<String>,
+    opt_in: bool,
 }
 
 pub fn derive_client_cli_args(input: TokenStream) -> TokenStream {
@@ -57,7 +58,7 @@ fn derive_client_cli_args_impl(input: &DeriveInput) -> syn::Result<TokenStream2>
     let mut apply_stmts = Vec::new();
 
     for field in fields {
-        if should_skip_field(field)? {
+        if should_skip_field(field, &container)? {
             continue;
         }
         let ident = field
@@ -96,6 +97,7 @@ fn derive_client_cli_args_impl(input: &DeriveInput) -> syn::Result<TokenStream2>
 fn container_config(input: &DeriveInput) -> syn::Result<ContainerConfig> {
     let mut prefix = None;
     let mut strip_suffix = None;
+    let mut opt_in = false;
     for attr in &input.attrs {
         if !attr.path().is_ident("client_cli") {
             continue;
@@ -105,9 +107,11 @@ fn container_config(input: &DeriveInput) -> syn::Result<ContainerConfig> {
                 prefix = Some(meta.value()?.parse::<syn::LitStr>()?.value());
             } else if meta.path.is_ident("strip_suffix") {
                 strip_suffix = Some(meta.value()?.parse::<syn::LitStr>()?.value());
+            } else if meta.path.is_ident("opt_in") {
+                opt_in = true;
             } else {
                 return Err(meta.error(
-                    "unsupported container-level client_cli attribute; use prefix or strip_suffix",
+                    "unsupported container-level client_cli attribute; use prefix, strip_suffix, or opt_in",
                 ));
             }
             Ok(())
@@ -116,6 +120,7 @@ fn container_config(input: &DeriveInput) -> syn::Result<ContainerConfig> {
     Ok(ContainerConfig {
         prefix,
         strip_suffix,
+        opt_in,
     })
 }
 
@@ -154,14 +159,21 @@ fn apply_override_stmt(
     Ok(assign)
 }
 
-fn should_skip_field(field: &Field) -> syn::Result<bool> {
+fn should_skip_field(field: &Field, container: &ContainerConfig) -> syn::Result<bool> {
     if has_serde_skip(field) {
         return Ok(true);
     }
-    if let Some(attr) = client_cli_attr(field)? {
+    let field_attr = client_cli_attr(field)?;
+    if let Some(attr) = &field_attr {
         if attr.skip {
             return Ok(true);
         }
+        if container.opt_in {
+            return Ok(false);
+        }
+    }
+    if container.opt_in {
+        return Ok(true);
     }
     Ok(false)
 }
@@ -173,6 +185,12 @@ struct ClientCliAttr {
 
 impl syn::parse::Parse for ClientCliAttr {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        if input.is_empty() {
+            return Ok(ClientCliAttr {
+                skip: false,
+                long: None,
+            });
+        }
         let mut skip = false;
         let mut long = None;
         while !input.is_empty() {
@@ -208,7 +226,20 @@ fn client_cli_attr(field: &Field) -> syn::Result<Option<ClientCliAttr>> {
                     "duplicate #[client_cli] attribute on the same field",
                 ));
             }
-            found = Some(attr.parse_args()?);
+            let parsed = match &attr.meta {
+                Meta::Path(_) => ClientCliAttr {
+                    skip: false,
+                    long: None,
+                },
+                Meta::List(list) => syn::parse2::<ClientCliAttr>(list.tokens.clone())?,
+                Meta::NameValue(nv) => {
+                    return Err(syn::Error::new_spanned(
+                        nv,
+                        "client_cli field attribute does not support name=value syntax",
+                    ));
+                }
+            };
+            found = Some(parsed);
         }
     }
     Ok(found)

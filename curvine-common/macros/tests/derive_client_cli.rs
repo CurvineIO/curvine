@@ -60,6 +60,7 @@ fn apply_to_updates_fields() {
         entry_timeout: Some(2.5),
     };
     overrides.apply_to(&mut conf).unwrap();
+    assert_eq!(conf.master_addrs, "ignored");
     assert_eq!(conf.io_threads, 8);
     assert_eq!(conf.block_size_str, "128MB");
     assert_eq!(conf.hugepage_str.as_deref(), Some("/dev/hugepages"));

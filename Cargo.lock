@@ -2001,6 +2001,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "crossbeam",
+ "curvine-common-macros",
  "dashmap 5.5.3",
  "flate2",
  "futures",
