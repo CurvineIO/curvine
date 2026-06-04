@@ -80,6 +80,26 @@ func TestBuildFuseExecArgs(t *testing.T) {
 	}
 }
 
+func TestBuildFuseExecArgsExplicitMntPath(t *testing.T) {
+	explicit := "/custom/mnt/path"
+	in := FuseExecArgsInput{
+		MountKey: "ignored-key",
+		MntPath:  explicit,
+		Passthrough: map[string]string{
+			"io-threads": "4",
+		},
+	}
+
+	got := BuildFuseExecArgs(in)
+	want := []string{
+		"--mnt-path", explicit,
+		"--io-threads", "4",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("BuildFuseExecArgs() = %#v, want %#v", got, want)
+	}
+}
+
 func TestIsRejectedVolumeParameterKey(t *testing.T) {
 	if !IsRejectedVolumeParameterKey("mnt-path") {
 		t.Fatal("expected mnt-path to be rejected")
