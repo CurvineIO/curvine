@@ -51,6 +51,7 @@ fn apply_to_updates_pilot_client_fields() {
         block_size_str: Some("64KB".to_string()),
         read_parallel: Some(2),
         short_circuit: Some(false),
+        ..Default::default()
     };
     overrides.apply_to(&mut conf).unwrap();
     conf.init().unwrap();
@@ -60,6 +61,47 @@ fn apply_to_updates_pilot_client_fields() {
     assert_eq!(conf.block_size_str, "64KB");
     assert_eq!(conf.read_parallel, 2);
     assert!(!conf.short_circuit);
+}
+
+#[test]
+fn parses_c4_chunk_unified_fs_and_audit_flags() {
+    let parsed = CliHarness::try_parse_from([
+        "curvine-fuse",
+        "--client.write-chunk-size",
+        "256KB",
+        "--client.read-chunk-num",
+        "4",
+        "--client.enable-unified-fs",
+        "true",
+        "--client.audit-logging-enabled",
+        "false",
+    ])
+    .unwrap();
+
+    assert_eq!(
+        parsed.overrides.write_chunk_size_str.as_deref(),
+        Some("256KB")
+    );
+    assert_eq!(parsed.overrides.read_chunk_num, Some(4));
+    assert_eq!(parsed.overrides.enable_unified_fs, Some(true));
+    assert_eq!(parsed.overrides.audit_logging_enabled, Some(false));
+}
+
+#[test]
+fn apply_to_updates_c4_fields() {
+    let mut conf = ClientConf::default();
+    let overrides = ClientConfCliOverrides {
+        write_chunk_size_str: Some("512KB".to_string()),
+        enable_rust_read_ufs: Some(true),
+        max_cache_block_handles: Some(20),
+        ..Default::default()
+    };
+    overrides.apply_to(&mut conf).unwrap();
+    conf.init().unwrap();
+
+    assert_eq!(conf.write_chunk_size_str, "512KB");
+    assert!(conf.enable_rust_read_ufs);
+    assert_eq!(conf.max_cache_block_handles, 20);
 }
 
 #[test]
