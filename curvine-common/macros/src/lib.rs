@@ -26,6 +26,7 @@ use proc_macro::TokenStream;
 /// - `#[client_cli(opt_in)]` — only fields marked with `#[client_cli]` are exposed (for incremental rollout)
 ///
 /// Field-level attributes:
+/// - `#[client_cli]` or `#[client_cli()]` — include field when `opt_in` is set
 /// - `#[client_cli(skip)]` — omit from generated overrides
 /// - `#[client_cli(long = "...")]` — explicit clap long name
 ///

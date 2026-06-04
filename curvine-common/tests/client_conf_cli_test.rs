@@ -15,7 +15,7 @@
 use clap::Parser;
 use curvine_common::conf::{ClientConf, ClientConfCliOverrides};
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 struct CliHarness {
     #[command(flatten)]
     overrides: ClientConfCliOverrides,
@@ -60,4 +60,11 @@ fn apply_to_updates_pilot_client_fields() {
     assert_eq!(conf.block_size_str, "64KB");
     assert_eq!(conf.read_parallel, 2);
     assert_eq!(conf.short_circuit, false);
+}
+
+#[test]
+fn rejects_unannotated_field_in_opt_in_mode() {
+    let err =
+        CliHarness::try_parse_from(["curvine-fuse", "--client.hostname", "host1"]).unwrap_err();
+    assert!(err.to_string().contains("hostname"));
 }

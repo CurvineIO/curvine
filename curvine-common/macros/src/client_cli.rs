@@ -15,7 +15,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, Lit, Type};
+use syn::{parse_macro_input, Data, DeriveInput, Field, Fields, Lit, Meta, Type};
 
 struct ContainerConfig {
     prefix: Option<String>,
@@ -226,7 +226,20 @@ fn client_cli_attr(field: &Field) -> syn::Result<Option<ClientCliAttr>> {
                     "duplicate #[client_cli] attribute on the same field",
                 ));
             }
-            found = Some(attr.parse_args()?);
+            let parsed = match &attr.meta {
+                Meta::Path(_) => ClientCliAttr {
+                    skip: false,
+                    long: None,
+                },
+                Meta::List(list) => syn::parse2::<ClientCliAttr>(list.tokens.clone())?,
+                Meta::NameValue(nv) => {
+                    return Err(syn::Error::new_spanned(
+                        nv,
+                        "client_cli field attribute does not support name=value syntax",
+                    ));
+                }
+            };
+            found = Some(parsed);
         }
     }
     Ok(found)
