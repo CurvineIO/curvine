@@ -23,8 +23,10 @@ use proc_macro::TokenStream;
 /// Container-level attributes (on the struct):
 /// - `#[client_cli(prefix = "client")]` — prepended to generated long names (e.g. `client.io-threads`)
 /// - `#[client_cli(strip_suffix = "_str")]` — strips a suffix from field names before kebab-case
+/// - `#[client_cli(opt_in)]` — only fields marked with `#[client_cli]` are exposed (for incremental rollout)
 ///
 /// Field-level attributes:
+/// - `#[client_cli]` or `#[client_cli()]` — include field when `opt_in` is set
 /// - `#[client_cli(skip)]` — omit from generated overrides
 /// - `#[client_cli(long = "...")]` — explicit clap long name
 ///

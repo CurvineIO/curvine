@@ -12,5 +12,4 @@ profiles:
       teams:
         - curvine-toc-voters
       exclude_team_maintainers: true
-
     close_on_passing: true
