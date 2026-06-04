@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -629,20 +628,12 @@ func mountPropagationBidirectionalPtr() *corev1.MountPropagationMode {
 // FUSE parameters supplied via opts.FuseParams.
 // Keys are sorted to ensure deterministic argument ordering across pod restarts.
 func buildFuseArgs(opts *StandaloneOptions) []string {
-	args := []string{
-		"--master-addrs", opts.MasterAddrs,
-		"--fs-path", opts.FSPath,
-		"--mnt-path", StandaloneMountPath,
-	}
-	keys := make([]string, 0, len(opts.FuseParams))
-	for key := range opts.FuseParams {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		args = append(args, "--"+key, opts.FuseParams[key])
-	}
-	return args
+	return BuildFuseExecArgs(FuseExecArgsInput{
+		MasterAddrs: opts.MasterAddrs,
+		FSPath:      opts.FSPath,
+		MntPath:     StandaloneMountPath,
+		Passthrough: opts.FuseParams,
+	})
 }
 
 // DeleteStandalone deletes the Standalone for the given mount key on this node

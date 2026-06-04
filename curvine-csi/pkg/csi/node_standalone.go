@@ -137,7 +137,7 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 	clusterID := GenerateClusterID(masterAddrs)
 
 	// Collect FUSE parameters from VolumeContext or PublishContext
-	fuseParams := collectFuseParams(volumeContext, publishContext)
+	fuseParams := CollectPassthroughParams(volumeContext, publishContext)
 
 	// Generate mount-key from master-addrs + fs-path + fuse-params
 	// Including fuse params ensures that StorageClasses with the same cluster endpoint
@@ -297,7 +297,7 @@ func (n *nodeServiceStandalone) NodePublishVolume(ctx context.Context, request *
 	clusterID := GenerateClusterID(masterAddrs)
 
 	// Collect FUSE parameters from VolumeContext or PublishContext
-	fuseParams := collectFuseParams(volumeContext, publishContext)
+	fuseParams := CollectPassthroughParams(volumeContext, publishContext)
 
 	// Generate mount-key from master-addrs + fs-path + fuse-params
 	// Including fuse params ensures that StorageClasses with the same cluster endpoint

@@ -113,11 +113,12 @@ type FuseExecArgsInput struct {
 	MasterAddrs string
 	FSPath      string
 	MountKey    string
+	// MntPath, when set, is used as --mnt-path instead of ComputeFuseMntPath(MountKey).
+	MntPath     string
 	Passthrough map[string]string
 }
 
 // BuildFuseExecArgs builds argv for curvine-fuse mount or validate-config.
-// Not wired into node/fuse_manager until a later commit.
 func BuildFuseExecArgs(in FuseExecArgsInput) []string {
 	args := make([]string, 0, 8+len(in.Passthrough)*2)
 	if in.Subcommand != "" {
@@ -132,7 +133,10 @@ func BuildFuseExecArgs(in FuseExecArgsInput) []string {
 	if in.FSPath != "" {
 		args = append(args, "--fs-path", in.FSPath)
 	}
-	if in.MountKey != "" {
+	switch {
+	case in.MntPath != "":
+		args = append(args, "--mnt-path", in.MntPath)
+	case in.MountKey != "":
 		args = append(args, "--mnt-path", ComputeFuseMntPath(in.MountKey))
 	}
 	args = appendPassthroughArgs(args, in.Passthrough)
