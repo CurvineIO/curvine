@@ -15,7 +15,9 @@
 mod fuse_cli;
 mod mount_args;
 mod mount_run;
+mod validate_run;
 
 pub use fuse_cli::{FuseCli, FuseSubcommand};
 pub use mount_args::FuseMountArgs;
 pub use mount_run::run_mount;
+pub use validate_run::run_validate_config;

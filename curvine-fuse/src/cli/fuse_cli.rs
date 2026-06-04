@@ -37,6 +37,8 @@ pub struct FuseCli {
 pub enum FuseSubcommand {
     /// Mount the curvine filesystem (also the default when omitted)
     Mount(FuseMountArgs),
+    /// Validate configuration without mounting
+    ValidateConfig(FuseMountArgs),
 }
 
 impl FuseCli {
@@ -50,6 +52,20 @@ impl FuseCli {
         match &self.cmd {
             Some(FuseSubcommand::Mount(args)) => args.clone(),
             None => self.mount.clone(),
+            Some(FuseSubcommand::ValidateConfig(_)) => {
+                unreachable!("resolve_mount_args called for validate-config")
+            }
+        }
+    }
+
+    /// Returns args for validate-config, from the subcommand or top-level flags.
+    pub fn resolve_validate_args(&self) -> FuseMountArgs {
+        match &self.cmd {
+            Some(FuseSubcommand::ValidateConfig(args)) => args.clone(),
+            None => self.mount.clone(),
+            Some(FuseSubcommand::Mount(_)) => {
+                unreachable!("resolve_validate_args called for mount")
+            }
         }
     }
 }
@@ -82,7 +98,22 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_is_rejected() {
-        let err = FuseCli::try_parse_from(["curvine-fuse", "validate-config"]).unwrap_err();
+        let err = FuseCli::try_parse_from(["curvine-fuse", "unknown-cmd"]).unwrap_err();
         assert!(err.to_string().contains("unrecognized subcommand"));
+    }
+
+    #[test]
+    fn validate_config_subcommand_parses() {
+        let cli = FuseCli::try_parse_from([
+            "curvine-fuse",
+            "validate-config",
+            "--conf",
+            "conf/curvine-cluster.toml",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(FuseSubcommand::ValidateConfig(_)) => {}
+            _ => panic!("expected validate-config subcommand"),
+        }
     }
 }
