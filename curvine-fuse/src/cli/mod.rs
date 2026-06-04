@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod fuse_cli;
 mod mount_args;
+mod mount_run;
 
+pub use fuse_cli::{FuseCli, FuseSubcommand};
 pub use mount_args::FuseMountArgs;
+pub use mount_run::run_mount;
