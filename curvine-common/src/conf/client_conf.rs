@@ -49,13 +49,17 @@ pub struct ClientConf {
     #[serde(skip)]
     pub write_chunk_size: usize,
     #[serde(alias = "write_chunk_size")]
+    #[client_cli]
     pub write_chunk_size_str: String,
+    #[client_cli]
     pub write_chunk_num: usize,
 
     #[serde(skip)]
     pub read_chunk_size: usize,
     #[serde(alias = "read_chunk_size")]
+    #[client_cli]
     pub read_chunk_size_str: String,
+    #[client_cli]
     pub read_chunk_num: usize,
 
     // These 2 parameters are used to improve the speed of reading a single file.
@@ -69,11 +73,13 @@ pub struct ClientConf {
     #[serde(skip)]
     pub read_slice_size: i64,
     #[serde(alias = "read_slice_size")]
+    #[client_cli]
     pub read_slice_size_str: String,
 
     // Maximum number of open block handles (readers and writers).
     // When the limit is reached, FIFO eviction will close the oldest (first opened) handle.
     // This limits memory usage and connection count in random read/write scenarios.
+    #[client_cli]
     pub max_cache_block_handles: usize,
 
     #[client_cli]
@@ -149,13 +155,16 @@ pub struct ClientConf {
     pub failed_worker_ttl_str: String,
 
     // Whether to enable the unified file system
+    #[client_cli]
     pub enable_unified_fs: bool,
     // If the cache hits, read data from Curvine.
     // If the cache misses, determine whether to allow Curvine to directly read data from the unified file system (UFS).
+    #[client_cli]
     pub enable_rust_read_ufs: bool,
 
     // Whether to enable client-side audit logging for UnifiedFileSystem operations.
     // The log target is "audit" and records: cmd, ok, src, dst, usedUs.
+    #[client_cli]
     pub audit_logging_enabled: bool,
 
     // Mount information update interval
