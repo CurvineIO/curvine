@@ -7,14 +7,9 @@ profiles:
 
     # Voting duration. For example, 72h means 72 hours. Units 'd' (days) and 'm' (minutes) are also supported.
     duration: 30d
-
-    # Defines which users' votes are binding.
-    # 'all' means every user who votes via comments counts; you can also specify specific users or teams.
-    binding: all
-
-    # Conditions required for a vote to pass.
-    # For example: at least 2 in-favor votes, with in-favor votes outnumbering against votes.
-    pass:
-      at-least: 5
-      with-majority: true
+    pass_threshold: 60
+    allowed_voters:
+      teams:
+        - curvine-toc-voters
+      exclude_team_maintainers: true
     close_on_passing: true
