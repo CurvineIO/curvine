@@ -33,8 +33,6 @@ var reservedVolumeParameterKeys = map[string]struct{}{
 }
 
 // rejectedVolumeParameterKeys must not appear in StorageClass / PV parameters.
-// Enforcement in validator/node wiring is deferred to C14; until then validator.go may
-// still accept a legacy user-provided mnt-path.
 var rejectedVolumeParameterKeys = map[string]struct{}{
 	"mnt-path": {},
 }
