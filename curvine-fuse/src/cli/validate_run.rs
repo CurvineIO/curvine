@@ -16,10 +16,9 @@ use crate::cli::FuseMountArgs;
 use orpc::CommonResult;
 
 /// Validates configuration by loading and initializing cluster settings without mounting.
+/// Exits quietly on success; failures are returned via `CommonResult` for stderr reporting.
 pub fn run_validate_config(args: FuseMountArgs) -> CommonResult<()> {
     let mut conf = args.get_conf()?;
     conf.client.init()?;
-    conf.print();
-    eprintln!("Configuration validated successfully");
     Ok(())
 }
