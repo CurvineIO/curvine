@@ -2039,8 +2039,11 @@ dependencies = [
 name = "curvine-common-macros"
 version = "0.2.0"
 dependencies = [
+ "clap",
+ "orpc",
  "proc-macro2",
  "quote",
+ "serde",
  "syn 2.0.117",
 ]
 

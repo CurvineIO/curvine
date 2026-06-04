@@ -12,3 +12,8 @@ proc-macro = true
 proc-macro2 = "1.0.92"
 quote = "1.0.37"
 syn = { version = "2.0.90", features = ["full"] }
+
+[dev-dependencies]
+clap = { version = "4.3.10", features = ["derive"] }
+serde = { workspace = true }
+orpc = { path = "../../orpc" }
