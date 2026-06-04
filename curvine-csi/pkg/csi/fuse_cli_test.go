@@ -108,3 +108,13 @@ func TestIsRejectedVolumeParameterKey(t *testing.T) {
 		t.Fatal("did not expect io-threads to be rejected")
 	}
 }
+
+func TestRejectDisallowedVolumeParameters(t *testing.T) {
+	volumeContext := map[string]string{
+		"master-addrs": "m1:8995",
+		"mnt-path":     "/custom",
+	}
+	if err := RejectDisallowedVolumeParameters(volumeContext, nil, "req"); err == nil {
+		t.Fatal("expected error for mnt-path in volume context")
+	}
+}

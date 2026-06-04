@@ -58,4 +58,7 @@ func TestValidateStorageClassParamsGeneratesMntPath(t *testing.T) {
 	if got.MntPath != want {
 		t.Fatalf("MntPath = %q, want %q", got.MntPath, want)
 	}
+	if got.FuseParams["io-threads"] != "4" {
+		t.Fatalf("FuseParams = %#v, want io-threads=4 from passthrough", got.FuseParams)
+	}
 }

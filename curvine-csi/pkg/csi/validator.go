@@ -89,22 +89,7 @@ func ValidateStorageClassParams(params map[string]string, requestID string) (*St
 		return nil, status.Error(codes.InvalidArgument, "path-type must be 'Directory' or 'DirectoryOrCreate'")
 	}
 	validated.PathType = pathType
-
-	// Collect optional FUSE parameters
-	fuseParamKeys := []string{
-		"io-threads", "worker-threads", "mnt-per-task", "clone-fd",
-		"fuse-channel-size", "stream-channel-size", "auto-cache",
-		"direct-io", "kernel-cache", "cache-readdir", "entry-timeout",
-		"attr-timeout", "negative-timeout", "max-background",
-		"congestion-threshold", "node-cache-size", "node-cache-timeout",
-		"master-hostname", "master-rpc-port", "master-web-port", "mnt-number",
-	}
-
-	for _, key := range fuseParamKeys {
-		if value, ok := params[key]; ok && value != "" {
-			validated.FuseParams[key] = value
-		}
-	}
+	validated.FuseParams = fuseParams
 
 	klog.Infof("RequestID: %s, Validated StorageClass parameters: master-addrs=%s, mnt-path=%s, fs-path=%s, path-type=%s",
 		requestID, validated.MasterAddrs, validated.MntPath, validated.FSPath, validated.PathType)

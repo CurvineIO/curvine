@@ -17,6 +17,10 @@ package csi
 import (
 	"fmt"
 	"sort"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"k8s.io/klog"
 )
 
 const fuseKubeletPluginBase = "/var/lib/kubelet/plugins/kubernetes.io/csi/curvine"
@@ -62,6 +66,24 @@ func IsRejectedVolumeParameterKey(key string) bool {
 func IsDeniedVolumeParameterKey(key string) bool {
 	_, ok := volumeParameterDenylist[key]
 	return ok
+}
+
+// RejectDisallowedVolumeParameters rejects user-supplied keys such as mnt-path on PVs
+// and in node volume/publish context before mount-key generation.
+func RejectDisallowedVolumeParameters(volumeContext, publishContext map[string]string, requestID string) error {
+	for key := range volumeContext {
+		if IsRejectedVolumeParameterKey(key) {
+			klog.Errorf("RequestID: %s, Parameter %q is not allowed on StorageClass or PV", requestID, key)
+			return status.Errorf(codes.InvalidArgument, "Parameter %q is not allowed on StorageClass or PV", key)
+		}
+	}
+	for key := range publishContext {
+		if IsRejectedVolumeParameterKey(key) {
+			klog.Errorf("RequestID: %s, Parameter %q is not allowed on StorageClass or PV", requestID, key)
+			return status.Errorf(codes.InvalidArgument, "Parameter %q is not allowed on StorageClass or PV", key)
+		}
+	}
+	return nil
 }
 
 // MergeVolumeParameters merges volumeContext and publishContext with volumeContext winning.
