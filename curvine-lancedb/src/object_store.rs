@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::result::Result as StdResult;
@@ -68,6 +68,7 @@ const CONDITIONAL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 const CONDITIONAL_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const OBJECT_STORE_ATTR_PREFIX: &str = "lancedb.object_store.attr.";
 const OBJECT_STORE_METADATA_ATTR_PREFIX: &str = "lancedb.object_store.attr.metadata.";
+const LANCE_DATASET_DIR_SUFFIX: &str = ".lance";
 
 static PROCESS_WRITE_LOCKS: Lazy<StdMutex<HashMap<String, Arc<Mutex<()>>>>> =
     Lazy::new(|| StdMutex::new(HashMap::new()));
@@ -519,24 +520,68 @@ impl ObjectStoreTrait for CurvineObjectStore {
 
     async fn delete(&self, location: &Path) -> OsResult<()> {
         let cv_path = self.object_path(location)?;
-        let lock = self.acquire_object_write_lock(location).await?;
-        let result = match self.context.fs.get_status(&cv_path).await {
-            Ok(status) if status.is_dir => Ok(()),
-            Ok(_) => self
-                .context
-                .fs
-                .delete(&cv_path, false)
-                .await
-                .map_err(|e| fs_error_to_object_store(location, e)),
-            Err(e) if is_not_found_error(&e) => Ok(()),
-            Err(e) => Err(fs_error_to_object_store(location, e)),
-        };
-        let _ = self.release_object_write_lock(&lock).await;
-        result?;
-        if !self.is_root_workspace() {
-            let _ = self.prune_empty_parents(&cv_path, location).await;
+        let dataset_root = nearest_lance_dataset_path(&cv_path);
+        self.delete_resolved_object_without_prune(location, &cv_path)
+            .await?;
+        if let Some(dataset_root) = dataset_root {
+            self.prune_empty_lance_object_parents(&cv_path, &dataset_root, location)
+                .await?;
         }
         Ok(())
+    }
+
+    fn delete_stream<'a>(
+        &'a self,
+        locations: BoxStream<'a, OsResult<Path>>,
+    ) -> BoxStream<'a, OsResult<Path>> {
+        let store = self.clone();
+        Box::pin(stream! {
+            let delete_store = store.clone();
+            let mut deletes = locations
+                .map(move |location| {
+                    let delete_store = delete_store.clone();
+                    async move {
+                        let location = location?;
+                        let cv_path = delete_store.object_path(&location)?;
+                        let dataset_root = nearest_lance_dataset_path(&cv_path);
+                        delete_store
+                            .delete_resolved_object_without_prune(&location, &cv_path)
+                            .await?;
+                        Ok((location, dataset_root))
+                    }
+                })
+                .buffered(10);
+
+            let mut dataset_roots = BTreeMap::new();
+            let mut saw_error = false;
+            while let Some(result) = deletes.next().await {
+                match result {
+                    Ok((location, dataset_root)) => {
+                        if let Some(dataset_root) = dataset_root {
+                            dataset_roots
+                                .entry(dataset_root.full_path().to_string())
+                                .or_insert((dataset_root, location.clone()));
+                        }
+                        yield Ok(location);
+                    }
+                    Err(err) => {
+                        saw_error = true;
+                        yield Err(err);
+                    }
+                }
+            }
+
+            if saw_error {
+                return;
+            }
+
+            for (_, (dataset_root, location)) in dataset_roots {
+                if let Err(err) = store.prune_empty_lance_dataset_dirs(&dataset_root, &location).await {
+                    yield Err(err);
+                    return;
+                }
+            }
+        })
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OsResult<ObjectMeta>> {
@@ -870,6 +915,29 @@ impl CurvineObjectStore {
         if result.is_err() {
             let _ = self.context.fs.delete(&staging, false).await;
         }
+        result
+    }
+
+    async fn delete_resolved_object_without_prune(
+        &self,
+        location: &Path,
+        cv_path: &CurvinePath,
+    ) -> OsResult<()> {
+        let lock = self.acquire_object_write_lock(location).await?;
+        let result = match self.context.fs.get_status(&cv_path).await {
+            Ok(status) if status.is_dir => Ok(()),
+            Ok(_) => {
+                self.context
+                    .fs
+                    .delete(&cv_path, false)
+                    .await
+                    .map_err(|e| fs_error_to_object_store(location, e))?;
+                Ok(())
+            }
+            Err(e) if is_not_found_error(&e) => Ok(()),
+            Err(e) => Err(fs_error_to_object_store(location, e)),
+        };
+        let _ = self.release_object_write_lock(&lock).await;
         result
     }
 
@@ -1251,12 +1319,84 @@ impl CurvineObjectStore {
         Ok(())
     }
 
-    async fn prune_empty_parents(&self, path: &CurvinePath, location: &Path) -> OsResult<()> {
-        let workspace_root = self
-            .context
-            .workspace_root
-            .full_path()
-            .trim_end_matches('/');
+    async fn prune_empty_lance_dataset_dirs(
+        &self,
+        dataset_root: &CurvinePath,
+        location: &Path,
+    ) -> OsResult<()> {
+        if !self
+            .existing_lance_dataset_dir(dataset_root, location)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let mut dirs = Vec::new();
+        let mut stack = vec![dataset_root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = match self.context.fs.list_status(&dir).await {
+                Ok(entries) => entries,
+                Err(e) if is_not_found_error(&e) => continue,
+                Err(e) => return Err(fs_error_to_object_store(location, e)),
+            };
+
+            dirs.push(dir);
+            for entry in entries {
+                if entry.is_dir {
+                    let child =
+                        CurvinePath::from_str(&entry.path).map_err(|e| OsError::Generic {
+                            store: CURVINE_SCHEME,
+                            source: e.to_string().into(),
+                        })?;
+                    stack.push(child);
+                }
+            }
+        }
+
+        dirs.sort_by(|left, right| right.full_path().len().cmp(&left.full_path().len()));
+        for dir in dirs {
+            match self.context.fs.delete(&dir, false).await {
+                Ok(()) => {}
+                Err(FsError::DirNotEmpty(_)) => {}
+                Err(e) if is_not_found_error(&e) => {}
+                Err(e) => return Err(fs_error_to_object_store(location, e)),
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn existing_lance_dataset_dir(
+        &self,
+        dataset_root: &CurvinePath,
+        location: &Path,
+    ) -> OsResult<bool> {
+        if !is_lance_dataset_path(dataset_root) {
+            return Ok(false);
+        }
+
+        match self.context.fs.get_status(dataset_root).await {
+            Ok(status) => Ok(status.is_dir),
+            Err(e) if is_not_found_error(&e) => Ok(false),
+            Err(e) => Err(fs_error_to_object_store(location, e)),
+        }
+    }
+
+    async fn prune_empty_lance_object_parents(
+        &self,
+        path: &CurvinePath,
+        dataset_root: &CurvinePath,
+        location: &Path,
+    ) -> OsResult<()> {
+        if !self
+            .existing_lance_dataset_dir(dataset_root, location)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let dataset_root = dataset_root.full_path().trim_end_matches('/').to_string();
+        let dataset_child_prefix = format!("{dataset_root}/");
         let mut current = path.parent().map_err(|e| OsError::Generic {
             store: CURVINE_SCHEME,
             source: e.to_string().into(),
@@ -1264,24 +1404,24 @@ impl CurvineObjectStore {
 
         while let Some(dir) = current {
             let full_path = dir.full_path().trim_end_matches('/').to_string();
-            if full_path.is_empty() || full_path == "/" || full_path == workspace_root {
-                break;
-            }
-            if !full_path.starts_with(&format!("{workspace_root}/")) {
+            if full_path != dataset_root && !full_path.starts_with(&dataset_child_prefix) {
                 break;
             }
 
             match self.context.fs.delete(&dir, false).await {
-                Ok(()) => {
-                    current = dir.parent().map_err(|e| OsError::Generic {
-                        store: CURVINE_SCHEME,
-                        source: e.to_string().into(),
-                    })?;
-                }
+                Ok(()) => {}
                 Err(FsError::DirNotEmpty(_)) => break,
                 Err(e) if is_not_found_error(&e) => break,
                 Err(e) => return Err(fs_error_to_object_store(location, e)),
             }
+
+            if full_path == dataset_root {
+                break;
+            }
+            current = dir.parent().map_err(|e| OsError::Generic {
+                store: CURVINE_SCHEME,
+                source: e.to_string().into(),
+            })?;
         }
 
         Ok(())
@@ -1623,6 +1763,30 @@ fn relative_object_path(root: &CurvinePath, full_path: &str) -> StdResult<Path, 
     Path::parse(relative).map_err(|e| e.to_string())
 }
 
+fn nearest_lance_dataset_path(path: &CurvinePath) -> Option<CurvinePath> {
+    let full_path = path.full_path();
+    let parts = full_path
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let dataset_idx = parts
+        .iter()
+        .rposition(|part| part.ends_with(LANCE_DATASET_DIR_SUFFIX))?;
+
+    let dataset_path = format!("/{}", parts[..=dataset_idx].join("/"));
+    CurvinePath::from_str(dataset_path).ok()
+}
+
+fn is_lance_dataset_path(path: &CurvinePath) -> bool {
+    path.full_path()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .map(|name| name.ends_with(LANCE_DATASET_DIR_SUFFIX))
+        .unwrap_or(false)
+}
+
 fn is_internal_reserved_relative_path(rel: &str) -> bool {
     rel == INTERNAL_RESERVED_ROOT || rel.starts_with(&format!("{INTERNAL_RESERVED_ROOT}/"))
 }
@@ -1737,6 +1901,14 @@ fn is_curvine_missing_common_message(message: &str) -> bool {
     let trimmed = message.trim();
     let trimmed = trimmed.strip_suffix(':').unwrap_or(trimmed).trim();
     let lower = trimmed.to_ascii_lowercase();
+    let lower = lower
+        .rsplit_once("error:")
+        .map(|(_, detail)| detail.trim())
+        .unwrap_or(&lower);
+    let lower = lower
+        .split_once('(')
+        .map(|(detail, _)| detail.trim())
+        .unwrap_or(lower);
 
     lower == "path does not exist"
         || lower == "directory does not exist"
@@ -1748,4 +1920,51 @@ fn is_curvine_missing_common_message(message: &str) -> bool {
         || (lower.starts_with("file ") && lower.ends_with(" not exists"))
         || (lower.starts_with("parent ") && lower.ends_with(" does not exist"))
         || (lower.starts_with("child ") && lower.ends_with(" not exists"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_curvine_master_not_exists_common_error() {
+        let message = "[curvine-master] ERROR: File /tmp/lancedb/events.lance/_versions not exists(curvine-server/src/master/meta/fs_dir.rs:452): ";
+
+        assert!(is_curvine_missing_common_message(message));
+    }
+
+    #[test]
+    fn finds_nearest_lance_dataset_path() {
+        let path = CurvinePath::from_str("/tmp/db/events.lance/_versions/1.manifest").unwrap();
+
+        assert_eq!(
+            nearest_lance_dataset_path(&path)
+                .as_ref()
+                .map(|p| p.full_path()),
+            Some("/tmp/db/events.lance")
+        );
+    }
+
+    #[test]
+    fn finds_root_level_lance_dataset_path() {
+        let path = CurvinePath::from_str("/events.lance/_versions/1.manifest").unwrap();
+
+        assert_eq!(
+            nearest_lance_dataset_path(&path)
+                .as_ref()
+                .map(|p| p.full_path()),
+            Some("/events.lance")
+        );
+    }
+
+    #[test]
+    fn recognizes_lance_dataset_path() {
+        let dataset = CurvinePath::from_str("/tmp/db/events.lance").unwrap();
+        let nested = CurvinePath::from_str("/tmp/db/events.lance/_versions").unwrap();
+        let non_dataset = CurvinePath::from_str("/tmp/db/events.lance.tmp").unwrap();
+
+        assert!(is_lance_dataset_path(&dataset));
+        assert!(!is_lance_dataset_path(&nested));
+        assert!(!is_lance_dataset_path(&non_dataset));
+    }
 }

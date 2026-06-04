@@ -67,15 +67,23 @@ fn curvine_provider_extracts_lance_relative_base_path() {
     assert_eq!(path.as_ref(), "tenant/data/db");
 }
 
-#[test]
-fn curvine_provider_prefix_does_not_require_config() {
+#[tokio::test]
+async fn curvine_provider_prefix_does_not_require_config() {
+    let _guard = ENV_MUTEX.lock().await;
+    let saved = env::var(ClusterConf::ENV_CONF_FILE).ok();
+    env::remove_var(ClusterConf::ENV_CONF_FILE);
+
     let provider = CurvineObjectStoreProvider::new();
-    let prefix = provider
-        .calculate_object_store_prefix(
-            &Url::parse("curvine://tenant/data/db").unwrap(),
-            Some(&HashMap::new()),
-        )
-        .unwrap();
+    let result = provider.calculate_object_store_prefix(
+        &Url::parse("curvine://tenant/data/db").unwrap(),
+        Some(&HashMap::new()),
+    );
+
+    if let Some(val) = saved {
+        env::set_var(ClusterConf::ENV_CONF_FILE, val);
+    }
+
+    let prefix = result.unwrap();
 
     assert_eq!(prefix, "curvine$uri:/tenant/data/db");
 }

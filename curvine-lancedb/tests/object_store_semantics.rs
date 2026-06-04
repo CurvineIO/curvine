@@ -530,6 +530,14 @@ async fn curvine_object_store_semantics_live_cluster() {
     store.delete(&copy_key).await.unwrap();
     assert!(store.inner.head(&copy_key).await.is_err());
 
+    let regular_lance_file = Path::parse(format!("{pfx}/regular_file.lance")).unwrap();
+    store
+        .put(&regular_lance_file, b"not-a-dataset")
+        .await
+        .unwrap();
+    store.inner.delete(&regular_lance_file).await.unwrap();
+    assert!(store.inner.head(&regular_lance_file).await.is_err());
+
     let listed_after: Vec<Path> = store
         .list(Some(prefix_path))
         .map(|r| r.expect("list entry").location)
