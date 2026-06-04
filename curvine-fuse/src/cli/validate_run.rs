@@ -12,17 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::Parser;
-use curvine_fuse::cli::{run_mount, run_validate_config, FuseCli, FuseSubcommand};
+use crate::cli::FuseMountArgs;
 use orpc::CommonResult;
 
-// fuse mount.
-// Debugging, after starting the cluster, execute the following naming, mount fuse
-// umount -f /curvine-fuse; cargo run --bin curvine-fuse -- --conf /server/conf/curvine-cluster.toml
-fn main() -> CommonResult<()> {
-    let cli = FuseCli::parse();
-    match &cli.cmd {
-        None | Some(FuseSubcommand::Mount(_)) => run_mount(cli.resolve_mount_args()),
-        Some(FuseSubcommand::ValidateConfig(_)) => run_validate_config(cli.resolve_validate_args()),
-    }
+/// Validates configuration by loading and initializing cluster settings without mounting.
+pub fn run_validate_config(args: FuseMountArgs) -> CommonResult<()> {
+    let mut conf = args.get_conf()?;
+    conf.client.init()?;
+    conf.print();
+    eprintln!("Configuration validated successfully");
+    Ok(())
 }
