@@ -59,7 +59,7 @@ fn apply_to_updates_pilot_client_fields() {
     assert_eq!(conf.worker_threads, 32);
     assert_eq!(conf.block_size_str, "64KB");
     assert_eq!(conf.read_parallel, 2);
-    assert_eq!(conf.short_circuit, false);
+    assert!(!conf.short_circuit);
 }
 
 #[test]
