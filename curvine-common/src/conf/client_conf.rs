@@ -115,25 +115,37 @@ pub struct ClientConf {
     pub default_cache_ttl: Option<String>,
 
     // Set up the customer service retry policy
+    #[client_cli]
     pub conn_retry_max_duration_ms: u64,
+    #[client_cli]
     pub conn_retry_min_sleep_ms: u64,
+    #[client_cli]
     pub conn_retry_max_sleep_ms: u64,
 
     // rpc requests retry policy.
+    #[client_cli]
     pub rpc_retry_max_duration_ms: u64,
+    #[client_cli]
     pub rpc_retry_min_sleep_ms: u64,
+    #[client_cli]
     pub rpc_retry_max_sleep_ms: u64,
 
     // Whether to close the idle rpc connection.
+    #[client_cli]
     pub rpc_close_idle: bool,
 
     //Configuration of timeout for a request.
+    #[client_cli]
     pub conn_timeout_ms: u64,
+    #[client_cli]
     pub rpc_timeout_ms: u64,
+    #[client_cli]
     pub data_timeout_ms: u64,
+    #[client_cli]
     pub pipeline_timeout_ms: u64,
 
     // After testing 3 connections, the best performance can be achieved, so the default value is 3.
+    #[client_cli]
     pub master_conn_pool_size: usize,
 
     // Whether to enable pre-reading

@@ -105,6 +105,45 @@ fn apply_to_updates_c4_fields() {
 }
 
 #[test]
+fn parses_c5_rpc_retry_and_timeout_flags() {
+    let parsed = CliHarness::try_parse_from([
+        "curvine-fuse",
+        "--client.rpc-timeout-ms",
+        "60000",
+        "--client.conn-timeout-ms",
+        "30000",
+        "--client.rpc-close-idle",
+        "false",
+        "--client.master-conn-pool-size",
+        "5",
+    ])
+    .unwrap();
+
+    assert_eq!(parsed.overrides.rpc_timeout_ms, Some(60000));
+    assert_eq!(parsed.overrides.conn_timeout_ms, Some(30000));
+    assert_eq!(parsed.overrides.rpc_close_idle, Some(false));
+    assert_eq!(parsed.overrides.master_conn_pool_size, Some(5));
+}
+
+#[test]
+fn apply_to_updates_c5_fields() {
+    let mut conf = ClientConf::default();
+    let overrides = ClientConfCliOverrides {
+        conn_retry_max_duration_ms: Some(120_000),
+        rpc_retry_min_sleep_ms: Some(200),
+        data_timeout_ms: Some(90_000),
+        pipeline_timeout_ms: Some(90_000),
+        ..Default::default()
+    };
+    overrides.apply_to(&mut conf).unwrap();
+
+    assert_eq!(conf.conn_retry_max_duration_ms, 120_000);
+    assert_eq!(conf.rpc_retry_min_sleep_ms, 200);
+    assert_eq!(conf.data_timeout_ms, 90_000);
+    assert_eq!(conf.pipeline_timeout_ms, 90_000);
+}
+
+#[test]
 fn rejects_unannotated_field_in_opt_in_mode() {
     let err =
         CliHarness::try_parse_from(["curvine-fuse", "--client.hostname", "host1"]).unwrap_err();
