@@ -64,27 +64,19 @@ func ValidateStorageClassParams(params map[string]string, requestID string) (*St
 	}
 	validated.FSPath = fsPath
 
-	// Generate mnt-path automatically (mnt-path parameter is now optional and internal)
-	// If mnt-path is provided (legacy support), use it; otherwise generate it
-	mntPath, ok := params["mnt-path"]
-	if !ok || mntPath == "" {
-		// Auto-generate mnt-path based on mount-key (master-addrs + fs-path)
-		// This ensures different StorageClasses with same master-addrs but different fs-path get different mount points
-		// Format: /var/lib/kubelet/plugins/kubernetes.io/csi/curvine/{mount-key}/fuse-mount
-		mountKey := GenerateMountKey(masterAddrs, fsPath)
-		clusterID := GenerateClusterID(masterAddrs) // Keep for logging
-		mntPath = fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/curvine/%s/fuse-mount", mountKey)
-		klog.Infof("RequestID: %s, Auto-generated mnt-path: %s (mount-key: %s, cluster-id: %s, fs-path: %s)",
-			requestID, mntPath, mountKey, clusterID, fsPath)
-	} else {
-		// User provided mnt-path (legacy mode)
-		klog.Warningf("RequestID: %s, Using user-provided mnt-path: %s (deprecated, will auto-generate in future)",
-			requestID, mntPath)
-		if err := ValidatePath(mntPath); err != nil {
-			klog.Errorf("RequestID: %s, Invalid mnt-path: %v", requestID, err)
-			return nil, status.Errorf(codes.InvalidArgument, "Invalid mnt-path: %v", err)
+	fuseParams := CollectPassthroughParams(params, nil)
+	for key := range params {
+		if IsRejectedVolumeParameterKey(key) {
+			klog.Errorf("RequestID: %s, Parameter %q is not allowed on StorageClass or PV", requestID, key)
+			return nil, status.Errorf(codes.InvalidArgument, "Parameter %q is not allowed on StorageClass or PV", key)
 		}
 	}
+
+	mountKey := GenerateMountKeyWithFuseParams(masterAddrs, fsPath, fuseParams)
+	mntPath := ComputeFuseMntPath(mountKey)
+	clusterID := GenerateClusterID(masterAddrs)
+	klog.Infof("RequestID: %s, Auto-generated mnt-path: %s (mount-key: %s, cluster-id: %s, fs-path: %s)",
+		requestID, mntPath, mountKey, clusterID, fsPath)
 	validated.MntPath = mntPath
 
 	// Validate path-type (optional, default to "Directory")
@@ -97,22 +89,7 @@ func ValidateStorageClassParams(params map[string]string, requestID string) (*St
 		return nil, status.Error(codes.InvalidArgument, "path-type must be 'Directory' or 'DirectoryOrCreate'")
 	}
 	validated.PathType = pathType
-
-	// Collect optional FUSE parameters
-	fuseParamKeys := []string{
-		"io-threads", "worker-threads", "mnt-per-task", "clone-fd",
-		"fuse-channel-size", "stream-channel-size", "auto-cache",
-		"direct-io", "kernel-cache", "cache-readdir", "entry-timeout",
-		"attr-timeout", "negative-timeout", "max-background",
-		"congestion-threshold", "node-cache-size", "node-cache-timeout",
-		"master-hostname", "master-rpc-port", "master-web-port", "mnt-number",
-	}
-
-	for _, key := range fuseParamKeys {
-		if value, ok := params[key]; ok && value != "" {
-			validated.FuseParams[key] = value
-		}
-	}
+	validated.FuseParams = fuseParams
 
 	klog.Infof("RequestID: %s, Validated StorageClass parameters: master-addrs=%s, mnt-path=%s, fs-path=%s, path-type=%s",
 		requestID, validated.MasterAddrs, validated.MntPath, validated.FSPath, validated.PathType)

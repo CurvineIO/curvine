@@ -111,6 +111,10 @@ func (n *nodeServiceStandalone) NodeStageVolume(ctx context.Context, request *cs
 		publishContext = make(map[string]string)
 	}
 
+	if err := RejectDisallowedVolumeParameters(volumeContext, publishContext, requestID); err != nil {
+		return nil, err
+	}
+
 	// Get required parameters
 	masterAddrs := volumeContext["master-addrs"]
 	if masterAddrs == "" {
