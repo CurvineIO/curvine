@@ -14,40 +14,22 @@
 
 //! Proc-macros for Curvine configuration structs under `curvine-common`.
 
-use proc_macro::TokenStream;
-use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DeriveInput};
+mod client_cli;
 
-/// Derives a `{Type}CliOverrides` companion struct and a no-op `apply_to` impl.
+use proc_macro::TokenStream;
+
+/// Derives `{Type}CliOverrides` with clap flags and `apply_to` for `#[client_cli]` fields.
 ///
-/// Field-level `#[client_cli(...)]` attributes will be handled in a later commit.
+/// Container-level attributes (on the struct):
+/// - `#[client_cli(prefix = "client")]` — prepended to generated long names (e.g. `client.io-threads`)
+/// - `#[client_cli(strip_suffix = "_str")]` — strips a suffix from field names before kebab-case
+///
+/// Field-level attributes:
+/// - `#[client_cli(skip)]` — omit from generated overrides
+/// - `#[client_cli(long = "...")]` — explicit clap long name
+///
+/// Fields marked `#[serde(skip)]` are skipped automatically.
 #[proc_macro_derive(ClientCliArgs, attributes(client_cli))]
 pub fn derive_client_cli_args(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-
-    if !matches!(input.data, Data::Struct(_)) {
-        return syn::Error::new_spanned(
-            &input.ident,
-            "ClientCliArgs can only be derived for structs",
-        )
-        .to_compile_error()
-        .into();
-    }
-
-    let conf_name = &input.ident;
-    let overrides_name = format_ident!("{}CliOverrides", conf_name);
-
-    let expanded = quote! {
-        #[derive(Debug, Default, Clone, PartialEq, Eq)]
-        pub struct #overrides_name {}
-
-        impl #overrides_name {
-            /// Applies CLI overrides onto the target configuration struct.
-            pub fn apply_to(&self, _target: &mut #conf_name) -> ::orpc::CommonResult<()> {
-                Ok(())
-            }
-        }
-    };
-
-    expanded.into()
+    client_cli::derive_client_cli_args(input)
 }
