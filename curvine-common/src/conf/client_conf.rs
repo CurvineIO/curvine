@@ -32,6 +32,7 @@ pub struct ClientConf {
 
     // The hostname of the machine where the customer service is located.
     // In some cases, this value needs to be set to identify that the client and worker are on the same machine.
+    #[client_cli]
     pub hostname: String,
 
     #[client_cli]
@@ -39,6 +40,7 @@ pub struct ClientConf {
     #[client_cli]
     pub worker_threads: usize,
 
+    #[client_cli]
     pub replicas: i32,
     #[serde(skip)]
     pub block_size: i64,
@@ -88,30 +90,36 @@ pub struct ClientConf {
     #[serde(skip)]
     pub storage_type: StorageType,
     #[serde(alias = "storage_type")]
+    #[client_cli]
     pub storage_type_str: String,
 
     #[serde(skip)]
     pub ttl_ms: i64,
     #[serde(alias = "ttl_ms")]
+    #[client_cli]
     pub ttl_ms_str: String,
 
     #[serde(skip)]
     pub ttl_action: TtlAction,
     #[serde(alias = "ttl_action")]
+    #[client_cli]
     pub ttl_action_str: String,
 
     /// Whether to enable automatic caching function
     /// When enabled, when the client reads files from external file systems (such as S3, OSS, etc.),
     /// will automatically submit a load request to the master and cache the file into curvine
+    #[client_cli]
     pub auto_cache_enabled: bool,
 
     /// Default TTL for automatic cache (living time)
     /// Format: Number + units, such as "10d" (10 days), "24h" (24 hours)
     /// Or pure number (seconds), such as "86400" (1 day)
+    #[client_cli]
     pub auto_cache_ttl: String,
 
     /// Default cache TTL
     /// Same as auto_cache_ttl, but as Option<String> type, it is convenient to use in the API
+    #[client_cli(skip)]
     pub default_cache_ttl: Option<String>,
 
     // Set up the customer service retry policy
@@ -148,21 +156,25 @@ pub struct ClientConf {
     pub master_conn_pool_size: usize,
 
     // Whether to enable pre-reading
+    #[client_cli]
     pub enable_read_ahead: bool,
     // Default is 0, the value is read_chunk_size * read_chunk_num
     #[serde(skip)]
     pub read_ahead_len: i64,
     #[serde(alias = "read_ahead_len")]
+    #[client_cli]
     pub read_ahead_len_str: String,
     #[serde(skip)]
     pub drop_cache_len: i64,
     #[serde(alias = "drop_cache_len")]
+    #[client_cli]
     pub drop_cache_len_str: String,
 
     // Worker blacklist survival time
     #[serde(skip)]
     pub failed_worker_ttl: Duration,
     #[serde(alias = "failed_worker_ttl")]
+    #[client_cli]
     pub failed_worker_ttl_str: String,
 
     // Whether to enable the unified file system
@@ -182,67 +194,86 @@ pub struct ClientConf {
     #[serde(skip)]
     pub mount_update_ttl: Duration,
     #[serde(alias = "mount_update_ttl")]
+    #[client_cli]
     pub mount_update_ttl_str: String,
 
+    // Octal umask values (e.g. 022) cannot be represented safely as a decimal u32 CLI flag yet.
+    #[client_cli(skip)]
     pub umask: u32,
 
+    #[client_cli]
     pub metric_report_enable: bool,
 
     #[serde(skip)]
     pub clean_task_interval: Duration,
     #[serde(alias = "clean_task_interval")]
+    #[client_cli]
     pub clean_task_interval_str: String,
 
+    #[client_cli]
     pub close_timeout_secs: u64,
 
+    #[client_cli(skip)]
     pub metadata_operation_buckets: Vec<f64>,
 
     // Minimum interval for checking if ufs sync task is complete / checking if curvine file data has updates
     #[serde(skip)]
     pub sync_check_interval_min: Duration,
     #[serde(alias = "sync_check_interval_min")]
+    #[client_cli]
     pub sync_check_interval_min_str: String,
 
     // Maximum interval for checking if ufs sync task is complete / checking if curvine file data has updates
     #[serde(skip)]
     pub sync_check_interval_max: Duration,
     #[serde(alias = "sync_check_interval_max")]
+    #[client_cli]
     pub sync_check_interval_max_str: String,
 
     // Maximum timeout for waiting for sync job to complete
     #[serde(skip)]
     pub max_sync_wait_timeout: Duration,
     #[serde(alias = "max_sync_wait_timeout")]
+    #[client_cli]
     pub max_sync_wait_timeout_str: String,
 
     // Number of sync_check_interval cycles before logging
+    #[client_cli]
     pub sync_check_log_tick: u32,
 
+    #[client_cli]
     pub enable_block_conn_pool: bool,
+    #[client_cli]
     pub block_conn_idle_size: usize,
 
     #[serde(skip)]
     pub block_conn_idle_time: Duration,
     #[serde(alias = "block_conn_idle_time")]
+    #[client_cli]
     pub block_conn_idle_time_str: String,
 
     #[serde(skip)]
     pub small_file_size: i64,
     #[serde(alias = "small_file_size")]
+    #[client_cli]
     pub small_file_size_str: String,
 
     // Smart prefetch configuration
     // Whether to enable smart prefetch, default is true
+    #[client_cli]
     pub enable_smart_prefetch: bool,
 
     #[serde(skip)]
     pub large_file_size: i64,
     #[serde(alias = "large_file_size")]
+    #[client_cli]
     pub large_file_size_str: String,
 
+    #[client_cli]
     pub max_read_parallel: i64,
 
     // Sequential read check threshold
+    #[client_cli]
     pub sequential_read_threshold: u64,
 }
 
