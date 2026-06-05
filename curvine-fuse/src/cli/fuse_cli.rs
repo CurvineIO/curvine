@@ -12,10 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use curvine_common::version;
 
 use crate::cli::mount_args::FuseMountArgs;
+
+/// Output format for `list-config-flags`.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+pub enum ListConfigFormat {
+    #[default]
+    Json,
+}
+
+/// Arguments for the `list-config-flags` subcommand.
+#[derive(Debug, Parser, Clone)]
+pub struct ListConfigFlagsArgs {
+    #[arg(long, value_enum, default_value_t = ListConfigFormat::Json)]
+    pub format: ListConfigFormat,
+}
 
 /// Top-level curvine-fuse CLI. Mount is the default when no subcommand is given.
 #[derive(Debug, Parser, Clone)]
@@ -39,6 +53,8 @@ pub enum FuseSubcommand {
     Mount(FuseMountArgs),
     /// Validate configuration without mounting
     ValidateConfig(FuseMountArgs),
+    /// List mount-related CLI flags as JSON for docs and CI
+    ListConfigFlags(ListConfigFlagsArgs),
 }
 
 impl FuseCli {
@@ -55,6 +71,9 @@ impl FuseCli {
             Some(FuseSubcommand::ValidateConfig(_)) => {
                 unreachable!("resolve_mount_args called for validate-config")
             }
+            Some(FuseSubcommand::ListConfigFlags(_)) => {
+                unreachable!("resolve_mount_args called for list-config-flags")
+            }
         }
     }
 
@@ -65,6 +84,9 @@ impl FuseCli {
             None => self.mount.clone(),
             Some(FuseSubcommand::Mount(_)) => {
                 unreachable!("resolve_validate_args called for mount")
+            }
+            Some(FuseSubcommand::ListConfigFlags(_)) => {
+                unreachable!("resolve_validate_args called for list-config-flags")
             }
         }
     }
@@ -114,6 +136,30 @@ mod tests {
         match cli.cmd {
             Some(FuseSubcommand::ValidateConfig(_)) => {}
             _ => panic!("expected validate-config subcommand"),
+        }
+    }
+
+    #[test]
+    fn list_config_flags_subcommand_parses() {
+        let cli = FuseCli::try_parse_from(["curvine-fuse", "list-config-flags"]).unwrap();
+        match cli.cmd {
+            Some(FuseSubcommand::ListConfigFlags(args)) => {
+                assert_eq!(args.format, ListConfigFormat::Json);
+            }
+            _ => panic!("expected list-config-flags subcommand"),
+        }
+    }
+
+    #[test]
+    fn list_config_flags_accepts_format_json() {
+        let cli =
+            FuseCli::try_parse_from(["curvine-fuse", "list-config-flags", "--format", "json"])
+                .unwrap();
+        match cli.cmd {
+            Some(FuseSubcommand::ListConfigFlags(args)) => {
+                assert_eq!(args.format, ListConfigFormat::Json);
+            }
+            _ => panic!("expected list-config-flags subcommand"),
         }
     }
 }

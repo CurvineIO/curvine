@@ -13,11 +13,13 @@
 // limitations under the License.
 
 mod fuse_cli;
+mod list_config_run;
 mod mount_args;
 mod mount_run;
 mod validate_run;
 
-pub use fuse_cli::{FuseCli, FuseSubcommand};
+pub use fuse_cli::{FuseCli, FuseSubcommand, ListConfigFlagsArgs, ListConfigFormat};
+pub use list_config_run::run_list_config_flags;
 pub use mount_args::FuseMountArgs;
 pub use mount_run::run_mount;
 pub use validate_run::run_validate_config;

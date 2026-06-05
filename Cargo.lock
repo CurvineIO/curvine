@@ -2073,6 +2073,7 @@ dependencies = [
  "pin-project-lite",
  "pkg-config",
  "serde",
+ "serde_json",
  "smallvec",
  "thiserror 1.0.69",
  "tokio",
