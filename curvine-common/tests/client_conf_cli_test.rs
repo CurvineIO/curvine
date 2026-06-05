@@ -181,8 +181,6 @@ fn parses_c6_remaining_client_flags() {
         "disk",
         "--client.enable-read-ahead",
         "true",
-        "--client.umask",
-        "18",
         "--client.max-read-parallel",
         "16",
         "--client.sequential-read-threshold",
@@ -194,7 +192,6 @@ fn parses_c6_remaining_client_flags() {
     assert_eq!(parsed.overrides.replicas, Some(3));
     assert_eq!(parsed.overrides.storage_type_str.as_deref(), Some("disk"));
     assert_eq!(parsed.overrides.enable_read_ahead, Some(true));
-    assert_eq!(parsed.overrides.umask, Some(18));
     assert_eq!(parsed.overrides.max_read_parallel, Some(16));
     assert_eq!(parsed.overrides.sequential_read_threshold, Some(10));
 }
@@ -225,4 +222,10 @@ fn rejects_skipped_client_cli_fields() {
     let err = CliHarness::try_parse_from(["curvine-fuse", "--client.default-cache-ttl", "7d"])
         .unwrap_err();
     assert!(err.to_string().contains("default-cache-ttl"));
+}
+
+#[test]
+fn rejects_umask_until_octal_cli_parsing() {
+    let err = CliHarness::try_parse_from(["curvine-fuse", "--client.umask", "022"]).unwrap_err();
+    assert!(err.to_string().contains("umask"));
 }
