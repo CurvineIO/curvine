@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_fuse::cli::{run_mount, run_validate_config, FuseCli, FuseSubcommand};
+use curvine_fuse::cli::{
+    run_list_config_flags, run_mount, run_validate_config, FuseCli, FuseSubcommand,
+};
 use orpc::CommonResult;
 
 // fuse mount.
@@ -24,5 +26,6 @@ fn main() -> CommonResult<()> {
     match &cli.cmd {
         None | Some(FuseSubcommand::Mount(_)) => run_mount(cli.resolve_mount_args()),
         Some(FuseSubcommand::ValidateConfig(_)) => run_validate_config(cli.resolve_validate_args()),
+        Some(FuseSubcommand::ListConfigFlags(args)) => run_list_config_flags(args.clone()),
     }
 }
