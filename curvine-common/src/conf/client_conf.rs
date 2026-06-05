@@ -141,7 +141,6 @@ pub struct ClientConf {
     pub rpc_timeout_ms: u64,
     #[client_cli]
     pub data_timeout_ms: u64,
-    #[client_cli]
     pub pipeline_timeout_ms: u64,
 
     // After testing 3 connections, the best performance can be achieved, so the default value is 3.
