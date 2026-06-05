@@ -19,11 +19,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct CliFlagRecord {
-    pub id: String,
+struct CliFlagRecord {
     pub long: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub short: Option<char>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub help: Option<String>,
     pub required: bool,
@@ -31,8 +28,7 @@ pub struct CliFlagRecord {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct CliFlagsDocument {
-    pub format: String,
+struct CliFlagsDocument {
     pub version: String,
     pub flags: Vec<CliFlagRecord>,
 }
@@ -48,16 +44,13 @@ pub fn run_list_config_flags(args: ListConfigFlagsArgs) -> CommonResult<()> {
     }
 }
 
-pub fn export_cli_flags_json() -> CommonResult<CliFlagsDocument> {
+fn export_cli_flags_json() -> CommonResult<CliFlagsDocument> {
+    let cmd = FuseCli::command();
     let mut by_long = BTreeMap::new();
-    collect_flags(&FuseCli::command(), &mut by_long);
+    collect_flags(&cmd, &mut by_long);
 
     Ok(CliFlagsDocument {
-        format: "json".to_string(),
-        version: FuseCli::command()
-            .get_version()
-            .unwrap_or_default()
-            .to_string(),
+        version: cmd.get_version().unwrap_or_default().to_string(),
         flags: by_long.into_values().collect(),
     })
 }
@@ -72,8 +65,15 @@ fn collect_flags(cmd: &clap::Command, out: &mut BTreeMap<String, CliFlagRecord>)
         }
     }
     for sub in cmd.get_subcommands() {
+        if should_skip_subcommand(sub.get_name()) {
+            continue;
+        }
         collect_flags(sub, out);
     }
+}
+
+fn should_skip_subcommand(name: &str) -> bool {
+    matches!(name, "list-config-flags" | "help")
 }
 
 fn should_skip_arg(arg: &Arg) -> bool {
@@ -84,9 +84,7 @@ fn should_skip_arg(arg: &Arg) -> bool {
 fn flag_record_from_arg(arg: &Arg) -> Option<CliFlagRecord> {
     let long = arg.get_long()?.to_string();
     Some(CliFlagRecord {
-        id: arg.get_id().as_str().to_string(),
         long,
-        short: arg.get_short(),
         help: arg.get_help().map(|h| h.to_string()),
         required: arg.is_required_set(),
         takes_value: arg.get_action().takes_values(),
@@ -120,5 +118,12 @@ mod tests {
         let mut sorted = longs.clone();
         sorted.sort_unstable();
         assert_eq!(longs, sorted);
+    }
+
+    #[test]
+    fn export_omits_list_config_flags_subcommand_args() {
+        let doc = export_cli_flags_json().unwrap();
+        let longs: Vec<_> = doc.flags.iter().map(|f| f.long.as_str()).collect();
+        assert!(!longs.contains(&"format"));
     }
 }
