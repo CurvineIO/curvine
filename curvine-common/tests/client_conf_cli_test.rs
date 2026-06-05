@@ -170,8 +170,59 @@ fn rejects_pipeline_timeout_ms_until_wired_to_rpc_conf() {
 }
 
 #[test]
-fn rejects_unannotated_field_in_opt_in_mode() {
-    let err =
-        CliHarness::try_parse_from(["curvine-fuse", "--client.hostname", "host1"]).unwrap_err();
-    assert!(err.to_string().contains("hostname"));
+fn parses_c6_remaining_client_flags() {
+    let parsed = CliHarness::try_parse_from([
+        "curvine-fuse",
+        "--client.hostname",
+        "worker-1",
+        "--client.replicas",
+        "3",
+        "--client.storage-type",
+        "disk",
+        "--client.enable-read-ahead",
+        "true",
+        "--client.umask",
+        "18",
+        "--client.max-read-parallel",
+        "16",
+        "--client.sequential-read-threshold",
+        "10",
+    ])
+    .unwrap();
+
+    assert_eq!(parsed.overrides.hostname.as_deref(), Some("worker-1"));
+    assert_eq!(parsed.overrides.replicas, Some(3));
+    assert_eq!(parsed.overrides.storage_type_str.as_deref(), Some("disk"));
+    assert_eq!(parsed.overrides.enable_read_ahead, Some(true));
+    assert_eq!(parsed.overrides.umask, Some(18));
+    assert_eq!(parsed.overrides.max_read_parallel, Some(16));
+    assert_eq!(parsed.overrides.sequential_read_threshold, Some(10));
+}
+
+#[test]
+fn apply_to_updates_c6_fields() {
+    let mut conf = ClientConf::default();
+    let overrides = ClientConfCliOverrides {
+        hostname: Some("node-a".to_string()),
+        auto_cache_ttl: Some("14d".to_string()),
+        failed_worker_ttl_str: Some("30m".to_string()),
+        sync_check_log_tick: Some(5),
+        enable_smart_prefetch: Some(false),
+        ..Default::default()
+    };
+    overrides.apply_to(&mut conf).unwrap();
+    conf.init().unwrap();
+
+    assert_eq!(conf.hostname, "node-a");
+    assert_eq!(conf.auto_cache_ttl, "14d");
+    assert_eq!(conf.failed_worker_ttl_str, "30m");
+    assert_eq!(conf.sync_check_log_tick, 5);
+    assert!(!conf.enable_smart_prefetch);
+}
+
+#[test]
+fn rejects_skipped_client_cli_fields() {
+    let err = CliHarness::try_parse_from(["curvine-fuse", "--client.default-cache-ttl", "7d"])
+        .unwrap_err();
+    assert!(err.to_string().contains("default-cache-ttl"));
 }
