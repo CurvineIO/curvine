@@ -142,7 +142,7 @@ func (n *nodeService) NodeStageVolume(ctx context.Context, request *csi.NodeStag
 		defer cancel()
 		if err := ValidateFuseParameters(validateCtx, masterAddrs, fsPathToMount, fuseParams); err != nil {
 			klog.Errorf("RequestID: %s, validate-config failed for static PV: %v", requestID, err)
-			return nil, status.Errorf(codes.InvalidArgument, "invalid volume parameters: %v", err)
+			return nil, StatusFromValidateConfigError(err)
 		}
 	}
 

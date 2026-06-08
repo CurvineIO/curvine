@@ -17,16 +17,29 @@ package csi
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
 	defaultFuseConfPath = "/opt/curvine/conf/curvine-cluster.toml"
 )
+
+// ValidateConfigError indicates validate-config rejected the supplied parameters.
+type ValidateConfigError struct {
+	Stderr string
+}
+
+func (e *ValidateConfigError) Error() string {
+	return e.Stderr
+}
 
 // ResolveFuseBinaryPath returns the curvine-fuse binary path from env or driver defaults.
 func ResolveFuseBinaryPath() string {
@@ -65,7 +78,9 @@ func ValidateFuseParameters(ctx context.Context, masterAddrs, fsPath string, pas
 	})
 }
 
-// ExecFuseValidateConfig executes curvine-fuse validate-config and returns stderr on failure.
+// ExecFuseValidateConfig executes curvine-fuse validate-config.
+// Non-zero exits are returned as *ValidateConfigError with stderr text; other
+// failures preserve their original error type for gRPC code mapping.
 func ExecFuseValidateConfig(ctx context.Context, in FuseExecArgsInput) error {
 	in.Subcommand = "validate-config"
 	if in.ConfPath == "" {
@@ -79,13 +94,39 @@ func ExecFuseValidateConfig(ctx context.Context, in FuseExecArgsInput) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
+		stderrMsg := strings.TrimSpace(stderr.String())
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if stderrMsg == "" {
+				stderrMsg = err.Error()
+			}
+			return &ValidateConfigError{Stderr: stderrMsg}
 		}
-		return fmt.Errorf("%s", msg)
+		if stderrMsg != "" {
+			return fmt.Errorf("%s: %w", stderrMsg, err)
+		}
+		return err
 	}
 	return nil
+}
+
+// StatusFromValidateConfigError maps validate-config failures to gRPC status codes.
+func StatusFromValidateConfigError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var paramErr *ValidateConfigError
+	if errors.As(err, &paramErr) {
+		return status.Errorf(codes.InvalidArgument, "invalid fuse configuration: %s", paramErr.Stderr)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return status.Errorf(codes.DeadlineExceeded, "validate-config timed out: %v", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		return status.Errorf(codes.Canceled, "validate-config canceled: %v", err)
+	}
+	return status.Errorf(codes.Internal, "validate-config failed: %v", err)
 }
 
 // fuseValidateTimeout returns the timeout for validate-config subprocess calls.

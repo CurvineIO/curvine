@@ -53,7 +53,7 @@ func ValidateStorageClassParams(params map[string]string, requestID string) (*St
 		fsPath = "/"
 		klog.Infof("RequestID: %s, fs-path not specified, using default: /", requestID)
 	}
-	if err := ValidatePath(fsPath); err != nil {
+	if err := ValidateFSPath(fsPath); err != nil {
 		klog.Errorf("RequestID: %s, Invalid fs-path: %v", requestID, err)
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid fs-path: %v", err)
 	}
@@ -112,5 +112,16 @@ func ValidateMasterAddrs(masterAddrs string) error {
 		}
 	}
 
+	return nil
+}
+
+// ValidateFSPath validates fs-path for volume handle generation and mount usage.
+func ValidateFSPath(fsPath string) error {
+	if err := ValidatePath(fsPath); err != nil {
+		return err
+	}
+	if strings.Contains(fsPath, VolumeHandleSeparator) {
+		return fmt.Errorf("fs-path must not contain %q", VolumeHandleSeparator)
+	}
 	return nil
 }

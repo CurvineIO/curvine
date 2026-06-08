@@ -15,8 +15,14 @@
 package csi
 
 import (
+	"context"
+	"errors"
+	"os/exec"
 	"reflect"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestBuildFuseValidateExecArgs(t *testing.T) {
@@ -54,5 +60,54 @@ func TestResolveFuseConfPathEnvOverride(t *testing.T) {
 	t.Setenv("FUSE_CONF_PATH", "/custom/conf.toml")
 	if got := ResolveFuseConfPath(); got != "/custom/conf.toml" {
 		t.Fatalf("ResolveFuseConfPath() = %q, want env override", got)
+	}
+}
+
+func TestStatusFromValidateConfigErrorMapsExitToInvalidArgument(t *testing.T) {
+	err := StatusFromValidateConfigError(&ValidateConfigError{Stderr: "unknown flag"})
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected gRPC status, got %v", err)
+	}
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", st.Code())
+	}
+}
+
+func TestStatusFromValidateConfigErrorMapsDeadlineExceeded(t *testing.T) {
+	err := StatusFromValidateConfigError(context.DeadlineExceeded)
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected gRPC status, got %v", err)
+	}
+	if st.Code() != codes.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded, got %v", st.Code())
+	}
+}
+
+func TestStatusFromValidateConfigErrorMapsMissingBinaryToInternal(t *testing.T) {
+	err := StatusFromValidateConfigError(&exec.Error{Name: "curvine-fuse", Err: exec.ErrNotFound})
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected gRPC status, got %v", err)
+	}
+	if st.Code() != codes.Internal {
+		t.Fatalf("expected Internal, got %v", st.Code())
+	}
+}
+
+func TestExecFuseValidateConfigPreservesExitErrorType(t *testing.T) {
+	t.Setenv("FUSE_BINARY_PATH", "/nonexistent/curvine-fuse-binary")
+	ctx := context.Background()
+	err := ExecFuseValidateConfig(ctx, FuseExecArgsInput{
+		MasterAddrs: "m1:8995",
+		FSPath:      "/",
+	})
+	if err == nil {
+		t.Fatal("expected error for missing binary")
+	}
+	var paramErr *ValidateConfigError
+	if errors.As(err, &paramErr) {
+		t.Fatal("expected infrastructure error, not ValidateConfigError")
 	}
 }

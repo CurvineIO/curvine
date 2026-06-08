@@ -86,7 +86,7 @@ func (d *controllerService) CreateVolume(ctx context.Context, request *csi.Creat
 	defer cancel()
 	if err := ValidateFuseParameters(validateCtx, params.MasterAddrs, params.FSPath, params.Passthrough); err != nil {
 		klog.Errorf("RequestID: %s, validate-config failed: %v", requestID, err)
-		return nil, status.Errorf(codes.InvalidArgument, "invalid StorageClass parameters: %v", err)
+		return nil, StatusFromValidateConfigError(err)
 	}
 
 	// Generate VolumeHandle: {cluster-id}@{fs-path}@{pv-name}

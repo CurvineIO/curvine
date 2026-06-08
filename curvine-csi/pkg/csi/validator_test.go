@@ -60,6 +60,31 @@ func TestValidateStorageClassParamsCollectsPassthrough(t *testing.T) {
 	}
 }
 
+func TestValidateStorageClassParamsRejectsFSPathWithAtSign(t *testing.T) {
+	params := map[string]string{
+		"master-addrs": "m1:8995",
+		"fs-path":      "/bad@path",
+	}
+
+	_, err := ValidateStorageClassParams(params, "test-req")
+	if err == nil {
+		t.Fatal("expected error for fs-path containing @")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("expected gRPC status error, got %v", err)
+	}
+	if st.Code() != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", st.Code())
+	}
+}
+
+func TestValidateFSPathRejectsAtSign(t *testing.T) {
+	if err := ValidateFSPath("/data@vol"); err == nil {
+		t.Fatal("expected error for fs-path with @")
+	}
+}
+
 func TestIsStaticVolumeID(t *testing.T) {
 	if !IsStaticVolumeID("my-existing-volume") {
 		t.Fatal("expected unstructured volume handle to be static")
