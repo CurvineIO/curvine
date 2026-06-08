@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cli::FuseMountArgs;
+use crate::cli::FuseRuntimeArgs;
 use crate::fs::CurvineFileSystem;
 use crate::session::FuseSession;
 use crate::web_server::WebServer;
@@ -22,7 +22,7 @@ use orpc::CommonResult;
 use std::sync::Arc;
 
 /// Runs the default mount command using the given CLI arguments.
-pub fn run_mount(args: FuseMountArgs) -> CommonResult<()> {
+pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
     println!("fuse args {:?}", args);
 
     unsafe {

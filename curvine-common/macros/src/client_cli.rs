@@ -67,12 +67,13 @@ fn derive_client_cli_args_impl(input: &DeriveInput) -> syn::Result<TokenStream2>
             .expect("named field must have an identifier");
         validate_cli_field_type(field)?;
         let long = cli_long_name(field, &container)?;
+        let arg_id = cli_arg_id(ident, &container);
         let field_is_option = unwrap_option_type(&field.ty).is_some();
         let inner_ty = unwrap_option_type(&field.ty).unwrap_or(&field.ty);
         let ty = quote! { Option<#inner_ty> };
 
         override_fields.push(quote! {
-            #[arg(long = #long)]
+            #[arg(long = #long, id = #arg_id)]
             pub #ident: #ty,
         });
         apply_stmts.push(apply_override_stmt(ident, inner_ty, field_is_option)?);
@@ -256,6 +257,14 @@ fn cli_long_name(field: &Field, container: &ContainerConfig) -> syn::Result<Stri
         Ok(format!("{prefix}.{kebab}"))
     } else {
         Ok(kebab)
+    }
+}
+
+fn cli_arg_id(ident: &syn::Ident, container: &ContainerConfig) -> String {
+    if let Some(prefix) = &container.prefix {
+        format!("{prefix}_{ident}")
+    } else {
+        ident.to_string()
     }
 }
 

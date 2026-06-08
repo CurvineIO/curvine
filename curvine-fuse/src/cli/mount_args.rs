@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use clap::Parser;
-use curvine_common::conf::ClusterConf;
+use curvine_common::conf::{ClientConfCliOverrides, ClusterConf};
 use curvine_common::version;
 use orpc::io::net::InetAddr;
 use orpc::{err_box, CommonResult};
@@ -145,6 +145,26 @@ pub struct FuseMountArgs {
         help = "Maximum number of entries returned per directory listing (optional)"
     )]
     pub list_limit: Option<usize>,
+}
+
+/// Mount CLI flags plus generated `ClientConf` overrides (`--client.*`).
+#[derive(Debug, Parser, Clone)]
+pub struct FuseRuntimeArgs {
+    #[command(flatten)]
+    pub mount: FuseMountArgs,
+
+    #[command(flatten)]
+    pub client: ClientConfCliOverrides,
+}
+
+impl FuseRuntimeArgs {
+    /// Loads cluster config from mount flags and applies `--client.*` overrides.
+    pub fn get_conf(&self) -> CommonResult<ClusterConf> {
+        let mut conf = self.mount.get_conf()?;
+        self.client.apply_to(&mut conf.client)?;
+        conf.client.init()?;
+        Ok(conf)
+    }
 }
 
 impl FuseMountArgs {

@@ -20,6 +20,6 @@ mod validate_run;
 
 pub use fuse_cli::{FuseCli, FuseSubcommand, ListConfigFlagsArgs, ListConfigFormat};
 pub use list_config_run::run_list_config_flags;
-pub use mount_args::FuseMountArgs;
+pub use mount_args::{FuseMountArgs, FuseRuntimeArgs};
 pub use mount_run::run_mount;
 pub use validate_run::run_validate_config;

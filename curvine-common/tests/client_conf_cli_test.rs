@@ -218,6 +218,35 @@ fn apply_to_updates_c6_fields() {
 }
 
 #[test]
+fn client_cli_flags_parse_alongside_mount_io_threads() {
+    #[derive(Debug, Parser)]
+    struct MountLikeArgs {
+        #[arg(long)]
+        pub io_threads: Option<usize>,
+    }
+
+    #[derive(Debug, Parser)]
+    struct FlattenHarness {
+        #[command(flatten)]
+        mount: MountLikeArgs,
+        #[command(flatten)]
+        client: ClientConfCliOverrides,
+    }
+
+    let parsed = FlattenHarness::try_parse_from([
+        "curvine-fuse",
+        "--io-threads",
+        "4",
+        "--client.io-threads",
+        "9",
+    ])
+    .unwrap();
+
+    assert_eq!(parsed.mount.io_threads, Some(4));
+    assert_eq!(parsed.client.io_threads, Some(9));
+}
+
+#[test]
 fn rejects_skipped_client_cli_fields() {
     let err = CliHarness::try_parse_from(["curvine-fuse", "--client.default-cache-ttl", "7d"])
         .unwrap_err();
