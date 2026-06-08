@@ -121,6 +121,13 @@ mod tests {
     }
 
     #[test]
+    fn export_includes_client_cli_flags() {
+        let doc = export_cli_flags_json().unwrap();
+        let longs: Vec<_> = doc.flags.iter().map(|f| f.long.as_str()).collect();
+        assert!(longs.iter().any(|long| long.starts_with("client.")));
+    }
+
+    #[test]
     fn export_omits_list_config_flags_subcommand_args() {
         let doc = export_cli_flags_json().unwrap();
         let longs: Vec<_> = doc.flags.iter().map(|f| f.long.as_str()).collect();
