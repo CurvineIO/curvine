@@ -1111,7 +1111,7 @@ impl fs::FileSystem for CurvineFileSystem {
         handle.read(&self.state, op, reply).await
     }
 
-    async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
+    async fn open(&self, op: Open<'_>, _reply: FuseResponse) -> FuseResult<fuse_open_out> {
         let path = self.state.get_path(op.header.nodeid)?;
         // Check file access permissions before opening
         let action = OpenAction::try_from(op.arg.flags)?;
@@ -1133,8 +1133,6 @@ impl fs::FileSystem for CurvineFileSystem {
                 .should_keep_cache(op.header.nodeid, handle.status());
             if keep_cache {
                 open_flags |= FUSE_FOPEN_KEEP_CACHE;
-            } else if self.conf.direct_io_on_cache_miss {
-                open_flags |= FUSE_FOPEN_DIRECT_IO;
             } else {
                 warn!(
                     "open ino={}: metadata cache miss (mtime/len changed), likely updated by \
@@ -1146,7 +1144,7 @@ impl fs::FileSystem for CurvineFileSystem {
             // Do not send FUSE_NOTIFY_INVAL_INODE here: synchronous invalidation
             // during open can deadlock when the kernel holds page locks on this inode.
             // Remote updates may still appear stale until attr cache expires (default 1s);
-            // use attr_ttl=0, direct_io, or direct_io_on_cache_miss for stronger consistency.
+            // use attr_ttl=0 or direct_io for stronger consistency.
         }
 
         let entry = fuse_open_out {
