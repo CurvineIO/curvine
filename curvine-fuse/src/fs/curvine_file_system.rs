@@ -670,7 +670,17 @@ impl fs::FileSystem for CurvineFileSystem {
             Some(n) => Path::from_str(format!("{}/{}", parent_path.full_path(), n))?,
             None => parent_path.clone(),
         };
-        let status = self.get_cached_status(&path).await?;
+        let status = match self.get_cached_status(&path).await {
+            Ok(s) => s,
+            Err(e) if e.errno == libc::ENOENT && !self.conf.negative_ttl.is_zero() => {
+                return Ok(fuse_entry_out {
+                    entry_valid: self.conf.negative_ttl.as_secs(),
+                    entry_valid_nsec: self.conf.negative_ttl.subsec_nanos(),
+                    ..Default::default()
+                });
+            }
+            Err(e) => return Err(e),
+        };
         let res = self.lookup_status(parent, name.as_deref(), &status);
 
         let entry = match res {
