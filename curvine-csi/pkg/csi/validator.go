@@ -24,23 +24,20 @@ import (
 	"k8s.io/klog"
 )
 
-// StorageClassParams represents validated StorageClass parameters
+// StorageClassParams represents validated StorageClass parameters.
 type StorageClassParams struct {
 	MasterAddrs string
-	MntPath     string
 	FSPath      string
 	PathType    string
-	// Optional FUSE parameters
-	FuseParams map[string]string
+	Passthrough map[string]string
 }
 
-// ValidateStorageClassParams validates StorageClass parameters
+// ValidateStorageClassParams validates StorageClass parameters.
 func ValidateStorageClassParams(params map[string]string, requestID string) (*StorageClassParams, error) {
-	validated := &StorageClassParams{
-		FuseParams: make(map[string]string),
+	if err := RejectDisallowedVolumeParameters(params, nil, requestID); err != nil {
+		return nil, err
 	}
 
-	// Validate master-addrs (required) - must validate first as it's needed for mnt-path generation
 	masterAddrs, ok := params["master-addrs"]
 	if !ok || masterAddrs == "" {
 		klog.Errorf("RequestID: %s, Parameter 'master-addrs' is required", requestID)
@@ -50,36 +47,17 @@ func ValidateStorageClassParams(params map[string]string, requestID string) (*St
 		klog.Errorf("RequestID: %s, Invalid master-addrs format: %v", requestID, err)
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid master-addrs format: %v", err)
 	}
-	validated.MasterAddrs = masterAddrs
 
-	// Validate fs-path first (needed for mnt-path generation)
 	fsPath, ok := params["fs-path"]
 	if !ok || fsPath == "" {
 		fsPath = "/"
 		klog.Infof("RequestID: %s, fs-path not specified, using default: /", requestID)
 	}
-	if err := ValidatePath(fsPath); err != nil {
+	if err := ValidateFSPath(fsPath); err != nil {
 		klog.Errorf("RequestID: %s, Invalid fs-path: %v", requestID, err)
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid fs-path: %v", err)
 	}
-	validated.FSPath = fsPath
 
-	fuseParams := CollectPassthroughParams(params, nil)
-	for key := range params {
-		if IsRejectedVolumeParameterKey(key) {
-			klog.Errorf("RequestID: %s, Parameter %q is not allowed on StorageClass or PV", requestID, key)
-			return nil, status.Errorf(codes.InvalidArgument, "Parameter %q is not allowed on StorageClass or PV", key)
-		}
-	}
-
-	mountKey := GenerateMountKeyWithFuseParams(masterAddrs, fsPath, fuseParams)
-	mntPath := ComputeFuseMntPath(mountKey)
-	clusterID := GenerateClusterID(masterAddrs)
-	klog.Infof("RequestID: %s, Auto-generated mnt-path: %s (mount-key: %s, cluster-id: %s, fs-path: %s)",
-		requestID, mntPath, mountKey, clusterID, fsPath)
-	validated.MntPath = mntPath
-
-	// Validate path-type (optional, default to "Directory")
 	pathType, ok := params["path-type"]
 	if !ok || pathType == "" {
 		pathType = "Directory"
@@ -88,16 +66,21 @@ func ValidateStorageClassParams(params map[string]string, requestID string) (*St
 		klog.Errorf("RequestID: %s, Invalid path-type: %s, must be 'Directory' or 'DirectoryOrCreate'", requestID, pathType)
 		return nil, status.Error(codes.InvalidArgument, "path-type must be 'Directory' or 'DirectoryOrCreate'")
 	}
-	validated.PathType = pathType
-	validated.FuseParams = fuseParams
 
-	klog.Infof("RequestID: %s, Validated StorageClass parameters: master-addrs=%s, mnt-path=%s, fs-path=%s, path-type=%s",
-		requestID, validated.MasterAddrs, validated.MntPath, validated.FSPath, validated.PathType)
+	passthrough := CollectPassthroughParams(params, nil)
 
-	return validated, nil
+	klog.Infof("RequestID: %s, Validated StorageClass parameters: master-addrs=%s, fs-path=%s, path-type=%s, passthrough-keys=%d",
+		requestID, masterAddrs, fsPath, pathType, len(passthrough))
+
+	return &StorageClassParams{
+		MasterAddrs: masterAddrs,
+		FSPath:      fsPath,
+		PathType:    pathType,
+		Passthrough: passthrough,
+	}, nil
 }
 
-// ValidateMasterAddrs validates master-addrs format
+// ValidateMasterAddrs validates master-addrs format.
 // Format: host:port,host:port,...
 func ValidateMasterAddrs(masterAddrs string) error {
 	if masterAddrs == "" {
@@ -132,10 +115,13 @@ func ValidateMasterAddrs(masterAddrs string) error {
 	return nil
 }
 
-// ValidateClusterConnection optionally validates cluster connection
-// This is a placeholder for future implementation
-func ValidateClusterConnection(masterAddrs string, requestID string) error {
-	// TODO: Implement actual connection validation if needed
-	// For now, just validate the format
-	return ValidateMasterAddrs(masterAddrs)
+// ValidateFSPath validates fs-path for volume handle generation and mount usage.
+func ValidateFSPath(fsPath string) error {
+	if err := ValidatePath(fsPath); err != nil {
+		return err
+	}
+	if strings.Contains(fsPath, VolumeHandleSeparator) {
+		return fmt.Errorf("fs-path must not contain %q", VolumeHandleSeparator)
+	}
+	return nil
 }

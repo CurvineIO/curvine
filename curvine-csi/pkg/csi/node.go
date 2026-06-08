@@ -137,6 +137,15 @@ func (n *nodeService) NodeStageVolume(ctx context.Context, request *csi.NodeStag
 	// Collect FUSE parameters from VolumeContext or PublishContext
 	fuseParams := CollectPassthroughParams(volumeContext, publishContext)
 
+	if IsStaticVolumeID(volumeID) {
+		validateCtx, cancel := context.WithTimeout(ctx, fuseValidateTimeout())
+		defer cancel()
+		if err := ValidateFuseParameters(validateCtx, masterAddrs, fsPathToMount, fuseParams); err != nil {
+			klog.Errorf("RequestID: %s, validate-config failed for static PV: %v", requestID, err)
+			return nil, StatusFromValidateConfigError(err)
+		}
+	}
+
 	// Generate mnt-path based on mount-key (master-addrs + fs-path + fuse-params)
 	// Including fuse params ensures that StorageClasses with the same cluster endpoint
 	// and fs-path but different FUSE parameters each get their own mount point and FUSE process.

@@ -115,6 +115,7 @@ RUN mkdir -p /opt/curvine
 COPY --from=builder /build-output/lib/curvine-cli /opt/curvine/
 COPY --from=builder /build-output/lib/curvine-fuse /opt/curvine/
 COPY --from=builder /build-output/bin/csi /opt/curvine/
+COPY --from=builder /build-output/conf/ /opt/curvine/conf/
 
 # Make binaries executable
 RUN chmod +x /opt/curvine/curvine-cli && \
