@@ -1,3 +1,17 @@
+# Static PersistentVolume example.
+#
+# Static PV volumeAttributes use curvine-path (full path to mount) instead of fs-path.
+# NodeStageVolume runs curvine-fuse validate-config before mounting.
+#
+# Reserved volume attribute keys:
+#   master-addrs, curvine-path, path-type, author
+# Rejected keys: mnt-path (computed by CSI)
+# Passthrough: any other non-empty key → curvine-fuse CLI flag (see storage-class.yaml)
+#
+# FUSE process sharing:
+#   PVs share one FUSE pod when master-addrs, curvine-path (used as fuse fs-path),
+#   and passthrough parameters match.
+#
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -13,32 +27,15 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   csi:
     driver: curvine
-    # For static PV, volumeHandle can be any unique string
+    # Any unique string for static PVs
     volumeHandle: "my-existing-volume"
     volumeAttributes:
-      # Required: Curvine cluster master addresses
+      # Required
       master-addrs: "m0:8995,m1:8995,m2:8995"
-      # Required: Complete path in curvine filesystem to mount
-      # This path will be mounted directly by FUSE
+      # Required: existing path in the Curvine filesystem
       curvine-path: "/my-existing-data"
-      # Optional: Path creation strategy
-      # "Directory" - path must exist (recommended for existing data)
-      # "DirectoryOrCreate" - create if not exist
+      # Optional (default: Directory)
       path-type: "Directory"
-      # Optional: FUSE parameters
+      # Optional passthrough examples:
       # io-threads: "4"
-      # worker-threads: "8"
-      
-# Static PV Configuration Notes:
-# - volumeHandle: Any unique string (e.g., "my-volume-1")
-# - curvine-path: Complete path in curvine filesystem to mount
-# - FUSE mounts curvine-path directly to local mount point
-# - Recommended: Use "Retain" policy to prevent accidental deletion
-# 
-# Sharing FUSE Process:
-# - Multiple PVs with same master-addrs + curvine-path will share one FUSE process
-# - Different curvine-path will have independent FUSE process
-# 
-# Example:
-# PV1 (curvine-path="/shared") + PV2 (curvine-path="/shared") → Share FUSE
-# PV3 (curvine-path="/data") → Independent FUSE
+      # client.umask: "022"

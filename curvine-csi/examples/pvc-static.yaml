@@ -1,3 +1,4 @@
+# Static PVC: binds to pre-created PV curvine-pv by name.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -11,4 +12,3 @@ spec:
     requests:
       storage: 5Gi
   volumeName: curvine-pv
-

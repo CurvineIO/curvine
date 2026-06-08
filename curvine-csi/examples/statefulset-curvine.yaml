@@ -1,3 +1,7 @@
+# StatefulSet with per-pod PVCs (volumeClaimTemplates).
+# Each pod gets data-<ordinal> PVC; dynamic provisioning creates a unique
+# Curvine path under fs-path for every PVC (see storage-class.yaml).
+# ReadWriteOnce is intentional: one pod per dedicated volume.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -55,4 +59,3 @@ spec:
   ports:
     - port: 80
       name: http
-

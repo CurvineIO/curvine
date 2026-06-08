@@ -1,8 +1,10 @@
+# Dynamic PVC: provisioned by curvine-sc StorageClass.
+# After binding, the PV mounts /test-data/<pvc-name> on the Curvine cluster.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: curvine-pvc
-  namespace: curvine
+  namespace: curvine-system
 spec:
   storageClassName: curvine-sc
   accessModes:

@@ -1,3 +1,4 @@
+# Deployment with a shared ReadWriteMany PVC (all replicas mount the same volume).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -48,4 +49,3 @@ spec:
         - name: curvine-storage
           persistentVolumeClaim:
             claimName: curvine-shared-pvc
-
