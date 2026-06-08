@@ -197,8 +197,8 @@ pub struct ClientConf {
     #[client_cli]
     pub mount_update_ttl_str: String,
 
-    // Octal umask values (e.g. 022) cannot be represented safely as a decimal u32 CLI flag yet.
-    #[client_cli(skip)]
+    // File creation umask in octal notation (e.g. 022 or 0o22).
+    #[client_cli(octal)]
     pub umask: u32,
 
     #[client_cli]

@@ -254,7 +254,19 @@ fn rejects_skipped_client_cli_fields() {
 }
 
 #[test]
-fn rejects_umask_until_octal_cli_parsing() {
-    let err = CliHarness::try_parse_from(["curvine-fuse", "--client.umask", "022"]).unwrap_err();
+fn parses_and_applies_octal_umask() {
+    let parsed = CliHarness::try_parse_from(["curvine-fuse", "--client.umask", "022"]).unwrap();
+    assert_eq!(parsed.overrides.umask.as_deref(), Some("022"));
+
+    let mut conf = ClientConf::default();
+    parsed.overrides.apply_to(&mut conf).unwrap();
+    assert_eq!(conf.umask, 0o22);
+}
+
+#[test]
+fn rejects_invalid_octal_umask() {
+    let parsed = CliHarness::try_parse_from(["curvine-fuse", "--client.umask", "9"]).unwrap();
+    let mut conf = ClientConf::default();
+    let err = parsed.overrides.apply_to(&mut conf).unwrap_err();
     assert!(err.to_string().contains("umask"));
 }

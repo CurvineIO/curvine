@@ -33,6 +33,9 @@ struct SampleClientConf {
 
     entry_timeout: f64,
 
+    #[client_cli(octal)]
+    file_mode: u32,
+
     #[serde(skip)]
     storage_type: String,
 }
@@ -51,6 +54,7 @@ fn apply_to_updates_fields() {
         block_size_str: "1MB".to_string(),
         hugepage_str: None,
         entry_timeout: 1.0,
+        file_mode: 0,
         storage_type: "memory".to_string(),
     };
     let overrides = SampleClientConfCliOverrides {
@@ -58,6 +62,7 @@ fn apply_to_updates_fields() {
         block_size_str: Some("128MB".to_string()),
         hugepage_str: Some("/dev/hugepages".to_string()),
         entry_timeout: Some(2.5),
+        ..Default::default()
     };
     overrides.apply_to(&mut conf).unwrap();
     assert_eq!(conf.master_addrs, "ignored");
@@ -80,6 +85,8 @@ fn parses_client_cli_flags() {
         "/dev/hugepages",
         "--client.entry-timeout",
         "2.5",
+        "--client.file-mode",
+        "0644",
     ])
     .unwrap();
 
@@ -90,4 +97,25 @@ fn parses_client_cli_flags() {
         Some("/dev/hugepages")
     );
     assert_eq!(parsed.overrides.entry_timeout, Some(2.5));
+    assert_eq!(parsed.overrides.file_mode.as_deref(), Some("0644"));
+}
+
+#[test]
+fn apply_to_parses_octal_field() {
+    let mut conf = SampleClientConf {
+        master_addrs: "ignored".to_string(),
+        io_threads: 1,
+        block_size_str: "1MB".to_string(),
+        hugepage_str: None,
+        entry_timeout: 1.0,
+        file_mode: 0,
+        storage_type: "memory".to_string(),
+    };
+    SampleClientConfCliOverrides {
+        file_mode: Some("0755".to_string()),
+        ..Default::default()
+    }
+    .apply_to(&mut conf)
+    .unwrap();
+    assert_eq!(conf.file_mode, 0o755);
 }
