@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"reflect"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -93,6 +94,35 @@ func TestStatusFromValidateConfigErrorMapsMissingBinaryToInternal(t *testing.T) 
 	}
 	if st.Code() != codes.Internal {
 		t.Fatalf("expected Internal, got %v", st.Code())
+	}
+}
+
+func TestExecFuseValidateConfigMapsSubprocessKillToDeadlineExceeded(t *testing.T) {
+	if _, err := exec.LookPath("yes"); err != nil {
+		t.Skip("yes not available")
+	}
+
+	t.Setenv("FUSE_BINARY_PATH", "yes")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	err := ExecFuseValidateConfig(ctx, FuseExecArgsInput{
+		MasterAddrs: "m1:8995",
+		FSPath:      "/",
+	})
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %T: %v", err, err)
+	}
+
+	st, ok := status.FromError(StatusFromValidateConfigError(err))
+	if !ok {
+		t.Fatalf("expected gRPC status, got %v", err)
+	}
+	if st.Code() != codes.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded, got %v", st.Code())
 	}
 }
 

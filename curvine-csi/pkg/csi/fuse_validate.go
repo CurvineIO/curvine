@@ -94,6 +94,9 @@ func ExecFuseValidateConfig(ctx context.Context, in FuseExecArgsInput) error {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		if ctxErr := context.Cause(ctx); ctxErr != nil {
+			return ctxErr
+		}
 		stderrMsg := strings.TrimSpace(stderr.String())
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
