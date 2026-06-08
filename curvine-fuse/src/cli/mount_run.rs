@@ -23,8 +23,6 @@ use std::sync::Arc;
 
 /// Runs the default mount command using the given CLI arguments.
 pub fn run_mount(args: FuseRuntimeArgs) -> CommonResult<()> {
-    println!("fuse args {:?}", args);
-
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }

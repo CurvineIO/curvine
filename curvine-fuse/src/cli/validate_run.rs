@@ -18,6 +18,6 @@ use orpc::CommonResult;
 /// Validates configuration by loading and initializing cluster settings without mounting.
 /// Exits quietly on success; failures are returned via `CommonResult` for stderr reporting.
 pub fn run_validate_config(args: FuseRuntimeArgs) -> CommonResult<()> {
-    let _conf = args.get_conf()?;
+    args.get_conf()?;
     Ok(())
 }
