@@ -41,7 +41,7 @@ func TestValidateStorageClassParamsRejectsMntPath(t *testing.T) {
 	}
 }
 
-func TestValidateStorageClassParamsGeneratesMntPath(t *testing.T) {
+func TestValidateStorageClassParamsCollectsPassthrough(t *testing.T) {
 	params := map[string]string{
 		"master-addrs": "m1:8995",
 		"fs-path":      "/data",
@@ -52,13 +52,19 @@ func TestValidateStorageClassParamsGeneratesMntPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ValidateStorageClassParams() error = %v", err)
 	}
-	want := ComputeFuseMntPath(GenerateMountKeyWithFuseParams("m1:8995", "/data", map[string]string{
-		"io-threads": "4",
-	}))
-	if got.MntPath != want {
-		t.Fatalf("MntPath = %q, want %q", got.MntPath, want)
+	if got.Passthrough["io-threads"] != "4" {
+		t.Fatalf("Passthrough = %#v, want io-threads=4", got.Passthrough)
 	}
-	if got.FuseParams["io-threads"] != "4" {
-		t.Fatalf("FuseParams = %#v, want io-threads=4 from passthrough", got.FuseParams)
+	if got.MasterAddrs != "m1:8995" || got.FSPath != "/data" {
+		t.Fatalf("unexpected validated params: %#v", got)
+	}
+}
+
+func TestIsStaticVolumeID(t *testing.T) {
+	if !IsStaticVolumeID("my-existing-volume") {
+		t.Fatal("expected unstructured volume handle to be static")
+	}
+	if IsStaticVolumeID(GenerateVolumeHandle("m1:8995", "/data", "pvc-a")) {
+		t.Fatal("expected structured volume handle to be dynamic")
 	}
 }
