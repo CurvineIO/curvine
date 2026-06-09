@@ -288,7 +288,18 @@ impl ClientConf {
 
     pub const DEFAULT_CLOSE_TIMEOUT_SECS: u64 = 5;
 
+    pub const DEFAULT_READ_PARALLEL: i64 = 1;
+
+    pub const DEFAULT_MAX_READ_PARALLEL: i64 = 8;
+
     pub fn init(&mut self) -> CommonResult<()> {
+        if self.read_parallel <= 0 {
+            self.read_parallel = Self::DEFAULT_READ_PARALLEL;
+        }
+        if self.max_read_parallel <= 0 {
+            self.max_read_parallel = Self::DEFAULT_MAX_READ_PARALLEL;
+        }
+
         self.block_size = ByteUnit::from_str(&self.block_size_str)?.as_byte() as i64;
 
         self.write_chunk_size = ByteUnit::from_str(&self.write_chunk_size_str)?.as_byte() as usize;
@@ -394,7 +405,7 @@ impl Default for ClientConf {
             read_chunk_size: 0,
             read_chunk_size_str: "128KB".to_owned(),
             read_chunk_num: 8,
-            read_parallel: 1,
+            read_parallel: Self::DEFAULT_READ_PARALLEL,
             read_slice_size: 0,
             read_slice_size_str: "0".to_owned(),
             max_cache_block_handles: 10,
@@ -480,7 +491,7 @@ impl Default for ClientConf {
             enable_smart_prefetch: true,
             large_file_size: 0,
             large_file_size_str: "10GB".to_string(),
-            max_read_parallel: 8,
+            max_read_parallel: Self::DEFAULT_MAX_READ_PARALLEL,
             sequential_read_threshold: 7,
         };
 

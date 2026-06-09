@@ -134,6 +134,7 @@ impl ReaderAdapter {
 // Reader with buffer.
 pub struct FsReaderBuffer {
     readers: Vec<ReaderAdapter>,
+    base_reader_index: usize,
     path: Path,
     pos: i64,
     len: i64,
@@ -208,10 +209,12 @@ impl FsReaderBuffer {
             readers.push(reader);
         }
 
+        let base_reader_index = readers.len();
         readers.push(ReaderAdapter::Base(base));
 
         let reader = Self {
             readers,
+            base_reader_index,
             path,
             pos,
             len,
@@ -245,14 +248,42 @@ impl FsReaderBuffer {
         &self.path
     }
 
+    fn select_reader_index(
+        is_random: bool,
+        pos: i64,
+        slice_size: i64,
+        read_parallel: i64,
+        base_reader_index: usize,
+    ) -> Option<usize> {
+        if is_random {
+            return Some(base_reader_index);
+        }
+
+        if slice_size <= 0 || read_parallel <= 0 {
+            return None;
+        }
+
+        Some((pos / slice_size % read_parallel) as usize)
+    }
+
     fn get_reader(&mut self) -> FsResult<&mut ReaderAdapter> {
-        let id = if self.read_detector.is_random() {
-            self.read_detector.read_parallel()
-        } else {
-            self.pos / self.slice_size % self.read_detector.read_parallel()
+        let Some(id) = Self::select_reader_index(
+            self.read_detector.is_random(),
+            self.pos,
+            self.slice_size,
+            self.read_detector.read_parallel(),
+            self.base_reader_index,
+        ) else {
+            return err_box!(
+                "reader is not initialized: pos={}, slice_size={}, read_parallel={}, base_reader_index={}",
+                self.pos,
+                self.slice_size,
+                self.read_detector.read_parallel(),
+                self.base_reader_index
+            );
         };
 
-        match self.readers.get_mut(id as usize) {
+        match self.readers.get_mut(id) {
             Some(v) => Ok(v),
             None => err_box!("reader {} is not initialized", id),
         }
@@ -403,5 +434,48 @@ impl FsReaderBuffer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use curvine_common::conf::ClusterConf;
+    use curvine_common::state::FileStatus;
+
+    fn sparse_file_blocks(len: i64) -> FileBlocks {
+        FileBlocks::new(
+            FileStatus {
+                id: 1,
+                len,
+                is_complete: true,
+                ..Default::default()
+            },
+            vec![],
+        )
+    }
+
+    #[test]
+    fn test_random_read_uses_base_reader_for_sparse_parallel_slices() {
+        let mut conf = ClusterConf::default();
+        conf.client.read_parallel = 4;
+        conf.client.read_chunk_num = 1;
+        conf.client.read_slice_size_str = "16MB".to_string();
+        conf.client.large_file_size_str = "1GB".to_string();
+        conf.client.init().unwrap();
+
+        let file_len = conf.client.read_slice_size / 2;
+        let file_blocks = sparse_file_blocks(file_len);
+        let path = Path::from_str("/small-file").unwrap();
+        let read_detector = ReadDetector::with_conf(&conf.client, file_len);
+        let fs_context = Arc::new(FsContext::new(conf).unwrap());
+        let rt = fs_context.clone_runtime();
+        let mut reader = FsReaderBuffer::new(path, fs_context, file_blocks, read_detector).unwrap();
+
+        assert_eq!(reader.base_reader_index, 1);
+
+        rt.block_on(reader.seek(file_len)).unwrap();
+        assert!(reader.read_detector.is_random());
+        assert!(reader.get_reader().is_ok());
     }
 }
