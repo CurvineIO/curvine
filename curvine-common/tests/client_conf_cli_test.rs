@@ -64,6 +64,25 @@ fn apply_to_updates_pilot_client_fields() {
 }
 
 #[test]
+fn normalizes_non_positive_read_parallel_settings_to_defaults() {
+    let mut conf = ClientConf {
+        read_parallel: 0,
+        max_read_parallel: 0,
+        ..Default::default()
+    };
+
+    conf.init().unwrap();
+
+    assert_eq!(
+        (conf.read_parallel, conf.max_read_parallel),
+        (
+            ClientConf::DEFAULT_READ_PARALLEL,
+            ClientConf::DEFAULT_MAX_READ_PARALLEL
+        )
+    );
+}
+
+#[test]
 fn parses_c4_chunk_unified_fs_and_audit_flags() {
     let parsed = CliHarness::try_parse_from([
         "curvine-fuse",
