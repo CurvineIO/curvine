@@ -11,7 +11,7 @@ Kubernetes manifests under `master-stress/` run **client-side workloads** agains
 
 **Apply rule:** `deployment.yaml` and `deployment-metadata-stable.yaml` both define the **same Kubernetes resource names** (e.g. StatefulSet `curvine-master-stress`, ConfigMap `curvine-stress-scripts`). Apply **only one** of them in a given namespace. `deployment-metadata-stress.yaml` uses a **different** app name and can coexist if namespaces or names differ.
 
-**Namespace:** examples below use `curvine-system` where listed; your copy of a manifest may use `default` or another namespace—check `metadata.namespace` before `kubectl apply`.
+**Namespace:** examples below use `curvine` where listed; your copy of a manifest may use `default` or another namespace—check `metadata.namespace` before `kubectl apply`.
 
 **Prerequisites:**
 
@@ -40,8 +40,8 @@ Kubernetes manifests under `master-stress/` run **client-side workloads** agains
 
 ```bash
 kubectl apply -f master-stress/deployment.yaml
-kubectl -n curvine-system get pods -l app=curvine-master-stress
-kubectl -n curvine-system logs -f statefulset/curvine-master-stress
+kubectl -n curvine get pods -l app=curvine-master-stress
+kubectl -n curvine logs -f statefulset/curvine-master-stress
 ```
 
 ### Main environment variables
@@ -97,8 +97,8 @@ Same labels and object names as §1 (`curvine-master-stress`). Use the same `kub
 
 ```bash
 kubectl apply -f master-stress/deployment-metadata-stable.yaml
-kubectl -n curvine-system get pods -l app=curvine-master-stress
-kubectl -n curvine-system logs -f statefulset/curvine-master-stress
+kubectl -n curvine get pods -l app=curvine-master-stress
+kubectl -n curvine logs -f statefulset/curvine-master-stress
 ```
 
 (Adjust `-n` to match `metadata.namespace` in your file.)
@@ -124,8 +124,8 @@ See §1 for environment variables, demo load table, and resource names.
 
 ```bash
 kubectl apply -f master-stress/deployment-metadata-stress.yaml
-kubectl -n curvine-system get pods -l app=curvine-metadata-stress
-kubectl -n curvine-system logs -f statefulset/curvine-metadata-stress
+kubectl -n curvine get pods -l app=curvine-metadata-stress
+kubectl -n curvine logs -f statefulset/curvine-metadata-stress
 ```
 
 ### Tree parameters (`META_*`)

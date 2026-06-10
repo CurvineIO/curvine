@@ -9,7 +9,7 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: curvine-csi-node-sa
-    namespace: curvine-system
+    namespace: curvine
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -22,4 +22,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: curvine-csi-controller-sa
-    namespace: curvine-system
+    namespace: curvine

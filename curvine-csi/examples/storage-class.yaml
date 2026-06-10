@@ -1,3 +1,24 @@
+# Curvine CSI StorageClass example (dynamic provisioning).
+#
+# Parameter model (see epic #865):
+#   Reserved (handled by CSI, not forwarded as generic CLI flags):
+#     master-addrs, fs-path, path-type
+#   Rejected in StorageClass / PV parameters:
+#     mnt-path  (computed internally by the CSI node plugin)
+#   Passthrough (any other non-empty key → curvine-fuse --key value):
+#     FUSE mount flags, e.g. io-threads, entry-timeout
+#     ClientConf overrides with client.* prefix, e.g. client.block-size, client.umask
+#
+# Validation:
+#   CreateVolume runs curvine-fuse validate-config with the resolved parameters
+#   before the PV is created.
+#
+# FUSE process sharing (mount key):
+#   Volumes share one standalone FUSE pod when master-addrs, the StorageClass
+#   fs-path prefix passed to curvine-fuse, and passthrough parameters are identical.
+#   For dynamic PVs, curvine-path (= fs-path + "/" + pv-name) is only the bind-mount
+#   subpath inside the pod; it does not change the FUSE mount key.
+#
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -7,23 +28,19 @@ reclaimPolicy: Delete
 volumeBindingMode: Immediate
 allowVolumeExpansion: true
 parameters:
-  # Required: Curvine cluster connection information
-  master-addrs: "m0:8995,m1:8995,m2:8995"  # Master node addresses, format: host:port,host:port
-  
-  # Required: Filesystem path prefix for dynamic PV
-  # Each dynamic PV will create: fs-path + pv-name
-  # Example: fs-path="/" → creates "/pvc-xxx"
-  #          fs-path="/test-data" → creates "/test-data/pvc-xxx"
+  # Required: Curvine master addresses (host:port,host:port,...)
+  master-addrs: "m0:8995,m1:8995,m2:8995"
+
+  # Required for dynamic provisioning: directory prefix on the Curvine filesystem.
+  # Each PV mounts fs-path + "/" + pv-name, e.g. fs-path="/test-data" → "/test-data/pvc-xxx"
   fs-path: "/test-data"
-  
-  # Optional: Path creation strategy
-  path-type: "DirectoryOrCreate"  # "DirectoryOrCreate" or "Directory" (default: "Directory")
-  
-  # Optional: FUSE parameters
+
+  # Optional: path creation strategy (default: Directory)
+  path-type: "DirectoryOrCreate"  # or "Directory"
+
+  # Optional passthrough examples (uncomment to override defaults):
   # io-threads: "4"
   # worker-threads: "8"
-  
-# How it works:
-# - Each PV gets curvine-path = fs-path + pv-name
-# - FUSE mounts curvine-path directly to local mount point
-# - PVs with same master-addrs + curvine-path share FUSE process
+  # entry-timeout: "1.0"
+  # client.block-size: "128MB"
+  # client.umask: "022"  # octal notation; also accepts 0o22

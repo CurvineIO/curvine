@@ -5,7 +5,7 @@ metadata:
     app.kubernetes.io/component: controller
     app.kubernetes.io/name: curvine-csi-controller
   name: curvine-csi-controller
-  namespace: curvine-system
+  namespace: curvine
 spec:
   replicas: 1
   selector:

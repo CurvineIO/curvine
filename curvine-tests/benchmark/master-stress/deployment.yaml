@@ -12,7 +12,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: curvine-stress-master
-  namespace: curvine-system
+  namespace: curvine
 type: Opaque
 stringData:
   master-addrs: "cv-curvine-master-0.cv-curvine-master.default.svc.cluster.local:8995,cv-curvine-master-1.cv-curvine-master.default.svc.cluster.local:8995,cv-curvine-master-2.cv-curvine-master.default.svc.cluster.local:8995"
@@ -21,7 +21,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: curvine-stress-scripts
-  namespace: curvine-system
+  namespace: curvine
 data:
   stress-entrypoint.sh: |
     #!/usr/bin/env bash
@@ -338,7 +338,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: curvine-master-stress
-  namespace: curvine-system
+  namespace: curvine
   labels:
     app: curvine-master-stress
 spec:
@@ -354,7 +354,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: curvine-master-stress
-  namespace: curvine-system 
+  namespace: curvine
   labels:
     app: curvine-master-stress
 spec:
