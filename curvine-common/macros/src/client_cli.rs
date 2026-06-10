@@ -66,17 +66,27 @@ fn derive_client_cli_args_impl(input: &DeriveInput) -> syn::Result<TokenStream2>
             .as_ref()
             .expect("named field must have an identifier");
         validate_cli_field_type(field)?;
+        let field_attr = client_cli_attr(field)?;
+        let octal = field_attr.as_ref().is_some_and(|a| a.octal);
         let long = cli_long_name(field, &container)?;
         let arg_id = cli_arg_id(ident, &container);
         let field_is_option = unwrap_option_type(&field.ty).is_some();
         let inner_ty = unwrap_option_type(&field.ty).unwrap_or(&field.ty);
-        let ty = quote! { Option<#inner_ty> };
+        let ty = if octal {
+            quote! { Option<String> }
+        } else {
+            quote! { Option<#inner_ty> }
+        };
 
         override_fields.push(quote! {
             #[arg(long = #long, id = #arg_id)]
             pub #ident: #ty,
         });
-        apply_stmts.push(apply_override_stmt(ident, inner_ty, field_is_option)?);
+        apply_stmts.push(if octal {
+            apply_octal_override_stmt(ident, inner_ty, field_is_option)?
+        } else {
+            apply_override_stmt(ident, inner_ty, field_is_option)?
+        });
     }
 
     Ok(quote! {
@@ -160,6 +170,62 @@ fn apply_override_stmt(
     Ok(assign)
 }
 
+fn apply_octal_override_stmt(
+    ident: &syn::Ident,
+    inner_ty: &Type,
+    field_is_option: bool,
+) -> syn::Result<TokenStream2> {
+    let Type::Path(tp) = inner_ty else {
+        return Err(syn::Error::new_spanned(
+            inner_ty,
+            "octal client_cli fields must use an integer type",
+        ));
+    };
+    let Some(seg) = tp.path.segments.last() else {
+        return Err(syn::Error::new_spanned(
+            inner_ty,
+            "octal client_cli fields must use an integer type",
+        ));
+    };
+    if seg.ident != "u32" {
+        return Err(syn::Error::new_spanned(
+            inner_ty,
+            "octal client_cli currently supports u32 fields only",
+        ));
+    }
+
+    let parse_and_assign = quote! {
+        let trimmed = v.trim();
+        let body = trimmed
+            .strip_prefix("0o")
+            .or_else(|| trimmed.strip_prefix("0O"))
+            .unwrap_or(trimmed);
+        let parsed = match u32::from_str_radix(body, 8) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return ::orpc::err_box!("invalid octal value for {} ('{}'): {}", stringify!(#ident), trimmed, err);
+            }
+        };
+    };
+
+    let assign = if field_is_option {
+        quote! {
+            if let Some(v) = &self.#ident {
+                #parse_and_assign
+                target.#ident = Some(parsed);
+            }
+        }
+    } else {
+        quote! {
+            if let Some(v) = &self.#ident {
+                #parse_and_assign
+                target.#ident = parsed;
+            }
+        }
+    };
+    Ok(assign)
+}
+
 fn should_skip_field(field: &Field, container: &ContainerConfig) -> syn::Result<bool> {
     if has_serde_skip(field) {
         return Ok(true);
@@ -182,6 +248,7 @@ fn should_skip_field(field: &Field, container: &ContainerConfig) -> syn::Result<
 struct ClientCliAttr {
     skip: bool,
     long: Option<String>,
+    octal: bool,
 }
 
 impl syn::parse::Parse for ClientCliAttr {
@@ -190,14 +257,18 @@ impl syn::parse::Parse for ClientCliAttr {
             return Ok(ClientCliAttr {
                 skip: false,
                 long: None,
+                octal: false,
             });
         }
         let mut skip = false;
         let mut long = None;
+        let mut octal = false;
         while !input.is_empty() {
             let ident: syn::Ident = input.parse()?;
             if ident == "skip" {
                 skip = true;
+            } else if ident == "octal" {
+                octal = true;
             } else if ident == "long" {
                 input.parse::<syn::Token![=]>()?;
                 let lit: Lit = input.parse()?;
@@ -213,7 +284,7 @@ impl syn::parse::Parse for ClientCliAttr {
                 input.parse::<syn::Token![,]>()?;
             }
         }
-        Ok(ClientCliAttr { skip, long })
+        Ok(ClientCliAttr { skip, long, octal })
     }
 }
 
@@ -231,6 +302,7 @@ fn client_cli_attr(field: &Field) -> syn::Result<Option<ClientCliAttr>> {
                 Meta::Path(_) => ClientCliAttr {
                     skip: false,
                     long: None,
+                    octal: false,
                 },
                 Meta::List(list) => syn::parse2::<ClientCliAttr>(list.tokens.clone())?,
                 Meta::NameValue(nv) => {
@@ -320,8 +392,18 @@ fn serde_alias(field: &Field) -> Option<String> {
 }
 
 fn validate_cli_field_type(field: &Field) -> syn::Result<()> {
+    let octal = client_cli_attr(field)?.is_some_and(|attr| attr.octal);
     let inner = unwrap_option_type(&field.ty).unwrap_or(&field.ty);
-    if is_supported_cli_type(inner) {
+    if octal {
+        if is_octal_cli_type(inner) {
+            Ok(())
+        } else {
+            Err(syn::Error::new_spanned(
+                &field.ty,
+                "octal client_cli fields must use u32 (or Option<u32>)",
+            ))
+        }
+    } else if is_supported_cli_type(inner) {
         Ok(())
     } else {
         Err(syn::Error::new_spanned(
@@ -369,6 +451,16 @@ fn is_copy_type(ty: &Type) -> bool {
                 | "i64"
                 | "f64"
         )
+}
+
+fn is_octal_cli_type(ty: &Type) -> bool {
+    let Type::Path(tp) = ty else {
+        return false;
+    };
+    let Some(seg) = tp.path.segments.last() else {
+        return false;
+    };
+    seg.ident == "u32"
 }
 
 fn is_supported_cli_type(ty: &Type) -> bool {
