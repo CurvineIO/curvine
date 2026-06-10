@@ -499,7 +499,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 					StartupProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
 							Exec: &corev1.ExecAction{
-								Command: []string{"mountpoint", "-q", StandaloneMountPath},
+								Command: standaloneFuseMountProbeCommand(),
 							},
 						},
 						InitialDelaySeconds: 1,
@@ -512,7 +512,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 					ReadinessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
 							Exec: &corev1.ExecAction{
-								Command: []string{"mountpoint", "-q", StandaloneMountPath},
+								Command: standaloneFuseMountProbeCommand(),
 							},
 						},
 						InitialDelaySeconds: 0,
@@ -525,7 +525,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 					LivenessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
 							Exec: &corev1.ExecAction{
-								Command: []string{"mountpoint", "-q", StandaloneMountPath},
+								Command: standaloneFuseMountProbeCommand(),
 							},
 						},
 						InitialDelaySeconds: 0, // StartupProbe handles initial delay
@@ -943,6 +943,15 @@ func (m *standaloneMountManagerImpl) GetState() *StandaloneState {
 	}
 
 	return stateCopy
+}
+
+// standaloneFuseMountProbeCommand returns a probe command that detects curvinefs on
+// StandaloneMountPath without calling mountpoint(1), which can block on FUSE backends.
+func standaloneFuseMountProbeCommand() []string {
+	return []string{
+		"sh", "-c",
+		fmt.Sprintf("grep -qE '^[^ ]+ %s fuse' /proc/mounts", StandaloneMountPath),
+	}
 }
 
 // isMountPoint checks if a path is a mount point

@@ -39,6 +39,8 @@ help:
 	@echo ""
 	@echo "CSI (Container Storage Interface):"
 	@echo "  make curvine-csi                 - Build curvine-csi Docker image"
+	@echo "  make curvine-csi-quick           - Quick rebuild CSI + curvine-cli + curvine-fuse (Dockerfile.quick)"
+	@echo "  make curvine-csi-quick-push      - Quick build and push to CSI_QUICK_REGISTRY (default localhost:5000)"
 	@echo ""
 	@echo "SPDK NVMe-oF (Storage Performance Development Kit):"
 	@echo "  make docker-build-spdk-target    - Build SPDK NVMe-oF target Docker image"
@@ -168,28 +170,36 @@ curvine-csi-push: curvine-csi
 	docker push curvineio/curvine-csi:latest
 	@echo "✓ Image pushed successfully: curvineio/curvine-csi:latest"
 
-# Quick iteration build for CSI development (only rebuilds CSI binary)
-# Prerequisite: curvine-csi:latest must exist (run 'make curvine-csi' first)
+# Quick iteration build for CSI development (CSI + curvine-cli + curvine-fuse)
+# Prerequisite: ghcr.io/curvineio/curvine-csi:latest base image (runtime libs only)
 .PHONY: curvine-csi-quick
+# Override for private registry, e.g. make curvine-csi-quick-push CSI_QUICK_REGISTRY=registry.example.com:5000
+CSI_QUICK_REGISTRY ?= localhost:5000
 curvine-csi-quick:
-	@echo "Quick building curvine-csi (CSI binary only)..."
-	@if ! docker image inspect curvine-csi:latest >/dev/null 2>&1; then \
-		echo "Error: Base image curvine-csi:latest not found. Please run 'make curvine-csi' first."; \
+	@echo "Quick building curvine-csi (CSI + curvine-cli + curvine-fuse)..."
+	@if ! docker image inspect ghcr.io/curvineio/curvine-csi:latest >/dev/null 2>&1; then \
+		echo "Error: Base image ghcr.io/curvineio/curvine-csi:latest not found."; \
 		exit 1; \
 	fi
+	@echo "Building curvine-cli and curvine-fuse..."
+	@cargo build --release -p curvine-cli -p curvine-fuse || exit 1
+	@mkdir -p curvine-csi/quick-build
+	@cp target/release/curvine-cli target/release/curvine-fuse curvine-csi/quick-build/
 	@echo "Building CSI binary locally..."
 	@cd curvine-csi && GOPROXY=https://goproxy.cn,direct go build -o csi-binary main.go || exit 1
-	@echo "Building Docker image with new CSI binary..."
+	@echo "Building Docker image with local binaries..."
 	docker build -t curvine-csi:latest -f curvine-csi/Dockerfile.quick .
+	docker tag curvine-csi:latest $(CSI_QUICK_REGISTRY)/curvine-csi:latest
 	@rm -f curvine-csi/csi-binary
+	@rm -rf curvine-csi/quick-build
+	@echo "✓ Quick image: curvine-csi:latest and $(CSI_QUICK_REGISTRY)/curvine-csi:latest"
 
-# Quick iteration build and push
+# Quick iteration build and push to local registry
 .PHONY: curvine-csi-quick-push
 curvine-csi-quick-push: curvine-csi-quick
-	@echo "Tagging and pushing quick-built curvine-csi image to private registry..."
-	docker tag curvine-csi:latest curvineio/curvine-csi:latest
-	docker push curvineio/curvine-csi:latest
-	@echo "✓ Quick-built image pushed successfully: curvineio/curvine-csi:latest"
+	@echo "Pushing quick-built curvine-csi image to $(CSI_QUICK_REGISTRY)..."
+	docker push $(CSI_QUICK_REGISTRY)/curvine-csi:latest
+	@echo "✓ Quick-built image pushed: $(CSI_QUICK_REGISTRY)/curvine-csi:latest"
 
 # 9. SPDK NVMe-oF builds
 .PHONY: docker-build-spdk-target docker-compose-spdk docker-compose-spdk-down
