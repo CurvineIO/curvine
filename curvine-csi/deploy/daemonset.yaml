@@ -2,7 +2,7 @@ kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: curvine-csi-node
-  namespace: curvine-system
+  namespace: curvine
 spec:
   selector:
     matchLabels:
@@ -155,4 +155,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: curvine-csi-node-sa
-    namespace: curvine-system
+    namespace: curvine

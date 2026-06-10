@@ -6,7 +6,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: curvine-statefulset
-  namespace: curvine-system
+  namespace: curvine
 spec:
   serviceName: curvine-service
   replicas: 3
@@ -51,7 +51,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: curvine-service
-  namespace: curvine-system
+  namespace: curvine
 spec:
   clusterIP: None
   selector:

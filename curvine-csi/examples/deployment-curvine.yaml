@@ -3,7 +3,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: curvine-shared-pvc
-  namespace: curvine-system
+  namespace: curvine
 spec:
   accessModes:
     - ReadWriteMany
@@ -16,7 +16,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: curvine-test-deployment
-  namespace: curvine-system
+  namespace: curvine
   labels:
     app: curvine-test
 spec:

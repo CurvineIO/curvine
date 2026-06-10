@@ -55,7 +55,7 @@ func newNodeService(nodeID string) (*nodeService, error) {
 	// Initialize Kubernetes client
 	kubernetesNamespace := os.Getenv("KUBERNETES_NAMESPACE")
 	if kubernetesNamespace == "" {
-		kubernetesNamespace = "curvine-system"
+		kubernetesNamespace = "curvine"
 	}
 	k8sClient, err := NewK8sClient(kubernetesNamespace, nodeID)
 	if err != nil {
