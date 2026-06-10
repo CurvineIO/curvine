@@ -14,9 +14,10 @@
 #   before the PV is created.
 #
 # FUSE process sharing (mount key):
-#   Volumes share one standalone FUSE pod when master-addrs, the fs-path passed
-#   to fuse (for dynamic PVs: fs-path + pv-name), and passthrough parameters
-#   are identical. Different passthrough values get separate FUSE pods.
+#   Volumes share one standalone FUSE pod when master-addrs, the StorageClass
+#   fs-path prefix passed to curvine-fuse, and passthrough parameters are identical.
+#   For dynamic PVs, curvine-path (= fs-path + "/" + pv-name) is only the bind-mount
+#   subpath inside the pod; it does not change the FUSE mount key.
 #
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
