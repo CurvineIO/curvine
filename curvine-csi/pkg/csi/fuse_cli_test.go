@@ -109,6 +109,29 @@ func TestIsRejectedVolumeParameterKey(t *testing.T) {
 	}
 }
 
+func TestIsDeniedVolumeParameterKeyKubernetesInternal(t *testing.T) {
+	if !IsDeniedVolumeParameterKey("storage.kubernetes.io/csiProvisionerIdentity") {
+		t.Fatal("expected storage.kubernetes.io/csiProvisionerIdentity to be denied")
+	}
+	if !IsDeniedVolumeParameterKey("csi.storage.k8s.io/pod.name") {
+		t.Fatal("expected csi.storage.k8s.io/pod.name to be denied")
+	}
+	if IsDeniedVolumeParameterKey("io-threads") {
+		t.Fatal("did not expect io-threads to be denied")
+	}
+}
+
+func TestCollectPassthroughParamsFiltersProvisionerIdentity(t *testing.T) {
+	volumeContext := map[string]string{
+		"io-threads": "4",
+		"storage.kubernetes.io/csiProvisionerIdentity": "1781067593753-8639-curvine",
+	}
+	got := CollectPassthroughParams(volumeContext, nil)
+	if len(got) != 1 || got["io-threads"] != "4" {
+		t.Fatalf("CollectPassthroughParams() = %#v, want only io-threads=4", got)
+	}
+}
+
 func TestRejectDisallowedVolumeParameters(t *testing.T) {
 	volumeContext := map[string]string{
 		"master-addrs": "m1:8995",

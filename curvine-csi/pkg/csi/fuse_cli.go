@@ -17,6 +17,7 @@ package csi
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -64,8 +65,14 @@ func IsRejectedVolumeParameterKey(key string) bool {
 
 // IsDeniedVolumeParameterKey reports whether the key must never be passed to curvine-fuse.
 func IsDeniedVolumeParameterKey(key string) bool {
-	_, ok := volumeParameterDenylist[key]
-	return ok
+	if _, ok := volumeParameterDenylist[key]; ok {
+		return true
+	}
+	// Kubernetes-injected volume context keys (e.g. storage.kubernetes.io/csiProvisionerIdentity).
+	if strings.HasPrefix(key, "csi.storage.k8s.io/") || strings.HasPrefix(key, "storage.kubernetes.io/") {
+		return true
+	}
+	return false
 }
 
 // RejectDisallowedVolumeParameters rejects user-supplied keys such as mnt-path on PVs
