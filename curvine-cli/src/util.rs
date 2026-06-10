@@ -29,7 +29,7 @@ pub fn parse_config(config_str: Option<&str>) -> CommonResult<HashMap<String, St
 
     if let Some(config) = config_str {
         for pair in config.split(',') {
-            let parts: Vec<&str> = pair.split('=').collect();
+            let parts: Vec<&str> = pair.splitn(2, '=').collect();
             if parts.len() == 2 {
                 configs.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
             } else {
