@@ -200,22 +200,25 @@ impl FsDir {
                     if let File(ref mut nf) = target_inode.as_mut() {
                         nf.decrement_nlink();
                     }
-                    self.store.apply_unlink(parent.as_ref(), child)?
+                    self.store
+                        .apply_unlink(parent.as_ref(), child, child_name)?
                 } else {
                     // This is the last link, delete the inode
-                    self.store.apply_delete(parent.as_ref(), child)?
+                    self.store
+                        .apply_delete(parent.as_ref(), child, child_name)?
                 }
             }
             FileEntry(e) => {
                 // This is a link entry, just remove the directory entry
                 // The actual inode's nlink count should be decremented
                 self.store
-                    .apply_unlink_file_entry(parent.as_ref(), child, e.id)?
+                    .apply_unlink_file_entry(parent.as_ref(), child, child_name, e.id)?
             }
             Dir(_) => {
                 parent.dec_nlink();
                 // Directories are always deleted
-                self.store.apply_delete(parent.as_ref(), child)?
+                self.store
+                    .apply_delete(parent.as_ref(), child, child_name)?
             }
         };
 
@@ -365,6 +368,7 @@ impl FsDir {
         self.store.apply_rename(
             src_parent.as_ref(),
             src_inode.as_ref(),
+            src_inp.name(),
             dst_parent.as_ref(),
             &new_inode,
         )?;
