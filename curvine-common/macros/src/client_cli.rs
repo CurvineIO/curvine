@@ -203,7 +203,7 @@ fn apply_octal_override_stmt(
         let parsed = match u32::from_str_radix(body, 8) {
             Ok(parsed) => parsed,
             Err(err) => {
-                return ::orpc::err_box!("invalid octal value '{}': {}", v, err);
+                return ::orpc::err_box!("invalid octal value for {} ('{}'): {}", stringify!(#ident), trimmed, err);
             }
         };
     };
