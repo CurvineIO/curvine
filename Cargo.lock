@@ -6114,6 +6114,7 @@ dependencies = [
  "prost 0.11.9",
  "prost-build 0.11.9",
  "rand 0.8.5",
+ "rolling-file",
  "serde",
  "socket2 0.5.10",
  "sysinfo",
@@ -7740,6 +7741,15 @@ checksum = "6bd13e55d6d7b8cd0ea569161127567cd587676c99f4472f779a0279aa60a7a7"
 dependencies = [
  "libc",
  "librocksdb-sys",
+]
+
+[[package]]
+name = "rolling-file"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8395b4f860856b740f20a296ea2cd4d823e81a2658cf05ef61be22916026a906"
+dependencies = [
+ "chrono",
 ]
 
 [[package]]
