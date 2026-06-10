@@ -29,11 +29,14 @@ use curvine_common::raft::storage::{AppStorage, LogStorage, RocksLogStorage};
 use curvine_common::raft::{RaftClient, RaftResult, RoleMonitor, RoleStateListener};
 use curvine_common::FsResult;
 use orpc::common::FileUtils;
+use orpc::err_box;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::StateCtl;
 use prost::Message;
 use raft::eraftpb::Entry;
 use raft::Storage;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 
 // Send and replay metadata operation logs based on raft.
@@ -141,8 +144,54 @@ impl JournalSystem {
         })
     }
 
+    fn require_existing_master_data(conf: &ClusterConf) -> FsResult<()> {
+        if conf.format_master || conf.journal.journal_addrs.len() > 1 {
+            return Ok(());
+        }
+
+        let meta_db_conf = conf.db_conf();
+        let journal_db_conf = conf.journal.db_conf();
+        let mut invalid_dirs = Vec::new();
+
+        if !Self::looks_like_rocksdb_data_dir(&meta_db_conf.data_dir) {
+            invalid_dirs.push(format!("meta={}", meta_db_conf.data_dir));
+        }
+        if !Self::looks_like_rocksdb_data_dir(&journal_db_conf.data_dir) {
+            invalid_dirs.push(format!("journal={}", journal_db_conf.data_dir));
+        }
+
+        if invalid_dirs.is_empty() {
+            return Ok(());
+        }
+
+        err_box!(
+            "format_master=false requires existing RocksDB data directories for single-master startup; missing, empty, or unreadable: {}",
+            invalid_dirs.join(", ")
+        )
+    }
+
+    fn looks_like_rocksdb_data_dir(path: &str) -> bool {
+        let path = Path::new(path);
+        if !path.is_dir() || !path.join("CURRENT").is_file() {
+            return false;
+        }
+
+        fs::read_dir(path)
+            .map(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("MANIFEST-"))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     pub fn from_conf(conf: &ClusterConf) -> FsResult<Self> {
         // When the journal system is used, please note that it is separate from the fs system.
+        Self::require_existing_master_data(conf)?;
+
         let rt = conf.journal.create_runtime();
 
         let log_store = RocksLogStorage::from_conf(&conf.journal, conf.format_master);
