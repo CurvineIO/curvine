@@ -26,6 +26,7 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+rolling-file = { workspace = true }
 log = { workspace = true }
 pin-project-lite = { workspace = true }
 prometheus = { workspace = true, features = ["process"] }

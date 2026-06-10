@@ -26,6 +26,18 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::common::{LocalTime, LogConf};
 
+// Thread name and id are immutable for the lifetime of a thread; cache them
+// to avoid a TLS lookup + Arc ref-count on every log event.
+thread_local! {
+    static THREAD_INFO: String = {
+        let t = std::thread::current();
+        match t.name() {
+            Some(name) => format!("{}-{:?}", name, t.id()),
+            None => format!("{:?}", t.id()),
+        }
+    };
+}
+
 pub struct LogFormatter {
     display_thread: bool,
     display_position: bool,
@@ -39,7 +51,7 @@ impl LogFormatter {
         }
     }
     pub fn short_target(target: &str) -> &str {
-        target.split("::").last().unwrap_or("")
+        target.rsplit_once("::").map_or(target, |(_, t)| t)
     }
 }
 
@@ -64,16 +76,7 @@ where
         write!(writer, " {}", metadata.level())?;
 
         if self.display_thread {
-            let current_thread = std::thread::current();
-            match current_thread.name() {
-                Some(name) => {
-                    write!(writer, " {}-{:0>2?}", name, current_thread.id())?;
-                }
-                // fall-back to thread id when name is absent and ids are not enabled
-                None => {
-                    write!(writer, " {:0>2?}", current_thread.id())?;
-                }
-            }
+            THREAD_INFO.with(|info| write!(writer, " {}", info))?;
         }
 
         // Format all the spans in the event's span context.
