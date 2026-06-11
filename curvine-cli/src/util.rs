@@ -22,25 +22,6 @@ use std::future::Future;
 use std::str::FromStr;
 use std::time::Duration;
 
-/// Parse configuration string
-#[allow(unused)]
-pub fn parse_config(config_str: Option<&str>) -> CommonResult<HashMap<String, String>> {
-    let mut configs = HashMap::new();
-
-    if let Some(config) = config_str {
-        for pair in config.split(',') {
-            let parts: Vec<&str> = pair.split('=').collect();
-            if parts.len() == 2 {
-                configs.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
-            } else {
-                return Err(format!("Invalid config format: {}", pair).into());
-            }
-        }
-    }
-
-    Ok(configs)
-}
-
 pub async fn handle_rpc_result<T, E: Display>(operation: impl Future<Output = Result<T, E>>) -> T {
     match operation.await {
         Ok(result) => result,
