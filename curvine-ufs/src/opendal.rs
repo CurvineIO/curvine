@@ -413,6 +413,16 @@ impl OpendalFileSystem {
                     builder = builder.secret_access_key(secret_key);
                 }
 
+                // OpenDAL defaults to path-style; enable virtual-host-style unless explicitly forced
+                // Note: object stores like tos/oss do not support path-style, only virtual-host-style
+                let force_path_style = conf
+                    .get("s3.force_path_style")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if !force_path_style {
+                    builder = builder.enable_virtual_host_style();
+                }
+
                 let base_op = Operator::new(builder)
                     .map_err(|e| FsError::common(format!("Failed to create S3 operator: {}", e)))?
                     .finish();
