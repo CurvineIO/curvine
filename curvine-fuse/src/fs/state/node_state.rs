@@ -105,6 +105,11 @@ impl NodeState {
         is_changed
     }
 
+    pub fn clear(&self) -> FuseResult<()> {
+        self.node_write().clean_cache();
+        Ok(())
+    }
+
     pub fn should_keep_cache(&self, id: u64, status: &FileStatus) -> bool {
         let is_changed = self.update_cache_state(id, status);
         !is_changed

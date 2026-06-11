@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::fs::operator::*;
-use crate::fs::state::{FileHandle, NodeState};
+use crate::fs::state::{CleanerTask, FileHandle, NodeState};
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
 use crate::session::{FuseBuf, FuseResponse};
@@ -49,6 +49,8 @@ impl CurvineFileSystem {
         let fuse_conf = conf.fuse.clone();
         let fs = UnifiedFileSystem::with_rt(conf, rt)?;
         let state = Arc::new(NodeState::new(fs.clone()));
+
+        CleanerTask::start(fuse_conf.node_cache_ttl.as_millis() as u64, state.clone())?;
 
         let fuse_fs = Self {
             fs,
