@@ -415,9 +415,9 @@ impl OpendalFileSystem {
 
                 // Default to path-style for backward compatibility (MinIO, Ceph RGW, localstack, etc.).
                 // Object stores like TOS/OSS only support virtual-host-style and must opt in by
-                // setting `s3.force_path_style=false`.
+                // setting `s3.force.path.style=false`.
                 let force_path_style = conf
-                    .get("s3.force_path_style")
+                    .get("s3.force.path.style")
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(true);
                 if !force_path_style {
