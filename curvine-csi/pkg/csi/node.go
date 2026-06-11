@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"sort"
 	"strings"
 	"time"
 
@@ -56,7 +55,7 @@ func newNodeService(nodeID string) (*nodeService, error) {
 	// Initialize Kubernetes client
 	kubernetesNamespace := os.Getenv("KUBERNETES_NAMESPACE")
 	if kubernetesNamespace == "" {
-		kubernetesNamespace = "curvine-system"
+		kubernetesNamespace = "curvine"
 	}
 	k8sClient, err := NewK8sClient(kubernetesNamespace, nodeID)
 	if err != nil {
@@ -105,6 +104,10 @@ func (n *nodeService) NodeStageVolume(ctx context.Context, request *csi.NodeStag
 		publishContext = make(map[string]string)
 	}
 
+	if err := RejectDisallowedVolumeParameters(volumeContext, publishContext, requestID); err != nil {
+		return nil, err
+	}
+
 	// Get required parameters
 	masterAddrs := volumeContext["master-addrs"]
 	if masterAddrs == "" {
@@ -132,13 +135,22 @@ func (n *nodeService) NodeStageVolume(ctx context.Context, request *csi.NodeStag
 	clusterID := GenerateClusterID(masterAddrs)
 
 	// Collect FUSE parameters from VolumeContext or PublishContext
-	fuseParams := collectFuseParams(volumeContext, publishContext)
+	fuseParams := CollectPassthroughParams(volumeContext, publishContext)
+
+	if IsStaticVolumeID(volumeID) {
+		validateCtx, cancel := context.WithTimeout(ctx, fuseValidateTimeout())
+		defer cancel()
+		if err := ValidateFuseParameters(validateCtx, masterAddrs, fsPathToMount, fuseParams); err != nil {
+			klog.Errorf("RequestID: %s, validate-config failed for static PV: %v", requestID, err)
+			return nil, StatusFromValidateConfigError(err)
+		}
+	}
 
 	// Generate mnt-path based on mount-key (master-addrs + fs-path + fuse-params)
 	// Including fuse params ensures that StorageClasses with the same cluster endpoint
 	// and fs-path but different FUSE parameters each get their own mount point and FUSE process.
 	mountKey := GenerateMountKeyWithFuseParams(masterAddrs, fsPathToMount, fuseParams)
-	mntPath := fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/curvine/%s/fuse-mount", mountKey)
+	mntPath := ComputeFuseMntPath(mountKey)
 	klog.Infof("RequestID: %s, Generated mnt-path: %s (mount-key: %s, cluster-id: %s, master-addrs: %s, fs-path: %s)",
 		requestID, mntPath, mountKey, clusterID, masterAddrs, fsPathToMount)
 
@@ -312,8 +324,9 @@ func (n *nodeService) NodePublishVolume(ctx context.Context, request *csi.NodePu
 
 	// Generate cluster-id and mnt-path (same as NodeStageVolume)
 	clusterID := GenerateClusterID(masterAddrs)
-	mountKey := GenerateMountKey(masterAddrs, fsPath)
-	mntPath := fmt.Sprintf("/var/lib/kubelet/plugins/kubernetes.io/csi/curvine/%s/fuse-mount", mountKey)
+	fuseParams := CollectPassthroughParams(volumeContext, publishContext)
+	mountKey := GenerateMountKeyWithFuseParams(masterAddrs, fsPath, fuseParams)
+	mntPath := ComputeFuseMntPath(mountKey)
 
 	// Ensure shared mount point is ready (call NodeStageVolume logic if needed)
 	klog.Infof("RequestID: %s, Checking mount state for mntPath: %s, clusterID: %s, curvine-path: %s",
@@ -643,111 +656,3 @@ func buildMountOptions(request *csi.NodePublishVolumeRequest, requestID string) 
 	return ""
 }
 
-// supportedFuseParams maps the CLI flag name (as used by curvine-fuse) to its value
-// type. This is the single source of truth for which StorageClass / PV parameters
-// are recognised and forwarded to the curvine-fuse process.
-var supportedFuseParams = map[string]string{
-	// Threading & mount-point settings
-	"mnt-number":          "usize",
-	"io-threads":          "usize",
-	"worker-threads":      "usize",
-	"mnt-per-task":        "usize",
-	"clone-fd":            "bool",
-	"fuse-channel-size":   "usize",
-	"stream-channel-size": "usize",
-	// I/O behaviour
-	"direct-io":        "bool",
-	"write-back-cache": "bool",
-	"non-seekable":     "bool",
-	"cache-readdir":    "bool",
-	// Timeout settings
-	"entry-timeout":    "f64",
-	"attr-timeout":     "f64",
-	"negative-timeout": "f64",
-	"ac-attr-timeout":  "f64",
-	// Performance settings
-	"max-background":       "uint16",
-	"congestion-threshold": "uint16",
-	// Node cache
-	"node-cache-size":    "uint64",
-	"node-cache-timeout": "string",
-	// Metadata cache
-	"enable-meta-cache":   "bool",
-	"meta-cache-capacity": "uint64",
-	"meta-cache-ttl":      "string",
-	// Miscellaneous
-	"read-dir-fill-ino": "bool",
-	"remember":          "bool",
-	"check-permission":  "bool",
-	"list-limit":        "usize",
-	"web-port":          "uint16",
-}
-
-// collectFuseParams gathers FUSE parameters that are present in either
-// volumeContext or publishContext (volumeContext takes precedence) and
-// returns them as a map of CLI-flag-name → value.
-func collectFuseParams(volumeContext, publishContext map[string]string) map[string]string {
-	params := make(map[string]string)
-	for key := range supportedFuseParams {
-		if v, ok := volumeContext[key]; ok && v != "" {
-			params[key] = v
-		} else if v, ok := publishContext[key]; ok && v != "" {
-			params[key] = v
-		}
-	}
-	return params
-}
-
-// appendFuseParameters adds all supported fuse parameters from publishContext
-func appendFuseParameters(args []string, publishContext map[string]string, requestID string) []string {
-	// Collect keys and sort them so the argument order is deterministic across calls,
-	// matching the behaviour of buildFuseArgs in standalone_manager.go.
-	keys := make([]string, 0, len(supportedFuseParams))
-	for key := range supportedFuseParams {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	for _, key := range keys {
-		paramType := supportedFuseParams[key]
-		value, ok := publishContext[key]
-		if !ok || value == "" {
-			continue
-		}
-
-		// Validate parameter value
-		if !isValidParameterValue(value, paramType, requestID, key) {
-			continue
-		}
-
-		// Add parameter to command args
-		args = append(args, "--"+key, value)
-		klog.Infof("RequestID: %s, Added fuse parameter: --%s=%s", requestID, key, value)
-	}
-
-	return args
-}
-
-func isValidParameterValue(value, paramType, requestID, paramName string) bool {
-	if value == "" {
-		klog.Warningf("RequestID: %s, Empty value for parameter %s", requestID, paramName)
-		return false
-	}
-
-	switch paramType {
-	case "bool":
-		if value != "true" && value != "false" {
-			klog.Warningf("RequestID: %s, Invalid boolean value '%s' for parameter %s", requestID, value, paramName)
-			return false
-		}
-	case "string":
-		return true
-	case "uint16", "usize", "uint64", "f64":
-		return true
-	default:
-		klog.Warningf("RequestID: %s, Unknown parameter type %s for parameter %s", requestID, paramType, paramName)
-		return false
-	}
-
-	return true
-}

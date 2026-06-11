@@ -1,0 +1,15 @@
+# .gitvote.yml example
+
+audit:
+  enabled: true
+profiles:
+  default:
+
+    # Voting duration. For example, 72h means 72 hours. Units 'd' (days) and 'm' (minutes) are also supported.
+    duration: 30d
+    pass_threshold: 60
+    allowed_voters:
+      teams:
+        - curvine-toc-voters
+      exclude_team_maintainers: true
+    close_on_passing: true

@@ -24,7 +24,7 @@ use curvine_common::FsResult;
 use log::error;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::{AsyncChannel, AsyncReceiver, AsyncSender, CallChannel, CallSender};
-use orpc::sync::ErrorMonitor;
+use orpc::sync::{AtomicCounter, ErrorMonitor};
 use orpc::sys::DataSlice;
 use std::sync::{Arc, Mutex};
 use tokio_util::bytes::Bytes;
@@ -43,6 +43,7 @@ pub struct FuseWriter {
     status: FileStatus,
     is_ufs: bool,
     len: Arc<Mutex<i64>>,
+    write_ver: AtomicCounter,
 }
 
 impl FuseWriter {
@@ -55,6 +56,7 @@ impl FuseWriter {
         let status = writer.status().clone();
         let monitor = err_monitor.clone();
         let len = Arc::new(Mutex::new(status.len));
+        let write_ver = AtomicCounter::new(0);
 
         let len1 = len.clone();
         rt.spawn(async move {
@@ -76,7 +78,12 @@ impl FuseWriter {
             status,
             is_ufs,
             len,
+            write_ver,
         }
+    }
+
+    pub fn write_ver(&self) -> u64 {
+        self.write_ver.get()
     }
 
     pub fn path(&self) -> &Path {
@@ -95,6 +102,7 @@ impl FuseWriter {
     }
 
     pub async fn write(&mut self, op: Write<'_>, reply: FuseResponse) -> FsResult<()> {
+        self.write_ver.incr();
         self.sender
             .send(WriteTask::Write(op.arg.offset as i64, op.data, reply))
             .await
@@ -128,6 +136,7 @@ impl FuseWriter {
             tx.receive().await?;
             Ok::<(), FsError>(())
         };
+        self.write_ver.incr();
         fun.await.map_err(|e| self.check_error(e))
     }
 

@@ -141,6 +141,17 @@ impl NodeMap {
             ino
         };
 
+        if self.is_pending_delete(attr.ino) {
+            if let Some(inode) = self.get_mut(attr.ino) {
+                inode.sub_lookup(1);
+            }
+            return err_fuse!(
+                libc::ENOENT,
+                "inode {} marked for deletion, suppress lookup revive",
+                attr.ino
+            );
+        }
+
         Ok(attr)
     }
 

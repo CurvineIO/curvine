@@ -72,6 +72,32 @@ get_fuse_version() {
   fi
 }
 
+# maturin is a Rust tool; install via cargo so builds do not depend on pip mirrors or venv pip.
+ensure_maturin_cmd() {
+  if command -v maturin >/dev/null 2>&1; then
+    MATURIN_CMD=(maturin)
+    return 0
+  fi
+  if [ -x "${HOME}/.cargo/bin/maturin" ]; then
+    MATURIN_CMD=("${HOME}/.cargo/bin/maturin")
+    return 0
+  fi
+
+  echo "maturin not found in PATH; installing via cargo ..."
+  cargo install maturin --locked
+  if command -v maturin >/dev/null 2>&1; then
+    MATURIN_CMD=(maturin)
+    return 0
+  fi
+  if [ -x "${HOME}/.cargo/bin/maturin" ]; then
+    MATURIN_CMD=("${HOME}/.cargo/bin/maturin")
+    return 0
+  fi
+
+  echo "Error: maturin install via cargo failed." >&2
+  return 1
+}
+
 print_help() {
   echo "Usage: $0 [options]"
   echo
@@ -581,41 +607,32 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
     exit 1
   fi
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "Error: python3 is required to build the Python SDK wheel." >&2
+  PYTHON3_BIN=""
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON3_BIN=python3
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON3_BIN=python
+  else
+    echo "Error: python3 (or python) is required to build the Python SDK wheel." >&2
     exit 1
   fi
 
-  # Isolated venv for maturin (no manual activation; works under sh and bash).
+  # Isolated venv for the wheel interpreter (no manual activation; works under sh and bash).
   PYTHON_SDK_VENV="${CURVINE_PYTHON_SDK_VENV:-$FS_HOME/build/.venv-python-sdk}"
-  PY_SDK_REQ="$FS_HOME/build/requirements-python-sdk.txt"
-  if [ ! -f "$PY_SDK_REQ" ]; then
-    echo "Error: missing $PY_SDK_REQ" >&2
-    exit 1
-  fi
-
-  if [ ! -d "$PYTHON_SDK_VENV" ]; then
+  if [ -d "$PYTHON_SDK_VENV" ]; then
+    if [ ! -f "$PYTHON_SDK_VENV/pyvenv.cfg" ]; then
+      echo "Error: ${PYTHON_SDK_VENV} exists but is not a Python venv (missing pyvenv.cfg)." >&2
+      exit 1
+    fi
+  else
     echo "Creating Python SDK build venv at ${PYTHON_SDK_VENV} ..."
-    python3 -m venv "$PYTHON_SDK_VENV" || {
-      echo "Error: python3 -m venv failed (install python3-venv on Debian/Ubuntu)." >&2
+    "$PYTHON3_BIN" -m venv "$PYTHON_SDK_VENV" || {
+      echo "Error: $PYTHON3_BIN -m venv failed (install python3-venv on Debian/Ubuntu)." >&2
       exit 1
     }
   fi
 
-  # Minimal venvs may lack pip; ensure it exists before installing maturin.
-  if ! "$PYTHON_SDK_VENV/bin/python" -m pip --version >/dev/null 2>&1; then
-    echo "Bootstrapping pip in Python SDK build venv (ensurepip) ..."
-    "$PYTHON_SDK_VENV/bin/python" -m ensurepip --upgrade || {
-      echo "Error: pip is not available and ensurepip failed (install python3-venv)." >&2
-      exit 1
-    }
-  fi
-
-  echo "Installing / updating Python SDK build dependencies (maturin) ..."
-  "$PYTHON_SDK_VENV/bin/python" -m pip install -q --upgrade pip
-  "$PYTHON_SDK_VENV/bin/python" -m pip install -q -r "$PY_SDK_REQ"
-
-  MATURIN_CMD=("$PYTHON_SDK_VENV/bin/python" -m maturin)
+  ensure_maturin_cmd || exit 1
 
   PROTO_DIR="$FS_HOME/curvine-common/proto"
   PY_SDK_PY="$FS_HOME/curvine-libsdk/python"
@@ -646,6 +663,7 @@ if [ $BUILD_PYTHON_SDK -eq 1 ]; then
   "${MATURIN_CMD[@]}" build --no-default-features \
     --features "curvine-common/${ALLOC},python-sdk" \
     "${MATURIN_RELEASE[@]}" \
+    --interpreter "$PYTHON_SDK_VENV/bin/python" \
     --compatibility "$MATURIN_COMPAT" \
     --auditwheel "$MATURIN_AUDIT" \
     --out "$DIST_DIR/lib"

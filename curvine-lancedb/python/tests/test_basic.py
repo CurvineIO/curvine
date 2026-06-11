@@ -8,9 +8,16 @@ import pytest
 import curvine_lancedb
 
 requires_curvine = pytest.mark.skipif(
-    not os.environ.get("CURVINE_CONF_FILE"),
-    reason="CURVINE_CONF_FILE not set; live Curvine cluster required",
+    not (os.environ.get("CURVINE_MASTER_ADDRS") or os.environ.get("CURVINE_CONF_FILE")),
+    reason="neither CURVINE_MASTER_ADDRS nor CURVINE_CONF_FILE is set; live Curvine cluster required",
 )
+
+
+def curvine_storage_option():
+    master_addrs = os.environ.get("CURVINE_MASTER_ADDRS")
+    if master_addrs:
+        return "curvine.master_addrs", master_addrs
+    return "curvine.conf.path", os.environ["CURVINE_CONF_FILE"]
 
 
 @pytest.fixture
@@ -94,8 +101,8 @@ class TestTable:
     @pytest.mark.asyncio
     async def test_query_filter(self, table):
         result = await table.search().where("score > 90").to_arrow()
-        df = result.to_pandas()
-        assert len(df) == 2
+        rows = result.to_pylist()
+        assert len(rows) == 2
 
     @pytest.mark.asyncio
     async def test_query_limit(self, table):
@@ -110,27 +117,26 @@ class TestTable:
     @pytest.mark.asyncio
     async def test_query_select_and_limit(self, table):
         result = await table.search().select(["name", "score"]).limit(2).to_arrow()
-        df = result.to_pandas()
-        assert len(df) == 2
-        assert list(df.columns) == ["name", "score"]
+        assert result.num_rows == 2
+        assert result.column_names == ["name", "score"]
 
 
 @requires_curvine
 class TestCurvineIntegration:
     """Integration tests against a live Curvine cluster (curvine:// URIs).
 
-    Mirrors the Rust-side lancedb_smoke.rs. Skipped unless CURVINE_CONF_FILE is set.
+    Mirrors the Rust-side lancedb_smoke.rs.
     """
 
     @pytest.mark.asyncio
     async def test_connect_create_query_drop(self):
-        conf = os.environ["CURVINE_CONF_FILE"]
+        option_key, option_value = curvine_storage_option()
         table_name = f"py_sdk_smoke_{uuid.uuid4().hex[:12]}"
         db_uri = f"curvine:///tmp/{table_name}"
 
         conn = await (
             curvine_lancedb.connect(db_uri)
-            .storage_option("curvine.conf.path", conf)
+            .storage_option(option_key, option_value)
             .execute()
         )
 
@@ -145,6 +151,9 @@ class TestCurvineIntegration:
         names = await conn.table_names()
         assert table_name in names
 
+        opened = await conn.open_table(table_name)
+        assert await opened.count_rows() == 3
+
         count = await table.count_rows()
         assert count == 3
 
@@ -153,3 +162,5 @@ class TestCurvineIntegration:
         assert set(result.column_names) == {"id", "name", "score"}
 
         await conn.drop_table(table_name)
+        names_after_drop = await conn.table_names()
+        assert table_name not in names_after_drop

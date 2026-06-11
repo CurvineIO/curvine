@@ -2001,6 +2001,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "crossbeam",
+ "curvine-common-macros",
  "dashmap 5.5.3",
  "flate2",
  "futures",
@@ -2036,13 +2037,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "curvine-common-macros"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "orpc",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "curvine-fuse"
 version = "0.2.0"
 dependencies = [
  "axum",
  "bindgen",
  "bitflags 2.10.0",
- "bytes",
  "clap",
  "curvine-client",
  "curvine-common",
@@ -2061,6 +2073,7 @@ dependencies = [
  "pin-project-lite",
  "pkg-config",
  "serde",
+ "serde_json",
  "smallvec",
  "thiserror 1.0.69",
  "tokio",
@@ -5805,11 +5818,10 @@ dependencies = [
 
 [[package]]
 name = "num-bigint-dig"
-version = "0.8.4"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc84195820f291c7697304f3cbdadd1cb7199c0efc917ff5eafd71225c136151"
+checksum = "e661dda6640fad38e827a6d4a310ff4763082116fe217f279885c97f511bb0b7"
 dependencies = [
- "byteorder",
  "lazy_static",
  "libm",
  "num-integer",
@@ -6102,6 +6114,7 @@ dependencies = [
  "prost 0.11.9",
  "prost-build 0.11.9",
  "rand 0.8.5",
+ "rolling-file",
  "serde",
  "socket2 0.5.10",
  "sysinfo",
@@ -7728,6 +7741,15 @@ checksum = "6bd13e55d6d7b8cd0ea569161127567cd587676c99f4472f779a0279aa60a7a7"
 dependencies = [
  "libc",
  "librocksdb-sys",
+]
+
+[[package]]
+name = "rolling-file"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8395b4f860856b740f20a296ea2cd4d823e81a2658cf05ef61be22916026a906"
+dependencies = [
+ "chrono",
 ]
 
 [[package]]

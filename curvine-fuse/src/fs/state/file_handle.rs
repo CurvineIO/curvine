@@ -20,6 +20,7 @@ use crate::{err_fuse, FuseError, FuseResult};
 use curvine_common::fs::{Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOptsBuilder, FileStatus, LockFlags, OpenFlags};
 use orpc::err_box;
+use orpc::sync::AtomicCounter;
 use orpc::sys::RawPtr;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -40,6 +41,8 @@ pub struct FileHandle {
     pub status: FileStatus,
 
     fh_locks: std::sync::Mutex<HandleLock>,
+
+    read_ver: AtomicCounter,
 }
 
 impl FileHandle {
@@ -57,6 +60,7 @@ impl FileHandle {
             writer,
             status,
             fh_locks: std::sync::Mutex::new(HandleLock::default()),
+            read_ver: AtomicCounter::new(0),
         }
     }
 
@@ -71,16 +75,18 @@ impl FileHandle {
             None => return err_fuse!(libc::EIO),
         };
 
-        if op.arg.offset as i64 >= reader.len() {
-            if let Some(writer) = state.find_writer(&op.header.nodeid) {
-                {
-                    writer.lock().await.flush(None).await?;
-                }
-                // TODO: Optimize by adding refresh interface to refresh block list
+        if let Some(lock) = state.find_writer(&self.ino) {
+            let mut writer = lock.lock().await;
+            let write_ver = writer.write_ver();
+            if self.read_ver.get() != write_ver {
+                writer.flush(None).await?;
+                drop(writer);
+
                 let path = reader.path().clone();
-                reader.as_mut().complete(None).await?;
                 let new_reader = state.new_reader(&path).await?;
                 reader.replace(new_reader);
+
+                self.read_ver.set(write_ver);
             }
         }
 
@@ -214,6 +220,7 @@ impl FileHandle {
             writer,
             status,
             fh_locks: std::sync::Mutex::new(locks),
+            read_ver: AtomicCounter::new(0),
         };
         Ok(handle)
     }

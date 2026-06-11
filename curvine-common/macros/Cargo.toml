@@ -1,0 +1,19 @@
+[package]
+name = "curvine-common-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Proc-macros for Curvine common configuration (ClientConf, ClusterConf, etc.)"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.92"
+quote = "1.0.37"
+syn = { version = "2.0.90", features = ["full"] }
+
+[dev-dependencies]
+clap = { version = "4.3.10", features = ["derive"] }
+serde = { workspace = true }
+orpc = { path = "../../orpc" }

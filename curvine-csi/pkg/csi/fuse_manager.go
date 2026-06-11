@@ -163,27 +163,18 @@ func (fm *FuseManager) StartFuseProcess(ctx context.Context, mntPath, clusterID,
 
 	// Build FUSE command
 	fuseBinaryPath := "/opt/curvine/curvine-fuse"
+	fuseArgv := BuildFuseExecArgs(FuseExecArgsInput{
+		MasterAddrs: masterAddrs,
+		FSPath:      fsPath,
+		MntPath:     mntPath,
+		Passthrough: fuseParams,
+	})
 	args := []string{fuseBinaryPath}
-
-	// Add debug flag if FUSE_DEBUG_ENABLED is set
 	if debugEnabled := os.Getenv("FUSE_DEBUG_ENABLED"); debugEnabled == "true" || debugEnabled == "1" {
 		args = append(args, "-d")
 		klog.Infof("FUSE debug mode enabled for %s", key)
 	}
-
-	// Add master-addrs
-	if masterAddrs != "" {
-		args = append(args, "--master-addrs", masterAddrs)
-	}
-
-	// Add paths
-	args = append(args, "--fs-path", fsPath)
-	args = append(args, "--mnt-path", mntPath)
-
-	// Add FUSE parameters
-	for key, value := range fuseParams {
-		args = append(args, fmt.Sprintf("--%s", key), value)
-	}
+	args = append(args, fuseArgv...)
 
 	// Use background context for FUSE process, as it should run independently
 	// of the request context. The request context may be cancelled after the

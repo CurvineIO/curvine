@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -500,7 +499,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 					StartupProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
 							Exec: &corev1.ExecAction{
-								Command: []string{"mountpoint", "-q", StandaloneMountPath},
+								Command: standaloneFuseMountProbeCommand(),
 							},
 						},
 						InitialDelaySeconds: 1,
@@ -513,7 +512,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 					ReadinessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
 							Exec: &corev1.ExecAction{
-								Command: []string{"mountpoint", "-q", StandaloneMountPath},
+								Command: standaloneFuseMountProbeCommand(),
 							},
 						},
 						InitialDelaySeconds: 0,
@@ -526,7 +525,7 @@ func (m *standaloneMountManagerImpl) buildStandalone(opts *StandaloneOptions, po
 					LivenessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
 							Exec: &corev1.ExecAction{
-								Command: []string{"mountpoint", "-q", StandaloneMountPath},
+								Command: standaloneFuseMountProbeCommand(),
 							},
 						},
 						InitialDelaySeconds: 0, // StartupProbe handles initial delay
@@ -629,20 +628,12 @@ func mountPropagationBidirectionalPtr() *corev1.MountPropagationMode {
 // FUSE parameters supplied via opts.FuseParams.
 // Keys are sorted to ensure deterministic argument ordering across pod restarts.
 func buildFuseArgs(opts *StandaloneOptions) []string {
-	args := []string{
-		"--master-addrs", opts.MasterAddrs,
-		"--fs-path", opts.FSPath,
-		"--mnt-path", StandaloneMountPath,
-	}
-	keys := make([]string, 0, len(opts.FuseParams))
-	for key := range opts.FuseParams {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		args = append(args, "--"+key, opts.FuseParams[key])
-	}
-	return args
+	return BuildFuseExecArgs(FuseExecArgsInput{
+		MasterAddrs: opts.MasterAddrs,
+		FSPath:      opts.FSPath,
+		MntPath:     StandaloneMountPath,
+		Passthrough: opts.FuseParams,
+	})
 }
 
 // DeleteStandalone deletes the Standalone for the given mount key on this node
@@ -952,6 +943,15 @@ func (m *standaloneMountManagerImpl) GetState() *StandaloneState {
 	}
 
 	return stateCopy
+}
+
+// standaloneFuseMountProbeCommand returns a probe command that detects curvinefs on
+// StandaloneMountPath without calling mountpoint(1), which can block on FUSE backends.
+func standaloneFuseMountProbeCommand() []string {
+	return []string{
+		"sh", "-c",
+		fmt.Sprintf("grep -qE '^[^ ]+ %s fuse' /proc/mounts", StandaloneMountPath),
+	}
 }
 
 // isMountPoint checks if a path is a mount point

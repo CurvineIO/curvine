@@ -323,37 +323,39 @@ impl FsDir {
             Some(v) => v,
         };
 
-        // If no_replace is true and target file exists, return error; otherwise delete target file first
-        let del_res = match dst_inp.get_last_inode() {
-            Some(v) if v.is_file() => {
-                if flags.no_replace() {
-                    return err_ext!(FsError::file_exists(dst_inp.path()));
-                } else {
-                    Some(self.unprotected_delete(dst_inp, mtime)?)
-                }
+        let del_res = if let Some(dst_inode) = dst_inp.get_last_inode() {
+            let src_is_file = src_inode.is_file();
+            let dst_is_file = dst_inode.is_file();
+            if flags.no_replace() {
+                return err_ext!(FsError::file_exists(dst_inp.path()));
             }
-            _ => None,
+            if src_is_file && !dst_is_file {
+                return err_ext!(FsError::is_a_directory(dst_inp.path()));
+            }
+            if !src_is_file && dst_is_file {
+                return err_ext!(FsError::not_a_directory(dst_inp.path()));
+            }
+            if !src_is_file && !dst_is_file && !dst_inp.is_empty_dir() {
+                return err_ext!(FsError::dir_not_empty(dst_inp.path()));
+            }
+            Some(self.unprotected_delete(dst_inp, mtime)?)
+        } else {
+            None
         };
 
-        let mut new_name = dst_inp.name().to_string();
-        let mut dst_parent = match dst_inp.get_last_inode() {
-            Some(v) if v.is_dir() => {
-                new_name = src_inp.name().to_string();
-                v
-            }
-            _ => {
-                // /1.log -> /a/b b does not exist, think that b is the new inode name
-                match dst_inp.get_inode(-2) {
-                    Some(v) => v,
-                    None => return err_box!("Parent {} does not exist", dst_inp.get_parent_path()),
-                }
-            }
+        let new_name = dst_inp.name().to_string();
+        // /1.log -> /a/b : b is the new inode name and /a is the destination parent.
+        // For replace semantics (dst exists), dst has been deleted above and we still
+        // rename to dst's original parent with dst's original name.
+        let mut dst_parent = match dst_inp.get_inode(-2) {
+            Some(v) => v,
+            None => return err_box!("Parent {} does not exist", dst_inp.get_parent_path()),
         };
 
         // Modify the time and name of the rename node.
         let mut new_inode = src_inode.as_ref().clone();
-        new_inode.update_mtime(mtime);
         new_inode.change_name(new_name);
+        new_inode.set_parent_id(dst_parent.id());
 
         // Update the parent directory for the last modification time.
         src_parent.update_mtime(mtime);

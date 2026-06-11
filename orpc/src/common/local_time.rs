@@ -12,23 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use chrono::{Local, Utc};
+use chrono::{Datelike, Local, Timelike};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
 
-const DEFAULT_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
-const LOG_FORMAT: &str = "%y/%m/%d %H:%M:%S%.3f";
+const DATETIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
 
-pub struct LocalTime {
-    timezone: Local,
-}
+pub struct LocalTime;
 
 impl LocalTime {
     pub const NANOSECONDS_PER_MILLISECOND: u128 = 1000000;
 
     pub fn new() -> Self {
-        Self { timezone: Local }
+        Self
     }
 
     pub fn nanos() -> u128 {
@@ -43,7 +40,7 @@ impl LocalTime {
     }
 
     pub fn now_datetime() -> String {
-        Local::now().format(DEFAULT_FORMAT).to_string()
+        Local::now().format(DATETIME_FORMAT).to_string()
     }
 }
 
@@ -55,7 +52,20 @@ impl Default for LocalTime {
 
 impl FormatTime for LocalTime {
     fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
-        let time = Utc::now().with_timezone(&self.timezone);
-        write!(w, "{}", time.format(LOG_FORMAT))
+        let t = Local::now();
+        // year() returns i32; clamp to 0-9999 so the {:04} field is always
+        // exactly 4 characters and never produces a sign or extra digits.
+        let year = t.year().clamp(0, 9999) as u32;
+        write!(
+            w,
+            "{:04}/{:02}/{:02} {:02}:{:02}:{:02}.{:03}",
+            year,
+            t.month(),
+            t.day(),
+            t.hour(),
+            t.minute(),
+            t.second(),
+            t.nanosecond() / 1_000_000,
+        )
     }
 }

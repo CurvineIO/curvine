@@ -1,3 +1,4 @@
+# Single-pod example using dynamically provisioned PVC curvine-pvc.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -11,7 +12,7 @@ spec:
       image: nginx:stable-alpine
       ports:
         - containerPort: 80
-          name: "http-server"
+          name: http-server
       volumeMounts:
         - mountPath: "/data"
           name: curvine-storage

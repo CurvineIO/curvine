@@ -43,6 +43,8 @@ slog-stdlog  = { workspace = true }
 chrono = { workspace = true }
 trait-variant = { workspace = true }
 
+curvine-common-macros = { path = "macros" }
+
 anyhow = { workspace = true }
 tracing = { workspace = true }
 bitflags = { workspace = true }

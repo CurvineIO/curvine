@@ -12,11 +12,27 @@ resolver = "2"
 members = [
     "orpc",
     "curvine-common",
+    "curvine-common/macros",
     "curvine-server",
     "curvine-client",
     "curvine-libsdk",
     "curvine-lancedb",
     'curvine-tests',
+    "curvine-fuse",
+    "curvine-web",
+    "curvine-ufs",
+    "curvine-cli",
+]
+
+# Mirror members here unless a crate is intentionally opt-in.
+# curvine-lancedb stays opt-in because it pulls heavy Lance/Arrow dependencies.
+default-members = [
+    "orpc",
+    "curvine-common",
+    "curvine-server",
+    "curvine-client",
+    "curvine-libsdk",
+    "curvine-tests",
     "curvine-fuse",
     "curvine-web",
     "curvine-ufs",
@@ -61,7 +77,8 @@ log = "0.4.22"
 tracing = "0.1.41"
 tracing-log = "0.2.0"
 tracing-subscriber = "0.3.19"
-tracing-appender = { package = "curvine-tracing-appender", version = "0.2.3"}
+tracing-appender = "0.2.3"
+rolling-file = "0.2"
 
 
 prost = "0.11.9"

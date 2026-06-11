@@ -94,4 +94,15 @@ async fn lancedb_curvine_smoke_connect_table_query_names() {
     let batches: Vec<RecordBatch> = stream.try_collect().await.expect("query batches");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3, "query row count");
+
+    conn.drop_table(&table_name, &[]).await.expect("drop_table");
+    let names_after_drop = conn
+        .table_names()
+        .execute()
+        .await
+        .expect("table_names after drop");
+    assert!(
+        !names_after_drop.contains(&table_name),
+        "table_names must not include {table_name} after drop, got {names_after_drop:?}"
+    );
 }

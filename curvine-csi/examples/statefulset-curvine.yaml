@@ -1,8 +1,12 @@
+# StatefulSet with per-pod PVCs (volumeClaimTemplates).
+# Each pod gets data-<ordinal> PVC; dynamic provisioning creates a unique
+# Curvine path under fs-path for every PVC (see storage-class.yaml).
+# ReadWriteOnce is intentional: one pod per dedicated volume.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: curvine-statefulset
-  namespace: curvine-system
+  namespace: curvine
 spec:
   serviceName: curvine-service
   replicas: 3
@@ -47,7 +51,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: curvine-service
-  namespace: curvine-system
+  namespace: curvine
 spec:
   clusterIP: None
   selector:
@@ -55,4 +59,3 @@ spec:
   ports:
     - port: 80
       name: http
-

@@ -45,7 +45,7 @@ func DefaultConfig() *Config {
 		RetryCount:          3,
 		RetryInterval:       2,
 		CommandTimeout:      30,
-		KubernetesNamespace: "curvine-system",
+		KubernetesNamespace: "curvine",
 	}
 }
 
