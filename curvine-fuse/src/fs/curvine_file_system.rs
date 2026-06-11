@@ -1239,14 +1239,16 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
         let ino = op.header.nodeid;
-        let handle = match self.state.remove_handle(ino, op.arg.fh) {
-            Some(handle) => handle,
-            None => return err_fuse!(libc::EBADF),
-        };
+        let handle = self.state.find_handle(ino, op.arg.fh)?;
 
-        self.fs_unlock(&handle, LockFlags::Flock).await?;
-        self.fs_unlock(&handle, LockFlags::Plock).await?;
-        let complete_result = handle.complete(Some(reply)).await;
+        let complete_result = self
+            .fs_unlock(&handle, LockFlags::Flock)
+            .await
+            .and(self.fs_unlock(&handle, LockFlags::Plock).await)
+            .and(handle.complete(Some(reply)).await);
+
+        self.state.remove_handle(ino, op.arg.fh);
+        complete_result?;
 
         if !self.state.has_open_handles(ino) && self.state.remove_pending_delete(ino) {
             let path = Path::from_str(&handle.status.path)?;
@@ -1264,7 +1266,7 @@ impl fs::FileSystem for CurvineFileSystem {
             self.invalidate_cache(&path)?;
         }
 
-        complete_result
+        Ok(())
     }
 
     async fn forget(&self, op: Forget<'_>) -> FuseResult<()> {

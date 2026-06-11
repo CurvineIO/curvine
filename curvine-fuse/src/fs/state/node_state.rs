@@ -298,6 +298,13 @@ impl NodeState {
         Ok(reader)
     }
 
+    pub async fn complete_writer(&self, ino: u64) -> FuseResult<()> {
+        if let Some(existing_writer) = self.find_writer(&ino) {
+            existing_writer.lock().await.complete(None).await?;
+        }
+        Ok(())
+    }
+
     pub async fn new_handle(
         &self,
         ino: u64,
