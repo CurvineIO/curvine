@@ -153,6 +153,7 @@ impl FuseWriter {
         mut req_receiver: AsyncReceiver<WriteTask>,
         file_len: Arc<Mutex<i64>>,
     ) -> FsResult<()> {
+        let mut complete = false;
         while let Some(task) = req_receiver.recv().await {
             match task {
                 WriteTask::Write(off, data, reply) => {
@@ -182,7 +183,16 @@ impl FuseWriter {
                 }
 
                 WriteTask::Complete(tx, reply) => {
-                    let res = writer.complete().await;
+                    let res = if !complete {
+                        let res = writer.complete().await;
+                        if res.is_ok() {
+                            complete = true;
+                        }
+                        res
+                    } else {
+                        Ok(())
+                    };
+
                     if let Some(reply) = reply {
                         reply.send_rep(res).await?;
                     }
