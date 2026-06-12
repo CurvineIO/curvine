@@ -68,7 +68,9 @@ impl<T: FileSystem> FuseSender<T> {
                 FuseTask::Reply(reply) => {
                     let id = reply.header.unique;
                     if let Err(e) = self.send(reply).await {
-                        warn!("error send unique {}: {}", id, e);
+                        if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
+                            warn!("error send unique {}: {}", id, e);
+                        }
                     }
                 }
 
