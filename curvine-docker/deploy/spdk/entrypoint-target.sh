@@ -12,6 +12,12 @@
 #   MEM_SIZE        — Memory size in MB (default: 128)
 #   NR_HUGE_PAGES   — Number of 2MB hugepages to allocate (default: 1024)
 #   SERIAL          — NVMe subsystem serial number (default: SPDK0001)
+#   MAX_QUEUE_DEPTH         — NVMe-oF transport max queue depth (SPDK default: 128)
+#   MAX_QPAIRS_PER_CTRLR    — NVMe-oF transport max qpairs per controller (SPDK default: 128)
+#   IN_CAPSULE_DATA_SIZE    — In-capsule data size in bytes (SPDK default: 4096)
+#   IO_UNIT_SIZE            — I/O unit size in bytes (SPDK default: 131072)
+#   NUM_SHARED_BUFFERS      — Number of shared buffers (SPDK default: 511)
+#   ZCOPY                   — Enable zero-copy (default: false)
 
 set -euo pipefail
 
@@ -24,6 +30,12 @@ REACTOR_MASK="${REACTOR_MASK:-0x3}"
 MEM_SIZE="${MEM_SIZE:-128}"
 NR_HUGE_PAGES="${NR_HUGE_PAGES:-1024}"
 SERIAL="${SERIAL:-SPDK0001}"
+MAX_QUEUE_DEPTH="${MAX_QUEUE_DEPTH:-128}"
+MAX_QPAIRS_PER_CTRLR="${MAX_QPAIRS_PER_CTRLR:-128}"
+IN_CAPSULE_DATA_SIZE="${IN_CAPSULE_DATA_SIZE:-4096}"
+IO_UNIT_SIZE="${IO_UNIT_SIZE:-131072}"
+NUM_SHARED_BUFFERS="${NUM_SHARED_BUFFERS:-511}"
+ZCOPY="${ZCOPY:-false}"
 
 RPC="${SPDK_DIR}/scripts/rpc.py"
 NVMF_TGT="${SPDK_DIR}/build/bin/nvmf_tgt"
@@ -122,15 +134,31 @@ print_success "framework_start_init complete"
 # Configure transport, subsystem, listener, bdev, namespace
 # ============================================================
 
-# Create transport matching TRTYPE
+ZCOPY_OPT=""
+if [ "$ZCOPY" = "true" ]; then
+    ZCOPY_OPT="-z"
+fi
+
 case "$TRTYPE" in
     tcp)
         print_info "Creating TCP transport..."
-        "$RPC" nvmf_create_transport -t TCP -u 16384 -m 8 -c 8192
+        "$RPC" nvmf_create_transport -t TCP \
+            -q "$MAX_QUEUE_DEPTH" \
+            -m "$MAX_QPAIRS_PER_CTRLR" \
+            -c "$IN_CAPSULE_DATA_SIZE" \
+            -u "$IO_UNIT_SIZE" \
+            -n "$NUM_SHARED_BUFFERS" \
+            $ZCOPY_OPT
         ;;
     rdma)
         print_info "Creating RDMA transport..."
-        "$RPC" nvmf_create_transport -t RDMA -u 16384 -m 8 -c 8192
+        "$RPC" nvmf_create_transport -t RDMA \
+            -q "$MAX_QUEUE_DEPTH" \
+            -m "$MAX_QPAIRS_PER_CTRLR" \
+            -c "$IN_CAPSULE_DATA_SIZE" \
+            -u "$IO_UNIT_SIZE" \
+            -n "$NUM_SHARED_BUFFERS" \
+            $ZCOPY_OPT
         ;;
 esac
 
