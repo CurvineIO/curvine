@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::fs::operator::*;
-use crate::fs::state::{FileHandle, NodeState};
+use crate::fs::state::{CleanerTask, FileHandle, NodeState};
 use crate::raw::fuse_abi::*;
 use crate::raw::FuseDirentList;
 use crate::session::{FuseBuf, FuseResponse};
@@ -49,6 +49,8 @@ impl CurvineFileSystem {
         let fuse_conf = conf.fuse.clone();
         let fs = UnifiedFileSystem::with_rt(conf, rt)?;
         let state = Arc::new(NodeState::new(fs.clone()));
+
+        CleanerTask::start(fuse_conf.node_cache_ttl.as_millis() as u64, state.clone())?;
 
         let fuse_fs = Self {
             fs,
@@ -608,7 +610,8 @@ impl fs::FileSystem for CurvineFileSystem {
             | FUSE_SPLICE_MOVE
             | FUSE_SPLICE_WRITE
             | FUSE_SPLICE_READ
-            | FUSE_READDIRPLUS_AUTO;
+            | FUSE_READDIRPLUS_AUTO
+            | FUSE_AUTO_INVAL_DATA;
 
         let max_write = FuseUtils::get_fuse_buf_size() - FUSE_BUFFER_HEADER_SIZE;
         let page_size = sys::get_pagesize()?;
@@ -1111,7 +1114,7 @@ impl fs::FileSystem for CurvineFileSystem {
         handle.read(&self.state, op, reply).await
     }
 
-    async fn open(&self, op: Open<'_>, _reply: FuseResponse) -> FuseResult<fuse_open_out> {
+    async fn open(&self, op: Open<'_>) -> FuseResult<fuse_open_out> {
         let path = self.state.get_path(op.header.nodeid)?;
         // Check file access permissions before opening
         let action = OpenAction::try_from(op.arg.flags)?;
@@ -1128,23 +1131,32 @@ impl fs::FileSystem for CurvineFileSystem {
         if self.conf.direct_io {
             open_flags |= FUSE_FOPEN_DIRECT_IO;
         } else {
+            // Page cache consistency is handled here rather than via explicit inode
+            // invalidation notifications, for two reasons:
+            //
+            // 1. Sending inode-invalidation notifications (FUSE_NOTIFY_INVAL_INODE) on
+            //    some older kernel versions can trigger a deadlock inside send_inode_out.
+            //
+            // 2. On open, the kernel always issues a fresh getattr to the FUSE daemon
+            //    regardless of whether the attr cache is still valid.  The kernel then
+            //    compares mtime and file size; if either has changed it automatically
+            //    invalidates the page cache for that inode.  This behaviour is governed
+            //    by the CAP_AUTO_INVAL_DATA capability (available since Linux 2.6.35,
+            //    enabled by default), so no additional notification is required from
+            //    our side.
+            //
+            // Note: if the user-space metadata cache (enable_meta_cache) is enabled,
+            // keep_cache may return true even after a remote modification, causing stale
+            // reads.  This is intentional — metadata caching trades strict consistency
+            // for performance, and callers that enable it accept this trade-off.
             let keep_cache = self
                 .state
                 .should_keep_cache(op.header.nodeid, handle.status());
             if keep_cache {
                 open_flags |= FUSE_FOPEN_KEEP_CACHE;
-            } else {
-                warn!(
-                    "open ino={}: metadata cache miss (mtime/len changed), likely updated by \
-                     another client or concurrent writer; omitting KEEP_CACHE so the kernel \
-                     drops stale pages",
-                    op.header.nodeid
-                );
+            } else if self.conf.open_direct_on_stale {
+                open_flags |= FUSE_FOPEN_DIRECT_IO;
             }
-            // Do not send FUSE_NOTIFY_INVAL_INODE here: synchronous invalidation
-            // during open can deadlock when the kernel holds page locks on this inode.
-            // Remote updates may still appear stale until attr cache expires (default 1s);
-            // use attr_ttl=0 or direct_io for stronger consistency.
         }
 
         let entry = fuse_open_out {
@@ -1239,14 +1251,16 @@ impl fs::FileSystem for CurvineFileSystem {
 
     async fn release(&self, op: Release<'_>, reply: FuseResponse) -> FuseResult<()> {
         let ino = op.header.nodeid;
-        let handle = match self.state.remove_handle(ino, op.arg.fh) {
-            Some(handle) => handle,
-            None => return err_fuse!(libc::EBADF),
-        };
+        let handle = self.state.find_handle(ino, op.arg.fh)?;
 
-        self.fs_unlock(&handle, LockFlags::Flock).await?;
-        self.fs_unlock(&handle, LockFlags::Plock).await?;
-        let complete_result = handle.complete(Some(reply)).await;
+        let complete_result = self
+            .fs_unlock(&handle, LockFlags::Flock)
+            .await
+            .and(self.fs_unlock(&handle, LockFlags::Plock).await)
+            .and(handle.complete(Some(reply)).await);
+
+        self.state.remove_handle(ino, op.arg.fh);
+        complete_result?;
 
         if !self.state.has_open_handles(ino) && self.state.remove_pending_delete(ino) {
             let path = Path::from_str(&handle.status.path)?;
@@ -1264,7 +1278,7 @@ impl fs::FileSystem for CurvineFileSystem {
             self.invalidate_cache(&path)?;
         }
 
-        complete_result
+        Ok(())
     }
 
     async fn forget(&self, op: Forget<'_>) -> FuseResult<()> {

@@ -1966,7 +1966,6 @@ dependencies = [
  "async-stream",
  "bytes",
  "curvine-common",
- "curvine-tracing-appender",
  "curvine-ufs",
  "dashmap 5.5.3",
  "futures",
@@ -1984,6 +1983,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 
@@ -2058,7 +2058,6 @@ dependencies = [
  "clap",
  "curvine-client",
  "curvine-common",
- "curvine-tracing-appender",
  "dashmap 5.5.3",
  "futures",
  "fxhash",
@@ -2079,6 +2078,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "trait-variant",
 ]
@@ -2122,7 +2122,6 @@ dependencies = [
  "cc",
  "curvine-client",
  "curvine-common",
- "curvine-tracing-appender",
  "dashmap 5.5.3",
  "futures",
  "jni",
@@ -2138,6 +2137,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 
@@ -2197,7 +2197,6 @@ dependencies = [
  "curvine-fuse",
  "curvine-lancedb",
  "curvine-server",
- "curvine-tracing-appender",
  "curvine-ufs",
  "futures",
  "lance-io",
@@ -2208,20 +2207,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "url",
-]
-
-[[package]]
-name = "curvine-tracing-appender"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d785fa01e9a1b7fd1aa71967e79bda314827c03997591d2d260b3f9bef226df"
-dependencies = [
- "crossbeam-channel",
- "thiserror 2.0.16",
- "time",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -6093,7 +6081,6 @@ dependencies = [
  "chrono",
  "crc32fast",
  "crossbeam",
- "curvine-tracing-appender",
  "dashmap 5.5.3",
  "fs2",
  "futures",
@@ -6123,6 +6110,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
  "uuid",
@@ -8612,6 +8600,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9313,6 +9307,19 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror 2.0.16",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]

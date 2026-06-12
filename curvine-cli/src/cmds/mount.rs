@@ -489,7 +489,7 @@ impl MountCommand {
     pub fn get_config_map(&self) -> CommonResult<HashMap<String, String>> {
         let mut configs = HashMap::new();
         for pair in &self.config {
-            let parts: Vec<&str> = pair.split('=').collect();
+            let parts: Vec<&str> = pair.splitn(2, '=').collect();
             if parts.len() == 2 {
                 configs.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
             } else {

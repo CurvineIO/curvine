@@ -95,6 +95,10 @@ pub const FUSE_POSIX_ACL: u32 = 1 << 20;
 
 pub const FUSE_DO_RENAME2: u32 = 1 << 11;
 
+/// Kernel automatically invalidates the page cache on open when mtime or size
+/// has changed (CAP_AUTO_INVAL_DATA, available since Linux 2.6.35).
+pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
+
 pub const FUSE_MAX_NAME_LENGTH: usize = 255;
 
 pub const FUSE_UNKNOWN_INODES: u64 = 0xffffffff;
