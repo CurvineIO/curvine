@@ -310,7 +310,7 @@ impl Default for FuseConf {
             meta_cache_ttl: "120s".to_string(),
 
             node_cache_size: 200000,
-            node_cache_timeout: "24h".to_string(),
+            node_cache_timeout: "1h".to_string(),
 
             direct_io: false,
             open_direct_on_stale: false,
