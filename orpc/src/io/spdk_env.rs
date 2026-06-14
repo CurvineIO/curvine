@@ -1,5 +1,6 @@
 #![cfg(feature = "spdk")]
 
+use crate::common::DurationUnit;
 use crate::err_msg;
 use crate::io::spdk_ffi;
 use crate::io::spdk_poller::PollerConfig;
@@ -148,17 +149,36 @@ impl Display for SpdkEnvState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct NvmeTarget {
-    pub trtype: String,             // "rdma" or "tcp"
-    pub adrfam: String,             // "ipv4" or "ipv6"
-    pub traddr: String,             // target IP
-    pub trsvcid: u16,               // port
-    pub subnqn: String,             // NVMe subsystem NQN
-    pub hostnqn: String,            // empty = auto-generated
-    pub io_queues: u32,             // 0 = default
-    pub keep_alive_timeout_ms: u64, // 0 = use global
+    pub trtype: String,  // "rdma" or "tcp"
+    pub adrfam: String,  // "ipv4" or "ipv6"
+    pub traddr: String,  // target IP
+    pub trsvcid: u16,    // port
+    pub subnqn: String,  // NVMe subsystem NQN
+    pub hostnqn: String, // empty = auto-generated
+    pub io_queues: u32,  // 0 = default
+    #[serde(alias = "keep_alive_timeout")]
+    pub keep_alive_timeout_str: String, // parsed when non-empty; 0 = inherit global
+    #[serde(skip)]
+    pub keep_alive_timeout_ms: u64, // ms; 0 = inherit global
+    #[serde(alias = "io_timeout")]
+    pub io_timeout_str: String, // parsed when non-empty; 0 = inherit global
+    #[serde(skip)]
+    pub io_timeout_ms: u64, // ms; 0 = inherit global
 }
 
 impl NvmeTarget {
+    /// Parse string fields
+    pub fn init(&mut self) -> CommonResult<()> {
+        if !self.keep_alive_timeout_str.is_empty() {
+            let dur = DurationUnit::from_str(&self.keep_alive_timeout_str)?;
+            self.keep_alive_timeout_ms = dur.as_millis();
+        }
+        if !self.io_timeout_str.is_empty() {
+            let dur = DurationUnit::from_str(&self.io_timeout_str)?;
+            self.io_timeout_ms = dur.as_millis();
+        }
+        Ok(())
+    }
     pub fn new(traddr: &str, trsvcid: u16, subnqn: &str) -> Self {
         Self {
             traddr: traddr.to_string(),
@@ -167,7 +187,6 @@ impl NvmeTarget {
             ..Default::default()
         }
     }
-
     /// Validate required fields
     pub fn validate(&self) -> CommonResult<()> {
         if self.traddr.is_empty() {
@@ -209,7 +228,10 @@ impl Default for NvmeTarget {
             subnqn: String::new(),
             hostnqn: String::new(),
             io_queues: 0,
+            keep_alive_timeout_str: String::new(),
             keep_alive_timeout_ms: 0,
+            io_timeout_str: String::new(),
+            io_timeout_ms: 0,
         }
     }
 }
@@ -226,71 +248,68 @@ impl Display for NvmeTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SpdkConf {
-    pub enabled: bool, // master switch - false = skip init
-    #[serde(default)]
+    pub enabled: bool,    // master switch - false = skip init
     pub app_name: String, // SPDK EAL name, e.g. "curvine"
-    #[serde(alias = "hugepage", default)]
+    #[serde(alias = "hugepage")]
     pub hugepage_str: String, // e.g. "1024MB"
     #[serde(skip)]
     pub hugepage_mb: u32, // parsed by init()
-    #[serde(default)]
     pub reactor_mask: String, // hex, e.g. "0x3"
-    #[serde(default)]
-    pub shm_id: i32, // -1 = single-process
-    #[serde(default)]
-    pub mem_channel: u32, // 0 = auto-detect
-    #[serde(default)]
     pub targets: Vec<NvmeTarget>,
-    #[serde(default)]
     pub io_queue_depth: u32,
-    #[serde(default)]
     pub io_queue_requests: u32,
-    #[serde(alias = "io_timeout", default)]
-    pub io_timeout_str: String, // e.g. "30s"
+    #[serde(alias = "io_timeout")]
+    pub io_timeout_str: String, // e.g. "30s", parsed when non-empty; prefer io_timeout_ms
     #[serde(skip)]
-    pub io_timeout_us: u64, // parsed by init()
-    #[serde(default)]
+    pub io_timeout_ms: u64, // e.g. 30000
     pub io_retry_count: u32,
-    #[serde(alias = "keep_alive_timeout", default)]
-    pub keep_alive_timeout_str: String, // e.g. "10s"
+    #[serde(alias = "keep_alive_timeout")]
+    pub keep_alive_timeout_str: String, // e.g. "10s", parsed when non-empty; prefer keep_alive_timeout_ms
     #[serde(skip)]
-    pub keep_alive_timeout_ms: u64, // parsed by init()
-    #[serde(alias = "poll_interval", default)]
-    pub poll_interval_ms: u64, // default = 1000
-    #[serde(default)]
+    pub keep_alive_timeout_ms: u64, // e.g. 10000
+    #[serde(alias = "poll_interval")]
+    pub poll_interval_ms: u64, // default = 100
     // PAUSE iterations before parking on eventfd (on x86, roughly 300 ns - 1 µs at 1000). Burns that much CPU to skip the wakeup
     // syscall for back-to-back I/O.
     pub spin_iter: u32,
-    #[serde(alias = "dma_pool_size", default)]
-    pub dma_pool_size_str: String, // e.g. "64MB"
+    #[serde(alias = "dma_buffer_size")]
+    pub dma_buffer_size_str: String, // e.g. "1MB", parsed when non-empty; prefer dma_buffer_bytes
     #[serde(skip)]
-    pub dma_pool_bytes: u64, // parsed by init()
-    pub block_align: u32, // 0 = auto-detect
+    pub dma_buffer_bytes: u64, // e.g. 1048576
 }
 
 impl SpdkConf {
     /// Parse string fields into computed values
     pub fn init(&mut self) -> CommonResult<()> {
-        use crate::common::{ByteUnit, DurationUnit};
+        use crate::common::ByteUnit;
 
         self.hugepage_mb =
             (ByteUnit::from_str(&self.hugepage_str)?.as_byte() / ByteUnit::MB) as u32;
 
-        let io_timeout = DurationUnit::from_str(&self.io_timeout_str)?;
-        self.io_timeout_us = io_timeout.as_millis() * 1000;
+        if !self.io_timeout_str.is_empty() {
+            let io_timeout = DurationUnit::from_str(&self.io_timeout_str)?;
+            self.io_timeout_ms = io_timeout.as_millis();
+        }
 
-        let keep_alive = DurationUnit::from_str(&self.keep_alive_timeout_str)?;
-        self.keep_alive_timeout_ms = keep_alive.as_millis();
+        if !self.keep_alive_timeout_str.is_empty() {
+            let keep_alive = DurationUnit::from_str(&self.keep_alive_timeout_str)?;
+            self.keep_alive_timeout_ms = keep_alive.as_millis();
+        }
 
-        let dma_pool = ByteUnit::from_str(&self.dma_pool_size_str)?;
-        self.dma_pool_bytes = dma_pool.as_byte();
+        if !self.dma_buffer_size_str.is_empty() {
+            let dma_buf = ByteUnit::from_str(&self.dma_buffer_size_str)?;
+            self.dma_buffer_bytes = dma_buf.as_byte();
+        }
+
+        for target in &mut self.targets {
+            target.init()?;
+        }
 
         Ok(())
     }
 
     /// Validate config
     pub fn validate(&self) -> CommonResult<()> {
-        use crate::common::ByteUnit;
         if !self.enabled {
             return Ok(());
         }
@@ -311,23 +330,8 @@ impl SpdkConf {
             );
         }
 
-        // Validate hugepage from source string (skip field is 0 after deserialization)
-        let hugepage_mb = if self.hugepage_mb > 0 {
-            self.hugepage_mb
-        } else {
-            // Parse from source string as fallback
-            match ByteUnit::from_str(&self.hugepage_str) {
-                Ok(v) => (v.as_byte() / ByteUnit::MB) as u32,
-                Err(_) => {
-                    return err_box!(
-                        "SpdkConf: invalid hugepage '{}', expected e.g. '1024MB'",
-                        self.hugepage_str
-                    );
-                }
-            }
-        };
-
-        if hugepage_mb == 0 {
+        // hugepage_mb is already parsed by init(); just validate it's non-zero
+        if self.hugepage_mb == 0 {
             return err_box!(
                 "SpdkConf: hugepage must be > 0 (got '{}')",
                 self.hugepage_str
@@ -351,13 +355,18 @@ impl SpdkConf {
                 let msg = format!("SpdkConf: targets[{}]: {}", i, e);
                 err_msg!(msg)
             })?;
-            if target.keep_alive_timeout_ms > 0
-                && target.keep_alive_timeout_ms < self.poll_interval_ms
-            {
+            // Resolve inheritance the same way attach_controller() does
+            let resolved_ka_ms = if target.keep_alive_timeout_ms > 0 {
+                target.keep_alive_timeout_ms
+            } else {
+                self.keep_alive_timeout_ms
+            };
+            if resolved_ka_ms < self.poll_interval_ms {
                 return err_box!(
-                    "SpdkConf: targets[{}]: keep_alive_timeout_ms ({}) must be >= poll_interval_ms ({})",
+                    "SpdkConf: targets[{}]: resolved keep_alive_timeout_ms ({}) \
+                     must be >= poll_interval_ms ({})",
                     i,
-                    target.keep_alive_timeout_ms,
+                    resolved_ka_ms,
                     self.poll_interval_ms
                 );
             }
@@ -387,21 +396,18 @@ impl Default for SpdkConf {
             hugepage_str: "1024MB".to_string(),
             hugepage_mb: 1024,
             reactor_mask: "0x1".to_string(),
-            shm_id: -1,
-            mem_channel: 0,
             targets: vec![],
             io_queue_depth: 128,
             io_queue_requests: 512,
-            io_timeout_str: "30s".to_string(),
-            io_timeout_us: 30_000_000,
+            io_timeout_str: String::new(),
+            io_timeout_ms: 30_000,
             io_retry_count: 4,
-            keep_alive_timeout_str: "10s".to_string(),
+            keep_alive_timeout_str: String::new(),
             keep_alive_timeout_ms: 10_000,
-            poll_interval_ms: 1000,
+            poll_interval_ms: 100,
             spin_iter: 1000,
-            dma_pool_size_str: "64MB".to_string(),
-            dma_pool_bytes: 64 * 1024 * 1024,
-            block_align: 0,
+            dma_buffer_size_str: String::new(),
+            dma_buffer_bytes: 1 * 1024 * 1024,
         }
     }
 }
@@ -429,8 +435,9 @@ pub struct BdevInfo {
     pub block_size: u32, // typically 512 or 4096
     pub num_blocks: u64,
     pub target_endpoint: String,
-    pub ctrlr: usize, // raw pointer for SpdkBdev
-    pub ns: usize,    // raw pointer for SpdkBdev
+    pub ctrlr: usize,       // raw pointer for SpdkBdev
+    pub ns: usize,          // raw pointer for SpdkBdev
+    pub io_timeout_ms: u64, // per-target I/O timeout in ms
 }
 
 impl Display for BdevInfo {
@@ -461,7 +468,8 @@ unsafe impl Sync for SpdkEnv {}
 
 impl SpdkEnv {
     /// Create in Created state
-    pub fn new(conf: SpdkConf) -> CommonResult<Self> {
+    pub fn new(mut conf: SpdkConf) -> CommonResult<Self> {
+        conf.init()?;
         conf.validate()?;
 
         info!("SpdkEnv created: {}", conf);
@@ -830,12 +838,8 @@ impl SpdkEnv {
     fn env_init(&self) -> CommonResult<()> {
         use std::ffi::CString;
         info!(
-            "SPDK env_init: app={}, hugepage={}MB, mask={}, shm_id={}, mem_ch={}",
-            self.conf.app_name,
-            self.conf.hugepage_mb,
-            self.conf.reactor_mask,
-            self.conf.shm_id,
-            self.conf.mem_channel
+            "SPDK env_init: app={}, hugepage={}MB, mask={}",
+            self.conf.app_name, self.conf.hugepage_mb, self.conf.reactor_mask
         );
         let app_name = CString::new(self.conf.app_name.as_str())
             .map_err(|e| err_msg!(format!("invalid app_name: {}", e)))?;
@@ -859,11 +863,6 @@ impl SpdkEnv {
             // C struct offsets regardless of SPDK version.
             spdk_ffi::curvine_spdk_env_opts_set_name(&mut opts, app_name.as_ptr());
             spdk_ffi::curvine_spdk_env_opts_set_core_mask(&mut opts, core_mask.as_ptr());
-            spdk_ffi::curvine_spdk_env_opts_set_shm_id(&mut opts, self.conf.shm_id);
-            spdk_ffi::curvine_spdk_env_opts_set_mem_channel(
-                &mut opts,
-                self.conf.mem_channel as i32,
-            );
             spdk_ffi::curvine_spdk_env_opts_set_mem_size(&mut opts, self.conf.hugepage_mb as i32);
             let rc = spdk_ffi::curvine_spdk_env_init(&mut opts);
             if rc != 0 {
@@ -930,12 +929,12 @@ impl SpdkEnv {
             if target.io_queues > 0 {
                 spdk_ffi::curvine_spdk_ctrlr_opts_set_num_io_queues(&mut opts, target.io_queues);
             }
-            if target.keep_alive_timeout_ms > 0 {
-                spdk_ffi::curvine_spdk_ctrlr_opts_set_keep_alive_timeout_ms(
-                    &mut opts,
-                    target.keep_alive_timeout_ms as u32,
-                );
-            }
+            let ka_ms = if target.keep_alive_timeout_ms > 0 {
+                target.keep_alive_timeout_ms
+            } else {
+                self.conf.keep_alive_timeout_ms
+            };
+            spdk_ffi::curvine_spdk_ctrlr_opts_set_keep_alive_timeout_ms(&mut opts, ka_ms as u32);
             if !target.hostnqn.is_empty() {
                 let hostnqn = CString::new(target.hostnqn.as_str())
                     .map_err(|e| err_msg!(format!("invalid hostnqn: {}", e)))?;
@@ -946,6 +945,12 @@ impl SpdkEnv {
             if ctrlr.is_null() {
                 return err_box!("spdk_nvme_connect failed for target {}", target.endpoint());
             }
+            // Resolve I/O timeout: per-target override or global default
+            let io_timeout_ms = if target.io_timeout_ms > 0 {
+                target.io_timeout_ms
+            } else {
+                self.conf.io_timeout_ms
+            };
             // Enumerate active namespaces
             let num_ns = spdk_ffi::spdk_nvme_ctrlr_get_num_ns(ctrlr);
             let mut bdevs = Vec::new();
@@ -973,6 +978,7 @@ impl SpdkEnv {
                     target_endpoint: target.endpoint(),
                     ctrlr: ctrlr as usize,
                     ns: ns as usize,
+                    io_timeout_ms,
                 });
             }
             if bdevs.is_empty() {
@@ -1118,5 +1124,192 @@ mod test {
             t.join().unwrap();
         }
         assert_eq!(tot(&p), 0);
+    }
+
+    mod config_tests {
+        use super::*;
+
+        #[test]
+        fn init_parses_global_strings() {
+            let mut conf = SpdkConf {
+                io_timeout_str: "15s".into(),
+                keep_alive_timeout_str: "300s".into(),
+                ..Default::default()
+            };
+            conf.init().unwrap();
+            assert_eq!(conf.io_timeout_ms, 15_000);
+            assert_eq!(conf.keep_alive_timeout_ms, 300_000);
+        }
+
+        #[test]
+        fn init_preserves_defaults_when_strings_empty() {
+            let mut conf = SpdkConf::default();
+            // io_timeout_str and keep_alive_timeout_str are already ""
+            conf.init().unwrap();
+            assert_eq!(conf.io_timeout_ms, 30_000);
+            assert_eq!(conf.keep_alive_timeout_ms, 10_000);
+        }
+
+        #[test]
+        fn init_parses_target_overrides() {
+            let mut conf = SpdkConf::default();
+            conf.targets.push(NvmeTarget {
+                io_timeout_str: "10s".into(),
+                keep_alive_timeout_str: "30s".into(),
+                ..Default::default()
+            });
+            conf.init().unwrap();
+            assert_eq!(conf.targets[0].io_timeout_ms, 10_000);
+            assert_eq!(conf.targets[0].keep_alive_timeout_ms, 30_000);
+        }
+
+        #[test]
+        fn init_keeps_target_zero_when_not_set() {
+            let mut conf = SpdkConf::default();
+            conf.targets.push(NvmeTarget::default());
+            conf.init().unwrap();
+            // 0 means "inherit from global" at runtime
+            assert_eq!(conf.targets[0].io_timeout_ms, 0);
+            assert_eq!(conf.targets[0].keep_alive_timeout_ms, 0);
+        }
+
+        #[test]
+        fn validate_rejects_low_keep_alive() {
+            let mut conf = SpdkConf {
+                enabled: true,
+                poll_interval_ms: 100,
+                targets: vec![NvmeTarget {
+                    traddr: "10.0.0.1".into(),
+                    trsvcid: 4420,
+                    subnqn: "nqn.test".into(),
+                    keep_alive_timeout_ms: 50, // below poll_interval_ms
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let result = conf.validate();
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("keep_alive_timeout_ms"));
+        }
+
+        #[test]
+        fn validate_accepts_high_keep_alive() {
+            let mut conf = SpdkConf {
+                enabled: true,
+                poll_interval_ms: 100,
+                targets: vec![NvmeTarget {
+                    traddr: "10.0.0.1".into(),
+                    trsvcid: 4420,
+                    subnqn: "nqn.test".into(),
+                    keep_alive_timeout_ms: 200, // above poll_interval_ms
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let result = conf.validate();
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn validate_rejects_inherited_low_keep_alive() {
+            let mut conf = SpdkConf {
+                enabled: true,
+                poll_interval_ms: 100,
+                keep_alive_timeout_ms: 50, // global is too low
+                targets: vec![NvmeTarget {
+                    traddr: "10.0.0.1".into(),
+                    trsvcid: 4420,
+                    subnqn: "nqn.test".into(),
+                    keep_alive_timeout_ms: 0, // inherit global
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let result = conf.validate();
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("keep_alive_timeout_ms"));
+        }
+
+        #[test]
+        fn toml_parsing_with_target_overrides() {
+            let toml = r#"
+                enabled = true
+                app_name = "curvine"
+                hugepage = "2048MB"
+                reactor_mask = "0x3"
+                io_queue_depth = 256
+                io_queue_requests = 512
+                io_timeout = "60s"
+                io_retry_count = 4
+                keep_alive_timeout = "120s"
+                poll_interval = 50
+                spin_iter = 2000
+                dma_buffer_size = "2MB"
+                [[targets]]
+                trtype = "rdma"
+                traddr = "10.0.0.1"
+                trsvcid = 4420
+                subnqn = "nqn.test:sub1"
+                io_timeout = "15s"
+                keep_alive_timeout = "300s"
+                io_queues = 1024
+                [[targets]]
+                trtype = "tcp"
+                traddr = "10.0.0.2"
+                trsvcid = 4420
+                subnqn = "nqn.test:sub2"
+            "#;
+            let mut conf: SpdkConf = toml::from_str(toml).unwrap();
+            conf.init().unwrap();
+
+            assert_eq!(conf.hugepage_mb, 2048);
+            assert_eq!(conf.io_timeout_ms, 60_000);
+            assert_eq!(conf.keep_alive_timeout_ms, 120_000);
+            assert_eq!(conf.poll_interval_ms, 50);
+            assert_eq!(conf.dma_buffer_bytes, 2 * 1024 * 1024);
+
+            assert_eq!(conf.targets[0].io_timeout_ms, 15_000);
+            assert_eq!(conf.targets[0].keep_alive_timeout_ms, 300_000);
+
+            assert_eq!(conf.targets[1].io_timeout_ms, 0);
+            assert_eq!(conf.targets[1].keep_alive_timeout_ms, 0);
+        }
+
+        #[test]
+        fn toml_uses_global_defaults_when_omitted() {
+            let mut conf: SpdkConf = toml::from_str("enabled = true").unwrap();
+            conf.init().unwrap();
+            assert_eq!(conf.io_timeout_ms, 30_000);
+            assert_eq!(conf.keep_alive_timeout_ms, 10_000);
+            assert_eq!(conf.poll_interval_ms, 100);
+            assert!(conf.hugepage_mb > 0);
+        }
+
+        #[test]
+        fn new_calls_init_before_validate() {
+            let conf = SpdkConf {
+                enabled: true,
+                io_timeout_str: "15s".into(),
+                keep_alive_timeout_str: "300s".into(),
+                hugepage_str: "512MB".into(),
+                targets: vec![NvmeTarget {
+                    traddr: "10.0.0.1".into(),
+                    trsvcid: 4420,
+                    subnqn: "nqn.test".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let env = SpdkEnv::new(conf).unwrap();
+            assert_eq!(env.conf.io_timeout_ms, 15_000);
+            assert_eq!(env.conf.keep_alive_timeout_ms, 300_000);
+            assert!(env.conf.hugepage_mb > 0);
+        }
     }
 }
