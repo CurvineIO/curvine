@@ -57,6 +57,7 @@ extern "C" {
         opts: *mut spdk_nvme_ctrlr_opts,
     ) -> *mut spdk_nvme_ctrlr;
     pub fn spdk_nvme_detach(ctrlr: *mut spdk_nvme_ctrlr) -> c_int;
+    pub fn spdk_nvme_ctrlr_process_admin_completions(ctrlr: *mut spdk_nvme_ctrlr) -> c_int;
     pub fn spdk_nvme_ctrlr_get_num_ns(ctrlr: *mut spdk_nvme_ctrlr) -> u32;
     pub fn spdk_nvme_ctrlr_get_ns(ctrlr: *mut spdk_nvme_ctrlr, ns_id: u32) -> *mut spdk_nvme_ns;
     pub fn spdk_nvme_ns_is_active(ns: *mut spdk_nvme_ns) -> bool;

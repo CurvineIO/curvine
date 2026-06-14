@@ -10,7 +10,7 @@ use crate::io::spdk_ffi;
 /// ## Disconnect Detection
 /// Detected via periodic keep-alive poll every 1s while idle (~1s latency).
 /// TODO: SPDK fabric eventfd for immediate detection.
-use log::{error, info};
+use log::{error, info, warn};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -139,6 +139,7 @@ pub struct PollerConfig {
     pub poll_interval_ms: u64,
     pub spin_iter: u32,
     pub io_queue_depth: usize,
+    pub ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr>,
 }
 
 /// Poller thread handle.
@@ -250,6 +251,7 @@ impl SpdkPoller {
         config: PollerConfig,
     ) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
+        let active_ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = config.ctrlrs;
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
@@ -307,6 +309,9 @@ impl SpdkPoller {
                         failed_qpairs.len()
                     );
                 }
+
+                // Process admin completions (keep-alive)
+                Self::process_admin_completions(&active_ctrlrs);
 
                 // Spin briefly before Idle to avoid eventfd round-trip for back-to-back I/O
                 if rx.is_empty() && active_qpairs.is_empty() {
@@ -403,6 +408,9 @@ impl SpdkPoller {
                                 failed_qpairs.len()
                             );
                         }
+
+                        // Process admin completions (keep-alive)
+                        Self::process_admin_completions(&active_ctrlrs);
 
                         state = PollerState::Idle;
                     }
@@ -571,6 +579,16 @@ impl SpdkPoller {
             }
         }
         dead_qpairs.remove(&key);
+    }
+
+    /// Process admin completions on all controllers to service keep-alive.
+    fn process_admin_completions(ctrlrs: &[*mut spdk_ffi::spdk_nvme_ctrlr]) {
+        for &ctrlr in ctrlrs {
+            let rc = unsafe { spdk_ffi::spdk_nvme_ctrlr_process_admin_completions(ctrlr) };
+            if rc < 0 {
+                warn!("ctrlr {:p} admin completion error: rc={}", ctrlr, rc);
+            }
+        }
     }
 }
 
