@@ -1350,6 +1350,15 @@ test_rename() {
         "rename_test.py" --dir "$TEST_DIR"
 }
 
+# Test 20: name_to_handle_at / open_by_handle_at
+test_file_handle_at() {
+    CURRENT_TEST_GROUP="Test 20: File Handle At"
+    print_header "$CURRENT_TEST_GROUP"
+    run_python_script_test \
+        "Testing name_to_handle_at / open_by_handle_at (exportfs handle round-trip)" \
+        "file_handle_at_test.py" --dir "$TEST_DIR"
+}
+
 # Print final report
 print_report() {
     print_header "Test Summary"
@@ -1454,6 +1463,7 @@ main() {
     test_mmap
     test_pwrite_visibility
     test_rename
+    test_file_handle_at
 
     test_git_clone
 
