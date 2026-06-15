@@ -9,14 +9,12 @@ mod test {
             app_name = "curvine"
             hugepage = "2048MB"
             reactor_mask = "0x3"
-            shm_id = -1
-            mem_channel = 0
             io_queue_depth = 256
             io_queue_requests = 512
             io_timeout = "60s"
             io_retry_count = 4
             keep_alive_timeout = "10s"
-            dma_pool_size = "64MB"
+            dma_buffer_size = "1MB"
             [[targets]]
             trtype = "rdma"
             traddr = "192.168.1.100"
@@ -34,7 +32,6 @@ mod test {
         assert_eq!(conf.app_name, "curvine");
         assert_eq!(conf.hugepage_str, "2048MB");
         assert_eq!(conf.reactor_mask, "0x3");
-        assert_eq!(conf.shm_id, -1);
         assert_eq!(conf.io_queue_depth, 256);
         assert_eq!(conf.targets.len(), 2);
         assert_eq!(conf.targets[0].traddr, "192.168.1.100");
