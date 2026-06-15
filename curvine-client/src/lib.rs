@@ -15,6 +15,7 @@
 use bytes::{Bytes, BytesMut};
 use orpc::sys::DataSlice;
 
+pub mod bench;
 pub mod block;
 pub mod file;
 pub mod rpc;
