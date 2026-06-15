@@ -39,6 +39,8 @@ pub use fuse_buf::FuseBuf;
 mod fuse_notify_code;
 pub use self::fuse_notify_code::FuseNotifyCode;
 
+pub mod bdi;
+
 pub enum FuseTask {
     Reply(ResponseData),
     Request(FuseRequest),

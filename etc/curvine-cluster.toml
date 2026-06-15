@@ -73,6 +73,11 @@ subnqn = "nqn.2024-01.io.curvine:subsystem2"
 
 # fuse configuration
 [fuse]
+# Optional. Override the FUSE mount BDI `max_readahead_kb` after mount, and
+# raise the FUSE init `max_readahead` accordingly. Recommended: 1024 (= 1 MiB)
+# for sequential read workloads. Leave commented out to keep kernel default
+# (typically 128 KB). Linux only; no effect on macOS.
+# max_readahead_kb = 1024
 
 # The log configuration of the customer service side, and the customer service side of rust, java, and fuse use this log file.
 [log]
