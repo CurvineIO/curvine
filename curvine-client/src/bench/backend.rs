@@ -88,7 +88,13 @@ impl<'a> BenchIo<'a> {
         file_size: usize,
         write_buf: &[u8],
     ) -> CommonResult<u64> {
-        let chunk_size = self.block_size.min(file_size.max(1));
+        let chunk_size = self.block_size.max(1).min(file_size.max(1));
+        let fallback = [0u8; 1];
+        let write_buf = if write_buf.is_empty() {
+            &fallback[..]
+        } else {
+            write_buf
+        };
         let data = &write_buf[..chunk_size.min(write_buf.len())];
         let mut remaining = file_size;
 

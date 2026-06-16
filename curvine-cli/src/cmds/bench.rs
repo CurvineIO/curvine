@@ -268,7 +268,7 @@ impl BenchCommand {
                 BenchMode::Fuse => BenchTarget::Fuse,
             },
             threads,
-            block_size: parse_size(self.block_size.as_deref().unwrap_or(DEFAULT_BLOCK_SIZE))?,
+            block_size: parse_block_size(self.block_size.as_deref().unwrap_or(DEFAULT_BLOCK_SIZE))?,
             big_file_size: parse_size(
                 self.big_file_size
                     .as_deref()
@@ -313,6 +313,14 @@ impl BenchPrefillCommand {
         if self.files == Some(0) {
             return err_box!("--files must be greater than 0");
         }
+        let target_size = self
+            .target_size
+            .as_deref()
+            .map(parse_size_u64)
+            .transpose()?;
+        if target_size == Some(0) {
+            return err_box!("--target-size must be greater than 0");
+        }
 
         let config = BenchPrefillConfig {
             base_path: path,
@@ -322,14 +330,10 @@ impl BenchPrefillCommand {
                 BenchMode::Fuse => BenchTarget::Fuse,
             },
             threads,
-            block_size: parse_size(&self.block_size)?,
+            block_size: parse_block_size(&self.block_size)?,
             file_size: parse_size(&self.file_size)?,
             files: self.files,
-            target_size: self
-                .target_size
-                .as_deref()
-                .map(parse_size_u64)
-                .transpose()?,
+            target_size,
             files_per_dir: self.files_per_dir,
         };
 
@@ -462,6 +466,52 @@ mod tests {
         assert_eq!(config.small_file_count, 3);
         assert_eq!(config.duration_ms, Some(2_000));
         assert_eq!(config.threads, 2);
+    }
+
+    #[test]
+    fn rejects_zero_block_size() {
+        let cmd = BenchCommand::try_parse_from(["bench", "--block-size", "0"]).unwrap();
+        let err = cmd
+            .build_config(
+                cmd.path.clone(),
+                BenchMode::Client,
+                BenchProfile::Basic,
+                None,
+                None,
+                cmd.threads.unwrap_or(DEFAULT_THREADS),
+            )
+            .expect_err("expected zero block size to be rejected");
+        assert!(
+            err.to_string()
+                .contains("--block-size must be greater than 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn prefill_rejects_zero_block_size() {
+        let cmd = BenchCommand::try_parse_from([
+            "bench",
+            "prefill",
+            "--path",
+            "cv://default/bench/ws",
+            "--files",
+            "10",
+            "--file-size",
+            "1KB",
+            "--block-size",
+            "0",
+        ])
+        .unwrap();
+        let Some(BenchSubcommand::Prefill(prefill)) = cmd.command else {
+            panic!("expected prefill subcommand");
+        };
+        let err = parse_block_size(&prefill.block_size).expect_err("expected zero block size");
+        assert!(
+            err.to_string()
+                .contains("--block-size must be greater than 0"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -662,4 +712,12 @@ fn parse_size_u64(value: &str) -> CommonResult<u64> {
 fn parse_size(value: &str) -> CommonResult<usize> {
     let size = parse_size_u64(value)?;
     usize::try_from(size).map_err(|e| format!("Size '{}' is too large: {}", value, e).into())
+}
+
+fn parse_block_size(value: &str) -> CommonResult<usize> {
+    let block_size = parse_size(value)?;
+    if block_size == 0 {
+        return err_box!("--block-size must be greater than 0");
+    }
+    Ok(block_size)
 }

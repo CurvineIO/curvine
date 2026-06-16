@@ -14,6 +14,9 @@
 //
 
 use orpc::{err_box, CommonResult};
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -118,6 +121,12 @@ pub struct WeightedOp {
 pub const MIXED_METADATA_SPEC: &str = "create:30,stat:40,rename:10,delete:20";
 pub const MIXED_THROUGHPUT_SPEC: &str = "read_big:50,write_big:50";
 
+/// Mixed workloads expand weights into this many slots before shuffling.
+const NORMALIZED_SLOTS: usize = 100;
+
+/// Fixed seed for parse-time shuffle only (not runtime op pick).
+const WORKLOAD_SHUFFLE_SEED: u64 = 982_451_653;
+
 /// Workload selection. `Metadata` and `Throughput` are NNBench-style
 /// single-op sequential suites; the `Mixed*` variants and `Custom` run a
 /// weighted timed-loop mixed workload.
@@ -166,6 +175,9 @@ impl WorkloadKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkloadSpec {
     pub ops: Vec<WeightedOp>,
+    /// Deterministic shuffled op sequence of length [`NORMALIZED_SLOTS`].
+    #[serde(skip)]
+    sequence: Vec<BenchOp>,
 }
 
 impl WorkloadSpec {
@@ -202,19 +214,12 @@ impl WorkloadSpec {
             return err_box!("Workload must contain at least one operation");
         }
 
-        Ok(Self { ops })
+        let sequence = build_normalized_sequence(&ops);
+        Ok(Self { ops, sequence })
     }
 
     pub(crate) fn select(&self, index: usize) -> BenchOp {
-        let total: usize = self.ops.iter().map(|v| v.weight).sum();
-        let mut pos = index.wrapping_mul(1_103_515_245).wrapping_add(12_345) % total;
-        for item in &self.ops {
-            if pos < item.weight {
-                return item.op;
-            }
-            pos -= item.weight;
-        }
-        self.ops[0].op
+        self.sequence[index % self.sequence.len()]
     }
 
     pub(crate) fn is_metadata_only(&self) -> bool {
@@ -232,6 +237,39 @@ impl WorkloadSpec {
         }
         Ok(())
     }
+}
+
+fn build_normalized_sequence(ops: &[WeightedOp]) -> Vec<BenchOp> {
+    let total: usize = ops.iter().map(|item| item.weight).sum();
+    debug_assert!(total > 0);
+
+    let mut counts = vec![0usize; ops.len()];
+    let mut remainders = Vec::with_capacity(ops.len());
+    for (index, item) in ops.iter().enumerate() {
+        let scaled = item.weight * NORMALIZED_SLOTS;
+        counts[index] = scaled / total;
+        remainders.push((scaled % total, index));
+    }
+
+    let slots_left = NORMALIZED_SLOTS.saturating_sub(counts.iter().sum());
+    remainders.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, index) in remainders.into_iter().take(slots_left) {
+        counts[index] += 1;
+    }
+
+    let mut sequence = Vec::with_capacity(NORMALIZED_SLOTS);
+    for (item, count) in ops.iter().zip(counts.iter()) {
+        sequence.extend(std::iter::repeat_n(item.op, *count));
+    }
+    debug_assert_eq!(sequence.len(), NORMALIZED_SLOTS);
+
+    shuffle_sequence(&mut sequence);
+    sequence
+}
+
+fn shuffle_sequence(sequence: &mut [BenchOp]) {
+    let mut rng = StdRng::seed_from_u64(WORKLOAD_SHUFFLE_SEED);
+    sequence.shuffle(&mut rng);
 }
 
 #[cfg(test)]
@@ -255,6 +293,48 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(selected.contains(&BenchOp::Read));
         assert!(selected.contains(&BenchOp::Write));
+    }
+
+    #[test]
+    fn workload_selection_matches_normalized_weights_per_period() {
+        let workload = WorkloadSpec::parse("read:70,write:30").unwrap();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        for index in 0..NORMALIZED_SLOTS {
+            match workload.select(index) {
+                BenchOp::Read => read += 1,
+                BenchOp::Write => write += 1,
+                other => panic!("unexpected op {:?}", other),
+            }
+        }
+        assert_eq!(read, 70);
+        assert_eq!(write, 30);
+    }
+
+    #[test]
+    fn workload_selection_honors_equal_small_weights() {
+        let workload = WorkloadSpec::parse("create:1,open:1,delete:1").unwrap();
+        let mut counts = std::collections::BTreeMap::<BenchOp, usize>::new();
+        for index in 0..NORMALIZED_SLOTS {
+            *counts.entry(workload.select(index)).or_default() += 1;
+        }
+        assert_eq!(counts.len(), 3);
+        assert!(counts.values().all(|count| (33..=34).contains(count)));
+        assert_eq!(counts.values().sum::<usize>(), NORMALIZED_SLOTS);
+    }
+
+    #[test]
+    fn workload_shuffle_is_deterministic() {
+        let left = WorkloadSpec::parse("create:50,open:30,delete:20").unwrap();
+        let right = WorkloadSpec::parse("create:50,open:30,delete:20").unwrap();
+        assert_eq!(
+            (0..NORMALIZED_SLOTS)
+                .map(|index| left.select(index))
+                .collect::<Vec<_>>(),
+            (0..NORMALIZED_SLOTS)
+                .map(|index| right.select(index))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
