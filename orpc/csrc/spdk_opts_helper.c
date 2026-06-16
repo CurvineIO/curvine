@@ -21,12 +21,6 @@ void curvine_spdk_env_opts_set_name(struct spdk_env_opts *opts, const char *name
 void curvine_spdk_env_opts_set_core_mask(struct spdk_env_opts *opts, const char *mask) {
     opts->core_mask = mask;
 }
-void curvine_spdk_env_opts_set_shm_id(struct spdk_env_opts *opts, int shm_id) {
-    opts->shm_id = shm_id;
-}
-void curvine_spdk_env_opts_set_mem_channel(struct spdk_env_opts *opts, int channel) {
-    opts->mem_channel = channel;
-}
 void curvine_spdk_env_opts_set_mem_size(struct spdk_env_opts *opts, int size_mb) {
     opts->mem_size = size_mb;
 }

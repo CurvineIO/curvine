@@ -143,8 +143,8 @@ pub struct SpdkBdev {
     io_channel: SpdkIoChannel,
     /// Raw controller pointer (for qpair pool on drop).
     ctrlr: *mut crate::io::spdk_ffi::spdk_nvme_ctrlr,
-    /// I/O timeout in microseconds. 0 = no timeout.
-    io_timeout_us: u64,
+    /// I/O timeout in milliseconds. 0 = no timeout.
+    io_timeout_ms: u64,
     inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -237,7 +237,7 @@ impl SpdkBdev {
                 poller_is_sleeping,
                 qpair_dead: qpair_dead.clone(),
             };
-            let io_timeout_us = env.conf().io_timeout_us;
+            let io_timeout_ms = info.io_timeout_ms;
             Ok(Self {
                 name: name.to_string(),
                 size,
@@ -249,7 +249,7 @@ impl SpdkBdev {
                 write_buf,
                 ns,
                 ctrlr,
-                io_timeout_us,
+                io_timeout_ms,
                 inflight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
         }
@@ -366,7 +366,7 @@ impl SpdkBdev {
                     );
                 }
             }
-            let rc = completion.wait(self.io_timeout_us);
+            let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
                 return err_box!(
                     "NVMe read failed on '{}' at offset={}: {}",
@@ -446,7 +446,7 @@ impl SpdkBdev {
                         );
                     }
                 }
-                let rc = completion.wait(self.io_timeout_us);
+                let rc = completion.wait(self.io_timeout_ms * 1000);
 
                 if rc != 0 {
                     return err_box!(
@@ -495,7 +495,7 @@ impl SpdkBdev {
                     );
                 }
             }
-            let rc = completion.wait(self.io_timeout_us);
+            let rc = completion.wait(self.io_timeout_ms * 1000);
             if rc != 0 {
                 return err_box!(
                     "NVMe write failed on '{}' at offset={}, len={}: {}",
@@ -542,7 +542,7 @@ impl SpdkBdev {
                 );
             }
         }
-        let rc = completion.wait(self.io_timeout_us);
+        let rc = completion.wait(self.io_timeout_ms * 1000);
         if rc != 0 {
             return err_box!(
                 "NVMe flush failed on '{}': {}",
@@ -690,8 +690,8 @@ impl Display for SpdkBdev {
 impl Drop for SpdkBdev {
     fn drop(&mut self) {
         // Wait for in-flight I/O.
-        let max_wait = if self.io_timeout_us > 0 {
-            std::time::Duration::from_micros(self.io_timeout_us * 2)
+        let max_wait = if self.io_timeout_ms > 0 {
+            std::time::Duration::from_millis(self.io_timeout_ms * 2)
         } else {
             std::time::Duration::from_secs(60)
         };
