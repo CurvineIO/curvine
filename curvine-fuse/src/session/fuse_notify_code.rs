@@ -30,3 +30,58 @@ pub enum FuseNotifyCode {
     FUSE_NOTIFY_INC_EPOCH = 8,
     FUSE_NOTIFY_CODE_MAX = 9,
 }
+
+impl FuseNotifyCode {
+    /// Returns a stable, low-cardinality `&'static str` name for this notify
+    /// code, suitable for the `code` label on `notify_total`. Zero-allocation.
+    ///
+    /// The label set is the closed enum defined in the metrics design's Label
+    /// rules: `inval_inode | inval_entry | delete | store | retrieve | poll |
+    /// other`. Notify codes outside that set (`unknown`, `resend`, `inc_epoch`,
+    /// `code_max`) collapse to `other` so the `notify_total{code}` series stays
+    /// bounded to exactly the documented values. If a new code needs its own
+    /// label, add it here and to the design doc's Label rules together.
+    // Phase 0 enabling primitive: defined here, wired to call sites in Phase 1.
+    #[allow(dead_code)]
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            FuseNotifyCode::FUSE_NOTIFY_INVAL_INODE => "inval_inode",
+            FuseNotifyCode::FUSE_NOTIFY_INVAL_ENTRY => "inval_entry",
+            FuseNotifyCode::FUSE_NOTIFY_DELETE => "delete",
+            FuseNotifyCode::FUSE_NOTIFY_STORE => "store",
+            FuseNotifyCode::FUSE_NOTIFY_RETRIEVE => "retrieve",
+            FuseNotifyCode::FUSE_NOTIFY_POLL => "poll",
+            FuseNotifyCode::FUSE_NOTIFY_UNKNOWN
+            | FuseNotifyCode::FUSE_NOTIFY_RESEND
+            | FuseNotifyCode::FUSE_NOTIFY_INC_EPOCH
+            | FuseNotifyCode::FUSE_NOTIFY_CODE_MAX => "other",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FuseNotifyCode;
+
+    #[test]
+    fn as_str_matches_the_closed_label_set() {
+        // Full (variant, expected-label) table. Any accidental relabeling must
+        // update this table and the design doc's Label rules together. Codes
+        // outside the documented set fold to "other".
+        let table = [
+            (FuseNotifyCode::FUSE_NOTIFY_UNKNOWN, "other"),
+            (FuseNotifyCode::FUSE_NOTIFY_POLL, "poll"),
+            (FuseNotifyCode::FUSE_NOTIFY_INVAL_INODE, "inval_inode"),
+            (FuseNotifyCode::FUSE_NOTIFY_INVAL_ENTRY, "inval_entry"),
+            (FuseNotifyCode::FUSE_NOTIFY_STORE, "store"),
+            (FuseNotifyCode::FUSE_NOTIFY_RETRIEVE, "retrieve"),
+            (FuseNotifyCode::FUSE_NOTIFY_DELETE, "delete"),
+            (FuseNotifyCode::FUSE_NOTIFY_RESEND, "other"),
+            (FuseNotifyCode::FUSE_NOTIFY_INC_EPOCH, "other"),
+            (FuseNotifyCode::FUSE_NOTIFY_CODE_MAX, "other"),
+        ];
+        for (code, expected) in table {
+            assert_eq!(code.as_str(), expected, "label mismatch for {:?}", code);
+        }
+    }
+}
