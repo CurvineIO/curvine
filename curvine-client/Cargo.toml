@@ -20,6 +20,7 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 log = { workspace = true }
 bytes = { workspace = true }
+serde = { workspace = true }
 pin-project-lite = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }
@@ -29,6 +30,7 @@ moka = { workspace = true }
 fxhash = { workspace = true }
 prometheus = { workspace = true }
 linked-hash-map = { workspace = true }
+rand = { workspace = true }
 
 [features]
 default = ["opendal-s3"]

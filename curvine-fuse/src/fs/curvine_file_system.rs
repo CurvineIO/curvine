@@ -611,7 +611,8 @@ impl fs::FileSystem for CurvineFileSystem {
             | FUSE_SPLICE_WRITE
             | FUSE_SPLICE_READ
             | FUSE_READDIRPLUS_AUTO
-            | FUSE_AUTO_INVAL_DATA;
+            | FUSE_AUTO_INVAL_DATA
+            | FUSE_EXPORT_SUPPORT;
 
         let max_write = FuseUtils::get_fuse_buf_size() - FUSE_BUFFER_HEADER_SIZE;
         let page_size = sys::get_pagesize()?;
