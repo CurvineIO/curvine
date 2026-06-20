@@ -614,7 +614,7 @@ impl SpdkEnv {
 
         // Collect unique controllers for admin completion polling (keep-alive)
         let mut seen = HashSet::new();
-        let mut ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = Vec::capacity(self.bdevs.len());
+        let mut ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = Vec::with_capacity(self.bdevs.len());
         for bdev in &self.bdevs {
             if bdev.ctrlr != 0 && seen.insert(bdev.ctrlr) {
                 ctrlrs.push(bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr);
