@@ -112,3 +112,90 @@ impl From<std::io::Error> for FuseError {
         Self::new(libc::EIO, value.into())
     }
 }
+
+/// Maps an errno integer to a stable, low-cardinality symbolic `&'static str`
+/// label, suitable for the `errno` label on error metrics. Zero-allocation: the
+/// metrics hot path must never format the raw integer or a libc-locale string.
+///
+/// The table is the closed set of errnos actually produced in the FUSE layer
+/// (verified against `libc::E*` usage across `curvine-fuse/src/` plus the
+/// `FsError -> errno` mapping above). Any errno outside the table collapses to
+/// `"OTHER"`; if a new errno starts being produced, add it here and to the
+/// design doc's label table together.
+// Phase 0 enabling primitive: defined here, wired to call sites in Phase 1.
+#[allow(dead_code)]
+pub(crate) fn errno_label(errno: i32) -> &'static str {
+    match errno {
+        libc::ENOENT => "ENOENT",
+        libc::EIO => "EIO",
+        libc::EINTR => "EINTR",
+        libc::ENOSYS => "ENOSYS",
+        libc::EAGAIN => "EAGAIN",
+        libc::EACCES => "EACCES",
+        libc::EBADF => "EBADF",
+        libc::EINVAL => "EINVAL",
+        libc::EPERM => "EPERM",
+        libc::EOPNOTSUPP => "EOPNOTSUPP",
+        libc::EEXIST => "EEXIST",
+        libc::ENOTDIR => "ENOTDIR",
+        libc::EISDIR => "EISDIR",
+        libc::ENOTEMPTY => "ENOTEMPTY",
+        libc::ETIMEDOUT => "ETIMEDOUT",
+        libc::ENOSPC => "ENOSPC",
+        libc::ETXTBSY => "ETXTBSY",
+        libc::EPROTO => "EPROTO",
+        libc::ERANGE => "ERANGE",
+        libc::ENODATA => "ENODATA",
+        libc::ENOMEM => "ENOMEM",
+        libc::EBUSY => "EBUSY",
+        libc::ENAMETOOLONG => "ENAMETOOLONG",
+        _ => "OTHER",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::errno_label;
+
+    #[test]
+    fn errno_label_maps_the_closed_set() {
+        // Full (errno, expected-label) table. Any accidental relabeling must
+        // update this table and the design doc's errno Label rules together.
+        let table = [
+            (libc::ENOENT, "ENOENT"),
+            (libc::EIO, "EIO"),
+            (libc::EINTR, "EINTR"),
+            (libc::ENOSYS, "ENOSYS"),
+            (libc::EAGAIN, "EAGAIN"),
+            (libc::EACCES, "EACCES"),
+            (libc::EBADF, "EBADF"),
+            (libc::EINVAL, "EINVAL"),
+            (libc::EPERM, "EPERM"),
+            (libc::EOPNOTSUPP, "EOPNOTSUPP"),
+            (libc::EEXIST, "EEXIST"),
+            (libc::ENOTDIR, "ENOTDIR"),
+            (libc::EISDIR, "EISDIR"),
+            (libc::ENOTEMPTY, "ENOTEMPTY"),
+            (libc::ETIMEDOUT, "ETIMEDOUT"),
+            (libc::ENOSPC, "ENOSPC"),
+            (libc::ETXTBSY, "ETXTBSY"),
+            (libc::EPROTO, "EPROTO"),
+            (libc::ERANGE, "ERANGE"),
+            (libc::ENODATA, "ENODATA"),
+            (libc::ENOMEM, "ENOMEM"),
+            (libc::EBUSY, "EBUSY"),
+            (libc::ENAMETOOLONG, "ENAMETOOLONG"),
+        ];
+        for (e, expected) in table {
+            assert_eq!(errno_label(e), expected, "label mismatch for errno {}", e);
+        }
+    }
+
+    #[test]
+    fn unmapped_errno_falls_back_to_other() {
+        // An errno not in the table (e.g. ELOOP) collapses to OTHER.
+        assert_eq!(errno_label(libc::ELOOP), "OTHER");
+        assert_eq!(errno_label(0), "OTHER");
+        assert_eq!(errno_label(99999), "OTHER");
+    }
+}

@@ -36,6 +36,7 @@ fn test_spdk_conf() -> SpdkConf {
             .and_then(|v| v.parse().ok())
             .unwrap_or(256),
         reactor_mask: std::env::var("SPDK_REACTOR_MASK").unwrap_or("0x1".to_string()),
+        keep_alive_timeout_ms: 500,
 
         targets: vec![NvmeTarget {
             traddr,
@@ -167,6 +168,20 @@ fn spdk_full_lifecycle() {
             h.join().expect("Concurrent poller I/O thread panicked");
         }
         println!("pass concurrent poller I/O test (8 threads)");
+    }
+
+    // Phase 7b: admin polling prevents KATO disconnect
+    {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let env = get_spdk_env();
+        assert!(
+            !env.bdev_names().is_empty(),
+            "Controller disconnected after idle past KATO"
+        );
+        let mut bdev = SpdkBdev::open_read(&bdev_name, 0, 0).unwrap();
+        let mut buf = vec![0u8; 512];
+        bdev.read_all(&mut buf).unwrap();
+        println!("pass admin polling prevents KATO disconnect test");
     }
 
     // Phase 8: shutdown (must be last — destructive)

@@ -17,6 +17,10 @@ use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Run Curvine benchmarks
+    #[command(name = "bench")]
+    Bench(BenchCommand),
+
     #[command(name = "fs")]
     Fs(FsCommand),
 
