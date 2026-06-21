@@ -200,10 +200,8 @@ RUN if [ -f "/workspace/build/build.sh" ]; then \
         grep -n "vue-cli-service" /workspace/build/build.sh || true; \
     fi
 
-# 8. Build the project from source (with cached cargo registry + target)
-# so only changed crates recompile
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/workspace/target \
+# 8. Build the project from source (with cached cargo registry)
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     echo "Building Curvine from source..." && \
     export CURVINE_HOME=/workspace && \
     # Use workspace tmp directory instead of /tmp to avoid "no space left on device"
