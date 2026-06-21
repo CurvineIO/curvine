@@ -225,7 +225,8 @@ docker-compose-spdk:
 	@echo "  sudo modprobe uio_pci_generic"
 	@echo "  sudo modprobe nvme nvme-fabrics nvme-tcp"
 	@echo ""
-	cd curvine-docker/deploy/spdk && docker compose up --build -d
+	DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
+	docker compose -f curvine-docker/deploy/spdk/docker-compose.yml up --build -d
 	@echo "✓ SPDK stack started. Check status with: docker compose -f curvine-docker/deploy/spdk/docker-compose.yml ps"
 
 # Stop SPDK target + initiator stack
