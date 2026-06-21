@@ -45,6 +45,8 @@ services:
     build:
       context: ../../..
       dockerfile: curvine-docker/deploy/Dockerfile_rocky9
+      args:
+        BUILD_ARGS: "${BUILD_ARGS}"
     network_mode: "host"
     volumes:
       - ${CURVINE_CONF_FILE:-./curvine-cluster-spdk.toml}:/app/curvine/conf/curvine-cluster.toml
@@ -58,6 +60,8 @@ services:
     build:
       context: ../../..
       dockerfile: curvine-docker/deploy/Dockerfile_rocky9
+      args:
+        BUILD_ARGS: "${BUILD_ARGS}"
     network_mode: "host"
     privileged: true
     volumes:
