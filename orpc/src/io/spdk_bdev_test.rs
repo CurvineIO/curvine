@@ -172,7 +172,10 @@ fn spdk_full_lifecycle() {
 
     // Phase 7b: admin polling prevents KATO disconnect
     {
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let conf = test_spdk_conf();
+        std::thread::sleep(std::time::Duration::from_millis(
+            conf.keep_alive_timeout_ms * 3,
+        ));
         let env = get_spdk_env();
         assert!(
             !env.bdev_names().is_empty(),
