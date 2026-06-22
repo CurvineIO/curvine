@@ -164,6 +164,19 @@ impl InnerMap {
     }
 }
 
+/// RAII guard that clears the `refreshing` flag on drop. This guarantees the
+/// flag is released on *every* exit path of the background task — normal
+/// completion, early return, and panic-unwind alike. 
+struct RefreshingGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for RefreshingGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
 pub struct MountCache {
     mounts: RwLock<InnerMap>,
     update_interval: u64,
@@ -257,6 +270,15 @@ impl MountCache {
         let fs = fs.clone();
         let rt = fs.clone_runtime();
         rt.spawn(async move {
+            // Take ownership of the claimed `refreshing` flag via an RAII guard
+            // so it is cleared on every exit path — including a panic in
+            // `do_refresh` (e.g. a poisoned RwLock) — not just on the normal
+            // tail. Without this, a panic here would leak the flag and wedge all
+            // future refreshes. Created before the lock so it covers the whole
+            // task body.
+            let _refreshing = RefreshingGuard {
+                flag: &cache.refreshing,
+            };
             // Hold the single-flight lock for the whole refresh so the semantics
             // match the synchronous path and double-refresh is impossible.
             let _guard = cache.refresh_lock.lock().await;
@@ -265,9 +287,6 @@ impl MountCache {
                     warn!("background mount cache refresh failed: {:?}", e);
                 }
             }
-            // Always clear the flag, even on error, so a future stale read can
-            // schedule another refresh attempt.
-            cache.refreshing.store(false, Ordering::Release);
         });
     }
 
