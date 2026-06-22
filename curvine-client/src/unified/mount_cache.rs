@@ -166,7 +166,7 @@ impl InnerMap {
 
 /// RAII guard that clears the `refreshing` flag on drop. This guarantees the
 /// flag is released on *every* exit path of the background task — normal
-/// completion, early return, and panic-unwind alike. 
+/// completion, early return, and panic-unwind alike.
 struct RefreshingGuard<'a> {
     flag: &'a AtomicBool,
 }
