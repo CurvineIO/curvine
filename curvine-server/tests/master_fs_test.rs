@@ -20,6 +20,7 @@ use curvine_common::proto::{
     CreateFileRequest, DeleteRequest, MkdirOptsProto, MkdirRequest, RenameRequest,
 };
 use curvine_common::raft::storage::{AppStorage, ApplyMsg};
+use curvine_common::raft::RaftPeer;
 use curvine_common::state::MountOptions;
 use curvine_common::state::{
     BlockLocation, ClientAddress, CommitBlock, CreateFileOpts, WorkerInfo,
@@ -34,7 +35,7 @@ use orpc::common::LocalTime;
 use orpc::common::Utils;
 use orpc::message::Builder;
 use orpc::runtime::{AsyncRuntime, RpcRuntime};
-use orpc::CommonResult;
+use orpc::{err_box, CommonResult};
 use raft::eraftpb::Entry;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -265,6 +266,83 @@ fn test_filesystem_metadata_restore_with_full_journal_system_reopen() -> CommonR
     assert_eq!(hash1, fs.sum_hash());
 
     drop(fs);
+    js.shutdown();
+
+    Ok(())
+}
+
+#[test]
+fn test_journal_system_refuses_non_format_start_with_empty_master_dirs() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+    let name = format!("empty-non-format-{}", Utils::rand_str(6));
+    let mut conf = ClusterConf {
+        format_master: false,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir(format!("master-fs-test/meta-{}", name)),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: false,
+            journal_dir: Utils::test_sub_dir(format!("master-fs-test/journal-{}", name)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let _ = std::fs::remove_dir_all(&conf.master.meta_dir);
+    let _ = std::fs::remove_dir_all(&conf.journal.journal_dir);
+    std::fs::create_dir_all(&conf.master.meta_dir)?;
+    std::fs::create_dir_all(&conf.journal.journal_dir)?;
+    conf.format_master = false;
+
+    let err = match JournalSystem::from_conf(&conf) {
+        Ok(js) => {
+            js.shutdown();
+            return err_box!("format_master=false initialized empty master data directories");
+        }
+        Err(e) => e,
+    };
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("format_master=false")
+            && err_msg.contains("missing, empty, or unreadable"),
+        "unexpected error: {}",
+        err_msg
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_journal_system_allows_empty_non_format_start_for_multi_master() -> CommonResult<()> {
+    let _serial = master_fs_test_serial();
+    Master::init_test_metrics();
+    let name = format!("empty-non-format-ha-{}", Utils::rand_str(6));
+    let mut conf = ClusterConf {
+        format_master: false,
+        testing: true,
+        master: MasterConf {
+            meta_dir: Utils::test_sub_dir(format!("master-fs-test/meta-{}", name)),
+            ..Default::default()
+        },
+        journal: JournalConf {
+            enable: false,
+            journal_dir: Utils::test_sub_dir(format!("master-fs-test/journal-{}", name)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    conf.journal.journal_addrs = vec![
+        RaftPeer::new(1, "localhost", conf.journal.rpc_port),
+        RaftPeer::new(2, "localhost", conf.journal.rpc_port + 1),
+    ];
+    let _ = std::fs::remove_dir_all(&conf.master.meta_dir);
+    let _ = std::fs::remove_dir_all(&conf.journal.journal_dir);
+    std::fs::create_dir_all(&conf.master.meta_dir)?;
+    std::fs::create_dir_all(&conf.journal.journal_dir)?;
+
+    let js = JournalSystem::from_conf(&conf)?;
     js.shutdown();
 
     Ok(())
