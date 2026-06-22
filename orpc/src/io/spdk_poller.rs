@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 const EVENTSZ: usize = std::mem::size_of::<u64>();
 /// I/O operation submitted to the poller thread.
@@ -94,10 +95,10 @@ impl IoCompletion {
                 inner = self.cond.wait(inner).unwrap();
             }
         } else {
-            let timeout = std::time::Duration::from_micros(timeout_us);
-            let deadline = std::time::Instant::now() + timeout;
+            let timeout = Duration::from_micros(timeout_us);
+            let deadline = Instant::now() + timeout;
             while !inner.done {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return -libc::ETIMEDOUT;
                 }
@@ -223,7 +224,7 @@ impl SpdkPoller {
         if let Some(tx) = &self.tx {
             let _ = tx.send(req);
             let _ = self.eventfd.write(1);
-            match ack_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            match ack_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(()) => true,
                 Err(_) => {
                     error!("Unregister timeout: poller may be stuck, qpair not removed");
@@ -276,7 +277,11 @@ impl SpdkPoller {
 
             // Active state: drain all pending I/Os and poll completions
             if matches!(state, PollerState::Active) {
-                // Drain pending requests (non-blocking)
+                // Drain pending requests (non-blocking) - yield to admin completions every ~128 ops
+                // to prevent keep-alive timeout during heavy I/O bursts.
+                let delta = Duration::from_millis(config.poll_interval_ms);
+                let mut deadline = Instant::now() + delta;
+                let mut drain_count: u64 = 0;
                 while let Ok(req) = rx.try_recv() {
                     if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                         Self::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs);
@@ -287,6 +292,11 @@ impl SpdkPoller {
                             &mut dead_qpairs,
                             config.io_queue_depth,
                         );
+                    }
+                    drain_count += 1;
+                    if drain_count & 0x7F == 0 && Instant::now() >= deadline {
+                        Self::process_admin_completions(&active_ctrlrs);
+                        deadline = Instant::now() + delta;
                     }
                 }
 
@@ -371,7 +381,10 @@ impl SpdkPoller {
                             libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, EVENTSZ)
                         };
 
-                        // Drain any pending channel data
+                        // Drain any pending channel data — yield to admin completions every ~128 ops.
+                        let delta = Duration::from_millis(config.poll_interval_ms);
+                        let mut deadline = Instant::now() + delta;
+                        let mut drain_count: u64 = 0;
                         while let Ok(req) = rx.try_recv() {
                             if matches!(req.op, IoOp::UnregisterQpair { .. }) {
                                 Self::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs);
@@ -382,6 +395,11 @@ impl SpdkPoller {
                                     &mut dead_qpairs,
                                     config.io_queue_depth,
                                 );
+                            }
+                            drain_count += 1;
+                            if drain_count & 0x7F == 0 && Instant::now() >= deadline {
+                                Self::process_admin_completions(&active_ctrlrs);
+                                deadline = Instant::now() + delta;
                             }
                         }
 

@@ -362,13 +362,15 @@ impl SpdkConf {
             } else {
                 self.keep_alive_timeout_ms
             };
-            if resolved_ka_ms < self.poll_interval_ms {
+            let min_ka_ms = self.poll_interval_ms * 3;
+            if resolved_ka_ms < min_ka_ms {
                 return err_box!(
-                    "SpdkConf: targets[{}]: resolved keep_alive_timeout_ms ({}) \
-                     must be >= poll_interval_ms ({})",
+                    "SpdkConf: targets[{}]: keep_alive_timeout_ms ({}) must be \
+                     >= 3 * poll_interval_ms ({}) as the worst-case idle->active gap spans \
+                     ~2 poll intervals, requiring 1 interval margin for safety",
                     i,
                     resolved_ka_ms,
-                    self.poll_interval_ms
+                    min_ka_ms
                 );
             }
         }
@@ -1214,7 +1216,7 @@ mod test {
                     traddr: "10.0.0.1".into(),
                     trsvcid: 4420,
                     subnqn: "nqn.test".into(),
-                    keep_alive_timeout_ms: 200, // above poll_interval_ms
+                    keep_alive_timeout_ms: 300, // >= 3 * poll_interval_ms
                     ..Default::default()
                 }],
                 ..Default::default()
