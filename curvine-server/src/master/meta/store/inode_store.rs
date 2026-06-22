@@ -14,7 +14,7 @@
 
 use crate::master::fs::DeleteResult;
 use crate::master::meta::inode::ttl::TtlBucketList;
-use crate::master::meta::inode::{InodeFile, InodePath, InodeView, ROOT_INODE_ID};
+use crate::master::meta::inode::{Inode, InodeFile, InodePath, InodeView, ROOT_INODE_ID};
 use crate::master::meta::store::{InodeWriteBatch, RocksInodeStore};
 use crate::master::meta::{FileSystemStats, FsDir, LockMeta};
 use curvine_common::rocksdb::{DBConf, RocksUtils};
@@ -74,19 +74,24 @@ impl InodeStore {
         Ok(())
     }
 
-    pub fn apply_delete(&self, parent: &InodeView, del: &InodeView) -> CommonResult<DeleteResult> {
+    pub fn apply_delete(
+        &self,
+        parent: &InodeView,
+        del: &InodeView,
+        del_name: &str,
+    ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
         batch.write_inode(parent)?;
 
         let mut stack = LinkedList::new();
-        stack.push_back((parent.id(), del.clone()));
+        stack.push_back((parent.id(), del_name.to_string(), del.clone()));
         let mut del_res = DeleteResult::new();
         let mut deleted_files = 0i64;
         let mut deleted_dirs = 0i64;
 
-        while let Some((parent_id, inode)) = stack.pop_front() {
+        while let Some((parent_id, edge_name, inode)) = stack.pop_front() {
             // Delete inode edges
-            batch.delete_child(parent_id, inode.name())?;
+            batch.delete_child(parent_id, &edge_name)?;
             del_res.inodes += 1;
 
             match &inode {
@@ -99,7 +104,7 @@ impl InodeStore {
                         deleted_dirs += 1;
                     }
                     for item in dir.children_iter() {
-                        stack.push_back((inode.id(), item.clone()))
+                        stack.push_back((inode.id(), item.name().to_string(), item.clone()))
                     }
                 }
 
@@ -136,13 +141,23 @@ impl InodeStore {
         &self,
         src_parent: &InodeView,
         src_inode: &InodeView,
+        src_name: &str,
         dst_parent: &InodeView,
         dst_inode: &InodeView,
     ) -> CommonResult<()> {
+        if src_inode.id() != dst_inode.id() {
+            return err_box!(
+                "rename inode id mismatch: source id {}, destination id {}",
+                src_inode.id(),
+                dst_inode.id()
+            );
+        }
+
         let mut batch = self.store.new_batch();
 
-        // Delete the old node using the original name
-        batch.delete_child(src_parent.id(), src_inode.name())?;
+        // The edge name is the namespace key. The inode name is duplicated metadata
+        // and may lag behind after older bugs or checkpoint restore.
+        batch.delete_child(src_parent.id(), src_name)?;
 
         // Add new node.
         batch.write_inode(dst_inode)?;
@@ -286,6 +301,7 @@ impl InodeStore {
         &self,
         parent: &InodeView,
         child: &InodeView,
+        child_name: &str,
     ) -> CommonResult<DeleteResult> {
         let mut batch = self.store.new_batch();
 
@@ -293,7 +309,7 @@ impl InodeStore {
         batch.write_inode(parent)?;
 
         // Remove the child from the parent's children list
-        batch.delete_child(parent.id(), child.name())?;
+        batch.delete_child(parent.id(), child_name)?;
 
         // Decrement nlink count of the file being unlinked.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
@@ -314,15 +330,24 @@ impl InodeStore {
         &self,
         parent: &InodeView,
         child: &InodeView,
+        child_name: &str,
         inode_id: i64,
     ) -> CommonResult<DeleteResult> {
+        if child.id() != inode_id {
+            return err_box!(
+                "unlink FileEntry->inode id mismatch: entry references inode id {}, caller passed inode id {}",
+                child.id(),
+                inode_id
+            );
+        }
+
         let mut batch = self.store.new_batch();
 
         // Write the updated parent directory
         batch.write_inode(parent)?;
 
         // Remove the FileEntry from the parent's children list
-        batch.delete_child(parent.id(), child.name())?;
+        batch.delete_child(parent.id(), child_name)?;
 
         // Decrement nlink count of the original inode.
         // If nlink reaches 0 the inode is also deleted and del_res.blocks will be populated.
@@ -393,11 +418,14 @@ impl InodeStore {
         let mut last_inode_id = ROOT_INODE_ID;
         let mut file_count = 0i64;
         let mut dir_count = 0i64;
+        let mut dir_edges: HashMap<i64, (i64, String)> = HashMap::new();
+        let mut repair_batch = self.store.new_batch();
+        let mut has_repairs = false;
         while let Some((mut parent, child_id, file_entry)) = stack.pop_front() {
             last_inode_id = last_inode_id.max(child_id);
 
             let next_parent = if child_id != ROOT_INODE_ID {
-                let store_inode = match self.store.get_inode(child_id)? {
+                let mut store_inode = match self.store.get_inode(child_id)? {
                     Some(v) => v,
                     None => {
                         // Orphaned edge: inode was deleted but edge was not cleaned up
@@ -410,12 +438,41 @@ impl InodeStore {
                         continue;
                     }
                 };
-                self.ttl_bucket_list.add(&store_inode);
+                let parent_id = parent.id();
+                let edge_name = file_entry.name().to_string();
 
-                let inode = if matches!(store_inode, InodeView::Dir(_)) {
-                    store_inode
-                } else {
-                    file_entry
+                let inode = match store_inode {
+                    InodeView::Dir(_) => {
+                        if let Some((old_parent_id, old_name)) = dir_edges.get(&child_id) {
+                            log::warn!(
+                                "create_tree: directory inode {} has multiple parent edges: keeping parent {} name '{}', dropping parent {} name '{}'",
+                                child_id,
+                                old_parent_id,
+                                old_name,
+                                parent_id,
+                                edge_name
+                            );
+                            repair_batch.delete_child(parent_id, &edge_name)?;
+                            has_repairs = true;
+                            continue;
+                        }
+                        dir_edges.insert(child_id, (parent_id, edge_name.clone()));
+
+                        if store_inode.name() != edge_name
+                            || store_inode.as_dir_ref()?.parent_id() != parent_id
+                        {
+                            store_inode.change_name(edge_name);
+                            store_inode.set_parent_id(parent_id);
+                            repair_batch.write_inode(&store_inode)?;
+                            has_repairs = true;
+                        }
+                        self.ttl_bucket_list.add(&store_inode);
+                        store_inode
+                    }
+                    _ => {
+                        self.ttl_bucket_list.add(&store_inode);
+                        file_entry
+                    }
                 };
 
                 // Count files and directories during tree reconstruction
@@ -449,7 +506,12 @@ impl InodeStore {
             }
         }
 
-        // Update statistics with the counts from tree reconstruction
+        if has_repairs {
+            repair_batch.commit()?;
+        }
+
+        // Update statistics with the counts from tree reconstruction after any
+        // durable repairs have succeeded.
         self.fs_stats.set_counts(file_count, dir_count);
 
         Ok((last_inode_id, root))
@@ -636,5 +698,116 @@ impl InodeStore {
 
     pub fn store(&self) -> &RocksInodeStore {
         &self.store
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::master::meta::inode::ttl::TtlBucketList;
+    use crate::master::meta::inode::{Inode, InodeDir, ROOT_INODE_ID};
+    use crate::master::Master;
+
+    fn new_store(name: &str) -> CommonResult<InodeStore> {
+        Master::init_test_metrics();
+        let conf = DBConf::new(Utils::test_sub_dir(format!(
+            "inode-store-test/{}-{}",
+            name,
+            Utils::rand_str(6)
+        )));
+        let rocks = RocksInodeStore::new(conf, true)?;
+        Ok(InodeStore::new(rocks, Arc::new(TtlBucketList::new(60_000))))
+    }
+
+    #[test]
+    fn apply_rename_deletes_source_edge_name_not_directory_inode_name() -> CommonResult<()> {
+        let store = new_store("rename-source-edge-name")?;
+        let root = FsDir::create_root();
+        let src_parent = root.clone();
+        let dst_parent = root.clone();
+        let src_inode = InodeView::new_dir("inode-name".to_string(), InodeDir::new(2001, 0));
+        let mut dst_inode = src_inode.clone();
+        dst_inode.change_name("renamed".to_string());
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&src_inode)?;
+            batch.add_child(ROOT_INODE_ID, "edge-name", src_inode.id())?;
+            batch.commit()?;
+        }
+
+        store.apply_rename(
+            &src_parent,
+            &src_inode,
+            "edge-name",
+            &dst_parent,
+            &dst_inode,
+        )?;
+
+        let (_, restored) = store.create_tree()?;
+        let names: Vec<&str> = restored
+            .children()
+            .into_iter()
+            .map(|child| child.name())
+            .collect();
+        assert_eq!(names, vec!["renamed"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_tree_drops_duplicate_directory_edges() -> CommonResult<()> {
+        let store = new_store("drop-dir-alias")?;
+        let root = FsDir::create_root();
+        let dir = InodeView::new_dir("dir".to_string(), InodeDir::new(2002, 0));
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&dir)?;
+            batch.add_child(ROOT_INODE_ID, "a", dir.id())?;
+            batch.add_child(ROOT_INODE_ID, "b", dir.id())?;
+            batch.commit()?;
+        }
+
+        let (_, restored) = store.create_tree()?;
+        let names: Vec<&str> = restored.children().into_iter().map(|c| c.name()).collect();
+        assert_eq!(names, vec!["a"]);
+
+        let edge_count = store.store.edges_iter(ROOT_INODE_ID)?.count();
+        assert_eq!(edge_count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_tree_persists_directory_edge_hydration() -> CommonResult<()> {
+        let store = new_store("persist-dir-edge-hydration")?;
+        let root = FsDir::create_root();
+        let dir = InodeView::new_dir("stale-name".to_string(), InodeDir::new(2003, 0));
+
+        {
+            let mut batch = store.new_batch();
+            batch.write_inode(&root)?;
+            batch.write_inode(&dir)?;
+            batch.add_child(ROOT_INODE_ID, "edge-name", dir.id())?;
+            batch.commit()?;
+        }
+
+        let (_, restored) = store.create_tree()?;
+        let child = restored
+            .get_child("edge-name")
+            .expect("edge name should be hydrated into restored tree");
+        assert_eq!(child.name(), "edge-name");
+
+        let persisted = store
+            .store
+            .get_inode(dir.id())?
+            .expect("directory inode should still exist");
+        assert_eq!(persisted.name(), "edge-name");
+        assert_eq!(persisted.as_dir_ref()?.parent_id(), ROOT_INODE_ID);
+
+        Ok(())
     }
 }
