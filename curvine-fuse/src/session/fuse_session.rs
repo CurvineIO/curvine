@@ -54,6 +54,12 @@ impl<T: FileSystem> FuseSession<T> {
     pub async fn new(rt: Arc<Runtime>, fs: T, conf: FuseConf) -> FuseResult<Self> {
         let mnts = Self::setup_mnts(&conf, &fs).await?;
 
+        if let Some(kb) = conf.max_readahead_kb {
+            for mnt in &mnts {
+                crate::session::bdi::apply_max_readahead_kb(&mnt.path, kb);
+            }
+        }
+
         let fs = Arc::new(fs);
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
