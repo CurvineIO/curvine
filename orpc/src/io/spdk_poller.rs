@@ -118,7 +118,7 @@ pub struct IoRequest {
     pub op: IoOp,
     pub completion: Arc<IoCompletion>,
     /// Per-bdev in-flight counter. Decremented on completion.
-    pub bdev_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub bdev_inflight: std::sync::Arc<AtomicUsize>,
     /// Per-qpair dead flag. Set by the poller when qpair poll fails;
     /// checked by the bdev to fail subsequent I/Os fast.
     pub qpair_dead: std::sync::Arc<AtomicBool>,
@@ -135,12 +135,19 @@ enum PollerState {
     Idle,
 }
 
+/// SPDK NVMe controller handle — thread-safe.
+#[repr(transparent)]
+pub struct CtrlHandle(pub *mut spdk_ffi::spdk_nvme_ctrlr);
+
+// SAFETY: opaque SPDK handle; admin completion is thread-safe.
+unsafe impl Send for CtrlHandle {}
+
 /// Configuration for the poller thread.
 pub struct PollerConfig {
     pub poll_interval_ms: u64,
     pub spin_iter: u32,
     pub io_queue_depth: usize,
-    pub ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr>,
+    pub ctrlrs: Vec<CtrlHandle>,
 }
 
 /// Poller thread handle.
@@ -215,7 +222,7 @@ impl SpdkPoller {
         let req = IoRequest {
             op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
             completion: IoCompletion::new(),
-            bdev_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bdev_inflight: Arc::new(AtomicUsize::new(0)),
             qpair_dead: Arc::new(AtomicBool::new(false)),
         };
         if let Some(tx) = &self.tx {
@@ -252,7 +259,7 @@ impl SpdkPoller {
         mut config: PollerConfig,
     ) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
-        let active_ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = std::mem::take(&mut config.ctrlrs);
+        let active_ctrlrs: Vec<CtrlHandle> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
@@ -600,11 +607,11 @@ impl SpdkPoller {
     }
 
     /// Process admin completions on all controllers to service keep-alive.
-    fn process_admin_completions(ctrlrs: &[*mut spdk_ffi::spdk_nvme_ctrlr]) {
-        for &ctrlr in ctrlrs {
-            let rc = unsafe { spdk_ffi::spdk_nvme_ctrlr_process_admin_completions(ctrlr) };
+    fn process_admin_completions(ctrlrs: &[CtrlHandle]) {
+        for handle in ctrlrs {
+            let rc = unsafe { spdk_ffi::spdk_nvme_ctrlr_process_admin_completions(handle.0) };
             if rc < 0 {
-                warn!("ctrlr {:p} admin completion error: rc={}", ctrlr, rc);
+                warn!("ctrlr {:p} admin completion error: rc={}", handle.0, rc);
             }
         }
     }
@@ -621,7 +628,7 @@ struct QpairState {
 struct CallbackCtx {
     completion: Arc<IoCompletion>,
     async_ctx: spdk_ffi::curvine_async_ctx,
-    bdev_inflight: Arc<std::sync::atomic::AtomicUsize>,
+    bdev_inflight: Arc<AtomicUsize>,
     /// Points back to the qpair's QpairState
     qpair_state: *mut QpairState,
     /// Index into QpairState::pending

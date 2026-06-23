@@ -3,7 +3,7 @@
 use crate::common::DurationUnit;
 use crate::err_msg;
 use crate::io::spdk_ffi;
-use crate::io::spdk_poller::PollerConfig;
+use crate::io::spdk_poller::{CtrlHandle, PollerConfig};
 use crate::io::spdk_poller::{IoRequest, SpdkPoller};
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
@@ -616,10 +616,10 @@ impl SpdkEnv {
 
         // Collect unique controllers for admin completion polling (keep-alive)
         let mut seen = HashSet::new();
-        let mut ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = Vec::with_capacity(self.bdevs.len());
+        let mut ctrlrs: Vec<CtrlHandle> = Vec::with_capacity(self.bdevs.len());
         for bdev in &self.bdevs {
             if bdev.ctrlr != 0 && seen.insert(bdev.ctrlr) {
-                ctrlrs.push(bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr);
+                ctrlrs.push(CtrlHandle(bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr));
             }
         }
 
