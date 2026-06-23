@@ -147,8 +147,11 @@ LABEL org.opencontainers.image.description="Curvine Native Kubernetes Runtime Im
 # The compile image has ENTRYPOINT ["/bin/bash", "-c"] which can interfere with RUN
 ENTRYPOINT []
 
-# Build-time SPDK feature selection: --spdk (TCP only) or --spdk-rdma (TCP + RDMA)
-ARG SPDK_FLAG=--spdk-rdma
+# Build-time package/UFS/feature selection (override with --build-arg BUILD_ARGS="...")
+# Examples:
+#   -p core --ufs opendal-s3 --spdk-rdma                   # Core + S3 + SPDK-RDMA
+#   -p server -p client -p tests --ufs opendal-s3 --spdk   # Bench + SPDK-TCP only
+ARG BUILD_ARGS="--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs --spdk-rdma"
 
 # Copy and apply build configurations
 COPY curvine-docker/deploy/config /build-config/config
@@ -208,8 +211,8 @@ RUN echo "Building Curvine from source..." && \
     # Build with retry mechanism
     for attempt in 1 2 3; do \
         echo "Build attempt $attempt..." && \
-        if make all ARGS="--skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs ${SPDK_FLAG}"; then \
-            echo "✓ Build succeeded with 'make all --skip-java-sdk --ufs opendal-s3 --ufs opendal-oss --ufs opendal-azblob --ufs opendal-gcs --ufs opendal-hdfs-native --ufs oss-hdfs ${SPDK_FLAG}'" && \
+        if make all ARGS="${BUILD_ARGS}"; then \
+            echo "✓ Build succeeded with 'make all ${BUILD_ARGS}'" && \
             break; \
         else \
             echo "✗ Build attempt $attempt failed" && \
