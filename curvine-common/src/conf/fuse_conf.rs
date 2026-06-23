@@ -148,7 +148,7 @@ pub struct FuseConf {
     ///
     /// When set (recommended: 1024 = 1 MiB), curvine-fuse will, after each
     /// successful mount, write the value to
-    /// `/sys/class/bdi/<major>:<minor>/max_readahead_kb` and bump the FUSE
+    /// `/sys/class/bdi/<major>:<minor>/read_ahead_kb` and bump the FUSE
     /// init `max_readahead` to at least `value * 1024` bytes, so the kernel
     /// can issue larger sequential read requests.
     ///

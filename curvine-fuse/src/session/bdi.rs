@@ -28,6 +28,12 @@ use std::path::Path;
 use log::{info, warn};
 
 #[cfg(target_os = "linux")]
+const BDI_RETRY_COUNT: u32 = 10;
+
+#[cfg(target_os = "linux")]
+const BDI_RETRY_DELAY_MS: u64 = 200;
+
+#[cfg(target_os = "linux")]
 fn bdi_path_from_majmin(majmin: &str) -> String {
     format!("/sys/class/bdi/{}/read_ahead_kb", majmin)
 }
@@ -89,7 +95,7 @@ pub fn apply_max_readahead_kb(mnt_path: &Path, kb: u32) {
     // The BDI sysfs entry may not be immediately available after the mount
     // syscall. Retry a few times with a short delay to give the kernel time
     // to create /sys/class/bdi/<maj>:<min>/read_ahead_kb.
-    let mut tries = 10;
+    let mut tries = BDI_RETRY_COUNT;
     while tries > 0 {
         match std::fs::write(&bdi_path, kb.to_string()) {
             Ok(()) => {
@@ -104,7 +110,7 @@ pub fn apply_max_readahead_kb(mnt_path: &Path, kb: u32) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tries -= 1;
                 if tries > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    std::thread::sleep(std::time::Duration::from_millis(BDI_RETRY_DELAY_MS));
                 }
             }
             Err(e) => {
@@ -146,6 +152,42 @@ mod tests {
         assert_eq!(
             mountinfo_bdi_path_from(mountinfo, Path::new("/curvine-fuse")),
             Some("/sys/class/bdi/0:114/read_ahead_kb".to_string())
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_returns_none_when_not_found() {
+        let mountinfo = "126 32 0:114 / /curvine-fuse rw,relatime shared:98 - fuse curvinefs rw\n";
+        assert_eq!(
+            mountinfo_bdi_path_from(mountinfo, Path::new("/other/mount")),
+            None
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_returns_none_on_empty() {
+        assert_eq!(mountinfo_bdi_path_from("", Path::new("/curvine-fuse")), None);
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_skips_malformed_lines() {
+        // A line with too few fields (no majmin, no mount point) must be skipped.
+        let mountinfo = "bad line\n126 32 0:114 / /curvine-fuse rw - fuse curvinefs rw\n";
+        assert_eq!(
+            mountinfo_bdi_path_from(mountinfo, Path::new("/curvine-fuse")),
+            Some("/sys/class/bdi/0:114/read_ahead_kb".to_string())
+        );
+    }
+
+    #[test]
+    fn mountinfo_bdi_path_from_picks_correct_entry_from_multiple() {
+        let mountinfo = concat!(
+            "126 32 0:114 / /curvine-fuse rw,relatime shared:98 - fuse curvinefs rw\n",
+            "127 32 8:1   / /other       rw,relatime shared:99 - ext4 /dev/sda1  rw\n",
+        );
+        assert_eq!(
+            mountinfo_bdi_path_from(mountinfo, Path::new("/other")),
+            Some("/sys/class/bdi/8:1/read_ahead_kb".to_string())
         );
     }
 
