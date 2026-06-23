@@ -1,716 +1,140 @@
 #![cfg(feature = "spdk")]
-
-//! SPDK I/O poller thread - handles NVMe submit/poll on dedicated thread.
-use crate::io::spdk_ffi;
-/// Qpairs not thread-safe: submit + poll must on same thread.
-/// Single poller to demonstrate the correctness work.
-/// Uses eventfd for instant wake on new I/O submission.
-/// TODO: shard to multiple pollers (one per controller).
-///
-/// ## Disconnect Detection
-/// Detected via periodic keep-alive poll every 1s while idle (~1s latency).
-/// TODO: SPDK fabric eventfd for immediate detection.
-use log::{error, info};
-use nix::sys::eventfd::{EfdFlags, EventFd};
-use std::collections::HashMap;
-use std::ffi::c_void;
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
-
-const EVENTSZ: usize = std::mem::size_of::<u64>();
-/// I/O operation submitted to the poller thread.
-pub enum IoOp {
-    Read {
-        ns: *mut spdk_ffi::spdk_nvme_ns,
-        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+#![allow(non_camel_case_types, non_snake_case, dead_code)]
+use std::ffi::{c_char, c_int, c_void};
+// Transport type constants
+pub const SPDK_NVME_TRANSPORT_RDMA: c_int = 1;
+pub const SPDK_NVME_TRANSPORT_TCP: c_int = 3;
+// Address family constants
+pub const SPDK_NVMF_ADRFAM_IPV4: c_int = 1;
+pub const SPDK_NVMF_ADRFAM_IPV6: c_int = 2;
+// SPDK structs - opaque byte buffers
+pub enum spdk_nvme_ctrlr {}
+pub enum spdk_nvme_ns {}
+pub enum spdk_nvme_qpair {}
+#[repr(C, align(8))]
+pub struct spdk_env_opts {
+    pub data: [u8; 4096],
+}
+#[repr(C, align(8))]
+pub struct spdk_nvme_transport_id {
+    pub data: [u8; 4096],
+}
+#[repr(C, align(8))]
+pub struct spdk_nvme_ctrlr_opts {
+    pub data: [u8; 8192],
+}
+extern "C" {
+    // Environment (via C helper)
+    pub fn curvine_spdk_env_opts_sizeof() -> usize;
+    pub fn curvine_spdk_env_opts_init(opts: *mut spdk_env_opts);
+    pub fn curvine_spdk_env_opts_set_name(opts: *mut spdk_env_opts, name: *const c_char);
+    pub fn curvine_spdk_env_opts_set_core_mask(opts: *mut spdk_env_opts, mask: *const c_char);
+    pub fn curvine_spdk_env_opts_set_mem_size(opts: *mut spdk_env_opts, mem_size: c_int);
+    pub fn curvine_spdk_env_init(opts: *mut spdk_env_opts) -> c_int;
+    pub fn spdk_env_fini();
+    // Transport ID (via C helper)
+    pub fn curvine_spdk_trid_sizeof() -> usize;
+    pub fn curvine_spdk_trid_set_trtype(trid: *mut spdk_nvme_transport_id, trtype: c_int);
+    pub fn curvine_spdk_trid_set_adrfam(trid: *mut spdk_nvme_transport_id, adrfam: c_int);
+    pub fn curvine_spdk_trid_set_traddr(trid: *mut spdk_nvme_transport_id, traddr: *const c_char);
+    pub fn curvine_spdk_trid_set_trsvcid(trid: *mut spdk_nvme_transport_id, trsvcid: *const c_char);
+    pub fn curvine_spdk_trid_set_subnqn(trid: *mut spdk_nvme_transport_id, subnqn: *const c_char);
+    // Controller opts (via C helper)
+    pub fn curvine_spdk_ctrlr_opts_sizeof() -> usize;
+    pub fn curvine_spdk_ctrlr_get_default_opts(opts: *mut spdk_nvme_ctrlr_opts);
+    pub fn curvine_spdk_ctrlr_opts_set_num_io_queues(opts: *mut spdk_nvme_ctrlr_opts, num: u32);
+    pub fn curvine_spdk_ctrlr_opts_set_keep_alive_timeout_ms(
+        opts: *mut spdk_nvme_ctrlr_opts,
+        ms: u32,
+    );
+    pub fn curvine_spdk_ctrlr_opts_set_hostnqn(
+        opts: *mut spdk_nvme_ctrlr_opts,
+        hostnqn: *const c_char,
+    );
+    // Connect / namespace
+    pub fn curvine_spdk_nvme_connect(
+        trid: *mut spdk_nvme_transport_id,
+        opts: *mut spdk_nvme_ctrlr_opts,
+    ) -> *mut spdk_nvme_ctrlr;
+    pub fn spdk_nvme_detach(ctrlr: *mut spdk_nvme_ctrlr) -> c_int;
+    pub fn spdk_nvme_ctrlr_get_num_ns(ctrlr: *mut spdk_nvme_ctrlr) -> u32;
+    pub fn spdk_nvme_ctrlr_get_ns(ctrlr: *mut spdk_nvme_ctrlr, ns_id: u32) -> *mut spdk_nvme_ns;
+    pub fn spdk_nvme_ns_is_active(ns: *mut spdk_nvme_ns) -> bool;
+    pub fn spdk_nvme_ns_get_sector_size(ns: *mut spdk_nvme_ns) -> u32;
+    pub fn spdk_nvme_ns_get_num_sectors(ns: *mut spdk_nvme_ns) -> u64;
+    pub fn curvine_spdk_register_transports();
+    // DMA buffer
+    pub fn curvine_spdk_dma_malloc(size: u64, align: u64) -> *mut c_void;
+    pub fn curvine_spdk_dma_free(buf: *mut c_void);
+    // I/O qpair
+    pub fn curvine_spdk_alloc_io_qpair(ctrlr: *mut spdk_nvme_ctrlr) -> *mut spdk_nvme_qpair;
+    pub fn curvine_spdk_free_io_qpair(qpair: *mut spdk_nvme_qpair);
+    // Sync NVMe I/O (unused, to remove)
+    pub fn curvine_spdk_ns_read(
+        ns: *mut spdk_nvme_ns,
+        qpair: *mut spdk_nvme_qpair,
         buf: *mut c_void,
         offset: u64,
         num_bytes: u64,
-    },
-    Write {
-        ns: *mut spdk_ffi::spdk_nvme_ns,
-        qpair: *mut spdk_ffi::spdk_nvme_qpair,
+        timeout_us: u64,
+    ) -> c_int;
+    pub fn curvine_spdk_ns_write(
+        ns: *mut spdk_nvme_ns,
+        qpair: *mut spdk_nvme_qpair,
         buf: *mut c_void,
         offset: u64,
         num_bytes: u64,
-    },
-    Flush {
-        ns: *mut spdk_ffi::spdk_nvme_ns,
-        qpair: *mut spdk_ffi::spdk_nvme_qpair,
-    },
-    /// Unregister a qpair from the poller before it is freed.
-    UnregisterQpair {
-        qpair: *mut spdk_ffi::spdk_nvme_qpair,
-        ack: mpsc::Sender<()>,
-    },
+        timeout_us: u64,
+    ) -> c_int;
+    pub fn curvine_spdk_ns_flush(
+        ns: *mut spdk_nvme_ns,
+        qpair: *mut spdk_nvme_qpair,
+        timeout_us: u64,
+    ) -> c_int;
 }
 
-// SAFETY: exclusive ownership - blocks until completion.
-unsafe impl Send for IoOp {}
-
-/// Completion state shared between poller callback and waiting handler.
-pub struct IoCompletion {
-    inner: Mutex<IoCompletionInner>,
-    cond: Condvar,
+// Async context - opaque C struct (byte buffer)
+#[repr(C)]
+pub struct curvine_async_ctx {
+    pub data: [u8; 64], // oversized to accommodate any SPDK version
 }
 
-struct IoCompletionInner {
-    done: bool,
-    status: i32,
-}
-
-impl IoCompletion {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(IoCompletionInner {
-                done: false,
-                status: 0,
-            }),
-            cond: Condvar::new(),
-        })
-    }
-
-    /// Called by C callback on completion.
-    /// Returns true if this call actually completed the I/O (first call wins).
-    pub fn complete(&self, status: i32) -> bool {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.done {
-            return false;
-        }
-        inner.done = true;
-        inner.status = status;
-        self.cond.notify_one();
-        true
-    }
-
-    /// Block until complete or timeout. Returns NVMe status.
-    pub fn wait(&self, timeout_us: u64) -> i32 {
-        let mut inner = self.inner.lock().unwrap();
-        if timeout_us == 0 {
-            while !inner.done {
-                inner = self.cond.wait(inner).unwrap();
-            }
-        } else {
-            let timeout = std::time::Duration::from_micros(timeout_us);
-            let deadline = std::time::Instant::now() + timeout;
-            while !inner.done {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    return -libc::ETIMEDOUT;
-                }
-                let (guard, result) = self.cond.wait_timeout(inner, remaining).unwrap();
-                inner = guard;
-                if result.timed_out() && !inner.done {
-                    return -libc::ETIMEDOUT;
-                }
-            }
-        }
-        inner.status
-    }
-}
-
-/// Request sent from handler threads to the poller.
-pub struct IoRequest {
-    pub op: IoOp,
-    pub completion: Arc<IoCompletion>,
-    /// Per-bdev in-flight counter. Decremented on completion.
-    pub bdev_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Per-qpair dead flag. Set by the poller when qpair poll fails;
-    /// checked by the bdev to fail subsequent I/Os fast.
-    pub qpair_dead: std::sync::Arc<AtomicBool>,
-}
-
-// SAFETY: exclusive ownership - blocks until completion.
-unsafe impl Send for IoRequest {}
-
-/// Poller states
-enum PollerState {
-    /// Active processing I/O - try_recv loop
-    Active,
-    /// Idle, blocked on eventfd waiting for work
-    Idle,
-}
-
-/// Configuration for the poller thread.
-pub struct PollerConfig {
-    pub poll_interval_ms: u64,
-    pub spin_iter: u32,
-    pub io_queue_depth: usize,
-}
-
-/// Poller thread handle.
-pub struct SpdkPoller {
-    /// Channel sender for I/O submissions
-    tx: Option<crossbeam::channel::Sender<IoRequest>>,
-    /// Eventfd for instant wake signaling
-    eventfd: Arc<EventFd>,
-    shutdown: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-    /// Whether poller is blocked on eventfd (idle). Bdevs check this to
-    /// skip eventfd write syscall when poller is already active.
-    is_sleeping: Arc<AtomicBool>,
-}
-
-impl SpdkPoller {
-    /// Spawn a new poller thread with the given config.
-    pub fn start(config: PollerConfig) -> Self {
-        let (tx, rx) = crossbeam::channel::unbounded::<IoRequest>();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
-        let is_sleeping = Arc::new(AtomicBool::new(false));
-        let is_sleeping_clone = is_sleeping.clone();
-
-        // Create eventfd for wake signaling
-        let eventfd = EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK)
-            .expect("Failed to create eventfd");
-        let eventfd_raw = eventfd.as_raw_fd();
-        let eventfd_arc = Arc::new(eventfd);
-
-        let handle = std::thread::Builder::new()
-            .name("spdk-poller".to_string())
-            .spawn(move || {
-                Self::poller_loop(rx, shutdown_clone, is_sleeping_clone, eventfd_raw, config);
-            })
-            .expect("Failed to spawn SPDK poller thread");
-
-        Self {
-            tx: Some(tx),
-            eventfd: eventfd_arc,
-            shutdown,
-            handle: Some(handle),
-            is_sleeping,
-        }
-    }
-
-    /// Get sender for SpdkBdev to hold.
-    pub fn sender(&self) -> crossbeam::channel::Sender<IoRequest> {
-        self.tx.as_ref().expect("Poller stopped").clone()
-    }
-
-    /// Get eventfd for signaling new I/O
-    pub fn eventfd(&self) -> RawFd {
-        self.eventfd.as_raw_fd()
-    }
-
-    /// Get eventfd as Arc for sharing with multiple bdevs
-    pub fn eventfd_arc(&self) -> Arc<EventFd> {
-        self.eventfd.clone()
-    }
-
-    /// Get is_sleeping flag for bdevs to check before eventfd write
-    pub fn is_sleeping_arc(&self) -> Arc<AtomicBool> {
-        self.is_sleeping.clone()
-    }
-
-    /// Unregister qpair from poller, blocking until removed to prevent UAF.
-    /// Returns false if poller didn't ack within timeout (likely stuck/dead).
-    pub fn unregister_qpair(&self, qpair: *mut spdk_ffi::spdk_nvme_qpair) -> bool {
-        let (ack_tx, ack_rx) = mpsc::channel::<()>();
-        // TODO: use dedicated control channel instead of IoRequest to avoid dummy allocation (negligible cost)
-        let req = IoRequest {
-            op: IoOp::UnregisterQpair { qpair, ack: ack_tx },
-            completion: IoCompletion::new(),
-            bdev_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            qpair_dead: Arc::new(AtomicBool::new(false)),
-        };
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(req);
-            let _ = self.eventfd.write(1);
-            match ack_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(()) => true,
-                Err(_) => {
-                    error!("Unregister timeout: poller may be stuck, qpair not removed");
-                    false
-                }
-            }
-        } else {
-            false // Poller stopped
-        }
-    }
-
-    /// Shut down the poller thread.
-    pub fn stop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
-        let _ = self.eventfd.write(1); // Wake poll(eventfd, timeout) so shutdown is observed promptly
-        self.tx.take(); // Drop sender to disconnect the channel during shutdown
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-
-    /// Main poller loop. Runs on dedicated thread.
-    fn poller_loop(
-        rx: crossbeam::channel::Receiver<IoRequest>,
-        shutdown: Arc<AtomicBool>,
-        is_sleeping: Arc<AtomicBool>,
-        eventfd: RawFd,
-        config: PollerConfig,
-    ) {
-        let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
-        let mut state = PollerState::Idle;
-        // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
-        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
-
-        // Verify curvine_async_ctx buffer fits the C struct.
-        debug_assert!(
-            unsafe { spdk_ffi::curvine_spdk_async_ctx_sizeof() }
-                <= std::mem::size_of::<spdk_ffi::curvine_async_ctx>(),
-            "curvine_async_ctx C struct exceeds Rust buffer"
-        );
-
-        // Poll interval for keep-alive check (parameterized to detect disconnects)
-        let poll_interval = config.poll_interval_ms as i32;
-        loop {
-            // Check shutdown first
-            if shutdown.load(Ordering::Acquire) && rx.is_empty() && active_qpairs.is_empty() {
-                break;
-            }
-
-            // Active state: drain all pending I/Os and poll completions
-            if matches!(state, PollerState::Active) {
-                // Drain pending requests (non-blocking)
-                while let Ok(req) = rx.try_recv() {
-                    if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                        Self::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs);
-                    } else {
-                        Self::submit_one(
-                            &req,
-                            &mut active_qpairs,
-                            &mut dead_qpairs,
-                            config.io_queue_depth,
-                        );
-                    }
-                }
-
-                // Poll qpairs for completions and detect failures
-                let mut failed_qpairs: Vec<usize> = Vec::new();
-                active_qpairs.retain(|qpair| {
-                    let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
-                    if rc < 0 {
-                        error!("qpair {:p} poll error: rc={}", qpair, rc);
-                        failed_qpairs.push(*qpair as usize);
-                        return false;
-                    }
-                    true
-                });
-
-                // Force-complete stranded I/Os on failed qpairs
-                for key in &failed_qpairs {
-                    Self::force_complete_qpair(*key, &mut dead_qpairs);
-                }
-                if !failed_qpairs.is_empty() {
-                    error!(
-                        "{} qpair(s) failed, removed from active set",
-                        failed_qpairs.len()
-                    );
-                }
-
-                // Spin briefly before Idle to avoid eventfd round-trip for back-to-back I/O
-                if rx.is_empty() && active_qpairs.is_empty() {
-                    state = PollerState::Idle;
-                    for _ in 0..config.spin_iter {
-                        std::hint::spin_loop();
-                        if !rx.is_empty() {
-                            state = PollerState::Active;
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Idle state: wait for work (eventfd or channel)
-            if matches!(state, PollerState::Idle) {
-                // Check if channel has pending data (peek)
-                let has_pending = !rx.is_empty();
-
-                if has_pending {
-                    // Channel has data, transition to Active
-                    state = PollerState::Active;
-                    continue;
-                }
-
-                // Mark as sleeping before blocking — bdevs will write eventfd to wake us
-                is_sleeping.store(true, Ordering::SeqCst);
-
-                // Recheck channel after setting flag (closes race with bdev send)
-                if !rx.is_empty() {
-                    is_sleeping.store(false, Ordering::Release);
-                    state = PollerState::Active;
-                    continue;
-                }
-
-                // Wait on eventfd with timeout for keep-alive check
-                let mut eventfd_pollfd = libc::pollfd {
-                    fd: eventfd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-
-                let result = unsafe { libc::poll(&mut eventfd_pollfd, 1, poll_interval) };
-
-                match result {
-                    n if n > 0 => {
-                        // Woken up — clear sleeping flag
-                        is_sleeping.store(false, Ordering::Release);
-
-                        // Eventfd signaled - drain it
-                        let mut buf = [0u8; EVENTSZ];
-                        let _ = unsafe {
-                            libc::read(eventfd, buf.as_mut_ptr() as *mut c_void, EVENTSZ)
-                        };
-
-                        // Drain any pending channel data
-                        while let Ok(req) = rx.try_recv() {
-                            if matches!(req.op, IoOp::UnregisterQpair { .. }) {
-                                Self::handle_unregister(&req, &mut active_qpairs, &mut dead_qpairs);
-                            } else {
-                                Self::submit_one(
-                                    &req,
-                                    &mut active_qpairs,
-                                    &mut dead_qpairs,
-                                    config.io_queue_depth,
-                                );
-                            }
-                        }
-
-                        // Transition to Active to process work
-                        state = PollerState::Active;
-                    }
-                    0 => {
-                        // Timeout - poll active qpairs to check connection health
-                        let mut failed_qpairs: Vec<usize> = Vec::new();
-                        active_qpairs.retain(|qpair| {
-                            let rc = unsafe { spdk_ffi::curvine_spdk_qpair_poll(*qpair, 0) };
-                            if rc < 0 {
-                                error!("Poller: keep-alive poll error: rc={}, removing qpair", rc);
-                                failed_qpairs.push(*qpair as usize);
-                                return false;
-                            }
-                            true
-                        });
-
-                        // Force-complete stranded I/Os on failed qpairs
-                        for key in &failed_qpairs {
-                            Self::force_complete_qpair(*key, &mut dead_qpairs);
-                        }
-                        if !failed_qpairs.is_empty() {
-                            error!(
-                                "{} qpair(s) failed during keep-alive, removed from active set",
-                                failed_qpairs.len()
-                            );
-                        }
-
-                        state = PollerState::Idle;
-                    }
-                    -1 => {
-                        let errno = unsafe { *libc::__errno_location() };
-                        if errno == libc::EINTR {
-                            continue;
-                        }
-                        error!("Poller: poll error: {}", errno);
-                        break;
-                    }
-                    _ => {
-                        break;
-                    }
-                }
-            }
-        }
-
-        info!("SPDK poller thread exiting");
-    }
-
-    /// Handle unregister request, remove qpair from active and dead_qpairs set and ack.
-    fn handle_unregister(
-        req: &IoRequest,
-        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
-        dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
-    ) {
-        if let IoOp::UnregisterQpair { qpair, ack } = &req.op {
-            active_qpairs.retain(|&qp| qp != *qpair);
-            let key = *qpair as usize;
-            dead_qpairs.remove(&key);
-            let _ = ack.send(());
-        }
-    }
-
-    /// Submit a single I/O request on the poller thread.
-    fn submit_one(
-        req: &IoRequest,
-        active_qpairs: &mut Vec<*mut spdk_ffi::spdk_nvme_qpair>,
-        dead_qpairs: &mut HashMap<usize, Box<QpairState>>,
-        io_queue_depth: usize,
-    ) {
-        let qpair = match &req.op {
-            IoOp::Read { qpair, .. } => *qpair,
-            IoOp::Write { qpair, .. } => *qpair,
-            IoOp::Flush { qpair, .. } => *qpair,
-            IoOp::UnregisterQpair { .. } => {
-                unreachable!("UnregisterQpair handled by handle_unregister")
-            }
-        };
-
-        let key = qpair as usize;
-
-        // Register/retrieve QpairState on first sight of this qpair.
-        let qs = dead_qpairs.entry(key).or_insert_with(|| {
-            Box::new(QpairState {
-                dead: req.qpair_dead.clone(),
-                pending: Vec::with_capacity(io_queue_depth),
-            })
-        });
-
-        // Fast-fail if this qpair is already known dead.
-        if req.qpair_dead.load(Ordering::Acquire) {
-            req.bdev_inflight.fetch_sub(1, Ordering::Release);
-            req.completion.complete(-libc::ENXIO);
-            return;
-        }
-
-        let pending_idx = qs.pending.len();
-        let qs_ptr = &mut **qs as *mut QpairState;
-
-        // Box::into_raw ensures CallbackCtx survives until poller_callback reclaims it
-        let cb_ctx = Box::new(CallbackCtx {
-            completion: req.completion.clone(),
-            async_ctx: unsafe { std::mem::zeroed() },
-            bdev_inflight: req.bdev_inflight.clone(),
-            qpair_state: qs_ptr,
-            pending_idx,
-        });
-        let cb_ctx_ptr = Box::into_raw(cb_ctx);
-
-        // Initialize async_ctx via C helper
-        unsafe {
-            spdk_ffi::curvine_spdk_async_ctx_init(
-                &mut (*cb_ctx_ptr).async_ctx,
-                poller_callback,
-                cb_ctx_ptr as *mut c_void,
-            );
-        }
-
-        let rc = match &req.op {
-            IoOp::Read {
-                ns,
-                qpair,
-                buf,
-                offset,
-                num_bytes,
-            } => unsafe {
-                spdk_ffi::curvine_spdk_ns_submit_read(
-                    *ns,
-                    *qpair,
-                    *buf,
-                    *offset,
-                    *num_bytes,
-                    &mut (*cb_ctx_ptr).async_ctx,
-                )
-            },
-            IoOp::Write {
-                ns,
-                qpair,
-                buf,
-                offset,
-                num_bytes,
-            } => unsafe {
-                spdk_ffi::curvine_spdk_ns_submit_write(
-                    *ns,
-                    *qpair,
-                    *buf,
-                    *offset,
-                    *num_bytes,
-                    &mut (*cb_ctx_ptr).async_ctx,
-                )
-            },
-            IoOp::Flush { ns, qpair } => unsafe {
-                spdk_ffi::curvine_spdk_ns_submit_flush(*ns, *qpair, &mut (*cb_ctx_ptr).async_ctx)
-            },
-            IoOp::UnregisterQpair { .. } => {
-                unreachable!("UnregisterQpair handled by handle_unregister")
-            }
-        };
-
-        if rc != 0 {
-            // Submission failed - reclaim allocation and complete with error
-            unsafe { drop(Box::from_raw(cb_ctx_ptr)) };
-            req.bdev_inflight.fetch_sub(1, Ordering::Release);
-            req.completion.complete(rc);
-            return;
-        }
-
-        qs.pending.push(cb_ctx_ptr);
-
-        // Track active qpair
-        if !active_qpairs.contains(&qpair) {
-            active_qpairs.push(qpair);
-        }
-    }
-
-    /// Force-complete all outstanding I/Os on a failed qpair using the
-    /// per-qpair pending Vec, then mark the qpair dead so future submissions fail fast.
-    fn force_complete_qpair(key: usize, dead_qpairs: &mut HashMap<usize, Box<QpairState>>) {
-        if let Some(qs) = dead_qpairs.get_mut(&key) {
-            qs.dead.store(true, Ordering::Release);
-            let pending = std::mem::take(&mut qs.pending);
-            let count = pending.len();
-            for cb_ptr in &pending {
-                let ctx = unsafe { Box::from_raw(*cb_ptr as *mut CallbackCtx) };
-                if ctx.completion.complete(-libc::EIO) {
-                    ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
-                }
-            }
-            if count > 0 {
-                error!(
-                    "Force-completed {} outstanding I/O(s) on failed qpair 0x{:x} with EIO",
-                    count, key
-                );
-            }
-        }
-        dead_qpairs.remove(&key);
-    }
-}
-
-/// Per-qpair state tracked on the poller thread. Holds the dead flag and
-/// a Vec of all in-flight CallbackCtx pointers for force-completion.
-struct QpairState {
-    dead: Arc<AtomicBool>,
-    pending: Vec<*mut CallbackCtx>,
-}
-
-/// C callback context. Heap-allocated for SPDK to hold pointer.
-struct CallbackCtx {
-    completion: Arc<IoCompletion>,
-    async_ctx: spdk_ffi::curvine_async_ctx,
-    bdev_inflight: Arc<std::sync::atomic::AtomicUsize>,
-    /// Points back to the qpair's QpairState
-    qpair_state: *mut QpairState,
-    /// Index into QpairState::pending
-    pending_idx: usize,
-}
-
-/// C callback invoked by SPDK when NVMe command completes.
-unsafe extern "C" fn poller_callback(cb_arg: *mut c_void, status: i32) {
-    let ctx = Box::from_raw(cb_arg as *mut CallbackCtx);
-
-    let qs = &mut *(ctx.qpair_state as *mut QpairState);
-    let idx = ctx.pending_idx;
-    let last = qs.pending.len() - 1;
-    if idx != last {
-        let last_ptr = qs.pending[last];
-        qs.pending.swap_remove(idx);
-        (*last_ptr).pending_idx = idx;
-    } else {
-        qs.pending.pop();
-    }
-
-    ctx.bdev_inflight.fetch_sub(1, Ordering::Release);
-    ctx.completion.complete(status);
-}
-
-impl Drop for SpdkPoller {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    const DEAD: usize = 0xDEAD;
-    const LIVE: usize = 0xCAFE;
-
-    #[test]
-    fn force_complete_reclaims_callback_ctx() {
-        // Allocate CallbackCtx as submit_one does, one per simulated I/O.
-        let completion_1 = IoCompletion::new();
-        let inflight_1 = Arc::new(AtomicUsize::new(1));
-        let completion_2 = IoCompletion::new();
-        let inflight_2 = Arc::new(AtomicUsize::new(1));
-        let completion_3 = IoCompletion::new();
-        let inflight_3 = Arc::new(AtomicUsize::new(1));
-
-        // Create QpairState for DEAD qpair.
-        let dead_flag = Arc::new(AtomicBool::new(false));
-        let mut qs_dead = Box::new(QpairState {
-            dead: dead_flag.clone(),
-            pending: Vec::new(),
-        });
-
-        // Allocate and push 2 CallbackCtx entries into DEAD's pending Vec.
-        let ctx_1 = Box::into_raw(Box::new(CallbackCtx {
-            completion: completion_1.clone(),
-            async_ctx: unsafe { std::mem::zeroed() },
-            bdev_inflight: inflight_1.clone(),
-            qpair_state: &mut *qs_dead as *mut QpairState,
-            pending_idx: 0,
-        }));
-        qs_dead.pending.push(ctx_1);
-
-        let ctx_2 = Box::into_raw(Box::new(CallbackCtx {
-            completion: completion_2.clone(),
-            async_ctx: unsafe { std::mem::zeroed() },
-            bdev_inflight: inflight_2.clone(),
-            qpair_state: &mut *qs_dead as *mut QpairState,
-            pending_idx: 1,
-        }));
-        qs_dead.pending.push(ctx_2);
-
-        // Create QpairState for LIVE qpair (control — should be untouched).
-        let live_flag = Arc::new(AtomicBool::new(false));
-        let mut qs_live = Box::new(QpairState {
-            dead: live_flag,
-            pending: Vec::new(),
-        });
-
-        let ctx_3 = Box::into_raw(Box::new(CallbackCtx {
-            completion: completion_3.clone(),
-            async_ctx: unsafe { std::mem::zeroed() },
-            bdev_inflight: inflight_3.clone(),
-            qpair_state: &mut *qs_live as *mut QpairState,
-            pending_idx: 0,
-        }));
-        qs_live.pending.push(ctx_3);
-
-        // Build dead_qpairs map.
-        let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
-        dead_qpairs.insert(DEAD, qs_dead);
-        dead_qpairs.insert(LIVE, qs_live);
-
-        // Act.
-        SpdkPoller::force_complete_qpair(DEAD, &mut dead_qpairs);
-
-        // Assert: DEAD entries completed with -EIO.
-        assert_eq!(completion_1.wait(0), -libc::EIO);
-        assert_eq!(completion_2.wait(0), -libc::EIO);
-
-        // Assert: LIVE entry NOT completed (timeout with 1ms).
-        assert_eq!(completion_3.wait(1000), -libc::ETIMEDOUT);
-
-        // Assert: DEAD entries' bdev_inflight decremented.
-        assert_eq!(inflight_1.load(Ordering::Acquire), 0);
-        assert_eq!(inflight_2.load(Ordering::Acquire), 0);
-
-        // Assert: LIVE entry's bdev_inflight unchanged.
-        assert_eq!(inflight_3.load(Ordering::Acquire), 1);
-
-        // Assert: dead flag set.
-        assert!(dead_flag.load(Ordering::Acquire));
-
-        // Assert: DEAD removed from dead_qpairs, LIVE still present.
-        assert!(!dead_qpairs.contains_key(&DEAD));
-        assert!(dead_qpairs.contains_key(&LIVE));
-
-        // Clean up LIVE entry (force_complete did not touch it).
-        // The raw pointer in qs_live.pending must be reclaimed.
-        if let Some(qs) = dead_qpairs.get_mut(&LIVE) {
-            for cb_ptr in qs.pending.drain(..) {
-                unsafe { drop(Box::from_raw(cb_ptr as *mut CallbackCtx)) };
-            }
-        }
-    }
+// Callback type
+pub type curvine_async_cb = unsafe extern "C" fn(cb_arg: *mut c_void, status: c_int);
+
+extern "C" {
+    // Async NVMe I/O (split submit/poll)
+    pub fn curvine_spdk_ns_submit_read(
+        ns: *mut spdk_nvme_ns,
+        qpair: *mut spdk_nvme_qpair,
+        buf: *mut c_void,
+        offset: u64,
+        num_bytes: u64,
+        async_ctx: *mut curvine_async_ctx,
+    ) -> c_int;
+
+    pub fn curvine_spdk_ns_submit_write(
+        ns: *mut spdk_nvme_ns,
+        qpair: *mut spdk_nvme_qpair,
+        buf: *mut c_void,
+        offset: u64,
+        num_bytes: u64,
+        async_ctx: *mut curvine_async_ctx,
+    ) -> c_int;
+
+    pub fn curvine_spdk_ns_submit_flush(
+        ns: *mut spdk_nvme_ns,
+        qpair: *mut spdk_nvme_qpair,
+        async_ctx: *mut curvine_async_ctx,
+    ) -> c_int;
+
+    pub fn curvine_spdk_qpair_poll(qpair: *mut spdk_nvme_qpair, max_completions: c_int) -> c_int;
+
+    pub fn curvine_spdk_async_ctx_sizeof() -> usize;
+
+    pub fn curvine_spdk_async_ctx_init(
+        ctx: *mut curvine_async_ctx,
+        cb: curvine_async_cb,
+        cb_arg: *mut c_void,
+    );
 }
