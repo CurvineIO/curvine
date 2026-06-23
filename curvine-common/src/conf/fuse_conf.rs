@@ -144,16 +144,18 @@ pub struct FuseConf {
 
     pub state_dir: String,
 
-    /// Optional override for the FUSE mount BDI `max_readahead_kb` (in KB).
+    /// Override for the FUSE mount BDI `max_readahead_kb` (in KB).
     ///
-    /// When set (recommended: 1024 = 1 MiB), curvine-fuse will, after each
-    /// successful mount, write the value to
-    /// `/sys/class/bdi/<major>:<minor>/max_readahead_kb` and bump the FUSE
-    /// init `max_readahead` to at least `value * 1024` bytes, so the kernel
-    /// can issue larger sequential read requests.
+    /// Defaults to [`FuseConf::DEFAULT_MAX_READAHEAD_KB`] (1024 = 1 MiB) for
+    /// all construction paths, including TOML `[fuse]` tables that omit this
+    /// field. When `Some(kb)` with `kb > 0`, curvine-fuse writes the value to
+    /// `/sys/class/bdi/<major>:<minor>/max_readahead_kb` after each successful
+    /// mount and bumps FUSE init `max_readahead` to at least `kb * 1024` bytes
+    /// so the kernel can issue larger sequential read requests.
     ///
-    /// `None` (default) keeps current behavior. Linux only; on other platforms
-    /// the value is accepted but has no effect.
+    /// Set to `None` programmatically to keep the kernel default (no BDI
+    /// override). Linux only; on other platforms the value is accepted but has
+    /// no effect.
     pub max_readahead_kb: Option<u32>,
 
     /// The following are some time types, which are initialized only after init is called.
@@ -189,6 +191,9 @@ impl FuseConf {
     pub const TTR_TIMEOUT: f64 = 1.0;
 
     pub const UMASK: u32 = 0o22;
+
+    /// Default FUSE BDI readahead window: 1 MiB (`1024` KB).
+    pub const DEFAULT_MAX_READAHEAD_KB: u32 = 1024;
 
     pub fn init(&mut self) -> CommonResult<()> {
         self.attr_ttl = Duration::from_secs_f64(self.attr_timeout);
@@ -338,7 +343,7 @@ impl Default for FuseConf {
 
             state_dir: std::env::temp_dir().to_string_lossy().to_string(),
 
-            max_readahead_kb: None,
+            max_readahead_kb: Some(Self::DEFAULT_MAX_READAHEAD_KB),
             attr_ttl: Default::default(),
             entry_ttl: Default::default(),
             negative_ttl: Default::default(),
@@ -359,15 +364,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_max_readahead_kb_is_none() {
+    fn default_max_readahead_kb_is_one_mib() {
         let conf = FuseConf::default();
-        assert!(conf.max_readahead_kb.is_none());
+        assert_eq!(
+            conf.max_readahead_kb,
+            Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
+        );
     }
 
     #[test]
     fn init_rejects_zero_max_readahead_kb() {
-        let mut conf = FuseConf::default();
-        conf.max_readahead_kb = Some(0);
+        let mut conf = FuseConf {
+            max_readahead_kb: Some(0),
+            ..Default::default()
+        };
         let err = conf.init().expect_err("zero must be rejected");
         assert!(
             err.to_string().contains("max_readahead_kb"),
@@ -378,8 +388,10 @@ mod tests {
 
     #[test]
     fn init_accepts_positive_max_readahead_kb() {
-        let mut conf = FuseConf::default();
-        conf.max_readahead_kb = Some(1024);
+        let mut conf = FuseConf {
+            max_readahead_kb: Some(1024),
+            ..Default::default()
+        };
         conf.init().expect("positive value must be accepted");
         assert_eq!(conf.max_readahead_kb, Some(1024));
     }
@@ -394,9 +406,28 @@ max_readahead_kb = 1024
     }
 
     #[test]
-    fn toml_round_trip_without_max_readahead_kb() {
-        // Backward compatibility: existing configs without the field load fine.
-        let conf: FuseConf = toml::from_str("").expect("parse empty");
-        assert!(conf.max_readahead_kb.is_none());
+    fn toml_omitted_max_readahead_kb_uses_default() {
+        let conf: FuseConf = toml::from_str("io_threads = 16").expect("parse partial");
+        assert_eq!(
+            conf.max_readahead_kb,
+            Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
+        );
+    }
+
+    #[test]
+    fn toml_fuse_section_omitted_max_readahead_kb_uses_default() {
+        use crate::conf::ClusterConf;
+
+        let conf: ClusterConf = toml::from_str(
+            r#"
+[fuse]
+io_threads = 16
+"#,
+        )
+        .expect("parse cluster conf");
+        assert_eq!(
+            conf.fuse.max_readahead_kb,
+            Some(FuseConf::DEFAULT_MAX_READAHEAD_KB)
+        );
     }
 }
