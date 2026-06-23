@@ -143,9 +143,6 @@ pub struct PollerConfig {
     pub ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr>,
 }
 
-// SAFETY: only used for admin completion polling, which is thread-safe.
-unsafe impl Send for PollerConfig {}
-
 /// Poller thread handle.
 pub struct SpdkPoller {
     /// Channel sender for I/O submissions
@@ -252,10 +249,10 @@ impl SpdkPoller {
         shutdown: Arc<AtomicBool>,
         is_sleeping: Arc<AtomicBool>,
         eventfd: RawFd,
-        config: PollerConfig,
+        mut config: PollerConfig,
     ) {
         let mut active_qpairs: Vec<*mut spdk_ffi::spdk_nvme_qpair> = Vec::new();
-        let active_ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = config.ctrlrs;
+        let active_ctrlrs: Vec<*mut spdk_ffi::spdk_nvme_ctrlr> = std::mem::take(&mut config.ctrlrs);
         let mut state = PollerState::Idle;
         // Tracks per-qpair state (dead flag + pending Vec) for force-completion.
         let mut dead_qpairs: HashMap<usize, Box<QpairState>> = HashMap::new();
