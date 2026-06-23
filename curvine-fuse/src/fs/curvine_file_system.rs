@@ -630,10 +630,18 @@ impl fs::FileSystem for CurvineFileSystem {
             out_flags &= !FUSE_WRITEBACK_CACHE;
         }
 
+        // If `fuse.max_readahead_kb` is configured, raise the negotiated
+        // `max_readahead` so the kernel cap (min(bdi.max_readahead_kb,
+        // fuse_conn.max_readahead)) does not silently shrink reads.
+        let max_readahead = match self.conf.max_readahead_kb {
+            Some(kb) => op.arg.max_readahead.max(kb.saturating_mul(1024)),
+            None => op.arg.max_readahead,
+        };
+
         let out = fuse_init_out {
             major: op.arg.major,
             minor: op.arg.minor,
-            max_readahead: op.arg.max_readahead,
+            max_readahead,
             flags: out_flags,
             max_background: self.conf.max_background,
             congestion_threshold: self.conf.congestion_threshold,

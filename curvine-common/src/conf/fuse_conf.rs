@@ -144,6 +144,18 @@ pub struct FuseConf {
 
     pub state_dir: String,
 
+    /// Optional override for the FUSE mount BDI `max_readahead_kb` (in KB).
+    ///
+    /// When set (recommended: 1024 = 1 MiB), curvine-fuse will, after each
+    /// successful mount, write the value to
+    /// `/sys/class/bdi/<major>:<minor>/max_readahead_kb` and bump the FUSE
+    /// init `max_readahead` to at least `value * 1024` bytes, so the kernel
+    /// can issue larger sequential read requests.
+    ///
+    /// `None` (default) keeps current behavior. Linux only; on other platforms
+    /// the value is accepted but has no effect.
+    pub max_readahead_kb: Option<u32>,
+
     /// The following are some time types, which are initialized only after init is called.
     #[serde(skip_serializing, skip_deserializing)]
     pub attr_ttl: Duration,
@@ -188,6 +200,11 @@ impl FuseConf {
         if self.mnt_per_task == 0 {
             self.mnt_per_task = self.io_threads;
         }
+
+        if let Some(0) = self.max_readahead_kb {
+            return err_box!("fuse.max_readahead_kb must be > 0 when set");
+        }
+
         Ok(())
     }
 
@@ -321,6 +338,7 @@ impl Default for FuseConf {
 
             state_dir: std::env::temp_dir().to_string_lossy().to_string(),
 
+            max_readahead_kb: None,
             attr_ttl: Default::default(),
             entry_ttl: Default::default(),
             negative_ttl: Default::default(),
@@ -333,5 +351,56 @@ impl Default for FuseConf {
 
         conf.init().unwrap();
         conf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_max_readahead_kb_is_none() {
+        let conf = FuseConf::default();
+        assert!(conf.max_readahead_kb.is_none());
+    }
+
+    #[test]
+    fn init_rejects_zero_max_readahead_kb() {
+        let mut conf = FuseConf {
+            max_readahead_kb: Some(0),
+            ..Default::default()
+        };
+        let err = conf.init().expect_err("zero must be rejected");
+        assert!(
+            err.to_string().contains("max_readahead_kb"),
+            "error message should mention the field, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn init_accepts_positive_max_readahead_kb() {
+        let mut conf = FuseConf {
+            max_readahead_kb: Some(1024),
+            ..Default::default()
+        };
+        conf.init().expect("positive value must be accepted");
+        assert_eq!(conf.max_readahead_kb, Some(1024));
+    }
+
+    #[test]
+    fn toml_round_trip_with_max_readahead_kb() {
+        let toml = r#"
+max_readahead_kb = 1024
+"#;
+        let conf: FuseConf = toml::from_str(toml).expect("parse");
+        assert_eq!(conf.max_readahead_kb, Some(1024));
+    }
+
+    #[test]
+    fn toml_round_trip_without_max_readahead_kb() {
+        // Backward compatibility: existing configs without the field load fine.
+        let conf: FuseConf = toml::from_str("").expect("parse empty");
+        assert!(conf.max_readahead_kb.is_none());
     }
 }
