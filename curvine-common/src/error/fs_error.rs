@@ -236,6 +236,15 @@ impl FsError {
         Self::FileAlreadyExists(ErrorImpl::with_source(msg.into()))
     }
 
+    pub fn file_too_large(len: i64) -> Self {
+        let msg = format!(
+            "file size {} exceeds maximum supported size {}",
+            len,
+            crate::MAX_FILE_SIZE
+        );
+        Self::InvalidFileSize(ErrorImpl::with_source(msg.into()))
+    }
+
     pub fn parent_not_dir(path: impl AsRef<str>) -> Self {
         let msg = format!("{} is not a directory", path.as_ref());
         Self::ParentNotDir(ErrorImpl::with_source(msg.into()))

@@ -16,13 +16,14 @@ use crate::master::meta::feature::{AclFeature, FileFeature, WriteFeature};
 use crate::master::meta::inode::{Inode, EMPTY_PARENT_ID};
 use crate::master::meta::store::InodeStore;
 use crate::master::meta::{BlockMeta, InodeId};
+use curvine_common::error::FsError;
 use curvine_common::state::{
     BlockLocation, CommitBlock, CreateFileOpts, ExtendedBlock, FileAllocOpts, FileType,
     StoragePolicy,
 };
 use curvine_common::FsResult;
 use orpc::common::LocalTime;
-use orpc::{err_box, CommonResult};
+use orpc::{err_box, err_ext, CommonResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -391,6 +392,10 @@ impl InodeFile {
     /// # Returns
     /// * `Vec<BlockMeta>` - Blocks that were removed during truncation (empty if extended or unchanged)
     pub fn resize(&mut self, opts: FileAllocOpts) -> FsResult<Vec<BlockMeta>> {
+        if opts.len > curvine_common::MAX_FILE_SIZE {
+            return err_ext!(FsError::file_too_large(opts.len));
+        }
+
         if self.len == opts.len {
             Ok(vec![])
         } else if opts.len < self.len {
