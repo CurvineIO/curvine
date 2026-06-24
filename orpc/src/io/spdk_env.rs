@@ -3,13 +3,14 @@
 use crate::common::DurationUnit;
 use crate::err_msg;
 use crate::io::spdk_ffi;
-use crate::io::spdk_poller::PollerConfig;
+use crate::io::spdk_poller::{CtrlHandle, PollerConfig};
 use crate::io::spdk_poller::{IoRequest, SpdkPoller};
 use crate::{err_box, CommonResult};
 use log::{error, info, warn};
 use nix::sys::eventfd::EventFd;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -361,13 +362,15 @@ impl SpdkConf {
             } else {
                 self.keep_alive_timeout_ms
             };
-            if resolved_ka_ms < self.poll_interval_ms {
+            let min_ka_ms = self.poll_interval_ms * 3;
+            if resolved_ka_ms < min_ka_ms {
                 return err_box!(
-                    "SpdkConf: targets[{}]: resolved keep_alive_timeout_ms ({}) \
-                     must be >= poll_interval_ms ({})",
+                    "SpdkConf: targets[{}]: keep_alive_timeout_ms ({}) must be \
+                     >= 3 * poll_interval_ms ({}) as the worst-case idle->active gap spans \
+                     ~2 poll intervals, requiring 1 interval margin for safety",
                     i,
                     resolved_ka_ms,
-                    self.poll_interval_ms
+                    min_ka_ms
                 );
             }
         }
@@ -611,12 +614,22 @@ impl SpdkEnv {
 
         self.bdevs = all_bdevs;
 
+        // Collect unique controllers for admin completion polling (keep-alive)
+        let mut seen = HashSet::new();
+        let mut ctrlrs: Vec<CtrlHandle> = Vec::with_capacity(self.bdevs.len());
+        for bdev in &self.bdevs {
+            if bdev.ctrlr != 0 && seen.insert(bdev.ctrlr) {
+                ctrlrs.push(CtrlHandle(bdev.ctrlr as *mut spdk_ffi::spdk_nvme_ctrlr));
+            }
+        }
+
         // Start the dedicated I/O poller thread
         {
             let poller = SpdkPoller::start(PollerConfig {
                 poll_interval_ms: self.conf.poll_interval_ms,
                 spin_iter: self.conf.spin_iter,
                 io_queue_depth: self.conf.io_queue_depth as usize,
+                ctrlrs,
             });
             *self.poller.lock().unwrap() = Some(poller);
             info!("SPDK poller thread started");
@@ -993,7 +1006,6 @@ impl SpdkEnv {
     }
 
     fn detach_controllers(&self) {
-        use std::collections::HashSet;
         let mut detached: HashSet<usize> = HashSet::new();
         for bdev in &self.bdevs {
             if bdev.ctrlr == 0 || !detached.insert(bdev.ctrlr) {
@@ -1204,7 +1216,7 @@ mod test {
                     traddr: "10.0.0.1".into(),
                     trsvcid: 4420,
                     subnqn: "nqn.test".into(),
-                    keep_alive_timeout_ms: 200, // above poll_interval_ms
+                    keep_alive_timeout_ms: 300, // >= 3 * poll_interval_ms
                     ..Default::default()
                 }],
                 ..Default::default()
