@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::fuse_metrics::{FuseReqCtx, FuseReqStatus, FuseRespMetrics};
+use crate::fuse_metrics::{
+    FuseMetrics, FuseReqCtx, FuseReqStatus, FuseRespMetrics, ENQUEUE_REASON_CHANNEL_CLOSED,
+    NOTIFY_ENQUEUE_FAILED, REPLY_TYPE_NO_REPLY,
+};
 use crate::raw::fuse_abi::{
     fuse_notify_inval_entry_out, fuse_notify_inval_inode_out, fuse_out_header,
 };
@@ -130,6 +133,13 @@ impl FuseResponse {
     /// / SETLKW-interrupt sites). Phase 1a-1 wires this as control flow; the
     /// status-labelled metrics read the stashed value in Phase 1a-2.
     fn err_status(unsupported_reason: Option<&'static str>, interrupted: bool) -> FuseReqStatus {
+        // The two source tags are mutually exclusive — no current call site
+        // passes both, and the classification below would silently drop the
+        // interrupt signal if they were combined. Catch a future mis-wiring.
+        debug_assert!(
+            unsupported_reason.is_none() || !interrupted,
+            "send_rep_tagged: unsupported_reason and interrupted are mutually exclusive"
+        );
         if unsupported_reason.is_some() {
             FuseReqStatus::Unsupported
         } else if interrupted {
@@ -166,21 +176,87 @@ impl FuseResponse {
             Some(slot) => slot,
         };
 
-        // Extract everything BEFORE the send: the active guard is move-only and
-        // `send` consumes the task (it is not returned on error), so the
-        // guard/labels must leave the slot here.
+        // **Cancellation safety on bounded channels.** A bounded `send().await`
+        // can suspend (channel full); if the holding task is cancelled mid-await,
+        // the task — and the `ActiveGuard` moved into it — is dropped, decrementing
+        // `active_requests` but emitting NO terminal metric. To avoid that
+        // "silent finish", on bounded channels we first `reserve()` a permit
+        // WITHOUT touching the slot. The only suspendable point is the reserve;
+        // if cancelled there, the slot is still `finished=false` and the guard is
+        // still in the slot, so the request is simply dropped (guard decremented
+        // by its own Drop) with no half-finished state. Once the permit is in
+        // hand, we commit the slot and `permit.send(...)` synchronously (no await,
+        // cannot be cancelled). Unbounded `send` is already synchronous, so it
+        // keeps the simple commit-then-send fast path.
+        if self.sender.is_bounded() {
+            let permit = match self.sender.reserve().await {
+                Ok(p) => p,
+                Err(e) => {
+                    // Channel closed before we could reserve. The slot is still
+                    // pending here, so commit the early-finish terminal now (guard
+                    // is taken and dropped inside), then surface the real error.
+                    self.finish_enqueue_failure(slot, status, errno, unsupported_reason);
+                    return Err(e);
+                }
+            };
+            // Permit acquired: from here on there is no await, so no cancellation
+            // window. Commit the slot, then send synchronously.
+            let task = match self.commit_reply_task(slot, data, status, errno, unsupported_reason) {
+                Some(task) => task,
+                None => return Ok(()), // double reply: warned/asserted in commit.
+            };
+            permit.send(task);
+            return Ok(());
+        }
+
+        // Unbounded fast path: `AsyncSender::send` resolves synchronously on its
+        // `Unbounded` branch (no `.await` suspension point before the value is
+        // enqueued), so there is no cancellation window between commit and
+        // enqueue. NOTE: this relies on that `Unbounded` behaviour — if
+        // `AsyncSender::send` ever gains a pre-enqueue await for unbounded
+        // channels, this path must move to the `reserve()`-style handling above.
+        let task = match self.commit_reply_task(slot, data, status, errno, unsupported_reason) {
+            Some(task) => task,
+            None => return Ok(()),
+        };
+        let send_result = self.sender.send(task).await;
+        if send_result.is_err() {
+            self.record_enqueue_failure_metrics(slot, status, errno, unsupported_reason);
+        }
+        send_result
+    }
+
+    /// Commit the metrics slot for a replied request and build its task: stash
+    /// status/errno, take the move-only `ActiveGuard` out of the slot exactly
+    /// once, mark `finished`. Returns `None` on a double reply (already finished)
+    /// — a logic bug surfaced via `debug_assert!`/`warn!`, never double-counting.
+    /// All slot access is scoped before any `.await` by the caller.
+    fn commit_reply_task(
+        &self,
+        slot: &Arc<Mutex<FuseRespMetrics>>,
+        data: ResponseData,
+        status: FuseReqStatus,
+        errno: i32,
+        unsupported_reason: Option<&'static str>,
+    ) -> Option<FuseTask> {
         let (labels, active) = {
             let mut m = slot.lock();
             if m.finished {
-                // Double reply on an already-finished context: a logic bug.
-                // Never double-count/double-drop — log and no-op in all builds
-                // (this is testable, unlike a debug_assert that would panic the
-                // release-path test).
+                // Double reply on an already-finished context: a logic bug (e.g.
+                // a `finish_early` followed by a `send_rep` on the same request).
+                // Surfaced loudly in debug; in release we never double-count or
+                // double-drop — we warn and no-op so a stray second reply cannot
+                // corrupt the gauges.
+                debug_assert!(
+                    !m.finished,
+                    "double reply on an already-finished FuseResponse (unique {})",
+                    self.unique
+                );
                 warn!(
                     "double reply on an already-finished FuseResponse (unique {})",
                     self.unique
                 );
-                return Ok(());
+                return None;
             }
             m.op_status = Some(status);
             m.request_status = Some(status);
@@ -192,62 +268,127 @@ impl FuseResponse {
                 .take()
                 .unwrap_or_else(crate::fuse_metrics::ActiveGuard::noop);
             (m.labels, active)
-        }; // lock dropped here, before the .await below.
+        };
+        Some(FuseTask::RequestReply {
+            data,
+            labels,
+            active,
+            status,
+            errno,
+            unsupported_reason,
+        })
+    }
 
-        let send_result = self
-            .sender
-            .send(FuseTask::RequestReply {
-                data,
-                labels,
-                active,
-                status,
-                errno,
-                unsupported_reason,
-            })
-            .await;
+    /// Enqueue-failure terminal for the path where the slot is **still pending**
+    /// (bounded `reserve()` returned a closed-channel error). Commits the slot
+    /// (taking and dropping the guard) and records the enqueue-failure metrics.
+    /// The caller surfaces the original channel error.
+    fn finish_enqueue_failure(
+        &self,
+        slot: &Arc<Mutex<FuseRespMetrics>>,
+        status: FuseReqStatus,
+        errno: i32,
+        unsupported_reason: Option<&'static str>,
+    ) {
+        {
+            let mut m = slot.lock();
+            if m.finished {
+                return;
+            }
+            m.op_status = Some(status);
+            m.request_status = Some(FuseReqStatus::Error);
+            m.errno = errno;
+            m.unsupported_reason = unsupported_reason;
+            m.finished = true;
+            // No task carries the guard on this path; drop it explicitly.
+            let _ = m.active.take();
+        }
+        self.record_enqueue_failure_metrics(slot, status, errno, unsupported_reason);
+    }
 
-        if send_result.is_err() {
-            // Enqueue failed: the request never reaches the sender's finish
-            // point. The FS-operation status (`op_status`) is preserved, but the
-            // delivered/result status becomes `Error`. (The guard was moved into
-            // the consumed task and dropped with it.) Phase 1a-2 reads this to
-            // emit `reply_enqueue_errors_total` + `request_duration_us{status=error}`.
+    /// Record the metrics for a reply-enqueue failure (the request never reaches
+    /// the sender). Shared by the unbounded post-send-failure path and the
+    /// bounded reserve-failure path: enqueue error + duration{error} (NOT
+    /// `requests_total` — excluded from QPS), plus the op-level terminal counter
+    /// if the FS op itself failed (with the real FS errno/reason).
+    fn record_enqueue_failure_metrics(
+        &self,
+        slot: &Arc<Mutex<FuseRespMetrics>>,
+        status: FuseReqStatus,
+        errno: i32,
+        unsupported_reason: Option<&'static str>,
+    ) {
+        let labels = {
             let mut m = slot.lock();
             m.request_status = Some(FuseReqStatus::Error);
-        }
-        send_result
+            m.labels
+        };
+        let metrics = FuseMetrics::get();
+        metrics.record_reply_enqueue_error(labels.opcode, ENQUEUE_REASON_CHANNEL_CLOSED);
+        metrics.record_request_duration(
+            labels.opcode,
+            labels.kind,
+            FuseReqStatus::Error,
+            labels.elapsed_us(),
+        );
+        // op_status side: if the FS op itself failed, record its terminal counter
+        // (with the real FS errno/reason) — symmetric with the sender write-failure
+        // path. Otherwise this records nothing. Without it, an op failure that
+        // races a closed channel would vanish behind the channel error.
+        metrics.record_op_terminal(
+            labels.opcode,
+            labels.kind,
+            status,
+            errno,
+            unsupported_reason,
+        );
     }
 
     /// Finish a no-reply request (`Forget` / `BatchForget`). Inspects the
     /// operation result (so a failing forget is not a phantom success), drops
     /// the active guard, and sends no task. Non-async: nothing reaches the
-    /// sender. Phase 1a-1 runs the state machine but emits no real metric.
+    /// sender.
     ///
-    /// No-reply errors are always classified `Error` (via `err_status` with no
-    /// interrupt tag): `Forget`/`BatchForget` are never interrupted, and the
-    /// `trait_default` unsupported reason is out of scope for Phase 1a-1. If
-    /// Phase 1a-2 needs no-reply `unsupported`, add a source-tag param here.
+    /// No-reply errors are always classified `Error` (no interrupt/unsupported
+    /// tag): `Forget`/`BatchForget` are never interrupted, and no-reply
+    /// `unsupported` (`trait_default`) is out of scope here. If a later phase
+    /// needs it, add a source-tag parameter.
     fn finish_no_reply(&self, res: FuseResult<()>) {
         if let Some(slot) = &self.metrics {
-            let mut m = slot.lock();
-            if m.finished {
-                return;
-            }
-            // No-reply errors are always `Error`: Forget/BatchForget are never
-            // interrupted, and the `trait_default` unsupported reason is out of
-            // scope for Phase 1a-1. Classified explicitly (not via the slot's
-            // `unsupported_reason`) so the code matches the doc comment and does
-            // not depend on prior slot state. If Phase 1a-2 needs no-reply
-            // `unsupported`, add a source-tag parameter here.
+            // Classified explicitly (not via the slot's `unsupported_reason`) so
+            // the code matches the doc comment and does not depend on prior slot
+            // state.
             let status = match &res {
                 Ok(_) => FuseReqStatus::Success,
                 Err(_) => FuseReqStatus::Error,
             };
-            m.op_status = Some(status);
-            m.request_status = Some(status);
-            m.finished = true;
-            // Drop the guard explicitly (no task carries it on the no-reply path).
-            let _ = m.active.take();
+            let labels = {
+                let mut m = slot.lock();
+                if m.finished {
+                    return;
+                }
+                m.op_status = Some(status);
+                m.request_status = Some(status);
+                m.finished = true;
+                // Drop the guard explicitly (no task carries it on the no-reply path).
+                let _ = m.active.take();
+                m.labels
+            }; // lock dropped before recording metrics.
+
+            // No-reply requests count toward QPS with reply_type=no_reply, and
+            // toward the E2E duration, but emit NO response_* (no reply pipeline)
+            // and NO errors_total. (`FuseError` does carry an errno, but this
+            // phase deliberately does not attribute no-reply failures by errno —
+            // forget failures are rare and the errno's diagnostic value is low;
+            // decision 2 / R14.)
+            let metrics = FuseMetrics::get();
+            metrics.record_request_total(labels.opcode, labels.kind, REPLY_TYPE_NO_REPLY, status);
+            metrics.record_request_duration(
+                labels.opcode,
+                labels.kind,
+                status,
+                labels.elapsed_us(),
+            );
         }
     }
 
@@ -264,16 +405,24 @@ impl FuseResponse {
     /// have no stable OS errno; `errno` is kept too for diagnostics.
     pub(crate) fn finish_early(&self, errno: i32, reason: &'static str) {
         if let Some(slot) = &self.metrics {
-            let mut m = slot.lock();
-            if m.finished {
-                return;
-            }
-            m.op_status = Some(FuseReqStatus::Error);
-            m.request_status = Some(FuseReqStatus::Error);
-            m.errno = errno;
-            m.parse_reason = Some(reason);
-            m.finished = true;
-            let _ = m.active.take();
+            {
+                let mut m = slot.lock();
+                if m.finished {
+                    return;
+                }
+                m.op_status = Some(FuseReqStatus::Error);
+                m.request_status = Some(FuseReqStatus::Error);
+                m.errno = errno;
+                m.parse_reason = Some(reason);
+                m.finished = true;
+                let _ = m.active.take();
+            } // lock dropped before recording the metric.
+
+            // A structural parse failure after the ctx existed: record the
+            // decode error, but NOT `requests_total` (the request never
+            // dispatched). Phase 1a-2 only ever passes reason="other" (the
+            // `finish_early` call sites); finer reasons need decoder changes.
+            FuseMetrics::get().record_parse_error(reason);
         }
     }
 
@@ -286,10 +435,10 @@ impl FuseResponse {
 
     /// Like `send_rep`, but lets the caller attach an explicit status source
     /// tag for the error case: `unsupported_reason` (a known unsupported path —
-    /// `unknown_opcode`/`unimplemented_opcode`/`trait_default`) or `interrupted`
-    /// (the SETLKW interrupt-notify path). Status is **never** inferred from
-    /// errno; an untagged error is always `Error`. (Phase 1a-1 stashes the tag
-    /// as control flow; `unsupported_total`/`interrupted_total` read it in 1a-2.)
+    /// `unknown_opcode`/`unimplemented_opcode`; `trait_default` reserved for a
+    /// later phase) or `interrupted` (the SETLKW interrupt-notify path). Status
+    /// is **never** inferred from errno; an untagged error is always `Error`.
+    /// The sender reads the tag to emit `unsupported_total`/`interrupted_total`.
     pub async fn send_rep_tagged<T: Debug, E: Into<FuseError> + Debug>(
         &self,
         res: Result<T, E>,
@@ -339,14 +488,24 @@ impl FuseResponse {
         let data = ResponseData::create(FUSE_NOTIFY_UNIQUE, code.into(), data);
         // Notifications are not request replies: they never touch the request
         // metrics slot. When metrics are disabled, fall back to the legacy Reply
-        // so the disabled path is byte-identical.
+        // so the disabled path is byte-identical AND emits no notify metric.
         if self.metrics.is_some() {
-            self.sender
+            let code_str = code.as_str();
+            let send_result = self
+                .sender
                 .send(FuseTask::NotifyReply {
                     data,
-                    code: code.as_str(),
+                    code: code_str,
                 })
-                .await
+                .await;
+            if send_result.is_err() {
+                // Enqueue failed: the notify never reaches the sender. The
+                // success / write_failed states are recorded later in the sender
+                // (NotifyReply arm); this is the only point where enqueue_failed
+                // can be observed.
+                FuseMetrics::get().record_notify_result(code_str, NOTIFY_ENQUEUE_FAILED);
+            }
+            send_result
         } else {
             self.sender.send(FuseTask::Reply(data)).await
         }
@@ -472,15 +631,48 @@ impl FuseResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuse_metrics::{ActiveGuard, FuseReqKind, FuseReqLabels};
+    use crate::fuse_metrics::{
+        ActiveGuard, FuseMetrics, FuseReqKind, FuseReqLabels, DECODE_PHASE_PARSE,
+        ENQUEUE_REASON_CHANNEL_CLOSED, REPLY_TYPE_NO_REPLY, REPLY_TYPE_REPLIED,
+    };
     use orpc::common::{Gauge, Metrics as m};
     use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
+
+    // The finish paths (`finish_no_reply` / `finish_early` / enqueue-failure)
+    // now read `FuseMetrics::get()`, which panics if the process-global registry
+    // was never initialized. `ensure_init` is idempotent, so every test that
+    // exercises a real finish path calls this first.
+    fn init_metrics() {
+        FuseMetrics::ensure_init().expect("init FuseMetrics for tests");
+    }
 
     // Build a FuseResponse whose active guard is backed by `gauge`, so tests can
     // assert "guard dropped exactly once" as a concrete `gauge.get()` count.
     fn reply_with_gauge(unique: u64, gauge: &Gauge) -> (FuseResponse, AsyncReceiver<FuseTask>) {
+        reply_with_gauge_opcode(unique, gauge, "Lookup")
+    }
+
+    // Like `reply_with_gauge` but with a caller-chosen opcode label. Value-
+    // assertion tests use a UNIQUE opcode each so their counter children never
+    // collide with another (parallel) test's deltas on the shared registry.
+    fn reply_with_gauge_opcode(
+        unique: u64,
+        gauge: &Gauge,
+        opcode: &'static str,
+    ) -> (FuseResponse, AsyncReceiver<FuseTask>) {
+        reply_with_gauge_opcode_kind(unique, gauge, opcode, FuseReqKind::Metadata)
+    }
+
+    // Like `reply_with_gauge_opcode` but also lets the test choose the kind, so
+    // stream-path tests can assert `kind="stream"` labels.
+    fn reply_with_gauge_opcode_kind(
+        unique: u64,
+        gauge: &Gauge,
+        opcode: &'static str,
+        kind: FuseReqKind,
+    ) -> (FuseResponse, AsyncReceiver<FuseTask>) {
         let (tx, rx) = AsyncChannel::new(16).split();
-        let labels = FuseReqLabels::new("Lookup", FuseReqKind::Metadata, 64);
+        let labels = FuseReqLabels::new(opcode, kind, 64);
         let ctx = FuseReqCtx {
             labels,
             active: Some(ActiveGuard::new(gauge.clone())), // inc to 1 now
@@ -526,8 +718,11 @@ mod tests {
 
     // T13: a real second reply on an already-finished slot is a no-op — no
     // second task enqueued, the guard is not double-taken or double-dropped.
-    // (This actually calls send_rep twice, unlike the earlier modelled version.)
+    // Release-only: a double reply trips `debug_assert!(!finished)` in debug
+    // builds (see `double_reply_panics_in_debug`); the release behaviour is the
+    // safe warn+no-op asserted here.
     #[tokio::test]
+    #[cfg(not(debug_assertions))]
     async fn t13_real_double_reply_is_noop() {
         let g = m::new_gauge("t13_active", "test").unwrap();
         let (reply, mut rx) = reply_with_gauge(2, &g);
@@ -546,10 +741,24 @@ mod tests {
         assert_eq!(g.get(), 0, "exactly one guard, dropped once");
     }
 
+    // Debug counterpart: a double reply is a logic bug and must trip the
+    // debug_assert. (Release turns this into a safe warn+no-op — see T13.)
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "double reply")]
+    async fn double_reply_panics_in_debug() {
+        let g = m::new_gauge("dbl_reply_dbg_active", "test").unwrap();
+        let (reply, _rx) = reply_with_gauge(2, &g);
+        reply.send_rep::<(), FuseError>(Ok(())).await.unwrap();
+        // Second reply on the finished slot trips debug_assert!(!finished).
+        let _ = reply.send_rep::<(), FuseError>(Ok(())).await;
+    }
+
     // T6: Forget/BatchForget — finish_no_reply inspects the result, drops the
     // guard, and enqueues NO task. Run for both Ok and Err.
     #[tokio::test]
     async fn t6_no_reply_finishes_without_task_for_ok_and_err() {
+        init_metrics();
         // Ok case
         let g_ok = m::new_gauge("t6_ok_active", "test").unwrap();
         let (reply_ok, mut rx_ok) = reply_with_gauge(3, &g_ok);
@@ -621,6 +830,7 @@ mod tests {
     // marks finished, and enqueues NO task. No requests_total would be emitted.
     #[tokio::test]
     async fn t8_finish_early_drops_guard_no_task() {
+        init_metrics();
         let g = m::new_gauge("t8_active", "test").unwrap();
         let (reply, mut rx) = reply_with_gauge(6, &g);
         reply.finish_early(libc::EINVAL, "other");
@@ -640,9 +850,17 @@ mod tests {
     }
 
     // T11: metrics disabled — produces the legacy Reply, constructs no metrics
-    // slot, and notifications also fall back to Reply.
+    // slot, and notifications also fall back to Reply AND emit no notify metric
+    // (R8d: the disabled production path records nothing).
     #[tokio::test]
     async fn t11_disabled_uses_legacy_reply() {
+        init_metrics();
+        let code = FuseNotifyCode::FUSE_NOTIFY_INVAL_INODE.as_str();
+        let notify_before = FuseMetrics::get()
+            .notify_total
+            .with_label_values(&[code, "success"])
+            .get();
+
         let (reply, mut rx) = disabled_reply(7);
         assert!(reply.metrics.is_none(), "no metrics slot when disabled");
 
@@ -661,6 +879,17 @@ mod tests {
         assert!(
             matches!(n, FuseTask::Reply(_)),
             "disabled notify = legacy Reply"
+        );
+
+        // The disabled notify went out as a legacy Reply, so notify_total is
+        // untouched (and the sender's Reply arm never records notify metrics).
+        assert_eq!(
+            FuseMetrics::get()
+                .notify_total
+                .with_label_values(&[code, "success"])
+                .get(),
+            notify_before,
+            "disabled notify must not increment notify_total"
         );
     }
 
@@ -691,6 +920,7 @@ mod tests {
     // consumed task).
     #[tokio::test]
     async fn enqueue_failure_sets_request_status_error_keeps_op_status() {
+        init_metrics();
         let g = m::new_gauge("enq_fail_active", "test").unwrap();
         let (reply, rx) = reply_with_gauge(9, &g);
         drop(rx); // close the channel so send() fails
@@ -769,5 +999,428 @@ mod tests {
             Some(FuseReqStatus::Interrupted),
             "interrupt-tagged path is Interrupted"
         );
+    }
+
+    // The process-global registry accumulates across tests, so value assertions
+    // read a child's counter/histogram before and after and check the delta.
+    fn requests_total(opcode: &str, kind: &str, reply_type: &str, status: &str) -> i64 {
+        FuseMetrics::get()
+            .requests_total
+            .with_label_values(&[opcode, kind, reply_type, status])
+            .get()
+    }
+    fn request_duration_count(opcode: &str, kind: &str, status: &str) -> u64 {
+        FuseMetrics::get()
+            .request_duration_us
+            .with_label_values(&[opcode, kind, status])
+            .get_sample_count()
+    }
+    fn errors_total(opcode: &str, kind: &str, errno: &str) -> i64 {
+        FuseMetrics::get()
+            .errors_total
+            .with_label_values(&[opcode, kind, errno])
+            .get()
+    }
+    fn unsupported_total(opcode: &str, reason: &str) -> i64 {
+        FuseMetrics::get()
+            .unsupported_total
+            .with_label_values(&[opcode, reason])
+            .get()
+    }
+    fn interrupted_total(opcode: &str) -> i64 {
+        FuseMetrics::get()
+            .interrupted_total
+            .with_label_values(&[opcode])
+            .get()
+    }
+
+    // B2 / test 4: enqueue failure records `reply_enqueue_errors_total` +
+    // `request_duration_us{status=error}` exactly once, and does NOT count
+    // toward `requests_total` (QPS) or `errors_total` (no OS errno).
+    #[tokio::test]
+    async fn enqueue_failure_emits_enqueue_error_and_duration_not_requests_total() {
+        init_metrics();
+        const OP: &str = "EnqFailTest";
+        let metrics = FuseMetrics::get();
+        let dur_before = request_duration_count(OP, "metadata", "error");
+
+        let g = m::new_gauge("enq_emit_active", "test").unwrap();
+        let (reply, rx) = reply_with_gauge_opcode(20, &g, OP);
+        drop(rx); // close channel so enqueue fails
+        assert!(reply.send_rep::<(), FuseError>(Ok(())).await.is_err());
+
+        assert_eq!(
+            metrics
+                .reply_enqueue_errors_total
+                .with_label_values(&[OP, ENQUEUE_REASON_CHANNEL_CLOSED])
+                .get(),
+            1,
+            "one reply_enqueue_errors_total channel_closed"
+        );
+        assert_eq!(
+            request_duration_count(OP, "metadata", "error"),
+            dur_before + 1,
+            "request_duration_us error observed once"
+        );
+        assert_eq!(
+            requests_total(OP, "metadata", REPLY_TYPE_REPLIED, "error"),
+            0,
+            "enqueue failure must NOT count toward requests_total"
+        );
+        assert_eq!(g.get(), 0, "guard dropped once with the consumed task");
+    }
+
+    // P1#1: enqueue failure layered on a FAILED op must still record the
+    // op-level terminal counter with the real FS errno — the channel error must
+    // not swallow the operation failure (symmetric with the sender write-failure
+    // path's op/request status split).
+    #[tokio::test]
+    async fn enqueue_failure_on_failed_op_still_records_errors_total() {
+        init_metrics();
+        const OP: &str = "EnqFailOpErr";
+        let before = errors_total(OP, "metadata", "EIO");
+
+        let g = m::new_gauge("enq_op_err_active", "test").unwrap();
+        let (reply, rx) = reply_with_gauge_opcode(30, &g, OP);
+        drop(rx); // close channel so enqueue fails
+        let err: FuseResult<()> = Err(FuseError::new(libc::EIO, "backend".into()));
+        assert!(reply.send_rep(err).await.is_err());
+
+        assert_eq!(
+            errors_total(OP, "metadata", "EIO"),
+            before + 1,
+            "failed op + enqueue failure still records errors_total with FS errno"
+        );
+        // enqueue error recorded too; QPS still excluded.
+        assert_eq!(
+            FuseMetrics::get()
+                .reply_enqueue_errors_total
+                .with_label_values(&[OP, ENQUEUE_REASON_CHANNEL_CLOSED])
+                .get(),
+            1
+        );
+        assert_eq!(
+            requests_total(OP, "metadata", REPLY_TYPE_REPLIED, "error"),
+            0
+        );
+        assert_eq!(g.get(), 0);
+    }
+
+    // P1#1: enqueue failure layered on a tagged-unsupported op still records
+    // unsupported_total{reason}.
+    #[tokio::test]
+    async fn enqueue_failure_on_unsupported_op_still_records_unsupported_total() {
+        init_metrics();
+        const OP: &str = "EnqFailUnsup";
+        let before = unsupported_total(OP, "unimplemented_opcode");
+
+        let g = m::new_gauge("enq_unsup_active", "test").unwrap();
+        let (reply, rx) = reply_with_gauge_opcode(31, &g, OP);
+        drop(rx);
+        let err: FuseResult<()> = Err(FuseError::new(libc::ENOSYS, "unimpl".into()));
+        assert!(reply
+            .send_rep_tagged(err, Some("unimplemented_opcode"), false)
+            .await
+            .is_err());
+
+        assert_eq!(
+            unsupported_total(OP, "unimplemented_opcode"),
+            before + 1,
+            "unsupported op + enqueue failure still records unsupported_total"
+        );
+        assert_eq!(g.get(), 0);
+    }
+
+    // P1#1: enqueue failure layered on an interrupted op still records
+    // interrupted_total.
+    #[tokio::test]
+    async fn enqueue_failure_on_interrupted_op_still_records_interrupted_total() {
+        init_metrics();
+        const OP: &str = "EnqFailIntr";
+        let before = interrupted_total(OP);
+
+        let g = m::new_gauge("enq_intr_active", "test").unwrap();
+        let (reply, rx) = reply_with_gauge_opcode(32, &g, OP);
+        drop(rx);
+        let err: FuseResult<()> = Err(FuseError::new(libc::EINTR, "setlkw".into()));
+        assert!(reply.send_rep_tagged(err, None, true).await.is_err());
+
+        assert_eq!(
+            interrupted_total(OP),
+            before + 1,
+            "interrupted op + enqueue failure still records interrupted_total"
+        );
+        assert_eq!(g.get(), 0);
+    }
+
+    // P1#2 (round-2): a stream worker (FuseReader::read_future /
+    // FuseWriter::writer_future) holds the `FuseResponse` and replies via
+    // `send_data`/`send_rep` from *inside* the task. If the reply channel is
+    // closed by then (sender shutdown), the worker's `send_*().await` returns Err
+    // and the worker exits via `?` — but the finish must still happen: the active
+    // guard must drop (no leak) and the enqueue error + duration{error} recorded.
+    // This exercises the worker-internal finish path without a real kernel fd.
+    #[tokio::test]
+    async fn stream_worker_send_data_enqueue_failure_finishes_without_leak() {
+        init_metrics();
+        const OP: &str = "StreamWorkerRead";
+        let g = m::new_gauge("stream_worker_read_active", "test").unwrap();
+        let (reply, rx) = reply_with_gauge_opcode(40, &g, OP);
+        assert_eq!(g.get(), 1, "guard live while the worker holds the reply");
+        drop(rx); // sender gone: the worker's reply enqueue will fail.
+
+        // The reader worker replies with data; enqueue fails on the closed channel.
+        let data: FuseResult<Vec<DataSlice>> = Ok(vec![]);
+        assert!(reply.send_data(data).await.is_err());
+
+        assert_eq!(
+            g.get(),
+            0,
+            "active guard dropped on worker enqueue failure (no leak)"
+        );
+        assert_eq!(
+            FuseMetrics::get()
+                .reply_enqueue_errors_total
+                .with_label_values(&[OP, ENQUEUE_REASON_CHANNEL_CLOSED])
+                .get(),
+            1,
+            "worker enqueue failure records reply_enqueue_errors_total"
+        );
+        // The fixture's labels carry kind=metadata; the worker enqueue-failure
+        // finish records request_duration_us{error} for whatever kind the ctx
+        // holds. (The reader/writer kind is exercised end-to-end, not here.)
+        assert!(
+            request_duration_count(OP, "metadata", "error") >= 1,
+            "worker enqueue failure records request_duration_us error"
+        );
+        // The op itself succeeded (data was Ok), so no op-level errors_total.
+        assert_eq!(errors_total(OP, "metadata", "OTHER"), 0);
+    }
+
+    // P1#2 companion: the writer worker's `send_rep` path on a closed channel.
+    #[tokio::test]
+    async fn stream_worker_send_rep_enqueue_failure_finishes_without_leak() {
+        init_metrics();
+        const OP: &str = "StreamWorkerWrite";
+        let g = m::new_gauge("stream_worker_write_active", "test").unwrap();
+        let (reply, rx) = reply_with_gauge_opcode(41, &g, OP);
+        drop(rx);
+
+        assert!(reply.send_rep::<(), FuseError>(Ok(())).await.is_err());
+
+        assert_eq!(g.get(), 0, "active guard dropped on writer enqueue failure");
+        assert_eq!(
+            FuseMetrics::get()
+                .reply_enqueue_errors_total
+                .with_label_values(&[OP, ENQUEUE_REASON_CHANNEL_CLOSED])
+                .get(),
+            1
+        );
+    }
+
+    // P2#2 (round-3): the worker enqueue-failure finish records under the real
+    // stream kind label — verifies `request_duration_us{kind="stream",error}`.
+    #[tokio::test]
+    async fn stream_worker_enqueue_failure_records_stream_kind_duration() {
+        init_metrics();
+        const OP: &str = "StreamWorkerKind";
+        let before = request_duration_count(OP, "stream", "error");
+
+        let g = m::new_gauge("stream_worker_kind_active", "test").unwrap();
+        let (reply, rx) = reply_with_gauge_opcode_kind(42, &g, OP, FuseReqKind::Stream);
+        drop(rx);
+        let data: FuseResult<Vec<DataSlice>> = Ok(vec![]);
+        assert!(reply.send_data(data).await.is_err());
+
+        assert_eq!(g.get(), 0, "stream worker guard dropped, no leak");
+        assert_eq!(
+            request_duration_count(OP, "stream", "error"),
+            before + 1,
+            "stream-kind worker enqueue failure records request_duration_us kind=stream error"
+        );
+    }
+
+    // Build a reply backed by an explicitly-bounded channel of the given
+    // capacity, so bounded-path tests don't depend on the default helper's
+    // internal `AsyncChannel::new(16)`.
+    fn bounded_reply_with_capacity(
+        unique: u64,
+        gauge: &Gauge,
+        opcode: &'static str,
+        cap: usize,
+    ) -> (FuseResponse, AsyncReceiver<FuseTask>) {
+        let (tx, rx) = AsyncChannel::new(cap).split();
+        debug_assert!(tx.is_bounded(), "cap>0 must yield a bounded channel");
+        let labels = FuseReqLabels::new(opcode, FuseReqKind::Metadata, 64);
+        let ctx = FuseReqCtx {
+            labels,
+            active: Some(ActiveGuard::new(gauge.clone())),
+        };
+        (FuseResponse::new_reply(unique, tx, false, Some(ctx)), rx)
+    }
+
+    // Build a bounded size-1 reply slot whose only buffer position is already
+    // filled, so the next `send` must suspend on `reserve().await`.
+    fn full_bounded_reply(
+        unique: u64,
+        gauge: &Gauge,
+        opcode: &'static str,
+    ) -> (FuseResponse, AsyncReceiver<FuseTask>) {
+        let (tx, rx) = AsyncChannel::new(1).split();
+        // Fill the single slot so a subsequent reserve()/send() blocks.
+        tx.try_reserve()
+            .unwrap()
+            .expect("one permit available")
+            .send(FuseTask::Reply(ResponseData::create(unique, 0, vec![])));
+        let labels = FuseReqLabels::new(opcode, FuseReqKind::Metadata, 64);
+        let ctx = FuseReqCtx {
+            labels,
+            active: Some(ActiveGuard::new(gauge.clone())),
+        };
+        (FuseResponse::new_reply(unique, tx, false, Some(ctx)), rx)
+    }
+
+    // P1 (round-3): on a bounded channel, if the task is cancelled while the
+    // reply is suspended on `reserve().await` (channel full), the request must
+    // NOT enter a "silent finished" state — the slot stays `finished=false` and
+    // the guard is released by passive Drop, so a retry/cleanup is still possible
+    // and no half-finished state corrupts the gauges.
+    #[tokio::test]
+    async fn bounded_reserve_cancellation_leaves_slot_unfinished() {
+        init_metrics();
+        const OP: &str = "BoundedCancel";
+        let g = m::new_gauge("bounded_cancel_active", "test").unwrap();
+        let (reply, _rx) = full_bounded_reply(99, &g, OP);
+        assert_eq!(g.get(), 1, "guard live before the reply");
+
+        // The slot we will inspect after cancellation.
+        let slot = reply.metrics.as_ref().unwrap().clone();
+
+        // Spawn the reply; it suspends on reserve() because the channel is full.
+        let handle = tokio::spawn(async move {
+            let _ = reply.send_rep::<(), FuseError>(Ok(())).await;
+        });
+        // Give it a moment to reach the suspended reserve().
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Cancel the suspended task: its future (and the `FuseResponse`) drops.
+        handle.abort();
+        let _ = handle.await;
+
+        // The critical invariant: NO silent finish. The slot was never committed,
+        // so the guard is still IN the slot (not moved onto a task, not dropped),
+        // and a real terminal path (retry / teardown cleanup) can still run.
+        {
+            let m = slot.lock();
+            assert!(
+                !m.finished,
+                "cancellation during reserve() must NOT mark the slot finished"
+            );
+            assert!(
+                m.active.is_some(),
+                "guard stays in the unfinished slot, available for a real terminal path"
+            );
+        }
+        assert_eq!(g.get(), 1, "guard still held by the unfinished slot");
+
+        // Dropping the last slot reference releases the guard by Drop — so even
+        // the abandoned request does not leak `active_requests`.
+        drop(slot);
+        assert_eq!(
+            g.get(),
+            0,
+            "guard released once the slot is finally dropped"
+        );
+    }
+
+    // P1 (round-3): bounded channel, reserve succeeds (slot free) -> the reply
+    // finishes normally (RequestReply enqueued, slot finished, guard rides task).
+    #[tokio::test]
+    async fn bounded_reserve_success_finishes_normally() {
+        init_metrics();
+        const OP: &str = "BoundedOk";
+        let g = m::new_gauge("bounded_ok_active", "test").unwrap();
+        // Explicitly bounded with a free slot, so reserve() succeeds immediately.
+        let (reply, mut rx) = bounded_reply_with_capacity(100, &g, OP, 4);
+
+        reply.send_rep::<(), FuseError>(Ok(())).await.unwrap();
+
+        let task = rx.try_recv().unwrap().expect("a task was enqueued");
+        assert!(matches!(task, FuseTask::RequestReply { .. }));
+        {
+            let slot = reply.metrics.as_ref().unwrap().lock();
+            assert!(slot.finished, "reserve-success path finishes the slot");
+        }
+        assert_eq!(g.get(), 1, "guard rides on the task");
+        drop(task);
+        assert_eq!(g.get(), 0, "guard dropped once at task drop");
+    }
+
+    // B3 / test 6: no-reply forget emits requests_total{reply_type=no_reply} +
+    // duration for both Ok and Err, and never errors_total.
+    #[tokio::test]
+    async fn no_reply_emits_requests_total_no_reply_for_ok_and_err() {
+        init_metrics();
+        const OP: &str = "NoReplyTest";
+        let err_errors_before = errors_total(OP, "metadata", "OTHER");
+
+        let g_ok = m::new_gauge("nr_emit_ok", "test").unwrap();
+        let (reply_ok, _rx_ok) = reply_with_gauge_opcode(21, &g_ok, OP);
+        reply_ok.send_none(Ok(())).unwrap();
+
+        let g_err = m::new_gauge("nr_emit_err", "test").unwrap();
+        let (reply_err, _rx_err) = reply_with_gauge_opcode(22, &g_err, OP);
+        reply_err.send_none(Err(FuseError::from("boom"))).unwrap();
+
+        assert_eq!(
+            requests_total(OP, "metadata", REPLY_TYPE_NO_REPLY, "success"),
+            1,
+            "Ok forget increments requests_total no_reply success"
+        );
+        assert_eq!(
+            requests_total(OP, "metadata", REPLY_TYPE_NO_REPLY, "error"),
+            1,
+            "Err forget increments requests_total no_reply error"
+        );
+        assert_eq!(
+            errors_total(OP, "metadata", "OTHER"),
+            err_errors_before,
+            "no-reply error must NOT emit errors_total"
+        );
+    }
+
+    // B4 / test 8: parse-after-ctx early finish emits decode_errors_total
+    // {phase=parse,reason=other} once and NO requests_total.
+    #[tokio::test]
+    async fn finish_early_emits_decode_error_not_requests_total() {
+        init_metrics();
+        const OP: &str = "FinishEarlyTest";
+        let metrics = FuseMetrics::get();
+        // `decode_errors_total` is opcode-free (phase,reason), so other parallel
+        // tests could also bump {parse,other}; assert a delta, not an absolute.
+        let decode_before = metrics
+            .decode_errors_total
+            .with_label_values(&[DECODE_PHASE_PARSE, "other"])
+            .get();
+
+        let g = m::new_gauge("fe_emit_active", "test").unwrap();
+        let (reply, _rx) = reply_with_gauge_opcode(23, &g, OP);
+        reply.finish_early(libc::EINVAL, "other");
+
+        assert!(
+            metrics
+                .decode_errors_total
+                .with_label_values(&[DECODE_PHASE_PARSE, "other"])
+                .get()
+                > decode_before,
+            "decode_errors_total parse other incremented at least once"
+        );
+        assert_eq!(
+            requests_total(OP, "metadata", REPLY_TYPE_REPLIED, "error"),
+            0,
+            "parse-after-ctx must NOT emit requests_total"
+        );
+        assert_eq!(g.get(), 0, "guard dropped on early finish");
     }
 }

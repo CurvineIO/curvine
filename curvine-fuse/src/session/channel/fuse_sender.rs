@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use crate::fs::FileSystem;
+use crate::fuse_metrics::{
+    mono_now, FuseMetrics, FuseReqStatus, WriteOutcome, NOTIFY_SUCCESS, NOTIFY_WRITE_FAILED,
+};
 use crate::session::{FuseTask, ResponseData};
 use crate::FuseResult;
 use log::{info, warn};
@@ -66,35 +69,83 @@ impl<T: FileSystem> FuseSender<T> {
         while let Some(task) = self.receiver.recv().await {
             match task {
                 // A replied request with metrics context. This is the E2E finish
-                // point: after the kernel-fd write, the `active` guard is dropped
-                // (releasing the in-flight count). Phase 1a-1 wires the drop as
-                // control flow only — `active` is a no-op guard until Phase 1a-2
-                // attaches it to the real `active_requests` gauge, and
-                // `labels`/`status`/`errno` are not yet read into any metric.
+                // point: after the kernel-fd write, the request metrics are
+                // recorded and the `active` guard is dropped (releasing the
+                // in-flight count). The match arm only does the splice + a single
+                // helper call; all `with_label_values` lives in the helper so it
+                // is unit-testable without a kernel fd.
                 FuseTask::RequestReply {
                     data,
-                    labels: _labels,
+                    labels,
                     active,
-                    status: _status,
-                    errno: _errno,
-                    unsupported_reason: _unsupported_reason,
+                    status,
+                    errno,
+                    unsupported_reason,
                 } => {
                     let id = data.header.unique;
-                    if let Err(e) = self.send(data).await {
-                        if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
-                            warn!("error send unique {}: {}", id, e);
+                    let response_bytes = data.len();
+
+                    let write_start = mono_now();
+                    let send_result = self.send(data).await;
+                    let write_us = write_start.elapsed().as_micros() as u64;
+                    // Taken AFTER the send so the E2E duration includes the write
+                    // (even a failed splice).
+                    let total_us = labels.elapsed_us();
+
+                    let write = match &send_result {
+                        Ok(()) => WriteOutcome::Success,
+                        Err(e) => {
+                            let os_errno = e.raw_error().raw_os_error();
+                            // Keep the existing diagnostic log alongside the metric.
+                            if os_errno != Some(libc::ENOENT) {
+                                warn!("error send unique {}: {}", id, e);
+                            }
+                            WriteOutcome::Failed { errno: os_errno }
                         }
-                    }
+                    };
+
+                    // `status` from the task is the FS-operation result
+                    // (`op_status`). The kernel-observed `request_status` is the
+                    // same, except a delivery (kernel-fd write) failure makes it
+                    // Error even when the op succeeded — see the design's
+                    // "operation vs request status".
+                    let op_status = status;
+                    let request_status = match write {
+                        WriteOutcome::Success => op_status,
+                        WriteOutcome::Failed { .. } => FuseReqStatus::Error,
+                    };
+
+                    FuseMetrics::get().record_request_finish(
+                        labels.opcode,
+                        labels.kind,
+                        op_status,
+                        request_status,
+                        errno,
+                        unsupported_reason,
+                        response_bytes,
+                        write,
+                        write_us,
+                        total_us,
+                    );
+
                     // Finish point: drop the in-flight guard after the write.
                     drop(active);
                 }
 
                 // A kernel notification: same splice, no request guard/finish.
-                FuseTask::NotifyReply { data, code: _code } => {
+                // Records notify_total at its two sender-side points: success
+                // after the write, write_failed on splice error (enqueue_failed
+                // is recorded earlier in send_notify).
+                FuseTask::NotifyReply { data, code } => {
                     let id = data.header.unique;
-                    if let Err(e) = self.send(data).await {
-                        if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
-                            warn!("error send notify {}: {}", id, e);
+                    let metrics = FuseMetrics::get();
+                    match self.send(data).await {
+                        Ok(()) => metrics.record_notify_result(code, NOTIFY_SUCCESS),
+                        Err(e) => {
+                            if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
+                                warn!("error send notify {}: {}", id, e);
+                            }
+                            metrics.record_notify_result(code, NOTIFY_WRITE_FAILED);
                         }
                     }
                 }
