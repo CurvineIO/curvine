@@ -15,7 +15,7 @@
 use crate::fs::FileSystem;
 use crate::session::{FuseTask, ResponseData};
 use crate::FuseResult;
-use log::{error, info, warn};
+use log::{info, warn};
 use orpc::io::IOResult;
 use orpc::runtime::Runtime;
 use orpc::sync::channel::AsyncReceiver;
@@ -37,7 +37,7 @@ pub struct FuseSender<T> {
 }
 
 impl<T: FileSystem> FuseSender<T> {
-    pub fn new(
+    pub(crate) fn new(
         fs: Arc<T>,
         rt: Arc<Runtime>,
         kernel_fd: Arc<AsyncFd>,
@@ -65,6 +65,41 @@ impl<T: FileSystem> FuseSender<T> {
     pub async fn start(mut self) -> FuseResult<()> {
         while let Some(task) = self.receiver.recv().await {
             match task {
+                // A replied request with metrics context. This is the E2E finish
+                // point: after the kernel-fd write, the `active` guard is dropped
+                // (releasing the in-flight count). Phase 1a-1 wires the drop as
+                // control flow only — `active` is a no-op guard until Phase 1a-2
+                // attaches it to the real `active_requests` gauge, and
+                // `labels`/`status`/`errno` are not yet read into any metric.
+                FuseTask::RequestReply {
+                    data,
+                    labels: _labels,
+                    active,
+                    status: _status,
+                    errno: _errno,
+                    unsupported_reason: _unsupported_reason,
+                } => {
+                    let id = data.header.unique;
+                    if let Err(e) = self.send(data).await {
+                        if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
+                            warn!("error send unique {}: {}", id, e);
+                        }
+                    }
+                    // Finish point: drop the in-flight guard after the write.
+                    drop(active);
+                }
+
+                // A kernel notification: same splice, no request guard/finish.
+                FuseTask::NotifyReply { data, code: _code } => {
+                    let id = data.header.unique;
+                    if let Err(e) = self.send(data).await {
+                        if e.raw_error().raw_os_error() != Some(libc::ENOENT) {
+                            warn!("error send notify {}: {}", id, e);
+                        }
+                    }
+                }
+
+                // Legacy fast path (metrics disabled): byte-identical to before.
                 FuseTask::Reply(reply) => {
                     let id = reply.header.unique;
                     if let Err(e) = self.send(reply).await {
@@ -72,10 +107,6 @@ impl<T: FileSystem> FuseSender<T> {
                             warn!("error send unique {}: {}", id, e);
                         }
                     }
-                }
-
-                FuseTask::Request(_) => {
-                    error!("Not support")
                 }
             }
         }

@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 trait-variant = { workspace = true }
 nix = { workspace = true }
 once_cell = { workspace = true }
+parking_lot = { workspace = true }
 mini-moka = { workspace = true }
 fxhash = { workspace = true }
 dashmap = { workspace = true }

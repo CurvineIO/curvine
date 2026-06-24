@@ -29,6 +29,12 @@ impl FuseError {
     pub fn new(errno: i32, error: CommonError) -> Self {
         Self { errno, error }
     }
+
+    /// The POSIX errno this error maps to. Used by the metrics finish path to
+    /// stash the errno label source.
+    pub(crate) fn errno(&self) -> i32 {
+        self.errno
+    }
 }
 
 impl From<String> for FuseError {

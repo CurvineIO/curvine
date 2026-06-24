@@ -14,6 +14,7 @@
 
 use crate::fs::operator::FuseOperator;
 use crate::fs::FileSystem;
+use crate::fuse_metrics::{ActiveGuard, FuseReqCtx, FuseReqKind, FuseReqLabels};
 use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
@@ -48,7 +49,7 @@ pub struct FuseReceiver<T> {
 
 impl<T: FileSystem> FuseReceiver<T> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         fs: Arc<T>,
         rt: Arc<Runtime>,
         kernel_fd: Arc<AsyncFd>,
@@ -120,8 +121,28 @@ impl<T: FileSystem> FuseReceiver<T> {
         Ok(req_buf)
     }
 
-    pub fn new_replay(&self, unique: u64) -> FuseResponse {
-        FuseResponse::new(unique, self.sender.clone(), self.debug)
+    /// Build a reply handle for `unique`. When `labels` is `Some`, a metrics
+    /// context (with a no-op `ActiveGuard` in Phase 1a-1) is created so the
+    /// reply finishes in the sender; when `None`, the legacy disabled path.
+    pub(crate) fn new_reply(&self, unique: u64, labels: Option<FuseReqLabels>) -> FuseResponse {
+        let ctx = labels.map(|labels| FuseReqCtx {
+            labels,
+            active: Some(ActiveGuard::noop()),
+        });
+        FuseResponse::new_reply(unique, self.sender.clone(), self.debug, ctx)
+    }
+
+    /// Derive the copyable metrics labels for a decoded request. Phase 1a-1
+    /// always builds these (metrics machinery is exercised but emits nothing);
+    /// the disabled-mode `None` path arrives with the Phase 1 kill switch.
+    fn req_labels(req: &FuseRequest) -> FuseReqLabels {
+        let kind = if req.is_stream() {
+            FuseReqKind::Stream
+        } else {
+            FuseReqKind::Metadata
+        };
+        let request_bytes = req.get_header().map(|h| h.len).unwrap_or(0);
+        FuseReqLabels::new(req.opcode().as_str(), kind, request_bytes)
     }
 
     fn audit(&self, req: &FuseRequest) {
@@ -139,8 +160,29 @@ impl<T: FileSystem> FuseReceiver<T> {
     }
 
     pub async fn send_stream(&self, req: FuseRequest) -> FuseResult<()> {
-        let operator = req.parse_operator()?;
-        let rep = self.new_replay(req.unique());
+        // Create the metrics context *before* parsing (ctx-before-parse), so a
+        // structural parse failure after this point is a real finish-state-machine
+        // event, consistent with the metadata path.
+        let labels = Self::req_labels(&req);
+        let rep = self.new_reply(req.unique(), Some(labels));
+
+        // A structural parse failure after the ctx exists must finish the context
+        // early (drop the active guard, mark finished) and emit no reply.
+        let operator = match req.parse_operator() {
+            Ok(op) => op,
+            Err(err) => {
+                // Structural parse failure after the ctx exists: no stable errno
+                // for the parse reason, so use the catch-all "other".
+                rep.finish_early(err.errno(), "other");
+                return Err(err);
+            }
+        };
+
+        // Clone shares the same metrics slot; the clone is the error-path reply
+        // so an enqueue/dispatch failure finishes the *original* context once
+        // (single logical finish, guard not double-counted) instead of building a
+        // fresh context.
+        let err_rep = rep.clone();
         let res = match operator {
             FuseOperator::Read(op) => self.fs.read(op, rep).await,
 
@@ -156,7 +198,7 @@ impl<T: FileSystem> FuseReceiver<T> {
         };
 
         if res.is_err() {
-            self.new_replay(req.unique()).send_rep(res).await?;
+            err_rep.send_rep(res).await?;
         }
         Ok(())
     }
@@ -171,12 +213,18 @@ impl<T: FileSystem> FuseReceiver<T> {
                             let req = FuseRequest::from_bytes(buf.freeze())?;
 
                             if self.debug {
-                                let operator = req.parse_operator()?;
+                                // Debug logging must NOT parse the operator here:
+                                // a parse failure would `?`-return out of the
+                                // receiver loop *before* the context is created,
+                                // both terminating the receiver and bypassing the
+                                // dispatch-path `finish_early` cleanup. The
+                                // dispatch path (`dispatch_meta` / `send_stream`)
+                                // is the single parse + cleanup site. Log only the
+                                // fields available without parsing the body.
                                 info!(
-                                    "receive unique: {}, code: {:?}, op: {:?}",
+                                    "receive unique: {}, code: {:?}",
                                     req.unique(),
                                     req.opcode(),
-                                    operator
                                 );
                             }
 
@@ -187,7 +235,8 @@ impl<T: FileSystem> FuseReceiver<T> {
                             } else {
                                 self.audit(&req);
 
-                                let reply = self.new_replay(req.unique());
+                                let labels = Self::req_labels(&req);
+                                let reply = self.new_reply(req.unique(), Some(labels));
                                 let fs = self.fs.clone();
                                 let pending_requests = self.pending_requests.clone();
                                 self.rt.spawn(async move {
@@ -242,7 +291,9 @@ impl<T: FileSystem> FuseReceiver<T> {
             _ = notify.notified() => {
                 pending_requests.remove(&req.unique());
                 let err: FuseResult<()> = err_fuse!(EINTR, "operation interrupted");
-                reply.send_rep(err).await.map_err(|x| x.into())
+                // Source-tagged as interrupted (the SETLKW interrupt-notify path),
+                // not inferred from the EINTR errno.
+                reply.send_rep_tagged(err, None, true).await.map_err(|x| x.into())
             }
         };
 
@@ -255,7 +306,16 @@ impl<T: FileSystem> FuseReceiver<T> {
         req: &FuseRequest,
         reply: &FuseResponse,
     ) -> FuseResult<()> {
-        let operator = req.parse_operator()?;
+        // A structural parse failure happens *after* the ctx was created in the
+        // receiver, so it must finish the context early (drop the active guard,
+        // mark finished) without emitting a request reply.
+        let operator = match req.parse_operator() {
+            Ok(op) => op,
+            Err(err) => {
+                reply.finish_early(err.errno(), "other");
+                return Err(err);
+            }
+        };
 
         let res = match operator {
             FuseOperator::Init(op) => reply.send_rep(fs.init(op).await).await,
@@ -335,9 +395,15 @@ impl<T: FileSystem> FuseReceiver<T> {
             FuseOperator::SetLkW(op) => reply.send_rep(fs.set_lkw(op).await).await,
 
             _ => {
+                // A parsed-but-unhandled opcode (e.g. Rename2, or any
+                // `Notimplemented`): source-tagged as `unimplemented_opcode` so
+                // it classifies as Unsupported, not a backend Error. (Phase 1a-2
+                // reads the tag for `unsupported_total{reason}`.)
                 let err: FuseResult<fuse_out_header> =
                     err_fuse!(libc::ENOSYS, "unsupported operation {:?}", req.opcode());
-                reply.send_rep(err).await
+                reply
+                    .send_rep_tagged(err, Some("unimplemented_opcode"), false)
+                    .await
             }
         };
 

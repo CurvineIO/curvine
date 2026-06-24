@@ -132,32 +132,134 @@ impl FuseReqLabels {
     }
 }
 
+/// The terminal status of a FUSE request, used as the `status` label.
+///
+/// Classified by `FuseResponse::send_rep_tagged()` (via `err_status()`) from the
+/// FS-operation result plus an explicit source tag — never from errno alone (see
+/// the metrics design's Status Semantics). Phase 1a-1 computes and stores it as
+/// control flow; the real `requests_total{status}` / duration series read it in
+/// 1a-2.
+#[allow(dead_code)] // status values are read by the request metrics in Phase 1a-2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FuseReqStatus {
+    Success,
+    Error,
+    Interrupted,
+    Unsupported,
+}
+
+/// Move-only request context created in the receiver right after a request is
+/// decoded. It owns the E2E `ActiveGuard`; dropping the context (or moving the
+/// guard out exactly once) is what keeps `active_requests` correct.
+///
+/// `labels` is `Copy` and travels onto the reply; the guard is move-only and
+/// must not be duplicated. Stored on the `FuseResponse` (inside `FuseRespMetrics`).
+#[allow(dead_code)] // constructed/consumed by the request path wired in Phase 1a.
+#[derive(Debug)]
+pub(crate) struct FuseReqCtx {
+    pub(crate) labels: FuseReqLabels,
+    pub(crate) active: Option<ActiveGuard>,
+}
+
+/// Interior-mutable per-request metrics slot held behind `Arc<Mutex<…>>` on the
+/// `FuseResponse`. The reply path writes it once (taking the guard, stashing
+/// status); the sender reads it once at finish. See the design's
+/// "FuseResponse API strategy" and "finish state machine".
+///
+/// `op_status` / `errno` / `unsupported_reason` are stored **independently of**
+/// `active`, so taking the guard out into the reply task does not clear the
+/// status the operation-duration timer reads later (Phase 1a-2 / Phase 2).
+#[derive(Debug)]
+pub(crate) struct FuseRespMetrics {
+    pub(crate) labels: FuseReqLabels,
+    /// The E2E guard; `take()`n exactly once when the reply is built.
+    pub(crate) active: Option<ActiveGuard>,
+    /// FS-operation result status; set when the reply / no-reply / early-finish
+    /// path classifies the operation result. Read by `operation_duration_us` in
+    /// Phase 1a-2 / Phase 2.
+    #[allow(dead_code)]
+    pub(crate) op_status: Option<FuseReqStatus>,
+    /// Final delivery/result status; read by `request_duration_us` in the
+    /// sender (Phase 1a-2).
+    #[allow(dead_code)]
+    pub(crate) request_status: Option<FuseReqStatus>,
+    /// errno label source for `errors_total` on the **replied** path (set by
+    /// `send_rep`/`send_buf`/`send_data`, Phase 1a-2). Deliberately left at 0 on
+    /// the no-reply path (`finish_no_reply`): `Forget`/`BatchForget` failures do
+    /// not emit an errno-labelled metric (no meaningful errno — design decision),
+    /// so the 0 is never read there.
+    #[allow(dead_code)]
+    pub(crate) errno: i32,
+    /// Set only at the wildcard / `Notimplemented` / trait-default sites; read
+    /// by status classification in Phase 1a-2.
+    #[allow(dead_code)]
+    pub(crate) unsupported_reason: Option<&'static str>,
+    /// Set on the parse-after-ctx early-finish path (`finish_early`); read by
+    /// `decode_errors_total{phase="parse",reason}` in Phase 1a-2. Stored as a
+    /// `&'static str` reason (`short_read`/`invalid_header`/`length_mismatch`/
+    /// `other`) because structural parse failures have no stable OS errno.
+    #[allow(dead_code)]
+    pub(crate) parse_reason: Option<&'static str>,
+    /// State-machine guard: prevents a second reply from double-finishing.
+    pub(crate) finished: bool,
+}
+
+#[allow(dead_code)] // call sites land across Phase 1a.
+impl FuseRespMetrics {
+    pub(crate) fn new(ctx: FuseReqCtx) -> Self {
+        Self {
+            labels: ctx.labels,
+            active: ctx.active,
+            op_status: None,
+            request_status: None,
+            errno: 0,
+            unsupported_reason: None,
+            parse_reason: None,
+            finished: false,
+        }
+    }
+}
+
 /// RAII guard for an in-flight gauge: increments on construction, decrements
 /// exactly once on drop.
 ///
 /// It is `Send` and movable (so it can travel into a spawned task or onto a
 /// reply task), and deliberately **not** `Copy` — a `Copy` guard could
-/// double-decrement. The guard holds its own `Gauge` handle so a single type
-/// can back different scopes (`active_requests`, `stream_io_inflight`,
+/// double-decrement. The guard holds an optional `Gauge` handle so a single
+/// type can back different scopes (`active_requests`, `stream_io_inflight`,
 /// `meta_task_inflight`) just by being constructed from different gauges.
+///
+/// The `None` (no-op) form is what Phase 1a-1 uses: it exercises the full
+/// move-and-drop lifetime — proving single-take / single-drop ownership — while
+/// touching no real gauge. Phase 1a-2 swaps in `new(active_requests_gauge)` so
+/// the same plumbing then drives the real metric.
 // Phase 0 enabling primitive: defined here, wired to call sites in Phase 1.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct ActiveGuard {
-    gauge: Gauge,
+    gauge: Option<Gauge>,
 }
 
 #[allow(dead_code)] // Phase 0 primitive; call sites land in Phase 1.
 impl ActiveGuard {
+    /// A guard backed by a real gauge: increments now, decrements on drop.
     pub(crate) fn new(gauge: Gauge) -> Self {
         gauge.inc();
-        Self { gauge }
+        Self { gauge: Some(gauge) }
+    }
+
+    /// A no-op guard: same move/drop semantics, but touches no gauge. Used in
+    /// Phase 1a-1 to validate ownership before the real gauge is wired (1a-2).
+    pub(crate) fn noop() -> Self {
+        Self { gauge: None }
     }
 }
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
-        self.gauge.dec();
+        if let Some(g) = &self.gauge {
+            g.dec();
+        }
     }
 }
 
