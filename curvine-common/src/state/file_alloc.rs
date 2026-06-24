@@ -122,11 +122,10 @@ impl FileAllocOpts {
         }
 
         if self.len < 0 {
-            return err_box!("len must be >= 0 for allocate operation, got {}", self.len);
+            return err_box!("len must be >= 0, got {}", self.len);
         }
 
-        let changes_file_size = self.truncate || !self.mode.contains(FileAllocMode::KEEP_SIZE);
-        if changes_file_size && self.len > MAX_FILE_SIZE {
+        if self.len > MAX_FILE_SIZE {
             return err_ext!(FsError::file_too_large(self.len));
         }
 
@@ -172,13 +171,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_skips_size_check_for_keep_size_allocate() {
+    fn validate_rejects_extreme_size_for_keep_size_allocate() {
         let opts = FileAllocOpts {
             truncate: false,
             off: 0,
             len: 1 << 60,
             mode: FileAllocMode::KEEP_SIZE,
         };
-        assert!(opts.validate().is_ok());
+        let err = opts.validate().unwrap_err();
+        assert!(matches!(err, FsError::InvalidFileSize(_)));
     }
 }
