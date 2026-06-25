@@ -14,7 +14,11 @@
 
 use crate::fs::operator::FuseOperator;
 use crate::fs::FileSystem;
-use crate::fuse_metrics::{ActiveGuard, FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels};
+use crate::fuse_error::splice_errno_label;
+use crate::fuse_metrics::{
+    mono_now, ActiveGuard, FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels,
+    RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT,
+};
 use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
@@ -243,11 +247,47 @@ impl<T: FileSystem> FuseReceiver<T> {
     pub async fn start(mut self, mut shutdown_rx: watch::Receiver<bool>) -> FuseResult<()> {
         debug!("fuse receiver started");
         loop {
+            // Receiver loop wait covers idle wait for the next kernel request
+            // plus the splice and header parse below. Observed only on the
+            // `receive()` Ok path (splice errors are counted by
+            // receive_errors_total instead). framework health -> metrics_enabled:
+            // when disabled we don't even read the clock (matches meta_spawn's
+            // `Option<Instant>` and the kill-switch "no machinery" goal).
+            //
+            // The clock is read before the `select!`, so a wake from the
+            // shutdown branch (rather than `receive()`) reads an `Instant` that
+            // is never observed. Acceptable: shutdown is rare and the read is
+            // cheap; scoping the start to only the receive branch would tangle
+            // with the `&mut self` borrow inside `select!` for no real gain.
+            let wait_start = if self.metrics_enabled {
+                Some(mono_now())
+            } else {
+                None
+            };
             tokio::select! {
                 res = self.receive() => {
                     match res {
                         Ok(buf) => {
-                            let req = FuseRequest::from_bytes(buf.freeze())?;
+                            // Parse first, THEN observe loop wait — so the
+                            // histogram includes the header-parse cost and a
+                            // decode failure still records a sample.
+                            let parsed = FuseRequest::from_bytes(buf.freeze());
+                            if let Some(start) = wait_start {
+                                FuseMetrics::get()
+                                    .record_receive_loop_wait(start.elapsed().as_micros() as u64);
+                            }
+                            let req = match parsed {
+                                Ok(req) => req,
+                                Err(e) => {
+                                    // Structural decode failure before any ctx:
+                                    // count it, but keep the existing `?` control
+                                    // flow (this still terminates the receiver).
+                                    if self.metrics_enabled {
+                                        FuseMetrics::get().record_decode_error("other");
+                                    }
+                                    return Err(e.into());
+                                }
+                            };
 
                             if self.debug {
                                 // Debug logging must NOT parse the operator here:
@@ -276,21 +316,63 @@ impl<T: FileSystem> FuseReceiver<T> {
                                 let reply = self.new_reply(req.unique(), labels);
                                 let fs = self.fs.clone();
                                 let pending_requests = self.pending_requests.clone();
+                                // meta_task_inflight guard + meta_spawn stage are
+                                // created BEFORE spawn so they cover the runtime
+                                // queue wait (submission -> first poll). Both gated
+                                // on metrics_enabled (None / no observe when off);
+                                // production disabled path must NOT use a noop guard.
+                                //
+                                // Boundary: `meta_spawn` measures tasks that reach
+                                // first poll. If the runtime drops/aborts a task
+                                // before its first poll (e.g. shutdown), the guard
+                                // still dec's meta_task_inflight on drop, but no
+                                // meta_spawn sample is recorded. Out of scope for
+                                // 1b-1 (would need spawn-drop instrumentation).
+                                let meta_guard = FuseMetrics::meta_task_guard(self.metrics_enabled);
+                                let spawn_start =
+                                    if self.metrics_enabled { Some(mono_now()) } else { None };
                                 self.rt.spawn(async move {
-                                    if let Err(e) = Self::dispatch_meta_interrupt(fs, pending_requests, req, reply).await {
+                                    // First poll: record the spawn->first-poll
+                                    // scheduling delay (status=success).
+                                    if let Some(start) = spawn_start {
+                                        FuseMetrics::get()
+                                            .record_meta_spawn(start.elapsed().as_micros() as u64);
+                                    }
+                                    let dispatch_result = Self::dispatch_meta_interrupt(
+                                        fs, pending_requests, req, reply,
+                                    )
+                                    .await;
+                                    // Drop the guard the moment dispatch returns
+                                    // (incl. error/interrupt paths), BEFORE the
+                                    // error log — so meta_task_inflight matches the
+                                    // "spawn submission -> dispatch returns" scope
+                                    // exactly and excludes log formatting time.
+                                    drop(meta_guard);
+                                    if let Err(e) = dispatch_result {
                                         error!("failed to dispatch meta request: {}", e);
                                     }
                                 });
                             }
                         }
 
-                        Err(e) => match e.raw_error().raw_os_error() {
-                            Some(ENOENT) => continue,
-                            Some(EINTR) => continue,
-                            Some(EAGAIN) => continue,
-                            Some(ENODEV) => break,
-                            _ => return Err(e.into()),
-                        },
+                        Err(e) => {
+                            // Splice/receive error before a request is decoded:
+                            // count by errno + loop action (framework health ->
+                            // metrics_enabled). Control flow is unchanged; the
+                            // original error is still propagated on the exit arm.
+                            let os_errno = e.raw_error().raw_os_error();
+                            if self.metrics_enabled {
+                                let (errno_label, action) = receive_error_labels(os_errno);
+                                FuseMetrics::get().record_receive_error(errno_label, action);
+                            }
+                            match os_errno {
+                                Some(ENOENT) => continue,
+                                Some(EINTR) => continue,
+                                Some(EAGAIN) => continue,
+                                Some(ENODEV) => break,
+                                _ => return Err(e.into()),
+                            }
+                        }
                     }
                 }
 
@@ -453,5 +535,55 @@ impl<T: FileSystem> FuseReceiver<T> {
 
         res?;
         Ok(())
+    }
+}
+
+/// Classify a splice/receive OS errno into `receive_errors_total{errno,action}`
+/// labels. A free function (not a method) so this classification — which mirrors
+/// the `start()` loop's error match and is otherwise hard to unit-test inline —
+/// is deterministically testable without constructing a `FuseReceiver`. The
+/// labels track the loop's control flow: ENOENT/EINTR/EAGAIN continue, and
+/// everything else (incl. ENODEV and unknown/None) exits.
+fn receive_error_labels(os_errno: Option<i32>) -> (&'static str, &'static str) {
+    let errno = splice_errno_label(os_errno.unwrap_or(0));
+    let action = match os_errno {
+        Some(ENOENT) | Some(EINTR) | Some(EAGAIN) => RECEIVE_ACTION_CONTINUE,
+        _ => RECEIVE_ACTION_EXIT,
+    };
+    (errno, action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::receive_error_labels;
+    use crate::fuse_metrics::{RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT};
+    use libc::{EAGAIN, EINTR, EIO, ENODEV, ENOENT};
+
+    #[test]
+    fn receive_error_labels_classify_errno_and_action() {
+        // continue arms: lowercase errno, action=continue.
+        assert_eq!(
+            receive_error_labels(Some(ENOENT)),
+            ("enoent", RECEIVE_ACTION_CONTINUE)
+        );
+        assert_eq!(
+            receive_error_labels(Some(EINTR)),
+            ("eintr", RECEIVE_ACTION_CONTINUE)
+        );
+        assert_eq!(
+            receive_error_labels(Some(EAGAIN)),
+            ("eagain", RECEIVE_ACTION_CONTINUE)
+        );
+        // ENODEV: graceful break -> exit.
+        assert_eq!(
+            receive_error_labels(Some(ENODEV)),
+            ("enodev", RECEIVE_ACTION_EXIT)
+        );
+        // unknown errno and missing errno -> other/exit.
+        assert_eq!(
+            receive_error_labels(Some(EIO)),
+            ("other", RECEIVE_ACTION_EXIT)
+        );
+        assert_eq!(receive_error_labels(None), ("other", RECEIVE_ACTION_EXIT));
     }
 }

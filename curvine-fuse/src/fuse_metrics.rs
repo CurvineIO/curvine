@@ -42,13 +42,21 @@ const STAGE_DURATION_BUCKETS_US: &[f64] = &[
 pub(crate) const REPLY_TYPE_REPLIED: &str = "replied";
 pub(crate) const REPLY_TYPE_NO_REPLY: &str = "no_reply";
 
-// `stage` label values actually emitted in Phase 1a-2 (only `reply_write`; the
-// rest of the stage enum lands in later phases — see the design's stage list).
+// `stage` label values. `reply_write` ships in 1a-2; `meta_spawn` in 1b
+// (rt.spawn submission -> first poll scheduling delay).
 pub(crate) const STAGE_REPLY_WRITE: &str = "reply_write";
+pub(crate) const STAGE_META_SPAWN: &str = "meta_spawn";
 
-// `phase` label values (`decode_errors_total`). Phase 1a-2 only emits `parse`
-// (the parse-after-ctx cleanup); `decode` (from_bytes failures) lands in 1b.
+// `phase` label values (`decode_errors_total`). `parse` (parse-after-ctx
+// cleanup) ships in 1a-2; `decode` (from_bytes failures) in 1b.
 pub(crate) const DECODE_PHASE_PARSE: &str = "parse";
+pub(crate) const DECODE_PHASE_DECODE: &str = "decode";
+
+// `action` label values for `receive_errors_total`. `exit` covers both the
+// graceful ENODEV break and an unexpected-error loop exit; the distinction is
+// carried by `errno` (see design's Status Semantics / receive-error notes).
+pub(crate) const RECEIVE_ACTION_CONTINUE: &str = "continue";
+pub(crate) const RECEIVE_ACTION_EXIT: &str = "exit";
 
 // `reason` label value for `reply_enqueue_errors_total`. Phase 1a-2 only uses
 // `channel_closed`: a tokio `SendError` means exactly "channel closed" and
@@ -128,9 +136,24 @@ pub struct FuseMetrics {
     pub(crate) reply_enqueue_errors_total: CounterVec,
     /// Kernel-fd write failures in the sender (delivery failure). `opcode,errno`.
     pub(crate) response_write_errors_total: CounterVec,
-    /// Per-stage latency, opcode-free. `stage,kind,status`. Phase 1a-2 emits
-    /// only `stage=reply_write`.
+    /// Per-stage latency, opcode-free. `stage,kind,status`. Bounded `stage`
+    /// enum emitted by the current build (reply_write in 1a-2, meta_spawn in 1b).
     pub(crate) stage_duration_us: HistogramVec,
+
+    // --- Phase 1b-1: framework health + scrape hygiene ---
+    /// Receiver loop wait: splice + header-parse, INCLUDING idle wait for the
+    /// next kernel request. A saturation/health histogram, NOT request latency.
+    pub(crate) receive_loop_wait_duration_us: Histogram,
+    /// Splice/receive errors before a request is decoded. `errno,action`
+    /// (action = continue | exit).
+    pub(crate) receive_errors_total: CounterVec,
+    /// Spawned metadata tasks in flight (rt.spawn submission -> dispatch
+    /// returns). Event-driven via a guard. No label.
+    pub(crate) meta_task_inflight: Gauge,
+    /// `/metrics` handler `text_output()` cost. Self-observation (last scrape).
+    pub(crate) metrics_scrape_duration_us: Histogram,
+    /// `/metrics` last scrape output size in bytes. Self-observation gauge.
+    pub(crate) metrics_scrape_bytes: Gauge,
 }
 
 impl FuseMetrics {
@@ -191,7 +214,11 @@ impl FuseMetrics {
             )?,
             decode_errors_total: m::new_counter_vec(
                 "curvine_fuse_decode_errors_total",
-                "Structural decode/parse failures; Phase 1a-2 emits only phase=parse,reason=other",
+                "Structural decode/parse failures by phase. phase=parse is per-request and \
+                 recurring (recoverable parse-after-ctx failures); phase=decode is TERMINAL — \
+                 a from_bytes failure kills the receiver, so it increments at most once per \
+                 receiver lifetime. Treat a phase=decode increment as 'receiver died, restart', \
+                 not a rate to threshold.",
                 &["phase", "reason"],
             )?,
             response_write_duration_us: m::new_histogram_vec_with_buckets(
@@ -217,9 +244,39 @@ impl FuseMetrics {
             )?,
             stage_duration_us: m::new_histogram_vec_with_buckets(
                 "curvine_fuse_stage_duration_us",
-                "Per-stage FUSE latency in microseconds; Phase 1a-2 emits only stage=reply_write",
+                "Per-stage FUSE framework latency in microseconds; label `stage` is a \
+                 bounded enum emitted by the current build",
                 &["stage", "kind", "status"],
                 STAGE_DURATION_BUCKETS_US,
+            )?,
+
+            receive_loop_wait_duration_us: m::new_histogram_with_buckets(
+                "curvine_fuse_receive_loop_wait_duration_us",
+                "Receiver loop wait (splice + header parse) in microseconds. \
+                 SATURATION/health metric, NOT request latency: includes idle wait for \
+                 the next kernel request, so long idle periods land in high/+Inf buckets. \
+                 Do not use for request P99.",
+                REQUEST_DURATION_BUCKETS_US,
+            )?,
+            receive_errors_total: m::new_counter_vec(
+                "curvine_fuse_receive_errors_total",
+                "Splice/receive errors before a request is decoded. action=continue \
+                 (loop retries) or exit (loop stops: graceful ENODEV break or unexpected \
+                 error return; the original error is still returned/logged)",
+                &["errno", "action"],
+            )?,
+            meta_task_inflight: m::new_gauge(
+                "curvine_fuse_meta_task_inflight",
+                "Spawned metadata tasks in flight (rt.spawn submission to dispatch return)",
+            )?,
+            metrics_scrape_duration_us: m::new_histogram_with_buckets(
+                "curvine_fuse_metrics_scrape_duration_us",
+                "Time to render the /metrics text output in microseconds (last scrape)",
+                STAGE_DURATION_BUCKETS_US,
+            )?,
+            metrics_scrape_bytes: m::new_gauge(
+                "curvine_fuse_metrics_scrape_bytes",
+                "Size of the last /metrics scrape output body in bytes",
             )?,
         })
     }
@@ -396,6 +453,69 @@ impl FuseMetrics {
         self.decode_errors_total
             .with_label_values(&[DECODE_PHASE_PARSE, reason])
             .inc();
+    }
+
+    // --- Phase 1b-1 framework health helpers ---
+
+    /// `decode_errors_total{phase="decode"} +1` — a structural `from_bytes`
+    /// failure before any request ctx exists. `reason` is `"other"` for now
+    /// (no structured decode-error classification yet).
+    ///
+    /// TERMINAL signal: the caller increments this and then immediately returns
+    /// the error, which ends the receive loop for this mount. So phase=decode
+    /// increments at most once per receiver lifetime — a one-shot fatal event,
+    /// not an accumulating rate (unlike the recurring per-request phase=parse).
+    /// Operators should read 0->1 as "receiver died, needs restart".
+    pub(crate) fn record_decode_error(&self, reason: &'static str) {
+        self.decode_errors_total
+            .with_label_values(&[DECODE_PHASE_DECODE, reason])
+            .inc();
+    }
+
+    /// `receive_errors_total{errno,action} +1` — a splice/receive error before
+    /// a request is decoded. `errno` is a `splice_errno_label`, `action` is
+    /// `RECEIVE_ACTION_CONTINUE` or `RECEIVE_ACTION_EXIT`.
+    pub(crate) fn record_receive_error(&self, errno: &'static str, action: &'static str) {
+        self.receive_errors_total
+            .with_label_values(&[errno, action])
+            .inc();
+    }
+
+    /// Observe the receiver loop wait (splice + header parse, incl. idle wait).
+    pub(crate) fn record_receive_loop_wait(&self, elapsed_us: u64) {
+        self.receive_loop_wait_duration_us
+            .observe(elapsed_us as f64);
+    }
+
+    /// Observe the `meta_spawn` stage (rt.spawn submission -> first poll). Always
+    /// `status=success` (the spawn itself cannot fail).
+    pub(crate) fn record_meta_spawn(&self, elapsed_us: u64) {
+        self.stage_duration_us
+            .with_label_values(&[
+                STAGE_META_SPAWN,
+                FuseReqKind::Metadata.as_str(),
+                FuseReqStatus::Success.as_str(),
+            ])
+            .observe(elapsed_us as f64);
+    }
+
+    /// Record one `/metrics` scrape: observe render duration and set the last
+    /// scrape output size. Self-observation (last-scrape semantics).
+    pub(crate) fn record_scrape(&self, elapsed_us: u64, output_bytes: usize) {
+        self.metrics_scrape_duration_us.observe(elapsed_us as f64);
+        self.metrics_scrape_bytes.set(output_bytes as i64);
+    }
+
+    /// Build the `meta_task_inflight` guard for a spawned metadata task. Returns
+    /// `Some(ActiveGuard)` (incrementing the gauge) when metrics are enabled,
+    /// `None` when disabled — disabled MUST be `None` (no metric machinery), it
+    /// must never be a `noop()` guard. Extracted so the gate is unit-testable.
+    pub(crate) fn meta_task_guard(metrics_enabled: bool) -> Option<ActiveGuard> {
+        if metrics_enabled {
+            Some(ActiveGuard::new(Self::get().meta_task_inflight.clone()))
+        } else {
+            None
+        }
     }
 }
 
@@ -1041,6 +1161,147 @@ mod tests {
                 .with_label_values(&[CODE, NOTIFY_WRITE_FAILED])
                 .get(),
             1
+        );
+    }
+
+    // --- Phase 1b-1 ---
+
+    // receive_errors_total: errno + action labels recorded as a delta.
+    #[test]
+    fn record_receive_error_counts_by_errno_action() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let before = mx
+            .receive_errors_total
+            .with_label_values(&["enoent", RECEIVE_ACTION_CONTINUE])
+            .get();
+        mx.record_receive_error("enoent", RECEIVE_ACTION_CONTINUE);
+        assert_eq!(
+            mx.receive_errors_total
+                .with_label_values(&["enoent", RECEIVE_ACTION_CONTINUE])
+                .get(),
+            before + 1
+        );
+        // exit action is a distinct series.
+        let exit_before = mx
+            .receive_errors_total
+            .with_label_values(&["enodev", RECEIVE_ACTION_EXIT])
+            .get();
+        mx.record_receive_error("enodev", RECEIVE_ACTION_EXIT);
+        assert_eq!(
+            mx.receive_errors_total
+                .with_label_values(&["enodev", RECEIVE_ACTION_EXIT])
+                .get(),
+            exit_before + 1
+        );
+    }
+
+    // record_decode_error emits under phase=decode (the 1b site; 1a-2 already
+    // had phase=parse via record_parse_error). We assert only the decode series
+    // delta: a cross-series ("parse untouched") assertion can't be made reliably
+    // against the process-global registry under parallel tests, and a `>=` guard
+    // would prove nothing — so we don't pretend to. `decode` vs `parse` being
+    // distinct labels is guaranteed by the const values, not by a runtime check.
+    #[test]
+    fn record_decode_error_increments_decode_phase() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let decode_before = mx
+            .decode_errors_total
+            .with_label_values(&[DECODE_PHASE_DECODE, "other"])
+            .get();
+        mx.record_decode_error("other");
+        assert_eq!(
+            mx.decode_errors_total
+                .with_label_values(&[DECODE_PHASE_DECODE, "other"])
+                .get(),
+            decode_before + 1,
+            "decode phase incremented"
+        );
+    }
+
+    // meta_task_guard: disabled MUST be None (no metric machinery); enabled is
+    // Some and inc/dec balances around the gauge.
+    // NOTE: the enabled inc/dec check uses before/after on the process-global
+    // `meta_task_inflight` gauge; it relies on no other test mutating that gauge
+    // in parallel (true today — this is the only meta_task test). If a future
+    // test also touches `meta_task_inflight`, switch this to a standalone
+    // test-only `Gauge` + `ActiveGuard::new(g.clone())` or serialize it.
+    #[test]
+    fn meta_task_guard_gate() {
+        FuseMetrics::ensure_init().unwrap();
+        assert!(
+            FuseMetrics::meta_task_guard(false).is_none(),
+            "disabled path must be None, never a noop guard"
+        );
+
+        let mx = FuseMetrics::get();
+        let before = mx.meta_task_inflight.get();
+        let guard = FuseMetrics::meta_task_guard(true);
+        assert!(guard.is_some());
+        assert_eq!(
+            mx.meta_task_inflight.get(),
+            before + 1,
+            "guard inc on create"
+        );
+        drop(guard);
+        assert_eq!(mx.meta_task_inflight.get(), before, "guard dec on drop");
+    }
+
+    // record_scrape sets bytes and observes duration (last-scrape semantics).
+    // NOTE: asserts an absolute `set` on the process-global `metrics_scrape_bytes`
+    // gauge; relies on no other test calling `record_scrape()` in parallel (true
+    // today). A future handler last-scrape test should serialize or use an
+    // isolated gauge to avoid clobbering this value.
+    #[test]
+    fn record_scrape_sets_bytes_and_observes_duration() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let count_before = mx.metrics_scrape_duration_us.get_sample_count();
+        mx.record_scrape(42, 1234);
+        assert_eq!(
+            mx.metrics_scrape_bytes.get(),
+            1234,
+            "bytes = last scrape size"
+        );
+        assert_eq!(
+            mx.metrics_scrape_duration_us.get_sample_count(),
+            count_before + 1,
+            "duration observed once"
+        );
+    }
+
+    // record_meta_spawn observes the stage_duration_us{meta_spawn,metadata,success}
+    // series — guards against a label/status/kind typo in the core 1b-1 helper.
+    #[test]
+    fn record_meta_spawn_observes_correct_labels() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let before = mx
+            .stage_duration_us
+            .with_label_values(&[STAGE_META_SPAWN, "metadata", "success"])
+            .get_sample_count();
+        mx.record_meta_spawn(123);
+        assert_eq!(
+            mx.stage_duration_us
+                .with_label_values(&[STAGE_META_SPAWN, "metadata", "success"])
+                .get_sample_count(),
+            before + 1,
+            "meta_spawn observed under stage=meta_spawn,kind=metadata,status=success"
+        );
+    }
+
+    // record_receive_loop_wait observes the (no-label) histogram — guards against
+    // the field/helper/name drifting silently.
+    #[test]
+    fn record_receive_loop_wait_observes() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let before = mx.receive_loop_wait_duration_us.get_sample_count();
+        mx.record_receive_loop_wait(42);
+        assert_eq!(
+            mx.receive_loop_wait_duration_us.get_sample_count(),
+            before + 1
         );
     }
 }
