@@ -14,9 +14,9 @@
 
 use crate::fs::operator::FuseOperator;
 use crate::fs::FileSystem;
-use crate::fuse_metrics::{ActiveGuard, FuseReqCtx, FuseReqKind, FuseReqLabels};
+use crate::fuse_metrics::{ActiveGuard, FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels};
 use crate::raw::fuse_abi::fuse_out_header;
-use crate::session::{FuseRequest, FuseResponse, FuseTask};
+use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{debug, error, info};
@@ -44,6 +44,7 @@ pub struct FuseReceiver<T> {
     fuse_len: usize,
     debug: bool,
     audit_logging_enabled: bool,
+    metrics_enabled: bool,
     pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
 }
 
@@ -57,6 +58,7 @@ impl<T: FileSystem> FuseReceiver<T> {
         buf_size: usize,
         debug: bool,
         audit_logging_enabled: bool,
+        metrics_enabled: bool,
         pending_requests: Arc<FastDashMap<u64, Arc<Notify>>>,
     ) -> IOResult<Self> {
         let pipe2 = Pipe2::new(PipeFd::new(buf_size, false, false)?)?;
@@ -72,6 +74,7 @@ impl<T: FileSystem> FuseReceiver<T> {
             fuse_len: buf_size,
             debug,
             audit_logging_enabled,
+            metrics_enabled,
             pending_requests,
         };
 
@@ -122,19 +125,24 @@ impl<T: FileSystem> FuseReceiver<T> {
     }
 
     /// Build a reply handle for `unique`. When `labels` is `Some`, a metrics
-    /// context (with a no-op `ActiveGuard` in Phase 1a-1) is created so the
-    /// reply finishes in the sender; when `None`, the legacy disabled path.
+    /// context is created (incrementing the `active_requests` gauge via the
+    /// `ActiveGuard`) so the reply finishes in the sender; when `None`, the
+    /// legacy disabled path — `FuseMetrics::get()` is never touched, so a
+    /// disabled or uninitialized-metrics process cannot panic here.
     pub(crate) fn new_reply(&self, unique: u64, labels: Option<FuseReqLabels>) -> FuseResponse {
-        let ctx = labels.map(|labels| FuseReqCtx {
-            labels,
-            active: Some(ActiveGuard::noop()),
+        let ctx = labels.map(|labels| {
+            let gauge = FuseMetrics::get()
+                .active_requests
+                .with_label_values(&[labels.kind.as_str()]);
+            FuseReqCtx {
+                labels,
+                active: Some(ActiveGuard::new(gauge)),
+            }
         });
         FuseResponse::new_reply(unique, self.sender.clone(), self.debug, ctx)
     }
 
-    /// Derive the copyable metrics labels for a decoded request. Phase 1a-1
-    /// always builds these (metrics machinery is exercised but emits nothing);
-    /// the disabled-mode `None` path arrives with the Phase 1 kill switch.
+    /// Derive the copyable metrics labels for a decoded request.
     fn req_labels(req: &FuseRequest) -> FuseReqLabels {
         let kind = if req.is_stream() {
             FuseReqKind::Stream
@@ -143,6 +151,17 @@ impl<T: FileSystem> FuseReceiver<T> {
         };
         let request_bytes = req.get_header().map(|h| h.len).unwrap_or(0);
         FuseReqLabels::new(req.opcode().as_str(), kind, request_bytes)
+    }
+
+    /// The kill switch (`metrics_enabled`) gate: `Some(labels)` enables the
+    /// metrics path for this request, `None` selects the legacy zero-cost path.
+    /// When disabled, no `FuseReqLabels`/ctx/gauge is constructed at all.
+    fn maybe_req_labels(&self, req: &FuseRequest) -> Option<FuseReqLabels> {
+        if self.metrics_enabled {
+            Some(Self::req_labels(req))
+        } else {
+            None
+        }
     }
 
     fn audit(&self, req: &FuseRequest) {
@@ -162,9 +181,9 @@ impl<T: FileSystem> FuseReceiver<T> {
     pub async fn send_stream(&self, req: FuseRequest) -> FuseResult<()> {
         // Create the metrics context *before* parsing (ctx-before-parse), so a
         // structural parse failure after this point is a real finish-state-machine
-        // event, consistent with the metadata path.
-        let labels = Self::req_labels(&req);
-        let rep = self.new_reply(req.unique(), Some(labels));
+        // event, consistent with the metadata path. `None` when metrics disabled.
+        let labels = self.maybe_req_labels(&req);
+        let rep = self.new_reply(req.unique(), labels);
 
         // A structural parse failure after the ctx exists must finish the context
         // early (drop the active guard, mark finished) and emit no reply.
@@ -183,6 +202,10 @@ impl<T: FileSystem> FuseReceiver<T> {
         // (single logical finish, guard not double-counted) instead of building a
         // fresh context.
         let err_rep = rep.clone();
+        // NOTE: keep this match's stream arms in sync with `FuseRequest::is_stream()`
+        // (Read/Write/Flush/Release/Fsync). `send_stream` is only entered when
+        // `is_stream()` is true, so the wildcard is unreachable today; it exists
+        // as a defensive branch in case the two ever drift.
         let res = match operator {
             FuseOperator::Read(op) => self.fs.read(op, rep).await,
 
@@ -194,7 +217,21 @@ impl<T: FileSystem> FuseReceiver<T> {
 
             FuseOperator::FSync(op) => self.fs.fsync(op, rep).await,
 
-            _ => err_fuse!(libc::ENOSYS, "unsupported operation {:?}", req.opcode()),
+            _ => {
+                // Defensive: a stream-gated request whose operator is not a known
+                // stream op. Tag it `unimplemented_opcode` so it classifies as
+                // Unsupported — the same semantics as the metadata `dispatch_meta`
+                // wildcard — rather than a plain backend Error.
+                let err: FuseResult<fuse_out_header> = err_fuse!(
+                    libc::ENOSYS,
+                    "unsupported stream operation {:?}",
+                    req.opcode()
+                );
+                return err_rep
+                    .send_rep_tagged(err, Some("unimplemented_opcode"), false)
+                    .await
+                    .map_err(|x| x.into());
+            }
         };
 
         if res.is_err() {
@@ -235,8 +272,8 @@ impl<T: FileSystem> FuseReceiver<T> {
                             } else {
                                 self.audit(&req);
 
-                                let labels = Self::req_labels(&req);
-                                let reply = self.new_reply(req.unique(), Some(labels));
+                                let labels = self.maybe_req_labels(&req);
+                                let reply = self.new_reply(req.unique(), labels);
                                 let fs = self.fs.clone();
                                 let pending_requests = self.pending_requests.clone();
                                 self.rt.spawn(async move {
@@ -395,15 +432,22 @@ impl<T: FileSystem> FuseReceiver<T> {
             FuseOperator::SetLkW(op) => reply.send_rep(fs.set_lkw(op).await).await,
 
             _ => {
-                // A parsed-but-unhandled opcode (e.g. Rename2, or any
-                // `Notimplemented`): source-tagged as `unimplemented_opcode` so
-                // it classifies as Unsupported, not a backend Error. (Phase 1a-2
-                // reads the tag for `unsupported_total{reason}`.)
+                // A parsed-but-unhandled opcode: source-tagged as Unsupported so
+                // it classifies that way (not a backend Error). The reason splits
+                // two cases the kernel can produce:
+                //   - opcode == NOT_SUPPORTED (the num_enum default, raw opcode
+                //     this build has no enum value for) -> `unknown_opcode`
+                //     (a kernel/daemon protocol-compatibility signal).
+                //   - a known opcode with no dispatch arm (e.g. Rename2) ->
+                //     `unimplemented_opcode` (an implementation-gap signal).
+                let reason = if req.opcode() == FuseOpCode::NOT_SUPPORTED {
+                    "unknown_opcode"
+                } else {
+                    "unimplemented_opcode"
+                };
                 let err: FuseResult<fuse_out_header> =
                     err_fuse!(libc::ENOSYS, "unsupported operation {:?}", req.opcode());
-                reply
-                    .send_rep_tagged(err, Some("unimplemented_opcode"), false)
-                    .await
+                reply.send_rep_tagged(err, Some(reason), false).await
             }
         };
 

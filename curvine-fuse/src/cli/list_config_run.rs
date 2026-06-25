@@ -104,6 +104,14 @@ mod tests {
         assert!(longs.contains(&"master-addrs"));
     }
 
+    // The kill switch must be discoverable in the exported flag list.
+    #[test]
+    fn export_includes_metrics_enabled_flag() {
+        let doc = export_cli_flags_json().unwrap();
+        let longs: Vec<_> = doc.flags.iter().map(|f| f.long.as_str()).collect();
+        assert!(longs.contains(&"metrics-enabled"));
+    }
+
     #[test]
     fn export_deduplicates_shared_mount_flags() {
         let doc = export_cli_flags_json().unwrap();

@@ -125,6 +125,12 @@ pub struct FuseMountArgs {
     #[arg(long, help = "Enable permission checking (optional)")]
     pub check_permission: Option<bool>,
 
+    #[arg(
+        long,
+        help = "Enable FUSE metrics; set false to disable, e.g. --metrics-enabled false (optional)"
+    )]
+    pub metrics_enabled: Option<bool>,
+
     #[arg(long, help = "Enable in-kernel metadata cache (optional)")]
     pub enable_meta_cache: Option<bool>,
 
@@ -275,6 +281,10 @@ impl FuseMountArgs {
 
         if let Some(check_permission) = self.check_permission {
             conf.fuse.check_permission = check_permission;
+        }
+
+        if let Some(metrics_enabled) = self.metrics_enabled {
+            conf.fuse.metrics_enabled = metrics_enabled;
         }
 
         if let Some(enable_meta_cache) = self.enable_meta_cache {

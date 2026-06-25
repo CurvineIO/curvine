@@ -157,6 +157,39 @@ mod tests {
         assert_eq!(args.mount.io_threads, Some(8));
     }
 
+    // Kill switch: FuseConf defaults metrics on (Phase 1–3 ship enabled).
+    #[test]
+    fn metrics_enabled_defaults_to_true() {
+        use curvine_common::conf::FuseConf;
+        assert!(FuseConf::default().metrics_enabled);
+    }
+
+    // Kill switch: `--metrics-enabled false` parses and overrides the conf to
+    // false (the production emergency-downgrade path).
+    #[test]
+    fn metrics_enabled_cli_override_disables() {
+        let args = FuseCli::try_parse_from(["curvine-fuse", "--metrics-enabled", "false"])
+            .unwrap()
+            .resolve_runtime_args();
+        assert_eq!(args.mount.metrics_enabled, Some(false));
+        let conf = args.get_conf().unwrap();
+        assert!(
+            !conf.fuse.metrics_enabled,
+            "--metrics-enabled false must disable metrics in the resolved conf"
+        );
+    }
+
+    // Kill switch: when the flag is absent the conf keeps its default (true).
+    #[test]
+    fn metrics_enabled_absent_keeps_default() {
+        let args = FuseCli::try_parse_from(["curvine-fuse", "--io-threads", "4"])
+            .unwrap()
+            .resolve_runtime_args();
+        assert_eq!(args.mount.metrics_enabled, None);
+        let conf = args.get_conf().unwrap();
+        assert!(conf.fuse.metrics_enabled, "absent flag keeps default true");
+    }
+
     #[test]
     fn mixed_top_level_flags_and_subcommand_is_rejected() {
         let err =

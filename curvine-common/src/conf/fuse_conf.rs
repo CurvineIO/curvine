@@ -30,6 +30,19 @@ pub struct FuseConf {
 
     pub audit_logging_enabled: bool,
 
+    // Master on/off switch for FUSE metrics instrumentation (request/error/
+    // latency/notify series). Read once at startup; when false the reply path
+    // takes the legacy zero-cost path and emits no per-request metrics.
+    // Defaults to true (Phase 1–3 ship everything enabled).
+    //
+    // Scope: this is a per-request *emission* switch, not a cardinality/footprint
+    // downgrade. The metric families are registered unconditionally at startup
+    // (`FuseMetrics::ensure_init`), so when disabled they still appear in the
+    // scrape as zero-valued series — this keeps a stable scrape schema and lets
+    // the switch flip back on without re-registration. "Disabled" means "no
+    // emission", not "no registration".
+    pub metrics_enabled: bool,
+
     pub io_threads: usize,
 
     pub worker_threads: usize,
@@ -300,6 +313,7 @@ impl Default for FuseConf {
         let mut conf = Self {
             debug: false,
             audit_logging_enabled: false,
+            metrics_enabled: true,
 
             io_threads: 32,
             worker_threads: Utils::worker_threads(32),

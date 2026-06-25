@@ -53,11 +53,11 @@ pub(crate) enum FuseTask {
         active: ActiveGuard,
         status: FuseReqStatus,
         errno: i32,
-        /// Source tag for `status == Unsupported` (`unknown_opcode` /
-        /// `unimplemented_opcode` / `trait_default`), carried so Phase 1a-2 can
-        /// emit `unsupported_total{reason}` at the sender finish point without
-        /// reaching back into the metrics slot. `None` for non-unsupported
-        /// replies. (Phase 1a-1 sets it but reads nothing.)
+        /// Source tag for `status == Unsupported`, carried so the sender can emit
+        /// `unsupported_total{reason}` without reaching back into the metrics
+        /// slot. Phase 1a-2 emits `unknown_opcode` / `unimplemented_opcode`;
+        /// `trait_default` is reserved for a later phase (no source site yet).
+        /// `None` for non-unsupported replies.
         unsupported_reason: Option<&'static str>,
     },
     /// A kernel notification (cache invalidation). No originating request, so no
