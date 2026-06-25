@@ -442,7 +442,7 @@ impl OpendalFileSystem {
                         builder = builder.disable_list_objects_v2();
                     }
                     Some(other) => {
-                        return Err(FsError::common(format!(
+                        return Err(FsError::invalid_argument(format!(
                             "Invalid s3.list_objects_version '{}': expected 'v1' or 'v2'",
                             other
                         )));
