@@ -1013,26 +1013,23 @@ mod list_objects_version_tests {
 
     #[test]
     fn defaults_to_v2_when_unset_or_empty() {
-        assert_eq!(resolve_disable_list_objects_v2(None).unwrap(), false);
-        assert_eq!(resolve_disable_list_objects_v2(Some("")).unwrap(), false);
-        assert_eq!(resolve_disable_list_objects_v2(Some("   ")).unwrap(), false);
+        assert!(!resolve_disable_list_objects_v2(None).unwrap());
+        assert!(!resolve_disable_list_objects_v2(Some("")).unwrap());
+        assert!(!resolve_disable_list_objects_v2(Some("   ")).unwrap());
     }
 
     #[test]
     fn v2_keeps_default() {
-        assert_eq!(resolve_disable_list_objects_v2(Some("v2")).unwrap(), false);
-        assert_eq!(resolve_disable_list_objects_v2(Some("V2")).unwrap(), false);
-        assert_eq!(
-            resolve_disable_list_objects_v2(Some("  v2 ")).unwrap(),
-            false
-        );
+        assert!(!resolve_disable_list_objects_v2(Some("v2")).unwrap());
+        assert!(!resolve_disable_list_objects_v2(Some("V2")).unwrap());
+        assert!(!resolve_disable_list_objects_v2(Some("  v2 ")).unwrap());
     }
 
     #[test]
     fn v1_disables_v2() {
-        assert_eq!(resolve_disable_list_objects_v2(Some("v1")).unwrap(), true);
-        assert_eq!(resolve_disable_list_objects_v2(Some("V1")).unwrap(), true);
-        assert_eq!(resolve_disable_list_objects_v2(Some(" v1 ")).unwrap(), true);
+        assert!(resolve_disable_list_objects_v2(Some("v1")).unwrap());
+        assert!(resolve_disable_list_objects_v2(Some("V1")).unwrap());
+        assert!(resolve_disable_list_objects_v2(Some(" v1 ")).unwrap());
     }
 
     #[test]
