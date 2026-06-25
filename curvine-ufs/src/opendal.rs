@@ -424,6 +424,31 @@ impl OpendalFileSystem {
                     builder = builder.enable_virtual_host_style();
                 }
 
+                // Select the S3 ListObjects API version via `s3.list_objects_version`.
+                //
+                // Defaults to v2 (OpenDAL's default). Some S3-compatible services (e.g. Baidu
+                // BOS) return `is_truncated=true` in a ListObjectsV2 response but omit the
+                // `NextContinuationToken`; OpenDAL's v2 lister then resends the request with an
+                // empty token, gets the same page back, and loops forever (mount/list hangs).
+                // Setting `s3.list_objects_version=v1` switches to ListObjects v1, whose lister
+                // falls back to using the last object key as the marker and advances correctly.
+                let list_objects_version = conf
+                    .get("s3.list_objects_version")
+                    .map(|v| v.trim().to_ascii_lowercase());
+                match list_objects_version.as_deref() {
+                    // v2 is the default; nothing to do.
+                    None | Some("") | Some("v2") | Some("2") => {}
+                    Some("v1") | Some("1") => {
+                        builder = builder.disable_list_objects_v2();
+                    }
+                    Some(other) => {
+                        return Err(FsError::common(format!(
+                            "Invalid s3.list_objects_version '{}': expected 'v1' or 'v2'",
+                            other
+                        )));
+                    }
+                }
+
                 let base_op = Operator::new(builder)
                     .map_err(|e| FsError::common(format!("Failed to create S3 operator: {}", e)))?
                     .finish();
