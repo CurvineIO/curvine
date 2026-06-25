@@ -1022,7 +1022,10 @@ mod list_objects_version_tests {
     fn v2_keeps_default() {
         assert_eq!(resolve_disable_list_objects_v2(Some("v2")).unwrap(), false);
         assert_eq!(resolve_disable_list_objects_v2(Some("V2")).unwrap(), false);
-        assert_eq!(resolve_disable_list_objects_v2(Some("  v2 ")).unwrap(), false);
+        assert_eq!(
+            resolve_disable_list_objects_v2(Some("  v2 ")).unwrap(),
+            false
+        );
     }
 
     #[test]
