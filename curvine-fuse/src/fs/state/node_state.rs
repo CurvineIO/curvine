@@ -46,6 +46,16 @@ pub struct NodeState {
 }
 
 impl NodeState {
+    /// Construct a `NodeState`. For the legacy `inode_num`/`*_handle_num` gauges
+    /// to be correct, the caller MUST have called `FuseMetrics::ensure_init()`
+    /// first (production does this in `CurvineFileSystem::new`, pinned by the
+    /// `ensure_init_precedes_node_state` test). If a caller skips `ensure_init`
+    /// the gauge updates here and at later mutation sites are silently no-op'd by
+    /// `FuseMetrics::with`; the danger is asymmetry — constructing/inserting
+    /// before init then removing after a later `ensure_init` would `dec` without
+    /// a matching `inc` and drive the gauge negative. Tests that exercise
+    /// `NodeState` without caring about the gauges rely on the no-op; tests that
+    /// do care must `ensure_init` before the first mutation.
     pub fn new(fs: UnifiedFileSystem) -> Self {
         let conf = fs.conf().fuse.clone();
         let node_map = NodeMap::new(&conf);
@@ -388,11 +398,57 @@ impl NodeState {
             check_writer,
             status,
         ));
-        lock.entry(handle.ino)
-            .or_default()
-            .insert(handle.fh, handle.clone());
+        Self::insert_file_handle_locked(&mut lock, handle.ino, handle.fh, handle.clone());
 
         Ok(handle)
+    }
+
+    /// Runtime chokepoint for inserting a file handle while holding the write
+    /// lock. Counts by handle (fh), matching `file_handles_len()`'s semantics
+    /// (sum of inner-map sizes), and only inc's on a genuinely new fh — a
+    /// replace (`is_some()`) does not, in case future code can reopen/reuse an
+    /// fh (today `next_fh()` is monotonic so every fh is new). The restore bulk
+    /// path does NOT use this — it sets the gauge from the live count once.
+    ///
+    /// Guard-rail (applies to all four `*_handle_locked` chokepoints): the
+    /// `FuseMetrics::with` closure runs with `handles`/`dir_handles` write-locked,
+    /// so it MUST stay a single atomic `AtomicI64` inc/dec (design rule 5) — no
+    /// `*Vec` label lookup, allocation, or registry traversal under the lock.
+    /// In-lock update is intentional: it keeps the gauge atomically consistent
+    /// with the map under concurrent FUSE workers.
+    fn insert_file_handle_locked(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
+        ino: u64,
+        fh: u64,
+        handle: Arc<FileHandle>,
+    ) {
+        let prev = lock.entry(ino).or_default().insert(fh, handle);
+        if prev.is_none() {
+            FuseMetrics::with(|m| m.file_handle_num.inc());
+        }
+    }
+
+    /// Runtime chokepoint for removing a file handle while holding the write
+    /// lock. Dec's only when an fh was actually present; pruning the now-empty
+    /// outer per-inode entry must NOT dec again (the count is per-fh, not
+    /// per-inode).
+    fn remove_file_handle_locked(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>>,
+        ino: u64,
+        fh: u64,
+    ) -> Option<Arc<FileHandle>> {
+        if let Some(map) = lock.get_mut(&ino) {
+            let handle = map.remove(&fh);
+            if handle.is_some() {
+                FuseMetrics::with(|m| m.file_handle_num.dec());
+            }
+            if map.is_empty() {
+                lock.remove(&ino);
+            }
+            handle
+        } else {
+            None
+        }
     }
 
     pub fn find_handle(&self, ino: u64, fh: u64) -> FuseResult<Arc<FileHandle>> {
@@ -412,17 +468,7 @@ impl NodeState {
 
     pub fn remove_handle(&self, ino: u64, fh: u64) -> Option<Arc<FileHandle>> {
         let mut lock = self.handles.write();
-        if let Some(map) = lock.get_mut(&ino) {
-            let handle = map.remove(&fh);
-
-            if map.is_empty() {
-                lock.remove(&ino);
-            }
-
-            handle
-        } else {
-            None
-        }
+        Self::remove_file_handle_locked(&mut lock, ino, fh)
     }
 
     pub fn has_open_handles(&self, ino: u64) -> bool {
@@ -489,13 +535,38 @@ impl NodeState {
 
     pub fn remove_dir_handle(&self, ino: u64, fh: u64) -> Option<Arc<DirHandle>> {
         let mut lock = self.dir_handles.write();
+        Self::remove_dir_handle_locked(&mut lock, ino, fh)
+    }
+
+    /// Dir-handle counterpart of [`Self::insert_file_handle_locked`]; same
+    /// per-fh inc-on-new-key invariant.
+    fn insert_dir_handle_locked(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
+        ino: u64,
+        fh: u64,
+        handle: Arc<DirHandle>,
+    ) {
+        let prev = lock.entry(ino).or_default().insert(fh, handle);
+        if prev.is_none() {
+            FuseMetrics::with(|m| m.dir_handle_num.inc());
+        }
+    }
+
+    /// Dir-handle counterpart of [`Self::remove_file_handle_locked`]; dec only
+    /// on a real removal, empty-outer prune does not dec again.
+    fn remove_dir_handle_locked(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>>,
+        ino: u64,
+        fh: u64,
+    ) -> Option<Arc<DirHandle>> {
         if let Some(map) = lock.get_mut(&ino) {
             let handle = map.remove(&fh);
-
+            if handle.is_some() {
+                FuseMetrics::with(|m| m.dir_handle_num.dec());
+            }
             if map.is_empty() {
                 lock.remove(&ino);
             }
-
             handle
         } else {
             None
@@ -512,9 +583,7 @@ impl NodeState {
             stream,
         ));
         let mut lock = self.dir_handles.write();
-        lock.entry(ino)
-            .or_default()
-            .insert(handle.fh, handle.clone());
+        Self::insert_dir_handle_locked(&mut lock, ino, handle.fh, handle.clone());
 
         Ok(handle)
     }
@@ -541,12 +610,6 @@ impl NodeState {
     pub fn dir_handles_len(&self) -> usize {
         let lock = self.dir_handles.read();
         lock.values().map(|m| m.len()).sum()
-    }
-
-    pub fn set_metrics(&self, m: &FuseMetrics) {
-        m.inode_num.set(self.node_read().nodes_len() as i64);
-        m.file_handle_num.set(self.file_handles_len() as i64);
-        m.dir_handle_num.set(self.dir_handles_len() as i64);
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
@@ -601,6 +664,14 @@ impl NodeState {
     }
 
     pub async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
+        // The magic/version early-returns below are gauge-safe ONLY because no
+        // map has been mutated yet: restore runs at mount time before any
+        // traffic, so the maps are still at cold-start and the gauges already
+        // read the correct baseline (inode 1, handles 0). Keep ALL map mutation
+        // after the finalizer-guarded sections (NodeMap::restore for inodes, the
+        // handle-phase finalizer below); pulling a map write ahead of these
+        // checks would skip the finalizer on a magic/version failure and drift
+        // the gauge.
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != STATE_FILE_MAGIC {
@@ -623,6 +694,10 @@ impl NodeState {
         {
             info!("node_state::restore: restoring node_map");
             let mut node_lock = self.node_write();
+            // inode_num is owned by NodeMap::restore (sets from live nodes.len()
+            // on success and on early-?), so a failure here needs no handle
+            // finalizer: the handle maps have not been touched this restore and
+            // their gauges keep their old (still-correct) live values.
             node_lock.restore(reader)?;
             info!(
                 "node_state::restore: node_map {}restored",
@@ -630,74 +705,303 @@ impl NodeState {
             );
         }
 
-        info!("node_state::restore: restoring file_handles");
-        let handles_count = reader.read_len()?;
-        let mut restored_handles = 0;
-        for i in 0..handles_count {
-            let handle = match FileHandle::restore(reader, self).await {
-                Ok(handle) => handle,
-                Err(e) => {
-                    error!(
-                        "failed to restore file_handle {}/{}: {}",
-                        i + 1,
-                        handles_count,
-                        e
-                    );
-                    continue;
-                }
-            };
+        // Handle-restore phase. The bulk inserts below do NOT go through the
+        // event-driven insert helpers (per-insert inc + a final set would churn
+        // and complicate the partial-failure value); instead the finalizer after
+        // this block sets file/dir_handle_num from the live map counts exactly
+        // once. NodeState::restore does NOT clear the handle maps first, so on a
+        // re-restore / non-empty state a "restored count" would be wrong — only
+        // the live `file_handles_len()`/`dir_handles_len()` are correct.
+        //
+        // The finalizer must run on success AND on every early-`?` in this phase
+        // (dir-handle read/path/list_stream, and the trailing fh_creator read),
+        // because any of those can fire after the handle maps were mutated.
+        let result: FuseResult<()> = async {
+            info!("node_state::restore: restoring file_handles");
+            let handles_count = reader.read_len()?;
+            let mut restored_handles = 0;
+            for i in 0..handles_count {
+                let handle = match FileHandle::restore(reader, self).await {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        error!(
+                            "failed to restore file_handle {}/{}: {}",
+                            i + 1,
+                            handles_count,
+                            e
+                        );
+                        continue;
+                    }
+                };
 
-            self.handles
-                .write()
-                .entry(handle.ino)
-                .or_default()
-                .insert(handle.fh, Arc::new(handle));
-            restored_handles += 1;
+                // Drift-check allowlist: restore bulk insert (file handles).
+                // Direct insert on purpose — the finalizer below owns the gauge.
+                self.handles
+                    .write()
+                    .entry(handle.ino)
+                    .or_default()
+                    .insert(handle.fh, Arc::new(handle));
+                restored_handles += 1;
+            }
+            info!(
+                "node_state::restore: {}/{} file_handles restored",
+                restored_handles, handles_count
+            );
+
+            info!("node_state::restore: restoring dir_handles");
+            let dir_handles_count = reader.read_len()?;
+            for _ in 0..dir_handles_count {
+                let mut handle = reader.read_struct::<DirHandle>()?;
+                let path = Path::from_str(&handle.path)?;
+                let stream = self.list_stream(&path).await?;
+                handle.set_stream(stream);
+
+                // Drift-check allowlist: restore bulk insert (dir handles).
+                self.dir_handles
+                    .write()
+                    .entry(handle.ino)
+                    .or_default()
+                    .insert(handle.fh, Arc::new(handle));
+            }
+            info!(
+                "node_state::restore: {} dir_handles restored",
+                dir_handles_count
+            );
+
+            let fh_creator_value = reader.read_len()?;
+            self.fh_creator.set(fh_creator_value);
+            Ok(())
         }
-        info!(
-            "node_state::restore: {}/{} file_handles restored",
-            restored_handles, handles_count
-        );
+        .await;
 
-        info!("node_state::restore: restoring dir_handles");
-        let dir_handles_count = reader.read_len()?;
-        for _ in 0..dir_handles_count {
-            let mut handle = reader.read_struct::<DirHandle>()?;
-            let path = Path::from_str(&handle.path)?;
-            let stream = self.list_stream(&path).await?;
-            handle.set_stream(stream);
+        // Finalizer: set both handle gauges from the actual live map counts,
+        // covering the Ok path and every early-? above. inode_num is not touched
+        // here (NodeMap::restore already owns it).
+        FuseMetrics::with(|m| {
+            Self::sync_handle_gauges(
+                &m.file_handle_num,
+                self.file_handles_len(),
+                &m.dir_handle_num,
+                self.dir_handles_len(),
+            )
+        });
 
-            self.dir_handles
-                .write()
-                .entry(handle.ino)
-                .or_default()
-                .insert(handle.fh, Arc::new(handle));
+        if result.is_ok() {
+            info!("node_state::restore: state restore completed successfully");
         }
-        info!(
-            "node_state::restore: {} dir_handles restored",
-            dir_handles_count
-        );
+        result
+    }
 
-        let fh_creator_value = reader.read_len()?;
-        self.fh_creator.set(fh_creator_value);
-
-        info!("node_state::restore: state restore completed successfully");
-        Ok(())
+    /// Set the file/dir handle gauges to the live map counts. Extracted as a
+    /// `&Gauge` taker so the restore finalizer's "live count -> gauge" mapping is
+    /// unit-testable against injected, isolated gauges (the process-global
+    /// handle gauges are shared with other tests). Pins that file count goes to
+    /// the file gauge and dir count to the dir gauge — a swap here would be a
+    /// silent drift that the map-count restore tests cannot catch.
+    fn sync_handle_gauges(
+        file_gauge: &orpc::common::Gauge,
+        file_len: usize,
+        dir_gauge: &orpc::common::Gauge,
+        dir_len: usize,
+    ) {
+        file_gauge.set(file_len as i64);
+        dir_gauge.set(dir_len as i64);
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::fs::state::NodeState;
+    use super::FileHandle;
+    use crate::fs::state::{DirHandle, NodeState};
     use crate::FUSE_ROOT_ID;
     use curvine_client::unified::UnifiedFileSystem;
     use curvine_common::conf::{ClusterConf, FuseConf};
+    use curvine_common::fs::{ListStream, Path};
     use curvine_common::state::FileStatus;
+    use orpc::common::FastHashMap;
     use orpc::runtime::AsyncRuntime;
     use orpc::CommonResult;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    fn file_handle(ino: u64, fh: u64) -> Arc<FileHandle> {
+        // reader/writer are None: the map-insertion chokepoints never touch them,
+        // so this avoids any backend I/O.
+        Arc::new(FileHandle::new(
+            ino,
+            fh,
+            None,
+            None,
+            FileStatus::with_name(ino as i64, "f".to_string(), false),
+        ))
+    }
+
+    fn dir_handle(ino: u64, fh: u64) -> Arc<DirHandle> {
+        let path = Path::from_str("/d").unwrap();
+        Arc::new(DirHandle::new(
+            ino,
+            fh,
+            &path,
+            16,
+            ListStream::new(futures::stream::empty()),
+        ))
+    }
+
+    // The handle gauges (file_handle_num / dir_handle_num) count by fh and are
+    // event-driven through the *_handle_locked chokepoints. We exercise the
+    // chokepoints directly on a local map, asserting the per-fh map-state
+    // invariants the inc/dec branches key off — race-free, unlike the
+    // process-global gauge. Covered: insert returns None on a new fh (would inc),
+    // Some on a replace (would NOT inc); remove returns Some on a real fh (would
+    // dec); pruning a now-empty outer per-inode entry does NOT dec again; and
+    // multiple fhs under the same inode each count.
+
+    #[test]
+    fn file_handle_chokepoint_per_fh_invariants() {
+        let mut map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> = FastHashMap::default();
+
+        // Two fhs under the same inode -> both count (sum-of-inner semantics).
+        NodeState::insert_file_handle_locked(&mut map, 1, 10, file_handle(1, 10));
+        NodeState::insert_file_handle_locked(&mut map, 1, 11, file_handle(1, 11));
+        assert_eq!(map.get(&1).map(|m| m.len()), Some(2));
+
+        // Removing one fh leaves the other; outer entry survives, no extra prune.
+        let removed = NodeState::remove_file_handle_locked(&mut map, 1, 10);
+        assert!(
+            removed.is_some(),
+            "real fh removal reports a handle (would dec)"
+        );
+        assert_eq!(map.get(&1).map(|m| m.len()), Some(1));
+
+        // Removing the last fh prunes the empty outer entry; this is one dec
+        // (the fh), NOT an extra dec for the pruned inode bucket.
+        let removed = NodeState::remove_file_handle_locked(&mut map, 1, 11);
+        assert!(removed.is_some());
+        assert!(
+            map.get(&1).is_none(),
+            "empty inner map prunes the outer entry"
+        );
+
+        // Removing a non-existent fh is a no-op (would NOT dec).
+        let removed = NodeState::remove_file_handle_locked(&mut map, 1, 99);
+        assert!(removed.is_none());
+    }
+
+    #[test]
+    fn dir_handle_chokepoint_per_fh_invariants() {
+        let mut map: FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>> = FastHashMap::default();
+
+        NodeState::insert_dir_handle_locked(&mut map, 2, 20, dir_handle(2, 20));
+        NodeState::insert_dir_handle_locked(&mut map, 2, 21, dir_handle(2, 21));
+        assert_eq!(map.get(&2).map(|m| m.len()), Some(2));
+
+        assert!(NodeState::remove_dir_handle_locked(&mut map, 2, 20).is_some());
+        assert!(NodeState::remove_dir_handle_locked(&mut map, 2, 21).is_some());
+        assert!(
+            map.get(&2).is_none(),
+            "empty inner map prunes the outer entry"
+        );
+        assert!(NodeState::remove_dir_handle_locked(&mut map, 2, 99).is_none());
+    }
+
+    // The per-fh invariant tests above assert on map state only, so an inverted
+    // inc/dec or a copy-pasted wrong gauge field (e.g. file chokepoint touching
+    // dir_handle_num) would pass them. These two tests close that gap by reading
+    // the real process-global gauge delta around one insert+remove cycle, the
+    // same before/after pattern as `meta_task_guard_gate`.
+    //
+    // Concurrency note: production `new_handle`/`new_dir_handle` need a live
+    // backend, so no other test drives these gauges; the file test only touches
+    // `file_handle_num` and the dir test only `dir_handle_num`, so they don't
+    // race each other. We assert deltas (not absolutes) since other tests'
+    // `ensure_init` leaves an unknown starting value. If a future test also
+    // writes these gauges, switch to a standalone injected gauge or serialize.
+
+    #[test]
+    fn insert_file_handle_inc_then_remove_dec_the_file_gauge() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let mx = crate::FuseMetrics::get();
+        let mut map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> = FastHashMap::default();
+
+        let file_before = mx.file_handle_num.get();
+        let dir_before = mx.dir_handle_num.get();
+
+        NodeState::insert_file_handle_locked(&mut map, 7, 70, file_handle(7, 70));
+        assert_eq!(
+            mx.file_handle_num.get(),
+            file_before + 1,
+            "new fh must inc file_handle_num"
+        );
+        assert_eq!(
+            mx.dir_handle_num.get(),
+            dir_before,
+            "file handle must NOT touch dir_handle_num"
+        );
+
+        NodeState::remove_file_handle_locked(&mut map, 7, 70);
+        assert_eq!(
+            mx.file_handle_num.get(),
+            file_before,
+            "removing the fh must dec file_handle_num back"
+        );
+    }
+
+    #[test]
+    fn insert_dir_handle_inc_then_remove_dec_the_dir_gauge() {
+        crate::FuseMetrics::ensure_init().unwrap();
+        let mx = crate::FuseMetrics::get();
+        let mut map: FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>> = FastHashMap::default();
+
+        let dir_before = mx.dir_handle_num.get();
+        let file_before = mx.file_handle_num.get();
+
+        NodeState::insert_dir_handle_locked(&mut map, 8, 80, dir_handle(8, 80));
+        assert_eq!(
+            mx.dir_handle_num.get(),
+            dir_before + 1,
+            "new fh must inc dir_handle_num"
+        );
+        assert_eq!(
+            mx.file_handle_num.get(),
+            file_before,
+            "dir handle must NOT touch file_handle_num"
+        );
+
+        NodeState::remove_dir_handle_locked(&mut map, 8, 80);
+        assert_eq!(
+            mx.dir_handle_num.get(),
+            dir_before,
+            "removing the fh must dec dir_handle_num back"
+        );
+    }
+
+    // The restore handle finalizer feeds file_handles_len()/dir_handles_len() to
+    // the two gauges via `sync_handle_gauges`. The restore tests prove the live
+    // counts; this proves the finalizer writes the FILE count into the FILE
+    // gauge and the DIR count into the DIR gauge (a copy-paste swap would be a
+    // silent drift the map-count tests miss). Injected isolated gauges, so no
+    // dependence on global state.
+    #[test]
+    fn sync_handle_gauges_maps_each_count_to_its_gauge() {
+        let file_g = orpc::common::Metrics::new_gauge(
+            "test_sync_file_handle_gauge_unique",
+            "isolated file gauge",
+        )
+        .unwrap();
+        let dir_g = orpc::common::Metrics::new_gauge(
+            "test_sync_dir_handle_gauge_unique",
+            "isolated dir gauge",
+        )
+        .unwrap();
+        file_g.set(111);
+        dir_g.set(222);
+
+        NodeState::sync_handle_gauges(&file_g, 3, &dir_g, 5);
+
+        assert_eq!(file_g.get(), 3, "file count must land in the file gauge");
+        assert_eq!(dir_g.get(), 5, "dir count must land in the dir gauge");
+    }
 
     #[test]
     pub fn path() -> CommonResult<()> {
