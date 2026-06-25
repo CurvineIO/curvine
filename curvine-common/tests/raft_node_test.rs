@@ -19,15 +19,19 @@ use curvine_common::proto::raft::{FsmState, SnapshotData};
 use curvine_common::raft::storage::{
     AppStorage, HashAppStorage, LogStorage, MemLogStorage, RocksLogStorage,
 };
-use curvine_common::raft::{RaftClient, RaftError, RaftJournal, RaftResult, RoleMonitor};
+use curvine_common::raft::{RaftClient, RaftCode, RaftError, RaftJournal, RaftResult, RoleMonitor};
 use curvine_common::utils::SerdeUtils;
-use orpc::common::{Logger, Utils};
+use orpc::client::{ClientConf, RpcClient};
+use orpc::common::{FileUtils, Logger, Utils};
+use orpc::message::{Builder, ResponseStatus};
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::CommonResult;
+use prost::bytes::BytesMut;
 use prost::Message;
 use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
 use raft::{GetEntriesContext, RaftState, StateRole, Storage, StorageError};
 use std::sync::Arc;
+use std::sync::{Mutex, RwLock};
 
 // Single-node memory storage test.
 // #[test]
@@ -120,7 +124,6 @@ where
 
     Ok(app_store)
 }
-
 #[derive(Clone, Default)]
 struct FailingSnapshotAppStorage;
 
@@ -143,6 +146,68 @@ impl AppStorage for FailingSnapshotAppStorage {
 
     async fn apply_snapshot(&self, _: SnapshotData) -> RaftResult<()> {
         Err(RaftError::other("injected snapshot restore failure".into()))
+    }
+
+    fn snapshot_dir(&self, _: u64) -> RaftResult<String> {
+        Ok(String::new())
+    }
+}
+
+#[derive(Clone, Default)]
+struct TestKvAppStorage {
+    map: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    fsm_state: Arc<Mutex<FsmState>>,
+}
+
+impl TestKvAppStorage {
+    fn get(&self, key: &str) -> Option<String> {
+        self.map.read().unwrap().get(key).cloned()
+    }
+}
+
+impl AppStorage for TestKvAppStorage {
+    async fn apply(&self, _: bool, msg: curvine_common::raft::storage::ApplyMsg) -> RaftResult<()> {
+        match msg {
+            curvine_common::raft::storage::ApplyMsg::Entry(entry) => {
+                let pair: (String, String) = SerdeUtils::deserialize(&entry.data)?;
+                self.map.write().unwrap().insert(pair.0, pair.1);
+                self.fsm_state.lock().unwrap().applied =
+                    curvine_common::proto::raft::AppliedIndex {
+                        term: entry.term,
+                        index: entry.index,
+                        op_id: 0,
+                        rpc_id: 0,
+                    };
+            }
+            curvine_common::raft::storage::ApplyMsg::Scan(applied) => {
+                self.fsm_state.lock().unwrap().applied = applied;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn get_fsm_state(&self) -> FsmState {
+        self.fsm_state.lock().unwrap().clone()
+    }
+
+    async fn role_change(&self, _: StateRole) -> RaftResult<()> {
+        Ok(())
+    }
+
+    async fn create_snapshot(&self) -> RaftResult<SnapshotData> {
+        Ok(SnapshotData {
+            snapshot_id: self.get_fsm_state().applied.index,
+            node_id: 0,
+            create_time: 0,
+            bytes_data: Some(Vec::new()),
+            files_data: None,
+            fsm_state: self.get_fsm_state(),
+        })
+    }
+
+    async fn apply_snapshot(&self, _: SnapshotData) -> RaftResult<()> {
+        Ok(())
     }
 
     fn snapshot_dir(&self, _: u64) -> RaftResult<String> {
@@ -219,6 +284,48 @@ impl Storage for NoSnapshotLogStorage {
             StorageError::SnapshotTemporarilyUnavailable,
         ))
     }
+}
+
+#[test]
+fn malformed_propose_request_does_not_stop_raft_node() -> CommonResult<()> {
+    Logger::default();
+
+    let mut conf = JournalConf::with_test();
+    conf.journal_dir = format!("../testing/malformed-propose-{}", Utils::rand_id());
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+
+    let rt = conf.create_runtime();
+    let store = TestKvAppStorage::default();
+    let raft = RaftJournal::new(
+        rt.clone(),
+        RocksLogStorage::from_conf(&conf, true),
+        store.clone(),
+        conf.clone(),
+        RoleMonitor::new(),
+    );
+    let mut listener = rt.block_on(raft.run())?;
+    rt.block_on(listener.wait_leader())?;
+
+    let client = RaftClient::from_conf(rt.clone(), &conf);
+    let malformed_header = SerdeUtils::serialize(&("bad".to_string(), "payload".to_string()))?;
+    let malformed_req = Builder::new_rpc(RaftCode::Propose)
+        .header(BytesMut::from(&malformed_header[..]))
+        .build();
+    let raw_client = rt.block_on(RpcClient::new(
+        false,
+        rt.clone(),
+        &conf.local_addr(),
+        &ClientConf::default(),
+    ))?;
+    let malformed_rep = rt.block_on(raw_client.rpc(malformed_req))?;
+    assert_eq!(malformed_rep.response_status(), ResponseStatus::Error);
+
+    rt.block_on(send_pair(rt.clone(), &conf, "name", "curvine"))?;
+    Utils::sleep(1000);
+    assert_eq!(store.get("name"), Some("curvine".to_string()));
+    FileUtils::delete_path(&conf.journal_dir, true)?;
+
+    Ok(())
 }
 
 #[test]
