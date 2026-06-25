@@ -239,7 +239,12 @@ impl Worker {
         rpc_status.wait_running().await.unwrap();
 
         // step 4: Start the web server
-        self.web_server.start();
+        let web_name = self.web_server.server_name().to_string();
+        let web_addr = self.web_server.bind_addr().clone();
+        let mut web_status = self.web_server.start();
+        WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &web_addr)
+            .await
+            .unwrap();
 
         // step 5: Start block heartbeat check service
         thread::spawn(move || self.block_actor.start())

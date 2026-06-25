@@ -22,7 +22,7 @@ use axum::Json;
 use log::{error, info};
 use orpc::io::net::{InetAddr, NetUtils};
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::server::ServerConf;
+use orpc::server::{ServerConf, ServerMonitor, ServerStateListener};
 use orpc::CommonResult;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -44,6 +44,7 @@ pub struct WebServer<S> {
     service: S,
     conf: ServerConf,
     address: InetAddr,
+    monitor: ServerMonitor,
 }
 
 impl<S> WebServer<S>
@@ -59,6 +60,7 @@ where
             service,
             conf,
             address,
+            monitor: ServerMonitor::new(),
         }
     }
 
@@ -69,24 +71,79 @@ where
             service,
             conf,
             address,
+            monitor: ServerMonitor::new(),
         }
+    }
+
+    pub fn bind_port(&self) -> u16 {
+        self.address.port
+    }
+
+    pub fn server_name(&self) -> &str {
+        &self.conf.name
+    }
+
+    pub fn bind_addr(&self) -> &InetAddr {
+        &self.address
     }
 
     pub fn block_on_start(&self) {
         self.rt.block_on(async {
             if let Err(e) = self.run().await {
-                error!("WebServer connect error: {}", e);
+                error!(
+                    "WebServer [{}] failed to bind address {} (port {}): {}",
+                    self.conf.name,
+                    self.get_bind_addr(),
+                    self.address.port,
+                    e
+                );
             }
         });
     }
 
-    pub fn start(self) {
+    pub fn start(self) -> ServerStateListener {
         let rt = self.rt.clone();
+        let listener = self.monitor.new_listener();
         rt.spawn(async move {
-            if let Err(e) = self.run().await {
-                error!("WebServer connect error: {}", e);
-            }
+            Self::start0(self).await;
         });
+        listener
+    }
+
+    pub async fn wait_bind(
+        listener: &mut ServerStateListener,
+        name: &str,
+        address: &InetAddr,
+    ) -> CommonResult<()> {
+        use orpc::err_box;
+
+        let port = address.port;
+        match listener.wait_startup().await {
+            Ok(()) => Ok(()),
+            Err(_) => err_box!(
+                "WebServer [{}] failed to bind address {} (port {}); the port may already be in use",
+                name,
+                address,
+                port
+            ),
+        }
+    }
+
+    async fn start0(server: Self) {
+        let bind_addr = server.get_bind_addr();
+        if let Err(e) = server.run().await {
+            error!(
+                "WebServer [{}] failed to bind address {} (port {}): {}",
+                server.conf.name, bind_addr, server.address.port, e
+            );
+        }
+
+        server.monitor.advance_shutdown();
+        server.monitor.advance_stop();
+
+        // Drop the server (and possibly its dedicated runtime) outside the async context
+        // to avoid Tokio panics when WebServer::new() owns the only runtime reference.
+        tokio::task::spawn_blocking(move || drop(server)).await.ok();
     }
 
     fn get_bind_addr(&self) -> String {
@@ -109,6 +166,8 @@ where
             "WebServer [{}] start successfully, bind address: {}",
             self.conf.name, self.address,
         );
+        self.monitor.advance_running();
+
         let webui_path = Path::new(WEBUI_DIR);
         let serve_dir = ServeDir::new(webui_path)
             .not_found_service(ServeFile::new(webui_path.join("index.html")));
@@ -152,13 +211,7 @@ fn test() {
     let mut conf = ServerConf::with_hostname("127.0.0.1", 9000);
     conf.name = "test".to_string();
     let web = WebServer::new(conf, service);
+    let _listener = web.start();
 
-    // Start server in background instead of blocking
-    web.start();
-
-    // Wait a short time for server to start
     thread::sleep(Duration::from_millis(500));
-
-    // Test completes - server continues running in background but test doesn't block
-    // The server will be cleaned up when the runtime shuts down
 }
