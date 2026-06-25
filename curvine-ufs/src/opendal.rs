@@ -432,21 +432,10 @@ impl OpendalFileSystem {
                 // empty token, gets the same page back, and loops forever (mount/list hangs).
                 // Setting `s3.list_objects_version=v1` switches to ListObjects v1, whose lister
                 // falls back to using the last object key as the marker and advances correctly.
-                let list_objects_version = conf
-                    .get("s3.list_objects_version")
-                    .map(|v| v.trim().to_ascii_lowercase());
-                match list_objects_version.as_deref() {
-                    // v2 is the default; nothing to do.
-                    None | Some("") | Some("v2") | Some("2") => {}
-                    Some("v1") | Some("1") => {
-                        builder = builder.disable_list_objects_v2();
-                    }
-                    Some(other) => {
-                        return Err(FsError::invalid_argument(format!(
-                            "Invalid s3.list_objects_version '{}': expected 'v1' or 'v2'",
-                            other
-                        )));
-                    }
+                if resolve_disable_list_objects_v2(
+                    conf.get("s3.list_objects_version").map(|s| s.as_str()),
+                )? {
+                    builder = builder.disable_list_objects_v2();
                 }
 
                 let base_op = Operator::new(builder)
@@ -996,5 +985,61 @@ impl FileSystem<OpendalWriter, OpendalReader> for OpendalFileSystem {
             });
 
         Ok(ListStream::new(stream))
+    }
+}
+
+/// Resolve the `s3.list_objects_version` mount option into "should disable ListObjectsV2".
+///
+/// Accepted values (case-insensitive, surrounding whitespace ignored):
+/// - unset / empty / `v2` -> use ListObjects V2 (OpenDAL default) -> returns `false`
+/// - `v1` -> fall back to ListObjects V1 -> returns `true`
+///
+/// Any other value is rejected with an `invalid_argument` error (POSIX EINVAL).
+#[cfg(feature = "opendal-s3")]
+fn resolve_disable_list_objects_v2(value: Option<&str>) -> FsResult<bool> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("v2") => Ok(false),
+        Some("v1") => Ok(true),
+        Some(other) => Err(FsError::invalid_argument(format!(
+            "Invalid s3.list_objects_version '{}': expected 'v1' or 'v2'",
+            other
+        ))),
+    }
+}
+
+#[cfg(all(test, feature = "opendal-s3"))]
+mod list_objects_version_tests {
+    use super::resolve_disable_list_objects_v2;
+
+    #[test]
+    fn defaults_to_v2_when_unset_or_empty() {
+        assert_eq!(resolve_disable_list_objects_v2(None).unwrap(), false);
+        assert_eq!(resolve_disable_list_objects_v2(Some("")).unwrap(), false);
+        assert_eq!(resolve_disable_list_objects_v2(Some("   ")).unwrap(), false);
+    }
+
+    #[test]
+    fn v2_keeps_default() {
+        assert_eq!(resolve_disable_list_objects_v2(Some("v2")).unwrap(), false);
+        assert_eq!(resolve_disable_list_objects_v2(Some("V2")).unwrap(), false);
+        assert_eq!(resolve_disable_list_objects_v2(Some("  v2 ")).unwrap(), false);
+    }
+
+    #[test]
+    fn v1_disables_v2() {
+        assert_eq!(resolve_disable_list_objects_v2(Some("v1")).unwrap(), true);
+        assert_eq!(resolve_disable_list_objects_v2(Some("V1")).unwrap(), true);
+        assert_eq!(resolve_disable_list_objects_v2(Some(" v1 ")).unwrap(), true);
+    }
+
+    #[test]
+    fn rejects_invalid_values() {
+        for bad in ["1", "2", "v3", "true", "list-v1", "foo"] {
+            let err = resolve_disable_list_objects_v2(Some(bad)).unwrap_err();
+            assert!(
+                err.to_string().contains("s3.list_objects_version"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
     }
 }
