@@ -80,6 +80,7 @@ impl From<FsError> for FuseError {
             FsError::ParentNotDir(_) => Some(libc::ENOTDIR),
             FsError::NotADirectory(_) => Some(libc::ENOTDIR),
             FsError::InvalidPath(_) => Some(libc::EINVAL),
+            FsError::InvalidFileSize(_) => Some(libc::EFBIG),
             FsError::InvalidArgument(_) => Some(libc::EINVAL),
             FsError::DiskOutOfSpace(_) => Some(libc::ENOSPC),
             FsError::Timeout(_) => Some(libc::ETIMEDOUT),
@@ -155,13 +156,22 @@ pub(crate) fn errno_label(errno: i32) -> &'static str {
         libc::ENOMEM => "ENOMEM",
         libc::EBUSY => "EBUSY",
         libc::ENAMETOOLONG => "ENAMETOOLONG",
+        libc::EFBIG => "EFBIG",
         _ => "OTHER",
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::errno_label;
+    use super::{errno_label, FuseError};
+    use curvine_common::error::FsError;
+
+    #[test]
+    fn invalid_file_size_maps_to_efbig() {
+        let err: FuseError = FsError::file_too_large(1 << 60).into();
+        assert_eq!(err.errno, libc::EFBIG);
+        assert_eq!(errno_label(err.errno), "EFBIG");
+    }
 
     #[test]
     fn errno_label_maps_the_closed_set() {
@@ -191,6 +201,7 @@ mod tests {
             (libc::ENOMEM, "ENOMEM"),
             (libc::EBUSY, "EBUSY"),
             (libc::ENAMETOOLONG, "ENAMETOOLONG"),
+            (libc::EFBIG, "EFBIG"),
         ];
         for (e, expected) in table {
             assert_eq!(errno_label(e), expected, "label mismatch for errno {}", e);
