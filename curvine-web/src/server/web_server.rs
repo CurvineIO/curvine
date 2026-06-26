@@ -22,7 +22,7 @@ use axum::Json;
 use log::{error, info};
 use orpc::io::net::{InetAddr, NetUtils};
 use orpc::runtime::{RpcRuntime, Runtime};
-use orpc::server::ServerConf;
+use orpc::server::{ServerConf, ServerMonitor, ServerStateListener};
 use orpc::CommonResult;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -44,6 +44,7 @@ pub struct WebServer<S> {
     service: S,
     conf: ServerConf,
     address: InetAddr,
+    monitor: ServerMonitor,
 }
 
 impl<S> WebServer<S>
@@ -59,6 +60,7 @@ where
             service,
             conf,
             address,
+            monitor: ServerMonitor::new(),
         }
     }
 
@@ -69,24 +71,100 @@ where
             service,
             conf,
             address,
+            monitor: ServerMonitor::new(),
         }
+    }
+
+    pub fn bind_port(&self) -> u16 {
+        self.address.port
+    }
+
+    pub fn server_name(&self) -> &str {
+        &self.conf.name
+    }
+
+    pub fn bind_addr(&self) -> &InetAddr {
+        &self.address
+    }
+
+    pub fn resolve_bind_addr(&self) -> String {
+        self.get_bind_addr()
     }
 
     pub fn block_on_start(&self) {
         self.rt.block_on(async {
             if let Err(e) = self.run().await {
-                error!("WebServer connect error: {}", e);
+                error!(
+                    "WebServer [{}] exited with error on address {}: {}",
+                    self.conf.name,
+                    self.get_bind_addr(),
+                    e
+                );
             }
         });
     }
 
-    pub fn start(self) {
+    pub fn start(self) -> ServerStateListener {
         let rt = self.rt.clone();
+        let listener = self.monitor.new_listener();
         rt.spawn(async move {
-            if let Err(e) = self.run().await {
-                error!("WebServer connect error: {}", e);
-            }
+            Self::start0(self).await;
         });
+        listener
+    }
+
+    pub async fn wait_bind(
+        listener: &mut ServerStateListener,
+        name: &str,
+        bind_addr: &str,
+    ) -> CommonResult<()> {
+        use orpc::err_box;
+
+        match listener.wait_startup().await {
+            Ok(()) => Ok(()),
+            Err(_) => err_box!(
+                "WebServer [{}] failed to start on address {}",
+                name,
+                bind_addr
+            ),
+        }
+    }
+
+    async fn start0(server: Self) {
+        let bind_addr = server.get_bind_addr();
+        let listener = match server.bind_listener().await {
+            Ok(listener) => listener,
+            Err(e) => {
+                error!(
+                    "WebServer [{}] failed to bind address {}: {}",
+                    server.conf.name, bind_addr, e
+                );
+                server.monitor.advance_shutdown();
+                server.monitor.advance_stop();
+                tokio::task::spawn_blocking(move || drop(server)).await.ok();
+                return;
+            }
+        };
+
+        info!(
+            "WebServer [{}] start successfully, bind address: {}",
+            server.conf.name, bind_addr
+        );
+        server.monitor.advance_running();
+
+        if let Err(e) = server.serve_listener(listener).await {
+            error!(
+                "WebServer [{}] exited with error on address {}: {}",
+                server.conf.name, bind_addr, e
+            );
+        }
+
+        server.monitor.advance_shutdown();
+        server.monitor.advance_stop();
+
+        // Drop the server (and possibly its dedicated runtime) outside the async context
+        // to avoid Tokio panics when WebServer::new() owns the only runtime reference.
+        tokio::task::spawn_blocking(move || drop(server)).await.ok();
     }
 
     fn get_bind_addr(&self) -> String {
@@ -94,21 +172,20 @@ where
         format!("{}:{}", hostname, self.address.port)
     }
 
-    pub async fn run(&self) -> CommonResult<()> {
+    async fn bind_listener(&self) -> CommonResult<TcpListener> {
         // Prefer a pre-bound listener from the test port reservation map.
         // This eliminates the TOCTOU race between port discovery and actual bind
         // when parallel test processes (cargo nextest) run simultaneously.
-        let listener = match NetUtils::take_held_listener(self.address.port) {
+        match NetUtils::take_held_listener(self.address.port) {
             Some(std_listener) => {
                 std_listener.set_nonblocking(true)?;
-                TcpListener::from_std(std_listener)?
+                Ok(TcpListener::from_std(std_listener)?)
             }
-            None => TcpListener::bind(self.get_bind_addr()).await?,
-        };
-        info!(
-            "WebServer [{}] start successfully, bind address: {}",
-            self.conf.name, self.address,
-        );
+            None => Ok(TcpListener::bind(self.get_bind_addr()).await?),
+        }
+    }
+
+    async fn serve_listener(&self, listener: TcpListener) -> CommonResult<()> {
         let webui_path = Path::new(WEBUI_DIR);
         let serve_dir = ServeDir::new(webui_path)
             .not_found_service(ServeFile::new(webui_path.join("index.html")));
@@ -129,6 +206,17 @@ where
             );
         axum::serve(listener, app).await?;
         Ok(())
+    }
+
+    pub async fn run(&self) -> CommonResult<()> {
+        let bind_addr = self.get_bind_addr();
+        let listener = self.bind_listener().await?;
+        info!(
+            "WebServer [{}] start successfully, bind address: {}",
+            self.conf.name, bind_addr
+        );
+        self.monitor.advance_running();
+        self.serve_listener(listener).await
     }
 }
 
@@ -152,13 +240,7 @@ fn test() {
     let mut conf = ServerConf::with_hostname("127.0.0.1", 9000);
     conf.name = "test".to_string();
     let web = WebServer::new(conf, service);
+    let _listener = web.start();
 
-    // Start server in background instead of blocking
-    web.start();
-
-    // Wait a short time for server to start
     thread::sleep(Duration::from_millis(500));
-
-    // Test completes - server continues running in background but test doesn't block
-    // The server will be cleaned up when the runtime shuts down
 }

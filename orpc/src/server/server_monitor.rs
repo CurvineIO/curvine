@@ -81,4 +81,66 @@ impl ServerStateListener {
     pub async fn wait_stop(&mut self) -> CommonResult<()> {
         self.0.wait_state(ServerState::Stop).await
     }
+
+    /// Wait until the server reaches Running, or fail fast if it shuts down before binding.
+    pub async fn wait_startup(&mut self) -> CommonResult<()> {
+        use crate::err_box;
+
+        let running = ServerState::Running.into();
+        let shutdown = ServerState::Shutdown.into();
+
+        if self.0.current() == running {
+            return Ok(());
+        }
+        if self.0.current() >= shutdown {
+            return err_box!("server failed to start");
+        }
+
+        loop {
+            let state = self.0.next_state().await?;
+            if state == running {
+                return Ok(());
+            }
+            if state >= shutdown {
+                return err_box!("server failed to start");
+            }
+            if self.0.current() == running {
+                return Ok(());
+            }
+            if self.0.current() >= shutdown {
+                return err_box!("server failed to start");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{AsyncRuntime, RpcRuntime};
+
+    #[test]
+    fn wait_startup_fails_when_shutdown_before_running() {
+        let monitor = ServerMonitor::new();
+        let mut listener = monitor.new_listener();
+        let rt = AsyncRuntime::single();
+
+        rt.block_on(async {
+            monitor.advance_shutdown();
+            monitor.advance_stop();
+            assert!(listener.wait_startup().await.is_err());
+        });
+    }
+
+    #[test]
+    fn wait_startup_succeeds_when_running() {
+        let monitor = ServerMonitor::new();
+        let mut listener = monitor.new_listener();
+        let rt = AsyncRuntime::single();
+
+        rt.block_on(async {
+            monitor.advance_running();
+            listener.wait_startup().await.unwrap();
+        });
+    }
 }
