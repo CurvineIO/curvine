@@ -240,9 +240,9 @@ impl Worker {
 
         // step 4: Start the web server
         let web_name = self.web_server.server_name().to_string();
-        let web_addr = self.web_server.bind_addr().clone();
+        let bind_addr = self.web_server.resolve_bind_addr();
         let mut web_status = self.web_server.start();
-        WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &web_addr)
+        WebServer::<WorkerService>::wait_bind(&mut web_status, &web_name, &bind_addr)
             .await
             .unwrap();
 
