@@ -34,9 +34,9 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     dnf clean all
 
 # Clone SPDK
-RUN git clone --depth 1 --branch "$SPDK_VERSION" --single-branch https://github.com/spdk/spdk.git /spdk
+RUN GIT_SSL_NO_VERIFY=true git clone --depth 1 --branch "$SPDK_VERSION" --single-branch https://github.com/spdk/spdk.git /spdk
 WORKDIR /spdk
-RUN git submodule update --init --depth 1
+RUN GIT_SSL_NO_VERIFY=true git submodule update --init --depth 1
 
 # Install SPDK build deps
 RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
@@ -45,7 +45,7 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     dnf clean all
 
 # Build nasm from source (needed by ISA-L, not available in EPEL 9 for aarch64)
-RUN curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
+RUN curl -ksL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
     tar -xz -C /tmp && \
     cd /tmp/nasm-$NASM_VERSION && \
     ./configure && \
@@ -55,7 +55,7 @@ RUN curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM
 
 # Build isa-l from source (needed by SPDK, not available in all Rocky 9 arches)
 RUN cd /tmp && \
-    git clone --depth 1 --branch $ISAL_VERSION https://github.com/intel/isa-l.git isa-l-src && \
+    GIT_SSL_NO_VERIFY=true git clone --depth 1 --branch $ISAL_VERSION https://github.com/intel/isa-l.git isa-l-src && \
     cd isa-l-src && \
     ./autogen.sh && \
     ./configure && \
@@ -179,28 +179,15 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     cp /opt/spdk/isa-l-crypto/.libs/*.so* /usr/lib64/ && \
     ldconfig
 
-# 6. Pre-install WebUI dependencies and fix vue-cli-service module resolution
+# 6. Pre-install WebUI dependencies
 RUN if [ -d "/workspace/curvine-web/webui" ]; then \
         echo "Pre-installing WebUI dependencies..."; \
         cd /workspace/curvine-web/webui && \
         npm install --legacy-peer-deps && \
-        echo "npm install completed" && \
-        # Fix: vue-cli-service wrapper script expects node_modules/package.json
-        # Create symlink to @vue/cli-service/package.json
-        ln -s @vue/cli-service/package.json node_modules/package.json && \
-        echo "Created symlink: node_modules/package.json -> @vue/cli-service/package.json" && \
-        ls -la node_modules/package.json; \
+        echo "npm install completed"; \
     fi
 
-# 7. Patch build.sh to use direct vue-cli-service.js call
-RUN if [ -f "/workspace/build/build.sh" ]; then \
-        echo "Patching build.sh to fix vue-cli-service wrapper script issue..."; \
-        sed -i 's/npm run build/node node_modules\/@vue\/cli-service\/bin\/vue-cli-service.js build/g' /workspace/build/build.sh && \
-        echo "Patch applied" && \
-        grep -n "vue-cli-service" /workspace/build/build.sh || true; \
-    fi
-
-# 8. Build the project from source
+# 7. Build the project from source
 RUN echo "Building Curvine from source..." && \
     export CURVINE_HOME=/workspace && \
     # Use workspace tmp directory instead of /tmp to avoid "no space left on device"
