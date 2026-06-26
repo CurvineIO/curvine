@@ -422,8 +422,7 @@ impl NodeState {
         fh: u64,
         handle: Arc<FileHandle>,
     ) {
-        let prev = lock.entry(ino).or_default().insert(fh, handle);
-        if prev.is_none() {
+        if Self::map_insert_handle(lock, ino, fh, handle) {
             FuseMetrics::with(|m| m.file_handle_num.inc());
         }
     }
@@ -437,17 +436,46 @@ impl NodeState {
         ino: u64,
         fh: u64,
     ) -> Option<Arc<FileHandle>> {
+        let (handle, removed) = Self::map_remove_handle(lock, ino, fh);
+        if removed {
+            FuseMetrics::with(|m| m.file_handle_num.dec());
+        }
+        handle
+    }
+
+    /// Pure map insert (no gauge side effect): insert `handle` at `ino`/`fh`,
+    /// returning `true` iff a genuinely new fh was added (the inc condition). The
+    /// gauge-free core of [`Self::insert_file_handle_locked`] / its dir twin, so
+    /// the per-fh map invariants can be unit-tested WITHOUT touching the
+    /// process-global handle gauges (which would couple parallel tests — see the
+    /// chokepoint tests). Generic over the handle type so file/dir share it.
+    fn map_insert_handle<H>(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<H>>>,
+        ino: u64,
+        fh: u64,
+        handle: Arc<H>,
+    ) -> bool {
+        lock.entry(ino).or_default().insert(fh, handle).is_none()
+    }
+
+    /// Pure map remove (no gauge side effect): remove `ino`/`fh`, prune the
+    /// now-empty outer entry, and return `(removed_handle, did_remove)` where
+    /// `did_remove` is the dec condition (an fh was actually present). Pruning
+    /// the empty inner map must NOT count as a second removal.
+    fn map_remove_handle<H>(
+        lock: &mut FastHashMap<u64, FastHashMap<u64, Arc<H>>>,
+        ino: u64,
+        fh: u64,
+    ) -> (Option<Arc<H>>, bool) {
         if let Some(map) = lock.get_mut(&ino) {
             let handle = map.remove(&fh);
-            if handle.is_some() {
-                FuseMetrics::with(|m| m.file_handle_num.dec());
-            }
+            let removed = handle.is_some();
             if map.is_empty() {
                 lock.remove(&ino);
             }
-            handle
+            (handle, removed)
         } else {
-            None
+            (None, false)
         }
     }
 
@@ -546,8 +574,7 @@ impl NodeState {
         fh: u64,
         handle: Arc<DirHandle>,
     ) {
-        let prev = lock.entry(ino).or_default().insert(fh, handle);
-        if prev.is_none() {
+        if Self::map_insert_handle(lock, ino, fh, handle) {
             FuseMetrics::with(|m| m.dir_handle_num.inc());
         }
     }
@@ -559,18 +586,11 @@ impl NodeState {
         ino: u64,
         fh: u64,
     ) -> Option<Arc<DirHandle>> {
-        if let Some(map) = lock.get_mut(&ino) {
-            let handle = map.remove(&fh);
-            if handle.is_some() {
-                FuseMetrics::with(|m| m.dir_handle_num.dec());
-            }
-            if map.is_empty() {
-                lock.remove(&ino);
-            }
-            handle
-        } else {
-            None
+        let (handle, removed) = Self::map_remove_handle(lock, ino, fh);
+        if removed {
+            FuseMetrics::with(|m| m.dir_handle_num.dec());
         }
+        handle
     }
 
     pub async fn new_dir_handle(&self, ino: u64, path: &Path) -> FuseResult<Arc<DirHandle>> {
@@ -849,74 +869,107 @@ mod test {
     }
 
     // The handle gauges (file_handle_num / dir_handle_num) count by fh and are
-    // event-driven through the *_handle_locked chokepoints. We exercise the
-    // chokepoints directly on a local map, asserting the per-fh map-state
-    // invariants the inc/dec branches key off — race-free, unlike the
-    // process-global gauge. Covered: insert returns None on a new fh (would inc),
-    // Some on a replace (would NOT inc); remove returns Some on a real fh (would
-    // dec); pruning a now-empty outer per-inode entry does NOT dec again; and
-    // multiple fhs under the same inode each count.
+    // event-driven through the *_handle_locked chokepoints. The per-fh MAP
+    // invariants are tested here via the gauge-free `map_insert_handle` /
+    // `map_remove_handle` cores — deliberately NOT the `*_handle_locked`
+    // wrappers, which would write the process-global gauge and couple these
+    // tests to the gauge-delta tests below under parallel execution. The
+    // returned bool/Option ARE the inc/dec conditions, so this still pins the
+    // branch the gauge keys off. Covered: insert returns true on a new fh (would
+    // inc), false on a replace (would NOT inc); remove returns (Some, true) on a
+    // real fh (would dec); pruning a now-empty outer per-inode entry does NOT
+    // dec again; multiple fhs under the same inode each count.
 
     #[test]
     fn file_handle_chokepoint_per_fh_invariants() {
         let mut map: FastHashMap<u64, FastHashMap<u64, Arc<FileHandle>>> = FastHashMap::default();
 
-        // Two fhs under the same inode -> both count (sum-of-inner semantics).
-        NodeState::insert_file_handle_locked(&mut map, 1, 10, file_handle(1, 10));
-        NodeState::insert_file_handle_locked(&mut map, 1, 11, file_handle(1, 11));
+        // Two fhs under the same inode -> both new (would inc), both count.
+        assert!(NodeState::map_insert_handle(
+            &mut map,
+            1,
+            10,
+            file_handle(1, 10)
+        ));
+        assert!(NodeState::map_insert_handle(
+            &mut map,
+            1,
+            11,
+            file_handle(1, 11)
+        ));
+        assert_eq!(map.get(&1).map(|m| m.len()), Some(2));
+
+        // Reinserting an existing fh -> false (would NOT inc), count unchanged.
+        assert!(!NodeState::map_insert_handle(
+            &mut map,
+            1,
+            10,
+            file_handle(1, 10)
+        ));
         assert_eq!(map.get(&1).map(|m| m.len()), Some(2));
 
         // Removing one fh leaves the other; outer entry survives, no extra prune.
-        let removed = NodeState::remove_file_handle_locked(&mut map, 1, 10);
-        assert!(
-            removed.is_some(),
-            "real fh removal reports a handle (would dec)"
-        );
+        let (removed, did_remove) = NodeState::map_remove_handle(&mut map, 1, 10);
+        assert!(removed.is_some() && did_remove, "real fh removal would dec");
         assert_eq!(map.get(&1).map(|m| m.len()), Some(1));
 
         // Removing the last fh prunes the empty outer entry; this is one dec
         // (the fh), NOT an extra dec for the pruned inode bucket.
-        let removed = NodeState::remove_file_handle_locked(&mut map, 1, 11);
-        assert!(removed.is_some());
+        let (_, did_remove) = NodeState::map_remove_handle(&mut map, 1, 11);
+        assert!(did_remove);
         assert!(
             map.get(&1).is_none(),
             "empty inner map prunes the outer entry"
         );
 
         // Removing a non-existent fh is a no-op (would NOT dec).
-        let removed = NodeState::remove_file_handle_locked(&mut map, 1, 99);
-        assert!(removed.is_none());
+        let (removed, did_remove) = NodeState::map_remove_handle(&mut map, 1, 99);
+        assert!(removed.is_none() && !did_remove);
     }
 
     #[test]
     fn dir_handle_chokepoint_per_fh_invariants() {
         let mut map: FastHashMap<u64, FastHashMap<u64, Arc<DirHandle>>> = FastHashMap::default();
 
-        NodeState::insert_dir_handle_locked(&mut map, 2, 20, dir_handle(2, 20));
-        NodeState::insert_dir_handle_locked(&mut map, 2, 21, dir_handle(2, 21));
+        assert!(NodeState::map_insert_handle(
+            &mut map,
+            2,
+            20,
+            dir_handle(2, 20)
+        ));
+        assert!(NodeState::map_insert_handle(
+            &mut map,
+            2,
+            21,
+            dir_handle(2, 21)
+        ));
         assert_eq!(map.get(&2).map(|m| m.len()), Some(2));
 
-        assert!(NodeState::remove_dir_handle_locked(&mut map, 2, 20).is_some());
-        assert!(NodeState::remove_dir_handle_locked(&mut map, 2, 21).is_some());
+        assert!(NodeState::map_remove_handle(&mut map, 2, 20).1);
+        assert!(NodeState::map_remove_handle(&mut map, 2, 21).1);
         assert!(
             map.get(&2).is_none(),
             "empty inner map prunes the outer entry"
         );
-        assert!(NodeState::remove_dir_handle_locked(&mut map, 2, 99).is_none());
+        assert!(!NodeState::map_remove_handle(&mut map, 2, 99).1);
     }
 
-    // The per-fh invariant tests above assert on map state only, so an inverted
-    // inc/dec or a copy-pasted wrong gauge field (e.g. file chokepoint touching
-    // dir_handle_num) would pass them. These two tests close that gap by reading
-    // the real process-global gauge delta around one insert+remove cycle, the
-    // same before/after pattern as `meta_task_guard_gate`.
+    // The per-fh invariant tests above use the gauge-free map_* cores, so an
+    // inverted inc/dec or a copy-pasted wrong gauge field (e.g. file chokepoint
+    // touching dir_handle_num) would pass them. These two tests close that gap by
+    // reading the real process-global gauge delta around one insert+remove cycle
+    // through the `*_handle_locked` wrappers, the same before/after pattern as
+    // `meta_task_guard_gate`.
     //
-    // Concurrency note: production `new_handle`/`new_dir_handle` need a live
-    // backend, so no other test drives these gauges; the file test only touches
-    // `file_handle_num` and the dir test only `dir_handle_num`, so they don't
-    // race each other. We assert deltas (not absolutes) since other tests'
-    // `ensure_init` leaves an unknown starting value. If a future test also
-    // writes these gauges, switch to a standalone injected gauge or serialize.
+    // Concurrency note: these are now the ONLY tests in this binary that write
+    // `file_handle_num`/`dir_handle_num` — the invariant tests above were moved
+    // off the gauge-writing wrappers onto the gauge-free map_* cores precisely so
+    // they no longer pollute these deltas (PR #941 review). Production
+    // `new_handle`/`new_dir_handle` need a live backend, so no other test drives
+    // them either. The file test touches only `file_handle_num` and the dir test
+    // only `dir_handle_num`, so they don't race each other. We assert deltas (not
+    // absolutes) since other tests' `ensure_init` leaves an unknown start. If a
+    // future test writes these gauges, switch to an injected gauge or serialize.
 
     #[test]
     fn insert_file_handle_inc_then_remove_dec_the_file_gauge() {
