@@ -759,4 +759,31 @@ mod test {
 
         Ok(())
     }
+
+    #[test]
+    pub fn rename_over_existing_name_keeps_destination_unlinkable() -> CommonResult<()> {
+        let mut conf = ClusterConf::default();
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        let old_dst_status = FileStatus::with_name(2, "asymbolic".to_string(), false);
+        let _old_dst = state.do_lookup(FUSE_ROOT_ID, Some("asymbolic"), &old_dst_status)?;
+
+        let src_status = FileStatus::with_name(3, "symbolic".to_string(), false);
+        let _src = state.do_lookup(FUSE_ROOT_ID, Some("symbolic"), &src_status)?;
+
+        state.rename_node(FUSE_ROOT_ID, "symbolic", FUSE_ROOT_ID, "asymbolic")?;
+
+        assert!(state.should_delete_now(FUSE_ROOT_ID, Some("asymbolic"))?);
+
+        state.unlink_node(FUSE_ROOT_ID, Some("asymbolic"))?;
+
+        // The renamed source must be removable through the destination name.
+        assert!(state
+            .should_delete_now(FUSE_ROOT_ID, Some("asymbolic"))
+            .is_err());
+
+        Ok(())
+    }
 }
