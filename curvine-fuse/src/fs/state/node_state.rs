@@ -27,7 +27,7 @@ use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
 use curvine_common::fs::{FileSystem, ListStream, MetaCache, Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOpts, FileBlocks, FileStatus, ListOptions, OpenFlags};
 use futures::stream::{self, StreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use orpc::common::FastHashMap;
 use orpc::err_box;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
@@ -445,7 +445,14 @@ impl NodeState {
             let map = self.node_read();
             match map.lookup_node(parent, name) {
                 Some(v) => v.id,
-                None => return err_fuse!(libc::ENOENT, "node {} not found", parent),
+                None => {
+                    debug!(
+                        "unlink node cache miss for parent={}, name={:?}; deleting backend path",
+                        parent,
+                        name.map(|v| v.as_ref().to_string())
+                    );
+                    return Ok(true);
+                }
             }
         };
 
@@ -779,10 +786,8 @@ mod test {
 
         state.unlink_node(FUSE_ROOT_ID, Some("asymbolic"))?;
 
-        // The renamed source must be removable through the destination name.
-        assert!(state
-            .should_delete_now(FUSE_ROOT_ID, Some("asymbolic"))
-            .is_err());
+        // A cache miss must not make unlink fail before the backend delete.
+        assert!(state.should_delete_now(FUSE_ROOT_ID, Some("asymbolic"))?);
 
         Ok(())
     }
