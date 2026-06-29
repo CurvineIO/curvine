@@ -40,3 +40,25 @@
 1. 首次使用时，需要确保 GitHub 仓库有权限访问 GitHub Container Registry
 2. 如果修改了 Docker 镜像的配置，需要重新构建并推送镜像
 3. Clippy 检查级别设置为 "deny"，可以在工作流文件中修改
+
+## 3. 触发 Helm Chart 发版 (trigger-helm-release.yml)
+
+当 `curvine` 推送 `v*` tag 后，此工作流会:
+
+1. 等待 runtime 和 CSI 镜像构建完成
+2. 校验 GHCR 中对应 tag 的镜像已发布
+3. 向 `CurvineIO/curvine-helm` 发送 `repository_dispatch` 事件 (`curvine-release`)
+
+`curvine-helm` 收到事件后会自动在 `main` 上创建同名 tag，并触发 chart 打包。
+
+### 前置配置
+
+在 `CurvineIO/curvine` 仓库 Settings -> Secrets and variables -> Actions 中添加:
+
+| Secret | 说明 |
+| --- | --- |
+| `CURVINE_HELM_DISPATCH_TOKEN` | 对 `curvine-helm` 有读写权限的 PAT，用于跨仓库 dispatch |
+
+### 手动重试
+
+Actions -> `Trigger Helm Release` -> Run workflow，填写 tag（如 `v0.3.0`）。
