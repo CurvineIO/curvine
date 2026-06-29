@@ -339,6 +339,7 @@ impl FsWriterBase {
         }
 
         // Step 4: Reset writer state
+        self.pos = self.pos.min(len);
         self.len = len;
         self.file_blocks = file_blocks;
 

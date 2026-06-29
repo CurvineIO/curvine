@@ -88,14 +88,14 @@ impl BufferChannel {
         fun.await.map_err(|e| self.check_error(e))
     }
 
-    async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+    async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<FileBlocks> {
         let fun = async {
             let (tx, rx) = CallChannel::channel();
             self.task_sender
                 .send(WriterTask::Resize((opts, tx)))
                 .await?;
-            rx.receive().await?;
-            Ok::<(), IOError>(())
+            let file_blocks = rx.receive().await?;
+            Ok::<FileBlocks, IOError>(file_blocks)
         };
         fun.await.map_err(|e| self.check_error(e))
     }
@@ -195,7 +195,10 @@ impl FsWriterBuffer {
     }
 
     pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
-        self.writer.resize(opts).await
+        let file_blocks = self.writer.resize(opts).await?;
+        self.pos = self.pos.min(file_blocks.len);
+        self.file_blocks = file_blocks;
+        Ok(())
     }
 
     async fn write_future(

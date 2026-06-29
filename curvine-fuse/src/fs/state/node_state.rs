@@ -265,7 +265,9 @@ impl NodeState {
         };
 
         if let Some(writer) = exists_writer {
-            return Ok(writer);
+            if !writer.lock().await.is_completed() {
+                return Ok(writer);
+            }
         }
 
         let writer = self.fs.open_with_opts(path, opts, flags).await?;
