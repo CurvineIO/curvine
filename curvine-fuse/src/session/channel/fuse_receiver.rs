@@ -16,8 +16,8 @@ use crate::fs::operator::FuseOperator;
 use crate::fs::FileSystem;
 use crate::fuse_error::splice_errno_label;
 use crate::fuse_metrics::{
-    mono_now, ActiveGuard, FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels, FuseReqStatus,
-    RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT,
+    dispatch_io_type, lifecycle_io_type, mono_now, ActiveGuard, FuseMetrics, FuseReqCtx,
+    FuseReqKind, FuseReqLabels, FuseReqStatus, RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT,
 };
 use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
@@ -188,7 +188,33 @@ impl<T: FileSystem> FuseReceiver<T> {
         // event, consistent with the metadata path. `None` when metrics disabled.
         let labels = self.maybe_req_labels(&req);
         let rep = self.new_reply(req.unique(), labels);
+        // All stream-IO attribution + dispatch logic lives in `send_stream_dispatch`,
+        // an associated fn that takes the already-built reply and needs only `&self.fs`
+        // — NOT `kernel_fd`/`pipe2`/the runtime. This keeps the metrics logic
+        // unit-testable without constructing a real `FuseReceiver` (no fd, no reactor,
+        // no `Pipe2`); see the tests module.
+        Self::send_stream_dispatch(&self.fs, req, rep).await
+    }
 
+    /// The stream dispatch + Phase 2b IO attribution core, factored out of
+    /// `send_stream` so it can be driven in tests against a hand-built
+    /// `FuseResponse` without a real `FuseReceiver`/`kernel_fd`/`Pipe2`/reactor.
+    /// `rep` is the reply handle already built by the caller (`new_reply`).
+    ///
+    /// The metrics kill switch is derived from a SINGLE source of truth —
+    /// `rep.metrics.is_some()` — NOT a separate `metrics_enabled` flag (review
+    /// round-5 P2-1): when metrics are disabled, `new_reply` builds the legacy
+    /// ctx-less reply (`metrics == None`), and when enabled it builds the ctx-bearing
+    /// one. Deriving the gate from `rep` makes it impossible to wire a "record stream
+    /// metrics but no request ctx" (or the inverse) split-brain state. Kept private
+    /// (the tests module is a child module and reaches it without `pub(crate)`).
+    async fn send_stream_dispatch(
+        fs: &Arc<T>,
+        req: FuseRequest,
+        rep: FuseResponse,
+    ) -> FuseResult<()> {
+        // Single gate source: metrics are on iff the reply carries a metrics ctx.
+        let metrics_enabled = rep.metrics.is_some();
         // A structural parse failure after the ctx exists must finish the context
         // early (drop the active guard, mark finished) and emit no reply.
         let operator = match req.parse_operator() {
@@ -206,20 +232,55 @@ impl<T: FileSystem> FuseReceiver<T> {
         // (single logical finish, guard not double-counted) instead of building a
         // fresh context.
         let err_rep = rep.clone();
+
+        // Phase 2b: IO attribution at the send_stream layer, created AFTER parse
+        // success and BEFORE the match, so they cover the match arm AND the
+        // `if res.is_err()` error reply enqueue below (a pre-dispatch error — e.g.
+        // a handle lookup failure — replies there, not inside `fs.<io>`). For a
+        // known stream opcode exactly one of these is `Some`:
+        //   - read/write  -> `io_dispatch_duration_us{io_type}` RAII timer (dispatch
+        //     latency: may include a read-after-write consistency flush/reopen for
+        //     read, or a zero-length no-op direct reply for write — NOT pure enqueue).
+        //   - flush/fsync/release -> a `StreamLifecycleScope` (attempt counted now,
+        //     duration timer + inflight guard held across the whole arm).
+        // The read/write backend `io_*` (duration/bytes/size/inflight) is recorded
+        // separately in the reader/writer task body (C2); this layer does NOT
+        // re-record it. Gated on `metrics_enabled` (disabled => both None, no
+        // attempt counted, no clock read).
+        //
+        // ⚠ INVARIANT (do not break): there must be NO `.await` and NO early
+        // return between `parse_operator()` succeeding above and the two scopes
+        // below. `stream_lifecycle_scope` counts the attempt and arms the
+        // duration timer + inflight guard as one atomic step; inserting a
+        // suspension/return in this window could count an attempt whose timer
+        // never observes (or vice versa), unbalancing the lifecycle family. The
+        // first awaits are the `fs.<io>(op, rep).await` calls inside the match,
+        // already covered by the scopes.
+        let _dispatch = if metrics_enabled {
+            dispatch_io_type(req.opcode()).map(FuseMetrics::io_dispatch_timer)
+        } else {
+            None
+        };
+        let _lifecycle = if metrics_enabled {
+            lifecycle_io_type(req.opcode()).map(FuseMetrics::stream_lifecycle_scope)
+        } else {
+            None
+        };
+
         // NOTE: keep this match's stream arms in sync with `FuseRequest::is_stream()`
         // (Read/Write/Flush/Release/Fsync). `send_stream` is only entered when
         // `is_stream()` is true, so the wildcard is unreachable today; it exists
         // as a defensive branch in case the two ever drift.
         let res = match operator {
-            FuseOperator::Read(op) => self.fs.read(op, rep).await,
+            FuseOperator::Read(op) => fs.read(op, rep).await,
 
-            FuseOperator::Write(op) => self.fs.write(op, rep).await,
+            FuseOperator::Write(op) => fs.write(op, rep).await,
 
-            FuseOperator::Flush(op) => self.fs.flush(op, rep).await,
+            FuseOperator::Flush(op) => fs.flush(op, rep).await,
 
-            FuseOperator::Release(op) => self.fs.release(op, rep).await,
+            FuseOperator::Release(op) => fs.release(op, rep).await,
 
-            FuseOperator::FSync(op) => self.fs.fsync(op, rep).await,
+            FuseOperator::FSync(op) => fs.fsync(op, rep).await,
 
             _ => {
                 // Defensive: a stream-gated request whose operator is not a known
@@ -1141,6 +1202,385 @@ mod tests {
             assert!(
                 pending2.get(&2002).is_none(),
                 "malformed SETLKW dispatch branch removed its pending_requests entry"
+            );
+        }
+    }
+
+    // --- Phase 2b: send_stream IO attribution integration ---
+    //
+    // These drive the real stream dispatch core `FuseReceiver::send_stream_dispatch`
+    // (extracted from `send_stream` so it needs only `&fs`, a `FuseRequest`, and a
+    // pre-built `FuseResponse` — NOT a `kernel_fd`/`Pipe2`/reactor; the metrics gate is
+    // derived from `rep.metrics.is_some()`, see `dispatch_one`). `TestFileSystem` returns
+    // ENOSYS for every stream op WITHOUT sending a reply, so each op exercises the
+    // pre-dispatch-error path: `fs.<io>` returns Err and the error reply is enqueued
+    // by the `if res.is_err()` arm — INSIDE the dispatch/lifecycle RAII scope, exactly
+    // the boundary we want to assert.
+    mod send_stream_integration {
+        use crate::fs::TestFileSystem;
+        use crate::fuse_metrics::{
+            ActiveGuard, FuseMetrics, IO_TYPE_FLUSH, IO_TYPE_FSYNC, IO_TYPE_READ, IO_TYPE_RELEASE,
+            IO_TYPE_WRITE, PATH_TYPE_UNKNOWN,
+        };
+        use crate::raw::fuse_abi::{
+            fuse_flush_in, fuse_fsync_in, fuse_in_header, fuse_read_in, fuse_release_in,
+            fuse_write_in,
+        };
+        use crate::session::{FuseRequest, FuseResponse};
+        use crate::FuseUtils;
+        use orpc::runtime::{AsyncRuntime, RpcRuntime};
+        use orpc::sync::channel::AsyncChannel;
+        use std::sync::Arc;
+        use tokio_util::bytes::{BufMut, BytesMut};
+
+        const OP_READ: u32 = 15;
+        const OP_WRITE: u32 = 16;
+        const OP_RELEASE: u32 = 18;
+        const OP_FSYNC: u32 = 20;
+        const OP_FLUSH: u32 = 25;
+
+        fn make_request(opcode: u32, unique: u64, payload: &[u8]) -> FuseRequest {
+            let header = fuse_in_header {
+                len: (size_of::<fuse_in_header>() + payload.len()) as u32,
+                opcode,
+                unique,
+                nodeid: 1,
+                uid: 0,
+                gid: 0,
+                pid: 0,
+                padding: 0,
+            };
+            let mut buf = BytesMut::new();
+            buf.put_slice(FuseUtils::struct_as_bytes(&header));
+            buf.put_slice(payload);
+            FuseRequest::from_bytes(buf.freeze()).expect("parse stream request")
+        }
+
+        fn flush_request(unique: u64) -> FuseRequest {
+            make_request(
+                OP_FLUSH,
+                unique,
+                FuseUtils::struct_as_bytes(&fuse_flush_in::default()),
+            )
+        }
+        fn fsync_request(unique: u64) -> FuseRequest {
+            make_request(
+                OP_FSYNC,
+                unique,
+                FuseUtils::struct_as_bytes(&fuse_fsync_in::default()),
+            )
+        }
+        fn release_request(unique: u64) -> FuseRequest {
+            make_request(
+                OP_RELEASE,
+                unique,
+                FuseUtils::struct_as_bytes(&fuse_release_in::default()),
+            )
+        }
+        fn read_request(unique: u64) -> FuseRequest {
+            make_request(
+                OP_READ,
+                unique,
+                FuseUtils::struct_as_bytes(&fuse_read_in::default()),
+            )
+        }
+        fn write_request(unique: u64) -> FuseRequest {
+            // size=0 (no write payload): the request parses, and TestFileSystem's
+            // fs.write returns ENOSYS at dispatch (pre-task), so this drives the
+            // io_dispatch path without needing a real writer task.
+            make_request(
+                OP_WRITE,
+                unique,
+                FuseUtils::struct_as_bytes(&fuse_write_in::default()),
+            )
+        }
+
+        // Drive ONE stream op through the REAL `send_stream_dispatch` core and run it
+        // to completion. `op` is the FUSE opcode; `unique`/`payload` build the
+        // request. Returns the dispatch result.
+        //
+        // FD-FREE by construction (review round-2/3/4 P1): earlier rounds built a
+        // real `FuseReceiver` here just to reach `send_stream`, which dragged in a
+        // `kernel_fd` `AsyncFd` + an internal `Pipe2` whose Drop deregisters from the
+        // tokio reactor AFTER closing its fds — aborting the process with `IO Safety
+        // violation` under the default parallel harness, and which leak workarounds
+        // failed to tame across two rounds. The real fix (codex's repeated
+        // recommendation): `send_stream`'s metrics/dispatch logic was extracted into
+        // `FuseReceiver::send_stream_dispatch`, which takes a pre-built `FuseResponse`
+        // (the metrics gate is derived from `rep.metrics.is_some()`) and only needs
+        // `&fs` — NO fd, NO Pipe2, NO reactor. So this helper builds just a
+        // `FuseResponse` over an in-memory reply channel
+        // and a single-thread runtime to `block_on` the async fn (which spawns
+        // nothing and touches no fd). Nothing here registers with a reactor, so there
+        // is no fd/runtime lifecycle hazard at all.
+        //
+        // The reply channel is drained by a spawned task so the error-reply enqueue
+        // inside the dispatch (the path the lifecycle/dispatch RAII scope covers)
+        // never blocks regardless of how many ops a body drives (review round-4 P2-1).
+        //
+        // Parallel-safety of the ASSERTIONS: these feed the process-global registry
+        // under FIXED io_type labels shared by every send_stream test, so the tests
+        // assert only POSITIVE LOWER BOUNDS on each op's own label ("incremented by
+        // at least 1"), never exact deltas. The deterministic negatives are covered
+        // by the structural unit tests in `fuse_metrics`.
+        // `with_metrics_ctx` decides whether the built `FuseResponse` carries a metrics
+        // ctx — which, since `send_stream_dispatch` derives its gate from
+        // `rep.metrics.is_some()`, IS the metrics on/off switch for the dispatch. It is
+        // NOT a separate flag passed to the dispatch (there is none).
+        fn dispatch_one(with_metrics_ctx: bool, req: FuseRequest) {
+            use crate::fuse_metrics::{FuseReqCtx, FuseReqKind, FuseReqLabels};
+            FuseMetrics::ensure_init().unwrap();
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let fs = Arc::new(TestFileSystem::new(
+                    curvine_common::conf::FuseConf::default(),
+                ));
+                // Reply channel with a drainer so any enqueued error reply is consumed
+                // (never blocks), independent of how many ops the caller drives.
+                let (tx, mut rx) = AsyncChannel::new(64).split();
+                let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+                // Build the reply handle exactly as `send_stream`'s caller would.
+                // with-ctx => an active guard backed by a throwaway gauge; without =>
+                // None (the legacy zero-cost path). The presence of the ctx IS the
+                // metrics gate — `send_stream_dispatch` derives it from
+                // `rep.metrics.is_some()`, so there is no separate flag to pass.
+                let opcode = req.opcode().as_str();
+                let ctx = if with_metrics_ctx {
+                    let gauge = orpc::common::Metrics::new_gauge(
+                        format!("ss_dispatch_active_{}", req.unique()),
+                        "test".to_string(),
+                    )
+                    .unwrap();
+                    Some(FuseReqCtx {
+                        labels: FuseReqLabels::new(opcode, FuseReqKind::Stream, 64),
+                        active: Some(ActiveGuard::new(gauge)),
+                    })
+                } else {
+                    None
+                };
+                let rep = FuseResponse::new_reply(req.unique(), tx, false, ctx);
+
+                let _ = super::super::FuseReceiver::<TestFileSystem>::send_stream_dispatch(
+                    &fs, req, rep,
+                )
+                .await;
+
+                // Drop the senders' side and let the drainer finish — no fd, no
+                // reactor registration, so nothing here can leak or abort.
+                drainer.abort();
+            });
+        }
+
+        fn lifecycle_attempts(io_type: &str) -> i64 {
+            FuseMetrics::get()
+                .stream_lifecycle_requests_total
+                .with_label_values(&[io_type, PATH_TYPE_UNKNOWN])
+                .get()
+        }
+        fn lifecycle_dur(io_type: &str) -> u64 {
+            FuseMetrics::get()
+                .stream_lifecycle_duration_us
+                .with_label_values(&[io_type, PATH_TYPE_UNKNOWN])
+                .get_sample_count()
+        }
+        fn dispatch_dur(io_type: &str) -> u64 {
+            FuseMetrics::get()
+                .io_dispatch_duration_us
+                .with_label_values(&[io_type])
+                .get_sample_count()
+        }
+
+        // E21/E26: a flush whose backend errors (pre-dispatch ENOSYS) STILL records a
+        // lifecycle attempt (counted before the match) AND a duration sample (the RAII
+        // timer observes on drop, covering the error reply enqueue that happens inside
+        // the scope), under {io_type=flush,path_type=unknown}. Lower-bound asserts.
+        #[test]
+        fn flush_records_lifecycle_attempt_and_duration() {
+            FuseMetrics::ensure_init().unwrap();
+            let attempts_before = lifecycle_attempts(IO_TYPE_FLUSH);
+            let dur_before = lifecycle_dur(IO_TYPE_FLUSH);
+
+            dispatch_one(true, flush_request(7001));
+
+            assert!(
+                lifecycle_attempts(IO_TYPE_FLUSH) > attempts_before,
+                "flush counts a lifecycle attempt (counted before the match)"
+            );
+            assert!(
+                lifecycle_dur(IO_TYPE_FLUSH) > dur_before,
+                "flush lifecycle duration observed (RAII timer covers the error reply)"
+            );
+        }
+
+        // fsync lands under io_type=fsync (NOT flush): at send_stream the operator
+        // distinguishes FSYNC from FLUSH — the very ambiguity the writer-task-body
+        // Flush arm cannot resolve, which is why lifecycle attribution lives here.
+        #[test]
+        fn fsync_records_lifecycle_fsync() {
+            FuseMetrics::ensure_init().unwrap();
+            let fsync_before = lifecycle_attempts(IO_TYPE_FSYNC);
+
+            dispatch_one(true, fsync_request(7002));
+
+            assert!(
+                lifecycle_attempts(IO_TYPE_FSYNC) > fsync_before,
+                "fsync lands under io_type=fsync"
+            );
+        }
+
+        // E15 (release attributed at send_stream): one FUSE Release opcode increments
+        // stream_lifecycle_requests_total{release}. Doing it here (one operator arm =
+        // one increment) is what avoids the reader+writer double-count the task-body
+        // approach would have. Lower-bound assert (parallel-safe).
+        #[test]
+        fn release_records_lifecycle_release() {
+            FuseMetrics::ensure_init().unwrap();
+            let before = lifecycle_attempts(IO_TYPE_RELEASE);
+
+            dispatch_one(true, release_request(7003));
+
+            assert!(
+                lifecycle_attempts(IO_TYPE_RELEASE) > before,
+                "release counted at send_stream"
+            );
+        }
+
+        // E20/E25: read/write at send_stream record io_dispatch_duration_us{io_type}.
+        // The backend io_* (duration/bytes/size) is recorded in the task body, not
+        // here, so a pre-dispatch ENOSYS read/write records dispatch only — which is
+        // exactly what this asserts (the dispatch timer fired). Lower-bound asserts.
+        #[test]
+        fn read_write_record_dispatch() {
+            FuseMetrics::ensure_init().unwrap();
+            let read_before = dispatch_dur(IO_TYPE_READ);
+            let write_before = dispatch_dur(IO_TYPE_WRITE);
+
+            dispatch_one(true, read_request(7004));
+            dispatch_one(true, write_request(7005));
+
+            assert!(
+                dispatch_dur(IO_TYPE_READ) > read_before,
+                "read records io_dispatch_duration_us{{read}}"
+            );
+            assert!(
+                dispatch_dur(IO_TYPE_WRITE) > write_before,
+                "write records io_dispatch_duration_us{{write}}"
+            );
+        }
+
+        // P2-2 (review round-2): a direct disabled-path integration test for
+        // `send_stream`. The send_stream gate (`self.metrics_enabled`) is a DIFFERENT
+        // source from the reader/writer task body's gate (`FuseConf.metrics_enabled`),
+        // so this guards the send_stream wiring specifically.
+        //
+        // What this is (review round-3 P2-2): a SMOKE test, not a no-emission proof.
+        // - It proves: one op of EACH stream family runs end-to-end through the real
+        //   disabled `send_stream` and completes (no panic, no hang). It is a guard
+        //   against the disabled send_stream path being wired so badly it cannot even
+        //   run all five families.
+        // - It does NOT prove "disabled emits nothing": the metrics singleton is
+        //   already initialized in the test binary, so a regression that wrongly built
+        //   the dispatch timer / lifecycle scope on the disabled path would NOT panic
+        //   here — it would just (wrongly) emit. The deterministic "disabled => guard
+        //   is None, emits nothing" guarantee is pinned by the isolated helper `*_gate`
+        //   unit tests instead. An `== before` count assertion is deliberately avoided:
+        //   the io_type labels are a fixed set shared with the enabled send_stream
+        //   tests, so it would be flaky under the default parallel harness. This split
+        //   — smoke for wiring here, isolated unit test for the no-emission guarantee —
+        //   is the same discipline the rest of this metrics work follows.
+        #[test]
+        fn disabled_send_stream_runs_clean_for_all_families() {
+            // ENOSYS replies (TestFileSystem); the point is the metrics gate, not the
+            // op result. None of these may touch the Phase 2b stream metrics.
+            dispatch_one(false, flush_request(7101));
+            dispatch_one(false, fsync_request(7102));
+            dispatch_one(false, release_request(7103));
+            dispatch_one(false, read_request(7104));
+            dispatch_one(false, write_request(7105));
+            // Reaching here (no panic) proves the disabled send_stream path drove all
+            // five op families to completion with `metrics_enabled=false`.
+        }
+
+        // P2-2 (review round-5): a malformed stream request whose `parse_operator()`
+        // fails AFTER the ctx was built. This is the ctx-before-parse corner case the
+        // round-4 seam refactor must preserve: the parse failure must finish the ctx
+        // early (drop the active guard, record the parse decode error) and must NOT
+        // enter the dispatch/lifecycle RAII scope (no io_dispatch / lifecycle sample).
+        // Pins the seam's most fragile behaviour — that nobody inserts an early
+        // return / await between ctx creation and the scope in a way that leaks the
+        // guard or emits a stray dispatch sample on the parse-failure path.
+        #[test]
+        fn malformed_stream_request_finishes_early_without_dispatch_or_lifecycle() {
+            use crate::fuse_metrics::{FuseReqCtx, FuseReqKind, FuseReqLabels, DECODE_PHASE_PARSE};
+            FuseMetrics::ensure_init().unwrap();
+            let mx = FuseMetrics::get();
+
+            // A FUSE_READ header with NO `fuse_read_in` payload: `parse_operator()`'s
+            // `get_struct::<fuse_read_in>` fails, so dispatch is never reached.
+            let malformed = make_request(OP_READ, 7201, &[]);
+
+            // Baseline: the opcode-free parse decode counter. The active guard uses a
+            // LOCAL gauge so we can assert it drops deterministically.
+            let decode_before = mx
+                .decode_errors_total
+                .with_label_values(&[DECODE_PHASE_PARSE, "other"])
+                .get();
+
+            let rt = AsyncRuntime::single();
+            rt.block_on(async {
+                let fs = Arc::new(TestFileSystem::new(
+                    curvine_common::conf::FuseConf::default(),
+                ));
+                let (tx, mut rx) = AsyncChannel::new(16).split();
+                let drainer = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+                let active_g = orpc::common::Metrics::new_gauge(
+                    "ss_malformed_active_7201".to_string(),
+                    "test".to_string(),
+                )
+                .unwrap();
+                let ctx = FuseReqCtx {
+                    labels: FuseReqLabels::new("Read", FuseReqKind::Stream, 64),
+                    active: Some(ActiveGuard::new(active_g.clone())),
+                };
+                assert_eq!(active_g.get(), 1, "active guard live before dispatch");
+                let rep = FuseResponse::new_reply(7201, tx, false, Some(ctx));
+
+                let res = super::super::FuseReceiver::<TestFileSystem>::send_stream_dispatch(
+                    &fs, malformed, rep,
+                )
+                .await;
+
+                // Parse failure surfaces as Err (finish_early then return Err).
+                assert!(
+                    res.is_err(),
+                    "malformed stream request returns the parse Err"
+                );
+                // Active guard released by finish_early — no leak.
+                assert_eq!(
+                    active_g.get(),
+                    0,
+                    "parse failure finishes the ctx early and drops the active guard"
+                );
+                drainer.abort();
+            });
+
+            // The "no io_dispatch / no lifecycle sample on parse failure" property is
+            // STRUCTURAL, not asserted on the shared dispatch gauge (which concurrent
+            // tests bump, making any count check flaky): the dispatch/lifecycle RAII
+            // scope is created only AFTER `parse_operator()` succeeds, so an Err parse
+            // returns via `finish_early` before the scope exists. The `res.is_err()` +
+            // active-guard-dropped assertions above prove we took exactly that path.
+            //
+            // The parse decode error was recorded (phase=parse). decode_errors_total is
+            // opcode-free/shared, so assert it moved by AT LEAST this one.
+            assert!(
+                mx.decode_errors_total
+                    .with_label_values(&[DECODE_PHASE_PARSE, "other"])
+                    .get()
+                    > decode_before,
+                "parse failure records decode_errors_total{{phase=parse}}"
             );
         }
     }
