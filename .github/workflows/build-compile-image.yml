@@ -144,12 +144,14 @@ jobs:
       - name: Create and push multi-arch manifest for ${{ matrix.tag }}
         run: |
           # Create manifest for GHCR
+          docker manifest rm ghcr.io/curvineio/curvine-compile:${{ matrix.tag }} || true
           docker manifest create ghcr.io/curvineio/curvine-compile:${{ matrix.tag }} \
             ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-amd64 \
             ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-arm64
           docker manifest push ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}
           
           # Create manifest for Docker Hub
+          docker manifest rm curvine/curvine-compile:${{ matrix.tag }} || true
           docker manifest create curvine/curvine-compile:${{ matrix.tag }} \
             curvine/curvine-compile:${{ matrix.tag }}-amd64 \
             curvine/curvine-compile:${{ matrix.tag }}-arm64
