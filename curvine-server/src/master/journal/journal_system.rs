@@ -145,7 +145,7 @@ impl JournalSystem {
     }
 
     fn require_existing_master_data(conf: &ClusterConf) -> FsResult<()> {
-        if conf.format_master || conf.journal.journal_addrs.len() > 1 {
+        if conf.format_master {
             return Ok(());
         }
 
@@ -165,7 +165,7 @@ impl JournalSystem {
         }
 
         err_box!(
-            "format_master=false requires existing RocksDB data directories for single-master startup; missing, empty, or unreadable: {}",
+            "format_master=false requires existing RocksDB data directories before master startup; missing, empty, or unreadable: {}. For a fresh cluster, bootstrap with format_master=true. For replacing an HA master, preseed a consistent meta and journal copy before starting the pod",
             invalid_dirs.join(", ")
         )
     }
