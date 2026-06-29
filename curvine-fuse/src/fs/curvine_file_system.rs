@@ -1576,3 +1576,57 @@ impl fs::FileSystem for CurvineFileSystem {
         self.state.restore(reader).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Pin the production init-order invariant that Phase 1b-2 depends on:
+    /// `FuseMetrics::ensure_init()` MUST run before `NodeState::new()` in
+    /// `CurvineFileSystem::new`. After 1b-2 removed the scrape-time
+    /// `set_metrics()` refresh, the legacy gauges are only correct if their
+    /// event-driven updates (routed through `FuseMetrics::with`) land on an
+    /// initialized singleton; the `NodeMap::new` root baseline `set(1)` is the
+    /// first such update and fires inside `NodeState::new`. If a refactor moved
+    /// `ensure_init()` after `NodeState::new` (or dropped it), that baseline —
+    /// and every subsequent inc/dec — would be silently no-op'd by `with`, and
+    /// the gauges would drift permanently low with no panic.
+    ///
+    /// A behavioral assertion (construct, then check the singleton is init) is
+    /// useless here: the process-global `OnceCell` is already initialized by
+    /// other tests in this binary, so it would pass even if `ensure_init` were
+    /// deleted. We assert on the source text instead, which catches both a
+    /// reordering and an outright removal.
+    ///
+    /// The search is scoped to the body of `fn new` so the literals in this
+    /// test's own doc comment / assert message do not satisfy `find()` — that
+    /// self-reference would make the `.expect` guards dead (the strings always
+    /// exist in this file) and let a removal of the real call slip through by
+    /// matching the prose instead. Slicing to `fn new` keeps `.expect` a real
+    /// "the call was deleted" guard.
+    #[test]
+    fn ensure_init_precedes_node_state() {
+        let src = include_str!("curvine_file_system.rs");
+        let body_start = src
+            .find("pub fn new(conf: ClusterConf")
+            .expect("CurvineFileSystem::new signature not found");
+        // First method after `new`; bounds the body so later occurrences (incl.
+        // this test's own text) are excluded.
+        let body_end = body_start
+            + src[body_start..]
+                .find("pub fn state(")
+                .expect("CurvineFileSystem::state not found after new()");
+        let body = &src[body_start..body_end];
+
+        let init_at = body
+            .find("FuseMetrics::ensure_init()")
+            .expect("CurvineFileSystem::new must call FuseMetrics::ensure_init()");
+        let node_state_at = body
+            .find("NodeState::new(")
+            .expect("CurvineFileSystem::new must construct NodeState::new(..)");
+        assert!(
+            init_at < node_state_at,
+            "FuseMetrics::ensure_init() must precede NodeState::new() in \
+             CurvineFileSystem::new so the legacy gauges' event-driven updates \
+             (FuseMetrics::with) land on an initialized singleton"
+        );
+    }
+}

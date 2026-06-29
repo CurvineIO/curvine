@@ -168,6 +168,32 @@ impl FuseMetrics {
             .expect("FuseMetrics not initialized; call ensure_init from CurvineFileSystem::new")
     }
 
+    /// Run `f` against the metrics singleton iff it has been initialized; a
+    /// no-op when not (instead of `get()`'s panic).
+    ///
+    /// This is the access path for the **legacy compatibility gauges**
+    /// (`inode_num` / `file_handle_num` / `dir_handle_num`), which are updated
+    /// unconditionally at their inode/handle mutation sites (Phase 1b-2 made
+    /// them event-driven and removed the scrape-time `set_metrics()` refresh).
+    /// Those sites live in `NodeState`/`NodeMap`, whose unit tests construct
+    /// state with a bare `NodeState::new` and never call `ensure_init()`;
+    /// routing every legacy-gauge write through `with()` keeps them from
+    /// panicking on the uninitialized singleton.
+    ///
+    /// The uninit branch is a deliberate, silent no-op — NOT a `debug_assert!`.
+    /// Tests run in debug with a process-global `OnceCell` whose init order
+    /// across parallel tests is unspecified, so a `node_state` test that fires
+    /// a mutation before any `ensure_init()` would trip the assert and reintroduce
+    /// exactly the flakiness this helper removes. The production invariant
+    /// (`ensure_init()` before `NodeState::new`) is instead pinned by the
+    /// `ensure_init_precedes_node_state` test below, which is the right place to
+    /// catch an ordering regression.
+    pub(crate) fn with<F: FnOnce(&Self)>(f: F) {
+        if let Some(m) = FUSE_METRICS.get() {
+            f(m);
+        }
+    }
+
     fn new() -> CommonResult<Self> {
         Ok(Self {
             inode_num: m::new_gauge("inode_num", "FUSE inode count in dcache")?,
