@@ -77,9 +77,11 @@ ENV PATH="/app/protoc/bin:${PATH}"
 
 # 4. Install Maven
 RUN cd /app && \
-    MAVEN_VERSION=3.9.15 && \
-    curl -fL -o apache-maven-${MAVEN_VERSION}-bin.tar.gz https://downloads.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
-    tar -xzf apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    MAVEN_VERSION=3.9.16 && \
+    MAVEN_PACKAGE=apache-maven-${MAVEN_VERSION}-bin.tar.gz && \
+    MAVEN_ARCHIVE_URL=https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/${MAVEN_PACKAGE} && \
+    curl -fL -o ${MAVEN_PACKAGE} ${MAVEN_ARCHIVE_URL} && \
+    tar -xzf ${MAVEN_PACKAGE} && \
     mv apache-maven-${MAVEN_VERSION} maven && \
     rm -f *.tar.gz && \
     echo "✓ Maven ${MAVEN_VERSION} installed successfully"
