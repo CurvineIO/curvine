@@ -135,7 +135,7 @@ jobs:
       - name: Build and push Fluid image for ${{ matrix.arch }}
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ./curvine-docker/fluid
           file: ./curvine-docker/fluid/Dockerfile
           platforms: linux/${{ matrix.arch }}
           push: ${{ needs.prepare.outputs.push_image == 'true' }}
@@ -280,4 +280,3 @@ jobs:
           else
             echo "**Note:** Image was built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY
           fi
-
