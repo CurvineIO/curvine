@@ -33,6 +33,7 @@ CURVINE_LOG_DIR="${CURVINE_HOME}/logs"
 
 FLUID_MODE=false
 FLUID_RUNTIME_TYPE_ENV="${FLUID_RUNTIME_TYPE:-}"
+FLUID_RUNTIME_TYPE=""
 
 if [ -n "$FLUID_RUNTIME_TYPE_ENV" ]; then
     FLUID_MODE=true
@@ -61,6 +62,16 @@ echo "SERVER_TYPE: $SERVER_TYPE, ACTION_TYPE: $ACTION_TYPE"
 
 set_hosts() {
     :
+}
+
+load_curvine_env() {
+    if [ -f "$CURVINE_HOME/conf/curvine-env.sh" ]; then
+        echo "Loading curvine environment variables..."
+        local original_home="$CURVINE_HOME"
+        source "$CURVINE_HOME/conf/curvine-env.sh"
+        export CURVINE_HOME="$original_home"
+        export CURVINE_CONF_FILE="${CURVINE_CONF_DIR}/curvine-cluster.toml"
+    fi
 }
 
 parse_fluid_config() {
@@ -167,72 +178,19 @@ setup_environment() {
 start_service() {
   local SERVICE_NAME=$1
 
-  if [ -z "$CURVINE_CONF_FILE" ]; then
+  if [ -z "${CURVINE_CONF_FILE:-}" ]; then
     export CURVINE_CONF_FILE=${CURVINE_HOME}/conf/curvine-cluster.toml
   fi
 
-  local LOG_DIR=${CURVINE_HOME}/logs
-  local OUT_FILE=${LOG_DIR}/${SERVICE_NAME}.out
-  mkdir -p "${LOG_DIR}"
+  mkdir -p "${CURVINE_HOME}/logs"
 
   cd "${CURVINE_HOME}"
 
   echo "Starting ${SERVICE_NAME} service..."
 
-  "${CURVINE_HOME}/lib/curvine-server" \
+  exec "${CURVINE_HOME}/lib/curvine-server" \
     --service "${SERVICE_NAME}" \
-    --conf "${CURVINE_CONF_FILE}" \
-    >> "${OUT_FILE}" 2>&1 &
-
-  local SERVER_PID=$!
-  sleep 3
-
-  if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-    wait "${SERVER_PID}" 2>/dev/null
-    local EXIT_CODE=$?
-    echo "${SERVICE_NAME} start fail - process exited during startup with code ${EXIT_CODE}"
-    if [ -f "${OUT_FILE}" ]; then
-      echo "Last 20 lines of output:"
-      tail -n 20 "${OUT_FILE}"
-    fi
-    exit 1
-  fi
-
-  local ACTUAL_PID
-  ACTUAL_PID=$(pgrep -n -f "${CURVINE_HOME}/lib/curvine-server[[:space:]].*--service[[:space:]]${SERVICE_NAME}" || true)
-  if [[ -n "${ACTUAL_PID}" ]] && kill -0 "${ACTUAL_PID}" 2>/dev/null; then
-    echo "${SERVICE_NAME} start success, pid=${ACTUAL_PID}"
-
-    local LOG_DATE=$(date +%Y-%m-%d)
-    local LOG_FILE="${LOG_DIR}/${SERVICE_NAME}.log.${LOG_DATE}"
-    
-    sleep 2
-    
-    if [ -f "${LOG_FILE}" ]; then
-      tail -f "${LOG_FILE}" &
-      local TAIL_PID=$!
-    else
-      tail -f "${OUT_FILE}" &
-      local TAIL_PID=$!
-    fi
-
-    wait "${SERVER_PID}"
-    local EXIT_CODE=$?
-    echo "${SERVICE_NAME} process exited with code ${EXIT_CODE}"
-    
-    if [ -n "${TAIL_PID}" ]; then
-      kill "${TAIL_PID}" 2>/dev/null || true
-    fi
-    
-    exit "${EXIT_CODE}"
-  else
-    echo "${SERVICE_NAME} start fail - process not found after startup check"
-    if [ -f "${OUT_FILE}" ]; then
-      echo "Last 20 lines of output:"
-      tail -n 20 "${OUT_FILE}"
-    fi
-    exit 1
-  fi
+    --conf "${CURVINE_CONF_FILE}"
 }
 
 start_curvine_component() {
@@ -244,12 +202,7 @@ start_curvine_component() {
     case "$component" in
         master)
             echo "Starting Curvine Master in Fluid cache-runtime mode..."
-            if [ -f "$CURVINE_HOME/conf/curvine-env.sh" ]; then
-                echo "Loading curvine environment variables..."
-                local original_home="$CURVINE_HOME"
-                source "$CURVINE_HOME/conf/curvine-env.sh"
-                export CURVINE_HOME="$original_home"
-            fi
+            load_curvine_env
             
             local pod_name="${HOSTNAME:-$(hostname)}"
             local namespace="${FLUID_DATASET_NAMESPACE:-default}"
@@ -263,12 +216,7 @@ start_curvine_component() {
         
         worker)
             echo "Starting Curvine Worker in Fluid cache-runtime mode..."
-            if [ -f "$CURVINE_HOME/conf/curvine-env.sh" ]; then
-                echo "Loading curvine environment variables..."
-                local original_home="$CURVINE_HOME"
-                source "$CURVINE_HOME/conf/curvine-env.sh"
-                export CURVINE_HOME="$original_home"
-            fi
+            load_curvine_env
             
             if [ -n "$CURVINE_MASTER_HOSTNAME" ]; then
                 echo "WARN: Ignoring CURVINE_MASTER_HOSTNAME in worker: $CURVINE_MASTER_HOSTNAME"
@@ -276,7 +224,8 @@ start_curvine_component() {
             
             local pod_name="${HOSTNAME:-$(hostname)}"
             local namespace="${FLUID_DATASET_NAMESPACE:-default}"
-            local worker_service="${CURVINE_WORKER_SERVICE:-$(echo $CURVINE_MASTER_SERVICE | sed 's/master/worker/')}"
+            local master_service="${CURVINE_MASTER_SERVICE:-curvine-master}"
+            local worker_service="${CURVINE_WORKER_SERVICE:-$(echo "$master_service" | sed 's/master/worker/')}"
             local worker_fqdn="${pod_name}.${worker_service}.${namespace}.svc.cluster.local"
             export CURVINE_WORKER_HOSTNAME="$worker_fqdn"
             echo "Set CURVINE_WORKER_HOSTNAME to: $CURVINE_WORKER_HOSTNAME"
@@ -300,8 +249,8 @@ start_curvine_component() {
             rm -rf "$target_path"/.* 2>/dev/null || true
             
             exec "$CURVINE_HOME/lib/curvine-fuse" \
-                --conf="$config_file" \
-                --mnt-path="$target_path"
+                --conf "$config_file" \
+                --mnt-path "$target_path"
             ;;
         
         *)

@@ -2,59 +2,93 @@ apiVersion: data.fluid.io/v1alpha1
 kind: CacheRuntimeClass
 metadata:
   name: curvine
-fileSystemType: fuse
+fileSystemType: curvinefs
 topology:
   master:
-    workloadType:
-      apiVersion: apps/v1
-      kind: StatefulSet
     service:
       headless: {}
-    dependencies:
-      encryptOption: {}
-    podTemplateSpec:
+    executionEntries:
+      mountUFS:
+        command:
+        - bash
+        - -c
+        - /app/curvine/mountUfs.sh
+        timeout: 120
+    template:
       spec:
         restartPolicy: Always
         containers:
         - name: master
-          image: ghcr.io/curvineio/curvine-fluid:latest
+          image: curvine-fluid:latest
+          command:
+          - /entrypoint.sh
           args:
           - master
+          - start
           imagePullPolicy: IfNotPresent
+          readinessProbe:
+            tcpSocket:
+              port: 8995
+            initialDelaySeconds: 35
+            periodSeconds: 5
+            failureThreshold: 12
+          env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          volumeMounts:
+          - name: curvine-logs
+            mountPath: /app/curvine/logs
+          - name: curvine-master-data
+            mountPath: /app/curvine/data
   worker:
-    workloadType:
-      apiVersion: apps/v1
-      kind: StatefulSet
     service:
       headless: {}
-    dependencies: {}
-    podTemplateSpec:
+    template:
       spec:
         restartPolicy: Always
         containers:
         - name: worker
-          image: ghcr.io/curvineio/curvine-fluid:latest
+          image: curvine-fluid:latest
+          command:
+          - /entrypoint.sh
           args:
           - worker
+          - start
           imagePullPolicy: IfNotPresent
+          readinessProbe:
+            tcpSocket:
+              port: 8997
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          volumeMounts:
+          - name: curvine-logs
+            mountPath: /app/curvine/logs
+          - name: curvine-cache
+            mountPath: /app/curvine/data
   client:
-    workloadType:
-      apiVersion: apps/v1
-      kind: DaemonSet
-    dependencies:
-      encryptOption: {}
-    podTemplateSpec:
+    template:
       spec:
         restartPolicy: Always
         containers:
         - name: client
-          image: ghcr.io/curvineio/curvine-fluid:latest
+          image: curvine-fluid:latest
+          command:
+          - /entrypoint.sh
+          args:
+          - client
+          - start
+          imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
             runAsUser: 0
-          args:
-          - client
-          imagePullPolicy: IfNotPresent
           lifecycle:
             preStop:
               exec:
@@ -62,16 +96,7 @@ topology:
                 - /bin/sh
                 - -c
                 - |
-                  echo "PreStop: Cleaning up FUSE mount..."
-                  target_path="${CURVINE_TARGET_PATH:-${FLUID_RUNTIME_MOUNT_PATH}}"
-                  if [ -z "$target_path" ]; then
-                    echo "WARNING: Neither CURVINE_TARGET_PATH nor FLUID_RUNTIME_MOUNT_PATH is set, skipping unmount"
-                    exit 0
-                  fi
-                  if mountpoint -q "$target_path" 2>/dev/null; then
-                    echo "Unmounting $target_path"
+                  target_path="${CURVINE_TARGET_PATH:-${FLUID_RUNTIME_MOUNT_PATH:-}}"
+                  if [ -n "$target_path" ] && mountpoint -q "$target_path" 2>/dev/null; then
                     fusermount -u "$target_path" 2>/dev/null || umount -f "$target_path" 2>/dev/null || true
-                  else
-                    echo "Mount point $target_path is not mounted, skipping"
                   fi
-                  echo "PreStop: Cleanup completed"
