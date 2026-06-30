@@ -162,6 +162,15 @@ pub struct FuseMetrics {
     pub file_handle_num: Gauge,
     pub dir_handle_num: Gauge,
 
+    // --- Phase 3b-1: namespaced aliases of the legacy gauges above ---
+    // Event-driven at the same insert/remove/restore sites, kept exactly in
+    // lockstep with their legacy counterparts (updated inside the same
+    // `FuseMetrics::with` closure). The legacy `*_num` gauges are deprecated and
+    // will be removed two minor releases after dashboards migrate to these.
+    pub inode_count: Gauge,
+    pub file_handle_count: Gauge,
+    pub dir_handle_count: Gauge,
+
     // --- Phase 1a-2: end-to-end request metrics ---
     /// E2E in-flight requests, driven by `ActiveGuard`: incremented at ctx
     /// creation, decremented at the sender/no-reply finish. `kind`.
@@ -318,13 +327,17 @@ impl FuseMetrics {
     /// no-op when not (instead of `get()`'s panic).
     ///
     /// This is the access path for the **legacy compatibility gauges**
-    /// (`inode_num` / `file_handle_num` / `dir_handle_num`), which are updated
-    /// unconditionally at their inode/handle mutation sites (Phase 1b-2 made
-    /// them event-driven and removed the scrape-time `set_metrics()` refresh).
-    /// Those sites live in `NodeState`/`NodeMap`, whose unit tests construct
-    /// state with a bare `NodeState::new` and never call `ensure_init()`;
-    /// routing every legacy-gauge write through `with()` keeps them from
-    /// panicking on the uninitialized singleton.
+    /// (`inode_num` / `file_handle_num` / `dir_handle_num`) **and their Phase 3b-1
+    /// namespaced aliases** (`curvine_fuse_{inode,file_handle,dir_handle}_count`),
+    /// which are updated unconditionally at their inode/handle mutation sites
+    /// (Phase 1b-2 made them event-driven and removed the scrape-time
+    /// `set_metrics()` refresh; 3b-1 added the aliases in lockstep at the same
+    /// sites). Those sites live in `NodeState`/`NodeMap`, whose unit tests
+    /// construct state with a bare `NodeState::new` and never call
+    /// `ensure_init()`; routing every gauge write through `with()` keeps them
+    /// from panicking on the uninitialized singleton. The aliases MUST use this
+    /// same `with()` path — do NOT switch them to `FuseMetrics::get()`, which
+    /// would reintroduce that panic on the bare-`NodeState` test paths.
     ///
     /// The uninit branch is a deliberate, silent no-op — NOT a `debug_assert!`.
     /// Tests run in debug with a process-global `OnceCell` whose init order
@@ -345,6 +358,20 @@ impl FuseMetrics {
             inode_num: m::new_gauge("inode_num", "FUSE inode count in dcache")?,
             file_handle_num: m::new_gauge("file_handle_num", "FUSE open file handle count")?,
             dir_handle_num: m::new_gauge("dir_handle_num", "FUSE open directory handle count")?,
+
+            // Phase 3b-1: namespaced aliases (same values, event-driven in lockstep).
+            inode_count: m::new_gauge(
+                "curvine_fuse_inode_count",
+                "FUSE inode count in dcache (namespaced alias of inode_num)",
+            )?,
+            file_handle_count: m::new_gauge(
+                "curvine_fuse_file_handle_count",
+                "FUSE open file handle count (namespaced alias of file_handle_num)",
+            )?,
+            dir_handle_count: m::new_gauge(
+                "curvine_fuse_dir_handle_count",
+                "FUSE open directory handle count (namespaced alias of dir_handle_num)",
+            )?,
 
             active_requests: m::new_gauge_vec(
                 "curvine_fuse_active_requests",
