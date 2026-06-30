@@ -72,6 +72,84 @@ check_service_status() {
     fi
 }
 
+read_rpc_port() {
+    local section=$1
+    local default_port=$2
+    local conf_file="${CURVINE_CONF_FILE:-$CURVINE_HOME/conf/curvine-cluster.toml}"
+
+    if [ ! -f "$conf_file" ]; then
+        echo "$default_port"
+        return
+    fi
+
+    awk -v section="[$section]" -v default_port="$default_port" '
+        /^[[:space:]]*\[/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            in_section = (line == section)
+        }
+        in_section && /^[[:space:]]*rpc_port[[:space:]]*=/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            sub(/^[^=]*=/, "", line)
+            gsub(/[[:space:]"]/, "", line)
+            if (line != "") {
+                print line
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) {
+                print default_port
+            }
+        }
+    ' "$conf_file"
+}
+
+wait_service_ready() {
+    local service=$1
+    local port=$2
+    local timeout=${3:-60}
+    local elapsed=0
+    local pid_file="$CURVINE_HOME/${service}.pid"
+
+    print_info "Waiting for $service RPC port $port to become ready..."
+    while [ $elapsed -lt $timeout ]; do
+        if [ -f "$pid_file" ]; then
+            local pid=$(cat "$pid_file")
+            if ! kill -0 "$pid" > /dev/null 2>&1; then
+                print_error "$service exited before RPC port $port became ready"
+                tail -80 "$LOG_DIR/${service}.out" 2>/dev/null || true
+                return 1
+            fi
+        fi
+
+        if command -v nc >/dev/null 2>&1; then
+            if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
+                print_info "$service RPC port $port is ready"
+                return 0
+            fi
+        elif command -v ss >/dev/null 2>&1; then
+            if ss -ltn "( sport = :$port )" | grep -q ":$port"; then
+                print_info "$service RPC port $port is ready"
+                return 0
+            fi
+        else
+            print_warn "Neither nc nor ss is available; only process start was verified"
+            return 0
+        fi
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    print_error "$service RPC port $port was not ready after ${timeout}s"
+    tail -80 "$LOG_DIR/${service}.out" 2>/dev/null || true
+    return 1
+}
+
 # Start all services
 start_all() {
     print_info "Starting Curvine local cluster..."
@@ -93,12 +171,16 @@ start_all() {
         return 1
     fi
     
-    # Start each service
-    for service in "${SERVICES[@]}"; do
-        print_info "Starting $service..."
-        "$BIN_DIR/curvine-${service}.sh" start
-        sleep 2
-    done
+    local master_port=$(read_rpc_port "master" 8995)
+    local worker_port=$(read_rpc_port "worker" 8997)
+
+    print_info "Starting master..."
+    "$BIN_DIR/curvine-master.sh" start
+    wait_service_ready "master" "$master_port" 180 || return 1
+
+    print_info "Starting worker..."
+    "$BIN_DIR/curvine-worker.sh" start
+    wait_service_ready "worker" "$worker_port" 60 || return 1
     
     print_info "All services started. Use 'status' to check cluster status."
 }

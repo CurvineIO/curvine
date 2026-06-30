@@ -254,9 +254,7 @@ impl DBEngine {
             info!("Delete(format) exists db path {:?}", base_dir)
         }
 
-        if FileUtils::exists(base_dir) {
-            FileUtils::create_dir(base_dir, true)?;
-        }
+        FileUtils::create_dir(base_dir, true)?;
 
         Ok(())
     }
