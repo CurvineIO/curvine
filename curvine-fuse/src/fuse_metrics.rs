@@ -43,9 +43,15 @@ pub(crate) const REPLY_TYPE_REPLIED: &str = "replied";
 pub(crate) const REPLY_TYPE_NO_REPLY: &str = "no_reply";
 
 // `stage` label values. `reply_write` ships in 1a-2; `meta_spawn` in 1b
-// (rt.spawn submission -> first poll scheduling delay).
+// (rt.spawn submission -> first poll scheduling delay); `operation` in 2a (the
+// whole metadata dispatch_meta match). NOTE: `stream_enqueue` is a reserved
+// stage value that Phase 2 deliberately does NOT emit — the send_stream
+// read/write dispatch is covered by the dedicated `io_dispatch_duration_us`
+// metric instead (it can include a consistency flush/reopen, so it is not a
+// pure channel push). Do not add a STAGE_STREAM_ENQUEUE const.
 pub(crate) const STAGE_REPLY_WRITE: &str = "reply_write";
 pub(crate) const STAGE_META_SPAWN: &str = "meta_spawn";
+pub(crate) const STAGE_OPERATION: &str = "operation";
 
 // `phase` label values (`decode_errors_total`). `parse` (parse-after-ctx
 // cleanup) ships in 1a-2; `decode` (from_bytes failures) in 1b.
@@ -154,6 +160,31 @@ pub struct FuseMetrics {
     pub(crate) metrics_scrape_duration_us: Histogram,
     /// `/metrics` last scrape output size in bytes. Self-observation gauge.
     pub(crate) metrics_scrape_bytes: Gauge,
+
+    // --- Phase 2a: metadata operation, reply-queue depth, SETLKW ---
+    /// Per-op metadata operation latency, observed at a single timer around the
+    /// whole `dispatch_meta` match. `opcode,kind,status` (kind always
+    /// `metadata`). Status is the stashed `op_status` (FS-operation result),
+    /// not the enqueue outcome. **Includes the awaited reply enqueue** by
+    /// construction (each arm is `reply.send_rep(fs.<op>(op).await).await`).
+    pub(crate) operation_duration_us: HistogramVec,
+    /// SETLKW interruptible-request duration (RAII timer over the whole
+    /// `dispatch_meta_interrupt` scope: parse + dispatch + lock polling + reply
+    /// enqueue, plus the interrupt-notify reply). NOT pure lock-acquisition time —
+    /// reply-channel backpressure can inflate it, so do NOT read it as lock
+    /// contention. Covers immediate interrupt (sample even if the lock poll loop
+    /// never ran) and malformed-SETLKW parse failures (near-zero sample). No label.
+    pub(crate) setlkw_wait_duration_us: Histogram,
+    /// Reply-channel backlog. Event-driven via a task-embedded `ActiveGuard`
+    /// created at enqueue and dropped when the sender dequeues (or when an
+    /// un-received task is dropped). No `_total` suffix (it is a gauge).
+    pub(crate) reply_queue_depth: Gauge,
+    /// SETLKW interruptible-request scope in flight (NOT a `pending_requests` map
+    /// size): the guard spans the whole `dispatch_meta_interrupt` scope, so under
+    /// reply-channel backpressure it can stay non-zero after the map entry is
+    /// already removed (esp. the interrupt branch). Event-driven via a guard.
+    /// No label.
+    pub(crate) setlkw_inflight: Gauge,
 }
 
 impl FuseMetrics {
@@ -303,6 +334,35 @@ impl FuseMetrics {
             metrics_scrape_bytes: m::new_gauge(
                 "curvine_fuse_metrics_scrape_bytes",
                 "Size of the last /metrics scrape output body in bytes",
+            )?,
+
+            operation_duration_us: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_operation_duration_us",
+                "Metadata FUSE operation latency in microseconds (whole dispatch_meta match); \
+                 includes the awaited reply enqueue, so it is NOT pure operation latency — do \
+                 not subtract reply_enqueue. Metadata only; interrupted SETLKW is excluded.",
+                &["opcode", "kind", "status"],
+                REQUEST_DURATION_BUCKETS_US,
+            )?,
+            setlkw_wait_duration_us: m::new_histogram_with_buckets(
+                "curvine_fuse_setlkw_wait_duration_us",
+                "SETLKW interruptible-request duration in microseconds: the whole \
+                 dispatch_meta_interrupt scope (parse + dispatch + lock polling + reply \
+                 enqueue). NOT pure lock-acquisition time — reply-channel backpressure can \
+                 inflate it, do not read as lock contention. Includes immediate interrupt \
+                 (sample even if the lock poll loop never ran) and malformed-SETLKW parse \
+                 failures (near-zero sample).",
+                REQUEST_DURATION_BUCKETS_US,
+            )?,
+            reply_queue_depth: m::new_gauge(
+                "curvine_fuse_reply_queue_depth",
+                "Reply-channel backlog (tasks enqueued but not yet received by the sender)",
+            )?,
+            setlkw_inflight: m::new_gauge(
+                "curvine_fuse_setlkw_inflight",
+                "SETLKW interruptible-request scopes in flight (whole dispatch_meta_interrupt \
+                 scope, NOT pending_requests map size; can stay non-zero under reply-channel \
+                 backpressure after the map entry is removed)",
             )?,
         })
     }
@@ -539,6 +599,97 @@ impl FuseMetrics {
     pub(crate) fn meta_task_guard(metrics_enabled: bool) -> Option<ActiveGuard> {
         if metrics_enabled {
             Some(ActiveGuard::new(Self::get().meta_task_inflight.clone()))
+        } else {
+            None
+        }
+    }
+
+    // --- Phase 2a emission helpers ---
+
+    /// Observe the metadata operation latency once around the whole
+    /// `dispatch_meta` match, feeding **two** families from one timer (the same
+    /// dual-emit shape as the 2b `stream_io` call site):
+    /// - `operation_duration_us{opcode,kind=metadata,status}` — per-opcode detail.
+    /// - `stage_duration_us{stage=operation,kind=metadata,status}` — the
+    ///   opcode-free stage view, so the operation stage is comparable against the
+    ///   other framework stages (`reply_enqueue`/`reply_write`/`meta_spawn`) at
+    ///   bounded cardinality.
+    ///
+    /// `status` is the stashed `op_status` (FS-operation result), read back after
+    /// the match — NOT the enqueue outcome. The duration includes the awaited
+    /// reply enqueue by construction. It does NOT call `record_op_terminal`: the
+    /// request terminal path already counted the op outcome; this only observes
+    /// latency.
+    pub(crate) fn record_operation(
+        &self,
+        opcode: &'static str,
+        status: FuseReqStatus,
+        elapsed_us: u64,
+    ) {
+        let kind = FuseReqKind::Metadata.as_str();
+        let status_str = status.as_str();
+        let elapsed = elapsed_us as f64;
+        self.operation_duration_us
+            .with_label_values(&[opcode, kind, status_str])
+            .observe(elapsed);
+        self.stage_duration_us
+            .with_label_values(&[STAGE_OPERATION, kind, status_str])
+            .observe(elapsed);
+    }
+
+    /// Build the `reply_queue_depth` guard for a task entering the reply channel.
+    /// Returns `Some(ActiveGuard)` (incrementing the gauge).
+    ///
+    /// **Call only from the metrics-enabled reply path** (`self.metrics.is_some()`
+    /// in `FuseResponse`). The disabled path produces the legacy `Reply` variant
+    /// and never reaches here, so the "disabled = `None`, never `noop()`" contract
+    /// is enforced at the call site, not by a `metrics_enabled` flag here.
+    ///
+    /// Uses `get()` (strict), like `setlkw_inflight_guard` / `setlkw_wait_timer`:
+    /// because this is only ever reached on the metrics-enabled path, an
+    /// uninitialized singleton here is a wiring/init-order regression and SHOULD
+    /// surface as a panic rather than silently drop `reply_queue_depth` (review
+    /// P1#5). Production order guarantees init before any reply (ensure_init
+    /// precedes NodeState; pinned by `ensure_init_precedes_node_state`); the
+    /// enabled-path unit tests call `ensure_init()` in their fixtures. The guard is
+    /// moved into the `RequestReply`/`NotifyReply` task and decrements when the
+    /// sender dequeues (or when an un-received task is dropped).
+    pub(crate) fn reply_queue_guard() -> Option<ActiveGuard> {
+        Some(ActiveGuard::new(Self::get().reply_queue_depth.clone()))
+    }
+
+    /// Build the `setlkw_inflight` guard for a SETLKW interruptible-request scope.
+    /// `Some` when enabled, `None` when disabled (never `noop()`). Created after
+    /// the `pending_requests` insert and held across the whole `select!`; its Drop
+    /// — not the `pending_requests.remove` — decrements the gauge, so every
+    /// `select!` branch / early return / cancellation balances. NOTE: the guard
+    /// scope is the whole `dispatch_meta_interrupt`, NOT the `pending_requests` map
+    /// entry — under reply-channel backpressure the gauge can stay non-zero after
+    /// the map entry is already removed (the interrupt branch removes before the
+    /// reply enqueue completes).
+    pub(crate) fn setlkw_inflight_guard(metrics_enabled: bool) -> Option<ActiveGuard> {
+        if metrics_enabled {
+            Some(ActiveGuard::new(Self::get().setlkw_inflight.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Build the SETLKW interruptible-request timer (RAII): `Some(HistogramTimer)`
+    /// when enabled, `None` when disabled (no clock read, no observe). Created in
+    /// `dispatch_meta_interrupt` BEFORE the `select!`, so its scope is the WHOLE
+    /// interruptible SETLKW request (parse, dispatch, `set_lkw()` lock polling, and
+    /// reply enqueue) — NOT pure lock-acquisition time (matches the registration
+    /// help; reply-channel backpressure can inflate it, so do not read it as lock
+    /// contention). It observes on every drop: normal completion, interrupt
+    /// cancellation, AND a malformed SETLKW whose `parse_operator()` fails before
+    /// `set_lkw()` is ever called (near-zero sample — the reason the timer lives
+    /// here and not inside `set_lkw()`).
+    pub(crate) fn setlkw_wait_timer(metrics_enabled: bool) -> Option<HistogramTimer> {
+        if metrics_enabled {
+            Some(HistogramTimer::new(
+                Self::get().setlkw_wait_duration_us.clone(),
+            ))
         } else {
             None
         }
@@ -1328,6 +1479,148 @@ mod tests {
         assert_eq!(
             mx.receive_loop_wait_duration_us.get_sample_count(),
             before + 1
+        );
+    }
+
+    // --- Phase 2a helper tests ---
+
+    // E1: record_operation feeds BOTH families from one timer — the per-opcode
+    // `operation_duration_us{opcode,kind=metadata,status}` and the opcode-free
+    // `stage_duration_us{stage=operation,kind=metadata,status}` — under the
+    // stashed op_status (here: success). Unique opcode + delta on the shared
+    // registry.
+    #[test]
+    fn record_operation_observes_both_operation_and_stage_families() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        const OP: &str = "OpDurSuccess";
+        let op_before = mx
+            .operation_duration_us
+            .with_label_values(&[OP, "metadata", "success"])
+            .get_sample_count();
+        let stage_before = mx
+            .stage_duration_us
+            .with_label_values(&[STAGE_OPERATION, "metadata", "success"])
+            .get_sample_count();
+
+        mx.record_operation(OP, FuseReqStatus::Success, 321);
+
+        assert_eq!(
+            mx.operation_duration_us
+                .with_label_values(&[OP, "metadata", "success"])
+                .get_sample_count(),
+            op_before + 1,
+            "operation_duration_us observed once under opcode/metadata/success"
+        );
+        assert_eq!(
+            mx.stage_duration_us
+                .with_label_values(&[STAGE_OPERATION, "metadata", "success"])
+                .get_sample_count(),
+            stage_before + 1,
+            "stage_duration_us observed once under stage=operation/metadata/success"
+        );
+    }
+
+    // E2: status comes through verbatim (here: error) — the timer observes
+    // whatever op_status the caller read back from the slot, NOT a hard-coded
+    // success. Guards against a status-source regression in the helper labels.
+    #[test]
+    fn record_operation_carries_error_status() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        const OP: &str = "OpDurError";
+        let before = mx
+            .operation_duration_us
+            .with_label_values(&[OP, "metadata", "error"])
+            .get_sample_count();
+        mx.record_operation(OP, FuseReqStatus::Error, 7);
+        assert_eq!(
+            mx.operation_duration_us
+                .with_label_values(&[OP, "metadata", "error"])
+                .get_sample_count(),
+            before + 1,
+            "error op_status lands under status=error, not success"
+        );
+        // record_operation must NOT touch the op-terminal counters (the request
+        // terminal already did) — no errors_total double-count from the timer.
+        assert_eq!(
+            mx.errors_total
+                .with_label_values(&[OP, "metadata", "OTHER"])
+                .get(),
+            0,
+            "record_operation only observes latency, never record_op_terminal"
+        );
+    }
+
+    // E (B2 gate): reply_queue_guard returns Some once the singleton is
+    // initialized, inc on create / dec on drop. (The disabled path produces the
+    // legacy Reply and never calls this; the gate lives at the FuseResponse call
+    // site, so there is no `false` arm to assert here.)
+    #[test]
+    fn reply_queue_guard_inc_dec_balances() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let before = mx.reply_queue_depth.get();
+        let guard = FuseMetrics::reply_queue_guard();
+        assert!(guard.is_some(), "initialized singleton yields Some");
+        assert_eq!(
+            mx.reply_queue_depth.get(),
+            before + 1,
+            "reply_queue_depth inc on guard create"
+        );
+        drop(guard);
+        assert_eq!(
+            mx.reply_queue_depth.get(),
+            before,
+            "reply_queue_depth dec on guard drop"
+        );
+    }
+
+    // E4: setlkw_inflight_guard gate — disabled is None (never noop), enabled
+    // inc/dec balances the gauge.
+    #[test]
+    fn setlkw_inflight_guard_gate() {
+        FuseMetrics::ensure_init().unwrap();
+        assert!(
+            FuseMetrics::setlkw_inflight_guard(false).is_none(),
+            "disabled path must be None, never a noop guard"
+        );
+        let mx = FuseMetrics::get();
+        let before = mx.setlkw_inflight.get();
+        let guard = FuseMetrics::setlkw_inflight_guard(true);
+        assert!(guard.is_some());
+        assert_eq!(mx.setlkw_inflight.get(), before + 1, "guard inc on create");
+        drop(guard);
+        assert_eq!(mx.setlkw_inflight.get(), before, "guard dec on drop");
+    }
+
+    // E17: setlkw_wait_timer gate — disabled builds NO timer (no clock read, no
+    // observe on drop), enabled observes exactly once on drop.
+    #[test]
+    fn setlkw_wait_timer_gate() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+
+        // Disabled: None, and dropping it observes nothing.
+        let before = mx.setlkw_wait_duration_us.get_sample_count();
+        let disabled = FuseMetrics::setlkw_wait_timer(false);
+        assert!(disabled.is_none(), "disabled must be None");
+        drop(disabled);
+        assert_eq!(
+            mx.setlkw_wait_duration_us.get_sample_count(),
+            before,
+            "disabled timer must not observe"
+        );
+
+        // Enabled: observes once on drop (covers normal completion AND the
+        // interrupt-cancellation drop — both are just a Drop).
+        let timer = FuseMetrics::setlkw_wait_timer(true);
+        assert!(timer.is_some());
+        drop(timer);
+        assert_eq!(
+            mx.setlkw_wait_duration_us.get_sample_count(),
+            before + 1,
+            "enabled timer observes once on drop"
         );
     }
 }

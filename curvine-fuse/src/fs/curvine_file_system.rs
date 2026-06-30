@@ -1550,6 +1550,12 @@ impl fs::FileSystem for CurvineFileSystem {
         let mut ticks = 0;
         let time = TimeSpent::new();
 
+        // NOTE: `setlkw_wait_duration_us` is NOT observed here. Its RAII timer is
+        // created one layer up, in `FuseReceiver::dispatch_meta_interrupt` before
+        // the `select!`, so that an interrupt arriving before this poll loop ever
+        // runs still records a wait sample. Observing it here would miss exactly
+        // that immediate-cancellation case. See the comment there.
+
         let lock = self.to_file_lock(op.arg);
         loop {
             let conflict = self.fs.set_lock(&path, lock.clone()).await?;

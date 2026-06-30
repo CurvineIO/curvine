@@ -120,6 +120,15 @@ impl FuseResponse {
         self.unique
     }
 
+    /// The stashed FS-operation status, read back after the reply path has run
+    /// (Phase 2a `operation_duration_us`). `None` when metrics are disabled (no
+    /// slot) or when nothing finished the request yet. The send helpers stash
+    /// `op_status` synchronously before enqueueing, so by the time `dispatch_meta`
+    /// finishes its match this reflects the FS result, not the enqueue outcome.
+    pub(crate) fn metrics_op_status(&self) -> Option<FuseReqStatus> {
+        self.metrics.as_ref().and_then(|m| m.lock().op_status)
+    }
+
     fn rep_log(&self, e: &FuseError) {
         if self.debug || !matches!(e.errno, libc::ENOENT | libc::ENODATA | libc::ENOSYS) {
             warn!("send_rep unique {}: {}", self.unique, e);
@@ -269,6 +278,13 @@ impl FuseResponse {
                 .unwrap_or_else(crate::fuse_metrics::ActiveGuard::noop);
             (m.labels, active)
         };
+        // reply_queue_depth guard: created here, at the enqueue boundary. This
+        // function is reached only after the bounded `reserve()` succeeded (or on
+        // the unbounded synchronous path), so a producer still parked in
+        // `reserve().await` has NOT created a guard and is not counted as backlog.
+        // The guard rides on the task and is dropped by the sender at dequeue (or
+        // on task drop if the task is never received).
+        let queue_guard = FuseMetrics::reply_queue_guard();
         Some(FuseTask::RequestReply {
             data,
             labels,
@@ -276,6 +292,7 @@ impl FuseResponse {
             status,
             errno,
             unsupported_reason,
+            queue_guard,
         })
     }
 
@@ -490,25 +507,64 @@ impl FuseResponse {
         // metrics slot. When metrics are disabled, fall back to the legacy Reply
         // so the disabled path is byte-identical AND emits no notify metric.
         if self.metrics.is_some() {
-            let code_str = code.as_str();
-            let send_result = self
-                .sender
-                .send(FuseTask::NotifyReply {
-                    data,
-                    code: code_str,
-                })
-                .await;
-            if send_result.is_err() {
-                // Enqueue failed: the notify never reaches the sender. The
-                // success / write_failed states are recorded later in the sender
-                // (NotifyReply arm); this is the only point where enqueue_failed
-                // can be observed.
-                FuseMetrics::get().record_notify_result(code_str, NOTIFY_ENQUEUE_FAILED);
-            }
-            send_result
+            self.send_notify_metrics(code, data).await
         } else {
             self.sender.send(FuseTask::Reply(data)).await
         }
+    }
+
+    /// Metrics-enabled `send_notify`: enqueue a `NotifyReply` carrying a
+    /// `reply_queue_depth` guard, using the same reserve-first discipline as the
+    /// request reply path so a producer blocked on a full bounded channel is not
+    /// counted as backlog. The guard is created only *after* the enqueue boundary
+    /// is committed (bounded: permit acquired; unbounded: just before the
+    /// synchronous send), and rides on the task to the sender's dequeue point.
+    ///
+    /// `enqueue_failed` is recorded at every point the notify fails to enter the
+    /// channel — the bounded `reserve()` error path (NEW: previously only the
+    /// `send()` error was counted) and the unbounded `send()` error path. A
+    /// *cancelled* bounded `reserve().await` is not a failure: no guard was
+    /// created and nothing is recorded.
+    async fn send_notify_metrics(&self, code: FuseNotifyCode, data: ResponseData) -> IOResult<()> {
+        let code_str = code.as_str();
+
+        // Bounded: reserve first (no guard yet — a cancelled reserve leaves the
+        // gauge untouched), then build the guard-carrying task and `permit.send`
+        // synchronously (no await, no cancellation window).
+        if self.sender.is_bounded() {
+            let permit = match self.sender.reserve().await {
+                Ok(p) => p,
+                Err(e) => {
+                    // Channel closed before we could reserve: the notify never
+                    // reaches the sender. (A cancelled reserve unwinds here without
+                    // returning Err, so it records nothing.)
+                    FuseMetrics::get().record_notify_result(code_str, NOTIFY_ENQUEUE_FAILED);
+                    return Err(e);
+                }
+            };
+            permit.send(FuseTask::NotifyReply {
+                data,
+                code: code_str,
+                queue_guard: FuseMetrics::reply_queue_guard(),
+            });
+            return Ok(());
+        }
+
+        // Unbounded: synchronous send, so there is no cancellation window between
+        // building the guard task and enqueuing. A send error drops the task (and
+        // its guard) and records enqueue_failed.
+        let send_result = self
+            .sender
+            .send(FuseTask::NotifyReply {
+                data,
+                code: code_str,
+                queue_guard: FuseMetrics::reply_queue_guard(),
+            })
+            .await;
+        if send_result.is_err() {
+            FuseMetrics::get().record_notify_result(code_str, NOTIFY_ENQUEUE_FAILED);
+        }
+        send_result
     }
 
     // `send_buf` / `send_data` always classify an error as `Error` and have no
@@ -633,7 +689,8 @@ mod tests {
     use super::*;
     use crate::fuse_metrics::{
         ActiveGuard, FuseMetrics, FuseReqKind, FuseReqLabels, DECODE_PHASE_PARSE,
-        ENQUEUE_REASON_CHANNEL_CLOSED, REPLY_TYPE_NO_REPLY, REPLY_TYPE_REPLIED,
+        ENQUEUE_REASON_CHANNEL_CLOSED, NOTIFY_ENQUEUE_FAILED, REPLY_TYPE_NO_REPLY,
+        REPLY_TYPE_REPLIED,
     };
     use orpc::common::{Gauge, Metrics as m};
     use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
@@ -671,6 +728,10 @@ mod tests {
         opcode: &'static str,
         kind: FuseReqKind,
     ) -> (FuseResponse, AsyncReceiver<FuseTask>) {
+        // Metrics-enabled reply path now resolves `reply_queue_guard()` via
+        // `get()` (strict), so the singleton must be initialized for any enabled
+        // fixture. Idempotent.
+        init_metrics();
         let (tx, rx) = AsyncChannel::new(16).split();
         let labels = FuseReqLabels::new(opcode, kind, 64);
         let ctx = FuseReqCtx {
@@ -1249,6 +1310,7 @@ mod tests {
         opcode: &'static str,
         cap: usize,
     ) -> (FuseResponse, AsyncReceiver<FuseTask>) {
+        init_metrics();
         let (tx, rx) = AsyncChannel::new(cap).split();
         debug_assert!(tx.is_bounded(), "cap>0 must yield a bounded channel");
         let labels = FuseReqLabels::new(opcode, FuseReqKind::Metadata, 64);
@@ -1266,6 +1328,7 @@ mod tests {
         gauge: &Gauge,
         opcode: &'static str,
     ) -> (FuseResponse, AsyncReceiver<FuseTask>) {
+        init_metrics();
         let (tx, rx) = AsyncChannel::new(1).split();
         // Fill the single slot so a subsequent reserve()/send() blocks.
         tx.try_reserve()
@@ -1422,5 +1485,286 @@ mod tests {
             "parse-after-ctx must NOT emit requests_total"
         );
         assert_eq!(g.get(), 0, "guard dropped on early finish");
+    }
+
+    // --- Phase 2a: reply_queue_depth task-embedded guard ---
+    //
+    // The production `reply_queue_guard()` increments the *process-global*
+    // `reply_queue_depth` gauge, which every parallel test in this binary shares.
+    // So these tests assert the **structural** invariant that is deterministic
+    // under parallelism — "is the guard present on the right task variant?" — and
+    // leave the numeric inc/dec balance to `ActiveGuard`'s own isolated-gauge unit
+    // test (`active_guard_inc_dec_balances` in fuse_metrics). The guard's effect
+    // on the gauge is the same `ActiveGuard` machinery either way.
+
+    // B1: `metrics_op_status()` reads back the stashed op_status that the
+    // `operation_duration_us` timer uses after the dispatch_meta match. It is the
+    // FS-operation result (here: an untagged error → Error), NOT the enqueue
+    // outcome, and is None when there is no metrics slot (disabled) or before any
+    // finish.
+    #[tokio::test]
+    async fn metrics_op_status_reads_stashed_fs_result() {
+        init_metrics();
+        let g = m::new_gauge("op_status_active", "test").unwrap();
+
+        // Before any finish: nothing stashed yet.
+        let (reply, mut rx) = reply_with_gauge_opcode(60, &g, "OpStatusOp");
+        assert_eq!(
+            reply.metrics_op_status(),
+            None,
+            "no op_status before the reply path runs"
+        );
+
+        // A failed FS op stashes Error (read by operation_duration as status=error).
+        let err: FuseResult<()> = Err(FuseError::new(libc::EIO, "backend".into()));
+        reply.send_rep(err).await.unwrap();
+        let _ = rx.try_recv();
+        assert_eq!(
+            reply.metrics_op_status(),
+            Some(FuseReqStatus::Error),
+            "metrics_op_status reflects the FS op result after the reply path"
+        );
+
+        // Disabled reply has no slot, so the accessor is None.
+        let (disabled, _rx2) = disabled_reply(61);
+        assert_eq!(disabled.metrics_op_status(), None, "disabled has no slot");
+    }
+
+    // B2 test 3(a): a metrics-enabled reply produces a RequestReply that CARRIES a
+    // queue guard (so the sender's `mark_dequeued` has something to drop at the
+    // dequeue point).
+    #[tokio::test]
+    async fn request_reply_carries_queue_guard() {
+        init_metrics();
+        let g = m::new_gauge("rq_req_active", "test").unwrap();
+        let (reply, mut rx) = reply_with_gauge_opcode(50, &g, "RqReqOp");
+        reply.send_rep::<(), FuseError>(Ok(())).await.unwrap();
+
+        let task = rx.try_recv().unwrap().expect("a task");
+        match task {
+            FuseTask::RequestReply { queue_guard, .. } => {
+                assert!(
+                    queue_guard.is_some(),
+                    "metrics-enabled RequestReply carries a reply_queue_depth guard"
+                );
+            }
+            other => panic!("expected RequestReply, got {}", as_variant(&other)),
+        }
+    }
+
+    // B2 test 3(d): the disabled legacy `Reply` carries no queue guard at all —
+    // the variant has no guard field, so disabled mode cannot touch
+    // reply_queue_depth. (Structural, not a gauge read.)
+    #[tokio::test]
+    async fn disabled_reply_carries_no_queue_guard() {
+        init_metrics();
+        let (reply, mut rx) = disabled_reply(52);
+        reply.send_rep::<(), FuseError>(Ok(())).await.unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap().unwrap(), FuseTask::Reply(_)),
+            "disabled path produces the legacy Reply (no queue guard field)"
+        );
+    }
+
+    // B2 test (notify): a metrics-enabled notify produces a NotifyReply carrying a
+    // queue guard, same discipline as the request path.
+    #[tokio::test]
+    async fn notify_reply_carries_queue_guard() {
+        init_metrics();
+        let g = m::new_gauge("rq_notify_active", "test").unwrap();
+        let (reply, mut rx) = reply_with_gauge_opcode(53, &g, "RqNotifyOp");
+        reply
+            .send_notify(FuseNotifyCode::FUSE_NOTIFY_INVAL_INODE, vec![])
+            .await
+            .unwrap();
+
+        let task = rx.try_recv().unwrap().expect("a notify task");
+        match task {
+            FuseTask::NotifyReply { queue_guard, .. } => {
+                assert!(queue_guard.is_some(), "NotifyReply carries a queue guard");
+            }
+            other => panic!("expected NotifyReply, got {}", as_variant(&other)),
+        }
+    }
+
+    // B2 test 18(a): on a bounded channel, a `reserve()` that fails with a closed
+    // channel records `notify_total{status=enqueue_failed}` — the NEW reserve-path
+    // failure point (previously only the send() error was counted). `notify_total`
+    // is keyed by a code unique to this test, so the delta is parallel-safe.
+    #[tokio::test]
+    async fn notify_bounded_reserve_closed_records_enqueue_failed() {
+        init_metrics();
+        // FUSE_NOTIFY_INVAL_ENTRY is the code this test owns for its delta; no
+        // other test enqueue_failed's this code.
+        let code = FuseNotifyCode::FUSE_NOTIFY_INVAL_ENTRY.as_str();
+        let before = FuseMetrics::get()
+            .notify_total
+            .with_label_values(&[code, NOTIFY_ENQUEUE_FAILED])
+            .get();
+
+        // Bounded channel, then close it by dropping the receiver so reserve()
+        // returns a closed-channel error.
+        let g = m::new_gauge("rq_notify_closed_active", "test").unwrap();
+        let (tx, rx) = AsyncChannel::new(1).split();
+        debug_assert!(tx.is_bounded());
+        let labels = FuseReqLabels::new("RqNotifyClosed", FuseReqKind::Metadata, 64);
+        let ctx = FuseReqCtx {
+            labels,
+            active: Some(ActiveGuard::new(g.clone())),
+        };
+        let reply = FuseResponse::new_reply(54, tx, false, Some(ctx));
+        drop(rx);
+
+        assert!(reply
+            .send_notify(FuseNotifyCode::FUSE_NOTIFY_INVAL_ENTRY, vec![])
+            .await
+            .is_err());
+
+        assert_eq!(
+            FuseMetrics::get()
+                .notify_total
+                .with_label_values(&[code, NOTIFY_ENQUEUE_FAILED])
+                .get(),
+            before + 1,
+            "bounded reserve-closed records notify enqueue_failed"
+        );
+    }
+
+    // Small helper so panic messages name the unexpected variant without deriving
+    // Debug on FuseTask (which carries non-Debug fields).
+    fn as_variant(task: &FuseTask) -> &'static str {
+        match task {
+            FuseTask::RequestReply { .. } => "RequestReply",
+            FuseTask::NotifyReply { .. } => "NotifyReply",
+            FuseTask::Reply(_) => "Reply",
+        }
+    }
+
+    // --- Phase 2a: reply_queue_depth REAL queue lifecycle (review P1#4) ---
+    //
+    // These drive an actual channel with locally-gauged guards (NOT the global
+    // `reply_queue_depth`, which parallel tests share and would make absolute/delta
+    // asserts flaky). The queue guard is just an `ActiveGuard`; its real-queue
+    // behaviour is fully determined by (a) where it is created (the enqueue
+    // boundary) and (b) where it is dropped (sender dequeue, or task drop). We
+    // build the `RequestReply` task with both an `active` guard and a `queue`
+    // guard on distinct local gauges so the two scopes can be asserted apart.
+
+    // Build a RequestReply task whose active/queue guards are backed by the two
+    // given gauges, so a test can watch each scope independently.
+    fn request_reply_task(unique: u64, active_g: &Gauge, queue_g: &Gauge) -> FuseTask {
+        let labels = FuseReqLabels::new("QDepthOp", FuseReqKind::Metadata, 64);
+        FuseTask::RequestReply {
+            data: ResponseData::create(unique, 0, vec![]),
+            labels,
+            active: ActiveGuard::new(active_g.clone()),
+            status: FuseReqStatus::Success,
+            errno: 0,
+            unsupported_reason: None,
+            queue_guard: Some(ActiveGuard::new(queue_g.clone())),
+        }
+    }
+
+    // P1#4 (a): recv dequeues -> the queue guard drops at the dequeue point, so
+    // queue depth returns to baseline BEFORE any splice; the active guard is a
+    // SEPARATE scope and is still held (active stays 1 while queue is back to 0).
+    #[tokio::test]
+    async fn reply_queue_depth_drops_at_dequeue_active_still_held() {
+        let active_g = m::new_gauge("qd_dequeue_active", "test").unwrap();
+        let queue_g = m::new_gauge("qd_dequeue_queue", "test").unwrap();
+        let (tx, mut rx) = AsyncChannel::<FuseTask>::new(16).split();
+
+        tx.send(request_reply_task(1, &active_g, &queue_g))
+            .await
+            .unwrap();
+        // Enqueued and not yet received: both scopes are live.
+        assert_eq!(queue_g.get(), 1, "queue depth +1 while task is in channel");
+        assert_eq!(active_g.get(), 1, "active +1 from ctx creation");
+
+        // Sender dequeues: take the task, drop ONLY the queue guard (== sender's
+        // `mark_dequeued`). The active guard rides on the task until sender finish.
+        let task = rx.try_recv().unwrap().expect("task");
+        match task {
+            FuseTask::RequestReply {
+                queue_guard,
+                active,
+                ..
+            } => {
+                drop(queue_guard); // mark_dequeued
+                assert_eq!(queue_g.get(), 0, "queue depth back to 0 at dequeue");
+                assert_eq!(
+                    active_g.get(),
+                    1,
+                    "active still held after dequeue (separate scope, splice not done)"
+                );
+                drop(active); // sender finish
+                assert_eq!(active_g.get(), 0, "active released at sender finish");
+            }
+            other => panic!("expected RequestReply, got {}", as_variant(&other)),
+        }
+    }
+
+    // P1#4 (b): a task enqueued but NEVER received (sender/channel dropped) still
+    // balances — the queue guard rides the task and drops with it, no leak.
+    #[tokio::test]
+    async fn reply_queue_depth_unreceived_task_drop_balances() {
+        let active_g = m::new_gauge("qd_unrecv_active", "test").unwrap();
+        let queue_g = m::new_gauge("qd_unrecv_queue", "test").unwrap();
+        let (tx, rx) = AsyncChannel::<FuseTask>::new(16).split();
+
+        tx.send(request_reply_task(2, &active_g, &queue_g))
+            .await
+            .unwrap();
+        assert_eq!(queue_g.get(), 1, "enqueued: +1");
+
+        // Drop both ends without recv: the queued task (and both its guards) is
+        // dropped with the channel.
+        drop(rx);
+        drop(tx);
+        assert_eq!(
+            queue_g.get(),
+            0,
+            "un-received task drop balances queue depth"
+        );
+        assert_eq!(active_g.get(), 0, "and the active guard too");
+    }
+
+    // P1#4 (c): bounded-full reserve-first does NOT inflate queue depth. The real
+    // `commit_reply_task` creates the queue guard only AFTER a permit is acquired
+    // (see `finish_request`), so a producer parked in `reserve().await` on a full
+    // channel holds no guard.
+    //
+    // SCOPE (review R2 P2#6): this is a PROTOCOL-LEVEL STAND-IN, not a real
+    // blocked-producer test. It asserts the reserve-first invariant directly
+    // against a full bounded channel (`try_reserve()` yields no permit -> no guard
+    // built -> local gauge stays 0); it does NOT drive `FuseResponse::finish_request`
+    // through a pending `reserve().await` and observe the guard's absence while the
+    // send future is parked. The cancellation half of that production path —
+    // `reserve()` cancelled mid-await leaves the slot unfinished — IS covered by
+    // `bounded_reserve_cancellation_leaves_slot_unfinished`. Driving a genuinely
+    // parked producer + observing queue depth would need the shared global gauge
+    // (parallel-unsafe) or a custom waker harness; deferred as not worth the flake.
+    #[tokio::test]
+    async fn reply_queue_depth_bounded_full_does_not_inflate() {
+        let queue_g = m::new_gauge("qd_bounded_full_queue", "test").unwrap();
+        let (tx, _rx) = AsyncChannel::<FuseTask>::new(1).split();
+        debug_assert!(tx.is_bounded());
+
+        // Fill the single slot.
+        let permit = tx.try_reserve().unwrap().expect("one permit");
+        permit.send(FuseTask::Reply(ResponseData::create(0, 0, vec![])));
+
+        // Channel now full: a producer would block in `reserve().await`. Reserve-
+        // first means the queue guard is created only after a permit is in hand,
+        // so right now NO guard exists and queue depth is untouched.
+        assert!(
+            tx.try_reserve().unwrap().is_none(),
+            "full bounded channel yields no permit"
+        );
+        assert_eq!(
+            queue_g.get(),
+            0,
+            "no permit -> no queue guard built -> depth not inflated"
+        );
     }
 }
