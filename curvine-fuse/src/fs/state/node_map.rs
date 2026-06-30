@@ -183,6 +183,41 @@ impl NodeMap {
         name: Option<T>,
         status: &FileStatus,
     ) -> FuseResult<fuse_attr> {
+        self.do_lookup_probed(parent, name, status, false).0
+    }
+
+    /// `do_lookup` plus an optional NodeMap-dcache hit/miss probe for
+    /// `node_cache_total` (Phase 3a). When `record && name.is_some()`, the second
+    /// tuple element is `Some(hit)` where `hit` reflects whether `(parent,name)`
+    /// already mapped to an inode **before** `find_node` auto-creates one — decided
+    /// here, inside the write lock, so it is atomic with the lookup (not a racy
+    /// pre-probe). The probe is returned (not emitted) so the caller can record the
+    /// metric AFTER releasing the lock, and it is returned on every path (incl. the
+    /// pending-delete/error early returns) so a hit/miss is never dropped. `record`
+    /// is `true` only on the real FUSE `Lookup` path; readdir / mkdir / create /
+    /// link / symlink pass `false`, and `name=None` (`.`/`..`) yields `None`.
+    pub fn do_lookup_probed<T: AsRef<str>>(
+        &mut self,
+        parent: u64,
+        name: Option<T>,
+        status: &FileStatus,
+        record: bool,
+    ) -> (FuseResult<fuse_attr>, Option<bool>) {
+        let node_cache_hit = if record {
+            name.as_ref()
+                .map(|n| self.lookup_node(parent, Some(n.as_ref())).is_some())
+        } else {
+            None
+        };
+        (self.do_lookup_inner(parent, name, status), node_cache_hit)
+    }
+
+    fn do_lookup_inner<T: AsRef<str>>(
+        &mut self,
+        parent: u64,
+        name: Option<T>,
+        status: &FileStatus,
+    ) -> FuseResult<fuse_attr> {
         let ino = match self.find_node(parent, name) {
             Ok(v) => v.id,
             Err(e) => return err_fuse!(libc::ENOMEM, "{}", e),
@@ -764,6 +799,47 @@ mod tests {
             "overwritten target inode removed"
         );
         assert!(map.get(src).is_some(), "source inode survives the rename");
+    }
+
+    // Phase 3a node_cache_total probe: `do_lookup_probed` must report the
+    // hit/miss decided BEFORE find_node auto-creates, only when record=true and
+    // name is Some, and on every return path. This is parallel-safe: it asserts
+    // the returned probe bool, not the process-global node_cache_total counter.
+    #[test]
+    fn do_lookup_probed_reports_hit_miss_only_when_recording() {
+        use curvine_common::state::FileStatus;
+        let mut map = test_map();
+        // Distinct names per case: EVEN a record=false lookup materializes the
+        // node via find_node (it is a real lookup, just not counted), so each
+        // presence assertion must use a name not yet touched.
+        let s_y = FileStatus::with_name(2, "y".to_string(), true);
+        let s_z = FileStatus::with_name(3, "z".to_string(), true);
+
+        // record=true, first lookup of "z": miss (not yet in the map).
+        let (_r, probe) = map.do_lookup_probed(FUSE_ROOT_ID, Some("z"), &s_z, true);
+        assert_eq!(probe, Some(false), "first lookup is a miss");
+
+        // record=true, second lookup of "z": hit (find_node materialized it).
+        let (_r, probe) = map.do_lookup_probed(FUSE_ROOT_ID, Some("z"), &s_z, true);
+        assert_eq!(probe, Some(true), "second lookup is a hit");
+
+        // record=false (readdir / mkdir path): never probes, even though it still
+        // materializes "y".
+        let (_r, probe) = map.do_lookup_probed(FUSE_ROOT_ID, Some("y"), &s_y, false);
+        assert_eq!(probe, None, "record=false must not probe");
+        // Confirm that record=false call DID materialize "y": a recording lookup
+        // now sees a hit.
+        let (_r, probe) = map.do_lookup_probed(FUSE_ROOT_ID, Some("y"), &s_y, true);
+        assert_eq!(
+            probe,
+            Some(true),
+            "record=false still materializes the node"
+        );
+
+        // record=true but name=None (`.`/`..`): not counted.
+        let root_status = FileStatus::with_name(1, "/".to_string(), true);
+        let (_r, probe) = map.do_lookup_probed(FUSE_ROOT_ID, None::<&str>, &root_status, true);
+        assert_eq!(probe, None, "name=None must not be counted");
     }
 
     #[test]
