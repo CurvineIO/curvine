@@ -20,6 +20,42 @@ BIN_DIR="$(cd "`dirname "$0"`"; pwd)"
 
 # Close all services and restart.
 
+read_rpc_port() {
+    local section=$1
+    local default_port=$2
+    local conf_file="${CURVINE_CONF_FILE:-${BIN_DIR}/../conf/curvine-cluster.toml}"
+
+    if [ ! -f "$conf_file" ]; then
+        echo "$default_port"
+        return
+    fi
+
+    awk -v section="[$section]" -v default_port="$default_port" '
+        /^[[:space:]]*\[/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            gsub(/[[:space:]]/, "", line)
+            in_section = (line == section)
+        }
+        in_section && /^[[:space:]]*rpc_port[[:space:]]*=/ {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            sub(/^[^=]*=/, "", line)
+            gsub(/[[:space:]"]/, "", line)
+            if (line != "") {
+                print line
+                found = 1
+                exit
+            }
+        }
+        END {
+            if (!found) {
+                print default_port
+            }
+        }
+    ' "$conf_file"
+}
+
 # Function to wait for a process to start
 wait_for_process() {
     local service_name=$1
@@ -40,19 +76,63 @@ wait_for_process() {
     return 1
 }
 
+wait_for_port() {
+    local service_name=$1
+    local port=$2
+    local timeout=${3:-60}
+    local count=0
+
+    echo "Waiting for $service_name RPC port $port..."
+    while [ $count -lt $timeout ]; do
+        if command -v nc >/dev/null 2>&1; then
+            if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
+                echo "$service_name RPC port $port is ready"
+                return 0
+            fi
+        elif command -v ss >/dev/null 2>&1; then
+            if ss -ltn "( sport = :$port )" | grep -q ":$port"; then
+                echo "$service_name RPC port $port is ready"
+                return 0
+            fi
+        else
+            echo "Warning: neither nc nor ss is available; only process start was verified"
+            return 0
+        fi
+
+        if ! ps -ef | grep "curvine" | grep "$service_name" | grep -v grep > /dev/null; then
+            echo "Error: $service_name exited before RPC port $port became ready"
+            tail -80 "${BIN_DIR}/../logs/${service_name}.out" 2>/dev/null || true
+            return 1
+        fi
+
+        sleep 1
+        count=$((count + 1))
+    done
+
+    echo "Error: $service_name RPC port $port did not become ready within $timeout seconds"
+    tail -80 "${BIN_DIR}/../logs/${service_name}.out" 2>/dev/null || true
+    return 1
+}
+
 umount -l /curvine-fuse
 pkill -9 -f "curvine"
 
 # Wait a moment for processes to be killed
 sleep 3
 
+MASTER_PORT=$(read_rpc_port "master" 8995)
+WORKER_PORT=$(read_rpc_port "worker" 8997)
+
 # Start master and worker services
 ${BIN_DIR}/curvine-master.sh start
+wait_for_process "master" || exit 1
+wait_for_port "master" "$MASTER_PORT" 180 || exit 1
+
 ${BIN_DIR}/curvine-worker.sh start
 
 # Wait for master and worker to start
-wait_for_process "master"
-wait_for_process "worker"
+wait_for_process "worker" || exit 1
+wait_for_port "worker" "$WORKER_PORT" 60 || exit 1
 
 # Start fuse service
 ${BIN_DIR}/curvine-fuse.sh start
