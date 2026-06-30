@@ -27,7 +27,7 @@ use curvine_common::conf::{ClientConf, ClusterConf, FuseConf};
 use curvine_common::fs::{FileSystem, ListStream, MetaCache, Path, StateReader, StateWriter};
 use curvine_common::state::{CreateFileOpts, FileBlocks, FileStatus, ListOptions, OpenFlags};
 use futures::stream::{self, StreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use orpc::common::FastHashMap;
 use orpc::err_box;
 use orpc::sync::{AtomicCounter, RwLockHashMap};
@@ -508,6 +508,15 @@ impl NodeState {
         }
     }
 
+    fn find_open_handle_by_path(&self, path: &Path) -> Option<Arc<FileHandle>> {
+        let path = path.full_path();
+        let lock = self.handles.read();
+        lock.values()
+            .flat_map(|handles| handles.values())
+            .find(|handle| handle.status.path == path)
+            .cloned()
+    }
+
     pub fn should_delete_now<T: AsRef<str>>(
         &self,
         parent: u64,
@@ -515,12 +524,31 @@ impl NodeState {
     ) -> FuseResult<bool> {
         let name = name.as_ref();
 
-        let id = {
+        let (id, missing_path) = {
             let map = self.node_read();
             match map.lookup_node(parent, name) {
-                Some(v) => v.id,
-                None => return err_fuse!(libc::ENOENT, "node {} not found", parent),
+                Some(v) => (Some(v.id), None),
+                None => (None, Some(map.get_path_common(parent, name)?)),
             }
+        };
+
+        let Some(id) = id else {
+            let path = missing_path.expect("missing path should be set when node id is absent");
+            if let Some(handle) = self.find_open_handle_by_path(&path) {
+                let mut map = self.node_write();
+                map.mark_pending_delete(handle.ino);
+                info!(
+                    "unlink {}: node cache missing but file has open handles (ino={}), marking for delayed deletion",
+                    path, handle.ino
+                );
+                return Ok(false);
+            }
+
+            debug!(
+                "unlink node cache miss for path={}; deleting backend path",
+                path
+            );
+            return Ok(true);
         };
 
         if self.has_open_handles(id) {
@@ -831,8 +859,7 @@ impl NodeState {
 
 #[cfg(test)]
 mod test {
-    use super::FileHandle;
-    use crate::fs::state::{DirHandle, NodeState};
+    use crate::fs::state::{DirHandle, FileHandle, NodeState};
     use crate::FUSE_ROOT_ID;
     use curvine_client::unified::UnifiedFileSystem;
     use curvine_common::conf::{ClusterConf, FuseConf};
@@ -1113,6 +1140,66 @@ mod test {
 
         let c1 = state.get_path_common(c.ino, Some("1.log"));
         assert!(c1.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn rename_over_existing_name_keeps_destination_unlinkable() -> CommonResult<()> {
+        let mut conf = ClusterConf::default();
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        let old_dst_status = FileStatus::with_name(2, "asymbolic".to_string(), false);
+        let _old_dst = state.do_lookup(FUSE_ROOT_ID, Some("asymbolic"), &old_dst_status)?;
+
+        let src_status = FileStatus::with_name(3, "symbolic".to_string(), false);
+        let _src = state.do_lookup(FUSE_ROOT_ID, Some("symbolic"), &src_status)?;
+
+        state.rename_node(FUSE_ROOT_ID, "symbolic", FUSE_ROOT_ID, "asymbolic")?;
+
+        assert!(state.should_delete_now(FUSE_ROOT_ID, Some("asymbolic"))?);
+
+        state.unlink_node(FUSE_ROOT_ID, Some("asymbolic"))?;
+
+        // A cache miss must not make unlink fail before the backend delete.
+        assert!(state.should_delete_now(FUSE_ROOT_ID, Some("asymbolic"))?);
+
+        Ok(())
+    }
+
+    #[test]
+    pub fn cache_miss_with_open_handle_keeps_delayed_delete() -> CommonResult<()> {
+        let mut conf = ClusterConf::default();
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        let status = FileStatus::with_name(2, "open-file".to_string(), false);
+        let node = state.do_lookup(FUSE_ROOT_ID, Some("open-file"), &status)?;
+        let path = state.get_path_common(FUSE_ROOT_ID, Some("open-file"))?;
+
+        let mut handle_status = status.clone();
+        handle_status.path = path.full_path().to_string();
+        let handle = Arc::new(FileHandle::new(
+            node.ino,
+            state.next_fh(),
+            None,
+            None,
+            handle_status,
+        ));
+        state
+            .handles
+            .write()
+            .entry(node.ino)
+            .or_default()
+            .insert(handle.fh, handle);
+
+        state.unlink_node(FUSE_ROOT_ID, Some("open-file"))?;
+
+        assert!(!state.should_delete_now(FUSE_ROOT_ID, Some("open-file"))?);
+        assert!(state.is_pending_delete(node.ino));
 
         Ok(())
     }

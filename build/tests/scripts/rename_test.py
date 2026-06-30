@@ -147,6 +147,31 @@ def test_file_overwrite_file(root: str) -> int:
     return expect_ok("file -> existing file (overwrite)", run)
 
 
+def test_symlink_overwrite_symlink_then_unlink(root: str) -> int:
+    d = case_dir(root, "symlink_over_symlink")
+    symbolic = os.path.join(d, "symbolic")
+    asymbolic = os.path.join(d, "asymbolic")
+    obj = os.path.join(d, "object")
+
+    def run() -> None:
+        os.symlink("nobody", symbolic)
+        os.rename(symbolic, asymbolic)
+
+        touch(obj, "")
+        os.symlink("object", symbolic)
+        os.rename(symbolic, asymbolic)
+
+        os.lstat(asymbolic)
+        os.stat(asymbolic)
+
+        os.unlink(asymbolic)
+        if os.path.lexists(asymbolic):
+            raise OSError("destination symlink still exists after unlink")
+        os.unlink(obj)
+
+    return expect_ok("symlink -> existing symlink then unlink", run)
+
+
 def test_dir_overwrite_empty_dir(root: str) -> int:
     d = case_dir(root, "dir_over_empty")
     src_dir = os.path.join(d, "src_dir")
@@ -281,14 +306,15 @@ TESTS: list[tuple[str, Callable[[str], int]]] = [
     ("2", test_basic_dir_rename),
     ("3", test_file_to_existing_dir),
     ("4", test_file_overwrite_file),
-    ("5", test_dir_overwrite_empty_dir),
-    ("6", test_dir_to_nonempty_dir),
-    ("7", test_dir_to_file),
-    ("8", test_rename_into_subdir),
-    ("9", test_same_path_noop),
-    ("10", test_same_path_noop_empty_dir),
-    ("11", test_same_path_noop_nonempty_dir),
-    ("12", test_missing_source),
+    ("5", test_symlink_overwrite_symlink_then_unlink),
+    ("6", test_dir_overwrite_empty_dir),
+    ("7", test_dir_to_nonempty_dir),
+    ("8", test_dir_to_file),
+    ("9", test_rename_into_subdir),
+    ("10", test_same_path_noop),
+    ("11", test_same_path_noop_empty_dir),
+    ("12", test_same_path_noop_nonempty_dir),
+    ("13", test_missing_source),
 ]
 
 

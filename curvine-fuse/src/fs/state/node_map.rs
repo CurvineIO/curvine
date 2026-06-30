@@ -361,18 +361,17 @@ impl NodeMap {
     ) -> FuseResult<()> {
         let (old_name, new_name) = (old_name.as_ref(), new_name.as_ref());
 
-        let old_node = match self.lookup_node_mut(old_id, Some(old_name)) {
+        let old_node = match self.lookup_node(old_id, Some(old_name)) {
             None => return err_fuse!(libc::ENOENT, "inode {} {} not exists", old_id, old_name),
-
-            Some(v) => {
-                v.sub_lookup(1);
-                v.clone()
-            }
+            Some(v) => v.clone(),
         };
         self.delete_name(&old_node)?;
 
         if let Some(exists_node) = self.lookup_node(new_id, Some(new_name)).cloned() {
             self.delete_name(&exists_node)?;
+            if exists_node.should_unref() {
+                self.nodes.remove(&exists_node.id);
+            }
         }
 
         let mut new_node = old_node;
