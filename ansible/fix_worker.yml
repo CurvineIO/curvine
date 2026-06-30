@@ -1,0 +1,181 @@
+---
+# 修复Worker节点问题
+# 使用方法: ansible-playbook fix_worker.yml --limit worker
+
+- name: Fix Worker Node Issues
+  hosts: worker
+  gather_facts: no
+  vars:
+    curvine_install_dir: /root/dist
+    worker_dist_file: /root/dist1.tar.gz
+  
+  tasks:
+    - name: Stop services first
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - curvine-worker
+        - curvine-fuse
+      ignore_errors: yes
+
+    - name: Check if dist1.tar.gz exists locally
+      delegate_to: localhost
+      stat:
+        path: "{{ worker_dist_file }}"
+      register: local_dist_check
+      run_once: true
+
+    - name: Check if dist1.tar.gz exists on worker node
+      stat:
+        path: /root/dist1.tar.gz
+      register: remote_dist_check
+
+    - name: Re-copy dist1.tar.gz if needed
+      copy:
+        src: "{{ worker_dist_file }}"
+        dest: /root/dist1.tar.gz
+        mode: '0644'
+      when: local_dist_check.stat.exists and (not remote_dist_check.stat.exists or remote_dist_check.stat.size != local_dist_check.stat.size)
+
+    - name: Backup old installation
+      shell: |
+        if [ -d {{ curvine_install_dir }} ]; then
+          mv {{ curvine_install_dir }} {{ curvine_install_dir }}.backup.$(date +%Y%m%d_%H%M%S)
+        fi
+        if [ -d /root/dist1 ]; then
+          rm -rf /root/dist1
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Extract dist1.tar.gz
+      unarchive:
+        src: /root/dist1.tar.gz
+        dest: /root/
+        remote_src: yes
+
+    - name: Check if extracted to dist1 directory
+      stat:
+        path: /root/dist1
+      register: extracted_dist1
+
+    - name: Move dist1 to dist if needed
+      shell: mv /root/dist1 {{ curvine_install_dir }}
+      when: extracted_dist1.stat.exists
+
+    - name: Check if dist directory exists now
+      stat:
+        path: "{{ curvine_install_dir }}"
+      register: dist_exists
+
+    - name: Fail if installation directory not found
+      fail:
+        msg: |
+          安装目录 {{ curvine_install_dir }} 不存在！
+          请检查 dist1.tar.gz 的内容和结构
+      when: not dist_exists.stat.exists
+
+    - name: Make all scripts executable
+      file:
+        path: "{{ item }}"
+        mode: '0755'
+        recurse: yes
+      loop:
+        - "{{ curvine_install_dir }}/bin"
+        - "{{ curvine_install_dir }}/lib"
+      ignore_errors: yes
+
+    - name: Check extracted files
+      shell: |
+        echo "=== Checking installation ==="
+        ls -la {{ curvine_install_dir }}/
+        echo ""
+        echo "=== Checking bin directory ==="
+        ls -la {{ curvine_install_dir }}/bin/ 2>/dev/null || echo "bin directory not found"
+        echo ""
+        echo "=== Checking lib directory ==="
+        ls -la {{ curvine_install_dir }}/lib/ 2>/dev/null || echo "lib directory not found"
+        echo ""
+        echo "=== Checking curvine-worker.sh ==="
+        if [ -f {{ curvine_install_dir }}/bin/curvine-worker.sh ]; then
+          file {{ curvine_install_dir }}/bin/curvine-worker.sh
+          head -n 5 {{ curvine_install_dir }}/bin/curvine-worker.sh
+        else
+          echo "curvine-worker.sh not found"
+        fi
+      register: check_result
+      args:
+        executable: /bin/bash
+
+    - name: Display check results
+      debug:
+        msg: "{{ check_result.stdout_lines }}"
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Start curvine-worker service
+      systemd:
+        name: curvine-worker
+        state: started
+      register: worker_start_result
+      ignore_errors: yes
+
+    - name: Display worker service start result
+      debug:
+        msg: |
+          Worker服务启动{{ '成功' if not (worker_start_result.failed | default(false)) else '失败' }}
+          {% if worker_start_result.failed | default(false) %}
+          错误信息: {{ worker_start_result.msg | default('无') }}
+          {% endif %}
+
+    - name: Get worker service logs if failed
+      shell: journalctl -u curvine-worker -n 30 --no-pager
+      register: worker_logs
+      when: worker_start_result.failed | default(false)
+
+    - name: Display worker service logs
+      debug:
+        msg: "{{ worker_logs.stdout_lines }}"
+      when: worker_start_result.failed | default(false)
+
+    - name: Start curvine-fuse service
+      systemd:
+        name: curvine-fuse
+        state: started
+      register: fuse_start_result
+      ignore_errors: yes
+      when: not (worker_start_result.failed | default(false))
+
+    - name: Display fuse service start result
+      debug:
+        msg: |
+          FUSE服务启动{{ '成功' if not (fuse_start_result.failed | default(false)) else '失败' }}
+          {% if fuse_start_result.failed | default(false) %}
+          错误信息: {{ fuse_start_result.msg | default('无') }}
+          {% endif %}
+      when: not (worker_start_result.failed | default(false))
+
+    - name: Final status check
+      systemd:
+        name: "{{ item }}"
+      register: final_status
+      ignore_errors: yes
+      loop:
+        - curvine-worker
+        - curvine-fuse
+
+    - name: Display final status
+      debug:
+        msg: |
+          ========================================
+          Worker节点 {{ inventory_hostname }} 修复完成
+          ========================================
+          
+          服务状态:
+          {% for result in final_status.results %}
+          - {{ result.item }}: {{ result.status.ActiveState | default('unknown') }}
+          {% endfor %}
+
