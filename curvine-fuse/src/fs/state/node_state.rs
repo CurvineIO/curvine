@@ -385,7 +385,15 @@ impl NodeState {
         // Check if writer already exists to prevent duplicate creation
         let check_writer = if let Some(writer) = writer {
             if let Some(exist_writer) = Self::find_writer0(&lock, &ino) {
-                Some(exist_writer)
+                if exist_writer
+                    .try_lock()
+                    .map(|writer| !writer.is_completed())
+                    .unwrap_or(false)
+                {
+                    Some(exist_writer)
+                } else {
+                    Some(writer)
+                }
             } else {
                 Some(writer)
             }

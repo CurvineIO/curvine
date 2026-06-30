@@ -126,15 +126,14 @@ impl FuseWriter {
     }
 
     pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
+        self.completed = true;
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(WriteTask::Complete(rx, reply)).await?;
             tx.receive().await?;
             Ok::<(), FsError>(())
         };
-        fun.await.map_err(|e| self.check_error(e))?;
-        self.completed = true;
-        Ok(())
+        fun.await.map_err(|e| self.check_error(e))
     }
 
     pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
