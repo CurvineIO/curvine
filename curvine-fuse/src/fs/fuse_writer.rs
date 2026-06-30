@@ -44,6 +44,7 @@ pub struct FuseWriter {
     is_ufs: bool,
     len: Arc<Mutex<i64>>,
     write_ver: AtomicCounter,
+    completed: bool,
 }
 
 impl FuseWriter {
@@ -79,6 +80,7 @@ impl FuseWriter {
             is_ufs,
             len,
             write_ver,
+            completed: false,
         }
     }
 
@@ -95,6 +97,10 @@ impl FuseWriter {
 
     pub fn is_ufs(&self) -> bool {
         self.is_ufs
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.completed
     }
 
     fn check_error(&self, e: FsError) -> FsError {
@@ -120,6 +126,7 @@ impl FuseWriter {
     }
 
     pub async fn complete(&mut self, reply: Option<FuseResponse>) -> FsResult<()> {
+        self.completed = true;
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(WriteTask::Complete(rx, reply)).await?;
@@ -130,6 +137,7 @@ impl FuseWriter {
     }
 
     pub async fn resize(&mut self, opts: FileAllocOpts) -> FsResult<()> {
+        let len = opts.len;
         let fun = async {
             let (rx, tx) = CallChannel::channel();
             self.sender.send(WriteTask::Resize(rx, opts)).await?;
@@ -137,7 +145,10 @@ impl FuseWriter {
             Ok::<(), FsError>(())
         };
         self.write_ver.incr();
-        fun.await.map_err(|e| self.check_error(e))
+        fun.await.map_err(|e| self.check_error(e))?;
+        let mut lock = self.len.lock().unwrap();
+        *lock = len;
+        Ok(())
     }
 
     pub fn len(&self) -> i64 {
