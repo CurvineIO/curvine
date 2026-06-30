@@ -256,3 +256,13 @@ jobs:
           else
             echo "**Note:** Image was built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY
           fi
+
+  build-fluid-image:
+    needs: [prepare, create-manifest]
+    if: needs.prepare.outputs.push_image == 'true'
+    uses: ./.github/workflows/build-fluid-image.yml
+    with:
+      push_image: true
+      image_tag: ${{ needs.prepare.outputs.tag }}
+      base_image_tag: ${{ needs.prepare.outputs.tag }}
+    secrets: inherit
