@@ -17,6 +17,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   # Build native libraries for each OS and architecture
@@ -78,51 +79,64 @@ jobs:
             also_alinux3: true
 
     runs-on: ${{ matrix.runner }}
-    container:
-      image: ${{ matrix.image }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
-        run: |
-          export PATH="/root/.cargo/bin:$PATH"
-          unset RUSTUP_UPDATE_ROOT
-          unset RUSTUP_DIST_SERVER
-          rustup default stable
-          rustc --version
-          cargo --version
-
       - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@v4
         with:
-          shared-key: "curvine-java-sdk-${{ matrix.os }}-${{ matrix.arch }}"
-          cache-all-crates: false
-          cache-targets: false
+          path: |
+            .ci-cargo/git
+            .ci-cargo/registry
+          key: curvine-java-sdk-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            curvine-java-sdk-${{ matrix.os }}-${{ matrix.arch }}-
 
-      - name: Build native library
+      - name: Build native library in compile container
         run: |
-          echo "Building native library for ${{ matrix.os }} ${{ matrix.arch }}_64"
-          cargo build --release -p curvine-libsdk --jobs 2
-          
-          # Create output directory
-          mkdir -p native-output
-          
-          # Copy the built library with proper naming
-          cp target/release/libcurvine_libsdk.so \
-             native-output/libcurvine_libsdk_${{ matrix.os }}_${{ matrix.arch }}_64.so
-          
-          # Also copy for alinux3 if amzn2 (glibc 2.26 forward compatible with glibc 2.32)
-          # NOTE: Rocky 9 requires glibc 2.33/2.34, but StarRocks alinux3 image only has glibc 2.32
-          # Amazon Linux 2 (glibc 2.26) is the best choice for alinux3 compatibility
-          if [ "${{ matrix.also_alinux3 }}" = "true" ]; then
-            echo "Creating alinux3 compatible .so from amzn2 build (glibc 2.26 -> 2.32)"
-            cp target/release/libcurvine_libsdk.so \
-               native-output/libcurvine_libsdk_alinux3_${{ matrix.arch }}_64.so
-          fi
-          
-          ls -la native-output/
+          mkdir -p .ci-cargo/git .ci-cargo/registry native-output
+
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -v "$PWD/.ci-cargo/git:/root/.cargo/git" \
+            -v "$PWD/.ci-cargo/registry:/root/.cargo/registry" \
+            -w /workspace \
+            -e CARGO_TERM_COLOR="${CARGO_TERM_COLOR}" \
+            -e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}" \
+            "${{ matrix.image }}" \
+            bash -lc '
+              set -euo pipefail
+
+              export PATH="/root/.cargo/bin:$PATH"
+              unset RUSTUP_UPDATE_ROOT
+              unset RUSTUP_DIST_SERVER
+
+              rustup default stable
+              rustc --version
+              cargo --version
+
+              echo "Building native library for ${{ matrix.os }} ${{ matrix.arch }}_64"
+              cargo build --release -p curvine-libsdk --jobs "${CARGO_BUILD_JOBS}"
+
+              mkdir -p native-output
+              cp target/release/libcurvine_libsdk.so \
+                native-output/libcurvine_libsdk_${{ matrix.os }}_${{ matrix.arch }}_64.so
+
+              if [ "${{ matrix.also_alinux3 }}" = "true" ]; then
+                echo "Creating alinux3 compatible .so from amzn2 build (glibc 2.26 -> 2.32)"
+                cp target/release/libcurvine_libsdk.so \
+                  native-output/libcurvine_libsdk_alinux3_${{ matrix.arch }}_64.so
+              fi
+
+              ls -la native-output/
+            '
+
+      - name: Normalize build output ownership
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" .ci-cargo target native-output 2>/dev/null || true
 
       - name: Upload native library artifact
         uses: actions/upload-artifact@v4
@@ -220,7 +234,7 @@ jobs:
           ls -la jars/
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: jars/*.jar
           generate_release_notes: false
@@ -353,4 +367,3 @@ jobs:
           else
             echo "**Note:** Manual trigger - artifacts uploaded but not published to release" >> $GITHUB_STEP_SUMMARY
           fi
-
