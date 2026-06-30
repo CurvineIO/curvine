@@ -380,37 +380,118 @@ impl NodeState {
             return err_fuse!(libc::EINVAL, "Invalid flags: {:?}", flags);
         };
 
-        let mut lock = self.handles.write();
-
-        // Check if writer already exists to prevent duplicate creation
-        let check_writer = if let Some(writer) = writer {
-            if let Some(exist_writer) = Self::find_writer0(&lock, &ino) {
-                if exist_writer
-                    .try_lock()
-                    .map(|writer| !writer.is_completed())
-                    .unwrap_or(false)
-                {
-                    Some(exist_writer)
-                } else {
-                    Some(writer)
-                }
-            } else {
-                Some(writer)
-            }
-        } else {
-            None
-        };
-
-        let handle = Arc::new(FileHandle::new(
-            ino,
-            self.next_fh(),
-            reader,
-            check_writer,
-            status,
-        ));
-        Self::insert_file_handle_locked(&mut lock, handle.ino, handle.fh, handle.clone());
+        let handle = self
+            .insert_handle_with_writer(ino, reader, writer, status)
+            .await;
 
         Ok(handle)
+    }
+
+    async fn insert_handle_with_writer(
+        &self,
+        ino: u64,
+        reader: Option<RawPtr<FuseReader>>,
+        writer: Option<Arc<Mutex<FuseWriter>>>,
+        status: FileStatus,
+    ) -> Arc<FileHandle> {
+        let mut candidate_writer = writer;
+        let mut ignored_completed: Vec<Arc<Mutex<FuseWriter>>> = vec![];
+        let mut reader = Some(reader);
+        let mut status = Some(status);
+
+        loop {
+            let writer = match candidate_writer.take() {
+                Some(writer) => writer,
+                None => {
+                    let handle = Arc::new(FileHandle::new(
+                        ino,
+                        self.next_fh(),
+                        reader.take().unwrap(),
+                        None,
+                        status.take().unwrap(),
+                    ));
+                    let mut lock = self.handles.write();
+                    Self::insert_file_handle_locked(
+                        &mut lock,
+                        handle.ino,
+                        handle.fh,
+                        handle.clone(),
+                    );
+                    return handle;
+                }
+            };
+
+            let exist_writer = self.find_writer_excluding(ino, &ignored_completed);
+
+            let Some(exist_writer) = exist_writer else {
+                let handle = Arc::new(FileHandle::new(
+                    ino,
+                    self.next_fh(),
+                    reader.take().unwrap(),
+                    Some(writer),
+                    status.take().unwrap(),
+                ));
+                let mut lock = self.handles.write();
+                Self::insert_file_handle_locked(&mut lock, handle.ino, handle.fh, handle.clone());
+                return handle;
+            };
+
+            let exist_guard = exist_writer.lock().await;
+            if exist_guard.is_completed() {
+                drop(exist_guard);
+                ignored_completed.push(exist_writer);
+                candidate_writer = Some(writer);
+                continue;
+            }
+
+            {
+                let mut lock = self.handles.write();
+                let still_exists = lock.get(&ino).is_some_and(|handles| {
+                    handles
+                        .values()
+                        .filter_map(|handle| handle.writer.as_ref())
+                        .any(|writer| Arc::ptr_eq(writer, &exist_writer))
+                });
+                if still_exists {
+                    let handle = Arc::new(FileHandle::new(
+                        ino,
+                        self.next_fh(),
+                        reader.take().unwrap(),
+                        Some(exist_writer.clone()),
+                        status.take().unwrap(),
+                    ));
+                    Self::insert_file_handle_locked(
+                        &mut lock,
+                        handle.ino,
+                        handle.fh,
+                        handle.clone(),
+                    );
+                    return handle;
+                }
+            };
+
+            drop(exist_guard);
+            candidate_writer = Some(writer);
+        }
+    }
+
+    fn find_writer_excluding(
+        &self,
+        ino: u64,
+        ignored_writers: &[Arc<Mutex<FuseWriter>>],
+    ) -> Option<Arc<Mutex<FuseWriter>>> {
+        let lock = self.handles.read();
+        lock.get(&ino).and_then(|handles| {
+            handles
+                .values()
+                .filter_map(|handle| handle.writer.as_ref())
+                .find(|writer| {
+                    !ignored_writers
+                        .iter()
+                        .any(|ignored| Arc::ptr_eq(ignored, writer))
+                })
+                .cloned()
+        })
     }
 
     /// Runtime chokepoint for inserting a file handle while holding the write
