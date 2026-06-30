@@ -325,7 +325,11 @@ impl CurvineFileSystem {
         }
         handle.set_buf(batch).await?;
 
-        let entries = index - arg.offset;
+        // `index` starts at `arg.offset` and only increases (inc'd once per
+        // successful add_dirent), so this never underflows today; use
+        // saturating_sub to keep it panic-safe if that invariant ever changes
+        // (review #961).
+        let entries = index.saturating_sub(arg.offset);
         Ok((res, entries))
     }
 
