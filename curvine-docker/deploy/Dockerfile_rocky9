@@ -1,5 +1,5 @@
 # ============================================================
-# EPEL + CRB (shared by spdk-deps and spdk-full)
+# EPEL + CRB (runtime base)
 # ============================================================
 FROM rockylinux:9 AS epel-base
 
@@ -21,86 +21,12 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     && dnf clean all
 
 # ============================================================
-# Stage 0: Install dependencies & clone SPDK
+# SPDK artifacts come from the compile image
 # ============================================================
-FROM epel-base AS spdk-deps
-
-ARG SPDK_VERSION=v25.09
-ARG NASM_VERSION=2.16.03
-ARG ISAL_VERSION=v2.31.1
-
-RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
-    dnf install -y git && \
-    dnf clean all
-
-# Clone SPDK
-RUN git clone --depth 1 --branch "$SPDK_VERSION" --single-branch https://github.com/spdk/spdk.git /spdk
-WORKDIR /spdk
-RUN git submodule update --init --depth 1
-
-# Install SPDK build deps
-RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
-    dnf config-manager --set-disabled devel 2>/dev/null || true && \
-    scripts/pkgdep.sh --rdma && \
-    dnf clean all
-
-# Build nasm from source (needed by ISA-L, not available in EPEL 9 for aarch64)
-RUN curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
-    tar -xz -C /tmp && \
-    cd /tmp/nasm-$NASM_VERSION && \
-    ./configure && \
-    make -j$(nproc) && \
-    make install && \
-    rm -rf /tmp/nasm-$NASM_VERSION
-
-# Build isa-l from source (needed by SPDK, not available in all Rocky 9 arches)
-RUN cd /tmp && \
-    git clone --depth 1 --branch $ISAL_VERSION https://github.com/intel/isa-l.git isa-l-src && \
-    cd isa-l-src && \
-    ./autogen.sh && \
-    ./configure && \
-    make -j$(nproc) && \
-    make install && \
-    ldconfig && \
-    cd / && rm -rf /tmp/isa-l-src
+FROM ghcr.io/curvineio/curvine-compile:rocky9 AS spdk-artifacts
 
 # ============================================================
-# Stage 1: Build SPDK
-# ============================================================
-FROM spdk-deps AS spdk-build
-
-ARG SPDK_VERSION
-WORKDIR /spdk
-
-RUN ./configure \
-    --disable-tests \
-    --with-rdma \
-    --without-vfio-user \
-    --target-arch=native \
-    --with-shared && \
-    make -j$(nproc) && \
-    mkdir -p /opt/spdk/build/bin \
-             /opt/spdk/build/lib \
-             /opt/spdk/dpdk/build/lib \
-             /opt/spdk/include/spdk \
-             /opt/spdk/dpdk/build/include \
-             /opt/spdk/isa-l/.libs \
-             /opt/spdk/isa-l-crypto/.libs && \
-    cp build/bin/nvmf_tgt /opt/spdk/build/bin/ && \
-    cp build/lib/libspdk*.so* /opt/spdk/build/lib/ && \
-    cp build/lib/libspdk*.a /opt/spdk/build/lib/ && \
-    cp dpdk/build/lib/librte_*.so* /opt/spdk/dpdk/build/lib/ && \
-    cp dpdk/build/lib/librte_*.a /opt/spdk/dpdk/build/lib/ && \
-    cp -r include/spdk/*.h /opt/spdk/include/spdk/ && \
-    cp -r dpdk/build/include/* /opt/spdk/dpdk/build/include/ && \
-    cp -r scripts /opt/spdk/scripts && \
-    cp -r python /opt/spdk/python && \
-    cp isa-l/.libs/libisal* /opt/spdk/isa-l/.libs/ && \
-    cp isa-l-crypto/.libs/libisal* /opt/spdk/isa-l-crypto/.libs/ && \
-    ldconfig
-
-# ============================================================
-# Stage 2: Full runtime for NVMe-oF Target nodes
+# Full runtime for NVMe-oF Target nodes
 # ============================================================
 FROM runtime-base AS spdk-full
 
@@ -109,7 +35,7 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     ncurses-libs kmod pciutils libffi fuse3-libs \
     && dnf clean all
 
-COPY --from=spdk-build /opt/spdk /opt/spdk
+COPY --from=spdk-artifacts /opt/spdk /opt/spdk
 
 RUN ldconfig && \
     mkdir -p /var/log/spdk /var/run/spdk
@@ -165,19 +91,9 @@ ENV PATH="/root/.cargo/bin:/app/protoc/bin:/app/maven/bin:${PATH}"
 COPY . /workspace/
 WORKDIR /workspace
 
-# Copy SPDK build artifacts for NVMe-oF initiator support
-COPY --from=spdk-build /opt/spdk /opt/spdk
+# SPDK build artifacts are provided by the compile image.
 ENV SPDK_DIR=/opt/spdk
 ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
-
-# Install SPDK linking dependencies (static .a libs)
-RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
-    dnf install -y epel-release && \
-    dnf install -y numactl-devel libuuid-devel rdma-core-devel \
-    libibverbs-devel librdmacm-devel && \
-    cp /opt/spdk/isa-l/.libs/*.so* /usr/lib64/ && \
-    cp /opt/spdk/isa-l-crypto/.libs/*.so* /usr/lib64/ && \
-    ldconfig
 
 # 6. Pre-install WebUI dependencies and fix vue-cli-service module resolution
 RUN if [ -d "/workspace/curvine-web/webui" ]; then \
@@ -257,9 +173,9 @@ RUN --mount=type=cache,sharing=locked,target=/var/cache/dnf \
     fuse3 zlib libstdc++ nvme-cli \
     && dnf clean all && rm -rf /var/cache/dnf/*
 
-# Copy ISA-L shared libs for SPDK initiator (built from source, not in EPEL)
-COPY --from=spdk-build /opt/spdk/isa-l/.libs/libisal* /usr/lib64/
-COPY --from=spdk-build /opt/spdk/isa-l-crypto/.libs/libisal* /usr/lib64/
+# Copy ISA-L shared libs for SPDK initiator (built into the compile image)
+COPY --from=builder /opt/spdk/isa-l/.libs/libisal* /usr/lib64/
+COPY --from=builder /opt/spdk/isa-l-crypto/.libs/libisal* /usr/lib64/
 RUN ldconfig
 
 # Copy JindoSDK from builder stage for OSS-HDFS support

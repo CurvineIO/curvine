@@ -17,9 +17,11 @@
 use curvine_common::conf::JournalConf;
 use curvine_common::proto::raft::{FsmState, SnapshotData};
 use curvine_common::raft::storage::{
-    AppStorage, HashAppStorage, LogStorage, MemLogStorage, RocksLogStorage,
+    AppStorage, HashAppStorage, LogStorage, MemLogStorage, PeerStorage, RocksLogStorage,
 };
-use curvine_common::raft::{RaftClient, RaftCode, RaftError, RaftJournal, RaftResult, RoleMonitor};
+use curvine_common::raft::{
+    RaftClient, RaftCode, RaftError, RaftGroup, RaftJournal, RaftPeer, RaftResult, RoleMonitor,
+};
 use curvine_common::utils::SerdeUtils;
 use orpc::client::{ClientConf, RpcClient};
 use orpc::common::{FileUtils, Logger, Utils};
@@ -28,7 +30,8 @@ use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::CommonResult;
 use prost::bytes::BytesMut;
 use prost::Message;
-use raft::eraftpb::{ConfState, Entry, HardState, Snapshot};
+use raft::eraftpb::{ConfState, Entry, HardState, Message as RaftMessage, MessageType, Snapshot};
+use raft::{Config, RawNode};
 use raft::{GetEntriesContext, RaftState, StateRole, Storage, StorageError};
 use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
@@ -354,6 +357,52 @@ fn run_candidate_returns_snapshot_restore_error_without_panicking() -> CommonRes
         err.to_string()
             .contains("injected snapshot restore failure"),
         "unexpected error: {err}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn empty_static_voter_panics_on_leader_commit_above_local_last_index() -> CommonResult<()> {
+    let conf = JournalConf {
+        hostname: "node3".to_string(),
+        rpc_port: 8996,
+        journal_addrs: vec![
+            RaftPeer::new(1, "node1", 8996),
+            RaftPeer::new(2, "node2", 8996),
+            RaftPeer::new(3, "node3", 8996),
+        ],
+        ..JournalConf::with_test()
+    };
+    let group = RaftGroup::from_conf(&conf);
+    let storage = PeerStorage::new(
+        conf.create_runtime(),
+        NoSnapshotLogStorage,
+        FailingSnapshotAppStorage,
+        RaftClient::new(conf.create_runtime(), &group, conf.new_client_conf()),
+        &conf,
+    );
+    let config = Config {
+        id: 3,
+        applied: 0,
+        election_tick: 10,
+        heartbeat_tick: 3,
+        ..Default::default()
+    };
+    let logger = slog::Logger::root(slog::Discard, slog::o!());
+    let mut node = RawNode::new(&config, storage, &logger)?;
+
+    let mut heartbeat = RaftMessage::default();
+    heartbeat.set_msg_type(MessageType::MsgHeartbeat);
+    heartbeat.from = 1;
+    heartbeat.to = 3;
+    heartbeat.term = 2;
+    heartbeat.commit = 10;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.step(heartbeat)));
+    assert!(
+        result.is_err(),
+        "raft-rs must reject commit 10 when the local voter has last_index 0"
     );
 
     Ok(())

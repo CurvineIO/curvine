@@ -14,7 +14,8 @@
 
 use crate::fs::FileSystem;
 use crate::fuse_metrics::{
-    mono_now, FuseMetrics, FuseReqStatus, WriteOutcome, NOTIFY_SUCCESS, NOTIFY_WRITE_FAILED,
+    mono_now, ActiveGuard, FuseMetrics, FuseReqStatus, WriteOutcome, NOTIFY_SUCCESS,
+    NOTIFY_WRITE_FAILED,
 };
 use crate::session::{FuseTask, ResponseData};
 use crate::FuseResult;
@@ -81,7 +82,13 @@ impl<T: FileSystem> FuseSender<T> {
                     status,
                     errno,
                     unsupported_reason,
+                    queue_guard,
                 } => {
+                    // reply_queue_depth dec at the DEQUEUE point: the task has left
+                    // the channel, so the subsequent splice() is NOT counted as
+                    // queue backlog. (The E2E `active` guard, dropped after the
+                    // write below, is a separate gauge.)
+                    mark_dequeued(queue_guard);
                     let id = data.header.unique;
                     let response_bytes = data.len();
 
@@ -136,7 +143,13 @@ impl<T: FileSystem> FuseSender<T> {
                 // Records notify_total at its two sender-side points: success
                 // after the write, write_failed on splice error (enqueue_failed
                 // is recorded earlier in send_notify).
-                FuseTask::NotifyReply { data, code } => {
+                FuseTask::NotifyReply {
+                    data,
+                    code,
+                    queue_guard,
+                } => {
+                    // Same dequeue-point dec as the request path.
+                    mark_dequeued(queue_guard);
                     let id = data.header.unique;
                     let metrics = FuseMetrics::get();
                     match self.send(data).await {
@@ -193,5 +206,42 @@ impl<T: FileSystem> FuseSender<T> {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Drop a dequeued task's `reply_queue_depth` guard, decrementing the gauge at
+/// the dequeue point (immediately after `recv()`), so the gauge reflects only
+/// channel backlog and excludes the subsequent `splice()`. A named helper so the
+/// "drop on dequeue, not on completion" rule is explicit at both call sites and
+/// hard to misplace. `None` (metrics disabled) is a no-op.
+#[inline]
+fn mark_dequeued(queue_guard: Option<ActiveGuard>) {
+    drop(queue_guard);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_dequeued;
+    use crate::fuse_metrics::ActiveGuard;
+    use orpc::common::Metrics as m;
+
+    // `mark_dequeued` decrements at the dequeue point. Uses an INJECTED isolated
+    // gauge (not the process-global `reply_queue_depth`) so it is parallel-safe
+    // and asserts the exact "guard held -> +1, mark_dequeued -> back to 0"
+    // behaviour the sender relies on (dec before the splice, not after).
+    #[test]
+    fn mark_dequeued_drops_guard_at_dequeue() {
+        let g = m::new_gauge("test_mark_dequeued_gauge", "test").unwrap();
+        let guard = ActiveGuard::new(g.clone());
+        assert_eq!(g.get(), 1, "guard rides the task: +1 in the channel");
+        // Sender's first line after recv(): drop the queue guard.
+        mark_dequeued(Some(guard));
+        assert_eq!(g.get(), 0, "dequeue decrements before any splice work");
+    }
+
+    // disabled mode carries `None`; mark_dequeued is a no-op.
+    #[test]
+    fn mark_dequeued_none_is_noop() {
+        mark_dequeued(None);
     }
 }

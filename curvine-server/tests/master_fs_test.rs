@@ -315,7 +315,7 @@ fn test_journal_system_refuses_non_format_start_with_empty_master_dirs() -> Comm
 }
 
 #[test]
-fn test_journal_system_allows_empty_non_format_start_for_multi_master() -> CommonResult<()> {
+fn test_journal_system_refuses_empty_non_format_start_for_multi_master() -> CommonResult<()> {
     let _serial = master_fs_test_serial();
     Master::init_test_metrics();
     let name = format!("empty-non-format-ha-{}", Utils::rand_str(6));
@@ -342,8 +342,21 @@ fn test_journal_system_allows_empty_non_format_start_for_multi_master() -> Commo
     std::fs::create_dir_all(&conf.master.meta_dir)?;
     std::fs::create_dir_all(&conf.journal.journal_dir)?;
 
-    let js = JournalSystem::from_conf(&conf)?;
-    js.shutdown();
+    let err = match JournalSystem::from_conf(&conf) {
+        Ok(js) => {
+            js.shutdown();
+            return err_box!("format_master=false initialized empty HA master data directories");
+        }
+        Err(e) => e,
+    };
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("format_master=false")
+            && err_msg.contains("before master startup")
+            && err_msg.contains("preseed a consistent meta and journal copy"),
+        "unexpected error: {}",
+        err_msg
+    );
 
     Ok(())
 }

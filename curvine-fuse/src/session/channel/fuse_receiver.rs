@@ -16,14 +16,14 @@ use crate::fs::operator::FuseOperator;
 use crate::fs::FileSystem;
 use crate::fuse_error::splice_errno_label;
 use crate::fuse_metrics::{
-    mono_now, ActiveGuard, FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels,
+    mono_now, ActiveGuard, FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels, FuseReqStatus,
     RECEIVE_ACTION_CONTINUE, RECEIVE_ACTION_EXIT,
 };
 use crate::raw::fuse_abi::fuse_out_header;
 use crate::session::{FuseOpCode, FuseRequest, FuseResponse, FuseTask};
 use crate::{err_fuse, FuseResult, FUSE_IN_HEADER_LEN};
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use orpc::io::IOResult;
 use orpc::runtime::{RpcRuntime, Runtime};
 use orpc::sync::channel::AsyncSender;
@@ -401,6 +401,47 @@ impl<T: FileSystem> FuseReceiver<T> {
         let notify = Arc::new(Notify::new());
         pending_requests.insert(req.unique(), notify.clone());
 
+        // This branch is reached only for FUSE_SETLKW (`is_interrupt()` is true
+        // only there), so the SETLKW metrics live here, wrapping the whole
+        // interruptible-request scope (parse + dispatch_meta + lock polling +
+        // reply enqueue):
+        //
+        // - `setlkw_inflight`: SETLKW interruptible-request scopes in flight.
+        // - `setlkw_wait_duration_us`: the interruptible-request-duration timer.
+        //   It is created here, BEFORE the `select!`, NOT inside `set_lkw()` — so
+        //   an interrupt that wins the `select!` before `dispatch_meta`'s future
+        //   ever polls into `set_lkw()` (immediate / fast cancellation) still
+        //   records a sample on drop; placing it inside `set_lkw()` would miss
+        //   exactly that case.
+        //
+        // CONSEQUENCE (review R2 P1#1): this is NOT pure lock-acquisition time —
+        // the scope spans parse, dispatch, AND the reply-channel enqueue, so
+        // reply-channel backpressure can inflate it. The metric is deliberately
+        // an "interruptible-request duration" wrapper, not a lock-contention gauge
+        // (see its help); dashboards must not read it as lock wait. Likewise a
+        // malformed SETLKW that fails `parse_operator()` produces a near-zero
+        // sample (timer exists before parse). This wrapper framing was the chosen
+        // trade-off over special-casing the SETLKW dispatch arm (which would touch
+        // the dispatch matrix the design avoids).
+        //
+        // Both are RAII: their Drop — not the `pending_requests.remove` — does the
+        // gauge dec / histogram observe, so every `select!` branch (and any future
+        // drop / cancellation) balances the gauge and records a sample exactly
+        // once. Gated by `reply.metrics.is_some()` (== metrics_enabled; the
+        // singleton is initialized whenever that holds), so disabled builds create
+        // neither.
+        //
+        // **Scope caveat — gauge/histogram only, NOT the map.** RAII here keeps
+        // `setlkw_inflight` and the wait histogram correct under cancellation, but
+        // it does NOT clean up the `pending_requests` map: the map `remove` runs
+        // only in the two `select!` branches below. If the whole future is aborted
+        // after the `insert` (runtime shutdown, task drop, a future-added timeout),
+        // the map entry leaks and a stray later interrupt could match a waiter that
+        // no longer exists. That is pre-existing behaviour, unchanged by Phase 2a;
+        // only the gauge/histogram are guaranteed cancellation-safe here.
+        let _setlkw_inflight = FuseMetrics::setlkw_inflight_guard(reply.metrics.is_some());
+        let _setlkw_wait = FuseMetrics::setlkw_wait_timer(reply.metrics.is_some());
+
         let res = tokio::select! {
             result = Self::dispatch_meta(&pending_requests, &fs, &req, &reply) => {
                 pending_requests.remove(&req.unique());
@@ -435,6 +476,14 @@ impl<T: FileSystem> FuseReceiver<T> {
                 return Err(err);
             }
         };
+
+        // operation_duration_us: a single timer around the whole match (NOT
+        // per-arm — the design's anti-goal is touching the ~30 dispatch arms).
+        // Gated by `reply.metrics.is_some()` (the disabled-mode signal — this is
+        // a free fn with no `metrics_enabled` field), so disabled mode does not
+        // even read the clock. Started after parse success, so a parse failure
+        // (handled above via finish_early) emits no operation sample.
+        let op_start = reply.metrics.is_some().then(mono_now);
 
         let res = match operator {
             FuseOperator::Init(op) => reply.send_rep(fs.init(op).await).await,
@@ -533,6 +582,54 @@ impl<T: FileSystem> FuseReceiver<T> {
             }
         };
 
+        // operation_duration_us{opcode,kind=metadata,status}: observe once, after
+        // the whole match. `status` is the stashed `op_status` (the FS-operation
+        // result computed by `finish_status`), NOT the `IOResult` of `res` — a
+        // successful enqueue of an error frame returns `Ok(())`, so deriving status
+        // from `res` would mislabel almost everything `success`. The send helpers
+        // stash `op_status` synchronously before enqueuing, and each match arm
+        // awaits its send, so by here the slot's `op_status` is the FS result.
+        //
+        // `op_start` is `Some` iff metrics are enabled (it was built with
+        // `reply.metrics.is_some().then(mono_now)`), so a disabled request never
+        // read the clock and skips the observe here too. A missing `op_status`
+        // (e.g. a no-reply path that didn't stash, or a defensive gap) is treated
+        // as `Error` rather than silently dropped — the only realistic miss is a
+        // wiring bug, and `Error` is the safe non-success bucket.
+        if let Some(start) = op_start {
+            // Every dispatched metadata op should have stashed `op_status` via a
+            // send helper / no-reply finish before the match returned. A `None`
+            // here means some arm bypassed that — a wiring bug. Surface it loudly
+            // in debug (debug_assert) AND leave a release-visible `warn!` so a
+            // production occurrence is diagnosable (it would otherwise only show as
+            // an unexplained `status=error` latency sample). Release still falls
+            // back to `Error` (the safe non-success bucket) rather than dropping
+            // the sample (review R1 P2#6 / R2 P2#8).
+            let op_status = match reply.metrics_op_status() {
+                Some(s) => s,
+                None => {
+                    debug_assert!(
+                        false,
+                        "operation_duration_us: op_status not stashed for opcode {} — a \
+                         dispatch arm bypassed the send/no-reply finish helpers",
+                        req.opcode().as_str()
+                    );
+                    warn!(
+                        "operation_duration_us: op_status missing for opcode {} (unique {}); \
+                         recording status=error — likely a dispatch-arm wiring bug",
+                        req.opcode().as_str(),
+                        req.unique()
+                    );
+                    FuseReqStatus::Error
+                }
+            };
+            FuseMetrics::get().record_operation(
+                req.opcode().as_str(),
+                op_status,
+                start.elapsed().as_micros() as u64,
+            );
+        }
+
         res?;
         Ok(())
     }
@@ -585,5 +682,466 @@ mod tests {
             ("other", RECEIVE_ACTION_EXIT)
         );
         assert_eq!(receive_error_labels(None), ("other", RECEIVE_ACTION_EXIT));
+    }
+
+    // --- Phase 2a: dispatch_meta integration (operation_duration_us wiring) ---
+    //
+    // These drive the real `dispatch_meta` link — parse_operator -> match arm ->
+    // send helper stashes op_status -> post-match `record_operation` reads it back
+    // — to prove the wiring the helper-only tests can't: that the
+    // `operation_duration_us{status}` label comes from the stashed `op_status`
+    // (the FS-operation result), not from the `IOResult` of the awaited send.
+    mod dispatch_meta_integration {
+        use crate::fs::TestFileSystem;
+        use crate::fuse_metrics::{
+            FuseMetrics, FuseReqCtx, FuseReqKind, FuseReqLabels, FuseReqStatus,
+        };
+        use crate::raw::fuse_abi::{fuse_forget_in, fuse_in_header};
+        use crate::session::{FuseRequest, FuseResponse, FuseTask};
+        use crate::FuseUtils;
+        use curvine_common::conf::FuseConf;
+        use orpc::common::Metrics as m;
+        use orpc::sync::channel::{AsyncChannel, AsyncReceiver};
+        use orpc::sync::FastDashMap;
+        use tokio_util::bytes::{BufMut, BytesMut};
+
+        // FUSE opcodes used here (avoid pulling the whole abi into scope). Each
+        // test uses a DISTINCT opcode so their `operation_duration_us` label
+        // children never collide on the shared process-global registry — the tests
+        // run in parallel and assert deltas, so a shared opcode would make
+        // `==before+1` / `==before` flaky.
+        const OP_LOOKUP: u32 = 1;
+        const OP_FORGET: u32 = 2;
+        const OP_GETATTR: u32 = 3;
+        const OP_STATFS: u32 = 17;
+        const OP_ACCESS: u32 = 34;
+
+        // Build a raw FUSE request: header (len auto-filled) + payload, then parse.
+        fn make_request(opcode: u32, unique: u64, nodeid: u64, payload: &[u8]) -> FuseRequest {
+            let header = fuse_in_header {
+                len: (size_of::<fuse_in_header>() + payload.len()) as u32,
+                opcode,
+                unique,
+                nodeid,
+                uid: 0,
+                gid: 0,
+                pid: 0,
+                padding: 0,
+            };
+            let mut buf = BytesMut::new();
+            buf.put_slice(FuseUtils::struct_as_bytes(&header));
+            buf.put_slice(payload);
+            FuseRequest::from_bytes(buf.freeze()).expect("parse header")
+        }
+
+        fn getattr_request(unique: u64) -> FuseRequest {
+            // GetAttr parses only the header (no arg read).
+            make_request(OP_GETATTR, unique, 1, &[])
+        }
+
+        fn statfs_request(unique: u64) -> FuseRequest {
+            // StatFs parses only the header; TestFileSystem.stat_fs returns Ok.
+            make_request(OP_STATFS, unique, 1, &[])
+        }
+
+        fn lookup_request(unique: u64, name: &str) -> FuseRequest {
+            // Lookup reads a null-terminated name os_str after the header.
+            let mut payload = Vec::from(name.as_bytes());
+            payload.push(0);
+            make_request(OP_LOOKUP, unique, 1, &payload)
+        }
+
+        fn forget_request(unique: u64) -> FuseRequest {
+            let arg = fuse_forget_in { nlookup: 1 };
+            make_request(OP_FORGET, unique, 2, FuseUtils::struct_as_bytes(&arg))
+        }
+
+        // A reply whose metrics slot is live (active guard backed by a throwaway
+        // gauge), wired to a real channel so send helpers can enqueue. `opcode`
+        // MUST match the request's opcode: the receiver's `new_reply` derives the
+        // ctx labels from the parsed request, so the enqueue-failure path
+        // (`finish_enqueue_failure`) records `request_duration_us{opcode}` under
+        // this label — a mismatch would silently miss the assertion.
+        fn metrics_reply(
+            unique: u64,
+            opcode: &'static str,
+        ) -> (FuseResponse, AsyncReceiver<FuseTask>) {
+            FuseMetrics::ensure_init().unwrap();
+            let (tx, rx) = AsyncChannel::new(16).split();
+            let gauge = m::new_gauge(format!("dmi_active_{unique}"), "test".to_string()).unwrap();
+            let labels = FuseReqLabels::new(opcode, FuseReqKind::Metadata, 64);
+            let ctx = FuseReqCtx {
+                labels,
+                active: Some(crate::fuse_metrics::ActiveGuard::new(gauge)),
+            };
+            (FuseResponse::new_reply(unique, tx, false, Some(ctx)), rx)
+        }
+
+        fn op_dur_count(opcode: &str, status: &str) -> u64 {
+            // Tests read a `before` baseline before building any reply, so init
+            // here too (idempotent) — the singleton must exist for `get()`.
+            FuseMetrics::ensure_init().unwrap();
+            FuseMetrics::get()
+                .operation_duration_us
+                .with_label_values(&[opcode, "metadata", status])
+                .get_sample_count()
+        }
+
+        fn request_dur_count(opcode: &str, status: &str) -> u64 {
+            FuseMetrics::ensure_init().unwrap();
+            FuseMetrics::get()
+                .request_duration_us
+                .with_label_values(&[opcode, "metadata", status])
+                .get_sample_count()
+        }
+
+        fn reply_enqueue_err_count(opcode: &str) -> i64 {
+            FuseMetrics::ensure_init().unwrap();
+            FuseMetrics::get()
+                .reply_enqueue_errors_total
+                .with_label_values(&[opcode, crate::fuse_metrics::ENQUEUE_REASON_CHANNEL_CLOSED])
+                .get()
+        }
+
+        fn fs() -> TestFileSystem {
+            TestFileSystem::new(FuseConf::default())
+        }
+
+        // (1a) GetAttr succeeds (TestFileSystem returns Ok) -> operation sample
+        // lands under status=success, NOT polluted by the enqueue IOResult.
+        #[tokio::test]
+        async fn getattr_success_records_operation_success() {
+            let before = op_dur_count("GetAttr", "success");
+            let pending = FastDashMap::default();
+            let (reply, _rx) = metrics_reply(1001, "GetAttr");
+            super::super::FuseReceiver::dispatch_meta(
+                &pending,
+                &fs(),
+                &getattr_request(1001),
+                &reply,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                op_dur_count("GetAttr", "success"),
+                before + 1,
+                "GetAttr Ok -> operation_duration_us{{status=success}}"
+            );
+        }
+
+        // (1b) Lookup fails with ENOENT (TestFileSystem) -> status=error, derived
+        // from the stashed op_status, even though send_buf/send_rep returned Ok(()).
+        #[tokio::test]
+        async fn lookup_error_records_operation_error() {
+            let before = op_dur_count("Lookup", "error");
+            let pending = FastDashMap::default();
+            let (reply, _rx) = metrics_reply(1002, "Lookup");
+            // dispatch_meta surfaces the FS error via `res?`, so it returns Err —
+            // but the operation sample must already be recorded as error.
+            let _ = super::super::FuseReceiver::dispatch_meta(
+                &pending,
+                &fs(),
+                &lookup_request(1002, "missing"),
+                &reply,
+            )
+            .await;
+            assert_eq!(
+                op_dur_count("Lookup", "error"),
+                before + 1,
+                "Lookup ENOENT -> operation_duration_us{{status=error}} (from op_status)"
+            );
+        }
+
+        // (2) no-reply Forget: TestFileSystem uses the trait-default forget (ENOSYS
+        // -> Err), so finish_no_reply classifies status=error. It must STILL record
+        // an operation sample (no-reply ops are in operation_duration_us), and emit
+        // NO reply task.
+        #[tokio::test]
+        async fn forget_no_reply_records_operation_and_enqueues_nothing() {
+            let before = op_dur_count("Forget", "error");
+            let pending = FastDashMap::default();
+            let (reply, mut rx) = metrics_reply(1003, "Forget");
+            super::super::FuseReceiver::dispatch_meta(
+                &pending,
+                &fs(),
+                &forget_request(1003),
+                &reply,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                op_dur_count("Forget", "error"),
+                before + 1,
+                "no-reply Forget still records an operation sample, status from finish_no_reply"
+            );
+            assert!(
+                rx.try_recv().unwrap().is_none(),
+                "Forget is no-reply: no task enqueued"
+            );
+        }
+
+        // (3) enqueue failure: channel closed before dispatch. The FS op (StatFs)
+        // succeeds, so the operation sample is status=success (op_status), even
+        // though delivery fails — proving operation status is independent of the
+        // request/delivery outcome. Uses StatFs (own opcode) to stay parallel-safe.
+        #[tokio::test]
+        async fn enqueue_failure_keeps_operation_success() {
+            let op_before = op_dur_count("StatFs", "success");
+            let req_err_before = request_dur_count("StatFs", "error");
+            let enq_err_before = reply_enqueue_err_count("StatFs");
+
+            let pending = FastDashMap::default();
+            let (reply, rx) = metrics_reply(1004, "StatFs");
+            drop(rx); // close the channel: the reply enqueue will fail.
+            let _ = super::super::FuseReceiver::dispatch_meta(
+                &pending,
+                &fs(),
+                &statfs_request(1004),
+                &reply,
+            )
+            .await;
+
+            // operation side: the FS op succeeded, so operation status=success.
+            assert_eq!(
+                op_dur_count("StatFs", "success"),
+                op_before + 1,
+                "op succeeded -> operation status=success even when delivery fails"
+            );
+            // request/delivery side: enqueue failed, so the request is finished
+            // early with status=error and a reply_enqueue_errors_total bump. Both
+            // sides asserted, proving operation-success vs request-error separation.
+            assert_eq!(
+                request_dur_count("StatFs", "error"),
+                req_err_before + 1,
+                "delivery failed -> request_duration_us status=error"
+            );
+            assert_eq!(
+                reply_enqueue_err_count("StatFs"),
+                enq_err_before + 1,
+                "enqueue failure records reply_enqueue_errors_total reason=channel_closed"
+            );
+        }
+
+        // (4) parse failure after ctx: an Access request with no arg payload makes
+        // parse_operator's get_struct fail -> finish_early, and NO operation
+        // sample. Uses Access (own opcode, TestFileSystem doesn't implement it, but
+        // we never reach dispatch) so the "no sample" assertion is parallel-safe.
+        #[tokio::test]
+        async fn parse_failure_records_no_operation_sample() {
+            let s_before = op_dur_count("Access", "success");
+            let e_before = op_dur_count("Access", "error");
+            let pending = FastDashMap::default();
+            let (reply, _rx) = metrics_reply(1005, "Access");
+
+            // Access parse needs a fuse_access_in arg via get_struct; with an empty
+            // payload that read fails, so parse_operator returns Err -> finish_early
+            // (decode_errors_total{phase=parse}), BEFORE the operation timer.
+            let truncated = make_request(OP_ACCESS, 1005, 1, &[]);
+            let _ = super::super::FuseReceiver::dispatch_meta(&pending, &fs(), &truncated, &reply)
+                .await;
+
+            // The truncated Access recorded NO operation sample (parse failed
+            // before the post-match `record_operation`).
+            assert_eq!(op_dur_count("Access", "success"), s_before);
+            assert_eq!(op_dur_count("Access", "error"), e_before);
+        }
+
+        // --- R2 P1#5: immediate-interrupt SETLKW records a wait sample ---
+
+        const OP_SETLKW: u32 = 33;
+
+        use crate::fs::operator::SetLkW;
+        use crate::fs::FileSystem;
+        use crate::raw::fuse_abi::fuse_lk_in;
+        use crate::FuseResult;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // A FileSystem whose `set_lkw` blocks forever (never acquires the lock) and
+        // records whether it was polled. Every other method keeps the trait
+        // default — only `set_lkw` is overridden — so the `select!` interrupt
+        // branch deterministically wins the race against the (never-completing)
+        // dispatch branch.
+        struct BlockingSetlkwFs {
+            polled: Arc<AtomicBool>,
+        }
+        impl FileSystem for BlockingSetlkwFs {
+            fn set_lkw(
+                &self,
+                _op: SetLkW<'_>,
+            ) -> impl std::future::Future<Output = FuseResult<()>> + Send {
+                let polled = self.polled.clone();
+                async move {
+                    polled.store(true, Ordering::SeqCst);
+                    // Block forever: the lock is never acquired, so only an
+                    // interrupt can end this request.
+                    std::future::pending::<()>().await;
+                    unreachable!("set_lkw is cancelled by interrupt, never completes")
+                }
+            }
+        }
+
+        fn setlkw_request(unique: u64) -> FuseRequest {
+            let arg = fuse_lk_in::default();
+            make_request(OP_SETLKW, unique, 1, FuseUtils::struct_as_bytes(&arg))
+        }
+
+        fn setlkw_wait_count() -> u64 {
+            FuseMetrics::ensure_init().unwrap();
+            FuseMetrics::get()
+                .setlkw_wait_duration_us
+                .get_sample_count()
+        }
+
+        // A blocking SETLKW that is interrupted AFTER `set_lkw()` has been polled
+        // (it acquired no lock — it blocks forever) still records a wait sample.
+        // We drive the real `dispatch_meta_interrupt` race: `set_lkw` blocks
+        // forever (polled=true), then we fire the interrupt via the
+        // pending_requests Notify, so the notify branch wins and the dispatch
+        // (set_lkw) branch is cancelled.
+        //
+        // SCOPE (review R3 P1#1): this covers "set_lkw entered, then interrupted",
+        // NOT "interrupt wins before set_lkw is ever polled" — the assertion
+        // `polled == true` makes that explicit. The complementary case where the
+        // timer's outer placement matters even though `set_lkw()` is NEVER reached
+        // is covered by `malformed_setlkw_records_wait_sample_without_set_lkw`
+        // below (parse failure → set_lkw never called → wait sample still +1).
+        #[tokio::test]
+        async fn interrupted_blocking_setlkw_records_wait_sample() {
+            FuseMetrics::ensure_init().unwrap();
+            let wait_before = setlkw_wait_count();
+
+            let polled = Arc::new(AtomicBool::new(false));
+            let fs = Arc::new(BlockingSetlkwFs {
+                polled: polled.clone(),
+            });
+            let pending: Arc<FastDashMap<u64, Arc<tokio::sync::Notify>>> =
+                Arc::new(FastDashMap::default());
+            let (reply, mut rx) = metrics_reply(2001, "SetLkW");
+
+            let pending2 = pending.clone();
+            let handle = tokio::spawn(async move {
+                super::super::FuseReceiver::dispatch_meta_interrupt(
+                    fs,
+                    pending,
+                    setlkw_request(2001),
+                    reply,
+                )
+                .await
+            });
+
+            // Wait until `set_lkw()` has ACTUALLY been polled (it sets `polled`
+            // then blocks forever), THEN fire the interrupt. Waiting on the
+            // `pending_requests` entry would be racy: the entry is inserted BEFORE
+            // the `select!`, so seeing it does NOT prove the dispatch branch (and
+            // thus `set_lkw()`) has been polled — under some schedules notify could
+            // win before `set_lkw()` is ever entered, breaking the `polled==true`
+            // assertion. Gating on `polled` makes this test deterministically cover
+            // "set_lkw entered, then interrupted". A timeout prevents a dead wait if
+            // that invariant ever regresses.
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if polled.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("set_lkw() must be polled within the timeout");
+            // set_lkw is now polled and blocked; fire the interrupt so the notify
+            // branch wins (the pending_requests entry exists — it was inserted
+            // before set_lkw was ever polled).
+            pending2
+                .get(&2001)
+                .expect("pending_requests entry exists once set_lkw is polled")
+                .notify_one();
+
+            let res = handle.await.unwrap();
+
+            // The interrupt branch builds an EINTR *reply frame* and enqueues it;
+            // `send_rep_tagged` returns Ok on a successful enqueue (an error frame
+            // is still a successful reply), so the function returns Ok — the EINTR
+            // is delivered as a reply, NOT propagated as a Rust Err.
+            assert!(res.is_ok(), "interrupt reply enqueued successfully");
+            // The enqueued reply is a RequestReply tagged Interrupted (source tag,
+            // not inferred from errno).
+            match rx.try_recv().unwrap().expect("an interrupt reply task") {
+                FuseTask::RequestReply { status, .. } => {
+                    assert_eq!(
+                        status,
+                        FuseReqStatus::Interrupted,
+                        "interrupt-notify reply is status=Interrupted"
+                    );
+                }
+                FuseTask::NotifyReply { .. } => panic!("expected RequestReply, got NotifyReply"),
+                FuseTask::Reply(_) => panic!("expected RequestReply, got legacy Reply"),
+            }
+            // set_lkw was entered but never acquired the lock (it blocks forever).
+            assert!(
+                polled.load(Ordering::SeqCst),
+                "set_lkw was polled (the dispatch branch started)"
+            );
+            // The core P1#1 invariant: a wait sample is recorded even though the
+            // lock poll loop never completed.
+            assert!(
+                setlkw_wait_count() > wait_before,
+                "interrupted SETLKW still records a setlkw_wait_duration_us sample"
+            );
+            // pending_requests entry was removed by the interrupt branch.
+            assert!(
+                pending2.get(&2001).is_none(),
+                "interrupt branch removed the pending_requests entry"
+            );
+        }
+
+        // R3 P1#1: the case that actually justifies hoisting the timer OUT of
+        // `set_lkw()`. A malformed SETLKW (empty payload) fails `parse_operator()`
+        // inside `dispatch_meta`, so `set_lkw()` is NEVER called — yet because the
+        // timer is created in `dispatch_meta_interrupt` BEFORE the `select!`, a
+        // `setlkw_wait_duration_us` sample is still recorded on drop (the wrapper
+        // semantics: parse-failure produces a near-zero sample). Had the timer
+        // stayed inside `set_lkw()`, this path would record nothing.
+        #[tokio::test]
+        async fn malformed_setlkw_records_wait_sample_without_set_lkw() {
+            FuseMetrics::ensure_init().unwrap();
+            let wait_before = setlkw_wait_count();
+
+            let polled = Arc::new(AtomicBool::new(false));
+            let fs = Arc::new(BlockingSetlkwFs {
+                polled: polled.clone(),
+            });
+            let pending: Arc<FastDashMap<u64, Arc<tokio::sync::Notify>>> =
+                Arc::new(FastDashMap::default());
+            let pending2 = pending.clone();
+            let (reply, _rx) = metrics_reply(2002, "SetLkW");
+
+            // Malformed SETLKW: opcode is FUSE_SETLKW (so is_interrupt() routes it
+            // through dispatch_meta_interrupt and creates the timer), but the empty
+            // payload makes parse_operator's get_struct::<fuse_lk_in> fail.
+            let malformed = make_request(OP_SETLKW, 2002, 1, &[]);
+            let res =
+                super::super::FuseReceiver::dispatch_meta_interrupt(fs, pending, malformed, reply)
+                    .await;
+
+            // parse failure went through finish_early / Err (not mistaken success).
+            assert!(res.is_err(), "malformed SETLKW returns the parse Err");
+            // set_lkw was NEVER called (parse failed before dispatch reached it).
+            assert!(
+                !polled.load(Ordering::SeqCst),
+                "set_lkw must NOT be called for a malformed SETLKW (parse failed first)"
+            );
+            // Yet a wait sample is still recorded — this is the timer-hoist value.
+            assert!(
+                setlkw_wait_count() > wait_before,
+                "malformed SETLKW still records a setlkw_wait_duration_us sample \
+                 (timer hoisted before parse)"
+            );
+            // The dispatch branch also cleaned up the pending_requests entry.
+            assert!(
+                pending2.get(&2002).is_none(),
+                "malformed SETLKW dispatch branch removed its pending_requests entry"
+            );
+        }
     }
 }

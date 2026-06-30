@@ -37,19 +37,6 @@ jobs:
             tag: rocky9
             arch: arm64
             runner: ubuntu-24.04-arm
-          # Rocky Linux 9 (cached)
-          - build_type: rocky9_cached
-            dockerfile: Dockerfile_rocky9_cached
-            context: .
-            tag: rocky9_cached
-            arch: amd64
-            runner: ubuntu-latest
-          - build_type: rocky9_cached
-            dockerfile: Dockerfile_rocky9_cached
-            context: .
-            tag: rocky9_cached
-            arch: arm64
-            runner: ubuntu-24.04-arm
           # Ubuntu 22.04
           - build_type: ubuntu22.04
             dockerfile: Dockerfile_ubuntu22
@@ -94,9 +81,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
       - name: Login to GitHub Container Registry
         if: inputs.push_image == true
         uses: docker/login-action@v3
@@ -112,19 +96,19 @@ jobs:
           username: curvine
           password: ${{ secrets.PAT_DOCKERIO_TOKEN }}
       
-      - name: Build and push compile image for ${{ matrix.build_type }} (${{ matrix.arch }})
-        uses: docker/build-push-action@v5
-        with:
-          context: ${{ matrix.context }}
-          file: ./curvine-docker/compile/${{ matrix.dockerfile }}
-          platforms: linux/${{ matrix.arch }}
-          push: ${{ inputs.push_image }}
-          tags: |
-            ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
-            curvine/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
-          cache-from: type=gha,scope=compile-${{ matrix.build_type }}-${{ matrix.arch }}
-          # Transient GHA cache API errors (e.g. 502) must not fail the job after image build/push succeeds.
-          cache-to: type=gha,mode=max,scope=compile-${{ matrix.build_type }}-${{ matrix.arch }},ignore-error=true
+      - name: Build compile image for ${{ matrix.build_type }} (${{ matrix.arch }})
+        run: |
+          docker build \
+            -f ./curvine-docker/compile/${{ matrix.dockerfile }} \
+            -t ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }} \
+            -t curvine/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }} \
+            ${{ matrix.context }}
+
+      - name: Push compile image for ${{ matrix.build_type }} (${{ matrix.arch }})
+        if: inputs.push_image == true
+        run: |
+          docker push ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
+          docker push curvine/curvine-compile:${{ matrix.tag }}-${{ matrix.arch }}
       
       - name: Build summary for ${{ matrix.build_type }} (${{ matrix.arch }})
         run: |
@@ -140,14 +124,10 @@ jobs:
       matrix:
         include:
           - tag: rocky9
-          - tag: rocky9_cached
           - tag: ubuntu22.04
           - tag: ubuntu24.04
           - tag: amzn2
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -164,14 +144,18 @@ jobs:
       - name: Create and push multi-arch manifest for ${{ matrix.tag }}
         run: |
           # Create manifest for GHCR
-          docker buildx imagetools create -t ghcr.io/curvineio/curvine-compile:${{ matrix.tag }} \
+          docker manifest rm ghcr.io/curvineio/curvine-compile:${{ matrix.tag }} || true
+          docker manifest create ghcr.io/curvineio/curvine-compile:${{ matrix.tag }} \
             ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-amd64 \
             ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}-arm64
+          docker manifest push ghcr.io/curvineio/curvine-compile:${{ matrix.tag }}
           
           # Create manifest for Docker Hub
-          docker buildx imagetools create -t curvine/curvine-compile:${{ matrix.tag }} \
+          docker manifest rm curvine/curvine-compile:${{ matrix.tag }} || true
+          docker manifest create curvine/curvine-compile:${{ matrix.tag }} \
             curvine/curvine-compile:${{ matrix.tag }}-amd64 \
             curvine/curvine-compile:${{ matrix.tag }}-arm64
+          docker manifest push curvine/curvine-compile:${{ matrix.tag }}
       
       - name: Manifest creation summary for ${{ matrix.tag }}
         run: |
@@ -194,7 +178,7 @@ jobs:
         run: |
           echo "### Compile Image Build Summary 🚀" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Build Types:** rocky9, rocky9_cached, ubuntu22.04, ubuntu24.04, amzn2" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Types:** rocky9, ubuntu22.04, ubuntu24.04, amzn2" >> $GITHUB_STEP_SUMMARY
           echo "**Architectures:** amd64 (native), arm64 (native)" >> $GITHUB_STEP_SUMMARY
           echo "**Build Strategy:** Native runners for each architecture" >> $GITHUB_STEP_SUMMARY
           echo "**Trigger:** workflow_dispatch" >> $GITHUB_STEP_SUMMARY
@@ -203,7 +187,6 @@ jobs:
           if [ "${{ inputs.push_image }}" == "true" ]; then
             echo "**Multi-arch images pushed to:**" >> $GITHUB_STEP_SUMMARY
             echo "- \`ghcr.io/curvineio/curvine-compile:rocky9\`" >> $GITHUB_STEP_SUMMARY
-            echo "- \`ghcr.io/curvineio/curvine-compile:rocky9_cached\`" >> $GITHUB_STEP_SUMMARY
             echo "- \`ghcr.io/curvineio/curvine-compile:ubuntu22.04\`" >> $GITHUB_STEP_SUMMARY
             echo "- \`ghcr.io/curvineio/curvine-compile:ubuntu24.04\`" >> $GITHUB_STEP_SUMMARY
             echo "- \`ghcr.io/curvineio/curvine-compile:amzn2\`" >> $GITHUB_STEP_SUMMARY
@@ -212,8 +195,6 @@ jobs:
             echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
             echo "# Rocky Linux 9 (standard)" >> $GITHUB_STEP_SUMMARY
             echo "docker pull ghcr.io/curvineio/curvine-compile:rocky9" >> $GITHUB_STEP_SUMMARY
-            echo "# Rocky Linux 9 (cached)" >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ghcr.io/curvineio/curvine-compile:rocky9_cached" >> $GITHUB_STEP_SUMMARY
             echo "# Ubuntu 22.04" >> $GITHUB_STEP_SUMMARY
             echo "docker pull ghcr.io/curvineio/curvine-compile:ubuntu22.04" >> $GITHUB_STEP_SUMMARY
             echo "# Ubuntu 24.04" >> $GITHUB_STEP_SUMMARY
@@ -222,7 +203,7 @@ jobs:
             echo "docker pull ghcr.io/curvineio/curvine-compile:amzn2" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "# Verify multi-arch" >> $GITHUB_STEP_SUMMARY
-            echo "docker buildx imagetools inspect ghcr.io/curvineio/curvine-compile:rocky9" >> $GITHUB_STEP_SUMMARY
+            echo "docker manifest inspect ghcr.io/curvineio/curvine-compile:rocky9" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "**Note:** Images were built but not pushed (push_image=false)" >> $GITHUB_STEP_SUMMARY
