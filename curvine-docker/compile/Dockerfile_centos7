@@ -11,18 +11,29 @@ ARG NASM_VERSION=2.16.03
 ARG ISAL_VERSION=v2.31.1
 
 # CentOS 7 is EOL; switch yum repos to vault.centos.org
-RUN sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*.repo && \
-    sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo
+RUN for repo in /etc/yum.repos.d/CentOS-*.repo; do \
+        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
+        sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo"; \
+        sed -i 's|^baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo"; \
+    done
 
 # 1. Install the basic toolchain and dependencies
 # CentOS 7 ships gcc 4.8; devtoolset-11 provides a modern compiler for Rust/SPDK builds.
 RUN yum install -y centos-release-scl && \
-    sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-SCLo*.repo && \
-    sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-SCLo*.repo && \
+    for repo in /etc/yum.repos.d/CentOS-SCLo*.repo; do \
+        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
+        sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo"; \
+        sed -i 's|^baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo"; \
+    done && \
     yum install -y epel-release && \
     sed -i 's/^metalink/#metalink/' /etc/yum.repos.d/epel*.repo && \
     sed -i 's|^#baseurl=|baseurl=|' /etc/yum.repos.d/epel*.repo && \
     sed -i 's|download.fedoraproject.org/pub/epel|download.fedoraproject.org/pub/archive/epel|' /etc/yum.repos.d/epel*.repo && \
+    for repo in /etc/yum.repos.d/CentOS-SCLo*.repo; do \
+        sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
+        sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo"; \
+        sed -i 's|^baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo"; \
+    done && \
     yum install -y \
     devtoolset-11-gcc \
     devtoolset-11-gcc-c++ \
