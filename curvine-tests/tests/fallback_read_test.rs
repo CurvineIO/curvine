@@ -37,6 +37,7 @@
 //! | TC-18  | CacheMode worker failure, S3 shrunk past pos -> seek error         |
 //! | TC-19  | CacheMode worker failure, S3 unchanged -> fallback reads value    |
 //! | TC-20  | CacheMode worker failure, S3 grown -> reads current (longer) S3   |
+//! | TC-21  | CacheMode fallback -> len() reflects current (grown) S3 length    |
 
 use bytes::BytesMut;
 use curvine_client::file::FsReader;
@@ -620,5 +621,44 @@ fn test_tc20_cachemode_worker_failure_grown_reads_current_s3() {
             changed.as_bytes(),
             "cache_mode fallback must return the grown S3 content in full"
         );
+    });
+}
+
+/// TC-21: CacheMode fallback must expose the CURRENT S3 length via len().
+/// Regression guard for the reviewer's note on PR #963: after fallback to S3,
+/// len() must delegate to the active ufs_reader so len()-based callers (e.g.
+/// read_as_string) see the grown object size, not the stale cached length.
+#[test]
+fn test_tc21_cachemode_fallback_len_reflects_current_s3() {
+    let Some(fs) = setup() else {
+        return;
+    };
+    let rt = fs.clone_runtime();
+    rt.block_on(async move {
+        let mount_dir = "fallback_read_tc21";
+        mount_cache_mode(&fs, mount_dir).await;
+
+        // Warm the cache with the original (shorter) content.
+        let original = "abcdefghij";
+        let cv_path = write_ufs_and_warm_cache(&fs, mount_dir, "tc21.log", original).await;
+
+        // Grow S3 out-of-band to a longer object.
+        let changed = "abcdefghijklmnopqrstuvwxyz";
+        let (ufs_path, mount) = fs.get_mount(&cv_path).await.unwrap().unwrap();
+        let mut w = mount.ufs.create(&ufs_path, true).await.unwrap();
+        w.write(changed.as_bytes()).await.unwrap();
+        w.complete().await.unwrap();
+
+        // Trigger fallback with a single read, then check len() reflects the grown S3.
+        let mut reader = build_reader_with_unreachable_worker(&fs, &cv_path).await;
+        let mut probe = BytesMut::zeroed(1);
+        let _ = reader.read(&mut probe).await.unwrap();
+
+        assert_eq!(
+            reader.len(),
+            changed.len() as i64,
+            "after CacheMode fallback, len() must report the current (grown) S3 length"
+        );
+        let _ = reader.complete().await;
     });
 }

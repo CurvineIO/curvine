@@ -128,7 +128,14 @@ impl Reader for FallbackFsReader {
     }
 
     fn len(&self) -> i64 {
-        self.cv_reader.len()
+        match &self.ufs_reader {
+            // CacheMode has fallen back to S3, which is authoritative: report its
+            // live length so len()-based callers (e.g. read_as_string) see the
+            // current object size, not the stale cached Curvine length.
+            Some(u) if !self.is_fs_mode => u.len(),
+            // FsMode (or no fallback yet): Curvine remains the metadata authority.
+            _ => self.cv_reader.len(),
+        }
     }
 
     // pos/chunk/chunk_size delegate to whichever reader is currently active.
