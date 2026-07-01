@@ -1,7 +1,6 @@
 # docker build -t curvine-compile-centos7 -f Dockerfile_centos7 .
 # Use the official CentOS 7 image as a base
-#FROM centos:7
-FROM devhub.baymax.oppoer.me/cloud-ci-image/centos7:v1.0
+FROM centos:7
 
 # Add metadata labels
 ARG REPO_URL=https://github.com/curvineio/curvine
