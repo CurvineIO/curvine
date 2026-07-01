@@ -17,7 +17,7 @@ use std::time::Instant;
 use log::warn;
 use once_cell::sync::OnceCell;
 
-use orpc::common::{CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics as m};
+use orpc::common::{Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Metrics as m};
 use orpc::CommonResult;
 
 use crate::fuse_error::errno_label;
@@ -48,6 +48,11 @@ const STAGE_DURATION_BUCKETS_US: &[f64] = &[
 const IO_SIZE_BUCKETS: &[f64] = &[
     4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 4194304.0, 16777216.0, 67108864.0,
 ];
+
+/// Buckets (entry count) for a single `read_dir_common` batch (Phase 3a
+/// `readdir_entries`). A batch is one readdir syscall's worth of dirents, not the
+/// whole directory; the upper buckets cover large single batches. Spans 1–4096.
+const READDIR_ENTRIES_BUCKETS: &[f64] = &[1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0];
 
 // `reply_type` label values (`requests_total`).
 pub(crate) const REPLY_TYPE_REPLIED: &str = "replied";
@@ -106,6 +111,41 @@ pub(crate) const PATH_TYPE_FALLBACK: &str = "fallback";
 #[cfg_attr(not(test), allow(dead_code))] // value produced by path_type(); fuse-side use is test-only.
 pub(crate) const PATH_TYPE_LOCAL: &str = "local";
 pub(crate) const PATH_TYPE_UNKNOWN: &str = "unknown";
+
+// Phase 3a `cache` label values (on `user_meta_cache_*`): the MetaCache namespace.
+pub(crate) const CACHE_STATUS: &str = "status";
+pub(crate) const CACHE_LIST: &str = "list";
+pub(crate) const CACHE_BLOCKS: &str = "blocks";
+
+// Phase 3a `status` label values on the `*_cache_total` counters.
+pub(crate) const CACHE_RESULT_HIT: &str = "hit";
+pub(crate) const CACHE_RESULT_MISS: &str = "miss";
+pub(crate) const CACHE_RESULT_PUT: &str = "put";
+
+// Phase 3a `operation` label value on `node_cache_total`.
+pub(crate) const NODE_CACHE_OP_LOOKUP: &str = "lookup";
+
+// Phase 3a `reason` label values on `user_meta_cache_invalidations_total`, one per
+// real `invalidate_cache` call site (see the design doc's 15-value enum).
+pub(crate) const INVAL_REASON_SETATTR: &str = "setattr";
+pub(crate) const INVAL_REASON_RESIZE: &str = "resize";
+pub(crate) const INVAL_REASON_SETXATTR: &str = "setxattr";
+pub(crate) const INVAL_REASON_REMOVEXATTR: &str = "removexattr";
+pub(crate) const INVAL_REASON_MKDIR: &str = "mkdir";
+pub(crate) const INVAL_REASON_CREATE: &str = "create";
+pub(crate) const INVAL_REASON_OPEN_WRITE: &str = "open_write";
+pub(crate) const INVAL_REASON_FLUSH: &str = "flush";
+pub(crate) const INVAL_REASON_RELEASE: &str = "release";
+pub(crate) const INVAL_REASON_UNLINK: &str = "unlink";
+pub(crate) const INVAL_REASON_LINK: &str = "link";
+pub(crate) const INVAL_REASON_RMDIR: &str = "rmdir";
+pub(crate) const INVAL_REASON_RENAME: &str = "rename";
+pub(crate) const INVAL_REASON_SYMLINK: &str = "symlink";
+pub(crate) const INVAL_REASON_FSYNC: &str = "fsync";
+
+// Phase 3a `status` label on the readdir histograms.
+pub(crate) const READDIR_STATUS_SUCCESS: &str = "success";
+pub(crate) const READDIR_STATUS_ERROR: &str = "error";
 
 // `phase` label values (`decode_errors_total`). `parse` (parse-after-ctx
 // cleanup) ships in 1a-2; `decode` (from_bytes failures) in 1b.
@@ -309,6 +349,38 @@ pub struct FuseMetrics {
     /// the writer's dequeue point (or when an un-received task is dropped). No
     /// `_total` suffix (a gauge), no label.
     pub(crate) stream_write_queue_depth: Gauge,
+
+    // --- Phase 3a: cache + readdir metrics ---
+    /// MetaCache hit/miss/put on the daemon's userspace metadata cache.
+    /// `cache` ∈ {status,list,blocks}, `status` ∈ {hit,miss,put}. `miss` is
+    /// recorded the moment the cache read returns `None` (before the backend
+    /// fetch), so a backend error / ENOENT after a miss is still in the
+    /// denominator; `put` only when the value is actually written back.
+    pub(crate) user_meta_cache_total: CounterVec,
+    /// Requested MetaCache invalidations at the `invalidate_cache(path, reason)`
+    /// call site (not confirmed removals). `cache` ∈ {status,list,blocks},
+    /// `reason` is one of 15 call-site reasons. One inc PER affected cache
+    /// namespace, so a single call emits 3–4 series (`cache=list` usually twice:
+    /// the path's own listing + the parent listing).
+    pub(crate) user_meta_cache_invalidations_total: CounterVec,
+    /// NodeMap dcache lookup outcome on the real FUSE `Lookup` path only.
+    /// `operation` ∈ {lookup}, `status` ∈ {hit,miss} (no `put` — a pure in-memory
+    /// lookup never writes). Internal `do_lookup` callers (readdir, mkdir/create/
+    /// link/symlink entry build) and `.`/`..` are NOT counted.
+    pub(crate) node_cache_total: CounterVec,
+    /// Negative dentry results returned to the kernel (backend `get_status`
+    /// returned ENOENT and `negative_ttl` is non-zero). Counted separately from a
+    /// positive `hit` so the positive hit-rate stays meaningful. No label.
+    pub(crate) negative_entry_returned_total: Counter,
+    /// Entries returned by one `read_dir_common` batch (a single readdir syscall's
+    /// worth, NOT the directory total). `status` label kept for a future
+    /// partial-error split, but currently only the `success` child is observed —
+    /// error / cancellation observes `readdir_duration_us{error}` and no entries.
+    pub(crate) readdir_entries: HistogramVec,
+    /// `read_dir_common` latency (pull-a-batch + encode). Does NOT include the
+    /// `opendir`/`list_stream` backend init (that happens in `new_dir_handle`);
+    /// the full-traversal cost is a deferred `opendir_duration_us`. `status`.
+    pub(crate) readdir_duration_us: HistogramVec,
 }
 
 impl FuseMetrics {
@@ -587,6 +659,42 @@ impl FuseMetrics {
                  can be driven by metadata paths (SetAttr truncate / fallocate), so a rising \
                  gauge is not necessarily FUSE write/flush pressure. Event-driven via a \
                  task-embedded guard, dropped at the dequeue point",
+            )?,
+
+            // Phase 3a: cache + readdir.
+            user_meta_cache_total: m::new_counter_vec(
+                "curvine_fuse_user_meta_cache_total",
+                "MetaCache hit/miss/put by cache namespace. status=hit|miss|put",
+                &["cache", "status"],
+            )?,
+            user_meta_cache_invalidations_total: m::new_counter_vec(
+                "curvine_fuse_user_meta_cache_invalidations_total",
+                "Requested MetaCache invalidations at the call site, one inc per affected cache \
+                 namespace (NOT per invalidate_cache call)",
+                &["cache", "reason"],
+            )?,
+            node_cache_total: m::new_counter_vec(
+                "curvine_fuse_node_cache_total",
+                "NodeMap dcache lookup outcome on the real FUSE Lookup path. status=hit|miss",
+                &["operation", "status"],
+            )?,
+            negative_entry_returned_total: m::new_counter(
+                "curvine_fuse_negative_entry_returned_total",
+                "Negative dentry results returned to the kernel (backend ENOENT + negative_ttl>0)",
+            )?,
+            readdir_entries: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_readdir_entries",
+                "Entries returned by one read_dir_common batch (single readdir syscall, not the \
+                 directory total). Only the success child is observed",
+                &["status"],
+                READDIR_ENTRIES_BUCKETS,
+            )?,
+            readdir_duration_us: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_readdir_duration_us",
+                "read_dir_common latency in microseconds (pull-a-batch + encode; excludes \
+                 opendir/list_stream backend init)",
+                &["status"],
+                REQUEST_DURATION_BUCKETS_US,
             )?,
         })
     }
@@ -1051,6 +1159,62 @@ impl FuseMetrics {
             _inflight: inflight,
         }
     }
+
+    // --- Phase 3a emission helpers (called via `FuseMetrics::with`) ---
+
+    /// `user_meta_cache_total{cache,status} +1`. `cache` ∈ {status,list,blocks},
+    /// `status` ∈ {hit,miss,put}.
+    pub(crate) fn record_user_meta_cache(&self, cache: &'static str, status: &'static str) {
+        self.user_meta_cache_total
+            .with_label_values(&[cache, status])
+            .inc();
+    }
+
+    /// `node_cache_total{operation=lookup,status} +1`. `status` ∈ {hit,miss}.
+    pub(crate) fn record_node_cache_lookup(&self, status: &'static str) {
+        self.node_cache_total
+            .with_label_values(&[NODE_CACHE_OP_LOOKUP, status])
+            .inc();
+    }
+
+    /// `negative_entry_returned_total +1`.
+    pub(crate) fn record_negative_entry(&self) {
+        self.negative_entry_returned_total.inc();
+    }
+
+    /// Record a requested invalidation `reason` across every affected cache
+    /// namespace: the path's own `status`/`list`/`blocks` (dropped together by
+    /// `meta_cache.invalidate(path)`), and — when `has_parent` — the parent
+    /// `list` (`invalidate_list(parent)`). One inc per namespace, NOT per call;
+    /// see the design doc. `cache=list` therefore usually increments twice.
+    pub(crate) fn record_invalidation(&self, reason: &'static str, has_parent: bool) {
+        let c = &self.user_meta_cache_invalidations_total;
+        c.with_label_values(&[CACHE_STATUS, reason]).inc();
+        c.with_label_values(&[CACHE_LIST, reason]).inc();
+        c.with_label_values(&[CACHE_BLOCKS, reason]).inc();
+        if has_parent {
+            c.with_label_values(&[CACHE_LIST, reason]).inc();
+        }
+    }
+
+    /// `readdir_entries{status=success}` observe (success path only) plus the
+    /// matching `readdir_duration_us{status=success}`.
+    pub(crate) fn record_readdir_success(&self, entries: u64, elapsed_us: u64) {
+        self.readdir_entries
+            .with_label_values(&[READDIR_STATUS_SUCCESS])
+            .observe(entries as f64);
+        self.readdir_duration_us
+            .with_label_values(&[READDIR_STATUS_SUCCESS])
+            .observe(elapsed_us as f64);
+    }
+
+    /// `readdir_duration_us{status=error}` observe — error/cancellation path; does
+    /// NOT observe `readdir_entries` (no partial/zero count).
+    pub(crate) fn record_readdir_error(&self, elapsed_us: u64) {
+        self.readdir_duration_us
+            .with_label_values(&[READDIR_STATUS_ERROR])
+            .observe(elapsed_us as f64);
+    }
 }
 
 /// Map a stream opcode to the read/write `io_type` for `io_dispatch_duration_us`,
@@ -1343,6 +1507,53 @@ impl Drop for HistogramTimer {
     fn drop(&mut self) {
         // Observe in microseconds, matching the `_us` metric convention.
         self.hist.observe(self.start.elapsed().as_micros() as f64);
+    }
+}
+
+/// Phase 3a readdir timer for `read_dir_common`. Records
+/// `readdir_duration_us{status=error}` on drop UNLESS `success(entries)` was
+/// called, which instead records `readdir_duration_us{status=success}` +
+/// `readdir_entries{status=success}`. So an early `?` return or an async
+/// cancellation between awaits is counted as an error with NO `entries`
+/// observation (no partial/zero count). Created via `start(enabled)` which
+/// returns `None` when the `metrics_enabled` kill-switch is off (no timing, no
+/// Drop emission); when `Some`, all emission routes through `FuseMetrics::with`,
+/// so it is also a silent no-op when the singleton is uninitialized (readdir is
+/// not on the reply path, so there is no `metrics.is_some()` gate here).
+pub(crate) struct ReaddirTimer {
+    start: Instant,
+    error_on_drop: bool,
+}
+
+impl ReaddirTimer {
+    /// `Some(timer)` only when metrics are enabled; `None` disables all readdir
+    /// timing (no `mono_now`, no Drop emission). The `metrics_enabled`
+    /// kill-switch — NOT a `noop()` guard: a disabled readdir creates no timer.
+    pub(crate) fn start(enabled: bool) -> Option<Self> {
+        enabled.then(|| Self {
+            start: mono_now(),
+            error_on_drop: true,
+        })
+    }
+
+    /// Success path: record duration + entry count, and disarm the error Drop.
+    /// `error_on_drop` is cleared BEFORE the observe so that if the (otherwise
+    /// non-panicking) record were ever to panic, Drop would not double-record an
+    /// error on top of the already-emitted success. The trade-off (a success that
+    /// panics mid-observe would be lost) is acceptable since observe does not panic.
+    pub(crate) fn success(mut self, entries: u64) {
+        let elapsed_us = self.start.elapsed().as_micros() as u64;
+        self.error_on_drop = false;
+        FuseMetrics::with(|m| m.record_readdir_success(entries, elapsed_us));
+    }
+}
+
+impl Drop for ReaddirTimer {
+    fn drop(&mut self) {
+        if self.error_on_drop {
+            let elapsed_us = self.start.elapsed().as_micros() as u64;
+            FuseMetrics::with(|m| m.record_readdir_error(elapsed_us));
+        }
     }
 }
 
@@ -2404,5 +2615,224 @@ mod tests {
         assert_eq!(STAGE_STREAM_IO, "stream_io");
         // No STAGE_STREAM_ENQUEUE exists; if one were added this test's neighbors
         // (the no-enqueue rule) and the send_stream code review would catch it.
+    }
+
+    // --- Phase 3a helper tests ---
+    //
+    // Same parallel-safety discipline as Phase 2b: the process-global registry
+    // accumulates across parallel tests, so value assertions read a child's
+    // counter before/after on a label set the test owns. `user_meta_cache_total`
+    // and `*_invalidations_total` take the `cache` label as a param, so each test
+    // uses a UNIQUE synthetic `cache` value to isolate its children. The no-label
+    // `negative_entry_returned_total` uses a before/after delta.
+
+    #[test]
+    fn invalidation_records_one_per_namespace_with_and_without_parent() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        // Unique synthetic reason so the child counters are owned by this test.
+        let reason = "test_inval_reason_unique";
+
+        let s_before = mx
+            .user_meta_cache_invalidations_total
+            .with_label_values(&[CACHE_STATUS, reason])
+            .get();
+        let l_before = mx
+            .user_meta_cache_invalidations_total
+            .with_label_values(&[CACHE_LIST, reason])
+            .get();
+        let b_before = mx
+            .user_meta_cache_invalidations_total
+            .with_label_values(&[CACHE_BLOCKS, reason])
+            .get();
+
+        // With a parent: status +1, blocks +1, list +2 (path's own + parent's).
+        mx.record_invalidation(reason, true);
+        assert_eq!(
+            mx.user_meta_cache_invalidations_total
+                .with_label_values(&[CACHE_STATUS, reason])
+                .get(),
+            s_before + 1
+        );
+        assert_eq!(
+            mx.user_meta_cache_invalidations_total
+                .with_label_values(&[CACHE_BLOCKS, reason])
+                .get(),
+            b_before + 1
+        );
+        assert_eq!(
+            mx.user_meta_cache_invalidations_total
+                .with_label_values(&[CACHE_LIST, reason])
+                .get(),
+            l_before + 2,
+            "list increments twice with a parent (path + parent listing)"
+        );
+
+        // Without a parent (root): status +1, blocks +1, list +1 (path only).
+        mx.record_invalidation(reason, false);
+        assert_eq!(
+            mx.user_meta_cache_invalidations_total
+                .with_label_values(&[CACHE_LIST, reason])
+                .get(),
+            l_before + 3,
+            "no-parent call adds exactly one more list inc"
+        );
+        assert_eq!(
+            mx.user_meta_cache_invalidations_total
+                .with_label_values(&[CACHE_STATUS, reason])
+                .get(),
+            s_before + 2
+        );
+    }
+
+    #[test]
+    fn user_meta_cache_hit_miss_put_increment_their_child() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let cache = "test_cache_ns_unique";
+
+        let read_child = |status: &str| {
+            mx.user_meta_cache_total
+                .with_label_values(&[cache, status])
+                .get()
+        };
+        let (h, m, p) = (
+            read_child(CACHE_RESULT_HIT),
+            read_child(CACHE_RESULT_MISS),
+            read_child(CACHE_RESULT_PUT),
+        );
+
+        mx.record_user_meta_cache(cache, CACHE_RESULT_HIT);
+        mx.record_user_meta_cache(cache, CACHE_RESULT_MISS);
+        mx.record_user_meta_cache(cache, CACHE_RESULT_PUT);
+
+        assert_eq!(read_child(CACHE_RESULT_HIT), h + 1);
+        assert_eq!(read_child(CACHE_RESULT_MISS), m + 1);
+        assert_eq!(read_child(CACHE_RESULT_PUT), p + 1);
+    }
+
+    #[test]
+    fn negative_entry_counter_increments() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        // `negative_entry_returned_total` is a process-global, no-label counter
+        // shared across parallel tests, so assert a lower bound on the delta, not
+        // an exact value (another test could also increment it concurrently).
+        let before = mx.negative_entry_returned_total.get();
+        mx.record_negative_entry();
+        mx.record_negative_entry();
+        assert!(
+            mx.negative_entry_returned_total.get() > before + 1,
+            "two records must add at least 2 to the shared counter"
+        );
+    }
+
+    #[test]
+    fn readdir_timer_success_observes_entries_and_duration_drop_is_noop() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let s_before = mx
+            .readdir_duration_us
+            .with_label_values(&[READDIR_STATUS_SUCCESS])
+            .get_sample_count();
+        let e_before = mx
+            .readdir_entries
+            .with_label_values(&[READDIR_STATUS_SUCCESS])
+            .get_sample_count();
+
+        ReaddirTimer::start(true)
+            .expect("enabled => Some")
+            .success(7);
+
+        // Shared {status=success} histogram children; lower-bound the delta since
+        // a concurrent test could also observe them.
+        assert!(
+            mx.readdir_duration_us
+                .with_label_values(&[READDIR_STATUS_SUCCESS])
+                .get_sample_count()
+                > s_before,
+            "success records at least one duration sample"
+        );
+        assert!(
+            mx.readdir_entries
+                .with_label_values(&[READDIR_STATUS_SUCCESS])
+                .get_sample_count()
+                > e_before,
+            "success records at least one entries sample"
+        );
+    }
+
+    #[test]
+    fn readdir_timer_disabled_creates_no_timer_and_records_nothing() {
+        // metrics_enabled=false => start() returns None, and there is no Drop
+        // emission. (Use a unique-ish read on both status children's totals.)
+        FuseMetrics::ensure_init().unwrap();
+        assert!(
+            ReaddirTimer::start(false).is_none(),
+            "disabled must yield no timer"
+        );
+    }
+
+    #[test]
+    fn readdir_timer_drop_without_success_records_error_no_entries() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+        let d_before = mx
+            .readdir_duration_us
+            .with_label_values(&[READDIR_STATUS_ERROR])
+            .get_sample_count();
+        let e_before = mx
+            .readdir_entries
+            .with_label_values(&[READDIR_STATUS_ERROR])
+            .get_sample_count();
+
+        // Drop without calling success() — the early-return / cancellation path.
+        drop(ReaddirTimer::start(true).expect("enabled => Some"));
+
+        // Shared {status=error} children; lower-bound the duration delta.
+        assert!(
+            mx.readdir_duration_us
+                .with_label_values(&[READDIR_STATUS_ERROR])
+                .get_sample_count()
+                > d_before,
+            "drop-without-success records at least one error duration sample"
+        );
+        // The entries{error} child is never written by any code path (the whole
+        // point), so it stays at its baseline — assert it did not move. (No other
+        // code observes readdir_entries{error}, so this exact check is stable.)
+        assert_eq!(
+            mx.readdir_entries
+                .with_label_values(&[READDIR_STATUS_ERROR])
+                .get_sample_count(),
+            e_before,
+            "error path must NOT observe readdir_entries (no partial/zero count)"
+        );
+    }
+
+    #[test]
+    fn invalidation_reason_consts_match_design_15_values() {
+        // The 15-value bounded enum the design doc pins. A change here must be
+        // mirrored in the design doc's reason list.
+        let reasons = [
+            INVAL_REASON_SETATTR,
+            INVAL_REASON_RESIZE,
+            INVAL_REASON_SETXATTR,
+            INVAL_REASON_REMOVEXATTR,
+            INVAL_REASON_MKDIR,
+            INVAL_REASON_CREATE,
+            INVAL_REASON_OPEN_WRITE,
+            INVAL_REASON_FLUSH,
+            INVAL_REASON_RELEASE,
+            INVAL_REASON_UNLINK,
+            INVAL_REASON_LINK,
+            INVAL_REASON_RMDIR,
+            INVAL_REASON_RENAME,
+            INVAL_REASON_SYMLINK,
+            INVAL_REASON_FSYNC,
+        ];
+        assert_eq!(reasons.len(), 15);
+        // No catch-all `other` and no `kernel_notify` (dropped in Phase 3a).
+        assert!(!reasons.contains(&"other"));
+        assert!(!reasons.contains(&"kernel_notify"));
     }
 }

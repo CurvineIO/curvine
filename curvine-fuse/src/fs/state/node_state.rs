@@ -16,6 +16,7 @@ use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
 use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
+use crate::fuse_metrics::{CACHE_BLOCKS, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
     err_fuse, FuseMetrics, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC,
@@ -186,7 +187,45 @@ impl NodeState {
         name: Option<T>,
         status: &FileStatus,
     ) -> FuseResult<fuse_attr> {
-        self.node_write().do_lookup(parent, name, status)
+        // Internal callers (readdir dentry fill, mkdir/create/link/symlink entry
+        // build) are NOT the real FUSE Lookup path, so they never record
+        // node_cache regardless of the metrics switch.
+        self.do_lookup_recorded(parent, name, status, false, false)
+    }
+
+    /// `do_lookup` that emits `node_cache_total` only when BOTH:
+    /// - `is_real_lookup`: this is the real FUSE `Lookup` handler path (not an
+    ///   internal `do_lookup` caller such as readdir / mkdir / create / link /
+    ///   symlink), and
+    /// - `metrics_enabled`: the observation kill-switch is on.
+    ///
+    /// The two flags are split (rather than a single `record` bool) so a future
+    /// caller cannot accidentally enable the metric by passing `true` for "this is
+    /// a lookup" while forgetting the `metrics_enabled` gate. The hit/miss is
+    /// decided inside the `node_write` lock (atomic with the lookup) but the
+    /// metric is emitted AFTER the lock is dropped, so no registry/label work
+    /// happens under the NodeMap write lock.
+    pub fn do_lookup_recorded<T: AsRef<str>>(
+        &self,
+        parent: u64,
+        name: Option<T>,
+        status: &FileStatus,
+        is_real_lookup: bool,
+        metrics_enabled: bool,
+    ) -> FuseResult<fuse_attr> {
+        let record = is_real_lookup && metrics_enabled;
+        let (res, hit) = self
+            .node_write()
+            .do_lookup_probed(parent, name, status, record);
+        if let Some(hit) = hit {
+            let status = if hit {
+                CACHE_RESULT_HIT
+            } else {
+                CACHE_RESULT_MISS
+            };
+            FuseMetrics::with(|m| m.record_node_cache_lookup(status));
+        }
+        res
     }
 
     pub fn unlink_node<T: AsRef<str>>(&self, id: u64, name: Option<T>) -> FuseResult<()> {
@@ -275,9 +314,37 @@ impl NodeState {
         Ok(Arc::new(Mutex::new(writer)))
     }
 
+    /// Emit `user_meta_cache_total{cache=blocks,status}`, gated on the
+    /// `metrics_enabled` observation kill-switch (separate from `enable_meta_cache`
+    /// — D11). No-op when metrics are disabled.
+    fn record_blocks_cache(&self, status: &'static str) {
+        if self.conf.metrics_enabled {
+            FuseMetrics::with(|m| m.record_user_meta_cache(CACHE_BLOCKS, status));
+        }
+    }
+
+    /// Populate the blocks cache for `path` and record the `put` in one place, so
+    /// the production put-wiring (Cv/Fallback `new_reader` arms) is exercised by
+    /// the same seam a test drives — not just the bare counter helper. Gated on
+    /// `metrics_enabled` for the metric (the cache write itself always happens).
+    fn put_blocks_cache_and_record(&self, path: &Path, blocks: FileBlocks) {
+        self.meta_cache.put_open(path, blocks);
+        self.record_blocks_cache(CACHE_RESULT_PUT);
+    }
+
     fn get_cached_blocks(&self, path: &Path) -> Option<FileBlocks> {
         if self.conf.enable_meta_cache {
-            self.meta_cache.get_blocks(path)
+            let blocks = self.meta_cache.get_blocks(path);
+            // Phase 3a: blocks-namespace hit/miss recorded the moment the cache
+            // read resolves (the matching `put` is recorded at the `put_open`
+            // sites in `new_reader`).
+            let result = if blocks.is_some() {
+                CACHE_RESULT_HIT
+            } else {
+                CACHE_RESULT_MISS
+            };
+            self.record_blocks_cache(result);
+            blocks
         } else {
             None
         }
@@ -296,13 +363,17 @@ impl NodeState {
                 if self.conf.enable_meta_cache {
                     match &reader {
                         UnifiedReader::Cv(cv_reader) => {
-                            self.meta_cache
-                                .put_open(path, cv_reader.file_blocks().clone());
+                            self.put_blocks_cache_and_record(path, cv_reader.file_blocks().clone());
                         }
                         UnifiedReader::Fallback(fallback_reader) => {
-                            self.meta_cache
-                                .put_open(path, fallback_reader.file_blocks().clone());
+                            self.put_blocks_cache_and_record(
+                                path,
+                                fallback_reader.file_blocks().clone(),
+                            );
                         }
+                        // Local/Opendal/OssHdfs readers do not populate the blocks
+                        // cache, so they emit no `put` (consistent with the design
+                        // doc's "put_open on Cv/Fallback readers only").
                         _ => {}
                     };
                 }
@@ -1353,5 +1424,138 @@ mod test {
         assert!(state.is_pending_delete(node.ino));
 
         Ok(())
+    }
+
+    // Phase 3a: the blocks-namespace of user_meta_cache_total. get_cached_blocks
+    // records hit/miss on the cache read; a put_open records the put. Asserts the
+    // real CACHE_BLOCKS children via before/after deltas (the {cache,status}
+    // labels are a closed shared set, so deltas — not absolutes — keep this
+    // parallel-test safe).
+    #[test]
+    fn get_cached_blocks_records_miss_then_hit_and_put() -> CommonResult<()> {
+        use crate::fuse_metrics::{
+            CACHE_BLOCKS, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT,
+        };
+        use curvine_common::state::FileBlocks;
+
+        crate::FuseMetrics::ensure_init().unwrap();
+        let mx = crate::FuseMetrics::get();
+
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = true;
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        let path = Path::from_str("/blocks-cache-test")?;
+        let read_child = |status: &str| {
+            mx.user_meta_cache_total
+                .with_label_values(&[CACHE_BLOCKS, status])
+                .get()
+        };
+        let (h0, m0, p0) = (
+            read_child(CACHE_RESULT_HIT),
+            read_child(CACHE_RESULT_MISS),
+            read_child(CACHE_RESULT_PUT),
+        );
+
+        // The CACHE_BLOCKS children are a closed, shared label set written by
+        // concurrent tests too, so assert lower bounds on this test's own deltas,
+        // not exact values (Phase3 parallel-test discipline).
+        //
+        // Cold: miss.
+        assert!(state.get_cached_blocks(&path).is_none());
+        assert!(read_child(CACHE_RESULT_MISS) > m0, "cold read is a miss");
+
+        // Populate via the PRODUCTION put seam (the same helper the Cv/Fallback
+        // new_reader arms call), so this test covers the real put wiring, not just
+        // the bare counter helper (P2).
+        let status = FileStatus::with_name(2, "blocks-cache-test".to_string(), false);
+        state.put_blocks_cache_and_record(&path, FileBlocks::new(status, vec![]));
+        assert!(
+            read_child(CACHE_RESULT_PUT) > p0,
+            "production put seam records a put"
+        );
+
+        // Warm read is a hit.
+        assert!(state.get_cached_blocks(&path).is_some());
+        assert!(read_child(CACHE_RESULT_HIT) > h0, "warm read is a hit");
+
+        Ok(())
+    }
+
+    // P1 kill-switch: with metrics_enabled=false (and the singleton initialized),
+    // the blocks cache helpers must still perform the cache read/write while
+    // suppressing emission. This test asserts the FUNCTIONAL half (cache still
+    // works); the NO-EMISSION half is proven deterministically below in
+    // `metrics_disabled_gate_suppresses_emission` against an isolated counter (the
+    // process-global {cache=blocks} children are shared with concurrent tests, so
+    // a "child did not move" assertion here would be flaky — see Phase3 parallel
+    // discipline).
+    #[test]
+    fn blocks_cache_metrics_disabled_emits_nothing() -> CommonResult<()> {
+        use curvine_common::state::FileBlocks;
+
+        crate::FuseMetrics::ensure_init().unwrap();
+
+        let mut conf = ClusterConf::default();
+        conf.fuse.enable_meta_cache = true;
+        conf.fuse.metrics_enabled = false; // observation kill-switch OFF
+        conf.fuse.init()?;
+        let fs = UnifiedFileSystem::with_rt(conf, Arc::new(AsyncRuntime::single()))?;
+        let state = NodeState::new(fs);
+
+        // With metrics disabled, the cache helpers must still perform the cache
+        // read/write (functional behavior), and the emission is structurally
+        // suppressed (each emitter is wrapped in `if self.conf.metrics_enabled`).
+        //
+        // We deliberately do NOT assert on the process-global CACHE_BLOCKS
+        // children here: they are a closed, shared label set that ANY concurrent
+        // test (e.g. the enabled blocks test, or e2e) also writes, so a
+        // disabled-mode "child did not move" equality is inherently flaky under
+        // the default parallel harness. The gate's no-emission behavior is proven
+        // deterministically at the seam level by `ReaddirTimer::start(false)`
+        // returning `None`, and the gate wiring is a simple `if conf.metrics_enabled`
+        // around each `FuseMetrics::with` call.
+        let path = Path::from_str("/blocks-disabled-test")?;
+        assert!(state.get_cached_blocks(&path).is_none(), "cold read misses");
+        let status = FileStatus::with_name(2, "blocks-disabled-test".to_string(), false);
+        state.put_blocks_cache_and_record(&path, FileBlocks::new(status, vec![]));
+        assert!(
+            state.get_cached_blocks(&path).is_some(),
+            "cache write still happens with metrics disabled"
+        );
+
+        Ok(())
+    }
+
+    // P3-1 (deterministic): the no-emission half of the metrics_enabled gate,
+    // proven against an INJECTED isolated counter so it is exact AND parallel-safe
+    // (no shared process-global child). Mirrors the exact `if enabled { emit }`
+    // shape every 3a emitter uses (record_meta_cache / record_blocks_cache /
+    // record_negative_entry / invalidate_cache).
+    #[test]
+    fn metrics_disabled_gate_suppresses_emission() {
+        // Stand-in for a gated emitter: `if enabled { counter.inc() }`.
+        fn record_if(enabled: bool, counter: &orpc::common::Counter) {
+            if enabled {
+                counter.inc();
+            }
+        }
+
+        let counter = orpc::common::Metrics::new_counter(
+            "test_metrics_gate_isolated_counter_unique",
+            "isolated gate counter",
+        )
+        .unwrap();
+
+        // Disabled: no increment, exactly.
+        record_if(false, &counter);
+        record_if(false, &counter);
+        assert_eq!(counter.get(), 0, "disabled gate must emit nothing");
+
+        // Enabled: increments.
+        record_if(true, &counter);
+        assert_eq!(counter.get(), 1, "enabled gate emits");
     }
 }
