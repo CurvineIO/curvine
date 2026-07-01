@@ -6,10 +6,6 @@ FROM centos:7
 ARG REPO_URL=https://github.com/curvineio/curvine
 LABEL org.opencontainers.image.source="${REPO_URL}"
 
-ARG SPDK_VERSION=v25.09
-ARG NASM_VERSION=2.16.03
-ARG ISAL_VERSION=v2.31.1
-
 # CentOS 7 is EOL; switch yum repos to vault.centos.org
 RUN for repo in /etc/yum.repos.d/CentOS-*.repo; do \
         sed -i 's/^mirrorlist=/#mirrorlist=/g' "$repo"; \
@@ -18,7 +14,7 @@ RUN for repo in /etc/yum.repos.d/CentOS-*.repo; do \
     done
 
 # 1. Install the basic toolchain and dependencies
-# CentOS 7 ships gcc 4.8; devtoolset-11 provides a modern compiler for Rust/SPDK builds.
+# CentOS 7 ships gcc 4.8; devtoolset-11 provides a modern compiler for Rust builds.
 RUN yum install -y centos-release-scl && \
     printf '%s\n' \
       '[centos-sclo-rh]' \
@@ -48,10 +44,7 @@ RUN yum install -y centos-release-scl && \
     llvm-toolset-7-llvm-devel \
     make \
     pkgconfig \
-    numactl-devel \
     libuuid-devel \
-    libibverbs-devel \
-    librdmacm-devel \
     fuse3 \
     fuse3-devel \
     git \
@@ -70,24 +63,6 @@ RUN yum install -y centos-release-scl && \
     zlib-devel \
     zlib-static \
     fio \
-    cmake3 \
-    autoconf \
-    automake \
-    libtool \
-    pciutils-devel \
-    CUnit-devel \
-    libaio-devel \
-    ncurses-devel \
-    json-c-devel \
-    libcmocka-devel \
-    keyutils \
-    keyutils-libs-devel \
-    patchelf \
-    systemtap-sdt-devel \
-    python \
-    python-devel \
-    python3-devel \
-    help2man \
     && yum clean all
 
 # Enable devtoolset-11 and llvm-toolset-7 for all subsequent build steps
@@ -186,63 +161,6 @@ RUN cd /opt && \
 ENV JINDOSDK_HOME=/opt/jindosdk
 ENV LD_LIBRARY_PATH="${JINDOSDK_HOME}/lib:${LD_LIBRARY_PATH}"
 
-# 4.2. Build SPDK once in the compile image. Runtime and test images consume
-# /opt/spdk from this image instead of rebuilding SPDK in deploy Dockerfiles.
-RUN ln -sf /usr/bin/cmake3 /usr/local/bin/cmake && \
-    pip3 install ninja meson pyelftools ijson Jinja2 pyyaml && \
-    cd /tmp && \
-    git clone --depth 1 --branch "$SPDK_VERSION" --single-branch https://github.com/spdk/spdk.git spdk-src && \
-    cd spdk-src && \
-    git submodule update --init && \
-    python3 -c "from pathlib import Path; p=Path('dpdk/lib/eal/unix/eal_unix_memory.c'); t=p.read_text(); needle='#ifdef RTE_EXEC_ENV_LINUX'; ins='#ifndef MAP_FIXED_NOREPLACE\n#define MAP_FIXED_NOREPLACE MAP_FIXED\n#endif\n\n'; \
-p.write_text(t if 'ifndef MAP_FIXED_NOREPLACE' in t else t.replace(needle, ins + needle, 1))" && \
-    curl -sL https://www.nasm.us/pub/nasm/releasebuilds/$NASM_VERSION/nasm-$NASM_VERSION.tar.gz | \
-        tar -xz -C /tmp && \
-    cd /tmp/nasm-$NASM_VERSION && \
-    ./configure && \
-    make -j$(nproc) && \
-    make install && \
-    cd /tmp && \
-    git clone --depth 1 --branch $ISAL_VERSION https://github.com/intel/isa-l.git isa-l-src && \
-    cd isa-l-src && \
-    ./autogen.sh && \
-    ./configure && \
-    make -j$(nproc) && \
-    make install && \
-    ldconfig && \
-    cd /tmp/spdk-src && \
-    ./configure \
-        --disable-tests \
-        --with-rdma \
-        --without-vfio-user \
-        --target-arch=native \
-        --with-shared && \
-    make -j$(nproc) && \
-    mkdir -p /opt/spdk/build/bin \
-             /opt/spdk/build/lib \
-             /opt/spdk/dpdk/build/lib \
-             /opt/spdk/include/spdk \
-             /opt/spdk/dpdk/build/include \
-             /opt/spdk/isa-l/.libs \
-             /opt/spdk/isa-l-crypto/.libs && \
-    cp build/bin/nvmf_tgt /opt/spdk/build/bin/ && \
-    cp build/lib/libspdk*.so* /opt/spdk/build/lib/ && \
-    cp build/lib/libspdk*.a /opt/spdk/build/lib/ && \
-    cp dpdk/build/lib/librte_*.so* /opt/spdk/dpdk/build/lib/ && \
-    cp dpdk/build/lib/librte_*.a /opt/spdk/dpdk/build/lib/ && \
-    cp -r include/spdk/*.h /opt/spdk/include/spdk/ && \
-    cp -r dpdk/build/include/* /opt/spdk/dpdk/build/include/ && \
-    cp -r scripts /opt/spdk/scripts && \
-    cp -r python /opt/spdk/python && \
-    cp isa-l/.libs/libisal* /opt/spdk/isa-l/.libs/ && \
-    cp isa-l-crypto/.libs/libisal* /opt/spdk/isa-l-crypto/.libs/ && \
-    ldconfig && \
-    rm -rf /tmp/spdk-src /tmp/nasm-$NASM_VERSION /tmp/isa-l-src
-
-ENV SPDK_DIR=/opt/spdk
-ENV PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig
-ENV LD_LIBRARY_PATH="/opt/spdk/build/lib:/opt/spdk/dpdk/build/lib:/opt/spdk/isa-l/.libs:/opt/spdk/isa-l-crypto/.libs:${JINDOSDK_HOME}/lib:${LD_LIBRARY_PATH}"
-
 # 5. Install Go toolchain with multi-arch support
 RUN ARCH=$(uname -m) && \
     case "${ARCH}" in \
@@ -287,8 +205,6 @@ WORKDIR /workspace
 # Verify toolchains. Do not `npm install -g npm@latest`: it replaces distro npm and can leave broken deps (e.g. MODULE_NOT_FOUND promise-retry).
 RUN rustc --version && cargo --version && protoc --version && mvn --version && node --version && \
     npm --version && \
-    test -f /opt/spdk/build/lib/libspdk_nvme.a && \
-    test -f /opt/spdk/build/bin/nvmf_tgt && \
     go version
 
 # Use ENTRYPOINT to ensure environment is loaded
