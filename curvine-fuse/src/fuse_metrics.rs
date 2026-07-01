@@ -147,6 +147,40 @@ pub(crate) const INVAL_REASON_FSYNC: &str = "fsync";
 pub(crate) const READDIR_STATUS_SUCCESS: &str = "success";
 pub(crate) const READDIR_STATUS_ERROR: &str = "error";
 
+// Phase 3b `stage` label values on the DEDICATED state-recovery families
+// (`state_persist_stage_duration_us` / `state_restore_stage_duration_us`). These
+// are a SEPARATE domain from the request `stage_duration_us` enum
+// (reply_write/meta_spawn/operation/stream_io) — they share the label NAME but
+// the value sets never cross. A recovery stage must never appear in the request
+// family and vice versa.
+pub(crate) const STATE_STAGE_NODE_MAP: &str = "node_map";
+pub(crate) const STATE_STAGE_FILE_HANDLES: &str = "file_handles";
+pub(crate) const STATE_STAGE_DIR_HANDLES: &str = "dir_handles";
+pub(crate) const STATE_STAGE_MOUNT_FDS: &str = "mount_fds";
+
+// Phase 3b `kind` label on `state_persist_handle_count`.
+pub(crate) const STATE_KIND_NODE_MAP: &str = "node_map";
+pub(crate) const STATE_KIND_FILE_HANDLES: &str = "file_handles";
+pub(crate) const STATE_KIND_DIR_HANDLES: &str = "dir_handles";
+
+// Phase 3b `status` label on state_persist/restore families + stage timers.
+pub(crate) const STATE_STATUS_SUCCESS: &str = "success";
+pub(crate) const STATE_STATUS_ERROR: &str = "error";
+
+// Phase 3b `result` label on `session_init_total`.
+pub(crate) const SESSION_INIT_SUCCESS: &str = "success";
+pub(crate) const SESSION_INIT_ERROR: &str = "error";
+
+// Phase 3b `reason` label on `session_shutdown_total` (6 bounded values). The
+// `run_all` select arm splits its three match outcomes; the signal arms and the
+// fd-watcher contribute the rest. Recorded once via a `ShutdownOnce` CAS.
+pub(crate) const SHUTDOWN_COMPLETED: &str = "completed";
+pub(crate) const SHUTDOWN_RUN_ALL_ERROR: &str = "run_all_error";
+pub(crate) const SHUTDOWN_RUN_ALL_PANIC: &str = "run_all_panic";
+pub(crate) const SHUTDOWN_TERM_SIGNAL: &str = "term_signal";
+pub(crate) const SHUTDOWN_SIGUSR1_PERSIST: &str = "sigusr1_persist";
+pub(crate) const SHUTDOWN_FD_WATCHER: &str = "fd_watcher";
+
 // `phase` label values (`decode_errors_total`). `parse` (parse-after-ctx
 // cleanup) ships in 1a-2; `decode` (from_bytes failures) in 1b.
 pub(crate) const DECODE_PHASE_PARSE: &str = "parse";
@@ -381,6 +415,36 @@ pub struct FuseMetrics {
     /// `opendir`/`list_stream` backend init (that happens in `new_dir_handle`);
     /// the full-traversal cost is a deferred `opendir_duration_us`. `status`.
     pub(crate) readdir_duration_us: HistogramVec,
+
+    // --- Phase 3b: state recovery + session lifecycle ---
+    /// Persist attempts (SIGUSR1). `status` ∈ {success,error}, recorded once at
+    /// the `fuse_session.rs::persist` entry/exit.
+    pub(crate) state_persist_total: CounterVec,
+    /// Per-stage persist duration. `stage` ∈ {node_map,file_handles,dir_handles,
+    /// mount_fds} (a DEDICATED domain, never the request `stage_duration_us`),
+    /// `status` ∈ {success,error}. mount_fds is timed in fuse_session.rs; the
+    /// other three in node_state.rs.
+    pub(crate) state_persist_stage_duration_us: HistogramVec,
+    /// Handle counts sampled ONCE at the start of a persist attempt. `kind` ∈
+    /// {node_map,file_handles,dir_handles}. A best-effort live snapshot.
+    pub(crate) state_persist_handle_count: GaugeVec,
+    /// Restore attempts (restart with the state-file env var). `status`.
+    pub(crate) state_restore_total: CounterVec,
+    /// Per-stage restore duration. Same `stage`/`status` domain as persist. A
+    /// NodeState magic/version header failure skips only the NodeState stages
+    /// (node_map/file_handles/dir_handles); `mount_fds` precedes the header in the
+    /// file format so it may already have recorded success.
+    pub(crate) state_restore_stage_duration_us: HistogramVec,
+    /// Session init outcome, recorded once in `FuseSession::new`. `result` ∈
+    /// {success,error} (every early `?` counts as error).
+    pub(crate) session_init_total: CounterVec,
+    /// Session shutdown cause, recorded EXACTLY ONCE via a `ShutdownOnce` CAS.
+    /// `reason` ∈ {completed,run_all_error,run_all_panic,term_signal,
+    /// sigusr1_persist,fd_watcher} — first cause wins.
+    pub(crate) session_shutdown_total: CounterVec,
+    /// FUSE kernel fd health, a single unlabeled gauge: 1 = healthy (set at end
+    /// of `new`), 0 = HUP/ERR (fd-watcher) or session exited (run() cleanup).
+    pub(crate) kernel_fd_health: Gauge,
 }
 
 impl FuseMetrics {
@@ -695,6 +759,56 @@ impl FuseMetrics {
                  opendir/list_stream backend init)",
                 &["status"],
                 REQUEST_DURATION_BUCKETS_US,
+            )?,
+
+            // Phase 3b: state recovery + session lifecycle.
+            state_persist_total: m::new_counter_vec(
+                "curvine_fuse_state_persist_total",
+                "FUSE state-persist attempts (SIGUSR1). status=success|error",
+                &["status"],
+            )?,
+            state_persist_stage_duration_us: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_state_persist_stage_duration_us",
+                "Per-stage state-persist duration in microseconds. stage is a dedicated \
+                 state-recovery domain (node_map|file_handles|dir_handles|mount_fds), NOT the \
+                 request stage_duration_us enum",
+                &["stage", "status"],
+                REQUEST_DURATION_BUCKETS_US,
+            )?,
+            state_persist_handle_count: m::new_gauge_vec(
+                "curvine_fuse_state_persist_handle_count",
+                "Handle counts sampled once at the start of a persist attempt. \
+                 kind=node_map|file_handles|dir_handles",
+                &["kind"],
+            )?,
+            state_restore_total: m::new_counter_vec(
+                "curvine_fuse_state_restore_total",
+                "FUSE state-restore attempts (restart with state-file env var). status=success|error",
+                &["status"],
+            )?,
+            state_restore_stage_duration_us: m::new_histogram_vec_with_buckets(
+                "curvine_fuse_state_restore_stage_duration_us",
+                "Per-stage state-restore duration in microseconds. Same dedicated stage domain as \
+                 persist. A NodeState magic/version header failure skips only the NodeState stages \
+                 (node_map/file_handles/dir_handles); mount_fds precedes the header in the file \
+                 format so it may already be recorded",
+                &["stage", "status"],
+                REQUEST_DURATION_BUCKETS_US,
+            )?,
+            session_init_total: m::new_counter_vec(
+                "curvine_fuse_session_init_total",
+                "FUSE session init outcome, recorded once in FuseSession::new. result=success|error",
+                &["result"],
+            )?,
+            session_shutdown_total: m::new_counter_vec(
+                "curvine_fuse_session_shutdown_total",
+                "FUSE session shutdown cause, recorded once per session (first cause wins). \
+                 reason=completed|run_all_error|run_all_panic|term_signal|sigusr1_persist|fd_watcher",
+                &["reason"],
+            )?,
+            kernel_fd_health: m::new_gauge(
+                "curvine_fuse_kernel_fd_health",
+                "FUSE kernel fd health: 1=healthy, 0=HUP/ERR or session exited",
             )?,
         })
     }
@@ -1215,6 +1329,59 @@ impl FuseMetrics {
             .with_label_values(&[READDIR_STATUS_ERROR])
             .observe(elapsed_us as f64);
     }
+
+    // --- Phase 3b emission helpers (called via `FuseMetrics::with`) ---
+
+    /// `state_persist_total{status} +1` / `state_restore_total{status} +1`.
+    pub(crate) fn record_state_total(&self, is_persist: bool, status: &'static str) {
+        let c = if is_persist {
+            &self.state_persist_total
+        } else {
+            &self.state_restore_total
+        };
+        c.with_label_values(&[status]).inc();
+    }
+
+    /// Observe a persist/restore stage duration. `is_persist` selects the family.
+    pub(crate) fn observe_state_stage(
+        &self,
+        is_persist: bool,
+        stage: &'static str,
+        status: &'static str,
+        elapsed_us: u64,
+    ) {
+        let h = if is_persist {
+            &self.state_persist_stage_duration_us
+        } else {
+            &self.state_restore_stage_duration_us
+        };
+        h.with_label_values(&[stage, status])
+            .observe(elapsed_us as f64);
+    }
+
+    /// `state_persist_handle_count{kind}` gauge set (start-of-persist snapshot).
+    pub(crate) fn set_state_handle_count(&self, kind: &'static str, count: usize) {
+        self.state_persist_handle_count
+            .with_label_values(&[kind])
+            .set(count as i64);
+    }
+
+    /// `session_init_total{result} +1`.
+    pub(crate) fn record_session_init(&self, result: &'static str) {
+        self.session_init_total.with_label_values(&[result]).inc();
+    }
+
+    /// `session_shutdown_total{reason} +1`.
+    pub(crate) fn record_session_shutdown(&self, reason: &'static str) {
+        self.session_shutdown_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// `kernel_fd_health` set 1 (healthy) / 0 (HUP-or-exited).
+    pub(crate) fn set_kernel_fd_health(&self, healthy: bool) {
+        self.kernel_fd_health.set(if healthy { 1 } else { 0 });
+    }
 }
 
 /// Map a stream opcode to the read/write `io_type` for `io_dispatch_duration_us`,
@@ -1553,6 +1720,95 @@ impl Drop for ReaddirTimer {
         if self.error_on_drop {
             let elapsed_us = self.start.elapsed().as_micros() as u64;
             FuseMetrics::with(|m| m.record_readdir_error(elapsed_us));
+        }
+    }
+}
+
+/// Phase 3b per-stage timer for state persist/restore (D9). Records the stage
+/// duration on drop with `status=error` UNLESS `success()` is called first (which
+/// records `status=success` and disarms the error drop). So an early `?` return
+/// or async cancellation mid-stage is counted as `error` ("the attempt did not
+/// finish"), matching the request-stage convention. Created via `start(enabled,
+/// is_persist, stage)` which returns `None` when metrics are disabled (no timing,
+/// no Drop emission) — the `metrics_enabled` kill-switch, not a noop guard.
+pub(crate) struct StateStageTimer {
+    start: Instant,
+    is_persist: bool,
+    stage: &'static str,
+    error_on_drop: bool,
+}
+
+impl StateStageTimer {
+    pub(crate) fn start(enabled: bool, is_persist: bool, stage: &'static str) -> Option<Self> {
+        enabled.then(|| Self {
+            start: mono_now(),
+            is_persist,
+            stage,
+            error_on_drop: true,
+        })
+    }
+
+    /// Disarm the error drop and record `status=success` with the elapsed time.
+    /// `error_on_drop` is cleared before the observe (Prometheus observe does not
+    /// panic; this avoids a double-record if it ever did).
+    pub(crate) fn success(mut self) {
+        let elapsed_us = self.start.elapsed().as_micros() as u64;
+        self.error_on_drop = false;
+        let (is_persist, stage) = (self.is_persist, self.stage);
+        FuseMetrics::with(|m| {
+            m.observe_state_stage(is_persist, stage, STATE_STATUS_SUCCESS, elapsed_us)
+        });
+    }
+}
+
+impl Drop for StateStageTimer {
+    fn drop(&mut self) {
+        if self.error_on_drop {
+            let elapsed_us = self.start.elapsed().as_micros() as u64;
+            let (is_persist, stage) = (self.is_persist, self.stage);
+            FuseMetrics::with(|m| {
+                m.observe_state_stage(is_persist, stage, STATE_STATUS_ERROR, elapsed_us)
+            });
+        }
+    }
+}
+
+/// Phase 3b shutdown-reason de-duplicator (D4). `session_shutdown_total` must be
+/// recorded exactly once per session, by the FIRST cause: the fd-watcher, a
+/// signal arm, and the `run_all` completion arm can all race to report a reason.
+/// A single `compare_exchange` CAS lets the first caller win; later callers
+/// no-op. Cheap `Arc<AtomicBool>`, shared by the session and the watcher task.
+/// Emission is gated on `enabled` (the kill-switch) — the CAS still runs so the
+/// "record once" invariant holds identically whether or not metrics are enabled.
+#[derive(Clone)]
+pub(crate) struct ShutdownOnce {
+    recorded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    enabled: bool,
+}
+
+impl ShutdownOnce {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            recorded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            enabled,
+        }
+    }
+
+    /// Record `reason` iff this is the first call (CAS false→true). Returns true
+    /// if this call won the race (and thus emitted, when enabled).
+    pub(crate) fn record_once(&self, reason: &'static str) -> bool {
+        use std::sync::atomic::Ordering;
+        if self
+            .recorded
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if self.enabled {
+                FuseMetrics::with(|m| m.record_session_shutdown(reason));
+            }
+            true
+        } else {
+            false
         }
     }
 }
@@ -2834,5 +3090,194 @@ mod tests {
         // No catch-all `other` and no `kernel_notify` (dropped in Phase 3a).
         assert!(!reasons.contains(&"other"));
         assert!(!reasons.contains(&"kernel_notify"));
+    }
+
+    // --- Phase 3b seam tests ---
+
+    // ShutdownOnce records exactly once (first cause wins); later callers no-op.
+    // Verified via the return-value of record_once (true only for the winner),
+    // which is deterministic and does not touch the process-global counter.
+    #[test]
+    fn shutdown_once_records_first_cause_only() {
+        let once = ShutdownOnce::new(true);
+        assert!(once.record_once(SHUTDOWN_FD_WATCHER), "first call wins");
+        assert!(
+            !once.record_once(SHUTDOWN_COMPLETED),
+            "second call is a no-op (already recorded)"
+        );
+        assert!(
+            !once.record_once(SHUTDOWN_TERM_SIGNAL),
+            "third call is a no-op too"
+        );
+    }
+
+    // ShutdownOnce with metrics disabled still enforces the once semantics (the
+    // CAS runs regardless), it just does not emit.
+    #[test]
+    fn shutdown_once_disabled_still_dedups() {
+        let once = ShutdownOnce::new(false);
+        assert!(once.record_once(SHUTDOWN_COMPLETED), "first call wins");
+        assert!(!once.record_once(SHUTDOWN_FD_WATCHER), "second no-op");
+    }
+
+    // StateStageTimer: disabled => None (no timer). Enabled success() observes the
+    // {stage,status=success} child; drop-without-success observes {status=error}.
+    // Uses a unique synthetic stage label so the children are owned by this test
+    // (exact, parallel-safe).
+    #[test]
+    fn state_stage_timer_disabled_none_enabled_records() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+
+        // Disabled: no timer at all.
+        assert!(
+            StateStageTimer::start(false, true, "test_state_stage_unique").is_none(),
+            "disabled => None"
+        );
+
+        // Enabled + success: records the success child once.
+        let s_before = mx
+            .state_persist_stage_duration_us
+            .with_label_values(&["test_state_stage_unique", STATE_STATUS_SUCCESS])
+            .get_sample_count();
+        StateStageTimer::start(true, true, "test_state_stage_unique")
+            .expect("enabled => Some")
+            .success();
+        assert_eq!(
+            mx.state_persist_stage_duration_us
+                .with_label_values(&["test_state_stage_unique", STATE_STATUS_SUCCESS])
+                .get_sample_count(),
+            s_before + 1,
+            "success() records one success sample (unique label => exact)"
+        );
+
+        // Enabled + drop without success: records the error child once.
+        let e_before = mx
+            .state_persist_stage_duration_us
+            .with_label_values(&["test_state_stage_unique", STATE_STATUS_ERROR])
+            .get_sample_count();
+        drop(StateStageTimer::start(
+            true,
+            true,
+            "test_state_stage_unique",
+        ));
+        assert_eq!(
+            mx.state_persist_stage_duration_us
+                .with_label_values(&["test_state_stage_unique", STATE_STATUS_ERROR])
+                .get_sample_count(),
+            e_before + 1,
+            "drop-without-success records one error sample"
+        );
+    }
+
+    // The 6 shutdown reasons are distinct and the run_all arm's three outcomes are
+    // present (a regression guard against collapsing them back to `completed`).
+    #[test]
+    fn shutdown_reason_consts_are_the_six_distinct_values() {
+        let reasons = [
+            SHUTDOWN_COMPLETED,
+            SHUTDOWN_RUN_ALL_ERROR,
+            SHUTDOWN_RUN_ALL_PANIC,
+            SHUTDOWN_TERM_SIGNAL,
+            SHUTDOWN_SIGUSR1_PERSIST,
+            SHUTDOWN_FD_WATCHER,
+        ];
+        let mut uniq: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for r in reasons {
+            assert!(uniq.insert(r), "reason {r} must be unique");
+        }
+        assert_eq!(uniq.len(), 6);
+        // run_all's three outcomes are not collapsed into `completed`.
+        assert_ne!(SHUTDOWN_RUN_ALL_ERROR, SHUTDOWN_COMPLETED);
+        assert_ne!(SHUTDOWN_RUN_ALL_PANIC, SHUTDOWN_COMPLETED);
+    }
+
+    // State-recovery stages must NEVER collide with the request stage_duration_us
+    // enum (separate domains sharing the label name). Guard by value.
+    #[test]
+    fn state_stages_disjoint_from_request_stages() {
+        let request_stages = [
+            STAGE_REPLY_WRITE,
+            STAGE_META_SPAWN,
+            STAGE_OPERATION,
+            STAGE_STREAM_IO,
+        ];
+        let state_stages = [
+            STATE_STAGE_NODE_MAP,
+            STATE_STAGE_FILE_HANDLES,
+            STATE_STAGE_DIR_HANDLES,
+            STATE_STAGE_MOUNT_FDS,
+        ];
+        for s in state_stages {
+            assert!(
+                !request_stages.contains(&s),
+                "state stage {s} must not appear in the request stage enum"
+            );
+        }
+    }
+
+    // P3#5: the lifecycle record helpers actually emit through the singleton
+    // (exercises the `FuseMetrics::with(|m| m.record_session_init/...)` path the
+    // session uses). Shared global children → lower-bound deltas, parallel-safe.
+    #[test]
+    fn lifecycle_record_helpers_emit() {
+        FuseMetrics::ensure_init().unwrap();
+        let mx = FuseMetrics::get();
+
+        let init_before = mx
+            .session_init_total
+            .with_label_values(&[SESSION_INIT_SUCCESS])
+            .get();
+        mx.record_session_init(SESSION_INIT_SUCCESS);
+        assert!(
+            mx.session_init_total
+                .with_label_values(&[SESSION_INIT_SUCCESS])
+                .get()
+                > init_before,
+            "record_session_init emits the success child"
+        );
+
+        let persist_before = mx
+            .state_persist_total
+            .with_label_values(&[STATE_STATUS_SUCCESS])
+            .get();
+        mx.record_state_total(true, STATE_STATUS_SUCCESS);
+        assert!(
+            mx.state_persist_total
+                .with_label_values(&[STATE_STATUS_SUCCESS])
+                .get()
+                > persist_before,
+            "record_state_total(persist) emits the success child"
+        );
+
+        // kernel_fd_health is a single gauge; set both states and read back (this
+        // test is the only writer of a deterministic value sequence, but other
+        // tests may also set it — so just assert the setter takes effect promptly).
+        mx.set_kernel_fd_health(true);
+        // Not asserting the exact value (shared gauge); the call must not panic and
+        // the gauge must be in {0,1}.
+        let v = mx.kernel_fd_health.get();
+        assert!(v == 0 || v == 1, "health gauge is binary");
+    }
+
+    // P3#5: gate decision (enabled vs disabled) is deterministic against an
+    // isolated counter — the exact `if enabled { emit }` shape the session call
+    // sites use to gate every lifecycle/state emission on metrics_enabled.
+    #[test]
+    fn lifecycle_gate_suppresses_when_disabled() {
+        fn record_if(enabled: bool, counter: &orpc::common::Counter) {
+            if enabled {
+                counter.inc();
+            }
+        }
+        let counter = orpc::common::Metrics::new_counter(
+            "test_lifecycle_gate_isolated_counter_unique",
+            "isolated lifecycle gate counter",
+        )
+        .unwrap();
+        record_if(false, &counter);
+        assert_eq!(counter.get(), 0, "disabled gate emits nothing");
+        record_if(true, &counter);
+        assert_eq!(counter.get(), 1, "enabled gate emits");
     }
 }

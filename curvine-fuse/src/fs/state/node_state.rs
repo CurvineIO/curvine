@@ -16,7 +16,11 @@ use crate::fs::state::file_handle::FileHandle;
 use crate::fs::state::DirHandle;
 use crate::fs::state::{NodeAttr, NodeMap};
 use crate::fs::{CurvineFileSystem, FuseReader, FuseWriter};
-use crate::fuse_metrics::{CACHE_BLOCKS, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT};
+use crate::fuse_metrics::{
+    StateStageTimer, CACHE_BLOCKS, CACHE_RESULT_HIT, CACHE_RESULT_MISS, CACHE_RESULT_PUT,
+    STATE_KIND_DIR_HANDLES, STATE_KIND_FILE_HANDLES, STATE_KIND_NODE_MAP, STATE_STAGE_DIR_HANDLES,
+    STATE_STAGE_FILE_HANDLES, STATE_STAGE_NODE_MAP,
+};
 use crate::raw::fuse_abi::{fuse_attr, fuse_forget_one};
 use crate::{
     err_fuse, FuseMetrics, FuseResult, FUSE_CURRENT_DIR, FUSE_PARENT_DIR, STATE_FILE_MAGIC,
@@ -831,38 +835,86 @@ impl NodeState {
     }
 
     pub async fn persist(&self, writer: &mut StateWriter) -> FuseResult<()> {
+        let metrics_enabled = self.conf.metrics_enabled;
+
+        // Phase 3b (P2#3): sample the live handle/node counts ONCE at the very
+        // start of the attempt — BEFORE the first fallible I/O (the magic/version
+        // header writes below) — so even a header-write failure still refreshes
+        // this gauge ("sampled at persist time, unaffected by a later stage
+        // failure"). Best-effort snapshot, each len under its own lock (not a
+        // cross-kind atomic).
+        if metrics_enabled {
+            let node_len = self.node_read().nodes_len();
+            let file_len = self.file_handles_len();
+            let dir_len = self.dir_handles_len();
+            FuseMetrics::with(|m| {
+                m.set_state_handle_count(STATE_KIND_NODE_MAP, node_len);
+                m.set_state_handle_count(STATE_KIND_FILE_HANDLES, file_len);
+                m.set_state_handle_count(STATE_KIND_DIR_HANDLES, dir_len);
+            });
+        }
+
         writer.write_all(STATE_FILE_MAGIC)?;
         writer.write_len(STATE_FILE_VERSION)?;
 
         {
+            let stage = StateStageTimer::start(metrics_enabled, true, STATE_STAGE_NODE_MAP);
             info!("node_state::persist: saving node_map");
             let node_lock = self.node_read();
             node_lock.persist(writer)?;
             info!("node_state::persist: {} node saved", node_lock.nodes_len());
-        }
-
-        info!("node_state::persist: saving file_handles");
-        let handles = self.all_handles();
-        writer.write_len(handles.len() as u64)?;
-        for handle in &handles {
-            if let Err(e) = handle.persist(writer).await {
-                error!("node_state::persist: error saving file_handle {:?}", e)
+            if let Some(stage) = stage {
+                stage.success();
             }
         }
-        info!("node_state::persist: {} file_handles saved", handles.len());
 
-        info!("node_state::persist: saving dir_handles");
-        let dir_handles = self.all_dir_handles();
-        writer.write_len(dir_handles.len() as u64)?;
-        for dir_handle in &dir_handles {
-            writer.write_struct(&**dir_handle)?;
+        {
+            let stage = StateStageTimer::start(metrics_enabled, true, STATE_STAGE_FILE_HANDLES);
+            info!("node_state::persist: saving file_handles");
+            let handles = self.all_handles();
+            writer.write_len(handles.len() as u64)?;
+            // best-effort: a failed handle is logged and skipped (control flow
+            // unchanged), but any failure means the stage did NOT complete cleanly
+            // — leave the StateStageTimer to drop as `error` (do not call
+            // success()), so metrics don't hide a partial/corrupt persist as
+            // success (review #961).
+            let mut any_failed = false;
+            for handle in &handles {
+                if let Err(e) = handle.persist(writer).await {
+                    error!("node_state::persist: error saving file_handle {:?}", e);
+                    any_failed = true;
+                }
+            }
+            info!("node_state::persist: {} file_handles saved", handles.len());
+            if let Some(stage) = stage {
+                if !any_failed {
+                    stage.success();
+                }
+            }
         }
-        info!(
-            "node_state::persist: {} dir_handles saved",
-            dir_handles.len()
-        );
 
-        writer.write_len(self.fh_creator.get())?;
+        {
+            let stage = StateStageTimer::start(metrics_enabled, true, STATE_STAGE_DIR_HANDLES);
+            info!("node_state::persist: saving dir_handles");
+            let dir_handles = self.all_dir_handles();
+            writer.write_len(dir_handles.len() as u64)?;
+            for dir_handle in &dir_handles {
+                writer.write_struct(&**dir_handle)?;
+            }
+            info!(
+                "node_state::persist: {} dir_handles saved",
+                dir_handles.len()
+            );
+            // Phase 3b (P2#2): the trailing fh_creator write is part of the
+            // dir/file-handle recovery chain — fold it into the dir_handles stage
+            // (before success()) so a failure here drops the timer as error,
+            // mirroring restore (which reads fh_creator inside its dir_handles
+            // stage). Avoids the "all stages success + persist_total error" gap.
+            writer.write_len(self.fh_creator.get())?;
+            if let Some(stage) = stage {
+                stage.success();
+            }
+        }
 
         Ok(())
     }
@@ -882,6 +934,7 @@ impl NodeState {
     }
 
     pub async fn restore(&self, reader: &mut StateReader) -> FuseResult<()> {
+        let metrics_enabled = self.conf.metrics_enabled;
         // The magic/version early-returns below are gauge-safe ONLY because no
         // map has been mutated yet: restore runs at mount time before any
         // traffic, so the maps are still at cold-start and the gauges already
@@ -890,6 +943,14 @@ impl NodeState {
         // handle-phase finalizer below); pulling a map write ahead of these
         // checks would skip the finalizer on a magic/version failure and drift
         // the gauge.
+        //
+        // Phase 3b (D8): the magic/version header validation is not one of the
+        // three NodeState recovery stages — a header failure records
+        // state_restore_total{error} (at the fuse_session.rs caller) and produces
+        // NO node_map/file_handles/dir_handles stage. (The earlier `mount_fds`
+        // stage, handled by fuse_session.rs before fs.restore, may already have
+        // recorded success — the fd map precedes this header in the file format.)
+        // So these early returns are intentionally outside any StateStageTimer.
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != STATE_FILE_MAGIC {
@@ -910,6 +971,7 @@ impl NodeState {
         }
 
         {
+            let stage = StateStageTimer::start(metrics_enabled, false, STATE_STAGE_NODE_MAP);
             info!("node_state::restore: restoring node_map");
             let mut node_lock = self.node_write();
             // inode_num is owned by NodeMap::restore (sets from live nodes.len()
@@ -921,6 +983,9 @@ impl NodeState {
                 "node_state::restore: node_map {}restored",
                 node_lock.nodes_len()
             );
+            if let Some(stage) = stage {
+                stage.success();
+            }
         }
 
         // Handle-restore phase. The bulk inserts below do NOT go through the
@@ -935,59 +1000,85 @@ impl NodeState {
         // (dir-handle read/path/list_stream, and the trailing fh_creator read),
         // because any of those can fire after the handle maps were mutated.
         let result: FuseResult<()> = async {
-            info!("node_state::restore: restoring file_handles");
-            let handles_count = reader.read_len()?;
-            let mut restored_handles = 0;
-            for i in 0..handles_count {
-                let handle = match FileHandle::restore(reader, self).await {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        error!(
-                            "failed to restore file_handle {}/{}: {}",
-                            i + 1,
-                            handles_count,
-                            e
-                        );
-                        continue;
+            // Phase 3b (P1-4): file_handles stage covers read_len + the restore
+            // loop + inserts; any early `?` (read_len) drops the timer as error.
+            {
+                let stage =
+                    StateStageTimer::start(metrics_enabled, false, STATE_STAGE_FILE_HANDLES);
+                info!("node_state::restore: restoring file_handles");
+                let handles_count = reader.read_len()?;
+                let mut restored_handles = 0;
+                // best-effort: a corrupt handle is logged and skipped (control
+                // flow unchanged), but a skipped handle means the stage did NOT
+                // recover cleanly — leave the timer to drop as `error` so metrics
+                // don't hide partial/corrupt restore as success (review #961).
+                let mut any_failed = false;
+                for i in 0..handles_count {
+                    let handle = match FileHandle::restore(reader, self).await {
+                        Ok(handle) => handle,
+                        Err(e) => {
+                            error!(
+                                "failed to restore file_handle {}/{}: {}",
+                                i + 1,
+                                handles_count,
+                                e
+                            );
+                            any_failed = true;
+                            continue;
+                        }
+                    };
+
+                    // Drift-check allowlist: restore bulk insert (file handles).
+                    // Direct insert on purpose — the finalizer below owns the gauge.
+                    self.handles
+                        .write()
+                        .entry(handle.ino)
+                        .or_default()
+                        .insert(handle.fh, Arc::new(handle));
+                    restored_handles += 1;
+                }
+                info!(
+                    "node_state::restore: {}/{} file_handles restored",
+                    restored_handles, handles_count
+                );
+                if let Some(stage) = stage {
+                    if !any_failed {
+                        stage.success();
                     }
-                };
-
-                // Drift-check allowlist: restore bulk insert (file handles).
-                // Direct insert on purpose — the finalizer below owns the gauge.
-                self.handles
-                    .write()
-                    .entry(handle.ino)
-                    .or_default()
-                    .insert(handle.fh, Arc::new(handle));
-                restored_handles += 1;
+                }
             }
-            info!(
-                "node_state::restore: {}/{} file_handles restored",
-                restored_handles, handles_count
-            );
 
-            info!("node_state::restore: restoring dir_handles");
-            let dir_handles_count = reader.read_len()?;
-            for _ in 0..dir_handles_count {
-                let mut handle = reader.read_struct::<DirHandle>()?;
-                let path = Path::from_str(&handle.path)?;
-                let stream = self.list_stream(&path).await?;
-                handle.set_stream(stream);
+            // dir_handles stage covers read_len + loop (read/path/list_stream/
+            // insert) + the trailing fh_creator read (P1-4: fh_creator folds into
+            // dir_handles' tail). Any early `?` drops the timer as error.
+            {
+                let stage = StateStageTimer::start(metrics_enabled, false, STATE_STAGE_DIR_HANDLES);
+                info!("node_state::restore: restoring dir_handles");
+                let dir_handles_count = reader.read_len()?;
+                for _ in 0..dir_handles_count {
+                    let mut handle = reader.read_struct::<DirHandle>()?;
+                    let path = Path::from_str(&handle.path)?;
+                    let stream = self.list_stream(&path).await?;
+                    handle.set_stream(stream);
 
-                // Drift-check allowlist: restore bulk insert (dir handles).
-                self.dir_handles
-                    .write()
-                    .entry(handle.ino)
-                    .or_default()
-                    .insert(handle.fh, Arc::new(handle));
+                    // Drift-check allowlist: restore bulk insert (dir handles).
+                    self.dir_handles
+                        .write()
+                        .entry(handle.ino)
+                        .or_default()
+                        .insert(handle.fh, Arc::new(handle));
+                }
+                info!(
+                    "node_state::restore: {} dir_handles restored",
+                    dir_handles_count
+                );
+
+                let fh_creator_value = reader.read_len()?;
+                self.fh_creator.set(fh_creator_value);
+                if let Some(stage) = stage {
+                    stage.success();
+                }
             }
-            info!(
-                "node_state::restore: {} dir_handles restored",
-                dir_handles_count
-            );
-
-            let fh_creator_value = reader.read_len()?;
-            self.fh_creator.set(fh_creator_value);
             Ok(())
         }
         .await;
